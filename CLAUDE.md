@@ -19,12 +19,15 @@ The Graphus server is developed with a focus on maximizing performance without l
 
 ### Connections
 
-Two types of connection are available to access and use the server:
+Three types of connection are available to access and use the server. Two of them speak the **Bolt** protocol (with **PackStream** serialization), and one speaks HTTP:
 
-- **UDS** — **Unix Domain Sockets** (also known as **IPC sockets**, Inter-Process Communication): a highly efficient method that allows direct data exchange and communication between processes (programs) running **on the same operating system**.
+- **UDS (Bolt)** — **Unix Domain Sockets** (also known as **IPC sockets**, Inter-Process Communication): a highly efficient method that allows direct data exchange and communication between processes (programs) running **on the same operating system**. Over UDS, the server speaks the Bolt protocol.
+- **Bolt over TCP** (`bolt://`) — the Bolt protocol exposed over the network (secured with TLS) so that the standard Neo4j driver ecosystem can connect to Graphus directly.
 - **Web REST API** — an interface that enables communication between different systems over the internet using the HTTP protocol. It acts as a "translator", allowing applications (such as websites or mobile apps) to talk to servers and databases in a standardized, fast, and secure way.
 
-In both cases (UDS and Web REST API), the implementations strictly follow the official, industry-reference standards and specifications of software development.
+In all cases, the implementations strictly follow the official, industry-reference standards and specifications of software development.
+
+> Note: the original definition listed two connections (UDS + REST). The third interface (Bolt over TCP) and the adoption of Bolt as the UDS protocol were ratified as design decisions `D-wire-protocol` and `D-bolt-compat` (see `specification/02-decision-register.md`).
 
 ### Systems and architectures
 

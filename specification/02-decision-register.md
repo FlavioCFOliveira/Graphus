@@ -55,6 +55,27 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 3. **D-graph-algos → full library.** A complete graph-algorithms library plus an in-memory projection
    engine is committed as a dedicated workstream (its own phase), in addition to the ACID/TCK core.
 
+## TCK target (pinned — closes `D-cypher-line` open question 1)
+
+The "100% Cypher TCK" target is pinned to the **openCypher `2024.3`** tag (commit `677cbaf`,
+dated 2026-03-20), the latest release on the GQL-convergent 2024.x line. **`1.0.0-M23`** is the
+first-milestone snapshot.
+
+Scenario counts (measured by cloning each tag and parsing `tck/features/**/*.feature` on 2026-06-05):
+
+| Snapshot | `.feature` files | `Scenario` + `Scenario Outline` blocks | Executable scenarios (outline examples expanded) |
+| --- | --- | --- | --- |
+| **2024.3 (target)** | 220 | 1615 (1339 + 276) | **3880** (1339 plain + 2541 example rows) |
+| 1.0.0-M23 (milestone) | 220 | 1615 (1339 + 276) | 3880 |
+
+The two tags coincide in totals but differ in content (the scenarios were revised, not net-added,
+along this path), so the 2024.x language surface (label expressions, quantified path patterns,
+`SHORTEST`, element-pattern `WHERE`) is delivered behind feature flags while certifying the same
+scenario budget. "100% TCK compliant" = **all 3880 executable scenarios of the pinned tag pass**
+(correct result bag/order, correct side-effect counts, correct error type at the correct phase).
+The verbatim `QueryType`/result/failure shapes and the error-classification table must still be read
+from the pinned tag (tracked as a spike; `04-technical-design.md` §12 item 13).
+
 | ID | Decision | Options | Affects |
 | --- | --- | --- | --- |
 | **D-cypher-line** | Cypher version / TCK snapshot | (a) openCypher 9 (M23), frozen, smaller surface; (b) openCypher 2024.x (GQL-convergent), larger surface; ★(c) implement 2024.x but feature-gate the newest constructs and certify the M-series milestone first — **pin a specific tagged commit and count its scenarios** | Query Language |
