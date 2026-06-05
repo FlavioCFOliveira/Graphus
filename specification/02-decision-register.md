@@ -9,7 +9,51 @@ Each decision is a `Decision` node in the Knowledge Graph (status `open`) with a
 to the domain/component it constrains. On ratification, the chosen option is recorded on the node
 and its status set to `ratified`.
 
+> **Status: all 24 decisions ratified on 2026-06-05.** The chosen option is recorded on each
+> `Decision` node (`status: ratified`, property `chosen`). The ratified outcomes are summarized in
+> the next section; the options tables below are kept for the rationale and trade-offs.
+
 Legend: ★ = recommended option.
+
+## Ratified outcomes (2026-06-05)
+
+| ID | Ratified choice |
+| --- | --- |
+| D-cypher-line | openCypher 2024.x line, feature-flagged; certify the M-series milestone first; pin a tagged commit |
+| D-tck-harness | Rust `cucumber` crate for CI + periodic JVM `tck-api` as ground-truth oracle |
+| D-element-id | Internal compact physical IDs + a stable, never-reused public element ID (ULID/UUIDv7) |
+| D-temporal-spatial | All temporal types in v1; spatial `POINT` deferred to a later phase |
+| D-concurrency-control | MVCC + Serializable Snapshot Isolation (SSI) |
+| D-isolation-level | Serializable (SSI) default; Snapshot Isolation as an opt-in documented mode |
+| D-durability-mode | Group commit + `fdatasync` default; per-transaction synchronous available; torn-write protection + page checksums + PANIC-on-fsync-failure |
+| D-buffer-mgmt | Custom self-managed buffer pool (not pure `mmap`) |
+| **D-storage-arch** | **Custom record store with index-free adjacency from day one; transactional + recovery layer built in-house** *(override of recommended staged-hybrid; raises storage-correctness risk — reinforces DST)* |
+| D-runtime-model | Hybrid: Tokio multi-thread baseline + a sharded write/ACID path (validate on a traversal-heavy benchmark) |
+| D-io-backend | Portable epoll/kqueue baseline + optional io_uring fast path on Linux with runtime fallback |
+| D-allocator | System allocator first; adopt mimalloc/jemalloc only with per-target before/after benchmarks |
+| D-target-matrix | Linux x86_64 + aarch64 and macOS aarch64 as Tier 1 tested; 64-bit only; CI on x86 + aarch64 |
+| **D-wire-protocol** | **Adopt Neo4j Bolt directly as the UDS wire protocol (PackStream)** *(override of recommended custom protocol)* |
+| **D-bolt-compat** | **Add a Bolt TCP listener (`bolt://`) for the Neo4j driver ecosystem — a third network interface beyond the originally-stated UDS + REST** *(override; requires TLS + network security for the Bolt TCP endpoint)* |
+| D-serialization | Typed JSON (Jolt-style) for REST + CBOR via negotiation; PackStream for Bolt (UDS + TCP); fix int53 from day one |
+| D-auth-scheme | UDS `SO_PEERCRED` + socket perms; REST Bearer/JWT over TLS + RBAC; Bolt TCP native auth over TLS; shared RBAC |
+| D-v1-topology | Single-node only in v1, clustering-ready internal interfaces |
+| D-v1-index-types | Token-lookup + range/B-tree + composite (incl. relationship-property) indexes in v1 |
+| **D-graph-algos** | **Full GDS-style graph-algorithms library (centrality, community detection, similarity, embeddings, in-memory projection engine)** *(override of recommended native-only; a large dedicated workstream/phase orthogonal to the ACID/TCK core)* |
+| D-multi-db | Single database in v1; catalog abstraction (catalog→schema→graph) designed in |
+| D-vector-index | Out of scope for v1; deferred to a later phase |
+| D-security-scope | Auth + RBAC + TLS (REST + Bolt) + user/role management in v1; fine-grained access control / encryption-at-rest / auditing in Phase 2 |
+| D-dst-investment | Scaffold a deterministic simulation testing harness from the start with fault injection |
+
+**Four owner overrides of the recommendation** (recorded with a `note` on their KG nodes) reshape the
+scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
+1. **D-storage-arch → custom from day one.** The transactional/recovery engine (WAL/ARIES/SSI) is
+   built in-house from the start; this is the highest-risk work and is the reason DST (D-dst-investment)
+   and the full verification arsenal are scaffolded immediately.
+2. **D-wire-protocol → Bolt directly**, and **D-bolt-compat → add a Bolt TCP listener.** Graphus now
+   exposes **three interfaces**: Bolt over UDS, Bolt over TCP (`bolt://`), and the Web REST API. This
+   extends the two-interface model in the project definition (`CLAUDE.md`); see the note in `00-overview.md`.
+3. **D-graph-algos → full library.** A complete graph-algorithms library plus an in-memory projection
+   engine is committed as a dedicated workstream (its own phase), in addition to the ACID/TCK core.
 
 | ID | Decision | Options | Affects |
 | --- | --- | --- | --- |

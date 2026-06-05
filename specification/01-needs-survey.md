@@ -6,8 +6,9 @@ definition and from authoritative sources (`03-sources.md`). Each need carries a
 
 - **[CORE]** — essential for the first solid deliverable (Phase 1 / v1).
 - **[ADV]** — advanced or optional; deferred to Phase 2/3 unless a decision moves it.
+- **[LIB]** — committed graph-algorithms-library workstream (dedicated phase), per `D-graph-algos`.
 
-Tiering of `[ADV]` items is subject to the decisions in `02-decision-register.md`.
+Tiering reflects the ratified decisions in `02-decision-register.md` (all 24 ratified 2026-06-05).
 
 ---
 
@@ -141,20 +142,28 @@ Target: **100% Cypher TCK compliant** on a pinned openCypher snapshot (decision 
 
 ## 5. Connectivity (CN)
 
-Two interfaces, both strictly standards-following. They **share the executor and value model**
-but differ in wire format.
+**Three** interfaces (per ratified decisions `D-wire-protocol`/`D-bolt-compat`), all strictly
+standards-following. They **share the executor and value model** but differ in transport/wire
+format: **Bolt over UDS**, **Bolt over TCP**, and the **Web REST API**.
 
-### UDS
+### UDS (Bolt)
 
 - **FR-CN-1** [CORE] **Pathname `SOCK_STREAM` socket** under a dedicated directory, portable across
   Linux/macOS/Raspberry Pi OS; access controlled by socket-file permissions.
 - **FR-CN-2** [CORE] **Length-prefixed framing** supporting arbitrarily large streamed result sets.
 - **FR-CN-3** [CORE] **Peer-credential authentication** (`SO_PEERCRED` / `LOCAL_PEERCRED`) mapping
   OS uid/gid to a Graphus role (passwordless local trust).
-- **FR-CN-4** [CORE] **Custom binary wire protocol** with Bolt-inspired semantics (decision
-  `D-wire-protocol`): versioned handshake; parameterized run; fetch-size-driven record streaming;
-  transaction begin/commit/rollback; structured failure with code/message/diagnostics;
-  fail-then-ignore-until-acknowledged under pipelining.
+- **FR-CN-4** [CORE] **Bolt protocol over UDS** (decision `D-wire-protocol`: adopt Neo4j Bolt
+  directly, PackStream serialization): versioned handshake; `HELLO`/`LOGON`; parameterized `RUN`;
+  fetch-size-driven `PULL`/`DISCARD` record streaming; `BEGIN`/`COMMIT`/`ROLLBACK`; structured
+  `FAILURE` with code/message/diagnostics; fail-then-ignore-until-`RESET` under pipelining.
+
+### Bolt over TCP
+
+- **FR-CN-13** [CORE] **Bolt TCP listener** (`bolt://`) exposing the same Bolt protocol over the
+  network for the standard Neo4j driver ecosystem (decision `D-bolt-compat`).
+- **FR-CN-14** [CORE] **TLS + network hardening for Bolt TCP** (`bolt+s://`): TLS 1.3, Bolt-native
+  authentication (`HELLO`/`LOGON`), connection/rate limits, and the same RBAC as the other interfaces.
 
 ### Web REST API
 
@@ -174,8 +183,9 @@ but differ in wire format.
 ### Serialization
 
 - **FR-CN-11** [CORE] **Lossless value serialization** of all graph values (nodes, relationships,
-  paths, 64-bit integers, lists, maps, and — when enabled — temporal/spatial). Solve the JSON
-  int53 problem from day one (typed JSON, Jolt-style; string-encode 64-bit integers).
+  paths, 64-bit integers, lists, maps, and — when enabled — temporal/spatial). **PackStream** on
+  the Bolt paths (UDS + TCP); **typed JSON (Jolt-style)** on REST. Solve the JSON int53 problem
+  from day one (string-encode 64-bit integers).
 - **FR-CN-12** [ADV] **CBOR** offered via content negotiation for compact binary without int53 hazard.
 
 ## 6. Architecture & Performance (AR)
@@ -288,13 +298,17 @@ but differ in wire format.
 
 ## 14. Graph Algorithms (GA)
 
+Decision `D-graph-algos` ratifies a **full GDS-style library** as a committed, dedicated
+workstream (its own phase), beyond the native path functions. `[LIB]` marks items in that
+workstream (committed, but not part of the Phase 1 correctness core).
+
 - **FR-GA-1** [CORE] **Native Cypher path functions:** `shortestPath`/`allShortestPaths`,
   variable-length expansion (part of Cypher/TCK).
-- **FR-GA-2** [ADV] **Weighted shortest path** (Dijkstra/A*).
-- **FR-GA-3** [ADV] **Centrality** (PageRank, betweenness, closeness, degree).
-- **FR-GA-4** [ADV] **Community detection** (Louvain, Label Propagation, WCC).
-- **FR-GA-5** [ADV] **Similarity / link prediction; embeddings; in-memory projection engine.**
-  (Decision `D-graph-algos`: native path functions only in v1.)
+- **FR-GA-2** [LIB] **Weighted shortest path** (Dijkstra/A*).
+- **FR-GA-3** [LIB] **Centrality** (PageRank, betweenness, closeness, degree).
+- **FR-GA-4** [LIB] **Community detection** (Louvain, Label Propagation, WCC).
+- **FR-GA-5** [LIB] **Similarity / link prediction; embeddings (Node2Vec, FastRP).**
+- **FR-GA-6** [LIB] **In-memory graph projection engine** for parallel algorithm execution.
 
 ## 15. Quality & Testing (QA)
 

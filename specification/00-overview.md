@@ -20,9 +20,14 @@ Both requirements are **absolutely inviolable** and constrain every design decis
 ## 2. Goals
 
 - A correct, durable, high-performance **single-node** LPG server (distribution is a later phase).
-- Two connection interfaces, both following official industry standards:
-  - **UDS** — Unix Domain Sockets (IPC) for clients on the same operating system.
+- Connection interfaces, all following official industry standards. The project definition
+  states two (UDS + REST); a ratified owner decision (`D-bolt-compat`) extends this to **three**
+  by adopting the **Bolt** protocol and exposing it over both UDS and TCP:
+  - **UDS** — Unix Domain Sockets (IPC) for clients on the same operating system, speaking **Bolt**.
+  - **Bolt over TCP** (`bolt://`) — for the standard Neo4j driver ecosystem (requires TLS).
   - **Web REST API** — HTTP for standardized, remote, interoperable access.
+  > Note: the Bolt-over-TCP interface is an owner-ratified extension of the two-interface model in
+  > `CLAUDE.md`; the project definition there should be updated to record the three-interface model.
 - Runs flawlessly on **Linux, macOS, and Raspberry Pi OS** across **x86_64, arm64, and
   aarch64**, explicitly including **Apple Silicon, x86 processors, and Raspberry Pi 5+**.
 - Maximum performance across all supported hardware, from the most basic to the most advanced.
@@ -33,29 +38,38 @@ Both requirements are **absolutely inviolable** and constrain every design decis
 
 In scope for the first solid deliverable (Phase 1):
 
-- Native LPG multigraph storage; full property type/value model.
-- CRUD via Cypher and via the native UDS API.
-- A Cypher engine targeting 100% TCK: parser → semantic analysis → planner → executor.
-- Token-lookup, range/B-tree, and composite indexes; index-backed lookups.
+- **Native LPG multigraph storage built in-house from day one** — custom record store with
+  index-free adjacency and an in-house transactional/recovery engine (`D-storage-arch`); full
+  property type/value model (all temporal types in v1; spatial deferred).
+- CRUD via Cypher and via the native (Bolt) API.
+- A Cypher engine targeting 100% TCK (openCypher 2024.x, feature-flagged): parser → semantic
+  analysis → planner → executor.
+- Token-lookup, range/B-tree, and composite (incl. relationship-property) indexes; index-backed lookups.
 - Uniqueness and existence constraints; DDL via Cypher.
-- ACID transactions: explicit and implicit, multi-statement, MVCC, a documented isolation
-  level, WAL + checkpointing + crash recovery.
-- Both interfaces (UDS + REST), one reference driver, and a CLI/shell.
+- ACID transactions: explicit and implicit, multi-statement, **MVCC + SSI (Serializable default)**,
+  WAL + group commit + checkpointing + crash recovery, with stable never-reused element IDs.
+- **All three interfaces** (Bolt over UDS, Bolt over TCP, REST), one reference driver, and a CLI/shell.
 - `LOAD CSV` + offline bulk importer + dump/export.
 - Offline backup/restore + snapshots + restore verification.
-- Baseline security: authentication, RBAC, user/role management, TLS for REST.
+- Baseline security: authentication, RBAC, user/role management, TLS for REST and Bolt TCP.
 - Observability: metrics (Prometheus/OpenMetrics), structured + query/slow-query logs,
   health checks, admin API, configuration management.
 - Reliability: consistency checker, page/record checksums, startup integrity verification.
+- **Deterministic Simulation Testing harness scaffolded from the start** (`D-dst-investment`).
+
+Committed but as a **dedicated workstream/phase** (owner override `D-graph-algos`), not part of the
+Phase 1 correctness core:
+
+- A **full GDS-style graph-algorithms library** (centrality, community detection, similarity,
+  embeddings) plus an **in-memory graph projection engine**.
 
 Out of scope for v1 (deferred — see `01-needs-survey.md` and the phased roadmap):
 
 - Clustering, replication, sharding, distributed transactions.
 - Full-text, spatial, and vector/similarity indexes.
-- A graph-algorithms library beyond native Cypher path functions.
 - Multiple databases / multi-tenancy (the catalog abstraction is designed in, not shipped).
 - User-defined functions/procedures and a plugin mechanism.
-- Bolt-protocol compatibility (optional later transport; not part of the TCK).
+- Fine-grained access control, encryption at rest, auditing (Phase 2).
 
 ## 4. Glossary
 
@@ -100,10 +114,12 @@ Out of scope for v1 (deferred — see `01-needs-survey.md` and the phased roadma
 - **Phase 2 — Production hardening & ecosystem:** cost-based optimizer with statistics;
   full-text/spatial indexes; online index builds; node-key/type constraints; online/hot and
   incremental backup + PITR; fine-grained access control, encryption at rest, auditing;
-  UDFs/UDPs + extension mechanism; multi-database; visualization; Bolt compatibility; full LDBC SNB.
+  UDFs/UDPs + extension mechanism; multi-database; visualization; full LDBC SNB.
+- **Graph-algorithms workstream (committed, dedicated phase):** a full GDS-style algorithms
+  library and in-memory projection engine (`D-graph-algos`); may run in parallel after Phase 1.
 - **Phase 3 — Distribution & advanced analytics:** replication, read replicas, consensus,
-  failover, sharding, distributed transactions; graph-algorithms library; vector/similarity
-  indexes; streaming ingestion; GQL conformance alongside Cypher.
+  failover, sharding, distributed transactions; vector/similarity indexes; streaming ingestion;
+  GQL conformance alongside Cypher.
 
 ## 7. Traceability
 

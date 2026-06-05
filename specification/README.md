@@ -15,7 +15,7 @@ in the project Knowledge Graph (`rmp` roadmap `graphus`).
 | --- | --- |
 | `00-overview.md` | Project definition, goals, scope boundaries, glossary, non-functional requirements, phased roadmap, traceability. |
 | `01-needs-survey.md` | **The global needs survey** — every functional need, organized by the 15 domains, each tagged `[CORE]` or `[ADV]`. |
-| `02-decision-register.md` | All open design decisions, each with options and a recommendation. **These require the project owner's ratification before the detailed per-domain functional spec is written.** |
+| `02-decision-register.md` | The 24 design decisions, each with options and a recommendation. **All ratified on 2026-06-05** — see the "Ratified outcomes" section; the chosen option is recorded on each KG `Decision` node. |
 | `03-sources.md` | Authoritative references (standards, papers, vendor docs) backing every requirement. |
 
 ## How to read this
@@ -35,6 +35,10 @@ Knowledge Graph.
 
 ## Status
 
-- **Stage:** Specify (baseline).
-- **Roadmap / KG:** `rmp` roadmap `graphus` (89 nodes, 113 edges at baseline).
+- **Stage:** Specify (baseline complete; all 24 design decisions ratified).
+- **Next:** per-domain detailed functional specification (one document per domain), consistent
+  with the ratified decisions; then Phase 1 implementation planning in `rmp`.
+- **Roadmap / KG:** `rmp` roadmap `graphus` (the queryable project map; updated on every commit).
 - **Inviolable requirements:** 100% ACID compliant, 100% Cypher TCK compliant.
+- **Interfaces:** Bolt over UDS, Bolt over TCP, and the Web REST API (three; the Bolt-over-TCP
+  interface is an owner-ratified extension of the project definition).
