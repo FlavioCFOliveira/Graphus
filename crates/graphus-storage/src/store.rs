@@ -863,6 +863,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         pages
     }
 
+    /// The next [`ElementId`] this store would allocate (one past the largest issued so far,
+    /// `04 §2.2`). Read-only; embedded as the creation marker of an offline backup
+    /// ([`crate::backup`]).
+    #[must_use]
+    pub fn element_id_next(&self) -> u128 {
+        self.element_ids.peek()
+    }
+
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.
     /// A DST helper for snapshotting the on-disk image (`04 §11`).
     ///

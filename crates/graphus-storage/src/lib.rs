@@ -54,6 +54,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod backup;
 pub mod check;
 pub mod idalloc;
 pub mod meta;
@@ -64,6 +65,10 @@ pub mod store;
 pub mod tokens;
 pub mod wal_rule;
 
+pub use backup::{
+    BACKUP_FORMAT_VERSION, BACKUP_MAGIC, backup_creation_marker, backup_store, restore,
+    restore_onto, verify_backup,
+};
 pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, IndexAgreement, IndexEntry,
     PropertyFault, Violation, verify_on_open,

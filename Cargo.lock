@@ -121,6 +121,7 @@ dependencies = [
 name = "graphus-storage"
 version = "0.0.0"
 dependencies = [
+ "crc32c",
  "graphus-bufpool",
  "graphus-core",
  "graphus-index",

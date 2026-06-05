@@ -16,6 +16,9 @@ graphus-wal = { path = "../graphus-wal" }
 # The consistency checker (src/check.rs) verifies store/index agreement, so it needs the index
 # types. This edge is acyclic: graphus-index depends on core/io/bufpool/wal, never on storage.
 graphus-index = { path = "../graphus-index" }
+# CRC32C for the whole-payload backup digest (src/backup.rs); same crate/version the page header
+# already uses in graphus-bufpool, so no new transitive dependency enters the workspace.
+crc32c = "0.6"
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

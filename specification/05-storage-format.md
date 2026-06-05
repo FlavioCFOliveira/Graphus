@@ -189,3 +189,27 @@ WAL-logged (redo + undo, the same intra-page patch format as the record store) a
 same three-phase ARIES machinery — there is no separate index rebuild (`04 §6.4`). Indexes are **not**
 separately MVCC-versioned: a seek returns candidate record ids and visibility is resolved against each
 record's MVCC header by the transaction layer (`04 §6.3`).
+
+---
+
+## 11. Frozen layout — offline backup artifact (`graphus-storage`)
+
+The offline backup/restore feature (FR-BR) froze a self-describing backup artifact. It is a
+**consistent snapshot**: the store is flushed (every dirty page written home under the WAL rule, the
+device synced) and a clean fuzzy checkpoint (`04 §4.7`) is appended, so the captured durable image
+has nothing in flight. Two integrity layers compose (`04 §4.6`): every page already carries its own
+CRC32C, and the artifact adds a whole-payload digest so tampering anywhere — header, framing, or page
+ids — is detected even if a per-page checksum were re-faked.
+
+| Region | Bytes | Contents |
+| --- | --- | --- |
+| Header | 44 | `magic` `b"GRPHBKUP"` (8) · `format_version` u32 · `page_size` u32 · `creation_mark` u128 (the store's never-reused `ElementId`-next at snapshot) · `page_count` u64 |
+| Page section | `page_count × (8 + 8192)` | per page, ascending device-page order: `page_id` u64 + the full 8192-byte page image |
+| Trailer | 4 | `digest` u32 = CRC32C over every preceding byte |
+
+`verify_backup` validates the structure + digest without restoring (catches truncation, bad magic,
+wrong version/page-size, page-count mismatch, a flipped digest, and a misplaced framing `page_id`).
+Restore writes the verified pages onto a fresh device and **runs the consistency checker** (§ the
+checker in `graphus-storage`): a backup that frames an internally-inconsistent image (even one that
+passes both integrity layers) is rejected rather than served. Online / incremental backup and
+point-in-time recovery are deferred to Phase 2; this is the offline path only.
