@@ -121,7 +121,7 @@ stable `ElementId`** (`D-element-id`) immediately after this prefix; property re
 
 ## 8. What remains deferred (with owner-visible flags)
 
-- Exact full record layouts (node/relationship/property/token type-specific fields) → finalized in
+- Exact full record layouts (node/relationship/property type-specific fields) → **frozen in §9** by
   the `graphus-storage` task.
 - B+-tree slotted-page directory format → `graphus-index` task.
 - Page-size / fanout / torn-write / MVCC **measurements** → confirmed against LDBC SNB once
@@ -129,3 +129,38 @@ stable `ElementId`** (`D-element-id`) immediately after this prefix; property re
 - CRC32C re-confirmation on `aarch64`.
 
 Nothing here is silently fixed: each provisional choice is flagged for its confirming measurement.
+
+---
+
+## 9. Frozen layout — record store (`graphus-storage`)
+
+The `graphus-storage` task froze the exact record layouts. All fields are little-endian. Records of
+a given store are **fixed-size** and laid out as an array inside each logical page's payload (bytes
+`24..8192`, after the §6 page header): record at store-slot `s` lives at byte offset
+`24 + (s mod records_per_page) × RECORD_SIZE`, where `records_per_page = (8192 − 24) / RECORD_SIZE`.
+Every record begins with the §7 **25-byte MVCC header**.
+
+- **Physical id `0` is reserved as the null pointer**, so `first_rel = 0`, `first_prop = 0`,
+  `next_prop = 0`, `undo_ptr = 0`, and the chain pointers all read as "none". Real records are
+  allocated from id `1` upward; freed ids are reused (a per-store WAL-logged free list, §2.7),
+  while the public `ElementId` is never reused.
+
+| Store | `RECORD_SIZE` | records/page | Type-specific fields after the 25-byte MVCC header |
+| --- | --- | --- | --- |
+| `nodes.store` | **65** | 125 | `element_id` u128 (16) · `first_rel` u64 (8) · `first_prop` u64 (8) · `labels` u64 (8) |
+| `rels.store` | **102** | 80 | `element_id` u128 (16) · `type` u32 (4) · `start_node` u64 (8) · `end_node` u64 (8) · `start_prev_rel` / `start_next_rel` / `end_prev_rel` / `end_next_rel` u64 (8 each) · `first_prop` u64 (8) · `chain_flags` u8 (1) |
+| `props.store` | **46** | 177 | `key` u32 (4) · `type_tag` u8 (1) · `value_inline` u64 (8) · `next_prop` u64 (8) |
+
+A relationship is threaded into **two** doubly-linked incidence chains (its start node's and its end
+node's, §2.3); `chain_flags` marks which side is its chain's head. A self-loop
+(`start_node == end_node`) is threaded into the single chain **twice** (via its start-side and
+end-side pointers) and deduped by relationship id on a distinct-incidence traversal (§2.4). Parallel
+edges are simply distinct relationship records (§2.4). `dense_ptr` reinterpretation of `first_rel`
+(§2.5) and `value_inline`'s overflow into `strings.store` are reserved by these layouts but their
+machinery lands with the dense-node and large-value tasks.
+
+Tokens (labels / reltypes / propkeys) are bidirectional `u32 ↔ name` dictionaries, WAL-logged and
+recovered (§2.6). The `ElementId → physical id` direction is rebuilt in memory on open (each record
+self-describes its `ElementId`; the never-reused 128-bit counter is persisted in the metadata
+catalog). All mutations are WAL-logged as intra-page `(u16 offset, bytes)` redo/undo patches and are
+crash-recoverable via three-phase ARIES recovery (`04-technical-design.md` §4.8).
