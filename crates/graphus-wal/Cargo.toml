@@ -10,3 +10,7 @@ description = "ARIES write-ahead log, group commit, checkpoints and recovery for
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+crc32c = "0.6"
+
+[dev-dependencies]
+graphus-sim = { path = "../graphus-sim" }

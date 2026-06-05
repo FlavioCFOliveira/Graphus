@@ -133,7 +133,9 @@ dependencies = [
 name = "graphus-wal"
 version = "0.0.0"
 dependencies = [
+ "crc32c",
  "graphus-core",
+ "graphus-sim",
 ]
 
 [[package]]
