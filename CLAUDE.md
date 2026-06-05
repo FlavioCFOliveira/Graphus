@@ -4,6 +4,42 @@ Operating instructions for the AI agent working on **Graphus**, a Label Property
 
 These rules are mandatory. Read them in full before starting any task and follow them at all times.
 
+## Project definition
+
+Graphus is an **LPG (Label Property Graph) database server**. The server is built to operate **exemplarily and without failure** under extreme load and concurrency (highly demanding environments). By default, the graph uses a **multigraph** architecture.
+
+The server implements, in an exemplary manner, all official software-development standards, specifications, and conventions in order to guarantee that it is:
+
+1. **100% ACID COMPLIANT** — guarantees full reliability and safety when processing transactions, even in the event of power failures, errors, or system faults; that is, it guarantees that the data will never become corrupted or left in an invalid state after an operation.
+2. **100% CYPHER TCK COMPLIANT** — fully compliant with the official specifications of the **Cypher** language; that is, it guarantees that any query written in Cypher will behave exactly as expected, with no unexpected behavior or syntax failures.
+
+**These two requirements (100% ACID COMPLIANT and 100% CYPHER TCK COMPLIANT) MUST be considered absolutely inviolable.**
+
+The Graphus server is developed with a focus on maximizing performance without leaving out any functionality, taking advantage of the available hardware capabilities (from the most basic to the most advanced).
+
+### Connections
+
+Two types of connection are available to access and use the server:
+
+- **UDS** — **Unix Domain Sockets** (also known as **IPC sockets**, Inter-Process Communication): a highly efficient method that allows direct data exchange and communication between processes (programs) running **on the same operating system**.
+- **Web REST API** — an interface that enables communication between different systems over the internet using the HTTP protocol. It acts as a "translator", allowing applications (such as websites or mobile apps) to talk to servers and databases in a standardized, fast, and secure way.
+
+In both cases (UDS and Web REST API), the implementations strictly follow the official, industry-reference standards and specifications of software development.
+
+### Systems and architectures
+
+The Graphus server can run on Linux, macOS, and Raspberry Pi OS, on the x86 / amd64, arm64, and aarch64 architectures. It must run without failure on Apple Silicon, x86 processors, and Raspberry Pi 5 or higher.
+
+The highest performance is observable across all of these architectures and operating systems.
+
+### Tests
+
+The project contains an extensive test suite to guarantee that the server behaves as expected — not only as a whole, but also each of its modules and components. Several types of tests are implemented, such as:
+
+1. **Unit tests** — All features are properly tested.
+2. **E2E (end-to-end) tests** — Realistic tests that prove the server's readiness for use in different scenarios.
+3. **Stress and load tests** — Realistic tests that prove the server's readiness for use in environments of **EXTREME CONCURRENCY AND LOAD**.
+
 ## Core rules
 
 1. **You are NOT authorized to make decisions on your own.** Whenever the instructions are insufficient, unclear, non-specific, non-concrete, or whenever there are contradictions or ambiguities, you MUST ALWAYS ASK the user how to proceed. When asking the user:
