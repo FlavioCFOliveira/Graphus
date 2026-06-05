@@ -6,7 +6,9 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Self-managed buffer pool, page format and checksums for Graphus."
+description = "Self-managed buffer pool, page header and CRC32C checksums for Graphus."
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+graphus-io = { path = "../graphus-io" }
+crc32c = "0.6"
