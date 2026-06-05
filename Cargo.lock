@@ -131,6 +131,7 @@ name = "graphus-txn"
 version = "0.0.0"
 dependencies = [
  "graphus-core",
+ "graphus-sim",
 ]
 
 [[package]]

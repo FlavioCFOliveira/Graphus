@@ -10,3 +10,6 @@ description = "MVCC + Serializable Snapshot Isolation transaction manager for Gr
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+
+[dev-dependencies]
+graphus-sim = { path = "../graphus-sim" }
