@@ -10,3 +10,9 @@ description = "B+-tree, token-lookup, composite and relationship-property indexe
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+graphus-io = { path = "../graphus-io" }
+graphus-bufpool = { path = "../graphus-bufpool" }
+graphus-wal = { path = "../graphus-wal" }
+
+[dev-dependencies]
+graphus-sim = { path = "../graphus-sim" }

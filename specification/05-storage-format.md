@@ -123,7 +123,7 @@ stable `ElementId`** (`D-element-id`) immediately after this prefix; property re
 
 - Exact full record layouts (node/relationship/property type-specific fields) → **frozen in §9** by
   the `graphus-storage` task.
-- B+-tree slotted-page directory format → `graphus-index` task.
+- B+-tree slotted-page directory format → **frozen in §10** by the `graphus-index` task.
 - Page-size / fanout / torn-write / MVCC **measurements** → confirmed against LDBC SNB once
   `graphus-bench` exists (this spike's choices are the working defaults until then).
 - CRC32C re-confirmation on `aarch64`.
@@ -164,3 +164,28 @@ recovered (§2.6). The `ElementId → physical id` direction is rebuilt in memor
 self-describes its `ElementId`; the never-reused 128-bit counter is persisted in the metadata
 catalog). All mutations are WAL-logged as intra-page `(u16 offset, bytes)` redo/undo patches and are
 crash-recoverable via three-phase ARIES recovery (`04-technical-design.md` §4.8).
+
+---
+
+## 10. Frozen layout — B+-tree index page (`graphus-index`)
+
+The `graphus-index` task froze the slotted B+-tree page. An index is a file of logical pages; each
+page reuses the §6 24-byte page header, then a slotted body laid out by `graphus-index`. Keys are the
+**order-preserving encoding** (`04-technical-design.md` §6.2) so that page byte order equals Cypher
+value order; values are 8-byte little-endian record ids.
+
+| Region | Location | Contents |
+| --- | --- | --- |
+| Node header | bytes `24..28` | `level` u16 (0 = leaf) · `slot_count` u16 |
+| Slot directory | grows down from byte `28` | fixed 8-byte slots `(cell_off u16, key_len u16, val_len u16, reserved u16)`, kept **sorted by key** (binary search) |
+| Cell heap | grows up from `PAGE_SIZE − 16` | leaf cell = `key ++ value(8-byte rid)`; internal cell = `key ++ child u64` |
+| Special area | last 16 bytes | `right_sibling` u64 at `−8` (B-link chain over all leaves in key order) · `leftmost_child` (`P0`) u64 at `−16` (internal nodes only) |
+
+An internal node with `k` keys has `k + 1` children (`P0` plus one per slot). Traversal is
+latch-coupled (crabbing) with B-link right-sibling retry on splits (`04 §6.1`); the discipline is
+documented and the right-sibling links maintained, with the concurrent implementation deferred to the
+concurrent-buffer-pool task (the single-threaded core is correct today). Every index-page mutation is
+WAL-logged (redo + undo, the same intra-page patch format as the record store) and recovered by the
+same three-phase ARIES machinery — there is no separate index rebuild (`04 §6.4`). Indexes are **not**
+separately MVCC-versioned: a seek returns candidate record ids and visibility is resolved against each
+record's MVCC header by the transaction layer (`04 §6.3`).

@@ -82,7 +82,11 @@ dependencies = [
 name = "graphus-index"
 version = "0.0.0"
 dependencies = [
+ "graphus-bufpool",
  "graphus-core",
+ "graphus-io",
+ "graphus-sim",
+ "graphus-wal",
 ]
 
 [[package]]
