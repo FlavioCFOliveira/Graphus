@@ -1,0 +1,12 @@
+[package]
+name = "graphus-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The Graphus server process: listener wiring, admission control and observability."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

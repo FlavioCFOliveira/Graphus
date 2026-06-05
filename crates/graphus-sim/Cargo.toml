@@ -1,0 +1,12 @@
+[package]
+name = "graphus-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic and production capability implementations and fault-injection hooks for Graphus DST."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

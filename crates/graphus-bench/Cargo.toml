@@ -1,0 +1,12 @@
+[package]
+name = "graphus-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Criterion micro-benchmarks and LDBC SNB macro harness for Graphus."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

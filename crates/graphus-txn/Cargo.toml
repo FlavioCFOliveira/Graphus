@@ -1,0 +1,12 @@
+[package]
+name = "graphus-txn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MVCC + Serializable Snapshot Isolation transaction manager for Graphus."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

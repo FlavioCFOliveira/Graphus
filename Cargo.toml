@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license-file = "LICENSE"
+repository = "https://github.com/FlavioCFOliveira/Graphus"
+authors = ["Flavio CF Oliveira"]
+
+# Release build configuration (revisit with measurements — see
+# specification/04-technical-design.md and the Rust Performance Book).
+[profile.release]
+codegen-units = 1
+lto = "thin"

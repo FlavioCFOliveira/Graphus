@@ -1,0 +1,12 @@
+[package]
+name = "graphus-cypher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Cypher parse, plan and execute pipeline for Graphus (targets the openCypher TCK)."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

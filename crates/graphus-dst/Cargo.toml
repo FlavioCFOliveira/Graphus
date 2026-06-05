@@ -1,0 +1,12 @@
+[package]
+name = "graphus-dst"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic simulation scenarios and fault injection for Graphus."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

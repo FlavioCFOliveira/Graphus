@@ -1,0 +1,12 @@
+[package]
+name = "graphus-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Async file and socket I/O for Graphus (epoll/kqueue baseline + optional io_uring)."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

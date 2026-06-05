@@ -1,0 +1,110 @@
+//! `graphus-sim` — production and deterministic implementations of the
+//! [`graphus_core::capability`] traits, plus the hooks for Deterministic Simulation
+//! Testing (`specification/04-technical-design.md` §11; decision `D-dst-investment`).
+//!
+//! The deterministic implementations make the whole engine reproducible from a seed
+//! so that injected faults (crashes, I/O errors, reorderings) replay exactly.
+#![forbid(unsafe_code)]
+
+use graphus_core::capability::{Clock, Rng};
+
+/// A deterministic clock that advances only when explicitly ticked.
+#[derive(Debug, Default, Clone)]
+pub struct SimClock {
+    nanos: u64,
+}
+
+impl SimClock {
+    /// Creates a clock starting at `start` nanoseconds.
+    #[must_use]
+    pub fn new(start: u64) -> Self {
+        Self { nanos: start }
+    }
+
+    /// Advances the clock by `delta` nanoseconds (saturating).
+    pub fn advance(&mut self, delta: u64) {
+        self.nanos = self.nanos.saturating_add(delta);
+    }
+}
+
+impl Clock for SimClock {
+    fn now_nanos(&self) -> u64 {
+        self.nanos
+    }
+}
+
+/// The production clock backed by the operating-system wall clock.
+///
+/// A future revision will switch to a monotonic source; this skeleton uses the
+/// system clock so the trait is wired end to end.
+#[derive(Debug, Default, Clone)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_nanos(&self) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+    }
+}
+
+/// A deterministic `xorshift64*` pseudo-random generator (seedable, reproducible).
+#[derive(Debug, Clone)]
+pub struct SimRng {
+    state: u64,
+}
+
+impl SimRng {
+    /// Creates an RNG from a seed; a zero seed is remapped to a fixed non-zero value.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
+        }
+    }
+}
+
+impl Rng for SimRng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sim_clock_advances_deterministically() {
+        let mut c = SimClock::new(100);
+        assert_eq!(c.now_nanos(), 100);
+        c.advance(50);
+        assert_eq!(c.now_nanos(), 150);
+    }
+
+    #[test]
+    fn sim_rng_is_reproducible_from_a_seed() {
+        let mut a = SimRng::new(42);
+        let mut b = SimRng::new(42);
+        let seq_a: Vec<u64> = (0..8).map(|_| a.next_u64()).collect();
+        let seq_b: Vec<u64> = (0..8).map(|_| b.next_u64()).collect();
+        assert_eq!(seq_a, seq_b);
+    }
+
+    #[test]
+    fn sim_rng_differs_by_seed() {
+        let mut a = SimRng::new(1);
+        let mut b = SimRng::new(2);
+        assert_ne!(a.next_u64(), b.next_u64());
+    }
+}

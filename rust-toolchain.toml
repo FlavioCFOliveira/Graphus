@@ -1,0 +1,4 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Edition 2024 requires Rust >= 1.85 (see workspace `rust-version`).

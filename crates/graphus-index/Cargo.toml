@@ -1,0 +1,12 @@
+[package]
+name = "graphus-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "B+-tree, token-lookup, composite and relationship-property indexes and constraints."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

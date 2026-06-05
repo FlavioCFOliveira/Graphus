@@ -1,0 +1,9 @@
+[package]
+name = "graphus-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared vocabulary (IDs, value model, errors, capability traits, constants) for Graphus."

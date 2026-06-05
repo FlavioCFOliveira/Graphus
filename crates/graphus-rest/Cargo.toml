@@ -1,0 +1,12 @@
+[package]
+name = "graphus-rest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP transactional REST API for Graphus (typed JSON / CBOR, NDJSON streaming)."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

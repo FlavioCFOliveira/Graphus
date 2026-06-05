@@ -1,0 +1,12 @@
+[package]
+name = "graphus-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Interactive shell and admin client for Graphus."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }

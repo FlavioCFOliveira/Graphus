@@ -1,0 +1,12 @@
+[package]
+name = "graphus-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Peer-credential, JWT/Bearer authentication and RBAC for Graphus."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }
