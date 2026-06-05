@@ -6,7 +6,20 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Deterministic simulation scenarios and fault injection for Graphus."
+description = "Deterministic simulation harness and fault injection for Graphus."
+
+[lib]
+name = "graphus_dst"
+path = "src/lib.rs"
+
+[[bin]]
+name = "graphus-dst"
+path = "src/main.rs"
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+graphus-sim = { path = "../graphus-sim" }
+graphus-io = { path = "../graphus-io" }
+graphus-wal = { path = "../graphus-wal" }
+graphus-bufpool = { path = "../graphus-bufpool" }
+graphus-storage = { path = "../graphus-storage" }
