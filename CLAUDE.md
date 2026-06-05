@@ -84,6 +84,8 @@ If the work being planned requires several phases (or sprints), then the plannin
 
 Use the **Knowledge Graph** to help identify which tasks bring the most gains and the extent of each task's impact. Use the KG (Knowledge Graph) to help determine which tasks are foundational and highest-gain, in order to optimize the best path for executing the tasks.
 
+High-gain tasks (those with the greatest gain or the greatest impact on the project), tasks that unblock other tasks or features, and foundational tasks MUST always take priority. By default, you must always seek to work from the highest-gain tasks down to the least essential ones.
+
 ### Task execution
 
 Task execution is the natural continuation (the next step) of planning. You MUST always use the `rmp` tool to determine:
