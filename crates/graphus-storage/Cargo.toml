@@ -13,6 +13,9 @@ graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
 graphus-bufpool = { path = "../graphus-bufpool" }
 graphus-wal = { path = "../graphus-wal" }
+# The consistency checker (src/check.rs) verifies store/index agreement, so it needs the index
+# types. This edge is acyclic: graphus-index depends on core/io/bufpool/wal, never on storage.
+graphus-index = { path = "../graphus-index" }
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

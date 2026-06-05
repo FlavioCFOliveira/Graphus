@@ -874,6 +874,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.pool.unpin(f);
         Ok(bytes)
     }
+
+    // ---------------------------- consistency checker ----------------------------
+    //
+    // Read-only accessors and a fetch wrapper the offline consistency checker
+    // ([`crate::check`]) needs over otherwise-private catalog state. They never mutate the store
+    // and are crate-private: the checker lives in this crate but in a sibling module, so it cannot
+    // reach `RecordStore`'s private fields directly.
+
+    /// The physical-id high-water mark of `kind`'s store (one past the largest id ever allocated,
+    /// `04 §2.2`): live ids of that store are a subset of `1..high_water`.
+    pub(crate) fn checker_high_water(&self, kind: StoreKind) -> u64 {
+        self.store(kind).alloc.high_water()
+    }
+
+    /// The freed physical ids of `kind`'s store (`04 §2.7`).
+    pub(crate) fn checker_free_ids(&self, kind: StoreKind) -> Vec<u64> {
+        self.store(kind).free.ids().to_vec()
+    }
 }
 
 /// Which neighbour pointer is being repaired during an unlink.

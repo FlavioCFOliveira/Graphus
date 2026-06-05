@@ -54,6 +54,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod check;
 pub mod idalloc;
 pub mod meta;
 pub mod paging;
@@ -63,6 +64,10 @@ pub mod store;
 pub mod tokens;
 pub mod wal_rule;
 
+pub use check::{
+    AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, IndexAgreement, IndexEntry,
+    PropertyFault, Violation, verify_on_open,
+};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use record::{
     ChainSide, MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE,

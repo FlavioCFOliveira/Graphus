@@ -112,6 +112,14 @@ impl FreeList {
         self.stack.len()
     }
 
+    /// The freed ids currently held, in stack (LIFO) order. Used by the consistency checker
+    /// ([`crate::check`]) to verify free-list sanity (`04 §2.7`): a freed id must not be in use and
+    /// must not be referenced by any live chain.
+    #[must_use]
+    pub fn ids(&self) -> &[u64] {
+        &self.stack
+    }
+
     /// Whether the free list is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
