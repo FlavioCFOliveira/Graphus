@@ -12,3 +12,21 @@ description = "Self-managed buffer pool, page header and CRC32C checksums for Gr
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
 crc32c = "0.6"
+
+# `loom` model-checks the concurrent buffer pool's latching logic. It is needed by the *library*
+# (via `src/sync.rs`) only when compiled with `--cfg loom`, so it is gated on that cfg rather than
+# being a plain dependency or a dev-dependency (the latter would not be visible to the lib build).
+# Run the loom tests with:
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-bufpool --test loom_bufpool --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+# The loom integration test (`tests/loom_bufpool.rs`) is itself a separate crate that needs loom
+# for `loom::model`, `loom::thread` and `loom::sync`; gate it on `--cfg loom` too.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+# `loom` is a known custom cfg the crate sets via RUSTFLAGS; register it so `unexpected_cfgs`
+# (and therefore `clippy -D warnings`) stays quiet without a build script.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
