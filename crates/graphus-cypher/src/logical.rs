@@ -612,20 +612,7 @@ impl LogicalOp {
                 input.fmt_indented(f, depth + 1)
             }
             Self::Sort { input, keys } => {
-                let rendered: Vec<String> = keys
-                    .iter()
-                    .map(|k| {
-                        format!(
-                            "{} {}",
-                            fmt_expr(&k.expr),
-                            match k.direction {
-                                SortDirection::Ascending => "ASC",
-                                SortDirection::Descending => "DESC",
-                            }
-                        )
-                    })
-                    .collect();
-                writeln!(f, "Sort({})", rendered.join(", "))?;
+                writeln!(f, "Sort({})", fmt_sort_keys(keys))?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::Skip { input, count } => {
@@ -727,6 +714,25 @@ impl LogicalOp {
 }
 
 // ---- Display helpers (diagnostics only; no semantic load) -------------------------------------
+
+/// Renders a list of [`SortKey`]s as `expr ASC, expr DESC, …` (shared by the logical `Sort` and the
+/// physical `Sort`/`TopN` pretty-printers via [`display_helpers`]).
+fn fmt_sort_keys(keys: &[SortKey]) -> String {
+    let rendered: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            format!(
+                "{} {}",
+                fmt_expr(&k.expr),
+                match k.direction {
+                    SortDirection::Ascending => "ASC",
+                    SortDirection::Descending => "DESC",
+                }
+            )
+        })
+        .collect();
+    rendered.join(", ")
+}
 
 fn arrow_left(direction: RelDirection) -> &'static str {
     match direction {
@@ -981,4 +987,75 @@ fn fmt_expr(expr: &Expr) -> String {
 
 fn fmt_opt_rhs(rhs: &Option<Box<Expr>>) -> String {
     rhs.as_deref().map(fmt_expr).unwrap_or_default()
+}
+
+/// Crate-internal re-exports of the [`LogicalOp`] [`Display`] helpers so the
+/// [physical plan](crate::physical) pretty-printer can render the operators it carries through
+/// (relationship arrows, types, columns, set/remove ops, expressions, …) **identically** to the
+/// logical printer. Keeping one set of helpers guarantees the two renderings never drift.
+///
+/// These are pure diagnostics formatters with no semantic load (the same caveat as on the private
+/// helpers): they are stable enough for golden tests but are **not** a serialization format.
+pub(crate) mod display_helpers {
+    use super::{
+        CreatePart, Expr, ProjectionColumn, RelDirection, RelType, RemoveOp, SetOp, SortKey, Var,
+        VarLengthRange, YieldColumn,
+    };
+
+    /// See [`super::arrow_left`].
+    pub(crate) fn arrow_left(direction: RelDirection) -> &'static str {
+        super::arrow_left(direction)
+    }
+    /// See [`super::arrow_right`].
+    pub(crate) fn arrow_right(direction: RelDirection) -> &'static str {
+        super::arrow_right(direction)
+    }
+    /// See [`super::fmt_types`].
+    pub(crate) fn types(types: &[RelType]) -> String {
+        super::fmt_types(types)
+    }
+    /// See [`super::fmt_range`].
+    pub(crate) fn range(range: &Option<VarLengthRange>) -> String {
+        super::fmt_range(range)
+    }
+    /// See [`super::fmt_vars`].
+    pub(crate) fn vars(vars: &[Var]) -> String {
+        super::fmt_vars(vars)
+    }
+    /// See [`super::fmt_columns`].
+    pub(crate) fn columns(cols: &[ProjectionColumn]) -> String {
+        super::fmt_columns(cols)
+    }
+    /// See [`super::fmt_sort_keys`].
+    pub(crate) fn sort_keys(keys: &[SortKey]) -> String {
+        super::fmt_sort_keys(keys)
+    }
+    /// See [`super::fmt_create_parts`].
+    pub(crate) fn create_parts(parts: &[CreatePart]) -> String {
+        super::fmt_create_parts(parts)
+    }
+    /// See [`super::fmt_merge_actions`].
+    pub(crate) fn merge_actions(label: &str, ops: &[SetOp]) -> String {
+        super::fmt_merge_actions(label, ops)
+    }
+    /// See [`super::fmt_set_ops`].
+    pub(crate) fn set_ops(ops: &[SetOp]) -> String {
+        super::fmt_set_ops(ops)
+    }
+    /// See [`super::fmt_remove_ops`].
+    pub(crate) fn remove_ops(ops: &[RemoveOp]) -> String {
+        super::fmt_remove_ops(ops)
+    }
+    /// See [`super::fmt_call_args`].
+    pub(crate) fn call_args(args: &Option<Vec<Expr>>) -> String {
+        super::fmt_call_args(args)
+    }
+    /// See [`super::fmt_yields`].
+    pub(crate) fn yields(yields: &Option<Vec<YieldColumn>>) -> String {
+        super::fmt_yields(yields)
+    }
+    /// See [`super::fmt_expr`].
+    pub(crate) fn expr(expr: &Expr) -> String {
+        super::fmt_expr(expr)
+    }
 }

@@ -34,9 +34,30 @@
 //!   *"logical planner → logical plan (relational-graph algebra: Expand, NodeScan, Filter, Project,
 //!   Apply, Optional, Merge, Create, SetProperty, …)"*). The plan is deliberately **index-agnostic**
 //!   and strategy-agnostic — index seeks, expand-into vs expand-all, and join/limit/sort strategy
-//!   are the **physical** planner's job (the next sub-task). The lowering is total and infallible
-//!   over a validated query and applies only conservative, semantics-preserving normalisation
-//!   (inline-property-map predicate hoisting); cost-based optimisation is Phase 2 (`00-overview`).
+//!   are the **physical** planner's job. The lowering is total and infallible over a validated query
+//!   and applies only conservative, semantics-preserving normalisation (inline-property-map
+//!   predicate hoisting); cost-based optimisation is Phase 2 (`00-overview`).
+//!
+//! - The **physical planner** ([`physical`]) — the pipeline's fifth stage — lowers a
+//!   [logical plan](logical) into a [`physical::PhysicalPlan`] ([`physical::plan_physical`] →
+//!   [`physical::PhysicalOp`]), consulting the **index catalog** ([`catalog`]) to make the strategy
+//!   choices the logical plan left open (`04 §7.1`: *"physical planner → physical plan (index seeks,
+//!   expand-into vs expand-all, hash vs nested-loop join, sort, limit pushdown)"*). v1 is
+//!   heuristic/rule-based with index awareness (`04 §6.6`); each rule is chosen to be obviously
+//!   semantics-preserving. The plan records the catalog [`catalog::IndexId`]s it depends on so the
+//!   plan cache invalidates on schema/index change (`04 §6.6`).
+//!
+//! - The **plan cache** ([`plan_cache`]) — keyed by `(normalized_query_text, schema_version,
+//!   feature_flags)` (`04 §7.5`), capacity-bounded LRU, invalidated on a `schema_version` bump.
+//!   Normalisation applies **literal auto-parameterisation** ([`plan_cache::normalize_query`]):
+//!   inline scalar literals are lifted to auto-parameters so structurally identical queries share a
+//!   plan — a TCK-safe transformation that preserves observable semantics (`04 §7.5`).
+//!
+//! - **Parameter binding** ([`binding`]) — the **runtime** phase ([`binding::bind_parameters`])
+//!   that binds parameters to a compiled plan at *execution*, never compile (`04 §7.5`). The plan is
+//!   parameter-independent (so the cache is parameter-independent); a missing or ill-typed parameter
+//!   is a **runtime** error ([`binding::BindError`]), validated here against the plan's expectations
+//!   (`04 §7.3`/§7.5).
 //!
 //! # The four value-model operations (they are genuinely different)
 //!
@@ -87,6 +108,8 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod binding;
+pub mod catalog;
 pub mod equality;
 pub mod equivalence;
 pub mod errors;
@@ -96,10 +119,18 @@ pub mod logical;
 pub mod lower;
 pub mod ordering;
 pub mod parser;
+pub mod physical;
+pub mod plan_cache;
 pub mod semantics;
 pub mod ternary;
 
 pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
+pub use binding::{
+    BindError, BoundParameters, ParamType, Parameters, bind_parameters, referenced_parameters,
+};
+pub use catalog::{
+    IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
+};
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
 pub use errors::{
@@ -113,5 +144,10 @@ pub use logical::{
 pub use lower::lower;
 pub use ordering::cmp_values;
 pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
+pub use physical::{PhysicalOp, PhysicalPlan, RangeBound, plan_physical};
+pub use plan_cache::{
+    CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
+    normalize_query,
+};
 pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};
 pub use ternary::Ternary;
