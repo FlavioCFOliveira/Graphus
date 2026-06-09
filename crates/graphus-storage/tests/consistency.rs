@@ -35,8 +35,8 @@ use graphus_storage::record::{
 use graphus_storage::store::StoreKind;
 use graphus_storage::{
     AgreementFault, ConsistencyReport, IndexAgreement, IndexEntry, Namespace, RecordStore,
-    Violation, check::AdjacencyFault, check::FreeListFault, check::PropertyFault, recovery,
-    verify_on_open,
+    Violation, check::AdjacencyFault, check::FreeListFault, check::LabelBitmapFault,
+    check::PropertyFault, recovery, verify_on_open,
 };
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
@@ -707,4 +707,106 @@ fn self_first_rel(img: &DiskImage) -> u64 {
         }
     }
     panic!("no node with a non-empty incidence chain in the image");
+}
+
+// ============================================================================================
+// Label-bitmap well-formedness (`05 §9`, `rmp` task #42 — node labels).
+// ============================================================================================
+
+/// A healthy labelled store passes (no false positive on a valid label bitmap).
+#[test]
+fn labelled_graph_passes() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, _) = s.create_node(txn).unwrap();
+    let (_b, _) = s.create_node(txn).unwrap();
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let admin = s.intern_token(Namespace::Label, "Admin").unwrap();
+    s.set_node_labels(txn, a, &[person, admin]).unwrap();
+    s.commit(txn).unwrap();
+
+    let r = report(&mut s);
+    assert!(
+        r.is_consistent(),
+        "healthy labelled graph: {:?}",
+        r.violations
+    );
+    // It also passes after crash + recovery.
+    let img = DiskImage::capture(&mut s);
+    let mut reopened = img.open();
+    assert!(report(&mut reopened).is_consistent());
+}
+
+/// (i) A node whose `labels` bitmap has the overflow flag set (a state this build never writes, so
+/// necessarily stale/corrupt) is flagged — and the *uncorrupted* image first passes.
+#[test]
+fn label_bitmap_overflow_flag_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (_a, eid_a) = s.create_node(txn).unwrap();
+    let l = s.intern_token(Namespace::Label, "L").unwrap();
+    s.set_node_labels(txn, _a, &[l]).unwrap();
+    s.commit(txn).unwrap();
+
+    // Uncorrupted image passes.
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent());
+
+    // Corrupt: set the overflow flag (bit 63) on the node's labels bitmap.
+    let (page_id, off) = img.locate(StoreKind::Node, eid_a.0);
+    let mut node = img.read_node_at(page_id, off);
+    node.labels |= 1u64 << graphus_storage::OVERFLOW_BIT;
+    img.write_node_at(page_id, off, &node);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::LabelBitmap {
+                detail: LabelBitmapFault::OverflowFlagSet,
+                ..
+            }
+        )),
+        "an overflow-flagged label bitmap must be flagged: {:?}",
+        r.violations
+    );
+}
+
+/// (j) A node whose `labels` bitmap references a `Label` token id that does not exist in the token
+/// store (a dangling label reference) is flagged.
+#[test]
+fn label_bitmap_unknown_token_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (_a, eid_a) = s.create_node(txn).unwrap();
+    let l = s.intern_token(Namespace::Label, "L").unwrap(); // token id 0
+    s.set_node_labels(txn, _a, &[l]).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent());
+
+    // Corrupt: set bit 5 too — no `Label` token with id 5 exists (only id 0 was interned).
+    let (page_id, off) = img.locate(StoreKind::Node, eid_a.0);
+    let mut node = img.read_node_at(page_id, off);
+    node.labels |= 1u64 << 5;
+    img.write_node_at(page_id, off, &node);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::LabelBitmap {
+                detail: LabelBitmapFault::UnknownLabelToken { token_id: 5 },
+                ..
+            }
+        )),
+        "a label bitmap referencing an unknown token id must be flagged: {:?}",
+        r.violations
+    );
 }

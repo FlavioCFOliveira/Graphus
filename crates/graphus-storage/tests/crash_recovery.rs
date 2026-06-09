@@ -214,6 +214,72 @@ fn tokens_and_element_id_counter_recover() {
 }
 
 #[test]
+fn committed_node_labels_survive_a_no_force_crash() {
+    // `rmp` task #42: node labels are WAL-logged page patches of the node record, so they recover
+    // exactly like any other committed node write.
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, _) = s.create_node(txn).unwrap();
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let admin = s.intern_token(Namespace::Label, "Admin").unwrap();
+    s.set_node_labels(txn, a, &[person, admin]).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut rec = recover_no_force(&s);
+    // The label token namespace recovered, and the node's bitmap recovered with it.
+    assert_eq!(rec.token_id(Namespace::Label, "Person"), Some(person));
+    let mut ids = rec.node_labels(a).unwrap();
+    ids.sort_unstable();
+    let mut want = vec![person, admin];
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    assert!(rec.node_has_label(a, person).unwrap());
+}
+
+#[test]
+fn label_mutations_recover_under_a_steal_crash() {
+    // Build a committed labelled node, then steal-crash and recover: the committed bitmap is intact.
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, _) = s.create_node(txn).unwrap();
+    let l = s.intern_token(Namespace::Label, "L").unwrap();
+    s.add_label(txn, a, l).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut rec = recover_steal(&mut s);
+    assert_eq!(rec.node_labels(a).unwrap(), vec![l]);
+}
+
+#[test]
+fn uncommitted_label_change_is_rolled_back_after_a_crash() {
+    // Committed baseline: node a labelled :L.
+    let mut s = fresh(64);
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let (a, _) = s.create_node(t1).unwrap();
+    let l = s.intern_token(Namespace::Label, "L").unwrap();
+    s.add_label(t1, a, l).unwrap();
+    s.commit(t1).unwrap();
+
+    // T2 adds a second label but never commits (a loser); harden its tail so undo runs.
+    let t2 = TxnId(2);
+    s.begin(t2);
+    let m = s.intern_token(Namespace::Label, "M").unwrap();
+    s.add_label(t2, a, m).unwrap();
+    s.with_wal(graphus_wal::WalManager::flush);
+
+    let mut rec = recover_no_force(&s);
+    // Only the committed label survives; the uncommitted one is undone.
+    assert_eq!(
+        rec.node_labels(a).unwrap(),
+        vec![l],
+        "the uncommitted second label must be rolled back"
+    );
+}
+
+#[test]
 fn free_list_recovers_so_ids_keep_reusing() {
     let mut s = fresh(64);
     let t1 = TxnId(1);

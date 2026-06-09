@@ -3,14 +3,18 @@
 //!
 //! These tests run the full pipeline (`parse → semantic analysis → physical plan → execute`) against
 //! a [`RecordStoreGraph`] wrapping a real [`graphus_storage::RecordStore`] over an in-memory DST
-//! device + log. They prove the achievable subset (#38): label-free MATCH / traversal / inline
-//! scalar property filter / aggregation / `CREATE`/`SET`/`DELETE`, the same-query-both-backends
-//! equivalence against the reference [`MemGraph`], crash-recovery durability, and that every #39
-//! deferral is signalled by a captured error rather than a wrong answer.
+//! device + log. They prove the achievable subset (#38 + #42): MATCH / traversal / inline scalar
+//! property filter / aggregation / `CREATE`/`SET`/`DELETE`, **node labels** (`CREATE (:L)`, `n:L`
+//! predicates, `labels(n)`, label scans, `SET`/`REMOVE` label — `rmp` task #42), the
+//! same-query-both-backends equivalence against the reference [`MemGraph`], crash-recovery
+//! durability (including labels), and that every #39 deferral is signalled by a captured error
+//! rather than a wrong answer.
 //!
 //! Property values here are restricted to the **inline scalar** classes (`Integer`/`Float`/
-//! `Boolean`) the store can encode in this build; string/list/map/temporal property values and node
-//! labels are deferred to #39 and are exercised here only to prove they signal an error.
+//! `Boolean`) the store can encode in this build; string/list/map/temporal property values are
+//! deferred to #39 and are exercised here only to prove they signal an error. Node labels use the
+//! inline label bitmap (`05 §9`); a label needing token id `≥ 63` (a 64th distinct label) is the
+//! documented overflow deferral (#39's token-list block) and is exercised to prove it errors.
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::binding::{Parameters, bind_parameters};
@@ -319,6 +323,150 @@ fn same_query_matches_memgraph_reference() {
 }
 
 // =================================================================================================
+// Node labels over the real store (`rmp` task #42)
+// =================================================================================================
+
+/// Extracts a single named column as a `Vec<RowValue>` (for non-property columns like `labels(n)`).
+fn col_row(rows: &[Row], name: &str) -> Vec<RowValue> {
+    rows.iter()
+        .map(|r| row_bindings(r).get(name).cloned().expect("column present"))
+        .collect()
+}
+
+#[test]
+fn create_labelled_node_then_match_by_label() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (:Person {n: 1})", store, 1);
+    // A label-free node so the scan must discriminate.
+    let (_r, store) = run_commit("CREATE ({n: 2})", store, 2);
+
+    let (rows, store) = run_commit("MATCH (n:Person) RETURN n.n AS v", store, 3);
+    assert_eq!(col(&rows, "v"), vec![i(1)], "only the :Person node matches");
+
+    // A node without the label is not returned by the label scan.
+    let (rows, _store) = run_commit("MATCH (n:NoSuch) RETURN n.n AS v", store, 4);
+    assert!(rows.is_empty(), "an uninterned label matches nothing");
+}
+
+#[test]
+fn multi_label_node_matches_each_label_and_conjunctions() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (n:A:B {n: 1})", store, 1);
+
+    // MATCH (n:A) and MATCH (n:B) both find it.
+    let (ra, store) = run_commit("MATCH (n:A) RETURN n.n AS v", store, 2);
+    assert_eq!(col(&ra, "v"), vec![i(1)]);
+    let (rb, store) = run_commit("MATCH (n:B) RETURN n.n AS v", store, 3);
+    assert_eq!(col(&rb, "v"), vec![i(1)]);
+
+    // n:A AND n:B is true; n:A AND n:C is false (no :C label).
+    let (rab, store) = run_commit("MATCH (n:A) WHERE n:B RETURN n.n AS v", store, 4);
+    assert_eq!(col(&rab, "v"), vec![i(1)]);
+    let (rac, store) = run_commit("MATCH (n:A) WHERE n:C RETURN n.n AS v", store, 5);
+    assert!(rac.is_empty(), "n:A AND n:C must be false");
+
+    // labels(n) returns both names (the executor's labels() maps token ids back to names).
+    let (rl, _store) = run_commit("MATCH (n:A) RETURN labels(n) AS ls", store, 6);
+    assert_eq!(
+        col_row(&rl, "ls"),
+        vec![RowValue::Value(Value::List(vec![
+            Value::String("A".to_owned()),
+            Value::String("B".to_owned()),
+        ]))],
+        "labels(n) returns the node's label names"
+    );
+}
+
+#[test]
+fn set_label_adds_it_and_remove_label_clears_it() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (:A {n: 1})", store, 1);
+
+    // SET n:NewLabel adds it; a later MATCH finds it.
+    let (_r, store) = run_commit("MATCH (n:A) SET n:NewLabel", store, 2);
+    let (rows, store) = run_commit("MATCH (n:NewLabel) RETURN n.n AS v", store, 3);
+    assert_eq!(col(&rows, "v"), vec![i(1)]);
+
+    // REMOVE n:A removes it; a later MATCH (n:A) no longer finds it, but :NewLabel still does.
+    let (_r, store) = run_commit("MATCH (n:NewLabel) REMOVE n:A", store, 4);
+    let (gone, store) = run_commit("MATCH (n:A) RETURN n.n AS v", store, 5);
+    assert!(gone.is_empty(), "REMOVE n:A must clear the :A label");
+    let (still, _store) = run_commit("MATCH (n:NewLabel) RETURN n.n AS v", store, 6);
+    assert_eq!(col(&still, "v"), vec![i(1)], ":NewLabel must remain");
+}
+
+#[test]
+fn labelled_query_matches_memgraph_reference() {
+    // Both-backends-identical for a labelled query: scan by label + conjunction + labels().
+    let query = "MATCH (n:Person) WHERE n:Admin RETURN n.n AS v, labels(n) AS ls";
+
+    let mem = rows_over_mem(query, |g| {
+        g.add_node(["Person", "Admin"], [("n", i(1))]);
+        g.add_node(["Person"], [("n", i(2))]); // not :Admin
+        g.add_node(["Admin"], [("n", i(3))]); // not :Person
+    });
+
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (:Person:Admin {n: 1})", store, 1);
+    let (_r, store) = run_commit("CREATE (:Person {n: 2})", store, 2);
+    let (_r, store) = run_commit("CREATE (:Admin {n: 3})", store, 3);
+    let (rows, _store) = run_commit(query, store, 4);
+    let real: Vec<_> = rows.iter().map(row_bindings).collect();
+
+    assert_eq!(
+        real, mem,
+        "labelled query must match the MemGraph reference"
+    );
+    assert_eq!(real.len(), 1, "only the :Person:Admin node matches");
+}
+
+#[test]
+fn overflow_label_is_a_documented_deferred_error() {
+    // Force a label whose Label-namespace token id is >= 63: intern 63 distinct labels (ids 0..=62)
+    // on a node, then a 64th distinct label (id 63) overflows the inline bitmap (#39's token-list
+    // block). It must be a captured, documented error — not a wrong answer or a panic.
+    let store = fresh_store();
+    // Create one node carrying labels L0..L62 (63 labels = token ids 0..=62, all inline).
+    let inline: String = (0..63)
+        .map(|k| format!(":L{k}"))
+        .collect::<Vec<_>>()
+        .join("");
+    let (_r, store) = run_commit(&format!("CREATE (n{inline} {{n: 1}})"), store, 1);
+    // Sanity: those 63 labels are all readable.
+    let (rows, store) = run_commit("MATCH (n:L0) WHERE n:L62 RETURN labels(n) AS ls", store, 2);
+    assert_eq!(rows.len(), 1);
+
+    // The 64th distinct label (L63 -> token id 63) overflows.
+    let err = run_expect_error("MATCH (n:L0) SET n:L63", store, 3);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("#39") && msg.contains("overflow"),
+        "overflowing label must signal the documented deferred error, got: {msg}"
+    );
+}
+
+#[test]
+fn committed_labels_survive_a_no_force_crash() {
+    // Create + commit a labelled node via Cypher, crash, recover, and MATCH by label still finds it.
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (:Person:Admin {n: 7})", store, 1);
+
+    let recovered = recover_no_force(&store);
+    let (rows, store) = run_commit("MATCH (n:Person) RETURN n.n AS v", recovered, 100);
+    assert_eq!(col(&rows, "v"), vec![i(7)], "label survives recovery");
+
+    // labels() still returns both names after recovery.
+    let (rl, _store) = run_commit("MATCH (n:Admin) RETURN labels(n) AS ls", store, 101);
+    assert_eq!(
+        col_row(&rl, "ls"),
+        vec![RowValue::Value(Value::List(vec![
+            Value::String("Admin".to_owned()),
+            Value::String("Person".to_owned()),
+        ]))]
+    );
+}
+
+// =================================================================================================
 // Crash recovery: committed-via-Cypher data survives; uncommitted does not
 // =================================================================================================
 
@@ -450,41 +598,6 @@ fn list_property_value_is_a_deferred_error() {
         err.to_string().contains("#39") || err.to_string().contains("overflow"),
         "list property must signal a deferred error, got: {err}"
     );
-}
-
-#[test]
-fn create_node_with_label_is_a_deferred_error() {
-    let store = fresh_store();
-    let err = run_expect_error("CREATE (n:Person {n: 1})", store, 1);
-    assert!(
-        err.to_string().contains("label") && err.to_string().contains("#39"),
-        "labelled CREATE must signal the deferred-label error, got: {err}"
-    );
-}
-
-#[test]
-fn label_scan_returns_no_rows_and_signals_deferral() {
-    // Seed a label-free node, then query by label. The label scan must NOT return it (a wrong
-    // answer) — it returns nothing and the deferral is captured.
-    let store = fresh_store();
-    let (_r, store) = run_commit("CREATE ({n: 1})", store, 1);
-
-    let plan = compile("MATCH (n:Person) RETURN n.n AS v");
-    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
-    let mut graph = RecordStoreGraph::begin(store, TxnId(2));
-    let rows = {
-        let mut cursor = execute(&plan, &bound, &mut graph).expect("open");
-        cursor.collect_all().expect("rows")
-    };
-    assert!(
-        rows.is_empty(),
-        "a label scan must not return label-free nodes"
-    );
-    let err = graph
-        .take_error()
-        .expect("label scan must signal the deferral");
-    assert!(err.to_string().contains("#39"));
-    graph.rollback().expect("rollback");
 }
 
 #[test]

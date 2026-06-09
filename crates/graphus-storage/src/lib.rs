@@ -57,6 +57,7 @@
 pub mod backup;
 pub mod check;
 pub mod idalloc;
+pub mod labels;
 pub mod meta;
 pub mod paging;
 pub mod propenc;
@@ -72,9 +73,10 @@ pub use backup::{
 };
 pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, IndexAgreement, IndexEntry,
-    PropertyFault, Violation, verify_on_open,
+    LabelBitmapFault, PropertyFault, Violation, verify_on_open,
 };
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
+pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,
 };

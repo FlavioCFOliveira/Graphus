@@ -29,6 +29,10 @@
 //! 5. **Free-list sanity** ([`Violation::FreeList`], `04 §2.7`): no freed id is in use or referenced
 //!    by a live chain; freed ids are in range and not duplicated; and every store's free list and
 //!    high-water mark are mutually consistent.
+//! 6. **Label-bitmap well-formedness** ([`Violation::LabelBitmap`], `05 §9`, `rmp` task #42): every
+//!    live node's `labels` bitmap has its overflow flag clear (this build never sets it; the
+//!    token-list overflow block is the follow-up #39) and references only `Label`-namespace token
+//!    ids that exist in the token store (no dangling label reference).
 //!
 //! # Termination on a corrupted store
 //!
@@ -117,6 +121,13 @@ pub enum Violation {
         /// Which free-list rule was broken.
         detail: FreeListFault,
     },
+    /// A live node's label bitmap is malformed (`05 §9`; `rmp` task #42 — node labels).
+    LabelBitmap {
+        /// The node whose `labels` bitmap is inconsistent.
+        node: u64,
+        /// Which label-bitmap rule was broken.
+        detail: LabelBitmapFault,
+    },
 }
 
 /// The precise adjacency rule broken by a [`Violation::Adjacency`].
@@ -173,6 +184,22 @@ pub enum AgreementFault {
     MissingEntry {
         /// The record id whose entry is missing.
         rid: u64,
+    },
+}
+
+/// The precise label-bitmap rule broken by a [`Violation::LabelBitmap`] (`05 §9`, `rmp` task #42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelBitmapFault {
+    /// The node's bitmap has the overflow flag ([`OVERFLOW_BIT`](crate::labels::OVERFLOW_BIT)) set,
+    /// but this build never writes that flag and the token-list overflow block (#39) is not present,
+    /// so the flag is necessarily stale/corrupt. (A future #39 build that legitimately uses the flag
+    /// would teach the checker to validate the referenced overflow block instead.)
+    OverflowFlagSet,
+    /// The node's bitmap sets the bit for a `Label`-namespace token id that does not exist in the
+    /// token store (`id >= label_token_count`): a dangling label reference.
+    UnknownLabelToken {
+        /// The dangling label token id the bitmap references.
+        token_id: u32,
     },
 }
 
@@ -302,6 +329,7 @@ pub fn check_store<D: BlockDevice, S: LogSink>(
     check_property_chains(store, &cat, &scan, &mut report)?;
     check_adjacency(store, &cat, &scan, &mut report)?;
     check_free_lists(&cat, &scan, &mut report);
+    check_label_bitmaps(&cat, &scan, &mut report);
 
     for ix in indexes {
         check_index_agreement(&scan, ix, &mut report);
@@ -345,6 +373,9 @@ struct Catalog {
     high_water: [u64; 3],
     free: [Vec<u64>; 3],
     pages: Vec<PageId>,
+    /// Number of interned `Label`-namespace tokens; valid label token ids are `0..label_token_count`
+    /// (`04 §2.6`). Used to flag a node label bitmap that references a non-existent label (#42).
+    label_token_count: usize,
 }
 
 impl Catalog {
@@ -361,6 +392,7 @@ impl Catalog {
                 store.checker_free_ids(StoreKind::Prop),
             ],
             pages: store.mapped_pages(),
+            label_token_count: store.checker_label_token_count(),
         }
     }
 
@@ -832,6 +864,43 @@ fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) 
                     kind,
                     id,
                     detail: FreeListFault::ReferencedByLiveChain,
+                });
+            }
+        }
+    }
+}
+
+/// 6. Label-bitmap well-formedness (`05 §9`, `rmp` task #42).
+///
+/// For every live node, validates its `labels` bitmap (purely from the live-record snapshot plus the
+/// catalog's `Label`-namespace token count):
+///
+/// * the overflow flag must be clear — this build never sets it and the overflow block (#39) is not
+///   present, so a set flag is necessarily stale/corrupt ([`LabelBitmapFault::OverflowFlagSet`]);
+/// * every membership bit must reference a `Label` token id that exists in the token store
+///   (`id < label_token_count`), else it is a dangling label reference
+///   ([`LabelBitmapFault::UnknownLabelToken`]).
+fn check_label_bitmaps(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
+    let token_count = cat.label_token_count as u32;
+    for (&nid, node) in &scan.live_nodes {
+        if crate::labels::is_overflowed(node.labels) {
+            report.push(Violation::LabelBitmap {
+                node: nid,
+                detail: LabelBitmapFault::OverflowFlagSet,
+            });
+            // The inline bits are not the authoritative set under overflow, so do not also flag them
+            // as unknown tokens; the overflow violation is the actionable one.
+            continue;
+        }
+        // `token_ids` cannot error here: we already excluded the overflow case.
+        let Ok(ids) = crate::labels::token_ids(node.labels) else {
+            continue;
+        };
+        for id in ids {
+            if id >= token_count {
+                report.push(Violation::LabelBitmap {
+                    node: nid,
+                    detail: LabelBitmapFault::UnknownLabelToken { token_id: id },
                 });
             }
         }

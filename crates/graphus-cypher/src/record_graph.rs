@@ -7,21 +7,23 @@
 //! [`MemGraph`](crate::graph_access::MemGraph). The executor depends only on the [`GraphAccess`]
 //! trait, so swapping the backend needs no operator change (`04 §7.4`).
 //!
-//! # The achievable subset (#38) and what is deferred (#39)
+//! # The achievable subset (#38 + #42) and what is deferred (#39)
 //!
-//! This is the **achievable subset** of the storage integration. The remaining wiring (node labels,
-//! index seeks, MVCC concurrency / SSI visibility, the string/overflow heap) is the follow-up
-//! **#39**. Every deferral is signalled by a **clear error**, never a silently wrong answer:
+//! This is the **achievable subset** of the storage integration: nodes/relationships/properties
+//! (#38) and **node labels** (#42, this task — the bit-packed small-label-set case of `05 §9`). The
+//! remaining wiring (index-accelerated label scans, the string/list property overflow heap, the
+//! label token-list overflow block, and MVCC concurrency / SSI visibility) is the follow-up **#39**.
+//! Every deferral is signalled by a **clear error**, never a silently wrong answer:
 //!
-//! | Capability | #38 (here) | How a deferral is signalled |
-//! |------------|-----------|-----------------------------|
+//! | Capability | here (#38 + #42) | How a deferral is signalled |
+//! |------------|------------------|-----------------------------|
 //! | Nodes / relationships CRUD + traverse | supported (over real records, real WAL) | — |
 //! | Inline scalar node properties (`Integer`/`Float`/`Boolean`) | supported via [`graphus_storage::encode_inline`] | — |
+//! | Node **labels** (`CREATE (:L)`, `SET`/`REMOVE` label, `n:L` predicates, `labels(n)`, label scan) | **supported** (#42) via the inline label bitmap, `05 §9` | a label needing token id `≥ 63` (a 64th+ distinct label) captures the documented overflow error (the token-list block is #39) |
 //! | `String`/`Bytes`/`List`/`Map`/temporal property values | **deferred (#39)** | a write captures a runtime error (the strings/overflow heap is not built) |
 //! | Property **removal** (`SET n.p = null`, `REMOVE n.p`) | **deferred (#39)** | a write captures a runtime error (the store has no in-place delete/tombstone API yet) |
 //! | **Relationship** properties | **deferred (#39)** | a write captures a runtime error (the store exposes no relationship-property chain API) |
-//! | Node **labels** (`scan_nodes_by_label`, `SET`/`REMOVE` label, label predicates) | **deferred (#39)** | label scans return empty + a captured error; label writes capture an error (no label-set API yet) |
-//! | Index seeks | **deferred (#39)** | the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
+//! | **Index-accelerated** label / property scans | **deferred (#39)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
 //! | MVCC concurrency / SSI | **deferred (#39)** | one query runs in a single transaction against the latest committed state |
 //!
 //! # Identity
@@ -186,6 +188,54 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         }
     }
 
+    /// Resolves the [`Namespace::Label`] token id for `name`, **interning it if new** (a new label
+    /// token becomes durable when the transaction commits, exactly like a relationship type,
+    /// `04 §2.6`). Used by label writes (`CREATE (:L)`, `SET n:L`). Captures and returns `None` on a
+    /// storage error.
+    fn label_id_intern(&self, name: &str) -> Option<u32> {
+        match self.store.borrow_mut().intern_token(Namespace::Label, name) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                self.capture(e);
+                None
+            }
+        }
+    }
+
+    /// The existing [`Namespace::Label`] token id for `name`, **without** interning it.
+    ///
+    /// Returns `None` when `name` was never interned — by which point no live node can carry it (a
+    /// label only exists once some node was labelled with it), so a label *read* (scan / predicate)
+    /// on an unknown label is correctly empty/false. This is the read-side counterpart to
+    /// [`label_id_intern`](Self::label_id_intern), which must not create a token just by *asking*
+    /// whether a node has a label.
+    fn label_id_existing(&self, name: &str) -> Option<u32> {
+        self.store.borrow().token_id(Namespace::Label, name)
+    }
+
+    /// Interns and sets each of `labels` on `node`'s inline label bitmap (`05 §9`, `rmp` task #42),
+    /// idempotently. Shared by `create_node` (with labels) and `add_labels`.
+    ///
+    /// On the first error — a storage fault, or the documented overflow deferral (a label whose
+    /// token id is `≥ 63`, i.e. the 64th+ distinct label, whose token-list block is #39) — the error
+    /// is captured and the rest are skipped; the captured error makes the whole query untrustworthy
+    /// (the caller rolls back). This is never a silently-dropped label.
+    fn apply_add_labels(&self, node: NodeId, labels: &[String]) {
+        for name in labels {
+            let Some(token_id) = self.label_id_intern(name) else {
+                return; // storage error already captured (token-namespace exhaustion)
+            };
+            if let Err(e) = self
+                .store
+                .borrow_mut()
+                .add_label(self.txn, node.0, token_id)
+            {
+                self.capture(e);
+                return;
+            }
+        }
+    }
+
     /// Reads `node`'s live properties as newest-wins `(key_name, value)` pairs.
     ///
     /// The store's property chain is prepend-ordered (newest record first), so a `SET` of an
@@ -245,11 +295,38 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
     }
 
-    fn scan_nodes_by_label(&self, _label: &str) -> Vec<NodeId> {
-        // Node labels are not stored yet (the label-set API is #39). Returning a wrong (non-empty)
-        // set would be a silently wrong answer, so signal the deferral and return empty.
-        self.defer("a label scan (node labels)");
-        Vec::new()
+    fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+        // Resolve the label name -> token id without interning: if the label was never created, no
+        // live node can carry it, so the scan is correctly empty (`05 §9`, `rmp` task #42).
+        let Some(token_id) = self.label_id_existing(label) else {
+            return Vec::new();
+        };
+        // Index-accelerated label scans are #39; here we scan every live node and filter by the
+        // inline label bitmap (`node_has_label`). This is correct, just O(live nodes).
+        let mut store = self.store.borrow_mut();
+        let ids = match store.scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            match store.node_has_label(id, token_id) {
+                Ok(true) => out.push(NodeId(id)),
+                Ok(false) => {}
+                Err(e) => {
+                    // An overflow-form bitmap (a #39-written node) surfaces as a captured error
+                    // rather than a wrong (missing/extra) row.
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            }
+        }
+        out
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
@@ -323,15 +400,33 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
-        // The node-label set is not stored yet (#39). A node with no readable labels would honestly
-        // report `Some(vec![])`, but since label storage is entirely absent, claiming "no labels"
-        // could mask a query that relies on labels; signal the deferral. We still report node
-        // existence faithfully so callers distinguish a missing node (`None`) from the deferral.
         if !self.node_exists(node) {
             return None;
         }
-        self.defer("reading node labels");
-        Some(Vec::new())
+        // Read the node's label token ids from its inline bitmap (`05 §9`, `rmp` task #42), then map
+        // each id back to its name. An overflow-form bitmap (a #39-written node) is captured as an
+        // error and reported as `Some(vec![])` so the result is not silently wrong; the caller must
+        // inspect `take_error`.
+        let mut store = self.store.borrow_mut();
+        let ids = match store.node_labels(node.0) {
+            Ok(ids) => ids,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return Some(Vec::new());
+            }
+        };
+        let mut names: Vec<String> = ids
+            .into_iter()
+            .filter_map(|id| {
+                store
+                    .token_name(Namespace::Label, id)
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+        // Deterministic, name-sorted order (mirrors `MemGraph`, which keeps labels sorted).
+        names.sort();
+        Some(names)
     }
 
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
@@ -397,11 +492,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             }
         };
         let node = NodeId(id);
-        if !labels.is_empty() {
-            // Node labels are not stored yet (#39); a CREATE with labels must not silently drop
-            // them, so signal the deferral.
-            self.defer("creating a node with labels");
-        }
+        // Apply labels via the inline label bitmap (`05 §9`, `rmp` task #42). An overflowing label
+        // (token id `≥ 63`) captures the documented deferred error rather than dropping it silently.
+        self.apply_add_labels(node, labels);
         for (k, v) in properties {
             self.set_node_property(node, k, v.clone());
         }
@@ -481,14 +574,28 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if labels.is_empty() || !self.node_exists(node) {
             return;
         }
-        self.defer("adding node labels");
+        self.apply_add_labels(node, labels);
     }
 
     fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
         if labels.is_empty() || !self.node_exists(node) {
             return;
         }
-        self.defer("removing node labels");
+        // Remove each label that has ever been interned; a label name that was never created cannot
+        // be set on any node, so removing it is a no-op (no token is created just to remove it).
+        for name in labels {
+            let Some(token_id) = self.label_id_existing(name) else {
+                continue;
+            };
+            if let Err(e) = self
+                .store
+                .borrow_mut()
+                .remove_label(self.txn, node.0, token_id)
+            {
+                self.capture(e);
+                return;
+            }
+        }
     }
 
     fn remove_node_property(&mut self, node: NodeId, _key: &str) {

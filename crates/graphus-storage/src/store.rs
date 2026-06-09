@@ -33,6 +33,7 @@ use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
+use crate::labels;
 use crate::meta::{Meta, StoreMeta};
 use crate::paging;
 use crate::record::{
@@ -541,6 +542,100 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
+    // ------------------------------ node labels -----------------------------
+    //
+    // A node's label set is encoded in the frozen `NodeRecord.labels` u64 as a
+    // `Label`-namespace token-id bitmap (`05 §9`; `rmp` task #42). Bit `i` set <=> the node has the
+    // label with token id `i`, for `i` in `0..=62`; bit 63 is the overflow flag. The token-list
+    // overflow block (a label token id >= 63, or > 63 labels) is the follow-up #39 and is signalled
+    // here as a clear `LabelError` rather than a wrong or partial write. See `crate::labels`.
+    //
+    // Every label mutation rewrites the node record through the same WAL-logged page-patch path as
+    // any other node write ([`write_node`] -> [`write_region`]), so a label change is durable on
+    // commit and recovered (redo/undo) by the same three-phase ARIES machinery (`04 §4`).
+
+    /// Replaces node `id`'s label set with exactly `label_token_ids` (the bitmap is overwritten),
+    /// under `txn`. Duplicate ids are idempotent; the order is irrelevant.
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
+    /// - [`GraphusError::Runtime`] (from [`LabelError::Overflow`](crate::labels::LabelError::Overflow),
+    ///   `04 §2.6` / `05 §9`) if any token id is `>= 63` (the inline bitmap is full and the overflow
+    ///   block is the follow-up #39).
+    pub fn set_node_labels(&mut self, txn: TxnId, id: u64, label_token_ids: &[u32]) -> Result<()> {
+        let mut node = self.read_node(id)?;
+        if !node.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("node {id} not in use")));
+        }
+        node.labels = labels::encode_set(label_token_ids).map_err(GraphusError::from)?;
+        self.write_node(id, &node, txn)
+    }
+
+    /// Adds the label with `label_token_id` to node `id` under `txn` (idempotent — a label already
+    /// present is a no-op write).
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
+    /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
+    ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
+    pub fn add_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
+        let mut node = self.read_node(id)?;
+        if !node.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("node {id} not in use")));
+        }
+        let next = labels::with_label(node.labels, label_token_id).map_err(GraphusError::from)?;
+        if next == node.labels {
+            return Ok(()); // already present: no write, no WAL churn
+        }
+        node.labels = next;
+        self.write_node(id, &node, txn)
+    }
+
+    /// Removes the label with `label_token_id` from node `id` under `txn` (idempotent — removing an
+    /// absent label is a no-op write).
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
+    /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
+    ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
+    pub fn remove_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
+        let mut node = self.read_node(id)?;
+        if !node.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("node {id} not in use")));
+        }
+        let next =
+            labels::without_label(node.labels, label_token_id).map_err(GraphusError::from)?;
+        if next == node.labels {
+            return Ok(()); // already absent: no write
+        }
+        node.labels = next;
+        self.write_node(id, &node, txn)
+    }
+
+    /// The `Label`-namespace token ids of node `id`'s labels, ascending.
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if `id`'s page is not allocated.
+    /// - [`GraphusError::Runtime`] (from
+    ///   [`LabelError::OverflowFlagSet`](crate::labels::LabelError::OverflowFlagSet)) if the node's
+    ///   bitmap is in overflow form (its labels live in a #39 token-list block this build cannot
+    ///   read).
+    pub fn node_labels(&mut self, id: u64) -> Result<Vec<u32>> {
+        let node = self.read_node(id)?;
+        labels::token_ids(node.labels).map_err(GraphusError::from)
+    }
+
+    /// Whether node `id` carries the label with `label_token_id`.
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if `id`'s page is not allocated.
+    /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
+    ///   `label_token_id` is `>= 63`, or the node's bitmap is in overflow form (#39).
+    pub fn node_has_label(&mut self, id: u64, label_token_id: u32) -> Result<bool> {
+        let node = self.read_node(id)?;
+        labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
+    }
+
     // --------------------------- relationship CRUD --------------------------
 
     /// Creates a relationship of `type_id` from `start` to `end` under `txn`, threading it into
@@ -922,6 +1017,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub(crate) fn checker_free_ids(&self, kind: StoreKind) -> Vec<u64> {
         self.store(kind).free.ids().to_vec()
     }
+
+    /// The number of interned `Label`-namespace tokens (`04 §2.6`): label token ids are dense in
+    /// `0..label_token_count`. The consistency checker uses this to verify that a node's label
+    /// bitmap references only token ids that exist in the token store (`rmp` task #42).
+    pub(crate) fn checker_label_token_count(&self) -> usize {
+        self.tokens.len(Namespace::Label)
+    }
 }
 
 /// Which neighbour pointer is being repaired during an unlink.
@@ -971,5 +1073,102 @@ mod pool_target {
             self.pool.unpin(f);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Node-labels API unit tests over a real in-memory store (`rmp` task #42). The bitmap codec
+    //! itself is tested in [`crate::labels`]; here we test the WAL-logged store methods end to end.
+    use super::*;
+    use graphus_io::MemBlockDevice;
+    use graphus_wal::{MemLogSink, WalManager};
+
+    type Store = RecordStore<MemBlockDevice, MemLogSink>;
+
+    fn fresh() -> Store {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        RecordStore::create(device, wal, 64, 1).expect("create store")
+    }
+
+    #[test]
+    fn label_set_get_add_remove_round_trip() {
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        let (a, _) = s.create_node(txn).unwrap();
+        let person = s.intern_token(Namespace::Label, "Person").unwrap();
+        let admin = s.intern_token(Namespace::Label, "Admin").unwrap();
+
+        // A fresh node has no labels.
+        assert_eq!(s.node_labels(a).unwrap(), Vec::<u32>::new());
+        assert!(!s.node_has_label(a, person).unwrap());
+
+        // set_node_labels overwrites the whole set.
+        s.set_node_labels(txn, a, &[person, admin]).unwrap();
+        let mut ids = s.node_labels(a).unwrap();
+        ids.sort_unstable();
+        let mut want = vec![person, admin];
+        want.sort_unstable();
+        assert_eq!(ids, want);
+        assert!(s.node_has_label(a, person).unwrap());
+        assert!(s.node_has_label(a, admin).unwrap());
+
+        // add_label is idempotent; remove_label clears one bit.
+        s.add_label(txn, a, person).unwrap();
+        s.remove_label(txn, a, admin).unwrap();
+        assert_eq!(s.node_labels(a).unwrap(), vec![person]);
+        assert!(s.node_has_label(a, person).unwrap());
+        assert!(!s.node_has_label(a, admin).unwrap());
+
+        // Removing an absent label is a no-op (idempotent).
+        s.remove_label(txn, a, admin).unwrap();
+        assert_eq!(s.node_labels(a).unwrap(), vec![person]);
+
+        s.commit(txn).unwrap();
+    }
+
+    #[test]
+    fn labels_are_independent_per_node() {
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        let (a, _) = s.create_node(txn).unwrap();
+        let (b, _) = s.create_node(txn).unwrap();
+        let l0 = s.intern_token(Namespace::Label, "L0").unwrap();
+        let l1 = s.intern_token(Namespace::Label, "L1").unwrap();
+        s.add_label(txn, a, l0).unwrap();
+        s.add_label(txn, b, l1).unwrap();
+        assert_eq!(s.node_labels(a).unwrap(), vec![l0]);
+        assert_eq!(s.node_labels(b).unwrap(), vec![l1]);
+        s.commit(txn).unwrap();
+    }
+
+    #[test]
+    fn label_token_id_at_overflow_boundary_is_a_clear_error() {
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        let (a, _) = s.create_node(txn).unwrap();
+        // Token ids 0..=62 fit inline; id 63 is the overflow flag and must be rejected.
+        let err = s.add_label(txn, a, 63).unwrap_err();
+        assert!(matches!(err, GraphusError::Runtime(_)));
+        assert!(err.to_string().contains("#39"), "got: {err}");
+        // The node is unchanged (no partial write).
+        assert_eq!(s.node_labels(a).unwrap(), Vec::<u32>::new());
+        s.commit(txn).unwrap();
+    }
+
+    #[test]
+    fn label_ops_on_a_missing_node_are_a_storage_error() {
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        let (a, _) = s.create_node(txn).unwrap();
+        s.delete_node(txn, a).unwrap();
+        let err = s.add_label(txn, a, 0).unwrap_err();
+        assert!(matches!(err, GraphusError::Storage(_)));
+        s.commit(txn).unwrap();
     }
 }
