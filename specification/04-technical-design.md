@@ -753,10 +753,11 @@ values, constraint violations). Graphus enforces this by construction:
   checks.
 - **The executor** never raises a compile-time error class. Runtime error classes are raised only
   during row production.
-- An **error-classification table** maps every internal error to its TCK `(status, classification,
-  phase)` triple; a CI test asserts the phase split against TCK expectations so we cannot regress the
-  classification. This table is derived from the *verbatim* TCK error shapes of the pinned tag
-  (escalated open item in `02-decision-register.md` Q2).
+- An **error-classification table** maps every internal error to its TCK `(phase, type, detail)`
+  triple; a CI test asserts the phase split against TCK expectations so we cannot regress the
+  classification. This table is derived from the *verbatim* TCK error shapes of the pinned tag and is
+  **frozen in `06-bolt-and-error-shapes.md` §2** (resolves `02-decision-register.md` Q2; grounded in
+  `crates/graphus-cypher/src/errors.rs`).
 
 ### 7.4 Execution model — recommendation: **Volcano with vectorized leaves**
 
@@ -824,10 +825,10 @@ translate framing/serialization; they never embed query or storage logic.
 2026-06). The same Bolt state machine and codec run over a `UnixStream` (UDS) and a `TcpStream`
 (TCP, **TLS-wrapped**); only the transport and auth differ.
 
-- **Target version:** implement **Bolt 5.x** (5.0 baseline through at least 5.4 message set). Whether
-  to also implement the **5.7+ "Manifest v1" handshake** is a small scoping call (§12-Q); the legacy
-  4-slot handshake is mandatory regardless. *Exact maximum minor is pinned in §12 against the driver
-  versions we certify.*
+- **Target version:** implement **Bolt 5.x**. The v1 target is **pinned to Bolt 5.4** (5.0 baseline
+  through the 5.4 message set) in `06-bolt-and-error-shapes.md` §1 (resolves §12 item 11). The
+  **5.7+ "Manifest v1" handshake** is deferred to Phase 2 (`06` §1.2); the legacy 4-slot handshake is
+  mandatory regardless.
 - **Handshake.** Client sends the 4-byte magic preamble **`60 60 B0 17`**, then four big-endian
   32-bit version proposals (range-encoded since 4.3; `00 00 00 00` placeholder for unused slots). The
   server replies with the single chosen version (or `00 00 00 00` to reject). Manifest handshake
@@ -869,9 +870,9 @@ transaction lifecycle (Source: Neo4j Query/HTTP transactional API), strictly fol
 - **Streaming:** large result sets stream as **NDJSON** (one JSON object per line), so the client can
   consume rows incrementally and the server keeps bounded memory — the HTTP analogue of Bolt's
   `PULL n` pull model. The same executor cursor (§7.7) feeds both.
-- **Access mode:** read/write access-mode selection for REST is an **open item** (`02` Q5) — Bolt's
-  `BEGIN` carries it but the REST equivalent must be specified (likely a request field), escalated
-  not guessed.
+- **Access mode:** read/write access-mode selection for REST is **specified in
+  `06-bolt-and-error-shapes.md` §4** (resolves `02` Q5): an `access_mode` request member with values
+  `"READ"` / `"WRITE"`, defaulting to `"WRITE"` when absent, matching the Bolt `BEGIN` semantics.
 
 ### 8.3 One executor, one value model
 
@@ -1089,15 +1090,23 @@ escalations already in `02-decision-register.md`.
    adopting (jemalloc has Apple-Silicon friction). Decision is per-target, evidence-gated.
 10. **Dense-node promotion threshold** (§2.5) — measure the degree at which the grouped representation
     beats the plain doubly-linked chain.
-11. **Bolt maximum minor version + Manifest-v1 handshake** (§8.1) — pin the exact Bolt 5.x minor and
-    decide whether to implement the 5.7+ manifest handshake, against the specific driver versions we
-    certify (read the verbatim spec for the pinned version, don't assume).
+11. **Bolt maximum minor version + Manifest-v1 handshake** (§8.1). **Resolved (SPIKE #9) — see
+    `06-bolt-and-error-shapes.md` §1:** the v1 target is pinned to **Bolt 5.4** (5.0 baseline through
+    the 5.4 message set), legacy 4-slot handshake mandatory; the **5.7+ Manifest-v1 handshake is
+    deferred to Phase 2**. Re-confirm against the certified driver matrix before adopting any minor
+    beyond 5.4.
 12. **`GString` representation** (§7.2) — `SmallString`/inline vs `Arc<str>` vs `Box<str>` for query
     values vs stored strings; measure on string-heavy workloads.
-13. **Pinned openCypher TCK tag + scenario/feature count** (`02` Q1/Q2) — read verbatim from the
-    pinned tag; derive the error-classification table (§7.3) from its exact error shapes.
-14. **REST access-mode selection** (`02` Q5, §8.2) — specify the read/write access-mode field for the
-    REST transactional API (no documented Bolt-`BEGIN` equivalent).
+13. **Pinned openCypher TCK tag + scenario/feature count** (`02` Q1/Q2). The tag is pinned to
+    `2024.3` (`02-decision-register.md` "TCK target"). **The error-classification table is resolved
+    (SPIKE #9) — see `06-bolt-and-error-shapes.md` §2:** derived from the verbatim TCK detail strings
+    and frozen against `crates/graphus-cypher/src/errors.rs`. **Deferred:** the verbatim Neo4j
+    two-letter Bolt status-code mapping (needs the pinned TCK and certified driver artifacts; `06`
+    §2.4).
+14. **REST access-mode selection** (`02` Q5, §8.2). **Resolved (SPIKE #9) — see
+    `06-bolt-and-error-shapes.md` §4:** an `access_mode` request member with values `"READ"` /
+    `"WRITE"`, defaulting to `"WRITE"` when absent, validated otherwise, matching the Bolt `BEGIN`
+    semantics.
 
 ---
 

@@ -15,8 +15,11 @@ in the project Knowledge Graph (`rmp` roadmap `graphus`).
 | --- | --- |
 | `00-overview.md` | Project definition, goals, scope boundaries, glossary, non-functional requirements, phased roadmap, traceability. |
 | `01-needs-survey.md` | **The global needs survey** — every functional need, organized by the 15 domains, each tagged `[CORE]` or `[ADV]`. |
-| `02-decision-register.md` | The 24 design decisions, each with options and a recommendation. **All ratified on 2026-06-05** — see the "Ratified outcomes" section; the chosen option is recorded on each KG `Decision` node. |
+| `02-decision-register.md` | The 24 design decisions, each with options and a recommendation. **All ratified on 2026-06-05** — see the "Ratified outcomes" section; the chosen option is recorded on each KG `Decision` node. Tracks the open questions and which spikes close them. |
 | `03-sources.md` | Authoritative references (standards, papers, vendor docs) backing every requirement. |
+| `04-technical-design.md` | The implementation-design layer (the "HOW"): crate boundaries, on-disk layouts, byte-level formats, algorithms, and control/data flow. Collects the remaining measurement-gated spikes in §12. |
+| `05-storage-format.md` | Phase 1 spike: storage-format and durability micro-decisions. Freezes the page header, the versioned-record header, the record-store and B+-tree page layouts, and the offline backup artifact. |
+| `06-bolt-and-error-shapes.md` | Phase 1 spike: pins the Bolt version (5.4), freezes the TCK error-classification table and the Bolt/REST result and failure shapes, and specifies the REST transactional access-mode field. Closes decision-register open questions 2 and 5. |
 
 ## How to read this
 

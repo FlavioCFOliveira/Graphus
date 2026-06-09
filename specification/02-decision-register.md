@@ -73,8 +73,9 @@ along this path), so the 2024.x language surface (label expressions, quantified 
 `SHORTEST`, element-pattern `WHERE`) is delivered behind feature flags while certifying the same
 scenario budget. "100% TCK compliant" = **all 3880 executable scenarios of the pinned tag pass**
 (correct result bag/order, correct side-effect counts, correct error type at the correct phase).
-The verbatim `QueryType`/result/failure shapes and the error-classification table must still be read
-from the pinned tag (tracked as a spike; `04-technical-design.md` §12 item 13).
+The verbatim result/failure shapes and the error-classification table were read and frozen by
+SPIKE #9 (`06-bolt-and-error-shapes.md` §2–§3; resolves open question 2 and `04-technical-design.md`
+§12 item 13).
 
 | ID | Decision | Options | Affects |
 | --- | --- | --- | --- |
@@ -117,9 +118,20 @@ from the pinned tag (tracked as a spike; `04-technical-design.md` §12 item 13).
 ## Open questions for the owner to close before locking the spec
 
 1. Pin the exact openCypher TCK tag and record its scenario/feature count (do not quote a number
-   from memory).
-2. Read the verbatim TCK `QueryType` / result / failure shapes from the pinned tag before locking
-   the Rust harness design.
+   from memory). **Resolved** in the "TCK target" section above: pinned to openCypher `2024.3`
+   (commit `677cbaf`).
+2. Read the verbatim TCK result / failure shapes and lock the error-classification table.
+   **Resolved (2026-06-09) by SPIKE #9 — see `06-bolt-and-error-shapes.md` §2 and §3.** The
+   compile-time error-classification table is frozen with `(phase, type, detail)` triples whose
+   detail strings are verbatim from `tck/features/**`, grounded in the implemented
+   `crates/graphus-cypher/src/errors.rs`; the Bolt `SUCCESS`/`RECORD`/`FAILURE` result and failure
+   shapes and their REST RFC 9457 equivalent are documented there. **Deferred:** the Neo4j
+   two-letter Bolt status codes (a Neo4j surface, not part of the openCypher TCK triple) need the
+   pinned TCK and certified driver artifacts to map verbatim and are not invented (`06` §2.4).
 3. Resolve the `D-element-id` tension (TCK ID-reuse literalism vs stable never-reused IDs).
 4. Decide whether spatial types ship in v1 (`D-temporal-spatial`).
-5. Confirm REST read/write access-mode selection (the Bolt `BEGIN` field has no documented REST equivalent).
+5. Confirm REST read/write access-mode selection (the Bolt `BEGIN` field has no documented REST
+   equivalent). **Resolved (2026-06-09) by SPIKE #9 — see `06-bolt-and-error-shapes.md` §4.** The
+   REST transactional API declares access mode through an `access_mode` request member with values
+   `"READ"` / `"WRITE"`, defaulting to `"WRITE"` when absent, validated as a client error otherwise,
+   matching the Bolt `BEGIN` semantics.
