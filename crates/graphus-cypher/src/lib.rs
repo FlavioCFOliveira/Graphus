@@ -1,11 +1,18 @@
 //! `graphus-cypher` — Cypher parse, plan and execute pipeline for Graphus (targets the openCypher
 //! TCK).
 //!
-//! This module implements the **Cypher value-model semantics** (`04-technical-design.md` §7.2,
-//! §7.6) — the meaning of comparing, ordering, and de-duplicating [`graphus_core::Value`]s. Getting
-//! these exactly right is a prerequisite for 100% Cypher TCK compliance, so every rule here is
-//! taken **verbatim from the openCypher comparability/orderability/equality CIP** (CIP2016-06-14),
-//! the source the TCK enforces, and cited in the module docs.
+//! This crate hosts the compile/execute pipeline (`04-technical-design.md` §7.1). Two parts exist
+//! today:
+//!
+//! - The **lexer** ([`lexer`]) — the pipeline's front door — turns query text into a token stream
+//!   with byte-accurate source spans (`04 §7.1`). Lexer errors are the compile-time `SyntaxError`
+//!   class with precise positions (`04 §7.3`), as the openCypher TCK asserts error offsets.
+//! - The **Cypher value-model semantics** ([`ordering`], [`equality`], [`equivalence`],
+//!   [`ternary`]) — the meaning of comparing, ordering, and de-duplicating [`graphus_core::Value`]s
+//!   (`04 §7.2`, §7.6). Every rule there is taken **verbatim from the openCypher
+//!   comparability/orderability/equality CIP** (CIP2016-06-14), the source the TCK enforces.
+//!
+//! The parser that consumes the lexer's token stream is the next sub-task (`04 §7.1`).
 //!
 //! # The four value-model operations (they are genuinely different)
 //!
@@ -57,10 +64,12 @@
 
 pub mod equality;
 pub mod equivalence;
+pub mod lexer;
 pub mod ordering;
 pub mod ternary;
 
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
+pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use ordering::cmp_values;
 pub use ternary::Ternary;
