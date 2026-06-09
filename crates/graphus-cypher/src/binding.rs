@@ -234,6 +234,17 @@ pub struct BoundParameters {
 }
 
 impl BoundParameters {
+    /// An empty bound-parameter set (no parameters supplied).
+    ///
+    /// Useful for the executor and tests that run a parameter-free plan without going through
+    /// [`bind_parameters`] explicitly. Equivalent to binding an empty [`Parameters`] against a plan
+    /// that references nothing.
+    pub fn empty() -> Self {
+        Self {
+            values: BTreeMap::new(),
+        }
+    }
+
     /// The value bound to `name`, if the plan referenced it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Value> {

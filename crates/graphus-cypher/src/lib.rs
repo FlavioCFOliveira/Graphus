@@ -113,7 +113,10 @@ pub mod catalog;
 pub mod equality;
 pub mod equivalence;
 pub mod errors;
+pub mod eval;
+pub mod executor;
 pub mod function_registry;
+pub mod graph_access;
 pub mod lexer;
 pub mod logical;
 pub mod lower;
@@ -121,6 +124,7 @@ pub mod ordering;
 pub mod parser;
 pub mod physical;
 pub mod plan_cache;
+pub mod runtime;
 pub mod semantics;
 pub mod ternary;
 
@@ -137,6 +141,9 @@ pub use errors::{
     Classification, ErrorPhase, ErrorType, SemanticDetail, SemanticError, SemanticErrorKind,
     VarKind,
 };
+pub use eval::{EvalError, EvalResult, eval, eval_value};
+pub use executor::{CancellationToken, Cursor, ExecError, Executor, execute};
+pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId};
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
@@ -149,5 +156,6 @@ pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,
 };
+pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};
 pub use ternary::Ternary;
