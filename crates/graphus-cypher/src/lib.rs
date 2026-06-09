@@ -15,9 +15,18 @@
 //! - The **parser** ([`parser`]) — the pipeline's second stage — consumes the lexer's token stream
 //!   and produces a typed [`ast`] (`04 §7.1`: *"parser (hand-written recursive descent / Pratt) →
 //!   AST"*). It raises **only** compile-time `SyntaxError`s with precise byte positions (`04 §7.3`);
-//!   the semantic-analysis phase (the next sub-task) raises `SemanticError`s.
+//!   the semantic-analysis phase raises `SemanticError`s.
 //!
-//! The semantic-analysis phase that validates the parser's AST is the next sub-task (`04 §7.3`).
+//! - The **semantic analysis** ([`semantics`]) — the pipeline's third stage — walks the parser's
+//!   [`ast`] and raises **all** statically-detectable Cypher errors as **compile-time** errors
+//!   ([`semantics::analyze`] → [`semantics::ValidatedQuery`]), then hands a validated AST to the
+//!   planner (`04 §7.1`/§7.3). It is the *only* phase allowed to emit compile-time errors and runs
+//!   to completion **before any side effect**; the error taxonomy and the TCK
+//!   **error-classification table** (the machine-checked compile-vs-runtime phase split) live in
+//!   [`errors`], and the built-in [`function_registry`] backs the unknown-function / wrong-arity
+//!   checks. Errors the TCK expects at *runtime* (division by zero, value type errors, constraint
+//!   violations, missing parameters) are deliberately **not** raised here — they belong to the
+//!   executor (`04 §7.3`; see [`semantics`] for the boundary).
 //!
 //! # The four value-model operations (they are genuinely different)
 //!
@@ -70,15 +79,23 @@
 pub mod ast;
 pub mod equality;
 pub mod equivalence;
+pub mod errors;
+pub mod function_registry;
 pub mod lexer;
 pub mod ordering;
 pub mod parser;
+pub mod semantics;
 pub mod ternary;
 
 pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
+pub use errors::{
+    Classification, ErrorPhase, ErrorType, SemanticDetail, SemanticError, SemanticErrorKind,
+    VarKind,
+};
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use ordering::cmp_values;
 pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
+pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};
 pub use ternary::Ternary;
