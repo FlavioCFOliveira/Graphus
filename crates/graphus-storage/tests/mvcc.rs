@@ -12,8 +12,8 @@
 
 use graphus_core::{Timestamp, TxnId, VersionStamp};
 use graphus_io::MemBlockDevice;
-use graphus_storage::recovery::recover_device;
 use graphus_storage::RecordStore;
+use graphus_storage::recovery::recover_device;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -47,7 +47,10 @@ fn created_ts_is_inflight_before_commit_then_settled_at_commit() {
     // Before commit: xmin is the writer's in-flight TxnId, xmax is the live sentinel, and no commit
     // timestamp has been issued yet.
     let mvcc = s.node(id).unwrap().mvcc;
-    assert_eq!(VersionStamp::from_raw(mvcc.created_ts), VersionStamp::InFlight(txn));
+    assert_eq!(
+        VersionStamp::from_raw(mvcc.created_ts),
+        VersionStamp::InFlight(txn)
+    );
     assert_eq!(mvcc.expired_ts, 0);
     assert_eq!(s.snapshot_ts(), Timestamp(0));
 

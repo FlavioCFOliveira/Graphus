@@ -32,7 +32,8 @@
 //! | **Index-accelerated** label / property scans | **deferred (#48)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
 //! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
 //! | **Serializable concurrency / SSI** (write-skew abort, write-write first-updater-wins) | **supported** (#46) via [`TxnCoordinator`](crate::coordinator::TxnCoordinator) — this seam records SIREAD markers and rw-edges into the shared `SsiTracker`, and the coordinator aborts a pivot at commit with a retriable serialization error | — |
-//! | Per-value property MVCC / index-range (predicate) SSI markers | **deferred (#50 / #48)** | a property overwrite is still in-place (the owning entity's visibility gates the read); read markers are node/relationship-level, so a full label/all-nodes scan reads every node (a safe SSI over-abort until index-range markers arrive with #48) |
+//! | **Per-value property MVCC** (snapshot-consistent property reads, no dirty read) | **supported** (#50) — a property overwrite/removal MVCC-tombstones the old `PropRecord` and prepends the new one; [`read_node_props`](Self::read_node_props) filters the chain by `is_visible` (newest-visible-wins), and GC reclaims tombstoned versions | — |
+//! | Index-range (predicate) SSI markers | **deferred (#48)** | read markers are node/relationship-level, so a full label/all-nodes scan reads every node (a safe SSI over-abort until index-range markers arrive with index wiring, #48) |
 //!
 //! [`RelRecord.first_prop`]: graphus_storage::record::RelRecord
 //!
@@ -386,18 +387,18 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         }
     }
 
-    /// Reads `node`'s live properties as newest-wins `(key_name, value)` pairs, decoding both inline
-    /// scalars (#38) and `String`/`List` values stored in the `strings.store` overflow heap
-    /// (`rmp` task #43) via [`RecordStore::node_property_values`].
+    /// Reads `node`'s properties as newest-**visible**-wins `(key_name, value)` pairs (`rmp` task
+    /// #50), decoding both inline scalars (#38) and `String`/`List` overflow values (`rmp` task #43).
     ///
-    /// The store's property chain is prepend-ordered (newest record first); this keeps the **first**
-    /// occurrence per key id while walking head-to-tail. (A `set_node_property` overwrite also
-    /// removes the old record, so in practice at most one record per key survives, but newest-wins is
-    /// kept as a robust invariant.) An undecodable value would mean the store holds bytes this build
-    /// cannot interpret — captured as an error rather than a wrong row.
+    /// A property overwrite is an MVCC operation now (`rmp` task #50): the old `PropRecord` is
+    /// tombstoned and the new one prepended, so the chain (from [`RecordStore::node_properties`])
+    /// holds **multiple versions per key**, live and not-yet-GC'd tombstones. Each is filtered through
+    /// [`is_visible`] on its `xmin`/`xmax`, so this query sees exactly the version committed at or
+    /// before its snapshot (or its own write) — never a concurrent transaction's uncommitted value.
+    /// The chain is prepend-ordered (newest first), so the **first visible** record per key id wins.
     fn read_node_props(&self, node: NodeId) -> Vec<(String, Value)> {
         let mut store = self.store.borrow_mut();
-        let chain = match store.node_property_values(node.0) {
+        let chain = match store.node_properties(node.0) {
             Ok(chain) => chain,
             Err(e) => {
                 drop(store);
@@ -406,12 +407,20 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
         };
         let mut out: Vec<(u32, Value)> = Vec::new();
-        for (_pid, key, value) in chain {
-            // Newest-wins: skip a key id already seen (a more recent record shadows it).
-            if out.iter().any(|(k, _)| *k == key) {
+        for (_pid, prop) in chain {
+            // MVCC visibility filter + newest-visible-wins: skip versions invisible to this snapshot,
+            // and a key id already resolved to a newer visible version.
+            if !self.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
                 continue;
             }
-            out.push((key, value));
+            match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                Ok(value) => out.push((prop.key, value)),
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            }
         }
         // Map key ids back to names and sort by name for the deterministic order the seam promises.
         let mut named: Vec<(String, Value)> = out
@@ -434,7 +443,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// node's `first_prop`.
     fn read_rel_props(&self, rel: RelId) -> Vec<(String, Value)> {
         let mut store = self.store.borrow_mut();
-        let chain = match store.rel_property_values(rel.0) {
+        let chain = match store.rel_properties(rel.0) {
             Ok(chain) => chain,
             Err(e) => {
                 drop(store);
@@ -443,12 +452,19 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
         };
         let mut out: Vec<(u32, Value)> = Vec::new();
-        for (_pid, key, value) in chain {
-            // Newest-wins: skip a key id already seen (a more recent record shadows it).
-            if out.iter().any(|(k, _)| *k == key) {
+        for (_pid, prop) in chain {
+            // MVCC visibility filter + newest-visible-wins (`rmp` task #50), as for node properties.
+            if !self.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
                 continue;
             }
-            out.push((key, value));
+            match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                Ok(value) => out.push((prop.key, value)),
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            }
         }
         // Map key ids back to names and sort by name for the deterministic order the seam promises.
         let mut named: Vec<(String, Value)> = out

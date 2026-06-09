@@ -29,6 +29,23 @@ fn fresh() -> Store {
     RecordStore::create(device, wal, 64, 1).expect("create store")
 }
 
+/// Runs one garbage-collection pass under a fresh `txn` (`04 §5.5`; `rmp` task #50). Per-value
+/// property MVCC made an overwrite / removal / clear a logical tombstone: the writing transaction
+/// stamps the old version's `xmax` and physical reclamation (freeing the property record, its
+/// `strings.store` overflow chain, and the record's id, then splicing it out of the chain) is
+/// deferred to GC.
+///
+/// The watermark is [`RecordStore::snapshot_ts`] — the latest commit timestamp. That is the correct
+/// (and safe) watermark for these single-threaded tests: the writing transaction has already
+/// committed (its `xmax` is therefore committed at or below `snapshot_ts`) and there is no older
+/// live reader that could still observe the tombstoned version, so GC reclaims it.
+fn gc_pass(s: &mut Store, txn: TxnId) {
+    let watermark = s.snapshot_ts();
+    s.begin(txn);
+    s.gc(txn, watermark).unwrap();
+    s.commit(txn).unwrap();
+}
+
 // =================================================================================================
 // Heap chain: alloc -> read round-trips across block counts
 // =================================================================================================
@@ -293,13 +310,20 @@ fn overwriting_an_overflow_value_frees_the_old_chain() {
     s.set_node_property_value(txn, n, k, &first).unwrap();
     assert_eq!(s.heap_block_usage().unwrap(), 4);
 
-    // Overwrite with a 2-block value; the old 4-block chain must be freed (and partly reused).
+    // Overwrite with a 2-block value. Per-value MVCC (`rmp` task #50) tombstones the old 4-block
+    // version and prepends the new 2-block one, so both chains are live until GC: the old chain's
+    // blocks survive for older snapshots (here: none) and are reclaimed by the GC pass below.
     let second = Value::String("b".repeat(BLOCK_PAYLOAD + 1)); // 2 blocks
     s.set_node_property_value(txn, n, k, &second).unwrap();
+    s.commit(txn).unwrap();
+
+    // After commit + GC the tombstoned 4-block version is physically reclaimed (record + overflow
+    // blocks + splice), so only the new 2-block chain remains live -- the original no-leak intent.
+    gc_pass(&mut s, TxnId(2));
     assert_eq!(
         s.heap_block_usage().unwrap(),
         2,
-        "overwrite frees the old chain; only the new 2-block chain is live"
+        "overwrite frees the old chain at GC; only the new 2-block chain is live"
     );
 
     // The read returns the new value, and only one property record for the key remains.
@@ -308,10 +332,9 @@ fn overwriting_an_overflow_value_frees_the_old_chain() {
     assert_eq!(
         for_key.len(),
         1,
-        "overwrite removes the old record (no shadow)"
+        "the tombstoned old record is spliced out at GC (no shadow)"
     );
     assert_eq!(for_key[0].2, second);
-    s.commit(txn).unwrap();
 }
 
 #[test]
@@ -325,12 +348,21 @@ fn removing_an_overflow_value_frees_its_chain() {
         .unwrap();
     assert_eq!(s.heap_block_usage().unwrap(), 3);
 
+    // Per-value MVCC (`rmp` task #50): the removal tombstones the live version (stamps `xmax`); it
+    // is no longer a live version, so removing again in the same txn is a no-op (returns false).
     assert!(s.remove_node_property_value(txn, n, k).unwrap());
-    assert_eq!(s.heap_block_usage().unwrap(), 0, "removal frees the chain");
-    // Removing again is a no-op (returns false), not an error.
     assert!(!s.remove_node_property_value(txn, n, k).unwrap());
-    assert!(s.node_property_values(n).unwrap().is_empty());
     s.commit(txn).unwrap();
+
+    // After commit + GC the tombstoned record and its 3-block overflow chain are reclaimed -- the
+    // original "removal frees the chain" no-leak intent, now satisfied at GC.
+    gc_pass(&mut s, TxnId(2));
+    assert_eq!(
+        s.heap_block_usage().unwrap(),
+        0,
+        "removal frees the chain at GC"
+    );
+    assert!(s.node_property_values(n).unwrap().is_empty());
 }
 
 #[test]
@@ -355,15 +387,20 @@ fn clearing_all_properties_frees_every_overflow_chain() {
     .unwrap();
     assert!(s.heap_block_usage().unwrap() >= 2);
 
+    // Per-value MVCC (`rmp` task #50): clearing tombstones all three live property records.
     let removed = s.clear_node_properties(txn, n).unwrap();
-    assert_eq!(removed, 3, "all three property records are removed");
+    assert_eq!(removed, 3, "all three live property records are tombstoned");
+    s.commit(txn).unwrap();
+
+    // After commit + GC every tombstoned record and its overflow chain is reclaimed -- the original
+    // "every overflow chain is freed" no-leak intent, now satisfied at GC.
+    gc_pass(&mut s, TxnId(2));
     assert_eq!(
         s.heap_block_usage().unwrap(),
         0,
-        "every overflow chain is freed"
+        "every overflow chain is freed at GC"
     );
     assert!(s.node_property_values(n).unwrap().is_empty());
-    s.commit(txn).unwrap();
 }
 
 #[test]

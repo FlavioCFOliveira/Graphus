@@ -137,12 +137,21 @@ fn removing_an_overflow_rel_value_frees_its_chain() {
         .unwrap();
     assert_eq!(s.heap_block_usage().unwrap(), 3);
 
+    // Per-value MVCC (`rmp` task #50): the removal tombstones the live version (stamps `xmax`); it
+    // is no longer a live version, so removing again in the same txn is a no-op (returns false).
     assert!(s.remove_rel_property_value(txn, r, k).unwrap());
-    assert_eq!(s.heap_block_usage().unwrap(), 0, "removal frees the chain");
-    // Removing again is a no-op (returns false), not an error.
     assert!(!s.remove_rel_property_value(txn, r, k).unwrap());
-    assert!(s.rel_property_values(r).unwrap().is_empty());
     s.commit(txn).unwrap();
+
+    // After commit + GC the tombstoned record and its 3-block overflow chain are reclaimed -- the
+    // original "removal frees the chain" no-leak intent, now satisfied at GC.
+    gc_pass(&mut s, TxnId(2));
+    assert_eq!(
+        s.heap_block_usage().unwrap(),
+        0,
+        "removal frees the chain at GC"
+    );
+    assert!(s.rel_property_values(r).unwrap().is_empty());
 }
 
 // =================================================================================================
@@ -174,14 +183,17 @@ fn rel_properties_are_independent_across_relationships() {
         Some(Value::String("hello".to_owned()))
     );
 
-    // Removing r1's property leaves r2's intact.
+    // Removing r1's property tombstones it (per-value MVCC, `rmp` task #50); it stays in-use (and so
+    // is still returned by `rel_property_values`, which the reader layer would filter by visibility)
+    // until GC. Commit + GC reclaims it, after which r1 has no value and r2 is untouched.
     assert!(s.remove_rel_property_value(txn, r1, k).unwrap());
+    s.commit(txn).unwrap();
+    gc_pass(&mut s, TxnId(2));
     assert_eq!(rel_val(&mut s, r1, k), None);
     assert_eq!(
         rel_val(&mut s, r2, k),
         Some(Value::String("hello".to_owned()))
     );
-    s.commit(txn).unwrap();
 }
 
 #[test]
@@ -196,13 +208,19 @@ fn overwriting_an_overflow_rel_value_is_newest_wins_and_frees_old_chain() {
     s.set_rel_property_value(txn, r, k, &first).unwrap();
     assert_eq!(s.heap_block_usage().unwrap(), 4);
 
-    // Overwrite with a 2-block value; the old 4-block chain must be freed (and partly reused).
+    // Overwrite with a 2-block value. Per-value MVCC (`rmp` task #50) tombstones the old 4-block
+    // version and prepends the new 2-block one, so both chains are live until GC.
     let second = Value::String("b".repeat(BLOCK_PAYLOAD + 1)); // 2 blocks
     s.set_rel_property_value(txn, r, k, &second).unwrap();
+    s.commit(txn).unwrap();
+
+    // After commit + GC the tombstoned 4-block version is physically reclaimed (record + overflow
+    // blocks + splice), so only the new 2-block chain remains live -- the original no-leak intent.
+    gc_pass(&mut s, TxnId(2));
     assert_eq!(
         s.heap_block_usage().unwrap(),
         2,
-        "overwrite frees the old chain; only the new 2-block chain is live"
+        "overwrite frees the old chain at GC; only the new 2-block chain is live"
     );
 
     // The read returns the new value, and only one property record for the key remains (no shadow).
@@ -211,10 +229,9 @@ fn overwriting_an_overflow_rel_value_is_newest_wins_and_frees_old_chain() {
     assert_eq!(
         for_key.len(),
         1,
-        "overwrite removes the old record (no shadow)"
+        "the tombstoned old record is spliced out at GC (no shadow)"
     );
     assert_eq!(for_key[0].2, second);
-    s.commit(txn).unwrap();
 }
 
 // =================================================================================================
@@ -306,17 +323,22 @@ fn clear_rel_properties_frees_every_overflow_chain() {
     .unwrap();
     assert!(s.heap_block_usage().unwrap() >= 2);
 
+    // Per-value MVCC (`rmp` task #50): clearing tombstones all three live property records.
     let removed = s.clear_rel_properties(txn, r).unwrap();
-    assert_eq!(removed, 3, "all three property records are removed");
+    assert_eq!(removed, 3, "all three live property records are tombstoned");
+    s.commit(txn).unwrap();
+
+    // After commit + GC every tombstoned record and its overflow chain is reclaimed -- the original
+    // "every overflow chain is freed" no-leak intent, now satisfied at GC.
+    gc_pass(&mut s, TxnId(2));
     assert_eq!(
         s.heap_block_usage().unwrap(),
         0,
-        "every overflow chain is freed"
+        "every overflow chain is freed at GC"
     );
     assert!(s.rel_property_values(r).unwrap().is_empty());
-    // The relationship itself survives a property clear (only the chain is freed).
+    // The relationship itself survives a property clear + GC (only its property chain is reclaimed).
     assert!(s.rel(r).unwrap().mvcc.in_use());
-    s.commit(txn).unwrap();
 }
 
 #[test]

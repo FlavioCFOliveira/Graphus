@@ -70,6 +70,17 @@ fn run_commit(src: &str, store: Store, txn: u64) -> (Vec<Row>, Store) {
     (rows, store)
 }
 
+/// Runs an MVCC GC pass under `txn` over `store`: delete / overwrite / remove are MVCC tombstones
+/// now (`rmp` tasks #45/#50), so physical reclamation of records and their overflow chains happens
+/// here, not at write time. Watermark = the latest commit, safe because these single-threaded tests
+/// have no older live reader.
+fn gc_pass(store: &mut Store, txn: TxnId) {
+    let watermark = store.snapshot_ts();
+    store.begin(txn);
+    store.gc(txn, watermark).expect("gc runs");
+    store.commit(txn).expect("gc commits");
+}
+
 /// Compiles `src` to a physical plan against the empty index catalog.
 fn compile(src: &str) -> graphus_cypher::physical::PhysicalPlan {
     let toks = tokenize(src).expect("lex");
@@ -840,6 +851,9 @@ fn overwriting_a_string_property_frees_the_old_chain_no_leak() {
 
     // Overwrite with a different (also multi-block) value.
     let (_r, mut store) = run_commit(&format!("MATCH (n) SET n.bio = '{second}'"), store, 2);
+    // The overwrite MVCC-tombstones the old version (`rmp` task #50); its chain is reclaimed by GC,
+    // so GC before measuring the no-leak invariant.
+    gc_pass(&mut store, TxnId(50));
     let after = store.heap_block_usage().expect("usage after overwrite");
 
     // The new value's chain replaced the old one; the old chain's blocks were freed (and reused), so
@@ -865,8 +879,9 @@ fn removing_a_string_property_frees_its_chain_and_clears_the_value() {
     let with_value = store.heap_block_usage().expect("usage with value");
     assert!(with_value >= 1);
 
-    // REMOVE the overflow property; its chain is freed.
+    // REMOVE the overflow property; the MVCC tombstone's chain is reclaimed by GC (`rmp` task #50).
     let (_r, mut store) = run_commit("MATCH (n) REMOVE n.drop", store, 2);
+    gc_pass(&mut store, TxnId(50));
     let after_remove = store.heap_block_usage().expect("usage after remove");
     assert_eq!(
         after_remove, 0,

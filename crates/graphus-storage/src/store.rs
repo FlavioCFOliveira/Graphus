@@ -119,14 +119,18 @@ impl FixedStore {
     }
 }
 
-/// The set of node/relationship records a still-open transaction has version-stamped, so its
-/// commit can **settle** their MVCC headers from the in-flight `TxnId` to the assigned commit
-/// timestamp (`04 §5.2`). `created` are records this txn stamped `xmin = in_flight(txn)`; `expired`
-/// are records it tombstoned `xmax = in_flight(txn)`.
+/// The set of records a still-open transaction has version-stamped, so its commit can **settle**
+/// their MVCC headers from the in-flight `TxnId` to the assigned commit timestamp (`04 §5.2`).
+/// `created` are records this txn stamped `xmin = in_flight(txn)`; `expired` are records it
+/// tombstoned `xmax = in_flight(txn)`.
 ///
-/// Only node and relationship records are tracked: they are the records MVCC visibility filters on
-/// (`04 §5.3`). Property / heap records remain single-version in this slice and are reclaimed with
-/// their owning node/rel at GC (the per-value property MVCC is a documented follow-up).
+/// Node, relationship **and property** records are tracked: all three are MVCC-versioned and
+/// visibility-filtered (`04 §5.3`). Per-value property MVCC (`rmp` task #50) makes a property write
+/// a tombstone of the old version + a fresh version, so old values survive for older snapshots and
+/// the reader layer filters them by visibility; the commit settle loop is kind-agnostic, so tracking
+/// `StoreKind::Prop` ids alongside nodes/rels is all it takes. The `strings.store` overflow heap
+/// blocks owned by a property are *not* tracked: they are never visibility-checked and are freed with
+/// their owning property at GC.
 #[derive(Debug, Default, Clone)]
 struct ActiveTxn {
     created: Vec<(StoreKind, u64)>,
@@ -563,9 +567,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
-    /// Garbage-collects MVCC tombstones under `txn`: physically reclaims every relationship and node
-    /// whose `xmax` committed at or before `watermark` — i.e. is invisible to every live and future
-    /// snapshot (`04 §5.5`) — and returns the number of records reclaimed.
+    /// Garbage-collects MVCC tombstones under `txn`: physically reclaims every relationship, node
+    /// **and per-value property version** whose `xmax` committed at or before `watermark` — i.e. is
+    /// invisible to every live and future snapshot (`04 §5.5`) — and returns the number of records
+    /// reclaimed.
     ///
     /// `watermark` MUST be at or below the oldest active reader's snapshot timestamp, so no live
     /// transaction can still observe a reclaimed version (the caller, which owns the timestamp
@@ -573,6 +578,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// node is reclaimed only once no live (not-yet-reclaimed) relationship still references it, so
     /// referential integrity and the incidence chains stay well-formed throughout — the consistency
     /// checker passes both before and after a GC pass.
+    ///
+    /// After the node/relationship sweep, every **still-live** node and relationship has its property
+    /// chain swept ([`gc_property_chain`](Self::gc_property_chain)): a tombstoned property version
+    /// (`rmp` task #50) whose `xmax` committed at or before `watermark` is freed (record + overflow
+    /// blocks) and spliced out of the chain. A reclaimed owner's chain is freed wholesale by its
+    /// reclamation, so only surviving owners are swept here — no chain is touched twice.
     ///
     /// The caller owns the transaction lifecycle (it must later commit or roll back `txn`), exactly
     /// as for any other mutator; the reclamation writes are WAL-logged and crash-recovered the same.
@@ -597,6 +608,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             {
                 self.reclaim_node(txn, id)?;
                 reclaimed += 1;
+            }
+        }
+
+        // Sweep the property chains of the owners that survived the node/rel reclamation above. A
+        // reclaimed owner's whole chain was already freed by its reclamation, so re-checking
+        // liveness here (after the sweeps) keeps each chain reclaimed exactly once.
+        for id in 1..node_hw {
+            if Self::is_live_version(self.read_node(id)?.mvcc) {
+                reclaimed += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
+            }
+        }
+        for id in 1..rel_hw {
+            if Self::is_live_version(self.read_rel(id)?.mvcc) {
+                reclaimed += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
             }
         }
 
@@ -1028,18 +1053,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
-    /// Frees every live property record in the chain rooted at `first_prop` (and any overflow heap
-    /// chain each owns), returning each record's id to the free list (`rmp` task #44; no leak), and
-    /// returns the number of live records freed. The `owner_id` is used only for the cycle-guard
-    /// diagnostic. Entity-agnostic: shared by [`reclaim_node`](Self::reclaim_node),
-    /// [`reclaim_rel`](Self::reclaim_rel) and [`clear_rel_properties`](Self::clear_rel_properties)
-    /// to free a node's or relationship's chain.
-    fn free_property_chain(
-        &mut self,
-        txn: TxnId,
-        owner_id: u64,
-        first_prop: u64,
-    ) -> Result<usize> {
+    /// Frees **every** still-`in_use` property record in the chain rooted at `first_prop` — live and
+    /// tombstoned alike — and any overflow heap chain each owns, returning each record's id to the
+    /// free list (`rmp` task #44; no leak), and returns the number of records freed. The `owner_id`
+    /// is used only for the cycle-guard diagnostic. Entity-agnostic and used only when the **owner
+    /// itself is being reclaimed** ([`reclaim_node`](Self::reclaim_node) /
+    /// [`reclaim_rel`](Self::reclaim_rel)): the whole chain dies with the owner, so visibility is
+    /// moot. For a *surviving* owner, GC uses [`gc_property_chain`](Self::gc_property_chain) instead,
+    /// which frees only the reclaimable tombstoned versions and splices the chain.
+    fn free_property_chain(&mut self, txn: TxnId, owner_id: u64, first_prop: u64) -> Result<usize> {
         let mut freed = 0usize;
         let mut cur = first_prop;
         let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
@@ -1065,6 +1087,116 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             cur = next;
         }
         Ok(freed)
+    }
+
+    /// Garbage-collects the property chain of a **still-live** owner (`rmp` task #50): walks the
+    /// chain rooted at `owner_kind`/`owner_id`'s `first_prop` and physically reclaims every property
+    /// record that [`is_reclaimable`](Self::is_reclaimable) at `watermark` — a tombstone whose `xmax`
+    /// committed at or before `watermark`, so no live or future snapshot can still see that version.
+    /// Returns the number of records reclaimed.
+    ///
+    /// For each reclaimable record it frees the property's overflow heap chain, clears the record
+    /// (`MvccHeader::default()` + `next_prop = NULL_ID`), returns its id to the Prop free list, and
+    /// **splices it out** of the chain: if it was the head (no kept predecessor) the owner's
+    /// `first_prop` is repointed past it and the owner record rewritten, otherwise the last kept
+    /// predecessor's `next_prop` is repointed past it. A non-reclaimable record (a live version, or a
+    /// not-yet-committed / not-yet-old-enough tombstone) is kept and becomes the new predecessor.
+    /// This mirrors the splice the pre-MVCC `remove_*_property_value` performed, but gates removal on
+    /// the GC watermark rather than a key match — so chains stay well-formed and leak-free (the
+    /// consistency checker passes after a GC pass).
+    ///
+    /// `owner_kind` MUST be [`StoreKind::Node`] or [`StoreKind::Rel`]; the owner is expected to be a
+    /// live version (a tombstoned owner is reclaimed wholesale by
+    /// [`reclaim_node`](Self::reclaim_node) / [`reclaim_rel`](Self::reclaim_rel), which frees the
+    /// entire chain).
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain read/write fails or the chain does not terminate within the
+    /// cycle guard.
+    fn gc_property_chain(
+        &mut self,
+        txn: TxnId,
+        owner_kind: StoreKind,
+        owner_id: u64,
+        watermark: Timestamp,
+    ) -> Result<usize> {
+        let mut first_prop = self.owner_first_prop(owner_kind, owner_id)?;
+        let mut reclaimed = 0usize;
+        let mut prev: u64 = NULL_ID; // last *kept* property record (NULL => list head is the owner)
+        let mut cur = first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of {owner_kind:?} {owner_id} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            let next = prop.next_prop;
+            if Self::is_reclaimable(prop.mvcc, watermark) {
+                // Free the overflow chain, clear and free the record, splice it out of the chain.
+                self.free_property_overflow(txn, &prop)?;
+                let mut dead = prop;
+                dead.mvcc = MvccHeader::default(); // clears in_use
+                dead.next_prop = NULL_ID;
+                self.write_prop(cur, &dead, txn)?;
+                self.store_mut(StoreKind::Prop).free.push(cur);
+                if prev == NULL_ID {
+                    first_prop = next;
+                    self.set_owner_first_prop(owner_kind, owner_id, first_prop, txn)?;
+                } else {
+                    let mut p = self.read_prop(prev)?;
+                    p.next_prop = next;
+                    self.write_prop(prev, &p, txn)?;
+                }
+                reclaimed += 1;
+            } else {
+                prev = cur; // kept: it becomes the predecessor of whatever follows
+            }
+            cur = next;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Reads the `first_prop` head pointer of a node or relationship owner (GC helper).
+    fn owner_first_prop(&mut self, owner_kind: StoreKind, owner_id: u64) -> Result<u64> {
+        Ok(match owner_kind {
+            StoreKind::Node => self.read_node(owner_id)?.first_prop,
+            StoreKind::Rel => self.read_rel(owner_id)?.first_prop,
+            StoreKind::Prop | StoreKind::Strings => {
+                return Err(GraphusError::Storage(format!(
+                    "{owner_kind:?} is not a property-chain owner"
+                )));
+            }
+        })
+    }
+
+    /// Repoints the `first_prop` head pointer of a node or relationship owner, rewriting the owner
+    /// record under `txn` (GC helper, used when the head property is spliced out).
+    fn set_owner_first_prop(
+        &mut self,
+        owner_kind: StoreKind,
+        owner_id: u64,
+        first_prop: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        match owner_kind {
+            StoreKind::Node => {
+                let mut node = self.read_node(owner_id)?;
+                node.first_prop = first_prop;
+                self.write_node(owner_id, &node, txn)
+            }
+            StoreKind::Rel => {
+                let mut rel = self.read_rel(owner_id)?;
+                rel.first_prop = first_prop;
+                self.write_rel(owner_id, &rel, txn)
+            }
+            StoreKind::Prop | StoreKind::Strings => Err(GraphusError::Storage(format!(
+                "{owner_kind:?} is not a property-chain owner"
+            ))),
+        }
     }
 
     fn unlink_side(&mut self, id: u64, side: ChainSide, node: u64, txn: TxnId) -> Result<()> {
@@ -1155,9 +1287,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop);
-        let mut prop = PropRecord::new(txn.0, key, type_tag, value_inline);
+        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
+        // #50); `commit` settles it to the commit timestamp. Until then the version is visible only
+        // to its own transaction.
+        let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
         prop.next_prop = node.first_prop;
         self.write_prop(pid, &prop, txn)?;
+        self.note_created(txn, StoreKind::Prop, pid);
         node.first_prop = pid;
         self.write_node(node_id, &node, txn)?;
         Ok(pid)
@@ -1196,6 +1332,64 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             cur = next;
         }
         Ok(out)
+    }
+
+    /// MVCC-tombstones the **live** property records in the chain rooted at `owner_first_prop`
+    /// (`rmp` task #50): for each prop that [`is_live_version`](Self::is_live_version) and — when
+    /// `key_filter` is `Some(k)` — whose `key == k`, it stamps `xmax = in_flight(txn)` via
+    /// [`patch_header_word`](Self::patch_header_word) and notes it expired so `commit` settles the
+    /// stamp. A `key_filter` of `None` tombstones every live property in the chain (used by
+    /// `clear_*_properties` for `SET n = map`).
+    ///
+    /// This is the property analogue of [`delete_node`](Self::delete_node) /
+    /// [`delete_rel`](Self::delete_rel): the tombstoned record keeps its `in_use` slot, its
+    /// `next_prop` link and its overflow heap chain, so an older snapshot still observes the old
+    /// value and the chain stays well-formed for the consistency checker. Physical reclamation
+    /// (record + overflow blocks + splice) is deferred to [`gc`](Self::gc) via
+    /// [`gc_property_chain`](Self::gc_property_chain) once no live snapshot can see the old version.
+    /// It therefore frees nothing, clears nothing and splices nothing here.
+    ///
+    /// `owner_label` is only used in the cycle-guard diagnostic (e.g. `"node 5"` / `"rel 7"`).
+    /// Returns the number of property records tombstoned (callers that only need "did anything
+    /// change?" compare it against `0`).
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain read or a tombstone write fails, or the chain does not
+    /// terminate within the cycle guard.
+    fn tombstone_props_for_key(
+        &mut self,
+        txn: TxnId,
+        owner_first_prop: u64,
+        key_filter: Option<u32>,
+        owner_label: &str,
+    ) -> Result<usize> {
+        let mut tombstoned = 0usize;
+        let mut cur = owner_first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of {owner_label} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            let next = prop.next_prop;
+            if Self::is_live_version(prop.mvcc) && key_filter.is_none_or(|key| prop.key == key) {
+                self.patch_header_word(
+                    StoreKind::Prop,
+                    cur,
+                    MVCC_OFF_EXPIRED_TS,
+                    VersionStamp::in_flight(txn),
+                    txn,
+                )?;
+                self.note_expired(txn, StoreKind::Prop, cur);
+                tombstoned += 1;
+            }
+            cur = next;
+        }
+        Ok(tombstoned)
     }
 
     // --------------------- strings.store overflow heap ----------------------
@@ -1327,15 +1521,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // block id into the property record's `value_inline`. Reading reverses the choice.
 
     /// Sets node `node_id`'s property `key` to `value` under `txn`, **replacing** any current value
-    /// of that key: it first removes every existing property record for `key` (freeing each one's
-    /// overflow chain so nothing leaks, `rmp` task #43), then writes the new value. Inline scalars
-    /// (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List` values are serialized to the
-    /// `strings.store` overflow heap and the property holds the head block id with the `type_tag`
-    /// overflow bit set (`04 §2.3`). Returns the new property's physical id.
-    ///
-    /// Replacing (rather than merely prepending a shadowing record) keeps the chain compact and is
-    /// what guarantees an overwrite frees the old chain — the no-leak invariant the regression tests
-    /// assert via [`heap_block_usage`](Self::heap_block_usage).
+    /// of that key via per-value MVCC (`rmp` task #50): it **MVCC-tombstones** every live property
+    /// record for `key` (stamping `xmax = in_flight(txn)`, like a node/rel delete in `rmp` task #45),
+    /// then prepends a fresh, in-flight version. The old version keeps its slot and its overflow
+    /// chain so an older snapshot still reads the previous value; physical reclamation of the
+    /// tombstoned record and its overflow blocks happens at [`gc`](Self::gc), not here. Inline
+    /// scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List` values are
+    /// serialized to the `strings.store` overflow heap and the property holds the head block id with
+    /// the `type_tag` overflow bit set (`04 §2.3`). Returns the new property's physical id.
     ///
     /// # Errors
     /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
@@ -1350,14 +1543,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ) -> Result<u64> {
         // Encode first so a non-persistable value errors before any mutation (no partial write).
         let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
-        self.remove_node_property_value(txn, node_id, key)?;
+        let node = self.read_node(node_id)?;
+        if !Self::is_live_version(node.mvcc) {
+            return Err(GraphusError::Storage(format!("node {node_id} not in use")));
+        }
+        self.tombstone_props_for_key(txn, node.first_prop, Some(key), &format!("node {node_id}"))?;
         self.add_node_property(txn, node_id, key, type_tag, value_inline)
     }
 
-    /// Removes node `node_id`'s property `key` under `txn`: unlinks **every** live property record
-    /// for `key` from the node's chain, freeing each record's physical id and any overflow heap
-    /// chain it owns (`rmp` task #43; no leak). Returns whether anything was removed (so a caller can
-    /// distinguish a real removal from a no-op, e.g. for `REMOVE n.p`).
+    /// Removes node `node_id`'s property `key` under `txn` via per-value MVCC (`rmp` task #50):
+    /// **MVCC-tombstones** every live property record for `key` (stamping `xmax = in_flight(txn)`)
+    /// rather than freeing it immediately. The tombstoned record keeps its slot, its `next_prop`
+    /// link and its overflow heap chain so an older snapshot still observes the value; physical
+    /// reclamation (record + overflow blocks + splice) is deferred to [`gc`](Self::gc). Returns
+    /// whether anything was tombstoned (so a caller can distinguish a real removal from a no-op,
+    /// e.g. for `REMOVE n.p`).
     ///
     /// # Errors
     /// Returns a storage error if the node is not in use or a write fails.
@@ -1367,50 +1567,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         node_id: u64,
         key: u32,
     ) -> Result<bool> {
-        let mut node = self.read_node(node_id)?;
+        let node = self.read_node(node_id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
-        // Walk the singly-linked chain, rebuilding it without any record whose key matches; free
-        // each removed record (and its overflow chain). The chain is short (per-entity), so the
-        // O(chain) rewrite is cheap and keeps the structure compact.
-        let mut removed_any = false;
-        let mut prev: u64 = NULL_ID; // last *kept* property record (NULL => list head is `node`)
-        let mut cur = node.first_prop;
-        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "property chain of node {node_id} is malformed (cycle?)"
-                )));
-            }
-            let prop = self.read_prop(cur)?;
-            let next = prop.next_prop;
-            if prop.mvcc.in_use() && prop.key == key {
-                // Remove this record: free its overflow chain, splice it out, free its id.
-                self.free_property_overflow(txn, &prop)?;
-                let mut dead = prop;
-                dead.mvcc = MvccHeader::default(); // clears in_use
-                dead.next_prop = NULL_ID;
-                self.write_prop(cur, &dead, txn)?;
-                self.store_mut(StoreKind::Prop).free.push(cur);
-                if prev == NULL_ID {
-                    node.first_prop = next;
-                    self.write_node(node_id, &node, txn)?;
-                } else {
-                    let mut p = self.read_prop(prev)?;
-                    p.next_prop = next;
-                    self.write_prop(prev, &p, txn)?;
-                }
-                removed_any = true;
-            } else if prop.mvcc.in_use() {
-                prev = cur;
-            }
-            cur = next;
-        }
-        Ok(removed_any)
+        let tombstoned = self.tombstone_props_for_key(
+            txn,
+            node.first_prop,
+            Some(key),
+            &format!("node {node_id}"),
+        )?;
+        Ok(tombstoned > 0)
     }
 
     /// Encodes `value` into the `(type_tag, value_inline)` pair to store in a property record,
@@ -1475,44 +1642,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(out)
     }
 
-    /// Clears **all** of node `node_id`'s properties under `txn`, freeing each property record's id
-    /// and any overflow heap chain it owns (`rmp` task #43; no leak). Used by `SET n = map`, which
-    /// replaces the whole property set. Returns the number of property records removed.
+    /// Clears **all** of node `node_id`'s properties under `txn` via per-value MVCC (`rmp` task #50):
+    /// **MVCC-tombstones** every live property record in the node's chain (stamping
+    /// `xmax = in_flight(txn)`), leaving the slots, the `next_prop` links and the overflow chains in
+    /// place so older snapshots still observe the old property set. Used by `SET n = map`, which
+    /// replaces the whole property set. The head pointer `first_prop` is **not** reset (the
+    /// tombstoned records stay linked until GC); physical reclamation (records + overflow blocks +
+    /// splice) is deferred to [`gc`](Self::gc). Returns the number of property records tombstoned.
     ///
     /// # Errors
     /// Returns a storage error if the node is not in use or a write fails.
     pub fn clear_node_properties(&mut self, txn: TxnId, node_id: u64) -> Result<usize> {
-        let mut node = self.read_node(node_id)?;
+        let node = self.read_node(node_id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
-        let mut removed = 0usize;
-        let mut cur = node.first_prop;
-        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "property chain of node {node_id} is malformed (cycle?)"
-                )));
-            }
-            let prop = self.read_prop(cur)?;
-            let next = prop.next_prop;
-            if prop.mvcc.in_use() {
-                self.free_property_overflow(txn, &prop)?;
-                let mut dead = prop;
-                dead.mvcc = MvccHeader::default();
-                dead.next_prop = NULL_ID;
-                self.write_prop(cur, &dead, txn)?;
-                self.store_mut(StoreKind::Prop).free.push(cur);
-                removed += 1;
-            }
-            cur = next;
-        }
-        node.first_prop = NULL_ID;
-        self.write_node(node_id, &node, txn)?;
-        Ok(removed)
+        self.tombstone_props_for_key(txn, node.first_prop, None, &format!("node {node_id}"))
     }
 
     /// Frees the overflow heap chain a property record owns, if any: a no-op for an inline scalar;
@@ -1559,9 +1704,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop);
-        let mut prop = PropRecord::new(txn.0, key, type_tag, value_inline);
+        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
+        // #50); `commit` settles it to the commit timestamp.
+        let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
         prop.next_prop = rel.first_prop;
         self.write_prop(pid, &prop, txn)?;
+        self.note_created(txn, StoreKind::Prop, pid);
         rel.first_prop = pid;
         self.write_rel(rel_id, &rel, txn)?;
         Ok(pid)
@@ -1597,12 +1745,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Sets relationship `rel_id`'s property `key` to `value` under `txn`, **replacing** any current
-    /// value of that key (`rmp` task #44): it first removes every existing property record for `key`
-    /// (freeing each one's overflow chain so nothing leaks, `rmp` task #43), then writes the new
-    /// value. Inline scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List` values
-    /// overflow to the `strings.store` heap with the `type_tag` overflow bit set (`04 §2.3`). Returns
-    /// the new property's physical id. The relationship analogue of
-    /// [`set_node_property_value`](Self::set_node_property_value).
+    /// value of that key via per-value MVCC (`rmp` task #50): it **MVCC-tombstones** every live
+    /// property record for `key` (stamping `xmax = in_flight(txn)`, like a node/rel delete in
+    /// `rmp` task #45), then prepends a fresh, in-flight version. The old version keeps its slot and
+    /// its overflow chain so an older snapshot still reads the previous value; physical reclamation
+    /// happens at [`gc`](Self::gc), not here. Inline scalars (`Integer`/`Float`/`Boolean`) stay
+    /// inline (#38); `String`/`List` values overflow to the `strings.store` heap with the `type_tag`
+    /// overflow bit set (`04 §2.3`). Returns the new property's physical id. The relationship
+    /// analogue of [`set_node_property_value`](Self::set_node_property_value).
     ///
     /// # Errors
     /// - [`GraphusError::Storage`] if the relationship is not in use or a write fails.
@@ -1617,62 +1767,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ) -> Result<u64> {
         // Encode first so a non-persistable value errors before any mutation (no partial write).
         let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
-        self.remove_rel_property_value(txn, rel_id, key)?;
+        let rel = self.read_rel(rel_id)?;
+        if !Self::is_live_version(rel.mvcc) {
+            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
+        }
+        self.tombstone_props_for_key(txn, rel.first_prop, Some(key), &format!("rel {rel_id}"))?;
         self.add_rel_property(txn, rel_id, key, type_tag, value_inline)
     }
 
-    /// Removes relationship `rel_id`'s property `key` under `txn`: unlinks **every** live property
-    /// record for `key` from the relationship's chain, freeing each record's id and any overflow heap
-    /// chain it owns (`rmp` task #44; no leak). Returns whether anything was removed (so `REMOVE r.p`
-    /// can distinguish a real removal from a no-op). The relationship analogue of
-    /// [`remove_node_property_value`](Self::remove_node_property_value).
+    /// Removes relationship `rel_id`'s property `key` under `txn` via per-value MVCC (`rmp` task
+    /// #50): **MVCC-tombstones** every live property record for `key` (stamping
+    /// `xmax = in_flight(txn)`) rather than freeing it immediately. The tombstoned record keeps its
+    /// slot, its `next_prop` link and its overflow heap chain so an older snapshot still observes the
+    /// value; physical reclamation is deferred to [`gc`](Self::gc). Returns whether anything was
+    /// tombstoned (so `REMOVE r.p` can distinguish a real removal from a no-op). The relationship
+    /// analogue of [`remove_node_property_value`](Self::remove_node_property_value).
     ///
     /// # Errors
     /// Returns a storage error if the relationship is not in use or a write fails.
     pub fn remove_rel_property_value(&mut self, txn: TxnId, rel_id: u64, key: u32) -> Result<bool> {
-        let mut rel = self.read_rel(rel_id)?;
+        let rel = self.read_rel(rel_id)?;
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
-        // Walk the singly-linked chain, rebuilding it without any record whose key matches; free each
-        // removed record (and its overflow chain). Mirrors `remove_node_property_value`.
-        let mut removed_any = false;
-        let mut prev: u64 = NULL_ID; // last *kept* property record (NULL => list head is the rel)
-        let mut cur = rel.first_prop;
-        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "property chain of rel {rel_id} is malformed (cycle?)"
-                )));
-            }
-            let prop = self.read_prop(cur)?;
-            let next = prop.next_prop;
-            if prop.mvcc.in_use() && prop.key == key {
-                // Remove this record: free its overflow chain, splice it out, free its id.
-                self.free_property_overflow(txn, &prop)?;
-                let mut dead = prop;
-                dead.mvcc = MvccHeader::default(); // clears in_use
-                dead.next_prop = NULL_ID;
-                self.write_prop(cur, &dead, txn)?;
-                self.store_mut(StoreKind::Prop).free.push(cur);
-                if prev == NULL_ID {
-                    rel.first_prop = next;
-                    self.write_rel(rel_id, &rel, txn)?;
-                } else {
-                    let mut p = self.read_prop(prev)?;
-                    p.next_prop = next;
-                    self.write_prop(prev, &p, txn)?;
-                }
-                removed_any = true;
-            } else if prop.mvcc.in_use() {
-                prev = cur;
-            }
-            cur = next;
-        }
-        Ok(removed_any)
+        let tombstoned =
+            self.tombstone_props_for_key(txn, rel.first_prop, Some(key), &format!("rel {rel_id}"))?;
+        Ok(tombstoned > 0)
     }
 
     /// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`, decoding
@@ -1695,25 +1815,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(out)
     }
 
-    /// Clears **all** of relationship `rel_id`'s properties under `txn`, freeing each property
-    /// record's id and any overflow heap chain it owns (`rmp` task #44; no leak). Used by `SET r =
-    /// map`, which replaces the whole property set, and shares the chain-freeing helper with
-    /// [`delete_rel`](Self::delete_rel). Returns the number of property records removed. The
-    /// relationship analogue of [`clear_node_properties`](Self::clear_node_properties).
+    /// Clears **all** of relationship `rel_id`'s properties under `txn` via per-value MVCC (`rmp`
+    /// task #50): **MVCC-tombstones** every live property record in the relationship's chain
+    /// (stamping `xmax = in_flight(txn)`), leaving the slots, the `next_prop` links and the overflow
+    /// chains in place so older snapshots still observe the old property set. Used by `SET r = map`,
+    /// which replaces the whole property set. The head pointer `first_prop` is **not** reset (the
+    /// tombstoned records stay linked until GC); physical reclamation is deferred to
+    /// [`gc`](Self::gc). Returns the number of property records tombstoned. The relationship analogue
+    /// of [`clear_node_properties`](Self::clear_node_properties).
     ///
     /// # Errors
     /// Returns a storage error if the relationship is not in use or a write fails.
     pub fn clear_rel_properties(&mut self, txn: TxnId, rel_id: u64) -> Result<usize> {
-        let mut rel = self.read_rel(rel_id)?;
+        let rel = self.read_rel(rel_id)?;
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
-        // Free the whole `first_prop`-rooted chain (records + overflow chains), then null the head
-        // pointer so the relationship has no properties (`rmp` task #44; no leak).
-        let removed = self.free_property_chain(txn, rel_id, rel.first_prop)?;
-        rel.first_prop = NULL_ID;
-        self.write_rel(rel_id, &rel, txn)?;
-        Ok(removed)
+        self.tombstone_props_for_key(txn, rel.first_prop, None, &format!("rel {rel_id}"))
     }
 
     // ------------------------------ adjacency -------------------------------
@@ -2010,5 +2128,162 @@ mod tests {
         let err = s.add_label(txn, a, 0).unwrap_err();
         assert!(matches!(err, GraphusError::Storage(_)));
         s.commit(txn).unwrap();
+    }
+
+    // ----------------------- per-value property MVCC (`rmp` task #50) -----------------------
+    //
+    // Regression guards for the dirty-read bug per-value MVCC fixes: `set_*_property_value` used to
+    // *compact* (free the old record + overflow chain, prepend the new), so a concurrent older
+    // snapshot could no longer read the previous value. The fix tombstones the old version (it keeps
+    // its slot, its chain link and its overflow chain) and prepends a fresh version, deferring
+    // physical reclamation to GC -- so an older snapshot still observes the old value until no live
+    // snapshot can. These tests assert the store-level mechanics that make that possible; the
+    // reader-side visibility filtering lives in `graphus-cypher` (out of scope here).
+
+    use graphus_core::{Value, VersionStamp};
+
+    /// Runs one GC pass under a fresh `txn` at the given `watermark` (see [`RecordStore::gc`]).
+    fn gc_at(s: &mut Store, txn: TxnId, watermark: Timestamp) -> usize {
+        s.begin(txn);
+        let reclaimed = s.gc(txn, watermark).unwrap();
+        s.commit(txn).unwrap();
+        reclaimed
+    }
+
+    #[test]
+    fn overwriting_a_node_property_tombstones_the_old_version_and_keeps_both_until_gc() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+
+        // Txn 1: create a node with `v = 1`, commit.
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let (n, _) = s.create_node(t1).unwrap();
+        s.set_node_property_value(t1, n, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(t1).unwrap();
+        let snap_after_v1 = s.snapshot_ts(); // a reader that began here must still see `v = 1`
+
+        // Txn 2: overwrite to `v = 2`, commit. The old version is tombstoned, not freed.
+        let t2 = TxnId(2);
+        s.begin(t2);
+        s.set_node_property_value(t2, n, key, &Value::Integer(2))
+            .unwrap();
+        s.commit(t2).unwrap();
+
+        // The chain now holds BOTH in-use records: the new live one (xmax == 0) and the old
+        // tombstoned one (xmax committed). `node_properties` returns every in-use record (the reader
+        // layer filters by visibility), so we see exactly two.
+        let chain = s.node_properties(n).unwrap();
+        assert_eq!(chain.len(), 2, "old version tombstoned, not freed");
+        let live: Vec<_> = chain
+            .iter()
+            .filter(|(_, p)| Store::is_live_version(p.mvcc))
+            .collect();
+        assert_eq!(live.len(), 1, "exactly one live version");
+        assert_eq!(
+            s.decode_property_value(live[0].1.type_tag, live[0].1.value_inline)
+                .unwrap(),
+            Value::Integer(2)
+        );
+        let tomb: Vec<_> = chain
+            .iter()
+            .filter(|(_, p)| p.mvcc.in_use() && p.mvcc.expired_ts != 0)
+            .collect();
+        assert_eq!(tomb.len(), 1, "exactly one tombstoned old version");
+        assert_eq!(
+            s.decode_property_value(tomb[0].1.type_tag, tomb[0].1.value_inline)
+                .unwrap(),
+            Value::Integer(1),
+            "the old value survives for an older snapshot"
+        );
+
+        // Snapshot isolation: GC at a watermark BELOW the tombstone's commit timestamp (the snapshot
+        // an older reader holds) must NOT reclaim the old version -- it is still observable.
+        assert_eq!(
+            gc_at(&mut s, TxnId(3), snap_after_v1),
+            0,
+            "GC must not reclaim a version an older snapshot can still see"
+        );
+        assert_eq!(
+            s.node_properties(n).unwrap().len(),
+            2,
+            "old version still present after a too-early GC"
+        );
+
+        // Once no live snapshot predates the overwrite (watermark = latest commit), GC reclaims the
+        // tombstoned old version and splices it out, leaving exactly the live one.
+        let latest = s.snapshot_ts();
+        gc_at(&mut s, TxnId(4), latest);
+        let chain = s.node_properties(n).unwrap();
+        assert_eq!(chain.len(), 1, "tombstoned old version reclaimed at GC");
+        assert_eq!(
+            s.node_property_values(n).unwrap(),
+            vec![(chain[0].0, key, Value::Integer(2))]
+        );
+    }
+
+    #[test]
+    fn new_property_version_is_in_flight_then_settles_at_commit() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let t1 = TxnId(7);
+        s.begin(t1);
+        let (n, _) = s.create_node(t1).unwrap();
+        let pid = s
+            .set_node_property_value(t1, n, key, &Value::Integer(42))
+            .unwrap();
+        // Before commit, the new version's `xmin` is the writer's in-flight TxnId (per-value MVCC).
+        let pre = s.property(pid).unwrap();
+        assert_eq!(
+            VersionStamp::from_raw(pre.mvcc.created_ts),
+            VersionStamp::InFlight(t1)
+        );
+        s.commit(t1).unwrap();
+        // After commit, `commit` settled `xmin` to a committed timestamp (the kind-agnostic settle
+        // loop handles `StoreKind::Prop` ids because `add_node_property` noted the create).
+        let post = s.property(pid).unwrap();
+        assert!(matches!(
+            VersionStamp::from_raw(post.mvcc.created_ts),
+            VersionStamp::Committed(_)
+        ));
+        assert_eq!(
+            post.mvcc.expired_ts, 0,
+            "the live version carries no tombstone"
+        );
+    }
+
+    #[test]
+    fn gc_reclaims_only_committed_tombstones_below_the_watermark() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let (n, _) = s.create_node(t1).unwrap();
+        s.set_node_property_value(t1, n, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(t1).unwrap();
+
+        // An in-flight (uncommitted) tombstone is never reclaimable: GC inside the still-open writing
+        // txn leaves the old version in place.
+        let t2 = TxnId(2);
+        s.begin(t2);
+        s.set_node_property_value(t2, n, key, &Value::Integer(2))
+            .unwrap();
+        // Within t2 the old version's xmax is in-flight; a GC at the current watermark cannot touch
+        // it (and would be unsafe to). We run GC under t2's own id so the chain is consistent.
+        let wm = s.snapshot_ts();
+        assert_eq!(
+            s.gc(t2, wm).unwrap(),
+            0,
+            "an in-flight tombstone is not reclaimable"
+        );
+        s.commit(t2).unwrap();
+        assert_eq!(s.node_properties(n).unwrap().len(), 2);
+
+        // After commit, a GC at the latest watermark reclaims it.
+        let latest = s.snapshot_ts();
+        gc_at(&mut s, TxnId(3), latest);
+        assert_eq!(s.node_properties(n).unwrap().len(), 1);
     }
 }
