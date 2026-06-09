@@ -124,6 +124,7 @@ pub mod ordering;
 pub mod parser;
 pub mod physical;
 pub mod plan_cache;
+pub mod record_graph;
 pub mod runtime;
 pub mod semantics;
 pub mod ternary;
@@ -156,6 +157,7 @@ pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,
 };
+pub use record_graph::RecordStoreGraph;
 pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};
 pub use ternary::Ternary;

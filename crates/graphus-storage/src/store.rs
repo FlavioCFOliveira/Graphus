@@ -502,6 +502,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.read_node(id)
     }
 
+    /// Enumerates the physical ids of every **live** (in-use) node, in ascending id order.
+    ///
+    /// The node store's physical-id space is `1..high_water` (id `0` is the reserved null pointer
+    /// and real records start at id `1`, `04 §2.2`); this walks that range and keeps the ids whose
+    /// node record is in use. A full scan is O(high-water): a vectorised / segment-skipping leaf
+    /// scan is the optimisation `04 §7.4` flags, not required for correctness. Used by the Cypher
+    /// executor's all-nodes scan over the real store (`rmp` task #38); label-restricted scans are a
+    /// follow-up (#39) since the label-set API does not exist yet.
+    ///
+    /// # Errors
+    /// Returns a storage error if a node store page in the range cannot be read.
+    pub fn scan_node_ids(&mut self) -> Result<Vec<u64>> {
+        let high_water = self.store(StoreKind::Node).alloc.high_water();
+        let mut out = Vec::new();
+        for id in 1..high_water {
+            if self.read_node(id)?.mvcc.in_use() {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Deletes the node at `id` under `txn` (clearing `in_use`) and frees its physical id. The
     /// caller must have detached the node's relationships first; remaining properties are not
     /// auto-deleted here.

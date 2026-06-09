@@ -59,6 +59,7 @@ pub mod check;
 pub mod idalloc;
 pub mod meta;
 pub mod paging;
+pub mod propenc;
 pub mod record;
 pub mod recovery;
 pub mod store;
@@ -74,6 +75,9 @@ pub use check::{
     PropertyFault, Violation, verify_on_open,
 };
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
+pub use propenc::{
+    PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,
+};
 pub use record::{
     ChainSide, MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE,
     PropRecord, REL_RECORD_SIZE, RelRecord,

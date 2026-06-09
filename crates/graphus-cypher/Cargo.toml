@@ -10,6 +10,14 @@ description = "Cypher parse, plan and execute pipeline for Graphus (targets the 
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+# The `RecordStoreGraph` GraphAccess implementation (src/record_graph.rs) runs the executor against
+# the real persistent record store (`rmp` task #38). This edge is acyclic: graphus-storage depends
+# on core/io/bufpool/wal/index, never on cypher.
+graphus-storage = { path = "../graphus-storage" }
+# `RecordStoreGraph` constructs/opens a `RecordStore` over the block-device and WAL abstractions,
+# so it names their public types (devices, log sinks, the WAL manager, recovery).
+graphus-io = { path = "../graphus-io" }
+graphus-wal = { path = "../graphus-wal" }
 
 [dev-dependencies]
 # Used by the ordering cross-check test to prove the Cypher value order agrees with the
