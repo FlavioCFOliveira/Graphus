@@ -31,7 +31,8 @@
 //! | **Relationship properties** — read (`r.k`, `properties(r)`), create (`CREATE ()-[:T {..}]->()`), `SET`/`REMOVE`, inline **and** `String`/`List` overflow | **supported** (#44) over [`RelRecord.first_prop`] (`04 §2.3`/§2.1, `05 §9`); `delete_rel` frees the chain (no leak) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures the same runtime error as a node property |
 //! | **Index-accelerated** label / property scans | **deferred (#48)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
 //! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
-//! | SSI conflict detection (write-skew abort) / per-value property MVCC | **deferred (#46)** | the single-transaction execution scope does not yet run concurrent transactions through SSI validation, and a property overwrite is still in-place (the owning entity's visibility gates the read) |
+//! | **Serializable concurrency / SSI** (write-skew abort, write-write first-updater-wins) | **supported** (#46) via [`TxnCoordinator`](crate::coordinator::TxnCoordinator) — this seam records SIREAD markers and rw-edges into the shared `SsiTracker`, and the coordinator aborts a pivot at commit with a retriable serialization error | — |
+//! | Per-value property MVCC / index-range (predicate) SSI markers | **deferred (#50 / #48)** | a property overwrite is still in-place (the owning entity's visibility gates the read); read markers are node/relationship-level, so a full label/all-nodes scan reads every node (a safe SSI over-abort until index-range markers arrive with #48) |
 //!
 //! [`RelRecord.first_prop`]: graphus_storage::record::RelRecord
 //!
@@ -58,8 +59,9 @@
 //! return `Result`. [`RecordStoreGraph`] bridges both:
 //!
 //! * a [`RefCell`] gives the `&self` trait methods the `&mut` access the store needs (the type is
-//!   single-threaded — `!Sync` — which matches the single-transaction execution scope; concurrent
-//!   transactions through SSI validation are the follow-up #46);
+//!   single-threaded — `!Sync`); several such seams over one `Rc`-shared store, driven by the
+//!   [`TxnCoordinator`](crate::coordinator::TxnCoordinator), run concurrent transactions through SSI
+//!   validation (#46);
 //! * a captured-error cell records the **first** storage / deferred-feature error a read or write
 //!   hits. The trait method then degrades safely (a read returns `None`/empty, a write is a no-op),
 //!   and the caller **must** inspect [`take_error`](RecordStoreGraph::take_error) after running the
@@ -67,13 +69,29 @@
 //!   rolled back. This keeps a deferral a hard, surfaced error — never a wrong row.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use graphus_core::error::GraphusError;
 use graphus_core::{Timestamp, TxnId, Value};
 use graphus_io::BlockDevice;
 use graphus_storage::{MvccHeader, Namespace, RecordStore};
-use graphus_txn::{CommitRegistry, Snapshot, is_visible};
+use graphus_txn::{CommitRegistry, LockOutcome, LockTable, Snapshot, SsiTracker, is_visible};
 use graphus_wal::LogSink;
+
+/// Tag bit distinguishing a relationship key from a node key in the shared [`SsiTracker`]
+/// (`rmp` task #46). Physical record ids fit far below this bit, so a node id and a relationship id
+/// with the same numeric value map to distinct SSI keys.
+const REL_SSI_KEY_TAG: u64 = 1 << 63;
+
+/// The SSI conflict key for node physical id `id` (its own id; node space is the low keys).
+fn node_ssi_key(id: u64) -> u64 {
+    id
+}
+
+/// The SSI conflict key for relationship physical id `id` (tagged into the high half of the space).
+fn rel_ssi_key(id: u64) -> u64 {
+    id | REL_SSI_KEY_TAG
+}
 
 use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
 
@@ -86,8 +104,11 @@ use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelDat
 #[must_use]
 pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// The store, behind a `RefCell` so the `&self` [`GraphAccess`] reads can drive the store's
-    /// `&mut self` methods (see module docs).
-    store: RefCell<RecordStore<D, S>>,
+    /// `&mut self` methods, and behind an `Rc` so a [`TxnCoordinator`](crate::coordinator::TxnCoordinator)
+    /// can share one store across the concurrent transactions it drives (`rmp` task #46). In the
+    /// standalone single-transaction path the `Rc` is the sole owner, so [`commit`](Self::commit) /
+    /// [`rollback`](Self::rollback) / [`into_store`](Self::into_store) unwrap it back to an owned store.
+    store: Rc<RefCell<RecordStore<D, S>>>,
     /// The single transaction this query runs in.
     txn: TxnId,
     /// This query's MVCC read snapshot (`04 §5.3`, `rmp` task #45): every read is filtered through
@@ -96,9 +117,20 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// in-flight writes, and not versions another transaction committed later or deleted.
     snapshot: Snapshot,
     /// Resolves any still-in-flight writer to its commit outcome (`04 §5.3`). Eager commit-time
-    /// settling makes committed records self-describing, so for the single-transaction execution
-    /// scope this stays empty; concurrent execution populates it (the SSI follow-up, #46).
+    /// settling makes committed records self-describing, so this stays empty even under the
+    /// concurrent execution the coordinator drives (a committed writer's headers are settled, never
+    /// observed as in-flight by a concurrent reader).
     registry: CommitRegistry,
+    /// When this graph is driven by a [`TxnCoordinator`](crate::coordinator::TxnCoordinator), the
+    /// shared SSI conflict tracker every concurrent transaction records its SIREAD markers and writes
+    /// into, so the coordinator can detect a dangerous structure and abort a pivot at commit
+    /// (`04 §5.4`, `rmp` task #46). `None` in the standalone single-transaction path (no concurrency,
+    /// nothing to track).
+    ssi: Option<Rc<RefCell<SsiTracker>>>,
+    /// The shared write-lock table, present iff coordinated. A write acquires the entity's lock
+    /// first-updater-wins; a conflicting concurrent writer captures a retriable serialization error
+    /// (`04 §5.7`, `rmp` task #46). Reads never touch it (they never block, NFR-4).
+    locks: Option<Rc<RefCell<LockTable>>>,
     /// The first storage / deferred-feature error encountered by a read or write, if any. While set,
     /// results are untrustworthy and the transaction should be rolled back (see module docs).
     error: RefCell<Option<GraphusError>>,
@@ -121,11 +153,64 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             ts: store.snapshot_ts(),
         };
         Self {
-            store: RefCell::new(store),
+            store: Rc::new(RefCell::new(store)),
             txn,
             snapshot,
             registry: CommitRegistry::new(),
+            ssi: None,
+            locks: None,
             error: RefCell::new(None),
+        }
+    }
+
+    /// Attaches a per-statement seam to an **already-open** transaction `txn` driven by a
+    /// [`TxnCoordinator`](crate::coordinator::TxnCoordinator) (`rmp` task #46): the coordinator owns
+    /// the shared `store`, has already called `store.begin(txn)`, holds `txn`'s `snapshot`, and
+    /// passes the shared `ssi` tracker so this statement's reads/writes contribute SIREAD markers and
+    /// rw-edges. Unlike [`begin`](Self::begin) it does **not** begin a transaction and must not be
+    /// committed/rolled back through this handle — the coordinator owns that lifecycle.
+    pub fn attach(
+        store: Rc<RefCell<RecordStore<D, S>>>,
+        txn: TxnId,
+        snapshot: Snapshot,
+        ssi: Rc<RefCell<SsiTracker>>,
+        locks: Rc<RefCell<LockTable>>,
+    ) -> Self {
+        Self {
+            store,
+            txn,
+            snapshot,
+            registry: CommitRegistry::new(),
+            ssi: Some(ssi),
+            locks: Some(locks),
+            error: RefCell::new(None),
+        }
+    }
+
+    /// Records a non-blocking SIREAD marker for `key` under this transaction, if it is coordinated
+    /// (`04 §5.4`); a no-op in the standalone path. Reads never block (NFR-4).
+    fn note_read(&self, key: u64) {
+        if let Some(ssi) = &self.ssi {
+            ssi.borrow_mut().record_read(self.txn, key);
+        }
+    }
+
+    /// Records that this transaction wrote `key`: closes rw-antidependency edges with concurrent
+    /// readers in the shared tracker (`04 §5.4`) and acquires the write lock first-updater-wins
+    /// (`04 §5.7`). On a write-write conflict with another in-flight transaction, captures a
+    /// retriable serialization error so the caller rolls this transaction back. A no-op in the
+    /// standalone path (no concurrency).
+    fn note_write(&self, key: u64) {
+        if let Some(ssi) = &self.ssi {
+            ssi.borrow_mut().record_write(self.txn, key);
+        }
+        if let Some(locks) = &self.locks
+            && let LockOutcome::Wait { holder } = locks.borrow_mut().acquire(self.txn, key)
+        {
+            self.capture(GraphusError::Transaction(format!(
+                "write-write conflict: entity held by transaction {}; retry (serialization failure)",
+                holder.0
+            )));
         }
     }
 
@@ -137,10 +222,12 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     pub fn begin_at_snapshot(mut store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
         Self {
-            store: RefCell::new(store),
+            store: Rc::new(RefCell::new(store)),
             txn,
             snapshot: Snapshot { owner: txn, ts },
             registry: CommitRegistry::new(),
+            ssi: None,
+            locks: None,
             error: RefCell::new(None),
         }
     }
@@ -184,9 +271,23 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// # Errors
     /// Returns a storage error if the commit (catalog persist + WAL group-commit) fails.
     pub fn commit(self) -> Result<RecordStore<D, S>, GraphusError> {
-        let mut store = self.store.into_inner();
-        store.commit(self.txn)?;
+        let txn = self.txn;
+        let mut store = Self::unwrap_store(self.store);
+        store.commit(txn)?;
         Ok(store)
+    }
+
+    /// Unwraps the sole-owner `Rc` back to an owned store. Panics if the store is still shared — only
+    /// a standalone graph (the single-transaction path) owns its store outright; a coordinated
+    /// statement handle must never end the transaction (the coordinator owns that lifecycle).
+    fn unwrap_store(store: Rc<RefCell<RecordStore<D, S>>>) -> RecordStore<D, S> {
+        match Rc::try_unwrap(store) {
+            Ok(cell) => cell.into_inner(),
+            Err(_) => panic!(
+                "RecordStoreGraph::{{commit,rollback,into_store}} requires sole ownership of the \
+                 store; a coordinated statement handle must not end the transaction"
+            ),
+        }
     }
 
     /// Rolls the query's transaction back (undoing every write via the WAL) and returns the wrapped
@@ -196,8 +297,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// # Errors
     /// Returns a storage error if the undo apply or catalog reload fails.
     pub fn rollback(self) -> Result<RecordStore<D, S>, GraphusError> {
-        let mut store = self.store.into_inner();
-        store.rollback(self.txn)?;
+        let txn = self.txn;
+        let mut store = Self::unwrap_store(self.store);
+        store.rollback(txn)?;
         Ok(store)
     }
 
@@ -208,7 +310,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// retrieve the store for inspection or shutdown, and the crash-recovery tests use it to crash
     /// with an in-flight (loser) transaction.
     pub fn into_store(self) -> RecordStore<D, S> {
-        self.store.into_inner()
+        Self::unwrap_store(self.store)
     }
 
     /// Records `err` as the first captured error (a later error does not overwrite the first, which
@@ -380,8 +482,14 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         let mut out = Vec::new();
         for id in ids {
             match store.node(id) {
-                Ok(rec) if self.visible(rec.mvcc) => out.push(NodeId(id)),
-                Ok(_) => {}
+                Ok(rec) => {
+                    // A full scan examines every node, so SIREAD-mark each one: a concurrent writer
+                    // of any scanned node closes an rw-edge (`04 §5.4`, `rmp` task #46).
+                    self.note_read(node_ssi_key(id));
+                    if self.visible(rec.mvcc) {
+                        out.push(NodeId(id));
+                    }
+                }
                 Err(e) => {
                     drop(store);
                     self.capture(e);
@@ -413,14 +521,18 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         for id in ids {
             // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
             // testing the label, so a label scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
-            match store.node(id) {
-                Ok(rec) if !self.visible(rec.mvcc) => continue,
-                Ok(_) => {}
+            let visible = match store.node(id) {
+                Ok(rec) => self.visible(rec.mvcc),
                 Err(e) => {
                     drop(store);
                     self.capture(e);
                     return Vec::new();
                 }
+            };
+            // SIREAD-mark every scanned node, visible or not (the label predicate examined it).
+            self.note_read(node_ssi_key(id));
+            if !visible {
+                continue;
             }
             match store.node_has_label(id, token_id) {
                 Ok(true) => out.push(NodeId(id)),
@@ -457,6 +569,8 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
                     return Vec::new();
                 }
             };
+            // SIREAD-mark each incident relationship the traversal examined (`04 §5.4`).
+            self.note_read(rel_ssi_key(rid));
             // Skip relationships not visible to this snapshot — a concurrently-deleted (tombstoned)
             // edge an older reader could still traverse, or an edge a later transaction committed
             // (`04 §5.3`, `rmp` task #45). The incidence chain still threads them until GC.
@@ -506,6 +620,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             // is a normal answer, not a captured storage fault.
             Err(_) => return false,
         };
+        // SIREAD marker: this transaction examined the node (independent of whether it is visible),
+        // so a concurrent writer of it closes an rw-edge (`04 §5.4`, `rmp` task #46).
+        self.note_read(node_ssi_key(node.0));
         self.visible(mvcc)
     }
 
@@ -514,6 +631,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             Ok(rec) => rec.mvcc,
             Err(_) => return false,
         };
+        self.note_read(rel_ssi_key(rel.0));
         self.visible(mvcc)
     }
 
@@ -550,10 +668,13 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
         let mut store = self.store.borrow_mut();
         let rec = match store.rel(rel.0) {
-            Ok(rec) if self.visible(rec.mvcc) => rec,
-            Ok(_) => return None,
+            Ok(rec) => rec,
             Err(_) => return None,
         };
+        self.note_read(rel_ssi_key(rel.0));
+        if !self.visible(rec.mvcc) {
+            return None;
+        }
         let rel_type = store
             .token_name(Namespace::RelType, rec.type_id)
             .unwrap_or("")
@@ -616,6 +737,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             }
         };
         let node = NodeId(id);
+        self.note_write(node_ssi_key(id));
         // Apply labels via the inline label bitmap (`05 §9`, `rmp` task #42). An overflowing label
         // (token id `≥ 63`) captures the documented deferred error rather than dropping it silently.
         self.apply_add_labels(node, labels);
@@ -655,6 +777,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             }
         };
         let rel = RelId(id);
+        self.note_write(rel_ssi_key(id));
         // Relationship properties are stored over `RelRecord.first_prop` (`rmp` task #44), exactly
         // like node properties on `create_node`. A null entry is not stored (Cypher does not persist
         // nulls); a non-persistable class captures a runtime error rather than dropping it silently.
@@ -670,6 +793,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         let Some(key_id) = self.prop_key_id(key) else {
             return; // error already captured
         };
+        self.note_write(node_ssi_key(node.0));
         if value.is_null() {
             // `SET n.p = null` is a removal in Cypher: drop the key (and free any overflow chain it
             // owned) so a later read sees the property absent.
@@ -702,6 +826,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         let Some(key_id) = self.prop_key_id(key) else {
             return; // error already captured
         };
+        self.note_write(rel_ssi_key(rel.0));
         if value.is_null() {
             // `SET r.p = null` is a removal in Cypher: drop the key (and free any overflow chain it
             // owned) so a later read sees the property absent.
@@ -732,6 +857,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if labels.is_empty() || !self.node_exists(node) {
             return;
         }
+        self.note_write(node_ssi_key(node.0));
         self.apply_add_labels(node, labels);
     }
 
@@ -739,6 +865,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if labels.is_empty() || !self.node_exists(node) {
             return;
         }
+        self.note_write(node_ssi_key(node.0));
         // Remove each label that has ever been interned; a label name that was never created cannot
         // be set on any node, so removing it is a no-op (no token is created just to remove it).
         for name in labels {
@@ -760,6 +887,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if !self.node_exists(node) {
             return;
         }
+        self.note_write(node_ssi_key(node.0));
         // `REMOVE n.p` over a never-interned key is a no-op (no node can carry an unknown key), so do
         // not intern just to remove. Otherwise drop the key and free any overflow chain it owned
         // (`rmp` task #43); removing an absent key is itself a no-op in the store.
@@ -851,6 +979,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if !self.visible(mvcc) {
             return;
         }
+        self.note_write(rel_ssi_key(rel.0));
         if let Err(e) = self.store.borrow_mut().delete_rel(self.txn, rel.0) {
             self.capture(e);
         }
@@ -864,6 +993,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if !self.visible(mvcc) {
             return;
         }
+        self.note_write(node_ssi_key(node.0));
         if let Err(e) = self.store.borrow_mut().delete_node(self.txn, node.0) {
             self.capture(e);
         }

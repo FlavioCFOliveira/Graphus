@@ -110,6 +110,7 @@
 pub mod ast;
 pub mod binding;
 pub mod catalog;
+pub mod coordinator;
 pub mod equality;
 pub mod equivalence;
 pub mod errors;
@@ -157,6 +158,7 @@ pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,
 };
+pub use coordinator::TxnCoordinator;
 pub use record_graph::RecordStoreGraph;
 pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};
