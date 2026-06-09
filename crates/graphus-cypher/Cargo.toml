@@ -10,3 +10,10 @@ description = "Cypher parse, plan and execute pipeline for Graphus (targets the 
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+
+[dev-dependencies]
+# Used by the ordering cross-check test to prove the Cypher value order agrees with the
+# order-preserving index key byte order for the encodable value classes.
+graphus-index = { path = "../graphus-index" }
+# Deterministic, seedable RNG for the reproducible cross-check property test.
+graphus-sim = { path = "../graphus-sim" }

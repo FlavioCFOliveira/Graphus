@@ -12,6 +12,7 @@
 pub use error::{GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use value::Value;
+pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {
@@ -65,12 +66,113 @@ pub mod ids {
 
 /// The Cypher value model (`01-needs-survey.md` FR-DM-6, FR-QL-5).
 ///
-/// Covers the scalar/list core here; the temporal, spatial, and structural
-/// (node / relationship / path) variants are introduced together with their owning
-/// subsystems. Cypher equality and ordering are three-valued and are implemented in
-/// `graphus-cypher` (FR-QL-8); the derived [`PartialEq`] here is structural and is
-/// **not** the Cypher equality operator.
+/// Covers the scalar, list, map and **temporal** value classes here. The spatial
+/// (`Point`) and structural (node / relationship / path) variants are introduced
+/// together with their owning subsystems. Cypher equality and ordering are
+/// three-valued and are implemented in `graphus-cypher` (FR-QL-8); the derived
+/// [`PartialEq`] here is structural and is **not** the Cypher equality operator.
+///
+/// The temporal variants ([`Date`](Value::Date), [`LocalTime`](Value::LocalTime),
+/// [`ZonedTime`](Value::ZonedTime), [`LocalDateTime`](Value::LocalDateTime),
+/// [`ZonedDateTime`](Value::ZonedDateTime), [`Duration`](Value::Duration)) were
+/// added additively for the Cypher value-model semantics sub-task. They use small,
+/// fixed-width component representations at **nanosecond resolution**, modelled
+/// directly on the openCypher temporal types (CIP2016-06-14 §Orderability and the
+/// temporal CIP). Their cross-class ordering rank is defined in `graphus-cypher`'s
+/// `ordering` module and mirrored in `graphus-index`'s `keycodec`.
 pub mod value {
+    pub use temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
+
+    /// Fixed-width temporal component types used by the temporal [`Value`] variants.
+    ///
+    /// These deliberately store **decomposed integer components** (not a single
+    /// instant) so that the order-preserving index key encoding can lay them out
+    /// most-significant-component-first and so that Cypher's component-wise temporal
+    /// semantics are representable. All resolutions are nanosecond. Modelled on the
+    /// openCypher temporal CIP (see `specification/04-technical-design.md` §7.2).
+    pub mod temporal {
+        /// Nanoseconds in one standard (non-leap) day: `24 * 60 * 60 * 1_000_000_000`.
+        pub const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+
+        /// A calendar date, as **days since the Unix epoch** (1970-01-01).
+        ///
+        /// `i32` days spans roughly ±5.8 million years, far beyond any practical
+        /// range, while keeping a compact fixed-width key component.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        pub struct Date {
+            /// Days since 1970-01-01 (negative for earlier dates).
+            pub days_since_epoch: i32,
+        }
+
+        /// A wall-clock time of day with no date and no zone, as **nanoseconds since
+        /// midnight** (`0 ..= NANOS_PER_DAY - 1`).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        pub struct LocalTime {
+            /// Nanoseconds since 00:00:00 (`< NANOS_PER_DAY`).
+            pub nanos_of_day: u64,
+        }
+
+        /// A time of day with a fixed UTC offset but no date (openCypher `Time`).
+        ///
+        /// Two `ZonedTime`s are ordered by the **instant they denote** (local time
+        /// minus offset), then by the offset to break ties between equal instants,
+        /// so the ordering is total and matches the index key layout.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+        pub struct ZonedTime {
+            /// The wall-clock time of day.
+            pub time: LocalTime,
+            /// UTC offset in seconds (east of UTC positive), e.g. `+01:00` = `3600`.
+            pub offset_seconds: i32,
+        }
+
+        /// A date-and-time with no zone, as **seconds since the Unix epoch** plus a
+        /// sub-second nanosecond field (`0 ..= 999_999_999`).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        pub struct LocalDateTime {
+            /// Seconds since 1970-01-01T00:00:00 (negative for earlier instants).
+            pub epoch_seconds: i64,
+            /// Sub-second nanoseconds (`< 1_000_000_000`).
+            pub nanos: u32,
+        }
+
+        /// A date-and-time with both a resolved UTC offset and an IANA zone id
+        /// (openCypher `DateTime`).
+        ///
+        /// The IANA zone id (e.g. `"Europe/Lisbon"`) is retained for round-tripping
+        /// and rendering, while the resolved `offset_seconds` is what fixes the
+        /// **instant**. Ordering is by the underlying UTC instant (`local - offset`).
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+        pub struct ZonedDateTime {
+            /// The local date-and-time as stored (interpreted in the zone/offset).
+            pub local: LocalDateTime,
+            /// Resolved UTC offset in seconds (east of UTC positive).
+            pub offset_seconds: i32,
+            /// IANA time-zone id (e.g. `"Europe/Lisbon"`), or empty if offset-only.
+            pub zone_id: String,
+        }
+
+        /// A Cypher [`Duration`]: a quantity of months, days, seconds and nanoseconds.
+        ///
+        /// Cypher durations are **not** a single scalar of seconds — months and days
+        /// are calendar-relative and are kept as independent components (a month is
+        /// not a fixed number of days, a day is not always 86 400 s across DST). For
+        /// ordering, Cypher compares durations by an approximate normalised length
+        /// (see `graphus-cypher`'s `ordering` module); component-wise equality is the
+        /// equality rule.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+        pub struct Duration {
+            /// Whole months.
+            pub months: i64,
+            /// Whole days (calendar days, not normalised into months).
+            pub days: i64,
+            /// Whole seconds.
+            pub seconds: i64,
+            /// Sub-second nanoseconds (may be negative to share the seconds' sign in
+            /// some constructions; consumers normalise as needed).
+            pub nanos: i32,
+        }
+    }
+
     /// A Cypher value.
     #[derive(Debug, Clone, PartialEq, Default)]
     pub enum Value {
@@ -91,8 +193,20 @@ pub mod value {
         List(Vec<Value>),
         /// A map of string keys to values (insertion order preserved).
         Map(Vec<(String, Value)>),
-        // Temporal, Point, Node, Relationship, and Path variants are added with
-        // their owning subsystems (see specification/04-technical-design.md §7.2).
+        /// A calendar date (openCypher `Date`).
+        Date(Date),
+        /// A wall-clock time of day with no zone (openCypher `LocalTime`).
+        LocalTime(LocalTime),
+        /// A time of day with a fixed UTC offset (openCypher `Time`).
+        ZonedTime(ZonedTime),
+        /// A date-and-time with no zone (openCypher `LocalDateTime`).
+        LocalDateTime(LocalDateTime),
+        /// A date-and-time with a resolved offset and IANA zone (openCypher `DateTime`).
+        ZonedDateTime(ZonedDateTime),
+        /// A Cypher duration (months / days / seconds / nanoseconds).
+        Duration(Duration),
+        // Point, Node, Relationship, and Path variants are added with their owning
+        // subsystems (see specification/04-technical-design.md §7.2).
     }
 
     impl Value {
@@ -116,6 +230,31 @@ pub mod value {
         fn non_null_values_are_not_null() {
             assert!(!Value::Integer(7).is_null());
             assert!(!Value::List(vec![Value::Null]).is_null());
+        }
+
+        #[test]
+        fn temporal_variants_construct() {
+            let _ = Value::Date(Date {
+                days_since_epoch: 0,
+            });
+            let _ = Value::LocalTime(LocalTime { nanos_of_day: 1 });
+            let _ = Value::ZonedTime(ZonedTime {
+                time: LocalTime { nanos_of_day: 1 },
+                offset_seconds: 3600,
+            });
+            let _ = Value::LocalDateTime(LocalDateTime {
+                epoch_seconds: 0,
+                nanos: 0,
+            });
+            let _ = Value::ZonedDateTime(ZonedDateTime {
+                local: LocalDateTime {
+                    epoch_seconds: 0,
+                    nanos: 0,
+                },
+                offset_seconds: 0,
+                zone_id: "Europe/Lisbon".to_owned(),
+            });
+            assert!(!Value::Duration(Duration::default()).is_null());
         }
     }
 }

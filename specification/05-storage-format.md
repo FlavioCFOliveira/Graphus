@@ -174,6 +174,17 @@ page reuses the §6 24-byte page header, then a slotted body laid out by `graphu
 **order-preserving encoding** (`04-technical-design.md` §6.2) so that page byte order equals Cypher
 value order; values are 8-byte little-endian record ids.
 
+The cross-type key order is the **openCypher orderability** (CIP2016-06-14 §Orderability, which the
+TCK enforces; `04 §7.6`), ascending:
+`MAP < NODE < RELATIONSHIP < LIST < PATH < {temporals} < STRING < BOOLEAN < NUMBER < NaN < null`,
+where the temporal block ascends `ZonedDateTime < LocalDateTime < Date < ZonedTime < LocalTime <
+Duration`, `NaN` is the largest number, and `null` is the largest value. (Note the openCypher quirk:
+`STRING < BOOLEAN < NUMBER`.) `graphus-cypher`'s value ordering is derived from exactly this order, and
+a 100k-pair property test cross-checks that the two agree, so indexes and `ORDER BY` never disagree.
+Within a class, the byte encoding preserves order (`i64` sign-flip, IEEE-754 total order with `-0.0 <
++0.0`, UTF-8 byte order, chronological temporals). `Bytes` (a PackStream/REST extension, not an
+openCypher type) is placed just above `STRING`.
+
 | Region | Location | Contents |
 | --- | --- | --- |
 | Node header | bytes `24..28` | `level` u16 (0 = leaf) · `slot_count` u16 |
