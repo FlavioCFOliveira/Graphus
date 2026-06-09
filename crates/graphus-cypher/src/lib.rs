@@ -28,6 +28,16 @@
 //!   violations, missing parameters) are deliberately **not** raised here — they belong to the
 //!   executor (`04 §7.3`; see [`semantics`] for the boundary).
 //!
+//! - The **logical planner** ([`lower`]) — the pipeline's fourth stage — lowers a
+//!   [`semantics::ValidatedQuery`] into a [logical plan](logical) ([`lower::lower`] →
+//!   [`logical::LogicalOp`]): a tree of relational-graph algebra operators (`04 §7.1`:
+//!   *"logical planner → logical plan (relational-graph algebra: Expand, NodeScan, Filter, Project,
+//!   Apply, Optional, Merge, Create, SetProperty, …)"*). The plan is deliberately **index-agnostic**
+//!   and strategy-agnostic — index seeks, expand-into vs expand-all, and join/limit/sort strategy
+//!   are the **physical** planner's job (the next sub-task). The lowering is total and infallible
+//!   over a validated query and applies only conservative, semantics-preserving normalisation
+//!   (inline-property-map predicate hoisting); cost-based optimisation is Phase 2 (`00-overview`).
+//!
 //! # The four value-model operations (they are genuinely different)
 //!
 //! A recurring source of TCK failures is conflating these; Graphus keeps them as four separate,
@@ -82,6 +92,8 @@ pub mod equivalence;
 pub mod errors;
 pub mod function_registry;
 pub mod lexer;
+pub mod logical;
+pub mod lower;
 pub mod ordering;
 pub mod parser;
 pub mod semantics;
@@ -95,6 +107,10 @@ pub use errors::{
     VarKind,
 };
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
+pub use logical::{
+    CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
+};
+pub use lower::lower;
 pub use ordering::cmp_values;
 pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
 pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};
