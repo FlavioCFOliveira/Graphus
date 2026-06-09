@@ -12,7 +12,12 @@
 //!   (`04 §7.2`, §7.6). Every rule there is taken **verbatim from the openCypher
 //!   comparability/orderability/equality CIP** (CIP2016-06-14), the source the TCK enforces.
 //!
-//! The parser that consumes the lexer's token stream is the next sub-task (`04 §7.1`).
+//! - The **parser** ([`parser`]) — the pipeline's second stage — consumes the lexer's token stream
+//!   and produces a typed [`ast`] (`04 §7.1`: *"parser (hand-written recursive descent / Pratt) →
+//!   AST"*). It raises **only** compile-time `SyntaxError`s with precise byte positions (`04 §7.3`);
+//!   the semantic-analysis phase (the next sub-task) raises `SemanticError`s.
+//!
+//! The semantic-analysis phase that validates the parser's AST is the next sub-task (`04 §7.3`).
 //!
 //! # The four value-model operations (they are genuinely different)
 //!
@@ -62,14 +67,18 @@
 //! work. Until then, this crate's operations are total over the value classes that *do* exist.
 #![forbid(unsafe_code)]
 
+pub mod ast;
 pub mod equality;
 pub mod equivalence;
 pub mod lexer;
 pub mod ordering;
+pub mod parser;
 pub mod ternary;
 
+pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use ordering::cmp_values;
+pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
 pub use ternary::Ternary;
