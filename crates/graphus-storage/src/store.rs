@@ -763,8 +763,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Deletes relationship `id` under `txn`, unlinking it from both endpoints' incidence chains
-    /// (or the single chain twice, for a self-loop) and freeing its physical id (`04 §2.4`,
-    /// `04 §2.7`).
+    /// (or the single chain twice, for a self-loop), **freeing its property chain** (every property
+    /// record and any `strings.store` overflow chain those properties own, `rmp` task #44; no leak),
+    /// and freeing its physical id (`04 §2.4`, `04 §2.7`).
+    ///
+    /// Freeing the property chain mirrors what `DELETE`/`DETACH DELETE` requires of a relationship:
+    /// a deleted relationship leaves no live property records nor live overflow blocks behind (the
+    /// no-leak invariant the regression tests assert via [`heap_block_usage`](Self::heap_block_usage)
+    /// and the consistency checker's free-list pass). Unlike `delete_node` — whose property chain the
+    /// executor clears explicitly before deletion — `delete_rel` owns its relationship's properties
+    /// outright, so it frees them here.
     ///
     /// # Errors
     /// Returns a storage error if the relationship is not in use or a write fails.
@@ -773,6 +781,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !rel.mvcc.in_use() {
             return Err(GraphusError::Storage(format!("rel {id} is not in use")));
         }
+        // Free the relationship's property chain first (records + overflow chains), so a deleted
+        // relationship leaves nothing live behind (`rmp` task #44; no leak). This walks and frees the
+        // same `first_prop`-rooted chain the node path frees via `clear_node_properties`.
+        let _freed = self.free_rel_property_chain(txn, id, rel.first_prop)?;
+
         if rel.start_node == rel.end_node {
             // Self-loop: unlink both links from the one chain. Re-read between unlinks because the
             // first unlink rewrites neighbours that the second consults.
@@ -785,10 +798,49 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
 
         let mut dead = self.read_rel(id)?;
+        dead.first_prop = NULL_ID; // the chain is freed; drop the now-dangling head pointer
         dead.mvcc = MvccHeader::default();
         self.write_rel(id, &dead, txn)?;
         self.store_mut(StoreKind::Rel).free.push(id);
         Ok(())
+    }
+
+    /// Frees every live property record in the chain rooted at `first_prop` (and any overflow heap
+    /// chain each owns), returning each record's id to the free list (`rmp` task #44; no leak), and
+    /// returns the number of live records freed. The owner `rel_id` is used only for the cycle-guard
+    /// diagnostic. Shared by [`delete_rel`](Self::delete_rel) and
+    /// [`clear_rel_properties`](Self::clear_rel_properties).
+    fn free_rel_property_chain(
+        &mut self,
+        txn: TxnId,
+        rel_id: u64,
+        first_prop: u64,
+    ) -> Result<usize> {
+        let mut freed = 0usize;
+        let mut cur = first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of rel {rel_id} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            let next = prop.next_prop;
+            if prop.mvcc.in_use() {
+                self.free_property_overflow(txn, &prop)?;
+                let mut dead = prop;
+                dead.mvcc = MvccHeader::default(); // clears in_use
+                dead.next_prop = NULL_ID;
+                self.write_prop(cur, &dead, txn)?;
+                self.store_mut(StoreKind::Prop).free.push(cur);
+                freed += 1;
+            }
+            cur = next;
+        }
+        Ok(freed)
     }
 
     fn unlink_side(&mut self, id: u64, side: ChainSide, node: u64, txn: TxnId) -> Result<()> {
@@ -1251,6 +1303,193 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.free_chain(txn, prop.value_inline)?;
         }
         Ok(())
+    }
+
+    // ---------------- relationship property CRUD (`rmp` task #44) -----------------
+    //
+    // Relationship properties mirror the node-property path exactly (`04 §2.3`, `05 §9`): a
+    // relationship's property chain is rooted at [`RelRecord.first_prop`](crate::record::RelRecord)
+    // — the relationship analogue of `NodeRecord.first_prop` — and threaded through the **same**
+    // `props.store` records via `PropRecord.next_prop`, with the **same** `strings.store` overflow
+    // heap for `String`/`List` values (`rmp` task #43) and the same prepend-chain + newest-wins
+    // discipline. Every write is WAL-logged and crash-recoverable through the same ARIES machinery
+    // (`04 §4`). Index seeks + MVCC over these chains remain `rmp` task #39, untouched here.
+
+    /// Creates a property `(key, type_tag, value_inline)` under `txn` and prepends it to relationship
+    /// `rel_id`'s property chain (`rmp` task #44); returns the property's physical id. The low-level
+    /// inline counterpart to [`add_node_property`](Self::add_node_property), over
+    /// [`RelRecord.first_prop`](crate::record::RelRecord).
+    ///
+    /// # Errors
+    /// Returns a storage error if the relationship is not in use or a write fails.
+    pub fn add_rel_property(
+        &mut self,
+        txn: TxnId,
+        rel_id: u64,
+        key: u32,
+        type_tag: u8,
+        value_inline: u64,
+    ) -> Result<u64> {
+        let mut rel = self.read_rel(rel_id)?;
+        if !rel.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
+        }
+        let pid = self.alloc_id(StoreKind::Prop);
+        let mut prop = PropRecord::new(txn.0, key, type_tag, value_inline);
+        prop.next_prop = rel.first_prop;
+        self.write_prop(pid, &prop, txn)?;
+        rel.first_prop = pid;
+        self.write_rel(rel_id, &rel, txn)?;
+        Ok(pid)
+    }
+
+    /// Collects every live property `(physical_id, record)` in relationship `rel_id`'s chain, head to
+    /// tail (`rmp` task #44). The relationship analogue of
+    /// [`node_properties`](Self::node_properties).
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain page is missing or the chain is malformed (cycle-guarded).
+    pub fn rel_properties(&mut self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
+        let rel = self.read_rel(rel_id)?;
+        let mut out = Vec::new();
+        let mut cur = rel.first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of rel {rel_id} is malformed (cycle?)"
+                )));
+            }
+            let p = self.read_prop(cur)?;
+            let next = p.next_prop;
+            if p.mvcc.in_use() {
+                out.push((cur, p));
+            }
+            cur = next;
+        }
+        Ok(out)
+    }
+
+    /// Sets relationship `rel_id`'s property `key` to `value` under `txn`, **replacing** any current
+    /// value of that key (`rmp` task #44): it first removes every existing property record for `key`
+    /// (freeing each one's overflow chain so nothing leaks, `rmp` task #43), then writes the new
+    /// value. Inline scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List` values
+    /// overflow to the `strings.store` heap with the `type_tag` overflow bit set (`04 §2.3`). Returns
+    /// the new property's physical id. The relationship analogue of
+    /// [`set_node_property_value`](Self::set_node_property_value).
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if the relationship is not in use or a write fails.
+    /// - [`GraphusError::Runtime`] (from the value codecs) if `value` is `Null` (not persisted) or a
+    ///   class this build cannot store (e.g. `Map`, a heterogeneous `List`).
+    pub fn set_rel_property_value(
+        &mut self,
+        txn: TxnId,
+        rel_id: u64,
+        key: u32,
+        value: &graphus_core::Value,
+    ) -> Result<u64> {
+        // Encode first so a non-persistable value errors before any mutation (no partial write).
+        let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
+        self.remove_rel_property_value(txn, rel_id, key)?;
+        self.add_rel_property(txn, rel_id, key, type_tag, value_inline)
+    }
+
+    /// Removes relationship `rel_id`'s property `key` under `txn`: unlinks **every** live property
+    /// record for `key` from the relationship's chain, freeing each record's id and any overflow heap
+    /// chain it owns (`rmp` task #44; no leak). Returns whether anything was removed (so `REMOVE r.p`
+    /// can distinguish a real removal from a no-op). The relationship analogue of
+    /// [`remove_node_property_value`](Self::remove_node_property_value).
+    ///
+    /// # Errors
+    /// Returns a storage error if the relationship is not in use or a write fails.
+    pub fn remove_rel_property_value(&mut self, txn: TxnId, rel_id: u64, key: u32) -> Result<bool> {
+        let mut rel = self.read_rel(rel_id)?;
+        if !rel.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
+        }
+        // Walk the singly-linked chain, rebuilding it without any record whose key matches; free each
+        // removed record (and its overflow chain). Mirrors `remove_node_property_value`.
+        let mut removed_any = false;
+        let mut prev: u64 = NULL_ID; // last *kept* property record (NULL => list head is the rel)
+        let mut cur = rel.first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of rel {rel_id} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            let next = prop.next_prop;
+            if prop.mvcc.in_use() && prop.key == key {
+                // Remove this record: free its overflow chain, splice it out, free its id.
+                self.free_property_overflow(txn, &prop)?;
+                let mut dead = prop;
+                dead.mvcc = MvccHeader::default(); // clears in_use
+                dead.next_prop = NULL_ID;
+                self.write_prop(cur, &dead, txn)?;
+                self.store_mut(StoreKind::Prop).free.push(cur);
+                if prev == NULL_ID {
+                    rel.first_prop = next;
+                    self.write_rel(rel_id, &rel, txn)?;
+                } else {
+                    let mut p = self.read_prop(prev)?;
+                    p.next_prop = next;
+                    self.write_prop(prev, &p, txn)?;
+                }
+                removed_any = true;
+            } else if prop.mvcc.in_use() {
+                prev = cur;
+            }
+            cur = next;
+        }
+        Ok(removed_any)
+    }
+
+    /// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`, decoding
+    /// both inline scalars and overflow `String`/`List` values (`rmp` task #44). The chain is walked
+    /// head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered). The
+    /// relationship analogue of [`node_property_values`](Self::node_property_values).
+    ///
+    /// # Errors
+    /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
+    pub fn rel_property_values(
+        &mut self,
+        rel_id: u64,
+    ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
+        let chain = self.rel_properties(rel_id)?;
+        let mut out = Vec::with_capacity(chain.len());
+        for (pid, prop) in chain {
+            let value = self.decode_property_value(prop.type_tag, prop.value_inline)?;
+            out.push((pid, prop.key, value));
+        }
+        Ok(out)
+    }
+
+    /// Clears **all** of relationship `rel_id`'s properties under `txn`, freeing each property
+    /// record's id and any overflow heap chain it owns (`rmp` task #44; no leak). Used by `SET r =
+    /// map`, which replaces the whole property set, and shares the chain-freeing helper with
+    /// [`delete_rel`](Self::delete_rel). Returns the number of property records removed. The
+    /// relationship analogue of [`clear_node_properties`](Self::clear_node_properties).
+    ///
+    /// # Errors
+    /// Returns a storage error if the relationship is not in use or a write fails.
+    pub fn clear_rel_properties(&mut self, txn: TxnId, rel_id: u64) -> Result<usize> {
+        let mut rel = self.read_rel(rel_id)?;
+        if !rel.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
+        }
+        // Free the whole `first_prop`-rooted chain (records + overflow chains), then null the head
+        // pointer so the relationship has no properties (`rmp` task #44; no leak).
+        let removed = self.free_rel_property_chain(txn, rel_id, rel.first_prop)?;
+        rel.first_prop = NULL_ID;
+        self.write_rel(rel_id, &rel, txn)?;
+        Ok(removed)
     }
 
     // ------------------------------ adjacency -------------------------------

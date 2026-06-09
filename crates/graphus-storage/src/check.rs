@@ -23,7 +23,11 @@
 //! 3. **Referential integrity** ([`Violation::Referential`], [`Violation::PropertyChain`]): every
 //!    live relationship's `start_node`/`end_node` reference live, in-use node records; every entity's
 //!    property chain terminates (cycle-guarded), references only in-use property records, and
-//!    `first_prop`/`next_prop` stay in range.
+//!    `first_prop`/`next_prop` stay in range. *Entity* here is both nodes **and relationships**: a
+//!    relationship's property chain (rooted at [`RelRecord::first_prop`](crate::record::RelRecord),
+//!    `rmp` task #44) is walked by the very same property-chain pass as a node's, and its overflow
+//!    chains by the heap-chain / free-list passes — no relationship-specific code, because
+//!    relationship and node properties share the one `props.store` and `strings.store`.
 //! 4. **Store/index agreement** ([`Violation::IndexAgreement`]): see [`IndexAgreement`] for the
 //!    exact (and deliberately scoped) properties verified.
 //! 5. **Free-list sanity** ([`Violation::FreeList`], `04 §2.7`): no freed id is in use or referenced
@@ -605,7 +609,10 @@ fn check_referential(scan: &Scan, report: &mut ConsistencyReport) {
     }
 }
 
-/// 3b. Property-chain integrity for both nodes and relationships (`04 §2.3`).
+/// 3b. Property-chain integrity for both nodes and relationships (`04 §2.3`; `rmp` task #44 wires
+/// relationship properties to the same `props.store` chain, so the relationship pass below is the
+/// identical walk over [`RelRecord::first_prop`](crate::record::RelRecord) as the node pass over
+/// `NodeRecord.first_prop`).
 fn check_property_chains<D: BlockDevice, S: LogSink>(
     _store: &mut RecordStore<D, S>,
     cat: &Catalog,

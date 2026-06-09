@@ -7,14 +7,16 @@
 //! [`MemGraph`](crate::graph_access::MemGraph). The executor depends only on the [`GraphAccess`]
 //! trait, so swapping the backend needs no operator change (`04 §7.4`).
 //!
-//! # The achievable subset (#38 + #42 + #43) and what is deferred (#39)
+//! # The achievable subset (#38 + #42 + #43 + #44) and what is deferred (#39)
 //!
 //! This is the **achievable subset** of the storage integration: nodes/relationships/properties
-//! (#38), **node labels** (#42, the bit-packed small-label-set case of `05 §9`), and the
-//! **`strings.store` String/List property overflow heap + node-property removal** (#43, this task).
-//! The remaining wiring (index-accelerated label scans, the label token-list overflow block,
-//! relationship-property storage, and MVCC concurrency / SSI visibility) is the follow-up **#39**.
-//! Every deferral is signalled by a **clear error**, never a silently wrong answer:
+//! (#38), **node labels** (#42, the bit-packed small-label-set case of `05 §9`), the
+//! **`strings.store` String/List property overflow heap + node-property removal** (#43), and
+//! **relationship properties** (#44, this task — over [`RelRecord.first_prop`], the relationship
+//! analogue of the node-property path, sharing the same `props.store` chain + `strings.store`
+//! overflow heap). The remaining wiring (index-accelerated label/property scans, the label
+//! token-list overflow block, and MVCC concurrency / SSI visibility) is the follow-up **#39**. Every
+//! deferral is signalled by a **clear error**, never a silently wrong answer:
 //!
 //! | Capability | status | How a deferral is signalled |
 //! |------------|--------|-----------------------------|
@@ -23,9 +25,11 @@
 //! | **`String` / `List` node property values** | **supported** (#43) via the `strings.store` overflow heap (`04 §2.1`/§2.3) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures a runtime error (outside the stored-property subtype, `05 §7.2`) |
 //! | **Node property removal / overwrite** (`SET n.p = null`, `REMOVE n.p`, `SET n = map`) | **supported** (#43) — removes the record and frees any overflow chain (no leak) | — |
 //! | Node **labels** (`CREATE (:L)`, `SET`/`REMOVE` label, `n:L` predicates, `labels(n)`, label scan) | **supported** (#42) via the inline label bitmap, `05 §9` | a label needing token id `≥ 63` (a 64th+ distinct label) captures the documented overflow error (the token-list block is #39) |
-//! | **Relationship** properties | **deferred (#39)** | a write captures a runtime error (the store exposes no relationship-property chain API) |
+//! | **Relationship properties** — read (`r.k`, `properties(r)`), create (`CREATE ()-[:T {..}]->()`), `SET`/`REMOVE`, inline **and** `String`/`List` overflow | **supported** (#44) over [`RelRecord.first_prop`] (`04 §2.3`/§2.1, `05 §9`); `delete_rel` frees the chain (no leak) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures the same runtime error as a node property |
 //! | **Index-accelerated** label / property scans | **deferred (#39)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
 //! | MVCC concurrency / SSI | **deferred (#39)** | one query runs in a single transaction against the latest committed state |
+//!
+//! [`RelRecord.first_prop`]: graphus_storage::record::RelRecord
 //!
 //! # Identity
 //!
@@ -165,14 +169,6 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         }
     }
 
-    /// Captures a "deferred to #39" runtime error for `feature` and returns it as the `Err` arm so a
-    /// write helper can early-return after recording it.
-    fn defer(&self, feature: &str) {
-        self.capture(GraphusError::Runtime(format!(
-            "{feature} is not supported in this build (deferred to graphus #39)"
-        )));
-    }
-
     /// Resolves the property key id for `key`, interning it if new (a new key becomes durable when
     /// the transaction commits, `04 §2.6`). Captures and returns `None` on a storage error.
     fn prop_key_id(&self, key: &str) -> Option<u32> {
@@ -249,6 +245,43 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     fn read_node_props(&self, node: NodeId) -> Vec<(String, Value)> {
         let mut store = self.store.borrow_mut();
         let chain = match store.node_property_values(node.0) {
+            Ok(chain) => chain,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+        let mut out: Vec<(u32, Value)> = Vec::new();
+        for (_pid, key, value) in chain {
+            // Newest-wins: skip a key id already seen (a more recent record shadows it).
+            if out.iter().any(|(k, _)| *k == key) {
+                continue;
+            }
+            out.push((key, value));
+        }
+        // Map key ids back to names and sort by name for the deterministic order the seam promises.
+        let mut named: Vec<(String, Value)> = out
+            .into_iter()
+            .filter_map(|(kid, v)| {
+                store
+                    .token_name(Namespace::PropKey, kid)
+                    .map(|name| (name.to_owned(), v))
+            })
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        named
+    }
+
+    /// Reads `rel`'s live properties as newest-wins `(key_name, value)` pairs, decoding both inline
+    /// scalars (#38) and `String`/`List` values stored in the `strings.store` overflow heap
+    /// (`rmp` task #43) via [`RecordStore::rel_property_values`] (`rmp` task #44). The relationship
+    /// analogue of [`read_node_props`](Self::read_node_props) — identical newest-wins + key-sort
+    /// discipline, over [`RelRecord.first_prop`](graphus_storage::record::RelRecord) instead of the
+    /// node's `first_prop`.
+    fn read_rel_props(&self, rel: RelId) -> Vec<(String, Value)> {
+        let mut store = self.store.borrow_mut();
+        let chain = match store.rel_property_values(rel.0) {
             Ok(chain) => chain,
             Err(e) => {
                 drop(store);
@@ -453,10 +486,16 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             .map(|(_, v)| v)
     }
 
-    fn rel_property(&self, _rel: RelId, _key: &str) -> Option<Value> {
-        // Relationship properties have no storage API yet (#39). Reading one is moot until it can be
-        // written; a write already captures the deferral, so a read just reports "absent".
-        None
+    fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
+        if !self.rel_exists(rel) {
+            return None;
+        }
+        // Relationship properties are stored over `RelRecord.first_prop`, the relationship analogue of
+        // the node-property path (`rmp` task #44). Read the live newest-wins set and pick `key`.
+        self.read_rel_props(rel)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
@@ -467,13 +506,13 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
-        // No relationship-property storage yet (#39); report an empty set for a live relationship so
-        // the caller distinguishes it from a missing relationship (`None`).
-        if self.rel_exists(rel) {
-            Some(Vec::new())
-        } else {
-            None
+        // Relationship properties are stored over `RelRecord.first_prop` (`rmp` task #44); report the
+        // live key-sorted set for a live relationship, or `None` for a missing one (mirrors
+        // `node_properties`).
+        if !self.rel_exists(rel) {
+            return None;
         }
+        Some(self.read_rel_props(rel))
     }
 
     // ---- writes -------------------------------------------------------------------------------
@@ -526,11 +565,16 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
                 return RelId(0);
             }
         };
-        if !properties.is_empty() {
-            // Relationship properties have no storage API yet (#39); do not silently drop them.
-            self.defer("relationship properties");
+        let rel = RelId(id);
+        // Relationship properties are stored over `RelRecord.first_prop` (`rmp` task #44), exactly
+        // like node properties on `create_node`. A null entry is not stored (Cypher does not persist
+        // nulls); a non-persistable class captures a runtime error rather than dropping it silently.
+        for (k, v) in properties {
+            if !v.is_null() {
+                self.set_rel_property(rel, k, v.clone());
+            }
         }
-        RelId(id)
+        rel
     }
 
     fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
@@ -562,8 +606,37 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
     }
 
-    fn set_rel_property(&mut self, _rel: RelId, _key: &str, _value: Value) {
-        self.defer("setting a relationship property");
+    fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
+        if !self.rel_exists(rel) {
+            return; // no-op on a missing relationship (mirrors `set_node_property` / `MemGraph`)
+        }
+        let Some(key_id) = self.prop_key_id(key) else {
+            return; // error already captured
+        };
+        if value.is_null() {
+            // `SET r.p = null` is a removal in Cypher: drop the key (and free any overflow chain it
+            // owned) so a later read sees the property absent.
+            if let Err(e) = self
+                .store
+                .borrow_mut()
+                .remove_rel_property_value(self.txn, rel.0, key_id)
+            {
+                self.capture(e);
+            }
+            return;
+        }
+        // Inline scalars stay inline (#38); String/List values overflow to the strings.store heap
+        // (`rmp` task #43). `set_rel_property_value` replaces any current value of the key, freeing
+        // its old overflow chain (no leak). A class the store cannot persist (Map/Bytes/temporal,
+        // heterogeneous List) is captured as a runtime error, never a silently-dropped property
+        // (`rmp` task #44).
+        if let Err(e) = self
+            .store
+            .borrow_mut()
+            .set_rel_property_value(self.txn, rel.0, key_id, &value)
+        {
+            self.capture(e);
+        }
     }
 
     fn add_labels(&mut self, node: NodeId, labels: &[String]) {
@@ -613,8 +686,24 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
     }
 
-    fn remove_rel_property(&mut self, _rel: RelId, _key: &str) {
-        self.defer("removing a relationship property");
+    fn remove_rel_property(&mut self, rel: RelId, key: &str) {
+        if !self.rel_exists(rel) {
+            return;
+        }
+        // `REMOVE r.p` over a never-interned key is a no-op (no relationship can carry an unknown
+        // key), so do not intern just to remove. Otherwise drop the key and free any overflow chain
+        // it owned (`rmp` task #44); removing an absent key is itself a no-op in the store. Mirrors
+        // `remove_node_property`.
+        let Some(key_id) = self.store.borrow().token_id(Namespace::PropKey, key) else {
+            return;
+        };
+        if let Err(e) = self
+            .store
+            .borrow_mut()
+            .remove_rel_property_value(self.txn, rel.0, key_id)
+        {
+            self.capture(e);
+        }
     }
 
     fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
@@ -663,7 +752,8 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
 
     fn delete_rel(&mut self, rel: RelId) {
         // Idempotent: a relationship that is already gone (or was never created) is a no-op, not an
-        // error — matching the `MemGraph` contract.
+        // error — matching the `MemGraph` contract. The store's `delete_rel` frees the relationship's
+        // property chain (records + any overflow chains) so no property leaks (`rmp` task #44).
         let in_use = matches!(self.store.borrow_mut().rel(rel.0), Ok(r) if r.mvcc.in_use());
         if !in_use {
             return;

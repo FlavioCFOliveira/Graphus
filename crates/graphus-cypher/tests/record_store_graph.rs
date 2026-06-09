@@ -108,8 +108,9 @@ fn col(rows: &[Row], name: &str) -> Vec<Value> {
 /// Seeds a small inline-scalar graph via Cypher `CREATE` over the real store and commits it:
 /// three nodes with an integer `n` property, chained `a -[:LINK]-> b -[:LINK]-> c`.
 ///
-/// Returns the store positioned after the seed commit. Labels and **relationship properties** are
-/// omitted — both are #39 (the store has no label-set nor relationship-property API yet).
+/// Returns the store positioned after the seed commit. (Labels and relationship properties are
+/// exercised in their own tests; this seed keeps to inline node scalars for the traversal/filter/
+/// aggregation tests.)
 fn seed_chain() -> Store {
     let store = fresh_store();
     // A single connected path pattern so the executor threads the relationships through the *same*
@@ -176,10 +177,10 @@ fn directed_traversal_with_type_filter() {
 }
 
 #[test]
-fn traversal_relationship_property_is_deferred_but_structure_works() {
+fn traversal_reads_node_and_relationship_properties() {
     let store = seed_chain();
-    // The traversal itself (structure + endpoints) works; we read endpoint *node* properties, not
-    // the relationship property (which is #39).
+    // The traversal threads structure + endpoints; we read both endpoint *node* properties and the
+    // relationship property (now stored over `RelRecord.first_prop`, `rmp` task #44).
     let (rows, _store) = run_commit(
         "MATCH (a)-[:LINK]->(b) RETURN a.n AS an, b.n AS bn",
         store,
@@ -199,6 +200,166 @@ fn traversal_relationship_property_is_deferred_but_structure_works() {
         .collect();
     pairs.sort_unstable();
     assert_eq!(pairs, vec![(1, 2), (2, 3)]);
+}
+
+// =================================================================================================
+// Relationship properties end-to-end over the real store (`rmp` task #44)
+// =================================================================================================
+
+#[test]
+fn create_rel_with_properties_then_read_them_back() {
+    let store = fresh_store();
+    // Create a relationship with an inline scalar and a String property, then read both back.
+    let (_r, store) = run_commit(
+        "CREATE (a)-[r:KNOWS {since: 1999, note: 'hi'}]->(b)",
+        store,
+        1,
+    );
+    let (rows, _store) = run_commit(
+        "MATCH (a)-[r:KNOWS]->(b) RETURN r.since AS since, r.note AS note",
+        store,
+        2,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("since"), i(1999));
+    assert_eq!(rows[0].value("note"), Value::String("hi".to_owned()));
+}
+
+#[test]
+fn filter_on_relationship_property() {
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE (a)-[:KNOWS {since: 1990}]->(b), (c)-[:KNOWS {since: 2010}]->(d)",
+        store,
+        1,
+    );
+    // WHERE on a relationship property keeps only the post-2000 edge.
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() WHERE r.since > 2000 RETURN r.since AS since",
+        store,
+        2,
+    );
+    assert_eq!(col(&rows, "since"), vec![i(2010)]);
+}
+
+#[test]
+fn set_relationship_property_then_read_back() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (a)-[:KNOWS {since: 1999}]->(b)", store, 1);
+    // SET a brand-new float property and read it back (newest-wins overwrite path under the hood).
+    let (_r, store) = run_commit("MATCH ()-[r:KNOWS]->() SET r.weight = 1.5", store, 2);
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() RETURN r.weight AS w, r.since AS since",
+        store,
+        3,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("w"), Value::Float(1.5));
+    assert_eq!(
+        rows[0].value("since"),
+        i(1999),
+        "unrelated key is preserved"
+    );
+}
+
+#[test]
+fn set_relationship_property_overwrites_newest_wins() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (a)-[:KNOWS {since: 1999}]->(b)", store, 1);
+    let (_r, store) = run_commit("MATCH ()-[r:KNOWS]->() SET r.since = 2024", store, 2);
+    let (rows, _store) = run_commit("MATCH ()-[r:KNOWS]->() RETURN r.since AS since", store, 3);
+    assert_eq!(col(&rows, "since"), vec![i(2024)]);
+}
+
+#[test]
+fn order_by_relationship_property() {
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE (a)-[:KNOWS {since: 2010}]->(b), (c)-[:KNOWS {since: 1990}]->(d), (e)-[:KNOWS {since: 2000}]->(f)",
+        store,
+        1,
+    );
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() RETURN r.since AS since ORDER BY since ASC",
+        store,
+        2,
+    );
+    assert_eq!(col(&rows, "since"), vec![i(1990), i(2000), i(2010)]);
+}
+
+#[test]
+fn remove_relationship_property() {
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE (a)-[:KNOWS {since: 1999, note: 'hi'}]->(b)",
+        store,
+        1,
+    );
+    let (_r, store) = run_commit("MATCH ()-[r:KNOWS]->() REMOVE r.note", store, 2);
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() RETURN r.since AS since, r.note AS note",
+        store,
+        3,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("since"), i(1999));
+    // The removed property reads as null (absent).
+    assert_eq!(rows[0].value("note"), Value::Null);
+}
+
+#[test]
+fn set_relationship_property_null_removes_it() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (a)-[:KNOWS {since: 1999}]->(b)", store, 1);
+    // `SET r.since = null` is a removal in Cypher.
+    let (_r, store) = run_commit("MATCH ()-[r:KNOWS]->() SET r.since = null", store, 2);
+    let (rows, _store) = run_commit("MATCH ()-[r:KNOWS]->() RETURN r.since AS since", store, 3);
+    assert_eq!(col(&rows, "since"), vec![Value::Null]);
+}
+
+#[test]
+fn relationship_string_and_list_property_values_round_trip() {
+    let store = fresh_store();
+    // A String long enough to overflow several heap blocks and a homogeneous List, both via the
+    // `strings.store` overflow heap (`rmp` task #43 + #44).
+    let long = "x".repeat(500);
+    let src = format!("CREATE (a)-[:KNOWS {{note: '{long}', tags: ['one', 'two', 'three']}}]->(b)");
+    let (_r, store) = run_commit(&src, store, 1);
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() RETURN r.note AS note, r.tags AS tags",
+        store,
+        2,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("note"), Value::String(long));
+    assert_eq!(
+        rows[0].value("tags"),
+        Value::List(vec![
+            Value::String("one".to_owned()),
+            Value::String("two".to_owned()),
+            Value::String("three".to_owned()),
+        ])
+    );
+}
+
+#[test]
+fn properties_function_returns_relationship_properties() {
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE (a)-[:KNOWS {since: 1999, note: 'hi'}]->(b)",
+        store,
+        1,
+    );
+    let (rows, _store) = run_commit("MATCH ()-[r:KNOWS]->() RETURN properties(r) AS p", store, 2);
+    assert_eq!(rows.len(), 1);
+    // `properties(r)` returns the key-sorted map of the relationship's properties.
+    assert_eq!(
+        row_bindings(&rows[0]).get("p").and_then(RowValue::as_value),
+        Some(&Value::Map(vec![
+            ("note".to_owned(), Value::String("hi".to_owned())),
+            ("since".to_owned(), Value::Integer(1999)),
+        ]))
+    );
 }
 
 // =================================================================================================
@@ -852,13 +1013,177 @@ fn heterogeneous_list_property_value_is_a_runtime_error() {
 }
 
 #[test]
-fn relationship_property_is_still_deferred() {
-    // Relationship-property storage remains #39; a write captures the deferral.
+fn non_persistable_relationship_property_value_is_a_runtime_error() {
+    // Relationship properties are supported (`rmp` task #44), but a value outside the stored-property
+    // subtype (here a Map) must still signal a runtime error — never a silently-dropped property —
+    // exactly like a node property.
     let store = fresh_store();
-    let (_r, store) = run_commit("CREATE (a), (b)", store, 1);
-    let err = run_expect_error("MATCH (a), (b) CREATE (a)-[:R {w: 1}]->(b)", store, 2);
+    let err = run_expect_error("CREATE (a)-[:R {m: {x: 1}}]->(b)", store, 1);
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("#39") || err.to_string().contains("relationship"),
-        "relationship property must signal the deferred error, got: {err}"
+        msg.contains("Map") || msg.contains("overflow heap") || msg.contains("subtype"),
+        "a Map relationship property must signal a runtime error, got: {msg}"
+    );
+}
+
+// =================================================================================================
+// Relationship properties: both backends identical, delete frees the chain, crash recovery
+// =================================================================================================
+
+#[test]
+fn relationship_property_query_matches_memgraph_reference() {
+    // A query that filters and projects on relationship properties must produce the identical rows
+    // over the real store as over the in-memory reference `MemGraph` (`rmp` task #44).
+    let query =
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since > 2000 RETURN r.since AS since, r.note AS note";
+
+    // Reference backend: build the graph directly in MemGraph (relationship props supported there).
+    let mem = rows_over_mem(query, |g| {
+        let a = g.add_node([] as [&str; 0], [] as [(&str, Value); 0]);
+        let b = g.add_node([] as [&str; 0], [] as [(&str, Value); 0]);
+        let c = g.add_node([] as [&str; 0], [] as [(&str, Value); 0]);
+        let d = g.add_node([] as [&str; 0], [] as [(&str, Value); 0]);
+        g.add_rel(
+            "KNOWS",
+            a,
+            b,
+            [
+                ("since", i(2010)),
+                ("note", Value::String("recent".to_owned())),
+            ],
+        );
+        g.add_rel(
+            "KNOWS",
+            c,
+            d,
+            [
+                ("since", i(1990)),
+                ("note", Value::String("old".to_owned())),
+            ],
+        );
+    });
+
+    // Real backend: seed the identical graph via Cypher CREATE over the record store.
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE (a)-[:KNOWS {since: 2010, note: 'recent'}]->(b), (c)-[:KNOWS {since: 1990, note: 'old'}]->(d)",
+        store,
+        1,
+    );
+    let (rows, _store) = run_commit(query, store, 2);
+    let real: Vec<_> = rows.iter().map(row_bindings).collect();
+
+    assert_eq!(
+        real, mem,
+        "RecordStoreGraph relationship-property query must match the MemGraph reference"
+    );
+    // Sanity: exactly the post-2000 edge is returned.
+    assert_eq!(real.len(), 1);
+}
+
+#[test]
+fn deleting_a_relationship_frees_its_property_chain() {
+    // A relationship with overflow (String/List) properties is created, then deleted. The store's
+    // `delete_rel` frees the property chain + overflow chains (no leak, `rmp` task #44); we assert the
+    // heap's live-block usage returns to zero and the relationship and its properties are gone.
+    let store = fresh_store();
+    let long = "y".repeat(400);
+    let src = format!("CREATE (a)-[:KNOWS {{since: 1999, note: '{long}', tags: [1, 2, 3]}}]->(b)");
+    let (_r, mut store) = run_commit(&src, store, 1);
+
+    assert!(
+        store.heap_block_usage().expect("heap usage") > 0,
+        "the String/List relationship properties allocated overflow blocks"
+    );
+
+    // Delete the relationship (its endpoints survive). DETACH is unnecessary — `r` has no further
+    // edges — but DELETE r alone suffices once the edge is matched.
+    let (_r, mut store) = run_commit("MATCH ()-[r:KNOWS]->() DELETE r", store, 2);
+
+    assert_eq!(
+        store.heap_block_usage().expect("heap usage"),
+        0,
+        "deleting the relationship freed every overflow chain (no block leak)"
+    );
+    // A full consistency pass is clean: no dangling property record, no leaked block, free lists sane.
+    let rep = graphus_storage::check::check_store(&mut store, &[]).expect("checker runs");
+    assert!(
+        rep.is_consistent(),
+        "store is consistent after relationship delete: {:?}",
+        rep.violations
+    );
+    assert_eq!(rep.live_rels, 0, "the relationship is gone");
+    assert_eq!(rep.live_props, 0, "its property records are freed");
+
+    // And no relationship matches any more.
+    let (rows, _store) = run_commit("MATCH ()-[r:KNOWS]->() RETURN r", store, 3);
+    assert!(rows.is_empty(), "no relationship remains, got {rows:?}");
+}
+
+#[test]
+fn committed_relationship_property_survives_a_no_force_crash() {
+    // Create + commit a relationship with inline and overflow properties via Cypher, crash, recover,
+    // and read them back (`rmp` task #44).
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE (a)-[:KNOWS {since: 1999, note: 'durable, long enough to span the heap cleanly!'}]->(b)",
+        store,
+        1,
+    );
+
+    let recovered = recover_no_force(&store);
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() RETURN r.since AS since, r.note AS note",
+        recovered,
+        100,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].value("since"),
+        i(1999),
+        "inline rel property survives recovery"
+    );
+    assert_eq!(
+        rows[0].value("note"),
+        Value::String("durable, long enough to span the heap cleanly!".to_owned()),
+        "overflow rel property recovers byte-for-byte"
+    );
+}
+
+#[test]
+fn uncommitted_relationship_property_is_rolled_back_after_a_crash() {
+    // A committed baseline relationship, then an uncommitted (loser) SET that crashes before commit:
+    // recovery rolls the loser back, leaving the committed value and no leaked blocks.
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (a)-[:KNOWS {since: 2000}]->(b)", store, 1);
+
+    // Loser transaction: overwrite with an overflow String, flush its tail, then crash before commit.
+    let plan =
+        compile("MATCH ()-[r:KNOWS]->() SET r.since = 'this is never committed at all, long'");
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let mut graph = RecordStoreGraph::begin(store, TxnId(2));
+    {
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+        cursor.collect_all().expect("collect");
+    }
+    assert!(!graph.has_error(), "the SET itself should not error");
+    let store = graph.into_store(); // do NOT commit — this is the loser
+    store.with_wal(graphus_wal::WalManager::flush);
+
+    let mut recovered = recover_no_force(&store);
+    assert_eq!(
+        recovered.heap_block_usage().expect("heap usage"),
+        0,
+        "the loser's overflow blocks were rolled back, not leaked"
+    );
+    let (rows, _store) = run_commit(
+        "MATCH ()-[r:KNOWS]->() RETURN r.since AS since",
+        recovered,
+        100,
+    );
+    assert_eq!(
+        col(&rows, "since"),
+        vec![i(2000)],
+        "the committed inline value stands; the uncommitted overwrite was undone"
     );
 }

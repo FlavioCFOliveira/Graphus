@@ -574,6 +574,137 @@ fn dangling_overflow_chain_is_flagged() {
     assert!(verify_on_open(&mut store, &[]).is_err());
 }
 
+/// (d3) A healthy store whose **relationships carry properties** (inline scalar + a multi-block
+/// `String` overflow value) passes with zero violations (`rmp` task #44). This is the no-false-
+/// positive guard for the relationship-property path — the checker walks a relationship's chain over
+/// [`RelRecord::first_prop`](graphus_storage::record::RelRecord) the same way it walks a node's.
+#[test]
+fn healthy_relationship_with_properties_passes() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, _) = s.create_node(txn).unwrap();
+    let (b, _) = s.create_node(txn).unwrap();
+    let t = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    let r = s.create_rel(txn, t, a, b).unwrap().0;
+    let k_i = s.intern_token(Namespace::PropKey, "since").unwrap();
+    let k_s = s.intern_token(Namespace::PropKey, "note").unwrap();
+    s.set_rel_property_value(txn, r, k_i, &Value::Integer(1999))
+        .unwrap();
+    s.set_rel_property_value(txn, r, k_s, &Value::String("z".repeat(200)))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    assert!(
+        report(&mut s).is_consistent(),
+        "a relationship with inline + overflow properties is healthy: {:?}",
+        report(&mut s).violations
+    );
+}
+
+/// (d4) Relationship property chain: make a **relationship's** `first_prop` reference a dead/missing
+/// property record → a [`Violation::PropertyChain`] whose owner is the relationship (`rmp` task #44).
+/// The relationship analogue of [`corrupt_property_chain_is_flagged`]; proves the checker has teeth
+/// on a relationship's property chain (rooted at
+/// [`RelRecord::first_prop`](graphus_storage::record::RelRecord)), and that the uncorrupted image
+/// first passes.
+#[test]
+fn corrupt_relationship_property_chain_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, _) = s.create_node(txn).unwrap();
+    let (b, _) = s.create_node(txn).unwrap();
+    let t = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    let (r, eid_r) = s.create_rel(txn, t, a, b).unwrap();
+    let k = s.intern_token(Namespace::PropKey, "since").unwrap();
+    s.set_rel_property_value(txn, r, k, &Value::Integer(2002))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    {
+        let mut clean = img.open();
+        assert!(
+            report(&mut clean).is_consistent(),
+            "clean rel-prop store passes"
+        );
+    }
+
+    // Point the relationship's first_prop at a non-existent property id (dangling chain head).
+    let (page_id, off) = img.locate(StoreKind::Rel, eid_r.0);
+    let mut rel = img.read_rel_at(page_id, off);
+    rel.first_prop = 5_000; // far past the prop high-water -> out of range
+    img.write_rel_at(page_id, off, &rel);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::PropertyChain {
+                owner_kind: StoreKind::Rel,
+                detail: PropertyFault::PropOutOfRange | PropertyFault::DeadProp,
+                ..
+            }
+        )),
+        "expected a relationship PropertyChain violation: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// (d5) Dangling **overflow** chain on a *relationship* property: corrupt the relationship's overflow
+/// property record's `value_inline` (its chain head) to point past the heap high-water → a
+/// [`Violation::HeapChain`] (`rmp` task #44 + #43). Proves a relationship's overflow property is
+/// validated identically to a node's (both live in the one `props.store` / `strings.store`).
+#[test]
+fn dangling_overflow_chain_on_a_rel_property_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, _) = s.create_node(txn).unwrap();
+    let (b, _) = s.create_node(txn).unwrap();
+    let t = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    let r = s.create_rel(txn, t, a, b).unwrap().0;
+    let key = s.intern_token(Namespace::PropKey, "bio").unwrap();
+    // A multi-block String value, so the relationship's property record holds an overflow chain head.
+    s.set_rel_property_value(txn, r, key, &Value::String("z".repeat(200)))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    {
+        let mut clean = img.open();
+        assert!(
+            report(&mut clean).is_consistent(),
+            "clean rel-overflow store passes"
+        );
+    }
+
+    // The single in-use overflow property record is the relationship's; point its chain head past
+    // the heap high-water (`locate_only_prop` matches the one in-use overflow property).
+    let (page_id, off) = img.locate_only_prop();
+    let mut prop = img.read_prop_at(page_id, off);
+    prop.value_inline = 9_999;
+    img.write_prop_at(page_id, off, &prop);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::HeapChain {
+                detail: HeapChainFault::BlockOutOfRange | HeapChainFault::DeadBlock,
+                ..
+            }
+        )),
+        "expected a HeapChain violation for the dangling rel overflow chain: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
 /// (e) Store/index agreement: an index entry pointing at a record whose value no longer matches
 /// (modelled as an entry absent from the expected set) and a missing expected entry.
 #[test]
