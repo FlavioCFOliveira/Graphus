@@ -93,9 +93,15 @@ fn write_skew_aborts_one_under_serializable() {
     let t2 = coord.begin_serializable();
 
     let (_r, e1) = run_stmt(&coord, t1, "MATCH (a:A) SET a.v = 0");
-    assert!(e1.is_none(), "t1 statement should not capture an error: {e1:?}");
+    assert!(
+        e1.is_none(),
+        "t1 statement should not capture an error: {e1:?}"
+    );
     let (_r, e2) = run_stmt(&coord, t2, "MATCH (b:B) SET b.v = 0");
-    assert!(e2.is_none(), "t2 statement should not capture an error: {e2:?}");
+    assert!(
+        e2.is_none(),
+        "t2 statement should not capture an error: {e2:?}"
+    );
 
     // Exactly one of the two commits is rejected with a retriable serialization failure; the other
     // commits. (The first committer is the pivot whose outbound partner is still concurrent, so it
@@ -104,7 +110,10 @@ fn write_skew_aborts_one_under_serializable() {
     let c2 = coord.commit(t2);
     let aborted = [&c1, &c2].iter().filter(|r| r.is_err()).count();
     let committed = [&c1, &c2].iter().filter(|r| r.is_ok()).count();
-    assert_eq!(aborted, 1, "exactly one transaction aborts (c1={c1:?}, c2={c2:?})");
+    assert_eq!(
+        aborted, 1,
+        "exactly one transaction aborts (c1={c1:?}, c2={c2:?})"
+    );
     assert_eq!(committed, 1, "exactly one transaction commits");
     // The abort is a (retriable) transaction error, not a storage fault.
     let err = [c1, c2].into_iter().find_map(Result::err).unwrap();
@@ -171,7 +180,11 @@ fn write_write_conflict_is_first_updater_wins() {
     // The conflicting transaction rolls back; the first updater commits.
     coord.rollback(t2).expect("rollback the conflicting txn");
     coord.commit(t1).expect("first updater commits");
-    assert_eq!(read_vs(&mut coord, "A"), vec![10], "first updater's value stands");
+    assert_eq!(
+        read_vs(&mut coord, "A"),
+        vec![10],
+        "first updater's value stands"
+    );
 }
 
 #[test]
@@ -194,10 +207,12 @@ fn read_only_transaction_commits_concurrently_with_a_writer() {
     let (rows, er) = run_stmt(&coord, reader, "MATCH (a:A) RETURN a.v AS v");
     assert!(er.is_none(), "reader error: {er:?}");
     assert_eq!(
-        rows.iter().filter_map(|r| match r.value("v") {
-            Value::Integer(k) => Some(k),
-            _ => None,
-        }).collect::<Vec<_>>(),
+        rows.iter()
+            .filter_map(|r| match r.value("v") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
         vec![1],
         "the reader sees the seeded value on its snapshot"
     );

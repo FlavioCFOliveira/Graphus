@@ -73,7 +73,11 @@ fn run_stmt(coord: &Coord, txn: TxnId, src: &str) -> (Vec<Row>, bool) {
 
 /// Reads register `k`'s value on `txn`'s snapshot; `None` if the statement captured an error.
 fn read_reg(coord: &Coord, txn: TxnId, k: u64) -> Option<i64> {
-    let (rows, ok) = run_stmt(coord, txn, &format!("MATCH (n:Reg {{k: {k}}}) RETURN n.v AS v"));
+    let (rows, ok) = run_stmt(
+        coord,
+        txn,
+        &format!("MATCH (n:Reg {{k: {k}}}) RETURN n.v AS v"),
+    );
     if !ok {
         return None;
     }
@@ -85,7 +89,11 @@ fn read_reg(coord: &Coord, txn: TxnId, k: u64) -> Option<i64> {
 
 /// Writes register `k`'s value to `new_v`; returns whether the statement succeeded (no conflict).
 fn write_reg(coord: &Coord, txn: TxnId, k: u64, new_v: i64) -> bool {
-    let (_rows, ok) = run_stmt(coord, txn, &format!("MATCH (n:Reg {{k: {k}}}) SET n.v = {new_v}"));
+    let (_rows, ok) = run_stmt(
+        coord,
+        txn,
+        &format!("MATCH (n:Reg {{k: {k}}}) SET n.v = {new_v}"),
+    );
     ok
 }
 

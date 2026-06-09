@@ -22,10 +22,19 @@ graphus-wal = { path = "../graphus-wal" }
 # it holds a `Snapshot` + `CommitRegistry` and calls `graphus_txn::is_visible` on each record's
 # frozen `xmin`/`xmax`. This edge is acyclic: graphus-txn depends only on core.
 graphus-txn = { path = "../graphus-txn" }
+# The `IndexSet` (src/index_set.rs) builds derived in-memory secondary indexes over the
+# `graphus-index` kinds (`TokenIndex`/`PropertyIndex` on the WAL-logged `BTree`) for index wiring
+# (`rmp` task #48). This edge is acyclic: graphus-index depends on core/io/bufpool/wal, never on
+# cypher. (Also used by the ordering cross-check test that proves the Cypher value order agrees with
+# the order-preserving index key byte order.)
+graphus-index = { path = "../graphus-index" }
+# Naming dependency only: `IndexSet::fresh_tree` constructs each backing `BTree` via
+# `BTree::create(BufferPool<_, SharedWal<_>>, _)`, whose signature names `graphus_bufpool::BufferPool`
+# directly. Already a transitive dependency (via graphus-index/graphus-storage), so this adds no new
+# crate to the build graph. The edge is acyclic: graphus-bufpool depends on core/io/wal, never on
+# cypher.
+graphus-bufpool = { path = "../graphus-bufpool" }
 
 [dev-dependencies]
-# Used by the ordering cross-check test to prove the Cypher value order agrees with the
-# order-preserving index key byte order for the encodable value classes.
-graphus-index = { path = "../graphus-index" }
 # Deterministic, seedable RNG for the reproducible cross-check property test.
 graphus-sim = { path = "../graphus-sim" }

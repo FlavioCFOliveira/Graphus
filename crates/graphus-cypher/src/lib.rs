@@ -118,6 +118,7 @@ pub mod eval;
 pub mod executor;
 pub mod function_registry;
 pub mod graph_access;
+pub mod index_set;
 pub mod lexer;
 pub mod logical;
 pub mod lower;
@@ -137,6 +138,7 @@ pub use binding::{
 pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
+pub use coordinator::TxnCoordinator;
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
 pub use errors::{
@@ -146,6 +148,7 @@ pub use errors::{
 pub use eval::{EvalError, EvalResult, eval, eval_value};
 pub use executor::{CancellationToken, Cursor, ExecError, Executor, execute};
 pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId};
+pub use index_set::IndexSet;
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
@@ -158,7 +161,6 @@ pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,
 };
-pub use coordinator::TxnCoordinator;
 pub use record_graph::RecordStoreGraph;
 pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 pub use semantics::{ValidatedQuery, analyze, analyze_to_graphus};

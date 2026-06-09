@@ -12,8 +12,8 @@
 pub use error::{GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use value::Value;
-pub use version::{MAX_TIMESTAMP, VersionStamp};
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
+pub use version::{MAX_TIMESTAMP, VersionStamp};
 
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {

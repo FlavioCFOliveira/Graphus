@@ -16,10 +16,11 @@
 //! the node-property path, sharing the same `props.store` chain + `strings.store` overflow heap),
 //! and **MVCC snapshot visibility** (#45 — every read is filtered through `graphus_txn::is_visible`
 //! against each record's frozen `xmin`/`xmax`, so a query reads a consistent point-in-time graph;
-//! see [`begin_at_snapshot`](RecordStoreGraph::begin_at_snapshot)). The remaining wiring
-//! (index-accelerated label/property scans #48, the label token-list overflow block, SSI
-//! conflict detection #46, and per-value property MVCC) is the follow-up under EPIC **#16/#39**.
-//! Every deferral is signalled by a **clear error**, never a silently wrong answer:
+//! see [`begin_at_snapshot`](RecordStoreGraph::begin_at_snapshot)), **SSI serializable concurrency**
+//! (#46), **per-value property MVCC** (#50), and **index-accelerated label/property scans** (#48).
+//! The remaining wiring (the label token-list overflow block, and index-range *predicate* SSI
+//! markers) is the follow-up under EPIC **#16/#39**. Every deferral is signalled by a **clear
+//! error**, never a silently wrong answer:
 //!
 //! | Capability | status | How a deferral is signalled |
 //! |------------|--------|-----------------------------|
@@ -29,7 +30,7 @@
 //! | **Node property removal / overwrite** (`SET n.p = null`, `REMOVE n.p`, `SET n = map`) | **supported** (#43) — removes the record and frees any overflow chain (no leak) | — |
 //! | Node **labels** (`CREATE (:L)`, `SET`/`REMOVE` label, `n:L` predicates, `labels(n)`, label scan) | **supported** (#42) via the inline label bitmap, `05 §9` | a label needing token id `≥ 63` (a 64th+ distinct label) captures the documented overflow error (the token-list block is #39) |
 //! | **Relationship properties** — read (`r.k`, `properties(r)`), create (`CREATE ()-[:T {..}]->()`), `SET`/`REMOVE`, inline **and** `String`/`List` overflow | **supported** (#44) over [`RelRecord.first_prop`] (`04 §2.3`/§2.1, `05 §9`); `delete_rel` frees the chain (no leak) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures the same runtime error as a node property |
-//! | **Index-accelerated** label / property scans | **deferred (#48)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
+//! | **Index-accelerated** label / property scans | **supported** (#48) — when driven by a [`TxnCoordinator`](crate::coordinator::TxnCoordinator) the seam holds a derived [`IndexSet`](crate::index_set::IndexSet): a label scan seeks the label index then re-checks, and `index_seek_eq`/`index_seek_range` seek the property index then re-check exactly the scan+filter residual, returning the same visible rows. Standalone (no coordinator) falls back to scan+filter | — |
 //! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
 //! | **Serializable concurrency / SSI** (write-skew abort, write-write first-updater-wins) | **supported** (#46) via [`TxnCoordinator`](crate::coordinator::TxnCoordinator) — this seam records SIREAD markers and rw-edges into the shared `SsiTracker`, and the coordinator aborts a pivot at commit with a retriable serialization error | — |
 //! | **Per-value property MVCC** (snapshot-consistent property reads, no dirty read) | **supported** (#50) — a property overwrite/removal MVCC-tombstones the old `PropRecord` and prepends the new one; [`read_node_props`](Self::read_node_props) filters the chain by `is_visible` (newest-visible-wins), and GC reclaims tombstoned versions | — |
@@ -95,6 +96,7 @@ fn rel_ssi_key(id: u64) -> u64 {
 }
 
 use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
+use crate::index_set::IndexSet;
 
 /// A [`GraphAccess`] implementation over a real [`RecordStore`], scoped to one transaction
 /// (`rmp` task #38; see the module docs for the supported-vs-deferred matrix).
@@ -135,6 +137,16 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// The first storage / deferred-feature error encountered by a read or write, if any. While set,
     /// results are untrustworthy and the transaction should be rolled back (see module docs).
     error: RefCell<Option<GraphusError>>,
+    /// The coordinator's derived secondary [`IndexSet`] (`rmp` task #48), present **only** on the
+    /// coordinated path ([`attach`](Self::attach)). When `Some`, label scans and node-property
+    /// predicates are answered from the index as **candidate** ids re-checked against the store
+    /// (visibility + current label + current value), which makes an index seek return *exactly* the
+    /// scan-and-filter result; writes (re)insert the node's current entries via
+    /// [`reindex_node`](Self::reindex_node). `None` on the standalone [`begin`](Self::begin) /
+    /// [`begin_at_snapshot`](Self::begin_at_snapshot) path, where every access falls back to a full
+    /// scan (the index lives in the coordinator, rebuilt from the store). The index is in-memory and
+    /// candidate-only, so it is never committed or recovered — see [`IndexSet`].
+    index: Option<Rc<RefCell<IndexSet>>>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
@@ -161,6 +173,10 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             ssi: None,
             locks: None,
             error: RefCell::new(None),
+            // Standalone path: no coordinator, so no derived index; every access falls back to a
+            // full scan (`rmp` task #48). This keeps the standalone `record_store_graph.rs` path
+            // behaviour byte-for-byte unchanged.
+            index: None,
         }
     }
 
@@ -176,6 +192,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         snapshot: Snapshot,
         ssi: Rc<RefCell<SsiTracker>>,
         locks: Rc<RefCell<LockTable>>,
+        index: Rc<RefCell<IndexSet>>,
     ) -> Self {
         Self {
             store,
@@ -185,6 +202,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             ssi: Some(ssi),
             locks: Some(locks),
             error: RefCell::new(None),
+            // Coordinated path: the shared derived index is present, so label scans and node-property
+            // predicates seek candidates from it and re-check them here (`rmp` task #48).
+            index: Some(index),
         }
     }
 
@@ -230,6 +250,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             ssi: None,
             locks: None,
             error: RefCell::new(None),
+            // Standalone snapshot path: no derived index (the index lives in the coordinator).
+            index: None,
         }
     }
 
@@ -478,6 +500,137 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         named.sort_by(|a, b| a.0.cmp(&b.0));
         named
     }
+
+    /// SIREAD-marks **every live node** as this transaction's predicate-read footprint (`04 §5.4`,
+    /// `rmp` task #46), the conservative phantom-safe approximation a label/all-nodes predicate read
+    /// requires while the `SsiTracker` is per-node (no predicate/range marker yet). Only meaningful
+    /// on the coordinated path; a no-op for the SSI tracker on the standalone path. Read errors are
+    /// captured exactly as the full scan would have, so the marker footprint matches the pre-index
+    /// behaviour byte-for-byte.
+    fn mark_all_live_nodes(&self) {
+        // No SSI tracker -> nothing to mark (the standalone path never reaches here, but guard anyway
+        // so this stays an O(0) call when there is nothing to track).
+        if self.ssi.is_none() {
+            return;
+        }
+        let mut store = self.store.borrow_mut();
+        let ids = match store.scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return;
+            }
+        };
+        drop(store);
+        for id in ids {
+            self.note_read(node_ssi_key(id));
+        }
+    }
+
+    /// Filters `ids` (a full-scan id list or an index candidate list) to the nodes that **currently**
+    /// carry `token_id` and are **visible** to this snapshot, SIREAD-marking each examined id
+    /// (`04 §5.3`/§5.4, `rmp` tasks #42/#45/#46). This is the one per-candidate filter shared by the
+    /// index-accelerated and full-scan label-scan paths, so an index seek returns *exactly* the
+    /// full-scan result over a candidate subset (`rmp` task #48).
+    ///
+    /// On a storage fault (or an overflow-form bitmap, a #39-written node) the error is captured and
+    /// an empty result returned, exactly as the full scan did — never a wrong (missing/extra) row.
+    fn filter_label_candidates(&self, token_id: u32, ids: Vec<u64>) -> Vec<NodeId> {
+        let mut store = self.store.borrow_mut();
+        let mut out = Vec::new();
+        for id in ids {
+            // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
+            // testing the label, so the scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
+            let visible = match store.node(id) {
+                Ok(rec) => self.visible(rec.mvcc),
+                // A candidate id whose page is unallocated (a stale index entry for a reclaimed slot)
+                // is not a live node; on the full-scan path `scan_node_ids` never yields such an id,
+                // so this only fires for stale candidates and is correctly dropped, not an error.
+                Err(_) => continue,
+            };
+            // SIREAD-mark every examined node, visible or not (the label predicate examined it).
+            self.note_read(node_ssi_key(id));
+            if !visible {
+                continue;
+            }
+            match store.node_has_label(id, token_id) {
+                Ok(true) => out.push(NodeId(id)),
+                Ok(false) => {}
+                Err(e) => {
+                    // An overflow-form bitmap (a #39-written node) surfaces as a captured error
+                    // rather than a wrong (missing/extra) row.
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            }
+        }
+        out
+    }
+
+    /// Re-derives `node`'s entries in the coordinator's [`IndexSet`] from the node's **current**
+    /// state at this transaction's snapshot (`rmp` task #48); a no-op on the standalone path (no
+    /// index). Called at the end of every node write (`create_node`, `set_node_property`,
+    /// `add_labels`) once the store write succeeded and no error was captured.
+    ///
+    /// Inserts the node's *current* label tokens and, for each registered `(label_token, prop_key)`
+    /// index the node matches, its current property value. This guarantees **no false negatives**:
+    /// after the write, every label/value the node currently carries is a candidate, so a later seek
+    /// re-checks the store and keeps exactly the matching rows. Stale entries left by a prior value
+    /// or label are harmless — the seek's re-check drops them — so no index removal is ever needed.
+    ///
+    /// The store and the index are borrowed in **separate, non-overlapping** scopes: the node's
+    /// labels and property values are read out first (releasing the store borrow), then the prop-key
+    /// tokens are resolved, then the entries are inserted into the index.
+    fn reindex_node(&self, node: NodeId) {
+        let Some(index) = &self.index else {
+            return; // standalone path: no derived index to maintain.
+        };
+
+        // --- read the node's current labels (store borrow, released before touching the index) ---
+        let label_tokens: Vec<u32> = {
+            let mut store = self.store.borrow_mut();
+            match store.node_labels(node.0) {
+                Ok(ids) => ids,
+                // An overflow-form bitmap (#39) surfaces elsewhere as a captured error; here it just
+                // means we cannot enumerate the labels, so we skip indexing (the seek then re-checks
+                // the store and, on a full scan, still finds the node — never a wrong row).
+                Err(_) => return,
+            }
+        };
+
+        // The node's current property values (this borrows the store internally and releases it).
+        let props = self.read_node_props(node);
+
+        // --- resolve each property's prop-key token (read-only store borrow) ---
+        // Pre-resolve all `(name, value, prop_key)` triples so the index borrow below does not
+        // overlap a store borrow.
+        let resolved_props: Vec<(u32, Value)> = {
+            let store = self.store.borrow();
+            props
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    store
+                        .token_id(Namespace::PropKey, &name)
+                        .map(|prop_key| (prop_key, value))
+                })
+                .collect()
+        };
+
+        // --- (re)insert the node's current entries into the index (index borrow only) ---
+        let mut index = index.borrow_mut();
+        for &lt in &label_tokens {
+            index.insert_label(lt, node.0);
+        }
+        for (prop_key, value) in &resolved_props {
+            for &lt in &label_tokens {
+                if index.has_node_property(lt, *prop_key) {
+                    index.insert_node_property(lt, *prop_key, value, node.0);
+                }
+            }
+        }
+    }
 }
 
 impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
@@ -522,47 +675,41 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         let Some(token_id) = self.label_id_existing(label) else {
             return Vec::new();
         };
-        // Index-accelerated label scans are #39; here we scan every live node and filter by the
-        // inline label bitmap (`node_has_label`). This is correct, just O(live nodes).
-        let mut store = self.store.borrow_mut();
-        let ids = match store.scan_node_ids() {
-            Ok(ids) => ids,
-            Err(e) => {
-                drop(store);
-                self.capture(e);
-                return Vec::new();
+
+        // Index-accelerated path (`rmp` task #48): on the coordinated path the derived label
+        // [`IndexSet`] yields **candidate** node ids carrying this token. Candidates may be a
+        // superset (stale entries from rolled-back / overwritten / deleted nodes), so the **same**
+        // per-candidate filter the full scan applies (visibility + `node_has_label`) is re-run; the
+        // result is therefore *exactly* the full-scan result over a candidate subset.
+        if let Some(index) = &self.index {
+            // SSI predicate footprint (`04 §5.4`, `rmp` task #46): a `MATCH (n:Label)` is a
+            // **predicate read**, not a point read of the matching rows — a concurrent transaction
+            // that writes *any* node (changing which nodes match the label, the phantom case) must
+            // close an rw-edge with this scan. The per-node `SsiTracker` has no predicate/range
+            // marker yet (that is the deferred index-range-marker follow-up, still #16/#39), so we
+            // keep the conservative, **correct** approximation the pre-index full scan used: SIREAD
+            // every live node. The index only accelerates computing the *result*, never narrows the
+            // read footprint — narrowing it would drop the phantom protection that makes write-skew
+            // over a label predicate serializable.
+            self.mark_all_live_nodes();
+            let candidates = index.borrow_mut().seek_label(token_id);
+            return self.filter_label_candidates(token_id, candidates);
+        }
+
+        // Standalone fallback: scan every live node and filter by the inline label bitmap. Correct,
+        // just O(live nodes).
+        let ids = {
+            let mut store = self.store.borrow_mut();
+            match store.scan_node_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
             }
         };
-        let mut out = Vec::new();
-        for id in ids {
-            // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
-            // testing the label, so a label scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
-            let visible = match store.node(id) {
-                Ok(rec) => self.visible(rec.mvcc),
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    return Vec::new();
-                }
-            };
-            // SIREAD-mark every scanned node, visible or not (the label predicate examined it).
-            self.note_read(node_ssi_key(id));
-            if !visible {
-                continue;
-            }
-            match store.node_has_label(id, token_id) {
-                Ok(true) => out.push(NodeId(id)),
-                Ok(false) => {}
-                Err(e) => {
-                    // An overflow-form bitmap (a #39-written node) surfaces as a captured error
-                    // rather than a wrong (missing/extra) row.
-                    drop(store);
-                    self.capture(e);
-                    return Vec::new();
-                }
-            }
-        }
-        out
+        self.filter_label_candidates(token_id, ids)
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
@@ -741,6 +888,130 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         Some(self.read_rel_props(rel))
     }
 
+    fn index_seek_eq(&self, label: &str, property: &str, seek: &Value) -> Option<Vec<NodeId>> {
+        // Only the coordinated path has a derived index; otherwise the executor falls back to
+        // `scan_filter_eq` (`rmp` task #48).
+        let index = self.index.as_ref()?;
+        // Resolve the label + prop-key tokens via the store; if either was never interned, no node
+        // can match, but we still only serve the seek when a *matching index is registered* (else
+        // fall back so the executor's scan covers a property the index does not).
+        let label_token = self.label_id_existing(label)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        if !index.borrow().has_node_property(label_token, prop_key) {
+            return None; // no usable index: scan fallback
+        }
+
+        // SSI predicate footprint: an indexed equality predicate replaces the `scan_filter_eq`
+        // fallback, which read every node via `scan_nodes_by_label`. Preserve that exact read
+        // footprint so an index seek and the scan fallback are indistinguishable to SSI (`04 §5.4`,
+        // `rmp` task #46) — see `mark_all_live_nodes`.
+        self.mark_all_live_nodes();
+
+        // Candidate ids for `(label_token, prop_key) == seek`. The index is candidate-only, so we
+        // re-check the FULL `scan_filter_eq` predicate per candidate: visible + carries the label
+        // (`filter_label_candidates`) + the *current* value equals `seek` by Cypher equality.
+        let candidates = index
+            .borrow_mut()
+            .seek_node_property_eq(label_token, prop_key, seek)
+            .unwrap_or_default();
+        let labelled = self.filter_label_candidates(label_token, candidates);
+
+        let mut out: Vec<NodeId> = labelled
+            .into_iter()
+            .filter(|id| {
+                self.node_property(*id, property)
+                    .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
+            })
+            .collect();
+        // De-duplicate: a stale + a live index entry can name the same id twice.
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    fn index_seek_range(
+        &self,
+        label: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<NodeId>> {
+        use std::cmp::Ordering;
+
+        let index = self.index.as_ref()?;
+        let label_token = self.label_id_existing(label)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        if !index.borrow().has_node_property(label_token, prop_key) {
+            return None; // no usable index: scan fallback
+        }
+
+        // SSI predicate footprint: an indexed range predicate replaces the `scan_filter_range`
+        // fallback (which read every node via `scan_nodes_by_label`). Preserve that read footprint so
+        // the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
+        self.mark_all_live_nodes();
+
+        // Candidate ids for the requested range (a superset; see `IndexSet::seek_node_property_range`).
+        // NOTE (v1-index limitation): the index keys by exact encoded value, so the value-match path
+        // assumes per-property type consistency (the common case). Mixed int/float values for one
+        // property would need the scan fallback; the planner is only given a property index where
+        // that holds. The re-check below guarantees no WRONG rows regardless of candidate skew.
+        let candidates = index
+            .borrow_mut()
+            .seek_node_property_range(label_token, prop_key, lower, upper)
+            .unwrap_or_default();
+        let labelled = self.filter_label_candidates(label_token, candidates);
+
+        // Re-check the FULL `scan_filter_range` predicate per candidate: visible + has label (done
+        // above) + the current value is non-null and satisfies BOTH provided bounds via `cmp_values`.
+        let satisfies = |v: &Value| -> bool {
+            if v.is_null() {
+                return false;
+            }
+            // Lower bound: `(value, inclusive)` -> keep `ord != Less` if inclusive else `ord == Greater`.
+            if let Some((bound_value, inclusive)) = lower {
+                if bound_value.is_null() {
+                    return false;
+                }
+                let ord = crate::ordering::cmp_values(v, bound_value);
+                let ok = if inclusive {
+                    ord != Ordering::Less
+                } else {
+                    ord == Ordering::Greater
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            // Upper bound: keep `ord != Greater` if inclusive else `ord == Less`.
+            if let Some((bound_value, inclusive)) = upper {
+                if bound_value.is_null() {
+                    return false;
+                }
+                let ord = crate::ordering::cmp_values(v, bound_value);
+                let ok = if inclusive {
+                    ord != Ordering::Greater
+                } else {
+                    ord == Ordering::Less
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let mut out: Vec<NodeId> = labelled
+            .into_iter()
+            .filter(|id| {
+                self.node_property(*id, property)
+                    .is_some_and(|v| satisfies(&v))
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
     // ---- writes -------------------------------------------------------------------------------
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
@@ -759,6 +1030,14 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         self.apply_add_labels(node, labels);
         for (k, v) in properties {
             self.set_node_property(node, k, v.clone());
+        }
+        // Index the node's now-current labels and property values, once all writes succeeded
+        // (`rmp` task #48). On any captured error the node is untrustworthy and the caller rolls
+        // back, so skip indexing rather than record entries for a doomed write. (`set_node_property`
+        // already reindexed per property, but a final pass after the labels are set is the single
+        // point that guarantees label entries are present too.)
+        if !self.has_error() {
+            self.reindex_node(node);
         }
         node
     }
@@ -832,7 +1111,12 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             .set_node_property_value(self.txn, node.0, key_id, &value)
         {
             self.capture(e);
+            return;
         }
+        // The store write succeeded: index the node's now-current value (`rmp` task #48). A removal
+        // (`SET n.p = null`, handled above) needs no reindex — dropping a key never adds a candidate,
+        // and the seek re-checks the store so a stale candidate is filtered out.
+        self.reindex_node(node);
     }
 
     fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
@@ -875,6 +1159,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
         self.note_write(node_ssi_key(node.0));
         self.apply_add_labels(node, labels);
+        // Index the node's now-current labels (and, for any newly-matched label-property index, its
+        // values) once the store write succeeded and no error was captured (`rmp` task #48).
+        if !self.has_error() {
+            self.reindex_node(node);
+        }
     }
 
     fn remove_labels(&mut self, node: NodeId, labels: &[String]) {

@@ -54,7 +54,11 @@ fn run_commit(src: &str, store: Store, txn: u64) -> Store {
         let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
         cursor.collect_all().expect("collect");
     }
-    assert!(!graph.has_error(), "captured error: {:?}", graph.take_error());
+    assert!(
+        !graph.has_error(),
+        "captured error: {:?}",
+        graph.take_error()
+    );
     graph.commit().expect("commit")
 }
 
@@ -68,7 +72,11 @@ fn read_at(src: &str, store: Store, txn: u64, ts: u64) -> (Vec<Row>, Store) {
         let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
         cursor.collect_all().expect("collect")
     };
-    assert!(!graph.has_error(), "captured error: {:?}", graph.take_error());
+    assert!(
+        !graph.has_error(),
+        "captured error: {:?}",
+        graph.take_error()
+    );
     (rows, graph.into_store())
 }
 
@@ -99,7 +107,11 @@ fn older_snapshot_does_not_see_a_later_committed_insert() {
 
     // A reader at or after the commit (ts = 1) sees the node.
     let (rows, _store) = read_at("MATCH (n) RETURN n.n AS v", store, 3, 1);
-    assert_eq!(ints(&rows, "v"), vec![1], "a snapshot at/after the insert sees it");
+    assert_eq!(
+        ints(&rows, "v"),
+        vec![1],
+        "a snapshot at/after the insert sees it"
+    );
 }
 
 #[test]
@@ -134,7 +146,11 @@ fn a_transaction_sees_its_own_uncommitted_writes() {
     let store = fresh_store();
     let mut graph = RecordStoreGraph::begin(store, TxnId(1));
     let node = graph.create_node(&["N".to_owned()], &[("n".to_owned(), Value::Integer(7))]);
-    assert!(!graph.has_error(), "create failed: {:?}", graph.take_error());
+    assert!(
+        !graph.has_error(),
+        "create failed: {:?}",
+        graph.take_error()
+    );
 
     assert!(
         graph.node_exists(node),
