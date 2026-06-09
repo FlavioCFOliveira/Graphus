@@ -33,6 +33,10 @@
 //!    live node's `labels` bitmap has its overflow flag clear (this build never sets it; the
 //!    token-list overflow block is the follow-up #39) and references only `Label`-namespace token
 //!    ids that exist in the token store (no dangling label reference).
+//! 7. **Overflow-heap-chain well-formedness** ([`Violation::HeapChain`], `04 §2.1`/§2.3,
+//!    `rmp` task #43): every live overflow property's `strings.store` block chain has no dangling /
+//!    out-of-range / freed block ids and terminates (cycle-guarded). Combined with the free-list
+//!    check, this proves a freed heap block is never referenced by a live property.
 //!
 //! # Termination on a corrupted store
 //!
@@ -53,9 +57,11 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
+use crate::heap::HeapBlock;
 use crate::idalloc::NULL_ID;
 use crate::record::{ChainSide, NodeRecord, PropRecord, RelRecord};
-use crate::store::{RecordStore, StoreKind};
+use crate::store::{RecordStore, STORE_COUNT, StoreKind};
+use crate::valenc::OVERFLOW_BIT as PROP_OVERFLOW_BIT;
 
 /// One structural inconsistency found by [`check_store`]. Each variant names the offending ids /
 /// pages so an operator (or a test) can pinpoint the fault (`04 §4.6` alerting).
@@ -127,6 +133,16 @@ pub enum Violation {
         node: u64,
         /// Which label-bitmap rule was broken.
         detail: LabelBitmapFault,
+    },
+    /// An overflow property's `strings.store` block chain is malformed (`04 §2.1`, `04 §2.3`;
+    /// `rmp` task #43 — the string/list overflow heap).
+    HeapChain {
+        /// Physical id of the property record whose overflow chain is malformed.
+        prop: u64,
+        /// Physical id of the heap block implicated (`0` for the property's `value_inline` head).
+        block: u64,
+        /// Which heap-chain rule was broken.
+        detail: HeapChainFault,
     },
 }
 
@@ -201,6 +217,19 @@ pub enum LabelBitmapFault {
         /// The dangling label token id the bitmap references.
         token_id: u32,
     },
+}
+
+/// The precise overflow-heap-chain rule broken by a [`Violation::HeapChain`] (`04 §2.1`, `04 §2.3`;
+/// `rmp` task #43).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapChainFault {
+    /// A `value_inline` head, or a block's `next_block`, references a block id outside
+    /// `1..high_water` of `strings.store` (out of range / dangling).
+    BlockOutOfRange,
+    /// The chain references a freed or dead (not in-use) heap block (dangling-by-reuse).
+    DeadBlock,
+    /// The chain did not terminate within the cycle guard (a corrupted cycle).
+    NonTerminating,
 }
 
 /// The precise free-list rule broken by a [`Violation::FreeList`].
@@ -285,6 +314,8 @@ pub struct ConsistencyReport {
     pub live_rels: u64,
     /// Number of live property records.
     pub live_props: u64,
+    /// Number of live `strings.store` overflow-heap blocks (`rmp` task #43).
+    pub live_blocks: u64,
 }
 
 impl ConsistencyReport {
@@ -324,10 +355,12 @@ pub fn check_store<D: BlockDevice, S: LogSink>(
     report.live_nodes = scan.live_nodes.len() as u64;
     report.live_rels = scan.live_rels.len() as u64;
     report.live_props = scan.live_props.len() as u64;
+    report.live_blocks = scan.live_blocks.len() as u64;
 
     check_referential(&scan, &mut report);
     check_property_chains(store, &cat, &scan, &mut report)?;
     check_adjacency(store, &cat, &scan, &mut report)?;
+    check_heap_chains(&cat, &scan, &mut report);
     check_free_lists(&cat, &scan, &mut report);
     check_label_bitmaps(&cat, &scan, &mut report);
 
@@ -370,8 +403,8 @@ pub fn verify_on_open<D: BlockDevice, S: LogSink>(
 
 /// A read-only snapshot of the per-store catalog the checker needs.
 struct Catalog {
-    high_water: [u64; 3],
-    free: [Vec<u64>; 3],
+    high_water: [u64; STORE_COUNT],
+    free: [Vec<u64>; STORE_COUNT],
     pages: Vec<PageId>,
     /// Number of interned `Label`-namespace tokens; valid label token ids are `0..label_token_count`
     /// (`04 §2.6`). Used to flag a node label bitmap that references a non-existent label (#42).
@@ -385,11 +418,13 @@ impl Catalog {
                 store.checker_high_water(StoreKind::Node),
                 store.checker_high_water(StoreKind::Rel),
                 store.checker_high_water(StoreKind::Prop),
+                store.checker_high_water(StoreKind::Strings),
             ],
             free: [
                 store.checker_free_ids(StoreKind::Node),
                 store.checker_free_ids(StoreKind::Rel),
                 store.checker_free_ids(StoreKind::Prop),
+                store.checker_free_ids(StoreKind::Strings),
             ],
             pages: store.mapped_pages(),
             label_token_count: store.checker_label_token_count(),
@@ -413,11 +448,13 @@ struct Scan {
     live_rels: BTreeMap<u64, RelRecord>,
     /// Live property ids -> their record.
     live_props: BTreeMap<u64, PropRecord>,
+    /// Live `strings.store` overflow-heap block ids -> their block (`rmp` task #43).
+    live_blocks: BTreeMap<u64, HeapBlock>,
     /// Freed ids per store (from the catalog), as a set for O(log n) membership.
-    freed: [BTreeSet<u64>; 3],
+    freed: [BTreeSet<u64>; STORE_COUNT],
     /// Per-store ids that are on the free list yet whose on-disk record still reads `in_use` — a
     /// contradiction the free-list check reports as [`FreeListFault::StillInUse`].
-    freed_but_in_use: [BTreeSet<u64>; 3],
+    freed_but_in_use: [BTreeSet<u64>; STORE_COUNT],
 }
 
 impl Scan {
@@ -426,6 +463,7 @@ impl Scan {
             StoreKind::Node => self.live_nodes.contains_key(&id),
             StoreKind::Rel => self.live_rels.contains_key(&id),
             StoreKind::Prop => self.live_props.contains_key(&id),
+            StoreKind::Strings => self.live_blocks.contains_key(&id),
         }
     }
 }
@@ -438,10 +476,11 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     cat: &Catalog,
     _report: &mut ConsistencyReport,
 ) -> Result<Scan> {
-    let freed: [BTreeSet<u64>; 3] = [
+    let freed: [BTreeSet<u64>; STORE_COUNT] = [
         cat.free(StoreKind::Node).iter().copied().collect(),
         cat.free(StoreKind::Rel).iter().copied().collect(),
         cat.free(StoreKind::Prop).iter().copied().collect(),
+        cat.free(StoreKind::Strings).iter().copied().collect(),
     ];
 
     // A per-record read can fail if the record's page is corrupt (checksum). That page is already
@@ -449,7 +488,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     // pass completes and collects the rest of the violations rather than aborting. Freed ids are
     // *not* counted live, but they are still read so that a freed slot whose record contradicts the
     // free list (still `in_use`) is caught (`FreeListFault::StillInUse`).
-    let mut freed_but_in_use: [BTreeSet<u64>; 3] = Default::default();
+    let mut freed_but_in_use: [BTreeSet<u64>; STORE_COUNT] = Default::default();
 
     let mut live_nodes = BTreeMap::new();
     for id in 1..cat.high_water(StoreKind::Node) {
@@ -489,10 +528,27 @@ fn scan_records<D: BlockDevice, S: LogSink>(
         }
     }
 
+    // The `strings.store` overflow heap (`rmp` task #43): heap blocks are fixed-size records with the
+    // same MVCC `in_use` discipline, so they are scanned identically.
+    let mut live_blocks = BTreeMap::new();
+    for id in 1..cat.high_water(StoreKind::Strings) {
+        let Ok(block) = store.checker_block(id) else {
+            continue;
+        };
+        if freed[StoreKind::Strings as usize].contains(&id) {
+            if block.mvcc.in_use() {
+                freed_but_in_use[StoreKind::Strings as usize].insert(id);
+            }
+        } else if block.mvcc.in_use() {
+            live_blocks.insert(id, block);
+        }
+    }
+
     Ok(Scan {
         live_nodes,
         live_rels,
         live_props,
+        live_blocks,
         freed,
         freed_but_in_use,
     })
@@ -788,10 +844,11 @@ fn link_of(rel: &RelRecord, node: u64, from: u64, is_loop: bool) -> (u64, u64) {
 
 /// 5. Free-list sanity (`04 §2.7`).
 fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
-    // Build the set of ids referenced by any live chain (incidence + property), per store, so we can
-    // flag a freed id that is still live-referenced.
+    // Build the set of ids referenced by any live chain (incidence + property + overflow heap), per
+    // store, so we can flag a freed id that is still live-referenced.
     let mut referenced_rels: BTreeSet<u64> = BTreeSet::new();
     let mut referenced_props: BTreeSet<u64> = BTreeSet::new();
+    let mut referenced_blocks: BTreeSet<u64> = BTreeSet::new();
     for n in scan.live_nodes.values() {
         if n.first_rel != NULL_ID {
             referenced_rels.insert(n.first_rel);
@@ -818,6 +875,16 @@ fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) 
     for p in scan.live_props.values() {
         if p.next_prop != NULL_ID {
             referenced_props.insert(p.next_prop);
+        }
+        // An overflowed property's `value_inline` is its chain head; track it (and the chain's
+        // links) so a freed heap block still referenced by a live property is flagged.
+        if p.type_tag & PROP_OVERFLOW_BIT != 0 && p.value_inline != NULL_ID {
+            referenced_blocks.insert(p.value_inline);
+        }
+    }
+    for b in scan.live_blocks.values() {
+        if b.next_block != NULL_ID {
+            referenced_blocks.insert(b.next_block);
         }
     }
 
@@ -855,6 +922,7 @@ fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) 
             let referenced = match kind {
                 StoreKind::Rel => referenced_rels.contains(&id),
                 StoreKind::Prop => referenced_props.contains(&id),
+                StoreKind::Strings => referenced_blocks.contains(&id),
                 // Nodes are not chained, so a freed node id cannot be live-referenced via a chain;
                 // a relationship endpoint pointing at a freed node is caught by `check_referential`.
                 StoreKind::Node => false,
@@ -903,6 +971,63 @@ fn check_label_bitmaps(cat: &Catalog, scan: &Scan, report: &mut ConsistencyRepor
                     detail: LabelBitmapFault::UnknownLabelToken { token_id: id },
                 });
             }
+        }
+    }
+}
+
+/// 7. Overflow-heap-chain well-formedness (`04 §2.1`, `04 §2.3`; `rmp` task #43).
+///
+/// For every live property record whose `type_tag` has the overflow bit set, walks the
+/// `strings.store` block chain whose head is the property's `value_inline`, asserting purely from
+/// the live-record snapshot:
+///
+/// * every block id (the head and each `next_block`) is in range `1..high_water` of `strings.store`
+///   ([`HeapChainFault::BlockOutOfRange`]);
+/// * every block is **live** (in use, not freed) — no dangling-by-reuse reference
+///   ([`HeapChainFault::DeadBlock`]);
+/// * the chain terminates within a generous cycle guard ([`HeapChainFault::NonTerminating`]).
+///
+/// This is the overflow-heap analogue of [`check_property_chains`]: it proves *"no dangling block
+/// ids, chain terminates, freed blocks not referenced"* (`rmp` task #43 acceptance).
+fn check_heap_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
+    let block_hw = cat.high_water(StoreKind::Strings);
+    // A well-formed chain has at most `block_hw` blocks; double it for slack against a corrupt cycle.
+    let guard = block_hw.saturating_mul(2).saturating_add(2);
+
+    for (&pid, prop) in &scan.live_props {
+        if prop.type_tag & PROP_OVERFLOW_BIT == 0 {
+            continue; // inline scalar: no overflow chain to validate
+        }
+        let mut cur = prop.value_inline;
+        let mut steps = 0u64;
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard || !seen.insert(cur) {
+                report.push(Violation::HeapChain {
+                    prop: pid,
+                    block: cur,
+                    detail: HeapChainFault::NonTerminating,
+                });
+                break;
+            }
+            if cur == 0 || cur >= block_hw {
+                report.push(Violation::HeapChain {
+                    prop: pid,
+                    block: cur,
+                    detail: HeapChainFault::BlockOutOfRange,
+                });
+                break;
+            }
+            let Some(block) = scan.live_blocks.get(&cur) else {
+                report.push(Violation::HeapChain {
+                    prop: pid,
+                    block: cur,
+                    detail: HeapChainFault::DeadBlock,
+                });
+                break;
+            };
+            cur = block.next_block;
         }
     }
 }
@@ -958,6 +1083,7 @@ fn scan_high_water(scan: &Scan, kind: StoreKind) -> u64 {
         StoreKind::Node => scan.live_nodes.keys().next_back().copied(),
         StoreKind::Rel => scan.live_rels.keys().next_back().copied(),
         StoreKind::Prop => scan.live_props.keys().next_back().copied(),
+        StoreKind::Strings => scan.live_blocks.keys().next_back().copied(),
     }
     .unwrap_or(0);
     let freed_max = scan.freed[kind as usize]

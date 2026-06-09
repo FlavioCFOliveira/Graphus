@@ -7,21 +7,22 @@
 //! [`MemGraph`](crate::graph_access::MemGraph). The executor depends only on the [`GraphAccess`]
 //! trait, so swapping the backend needs no operator change (`04 §7.4`).
 //!
-//! # The achievable subset (#38 + #42) and what is deferred (#39)
+//! # The achievable subset (#38 + #42 + #43) and what is deferred (#39)
 //!
 //! This is the **achievable subset** of the storage integration: nodes/relationships/properties
-//! (#38) and **node labels** (#42, this task — the bit-packed small-label-set case of `05 §9`). The
-//! remaining wiring (index-accelerated label scans, the string/list property overflow heap, the
-//! label token-list overflow block, and MVCC concurrency / SSI visibility) is the follow-up **#39**.
+//! (#38), **node labels** (#42, the bit-packed small-label-set case of `05 §9`), and the
+//! **`strings.store` String/List property overflow heap + node-property removal** (#43, this task).
+//! The remaining wiring (index-accelerated label scans, the label token-list overflow block,
+//! relationship-property storage, and MVCC concurrency / SSI visibility) is the follow-up **#39**.
 //! Every deferral is signalled by a **clear error**, never a silently wrong answer:
 //!
-//! | Capability | here (#38 + #42) | How a deferral is signalled |
-//! |------------|------------------|-----------------------------|
+//! | Capability | status | How a deferral is signalled |
+//! |------------|--------|-----------------------------|
 //! | Nodes / relationships CRUD + traverse | supported (over real records, real WAL) | — |
-//! | Inline scalar node properties (`Integer`/`Float`/`Boolean`) | supported via [`graphus_storage::encode_inline`] | — |
+//! | Inline scalar node properties (`Integer`/`Float`/`Boolean`) | supported (#38) inline | — |
+//! | **`String` / `List` node property values** | **supported** (#43) via the `strings.store` overflow heap (`04 §2.1`/§2.3) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures a runtime error (outside the stored-property subtype, `05 §7.2`) |
+//! | **Node property removal / overwrite** (`SET n.p = null`, `REMOVE n.p`, `SET n = map`) | **supported** (#43) — removes the record and frees any overflow chain (no leak) | — |
 //! | Node **labels** (`CREATE (:L)`, `SET`/`REMOVE` label, `n:L` predicates, `labels(n)`, label scan) | **supported** (#42) via the inline label bitmap, `05 §9` | a label needing token id `≥ 63` (a 64th+ distinct label) captures the documented overflow error (the token-list block is #39) |
-//! | `String`/`Bytes`/`List`/`Map`/temporal property values | **deferred (#39)** | a write captures a runtime error (the strings/overflow heap is not built) |
-//! | Property **removal** (`SET n.p = null`, `REMOVE n.p`) | **deferred (#39)** | a write captures a runtime error (the store has no in-place delete/tombstone API yet) |
 //! | **Relationship** properties | **deferred (#39)** | a write captures a runtime error (the store exposes no relationship-property chain API) |
 //! | **Index-accelerated** label / property scans | **deferred (#39)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
 //! | MVCC concurrency / SSI | **deferred (#39)** | one query runs in a single transaction against the latest committed state |
@@ -62,7 +63,7 @@ use std::cell::RefCell;
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value};
 use graphus_io::BlockDevice;
-use graphus_storage::{Namespace, RecordStore, decode_inline, encode_inline};
+use graphus_storage::{Namespace, RecordStore};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
@@ -236,16 +237,18 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         }
     }
 
-    /// Reads `node`'s live properties as newest-wins `(key_name, value)` pairs.
+    /// Reads `node`'s live properties as newest-wins `(key_name, value)` pairs, decoding both inline
+    /// scalars (#38) and `String`/`List` values stored in the `strings.store` overflow heap
+    /// (`rmp` task #43) via [`RecordStore::node_property_values`].
     ///
-    /// The store's property chain is prepend-ordered (newest record first), so a `SET` of an
-    /// existing key adds a newer record that shadows the older one; this keeps the **first**
-    /// occurrence per key id while walking head-to-tail. Non-inline / unknown-tag values would mean
-    /// the store holds something this build cannot decode — that is captured as an error (it cannot
-    /// happen for data this build wrote, since writing such values is itself deferred).
+    /// The store's property chain is prepend-ordered (newest record first); this keeps the **first**
+    /// occurrence per key id while walking head-to-tail. (A `set_node_property` overwrite also
+    /// removes the old record, so in practice at most one record per key survives, but newest-wins is
+    /// kept as a robust invariant.) An undecodable value would mean the store holds bytes this build
+    /// cannot interpret — captured as an error rather than a wrong row.
     fn read_node_props(&self, node: NodeId) -> Vec<(String, Value)> {
         let mut store = self.store.borrow_mut();
-        let chain = match store.node_properties(node.0) {
+        let chain = match store.node_property_values(node.0) {
             Ok(chain) => chain,
             Err(e) => {
                 drop(store);
@@ -254,19 +257,12 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
         };
         let mut out: Vec<(u32, Value)> = Vec::new();
-        for (_pid, prop) in chain {
+        for (_pid, key, value) in chain {
             // Newest-wins: skip a key id already seen (a more recent record shadows it).
-            if out.iter().any(|(k, _)| *k == prop.key) {
+            if out.iter().any(|(k, _)| *k == key) {
                 continue;
             }
-            match decode_inline(prop.type_tag, prop.value_inline) {
-                Ok(v) => out.push((prop.key, v)),
-                Err(e) => {
-                    drop(store);
-                    self.capture(e.into());
-                    return Vec::new();
-                }
-            }
+            out.push((key, value));
         }
         // Map key ids back to names and sort by name for the deterministic order the seam promises.
         let mut named: Vec<(String, Value)> = out
@@ -538,30 +534,30 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
-        if value.is_null() {
-            // Removal (`SET n.p = null`) needs an in-place delete / tombstone the store lacks (#39);
-            // signal rather than no-op (a no-op would leave a stale value = a wrong answer).
-            self.defer("removing a node property (SET n.p = null)");
-            return;
-        }
-        let (type_tag, value_inline) = match encode_inline(&value) {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Non-inline value class (String/List/Map/temporal): deferred to #39's overflow heap.
-                self.capture(e.into());
-                return;
-            }
-        };
         let Some(key_id) = self.prop_key_id(key) else {
             return; // error already captured
         };
-        if let Err(e) = self.store.borrow_mut().add_node_property(
-            self.txn,
-            node.0,
-            key_id,
-            type_tag,
-            value_inline,
-        ) {
+        if value.is_null() {
+            // `SET n.p = null` is a removal in Cypher: drop the key (and free any overflow chain it
+            // owned) so a later read sees the property absent.
+            if let Err(e) = self
+                .store
+                .borrow_mut()
+                .remove_node_property_value(self.txn, node.0, key_id)
+            {
+                self.capture(e);
+            }
+            return;
+        }
+        // Inline scalars stay inline (#38); String/List values overflow to the strings.store heap
+        // (`rmp` task #43). `set_node_property_value` replaces any current value of the key, freeing
+        // its old overflow chain (no leak). A class the store cannot persist (Map/Bytes/temporal,
+        // heterogeneous List) is captured as a runtime error, never a silently-dropped property.
+        if let Err(e) = self
+            .store
+            .borrow_mut()
+            .set_node_property_value(self.txn, node.0, key_id, &value)
+        {
             self.capture(e);
         }
     }
@@ -598,24 +594,49 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
     }
 
-    fn remove_node_property(&mut self, node: NodeId, _key: &str) {
+    fn remove_node_property(&mut self, node: NodeId, key: &str) {
         if !self.node_exists(node) {
             return;
         }
-        self.defer("removing a node property (REMOVE n.p)");
+        // `REMOVE n.p` over a never-interned key is a no-op (no node can carry an unknown key), so do
+        // not intern just to remove. Otherwise drop the key and free any overflow chain it owned
+        // (`rmp` task #43); removing an absent key is itself a no-op in the store.
+        let Some(key_id) = self.store.borrow().token_id(Namespace::PropKey, key) else {
+            return;
+        };
+        if let Err(e) = self
+            .store
+            .borrow_mut()
+            .remove_node_property_value(self.txn, node.0, key_id)
+        {
+            self.capture(e);
+        }
     }
 
     fn remove_rel_property(&mut self, _rel: RelId, _key: &str) {
         self.defer("removing a relationship property");
     }
 
-    fn replace_node_properties(&mut self, node: NodeId, _properties: &[(String, Value)]) {
+    fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
         if !self.node_exists(node) {
             return;
         }
-        // `SET n = map` must first clear the existing properties, which needs the in-place
-        // delete/tombstone the store lacks (#39); signal rather than partially apply.
-        self.defer("replacing node properties (SET n = map)");
+        // `SET n = map` replaces the whole property set: clear the existing properties (freeing any
+        // overflow chains, `rmp` task #43), then set each non-null entry of the map (mirrors
+        // `MemGraph::replace_node_properties`).
+        if let Err(e) = self
+            .store
+            .borrow_mut()
+            .clear_node_properties(self.txn, node.0)
+        {
+            self.capture(e);
+            return;
+        }
+        for (k, v) in properties {
+            if !v.is_null() {
+                self.set_node_property(node, k, v.clone());
+            }
+        }
     }
 
     fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {

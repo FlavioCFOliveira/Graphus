@@ -15,6 +15,7 @@ use graphus_core::error::{GraphusError, Result};
 
 use crate::idalloc::FreeList;
 use crate::paging::PAGE_PAYLOAD;
+use crate::store::STORE_COUNT;
 use crate::tokens::TokenStore;
 
 /// The durable catalog stored in the metadata page.
@@ -26,8 +27,9 @@ use crate::tokens::TokenStore;
 pub struct Meta {
     /// Next `ElementId` to allocate (never-reused monotonic counter, `04 §2.2`).
     pub element_id_next: u128,
-    /// Per-store state, indexed by [`StoreKind`](crate::store::StoreKind) `as usize`.
-    pub stores: [StoreMeta; 3],
+    /// Per-store state, indexed by [`StoreKind`](crate::store::StoreKind) `as usize` (the node, rel
+    /// and prop stores plus the `strings.store` overflow heap, `04 §2.1`).
+    pub stores: [StoreMeta; STORE_COUNT],
     /// The token dictionaries (`04 §2.6`).
     pub tokens: TokenStore,
 }
@@ -90,7 +92,7 @@ impl Meta {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cur = 0usize;
         let element_id_next = read_u128(bytes, &mut cur)?;
-        let mut stores: [StoreMeta; 3] = Default::default();
+        let mut stores: [StoreMeta; STORE_COUNT] = Default::default();
         for s in &mut stores {
             s.high_water = read_u64(bytes, &mut cur)?;
             let fl_len = read_u32(bytes, &mut cur)? as usize;
@@ -161,6 +163,10 @@ mod tests {
         m.stores[1].high_water = 2;
         m.stores[1].device_pages = vec![2];
         m.stores[2].device_pages = vec![3, 5];
+        // The strings.store overflow heap (`rmp` task #43) is the fourth catalog store.
+        m.stores[3].high_water = 4;
+        m.stores[3].free_list.push(2);
+        m.stores[3].device_pages = vec![6, 7];
         m.tokens.intern(Namespace::Label, "Person").unwrap();
         m.tokens.intern(Namespace::RelType, "KNOWS").unwrap();
 

@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use graphus_bufpool::page;
 use graphus_core::capability::Rng;
-use graphus_core::{PageId, TxnId};
+use graphus_core::{PageId, TxnId, Value};
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_sim::SimRng;
 use graphus_storage::record::{
@@ -35,8 +35,8 @@ use graphus_storage::record::{
 use graphus_storage::store::StoreKind;
 use graphus_storage::{
     AgreementFault, ConsistencyReport, IndexAgreement, IndexEntry, Namespace, RecordStore,
-    Violation, check::AdjacencyFault, check::FreeListFault, check::LabelBitmapFault,
-    check::PropertyFault, recovery, verify_on_open,
+    Violation, check::AdjacencyFault, check::FreeListFault, check::HeapChainFault,
+    check::LabelBitmapFault, check::PropertyFault, recovery, verify_on_open,
 };
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
@@ -163,6 +163,49 @@ impl DiskImage {
         self.page_mut(page_id)[off..off + buf.len()].copy_from_slice(&buf);
         self.refresh_checksum(page_id);
     }
+
+    /// Reads a property record at `(page_id, off)`.
+    fn read_prop_at(&self, page_id: u64, off: usize) -> PropRecord {
+        let bytes = &self.pages.iter().find(|(i, _)| *i == page_id).unwrap().1;
+        PropRecord::decode(&bytes[off..off + StoreKind::Prop.record_size()])
+    }
+
+    /// Overwrites a property record at `(page_id, off)` and refreshes the checksum.
+    fn write_prop_at(&mut self, page_id: u64, off: usize, prop: &PropRecord) {
+        let size = StoreKind::Prop.record_size();
+        let mut buf = vec![0u8; size];
+        prop.encode(&mut buf);
+        self.page_mut(page_id)[off..off + size].copy_from_slice(&buf);
+        self.refresh_checksum(page_id);
+    }
+
+    /// Locates the **single** in-use property record in the image (the corruption tests build exactly
+    /// one), returning its `(device_page_id, byte_offset)`. Property records have no element id, so
+    /// they are found by scanning record pages for an in-use property slot.
+    fn locate_only_prop(&self) -> (u64, usize) {
+        let size = StoreKind::Prop.record_size();
+        let rpp = (PAGE_SIZE - page::HEADER_SIZE) / size;
+        for (pid, bytes) in &self.pages {
+            if page::page_type(bytes) != 1 {
+                continue;
+            }
+            for slot in 0..rpp {
+                let off = page::HEADER_SIZE + slot * size;
+                if off + size > PAGE_SIZE {
+                    break;
+                }
+                let prop = PropRecord::decode(&bytes[off..off + size]);
+                // A property record is distinguished from node/rel pages only by being on the prop
+                // store's pages; the corruption tests place exactly one in-use prop, and node/rel
+                // records on other pages will not coincidentally decode as an in-use prop *with* the
+                // overflow tag we look for, so match the overflow flag to disambiguate.
+                if prop.mvcc.in_use() && prop.type_tag & graphus_storage::PROP_OVERFLOW_BIT != 0 {
+                    return (*pid, off);
+                }
+            }
+        }
+        panic!("no in-use overflow property record found in the image");
+    }
 }
 
 /// Decodes just the `element_id` field of a record slice for the given kind (used to locate a record
@@ -171,8 +214,9 @@ fn decode_element_id(kind: StoreKind, bytes: &[u8]) -> u128 {
     match kind {
         StoreKind::Node => NodeRecord::decode(bytes).element_id.0,
         StoreKind::Rel => RelRecord::decode(bytes).element_id.0,
-        // Property records have no element id; never located by element id.
+        // Property and heap-block records have no element id; never located by element id.
         StoreKind::Prop => PropRecord::decode(bytes).mvcc.created_ts as u128,
+        StoreKind::Strings => u128::from(graphus_storage::HeapBlock::decode(bytes).mvcc.created_ts),
     }
 }
 
@@ -478,6 +522,53 @@ fn corrupt_property_chain_is_flagged() {
             }
         )),
         "expected a PropertyChain violation: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// (d2) Overflow heap chain: make an overflow property's `value_inline` (chain head) point at a
+/// non-existent heap block → a [`Violation::HeapChain`] (`rmp` task #43). Proves the checker has
+/// teeth on dangling overflow chains, and that the uncorrupted image first passes.
+#[test]
+fn dangling_overflow_chain_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+    let key = s.intern_token(Namespace::PropKey, "bio").unwrap();
+    // A multi-block String value, so the property record holds an overflow chain head.
+    s.set_node_property_value(txn, n, key, &Value::String("z".repeat(200)))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    {
+        // The uncorrupted image is healthy.
+        let mut clean = img.open();
+        assert!(
+            report(&mut clean).is_consistent(),
+            "clean overflow store passes"
+        );
+    }
+
+    // Point the overflow property's chain head at a non-existent (out-of-range) block id.
+    let (page_id, off) = img.locate_only_prop();
+    let mut prop = img.read_prop_at(page_id, off);
+    prop.value_inline = 9_999; // far past the heap high-water
+    img.write_prop_at(page_id, off, &prop);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::HeapChain {
+                detail: HeapChainFault::BlockOutOfRange | HeapChainFault::DeadBlock,
+                ..
+            }
+        )),
+        "expected a HeapChain violation for the dangling chain: {:?}",
         r.violations
     );
     assert!(verify_on_open(&mut store, &[]).is_err());

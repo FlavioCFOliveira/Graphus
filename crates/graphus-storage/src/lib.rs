@@ -56,6 +56,7 @@
 
 pub mod backup;
 pub mod check;
+pub mod heap;
 pub mod idalloc;
 pub mod labels;
 pub mod meta;
@@ -65,6 +66,7 @@ pub mod record;
 pub mod recovery;
 pub mod store;
 pub mod tokens;
+pub mod valenc;
 pub mod wal_rule;
 
 pub use backup::{
@@ -72,9 +74,10 @@ pub use backup::{
     restore_onto, verify_backup,
 };
 pub use check::{
-    AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, IndexAgreement, IndexEntry,
-    LabelBitmapFault, PropertyFault, Violation, verify_on_open,
+    AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, HeapChainFault,
+    IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, Violation, verify_on_open,
 };
+pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use propenc::{
@@ -86,4 +89,7 @@ pub use record::{
 };
 pub use store::{META_PAGE, RecordStore, StoreKind};
 pub use tokens::{Namespace, TokenStore};
+pub use valenc::{
+    OVERFLOW_BIT as PROP_OVERFLOW_BIT, TAG_LIST, TAG_STRING, ValueDecodeError, ValueEncodeError,
+};
 pub use wal_rule::SharedWal;

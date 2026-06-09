@@ -76,7 +76,7 @@ impl MvccHeader {
         self.flags & FLAG_DENSE != 0
     }
 
-    fn read(buf: &[u8]) -> Self {
+    pub(crate) fn read(buf: &[u8]) -> Self {
         Self {
             flags: buf[OFF_FLAGS],
             created_ts: read_u64(buf, OFF_CREATED_TS),
@@ -85,7 +85,7 @@ impl MvccHeader {
         }
     }
 
-    fn write(self, buf: &mut [u8]) {
+    pub(crate) fn write(self, buf: &mut [u8]) {
         buf[OFF_FLAGS] = self.flags;
         write_u64(buf, OFF_CREATED_TS, self.created_ts);
         write_u64(buf, OFF_EXPIRED_TS, self.expired_ts);

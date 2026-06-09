@@ -3,18 +3,20 @@
 //!
 //! These tests run the full pipeline (`parse → semantic analysis → physical plan → execute`) against
 //! a [`RecordStoreGraph`] wrapping a real [`graphus_storage::RecordStore`] over an in-memory DST
-//! device + log. They prove the achievable subset (#38 + #42): MATCH / traversal / inline scalar
-//! property filter / aggregation / `CREATE`/`SET`/`DELETE`, **node labels** (`CREATE (:L)`, `n:L`
-//! predicates, `labels(n)`, label scans, `SET`/`REMOVE` label — `rmp` task #42), the
-//! same-query-both-backends equivalence against the reference [`MemGraph`], crash-recovery
-//! durability (including labels), and that every #39 deferral is signalled by a captured error
+//! device + log. They prove the achievable subset (#38 + #42 + #43): MATCH / traversal / inline
+//! scalar property filter / aggregation / `CREATE`/`SET`/`DELETE`, **node labels** (`CREATE (:L)`,
+//! `n:L` predicates, `labels(n)`, label scans, `SET`/`REMOVE` label — `rmp` task #42), **`String`
+//! and `List` property values via the `strings.store` overflow heap + node-property removal**
+//! (`rmp` task #43), the same-query-both-backends equivalence against the reference [`MemGraph`],
+//! crash-recovery durability, and that every remaining #39 deferral is signalled by a captured error
 //! rather than a wrong answer.
 //!
-//! Property values here are restricted to the **inline scalar** classes (`Integer`/`Float`/
-//! `Boolean`) the store can encode in this build; string/list/map/temporal property values are
-//! deferred to #39 and are exercised here only to prove they signal an error. Node labels use the
-//! inline label bitmap (`05 §9`); a label needing token id `≥ 63` (a 64th distinct label) is the
-//! documented overflow deferral (#39's token-list block) and is exercised to prove it errors.
+//! Node `String`/`List` property values round-trip through the `strings.store` block-chained heap
+//! (`04 §2.1`/§2.3; `rmp` task #43); an overwrite/removal frees the old chain (asserted via the
+//! heap's live-block usage). A `Map`/`Bytes`/temporal value or a heterogeneous/nested `List` is
+//! outside the stored-property subtype (`05 §7.2`) and is exercised to prove it signals an error.
+//! Node labels use the inline label bitmap (`05 §9`); a label needing token id `≥ 63` (a 64th
+//! distinct label) is the documented overflow deferral (#39's token-list block) and errors.
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::binding::{Parameters, bind_parameters};
@@ -576,37 +578,287 @@ fn uncommitted_cypher_writes_do_not_survive_a_crash() {
 }
 
 // =================================================================================================
-// Deferred-to-#39 surfaces signal an error, never a wrong answer
+// String / List property values over the strings.store overflow heap (`rmp` task #43)
 // =================================================================================================
 
 #[test]
-fn string_property_value_is_a_deferred_error() {
+fn string_and_list_properties_round_trip_through_the_overflow_heap() {
     let store = fresh_store();
-    let err = run_expect_error("CREATE (n {name: 'Ada'})", store, 1);
+    // The task's canonical example: a String and a homogeneous List property on one node.
+    let (_r, store) = run_commit("CREATE (n {name: 'Ada', tags: ['x', 'y']})", store, 1);
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.name AS name, n.tags AS tags", store, 2);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("name"), Value::String("Ada".to_owned()));
+    assert_eq!(
+        rows[0].value("tags"),
+        Value::List(vec![
+            Value::String("x".to_owned()),
+            Value::String("y".to_owned()),
+        ])
+    );
+}
+
+#[test]
+fn long_multi_block_string_round_trips() {
+    let store = fresh_store();
+    // A long string spans many heap blocks (BLOCK_PAYLOAD = 48 bytes); proves the chain reassembles.
+    let long: String = "Ada Lovelace ".repeat(40); // ~520 bytes -> many blocks
+    let (_r, store) = run_commit(&format!("CREATE (n {{bio: '{long}'}})"), store, 1);
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.bio AS bio", store, 2);
+    assert_eq!(rows[0].value("bio"), Value::String(long));
+}
+
+#[test]
+fn unicode_and_empty_string_properties_round_trip() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (n {u: 'héllo 世界 🌍', e: ''})", store, 1);
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.u AS u, n.e AS e", store, 2);
+    assert_eq!(
+        rows[0].value("u"),
+        Value::String("héllo 世界 🌍".to_owned())
+    );
+    assert_eq!(rows[0].value("e"), Value::String(String::new()));
+}
+
+#[test]
+fn list_of_ints_round_trips() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (n {xs: [1, 2, 3, -7]})", store, 1);
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.xs AS xs", store, 2);
+    assert_eq!(
+        rows[0].value("xs"),
+        Value::List(vec![i(1), i(2), i(3), i(-7)])
+    );
+}
+
+#[test]
+fn filter_and_order_on_a_string_property() {
+    let store = fresh_store();
+    let (_r, store) = run_commit(
+        "CREATE ({name: 'Carol'}), ({name: 'Ada'}), ({name: 'Bob'})",
+        store,
+        1,
+    );
+    // Filter on a string property (equality) ...
+    let (eq, store) = run_commit(
+        "MATCH (n) WHERE n.name = 'Ada' RETURN n.name AS name",
+        store,
+        2,
+    );
+    assert_eq!(eq.len(), 1);
+    assert_eq!(eq[0].value("name"), Value::String("Ada".to_owned()));
+    // ... and order by it ascending.
+    let (ord, _store) = run_commit(
+        "MATCH (n) RETURN n.name AS name ORDER BY name ASC",
+        store,
+        3,
+    );
+    assert_eq!(
+        col(&ord, "name"),
+        vec![
+            Value::String("Ada".to_owned()),
+            Value::String("Bob".to_owned()),
+            Value::String("Carol".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn overwriting_a_string_property_frees_the_old_chain_no_leak() {
+    // A SET overwriting an overflow value must free the old chain — assert via the heap's live-block
+    // usage so a block leak is caught (`rmp` task #43 acceptance).
+    let first = "first value, deliberately long enough that it spans several heap blocks of forty-eight bytes each";
+    let second = "second value, also long enough to span multiple heap blocks so the chain has more than one link";
+    let store = fresh_store();
+    let (_r, mut store) = run_commit(&format!("CREATE (n {{bio: '{first}'}})"), store, 1);
+    let before = store.heap_block_usage().expect("usage before overwrite");
+    assert!(
+        before > 1,
+        "the long value spans multiple heap blocks, got {before}"
+    );
+
+    // Overwrite with a different (also multi-block) value.
+    let (_r, mut store) = run_commit(&format!("MATCH (n) SET n.bio = '{second}'"), store, 2);
+    let after = store.heap_block_usage().expect("usage after overwrite");
+
+    // The new value's chain replaced the old one; the old chain's blocks were freed (and reused), so
+    // live usage did not accumulate the first value's blocks on top of the second's.
+    assert!(
+        after <= before + 1,
+        "overwrite leaked heap blocks: before={before}, after={after}"
+    );
+
+    // And the read returns the new value.
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.bio AS bio", store, 3);
+    assert_eq!(rows[0].value("bio"), Value::String(second.to_owned()));
+}
+
+#[test]
+fn removing_a_string_property_frees_its_chain_and_clears_the_value() {
+    let store = fresh_store();
+    let (_r, mut store) = run_commit(
+        "CREATE (n {keep: 1, drop: 'a string long enough to use multiple heap blocks'})",
+        store,
+        1,
+    );
+    let with_value = store.heap_block_usage().expect("usage with value");
+    assert!(with_value >= 1);
+
+    // REMOVE the overflow property; its chain is freed.
+    let (_r, mut store) = run_commit("MATCH (n) REMOVE n.drop", store, 2);
+    let after_remove = store.heap_block_usage().expect("usage after remove");
+    assert_eq!(
+        after_remove, 0,
+        "removing the only overflow value frees its chain"
+    );
+
+    // The property reads as absent; the inline sibling survives.
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.drop AS d, n.keep AS k", store, 3);
+    assert_eq!(rows[0].value("d"), Value::Null, "removed property is null");
+    assert_eq!(rows[0].value("k"), i(1), "the other property survives");
+}
+
+#[test]
+fn set_string_property_to_null_removes_it() {
+    // `SET n.p = null` is a removal in Cypher (`rmp` task #43 enables it for nodes).
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (n {s: 'hello'})", store, 1);
+    let (_r, store) = run_commit("MATCH (n) SET n.s = null", store, 2);
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.s AS s", store, 3);
+    assert_eq!(col(&rows, "s"), vec![Value::Null]);
+}
+
+#[test]
+fn string_list_query_matches_memgraph_reference() {
+    // Both-backends-identical: a query reading String and List properties over the real heap must
+    // equal the MemGraph reference (`rmp` task #43 acceptance).
+    let query = "MATCH (n) WHERE n.name = 'Ada' RETURN n.name AS name, n.tags AS tags";
+
+    let mem = rows_over_mem(query, |g| {
+        g.add_node(
+            [] as [&str; 0],
+            [
+                ("name", Value::String("Ada".to_owned())),
+                (
+                    "tags",
+                    Value::List(vec![
+                        Value::String("x".to_owned()),
+                        Value::String("y".to_owned()),
+                    ]),
+                ),
+            ],
+        );
+        g.add_node([] as [&str; 0], [("name", Value::String("Bob".to_owned()))]);
+    });
+
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (n {name: 'Ada', tags: ['x', 'y']})", store, 1);
+    let (_r, store) = run_commit("CREATE (n {name: 'Bob'})", store, 2);
+    let (rows, _store) = run_commit(query, store, 3);
+    let real: Vec<_> = rows.iter().map(row_bindings).collect();
+
+    assert_eq!(
+        real, mem,
+        "String/List query over the real heap must match the MemGraph reference"
+    );
+    assert_eq!(real.len(), 1, "only Ada matches");
+}
+
+#[test]
+fn committed_string_and_list_properties_survive_a_no_force_crash() {
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (n {name: 'Ada', tags: ['x', 'y', 'z']})", store, 1);
+
+    let recovered = recover_no_force(&store);
+    let (rows, _store) = run_commit(
+        "MATCH (n) RETURN n.name AS name, n.tags AS tags",
+        recovered,
+        100,
+    );
+    assert_eq!(rows[0].value("name"), Value::String("Ada".to_owned()));
+    assert_eq!(
+        rows[0].value("tags"),
+        Value::List(vec![
+            Value::String("x".to_owned()),
+            Value::String("y".to_owned()),
+            Value::String("z".to_owned()),
+        ])
+    );
+}
+
+#[test]
+fn uncommitted_string_property_does_not_survive_a_crash() {
+    // Committed baseline node with an inline scalar.
+    let store = fresh_store();
+    let (_r, mut store) = run_commit("CREATE ({n: 1})", store, 1);
+
+    // A second transaction creates a node with a String property but is NOT committed; harden its
+    // WAL tail and steal-crash so undo runs.
+    {
+        let plan =
+            compile("CREATE ({s: 'uncommitted, spanning several heap blocks for good measure'})");
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = RecordStoreGraph::begin(store, TxnId(2));
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open");
+            let _ = cursor.collect_all().expect("rows");
+        }
+        assert!(!graph.has_error());
+        store = graph.into_store();
+        store.with_wal(graphus_wal::WalManager::flush);
+    }
+
+    let mut recovered = recover_steal(&mut store);
+    // The loser's heap blocks were rolled back: no live heap blocks remain.
+    assert_eq!(
+        recovered.heap_block_usage().expect("usage"),
+        0,
+        "the uncommitted overflow chain must be rolled back (no leaked blocks)"
+    );
+    let (rows, _store) = run_commit("MATCH (n) RETURN n.n AS v", recovered, 100);
+    assert_eq!(
+        col(&rows, "v"),
+        vec![i(1)],
+        "only the committed node survives"
+    );
+}
+
+// =================================================================================================
+// Remaining #39 deferrals still signal an error, never a wrong answer
+// =================================================================================================
+
+#[test]
+fn map_property_value_is_a_runtime_error() {
+    // A Map is outside the stored-property subtype (`05 §7.2`); it must signal, not silently drop.
+    let store = fresh_store();
+    let err = run_expect_error("CREATE (n {m: {a: 1}})", store, 1);
     let msg = err.to_string();
     assert!(
-        msg.contains("strings") || msg.contains("overflow") || msg.contains("#39"),
-        "string property must signal the deferred-overflow error, got: {msg}"
+        msg.contains("Map") || msg.contains("overflow heap") || msg.contains("subtype"),
+        "a Map property must signal a runtime error, got: {msg}"
     );
 }
 
 #[test]
-fn list_property_value_is_a_deferred_error() {
+fn heterogeneous_list_property_value_is_a_runtime_error() {
+    // A persisted list must be homogeneous (`05 §7.2`); a mixed list signals an error.
     let store = fresh_store();
-    let err = run_expect_error("CREATE (n {tags: [1, 2, 3]})", store, 1);
+    let err = run_expect_error("CREATE (n {xs: [1, 'two']})", store, 1);
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("#39") || err.to_string().contains("overflow"),
-        "list property must signal a deferred error, got: {err}"
+        msg.contains("homogeneous") || msg.contains("element"),
+        "a heterogeneous list must signal a runtime error, got: {msg}"
     );
 }
 
 #[test]
-fn set_property_to_null_removal_is_a_deferred_error() {
+fn relationship_property_is_still_deferred() {
+    // Relationship-property storage remains #39; a write captures the deferral.
     let store = fresh_store();
-    let (_r, store) = run_commit("CREATE ({n: 1})", store, 1);
-    let err = run_expect_error("MATCH (x) SET x.n = null", store, 2);
+    let (_r, store) = run_commit("CREATE (a), (b)", store, 1);
+    let err = run_expect_error("MATCH (a), (b) CREATE (a)-[:R {w: 1}]->(b)", store, 2);
     assert!(
-        err.to_string().contains("#39"),
-        "property removal must signal a deferred error, got: {err}"
+        err.to_string().contains("#39") || err.to_string().contains("relationship"),
+        "relationship property must signal the deferred error, got: {err}"
     );
 }

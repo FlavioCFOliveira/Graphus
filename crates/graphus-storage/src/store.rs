@@ -32,6 +32,7 @@ use graphus_core::{ElementId, PageId, TxnId};
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_wal::{LogSink, WalManager};
 
+use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
 use crate::meta::{Meta, StoreMeta};
@@ -41,6 +42,7 @@ use crate::record::{
     NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenStore};
+use crate::valenc;
 use crate::wal_rule::SharedWal;
 
 /// The device page reserved for the durable catalog ([`crate::meta`]).
@@ -55,7 +57,11 @@ const PAGE_TYPE_RECORD: u8 = 1;
 /// Page-type byte for the metadata page.
 const PAGE_TYPE_META: u8 = 5;
 
-/// Which of the three fixed-record stores a record id belongs to (`04 §2.1`).
+/// The number of fixed-record stores backed by the catalog (`nodes`, `rels`, `props`, and the
+/// `strings.store` overflow heap, `04 §2.1`). Indexed by [`StoreKind`] `as usize`.
+pub const STORE_COUNT: usize = 4;
+
+/// Which of the fixed-record stores a record id belongs to (`04 §2.1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreKind {
     /// The node store (`nodes.store`).
@@ -64,6 +70,9 @@ pub enum StoreKind {
     Rel = 1,
     /// The property store (`props.store`).
     Prop = 2,
+    /// The `strings.store` variable-length overflow heap (`04 §2.1`, `rmp` task #43): its
+    /// fixed-size "records" are the [`HeapBlock`]s of a value's block chain.
+    Strings = 3,
 }
 
 impl StoreKind {
@@ -74,6 +83,7 @@ impl StoreKind {
             StoreKind::Node => NODE_RECORD_SIZE,
             StoreKind::Rel => REL_RECORD_SIZE,
             StoreKind::Prop => PROP_RECORD_SIZE,
+            StoreKind::Strings => crate::heap::STRINGS_RECORD_SIZE,
         }
     }
 }
@@ -116,7 +126,7 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     wal: SharedWal<S>,
     element_ids: ElementIdAllocator,
     tokens: TokenStore,
-    stores: [FixedStore; 3],
+    stores: [FixedStore; STORE_COUNT],
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
@@ -151,6 +161,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 FixedStore::from_meta(StoreKind::Node, &StoreMeta::default()),
                 FixedStore::from_meta(StoreKind::Rel, &StoreMeta::default()),
                 FixedStore::from_meta(StoreKind::Prop, &StoreMeta::default()),
+                FixedStore::from_meta(StoreKind::Strings, &StoreMeta::default()),
             ],
         };
         store.init_meta_page()?;
@@ -172,6 +183,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0]),
             FixedStore::from_meta(StoreKind::Rel, &meta.stores[1]),
             FixedStore::from_meta(StoreKind::Prop, &meta.stores[2]),
+            FixedStore::from_meta(StoreKind::Strings, &meta.stores[3]),
         ];
         Ok(Self {
             pool,
@@ -204,6 +216,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.stores[0].to_meta(),
                 self.stores[1].to_meta(),
                 self.stores[2].to_meta(),
+                self.stores[3].to_meta(),
             ],
             tokens: self.tokens.clone(),
         }
@@ -370,6 +383,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(rec)
     }
 
+    fn read_block(&mut self, id: u64) -> Result<HeapBlock> {
+        let (rel_page, off) = paging::record_location(id, STRINGS_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Strings, rel_page)?;
+        let f = self.pool.fetch(dev)?;
+        let rec = HeapBlock::decode(&self.pool.page(f)[off..off + STRINGS_RECORD_SIZE]);
+        self.pool.unpin(f);
+        Ok(rec)
+    }
+
+    fn write_block(&mut self, id: u64, rec: &HeapBlock, txn: TxnId) -> Result<()> {
+        let mut buf = [0u8; STRINGS_RECORD_SIZE];
+        rec.encode(&mut buf);
+        self.write_record(StoreKind::Strings, id, &buf, txn)
+    }
+
     fn write_node(&mut self, id: u64, rec: &NodeRecord, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; NODE_RECORD_SIZE];
         rec.encode(&mut buf);
@@ -426,10 +454,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Panics
     /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
     pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
-        let device_pages: [Vec<PageId>; 3] = [
+        let device_pages: [Vec<PageId>; STORE_COUNT] = [
             self.stores[0].device_pages.clone(),
             self.stores[1].device_pages.clone(),
             self.stores[2].device_pages.clone(),
+            self.stores[3].device_pages.clone(),
         ];
         let mut target = pool_target::PoolTarget::new(&mut self.pool);
         self.wal.with(|w| w.rollback(txn, &mut target))?;
@@ -893,6 +922,337 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(out)
     }
 
+    // --------------------- strings.store overflow heap ----------------------
+    //
+    // The `strings.store` variable-length value heap (`04 §2.1`, `04 §2.3`; `rmp` task #43). A byte
+    // payload is stored as a chain of fixed-size [`HeapBlock`]s (one block per `BLOCK_PAYLOAD`-byte
+    // chunk, see [`crate::heap`]); the chain is addressed by the physical id of its **head** block —
+    // the id a property record holds in `value_inline` with the `type_tag` overflow bit set. Blocks
+    // are allocated/freed through the same WAL-logged page-patch path and per-store free list as
+    // every other record, so a chain is durable on commit and recovered (redo/undo) by the same
+    // three-phase ARIES machinery (`04 §4`); freeing a chain returns its blocks to the free list so
+    // a later allocation reuses them (no leak).
+
+    /// Allocates a block chain holding `payload` and returns the physical id of its **head** block
+    /// (`rmp` task #43). The chain always has at least one block (an empty payload allocates one
+    /// empty block), so the returned head id is a valid, non-null pointer (`04 §2.2`).
+    ///
+    /// Blocks are linked tail-to-head: each block's `next_block` points at the block holding the
+    /// following chunk. Freed block ids are reused before the store is extended (`04 §2.7`).
+    ///
+    /// # Errors
+    /// Returns a storage error if a block write fails.
+    pub fn alloc_chain(&mut self, txn: TxnId, payload: &[u8]) -> Result<u64> {
+        let n_blocks = heap::blocks_needed(payload.len());
+        // Build the chain from the tail back to the head so each block knows its successor's id.
+        let mut next = NULL_ID;
+        let mut head = NULL_ID;
+        for chunk in payload_chunks(payload).into_iter().rev() {
+            let id = self.alloc_id(StoreKind::Strings);
+            let block = HeapBlock::new(txn.0, chunk, next);
+            self.write_block(id, &block, txn)?;
+            next = id;
+            head = id;
+        }
+        debug_assert_ne!(head, NULL_ID, "a chain always has >= 1 block");
+        debug_assert!(n_blocks >= 1);
+        Ok(head)
+    }
+
+    /// Reads back the byte payload of the chain whose head block is `head`, concatenating each
+    /// block's used bytes head-to-tail (`rmp` task #43).
+    ///
+    /// # Errors
+    /// Returns a storage error if a block page is missing, a block id is out of range, or the chain
+    /// does not terminate within a cycle guard (a corrupted chain is *reported*, never looped on —
+    /// mirrors the property/adjacency chain guards).
+    pub fn read_chain(&mut self, head: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut cur = head;
+        let guard = self.store(StoreKind::Strings).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "overflow chain at head {head} is malformed (cycle?)"
+                )));
+            }
+            let block = self.read_block(cur)?;
+            if !block.mvcc.in_use() {
+                return Err(GraphusError::Storage(format!(
+                    "overflow chain at head {head} references freed block {cur}"
+                )));
+            }
+            out.extend_from_slice(block.bytes());
+            cur = block.next_block;
+        }
+        Ok(out)
+    }
+
+    /// Frees every block of the chain whose head is `head`, clearing each block's `in_use` bit (a
+    /// WAL-logged write) and returning its id to the free list so it is reused (`04 §2.7`; no leak).
+    ///
+    /// # Errors
+    /// Returns a storage error if a block read/write fails or the chain does not terminate within a
+    /// cycle guard.
+    pub fn free_chain(&mut self, txn: TxnId, head: u64) -> Result<()> {
+        let mut cur = head;
+        let guard = self.store(StoreKind::Strings).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "overflow chain at head {head} is malformed (cycle?)"
+                )));
+            }
+            let mut block = self.read_block(cur)?;
+            let next = block.next_block;
+            if block.mvcc.in_use() {
+                block.mvcc = MvccHeader::default(); // clears in_use
+                self.write_block(cur, &block, txn)?;
+                self.store_mut(StoreKind::Strings).free.push(cur);
+            }
+            cur = next;
+        }
+        Ok(())
+    }
+
+    /// The number of currently-allocated (in-use, not freed) heap blocks — i.e. the heap's live
+    /// block usage. A test asserts an overwrite/removal frees the old chain by checking this does
+    /// **not** grow across an overwrite (no block leak, `rmp` task #43).
+    ///
+    /// # Errors
+    /// Returns a storage error if a heap page cannot be read.
+    pub fn heap_block_usage(&mut self) -> Result<u64> {
+        let high_water = self.store(StoreKind::Strings).alloc.high_water();
+        let freed: std::collections::BTreeSet<u64> = self
+            .store(StoreKind::Strings)
+            .free
+            .ids()
+            .iter()
+            .copied()
+            .collect();
+        let mut live = 0u64;
+        for id in 1..high_water {
+            if !freed.contains(&id) && self.read_block(id)?.mvcc.in_use() {
+                live += 1;
+            }
+        }
+        Ok(live)
+    }
+
+    // -------------------- value-level node property API ---------------------
+    //
+    // The value-level layer (`rmp` task #43) sits above the low-level inline `add_node_property`:
+    // it takes a typed [`Value`], stores inline scalars exactly as #38 did, and overflows String /
+    // List values to the `strings.store` heap, stamping the `type_tag` overflow bit and the head
+    // block id into the property record's `value_inline`. Reading reverses the choice.
+
+    /// Sets node `node_id`'s property `key` to `value` under `txn`, **replacing** any current value
+    /// of that key: it first removes every existing property record for `key` (freeing each one's
+    /// overflow chain so nothing leaks, `rmp` task #43), then writes the new value. Inline scalars
+    /// (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List` values are serialized to the
+    /// `strings.store` overflow heap and the property holds the head block id with the `type_tag`
+    /// overflow bit set (`04 §2.3`). Returns the new property's physical id.
+    ///
+    /// Replacing (rather than merely prepending a shadowing record) keeps the chain compact and is
+    /// what guarantees an overwrite frees the old chain — the no-leak invariant the regression tests
+    /// assert via [`heap_block_usage`](Self::heap_block_usage).
+    ///
+    /// # Errors
+    /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
+    /// - [`GraphusError::Runtime`] (from the value codecs) if `value` is `Null` (not persisted) or a
+    ///   class this build cannot store (e.g. `Map`, a heterogeneous `List`).
+    pub fn set_node_property_value(
+        &mut self,
+        txn: TxnId,
+        node_id: u64,
+        key: u32,
+        value: &graphus_core::Value,
+    ) -> Result<u64> {
+        // Encode first so a non-persistable value errors before any mutation (no partial write).
+        let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
+        self.remove_node_property_value(txn, node_id, key)?;
+        self.add_node_property(txn, node_id, key, type_tag, value_inline)
+    }
+
+    /// Removes node `node_id`'s property `key` under `txn`: unlinks **every** live property record
+    /// for `key` from the node's chain, freeing each record's physical id and any overflow heap
+    /// chain it owns (`rmp` task #43; no leak). Returns whether anything was removed (so a caller can
+    /// distinguish a real removal from a no-op, e.g. for `REMOVE n.p`).
+    ///
+    /// # Errors
+    /// Returns a storage error if the node is not in use or a write fails.
+    pub fn remove_node_property_value(
+        &mut self,
+        txn: TxnId,
+        node_id: u64,
+        key: u32,
+    ) -> Result<bool> {
+        let mut node = self.read_node(node_id)?;
+        if !node.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("node {node_id} not in use")));
+        }
+        // Walk the singly-linked chain, rebuilding it without any record whose key matches; free
+        // each removed record (and its overflow chain). The chain is short (per-entity), so the
+        // O(chain) rewrite is cheap and keeps the structure compact.
+        let mut removed_any = false;
+        let mut prev: u64 = NULL_ID; // last *kept* property record (NULL => list head is `node`)
+        let mut cur = node.first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of node {node_id} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            let next = prop.next_prop;
+            if prop.mvcc.in_use() && prop.key == key {
+                // Remove this record: free its overflow chain, splice it out, free its id.
+                self.free_property_overflow(txn, &prop)?;
+                let mut dead = prop;
+                dead.mvcc = MvccHeader::default(); // clears in_use
+                dead.next_prop = NULL_ID;
+                self.write_prop(cur, &dead, txn)?;
+                self.store_mut(StoreKind::Prop).free.push(cur);
+                if prev == NULL_ID {
+                    node.first_prop = next;
+                    self.write_node(node_id, &node, txn)?;
+                } else {
+                    let mut p = self.read_prop(prev)?;
+                    p.next_prop = next;
+                    self.write_prop(prev, &p, txn)?;
+                }
+                removed_any = true;
+            } else if prop.mvcc.in_use() {
+                prev = cur;
+            }
+            cur = next;
+        }
+        Ok(removed_any)
+    }
+
+    /// Encodes `value` into the `(type_tag, value_inline)` pair to store in a property record,
+    /// allocating an overflow chain for `String`/`List` values.
+    fn encode_property_value(
+        &mut self,
+        txn: TxnId,
+        value: &graphus_core::Value,
+    ) -> Result<(u8, u64)> {
+        // Inline scalars (Integer/Float/Boolean) keep the #38 inline path verbatim.
+        match crate::propenc::encode_inline(value) {
+            Ok(pair) => return Ok(pair),
+            Err(crate::propenc::PropEncodeError::Null) => {
+                return Err(GraphusError::from(crate::propenc::PropEncodeError::Null));
+            }
+            // Not inline: fall through to the overflow heap (String / List); a class neither the
+            // inline codec nor the overflow codec accepts is surfaced by `valenc::encode` below.
+            Err(crate::propenc::PropEncodeError::NonInline { .. }) => {}
+        }
+        let (class_tag, bytes) = valenc::encode(value).map_err(GraphusError::from)?;
+        let head = self.alloc_chain(txn, &bytes)?;
+        Ok((class_tag | valenc::OVERFLOW_BIT, head))
+    }
+
+    /// Decodes a property record's `(type_tag, value_inline)` into a [`Value`](graphus_core::Value),
+    /// reading the overflow heap chain when the `type_tag`'s overflow bit is set (`04 §2.3`,
+    /// `rmp` task #43).
+    ///
+    /// # Errors
+    /// Returns a storage error if the chain is unreadable/corrupt or the tag is one this build does
+    /// not understand.
+    pub fn decode_property_value(
+        &mut self,
+        type_tag: u8,
+        value_inline: u64,
+    ) -> Result<graphus_core::Value> {
+        if type_tag & valenc::OVERFLOW_BIT == 0 {
+            return crate::propenc::decode_inline(type_tag, value_inline)
+                .map_err(GraphusError::from);
+        }
+        let class_tag = type_tag & !valenc::OVERFLOW_BIT;
+        let bytes = self.read_chain(value_inline)?;
+        valenc::decode(class_tag, &bytes).map_err(GraphusError::from)
+    }
+
+    /// Collects node `node_id`'s live properties as `(physical_id, key_token, Value)`, decoding both
+    /// inline scalars and overflow `String`/`List` values (`rmp` task #43). The chain is walked
+    /// head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered).
+    ///
+    /// # Errors
+    /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
+    pub fn node_property_values(
+        &mut self,
+        node_id: u64,
+    ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
+        let chain = self.node_properties(node_id)?;
+        let mut out = Vec::with_capacity(chain.len());
+        for (pid, prop) in chain {
+            let value = self.decode_property_value(prop.type_tag, prop.value_inline)?;
+            out.push((pid, prop.key, value));
+        }
+        Ok(out)
+    }
+
+    /// Clears **all** of node `node_id`'s properties under `txn`, freeing each property record's id
+    /// and any overflow heap chain it owns (`rmp` task #43; no leak). Used by `SET n = map`, which
+    /// replaces the whole property set. Returns the number of property records removed.
+    ///
+    /// # Errors
+    /// Returns a storage error if the node is not in use or a write fails.
+    pub fn clear_node_properties(&mut self, txn: TxnId, node_id: u64) -> Result<usize> {
+        let mut node = self.read_node(node_id)?;
+        if !node.mvcc.in_use() {
+            return Err(GraphusError::Storage(format!("node {node_id} not in use")));
+        }
+        let mut removed = 0usize;
+        let mut cur = node.first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of node {node_id} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            let next = prop.next_prop;
+            if prop.mvcc.in_use() {
+                self.free_property_overflow(txn, &prop)?;
+                let mut dead = prop;
+                dead.mvcc = MvccHeader::default();
+                dead.next_prop = NULL_ID;
+                self.write_prop(cur, &dead, txn)?;
+                self.store_mut(StoreKind::Prop).free.push(cur);
+                removed += 1;
+            }
+            cur = next;
+        }
+        node.first_prop = NULL_ID;
+        self.write_node(node_id, &node, txn)?;
+        Ok(removed)
+    }
+
+    /// Frees the overflow heap chain a property record owns, if any: a no-op for an inline scalar;
+    /// for an overflowed `String`/`List` it frees the chain whose head is `value_inline`
+    /// (`rmp` task #43). Used when a property value is overwritten or removed so its old bytes are
+    /// not leaked.
+    ///
+    /// # Errors
+    /// Returns a storage error if freeing the chain fails.
+    pub fn free_property_overflow(&mut self, txn: TxnId, prop: &PropRecord) -> Result<()> {
+        if prop.type_tag & valenc::OVERFLOW_BIT != 0 && prop.value_inline != NULL_ID {
+            self.free_chain(txn, prop.value_inline)?;
+        }
+        Ok(())
+    }
+
     // ------------------------------ adjacency -------------------------------
 
     /// Enumerates the physical ids of the relationships incident to `node_id`, walking its
@@ -1024,6 +1384,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub(crate) fn checker_label_token_count(&self) -> usize {
         self.tokens.len(Namespace::Label)
     }
+
+    /// Reads the `strings.store` overflow-heap block at physical id `id` (`rmp` task #43). Used by
+    /// the consistency checker to scan and validate overflow chains.
+    pub(crate) fn checker_block(&mut self, id: u64) -> Result<HeapBlock> {
+        self.read_block(id)
+    }
 }
 
 /// Which neighbour pointer is being repaired during an unlink.
@@ -1031,6 +1397,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 enum NeighbourPtr {
     Prev,
     Next,
+}
+
+/// Splits `payload` into [`BLOCK_PAYLOAD`]-sized chunks for the overflow heap (`rmp` task #43). An
+/// **empty** payload yields a single empty chunk, so a chain always has at least one block and its
+/// head id is a valid, non-null pointer (`04 §2.2`).
+fn payload_chunks(payload: &[u8]) -> Vec<&[u8]> {
+    if payload.is_empty() {
+        vec![&[]]
+    } else {
+        payload.chunks(BLOCK_PAYLOAD).collect()
+    }
 }
 
 /// A buffer-pool-backed [`ApplyTarget`](graphus_wal::ApplyTarget) used for **live rollback** only
