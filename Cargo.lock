@@ -108,6 +108,7 @@ dependencies = [
  "graphus-io",
  "graphus-sim",
  "graphus-storage",
+ "graphus-txn",
  "graphus-wal",
 ]
 

@@ -12,11 +12,14 @@
 //! This is the **achievable subset** of the storage integration: nodes/relationships/properties
 //! (#38), **node labels** (#42, the bit-packed small-label-set case of `05 §9`), the
 //! **`strings.store` String/List property overflow heap + node-property removal** (#43), and
-//! **relationship properties** (#44, this task — over [`RelRecord.first_prop`], the relationship
-//! analogue of the node-property path, sharing the same `props.store` chain + `strings.store`
-//! overflow heap). The remaining wiring (index-accelerated label/property scans, the label
-//! token-list overflow block, and MVCC concurrency / SSI visibility) is the follow-up **#39**. Every
-//! deferral is signalled by a **clear error**, never a silently wrong answer:
+//! **relationship properties** (#44, over [`RelRecord.first_prop`], the relationship analogue of
+//! the node-property path, sharing the same `props.store` chain + `strings.store` overflow heap),
+//! and **MVCC snapshot visibility** (#45 — every read is filtered through `graphus_txn::is_visible`
+//! against each record's frozen `xmin`/`xmax`, so a query reads a consistent point-in-time graph;
+//! see [`begin_at_snapshot`](RecordStoreGraph::begin_at_snapshot)). The remaining wiring
+//! (index-accelerated label/property scans #48, the label token-list overflow block, SSI
+//! conflict detection #46, and per-value property MVCC) is the follow-up under EPIC **#16/#39**.
+//! Every deferral is signalled by a **clear error**, never a silently wrong answer:
 //!
 //! | Capability | status | How a deferral is signalled |
 //! |------------|--------|-----------------------------|
@@ -26,8 +29,9 @@
 //! | **Node property removal / overwrite** (`SET n.p = null`, `REMOVE n.p`, `SET n = map`) | **supported** (#43) — removes the record and frees any overflow chain (no leak) | — |
 //! | Node **labels** (`CREATE (:L)`, `SET`/`REMOVE` label, `n:L` predicates, `labels(n)`, label scan) | **supported** (#42) via the inline label bitmap, `05 §9` | a label needing token id `≥ 63` (a 64th+ distinct label) captures the documented overflow error (the token-list block is #39) |
 //! | **Relationship properties** — read (`r.k`, `properties(r)`), create (`CREATE ()-[:T {..}]->()`), `SET`/`REMOVE`, inline **and** `String`/`List` overflow | **supported** (#44) over [`RelRecord.first_prop`] (`04 §2.3`/§2.1, `05 §9`); `delete_rel` frees the chain (no leak) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures the same runtime error as a node property |
-//! | **Index-accelerated** label / property scans | **deferred (#39)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
-//! | MVCC concurrency / SSI | **deferred (#39)** | one query runs in a single transaction against the latest committed state |
+//! | **Index-accelerated** label / property scans | **deferred (#48)** | a label scan is correct but does a full scan + `node_has_label` filter (no label index); the [`GraphAccess`] default `index_seek_*` returns `None`, so the executor falls back to scan+filter |
+//! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
+//! | SSI conflict detection (write-skew abort) / per-value property MVCC | **deferred (#46)** | the single-transaction execution scope does not yet run concurrent transactions through SSI validation, and a property overwrite is still in-place (the owning entity's visibility gates the read) |
 //!
 //! [`RelRecord.first_prop`]: graphus_storage::record::RelRecord
 //!
@@ -54,8 +58,8 @@
 //! return `Result`. [`RecordStoreGraph`] bridges both:
 //!
 //! * a [`RefCell`] gives the `&self` trait methods the `&mut` access the store needs (the type is
-//!   single-threaded — `!Sync` — which matches the #38 single-transaction scope; concurrency is
-//!   #39);
+//!   single-threaded — `!Sync` — which matches the single-transaction execution scope; concurrent
+//!   transactions through SSI validation are the follow-up #46);
 //! * a captured-error cell records the **first** storage / deferred-feature error a read or write
 //!   hits. The trait method then degrades safely (a read returns `None`/empty, a write is a no-op),
 //!   and the caller **must** inspect [`take_error`](RecordStoreGraph::take_error) after running the
@@ -65,9 +69,10 @@
 use std::cell::RefCell;
 
 use graphus_core::error::GraphusError;
-use graphus_core::{TxnId, Value};
+use graphus_core::{Timestamp, TxnId, Value};
 use graphus_io::BlockDevice;
-use graphus_storage::{Namespace, RecordStore};
+use graphus_storage::{MvccHeader, Namespace, RecordStore};
+use graphus_txn::{CommitRegistry, Snapshot, is_visible};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
@@ -85,6 +90,15 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     store: RefCell<RecordStore<D, S>>,
     /// The single transaction this query runs in.
     txn: TxnId,
+    /// This query's MVCC read snapshot (`04 §5.3`, `rmp` task #45): every read is filtered through
+    /// [`is_visible`] against each record's frozen `xmin`/`xmax`, so the query sees a consistent
+    /// point-in-time graph — only versions committed at or before its begin timestamp, plus its own
+    /// in-flight writes, and not versions another transaction committed later or deleted.
+    snapshot: Snapshot,
+    /// Resolves any still-in-flight writer to its commit outcome (`04 §5.3`). Eager commit-time
+    /// settling makes committed records self-describing, so for the single-transaction execution
+    /// scope this stays empty; concurrent execution populates it (the SSI follow-up, #46).
+    registry: CommitRegistry,
     /// The first storage / deferred-feature error encountered by a read or write, if any. While set,
     /// results are untrustworthy and the transaction should be rolled back (see module docs).
     error: RefCell<Option<GraphusError>>,
@@ -98,12 +112,49 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// [`commit`](Self::commit) (to make the writes durable) or [`rollback`](Self::rollback) (to
     /// undo them), and should first check [`take_error`](Self::take_error).
     pub fn begin(mut store: RecordStore<D, S>, txn: TxnId) -> Self {
+        // The snapshot timestamp is the store's latest commit (`04 §5.2`): this query sees exactly
+        // what has committed so far, plus its own writes. Reads on a database that has changed since
+        // this begin therefore stay on this consistent snapshot.
+        store.begin(txn);
+        let snapshot = Snapshot {
+            owner: txn,
+            ts: store.snapshot_ts(),
+        };
+        Self {
+            store: RefCell::new(store),
+            txn,
+            snapshot,
+            registry: CommitRegistry::new(),
+            error: RefCell::new(None),
+        }
+    }
+
+    /// Like [`begin`](Self::begin) but with an explicit snapshot timestamp `ts` instead of the
+    /// store's latest commit. This is how a reader that *began earlier* (before some later commit)
+    /// is modelled over the single-threaded store: choosing `ts` below a record's commit timestamp
+    /// makes that record invisible, exactly as a concurrent older reader would experience it
+    /// (`04 §5.3`). Primarily an MVCC-visibility testing seam.
+    pub fn begin_at_snapshot(mut store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
         Self {
             store: RefCell::new(store),
             txn,
+            snapshot: Snapshot { owner: txn, ts },
+            registry: CommitRegistry::new(),
             error: RefCell::new(None),
         }
+    }
+
+    /// Whether the version carrying `mvcc` is visible to this query's snapshot (`04 §5.3`): its
+    /// creator committed at or before the snapshot (or is this transaction's own write) and its
+    /// expirer does not hide it. The one place the executor's reads consult MVCC.
+    fn visible(&self, mvcc: MvccHeader) -> bool {
+        is_visible(
+            self.snapshot,
+            mvcc.created_ts,
+            mvcc.expired_ts,
+            &self.registry,
+        )
     }
 
     /// The transaction id this query runs in.
@@ -315,13 +366,30 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     // ---- reads --------------------------------------------------------------------------------
 
     fn scan_nodes(&self) -> Vec<NodeId> {
-        match self.store.borrow_mut().scan_node_ids() {
-            Ok(ids) => ids.into_iter().map(NodeId).collect(),
+        // `scan_node_ids` returns every slot-occupied node (live versions *and* tombstones not yet
+        // GC'd); keep only those visible to this snapshot (`04 §5.3`, `rmp` task #45).
+        let mut store = self.store.borrow_mut();
+        let ids = match store.scan_node_ids() {
+            Ok(ids) => ids,
             Err(e) => {
+                drop(store);
                 self.capture(e);
-                Vec::new()
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            match store.node(id) {
+                Ok(rec) if self.visible(rec.mvcc) => out.push(NodeId(id)),
+                Ok(_) => {}
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
             }
         }
+        out
     }
 
     fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
@@ -343,6 +411,17 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         };
         let mut out = Vec::new();
         for id in ids {
+            // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
+            // testing the label, so a label scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
+            match store.node(id) {
+                Ok(rec) if !self.visible(rec.mvcc) => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            }
             match store.node_has_label(id, token_id) {
                 Ok(true) => out.push(NodeId(id)),
                 Ok(false) => {}
@@ -378,6 +457,12 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
                     return Vec::new();
                 }
             };
+            // Skip relationships not visible to this snapshot — a concurrently-deleted (tombstoned)
+            // edge an older reader could still traverse, or an edge a later transaction committed
+            // (`04 §5.3`, `rmp` task #45). The incidence chain still threads them until GC.
+            if !self.visible(rec.mvcc) {
+                continue;
+            }
             // Filter by relationship type name (empty = any type).
             if !types.is_empty() {
                 let type_ok = store
@@ -413,19 +498,23 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn node_exists(&self, node: NodeId) -> bool {
-        match self.store.borrow_mut().node(node.0) {
-            Ok(rec) => rec.mvcc.in_use(),
+        // "Exists" means "visible to this query's snapshot" (`04 §5.3`): a node created after this
+        // snapshot, deleted before it, or never allocated, does not exist *for us*.
+        let mvcc = match self.store.borrow_mut().node(node.0) {
+            Ok(rec) => rec.mvcc,
             // A missing page means the id was never allocated — i.e. the node does not exist. That
             // is a normal answer, not a captured storage fault.
-            Err(_) => false,
-        }
+            Err(_) => return false,
+        };
+        self.visible(mvcc)
     }
 
     fn rel_exists(&self, rel: RelId) -> bool {
-        match self.store.borrow_mut().rel(rel.0) {
-            Ok(rec) => rec.mvcc.in_use(),
-            Err(_) => false,
-        }
+        let mvcc = match self.store.borrow_mut().rel(rel.0) {
+            Ok(rec) => rec.mvcc,
+            Err(_) => return false,
+        };
+        self.visible(mvcc)
     }
 
     fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
@@ -461,7 +550,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
         let mut store = self.store.borrow_mut();
         let rec = match store.rel(rel.0) {
-            Ok(rec) if rec.mvcc.in_use() => rec,
+            Ok(rec) if self.visible(rec.mvcc) => rec,
             Ok(_) => return None,
             Err(_) => return None,
         };
@@ -751,11 +840,15 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn delete_rel(&mut self, rel: RelId) {
-        // Idempotent: a relationship that is already gone (or was never created) is a no-op, not an
-        // error — matching the `MemGraph` contract. The store's `delete_rel` frees the relationship's
-        // property chain (records + any overflow chains) so no property leaks (`rmp` task #44).
-        let in_use = matches!(self.store.borrow_mut().rel(rel.0), Ok(r) if r.mvcc.in_use());
-        if !in_use {
+        // Idempotent: a relationship not visible to this query (already gone, deleted by us earlier,
+        // or never created) is a no-op, not an error — matching the `MemGraph` contract. Visibility
+        // (not raw `in_use`) is the right guard now that delete is an MVCC tombstone (the slot stays
+        // in use): a second delete in the same transaction sees its own tombstone and does nothing.
+        let mvcc = match self.store.borrow_mut().rel(rel.0) {
+            Ok(r) => r.mvcc,
+            Err(_) => return,
+        };
+        if !self.visible(mvcc) {
             return;
         }
         if let Err(e) = self.store.borrow_mut().delete_rel(self.txn, rel.0) {
@@ -764,8 +857,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn delete_node(&mut self, node: NodeId) {
-        let in_use = matches!(self.store.borrow_mut().node(node.0), Ok(n) if n.mvcc.in_use());
-        if !in_use {
+        let mvcc = match self.store.borrow_mut().node(node.0) {
+            Ok(n) => n.mvcc,
+            Err(_) => return,
+        };
+        if !self.visible(mvcc) {
             return;
         }
         if let Err(e) = self.store.borrow_mut().delete_node(self.txn, node.0) {

@@ -157,7 +157,13 @@ fn run_history(seed: u64, steps: usize) {
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
     let mut store: Store = RecordStore::create(device, wal, 32, 1).expect("create store");
 
-    let txn = TxnId(1);
+    // Deletes are MVCC tombstones (`rmp` task #45): a deleted relationship stays threaded into the
+    // incidence chain until a committed GC pass reclaims it, whereas the reference model drops a
+    // deleted edge immediately. So each checkpoint commits the current batch, runs a GC pass
+    // (watermark = the latest commit — safe because this single-threaded history has no older live
+    // reader), and only then checks: the physical chains then reflect the logical model exactly.
+    let mut txn_ctr = 1u64;
+    let mut txn = TxnId(txn_ctr);
     store.begin(txn);
     let rt = store.intern_token(Namespace::RelType, "E").unwrap();
 
@@ -183,7 +189,7 @@ fn run_history(seed: u64, steps: usize) {
             rel_ids.push(rid);
             alive_rels.insert(rid);
         } else if !alive_rels.is_empty() {
-            // delete a live edge
+            // delete a live edge (MVCC tombstone; reclaimed at the next checkpoint's GC pass)
             let live: Vec<u64> = alive_rels.iter().copied().collect();
             let rid = live[(rng.next_u64() as usize) % live.len()];
             store.delete_rel(txn, rid).unwrap();
@@ -192,12 +198,24 @@ fn run_history(seed: u64, steps: usize) {
         }
 
         // Check invariants periodically (every op is correct but checking every op is O(n^2);
-        // check every few steps and always at the end).
+        // check every few steps and always at the end). Commit the batch and GC its tombstones
+        // first so the store's physical chains match the model before we compare.
         if step % 7 == 0 || step + 1 == steps {
+            store.commit(txn).unwrap();
+            txn_ctr += 1;
+            let gc_txn = TxnId(txn_ctr);
+            let watermark = store.snapshot_ts();
+            store.begin(gc_txn);
+            store.gc(gc_txn, watermark).unwrap();
+            store.commit(gc_txn).unwrap();
             check(&mut store, &model, seed, step);
+            txn_ctr += 1;
+            txn = TxnId(txn_ctr);
+            store.begin(txn);
         }
     }
 
+    // The final loop iteration already committed, GC'd and checked; `txn` is a fresh empty txn.
     store.commit(txn).unwrap();
     // A final full check after commit, and after a flush (pages written home).
     check(&mut store, &model, seed, steps);

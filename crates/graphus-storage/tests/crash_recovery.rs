@@ -86,6 +86,19 @@ fn recover_steal(store: &mut Store) -> Store {
     RecordStore::open(device, wal, 64).expect("open store")
 }
 
+/// Runs one committed garbage-collection pass over `s`: reclaims every tombstone whose `xmax`
+/// committed at or before the current snapshot (`04 §5.5`). Under MVCC `delete_node`/`delete_rel`
+/// only stamp a tombstone, so a physical id returns to the free list only here — and the
+/// reclamation writes are WAL-logged, so committing this pass is what makes the freed-id state
+/// durable and crash-recoverable. The snapshot timestamp is the correct watermark in these tests:
+/// no older live reader exists, so every committed tombstone is reclaimable.
+fn gc_pass(s: &mut Store, txn: TxnId) {
+    let watermark = s.snapshot_ts();
+    s.begin(txn);
+    s.gc(txn, watermark).unwrap();
+    s.commit(txn).unwrap();
+}
+
 #[test]
 fn committed_nodes_and_edges_survive_a_no_force_crash() {
     let mut s = fresh(64);
@@ -289,15 +302,19 @@ fn free_list_recovers_so_ids_keep_reusing() {
     s.commit(t1).unwrap();
     let t2 = TxnId(2);
     s.begin(t2);
-    s.delete_node(t2, b).unwrap(); // frees physical id b
+    s.delete_node(t2, b).unwrap(); // tombstones b (xmax); the physical id is NOT freed yet
     s.commit(t2).unwrap();
+    // Under MVCC the physical id returns to the free list only at GC, not at delete. Run a committed
+    // GC pass *before* the crash (the `recover_no_force` below) so the freed-id state is part of the
+    // durable WAL prefix that recovery replays — that is the state this test asserts is recovered.
+    gc_pass(&mut s, TxnId(3));
 
     let mut rec = recover_no_force(&s);
     // The freed id is still on the recovered free list and is reused first.
-    let t3 = TxnId(3);
-    rec.begin(t3);
-    let (c, _) = rec.create_node(t3).unwrap();
-    rec.commit(t3).unwrap();
+    let t4 = TxnId(4);
+    rec.begin(t4);
+    let (c, _) = rec.create_node(t4).unwrap();
+    rec.commit(t4).unwrap();
     assert_eq!(c, b, "the recovered free list reuses the freed id");
     assert!(rec.node(a).unwrap().mvcc.in_use());
 

@@ -18,6 +18,16 @@ fn fresh(cap: usize) -> RecordStore<MemBlockDevice, MemLogSink> {
     RecordStore::create(device, wal, cap, 1).expect("create store")
 }
 
+/// Runs an MVCC GC pass that physically reclaims every tombstone (delete is a tombstone now;
+/// unlink / id-reuse / chain-free happen here -- `rmp` task #45). Watermark = latest commit, safe
+/// because these single-threaded tests have no older live reader.
+fn gc_pass(s: &mut RecordStore<MemBlockDevice, MemLogSink>, txn: graphus_core::TxnId) {
+    let watermark = s.snapshot_ts();
+    s.begin(txn);
+    s.gc(txn, watermark).unwrap();
+    s.commit(txn).unwrap();
+}
+
 #[test]
 fn create_two_nodes_and_an_edge_then_traverse() {
     let mut s = fresh(64);
@@ -136,6 +146,8 @@ fn multiple_self_loops_on_one_node_traverse_and_delete() {
     s.begin(txn2);
     s.delete_rel(txn2, l1).unwrap();
     s.commit(txn2).unwrap();
+    // Physically reclaim the tombstone (unlink from the incidence chains) before asserting.
+    gc_pass(&mut s, graphus_core::TxnId(3));
     let mut inc = s.incident_rels(a).unwrap();
     inc.sort_unstable();
     let mut expect = vec![n1, l2];
@@ -158,6 +170,8 @@ fn delete_edge_unlinks_from_both_chains() {
     // Delete the middle-of-chain edge r2 (it is neither head nor tail of a's chain).
     s.delete_rel(txn, r2).unwrap();
     s.commit(txn).unwrap();
+    // Physically reclaim the r2 tombstone (unlink from both incidence chains) before asserting.
+    gc_pass(&mut s, graphus_core::TxnId(2));
 
     let mut a_inc = s.incident_rels(a).unwrap();
     let mut b_inc = s.incident_rels(b).unwrap();
@@ -182,6 +196,8 @@ fn delete_self_loop_unlinks_both_links() {
     let r_loop = s.create_rel(txn, t, a, a).unwrap().0;
     s.delete_rel(txn, r_loop).unwrap();
     s.commit(txn).unwrap();
+    // Physically reclaim the loop tombstone (unlink both self-loop links) before asserting.
+    gc_pass(&mut s, graphus_core::TxnId(2));
 
     // After deleting the loop, only the normal edge remains incident to a.
     assert_eq!(s.incident_rels(a).unwrap(), vec![r_ab_pre]);
@@ -204,6 +220,8 @@ fn delete_head_then_tail_keeps_chain_consistent() {
     s.delete_rel(txn, r3).unwrap(); // delete head
     s.delete_rel(txn, r1).unwrap(); // delete tail
     s.commit(txn).unwrap();
+    // Physically reclaim both tombstones (unlink head + tail) before asserting chain consistency.
+    gc_pass(&mut s, graphus_core::TxnId(2));
 
     assert_eq!(s.incident_rels(a).unwrap(), vec![r2]);
     assert_eq!(s.incident_rels(b).unwrap(), vec![r2]);
@@ -284,6 +302,9 @@ fn freed_physical_ids_are_reused_lifo() {
     s.delete_node(txn2, b).unwrap();
     s.delete_node(txn2, c).unwrap();
     s.commit(txn2).unwrap();
+    // Tombstones only return their physical ids to the free list during GC, so reclaim before the
+    // creates that are expected to reuse them. TxnId(4) is fresh (higher than txn3 below).
+    gc_pass(&mut s, graphus_core::TxnId(4));
 
     let txn3 = graphus_core::TxnId(3);
     s.begin(txn3);

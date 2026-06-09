@@ -54,6 +54,17 @@ fn report(store: &mut Store) -> ConsistencyReport {
     graphus_storage::check::check_store(store, &[]).expect("checker runs")
 }
 
+/// Runs an MVCC GC pass under `txn`, physically reclaiming every tombstone visible to no live
+/// snapshot (`rmp` task #45). Deletes are MVCC tombstones now — a deleted record stays in use until
+/// GC frees its id and clears it — so a test that needs the *freed / dead* end state runs this after
+/// the deleting transaction has committed (watermark = latest commit; no older live reader here).
+fn gc_pass(store: &mut Store, txn: TxnId) {
+    let watermark = store.snapshot_ts();
+    store.begin(txn);
+    store.gc(txn, watermark).expect("gc runs");
+    store.commit(txn).expect("gc commits");
+}
+
 // ============================================================================================
 // A captured, mutable on-disk image + WAL — the corruption harness.
 // ============================================================================================
@@ -766,8 +777,9 @@ fn index_agreement_dead_record_is_flagged() {
     s.commit(txn).unwrap();
     let txn2 = TxnId(2);
     s.begin(txn2);
-    s.delete_node(txn2, b).unwrap(); // b is now dead/freed
+    s.delete_node(txn2, b).unwrap(); // b is MVCC-tombstoned
     s.commit(txn2).unwrap();
+    gc_pass(&mut s, TxnId(3)); // GC reclaims b -> dead/freed, so a stale index entry is now dangling
 
     let ix = IndexAgreement {
         name: "label:Stale".to_owned(),
@@ -839,8 +851,9 @@ fn corrupt_free_list_still_in_use_is_flagged() {
     s.commit(txn).unwrap();
     let txn2 = TxnId(2);
     s.begin(txn2);
-    s.delete_node(txn2, b).unwrap(); // b -> free list, record cleared (not in use)
+    s.delete_node(txn2, b).unwrap(); // b is MVCC-tombstoned
     s.commit(txn2).unwrap();
+    gc_pass(&mut s, TxnId(3)); // GC reclaims b -> free list, record cleared (not in use)
 
     let mut img = DiskImage::capture(&mut s);
     {

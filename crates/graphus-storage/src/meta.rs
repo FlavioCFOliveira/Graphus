@@ -27,6 +27,10 @@ use crate::tokens::TokenStore;
 pub struct Meta {
     /// Next `ElementId` to allocate (never-reused monotonic counter, `04 §2.2`).
     pub element_id_next: u128,
+    /// The largest MVCC commit timestamp issued so far (`04 §5.2`). Persisted so the timestamp
+    /// oracle resumes strictly monotonically after reopen/recovery — a reader's snapshot and a new
+    /// committer's timestamp must never alias or regress past a durable committed version.
+    pub commit_ts_hw: u64,
     /// Per-store state, indexed by [`StoreKind`](crate::store::StoreKind) `as usize` (the node, rel
     /// and prop stores plus the `strings.store` overflow heap, `04 §2.1`).
     pub stores: [StoreMeta; STORE_COUNT],
@@ -51,6 +55,7 @@ impl Meta {
     pub fn new(element_id_seed: u128) -> Self {
         Self {
             element_id_next: element_id_seed,
+            commit_ts_hw: 0,
             stores: Default::default(),
             tokens: TokenStore::new(),
         }
@@ -63,6 +68,7 @@ impl Meta {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.element_id_next.to_le_bytes());
+        out.extend_from_slice(&self.commit_ts_hw.to_le_bytes());
         for s in &self.stores {
             out.extend_from_slice(&s.high_water.to_le_bytes());
             let fl = s.free_list.encode();
@@ -92,6 +98,7 @@ impl Meta {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cur = 0usize;
         let element_id_next = read_u128(bytes, &mut cur)?;
+        let commit_ts_hw = read_u64(bytes, &mut cur)?;
         let mut stores: [StoreMeta; STORE_COUNT] = Default::default();
         for s in &mut stores {
             s.high_water = read_u64(bytes, &mut cur)?;
@@ -109,6 +116,7 @@ impl Meta {
         let tokens = TokenStore::decode(&bytes[cur - tok_len..tok_end])?;
         Ok(Self {
             element_id_next,
+            commit_ts_hw,
             stores,
             tokens,
         })

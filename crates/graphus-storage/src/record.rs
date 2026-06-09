@@ -32,14 +32,25 @@ const OFF_CREATED_TS: usize = 1; // u64
 const OFF_EXPIRED_TS: usize = 9; // u64
 const OFF_UNDO_PTR: usize = 17; // u64
 
+/// Byte offset of the `created_ts` (`xmin`) word within any record's MVCC header (`05 §7`). Exposed
+/// so the store can settle just this 8-byte word at commit (freeze `xmin` to a committed timestamp)
+/// without rewriting the whole record.
+pub const MVCC_OFF_CREATED_TS: usize = OFF_CREATED_TS;
+/// Byte offset of the `expired_ts` (`xmax`) word within any record's MVCC header (`05 §7`). Exposed
+/// so the store can stamp an MVCC tombstone (`xmax`) or settle it at commit with an 8-byte patch.
+pub const MVCC_OFF_EXPIRED_TS: usize = OFF_EXPIRED_TS;
+
 /// The frozen MVCC record header shared by every node, relationship and property record
 /// (`05 §7`).
 ///
 /// `created_ts` holds the creating transaction's commit [`Timestamp`](graphus_core::Timestamp)
-/// once committed, or the writer's [`TxnId`](graphus_core::TxnId) while uncommitted; `expired_ts`
-/// is `0` while the version is live; `undo_ptr` is the physical id of the older version (`0` =
-/// none). This crate is single-version for now — it writes the header and round-trips every field
-/// so `graphus-txn` can layer MVCC on top without a format change.
+/// once committed, or the writer's [`TxnId`](graphus_core::TxnId) while uncommitted (the
+/// [`VersionStamp`](graphus_core::VersionStamp) convention); `expired_ts` is `0` while the version
+/// is live, or carries the deleting transaction's stamp once tombstoned; `undo_ptr` is the physical
+/// id of the older version (`0` = none, reserved for the per-value version chain, a follow-up). The
+/// store is **MVCC-native** (`rmp` task #45): it stamps `xmin` in-flight on create, settles it to
+/// the commit timestamp at commit, MVCC-tombstones `xmax` on delete, and reclaims tombstones by GC;
+/// `graphus-txn`'s visibility rule reads these words directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MvccHeader {
     /// Flag bits ([`FLAG_IN_USE`], [`FLAG_DENSE`], rest reserved).

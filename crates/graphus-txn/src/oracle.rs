@@ -28,79 +28,13 @@
 //! This module owns [`VersionStamp`], the typed view over that one `u64`, so every other module
 //! reads and writes the convention through one place rather than re-deriving the bit twiddling.
 
-use graphus_core::{Timestamp, TxnId};
+use graphus_core::Timestamp;
 
-/// The high bit that marks a [`VersionStamp`] word as an in-flight [`TxnId`] rather than a
-/// committed commit-[`Timestamp`] (`04 §5.2`).
-const INFLIGHT_BIT: u64 = 1 << 63;
-
-/// Mask selecting the payload (low 63 bits) of a [`VersionStamp`] word.
-const PAYLOAD_MASK: u64 = INFLIGHT_BIT - 1;
-
-/// The largest timestamp the oracle may ever issue, so a committed stamp never collides with the
-/// `INFLIGHT_BIT`. In practice unreachable, but enforced so the convention can never silently
-/// alias.
-pub const MAX_TIMESTAMP: u64 = PAYLOAD_MASK;
-
-/// A typed view over the single `u64` stored in an MVCC header's `created_ts`/`expired_ts` field.
-///
-/// It is **either** a committed commit-[`Timestamp`] **or** an in-flight [`TxnId`], discriminated
-/// by `INFLIGHT_BIT` (`04 §5.2`). The `0` word is the frozen *none/live* sentinel and decodes to
-/// [`VersionStamp::None`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VersionStamp {
-    /// The sentinel `0`: no creator recorded, or (for `expired_ts`) the version is live.
-    None,
-    /// A committed transaction's commit timestamp.
-    Committed(Timestamp),
-    /// A still-in-flight writer, identified by its [`TxnId`].
-    InFlight(TxnId),
-}
-
-impl VersionStamp {
-    /// Decodes the raw header word into a typed stamp.
-    #[must_use]
-    pub fn from_raw(word: u64) -> Self {
-        if word == 0 {
-            Self::None
-        } else if word & INFLIGHT_BIT != 0 {
-            Self::InFlight(TxnId(word & PAYLOAD_MASK))
-        } else {
-            Self::Committed(Timestamp(word))
-        }
-    }
-
-    /// Encodes this stamp back into the raw header word.
-    #[must_use]
-    pub fn to_raw(self) -> u64 {
-        match self {
-            Self::None => 0,
-            Self::Committed(ts) => ts.0,
-            Self::InFlight(txn) => INFLIGHT_BIT | (txn.0 & PAYLOAD_MASK),
-        }
-    }
-
-    /// The header word for an in-flight writer `txn` (its `created_ts` until commit).
-    ///
-    /// # Panics
-    /// Panics if `txn` is `TxnId(0)` (reserved) or its id does not fit in 63 bits, because either
-    /// would corrupt the discriminant. These are manager invariants, not user input.
-    #[must_use]
-    pub fn in_flight(txn: TxnId) -> u64 {
-        assert!(txn.0 != 0, "TxnId(0) is reserved and is never a writer");
-        assert!(
-            txn.0 & INFLIGHT_BIT == 0,
-            "TxnId must fit in 63 bits for the version-stamp discriminant"
-        );
-        Self::InFlight(txn).to_raw()
-    }
-
-    /// The header word for a committed version created/expired at `ts`.
-    #[must_use]
-    pub fn committed(ts: Timestamp) -> u64 {
-        Self::Committed(ts).to_raw()
-    }
-}
+// The version-stamp convention (committed-`Timestamp` vs in-flight-`TxnId`, discriminated by the
+// high bit) is shared with `graphus-storage`'s frozen `MvccHeader`, so it lives in the
+// dependency-free `graphus-core` as the single source of truth. Re-exported here so the
+// historical `crate::oracle::VersionStamp` / `MAX_TIMESTAMP` paths keep resolving.
+pub use graphus_core::{MAX_TIMESTAMP, VersionStamp};
 
 /// A monotonic logical-time source that also tracks the oldest live snapshot (`04 §5.2`, `§5.5`).
 ///
@@ -197,43 +131,9 @@ impl TimestampOracle {
 
 #[cfg(test)]
 mod tests {
+    // The `VersionStamp` round-trip/aliasing/panic tests live with the type in `graphus-core`'s
+    // `version` module (the convention's single source of truth); here we test the oracle only.
     use super::*;
-
-    #[test]
-    fn stamp_round_trips_each_class() {
-        assert_eq!(VersionStamp::from_raw(0), VersionStamp::None);
-        assert_eq!(
-            VersionStamp::from_raw(VersionStamp::committed(Timestamp(7))),
-            VersionStamp::Committed(Timestamp(7))
-        );
-        assert_eq!(
-            VersionStamp::from_raw(VersionStamp::in_flight(TxnId(42))),
-            VersionStamp::InFlight(TxnId(42))
-        );
-    }
-
-    #[test]
-    fn committed_and_inflight_never_alias() {
-        // A committed timestamp and an in-flight txn id with the same numeric payload must decode
-        // to different classes — this is the whole point of the high bit.
-        let raw_commit = VersionStamp::committed(Timestamp(100));
-        let raw_inflight = VersionStamp::in_flight(TxnId(100));
-        assert_ne!(raw_commit, raw_inflight);
-        assert!(matches!(
-            VersionStamp::from_raw(raw_commit),
-            VersionStamp::Committed(_)
-        ));
-        assert!(matches!(
-            VersionStamp::from_raw(raw_inflight),
-            VersionStamp::InFlight(_)
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "reserved")]
-    fn inflight_zero_txn_panics() {
-        let _ = VersionStamp::in_flight(TxnId(0));
-    }
 
     #[test]
     fn timestamps_are_strictly_monotonic() {

@@ -25,10 +25,12 @@
 //! and traversal dedupes it by relationship id (`04 §2.4`). [`RecordStore::incident_rels`] walks
 //! a node's chain in O(degree) with no index probe.
 
+use std::collections::HashMap;
+
 use graphus_bufpool::BufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{ElementId, PageId, TxnId};
+use graphus_core::{ElementId, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_wal::{LogSink, WalManager};
 
@@ -38,8 +40,9 @@ use crate::labels;
 use crate::meta::{Meta, StoreMeta};
 use crate::paging;
 use crate::record::{
-    CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MvccHeader, NODE_RECORD_SIZE,
-    NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_RECORD_SIZE, RelRecord,
+    CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_OFF_CREATED_TS,
+    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
+    REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenStore};
 use crate::valenc;
@@ -116,6 +119,20 @@ impl FixedStore {
     }
 }
 
+/// The set of node/relationship records a still-open transaction has version-stamped, so its
+/// commit can **settle** their MVCC headers from the in-flight `TxnId` to the assigned commit
+/// timestamp (`04 §5.2`). `created` are records this txn stamped `xmin = in_flight(txn)`; `expired`
+/// are records it tombstoned `xmax = in_flight(txn)`.
+///
+/// Only node and relationship records are tracked: they are the records MVCC visibility filters on
+/// (`04 §5.3`). Property / heap records remain single-version in this slice and are reclaimed with
+/// their owning node/rel at GC (the per-value property MVCC is a documented follow-up).
+#[derive(Debug, Default, Clone)]
+struct ActiveTxn {
+    created: Vec<(StoreKind, u64)>,
+    expired: Vec<(StoreKind, u64)>,
+}
+
 /// A record store with index-free adjacency, over a buffer pool and the ARIES WAL.
 ///
 /// `RecordStore` is generic over the block device `D` and the WAL log sink `S` so it runs over
@@ -127,6 +144,13 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     element_ids: ElementIdAllocator,
     tokens: TokenStore,
     stores: [FixedStore; STORE_COUNT],
+    /// The largest MVCC commit timestamp issued so far (`04 §5.2`); persisted in [`Meta`] so it
+    /// resumes monotonically after reopen. The next commit timestamp is `commit_ts_hw + 1`, and a
+    /// fresh reader's snapshot timestamp is `commit_ts_hw` (it sees exactly what has committed).
+    commit_ts_hw: u64,
+    /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
+    /// settle in-flight headers to the commit timestamp (`04 §5.2`).
+    active: HashMap<TxnId, ActiveTxn>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
@@ -163,6 +187,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 FixedStore::from_meta(StoreKind::Prop, &StoreMeta::default()),
                 FixedStore::from_meta(StoreKind::Strings, &StoreMeta::default()),
             ],
+            commit_ts_hw: 0,
+            active: HashMap::new(),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -191,6 +217,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             element_ids: ElementIdAllocator::new(meta.element_id_next.max(1)),
             tokens: meta.tokens,
             stores,
+            commit_ts_hw: meta.commit_ts_hw,
+            active: HashMap::new(),
         })
     }
 
@@ -212,6 +240,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn snapshot_meta(&self) -> Meta {
         Meta {
             element_id_next: self.element_ids.peek(),
+            commit_ts_hw: self.commit_ts_hw,
             stores: [
                 self.stores[0].to_meta(),
                 self.stores[1].to_meta(),
@@ -418,11 +447,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     // ------------------------- transaction control -------------------------
 
-    /// Begins transaction `txn` in the WAL.
+    /// Begins transaction `txn` in the WAL and opens its MVCC version-stamp bookkeeping.
     pub fn begin(&mut self, txn: TxnId) {
         self.wal.with(|w| {
             w.begin(txn);
         });
+        self.active.insert(txn, ActiveTxn::default());
+    }
+
+    /// The current MVCC read snapshot timestamp (`04 §5.2`): the largest commit timestamp issued so
+    /// far, so a reader that begins now sees exactly every transaction that has already committed
+    /// and nothing committed later. A fresh store (no commits yet) returns `Timestamp(0)`.
+    #[must_use]
+    pub fn snapshot_ts(&self) -> Timestamp {
+        Timestamp(self.commit_ts_hw)
     }
 
     /// Commits `txn`: persists the catalog under `txn`, then group-commits the WAL so all of
@@ -434,9 +472,135 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Panics
     /// Panics if the commit `fdatasync` fails (`04 §4.9`).
     pub fn commit(&mut self, txn: TxnId) -> Result<()> {
+        // Assign this transaction's commit timestamp (`04 §5.2`) and settle every version it stamped
+        // from the in-flight `TxnId` to that committed timestamp, so committed records are
+        // self-describing for visibility without consulting an in-memory table — which is what makes
+        // a committed insert/delete survive a crash (the settle patches are WAL-logged *before* the
+        // commit record, so recovery redoes them for a winner and undoes them for a loser). Settling
+        // eagerly at commit is correctness-first; settling lazily at GC (`04 §5.5`, hint-bit style)
+        // to avoid the commit-time write is a documented performance follow-up.
+        let commit_ts = self.next_commit_ts();
+        let active = self.active.remove(&txn).unwrap_or_default();
+        let settled = VersionStamp::committed(commit_ts);
+        for (kind, id) in active.created {
+            self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, settled, txn)?;
+        }
+        for (kind, id) in active.expired {
+            self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, settled, txn)?;
+        }
         self.checkpoint_meta(txn, false)?;
         self.wal.with(|w| w.commit(txn))?;
         Ok(())
+    }
+
+    /// Issues the next strictly-monotonic commit timestamp (`04 §5.2`), advancing the durable
+    /// high-water mark (persisted by the [`checkpoint_meta`](Self::checkpoint_meta) that follows in
+    /// [`commit`](Self::commit)).
+    ///
+    /// # Panics
+    /// Panics if the 63-bit timestamp space is exhausted (in practice unreachable; the assertion
+    /// guards the version-stamp discriminant just like the transaction oracle's).
+    fn next_commit_ts(&mut self) -> Timestamp {
+        self.commit_ts_hw += 1;
+        assert!(
+            self.commit_ts_hw <= MAX_TIMESTAMP,
+            "commit timestamp space exhausted (63-bit)"
+        );
+        Timestamp(self.commit_ts_hw)
+    }
+
+    /// Overwrites the 8-byte MVCC header word at `field_off` (one of [`MVCC_OFF_CREATED_TS`] /
+    /// [`MVCC_OFF_EXPIRED_TS`]) of record `id` in `kind`'s store with `word`, as one WAL-logged
+    /// update under `txn`. Used to stamp a tombstone (`xmax`) and to settle in-flight stamps at
+    /// commit — both touch only the header word, never the record body.
+    fn patch_header_word(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        field_off: usize,
+        word: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        self.write_region(dev, off + field_off, &word.to_le_bytes(), txn)
+    }
+
+    /// Records that `txn` version-stamped (created) record `id` in `kind`'s store, so `commit` can
+    /// settle its `xmin`. A no-op for the reserved system transaction, which never creates records.
+    fn note_created(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+        if txn != SYSTEM_TXN {
+            self.active.entry(txn).or_default().created.push((kind, id));
+        }
+    }
+
+    /// Records that `txn` tombstoned (expired) record `id` in `kind`'s store, so `commit` can settle
+    /// its `xmax`.
+    fn note_expired(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+        if txn != SYSTEM_TXN {
+            self.active.entry(txn).or_default().expired.push((kind, id));
+        }
+    }
+
+    /// Whether `mvcc` is a **live version**: its slot is in use and it carries no expiry tombstone
+    /// (`xmax == 0`). A tombstoned record keeps its `in_use` slot (it survives for older snapshots
+    /// until GC) but is no longer the live version, so it must not be re-deleted or re-stamped.
+    fn is_live_version(mvcc: MvccHeader) -> bool {
+        mvcc.in_use() && mvcc.expired_ts == 0
+    }
+
+    /// Whether a tombstoned record is reclaimable at `watermark`: it occupies its slot, carries an
+    /// expiry, and that expiry **committed** at or before `watermark` — so no live or future
+    /// snapshot can still observe it (`04 §5.5`). A still-in-flight or yet-uncommitted tombstone is
+    /// not reclaimable.
+    fn is_reclaimable(mvcc: MvccHeader, watermark: Timestamp) -> bool {
+        if !mvcc.in_use() {
+            return false;
+        }
+        match VersionStamp::from_raw(mvcc.expired_ts) {
+            VersionStamp::Committed(ts) => ts <= watermark,
+            VersionStamp::None | VersionStamp::InFlight(_) => false,
+        }
+    }
+
+    /// Garbage-collects MVCC tombstones under `txn`: physically reclaims every relationship and node
+    /// whose `xmax` committed at or before `watermark` — i.e. is invisible to every live and future
+    /// snapshot (`04 §5.5`) — and returns the number of records reclaimed.
+    ///
+    /// `watermark` MUST be at or below the oldest active reader's snapshot timestamp, so no live
+    /// transaction can still observe a reclaimed version (the caller, which owns the timestamp
+    /// oracle's low-water mark, guarantees this). Relationships are reclaimed before nodes, and a
+    /// node is reclaimed only once no live (not-yet-reclaimed) relationship still references it, so
+    /// referential integrity and the incidence chains stay well-formed throughout — the consistency
+    /// checker passes both before and after a GC pass.
+    ///
+    /// The caller owns the transaction lifecycle (it must later commit or roll back `txn`), exactly
+    /// as for any other mutator; the reclamation writes are WAL-logged and crash-recovered the same.
+    ///
+    /// # Errors
+    /// Returns a storage error if a record read or a reclamation write fails.
+    pub fn gc(&mut self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
+        let mut reclaimed = 0usize;
+
+        let rel_hw = self.store(StoreKind::Rel).alloc.high_water();
+        for id in 1..rel_hw {
+            if Self::is_reclaimable(self.read_rel(id)?.mvcc, watermark) {
+                self.reclaim_rel(txn, id)?;
+                reclaimed += 1;
+            }
+        }
+
+        let node_hw = self.store(StoreKind::Node).alloc.high_water();
+        for id in 1..node_hw {
+            if Self::is_reclaimable(self.read_node(id)?.mvcc, watermark)
+                && self.incident_rels(id)?.is_empty()
+            {
+                self.reclaim_node(txn, id)?;
+                reclaimed += 1;
+            }
+        }
+
+        Ok(reclaimed)
     }
 
     /// Rolls `txn` back: undoes its logged page changes newest-first (writing CLRs and applying
@@ -454,6 +618,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Panics
     /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
     pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
+        // Drop the version-stamp bookkeeping: every stamp this txn wrote (in-flight `xmin`/`xmax`)
+        // is reverted by the WAL undo below, and the commit timestamp was never issued (only
+        // `commit` advances it), so nothing of this txn remains visible or durable.
+        self.active.remove(&txn);
         let device_pages: [Vec<PageId>; STORE_COUNT] = [
             self.stores[0].device_pages.clone(),
             self.stores[1].device_pages.clone(),
@@ -477,6 +645,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn reload_catalog(&mut self) -> Result<()> {
         let meta = Self::read_meta(&mut self.pool)?;
         self.element_ids = ElementIdAllocator::new(meta.element_id_next.max(1));
+        self.commit_ts_hw = meta.commit_ts_hw;
         for (i, sm) in meta.stores.iter().enumerate() {
             let kind = self.stores[i].kind;
             self.stores[i] = FixedStore::from_meta(kind, sm);
@@ -519,8 +688,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn create_node(&mut self, txn: TxnId) -> Result<(u64, ElementId)> {
         let id = self.alloc_id(StoreKind::Node);
         let eid = self.element_ids.alloc();
-        let rec = NodeRecord::new(eid, txn.0);
+        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); `commit` settles it to the
+        // commit timestamp. Until then the version is visible only to its own transaction.
+        let rec = NodeRecord::new(eid, VersionStamp::in_flight(txn));
         self.write_node(id, &rec, txn)?;
+        self.note_created(txn, StoreKind::Node, id);
         Ok((id, eid))
     }
 
@@ -532,14 +704,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.read_node(id)
     }
 
-    /// Enumerates the physical ids of every **live** (in-use) node, in ascending id order.
+    /// Enumerates the physical ids of every **slot-occupied** node (`in_use`), in ascending id
+    /// order. This includes MVCC tombstones not yet GC'd (a deleted node keeps its slot until
+    /// reclamation, `04 §5.5`): whether a returned node is *visible* to a given reader is decided by
+    /// the snapshot/visibility layer above (`graphus-cypher`'s `RecordStoreGraph`, `04 §5.3`), which
+    /// filters these ids through `graphus_txn::is_visible` on each record's `xmin`/`xmax`.
     ///
     /// The node store's physical-id space is `1..high_water` (id `0` is the reserved null pointer
     /// and real records start at id `1`, `04 §2.2`); this walks that range and keeps the ids whose
     /// node record is in use. A full scan is O(high-water): a vectorised / segment-skipping leaf
-    /// scan is the optimisation `04 §7.4` flags, not required for correctness. Used by the Cypher
-    /// executor's all-nodes scan over the real store (`rmp` task #38); label-restricted scans are a
-    /// follow-up (#39) since the label-set API does not exist yet.
+    /// scan is the optimisation `04 §7.4` flags, not required for correctness. Index-accelerated
+    /// label scans are the follow-up #48.
     ///
     /// # Errors
     /// Returns a storage error if a node store page in the range cannot be read.
@@ -554,19 +729,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(out)
     }
 
-    /// Deletes the node at `id` under `txn` (clearing `in_use`) and frees its physical id. The
-    /// caller must have detached the node's relationships first; remaining properties are not
-    /// auto-deleted here.
+    /// **MVCC-deletes** the node at `id` under `txn` by stamping its `xmax` tombstone (`04 §5.3`).
+    ///
+    /// The record keeps its slot, its label bitmap and its property chain: an older snapshot that
+    /// could see the node must still see it until no live snapshot can, at which point
+    /// [`gc`](Self::gc) physically reclaims it ([`reclaim_node`](Self::reclaim_node)). The caller is
+    /// expected to have MVCC-deleted the node's relationships first (`DETACH DELETE`); GC will not
+    /// reclaim a node while a live relationship still references it.
     ///
     /// # Errors
-    /// Returns a storage error if the node is not in use or the write fails.
+    /// Returns a storage error if the node is not a live version (already deleted or never in use)
+    /// or the write fails.
     pub fn delete_node(&mut self, txn: TxnId, id: u64) -> Result<()> {
-        let mut rec = self.read_node(id)?;
-        if !rec.mvcc.in_use() {
+        let rec = self.read_node(id)?;
+        if !Self::is_live_version(rec.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} is not in use")));
         }
-        rec.mvcc = MvccHeader::default(); // clears in_use
-        self.write_node(id, &rec, txn)?;
+        self.patch_header_word(
+            StoreKind::Node,
+            id,
+            MVCC_OFF_EXPIRED_TS,
+            VersionStamp::in_flight(txn),
+            txn,
+        )?;
+        self.note_expired(txn, StoreKind::Node, id);
+        Ok(())
+    }
+
+    /// Physically reclaims a tombstoned node under `txn` (called by [`gc`](Self::gc) once the node
+    /// is invisible to every live snapshot): frees its property chain (records + overflow blocks, no
+    /// leak), clears the record, and returns its physical id to the free list (`04 §2.7`). This is
+    /// the old single-version delete body, now gated behind the MVCC tombstone + GC watermark.
+    fn reclaim_node(&mut self, txn: TxnId, id: u64) -> Result<()> {
+        // Free the node's property chain first so a reclaimed node leaves nothing live behind (the
+        // executor no longer clears it eagerly — the tombstone defers everything to here). Uses the
+        // entity-agnostic chain free (not `clear_node_properties`, whose live-version precondition
+        // would reject the tombstoned node we are reclaiming).
+        let first_prop = self.read_node(id)?.first_prop;
+        let _freed = self.free_property_chain(txn, id, first_prop)?;
+        let mut dead = self.read_node(id)?;
+        dead.first_prop = NULL_ID;
+        dead.mvcc = MvccHeader::default(); // clears in_use
+        self.write_node(id, &dead, txn)?;
         self.store_mut(StoreKind::Node).free.push(id);
         Ok(())
     }
@@ -593,7 +797,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   block is the follow-up #39).
     pub fn set_node_labels(&mut self, txn: TxnId, id: u64, label_token_ids: &[u32]) -> Result<()> {
         let mut node = self.read_node(id)?;
-        if !node.mvcc.in_use() {
+        if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
         }
         node.labels = labels::encode_set(label_token_ids).map_err(GraphusError::from)?;
@@ -609,7 +813,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
     pub fn add_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
         let mut node = self.read_node(id)?;
-        if !node.mvcc.in_use() {
+        if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
         }
         let next = labels::with_label(node.labels, label_token_id).map_err(GraphusError::from)?;
@@ -629,7 +833,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
     pub fn remove_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
         let mut node = self.read_node(id)?;
-        if !node.mvcc.in_use() {
+        if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
         }
         let next =
@@ -681,14 +885,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         end: u64,
     ) -> Result<(u64, ElementId)> {
         let mut start_node = self.read_node(start)?;
-        if !start_node.mvcc.in_use() {
+        if !Self::is_live_version(start_node.mvcc) {
             return Err(GraphusError::Storage(format!(
                 "start node {start} not in use"
             )));
         }
         let id = self.alloc_id(StoreKind::Rel);
         let eid = self.element_ids.alloc();
-        let mut rel = RelRecord::new(eid, txn.0, type_id, start, end);
+        self.note_created(txn, StoreKind::Rel, id);
+        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); settled at commit.
+        let mut rel = RelRecord::new(eid, VersionStamp::in_flight(txn), type_id, start, end);
 
         if start == end {
             // Self-loop: thread into the single chain twice. New head order:
@@ -707,7 +913,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
 
         let mut end_node = self.read_node(end)?;
-        if !end_node.mvcc.in_use() {
+        if !Self::is_live_version(end_node.mvcc) {
             return Err(GraphusError::Storage(format!("end node {end} not in use")));
         }
 
@@ -762,29 +968,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.read_rel(id)
     }
 
-    /// Deletes relationship `id` under `txn`, unlinking it from both endpoints' incidence chains
-    /// (or the single chain twice, for a self-loop), **freeing its property chain** (every property
-    /// record and any `strings.store` overflow chain those properties own, `rmp` task #44; no leak),
-    /// and freeing its physical id (`04 §2.4`, `04 §2.7`).
+    /// **MVCC-deletes** relationship `id` under `txn` by stamping its `xmax` tombstone (`04 §5.3`).
     ///
-    /// Freeing the property chain mirrors what `DELETE`/`DETACH DELETE` requires of a relationship:
-    /// a deleted relationship leaves no live property records nor live overflow blocks behind (the
-    /// no-leak invariant the regression tests assert via [`heap_block_usage`](Self::heap_block_usage)
-    /// and the consistency checker's free-list pass). Unlike `delete_node` — whose property chain the
-    /// executor clears explicitly before deletion — `delete_rel` owns its relationship's properties
-    /// outright, so it frees them here.
+    /// The record keeps its slot, its incidence-chain links and its property chain, so an older
+    /// snapshot that could traverse to it still does until no live snapshot can — at which point
+    /// [`gc`](Self::gc) physically unlinks and reclaims it ([`reclaim_rel`](Self::reclaim_rel)).
+    /// Read-side traversal ([`RecordStore::incident_rels`]) is unchanged; visibility filtering of a
+    /// tombstoned relationship is the reader's (snapshot's) concern, layered above the store.
     ///
     /// # Errors
-    /// Returns a storage error if the relationship is not in use or a write fails.
+    /// Returns a storage error if the relationship is not a live version (already deleted or never
+    /// in use) or a write fails.
     pub fn delete_rel(&mut self, txn: TxnId, id: u64) -> Result<()> {
         let rel = self.read_rel(id)?;
-        if !rel.mvcc.in_use() {
+        if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {id} is not in use")));
         }
-        // Free the relationship's property chain first (records + overflow chains), so a deleted
+        self.patch_header_word(
+            StoreKind::Rel,
+            id,
+            MVCC_OFF_EXPIRED_TS,
+            VersionStamp::in_flight(txn),
+            txn,
+        )?;
+        self.note_expired(txn, StoreKind::Rel, id);
+        Ok(())
+    }
+
+    /// Physically reclaims a tombstoned relationship under `txn` (called by [`gc`](Self::gc) once it
+    /// is invisible to every live snapshot): unlinks it from both endpoints' incidence chains (or the
+    /// single chain twice, for a self-loop), **frees its property chain** (every property record and
+    /// any `strings.store` overflow chain those properties own, `rmp` task #44; no leak), and frees
+    /// its physical id (`04 §2.4`, `04 §2.7`). This is the old single-version delete body, now gated
+    /// behind the MVCC tombstone + GC watermark — it preserves the no-leak invariant the regression
+    /// tests assert via [`heap_block_usage`](Self::heap_block_usage) and the consistency checker.
+    fn reclaim_rel(&mut self, txn: TxnId, id: u64) -> Result<()> {
+        let rel = self.read_rel(id)?;
+        // Free the relationship's property chain first (records + overflow chains), so a reclaimed
         // relationship leaves nothing live behind (`rmp` task #44; no leak). This walks and frees the
         // same `first_prop`-rooted chain the node path frees via `clear_node_properties`.
-        let _freed = self.free_rel_property_chain(txn, id, rel.first_prop)?;
+        let _freed = self.free_property_chain(txn, id, rel.first_prop)?;
 
         if rel.start_node == rel.end_node {
             // Self-loop: unlink both links from the one chain. Re-read between unlinks because the
@@ -807,13 +1030,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Frees every live property record in the chain rooted at `first_prop` (and any overflow heap
     /// chain each owns), returning each record's id to the free list (`rmp` task #44; no leak), and
-    /// returns the number of live records freed. The owner `rel_id` is used only for the cycle-guard
-    /// diagnostic. Shared by [`delete_rel`](Self::delete_rel) and
-    /// [`clear_rel_properties`](Self::clear_rel_properties).
-    fn free_rel_property_chain(
+    /// returns the number of live records freed. The `owner_id` is used only for the cycle-guard
+    /// diagnostic. Entity-agnostic: shared by [`reclaim_node`](Self::reclaim_node),
+    /// [`reclaim_rel`](Self::reclaim_rel) and [`clear_rel_properties`](Self::clear_rel_properties)
+    /// to free a node's or relationship's chain.
+    fn free_property_chain(
         &mut self,
         txn: TxnId,
-        rel_id: u64,
+        owner_id: u64,
         first_prop: u64,
     ) -> Result<usize> {
         let mut freed = 0usize;
@@ -824,7 +1048,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             steps += 1;
             if steps > guard {
                 return Err(GraphusError::Storage(format!(
-                    "property chain of rel {rel_id} is malformed (cycle?)"
+                    "property chain of entity {owner_id} is malformed (cycle?)"
                 )));
             }
             let prop = self.read_prop(cur)?;
@@ -927,7 +1151,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         value_inline: u64,
     ) -> Result<u64> {
         let mut node = self.read_node(node_id)?;
-        if !node.mvcc.in_use() {
+        if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop);
@@ -1144,7 +1368,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         key: u32,
     ) -> Result<bool> {
         let mut node = self.read_node(node_id)?;
-        if !node.mvcc.in_use() {
+        if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
         // Walk the singly-linked chain, rebuilding it without any record whose key matches; free
@@ -1259,7 +1483,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if the node is not in use or a write fails.
     pub fn clear_node_properties(&mut self, txn: TxnId, node_id: u64) -> Result<usize> {
         let mut node = self.read_node(node_id)?;
-        if !node.mvcc.in_use() {
+        if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
         let mut removed = 0usize;
@@ -1331,7 +1555,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         value_inline: u64,
     ) -> Result<u64> {
         let mut rel = self.read_rel(rel_id)?;
-        if !rel.mvcc.in_use() {
+        if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop);
@@ -1407,7 +1631,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if the relationship is not in use or a write fails.
     pub fn remove_rel_property_value(&mut self, txn: TxnId, rel_id: u64, key: u32) -> Result<bool> {
         let mut rel = self.read_rel(rel_id)?;
-        if !rel.mvcc.in_use() {
+        if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
         // Walk the singly-linked chain, rebuilding it without any record whose key matches; free each
@@ -1481,12 +1705,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if the relationship is not in use or a write fails.
     pub fn clear_rel_properties(&mut self, txn: TxnId, rel_id: u64) -> Result<usize> {
         let mut rel = self.read_rel(rel_id)?;
-        if !rel.mvcc.in_use() {
+        if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
         // Free the whole `first_prop`-rooted chain (records + overflow chains), then null the head
         // pointer so the relationship has no properties (`rmp` task #44; no leak).
-        let removed = self.free_rel_property_chain(txn, rel_id, rel.first_prop)?;
+        let removed = self.free_property_chain(txn, rel_id, rel.first_prop)?;
         rel.first_prop = NULL_ID;
         self.write_rel(rel_id, &rel, txn)?;
         Ok(removed)

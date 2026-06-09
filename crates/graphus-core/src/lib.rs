@@ -12,6 +12,7 @@
 pub use error::{GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use value::Value;
+pub use version::{MAX_TIMESTAMP, VersionStamp};
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 
 /// Identifier newtypes used across the storage, transaction, and query layers.
@@ -60,6 +61,131 @@ pub mod ids {
         fn ids_are_ordered_by_value() {
             assert!(Lsn(1) < Lsn(2));
             assert!(PageId(10) > PageId(9));
+        }
+    }
+}
+
+/// The MVCC version-stamp convention shared by the frozen record header and the transaction
+/// manager (`04-technical-design.md` §5.2, `05-storage-format.md` §7).
+///
+/// The frozen MVCC record header (`graphus_storage::record::MvccHeader`) stores `created_ts`
+/// (a.k.a. `xmin`) and `expired_ts` (a.k.a. `xmax`) as raw `u64`s. A single field must encode
+/// **either** a committed [`Timestamp`] **or** the [`TxnId`] of a still-in-flight writer, so both
+/// the storage codec (which stamps the words) and the transaction visibility logic (which reads
+/// them) must agree on one convention. It lives here, in the dependency-free core, so it is the
+/// single source of truth for both crates rather than duplicated bit-twiddling.
+pub mod version {
+    use crate::ids::{Timestamp, TxnId};
+
+    /// The high bit that marks a [`VersionStamp`] word as an in-flight [`TxnId`] rather than a
+    /// committed commit-[`Timestamp`] (`04 §5.2`).
+    const INFLIGHT_BIT: u64 = 1 << 63;
+
+    /// Mask selecting the payload (low 63 bits) of a [`VersionStamp`] word.
+    const PAYLOAD_MASK: u64 = INFLIGHT_BIT - 1;
+
+    /// The largest timestamp the oracle may ever issue, so a committed stamp never collides with
+    /// the `INFLIGHT_BIT`. In practice unreachable, but enforced so the convention can never
+    /// silently alias.
+    pub const MAX_TIMESTAMP: u64 = PAYLOAD_MASK;
+
+    /// A typed view over the single `u64` stored in an MVCC header's `created_ts`/`expired_ts`
+    /// field.
+    ///
+    /// It is **either** a committed commit-[`Timestamp`] **or** an in-flight [`TxnId`],
+    /// discriminated by `INFLIGHT_BIT` (`04 §5.2`). The `0` word is the frozen *none/live*
+    /// sentinel and decodes to [`VersionStamp::None`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum VersionStamp {
+        /// The sentinel `0`: no creator recorded, or (for `expired_ts`) the version is live.
+        None,
+        /// A committed transaction's commit timestamp.
+        Committed(Timestamp),
+        /// A still-in-flight writer, identified by its [`TxnId`].
+        InFlight(TxnId),
+    }
+
+    impl VersionStamp {
+        /// Decodes the raw header word into a typed stamp.
+        #[must_use]
+        pub fn from_raw(word: u64) -> Self {
+            if word == 0 {
+                Self::None
+            } else if word & INFLIGHT_BIT != 0 {
+                Self::InFlight(TxnId(word & PAYLOAD_MASK))
+            } else {
+                Self::Committed(Timestamp(word))
+            }
+        }
+
+        /// Encodes this stamp back into the raw header word.
+        #[must_use]
+        pub fn to_raw(self) -> u64 {
+            match self {
+                Self::None => 0,
+                Self::Committed(ts) => ts.0,
+                Self::InFlight(txn) => INFLIGHT_BIT | (txn.0 & PAYLOAD_MASK),
+            }
+        }
+
+        /// The header word for an in-flight writer `txn` (its `created_ts` until commit).
+        ///
+        /// # Panics
+        /// Panics if `txn` is `TxnId(0)` (reserved) or its id does not fit in 63 bits, because
+        /// either would corrupt the discriminant. These are manager invariants, not user input.
+        #[must_use]
+        pub fn in_flight(txn: TxnId) -> u64 {
+            assert!(txn.0 != 0, "TxnId(0) is reserved and is never a writer");
+            assert!(
+                txn.0 & INFLIGHT_BIT == 0,
+                "TxnId must fit in 63 bits for the version-stamp discriminant"
+            );
+            Self::InFlight(txn).to_raw()
+        }
+
+        /// The header word for a committed version created/expired at `ts`.
+        #[must_use]
+        pub fn committed(ts: Timestamp) -> u64 {
+            Self::Committed(ts).to_raw()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn stamp_round_trips_each_class() {
+            assert_eq!(VersionStamp::from_raw(0), VersionStamp::None);
+            assert_eq!(
+                VersionStamp::from_raw(VersionStamp::committed(Timestamp(7))),
+                VersionStamp::Committed(Timestamp(7))
+            );
+            assert_eq!(
+                VersionStamp::from_raw(VersionStamp::in_flight(TxnId(42))),
+                VersionStamp::InFlight(TxnId(42))
+            );
+        }
+
+        #[test]
+        fn committed_and_inflight_never_alias() {
+            let raw_commit = VersionStamp::committed(Timestamp(100));
+            let raw_inflight = VersionStamp::in_flight(TxnId(100));
+            assert_ne!(raw_commit, raw_inflight);
+            assert!(matches!(
+                VersionStamp::from_raw(raw_commit),
+                VersionStamp::Committed(_)
+            ));
+            assert!(matches!(
+                VersionStamp::from_raw(raw_inflight),
+                VersionStamp::InFlight(_)
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "reserved")]
+        fn inflight_zero_txn_panics() {
+            let _ = VersionStamp::in_flight(TxnId(0));
         }
     }
 }

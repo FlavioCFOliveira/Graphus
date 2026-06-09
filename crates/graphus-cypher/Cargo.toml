@@ -18,6 +18,10 @@ graphus-storage = { path = "../graphus-storage" }
 # so it names their public types (devices, log sinks, the WAL manager, recovery).
 graphus-io = { path = "../graphus-io" }
 graphus-wal = { path = "../graphus-wal" }
+# `RecordStoreGraph` filters every read by MVCC snapshot visibility (`04 §5.3`, `rmp` task #45):
+# it holds a `Snapshot` + `CommitRegistry` and calls `graphus_txn::is_visible` on each record's
+# frozen `xmin`/`xmax`. This edge is acyclic: graphus-txn depends only on core.
+graphus-txn = { path = "../graphus-txn" }
 
 [dev-dependencies]
 # Used by the ordering cross-check test to prove the Cypher value order agrees with the

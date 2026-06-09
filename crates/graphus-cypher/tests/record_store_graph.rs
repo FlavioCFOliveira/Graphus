@@ -1100,6 +1100,15 @@ fn deleting_a_relationship_frees_its_property_chain() {
     // edges — but DELETE r alone suffices once the edge is matched.
     let (_r, mut store) = run_commit("MATCH ()-[r:KNOWS]->() DELETE r", store, 2);
 
+    // DELETE is an MVCC tombstone now (`rmp` task #45): the relationship and its property/overflow
+    // records are only physically reclaimed by a committed GC pass once no live snapshot can see the
+    // tombstone (watermark = latest commit; this single-threaded test has no older live reader). Run
+    // it so the no-leak / physical-state assertions below observe the reclaimed state.
+    let watermark = store.snapshot_ts();
+    store.begin(TxnId(99));
+    store.gc(TxnId(99), watermark).expect("gc runs");
+    store.commit(TxnId(99)).expect("gc commits");
+
     assert_eq!(
         store.heap_block_usage().expect("heap usage"),
         0,

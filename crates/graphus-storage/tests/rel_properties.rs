@@ -59,6 +59,21 @@ fn prop_record_usage(s: &mut Store) -> u64 {
         .live_props
 }
 
+/// Runs one garbage-collection pass under a fresh `txn` (`04 §5.5`; `rmp` task #45). MVCC made
+/// `delete_*` a logical tombstone: the deleting transaction stamps `xmax` and physical reclamation
+/// (freeing the property chain, every overflow heap block, and the record's id) is deferred to GC.
+///
+/// The watermark is [`RecordStore::snapshot_ts`] — the latest commit timestamp. That is the correct
+/// (and safe) watermark for these single-threaded tests: every deleting transaction has already
+/// committed (its `xmax` is therefore committed at or below `snapshot_ts`) and there is no older live
+/// reader that could still observe the tombstoned version, so GC reclaims it.
+fn gc_pass(s: &mut Store, txn: TxnId) {
+    let watermark = s.snapshot_ts();
+    s.begin(txn);
+    s.gc(txn, watermark).unwrap();
+    s.commit(txn).unwrap();
+}
+
 // =================================================================================================
 // set / get / remove round-trips: inline scalar, String overflow, List
 // =================================================================================================
@@ -245,8 +260,16 @@ fn delete_rel_frees_its_property_chain_and_overflow_chains() {
     );
     assert_eq!(props_before, 3, "three live property records before delete");
 
-    // Deleting the relationship must free its three property records AND every overflow chain.
+    // Under MVCC `delete_rel` is a logical tombstone (`04 §5.5`; `rmp` task #45): it stamps `xmax`
+    // and keeps the property chain + overflow blocks alive for older snapshots. Physical reclamation
+    // — freeing the three property records AND every overflow chain — happens at GC, once the
+    // deleting transaction has committed (so its `xmax` is itself committed at/below the watermark).
     s.delete_rel(txn, r).unwrap();
+    s.commit(txn).unwrap();
+    gc_pass(&mut s, TxnId(2));
+
+    // After GC the no-leak invariant holds exactly as before: no overflow block and no property
+    // record survives the deleted relationship.
     assert_eq!(
         s.heap_block_usage().unwrap(),
         0,
@@ -259,7 +282,6 @@ fn delete_rel_frees_its_property_chain_and_overflow_chains() {
     );
     // The relationship is gone.
     assert!(!s.rel(r).unwrap().mvcc.in_use());
-    s.commit(txn).unwrap();
 }
 
 #[test]

@@ -233,6 +233,12 @@ impl Driver {
         }
 
         let recovery = self.crash_and_recover(rng);
+        // Deletes are MVCC tombstones (`rmp` task #45): a committed-deleted node/relationship keeps
+        // its slot (and incidence-chain links) until GC reclaims it. Run a GC pass post-recovery
+        // (watermark = the latest commit; recovery leaves no live reader) so the physical store
+        // reflects the committed logical model the checker compares against. In-flight (loser)
+        // tombstones were already undone by recovery, so only committed deletions are reclaimed.
+        self.gc_after_recovery();
         let result = checker::verify(&mut self.store, &self.model);
 
         let non_vacuous = committed_seen && (in_flight_seen || recovery.losers > 0);
@@ -247,6 +253,22 @@ impl Driver {
             recovery_losers: recovery.losers,
             tail_truncated: recovery.tail_truncated,
         }
+    }
+
+    /// Runs an MVCC GC pass over the recovered store, reclaiming every tombstone whose deletion
+    /// committed at or before the latest commit timestamp (`04 §5.5`, `rmp` task #45). After
+    /// recovery there is no live reader, so the latest commit is a safe watermark and every
+    /// committed deletion becomes physically reclaimable — leaving the store's live records and
+    /// incidence chains exactly equal to the committed logical model.
+    fn gc_after_recovery(&mut self) {
+        let tid = self.fresh_txn();
+        let watermark = self.store.snapshot_ts();
+        self.store.begin(tid);
+        self.store.gc(tid, watermark).expect("gc");
+        self.store.commit(tid).expect("gc commit");
+        // Write the GC's pages home so the checker's page-checksum pass reads a clean durable image
+        // (a committed-but-unflushed page carries a stale checksum field until write-back).
+        self.store.flush().expect("flush after gc");
     }
 
     /// Applies one planned transaction to completion, mirroring acknowledged effects into the model
@@ -379,8 +401,12 @@ impl Driver {
                 let Some(rid) = resolve(rel_slot, &live) else {
                     return;
                 };
-                // Only delete a relationship the store currently holds live.
-                if self.store.rel(rid).expect("rel").mvcc.in_use() {
+                // Only delete a relationship the store still holds as a *live version*. A deleted
+                // relationship is now an MVCC tombstone (`rmp` task #45): it keeps its in-use slot
+                // until GC, so we check `expired_ts == 0` (not just `in_use`) to avoid re-deleting a
+                // tombstone, which the store rejects.
+                let mvcc = self.store.rel(rid).expect("rel").mvcc;
+                if mvcc.in_use() && mvcc.expired_ts == 0 {
                     self.store.delete_rel(tid, rid).expect("delete_rel");
                     pending.push(Effect::DelRel(rid));
                 }
@@ -390,15 +416,21 @@ impl Driver {
                 let Some(node) = resolve(node_slot, &live) else {
                     return;
                 };
-                // Detach the node's relationships first (the store requires an edge-free node).
+                // Detach the node's live relationships first. `incident_rels` returns every
+                // relationship still threaded into the chain, including MVCC tombstones not yet GC'd
+                // (`rmp` task #45), so skip any already-expired one to avoid re-deleting a tombstone.
                 let incident = self.store.incident_rels(node).expect("incident_rels");
                 for rid in incident {
-                    self.store
-                        .delete_rel(tid, rid)
-                        .expect("delete_rel (detach)");
-                    pending.push(Effect::DelRel(rid));
+                    let mvcc = self.store.rel(rid).expect("rel").mvcc;
+                    if mvcc.in_use() && mvcc.expired_ts == 0 {
+                        self.store
+                            .delete_rel(tid, rid)
+                            .expect("delete_rel (detach)");
+                        pending.push(Effect::DelRel(rid));
+                    }
                 }
-                if self.store.node(node).expect("node").mvcc.in_use() {
+                let mvcc = self.store.node(node).expect("node").mvcc;
+                if mvcc.in_use() && mvcc.expired_ts == 0 {
                     self.store.delete_node(tid, node).expect("delete_node");
                     pending.push(Effect::DelNode(node));
                 }
