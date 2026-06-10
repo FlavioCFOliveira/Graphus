@@ -44,6 +44,7 @@
 pub mod compare;
 pub mod feature;
 pub mod graphs;
+pub mod procedures;
 pub mod report;
 pub mod runner;
 pub mod value;

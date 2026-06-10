@@ -149,6 +149,34 @@ pub fn parse_expected(input: &str) -> Result<ExpectedValue, ParseValueError> {
     Ok(v)
 }
 
+/// Converts an [`ExpectedValue`] into a property [`graphus_core::Value`], or `None` if it is (or
+/// contains) a structural value (node / relationship / path), which has no property-`Value` form.
+///
+/// Used wherever the harness must hand a parsed TCK cell to the engine as data: query parameters
+/// and fixture-procedure tables (`tck/features/clauses/call/**`).
+#[must_use]
+pub fn to_property_value(expected: &ExpectedValue) -> Option<graphus_core::Value> {
+    use graphus_core::Value;
+    match expected {
+        ExpectedValue::Null => Some(Value::Null),
+        ExpectedValue::Boolean(b) => Some(Value::Boolean(*b)),
+        ExpectedValue::Integer(i) => Some(Value::Integer(*i)),
+        ExpectedValue::Float(f) => Some(Value::Float(*f)),
+        ExpectedValue::String(s) => Some(Value::String(s.clone())),
+        ExpectedValue::List(items) => items
+            .iter()
+            .map(to_property_value)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::List),
+        ExpectedValue::Map(entries) => entries
+            .iter()
+            .map(|(k, v)| to_property_value(v).map(|vv| (k.clone(), vv)))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Map),
+        ExpectedValue::Node(_) | ExpectedValue::Relationship(_) | ExpectedValue::Path(_) => None,
+    }
+}
+
 /// A recursive-descent parser over a single expected-value cell.
 struct ValueParser<'a> {
     bytes: &'a [u8],

@@ -605,3 +605,213 @@ impl SpanReturnExt for Span {
         Span::new(self.start + 7, self.end)
     }
 }
+
+// =================================================================================================
+// Procedure calls (`CALL … [YIELD …]`, rmp #57; `tck/features/clauses/call/**`)
+// =================================================================================================
+
+mod procedures {
+    use super::{assert_detail, ast, ok};
+    use graphus_core::Value;
+    use graphus_cypher::ast::{ExprKind, QueryBody};
+    use graphus_cypher::binding::Parameters;
+    use graphus_cypher::errors::{ErrorType, SemanticDetail, SemanticError};
+    use graphus_cypher::procedure_registry::{
+        FieldSpec, FieldType, ProcedureSet, ProcedureSignature, ValueClass,
+    };
+    use graphus_cypher::semantics::{analyze_with_procedures, check_implicit_call_parameters};
+
+    /// A registry with `test.my.proc(name :: STRING?, id :: INTEGER?) :: (out :: STRING?)` and the
+    /// no-input/no-output `test.doNothing() :: ()` (the shapes the TCK CALL features lean on).
+    fn registry() -> ProcedureSet {
+        let mut set = ProcedureSet::with_builtins();
+        set.register_table(
+            ProcedureSignature::new(
+                "test.my.proc",
+                vec![
+                    FieldSpec::new("name", FieldType::nullable(ValueClass::String)),
+                    FieldSpec::new("id", FieldType::nullable(ValueClass::Integer)),
+                ],
+                vec![FieldSpec::new(
+                    "out",
+                    FieldType::nullable(ValueClass::String),
+                )],
+            ),
+            vec![(
+                vec![Value::String("Stefan".into()), Value::Integer(1)],
+                vec![Value::String("Berlin".into())],
+            )],
+        )
+        .expect("well-formed fixture");
+        set.register_table(
+            ProcedureSignature::new("test.doNothing", Vec::new(), Vec::new()),
+            Vec::new(),
+        )
+        .expect("well-formed fixture");
+        set
+    }
+
+    fn ok_with(src: &str) {
+        let q = ast(src);
+        if let Err(e) = analyze_with_procedures(&q, &registry()) {
+            panic!("expected `{src}` to be semantically valid, but got: {e}");
+        }
+    }
+
+    fn err_with(src: &str) -> SemanticError {
+        let q = ast(src);
+        analyze_with_procedures(&q, &registry()).expect_err("expected a semantic error")
+    }
+
+    #[test]
+    fn unknown_procedure_is_procedure_error_procedure_not_found() {
+        // TCK Call1 [13]/[14]: type `ProcedureError`, detail `ProcedureNotFound`, compile time —
+        // for both the standalone implicit form and the in-query form.
+        for src in [
+            "CALL no.such.proc",
+            "CALL no.such.proc() YIELD out RETURN out",
+        ] {
+            let e = err_with(src);
+            assert_eq!(
+                e.classification().error_type,
+                ErrorType::ProcedureError,
+                "{src}"
+            );
+            assert_eq!(
+                e.classification().detail,
+                SemanticDetail::ProcedureNotFound,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_arity_is_invalid_number_of_arguments() {
+        // TCK Call1 [7]–[10]: missing and surplus explicit arguments, standalone and in-query.
+        for src in [
+            "CALL test.my.proc('Dobby')",
+            "CALL test.my.proc('Dobby') YIELD out RETURN out",
+            "CALL test.my.proc('a', 1, 2, 3)",
+        ] {
+            let e = err_with(src);
+            assert_eq!(
+                e.classification().error_type,
+                ErrorType::SyntaxError,
+                "{src}"
+            );
+            assert_eq!(
+                e.classification().detail,
+                SemanticDetail::InvalidNumberOfArguments,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_argument_type_mismatch_is_invalid_argument_type() {
+        // TCK Call2 [5]/[6]: a BOOLEAN literal where INTEGER? is declared.
+        for src in [
+            "CALL test.my.proc('x', true)",
+            "CALL test.my.proc('x', true) YIELD out RETURN out",
+        ] {
+            let e = err_with(src);
+            assert_eq!(
+                e.classification().error_type,
+                ErrorType::SyntaxError,
+                "{src}"
+            );
+            assert_eq!(
+                e.classification().detail,
+                SemanticDetail::InvalidArgumentType,
+                "{src}"
+            );
+        }
+        // Coercions are accepted: null where nullable, INTEGER where INTEGER.
+        ok_with("CALL test.my.proc(null, null)");
+    }
+
+    #[test]
+    fn in_query_call_with_outputs_requires_yield() {
+        // TCK Call1 [12]: detail `UndefinedVariable` at compile time.
+        let e = err_with("CALL test.my.proc('x', 1) RETURN out");
+        assert_eq!(e.classification().detail, SemanticDetail::UndefinedVariable);
+        // A void procedure needs no YIELD in-query (TCK Call1 [3]).
+        ok_with("MATCH (n) CALL test.doNothing() RETURN n");
+    }
+
+    #[test]
+    fn yield_rebinding_an_in_scope_name_is_variable_already_bound() {
+        // TCK Call1 [15] and Call5 [5]/[6].
+        for src in [
+            "WITH 'Hi' AS out CALL test.my.proc('x', 1) YIELD out RETURN *",
+            "CALL test.my.proc('x', 1) YIELD out, out AS out RETURN out",
+        ] {
+            let e = err_with(src);
+            assert_eq!(
+                e.classification().detail,
+                SemanticDetail::VariableAlreadyBound,
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregation_in_call_arguments_is_invalid_aggregation() {
+        // TCK Call1 [16].
+        let e = err_with("MATCH (n) CALL test.my.proc('x', count(n)) YIELD out RETURN out");
+        assert_eq!(
+            e.classification().detail,
+            SemanticDetail::InvalidAggregation
+        );
+    }
+
+    #[test]
+    fn implicit_call_arguments_are_resolved_to_parameters() {
+        // openCypher `ImplicitProcedureInvocation`: `CALL test.my.proc` takes its arguments from
+        // the query parameters by input name; analysis rewrites them to `$name`, `$id`.
+        let q = ast("CALL test.my.proc");
+        let validated = analyze_with_procedures(&q, &registry()).expect("valid");
+        let QueryBody::StandaloneCall(call) = &validated.query().body else {
+            panic!("expected a standalone call");
+        };
+        let args = call.call.args.as_ref().expect("args resolved");
+        let names: Vec<&str> = args
+            .iter()
+            .map(|a| match &a.kind {
+                ExprKind::Parameter(name) => name.as_str(),
+                other => panic!("expected a parameter expression, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["name", "id"]);
+    }
+
+    #[test]
+    fn implicit_call_missing_parameter_is_parameter_missing() {
+        // TCK Call1 [11]: type `ParameterMissing`, detail `MissingParameter`, compile time.
+        let q = ast("CALL test.my.proc");
+        let mut params = Parameters::new();
+        params.insert("name".to_owned(), Value::String("Stefan".into()));
+        let e =
+            check_implicit_call_parameters(&q, &params, &registry()).expect_err("`id` is missing");
+        assert_eq!(e.classification().error_type, ErrorType::ParameterMissing);
+        assert_eq!(e.classification().detail, SemanticDetail::MissingParameter);
+
+        params.insert("id".to_owned(), Value::Integer(1));
+        check_implicit_call_parameters(&q, &params, &registry()).expect("all inputs supplied");
+        // Explicit calls and non-CALL queries are no-ops for this check.
+        check_implicit_call_parameters(&ast("RETURN 1 AS x"), &Parameters::new(), &registry())
+            .expect("not a standalone call");
+    }
+
+    #[test]
+    fn builtin_procedures_resolve_through_the_default_registry() {
+        // The registry-less `analyze` resolves the engine built-ins (regression pin for the
+        // pre-existing `ok("CALL db.labels()")` behaviour, now registry-backed).
+        ok("CALL db.relationshipTypes()");
+        ok("CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey");
+        assert_detail(
+            "CALL db.labels(1)",
+            SemanticDetail::InvalidNumberOfArguments,
+        );
+    }
+}

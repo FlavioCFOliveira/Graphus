@@ -32,21 +32,24 @@ use std::time::Duration;
 
 use graphus_core::Value;
 use graphus_cypher::binding::{Parameters, bind_parameters};
-use graphus_cypher::executor::execute;
+use graphus_cypher::executor::execute_with_procedures;
 use graphus_cypher::graph_access::{GraphAccess, NodeId, RelId};
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
 use graphus_cypher::physical::{PhysicalOp, plan_physical};
+use graphus_cypher::procedure_registry::{ProcedureRegistry, ProcedureSet};
 use graphus_cypher::runtime::{Row, RowValue};
-use graphus_cypher::semantics::{ValidatedQuery, analyze};
+use graphus_cypher::semantics::{
+    ValidatedQuery, analyze_with_procedures, check_implicit_call_parameters,
+};
 use graphus_cypher::{ErrorPhase, ErrorType};
 use graphus_io::MemBlockDevice;
 use graphus_storage::RecordStore;
 use graphus_wal::{MemLogSink, WalManager};
 
 use crate::compare::{Concrete, assert_ordered, assert_unordered};
-use crate::feature::{KvRows, ResultTable, Scenario, StepKind, parse_row};
+use crate::feature::{KvRows, ProcedureStep, ResultTable, Scenario, StepKind, parse_row};
 use crate::graphs::named_graph_cypher;
 
 /// The store type the harness runs over: a real [`RecordStore`] on an in-memory device + log (the
@@ -167,6 +170,14 @@ fn run_scenario_inner(scenario: &Scenario, graphs_root: &Path) -> Outcome {
         return Outcome::Unsupported("scenario has no `When executing query:` step".to_owned());
     };
 
+    // ---- fixture procedures: the registry that backs compile AND execute for this scenario -----
+    let mut registry = ProcedureSet::with_builtins();
+    for step in &plan.procedures {
+        if let Err(e) = crate::procedures::register(&mut registry, step) {
+            return Outcome::Failed(format!("fixture procedure registration failed: {e}"));
+        }
+    }
+
     let mut coord = Coord::new(fresh_store());
 
     // ---- Given: seed a named graph, if any -----------------------------------------------------
@@ -175,14 +186,14 @@ fn run_scenario_inner(scenario: &Scenario, graphs_root: &Path) -> Outcome {
             Ok(seed) => seed,
             Err(e) => return Outcome::Unsupported(format!("named graph load: {e}")),
         };
-        if let Err(e) = run_write_query(&mut coord, &seed, &Parameters::new()) {
+        if let Err(e) = run_write_query(&mut coord, &seed, &Parameters::new(), &registry) {
             return Outcome::Failed(format!("named-graph seed `{name}` failed: {e}"));
         }
     }
 
     // ---- having executed: initialisation queries -----------------------------------------------
     for init in &plan.init_queries {
-        if let Err(e) = run_write_query(&mut coord, init, &Parameters::new()) {
+        if let Err(e) = run_write_query(&mut coord, init, &Parameters::new(), &registry) {
             return Outcome::Failed(format!("init query failed: {init:?}: {e}"));
         }
     }
@@ -200,7 +211,7 @@ fn run_scenario_inner(scenario: &Scenario, graphs_root: &Path) -> Outcome {
     };
 
     // ---- run the When query --------------------------------------------------------------------
-    let run = run_query_resolving(&mut coord, query, &params);
+    let run = run_query_resolving(&mut coord, query, &params, &registry);
 
     // ---- decide against the Then step ----------------------------------------------------------
     match &plan.expectation {
@@ -271,6 +282,7 @@ struct ScenarioPlan {
     named_graph: Option<String>,
     init_queries: Vec<String>,
     parameters: KvRows,
+    procedures: Vec<ProcedureStep>,
     query: Option<String>,
     expectation: Expectation,
     side_effects: SideEffectSpec,
@@ -286,6 +298,7 @@ impl ScenarioPlan {
                 StepKind::NamedGraph(name) => self.named_graph = Some(name.clone()),
                 StepKind::InitQuery(q) => self.init_queries.push(q.clone()),
                 StepKind::Parameters(rows) => self.parameters = rows.clone(),
+                StepKind::Procedure(step) => self.procedures.push(step.clone()),
                 StepKind::Query(q) => self.query = Some(q.clone()),
                 StepKind::ResultUnordered(t) => {
                     self.expectation = Expectation::Rows {
@@ -334,35 +347,12 @@ fn build_parameters(rows: &KvRows) -> Result<Parameters, String> {
     for (name, raw) in rows {
         let expected = crate::value::parse_expected(raw)
             .map_err(|e| format!("parameter `{name}` value {raw:?}: {e}"))?;
-        let value = expected_to_param_value(&expected).ok_or_else(|| {
+        let value = crate::value::to_property_value(&expected).ok_or_else(|| {
             format!("parameter `{name}` is a structural value, unsupported: {raw}")
         })?;
         params.insert(name.clone(), value);
     }
     Ok(params)
-}
-
-/// Converts a parameter's expected value to a property [`Value`], or `None` if it is structural.
-fn expected_to_param_value(expected: &crate::value::ExpectedValue) -> Option<Value> {
-    use crate::value::ExpectedValue as E;
-    match expected {
-        E::Null => Some(Value::Null),
-        E::Boolean(b) => Some(Value::Boolean(*b)),
-        E::Integer(i) => Some(Value::Integer(*i)),
-        E::Float(f) => Some(Value::Float(*f)),
-        E::String(s) => Some(Value::String(s.clone())),
-        E::List(items) => items
-            .iter()
-            .map(expected_to_param_value)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::List),
-        E::Map(entries) => entries
-            .iter()
-            .map(|(k, v)| expected_to_param_value(v).map(|vv| (k.clone(), vv)))
-            .collect::<Option<Vec<_>>>()
-            .map(Value::Map),
-        E::Node(_) | E::Relationship(_) | E::Path(_) => None,
-    }
 }
 
 // =================================================================================================
@@ -393,8 +383,18 @@ struct TckError {
     message: String,
 }
 
-/// Compiles `src` to a validated query, mapping any compile-time failure to a [`TckError`].
-fn compile(src: &str) -> Result<ValidatedQuery, TckError> {
+/// Compiles `src` to a validated query against `registry`, mapping any compile-time failure to a
+/// [`TckError`].
+///
+/// `params` is consulted for one compile-time check only: a standalone **implicit** procedure
+/// call's arguments are the query parameters, and the TCK raises a missing one at compile time
+/// (`ParameterMissing`/`MissingParameter` — [`check_implicit_call_parameters`]). The plan itself
+/// stays parameter-independent.
+fn compile(
+    src: &str,
+    params: &Parameters,
+    registry: &dyn ProcedureRegistry,
+) -> Result<ValidatedQuery, TckError> {
     let tokens = tokenize(src).map_err(|e| TckError {
         // A lexer error is a compile-time SyntaxError (`04 §7.3`).
         error_type: ErrorType::SyntaxError.as_tck_str().to_owned(),
@@ -409,8 +409,9 @@ fn compile(src: &str) -> Result<ValidatedQuery, TckError> {
         detail: None,
         message: e.to_string(),
     })?;
-    analyze(&ast).map_err(|e| {
-        // Semantic analysis carries its own verbatim TCK classification.
+    // Semantic analysis (and the implicit-call parameter check) carry their own verbatim TCK
+    // classifications.
+    let classify = |e: &graphus_cypher::SemanticError| {
         let c = e.classification();
         TckError {
             error_type: c.error_type.as_tck_str().to_owned(),
@@ -418,14 +419,22 @@ fn compile(src: &str) -> Result<ValidatedQuery, TckError> {
             detail: Some(c.detail.as_tck_str().to_owned()),
             message: e.to_string(),
         }
-    })
+    };
+    let validated = analyze_with_procedures(&ast, registry).map_err(|e| classify(&e))?;
+    check_implicit_call_parameters(&ast, params, registry).map_err(|e| classify(&e))?;
+    Ok(validated)
 }
 
 /// Runs `src` as a **write** statement (named-graph seed / init query) and commits it.
 ///
 /// Returns the engine error message on any compile or runtime failure (rolling back).
-fn run_write_query(coord: &mut Coord, src: &str, params: &Parameters) -> Result<(), String> {
-    let validated = compile(src).map_err(|e| e.message)?;
+fn run_write_query(
+    coord: &mut Coord,
+    src: &str,
+    params: &Parameters,
+    registry: &dyn ProcedureRegistry,
+) -> Result<(), String> {
+    let validated = compile(src, params, registry).map_err(|e| e.message)?;
     let plan = plan_physical(&lower(&validated), &coord.catalog());
     let bound = bind_parameters(&plan, params).map_err(|e| e.to_string())?;
 
@@ -433,7 +442,8 @@ fn run_write_query(coord: &mut Coord, src: &str, params: &Parameters) -> Result<
     let run_result: Result<(), String> = (|| {
         let mut graph = coord.statement(txn).map_err(|e| e.to_string())?;
         {
-            let mut cursor = execute(&plan, &bound, &mut graph).map_err(|e| e.to_string())?;
+            let mut cursor = execute_with_procedures(&plan, &bound, &mut graph, registry)
+                .map_err(|e| e.to_string())?;
             cursor.collect_all().map_err(|e| e.to_string())?;
         }
         if graph.has_error() {
@@ -453,8 +463,13 @@ fn run_write_query(coord: &mut Coord, src: &str, params: &Parameters) -> Result<
 
 /// Runs the When query and resolves its result cells into self-contained [`Concrete`] snapshots
 /// while the statement seam is live, committing on success and rolling back on a runtime error.
-fn run_query_resolving(coord: &mut Coord, src: &str, params: &Parameters) -> QueryRun {
-    let validated = match compile(src) {
+fn run_query_resolving(
+    coord: &mut Coord,
+    src: &str,
+    params: &Parameters,
+    registry: &dyn ProcedureRegistry,
+) -> QueryRun {
+    let validated = match compile(src, params, registry) {
         Ok(v) => v,
         Err(e) => return QueryRun::Error(e),
     };
@@ -477,7 +492,8 @@ fn run_query_resolving(coord: &mut Coord, src: &str, params: &Parameters) -> Que
             message: e.to_string(),
         })?;
 
-        let mut cursor = execute(&plan, &bound, &mut graph).map_err(classify_exec_error)?;
+        let mut cursor = execute_with_procedures(&plan, &bound, &mut graph, registry)
+            .map_err(classify_exec_error)?;
         let columns = cursor.columns().to_vec();
         let rows = cursor.collect_all().map_err(classify_exec_error)?;
         drop(cursor);
@@ -494,7 +510,12 @@ fn run_query_resolving(coord: &mut Coord, src: &str, params: &Parameters) -> Que
         // internal driving row per write and exposes the *internal* bindings (e.g. the matched `x`,
         // `y` of `MATCH (x), (y) CREATE (x)-[:R]->(y)`) as plan columns. The TCK result set is the
         // projected data; for a write-only query that is empty (`Then the result should be empty`).
-        if write_only {
+        //
+        // Likewise a **zero-column** result (a standalone CALL of a *void* procedure — the only
+        // plan shape with no result columns, since `RETURN` always projects at least one) carries
+        // no client-facing data: the executor's unit row is internal, and the TCK asserts
+        // `Then the result should be empty` (`tck/features/clauses/call/Call1.feature` [1]).
+        if write_only || columns.is_empty() {
             return Ok(QueryRun::Rows {
                 columns: Vec::new(),
                 rows: Vec::new(),
@@ -639,6 +660,10 @@ fn classify_exec_error(e: graphus_cypher::ExecError) -> TckError {
         // The pipeline was cancelled — not a TCK error class; surface as a generic runtime error so
         // the scenario fails loudly rather than masquerading as a matched error.
         X::Cancelled => ("Cancelled", None),
+        // A runtime procedure-invocation failure (rmp #57). The TCK has no *runtime* CALL error
+        // scenarios (procedure faults classify at compile time), so this only surfaces honestly on
+        // a harness/engine defect (e.g. a compile/execute registry mismatch).
+        X::Procedure(_) => ("ProcedureError", None),
         _ => ("TypeError", None),
     };
     TckError {

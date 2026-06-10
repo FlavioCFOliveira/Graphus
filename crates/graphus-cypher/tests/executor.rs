@@ -1219,3 +1219,245 @@ fn node_binding_round_trips_through_id_function() {
     let rows2 = run("MATCH (n:P) RETURN n", &mut g);
     assert!(matches!(rows2[0].get("n"), Some(RowValue::Node(_))));
 }
+
+// =================================================================================================
+// Procedure calls (`CALL … [YIELD …]`, rmp #57; `tck/features/clauses/call/**`)
+// =================================================================================================
+
+mod procedures {
+    use super::{NO_PROPS, col, i, run, s};
+    use graphus_core::Value;
+    use graphus_cypher::binding::{Parameters, bind_parameters};
+    use graphus_cypher::catalog::IndexCatalog;
+    use graphus_cypher::executor::execute_with_procedures;
+    use graphus_cypher::graph_access::MemGraph;
+    use graphus_cypher::lexer::tokenize;
+    use graphus_cypher::lower::lower;
+    use graphus_cypher::parser::parse_tokens;
+    use graphus_cypher::procedure_registry::{
+        FieldSpec, FieldType, ProcedureRegistry, ProcedureSet, ProcedureSignature, ValueClass,
+    };
+    use graphus_cypher::runtime::Row;
+    use graphus_cypher::semantics::analyze_with_procedures;
+
+    /// Compiles and executes `src` against `registry` (compile **and** execute over the same
+    /// registry — the load-bearing contract), returning the result columns and rows.
+    fn run_with(
+        src: &str,
+        graph: &mut MemGraph,
+        registry: &dyn ProcedureRegistry,
+        params: &Parameters,
+    ) -> (Vec<String>, Vec<Row>) {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze_with_procedures(&ast, registry).expect("analyze");
+        let plan = plan_physical(&lower(&validated), &IndexCatalog::empty());
+        let bound = bind_parameters(&plan, params).expect("bind");
+        let mut cursor = execute_with_procedures(&plan, &bound, graph, registry).expect("open");
+        let columns = cursor.columns().to_vec();
+        let rows = cursor.collect_all().expect("rows");
+        (columns, rows)
+    }
+
+    use graphus_cypher::physical::plan_physical;
+
+    /// The TCK Call2 fixture: `test.my.proc(name :: STRING?, id :: INTEGER?) ::
+    /// (city :: STRING?, country_code :: INTEGER?)`.
+    fn city_registry() -> ProcedureSet {
+        let mut set = ProcedureSet::with_builtins();
+        set.register_table(
+            ProcedureSignature::new(
+                "test.my.proc",
+                vec![
+                    FieldSpec::new("name", FieldType::nullable(ValueClass::String)),
+                    FieldSpec::new("id", FieldType::nullable(ValueClass::Integer)),
+                ],
+                vec![
+                    FieldSpec::new("city", FieldType::nullable(ValueClass::String)),
+                    FieldSpec::new("country_code", FieldType::nullable(ValueClass::Integer)),
+                ],
+            ),
+            vec![
+                (vec![s("Andres"), i(1)], vec![s("Malmö"), i(46)]),
+                (vec![s("Stefan"), i(1)], vec![s("Berlin"), i(49)]),
+                (vec![s("Stefan"), i(2)], vec![s("München"), i(49)]),
+            ],
+        )
+        .expect("fixture");
+        set
+    }
+
+    /// `test.labels() :: (label :: STRING?)` yielding A, B, C in table order (TCK Call1 [5]).
+    fn labels_registry() -> ProcedureSet {
+        let mut set = ProcedureSet::with_builtins();
+        set.register_table(
+            ProcedureSignature::new(
+                "test.labels",
+                Vec::new(),
+                vec![FieldSpec::new(
+                    "label",
+                    FieldType::nullable(ValueClass::String),
+                )],
+            ),
+            vec![
+                (Vec::new(), vec![s("A")]),
+                (Vec::new(), vec![s("B")]),
+                (Vec::new(), vec![s("C")]),
+            ],
+        )
+        .expect("fixture");
+        set
+    }
+
+    /// The void `test.doNothing() :: ()` (TCK Call1 [1]–[4]).
+    fn void_registry() -> ProcedureSet {
+        let mut set = ProcedureSet::with_builtins();
+        set.register_table(
+            ProcedureSignature::new("test.doNothing", Vec::new(), Vec::new()),
+            Vec::new(),
+        )
+        .expect("fixture");
+        set
+    }
+
+    #[test]
+    fn standalone_call_yields_the_signature_columns() {
+        // TCK Call2 [2]: no YIELD — the declared outputs are the result columns.
+        let mut g = MemGraph::new();
+        let (columns, rows) = run_with(
+            "CALL test.my.proc('Stefan', 1)",
+            &mut g,
+            &city_registry(),
+            &Parameters::new(),
+        );
+        assert_eq!(columns, ["city", "country_code"]);
+        assert_eq!(col(&rows, "city"), vec![s("Berlin")]);
+        assert_eq!(col(&rows, "country_code"), vec![i(49)]);
+    }
+
+    #[test]
+    fn standalone_call_with_yield_star_and_ordered_results() {
+        // TCK Call5 [8] (`YIELD *`) and Call1 [5] (table order is preserved).
+        let mut g = MemGraph::new();
+        let (columns, rows) = run_with(
+            "CALL test.labels() YIELD *",
+            &mut g,
+            &labels_registry(),
+            &Parameters::new(),
+        );
+        assert_eq!(columns, ["label"]);
+        assert_eq!(col(&rows, "label"), vec![s("A"), s("B"), s("C")]);
+    }
+
+    #[test]
+    fn in_query_call_with_yield_and_rename() {
+        // TCK Call5 [4]: `YIELD city AS c` binds the renamed column.
+        let mut g = MemGraph::new();
+        let (_, rows) = run_with(
+            "CALL test.my.proc('Stefan', 1) YIELD city AS c, country_code RETURN c, country_code",
+            &mut g,
+            &city_registry(),
+            &Parameters::new(),
+        );
+        assert_eq!(col(&rows, "c"), vec![s("Berlin")]);
+        assert_eq!(col(&rows, "country_code"), vec![i(49)]);
+    }
+
+    #[test]
+    fn in_query_call_fans_results_across_driving_rows() {
+        // TCK Call6 [1] shape: a leading CALL is a row source; a mid-query CALL multiplies rows.
+        let mut g = MemGraph::new();
+        let (_, rows) = run_with(
+            "CALL test.labels() YIELD label WITH count(*) AS c CALL test.labels() YIELD label \
+             RETURN c, label",
+            &mut g,
+            &labels_registry(),
+            &Parameters::new(),
+        );
+        assert_eq!(col(&rows, "c"), vec![i(3), i(3), i(3)]);
+        assert_eq!(col(&rows, "label"), vec![s("A"), s("B"), s("C")]);
+    }
+
+    #[test]
+    fn void_procedure_passes_driving_rows_through() {
+        // TCK Call1 [4]: a void CALL preserves cardinality and adds no columns.
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["A"], [("name", s("a"))]);
+        let _ = g.add_node(["B"], [("name", s("b"))]);
+        let (_, rows) = run_with(
+            "MATCH (n) CALL test.doNothing() RETURN n.name AS name",
+            &mut g,
+            &void_registry(),
+            &Parameters::new(),
+        );
+        let mut names = col(&rows, "name");
+        names.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(names, vec![s("a"), s("b")]);
+    }
+
+    #[test]
+    fn standalone_void_call_produces_one_empty_row() {
+        // TCK Call1 [1]: zero result columns; the single unit row carries no client-visible data
+        // (the client result set is empty — zero columns).
+        let mut g = MemGraph::new();
+        let (columns, rows) = run_with(
+            "CALL test.doNothing()",
+            &mut g,
+            &void_registry(),
+            &Parameters::new(),
+        );
+        assert!(columns.is_empty());
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn implicit_call_takes_arguments_from_parameters() {
+        // TCK Call2 [3]: `CALL test.my.proc` with parameters `name`/`id`.
+        let mut g = MemGraph::new();
+        let mut params = Parameters::new();
+        params.insert("name".to_owned(), s("Stefan"));
+        params.insert("id".to_owned(), i(1));
+        let (columns, rows) = run_with("CALL test.my.proc", &mut g, &city_registry(), &params);
+        assert_eq!(columns, ["city", "country_code"]);
+        assert_eq!(col(&rows, "city"), vec![s("Berlin")]);
+    }
+
+    #[test]
+    fn null_argument_matches_null_fixture_row() {
+        // TCK Call4: `CALL test.my.proc(null)` matches the `| null | 'nix' |` row.
+        let mut set = ProcedureSet::with_builtins();
+        set.register_table(
+            ProcedureSignature::new(
+                "test.nullable",
+                vec![FieldSpec::new(
+                    "in",
+                    FieldType::nullable(ValueClass::Integer),
+                )],
+                vec![FieldSpec::new(
+                    "out",
+                    FieldType::nullable(ValueClass::String),
+                )],
+            ),
+            vec![(vec![Value::Null], vec![s("nix")])],
+        )
+        .expect("fixture");
+        let mut g = MemGraph::new();
+        let (_, rows) = run_with(
+            "CALL test.nullable(null) YIELD out RETURN out",
+            &mut g,
+            &set,
+            &Parameters::new(),
+        );
+        assert_eq!(col(&rows, "out"), vec![s("nix")]);
+    }
+
+    #[test]
+    fn builtin_db_labels_runs_through_the_default_pipeline() {
+        // The registry-less `execute` resolves the engine built-ins.
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["B"], NO_PROPS);
+        let _ = g.add_node(["A", "B"], NO_PROPS);
+        let rows = run("CALL db.labels() YIELD label RETURN label", &mut g);
+        assert_eq!(col(&rows, "label"), vec![s("A"), s("B")]);
+    }
+}

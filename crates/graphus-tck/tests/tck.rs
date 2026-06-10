@@ -26,19 +26,20 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **2944 / 3884 scenarios pass (75.80 %)**, with 0 panics and 50 scenarios skipped
-/// as genuinely unsupported (all `CALL`-procedure forms — the engine has no procedure facility yet).
-/// This rose from 2614 when `rmp` task #56 aligned error classification with the TCK: every
-/// compile-time fault is a `SyntaxError` (measured corpus-wide), `VariableAlreadyBound` is
-/// detected for CREATE/MERGE node re-use and named-path re-use (vs the node/relationship
-/// cross-kind `VariableTypeConflict`), `DifferentColumnsInUnion` is validated, and the runner
-/// honours the TCK wildcards (`Error` type / `any time` phase / `*` detail) (+330 scenarios).
-/// Prior rises: 1782 → 2614 (#53, temporal types); 1192 → 1782 (#54,
-/// quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55, verbatim column names). Remaining
-/// failures are honest gaps: compile-time expression type checking (most of the residual TYPE
-/// mismatches), IANA zone resolution (rmp #60), CALL procedures (rmp #57), and the full-query
-/// `EXISTS { ... RETURN ... }` form.
-const BASELINE: usize = 2944;
+/// Current ratchet: **2996 / 3884 scenarios pass (77.14 %)**, with 0 panics and 0 scenarios
+/// skipped as unsupported. This rose from 2944 when `rmp` task #57 implemented `CALL` procedures:
+/// a [`graphus_cypher::procedure_registry`] backs both compile-time resolution
+/// (`ProcedureError`/`ProcedureNotFound`, `InvalidNumberOfArguments`, `InvalidArgumentType`,
+/// `ParameterMissing`/`MissingParameter` for implicit calls) and execution (standalone, in-query
+/// `CALL … YIELD [field AS var]`, `YIELD *`, implicit parameter-fed arguments, void pass-through),
+/// and the harness registers each scenario's `there exists a procedure …` fixtures on a
+/// scenario-local registry that backs compile *and* execute — all 52 `clauses/call` scenarios pass
+/// (+52). Prior rises: 2614 → 2944 (#56, TCK-faithful error classification); 1782 → 2614 (#53,
+/// temporal types); 1192 → 1782 (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55,
+/// verbatim column names). Remaining failures are honest gaps: compile-time expression type
+/// checking (most of the residual TYPE mismatches), IANA zone resolution (rmp #60), and the
+/// full-query `EXISTS { ... RETURN ... }` form.
+const BASELINE: usize = 2996;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

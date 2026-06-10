@@ -61,6 +61,20 @@ pub struct Step {
 /// A two-column TCK data table (parameters, side effects) as `(key, value)` rows, header dropped.
 pub type KvRows = Vec<(String, String)>;
 
+/// A `there exists a procedure …` step: the raw signature text (everything after the phrase, e.g.
+/// `test.my.proc(in :: INTEGER?) :: (out :: STRING?)`) plus the fixture table — its header (the
+/// input names followed by the output names) and its raw-cell data rows. Structured parsing into a
+/// procedure registration lives in [`crate::procedures`].
+#[derive(Debug, Clone, Default)]
+pub struct ProcedureStep {
+    /// The raw signature text, trailing colon stripped.
+    pub signature: String,
+    /// The fixture-table header (input names then output names); empty for a no-field signature.
+    pub header: Vec<String>,
+    /// The fixture-table data rows (raw TCK mini-language cells).
+    pub rows: Vec<Vec<String>>,
+}
+
 /// A result table: the header (column names) and the data rows (each a vector of raw cell strings).
 #[derive(Debug, Clone, Default)]
 pub struct ResultTable {
@@ -84,6 +98,11 @@ pub enum StepKind {
     InitQuery(String),
     /// `And parameters are:` — the parameter table for the query under test.
     Parameters(KvRows),
+    /// `And there exists a procedure <signature>:` — registers a scenario-local fixture procedure
+    /// (`tck/features/clauses/call/**`). Carries the raw signature text and the fixture data table
+    /// (header = input names then output names; rows in the TCK value mini-language), parsed into
+    /// an engine registration by [`crate::procedures`].
+    Procedure(ProcedureStep),
     /// `When executing query:` — the query under test (docstring, or inline after the colon).
     Query(String),
     /// `Then the result should be, in any order:` — an unordered (bag) result-set assertion.
@@ -286,6 +305,11 @@ fn classify(
         );
     }
 
+    // ---- fixture procedures (`tck/features/clauses/call/**`) -------------------------------------
+    if let Some(sig) = value.strip_prefix("there exists a procedure ") {
+        return StepKind::Procedure(procedure_step(sig, table));
+    }
+
     // ---- query under test -----------------------------------------------------------------------
     // The query is normally a docstring (`When executing query:` + `"""…"""`); the README also shows
     // a one-line inline form (`When executing query: <query>`), so accept that fallback too.
@@ -374,6 +398,40 @@ fn kv_rows(table: &gherkin::Table) -> KvRows {
             _ => None,
         })
         .collect()
+}
+
+/// Builds a [`ProcedureStep`] from the raw signature text and the fixture table.
+///
+/// The signature keeps its raw text (trailing `:` and whitespace stripped; structured parsing is
+/// [`crate::procedures`]'s job). The table's first row is the header (input then output names); a
+/// void signature (`() :: ()`) is written in the corpus with a single empty table line, which
+/// gherkin yields as one empty-cell row — normalised here to an empty header and no rows.
+fn procedure_step(signature: &str, table: Option<&gherkin::Table>) -> ProcedureStep {
+    let signature = signature.trim().trim_end_matches(':').trim().to_owned();
+    let (header, rows) = match table {
+        Some(t) => {
+            let mut iter = t.rows.iter();
+            let header: Vec<String> = iter
+                .next()
+                .map(|h| {
+                    h.iter()
+                        .map(|c| c.trim().to_owned())
+                        .filter(|c| !c.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let rows = iter
+                .map(|r| r.iter().map(|c| c.trim().to_owned()).collect())
+                .collect();
+            (header, rows)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    ProcedureStep {
+        signature,
+        header,
+        rows,
+    }
 }
 
 /// A result table: header row + data rows of raw cell strings.
@@ -511,15 +569,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_step_form_is_unsupported_not_dropped() {
+    fn procedure_step_is_classified_with_signature_and_table() {
         let f = "Feature: F\n\n  Scenario: S\n\
                  \x20   Given an empty graph\n\
                  \x20   And there exists a procedure test.my.proc() :: (x :: INTEGER?):\n      | x |\n      | 1 |\n\
                  \x20   When executing query:\n      \"\"\"\n      RETURN 1 AS n\n      \"\"\"\n\
                  \x20   Then the result should be, in any order:\n      | n |\n      | 1 |\n";
         let scs = one(f);
+        let StepKind::Procedure(p) = &scs[0].steps[1].kind else {
+            panic!("expected a Procedure step, got {:?}", scs[0].steps[1].kind);
+        };
+        assert_eq!(p.signature, "test.my.proc() :: (x :: INTEGER?)");
+        assert_eq!(p.header, ["x"]);
+        assert_eq!(p.rows, [["1"]]);
+    }
+
+    #[test]
+    fn unknown_step_form_is_unsupported_not_dropped() {
+        let f = "Feature: F\n\n  Scenario: S\n\
+                 \x20   Given an empty graph\n\
+                 \x20   And some entirely novel step phrasing\n\
+                 \x20   When executing query:\n      \"\"\"\n      RETURN 1 AS n\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | n |\n      | 1 |\n";
+        let scs = one(f);
         assert!(
-            matches!(&scs[0].steps[1].kind, StepKind::Unsupported(t) if t.contains("procedure")),
+            matches!(&scs[0].steps[1].kind, StepKind::Unsupported(t) if t.contains("novel")),
             "an unrecognised step keeps its raw text as Unsupported"
         );
     }

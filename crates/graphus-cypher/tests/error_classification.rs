@@ -61,6 +61,17 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
             expected: "1".to_owned(),
             got: 2,
         },
+        SemanticErrorKind::ProcedureNotFound {
+            name: "test.my.proc".to_owned(),
+        },
+        SemanticErrorKind::InvalidProcedureArgumentType {
+            name: "test.my.proc".to_owned(),
+            parameter: "in".to_owned(),
+            expected: "INTEGER?".to_owned(),
+        },
+        SemanticErrorKind::MissingParameter {
+            name: "in".to_owned(),
+        },
         SemanticErrorKind::InvalidDelete,
         SemanticErrorKind::InvalidClauseComposition { reason: "test" },
         SemanticErrorKind::DifferentColumnsInUnion,
@@ -76,10 +87,12 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
 /// wildcard-free match here).
 fn expected_classification(kind: &SemanticErrorKind) -> (ErrorType, SemanticDetail) {
     use SemanticErrorKind as K;
-    // The openCypher TCK classifies **every** compile-time fault as a `SyntaxError`: measured over
-    // the pinned corpus, every `... should be raised at compile time:` step names SyntaxError (the
-    // only SemanticError in the corpus is the *runtime* `MergeReadOwnWrites`). The table therefore
-    // expects SyntaxError uniformly; the cross-check value is the per-variant **detail**.
+    // The openCypher TCK classifies almost every compile-time fault as a `SyntaxError`: measured
+    // over the pinned corpus, nearly every `... should be raised at compile time:` step names
+    // SyntaxError (the only SemanticError in the corpus is the *runtime* `MergeReadOwnWrites`).
+    // The measured exceptions, both from `tck/features/clauses/call/Call1.feature`, are
+    // `ProcedureError`/`ProcedureNotFound` and `ParameterMissing`/`MissingParameter`. The table
+    // expects SyntaxError everywhere else; the cross-check value is the per-variant **detail**.
     match kind {
         K::UndefinedVariable { .. } => (ErrorType::SyntaxError, SemanticDetail::UndefinedVariable),
         K::VariableAlreadyBound { .. } => {
@@ -117,6 +130,18 @@ fn expected_classification(kind: &SemanticErrorKind) -> (ErrorType, SemanticDeta
         K::InvalidNumberOfArguments { .. } => (
             ErrorType::SyntaxError,
             SemanticDetail::InvalidNumberOfArguments,
+        ),
+        // The two measured non-SyntaxError compile-time types in the corpus, both from
+        // `tck/features/clauses/call/Call1.feature` (rmp #57).
+        K::ProcedureNotFound { .. } => {
+            (ErrorType::ProcedureError, SemanticDetail::ProcedureNotFound)
+        }
+        K::InvalidProcedureArgumentType { .. } => {
+            (ErrorType::SyntaxError, SemanticDetail::InvalidArgumentType)
+        }
+        K::MissingParameter { .. } => (
+            ErrorType::ParameterMissing,
+            SemanticDetail::MissingParameter,
         ),
         K::InvalidDelete => (ErrorType::SyntaxError, SemanticDetail::InvalidDelete),
         K::InvalidClauseComposition { .. } => (
@@ -203,11 +228,11 @@ fn renders_the_verbatim_tck_gherkin_triple() {
 #[test]
 fn every_listed_kind_is_distinct() {
     let kinds = all_kinds();
-    // 18 variants as of this writing; the assert documents the count and trips if one is dropped
+    // 21 variants as of this writing; the assert documents the count and trips if one is dropped
     // from `all_kinds` without the match also changing (the match would then fail to compile).
     assert_eq!(
         kinds.len(),
-        18,
+        21,
         "all_kinds() should list every SemanticErrorKind variant once"
     );
     let details: std::collections::HashSet<_> = kinds.iter().map(|k| k.detail()).collect();

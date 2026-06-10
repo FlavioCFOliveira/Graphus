@@ -78,9 +78,9 @@ impl fmt::Display for ErrorPhase {
 }
 
 /// The TCK error **type** (the second component of the TCK triple), taken verbatim from the
-/// openCypher TCK `tck/README.adoc`.
+/// openCypher TCK `tck/README.adoc` and the feature files that assert it.
 ///
-/// Only the two compile-time types are modelled here, since semantic analysis emits only those.
+/// Only the compile-time types are modelled here, since semantic analysis emits only those.
 /// The runtime types (`TypeError`, `ArithmeticError`, `EntityNotFound`,
 /// `ConstraintVerificationFailed`, …) belong to the executor and are intentionally **not** in this
 /// enum (see [`crate::semantics`] for the boundary documentation).
@@ -94,15 +94,27 @@ pub enum ErrorType {
     /// `SemanticError` — *"The statement is syntactically valid, but expresses something that the
     /// database cannot do."* (TCK `tck/README.adoc`.)
     SemanticError,
+    /// `ProcedureError` — a procedure-resolution fault. The corpus raises it **at compile time**
+    /// for an unknown procedure name (`tck/features/clauses/call/Call1.feature`:
+    /// `Then a ProcedureError should be raised at compile time: ProcedureNotFound`).
+    ProcedureError,
+    /// `ParameterMissing` — a statement needs a query parameter that was not supplied. The corpus
+    /// raises it **at compile time** for a standalone implicit procedure call whose input is not
+    /// among the supplied parameters (`tck/features/clauses/call/Call1.feature`:
+    /// `Then a ParameterMissing should be raised at compile time: MissingParameter`).
+    ParameterMissing,
 }
 
 impl ErrorType {
-    /// The verbatim TCK type name (`"SyntaxError"` / `"SemanticError"`).
+    /// The verbatim TCK type name (`"SyntaxError"` / `"SemanticError"` / `"ProcedureError"` /
+    /// `"ParameterMissing"`).
     #[must_use]
     pub const fn as_tck_str(self) -> &'static str {
         match self {
             Self::SyntaxError => "SyntaxError",
             Self::SemanticError => "SemanticError",
+            Self::ProcedureError => "ProcedureError",
+            Self::ParameterMissing => "ParameterMissing",
         }
     }
 }
@@ -156,8 +168,20 @@ pub enum SemanticDetail {
     CreatingVarLength,
     /// `UnknownFunction` — a function invocation names a function the database does not provide.
     UnknownFunction,
-    /// `InvalidNumberOfArguments` — a known function is called with the wrong arity.
+    /// `InvalidNumberOfArguments` — a known function or procedure is called with the wrong arity
+    /// (procedures: `tck/features/clauses/call/Call1.feature`).
     InvalidNumberOfArguments,
+    /// `ProcedureNotFound` — a `CALL` names a procedure the database does not provide
+    /// (`tck/features/clauses/call/Call1.feature`; paired with the [`ErrorType::ProcedureError`]
+    /// type).
+    ProcedureNotFound,
+    /// `InvalidArgumentType` — a procedure argument whose type is statically known cannot satisfy
+    /// the declared input type (`tck/features/clauses/call/Call2.feature`).
+    InvalidArgumentType,
+    /// `MissingParameter` — a standalone implicit procedure call needs a query parameter that was
+    /// not supplied (`tck/features/clauses/call/Call1.feature`; paired with the
+    /// [`ErrorType::ParameterMissing`] type).
+    MissingParameter,
     /// `InvalidDelete` — `DELETE` targets something that is not a deletable graph entity reference.
     InvalidDelete,
     /// `InvalidClauseComposition` — clauses are composed in an order Cypher forbids (e.g. a
@@ -191,6 +215,9 @@ impl SemanticDetail {
             Self::CreatingVarLength => "CreatingVarLength",
             Self::UnknownFunction => "UnknownFunction",
             Self::InvalidNumberOfArguments => "InvalidNumberOfArguments",
+            Self::ProcedureNotFound => "ProcedureNotFound",
+            Self::InvalidArgumentType => "InvalidArgumentType",
+            Self::MissingParameter => "MissingParameter",
             Self::InvalidDelete => "InvalidDelete",
             Self::InvalidClauseComposition => "InvalidClauseComposition",
             Self::DifferentColumnsInUnion => "DifferentColumnsInUnion",
@@ -342,15 +369,38 @@ pub enum SemanticErrorKind {
         /// The (dotted) function name as written.
         name: String,
     },
-    /// A known function is called with the wrong number of arguments. TCK detail
+    /// A known function or procedure is called with the wrong number of arguments. TCK detail
     /// `InvalidNumberOfArguments`.
     InvalidNumberOfArguments {
-        /// The function name.
+        /// The function or procedure name.
         name: String,
-        /// How many arguments the function accepts (rendered as a human range).
+        /// How many arguments the callee accepts (rendered as a human range).
         expected: String,
         /// How many were supplied.
         got: usize,
+    },
+    /// A `CALL` names a procedure that is not registered. TCK type `ProcedureError`, detail
+    /// `ProcedureNotFound` (`tck/features/clauses/call/Call1.feature`).
+    ProcedureNotFound {
+        /// The dotted procedure name as written.
+        name: String,
+    },
+    /// A procedure argument whose type is statically known (a literal) cannot satisfy the declared
+    /// input type. TCK detail `InvalidArgumentType` (`tck/features/clauses/call/Call2.feature`).
+    InvalidProcedureArgumentType {
+        /// The dotted procedure name.
+        name: String,
+        /// The declared input parameter name.
+        parameter: String,
+        /// The declared input type (e.g. `INTEGER?`).
+        expected: String,
+    },
+    /// A standalone implicit procedure call (`CALL proc` without parentheses, arguments taken from
+    /// the query parameters by input name) needs a parameter that was not supplied. TCK type
+    /// `ParameterMissing`, detail `MissingParameter` (`tck/features/clauses/call/Call1.feature`).
+    MissingParameter {
+        /// The missing parameter (= procedure input) name.
+        name: String,
     },
     /// `DELETE` targets a non-entity expression. TCK detail `InvalidDelete`.
     InvalidDelete,
@@ -408,6 +458,9 @@ impl SemanticErrorKind {
             Self::CreatingVarLength => SemanticDetail::CreatingVarLength,
             Self::UnknownFunction { .. } => SemanticDetail::UnknownFunction,
             Self::InvalidNumberOfArguments { .. } => SemanticDetail::InvalidNumberOfArguments,
+            Self::ProcedureNotFound { .. } => SemanticDetail::ProcedureNotFound,
+            Self::InvalidProcedureArgumentType { .. } => SemanticDetail::InvalidArgumentType,
+            Self::MissingParameter { .. } => SemanticDetail::MissingParameter,
             Self::InvalidDelete => SemanticDetail::InvalidDelete,
             Self::InvalidClauseComposition { .. } => SemanticDetail::InvalidClauseComposition,
             Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
@@ -417,13 +470,20 @@ impl SemanticErrorKind {
 
     /// The TCK error **type** for this error.
     ///
-    /// The openCypher TCK classifies **every** compile-time fault as a `SyntaxError` — measured
-    /// over the whole pinned corpus, every `... should be raised at compile time:` step in
+    /// The openCypher TCK classifies almost every compile-time fault as a `SyntaxError` — measured
+    /// over the whole pinned corpus, nearly every `... should be raised at compile time:` step in
     /// `tck/features/**` names `SyntaxError` (the only `SemanticError` in the corpus is the
-    /// *runtime* `MergeReadOwnWrites`). We follow the TCK, not intuition: semantic-analysis faults
-    /// are `SyntaxError`s with a fine-grained detail.
+    /// *runtime* `MergeReadOwnWrites`). The measured exceptions, both from
+    /// `tck/features/clauses/call/Call1.feature`, are an unknown procedure
+    /// (`ProcedureError`/`ProcedureNotFound`) and a missing implicit-call parameter
+    /// (`ParameterMissing`/`MissingParameter`). We follow the TCK, not intuition: every other
+    /// semantic-analysis fault is a `SyntaxError` with a fine-grained detail.
     pub const fn error_type(&self) -> ErrorType {
-        ErrorType::SyntaxError
+        match self {
+            Self::ProcedureNotFound { .. } => ErrorType::ProcedureError,
+            Self::MissingParameter { .. } => ErrorType::ParameterMissing,
+            _ => ErrorType::SyntaxError,
+        }
     }
 
     /// The full TCK `(phase, type, detail)` classification — the **error-classification table**
@@ -495,7 +555,24 @@ impl fmt::Display for SemanticErrorKind {
                 got,
             } => write!(
                 f,
-                "function `{name}` takes {expected} argument(s), but {got} were given"
+                "`{name}` takes {expected} argument(s), but {got} were given"
+            ),
+            Self::ProcedureNotFound { name } => {
+                write!(f, "there is no procedure registered as `{name}`")
+            }
+            Self::InvalidProcedureArgumentType {
+                name,
+                parameter,
+                expected,
+            } => write!(
+                f,
+                "procedure `{name}` parameter `{parameter}` requires {expected}, \
+                 but an incompatible value was given"
+            ),
+            Self::MissingParameter { name } => write!(
+                f,
+                "implicit procedure call requires the query parameter `{name}`, \
+                 which was not supplied"
             ),
             Self::InvalidDelete => {
                 f.write_str("DELETE expects a node, relationship or path expression")
@@ -551,6 +628,9 @@ mod tests {
                 SemanticDetail::InvalidNumberOfArguments,
                 "InvalidNumberOfArguments",
             ),
+            (SemanticDetail::ProcedureNotFound, "ProcedureNotFound"),
+            (SemanticDetail::InvalidArgumentType, "InvalidArgumentType"),
+            (SemanticDetail::MissingParameter, "MissingParameter"),
             (SemanticDetail::InvalidDelete, "InvalidDelete"),
             (
                 SemanticDetail::InvalidClauseComposition,
@@ -566,11 +646,11 @@ mod tests {
         }
     }
 
-    /// `UndefinedVariable` is a `SyntaxError` (TCK-faithful); everything else is a `SemanticError`.
+    /// Every kind is a TCK `SyntaxError`, except the two measured exceptions from the CALL corpus:
+    /// `ProcedureNotFound` (type `ProcedureError`) and `MissingParameter` (type
+    /// `ParameterMissing`).
     #[test]
-    fn every_semantic_kind_is_a_tck_syntax_error() {
-        // The openCypher TCK classifies every compile-time fault as a SyntaxError (measured over
-        // the pinned corpus: every `should be raised at compile time:` step names SyntaxError).
+    fn error_types_match_the_measured_corpus() {
         let undef = SemanticErrorKind::UndefinedVariable {
             name: "n".to_owned(),
         };
@@ -581,6 +661,23 @@ mod tests {
 
         let union = SemanticErrorKind::DifferentColumnsInUnion;
         assert_eq!(union.error_type(), ErrorType::SyntaxError);
+
+        let arg_type = SemanticErrorKind::InvalidProcedureArgumentType {
+            name: "test.my.proc".to_owned(),
+            parameter: "in".to_owned(),
+            expected: "INTEGER?".to_owned(),
+        };
+        assert_eq!(arg_type.error_type(), ErrorType::SyntaxError);
+
+        // The two measured exceptions (tck/features/clauses/call/Call1.feature).
+        let not_found = SemanticErrorKind::ProcedureNotFound {
+            name: "test.my.proc".to_owned(),
+        };
+        assert_eq!(not_found.error_type(), ErrorType::ProcedureError);
+        let missing = SemanticErrorKind::MissingParameter {
+            name: "in".to_owned(),
+        };
+        assert_eq!(missing.error_type(), ErrorType::ParameterMissing);
     }
 
     /// The phase-split invariant in isolation (also asserted across *all* variants in
@@ -623,6 +720,9 @@ mod tests {
                 | SemanticErrorKind::CreatingVarLength
                 | SemanticErrorKind::UnknownFunction { .. }
                 | SemanticErrorKind::InvalidNumberOfArguments { .. }
+                | SemanticErrorKind::ProcedureNotFound { .. }
+                | SemanticErrorKind::InvalidProcedureArgumentType { .. }
+                | SemanticErrorKind::MissingParameter { .. }
                 | SemanticErrorKind::InvalidDelete
                 | SemanticErrorKind::InvalidClauseComposition { .. }
                 | SemanticErrorKind::DifferentColumnsInUnion
@@ -660,6 +760,17 @@ mod tests {
                 name: "f".to_owned(),
                 expected: "1".to_owned(),
                 got: 2,
+            },
+            SemanticErrorKind::ProcedureNotFound {
+                name: "test.my.proc".to_owned(),
+            },
+            SemanticErrorKind::InvalidProcedureArgumentType {
+                name: "test.my.proc".to_owned(),
+                parameter: "in".to_owned(),
+                expected: "INTEGER?".to_owned(),
+            },
+            SemanticErrorKind::MissingParameter {
+                name: "in".to_owned(),
             },
             SemanticErrorKind::InvalidDelete,
             SemanticErrorKind::InvalidClauseComposition { reason: "x" },

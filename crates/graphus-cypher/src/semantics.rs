@@ -21,7 +21,13 @@
 //! - **Constraint / uniqueness violations**, **entity-not-found**, **property-not-found** — runtime,
 //!   raised by the executor against the live graph.
 //! - **Missing parameters** (`ParameterMissing`) — a *bind-time* (runtime) check; parameters bind at
-//!   execution, never at compile (`04 §7.5`), so an unbound `$p` is **not** a semantic error.
+//!   execution, never at compile (`04 §7.5`), so an unbound `$p` is **not** a semantic error. The
+//!   one TCK-measured exception is the standalone **implicit procedure call** (`CALL proc` without
+//!   parentheses), whose arguments *are* the query parameters: the TCK raises a missing input there
+//!   at **compile time** (`ParameterMissing`/`MissingParameter`). Because that check needs the
+//!   supplied parameter names, it is a separate, explicit entry point —
+//!   [`check_implicit_call_parameters`] — run by callers that know the parameters before execution
+//!   (the statement plan itself stays parameter-independent, `04 §7.5`).
 //!
 //! The phase split is machine-checked: [`crate::errors::SemanticErrorKind::classification`] maps
 //! every variant to `phase = CompileTime`, and `tests/error_classification.rs` asserts it for the
@@ -76,14 +82,26 @@
 //! in the classification table because it is a real TCK detail that becomes reachable once bounds
 //! may be parameter-driven; wiring it then is mechanical.
 //!
+//! # Procedure calls (`CALL … [YIELD …]`)
+//!
+//! Procedure invocations are resolved against a [`ProcedureRegistry`] (rmp #57): an unknown name is
+//! `ProcedureError`/`ProcedureNotFound`, a wrong explicit-argument count is
+//! `SyntaxError`/`InvalidNumberOfArguments`, a literal argument that cannot satisfy the declared
+//! input type is `SyntaxError`/`InvalidArgumentType`, an aggregate in an argument is
+//! `InvalidAggregation`, a `YIELD` that (re)binds an in-scope name is `VariableAlreadyBound`, and an
+//! in-query call to a procedure **with outputs** but **without `YIELD`** is `UndefinedVariable`
+//! (the outputs are unnameable; all spellings verbatim from `tck/features/clauses/call/**`). After
+//! validation, a standalone **implicit** call's arguments (`CALL proc` — no parentheses) are
+//! resolved to one [`Parameter`](crate::ast::ExprKind::Parameter) expression per declared input, so
+//! lowering, binding and execution are uniform over the explicit form.
+//!
 //! Deferred to later phases / sub-tasks, **by name**: (1) full static **type inference** of
 //! expression results (most type mismatches are runtime `TypeError`s by TCK design); (2)
 //! **`SET`-on-non-entity** static rejection — the parser already constrains `SET` targets to
 //! variables / property chains, and whether the target *is* an entity is generally a runtime fact,
-//! so only the structural part is enforced here; (3) **procedure** signature/arity validation
-//! (needs the procedure catalogue, an executor concern); (4) the exotic productions the parser
-//! itself defers (`FOREACH`, `CALL { subquery }`, existential subqueries, quantifier predicates,
-//! `LOAD CSV`, DDL); (5) the two-letter Neo4j **status codes** (escalated, `02 Q2`).
+//! so only the structural part is enforced here; (3) the exotic productions the parser
+//! itself defers (`FOREACH`, `CALL { subquery }`, DDL); (4) the two-letter Neo4j **status codes**
+//! (escalated, `02 Q2`).
 
 use crate::ast::{
     Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause, MatchClause,
@@ -95,6 +113,7 @@ use crate::ast::{
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck};
 use crate::lexer::Span;
+use crate::procedure_registry::{self, FieldType, ProcedureRegistry, ProcedureSignature};
 use graphus_core::GraphusError;
 use std::collections::{BTreeSet, HashMap};
 
@@ -154,10 +173,120 @@ impl ValidatedQuery {
 /// assert_eq!(validated.query().span, ast.span);
 /// ```
 pub fn analyze(query: &Query) -> Result<ValidatedQuery, SemanticError> {
-    Analyzer.check_query(query)?;
-    Ok(ValidatedQuery {
-        query: query.clone(),
-    })
+    analyze_with_procedures(query, procedure_registry::builtins())
+}
+
+/// [`analyze`] against a caller-supplied [`ProcedureRegistry`] (`04 §7.3`; rmp #57).
+///
+/// Procedure invocations (`CALL …`) are resolved against `procedures` — see the module docs for
+/// the checks. The **same** registry must back execution
+/// ([`execute_with_procedures`](crate::executor::execute_with_procedures)), or the compile-time
+/// procedure guarantees are void. The registry-less [`analyze`] uses the engine
+/// [built-ins](crate::procedure_registry::builtins).
+///
+/// On success, a standalone **implicit** procedure call's arguments are resolved to one
+/// [`Parameter`](crate::ast::ExprKind::Parameter) expression per declared input (openCypher
+/// `ImplicitProcedureInvocation` takes its arguments from the query parameters by input name), so
+/// the rest of the pipeline is uniform over the explicit form.
+///
+/// # Errors
+///
+/// Returns a [`SemanticError`] exactly as [`analyze`] does, plus the procedure-resolution errors
+/// described in the module docs.
+pub fn analyze_with_procedures(
+    query: &Query,
+    procedures: &dyn ProcedureRegistry,
+) -> Result<ValidatedQuery, SemanticError> {
+    Analyzer { procedures }.check_query(query)?;
+    let mut query = query.clone();
+    resolve_implicit_call_arguments(&mut query, procedures);
+    Ok(ValidatedQuery { query })
+}
+
+/// Rewrites a validated standalone **implicit** call's `args: None` into one
+/// [`ExprKind::Parameter`] per declared input, in declaration order (openCypher
+/// `ImplicitProcedureInvocation`). A no-op for every other query shape; the procedure is known to
+/// exist because [`Analyzer::check_standalone_call`] already resolved it.
+fn resolve_implicit_call_arguments(query: &mut Query, procedures: &dyn ProcedureRegistry) {
+    let QueryBody::StandaloneCall(call) = &mut query.body else {
+        return;
+    };
+    if call.call.args.is_some() {
+        return;
+    }
+    let Some(sig) = procedures.signature(&call.call.name.join(".")) else {
+        return;
+    };
+    let span = call.call.span;
+    call.call.args = Some(
+        sig.inputs
+            .iter()
+            .map(|input| Expr::new(ExprKind::Parameter(input.name.clone()), span))
+            .collect(),
+    );
+}
+
+/// Whether a procedure argument whose type is **statically known** — a bare literal — cannot
+/// satisfy the declared input type (TCK `InvalidArgumentType`,
+/// `tck/features/clauses/call/Call2.feature`). Deliberately conservative: any non-literal
+/// expression (a parameter, property access, arithmetic, …) is left to the runtime, where type
+/// mismatches on actual values belong (`04 §7.3`). Coercions ([`FieldType::accepts`]):
+/// `INTEGER` → `FLOAT`/`NUMBER`, `FLOAT` → `NUMBER`, `null` wherever nullable.
+fn literal_violates_type(arg: &Expr, ty: FieldType) -> bool {
+    // A representative value of the literal's class is enough — `accepts` discriminates on the
+    // class, never the magnitude.
+    let representative = match &arg.kind {
+        ExprKind::Literal(Literal::Null) => graphus_core::Value::Null,
+        ExprKind::Literal(Literal::Boolean(b)) => graphus_core::Value::Boolean(*b),
+        ExprKind::Literal(Literal::Integer(_)) => graphus_core::Value::Integer(0),
+        ExprKind::Literal(Literal::Float(f)) => graphus_core::Value::Float(*f),
+        ExprKind::Literal(Literal::String(s)) => graphus_core::Value::String(s.clone()),
+        _ => return false,
+    };
+    !ty.accepts(&representative)
+}
+
+/// Validates a standalone **implicit** procedure call's arguments against the **supplied query
+/// parameters** (openCypher `ImplicitProcedureInvocation`: the arguments are the parameters, keyed
+/// by input name). The TCK raises a missing input at **compile time**
+/// (`ParameterMissing`/`MissingParameter`, `tck/features/clauses/call/Call1.feature`), so callers
+/// that know the parameters before execution (the TCK harness; a Bolt `RUN` message, where query
+/// and parameters arrive together) run this check after [`analyze_with_procedures`] and before
+/// planning/execution. It is a separate entry point — not part of [`analyze`] — because the
+/// compiled plan itself must stay parameter-independent (`04 §7.5`).
+///
+/// A no-op (`Ok`) for any other query shape, for an explicit call, and for an unknown procedure
+/// (that is [`analyze`]'s `ProcedureNotFound`).
+///
+/// # Errors
+///
+/// Returns [`SemanticErrorKind::MissingParameter`] for the first (declaration-order) input whose
+/// name is not among `supplied`.
+pub fn check_implicit_call_parameters(
+    query: &Query,
+    supplied: &crate::binding::Parameters,
+    procedures: &dyn ProcedureRegistry,
+) -> Result<(), SemanticError> {
+    let QueryBody::StandaloneCall(call) = &query.body else {
+        return Ok(());
+    };
+    if call.call.args.is_some() {
+        return Ok(());
+    }
+    let Some(sig) = procedures.signature(&call.call.name.join(".")) else {
+        return Ok(());
+    };
+    for input in &sig.inputs {
+        if supplied.get(&input.name).is_none() {
+            return Err(SemanticError::new(
+                SemanticErrorKind::MissingParameter {
+                    name: input.name.clone(),
+                },
+                call.call.span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`analyze`] at the engine boundary: maps the [`SemanticError`] onto [`GraphusError::Compile`]
@@ -229,10 +358,14 @@ impl Scope {
 // The analyzer
 // =================================================================================================
 
-/// The analysis driver. Stateless beyond per-call locals, so it is a zero-sized walker.
-struct Analyzer;
+/// The analysis driver. Stateless beyond per-call locals and the procedure catalogue it resolves
+/// `CALL` invocations against.
+struct Analyzer<'a> {
+    /// The procedure catalogue (`04 §7.3`; rmp #57).
+    procedures: &'a dyn ProcedureRegistry,
+}
 
-impl Analyzer {
+impl Analyzer<'_> {
     /// Checks a whole [`Query`]: each single query of a `UNION` chain is analysed independently
     /// (each has its own scope), or the standalone `CALL`. The branches of a `UNION` must all
     /// return the same column names — TCK `DifferentColumnsInUnion`.
@@ -451,10 +584,18 @@ impl Analyzer {
         c: &crate::ast::CallClause,
         scope: &mut Scope,
     ) -> Result<(), SemanticError> {
-        if let Some(args) = &c.call.args {
-            for a in args {
-                self.check_expr_refs(a, scope)?;
-            }
+        let sig = self.resolve_procedure(&c.call)?;
+        self.check_call_arguments(&c.call, sig, scope)?;
+        // An in-query call to a procedure **with outputs** must name them with `YIELD` — without
+        // it the outputs are unnameable by the following clauses. The TCK raises this as the
+        // compile-time `UndefinedVariable` (`tck/features/clauses/call/Call1.feature` [12]).
+        if c.yield_items.is_none() && !sig.outputs.is_empty() {
+            return Err(SemanticError::new(
+                SemanticErrorKind::UndefinedVariable {
+                    name: sig.outputs[0].name.clone(),
+                },
+                c.call.span,
+            ));
         }
         if let Some(items) = &c.yield_items {
             self.bind_yield_items(items, scope)?;
@@ -466,12 +607,9 @@ impl Analyzer {
     }
 
     fn check_standalone_call(&self, call: &StandaloneCall) -> Result<(), SemanticError> {
-        if let Some(args) = &call.call.args {
-            let empty = Scope::default();
-            for a in args {
-                self.check_expr_refs(a, &empty)?;
-            }
-        }
+        let sig = self.resolve_procedure(&call.call)?;
+        let empty = Scope::default();
+        self.check_call_arguments(&call.call, sig, &empty)?;
         // A standalone `YIELD *` / items introduces names but there is no following clause to
         // reference them, so there is nothing further to resolve here.
         if let Some(StandaloneYield::Items {
@@ -488,12 +626,86 @@ impl Analyzer {
         Ok(())
     }
 
+    /// Resolves a procedure invocation's dotted name against the registry. TCK
+    /// `ProcedureError`/`ProcedureNotFound` on a miss (`tck/features/clauses/call/Call1.feature`).
+    fn resolve_procedure(
+        &self,
+        call: &crate::ast::ProcedureCall,
+    ) -> Result<&ProcedureSignature, SemanticError> {
+        let dotted = call.name.join(".");
+        self.procedures.signature(&dotted).ok_or_else(|| {
+            SemanticError::new(
+                SemanticErrorKind::ProcedureNotFound { name: dotted },
+                call.span,
+            )
+        })
+    }
+
+    /// Checks a procedure invocation's **explicit** argument list against `sig`: scope-resolves
+    /// each expression, rejects aggregates (TCK `InvalidAggregation`,
+    /// `tck/features/clauses/call/Call1.feature` [16]), enforces the exact declared arity (TCK
+    /// `InvalidNumberOfArguments`), and statically type-checks **literal** arguments against the
+    /// declared input types (TCK `InvalidArgumentType`,
+    /// `tck/features/clauses/call/Call2.feature`). The implicit form (`args: None`) has nothing to
+    /// check here — its arguments are the query parameters, validated by
+    /// [`check_implicit_call_parameters`].
+    fn check_call_arguments(
+        &self,
+        call: &crate::ast::ProcedureCall,
+        sig: &ProcedureSignature,
+        scope: &Scope,
+    ) -> Result<(), SemanticError> {
+        let Some(args) = &call.args else {
+            return Ok(());
+        };
+        for a in args {
+            self.check_expr_refs(a, scope)?;
+            self.reject_aggregation(a, "a procedure CALL argument")?;
+        }
+        if args.len() != sig.inputs.len() {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidNumberOfArguments {
+                    name: sig.name.clone(),
+                    expected: sig.inputs.len().to_string(),
+                    got: args.len(),
+                },
+                call.span,
+            ));
+        }
+        for (arg, input) in args.iter().zip(&sig.inputs) {
+            if literal_violates_type(arg, input.ty) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidProcedureArgumentType {
+                        name: sig.name.clone(),
+                        parameter: input.name.clone(),
+                        expected: input.ty.to_string(),
+                    },
+                    arg.span,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds `YIELD` items into `scope`. A `YIELD` **introduces** each alias, so a name already in
+    /// scope — bound by an earlier clause, or by a previous item of the same `YIELD` — is the TCK
+    /// compile-time `VariableAlreadyBound` (`tck/features/clauses/call/Call1.feature` [15],
+    /// `Call5.feature` [5]/[6]); this is stricter than [`Scope::bind`]'s benign same-kind re-binding
+    /// rule for `MATCH` patterns.
     fn bind_yield_items(
         &self,
         items: &[YieldItem],
         scope: &mut Scope,
     ) -> Result<(), SemanticError> {
         for item in items {
+            if scope.contains(&item.alias.name) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::VariableAlreadyBound {
+                        name: item.alias.name.clone(),
+                    },
+                    item.alias.span,
+                ));
+            }
             scope.bind(&item.alias.name, VarKind::Value, item.alias.span)?;
         }
         Ok(())
@@ -1264,7 +1476,10 @@ mod tests {
         } else {
             unreachable!()
         };
-        assert!(Analyzer.projection_is_aggregating(body));
+        let analyzer = Analyzer {
+            procedures: procedure_registry::builtins(),
+        };
+        assert!(analyzer.projection_is_aggregating(body));
     }
 
     #[test]

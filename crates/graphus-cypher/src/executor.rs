@@ -51,6 +51,7 @@ use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
 use crate::ordering::cmp_values;
 use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound};
+use crate::procedure_registry::{self, ProcedureFailure, ProcedureRegistry};
 use crate::runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 use crate::ternary::Ternary;
 
@@ -112,6 +113,10 @@ pub enum ExecError {
         /// A human description of the failure (path / scheme / I/O / parse detail).
         reason: String,
     },
+    /// A procedure invocation failed at runtime (`CALL …`; rmp #57): the registry rejected it
+    /// (compile/execute registry mismatch — semantic analysis resolves names at compile time), a
+    /// `YIELD` named a result field the signature does not declare, or the procedure body failed.
+    Procedure(ProcedureFailure),
 }
 
 impl fmt::Display for ExecError {
@@ -128,6 +133,7 @@ impl fmt::Display for ExecError {
             }
             Self::PropertiesNotAMap => write!(f, "inline properties must be a map"),
             Self::LoadCsv { reason } => write!(f, "LOAD CSV failed: {reason}"),
+            Self::Procedure(failure) => write!(f, "{failure}"),
         }
     }
 }
@@ -148,7 +154,7 @@ impl From<ExecError> for graphus_core::GraphusError {
 }
 
 /// The shared, per-execution context every operator threads through `next`: the bound parameters,
-/// the cancellation token, and the live graph seam.
+/// the cancellation token, the live graph seam, and the procedure registry.
 ///
 /// The graph is a `&mut dyn GraphAccess` so write operators can mutate it; read operators take it
 /// by shared reborrow. Bundling it keeps the operator `next` signature small.
@@ -156,6 +162,7 @@ struct Ctx<'a> {
     params: &'a BoundParameters,
     token: &'a CancellationToken,
     graph: &'a mut dyn GraphAccess,
+    procedures: &'a dyn ProcedureRegistry,
 }
 
 impl Ctx<'_> {
@@ -265,6 +272,27 @@ enum Operator {
     Write {
         input: Box<Operator>,
         kind: WriteKind,
+    },
+
+    /// `CALL proc(args) [YIELD …]` (rmp #57): for each driving row, evaluate the arguments, invoke
+    /// the procedure through the registry, and stream one output row per procedure result row —
+    /// the driving row extended with the `bindings` columns. A **void** procedure (no declared
+    /// outputs) is invoked for its effect and passes the driving row through once (openCypher
+    /// `test.doNothing()` semantics). A leading/standalone call's `input` is a [`Self::SingleRow`].
+    ProcedureCall {
+        input: Box<Operator>,
+        /// The dotted procedure name.
+        name: String,
+        /// The argument expressions, evaluated per driving row (semantic analysis already resolved
+        /// the implicit form to parameter expressions).
+        args: Vec<Expr>,
+        /// The output bindings, resolved at build time: `(variable name, index into the
+        /// procedure's result row)`.
+        bindings: Vec<(String, usize)>,
+        /// `true` when the signature declares no outputs (the void pass-through case).
+        void: bool,
+        /// The driving row plus its pending procedure result rows.
+        current: Option<(Row, VecDeque<Vec<Value>>)>,
     },
 }
 
@@ -513,6 +541,52 @@ impl Operator {
                     Ok(None)
                 }
             }
+
+            Operator::ProcedureCall {
+                input,
+                name,
+                args,
+                bindings,
+                void,
+                current,
+            } => loop {
+                // Drain the pending result rows of the current driving row first.
+                if let Some((base, queue)) = current {
+                    if let Some(out) = queue.pop_front() {
+                        let mut row = base.clone();
+                        for (variable, idx) in bindings.iter() {
+                            // `idx` was resolved against the signature's outputs at build time and
+                            // the registry contract aligns each result row with them, so a short
+                            // row is a registry bug — surface `null` rather than panic.
+                            let value = out.get(*idx).cloned().unwrap_or(Value::Null);
+                            row.set(variable.clone(), RowValue::Value(value));
+                        }
+                        return Ok(Some(row));
+                    }
+                    *current = None;
+                }
+                let Some(base) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                // Arguments are evaluated per driving row (they may reference its bindings), then
+                // collapsed to property values — the v1 procedure argument domain.
+                let mut arg_values = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    arg_values.push(eval_value(a, &base, ctx.params, ctx.graph)?);
+                }
+                let rows = ctx
+                    .procedures
+                    .invoke(name, &arg_values, &mut *ctx.graph)
+                    .map_err(ExecError::Procedure)?;
+                if *void {
+                    // VOID procedure: invoked for its effect; the driving row passes through once
+                    // (openCypher `test.doNothing()` semantics — cardinality is preserved).
+                    return Ok(Some(base));
+                }
+                if !rows.is_empty() {
+                    *current = Some((base, VecDeque::from(rows)));
+                }
+            },
         }
     }
 }
@@ -928,10 +1002,77 @@ fn build_operator(
             kind: WriteKind::Remove { ops: ops.clone() },
         }),
 
-        // ---- procedure (deferred, named) ------------------------------------------------------
-        PhysicalOp::ProcedureCall { .. } => Err(ExecError::Eval(EvalError::UnsupportedFunction {
-            name: "CALL <procedure>".to_owned(),
-        })),
+        // ---- procedure ------------------------------------------------------------------------
+        PhysicalOp::ProcedureCall {
+            input,
+            name,
+            args,
+            yields,
+        } => {
+            let dotted = name.join(".");
+            // Semantic analysis resolved the name at compile time over the *same* registry, so a
+            // miss here means the compile-time and execution-time registries diverged.
+            let Some(sig) = ctx.procedures.signature(&dotted) else {
+                return Err(ExecError::Procedure(ProcedureFailure::new(
+                    &dotted,
+                    "procedure is not registered (compile/execute registry mismatch)",
+                )));
+            };
+            // Resolve the output bindings once: `YIELD [field AS] var` columns by declared result
+            // field, or — for the standalone / `YIELD *` form (`yields: None`) — every declared
+            // output verbatim.
+            let bindings: Vec<(String, usize)> = match yields {
+                Some(items) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for y in items {
+                        let field = y.field.as_deref().unwrap_or(&y.variable.name);
+                        let Some(idx) = sig.outputs.iter().position(|o| o.name == field) else {
+                            return Err(ExecError::Procedure(ProcedureFailure::new(
+                                &dotted,
+                                format!("YIELD names unknown result field `{field}`"),
+                            )));
+                        };
+                        out.push((y.variable.name.clone(), idx));
+                    }
+                    out
+                }
+                None => sig
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| (o.name.clone(), i))
+                    .collect(),
+            };
+            // The implicit form was resolved to parameter expressions by semantic analysis; a
+            // zero-input procedure's implicit form is equivalent to `()`.
+            let args = match args {
+                Some(a) => a.clone(),
+                None if sig.inputs.is_empty() => Vec::new(),
+                None => {
+                    return Err(ExecError::Procedure(ProcedureFailure::new(
+                        &dotted,
+                        "implicit argument passing reached the executor unresolved",
+                    )));
+                }
+            };
+            let void = sig.outputs.is_empty();
+            let input = match input {
+                Some(op) => build_operator(op, arg, ctx)?,
+                // A leading/standalone call is driven by the single empty row.
+                None => Operator::SingleRow {
+                    emitted: false,
+                    row: Row::empty(),
+                },
+            };
+            Ok(Operator::ProcedureCall {
+                input: Box::new(input),
+                name: dotted,
+                args,
+                bindings,
+                void,
+                current: None,
+            })
+        }
     }
 }
 
@@ -1818,6 +1959,7 @@ pub struct Cursor<'a> {
     params: BoundParameters,
     token: CancellationToken,
     graph: &'a mut dyn GraphAccess,
+    procedures: &'a dyn ProcedureRegistry,
     columns: Vec<String>,
     finished: bool,
 }
@@ -1849,6 +1991,7 @@ impl<'a> Cursor<'a> {
             params: &self.params,
             token: &self.token,
             graph: self.graph,
+            procedures: self.procedures,
         };
         match self.root.next(&mut ctx) {
             Ok(Some(row)) => Ok(Some(row)),
@@ -1913,13 +2056,17 @@ impl Executor {
         Self { plan, params }
     }
 
-    /// The result column names this plan produces (the root projection's output schema).
+    /// The result column names this plan produces (the root projection's output schema), resolved
+    /// against the engine's [built-in procedures](crate::procedure_registry::builtins). When
+    /// running against a caller-supplied registry, use the columns of the cursor returned by
+    /// [`open_with_procedures`](Self::open_with_procedures) instead.
     #[must_use]
     pub fn columns(&self) -> Vec<String> {
-        result_columns(&self.plan.root)
+        result_columns(&self.plan.root, procedure_registry::builtins())
     }
 
-    /// Opens a [`Cursor`] over `graph` with cancellation token `token` (`04 §7.7`).
+    /// Opens a [`Cursor`] over `graph` with cancellation token `token` (`04 §7.7`), resolving any
+    /// procedure call against the engine [built-ins](crate::procedure_registry::builtins).
     ///
     /// Leaf scans and materialising operators are computed during this call (they need the graph);
     /// streaming operators stay lazy and are driven by [`Cursor::next`] / [`Cursor::pull`].
@@ -1933,12 +2080,33 @@ impl Executor {
         graph: &'a mut dyn GraphAccess,
         token: CancellationToken,
     ) -> Result<Cursor<'a>, ExecError> {
-        let columns = result_columns(&self.plan.root);
+        self.open_with_procedures(graph, token, procedure_registry::builtins())
+    }
+
+    /// [`open`](Self::open) against a caller-supplied [`ProcedureRegistry`] (rmp #57).
+    ///
+    /// The registry must be the **same** one the statement was compiled against
+    /// ([`crate::semantics::analyze_with_procedures`]); a swap between the phases voids the
+    /// compile-time procedure guarantees.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open), plus [`ExecError::Procedure`] if the plan calls a procedure the
+    /// registry does not provide (a compile/execute registry mismatch) or a `YIELD` names a result
+    /// field the signature does not declare.
+    pub fn open_with_procedures<'a>(
+        &self,
+        graph: &'a mut dyn GraphAccess,
+        token: CancellationToken,
+        procedures: &'a dyn ProcedureRegistry,
+    ) -> Result<Cursor<'a>, ExecError> {
+        let columns = result_columns(&self.plan.root, procedures);
         let root = {
             let mut ctx = Ctx {
                 params: &self.params,
                 token: &token,
                 graph,
+                procedures,
             };
             build_operator(&self.plan.root, None, &mut ctx)?
         };
@@ -1947,6 +2115,7 @@ impl Executor {
             params: self.params.clone(),
             token,
             graph,
+            procedures,
             columns,
             finished: false,
         })
@@ -1996,11 +2165,35 @@ pub fn execute<'a>(
     Executor::new(plan.clone(), params.clone()).open(graph, CancellationToken::new())
 }
 
+/// [`execute`] against a caller-supplied [`ProcedureRegistry`] (rmp #57): a convenience wrapping
+/// [`Executor::open_with_procedures`] with a fresh [`CancellationToken`].
+///
+/// The registry must be the **same** one the statement was compiled against
+/// ([`crate::semantics::analyze_with_procedures`]).
+///
+/// # Errors
+///
+/// As [`execute`], plus [`ExecError::Procedure`] for a compile/execute registry mismatch.
+pub fn execute_with_procedures<'a>(
+    plan: &PhysicalPlan,
+    params: &BoundParameters,
+    graph: &'a mut dyn GraphAccess,
+    procedures: &'a dyn ProcedureRegistry,
+) -> Result<Cursor<'a>, ExecError> {
+    Executor::new(plan.clone(), params.clone()).open_with_procedures(
+        graph,
+        CancellationToken::new(),
+        procedures,
+    )
+}
+
 /// The result column names a plan produces, derived from its root operator's output schema.
 ///
 /// A `Projection`/`Aggregation` root names its columns explicitly; a write/`Optional`/`Skip`/`Limit`
-/// root delegates to its input's columns. Leaves name their introduced variable(s).
-fn result_columns(op: &PhysicalOp) -> Vec<String> {
+/// root delegates to its input's columns. Leaves name their introduced variable(s). A
+/// `ProcedureCall` without `YIELD` (the standalone / `YIELD *` form) names the procedure's declared
+/// outputs, resolved through `procedures`.
+fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<String> {
     match op {
         PhysicalOp::Projection { items, .. } => items.iter().map(|c| c.alias.clone()).collect(),
         PhysicalOp::Aggregation {
@@ -2022,15 +2215,15 @@ fn result_columns(op: &PhysicalOp) -> Vec<String> {
         | PhysicalOp::Merge { input, .. }
         | PhysicalOp::SetClause { input, .. }
         | PhysicalOp::Delete { input, .. }
-        | PhysicalOp::Remove { input, .. } => result_columns(input),
-        PhysicalOp::TopN { input, .. } => result_columns(input),
+        | PhysicalOp::Remove { input, .. } => result_columns(input, procedures),
+        PhysicalOp::TopN { input, .. } => result_columns(input, procedures),
         PhysicalOp::Unwind {
             input, variable, ..
         }
         | PhysicalOp::LoadCsv {
             input, variable, ..
         } => {
-            let mut cols = result_columns(input);
+            let mut cols = result_columns(input, procedures);
             if !cols.contains(&variable.name) {
                 cols.push(variable.name.clone());
             }
@@ -2048,7 +2241,7 @@ fn result_columns(op: &PhysicalOp) -> Vec<String> {
             to,
             ..
         } => {
-            let mut cols = result_columns(input);
+            let mut cols = result_columns(input, procedures);
             for v in [relationship, to] {
                 if !cols.contains(&v.name) {
                     cols.push(v.name.clone());
@@ -2057,15 +2250,15 @@ fn result_columns(op: &PhysicalOp) -> Vec<String> {
             cols
         }
         PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
-            let mut cols = result_columns(left);
-            for c in result_columns(right) {
+            let mut cols = result_columns(left, procedures);
+            for c in result_columns(right, procedures) {
                 if !cols.contains(&c) {
                     cols.push(c);
                 }
             }
             cols
         }
-        PhysicalOp::Union { left, .. } => result_columns(left),
+        PhysicalOp::Union { left, .. } => result_columns(left, procedures),
         PhysicalOp::AllNodesScan { variable }
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
@@ -2085,14 +2278,39 @@ fn result_columns(op: &PhysicalOp) -> Vec<String> {
         }
         PhysicalOp::Argument { arguments } => arguments.iter().map(|v| v.name.clone()).collect(),
         PhysicalOp::Empty => Vec::new(),
-        PhysicalOp::ProcedureCall { yields, .. } => yields
-            .as_ref()
-            .map(|ys| {
-                ys.iter()
-                    .map(|y: &YieldColumn| y.variable.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default(),
+        PhysicalOp::ProcedureCall {
+            input,
+            name,
+            yields,
+            ..
+        } => {
+            let mut cols = input
+                .as_deref()
+                .map(|i| result_columns(i, procedures))
+                .unwrap_or_default();
+            match yields {
+                Some(ys) => {
+                    for y in ys.iter().map(|y: &YieldColumn| &y.variable.name) {
+                        if !cols.contains(y) {
+                            cols.push(y.clone());
+                        }
+                    }
+                }
+                // The standalone / `YIELD *` form binds every declared output verbatim. An
+                // unknown procedure yields no columns here; opening the cursor then raises the
+                // registry-mismatch error.
+                None => {
+                    if let Some(sig) = procedures.signature(&name.join(".")) {
+                        for o in &sig.outputs {
+                            if !cols.contains(&o.name) {
+                                cols.push(o.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            cols
+        }
     }
 }
 
