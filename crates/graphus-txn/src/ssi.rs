@@ -236,6 +236,32 @@ impl SsiTracker {
         }
     }
 
+    /// Prunes committed transactions no live transaction can conflict with, returning how many were
+    /// forgotten (`04 §5.5`, `rmp` task #59).
+    ///
+    /// `low_water` is the oldest active begin timestamp (`None` = no active transactions). A
+    /// transaction that committed at or before `low_water` committed before every active transaction
+    /// began, so it is concurrent with none of them: no rw-antidependency edge can connect it to any
+    /// live transaction (edges are only ever recorded between concurrent transactions, and any
+    /// transaction that *was* concurrent with it has since finished). Forgetting it can therefore
+    /// never hide a dangerous structure from [`detect_pivot_abort`](Self::detect_pivot_abort) —
+    /// the same retention rule PostgreSQL applies to its SSI summary of committed transactions.
+    pub fn prune_committed(&mut self, low_water: Option<Timestamp>) -> usize {
+        let settled: Vec<TxnId> = self
+            .txns
+            .iter()
+            .filter(|(_, t)| {
+                t.commit_ts
+                    .is_some_and(|c| low_water.is_none_or(|mark| c <= mark))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for txn in &settled {
+            self.forget(*txn);
+        }
+        settled.len()
+    }
+
     /// Whether `txn` currently has both an inbound and an outbound rw-edge (is a pivot). Test aid.
     #[must_use]
     pub fn is_pivot(&self, txn: TxnId) -> bool {
@@ -324,6 +350,33 @@ mod tests {
         s.register(TxnId(2), ts(2));
         s.record_write(TxnId(2), 100);
         assert_eq!(s.detect_pivot_abort(TxnId(2)), None);
+    }
+
+    #[test]
+    fn prune_committed_forgets_only_settled_transactions() {
+        let mut s = SsiTracker::new();
+        // T1 committed at 5; T2 committed at 30; T3 is in flight (begun at 20).
+        s.register(TxnId(1), ts(1));
+        s.record_write(TxnId(1), 100);
+        s.record_commit(TxnId(1), ts(5));
+        s.register(TxnId(2), ts(10));
+        s.record_write(TxnId(2), 200);
+        s.record_commit(TxnId(2), ts(30));
+        s.register(TxnId(3), ts(20));
+        s.record_read(TxnId(3), 200);
+
+        // low_water = 20 (T3's begin): T1 (committed at 5 ≤ 20) is settled; T2 (committed at 30,
+        // concurrent with T3) and T3 (in flight) must be retained.
+        assert_eq!(s.prune_committed(Some(ts(20))), 1);
+        assert!(!s.is_pivot(TxnId(1))); // forgotten
+        // T3's edge to the retained T2 still works: T3 read 200 which T2 (concurrent) wrote.
+        assert!(s.txns.contains_key(&TxnId(2)));
+        assert!(s.txns.contains_key(&TxnId(3)));
+
+        // With no active transactions, every committed entry is settled; in-flight ones stay.
+        assert_eq!(s.prune_committed(None), 1);
+        assert!(!s.txns.contains_key(&TxnId(2)));
+        assert!(s.txns.contains_key(&TxnId(3)));
     }
 
     #[test]

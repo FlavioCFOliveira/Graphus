@@ -100,6 +100,56 @@ impl CommitRegistry {
         self.outcomes.remove(&txn);
     }
 
+    /// The number of entries currently in the table (observability: GC-time pruning, `04 §5.5`,
+    /// bounds this; see [`prune_settled`](Self::prune_settled)).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether the table holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.outcomes.is_empty()
+    }
+
+    /// The writers currently recorded as [`TxnOutcome::Committed`], in no particular order.
+    ///
+    /// GC captures this set **after** its header-freeze sweep (`04 §5.5`, `rmp` task #59): the sweep
+    /// rewrote every on-disk in-flight stamp of these writers to its committed timestamp, so once
+    /// the freeze is durable (the GC transaction commits) every one of them may be
+    /// [`forget`](Self::forget)-ten without any version becoming unresolvable.
+    #[must_use]
+    pub fn committed_writers(&self) -> Vec<TxnId> {
+        self.outcomes
+            .iter()
+            .filter_map(|(txn, outcome)| match outcome {
+                TxnOutcome::Committed(_) => Some(*txn),
+                TxnOutcome::InFlight | TxnOutcome::Aborted => None,
+            })
+            .collect()
+    }
+
+    /// Prunes entries that GC has proven settled, returning how many were removed (`04 §5.5`,
+    /// `rmp` task #59): every [`TxnOutcome::Aborted`] entry (an unknown id already resolves as
+    /// aborted, so forgetting one is semantically a no-op) and every [`TxnOutcome::Committed`] entry
+    /// whose commit timestamp is at or below `low_water` (`None` = no active transactions, so every
+    /// committed entry is settled). [`TxnOutcome::InFlight`] entries are always kept.
+    ///
+    /// The caller must guarantee that no version header a reader can still consult carries a pruned
+    /// writer's in-flight stamp — for the [`VersionedStore`](crate::store::VersionedStore) contract
+    /// that holds at commit (`commit_writer` settles every stamp); for a lazy-freezing store it holds
+    /// only after a durable GC freeze pass.
+    pub fn prune_settled(&mut self, low_water: Option<Timestamp>) -> usize {
+        let before = self.outcomes.len();
+        self.outcomes.retain(|_, outcome| match outcome {
+            TxnOutcome::InFlight => true,
+            TxnOutcome::Aborted => false,
+            TxnOutcome::Committed(ts) => low_water.is_some_and(|mark| *ts > mark),
+        });
+        before - self.outcomes.len()
+    }
+
     /// The recorded outcome of `txn`. An unknown id is treated as [`TxnOutcome::Aborted`]: it was
     /// either never committed, or already GC'd because it is provably invisible — both mean its
     /// writes are not visible (`04 §5.3`).
@@ -161,6 +211,32 @@ mod tests {
         assert_eq!(reg.resolve_commit_ts(word), Some(Timestamp(50)));
         reg.record_abort(TxnId(3));
         assert_eq!(reg.resolve_commit_ts(word), None); // aborted
+    }
+
+    #[test]
+    fn prune_settled_keeps_in_flight_and_unsettled_committed_entries() {
+        let mut reg = CommitRegistry::new();
+        reg.register_begin(TxnId(1)); // in flight: always kept
+        reg.record_commit(TxnId(2), Timestamp(10)); // committed ≤ low_water: pruned
+        reg.record_commit(TxnId(3), Timestamp(30)); // committed > low_water: kept
+        reg.record_abort(TxnId(4)); // aborted: pruned (unknown resolves as aborted anyway)
+        assert_eq!(reg.len(), 4);
+
+        let mut committed = reg.committed_writers();
+        committed.sort_unstable();
+        assert_eq!(committed, vec![TxnId(2), TxnId(3)]);
+
+        assert_eq!(reg.prune_settled(Some(Timestamp(20))), 2);
+        assert_eq!(reg.outcome(TxnId(1)), TxnOutcome::InFlight);
+        assert_eq!(reg.outcome(TxnId(2)), TxnOutcome::Aborted); // forgotten = unknown = aborted
+        assert_eq!(reg.outcome(TxnId(3)), TxnOutcome::Committed(Timestamp(30)));
+        assert_eq!(reg.len(), 2);
+
+        // No active transactions: every committed entry is settled.
+        assert_eq!(reg.prune_settled(None), 1);
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+        assert_eq!(reg.outcome(TxnId(1)), TxnOutcome::InFlight);
     }
 
     #[test]

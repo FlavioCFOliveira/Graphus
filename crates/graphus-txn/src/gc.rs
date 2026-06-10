@@ -23,6 +23,11 @@ pub struct GcReport {
     pub low_water: Option<Timestamp>,
     /// Number of physical versions reclaimed.
     pub versions_reclaimed: usize,
+    /// Number of settled transactions pruned from the manager's commit registry after the pass
+    /// (`rmp` task #59; `0` from [`collect`] itself — the manager's
+    /// [`run_gc`](crate::manager::TxnManager::run_gc) fills it in, since the registry prune is the
+    /// manager-facing half of GC).
+    pub txns_pruned: usize,
 }
 
 /// Runs one GC pass over `store` at the given `low_water` watermark, resolving writer outcomes via
@@ -40,6 +45,7 @@ pub fn collect<S: VersionedStore>(
     GcReport {
         low_water,
         versions_reclaimed,
+        txns_pruned: 0,
     }
 }
 

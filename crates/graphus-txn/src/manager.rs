@@ -254,11 +254,20 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     /// Runs one GC pass at the current low-water mark and forgets fully-dead transactions.
     ///
     /// Reclaims versions invisible to every live snapshot (`04 §5.5`) and prunes registry/SSI
-    /// entries that no live reader can still resolve. Long-running readers hold the watermark back
-    /// automatically. Returns the [`GcReport`].
+    /// entries that no live reader can still resolve (`rmp` task #59), so neither table grows with
+    /// the store's lifetime. Long-running readers hold the watermark back automatically. Returns the
+    /// [`GcReport`].
+    ///
+    /// Pruning the commit registry here is safe because the [`VersionedStore`] contract settles
+    /// every committed writer's in-flight stamps at `commit_writer`, so no version header a reader
+    /// can still consult resolves through a settled entry; the `≤ low_water` gate additionally
+    /// matches the SSI retention rule (see [`SsiTracker::prune_committed`]).
     pub fn run_gc(&mut self) -> GcReport {
         let low_water = self.oracle.low_water_mark();
-        collect(&mut self.store, low_water, &self.registry)
+        let mut report = collect(&mut self.store, low_water, &self.registry);
+        report.txns_pruned = self.registry.prune_settled(low_water);
+        self.ssi.prune_committed(low_water);
+        report
     }
 
     /// The current GC low-water mark (oldest active begin timestamp), for observability/tests.
@@ -271,6 +280,13 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+
+    /// The number of entries in the commit registry (the Active/Recent Transaction Table). Bounded
+    /// by the [`run_gc`](Self::run_gc) prune (`rmp` task #59); observability/tests.
+    #[must_use]
+    pub fn registry_len(&self) -> usize {
+        self.registry.len()
     }
 
     /// Borrows the underlying store (read-only inspection, tests).
@@ -444,6 +460,42 @@ mod tests {
         m.commit(t1).unwrap();
         let t2 = m.begin_serializable();
         assert_eq!(m.read(t2, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn run_gc_prunes_settled_registry_entries_but_keeps_live_ones() {
+        let mut m = mgr();
+        // Three committed writers grow the registry.
+        for key in 1..=3u64 {
+            let t = m.begin_serializable();
+            m.write(t, key, b"v".to_vec()).unwrap();
+            m.commit(t).unwrap();
+        }
+        assert_eq!(m.registry_len(), 3);
+
+        // A long reader pins the low-water mark at its begin timestamp: a writer that commits
+        // *after* the reader began stays in the registry (it is still potentially relevant), while
+        // the three writers settled before the reader began are pruned.
+        let reader = m.begin_serializable();
+        let late = m.begin_serializable();
+        m.write(late, 9, b"late".to_vec()).unwrap();
+        m.commit(late).unwrap();
+        let report = m.run_gc();
+        assert_eq!(report.txns_pruned, 3);
+        assert_eq!(
+            m.registry_len(),
+            2,
+            "the reader (in flight) + the late writer"
+        );
+        // The reader still resolves everything it could see (the settled writers' versions carry
+        // committed stamps per the VersionedStore contract).
+        assert_eq!(m.read(reader, 1).unwrap(), Some(b"v".to_vec()));
+        m.commit(reader).unwrap();
+
+        // With no active transactions, everything settles.
+        let report = m.run_gc();
+        assert!(report.txns_pruned >= 2);
+        assert_eq!(m.registry_len(), 0);
     }
 
     #[test]

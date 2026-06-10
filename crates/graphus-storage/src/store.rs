@@ -32,7 +32,7 @@ use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{ElementId, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
 use graphus_io::{BlockDevice, PAGE_SIZE};
-use graphus_txn::CommitRegistry;
+use graphus_txn::{CommitRegistry, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
@@ -41,8 +41,9 @@ use crate::labels;
 use crate::meta::{Meta, StoreMeta};
 use crate::paging;
 use crate::record::{
-    CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_OFF_EXPIRED_TS, MvccHeader,
-    NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_RECORD_SIZE, RelRecord,
+    CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
+    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
+    REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenStore};
 use crate::valenc;
@@ -148,6 +149,30 @@ struct ActiveTxn {
     expired: Vec<(StoreKind, u64)>,
 }
 
+/// What one [`RecordStore::gc`] pass did (observability, NFR-10; `rmp` task #59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GcPassReport {
+    /// Physical record versions reclaimed (slots freed, `04 §5.5`).
+    pub reclaimed: usize,
+    /// MVCC header words (`xmin`/`xmax`) frozen from a committed writer's in-flight `TxnId` to its
+    /// `Committed(ts)` stamp (`rmp` task #59), making those versions self-describing.
+    pub frozen: usize,
+    /// Committed writers scheduled to be forgotten from the Active/Recent Transaction Table when
+    /// the GC transaction commits (a mid-pass rollback discards the schedule and prunes nothing).
+    pub prune_scheduled: usize,
+}
+
+/// The prune a completed [`RecordStore::gc`] freeze sweep scheduled, held until its GC transaction
+/// resolves (`rmp` task #59): [`RecordStore::commit`] of `gc_txn` forgets `writers` from the
+/// Active/Recent Transaction Table (the freeze that made them forgettable is durable from that
+/// point on); [`RecordStore::rollback`] of `gc_txn` discards the schedule, because the rollback's
+/// WAL undo restores the in-flight header stamps that still need those entries to resolve.
+#[derive(Debug)]
+struct PendingGcPrune {
+    gc_txn: TxnId,
+    writers: Vec<TxnId>,
+}
+
 /// A record store with index-free adjacency, over a buffer pool and the ARIES WAL.
 ///
 /// `RecordStore` is generic over the block device `D` and the WAL log sink `S` so it runs over
@@ -179,10 +204,15 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// Visibility and reclamation resolve an on-disk in-flight stamp through this table
     /// ([`is_reclaimable`](Self::is_reclaimable); readers via [`commit_registry`](Self::commit_registry)).
     /// Rebuilt on reopen from the WAL's commit records (each carries its `commit_ts`), so a
-    /// committed-but-unfrozen version stays resolvable across a crash. Entries are currently retained
-    /// for the store's lifetime (re-derivable from the log); opportunistic GC-time header freezing
-    /// plus entry pruning, to bound the table, is a tracked follow-up.
+    /// committed-but-unfrozen version stays resolvable across a crash. The table is **bounded** by
+    /// GC-time header freezing (`rmp` task #59): a [`gc`](Self::gc) pass rewrites every in-flight
+    /// stamp of a committed writer to its `Committed(ts)` form and, once that freeze is durable
+    /// (the GC transaction commits), forgets the now-unreferenced writers from this table.
     commit_registry: CommitRegistry,
+    /// The registry prune the last completed [`gc`](Self::gc) freeze sweep scheduled, applied at
+    /// the GC transaction's [`commit`](Self::commit) and discarded at its
+    /// [`rollback`](Self::rollback) (`rmp` task #59). `None` while no GC pass is pending.
+    pending_gc_prune: Option<PendingGcPrune>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
@@ -223,6 +253,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             active: HashMap::new(),
             meta_chain: Vec::new(),
             commit_registry: CommitRegistry::new(),
+            pending_gc_prune: None,
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -243,7 +274,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // with lazy GC-time freezing a committed version may still carry its writer's in-flight
         // `TxnId` on disk, so visibility/reclamation must resolve that id to the commit timestamp the
         // commit record durably holds. The scan is robust to checkpoint truncation (the timestamp
-        // lives in each commit record, not derived from log position).
+        // lives in each commit record, not derived from log position). Writers a pre-crash GC pass
+        // had already frozen and pruned (`rmp` task #59) reappear here; that is harmless — no header
+        // references them, so the entries are never consulted and the next GC pass prunes them again.
         let mut commit_registry = CommitRegistry::new();
         for (committed_txn, ts) in shared.with(|w| w.committed_transactions())? {
             commit_registry.record_commit(committed_txn, ts);
@@ -264,6 +297,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             active: HashMap::new(),
             meta_chain,
             commit_registry,
+            pending_gc_prune: None,
         })
     }
 
@@ -566,7 +600,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// ([`RecordStoreGraph`](../../graphus_cypher)) resolves an on-disk in-flight `xmin`/`xmax`
     /// stamp to its writer's commit timestamp — or learns the writer is still in flight or aborted —
     /// through this, since lazy freezing leaves a committed version stamped with its writer's
-    /// `TxnId` until a follow-up GC freeze settles it. Borrowed read-only; the store owns the table.
+    /// `TxnId` until a [`gc`](Self::gc) pass freezes it to `Committed(ts)` and prunes the entry
+    /// (`rmp` task #59). Borrowed read-only; the store owns the table.
     #[must_use]
     pub fn commit_registry(&self) -> &CommitRegistry {
         &self.commit_registry
@@ -603,10 +638,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // header writes (the eager, correctness-first path of task #45). Instead record the outcome
         // in the Active/Recent Transaction Table; a reader resolves an in-flight stamp to its commit
         // timestamp through that table ([`is_reclaimable`](Self::is_reclaimable) and the cypher
-        // visibility layer via [`commit_registry`](Self::commit_registry)); a GC-time header freeze
-        // plus entry pruning, to bound the table, is a tracked follow-up. What makes a committed
-        // insert/delete survive a crash is now the WAL commit record carrying `commit_ts`
-        // (`commit_at`): recovery rebuilds the table from it
+        // visibility layer via [`commit_registry`](Self::commit_registry)); the GC-time header
+        // freeze (`rmp` task #59) later settles the stamps and prunes the entries, bounding the
+        // table. What makes a committed insert/delete survive a crash is now the WAL commit record
+        // carrying `commit_ts` (`commit_at`): recovery rebuilds the table from it
         // ([`open`](Self::open)). Commit is now O(1) in header writes.
         let commit_ts = self.next_commit_ts();
         // Drop the per-txn created/expired bookkeeping (it fed the old eager settle loop; the table
@@ -615,6 +650,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.commit_registry.record_commit(txn, commit_ts);
         self.checkpoint_meta(txn, false)?;
         self.wal.with(|w| w.commit_at(txn, commit_ts))?;
+        // If `txn` was a GC pass, its header freeze is durable from here on (`rmp` task #59): every
+        // writer the pass scheduled is no longer referenced by any on-disk in-flight stamp, so the
+        // Active/Recent Transaction Table entries can be forgotten — this, after the freeze, is what
+        // bounds the table. Pruning strictly AFTER the commit hardens means a crash or rollback
+        // before this point leaves the table intact for the restored in-flight stamps.
+        if self
+            .pending_gc_prune
+            .as_ref()
+            .is_some_and(|p| p.gc_txn == txn)
+        {
+            let pending = self.pending_gc_prune.take().expect("checked Some above");
+            for writer in pending.writers {
+                self.commit_registry.forget(writer);
+            }
+        }
         Ok(())
     }
 
@@ -713,9 +763,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The caller owns the transaction lifecycle (it must later commit or roll back `txn`), exactly
     /// as for any other mutator; the reclamation writes are WAL-logged and crash-recovered the same.
     ///
+    /// ## GC-time header freezing + table pruning (`rmp` task #59)
+    ///
+    /// After the reclamation sweeps, every surviving record of **all MVCC record kinds** (nodes,
+    /// relationships, per-value property versions) has its header **frozen**
+    /// ([`freeze_store_headers`](Self::freeze_store_headers)): an `xmin`/`xmax` word that carries a
+    /// committed writer's in-flight `TxnId` is rewritten — WAL-logged under `txn`, like every other
+    /// header write — to the `Committed(ts)` form the Active/Recent Transaction Table resolves it
+    /// to. Still-in-flight stamps (no committed outcome) are left untouched. The freeze sweep walks
+    /// each store's full physical-id range, independent of chain structure and of `watermark`, so a
+    /// single pass provably visits every record: after it, **no** in-use record references any
+    /// writer the table records as committed.
+    ///
+    /// The pass therefore schedules every such writer to be **forgotten** from the table — but only
+    /// once the freeze is durable: the prune applies when `txn` **commits**
+    /// ([`commit`](Self::commit)) and is discarded if `txn` rolls back
+    /// ([`rollback`](Self::rollback)), whose WAL undo restores the in-flight stamps that still need
+    /// the entries. A crash before the GC commit recovers the same way (the GC txn is a loser; the
+    /// table is rebuilt from the WAL commit records on [`open`](Self::open)). This freeze-then-prune
+    /// cycle is what bounds the table on a long-lived server: it ends each completed pass holding
+    /// only still-in-flight writers plus writers that committed after the pass's freeze sweep.
+    ///
     /// # Errors
-    /// Returns a storage error if a record read or a reclamation write fails.
-    pub fn gc(&mut self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
+    /// Returns a storage error if a record read or a reclamation/freeze write fails.
+    pub fn gc(&mut self, txn: TxnId, watermark: Timestamp) -> Result<GcPassReport> {
         let mut reclaimed = 0usize;
 
         let rel_hw = self.store(StoreKind::Rel).alloc.high_water();
@@ -752,7 +823,85 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
 
-        Ok(reclaimed)
+        // Freeze sweep (`rmp` task #59): settle every surviving committed in-flight stamp across
+        // all three MVCC record stores (the `strings.store` heap blocks carry no version stamps —
+        // they are never visibility-checked). Runs after the reclamation sweeps so reclaimed slots
+        // (no longer `in_use`) are skipped, and over the full id ranges so even records the
+        // reclamation sweeps could not reach (e.g. the property chain of a tombstoned-but-retained
+        // owner) are frozen.
+        let mut frozen = 0usize;
+        frozen += self.freeze_store_headers(txn, StoreKind::Rel)?;
+        frozen += self.freeze_store_headers(txn, StoreKind::Node)?;
+        frozen += self.freeze_store_headers(txn, StoreKind::Prop)?;
+
+        // Schedule the table prune: every writer recorded as committed at this point had ALL of its
+        // on-disk in-flight stamps rewritten by the sweep above (it covered every in-use record), so
+        // each becomes forgettable the moment the freeze is durable — i.e. when `txn` commits. The
+        // GC transaction itself, and any transaction that commits between here and that commit, is
+        // not in this set and is pruned by a later pass.
+        let writers = self.commit_registry.committed_writers();
+        let prune_scheduled = writers.len();
+        self.pending_gc_prune = Some(PendingGcPrune {
+            gc_txn: txn,
+            writers,
+        });
+
+        Ok(GcPassReport {
+            reclaimed,
+            frozen,
+            prune_scheduled,
+        })
+    }
+
+    /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
+    /// avoids decoding the full record when only the header words matter).
+    fn read_mvcc(&mut self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let f = self.pool.fetch(dev)?;
+        let mvcc = MvccHeader::read(&self.pool.page(f)[off..off + MVCC_HEADER_SIZE]);
+        self.pool.unpin(f);
+        Ok(mvcc)
+    }
+
+    /// The `Committed(ts)` word to freeze `word` to, if it is the in-flight stamp of a writer the
+    /// Active/Recent Transaction Table records as committed (`rmp` task #59). `None` for the `0`
+    /// sentinel, an already-committed stamp, and a still-in-flight or aborted writer (an aborted
+    /// writer's stamps are reverted by its rollback's WAL undo, never frozen).
+    fn frozen_word(&self, word: u64) -> Option<u64> {
+        match VersionStamp::from_raw(word) {
+            VersionStamp::InFlight(writer) => match self.commit_registry.outcome(writer) {
+                TxnOutcome::Committed(ts) => Some(VersionStamp::committed(ts)),
+                TxnOutcome::InFlight | TxnOutcome::Aborted => None,
+            },
+            VersionStamp::None | VersionStamp::Committed(_) => None,
+        }
+    }
+
+    /// Freezes the MVCC headers of every in-use record in `kind`'s store (`rmp` task #59): each
+    /// `xmin`/`xmax` word carrying a committed writer's in-flight `TxnId` is rewritten to its
+    /// `Committed(ts)` form via the same WAL-logged 8-byte header patch as a tombstone or the old
+    /// eager commit settle ([`patch_header_word`](Self::patch_header_word)), under the GC `txn`.
+    /// Walks the full physical-id range `1..high_water`, so the sweep is complete regardless of
+    /// chain reachability. Returns the number of header words frozen.
+    fn freeze_store_headers(&mut self, txn: TxnId, kind: StoreKind) -> Result<usize> {
+        let high_water = self.store(kind).alloc.high_water();
+        let mut frozen = 0usize;
+        for id in 1..high_water {
+            let mvcc = self.read_mvcc(kind, id)?;
+            if !mvcc.in_use() {
+                continue; // freed slot (or reclaimed earlier this pass): no stamps to freeze
+            }
+            if let Some(word) = self.frozen_word(mvcc.created_ts) {
+                self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
+                frozen += 1;
+            }
+            if let Some(word) = self.frozen_word(mvcc.expired_ts) {
+                self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
+                frozen += 1;
+            }
+        }
+        Ok(frozen)
     }
 
     /// Rolls `txn` back: undoes its logged page changes newest-first (writing CLRs and applying
@@ -774,6 +923,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is reverted by the WAL undo below, and the commit timestamp was never issued (only
         // `commit` advances it), so nothing of this txn remains visible or durable.
         self.active.remove(&txn);
+        // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
+        // undo below restores the in-flight header stamps the freeze had rewritten, and those
+        // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
+        // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
+        // stranded as unresolvable (it would wrongly read as aborted).
+        if self
+            .pending_gc_prune
+            .as_ref()
+            .is_some_and(|p| p.gc_txn == txn)
+        {
+            self.pending_gc_prune = None;
+        }
         let device_pages: [Vec<PageId>; STORE_COUNT] = [
             self.stores[0].device_pages.clone(),
             self.stores[1].device_pages.clone(),
@@ -2301,9 +2462,9 @@ mod tests {
     /// Runs one GC pass under a fresh `txn` at the given `watermark` (see [`RecordStore::gc`]).
     fn gc_at(s: &mut Store, txn: TxnId, watermark: Timestamp) -> usize {
         s.begin(txn);
-        let reclaimed = s.gc(txn, watermark).unwrap();
+        let report = s.gc(txn, watermark).unwrap();
         s.commit(txn).unwrap();
-        reclaimed
+        report.reclaimed
     }
 
     #[test]
@@ -2438,7 +2599,7 @@ mod tests {
         // it (and would be unsafe to). We run GC under t2's own id so the chain is consistent.
         let wm = s.snapshot_ts();
         assert_eq!(
-            s.gc(t2, wm).unwrap(),
+            s.gc(t2, wm).unwrap().reclaimed,
             0,
             "an in-flight tombstone is not reclaimable"
         );
