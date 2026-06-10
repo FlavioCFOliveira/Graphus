@@ -67,7 +67,7 @@ pub enum TxnOutcome {
 /// timestamp (or to learn it aborted). Entries are kept until garbage collection proves no live
 /// snapshot can still observe the transaction's effect; until then they must be retained so an
 /// older reader resolves the writer correctly.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CommitRegistry {
     outcomes: HashMap<TxnId, TxnOutcome>,
 }

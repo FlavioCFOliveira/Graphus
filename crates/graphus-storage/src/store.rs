@@ -32,6 +32,7 @@ use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{ElementId, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
 use graphus_io::{BlockDevice, PAGE_SIZE};
+use graphus_txn::CommitRegistry;
 use graphus_wal::{LogSink, WalManager};
 
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
@@ -40,9 +41,8 @@ use crate::labels;
 use crate::meta::{Meta, StoreMeta};
 use crate::paging;
 use crate::record::{
-    CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_OFF_CREATED_TS,
-    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
-    REL_RECORD_SIZE, RelRecord,
+    CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_OFF_EXPIRED_TS, MvccHeader,
+    NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenStore};
 use crate::valenc;
@@ -173,6 +173,16 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// surfaced through [`mapped_pages`](Self::mapped_pages) so backup, the consistency checker and
     /// the crash-recovery harness treat these as part of the durable image.
     meta_chain: Vec<PageId>,
+    /// The Active/Recent Transaction Table (`04 §5.2`, `rmp` task #49). With **lazy GC-time header
+    /// freezing**, [`commit`](Self::commit) no longer rewrites every version's header to settle its
+    /// in-flight `TxnId` to the commit timestamp — it just records the `(TxnId → commit_ts)` here.
+    /// Visibility and reclamation resolve an on-disk in-flight stamp through this table
+    /// ([`is_reclaimable`](Self::is_reclaimable); readers via [`commit_registry`](Self::commit_registry)).
+    /// Rebuilt on reopen from the WAL's commit records (each carries its `commit_ts`), so a
+    /// committed-but-unfrozen version stays resolvable across a crash. Entries are currently retained
+    /// for the store's lifetime (re-derivable from the log); opportunistic GC-time header freezing
+    /// plus entry pruning, to bound the table, is a tracked follow-up.
+    commit_registry: CommitRegistry,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
@@ -212,6 +222,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             commit_ts_hw: 0,
             active: HashMap::new(),
             meta_chain: Vec::new(),
+            commit_registry: CommitRegistry::new(),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -228,6 +239,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let shared = SharedWal::new(wal);
         let mut pool = BufferPool::with_wal(device, shared.clone(), pool_capacity);
         let (meta, meta_chain) = Self::read_meta(&mut pool)?;
+        // Rebuild the Active/Recent Transaction Table from the WAL's commit records (`rmp` task #49):
+        // with lazy GC-time freezing a committed version may still carry its writer's in-flight
+        // `TxnId` on disk, so visibility/reclamation must resolve that id to the commit timestamp the
+        // commit record durably holds. The scan is robust to checkpoint truncation (the timestamp
+        // lives in each commit record, not derived from log position).
+        let mut commit_registry = CommitRegistry::new();
+        for (committed_txn, ts) in shared.with(|w| w.committed_transactions())? {
+            commit_registry.record_commit(committed_txn, ts);
+        }
         let stores = [
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0]),
             FixedStore::from_meta(StoreKind::Rel, &meta.stores[1]),
@@ -243,6 +263,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             commit_ts_hw: meta.commit_ts_hw,
             active: HashMap::new(),
             meta_chain,
+            commit_registry,
         })
     }
 
@@ -541,6 +562,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     // ------------------------- transaction control -------------------------
 
+    /// The Active/Recent Transaction Table (`rmp` task #49). The reader layer
+    /// ([`RecordStoreGraph`](../../graphus_cypher)) resolves an on-disk in-flight `xmin`/`xmax`
+    /// stamp to its writer's commit timestamp — or learns the writer is still in flight or aborted —
+    /// through this, since lazy freezing leaves a committed version stamped with its writer's
+    /// `TxnId` until a follow-up GC freeze settles it. Borrowed read-only; the store owns the table.
+    #[must_use]
+    pub fn commit_registry(&self) -> &CommitRegistry {
+        &self.commit_registry
+    }
+
     /// Begins transaction `txn` in the WAL and opens its MVCC version-stamp bookkeeping.
     pub fn begin(&mut self, txn: TxnId) {
         self.wal.with(|w| {
@@ -566,24 +597,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Panics
     /// Panics if the commit `fdatasync` fails (`04 §4.9`).
     pub fn commit(&mut self, txn: TxnId) -> Result<()> {
-        // Assign this transaction's commit timestamp (`04 §5.2`) and settle every version it stamped
-        // from the in-flight `TxnId` to that committed timestamp, so committed records are
-        // self-describing for visibility without consulting an in-memory table — which is what makes
-        // a committed insert/delete survive a crash (the settle patches are WAL-logged *before* the
-        // commit record, so recovery redoes them for a winner and undoes them for a loser). Settling
-        // eagerly at commit is correctness-first; settling lazily at GC (`04 §5.5`, hint-bit style)
-        // to avoid the commit-time write is a documented performance follow-up.
+        // Assign this transaction's commit timestamp (`04 §5.2`). **Lazy GC-time freezing**
+        // (`04 §5.5`, hint-bit style, `rmp` task #49): do NOT settle each version's header from the
+        // in-flight `TxnId` to the commit timestamp here — that was O(records touched) WAL-logged
+        // header writes (the eager, correctness-first path of task #45). Instead record the outcome
+        // in the Active/Recent Transaction Table; a reader resolves an in-flight stamp to its commit
+        // timestamp through that table ([`is_reclaimable`](Self::is_reclaimable) and the cypher
+        // visibility layer via [`commit_registry`](Self::commit_registry)); a GC-time header freeze
+        // plus entry pruning, to bound the table, is a tracked follow-up. What makes a committed
+        // insert/delete survive a crash is now the WAL commit record carrying `commit_ts`
+        // (`commit_at`): recovery rebuilds the table from it
+        // ([`open`](Self::open)). Commit is now O(1) in header writes.
         let commit_ts = self.next_commit_ts();
-        let active = self.active.remove(&txn).unwrap_or_default();
-        let settled = VersionStamp::committed(commit_ts);
-        for (kind, id) in active.created {
-            self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, settled, txn)?;
-        }
-        for (kind, id) in active.expired {
-            self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, settled, txn)?;
-        }
+        // Drop the per-txn created/expired bookkeeping (it fed the old eager settle loop; the table
+        // entry below is all the durable/visible state a committed version now needs).
+        self.active.remove(&txn);
+        self.commit_registry.record_commit(txn, commit_ts);
         self.checkpoint_meta(txn, false)?;
-        self.wal.with(|w| w.commit(txn))?;
+        self.wal.with(|w| w.commit_at(txn, commit_ts))?;
         Ok(())
     }
 
@@ -647,13 +678,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// expiry, and that expiry **committed** at or before `watermark` — so no live or future
     /// snapshot can still observe it (`04 §5.5`). A still-in-flight or yet-uncommitted tombstone is
     /// not reclaimable.
-    fn is_reclaimable(mvcc: MvccHeader, watermark: Timestamp) -> bool {
+    fn is_reclaimable(mvcc: MvccHeader, watermark: Timestamp, registry: &CommitRegistry) -> bool {
         if !mvcc.in_use() {
             return false;
         }
-        match VersionStamp::from_raw(mvcc.expired_ts) {
-            VersionStamp::Committed(ts) => ts <= watermark,
-            VersionStamp::None | VersionStamp::InFlight(_) => false,
+        // Resolve the expiry stamp through the Active/Recent Transaction Table (`rmp` task #49): a
+        // frozen tombstone carries `Committed(ts)` directly; a lazily-committed one still carries the
+        // deleter's in-flight `TxnId`, which the registry maps to its commit timestamp. A live
+        // (`xmax == 0`), still-in-flight, or aborted expiry resolves to `None` and is not reclaimable.
+        match registry.resolve_commit_ts(mvcc.expired_ts) {
+            Some(ts) => ts <= watermark,
+            None => false,
         }
     }
 
@@ -685,7 +720,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
         let rel_hw = self.store(StoreKind::Rel).alloc.high_water();
         for id in 1..rel_hw {
-            if Self::is_reclaimable(self.read_rel(id)?.mvcc, watermark) {
+            let mvcc = self.read_rel(id)?.mvcc;
+            if Self::is_reclaimable(mvcc, watermark, &self.commit_registry) {
                 self.reclaim_rel(txn, id)?;
                 reclaimed += 1;
             }
@@ -693,7 +729,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
         let node_hw = self.store(StoreKind::Node).alloc.high_water();
         for id in 1..node_hw {
-            if Self::is_reclaimable(self.read_node(id)?.mvcc, watermark)
+            let mvcc = self.read_node(id)?.mvcc;
+            if Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
                 && self.incident_rels(id)?.is_empty()
             {
                 self.reclaim_node(txn, id)?;
@@ -1249,7 +1286,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             let prop = self.read_prop(cur)?;
             let next = prop.next_prop;
-            if Self::is_reclaimable(prop.mvcc, watermark) {
+            if Self::is_reclaimable(prop.mvcc, watermark, &self.commit_registry) {
                 // Free the overflow chain, clear and free the record, splice it out of the chain.
                 self.free_property_overflow(txn, &prop)?;
                 let mut dead = prop;
@@ -2356,13 +2393,21 @@ mod tests {
             VersionStamp::InFlight(t1)
         );
         s.commit(t1).unwrap();
-        // After commit, `commit` settled `xmin` to a committed timestamp (the kind-agnostic settle
-        // loop handles `StoreKind::Prop` ids because `add_node_property` noted the create).
+        // After commit (lazy GC-time freezing, `rmp` task #49): `xmin` is NOT settled — it keeps the
+        // writer's in-flight TxnId — but the Active/Recent Transaction Table resolves it to the
+        // commit timestamp. Per-value property versions resolve through the same table as node/rel
+        // versions; GC freezes the header later.
         let post = s.property(pid).unwrap();
-        assert!(matches!(
+        assert_eq!(
             VersionStamp::from_raw(post.mvcc.created_ts),
-            VersionStamp::Committed(_)
-        ));
+            VersionStamp::InFlight(t1)
+        );
+        assert!(
+            s.commit_registry()
+                .resolve_commit_ts(post.mvcc.created_ts)
+                .is_some(),
+            "the transaction table resolves the property version's in-flight xmin to its commit ts"
+        );
         assert_eq!(
             post.mvcc.expired_ts, 0,
             "the live version carries no tombstone"

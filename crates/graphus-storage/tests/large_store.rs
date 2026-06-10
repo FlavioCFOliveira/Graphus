@@ -9,7 +9,7 @@
 //! This test grows a store well past that old one-page cap, then proves the catalog (including its
 //! high device-page ids) survives a crash + ARIES recovery and a clean consistency check.
 
-use graphus_core::{TxnId, VersionStamp};
+use graphus_core::TxnId;
 use graphus_io::MemBlockDevice;
 use graphus_storage::RecordStore;
 use graphus_storage::check::verify_on_open;
@@ -81,12 +81,14 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
         last.mvcc.in_use(),
         "last node must be a live committed version"
     );
+    // Lazy GC-time freezing (`rmp` task #49): the header keeps the writer's in-flight stamp until GC,
+    // but the Active/Recent Transaction Table resolves it to its commit timestamp.
     assert!(
-        matches!(
-            VersionStamp::from_raw(last.mvcc.created_ts),
-            VersionStamp::Committed(_)
-        ),
-        "last node's xmin must be settled to a commit timestamp"
+        store
+            .commit_registry()
+            .resolve_commit_ts(last.mvcc.created_ts)
+            .is_some(),
+        "last node's xmin resolves to a commit timestamp through the transaction table"
     );
 
     // --- crash + ARIES recovery, then reopen ---

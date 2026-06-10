@@ -165,11 +165,16 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             owner: txn,
             ts: store.snapshot_ts(),
         };
+        // Snapshot the store's Active/Recent Transaction Table at begin (`rmp` task #49): reads
+        // resolve an on-disk in-flight stamp to its commit timestamp through this. A later commit is
+        // correctly excluded whether or not this snapshot captured it (visibility filters by `ts`),
+        // and own in-flight writes are visible via the owner rule, not the table.
+        let registry = store.commit_registry().clone();
         Self {
             store: Rc::new(RefCell::new(store)),
             txn,
             snapshot,
-            registry: CommitRegistry::new(),
+            registry,
             ssi: None,
             locks: None,
             error: RefCell::new(None),
@@ -194,11 +199,16 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         locks: Rc<RefCell<LockTable>>,
         index: Rc<RefCell<IndexSet>>,
     ) -> Self {
+        // Snapshot the shared store's Active/Recent Transaction Table for this statement's reads
+        // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
+        // that commits later is excluded by the `ts` filter regardless, and this statement's own
+        // in-flight writes resolve via the owner rule.
+        let registry = store.borrow().commit_registry().clone();
         Self {
             store,
             txn,
             snapshot,
-            registry: CommitRegistry::new(),
+            registry,
             ssi: Some(ssi),
             locks: Some(locks),
             error: RefCell::new(None),
@@ -242,11 +252,12 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// (`04 §5.3`). Primarily an MVCC-visibility testing seam.
     pub fn begin_at_snapshot(mut store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
+        let registry = store.commit_registry().clone();
         Self {
             store: Rc::new(RefCell::new(store)),
             txn,
             snapshot: Snapshot { owner: txn, ts },
-            registry: CommitRegistry::new(),
+            registry,
             ssi: None,
             locks: None,
             error: RefCell::new(None),

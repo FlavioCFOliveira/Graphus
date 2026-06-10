@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{Lsn, PageId, TxnId};
+use graphus_core::{Lsn, PageId, Timestamp, TxnId};
 
 use crate::checkpoint::CheckpointSnapshot;
 use crate::record::{LogRecord, RecordType};
@@ -130,6 +130,40 @@ impl<S: LogSink> WalManager<S> {
         &self.sink
     }
 
+    /// Scans the durable log and returns every committed transaction with the MVCC `commit_ts` its
+    /// commit record carries (`rmp` task #49).
+    ///
+    /// This is how a reopened [`RecordStore`](../../graphus_storage) rebuilds its Active/Recent
+    /// Transaction Table after recovery: with lazy GC-time header freezing a committed version keeps
+    /// the writer's in-flight `TxnId` on disk, so visibility must resolve that id to a commit
+    /// timestamp, and the durable commit records are the source of truth. Non-MVCC commits (index /
+    /// system transactions written via [`commit`](Self::commit)) carry the `0` sentinel timestamp;
+    /// they are harmless to include (no version header references their `TxnId`). The scan stops at
+    /// the first torn/short tail record, exactly like recovery, preserving committed-or-nothing.
+    ///
+    /// # Errors
+    /// Propagates a sink read error.
+    pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp)>> {
+        let mut log = Vec::new();
+        self.read_durable(Lsn(0), &mut log)?;
+        let mut out = Vec::new();
+        let mut cursor = HEADER_LEN as usize;
+        while cursor < log.len() {
+            match LogRecord::decode(&log[cursor..]) {
+                Ok((rec, n)) => {
+                    cursor += n;
+                    if rec.rec_type == RecordType::Commit {
+                        if let Some(ts) = rec.commit_ts() {
+                            out.push((rec.txn_id, ts));
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// Logs the start of transaction `txn`.
     pub fn begin(&mut self, txn: TxnId) -> Lsn {
         let mut r = LogRecord::new(RecordType::Begin, txn, PageId(0));
@@ -167,8 +201,11 @@ impl<S: LogSink> WalManager<S> {
         lsn
     }
 
-    /// Commits `txn` (group commit): appends its `COMMIT` record and hardens the log so the
-    /// commit and everything before it are durable before returning.
+    /// Commits `txn` (group commit): appends its `COMMIT` record and hardens the log so the commit
+    /// and everything before it are durable before returning. The record carries no MVCC timestamp
+    /// (it decodes to the `0` sentinel via [`LogRecord::commit_ts`]); generic transactions that are
+    /// not MVCC version-stamped — e.g. the index/system transactions — use this. MVCC record-store
+    /// commits use [`commit_at`](Self::commit_at) so recovery can rebuild the transaction table.
     ///
     /// # Errors
     /// Returns an error if `txn` is not active.
@@ -176,17 +213,50 @@ impl<S: LogSink> WalManager<S> {
     /// # Panics
     /// Panics (controlled abort) if the durability `fdatasync` fails (`§4.9`).
     pub fn commit(&mut self, txn: TxnId) -> Result<Lsn> {
-        let prev = self
+        let prev = self.commit_prev_lsn(txn)?;
+        // Built exactly as before commit records carried a timestamp (empty `redo`), so existing
+        // logs/LSNs are byte-for-byte unchanged; `commit_ts()` still reads the `0` sentinel.
+        let mut r = LogRecord::new(RecordType::Commit, txn, PageId(0));
+        r.prev_lsn = prev;
+        Ok(self.finish_commit(txn, &mut r))
+    }
+
+    /// Commits `txn` (group commit) carrying its MVCC `commit_ts` (`04 §5.2`, `rmp` task #49) in the
+    /// commit record, then hardens the log.
+    ///
+    /// The `commit_ts` is embedded in the commit record so recovery can rebuild the Active/Recent
+    /// Transaction Table: with lazy GC-time header freezing a committed version keeps the writer's
+    /// in-flight `TxnId` on disk, and the commit record is the only durable proof of the timestamp it
+    /// committed at (robust to checkpoint truncation — see [`LogRecord::commit`]).
+    ///
+    /// # Errors
+    /// Returns an error if `txn` is not active.
+    ///
+    /// # Panics
+    /// Panics (controlled abort) if the durability `fdatasync` fails (`§4.9`).
+    pub fn commit_at(&mut self, txn: TxnId, commit_ts: Timestamp) -> Result<Lsn> {
+        let prev = self.commit_prev_lsn(txn)?;
+        let mut r = LogRecord::commit(txn, prev, commit_ts);
+        Ok(self.finish_commit(txn, &mut r))
+    }
+
+    /// The `prev_lsn` to thread into `txn`'s commit record (its last logged action).
+    fn commit_prev_lsn(&self, txn: TxnId) -> Result<Lsn> {
+        Ok(self
             .active
             .get(&txn)
             .ok_or_else(|| GraphusError::Transaction(format!("commit of inactive txn {}", txn.0)))?
-            .last_lsn;
-        let mut r = LogRecord::new(RecordType::Commit, txn, PageId(0));
-        r.prev_lsn = prev;
-        let lsn = self.append(&mut r);
+            .last_lsn)
+    }
+
+    /// Appends `txn`'s prepared commit record, hardens the log (group commit, `§4.2`), and retires
+    /// `txn` from the active table. Shared by [`commit`](Self::commit) and
+    /// [`commit_at`](Self::commit_at).
+    fn finish_commit(&mut self, txn: TxnId, r: &mut LogRecord) -> Lsn {
+        let lsn = self.append(r);
         self.harden();
         self.active.remove(&txn);
-        Ok(lsn)
+        lsn
     }
 
     /// Rolls `txn` back: undoes its actions newest-first, writing a CLR per action and applying

@@ -1091,6 +1091,7 @@ dependencies = [
  "graphus-index",
  "graphus-io",
  "graphus-sim",
+ "graphus-txn",
  "graphus-wal",
  "proptest",
 ]

@@ -11,7 +11,7 @@
 //! partially written tail so recovery can stop at the last intact record (physiological
 //! logging, `§4.1`).
 
-use graphus_core::{Lsn, PageId, TxnId};
+use graphus_core::{Lsn, PageId, Timestamp, TxnId};
 
 /// Bytes of the fixed record prefix that precede the variable-length `redo`/`undo` images:
 /// `total_len(4) + lsn(8) + prev_lsn(8) + txn_id(8) + type(1) + page_id(8) + undo_next_lsn(8)`.
@@ -157,6 +157,42 @@ impl LogRecord {
             redo: Vec::new(),
             undo: Vec::new(),
         }
+    }
+
+    /// Builds a [`Commit`](RecordType::Commit) record for `txn` carrying its MVCC `commit_ts` in the
+    /// `redo` field (`04 §5.2`, `rmp` task #49).
+    ///
+    /// Lazy GC-time freezing leaves a committed version's on-disk `xmin`/`xmax` as the writer's
+    /// in-flight `TxnId`; the only durable record of "this `TxnId` committed at this timestamp" is the
+    /// commit record itself, so it must carry the timestamp. Recovery rebuilds the in-memory
+    /// Active/Recent Transaction Table from these records ([`commit_ts`](Self::commit_ts)) regardless
+    /// of which older commits a checkpoint truncated away. The 8 little-endian bytes live in `redo`
+    /// because a `Commit` record is never a page change ([`RecordType::is_page_change`] excludes it),
+    /// so recovery never replays `redo` as a page image — the field is otherwise unused for commits.
+    #[must_use]
+    pub fn commit(txn: TxnId, prev_lsn: Lsn, commit_ts: Timestamp) -> Self {
+        let mut r = Self::new(RecordType::Commit, txn, PageId(0));
+        r.prev_lsn = prev_lsn;
+        r.redo = commit_ts.0.to_le_bytes().to_vec();
+        r
+    }
+
+    /// The MVCC commit timestamp carried by a [`Commit`](RecordType::Commit) record (`rmp` task #49).
+    ///
+    /// Returns the 8-byte little-endian timestamp written by [`commit`](Self::commit). A commit
+    /// record whose `redo` is empty or shorter than 8 bytes (a torn tail, or a log written before
+    /// commit records carried a timestamp) decodes to [`Timestamp(0)`](graphus_core::Timestamp) — the
+    /// "unknown" sentinel the recovery wiring treats conservatively. Returns `None` for a non-commit
+    /// record.
+    #[must_use]
+    pub fn commit_ts(&self) -> Option<Timestamp> {
+        if self.rec_type != RecordType::Commit {
+            return None;
+        }
+        let ts = self.redo.get(..8).map_or(0, |b| {
+            u64::from_le_bytes(b.try_into().expect("8-byte slice"))
+        });
+        Some(Timestamp(ts))
     }
 
     /// The number of bytes this record occupies when encoded.
@@ -319,6 +355,34 @@ mod tests {
         }
         assert_eq!(got, want);
     }
+
+    #[test]
+    fn commit_record_carries_its_commit_ts_through_encode_decode() {
+        // `rmp` task #49: lazy freeze relies on the commit record carrying the commit timestamp so
+        // recovery can rebuild the Active/Recent Transaction Table.
+        let mut r = LogRecord::commit(TxnId(9), Lsn(40), Timestamp(0x1234_5678));
+        assert_eq!(r.rec_type, RecordType::Commit);
+        assert_eq!(r.commit_ts(), Some(Timestamp(0x1234_5678)));
+        let mut buf = Vec::new();
+        r.encode_to(Lsn(64), &mut buf);
+        let (got, _) = LogRecord::decode(&buf).unwrap();
+        assert_eq!(got.rec_type, RecordType::Commit);
+        assert_eq!(got.commit_ts(), Some(Timestamp(0x1234_5678)));
+        assert_eq!(got.prev_lsn, Lsn(40));
+        // A commit record is never a page change, so its `redo` is never replayed as a page image.
+        assert!(!got.rec_type.is_page_change());
+    }
+
+    #[test]
+    fn commit_ts_is_none_for_a_non_commit_record_and_zero_for_an_empty_redo() {
+        let upd = LogRecord::new(RecordType::Update, TxnId(1), PageId(3));
+        assert_eq!(upd.commit_ts(), None);
+        // A commit record with no embedded timestamp (legacy / torn) reads as the 0 sentinel.
+        let bare = LogRecord::new(RecordType::Commit, TxnId(1), PageId(0));
+        assert_eq!(bare.commit_ts(), Some(Timestamp(0)));
+    }
+
+    use graphus_core::Timestamp;
 
     #[test]
     fn record_type_byte_round_trips() {
