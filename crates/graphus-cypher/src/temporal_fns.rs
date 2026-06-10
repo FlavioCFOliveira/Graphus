@@ -118,9 +118,7 @@ fn construct_time(arg: &Value) -> Result<Value, EvalError> {
             }
         },
         Value::ZonedTime(zt) => Ok(Value::ZonedTime(*zt)),
-        Value::LocalTime(t) => Ok(Value::ZonedTime(
-            ZonedTime::new(*t, 0).map_err(terr)?,
-        )),
+        Value::LocalTime(t) => Ok(Value::ZonedTime(ZonedTime::new(*t, 0).map_err(terr)?)),
         Value::ZonedDateTime(z) => Ok(Value::ZonedTime(
             ZonedTime::new(z.local.to_date_time().1, z.offset_seconds).map_err(terr)?,
         )),
@@ -131,7 +129,9 @@ fn construct_time(arg: &Value) -> Result<Value, EvalError> {
             let map = ComponentMap::new(entries)?;
             let time = time_from_map(&map)?;
             let offset = map.offset_seconds()?.unwrap_or(0);
-            Ok(Value::ZonedTime(ZonedTime::new(time, offset).map_err(terr)?))
+            Ok(Value::ZonedTime(
+                ZonedTime::new(time, offset).map_err(terr)?,
+            ))
         }
         other => Err(type_err(format!(
             "time() requires a string, map or temporal argument, got {}",
@@ -170,8 +170,7 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
                 return Err(zone_resolution_error(zone.as_deref().unwrap_or("?")));
             };
             Ok(Value::ZonedDateTime(
-                ZonedDateTime::from_local(local, offset, zone.unwrap_or_default())
-                    .map_err(terr)?,
+                ZonedDateTime::from_local(local, offset, zone.unwrap_or_default()).map_err(terr)?,
             ))
         }
         Value::ZonedDateTime(z) => Ok(Value::ZonedDateTime(z.clone())),
@@ -224,9 +223,7 @@ fn construct_duration(arg: &Value) -> Result<Value, EvalError> {
                     "microseconds" => nanos += n * 1_000.0,
                     "nanoseconds" => nanos += n,
                     other => {
-                        return Err(type_err(format!(
-                            "unknown duration() component `{other}`"
-                        )));
+                        return Err(type_err(format!("unknown duration() component `{other}`")));
                     }
                 }
             }
@@ -279,10 +276,7 @@ impl<'v> ComponentMap<'v> {
     }
 
     fn get(&self, key: &str) -> Option<&'v Value> {
-        self.entries
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| *v)
+        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
     }
 
     fn has(&self, key: &str) -> bool {
@@ -489,13 +483,29 @@ pub(crate) fn component(base: &Value, key: &str) -> Option<Value> {
     let k = key.to_ascii_lowercase();
     Some(match base {
         Value::Date(d) => date_component(d, &k),
-        Value::LocalTime(t) => time_component(t.hour(), t.minute(), t.second(), t.millisecond(), t.microsecond(), t.nanosecond(), &k),
+        Value::LocalTime(t) => time_component(
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.millisecond(),
+            t.microsecond(),
+            t.nanosecond(),
+            &k,
+        ),
         Value::ZonedTime(zt) => match k.as_str() {
             "offset" => Value::String(zt.offset_string()),
             "offsetminutes" => Value::Integer(zt.offset_minutes()),
             "offsetseconds" => Value::Integer(i64::from(zt.offset_seconds)),
             "timezone" => Value::String(zt.timezone_name()),
-            _ => time_component(zt.hour(), zt.minute(), zt.second(), zt.millisecond(), zt.microsecond(), zt.nanosecond(), &k),
+            _ => time_component(
+                zt.hour(),
+                zt.minute(),
+                zt.second(),
+                zt.millisecond(),
+                zt.microsecond(),
+                zt.nanosecond(),
+                &k,
+            ),
         },
         Value::LocalDateTime(dt) => match k.as_str() {
             "epochseconds" => Value::Integer(dt.epoch_seconds()),
@@ -506,7 +516,15 @@ pub(crate) fn component(base: &Value, key: &str) -> Option<Value> {
                 if from_date != Value::Null {
                     from_date
                 } else {
-                    time_component(time.hour(), time.minute(), time.second(), time.millisecond(), time.microsecond(), time.nanosecond(), &k)
+                    time_component(
+                        time.hour(),
+                        time.minute(),
+                        time.second(),
+                        time.millisecond(),
+                        time.microsecond(),
+                        time.nanosecond(),
+                        &k,
+                    )
                 }
             }
         },
@@ -523,7 +541,15 @@ pub(crate) fn component(base: &Value, key: &str) -> Option<Value> {
                 if from_date != Value::Null {
                     from_date
                 } else {
-                    time_component(time.hour(), time.minute(), time.second(), time.millisecond(), time.microsecond(), time.nanosecond(), &k)
+                    time_component(
+                        time.hour(),
+                        time.minute(),
+                        time.second(),
+                        time.millisecond(),
+                        time.microsecond(),
+                        time.nanosecond(),
+                        &k,
+                    )
                 }
             }
         },
@@ -743,10 +769,10 @@ pub(crate) fn duration_between(kind: &str, a: &Value, b: &Value) -> Result<Value
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
     }
-    let pa = point_parts(a)
-        .ok_or_else(|| type_err(format!("{kind}() requires temporal arguments")))?;
-    let mut pb = point_parts(b)
-        .ok_or_else(|| type_err(format!("{kind}() requires temporal arguments")))?;
+    let pa =
+        point_parts(a).ok_or_else(|| type_err(format!("{kind}() requires temporal arguments")))?;
+    let mut pb =
+        point_parts(b).ok_or_else(|| type_err(format!("{kind}() requires temporal arguments")))?;
     // Re-express b at a's offset so the difference measures instants, not wall clocks.
     if let (Some(oa), Some(ob)) = (pa.offset, pb.offset) {
         let shift = i64::from(oa) - i64::from(ob);
@@ -934,9 +960,7 @@ pub(crate) fn truncate(
         "date.truncate" => Value::Date(date),
         "localtime.truncate" => Value::LocalTime(time),
         "time.truncate" => Value::ZonedTime(ZonedTime::new(time, offset).map_err(terr)?),
-        "localdatetime.truncate" => {
-            Value::LocalDateTime(LocalDateTime::from_date_time(date, time))
-        }
+        "localdatetime.truncate" => Value::LocalDateTime(LocalDateTime::from_date_time(date, time)),
         _ => Value::ZonedDateTime(
             ZonedDateTime::from_local(LocalDateTime::from_date_time(date, time), offset, "")
                 .map_err(terr)?,
@@ -954,7 +978,10 @@ fn truncate_parts(unit: &str, date: Date, time: LocalTime) -> Option<(Date, Loca
         "century" => (date_of(y.div_euclid(100) * 100, 1, 1)?, midnight),
         "decade" => (date_of(y.div_euclid(10) * 10, 1, 1)?, midnight),
         "year" => (date_of(y, 1, 1)?, midnight),
-        "weekyear" => (Date::from_year_week_day(date.week_year(), 1, 1).ok()?, midnight),
+        "weekyear" => (
+            Date::from_year_week_day(date.week_year(), 1, 1).ok()?,
+            midnight,
+        ),
         "quarter" => (date_of(y, (m - 1) / 3 * 3 + 1, 1)?, midnight),
         "month" => (date_of(y, m, 1)?, midnight),
         "week" => {
@@ -966,7 +993,10 @@ fn truncate_parts(unit: &str, date: Date, time: LocalTime) -> Option<(Date, Loca
             (monday, midnight)
         }
         "day" => (date, midnight),
-        "hour" => (date, LocalTime::from_hms_nanos(time.hour() as u32, 0, 0, 0).ok()?),
+        "hour" => (
+            date,
+            LocalTime::from_hms_nanos(time.hour() as u32, 0, 0, 0).ok()?,
+        ),
         "minute" => (
             date,
             LocalTime::from_hms_nanos(time.hour() as u32, time.minute() as u32, 0, 0).ok()?,

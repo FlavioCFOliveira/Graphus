@@ -48,29 +48,45 @@ pub struct OpReport {
     pub sample_rows: usize,
 }
 
+/// The property indexes the harness creates after the load, mirroring the official SNB setup
+/// (every Interactive point lookup anchors on an `id` property). With these in place the planner's
+/// inline-equality index selection turns `MATCH (:Person {id: x})` from an O(n) label scan into an
+/// index seek (`rmp` #58).
+const INDEXES: &[(&str, &str)] = &[("Person", "id"), ("Forum", "id"), ("Post", "id")];
+
 /// The full harness report.
 pub struct Report {
     pub scale: ScaleFactor,
     pub stats: GraphStats,
     pub load_latency: Duration,
+    /// Time to build the standard SNB-style property indexes ([`INDEXES`]) after the load.
+    pub index_build_latency: Duration,
     pub ops: Vec<OpReport>,
 }
 
-/// Runs the whole harness: generate the graph at `scale`, then time every operation in the catalog.
-/// Reads run against the loaded graph; the single write operation runs against the same coordinator
-/// (its inserts use disjoint synthetic ids so they neither collide nor distort read results
-/// materially at this scale).
+/// Runs the whole harness: generate the graph at `scale`, build the standard SNB-style property
+/// indexes, then time every operation in the catalog. Reads run against the loaded graph; the
+/// single write operation runs against the same coordinator (its inserts use disjoint synthetic
+/// ids so they neither collide nor distort read results materially at this scale).
 ///
 /// # Errors
-/// Returns an error only if **graph generation** fails (a harness bug — a generator statement
-/// outside the engine's subset). Per-operation failures are captured in [`OpReport::outcome`], never
-/// propagated, so the macro benchmark always runs to completion.
+/// Returns an error only if **graph generation or index creation** fails (a harness bug — a
+/// generator statement outside the engine's subset). Per-operation failures are captured in
+/// [`OpReport::outcome`], never propagated, so the macro benchmark always runs to completion.
 pub fn run(scale: ScaleFactor) -> Result<Report, RunError> {
     let mut coord = fresh_coord();
 
     let load_start = Instant::now();
     let stats = generator::generate(&mut coord, scale)?;
     let load_latency = load_start.elapsed();
+
+    let index_start = Instant::now();
+    for (label, property) in INDEXES {
+        coord
+            .create_node_property_index(label, property)
+            .map_err(|e| RunError::Execute(format!("create index {label}.{property}: {e}")))?;
+    }
+    let index_build_latency = index_start.elapsed();
 
     let mut ops = Vec::new();
     for op in operations::catalog() {
@@ -81,6 +97,7 @@ pub fn run(scale: ScaleFactor) -> Result<Report, RunError> {
         scale,
         stats,
         load_latency,
+        index_build_latency,
         ops,
     })
 }
@@ -182,6 +199,17 @@ pub fn render(report: &Report) -> String {
         st.load_txns,
         report.load_latency.as_secs_f64(),
         st.load_txns as f64 / report.load_latency.as_secs_f64().max(1e-9)
+    );
+    let _ = writeln!(
+        out,
+        " index: {} property indexes built in {:.3}s ({})",
+        INDEXES.len(),
+        report.index_build_latency.as_secs_f64(),
+        INDEXES
+            .iter()
+            .map(|(l, p)| format!("{l}.{p}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let _ = writeln!(
         out,

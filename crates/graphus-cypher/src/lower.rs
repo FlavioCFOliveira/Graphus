@@ -643,7 +643,8 @@ impl Planner {
             // n.b AS b` yields columns a, c, b), but the Aggregation operator emits its keys first,
             // then the aggregates. Track the source order and restore it with a re-ordering
             // projection when the two differ.
-            let mut source_order: Vec<String> = group_keys.iter().map(|c| c.alias.clone()).collect();
+            let mut source_order: Vec<String> =
+                group_keys.iter().map(|c| c.alias.clone()).collect();
             for (item, col) in body.items.iter().zip(explicit_cols) {
                 source_order.push(col.alias.clone());
                 if expr_contains_aggregate(&item.expr) {

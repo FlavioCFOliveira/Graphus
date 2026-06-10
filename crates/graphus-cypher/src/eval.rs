@@ -936,7 +936,10 @@ fn call_function(
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
             crate::temporal_fns::duration_between(&lower, &argv[0], &argv[1])?
         }
-        "date.truncate" | "time.truncate" | "localtime.truncate" | "datetime.truncate"
+        "date.truncate"
+        | "time.truncate"
+        | "localtime.truncate"
+        | "datetime.truncate"
         | "localdatetime.truncate" => {
             crate::temporal_fns::truncate(&lower, &argv[0], &argv[1], argv.get(2))?
         }
@@ -1385,7 +1388,13 @@ fn eval_exists_subquery(
         }
         let mut next = Vec::new();
         for r in &rows {
-            next.extend(pattern_element_rows(&part.element, r, params, graph, false)?);
+            next.extend(pattern_element_rows(
+                &part.element,
+                r,
+                params,
+                graph,
+                false,
+            )?);
         }
         if next.is_empty() {
             return Ok(RowValue::Value(Value::Boolean(false)));
@@ -1506,9 +1515,7 @@ fn match_chain(
                 Some(_) => continue,
                 None => next_row.set(
                     v.name.clone(),
-                    RowValue::Node(NodeRef {
-                        id: inc.neighbour,
-                    }),
+                    RowValue::Node(NodeRef { id: inc.neighbour }),
                 ),
             }
         }

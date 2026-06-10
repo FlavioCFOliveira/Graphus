@@ -1640,7 +1640,10 @@ mod tests {
         let limit_pos = rendered.find("Limit").expect("limit");
         let eager_pos = rendered.find("Eager").expect("eager");
         let create_pos = rendered.find("Create").expect("create");
-        assert!(limit_pos < eager_pos && eager_pos < create_pos, "{rendered}");
+        assert!(
+            limit_pos < eager_pos && eager_pos < create_pos,
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1657,6 +1660,30 @@ mod tests {
         let plan = physical("MATCH (n:Person) WHERE n.age = 30 RETURN n", &catalog);
         assert!(plan.to_string().contains("NodeIndexSeek"), "{plan}");
         assert_eq!(plan.index_dependencies().count(), 1);
+    }
+
+    #[test]
+    fn inline_property_equality_becomes_index_seek() {
+        // The LDBC point-lookup shape (rmp #58): an inline `{id: x}` map is hoisted to an equality
+        // filter by the logical planner and must use the index, recording the IndexId dependency.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "id")
+            .build();
+        let plan = physical("MATCH (n:Person {id: 5}) RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeIndexSeek"), "{rendered}");
+        assert!(!rendered.contains("NodeByLabelScan"), "{rendered}");
+        assert_eq!(plan.index_dependencies().count(), 1);
+
+        // Multi-key inline map: one key drives the seek, the rest stay a residual filter.
+        let plan = physical("MATCH (n:Person {id: 5, name: 'x'}) RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeIndexSeek"), "{rendered}");
+        assert!(rendered.contains("Filter"), "{rendered}");
+
+        // The anchored end of an expand uses the seek too.
+        let plan = physical("MATCH (a:Person {id: 5})-[:KNOWS]->(b) RETURN b", &catalog);
+        assert!(plan.to_string().contains("NodeIndexSeek"), "{plan}");
     }
 
     #[test]

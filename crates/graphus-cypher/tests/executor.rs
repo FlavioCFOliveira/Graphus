@@ -592,7 +592,10 @@ fn create_under_limit_zero_still_creates_the_node() {
 #[test]
 fn create_per_row_under_limit_one_runs_every_write() {
     let mut g = MemGraph::new();
-    let rows = run("UNWIND [1, 2, 3] AS x CREATE (n:T {v: x}) RETURN x LIMIT 1", &mut g);
+    let rows = run(
+        "UNWIND [1, 2, 3] AS x CREATE (n:T {v: x}) RETURN x LIMIT 1",
+        &mut g,
+    );
     assert_eq!(rows.len(), 1, "LIMIT 1 returns one row");
     assert_eq!(g.node_count(), 3, "CREATE must run once per input row");
 }
@@ -602,7 +605,11 @@ fn merge_under_limit_zero_still_creates() {
     let mut g = MemGraph::new();
     let rows = run("MERGE (n:City {name: 'Faro'}) RETURN n LIMIT 0", &mut g);
     assert_eq!(rows.len(), 0);
-    assert_eq!(g.node_count(), 1, "the MERGE-create side effect must still run");
+    assert_eq!(
+        g.node_count(),
+        1,
+        "the MERGE-create side effect must still run"
+    );
 }
 
 #[test]
@@ -613,7 +620,11 @@ fn set_under_limit_zero_still_applies() {
     let rows = run("MATCH (n:P) SET n.age = 99 RETURN n LIMIT 0", &mut g);
     assert_eq!(rows.len(), 0);
     assert_eq!(g.node_property(a, "age"), Some(i(99)));
-    assert_eq!(g.node_property(b, "age"), Some(i(99)), "SET must run for every matched row");
+    assert_eq!(
+        g.node_property(b, "age"),
+        Some(i(99)),
+        "SET must run for every matched row"
+    );
 }
 
 #[test]
@@ -636,7 +647,11 @@ fn create_under_order_by_limit_runs_every_write() {
     );
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].value("x"), i(1));
-    assert_eq!(g.node_count(), 3, "CREATE must run once per input row under TopN");
+    assert_eq!(
+        g.node_count(),
+        3,
+        "CREATE must run once per input row under TopN"
+    );
 }
 
 #[test]
@@ -644,7 +659,11 @@ fn create_under_skip_past_end_still_creates() {
     let mut g = MemGraph::new();
     let rows = run("CREATE (n) RETURN n SKIP 1", &mut g);
     assert_eq!(rows.len(), 0);
-    assert_eq!(g.node_count(), 1, "SKIP must not suppress the CREATE side effect");
+    assert_eq!(
+        g.node_count(),
+        1,
+        "SKIP must not suppress the CREATE side effect"
+    );
 }
 
 // =================================================================================================
@@ -673,10 +692,26 @@ fn quantifiers_follow_kleene_three_valued_logic() {
          single(x IN [3, null] WHERE x = 3) AS maybe",
         &mut g,
     );
-    assert_eq!(rows[0].value("hit"), Value::Boolean(true), "a true decides any()");
-    assert_eq!(rows[0].value("miss"), Value::Boolean(false), "a true decides none()");
-    assert_eq!(rows[0].value("unknown"), Value::Null, "a null leaves all() unknown");
-    assert_eq!(rows[0].value("maybe"), Value::Null, "a null could be a second match");
+    assert_eq!(
+        rows[0].value("hit"),
+        Value::Boolean(true),
+        "a true decides any()"
+    );
+    assert_eq!(
+        rows[0].value("miss"),
+        Value::Boolean(false),
+        "a true decides none()"
+    );
+    assert_eq!(
+        rows[0].value("unknown"),
+        Value::Null,
+        "a null leaves all() unknown"
+    );
+    assert_eq!(
+        rows[0].value("maybe"),
+        Value::Null,
+        "a null could be a second match"
+    );
 
     // single: exactly one definite match.
     let rows = run(
@@ -740,7 +775,11 @@ fn exists_subquery_tests_pattern_existence() {
          RETURN n.name AS name",
         &mut g,
     );
-    assert_eq!(col(&rows, "name"), vec![s("Bob")], "only Bob knows a 36-year-old");
+    assert_eq!(
+        col(&rows, "name"),
+        vec![s("Bob")],
+        "only Bob knows a 36-year-old"
+    );
 }
 
 // =================================================================================================
@@ -1119,9 +1158,16 @@ fn unaliased_columns_are_named_by_verbatim_source_text() {
     // expression (regression for rmp #55).
     assert_eq!(columns_of("MATCH (n:P) RETURN n.age"), vec!["n.age"]);
     assert_eq!(columns_of("RETURN 1 + 2"), vec!["1 + 2"]);
-    assert_eq!(columns_of("RETURN 1+2"), vec!["1+2"], "spacing is preserved verbatim");
+    assert_eq!(
+        columns_of("RETURN 1+2"),
+        vec!["1+2"],
+        "spacing is preserved verbatim"
+    );
     assert_eq!(columns_of("RETURN count(*)"), vec!["count(*)"]);
-    assert_eq!(columns_of("MATCH (n:P) RETURN size(n.name)"), vec!["size(n.name)"]);
+    assert_eq!(
+        columns_of("MATCH (n:P) RETURN size(n.name)"),
+        vec!["size(n.name)"]
+    );
     assert_eq!(columns_of("RETURN [1, 2][0]"), vec!["[1, 2][0]"]);
 }
 
@@ -1136,7 +1182,10 @@ fn return_star_projects_variables_alphabetically_without_synthetics() {
     let src = "MATCH (x:P)-[r:T]->(m:P) RETURN *";
     let rows = run(src, &mut g);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].columns(), &["m".to_owned(), "r".to_owned(), "x".to_owned()]);
+    assert_eq!(
+        rows[0].columns(),
+        &["m".to_owned(), "r".to_owned(), "x".to_owned()]
+    );
     // An anonymous relationship must not surface through `*`.
     let anon = run("MATCH (x:P)-[:T]->(m:P) RETURN *", &mut g);
     assert_eq!(anon[0].columns(), &["m".to_owned(), "x".to_owned()]);
