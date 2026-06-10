@@ -471,6 +471,18 @@ fn collect_expr_literals(expr: &Expr, out: &mut Vec<LiteralSite>) {
             }
         }
         ExprKind::PatternComprehension(pc) => collect_pattern_comprehension_literals(pc, out),
+        ExprKind::Quantifier(q) => {
+            collect_expr_literals(&q.list, out);
+            collect_expr_literals(&q.predicate, out);
+        }
+        ExprKind::ExistsSubquery(ex) => {
+            for part in &ex.pattern {
+                collect_pattern_element_literals(&part.element, out);
+            }
+            if let Some(p) = &ex.predicate {
+                collect_expr_literals(p, out);
+            }
+        }
     }
 }
 

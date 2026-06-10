@@ -46,7 +46,7 @@ use std::fmt;
 
 use graphus_core::Value;
 
-use crate::ast::{CaseExpr, Expr, ExprKind};
+use crate::ast::{CaseExpr, Expr, ExprKind, PatternPart};
 use crate::physical::{PhysicalOp, PhysicalPlan};
 use crate::plan_cache::NormalizedQuery;
 
@@ -592,6 +592,33 @@ fn params_in_expr(expr: &Expr, ty: ParamType, record: &mut impl FnMut(&str, Para
                 params_in_expr(p, ParamType::Any, record);
             }
             params_in_expr(&pc.projection, ParamType::Any, record);
+        }
+        ExprKind::Quantifier(q) => {
+            params_in_expr(&q.list, ParamType::Any, record);
+            params_in_expr(&q.predicate, ParamType::Any, record);
+        }
+        ExprKind::ExistsSubquery(ex) => {
+            for part in &ex.pattern {
+                params_in_pattern_part(part, record);
+            }
+            if let Some(p) = &ex.predicate {
+                params_in_expr(p, ParamType::Any, record);
+            }
+        }
+    }
+}
+
+/// Reports the parameters referenced by a pattern part's inline property maps (`{p: $x}`).
+fn params_in_pattern_part(part: &PatternPart, record: &mut impl FnMut(&str, ParamType)) {
+    if let Some(props) = &part.element.start.properties {
+        params_in_expr(props, ParamType::Any, record);
+    }
+    for link in &part.element.chain {
+        if let Some(props) = &link.relationship.properties {
+            params_in_expr(props, ParamType::Any, record);
+        }
+        if let Some(props) = &link.node.properties {
+            params_in_expr(props, ParamType::Any, record);
         }
     }
 }

@@ -1122,9 +1122,13 @@ fn expr_references_var(expr: &Expr, variable: &str) -> bool {
                     .as_deref()
                     .is_some_and(|e| expr_references_var(e, variable))
         }
-        // Comprehensions establish their own scope; conservatively treat them as referencing the
-        // variable so a seek is never built on a value that might shadow/close over it.
-        ExprKind::ListComprehension(_) | ExprKind::PatternComprehension(_) => true,
+        // Comprehensions, quantifiers and existential subqueries establish their own scope;
+        // conservatively treat them as referencing the variable so a seek is never built on a
+        // value that might shadow/close over it.
+        ExprKind::ListComprehension(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::ExistsSubquery(_) => true,
     }
 }
 

@@ -156,15 +156,10 @@ pub fn eval(
 
         ExprKind::Case(case) => eval_case(case, row, params, graph),
 
-        // List/pattern comprehensions are a documented deferral (named in lib.rs): they require a
-        // sub-evaluation scope the v1 executor does not yet model. A typed runtime error keeps the
-        // engine honest rather than silently returning a wrong value.
-        ExprKind::ListComprehension(_) => Err(EvalError::UnsupportedFunction {
-            name: "list comprehension".to_owned(),
-        }),
-        ExprKind::PatternComprehension(_) => Err(EvalError::UnsupportedFunction {
-            name: "pattern comprehension".to_owned(),
-        }),
+        ExprKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params, graph),
+        ExprKind::PatternComprehension(pc) => eval_pattern_comprehension(pc, row, params, graph),
+        ExprKind::Quantifier(q) => eval_quantifier(q, row, params, graph),
+        ExprKind::ExistsSubquery(ex) => eval_exists_subquery(ex, row, params, graph),
     }
 }
 
@@ -1192,6 +1187,409 @@ fn left_right_fn(argv: &[Value], left: bool) -> Result<Value, EvalError> {
         (Value::Null, _) => Ok(Value::Null),
         _ => Err(EvalError::TypeError {
             context: "left()/right() require (string, integer)".to_owned(),
+        }),
+    }
+}
+
+// =================================================================================================
+// Comprehensions, quantifiers and existential subqueries (expression-level sub-scopes)
+// =================================================================================================
+
+/// Evaluates a list comprehension `[x IN list WHERE p | e]`: iterate the list with `x` bound,
+/// keep elements whose predicate is `TRUE` (3VL — `NULL` excludes, like `WHERE`), and project each
+/// kept element (or the element itself in the filter-only form). A `null` list yields `null`.
+fn eval_list_comprehension(
+    lc: &crate::ast::ListComprehension,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> EvalResult {
+    let items = match eval_value(&lc.list, row, params, graph)? {
+        Value::Null => return Ok(RowValue::NULL),
+        Value::List(items) => items,
+        other => {
+            return Err(EvalError::TypeError {
+                context: format!("list comprehension requires a list, got {other:?}"),
+            });
+        }
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let inner = row.with(lc.variable.name.clone(), RowValue::Value(item.clone()));
+        if let Some(pred) = &lc.predicate {
+            if !eval_to_ternary(pred, &inner, params, graph)?.is_true() {
+                continue;
+            }
+        }
+        match &lc.projection {
+            Some(proj) => out.push(eval_value(proj, &inner, params, graph)?),
+            None => out.push(item),
+        }
+    }
+    Ok(RowValue::Value(Value::List(out)))
+}
+
+/// Evaluates a quantifier `all/any/none/single(x IN list WHERE p)` under Kleene 3VL with
+/// short-circuiting. A `null` list yields `null`; a `null` predicate outcome leaves the overall
+/// result unknown unless a definite element already decided it.
+fn eval_quantifier(
+    q: &crate::ast::QuantifierExpr,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> EvalResult {
+    use crate::ast::QuantifierKind;
+    let items = match eval_value(&q.list, row, params, graph)? {
+        Value::Null => return Ok(RowValue::NULL),
+        Value::List(items) => items,
+        other => {
+            return Err(EvalError::TypeError {
+                context: format!("quantifier requires a list, got {other:?}"),
+            });
+        }
+    };
+    let yes = || Ok(RowValue::Value(Value::Boolean(true)));
+    let no = || Ok(RowValue::Value(Value::Boolean(false)));
+    let mut trues = 0usize;
+    let mut nulls = 0usize;
+    for item in items {
+        let inner = row.with(q.variable.name.clone(), RowValue::Value(item));
+        match eval_to_ternary(&q.predicate, &inner, params, graph)? {
+            Ternary::True => match q.kind {
+                // One satisfied element decides ANY (true) and NONE (false) outright.
+                QuantifierKind::Any => return yes(),
+                QuantifierKind::None => return no(),
+                QuantifierKind::All => {}
+                QuantifierKind::Single => {
+                    trues += 1;
+                    if trues > 1 {
+                        return no();
+                    }
+                }
+            },
+            // One failed element decides ALL outright.
+            Ternary::False => {
+                if q.kind == QuantifierKind::All {
+                    return no();
+                }
+            }
+            Ternary::Null => nulls += 1,
+        }
+    }
+    // End of list: any unknown element leaves the undecided quantifiers unknown.
+    match q.kind {
+        QuantifierKind::All | QuantifierKind::None => {
+            if nulls > 0 {
+                Ok(RowValue::NULL)
+            } else {
+                yes()
+            }
+        }
+        QuantifierKind::Any => {
+            if nulls > 0 {
+                Ok(RowValue::NULL)
+            } else {
+                no()
+            }
+        }
+        QuantifierKind::Single => {
+            // An unknown element could be the (second) satisfying one, so any null leaves the
+            // result unknown; otherwise exactly-one decides.
+            if nulls > 0 {
+                Ok(RowValue::NULL)
+            } else {
+                Ok(RowValue::Value(Value::Boolean(trues == 1)))
+            }
+        }
+    }
+}
+
+/// Evaluates a pattern comprehension `[(a)-[r]->(b) WHERE p | e]`: match the pattern seeded by the
+/// outer row's bindings, filter by the predicate (3VL), and project each match into the list.
+fn eval_pattern_comprehension(
+    pc: &crate::ast::PatternComprehension,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> EvalResult {
+    if pc.var.is_some() {
+        // Named paths need the path value model (a deferral shared with MATCH paths).
+        return Err(EvalError::UnsupportedFunction {
+            name: "named path in a pattern comprehension".to_owned(),
+        });
+    }
+    let matches = pattern_element_rows(&pc.element, row, params, graph, false)?;
+    let mut out = Vec::new();
+    for m in matches {
+        if let Some(pred) = &pc.predicate {
+            if !eval_to_ternary(pred, &m, params, graph)?.is_true() {
+                continue;
+            }
+        }
+        out.push(eval_value(&pc.projection, &m, params, graph)?);
+    }
+    Ok(RowValue::Value(Value::List(out)))
+}
+
+/// Evaluates an existential subquery `EXISTS { [MATCH] pattern [WHERE p] }`: true iff the pattern
+/// (all comma-separated parts jointly, constrained by the outer bindings) matches at least once
+/// with the predicate `TRUE`. Always boolean, never null.
+fn eval_exists_subquery(
+    ex: &crate::ast::ExistsSubquery,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> EvalResult {
+    // Comma-separated parts join through their shared variables: each part's matches seed the next.
+    let mut rows = vec![row.clone()];
+    for part in &ex.pattern {
+        if part.var.is_some() {
+            return Err(EvalError::UnsupportedFunction {
+                name: "named path in an EXISTS subquery".to_owned(),
+            });
+        }
+        let mut next = Vec::new();
+        for r in &rows {
+            next.extend(pattern_element_rows(&part.element, r, params, graph, false)?);
+        }
+        if next.is_empty() {
+            return Ok(RowValue::Value(Value::Boolean(false)));
+        }
+        rows = next;
+    }
+    match &ex.predicate {
+        None => Ok(RowValue::Value(Value::Boolean(true))),
+        Some(pred) => {
+            for r in &rows {
+                if eval_to_ternary(pred, r, params, graph)?.is_true() {
+                    return Ok(RowValue::Value(Value::Boolean(true)));
+                }
+            }
+            Ok(RowValue::Value(Value::Boolean(false)))
+        }
+    }
+}
+
+// =================================================================================================
+// Expression-level pattern matching (pattern comprehensions / EXISTS subqueries)
+// =================================================================================================
+
+/// All binding rows produced by matching `element` against the graph, seeded by `row`: variables
+/// already bound in `row` constrain the match (an outer `n` in `[(n)-->(b) | b]` anchors the
+/// start), unbound pattern variables bind into the produced rows. Relationship uniqueness (trail
+/// semantics) holds within the element — one relationship is traversed at most once per match.
+///
+/// `first_only` stops at the first complete match (the `EXISTS` fast path when no joint
+/// constraints follow).
+fn pattern_element_rows(
+    element: &crate::ast::PatternElement,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    first_only: bool,
+) -> Result<Vec<Row>, EvalError> {
+    let mut results = Vec::new();
+    for start in node_candidates(&element.start, row, params, graph)? {
+        let mut seeded = row.clone();
+        if let Some(v) = &element.start.variable {
+            seeded.set(v.name.clone(), RowValue::Node(NodeRef { id: start }));
+        }
+        match_chain(
+            &element.chain,
+            0,
+            start,
+            seeded,
+            &mut Vec::new(),
+            &mut results,
+            params,
+            graph,
+            first_only,
+        )?;
+        if first_only && !results.is_empty() {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+/// Depth-first chain matcher: extend the partial match at `chain[idx]` from `current`, pushing
+/// every complete match into `out`. `used_rels` enforces per-match relationship uniqueness.
+#[allow(clippy::too_many_arguments)] // an internal DFS worker; bundling these adds no clarity
+fn match_chain(
+    chain: &[crate::ast::PatternChainLink],
+    idx: usize,
+    current: crate::graph_access::NodeId,
+    row: Row,
+    used_rels: &mut Vec<crate::graph_access::RelId>,
+    out: &mut Vec<Row>,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    first_only: bool,
+) -> Result<(), EvalError> {
+    let Some(link) = chain.get(idx) else {
+        out.push(row);
+        return Ok(());
+    };
+    if link.relationship.range.is_some() {
+        // Variable-length inside an expression shares MATCH's var-length machinery (deferred).
+        return Err(EvalError::UnsupportedFunction {
+            name: "variable-length pattern in an expression".to_owned(),
+        });
+    }
+    let types: Vec<String> = link
+        .relationship
+        .types
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    let direction = crate::graph_access::ExpandDirection::from_pattern(link.relationship.direction);
+    for inc in graph.expand(current, direction, &types) {
+        if used_rels.contains(&inc.rel) {
+            continue;
+        }
+        let mut next_row = row.clone();
+        // Relationship variable: an already-bound one is an identity constraint; otherwise bind.
+        if let Some(v) = &link.relationship.variable {
+            match next_row.get(&v.name) {
+                Some(RowValue::Rel(r)) if r.id == inc.rel => {}
+                Some(_) => continue,
+                None => next_row.set(v.name.clone(), RowValue::Rel(RelRef { id: inc.rel })),
+            }
+        }
+        if let Some(props) = &link.relationship.properties {
+            if !rel_props_match(inc.rel, props, &row, params, graph)? {
+                continue;
+            }
+        }
+        // Target node: label/property filters plus the identity constraint when already bound.
+        if !node_matches(inc.neighbour, &link.node, &row, params, graph)? {
+            continue;
+        }
+        if let Some(v) = &link.node.variable {
+            match next_row.get(&v.name) {
+                Some(RowValue::Node(n)) if n.id == inc.neighbour => {}
+                Some(_) => continue,
+                None => next_row.set(
+                    v.name.clone(),
+                    RowValue::Node(NodeRef {
+                        id: inc.neighbour,
+                    }),
+                ),
+            }
+        }
+        used_rels.push(inc.rel);
+        match_chain(
+            chain,
+            idx + 1,
+            inc.neighbour,
+            next_row,
+            used_rels,
+            out,
+            params,
+            graph,
+            first_only,
+        )?;
+        used_rels.pop();
+        if first_only && !out.is_empty() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// The candidate start nodes for `np` under `row`: a bound outer variable anchors to that node
+/// (re-checked against the pattern's labels/properties); otherwise a label scan (or full scan)
+/// filtered by the pattern.
+fn node_candidates(
+    np: &crate::ast::NodePattern,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> Result<Vec<crate::graph_access::NodeId>, EvalError> {
+    if let Some(v) = &np.variable {
+        if let Some(rv) = row.get(&v.name) {
+            return match rv {
+                RowValue::Node(n) if node_matches(n.id, np, row, params, graph)? => Ok(vec![n.id]),
+                _ => Ok(Vec::new()),
+            };
+        }
+    }
+    let ids = match np.labels.first() {
+        Some(l) => graph.scan_nodes_by_label(&l.name),
+        None => graph.scan_nodes(),
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        if node_matches(id, np, row, params, graph)? {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether node `id` satisfies `np`'s labels (all of them) and inline property map (every entry
+/// equal under Cypher `=` semantics).
+fn node_matches(
+    id: crate::graph_access::NodeId,
+    np: &crate::ast::NodePattern,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> Result<bool, EvalError> {
+    if !np.labels.is_empty() {
+        let Some(labels) = graph.node_labels(id) else {
+            return Ok(false);
+        };
+        if !np
+            .labels
+            .iter()
+            .all(|l| labels.iter().any(|have| have == &l.name))
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(props) = &np.properties {
+        let entries = eval_props_map(props, row, params, graph)?;
+        for (k, want) in entries {
+            let actual = graph.node_property(id, &k).unwrap_or(Value::Null);
+            if !equals(&actual, &want).is_true() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Whether relationship `id` satisfies the inline property map `props`.
+fn rel_props_match(
+    id: crate::graph_access::RelId,
+    props: &Expr,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> Result<bool, EvalError> {
+    let entries = eval_props_map(props, row, params, graph)?;
+    for (k, want) in entries {
+        let actual = graph.rel_property(id, &k).unwrap_or(Value::Null);
+        if !equals(&actual, &want).is_true() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Evaluates an inline pattern property expression (`{k: v, ...}` or a map parameter) to its
+/// key/value pairs.
+fn eval_props_map(
+    props: &Expr,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> Result<Vec<(String, Value)>, EvalError> {
+    match eval_value(props, row, params, graph)? {
+        Value::Map(entries) => Ok(entries),
+        other => Err(EvalError::TypeError {
+            context: format!("pattern properties must be a map, got {other:?}"),
         }),
     }
 }

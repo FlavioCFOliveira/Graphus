@@ -871,6 +871,25 @@ impl Analyzer {
                 }
                 self.check_expr_refs(&pc.projection, &inner)
             }
+            ExprKind::Quantifier(q) => {
+                // The list is in the outer scope; the iteration variable is local to the predicate.
+                self.check_expr_refs(&q.list, scope)?;
+                let mut inner = scope.clone();
+                inner.bind(&q.variable.name, VarKind::Value, q.variable.span)?;
+                self.check_expr_refs(&q.predicate, &inner)
+            }
+            ExprKind::ExistsSubquery(ex) => {
+                // The pattern binds its variables locally (outer bindings stay visible as
+                // constraints); the WHERE predicate sees both.
+                let mut inner = scope.clone();
+                for part in &ex.pattern {
+                    self.bind_pattern_part(part, &mut inner, PatternRole::Read)?;
+                }
+                if let Some(pred) = &ex.predicate {
+                    self.check_expr_refs(pred, &inner)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1115,6 +1134,16 @@ impl Analyzer {
                 }
                 if let Some(proj) = &lc.projection {
                     f(proj)?;
+                }
+                Ok(())
+            }
+            ExprKind::Quantifier(q) => {
+                f(&q.list)?;
+                f(&q.predicate)
+            }
+            ExprKind::ExistsSubquery(ex) => {
+                if let Some(pred) = &ex.predicate {
+                    f(pred)?;
                 }
                 Ok(())
             }

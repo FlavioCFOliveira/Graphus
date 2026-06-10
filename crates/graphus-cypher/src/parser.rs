@@ -55,13 +55,14 @@
 //! an explicit decision here.
 
 use crate::ast::{
-    BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause, Expr,
-    ExprKind, Label, ListComprehension, Literal, LoadCsvClause, MapKey, MatchClause, MergeAction,
-    MergeClause, NodePattern, PatternChainLink, PatternComprehension, PatternElement, PatternPart,
-    PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection,
-    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
-    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart,
-    UnwindClause, VarLengthRange, Variable, WithClause, YieldItem,
+    BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause,
+    ExistsSubquery, Expr, ExprKind, Label, ListComprehension, Literal, LoadCsvClause, MapKey,
+    MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink, PatternComprehension,
+    PatternElement, PatternPart, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, Query,
+    QueryBody, QuantifierExpr, QuantifierKind, RelDirection, RelType, RelationshipPattern,
+    RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery, SortDirection,
+    SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, VarLengthRange,
+    Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -1737,6 +1738,15 @@ impl<'t, 's> Parser<'t, 's> {
                 Ok(Expr::new(ExprKind::Parameter(name), span))
             }
             TokenKind::Case => self.parse_case(),
+            // `ALL` lexes as a keyword; as an atom it can only begin the `all(x IN xs WHERE p)`
+            // quantifier. The other three quantifiers lex as identifiers (see
+            // `parse_variable_or_call`).
+            TokenKind::All => {
+                let start = self.bump().expect("ALL peeked").span.start;
+                self.finish_quantifier(QuantifierKind::All, start)
+            }
+            // `EXISTS` heads either the `EXISTS { ... }` subquery or the `exists(expr)` function.
+            TokenKind::Exists => self.parse_exists(),
             TokenKind::LBracket => self.parse_list_or_comprehension(),
             TokenKind::LBrace => self.parse_map_literal(),
             TokenKind::LParen => {
@@ -1794,6 +1804,27 @@ impl<'t, 's> Parser<'t, 's> {
             ));
         }
 
+        // Quantifier predicates `any/none/single(x IN list WHERE p)` — recognised by the name plus
+        // the `( name IN` lookahead (`all` lexes as a keyword and is handled in `parse_atom`).
+        // Anything else with these names falls through to a regular function call.
+        if self.at(&TokenKind::LParen)
+            && matches!(
+                self.peek_at(1).map(|t| &t.kind),
+                Some(TokenKind::Identifier(_))
+            )
+            && matches!(self.peek_at(2).map(|t| &t.kind), Some(TokenKind::In))
+        {
+            let kind = match first.to_ascii_lowercase().as_str() {
+                "any" => Some(QuantifierKind::Any),
+                "none" => Some(QuantifierKind::None),
+                "single" => Some(QuantifierKind::Single),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return self.finish_quantifier(kind, start_span.start);
+            }
+        }
+
         // Plain function call `f(...)`.
         if self.at(&TokenKind::LParen) {
             return self.finish_function_call(vec![first], start_span.start);
@@ -1801,6 +1832,60 @@ impl<'t, 's> Parser<'t, 's> {
 
         // Otherwise: a variable reference.
         Ok(Expr::new(ExprKind::Variable(first), start_span))
+    }
+
+    /// Finishes a quantifier predicate after its head keyword/name:
+    /// `'(' Variable IN Expression WHERE Expression ')'`. The `WHERE` predicate is required
+    /// (openCypher rejects a quantifier without one).
+    fn finish_quantifier(
+        &mut self,
+        kind: QuantifierKind,
+        start: usize,
+    ) -> Result<Expr, SyntaxError> {
+        self.expect(&TokenKind::LParen, "'(' to begin a quantifier")?;
+        let variable = self.parse_variable()?;
+        self.expect(&TokenKind::In, "IN in a quantifier")?;
+        let list = Box::new(self.parse_expr()?);
+        self.expect(
+            &TokenKind::Where,
+            "WHERE in a quantifier (the predicate is required)",
+        )?;
+        let predicate = Box::new(self.parse_expr()?);
+        let rp = self.expect(&TokenKind::RParen, "')' to close the quantifier")?;
+        Ok(Expr::new(
+            ExprKind::Quantifier(Box::new(QuantifierExpr {
+                kind,
+                variable,
+                list,
+                predicate,
+            })),
+            Span::new(start, rp.span.end),
+        ))
+    }
+
+    /// Parses the `EXISTS` atom: the `EXISTS { [MATCH] pattern [WHERE p] }` existential subquery,
+    /// or the `exists(expr)` function form when a `(` follows.
+    fn parse_exists(&mut self) -> Result<Expr, SyntaxError> {
+        let tok = self.bump().expect("caller saw EXISTS");
+        let start = tok.span.start;
+        if self.at(&TokenKind::LBrace) {
+            self.bump();
+            // The pattern form optionally writes a leading MATCH (Neo4j accepts both).
+            self.eat(&TokenKind::Match);
+            let pattern = self.parse_pattern()?;
+            let predicate = if self.eat(&TokenKind::Where) {
+                Some(Box::new(self.parse_expr()?))
+            } else {
+                None
+            };
+            let rb = self.expect(&TokenKind::RBrace, "'}' to close an EXISTS subquery")?;
+            return Ok(Expr::new(
+                ExprKind::ExistsSubquery(Box::new(ExistsSubquery { pattern, predicate })),
+                Span::new(start, rb.span.end),
+            ));
+        }
+        // Function form `exists(expr)`.
+        self.finish_function_call(vec!["exists".to_owned()], start)
     }
 
     /// Looks ahead from a `.` to decide whether a dotted name is a namespaced function call

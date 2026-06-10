@@ -715,6 +715,14 @@ pub enum ExprKind {
     /// turn embed [`Expr`]s (inline property maps), which would otherwise make [`Expr`] infinitely
     /// sized.
     PatternComprehension(Box<PatternComprehension>),
+
+    /// A quantifier predicate `all/any/none/single(x IN list WHERE p)` (openCypher
+    /// `Quantifier`).
+    Quantifier(Box<QuantifierExpr>),
+    /// An existential subquery `EXISTS { [MATCH] pattern [WHERE p] }` (openCypher
+    /// `ExistentialSubquery`). Boxed for the same embedded-pattern reason as
+    /// [`PatternComprehension`](Self::PatternComprehension).
+    ExistsSubquery(Box<ExistsSubquery>),
 }
 
 /// A literal in the AST (openCypher `Literal`), kept unevaluated; range/encoding checks are deferred
@@ -867,4 +875,50 @@ pub struct PatternComprehension {
     pub predicate: Option<Box<Expr>>,
     /// The mandatory `| projection` expression.
     pub projection: Box<Expr>,
+}
+
+/// A quantifier predicate `all/any/none/single(var IN list WHERE pred)` (openCypher `Quantifier`).
+///
+/// Evaluates the predicate for each list element with `var` bound, combining the per-element
+/// ternary results per the quantifier kind (Kleene 3VL with short-circuiting).
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct QuantifierExpr {
+    /// Which quantifier was written.
+    pub kind: QuantifierKind,
+    /// The iteration variable.
+    pub variable: Variable,
+    /// The list being quantified over.
+    pub list: Box<Expr>,
+    /// The `WHERE` predicate tested per element.
+    pub predicate: Box<Expr>,
+}
+
+/// The four openCypher quantifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum QuantifierKind {
+    /// `all(...)` — every element satisfies the predicate.
+    All,
+    /// `any(...)` — at least one element satisfies the predicate.
+    Any,
+    /// `none(...)` — no element satisfies the predicate.
+    None,
+    /// `single(...)` — exactly one element satisfies the predicate.
+    Single,
+}
+
+/// An existential subquery `EXISTS { [MATCH] pattern [WHERE pred] }` (openCypher
+/// `ExistentialSubquery`, pattern form).
+///
+/// True iff the pattern (constrained by the outer row's bindings and the optional `WHERE`)
+/// matches at least once. The full-query form (`EXISTS { MATCH ... RETURN ... }`) is a named
+/// deferral.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct ExistsSubquery {
+    /// The pattern parts (comma-separated), at least one.
+    pub pattern: Vec<PatternPart>,
+    /// The optional `WHERE` predicate over the pattern's bindings.
+    pub predicate: Option<Box<Expr>>,
 }

@@ -1020,6 +1020,21 @@ fn fmt_expr(expr: &Expr) -> String {
         ExprKind::Case(_) => "CASE(...)".to_owned(),
         ExprKind::ListComprehension(_) => "[list-comprehension]".to_owned(),
         ExprKind::PatternComprehension(_) => "[pattern-comprehension]".to_owned(),
+        ExprKind::Quantifier(q) => {
+            let kw = match q.kind {
+                crate::ast::QuantifierKind::All => "all",
+                crate::ast::QuantifierKind::Any => "any",
+                crate::ast::QuantifierKind::None => "none",
+                crate::ast::QuantifierKind::Single => "single",
+            };
+            format!(
+                "{kw}({} IN {} WHERE {})",
+                q.variable.name,
+                fmt_expr(&q.list),
+                fmt_expr(&q.predicate),
+            )
+        }
+        ExprKind::ExistsSubquery(_) => "EXISTS{...}".to_owned(),
     }
 }
 

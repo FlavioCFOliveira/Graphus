@@ -992,9 +992,13 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
                     .is_some_and(expr_contains_aggregate)
         }
         ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => false,
-        // Comprehensions establish their own scope; an aggregate cannot legally appear inside
-        // (the semantic pass rejects it), so they never contribute an aggregate here.
-        ExprKind::ListComprehension(_) | ExprKind::PatternComprehension(_) => false,
+        // Comprehensions, quantifiers and existential subqueries establish their own scope; an
+        // aggregate cannot legally appear inside (the semantic pass rejects it), so they never
+        // contribute an aggregate here.
+        ExprKind::ListComprehension(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::ExistsSubquery(_) => false,
     }
 }
 

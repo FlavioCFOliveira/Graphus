@@ -26,18 +26,19 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **1192 / 3884 scenarios pass (30.69 %)**, with 0 panics and 50 scenarios skipped
+/// Current ratchet: **1782 / 3884 scenarios pass (45.88 %)**, with 0 panics and 50 scenarios skipped
 /// as genuinely unsupported (all `CALL`-procedure forms — the engine has no procedure facility yet).
-/// This rose from 1112 when `rmp` task #55 fixed projection-column naming: un-aliased columns are
-/// now named by the expression's verbatim source text (captured by the parser), `RETURN *` expands
-/// alphabetically and never leaks synthetic variables, and aggregation results keep the source
-/// column order (+80 scenarios). Prior rises: 1095 → 1112 (#52, eager writes under `LIMIT`);
-/// 1094 → 1095 (#22, `count(<entity>)`). The remaining failures are honest engine gaps, dominated
-/// by: missing temporal builtins (`datetime`/`date`/`duration`/…), the parser not accepting
-/// quantifier / comprehension syntax (`ALL(... WHERE ...)`, `[x IN xs WHERE ...]`), and boolean
-/// operands type-checked at runtime rather than compile time. See the printed `failure reasons`
-/// histogram for the live breakdown.
-const BASELINE: usize = 1192;
+/// This rose from 1192 when `rmp` task #54 delivered quantifier predicates
+/// (`all`/`any`/`none`/`single` under Kleene 3VL), list/pattern-comprehension evaluation, and the
+/// pattern-form `EXISTS { ... }` existential subquery, all backed by an expression-level pattern
+/// matcher (+590 scenarios). Prior rises: 1112 → 1192 (#55, verbatim column names);
+/// 1095 → 1112 (#52, eager writes under `LIMIT`); 1094 → 1095 (#22, `count(<entity>)`). The
+/// remaining failures are honest engine gaps, dominated by: missing temporal builtins
+/// (`datetime`/`date`/`duration`/…), error-classification mismatches (SyntaxError vs SemanticError
+/// vs runtime), the full-query `EXISTS { MATCH ... RETURN ... }` form, and assorted missing
+/// builtins (`nodes`, `rand`, …). See the printed `failure reasons` histogram for the live
+/// breakdown.
+const BASELINE: usize = 1782;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

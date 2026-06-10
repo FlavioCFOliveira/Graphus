@@ -648,6 +648,102 @@ fn create_under_skip_past_end_still_creates() {
 }
 
 // =================================================================================================
+// Quantifiers, comprehensions and existential subqueries (rmp #54)
+// =================================================================================================
+
+#[test]
+fn quantifiers_follow_kleene_three_valued_logic() {
+    let mut g = MemGraph::new();
+    // Empty list: all/none are vacuously true, any is false, single is false.
+    let rows = run(
+        "RETURN all(x IN [] WHERE x > 0) AS a, any(x IN [] WHERE x > 0) AS b, \
+         none(x IN [] WHERE x > 0) AS c, single(x IN [] WHERE x > 0) AS d",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("a"), Value::Boolean(true));
+    assert_eq!(rows[0].value("b"), Value::Boolean(false));
+    assert_eq!(rows[0].value("c"), Value::Boolean(true));
+    assert_eq!(rows[0].value("d"), Value::Boolean(false));
+
+    // Definite short-circuits beat nulls; otherwise a null leaves the result unknown.
+    let rows = run(
+        "RETURN any(x IN [1, null, 3] WHERE x = 3) AS hit, \
+         none(x IN [2, null] WHERE x = 2) AS miss, \
+         all(x IN [1, null] WHERE x > 0) AS unknown, \
+         single(x IN [3, null] WHERE x = 3) AS maybe",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("hit"), Value::Boolean(true), "a true decides any()");
+    assert_eq!(rows[0].value("miss"), Value::Boolean(false), "a true decides none()");
+    assert_eq!(rows[0].value("unknown"), Value::Null, "a null leaves all() unknown");
+    assert_eq!(rows[0].value("maybe"), Value::Null, "a null could be a second match");
+
+    // single: exactly one definite match.
+    let rows = run(
+        "RETURN single(x IN [1, 2, 3] WHERE x = 2) AS one, \
+         single(x IN [2, 2] WHERE x = 2) AS two",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("one"), Value::Boolean(true));
+    assert_eq!(rows[0].value("two"), Value::Boolean(false));
+}
+
+#[test]
+fn list_comprehension_filters_and_projects() {
+    let mut g = MemGraph::new();
+    let rows = run(
+        "RETURN [x IN [1, 2, 3, 4] WHERE x > 1 | x * 10] AS both, \
+         [x IN [1, 2, 3] WHERE x <> 2] AS filter_only, \
+         [x IN [1, 2] | x + 1] AS map_only, \
+         [x IN null | x] AS null_list",
+        &mut g,
+    );
+    assert_eq!(
+        rows[0].value("both"),
+        Value::List(vec![i(20), i(30), i(40)])
+    );
+    assert_eq!(rows[0].value("filter_only"), Value::List(vec![i(1), i(3)]));
+    assert_eq!(rows[0].value("map_only"), Value::List(vec![i(2), i(3)]));
+    assert_eq!(rows[0].value("null_list"), Value::Null);
+}
+
+#[test]
+fn pattern_comprehension_collects_matches_from_the_outer_binding() {
+    let (mut g, ..) = seed_social();
+    // Ada KNOWS Bob; collect the names of everyone Ada knows.
+    let rows = run(
+        "MATCH (a:Person {name: 'Ada'}) RETURN [(a)-[:KNOWS]->(b) | b.name] AS known",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("known"), Value::List(vec![s("Bob")]));
+    // With a WHERE filter that rejects every match: empty list.
+    let rows = run(
+        "MATCH (a:Person {name: 'Ada'}) RETURN [(a)-[:KNOWS]->(b) WHERE b.age > 99 | b.name] AS known",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("known"), Value::List(vec![]));
+}
+
+#[test]
+fn exists_subquery_tests_pattern_existence() {
+    let (mut g, ..) = seed_social();
+    // Everyone with an outgoing KNOWS edge: Ada and Bob (Cara only receives).
+    let rows = run(
+        "MATCH (n:Person) WHERE exists { (n)-[:KNOWS]->() } RETURN n.name AS name ORDER BY name",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "name"), vec![s("Ada"), s("Bob")]);
+    // The WHERE inside the subquery constrains the match; MATCH keyword optional.
+    let rows = run(
+        "MATCH (n:Person) WHERE exists { MATCH (n)-[:KNOWS]->(m) WHERE m.age = 36 } \
+         RETURN n.name AS name",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "name"), vec![s("Bob")], "only Bob knows a 36-year-old");
+}
+
+// =================================================================================================
 // Parameters
 // =================================================================================================
 
