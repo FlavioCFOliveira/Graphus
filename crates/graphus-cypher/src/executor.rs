@@ -811,6 +811,17 @@ fn build_operator(
             primed: false,
             count_expr: count.clone(),
         }),
+        PhysicalOp::Eager { input } => {
+            // The eager-write barrier (planner-inserted under a Limit over writes): drain the
+            // input in full at build time so every write side effect runs, then serve the buffer.
+            // Cancellation is still polled row-by-row through the inner operator's `next`.
+            let mut inner = build_operator(input, arg, ctx)?;
+            let mut rows = VecDeque::new();
+            while let Some(row) = inner.next(ctx)? {
+                rows.push_back(row);
+            }
+            Ok(Operator::Buffered { rows })
+        }
         PhysicalOp::Unwind {
             input,
             list,
@@ -2004,6 +2015,7 @@ fn result_columns(op: &PhysicalOp) -> Vec<String> {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::Optional { input, .. }
         | PhysicalOp::Create { input, .. }

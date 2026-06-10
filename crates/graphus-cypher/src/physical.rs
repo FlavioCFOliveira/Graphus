@@ -354,6 +354,16 @@ pub enum PhysicalOp {
         /// The maximum-row-count expression.
         count: Expr,
     },
+    /// **Eager barrier**: drain `input` completely, then emit the buffered rows.
+    ///
+    /// Inserted by the planner between a [`Limit`](Self::Limit) and an input subtree containing a
+    /// write operator, so the write side effects run to completion no matter how many rows the
+    /// limit lets through. openCypher write clauses are *eager*: `LIMIT` bounds the **returned**
+    /// rows, never the side effects — `CREATE (n) RETURN n LIMIT 0` must still create the node.
+    Eager {
+        /// The upstream relation, drained in full before any row is emitted.
+        input: Box<PhysicalOp>,
+    },
     /// Expand `list` into one row per element bound to `variable` (`UNWIND`).
     Unwind {
         /// The upstream relation.
@@ -788,6 +798,13 @@ impl Planner<'_> {
 
     /// Lowers a `Limit`: fuse a `Limit(Sort)` into [`TopN`](PhysicalOp::TopN), or push a `Limit`
     /// below a row-count-preserving projection; otherwise a plain [`Limit`](PhysicalOp::Limit).
+    ///
+    /// **Eager-write barrier.** openCypher write clauses are eager: `LIMIT` bounds the returned
+    /// rows, never the side effects (`CREATE (n) RETURN n LIMIT 0` still creates the node). A
+    /// `Limit` operator stops pulling from its input once satisfied, which would suppress upstream
+    /// writes — so when the limited subtree contains a write operator it is wrapped in an
+    /// [`Eager`](PhysicalOp::Eager) barrier that drains it in full first. `TopN` needs no barrier:
+    /// sorting already consumes its whole input.
     fn lower_limit(
         &self,
         input: &LogicalOp,
@@ -814,7 +831,7 @@ impl Planner<'_> {
                 distinct: false,
             } => {
                 let pushed = PhysicalOp::Limit {
-                    input: Box::new(self.lower(proj_input, deps)),
+                    input: Box::new(eager_over_writes(self.lower(proj_input, deps))),
                     count: count.clone(),
                 };
                 PhysicalOp::Projection {
@@ -826,10 +843,59 @@ impl Planner<'_> {
             // Any other input (incl. DISTINCT projection / Aggregation): plain Limit, NOT pushed —
             // pushing below a row-count-changing operator would change the result.
             other => PhysicalOp::Limit {
-                input: Box::new(self.lower(other, deps)),
+                input: Box::new(eager_over_writes(self.lower(other, deps))),
                 count: count.clone(),
             },
         }
+    }
+}
+
+/// Wraps `input` in an [`Eager`](PhysicalOp::Eager) barrier when its subtree contains a write
+/// operator, so a `Limit` above cannot suppress the writes (see [`Planner::lower_limit`]).
+fn eager_over_writes(input: PhysicalOp) -> PhysicalOp {
+    if contains_write(&input) {
+        PhysicalOp::Eager {
+            input: Box::new(input),
+        }
+    } else {
+        input
+    }
+}
+
+/// Whether the physical (sub)plan contains a write operator
+/// (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`) anywhere.
+fn contains_write(op: &PhysicalOp) -> bool {
+    match op {
+        PhysicalOp::Create { .. }
+        | PhysicalOp::Merge { .. }
+        | PhysicalOp::SetClause { .. }
+        | PhysicalOp::Delete { .. }
+        | PhysicalOp::Remove { .. } => true,
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::Optional { input, .. } => contains_write(input),
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => contains_write(left) || contains_write(right),
+        PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_write),
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => false,
     }
 }
 
@@ -1199,6 +1265,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
         | PhysicalOp::Sort { input, .. } => gather_bound_vars(input, out),
         PhysicalOp::TopN { input, .. } => gather_bound_vars(input, out),
         PhysicalOp::Unwind {
@@ -1422,6 +1489,10 @@ impl PhysicalOp {
                 writeln!(f, "Limit({})", h::expr(count))?;
                 input.fmt_indented(f, depth + 1)
             }
+            Self::Eager { input } => {
+                writeln!(f, "Eager")?;
+                input.fmt_indented(f, depth + 1)
+            }
             Self::Unwind {
                 input,
                 list,
@@ -1554,6 +1625,24 @@ mod tests {
         let validated = analyze(&ast).expect("analyze");
         let logical = lower(&validated);
         plan_physical(&logical, catalog)
+    }
+
+    #[test]
+    fn limit_over_a_write_gets_an_eager_barrier() {
+        let plan = physical("CREATE (n) RETURN n LIMIT 0", &IndexCatalog::empty());
+        let rendered = plan.to_string();
+        assert!(rendered.contains("Eager"), "{rendered}");
+        // The barrier sits between the Limit and the write.
+        let limit_pos = rendered.find("Limit").expect("limit");
+        let eager_pos = rendered.find("Eager").expect("eager");
+        let create_pos = rendered.find("Create").expect("create");
+        assert!(limit_pos < eager_pos && eager_pos < create_pos, "{rendered}");
+    }
+
+    #[test]
+    fn limit_over_a_pure_read_has_no_eager_barrier() {
+        let plan = physical("MATCH (n) RETURN n LIMIT 1", &IndexCatalog::empty());
+        assert!(!plan.to_string().contains("Eager"), "{plan}");
     }
 
     #[test]

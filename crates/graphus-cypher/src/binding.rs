@@ -433,7 +433,9 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             walk_physical(left, record);
             walk_physical(right, record);
         }
-        PhysicalOp::Optional { input, .. } => walk_physical(input, record),
+        PhysicalOp::Optional { input, .. } | PhysicalOp::Eager { input } => {
+            walk_physical(input, record)
+        }
 
         // ---- write operators carry expressions in their pattern/ops -------------------------
         PhysicalOp::Create { input, pattern } | PhysicalOp::Merge { input, pattern, .. } => {

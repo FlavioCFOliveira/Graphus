@@ -577,6 +577,77 @@ fn delete_connected_node_without_detach_is_runtime_error() {
 }
 
 // =================================================================================================
+// Eager writes under LIMIT (regression for rmp #52): openCypher write clauses are eager — LIMIT
+// bounds the returned rows, never the side effects.
+// =================================================================================================
+
+#[test]
+fn create_under_limit_zero_still_creates_the_node() {
+    let mut g = MemGraph::new();
+    let rows = run("CREATE (n) RETURN n LIMIT 0", &mut g);
+    assert_eq!(rows.len(), 0, "LIMIT 0 returns no rows");
+    assert_eq!(g.node_count(), 1, "the CREATE side effect must still run");
+}
+
+#[test]
+fn create_per_row_under_limit_one_runs_every_write() {
+    let mut g = MemGraph::new();
+    let rows = run("UNWIND [1, 2, 3] AS x CREATE (n:T {v: x}) RETURN x LIMIT 1", &mut g);
+    assert_eq!(rows.len(), 1, "LIMIT 1 returns one row");
+    assert_eq!(g.node_count(), 3, "CREATE must run once per input row");
+}
+
+#[test]
+fn merge_under_limit_zero_still_creates() {
+    let mut g = MemGraph::new();
+    let rows = run("MERGE (n:City {name: 'Faro'}) RETURN n LIMIT 0", &mut g);
+    assert_eq!(rows.len(), 0);
+    assert_eq!(g.node_count(), 1, "the MERGE-create side effect must still run");
+}
+
+#[test]
+fn set_under_limit_zero_still_applies() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["P"], [("age", i(20))]);
+    let b = g.add_node(["P"], [("age", i(30))]);
+    let rows = run("MATCH (n:P) SET n.age = 99 RETURN n LIMIT 0", &mut g);
+    assert_eq!(rows.len(), 0);
+    assert_eq!(g.node_property(a, "age"), Some(i(99)));
+    assert_eq!(g.node_property(b, "age"), Some(i(99)), "SET must run for every matched row");
+}
+
+#[test]
+fn delete_under_limit_zero_still_deletes() {
+    let mut g = MemGraph::new();
+    g.add_node(["P"], NO_PROPS);
+    g.add_node(["P"], NO_PROPS);
+    let rows = run("MATCH (n:P) DELETE n RETURN n LIMIT 0", &mut g);
+    assert_eq!(rows.len(), 0);
+    assert_eq!(g.node_count(), 0, "DELETE must run for every matched row");
+}
+
+#[test]
+fn create_under_order_by_limit_runs_every_write() {
+    // ORDER BY + LIMIT fuses into TopN, which drains its input; pin that writes still all run.
+    let mut g = MemGraph::new();
+    let rows = run(
+        "UNWIND [3, 1, 2] AS x CREATE (n:T {v: x}) RETURN x ORDER BY x LIMIT 1",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("x"), i(1));
+    assert_eq!(g.node_count(), 3, "CREATE must run once per input row under TopN");
+}
+
+#[test]
+fn create_under_skip_past_end_still_creates() {
+    let mut g = MemGraph::new();
+    let rows = run("CREATE (n) RETURN n SKIP 1", &mut g);
+    assert_eq!(rows.len(), 0);
+    assert_eq!(g.node_count(), 1, "SKIP must not suppress the CREATE side effect");
+}
+
+// =================================================================================================
 // Parameters
 // =================================================================================================
 
