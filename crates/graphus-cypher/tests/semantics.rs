@@ -243,10 +243,37 @@ fn duplicate_column_against_star_expansion() {
 }
 
 #[test]
-fn order_by_on_out_of_scope_name_is_an_error() {
-    // After RETURN projects only `name`, ORDER BY may reference `name` but not the dropped `n`.
+fn order_by_may_reference_a_pre_projection_variable() {
+    // `rmp` task #40: openCypher lets ORDER BY of a **non-aggregating, non-DISTINCT** projection
+    // reference variables in scope *before* the projection (here `n`), not only the projected alias.
+    // (This was previously rejected — an over-strict scoping bug, now relaxed to match the TCK.)
+    ok("MATCH (n) RETURN n.name AS name ORDER BY n.age");
+}
+
+#[test]
+fn order_by_cannot_reference_a_dropped_variable_under_aggregation() {
+    // An aggregating projection drops the pre-projection variables; ORDER BY then sees only the
+    // projected columns, so the dropped `n` is undefined.
     assert_detail(
-        "MATCH (n) RETURN n.name AS name ORDER BY n.age",
+        "MATCH (n) RETURN count(n) AS c ORDER BY n.age",
+        SemanticDetail::UndefinedVariable,
+    );
+}
+
+#[test]
+fn order_by_cannot_reference_a_dropped_variable_under_distinct() {
+    // DISTINCT likewise reduces to the projected values, so a pre-projection variable is gone.
+    assert_detail(
+        "MATCH (n) RETURN DISTINCT n.name AS name ORDER BY n.age",
+        SemanticDetail::UndefinedVariable,
+    );
+}
+
+#[test]
+fn order_by_on_a_truly_undefined_name_is_still_an_error() {
+    // A name bound nowhere — neither projected nor in the pre-projection scope — is undefined.
+    assert_detail(
+        "MATCH (n) RETURN n.name AS name ORDER BY zzz.age",
         SemanticDetail::UndefinedVariable,
     );
 }

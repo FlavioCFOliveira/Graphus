@@ -518,9 +518,23 @@ impl Analyzer {
         }
 
         // 4) ORDER BY / SKIP / LIMIT and a trailing WHERE are evaluated in the *post*-projection
-        //    scope (they sit inside the ProjectionBody per the grammar).
+        //    scope (they sit inside the ProjectionBody per the grammar). ORDER BY is the one
+        //    exception: for a **non-aggregating, non-DISTINCT** projection, openCypher lets it
+        //    reference both the projected aliases AND the variables in scope *before* the projection
+        //    (`rmp` task #40; Neo4j/openCypher ORDER BY scoping). An aggregating or DISTINCT
+        //    projection drops the pre-projection variables, so its ORDER BY sees only the projected
+        //    columns. Aliases shadow a pre-projection variable of the same name.
+        let order_scope = if aggregating || body.distinct {
+            new_scope.clone()
+        } else {
+            let mut s = scope.clone();
+            for (name, binding) in &new_scope.bindings {
+                s.bindings.insert(name.clone(), *binding);
+            }
+            s
+        };
         for sort in &body.order_by {
-            self.check_order_by_item(sort, &new_scope, aggregating)?;
+            self.check_order_by_item(sort, &order_scope, aggregating)?;
         }
         if let Some(skip) = &body.skip {
             self.check_expr_refs(skip, &new_scope)?;

@@ -1377,6 +1377,18 @@ fn create_pattern(
                 labels,
                 properties,
             } => {
+                // A variable already bound — by an earlier comma-separated pattern part or a prior
+                // clause (e.g. `CREATE (a {..}), (a)-[:R]->(b)` or `MATCH (a) CREATE (a)-[:R]->(b)`)
+                // — REFERENCES the existing node; it must not create a second one (`rmp` task #41).
+                // Anonymous nodes get unique generated variable names, so they never collide here and
+                // are always created.
+                if row
+                    .get(&variable.name)
+                    .and_then(RowValue::as_node)
+                    .is_some()
+                {
+                    continue;
+                }
                 let props = eval_properties(properties.as_ref(), &row, ctx)?;
                 let label_names: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
                 let id = ctx.graph.create_node(&label_names, &props);
@@ -2022,6 +2034,33 @@ mod tests {
         let rows = run("MATCH (n) RETURN n", &mut g);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.get("n").unwrap().as_node().is_some()));
+    }
+
+    #[test]
+    fn create_reuses_a_rementioned_variable_across_comma_parts() {
+        // `rmp` task #41: `CREATE (a {..}), (a)-[:R]->(b)` must REUSE the bound `a`, creating exactly
+        // one `a` (plus one `b` and one relationship), not a second anonymous node.
+        let mut g = MemGraph::new();
+        let _ = run("CREATE (a {n: 1}), (a)-[:R]->(b {n: 2})", &mut g);
+
+        let mut vs: Vec<i64> = run("MATCH (x) RETURN x.n AS v", &mut g)
+            .iter()
+            .filter_map(|r| match r.value("v") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        vs.sort_unstable();
+        assert_eq!(
+            vs,
+            vec![1, 2],
+            "exactly one a (n=1) and one b (n=2); no duplicate a"
+        );
+
+        let rels = run("MATCH (x)-[:R]->(y) RETURN x.n AS xn, y.n AS yn", &mut g);
+        assert_eq!(rels.len(), 1, "exactly one relationship, from the reused a");
+        assert_eq!(rels[0].value("xn"), Value::Integer(1));
+        assert_eq!(rels[0].value("yn"), Value::Integer(2));
     }
 
     #[test]
