@@ -949,9 +949,13 @@ impl<'t, 's> Parser<'t, 's> {
         } else {
             (None, expr.span.end)
         };
+        // The un-aliased column name is the expression's exact source text (openCypher); capture
+        // it here while the source is in reach (spans are byte-accurate, so this slice is exact).
+        let verbatim = self.source[expr.span.start..expr.span.end].to_owned();
         Ok(ProjectionItem {
             expr,
             alias,
+            verbatim,
             span: Span::new(start, end),
         })
     }

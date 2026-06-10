@@ -669,11 +669,11 @@ impl Analyzer {
                 let kind = scope.kind_of(name).unwrap_or(VarKind::Value);
                 Ok((name.clone(), kind))
             }
-            // A bare property `n.x` infers the column name `n.x` (Cypher's name inference). It
-            // carries no entity identity, so it is a plain value.
-            ExprKind::Property { .. } => Ok((Self::render_expr_name(&item.expr), VarKind::Value)),
-            // Other bare expressions in a final RETURN take their source text as the column name.
-            _ => Ok((Self::render_expr_name(&item.expr), VarKind::Value)),
+            // Any other un-aliased expression is named by its verbatim source text (openCypher's
+            // column-name rule; the parser captured the slice). `n.x` carries no entity identity,
+            // so every such column is a plain value. Must agree with the planner's
+            // `projection_column` ([`crate::lower`]) so duplicate detection sees the same names.
+            _ => Ok((item.verbatim.clone(), VarKind::Value)),
         }
     }
 
@@ -1036,19 +1036,6 @@ impl Analyzer {
                 )
             }
             _ => false,
-        }
-    }
-
-    /// Renders a stable column name for an unaliased expression (variable / property path; otherwise
-    /// a placeholder derived from the kind). This is a diagnostics/grouping aid, not the canonical
-    /// Cypher column-name algorithm (which echoes source text — a planner concern).
-    fn render_expr_name(expr: &Expr) -> String {
-        match &expr.kind {
-            ExprKind::Variable(n) => n.clone(),
-            ExprKind::Property { base, key } => format!("{}.{key}", Self::render_expr_name(base)),
-            ExprKind::CountStar => "count(*)".to_owned(),
-            ExprKind::FunctionCall { name, .. } => format!("{}(...)", name.join(".")),
-            _ => format!("anon@{}..{}", expr.span.start, expr.span.end),
         }
     }
 

@@ -611,15 +611,22 @@ impl Planner {
 
         // Build the projected columns. `*` carries through the incoming bindings; the planner does
         // not know the runtime column set, so `*` is represented by projecting each currently-bound
-        // variable as itself (a faithful, index-agnostic expansion).
+        // variable as itself (a faithful, index-agnostic expansion). openCypher orders the
+        // `*`-expanded columns alphabetically by variable name (the TCK asserts this shape).
         let mut star_cols: Vec<ProjectionColumn> = Vec::new();
         if body.star {
             for v in collect_bound_vars(&input) {
+                // Planner-introduced synthetic variables (anonymous pattern parts) are not
+                // user-visible bindings; `*` must never project them.
+                if v.synthetic {
+                    continue;
+                }
                 star_cols.push(ProjectionColumn {
                     expr: Expr::new(ExprKind::Variable(v.name.clone()), clause_span),
                     alias: v.name.clone(),
                 });
             }
+            star_cols.sort_by(|a, b| a.alias.cmp(&b.alias));
         }
         let explicit_cols: Vec<ProjectionColumn> = body
             .items
@@ -632,17 +639,44 @@ impl Planner {
             // always grouping keys (bare variables).
             let mut group_keys = star_cols;
             let mut aggregates = Vec::new();
+            // The result shape must keep the source column order (`RETURN n.a AS a, count(*) AS c,
+            // n.b AS b` yields columns a, c, b), but the Aggregation operator emits its keys first,
+            // then the aggregates. Track the source order and restore it with a re-ordering
+            // projection when the two differ.
+            let mut source_order: Vec<String> = group_keys.iter().map(|c| c.alias.clone()).collect();
             for (item, col) in body.items.iter().zip(explicit_cols) {
+                source_order.push(col.alias.clone());
                 if expr_contains_aggregate(&item.expr) {
                     aggregates.push(col);
                 } else {
                     group_keys.push(col);
                 }
             }
-            LogicalOp::Aggregation {
+            let emitted: Vec<String> = group_keys
+                .iter()
+                .chain(&aggregates)
+                .map(|c| c.alias.clone())
+                .collect();
+            let agg = LogicalOp::Aggregation {
                 input: Box::new(input),
                 group_keys,
                 aggregates,
+            };
+            if emitted == source_order {
+                agg
+            } else {
+                let items = source_order
+                    .into_iter()
+                    .map(|name| ProjectionColumn {
+                        expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
+                        alias: name,
+                    })
+                    .collect();
+                LogicalOp::Projection {
+                    input: Box::new(agg),
+                    items,
+                    distinct: false,
+                }
             }
         } else {
             let mut items = star_cols;
@@ -692,10 +726,18 @@ impl Planner {
 
     /// Lowers one projection item to a [`ProjectionColumn`], using the explicit `AS` alias or
     /// Cypher's inferred column name.
+    ///
+    /// openCypher names an un-aliased column by the expression's **verbatim source text** (captured
+    /// by the parser into [`ProjectionItem::verbatim`]): `RETURN a.x` yields a column named `a.x`,
+    /// `RETURN 1 + 2` one named `1 + 2`. A bare variable is named by the variable itself, so a
+    /// backtick-escaped `` RETURN `x` `` yields column `x` (no backticks).
     fn projection_column(&self, item: &ProjectionItem) -> ProjectionColumn {
         let alias = match &item.alias {
             Some(a) => a.name.clone(),
-            None => inferred_column_name(&item.expr),
+            None => match &item.expr.kind {
+                ExprKind::Variable(n) => n.clone(),
+                _ => item.verbatim.clone(),
+            },
         };
         ProjectionColumn {
             expr: item.expr.clone(),
@@ -956,22 +998,6 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
-/// Cypher's inferred result-column name for an unaliased projection item.
-///
-/// A bare variable, property path, or `count(*)` infers a stable name; any other unaliased
-/// expression echoes a compact rendering of its source (the semantic pass only allows unaliased
-/// non-trivial expressions in a *final* `RETURN`, where the column name is the source text). This
-/// matches the name the semantic pass uses for duplicate-column detection ([`crate::semantics`]).
-fn inferred_column_name(expr: &Expr) -> String {
-    match &expr.kind {
-        ExprKind::Variable(n) => n.clone(),
-        ExprKind::Property { base, key } => format!("{}.{key}", inferred_column_name(base)),
-        ExprKind::CountStar => "count(*)".to_owned(),
-        ExprKind::FunctionCall { name, .. } => format!("{}(...)", name.join(".")),
-        _ => format!("anon@{}..{}", expr.span.start, expr.span.end),
-    }
-}
-
 /// Pushes `var` into `out` only if a variable of the same name is not already present.
 fn push_unique(out: &mut Vec<Var>, var: Var) {
     if !out.iter().any(|v| v.name == var.name) {
@@ -1148,11 +1174,12 @@ mod tests {
     }
 
     #[test]
-    fn inferred_column_name_matches_cypher_inference() {
+    fn unaliased_column_takes_verbatim_source_text() {
         let toks = tokenize("RETURN n.a.b").unwrap();
         let ast = parse_tokens(&toks, "RETURN n.a.b").unwrap();
         if let Clause::Return(r) = &ast.body_single_query().clauses[0] {
-            assert_eq!(inferred_column_name(&r.body.items[0].expr), "n.a.b");
+            let col = Planner::default().projection_column(&r.body.items[0]);
+            assert_eq!(col.alias, "n.a.b");
         } else {
             unreachable!()
         }

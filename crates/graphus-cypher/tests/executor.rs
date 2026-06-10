@@ -907,6 +907,62 @@ fn result_columns_reflect_projection() {
     assert_eq!(cursor.columns(), &["name".to_owned(), "again".to_owned()]);
 }
 
+/// Compiles `src` and returns the executor's result column names (no execution needed).
+fn columns_of(src: &str) -> Vec<String> {
+    let toks = tokenize(src).unwrap();
+    let ast = parse_tokens(&toks, src).unwrap();
+    let plan = plan_physical(&lower(&analyze(&ast).unwrap()), &IndexCatalog::empty());
+    let bound = bind_parameters(&plan, &Parameters::new()).unwrap();
+    Executor::new(plan, bound).columns()
+}
+
+#[test]
+fn unaliased_columns_are_named_by_verbatim_source_text() {
+    // openCypher: an un-aliased projection column is named by the exact source text of its
+    // expression (regression for rmp #55).
+    assert_eq!(columns_of("MATCH (n:P) RETURN n.age"), vec!["n.age"]);
+    assert_eq!(columns_of("RETURN 1 + 2"), vec!["1 + 2"]);
+    assert_eq!(columns_of("RETURN 1+2"), vec!["1+2"], "spacing is preserved verbatim");
+    assert_eq!(columns_of("RETURN count(*)"), vec!["count(*)"]);
+    assert_eq!(columns_of("MATCH (n:P) RETURN size(n.name)"), vec!["size(n.name)"]);
+    assert_eq!(columns_of("RETURN [1, 2][0]"), vec!["[1, 2][0]"]);
+}
+
+#[test]
+fn return_star_projects_variables_alphabetically_without_synthetics() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["P"], [("name", s("A"))]);
+    let b = g.add_node(["P"], [("name", s("B"))]);
+    g.add_rel("T", b, a, [] as [(&str, Value); 0]);
+    // `*` orders columns alphabetically by variable name, and never projects the planner's
+    // synthetic (anonymous-pattern) variables.
+    let src = "MATCH (x:P)-[r:T]->(m:P) RETURN *";
+    let rows = run(src, &mut g);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns(), &["m".to_owned(), "r".to_owned(), "x".to_owned()]);
+    // An anonymous relationship must not surface through `*`.
+    let anon = run("MATCH (x:P)-[:T]->(m:P) RETURN *", &mut g);
+    assert_eq!(anon[0].columns(), &["m".to_owned(), "x".to_owned()]);
+}
+
+#[test]
+fn aggregation_columns_keep_source_order() {
+    let mut g = MemGraph::new();
+    g.add_node(["P"], [("dept", s("eng")), ("team", s("db"))]);
+    // The Aggregation operator computes keys then aggregates; the result shape must still be the
+    // source order (dept, count, team).
+    let rows = run(
+        "MATCH (n:P) RETURN n.dept AS d, count(*) AS c, n.team AS t",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].columns(),
+        &["d".to_owned(), "c".to_owned(), "t".to_owned()]
+    );
+    assert_eq!(rows[0].value("c"), i(1));
+}
+
 #[test]
 fn node_binding_round_trips_through_id_function() {
     let mut g = MemGraph::new();

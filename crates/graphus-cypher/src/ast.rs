@@ -359,6 +359,10 @@ pub struct ProjectionItem {
     pub expr: Expr,
     /// The optional `AS` alias.
     pub alias: Option<Variable>,
+    /// The verbatim source text of `expr`. openCypher names an un-aliased projection column by the
+    /// exact query text of its expression (`RETURN a.x` yields a column named `a.x`), so the parser
+    /// captures the source slice here — downstream phases have no access to the original source.
+    pub verbatim: String,
     /// Span from the expression start to the alias / expression end.
     pub span: Span,
 }
