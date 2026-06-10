@@ -890,6 +890,15 @@ mod tests {
         assert_eq!(t.height().unwrap(), 1); // single leaf
     }
 
+    // 1000 inserts drive many page splits through the buffer pool + WAL; under the miri interpreter
+    // that page churn takes minutes. The split/grow *logic* is also covered by the smaller tests
+    // above that run fast under miri, and full-scale B+-tree campaigns live in `tests/btree_props.rs`
+    // (run natively). So this is skipped under miri purely for runtime — it hides no UB. (See
+    // `VERIFICATION.md` → miri gate.)
+    #[cfg_attr(
+        miri,
+        ignore = "1000-insert page churn is impractically slow under the miri interpreter"
+    )]
     #[test]
     fn many_inserts_grow_the_tree_height() {
         let mut t = fresh();

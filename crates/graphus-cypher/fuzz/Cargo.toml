@@ -1,0 +1,44 @@
+# cargo-fuzz target package for the Graphus Cypher front end (`rmp` task #27, the verification
+# arsenal's fuzzing TR). This is a SEPARATE package, deliberately *not* a member of the Graphus
+# workspace (the empty `[workspace]` table below detaches it), because it depends on the nightly-only
+# `libfuzzer-sys` runtime and must build under `cargo +nightly fuzz`, not the stable workspace build.
+#
+# Run (after `cargo install cargo-fuzz`):
+#   cargo +nightly fuzz build --fuzz-dir crates/graphus-cypher/fuzz      # compile the targets
+#   cargo +nightly fuzz run parse_cypher --fuzz-dir crates/graphus-cypher/fuzz   # campaign
+#   cargo +nightly fuzz run tokenize_cypher --fuzz-dir crates/graphus-cypher/fuzz
+[package]
+name = "graphus-cypher-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent workspace: the fuzz package has its own lockfile and the libfuzzer runtime
+# is nightly-only, so it must not be pulled into the stable workspace build/test graph.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+graphus-cypher = { path = ".." }
+
+[[bin]]
+name = "parse_cypher"
+path = "fuzz_targets/parse_cypher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenize_cypher"
+path = "fuzz_targets/tokenize_cypher.rs"
+test = false
+doc = false
+bench = false
+
+# libFuzzer needs unwinding to recover from a discovered panic, and the standard cargo-fuzz profile
+# keeps debug assertions + overflow checks on so the fuzzer surfaces them as crashes.
+[profile.release]
+debug = 1

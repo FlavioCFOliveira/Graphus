@@ -33,19 +33,32 @@ mod block;
 mod file;
 mod mem;
 
+// The async/network half is built on Tokio. Tokio's own `net`/runtime modules are
+// `#![cfg(not(loom))]`, so under `--cfg loom` `tokio::net` does not exist and these modules cannot
+// compile. They are also irrelevant to loom model-checking, which targets the *synchronous*
+// buffer-pool latch logic (`graphus-bufpool`, the only loom-tested crate) over the
+// `block`/`mem` device types below. Gating the Tokio-backed half on `not(loom)` therefore lets the
+// workspace build under `--cfg loom` without touching any production behaviour: `loom` is a
+// test-only cfg never set in a real build.
+#[cfg(not(loom))]
 pub mod backend;
+#[cfg(not(loom))]
 pub mod fsync;
+#[cfg(not(loom))]
 pub mod net;
 
 // The io_uring fast path: real capability probe + stubbed submission. Linux + feature only; the
 // portable build does not compile it (and so compiles no `unsafe`). See `backend` for selection.
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(all(target_os = "linux", feature = "io-uring", not(loom)))]
 mod uring;
 
 pub use block::{BlockDevice, PAGE_SIZE, Page};
 pub use file::FileBlockDevice;
 pub use mem::MemBlockDevice;
 
+#[cfg(not(loom))]
 pub use backend::{IoBackend, probe_io_uring, select_backend};
+#[cfg(not(loom))]
 pub use fsync::{FsyncPool, SyncTarget};
+#[cfg(not(loom))]
 pub use net::{PeerCred, TcpAcceptor, TcpConn, UdsAcceptor, UdsConn};

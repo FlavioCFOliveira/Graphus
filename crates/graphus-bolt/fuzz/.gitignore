@@ -1,0 +1,6 @@
+# cargo-fuzz generated artifacts — only the targets and Cargo.toml are source.
+/target
+/corpus
+/artifacts
+/coverage
+Cargo.lock

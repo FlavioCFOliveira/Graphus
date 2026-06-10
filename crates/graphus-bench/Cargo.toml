@@ -13,14 +13,19 @@ autobenches = false
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
-
-[dev-dependencies]
-# The commit-path and read-path benchmarks drive the real persistent store end to end over the
-# in-memory DST device + log sink, so the WAL group-commit serialization point (`04 §4.2`/§9.1)
-# and the lock-free read path (`04 §9.1`) are exercised deterministically without disk noise.
+# The LDBC-SNB macro harness (`src/ldbc/`) and its `ldbc_snb` binary drive the real engine end to
+# end (compile → plan → execute → commit through the `TxnCoordinator`), so these are *normal*
+# dependencies (a crate's own `src/` cannot see dev-dependencies). `graphus-bench` is an unpublished
+# leaf crate, so the broader dependency surface is harmless — see the crate-level docs.
+graphus-cypher = { path = "../graphus-cypher" }
+graphus-txn = { path = "../graphus-txn" }
 graphus-storage = { path = "../graphus-storage" }
 graphus-wal = { path = "../graphus-wal" }
 graphus-io = { path = "../graphus-io" }
+
+[dev-dependencies]
+# Lean Criterion for the micro-benchmarks (commit_path / read_path / loopback). The engine crates
+# the benches drive are already normal dependencies above (shared with the LDBC harness).
 
 # Lean Criterion (same pin/features as `graphus-io`'s `loopback` bench): `cargo_bench_support` is
 # what lets `cargo bench` actually run the harness; gnuplot/HTML/rayon are left off to keep the dev
@@ -29,6 +34,20 @@ graphus-io = { path = "../graphus-io" }
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }
+
+# The LDBC-SNB macro harness runner (`rmp` #27, AC "LDBC SNB runs"): generates a synthetic social
+# graph and times SNB-style operations through the real engine. `cargo run -p graphus-bench
+# --bin ldbc_snb [-- --medium]`.
+[[bin]]
+name = "ldbc_snb"
+path = "src/bin/ldbc_snb.rs"
+
+# The Criterion regression gate (`rmp` #27, AC "benchmarks gate regressions"): measures
+# representative commit/read slices and fails if any metric regresses past the threshold vs
+# `baseline.toml`. `cargo run -p graphus-bench --release --bin bench_gate`.
+[[bin]]
+name = "bench_gate"
+path = "src/bin/bench_gate.rs"
 
 [[bench]]
 name = "commit_path"

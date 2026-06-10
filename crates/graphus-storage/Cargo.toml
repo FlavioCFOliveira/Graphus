@@ -22,3 +22,7 @@ crc32c = "0.6"
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }
+# Property-based round-trip invariants for the value/property codecs (`tests/proptest_codecs.rs`,
+# `rmp` task #27). `default-features = false` + only `std` keeps the test-time dependency tree
+# minimal (no fork/timeout/tempfile), matching the pin already used by `graphus-bolt`.
+proptest = { version = "1", default-features = false, features = ["std"] }

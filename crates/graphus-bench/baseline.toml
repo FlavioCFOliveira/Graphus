@@ -1,0 +1,16 @@
+# Graphus benchmark regression-gate baseline (`rmp` task #27).
+#
+# Per-metric median latency in nanoseconds, recorded from a RELEASE build on the
+# machine class noted below. The `bench_gate` binary fails CI if a measured metric
+# regresses past `tolerance`. Re-seed with `bench_gate --update` after an intentional
+# perf change, on a quiet release build, and commit the new numbers.
+#
+# Machine class: see RESULTS.md §1 (recorded there alongside the Criterion numbers).
+
+tolerance = 0.2
+
+[metrics]
+# commit_short_txn: 4-op write transaction commit (median)
+commit_short_txn_ns = 4330
+# scan_1k_nodes: full node-store scan of 1000 nodes (median)
+scan_1k_nodes_ns = 21651

@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Async file and socket I/O for Graphus (epoll/kqueue baseline + optional io_uring)."
 
+# `loom` is a known test-only cfg (set via `RUSTFLAGS="--cfg loom"` when model-checking the
+# buffer pool, which depends on this crate's synchronous `BlockDevice` half). Under it, the
+# Tokio-backed async modules are gated out (see `src/lib.rs`). Register the cfg so `unexpected_cfgs`
+# — and therefore `clippy -D warnings` — stays quiet without a build script.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 # Optional Linux-only io_uring fast path (`D-io-backend`, `04 §9.1`/§3.6). Off by default so the
 # portable build never pulls a Linux-only dependency and stays `#![forbid(unsafe_code)]`. When

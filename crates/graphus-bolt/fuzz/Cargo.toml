@@ -1,0 +1,31 @@
+# cargo-fuzz target package for the Graphus Bolt PackStream decoder (`rmp` task #27, the
+# verification arsenal's fuzzing TR). A SEPARATE package, deliberately *not* a workspace member (the
+# empty `[workspace]` table detaches it), because `libfuzzer-sys` is nightly-only.
+#
+# Run (after `cargo install cargo-fuzz`):
+#   cargo +nightly fuzz build --fuzz-dir crates/graphus-bolt/fuzz
+#   cargo +nightly fuzz run unpack_packstream --fuzz-dir crates/graphus-bolt/fuzz
+[package]
+name = "graphus-bolt-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+graphus-bolt = { path = ".." }
+
+[[bin]]
+name = "unpack_packstream"
+path = "fuzz_targets/unpack_packstream.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

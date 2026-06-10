@@ -794,8 +794,10 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "graphus-core",
+ "graphus-cypher",
  "graphus-io",
  "graphus-storage",
+ "graphus-txn",
  "graphus-wal",
 ]
 
@@ -841,6 +843,7 @@ dependencies = [
  "graphus-storage",
  "graphus-txn",
  "graphus-wal",
+ "proptest",
 ]
 
 [[package]]
@@ -946,6 +949,7 @@ dependencies = [
  "graphus-io",
  "graphus-sim",
  "graphus-wal",
+ "proptest",
 ]
 
 [[package]]

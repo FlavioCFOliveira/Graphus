@@ -229,6 +229,15 @@ mod tests {
         assert_eq!(buf, b"456789");
     }
 
+    // miri has filesystem isolation enabled by default, so the real `open`/`remove_file` syscalls
+    // here abort under it. This test exercises the *production* `FileLogSink` (real disk durability),
+    // which is out of miri's UB-checking scope anyway — the WAL *logic* is validated over the
+    // in-memory `MemLogSink` in the other tests, which DO run under miri. (See `VERIFICATION.md` →
+    // miri gate.)
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
     #[test]
     fn file_sink_round_trips_and_survives_reopen() {
         let path =

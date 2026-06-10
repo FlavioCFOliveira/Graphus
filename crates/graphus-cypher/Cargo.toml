@@ -38,3 +38,7 @@ graphus-bufpool = { path = "../graphus-bufpool" }
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.
 graphus-sim = { path = "../graphus-sim" }
+# Property-based (shrinking) formulation of the order-preserving key-codec invariant
+# (`tests/proptest_keycodec.rs`, `rmp` task #27), complementing the deterministic cross-check in
+# `ordering_vs_keycodec.rs`. `std`-only pin, matching the rest of the workspace.
+proptest = { version = "1", default-features = false, features = ["std"] }

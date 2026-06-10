@@ -250,3 +250,33 @@ the **multi-threaded group-commit** benchmark: N committer threads parking on on
 *amplification* of candidate (a) is proven or disproven; this SPIKE establishes that the underlying
 single-log per-commit serialization cost is small and bounded, which is the prerequisite for that
 batching to pay off.
+
+---
+
+## 8. The CI regression gate (`bin/bench_gate`, `rmp` #27)
+
+The full Criterion suites above are the measurement instrument; the **regression gate** is the
+lightweight CI counterpart (`crates/graphus-bench/src/bin/bench_gate.rs`). It measures two
+representative slices of the hot paths — the **commit serialization point** and the **lock-free scan
+leaf** — as wall-clock **medians** (robust to outliers; `WARMUP = 50`, `SAMPLES = 201`), and fails if
+either regresses past a tolerance versus the committed baseline `baseline.toml`. It carries no
+Criterion dependency, so it is self-contained and runs in ~1–2 s.
+
+The committed baseline was seeded from a release build on this machine class (§1):
+
+| metric | baseline (median) | corresponds to |
+| --- | ---: | --- |
+| `commit_short_txn_ns` | 4,330 ns | §3.1 short-txn commit (4-op) |
+| `scan_1k_nodes_ns` | 21,651 ns | §4.2 scan @ 1,000 nodes |
+
+Default tolerance is **20 %** (absorbs run-to-run jitter — repeated release runs land within ±8 % —
+while still catching a real regression, which is typically ≥ 1.5–2×). Run, re-seed, or loosen:
+
+```sh
+cargo run -p graphus-bench --release --bin bench_gate              # gate vs baseline (PASS/FAIL)
+cargo run -p graphus-bench --release --bin bench_gate -- --update  # re-seed after an intended change
+cargo run -p graphus-bench --release --bin bench_gate -- --tolerance 0.30
+```
+
+The gate **must** be run in `--release`: the baseline is a release measurement, so a debug run (~10×
+slower) deliberately trips it (a useful self-check that the gate has teeth). See `VERIFICATION.md` §6.
