@@ -9,4 +9,41 @@ authors.workspace = true
 description = "HTTP transactional REST API for Graphus (typed JSON / CBOR, NDJSON streaming)."
 
 [dependencies]
+# The shared `Value` model (`04 §7.2`), the error taxonomy mapped onto RFC 9457, and the injected
+# `Clock` capability that drives transaction expiry deterministically (no wall-clock in logic).
 graphus-core = { path = "../graphus-core" }
+# REST Bearer/JWT auth + RBAC resolve through `Authenticator::authenticate_bearer` / `require`
+# (`04 §8.4`, `06 §4`). No socket/TLS work happens here; the listener wires the transport (rmp #20).
+graphus-auth = { path = "../graphus-auth" }
+
+# The HTTP framework. axum 0.8 sits on hyper 1 + tower 0.5 and supports HTTP/2 through hyper; MSRV
+# 1.80 <= our 1.85. `tokio`/`http1`/`http2`/`json` are the features we actually use; the rest of the
+# default set (matched-path, original-uri, …) is harmless and used by the router. `macros` gives the
+# `#[debug_handler]` aid but is not pulled (kept off to keep the surface tight).
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2", "json"] }
+# axum re-exports most of `http`, but the router builds a few responses (problem+json, NDJSON) from
+# the raw `http`/`bytes` types directly, so they are declared explicitly (same major as axum's).
+bytes = "1"
+http = "1"
+# Async runtime. Only `rt` + `rt-multi-thread` (axum's executor) and `sync` (the `oneshot` the
+# auto-rollback sweep uses) are needed in the lib; `macros`/`rt`/`time` are dev-only for `#[tokio::test]`.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync"] }
+# The middleware stack: CORS + response compression are wired as layers (`04 §8.2` HTTP niceties).
+# `tower` itself is needed for `ServiceExt`/`ServiceBuilder` when composing those layers.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors", "compression-gzip"] }
+
+# Serialization. `serde` derives the request/response body shapes; `serde_json` is the JSON/Jolt
+# codec; `ciborium` is the CBOR codec (RFC 8949). int53 string-encoding (`04 §8.2`) is hand-rolled in
+# `value.rs` over these.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+
+[dev-dependencies]
+# Drives the `Router` fully in-process (`ServiceExt::oneshot`) — no real sockets/TLS (`04 §8.2`,
+# the hard rule). `time`/`macros` enable `#[tokio::test]`; `util` brings `ServiceExt`.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Collects a streaming (NDJSON) response body to bytes in tests.
+http-body-util = "0.1"
