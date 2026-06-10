@@ -702,9 +702,11 @@ fn check_error_expectation(
         }
     };
 
-    // TYPE and PHASE must match (the load-bearing assertion). The TCK phase `any time` matches any
-    // engine phase (`tck/README.adoc` uses it where the phase is implementation-defined).
-    if err.error_type != expected_type {
+    // TYPE and PHASE must match (the load-bearing assertion). The TCK writes three wildcards where
+    // the classification is implementation-defined (`tck/README.adoc`): the generic type `Error`
+    // matches any engine error class, the phase `any time` matches any phase, and the detail `*`
+    // matches any detail.
+    if expected_type != "Error" && err.error_type != expected_type {
         return Outcome::Failed(format!(
             "error TYPE mismatch: expected {expected_type}, got {} (phase {}, msg: {})",
             err.error_type, err.phase, err.message
@@ -719,6 +721,9 @@ fn check_error_expectation(
 
     // DETAIL is compared only when the engine produced one; a detail mismatch where the engine has
     // no equivalent detail is a soft note, not a hard fail (`tck` guidance: TYPE/PHASE is the gate).
+    if expected_detail == "*" {
+        return Outcome::Passed;
+    }
     match &err.detail {
         Some(detail) if detail != expected_detail => Outcome::Failed(format!(
             "error DETAIL mismatch: expected {expected_detail}, got {detail}"

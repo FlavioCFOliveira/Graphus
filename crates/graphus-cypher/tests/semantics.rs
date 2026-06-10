@@ -142,7 +142,8 @@ fn variable_type_conflict_node_vs_relationship() {
         e.classification().detail,
         SemanticDetail::VariableTypeConflict
     );
-    assert_eq!(e.classification().error_type, ErrorType::SemanticError);
+    // Every compile-time fault is a TCK SyntaxError (the corpus-wide classification rule).
+    assert_eq!(e.classification().error_type, ErrorType::SyntaxError);
 }
 
 #[test]
@@ -528,6 +529,65 @@ fn missing_parameter_is_not_a_compile_time_error() {
 fn nonexistent_property_access_is_not_a_compile_time_error() {
     // Property presence is a runtime fact against the live graph.
     ok("MATCH (n) RETURN n.totally_made_up_property");
+}
+
+// =================================================================================================
+// Error-classification fidelity (rmp #56)
+// =================================================================================================
+
+#[test]
+fn create_of_a_bound_node_is_variable_already_bound() {
+    // A standalone node part re-using a bound name (TCK Create1).
+    assert_detail("MATCH (n) CREATE (n)", SemanticDetail::VariableAlreadyBound);
+    // Adding a label to a bound node inside a CREATE pattern (TCK Create1).
+    assert_detail(
+        "MATCH (n) CREATE (n:Foo)-[:R]->(m)",
+        SemanticDetail::VariableAlreadyBound,
+    );
+    // Bare endpoints of a relationship chain remain legal.
+    ok("MATCH (a), (b) CREATE (a)-[:R]->(b)");
+}
+
+#[test]
+fn create_of_a_bound_relationship_wins_over_well_formedness() {
+    // The variable fault is reported even when the CREATE relationship also lacks a type
+    // (TCK Create2 [23]).
+    assert_detail(
+        "MATCH ()-[r]->() CREATE ()-[r]->()",
+        SemanticDetail::VariableAlreadyBound,
+    );
+}
+
+#[test]
+fn path_variable_reuse_is_variable_already_bound() {
+    // A named path can never re-use a bound name (TCK Match6 [21]).
+    assert_detail(
+        "MATCH (p)-[]-() MATCH p = ()-[]-() RETURN p",
+        SemanticDetail::VariableAlreadyBound,
+    );
+    // … including a re-use of the path's own name inside its own pattern (TCK Match6 [23]/[24]).
+    assert_detail(
+        "MATCH p = (p)-[]-() RETURN p",
+        SemanticDetail::VariableAlreadyBound,
+    );
+    // A node/relationship cross-kind re-bind stays a VariableTypeConflict (TCK Match2 [9]).
+    assert_detail(
+        "MATCH (r) MATCH ()-[r]-() RETURN r",
+        SemanticDetail::VariableTypeConflict,
+    );
+}
+
+#[test]
+fn union_branches_must_return_the_same_columns() {
+    assert_detail(
+        "RETURN 1 AS a UNION RETURN 2 AS b",
+        SemanticDetail::DifferentColumnsInUnion,
+    );
+    assert_detail(
+        "RETURN 1 AS a UNION ALL RETURN 2 AS b",
+        SemanticDetail::DifferentColumnsInUnion,
+    );
+    ok("RETURN 1 AS a UNION RETURN 2 AS a");
 }
 
 // =================================================================================================

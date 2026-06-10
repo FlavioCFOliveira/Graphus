@@ -96,7 +96,7 @@ use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck};
 use crate::lexer::Span;
 use graphus_core::GraphusError;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// A [`Query`] that has passed semantic analysis (`04 §7.3`) and is ready for logical planning.
 ///
@@ -234,13 +234,24 @@ struct Analyzer;
 
 impl Analyzer {
     /// Checks a whole [`Query`]: each single query of a `UNION` chain is analysed independently
-    /// (each has its own scope), or the standalone `CALL`.
+    /// (each has its own scope), or the standalone `CALL`. The branches of a `UNION` must all
+    /// return the same column names — TCK `DifferentColumnsInUnion`.
     fn check_query(&self, query: &Query) -> Result<(), SemanticError> {
         match &query.body {
             QueryBody::Regular { head, unions } => {
-                self.check_single_query(head)?;
+                let head_cols = self.check_single_query(head)?;
                 for UnionPart { query: sq, .. } in unions {
-                    self.check_single_query(sq)?;
+                    let cols = self.check_single_query(sq)?;
+                    // Compare as name sets (order-insensitive; both branches end in RETURN when a
+                    // UNION is well-formed, so a `None` side only happens alongside other errors).
+                    if let (Some(a), Some(b)) = (&head_cols, &cols) {
+                        if a != b {
+                            return Err(SemanticError::new(
+                                SemanticErrorKind::DifferentColumnsInUnion,
+                                sq.span,
+                            ));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -249,11 +260,16 @@ impl Analyzer {
     }
 
     /// Checks a single query: validate clause composition, then walk clauses left-to-right,
-    /// threading the [`Scope`] and resetting it at every projection boundary.
-    fn check_single_query(&self, sq: &SingleQuery) -> Result<(), SemanticError> {
+    /// threading the [`Scope`] and resetting it at every projection boundary. Returns the final
+    /// `RETURN`'s column-name set (`None` for a write-only query), for the `UNION` shape check.
+    fn check_single_query(
+        &self,
+        sq: &SingleQuery,
+    ) -> Result<Option<BTreeSet<String>>, SemanticError> {
         self.check_clause_composition(sq)?;
 
         let mut scope = Scope::default();
+        let mut final_columns = None;
         for (idx, clause) in sq.clauses.iter().enumerate() {
             match clause {
                 Clause::Match(m) => self.check_match(m, &mut scope)?,
@@ -279,10 +295,12 @@ impl Analyzer {
                     let is_last = idx + 1 == sq.clauses.len();
                     debug_assert!(is_last, "clause composition guarantees RETURN is last");
                     scope = self.check_projection(&r.body, r.span, &scope, None, true)?;
+                    // The post-RETURN scope is exactly the result columns.
+                    final_columns = Some(scope.bindings.keys().cloned().collect());
                 }
             }
         }
-        Ok(())
+        Ok(final_columns)
     }
 
     /// Validates clause ordering / composition that the parser deliberately left to this phase
@@ -686,7 +704,18 @@ impl Analyzer {
         role: PatternRole,
     ) -> Result<(), SemanticError> {
         if let Some(var) = &part.var {
-            // A named path variable is a path value.
+            // A named path variable can never re-use an existing name (paths do not unify), and
+            // its own pattern cannot re-use the path name for a node/relationship either: both are
+            // `VariableAlreadyBound` (TCK Match6) — unlike the node/relationship cross-kind
+            // re-bind, which is `VariableTypeConflict`.
+            if scope.contains(&var.name) || element_uses_name(&part.element, &var.name) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::VariableAlreadyBound {
+                        name: var.name.clone(),
+                    },
+                    var.span,
+                ));
+            }
             scope.bind(&var.name, VarKind::Value, var.span)?;
         }
         self.bind_pattern_element(&part.element, scope, role)
@@ -698,6 +727,22 @@ impl Analyzer {
         scope: &mut Scope,
         role: PatternRole,
     ) -> Result<(), SemanticError> {
+        // In a CREATE/MERGE pattern an already-bound node variable is only legal as a *bare
+        // endpoint* of a relationship chain (`MATCH (a), (b) CREATE (a)-[:R]->(b)`). A standalone
+        // node part re-using a bound name always creates a new node and so conflicts: TCK
+        // `VariableAlreadyBound` (`Fail when creating a node that is already bound`).
+        if role == PatternRole::Create && element.chain.is_empty() {
+            if let Some(var) = &element.start.variable {
+                if scope.contains(&var.name) {
+                    return Err(SemanticError::new(
+                        SemanticErrorKind::VariableAlreadyBound {
+                            name: var.name.clone(),
+                        },
+                        var.span,
+                    ));
+                }
+            }
+        }
         self.bind_node_pattern(&element.start, scope, role)?;
         for link in &element.chain {
             self.bind_relationship_pattern(&link.relationship, scope, role)?;
@@ -710,9 +755,24 @@ impl Analyzer {
         &self,
         node: &NodePattern,
         scope: &mut Scope,
-        _role: PatternRole,
+        role: PatternRole,
     ) -> Result<(), SemanticError> {
         if let Some(var) = &node.variable {
+            // A bound node variable inside a CREATE/MERGE pattern may only be re-used bare: adding
+            // labels or properties to it would redefine the existing node — TCK
+            // `VariableAlreadyBound` (`Fail when adding a new label predicate on a node that is
+            // already bound`).
+            if role == PatternRole::Create
+                && scope.contains(&var.name)
+                && (!node.labels.is_empty() || node.properties.is_some())
+            {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::VariableAlreadyBound {
+                        name: var.name.clone(),
+                    },
+                    var.span,
+                ));
+            }
             scope.bind(&var.name, VarKind::Node, var.span)?;
         }
         if let Some(props) = &node.properties {
@@ -728,7 +788,22 @@ impl Analyzer {
         scope: &mut Scope,
         role: PatternRole,
     ) -> Result<(), SemanticError> {
+        // A CREATE/MERGE always creates a *new* relationship, so its variable must be fresh:
+        // re-using an already-bound name is `VariableAlreadyBound` (TCK; e.g.
+        // `MATCH ()-[r]->() CREATE ()-[r]->()`). Checked BEFORE the well-formedness rules below —
+        // the TCK expects the variable fault to win when both apply (Create2 [23]). For MATCH,
+        // repeating a relationship variable is handled by `Scope::bind`'s same-kind/conflict rules.
         if role == PatternRole::Create {
+            if let Some(var) = &rel.variable {
+                if scope.contains(&var.name) {
+                    return Err(SemanticError::new(
+                        SemanticErrorKind::VariableAlreadyBound {
+                            name: var.name.clone(),
+                        },
+                        var.span,
+                    ));
+                }
+            }
             // CREATE/MERGE relationship well-formedness (TCK):
             // exactly one type, a direction, and no variable-length range.
             if rel.range.is_some() {
@@ -753,18 +828,6 @@ impl Analyzer {
             }
         }
         if let Some(var) = &rel.variable {
-            // A CREATE/MERGE always creates a *new* relationship, so its variable must be fresh:
-            // re-using an already-bound name is `VariableAlreadyBound` (TCK; e.g.
-            // `MATCH ()-[r]->() CREATE ()-[r]->()`). For MATCH, repeating a relationship variable
-            // is handled by `Scope::bind`'s same-kind/conflict rules instead.
-            if role == PatternRole::Create && scope.contains(&var.name) {
-                return Err(SemanticError::new(
-                    SemanticErrorKind::VariableAlreadyBound {
-                        name: var.name.clone(),
-                    },
-                    var.span,
-                ));
-            }
             scope.bind(&var.name, VarKind::Relationship, var.span)?;
         }
         if let Some(props) = &rel.properties {
@@ -1163,6 +1226,21 @@ impl Analyzer {
 enum PatternRole {
     Read,
     Create,
+}
+
+/// Whether any node or relationship variable inside `element` is named `name` (the same-pattern
+/// path-name re-use check, TCK `VariableAlreadyBound`).
+fn element_uses_name(element: &PatternElement, name: &str) -> bool {
+    let node_uses =
+        |node: &crate::ast::NodePattern| node.variable.as_ref().is_some_and(|v| v.name == name);
+    node_uses(&element.start)
+        || element.chain.iter().any(|link| {
+            link.relationship
+                .variable
+                .as_ref()
+                .is_some_and(|v| v.name == name)
+                || node_uses(&link.node)
+        })
 }
 
 #[cfg(test)]

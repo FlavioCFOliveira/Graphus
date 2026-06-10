@@ -744,7 +744,8 @@ fn standalone_call_lowers_to_procedure_call() {
 
 #[test]
 fn union_all_combines_branch_plans() {
-    let plan = plan("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m");
+    // Both branches must return the same column names (openCypher `DifferentColumnsInUnion`).
+    let plan = plan("MATCH (n) RETURN n AS x UNION ALL MATCH (m) RETURN m AS x");
     match &plan {
         LogicalOp::Union { left, right, all } => {
             assert!(*all, "UNION ALL keeps duplicates");
@@ -754,11 +755,11 @@ fn union_all_combines_branch_plans() {
         other => panic!("expected Union root, got: {other}"),
     }
     assert_eq!(
-        rendered("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m"),
+        rendered("MATCH (n) RETURN n AS x UNION ALL MATCH (m) RETURN m AS x"),
         "Union ALL\n  \
-         Projection(n AS n)\n    \
+         Projection(n AS x)\n    \
          AllNodesScan(n)\n  \
-         Projection(m AS m)\n    \
+         Projection(m AS x)\n    \
          AllNodesScan(m)\n"
     );
 }
@@ -903,7 +904,7 @@ fn display_indents_inputs_one_level_per_depth() {
 #[test]
 fn display_renders_binary_branches_at_same_depth() {
     // Union (and Apply) render both children at the same indentation depth.
-    let r = rendered("MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m");
+    let r = rendered("MATCH (n) RETURN n AS x UNION ALL MATCH (m) RETURN m AS x");
     let lines: Vec<&str> = r.lines().collect();
     assert_eq!(lines[0], "Union ALL");
     // Both branch roots are at depth 1 (two-space indent).

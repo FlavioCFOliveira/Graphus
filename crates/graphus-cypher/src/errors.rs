@@ -163,6 +163,8 @@ pub enum SemanticDetail {
     /// `InvalidClauseComposition` — clauses are composed in an order Cypher forbids (e.g. a
     /// `RETURN` that is not the final clause, or an empty single query).
     InvalidClauseComposition,
+    /// `DifferentColumnsInUnion` — the branches of a `UNION` return different column names.
+    DifferentColumnsInUnion,
     /// `InvalidLoadCsvUrl` — a `LOAD CSV ... FROM <expr>` URL is a statically-typed non-string
     /// literal (the openCypher `LoadCSV` grammar requires a string expression). `LOAD CSV` is a
     /// Neo4j extension absent from the openCypher TCK corpus, so this detail has **no** TCK
@@ -191,6 +193,7 @@ impl SemanticDetail {
             Self::InvalidNumberOfArguments => "InvalidNumberOfArguments",
             Self::InvalidDelete => "InvalidDelete",
             Self::InvalidClauseComposition => "InvalidClauseComposition",
+            Self::DifferentColumnsInUnion => "DifferentColumnsInUnion",
             // `LOAD CSV` is a Neo4j extension absent from the openCypher TCK; this is an internal
             // spelling with no TCK `Then ... should be raised` counterpart.
             Self::InvalidLoadCsvUrl => "InvalidLoadCsvUrl",
@@ -357,6 +360,9 @@ pub enum SemanticErrorKind {
         /// A short human reason.
         reason: &'static str,
     },
+    /// The branches of a `UNION` return different column names. TCK detail
+    /// `DifferentColumnsInUnion`.
+    DifferentColumnsInUnion,
     /// A `LOAD CSV ... FROM <expr>` URL is a statically-typed non-string literal. Internal detail
     /// `InvalidLoadCsvUrl` (no TCK counterpart — `LOAD CSV` is a Neo4j extension).
     InvalidLoadCsvUrl,
@@ -404,20 +410,20 @@ impl SemanticErrorKind {
             Self::InvalidNumberOfArguments { .. } => SemanticDetail::InvalidNumberOfArguments,
             Self::InvalidDelete => SemanticDetail::InvalidDelete,
             Self::InvalidClauseComposition { .. } => SemanticDetail::InvalidClauseComposition,
+            Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
             Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
         }
     }
 
     /// The TCK error **type** for this error.
     ///
-    /// Almost every semantic-analysis fault is a TCK `SemanticError`; the lone exception is
-    /// [`Self::UndefinedVariable`], which the openCypher TCK raises as a **`SyntaxError`** (verbatim
-    /// in e.g. `tck/features/clauses/return/Return1.feature`). We follow the TCK, not intuition.
+    /// The openCypher TCK classifies **every** compile-time fault as a `SyntaxError` — measured
+    /// over the whole pinned corpus, every `... should be raised at compile time:` step in
+    /// `tck/features/**` names `SyntaxError` (the only `SemanticError` in the corpus is the
+    /// *runtime* `MergeReadOwnWrites`). We follow the TCK, not intuition: semantic-analysis faults
+    /// are `SyntaxError`s with a fine-grained detail.
     pub const fn error_type(&self) -> ErrorType {
-        match self {
-            Self::UndefinedVariable { .. } => ErrorType::SyntaxError,
-            _ => ErrorType::SemanticError,
-        }
+        ErrorType::SyntaxError
     }
 
     /// The full TCK `(phase, type, detail)` classification — the **error-classification table**
@@ -494,6 +500,9 @@ impl fmt::Display for SemanticErrorKind {
             Self::InvalidDelete => {
                 f.write_str("DELETE expects a node, relationship or path expression")
             }
+            Self::DifferentColumnsInUnion => {
+                f.write_str("all branches of a UNION must return the same column names")
+            }
             Self::InvalidClauseComposition { reason } => {
                 write!(f, "invalid clause composition: {reason}")
             }
@@ -559,14 +568,19 @@ mod tests {
 
     /// `UndefinedVariable` is a `SyntaxError` (TCK-faithful); everything else is a `SemanticError`.
     #[test]
-    fn undefined_variable_is_a_syntax_error() {
+    fn every_semantic_kind_is_a_tck_syntax_error() {
+        // The openCypher TCK classifies every compile-time fault as a SyntaxError (measured over
+        // the pinned corpus: every `should be raised at compile time:` step names SyntaxError).
         let undef = SemanticErrorKind::UndefinedVariable {
             name: "n".to_owned(),
         };
         assert_eq!(undef.error_type(), ErrorType::SyntaxError);
 
         let other = SemanticErrorKind::NestedAggregation;
-        assert_eq!(other.error_type(), ErrorType::SemanticError);
+        assert_eq!(other.error_type(), ErrorType::SyntaxError);
+
+        let union = SemanticErrorKind::DifferentColumnsInUnion;
+        assert_eq!(union.error_type(), ErrorType::SyntaxError);
     }
 
     /// The phase-split invariant in isolation (also asserted across *all* variants in
@@ -611,6 +625,7 @@ mod tests {
                 | SemanticErrorKind::InvalidNumberOfArguments { .. }
                 | SemanticErrorKind::InvalidDelete
                 | SemanticErrorKind::InvalidClauseComposition { .. }
+                | SemanticErrorKind::DifferentColumnsInUnion
                 | SemanticErrorKind::InvalidLoadCsvUrl => kind.classification(),
             }
         }
@@ -648,6 +663,7 @@ mod tests {
             },
             SemanticErrorKind::InvalidDelete,
             SemanticErrorKind::InvalidClauseComposition { reason: "x" },
+            SemanticErrorKind::DifferentColumnsInUnion,
             SemanticErrorKind::InvalidLoadCsvUrl,
         ] {
             assert_eq!(classify(&kind).phase, ErrorPhase::CompileTime, "{kind:?}");

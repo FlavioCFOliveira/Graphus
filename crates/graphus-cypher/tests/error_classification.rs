@@ -63,6 +63,7 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
         },
         SemanticErrorKind::InvalidDelete,
         SemanticErrorKind::InvalidClauseComposition { reason: "test" },
+        SemanticErrorKind::DifferentColumnsInUnion,
         SemanticErrorKind::InvalidLoadCsvUrl,
     ]
 }
@@ -75,54 +76,58 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
 /// wildcard-free match here).
 fn expected_classification(kind: &SemanticErrorKind) -> (ErrorType, SemanticDetail) {
     use SemanticErrorKind as K;
+    // The openCypher TCK classifies **every** compile-time fault as a `SyntaxError`: measured over
+    // the pinned corpus, every `... should be raised at compile time:` step names SyntaxError (the
+    // only SemanticError in the corpus is the *runtime* `MergeReadOwnWrites`). The table therefore
+    // expects SyntaxError uniformly; the cross-check value is the per-variant **detail**.
     match kind {
-        // `UndefinedVariable` is the lone TCK `SyntaxError` (verbatim in
-        // `tck/features/clauses/return/Return1.feature`); the rest are `SemanticError`.
         K::UndefinedVariable { .. } => (ErrorType::SyntaxError, SemanticDetail::UndefinedVariable),
-        K::VariableAlreadyBound { .. } => (
-            ErrorType::SemanticError,
-            SemanticDetail::VariableAlreadyBound,
-        ),
-        K::VariableTypeConflict { .. } => (
-            ErrorType::SemanticError,
-            SemanticDetail::VariableTypeConflict,
-        ),
+        K::VariableAlreadyBound { .. } => {
+            (ErrorType::SyntaxError, SemanticDetail::VariableAlreadyBound)
+        }
+        K::VariableTypeConflict { .. } => {
+            (ErrorType::SyntaxError, SemanticDetail::VariableTypeConflict)
+        }
         K::AmbiguousAggregationExpression => (
-            ErrorType::SemanticError,
+            ErrorType::SyntaxError,
             SemanticDetail::AmbiguousAggregationExpression,
         ),
-        K::NestedAggregation => (ErrorType::SemanticError, SemanticDetail::NestedAggregation),
+        K::NestedAggregation => (ErrorType::SyntaxError, SemanticDetail::NestedAggregation),
         K::InvalidAggregation { .. } => {
-            (ErrorType::SemanticError, SemanticDetail::InvalidAggregation)
+            (ErrorType::SyntaxError, SemanticDetail::InvalidAggregation)
         }
-        K::NoExpressionAlias => (ErrorType::SemanticError, SemanticDetail::NoExpressionAlias),
+        K::NoExpressionAlias => (ErrorType::SyntaxError, SemanticDetail::NoExpressionAlias),
         K::ColumnNameConflict { .. } => {
-            (ErrorType::SemanticError, SemanticDetail::ColumnNameConflict)
+            (ErrorType::SyntaxError, SemanticDetail::ColumnNameConflict)
         }
         K::NegativeIntegerArgument => (
-            ErrorType::SemanticError,
+            ErrorType::SyntaxError,
             SemanticDetail::NegativeIntegerArgument,
         ),
         K::NoSingleRelationshipType { .. } => (
-            ErrorType::SemanticError,
+            ErrorType::SyntaxError,
             SemanticDetail::NoSingleRelationshipType,
         ),
         K::RequiresDirectedRelationship => (
-            ErrorType::SemanticError,
+            ErrorType::SyntaxError,
             SemanticDetail::RequiresDirectedRelationship,
         ),
-        K::CreatingVarLength => (ErrorType::SemanticError, SemanticDetail::CreatingVarLength),
-        K::UnknownFunction { .. } => (ErrorType::SemanticError, SemanticDetail::UnknownFunction),
+        K::CreatingVarLength => (ErrorType::SyntaxError, SemanticDetail::CreatingVarLength),
+        K::UnknownFunction { .. } => (ErrorType::SyntaxError, SemanticDetail::UnknownFunction),
         K::InvalidNumberOfArguments { .. } => (
-            ErrorType::SemanticError,
+            ErrorType::SyntaxError,
             SemanticDetail::InvalidNumberOfArguments,
         ),
-        K::InvalidDelete => (ErrorType::SemanticError, SemanticDetail::InvalidDelete),
+        K::InvalidDelete => (ErrorType::SyntaxError, SemanticDetail::InvalidDelete),
         K::InvalidClauseComposition { .. } => (
-            ErrorType::SemanticError,
+            ErrorType::SyntaxError,
             SemanticDetail::InvalidClauseComposition,
         ),
-        K::InvalidLoadCsvUrl => (ErrorType::SemanticError, SemanticDetail::InvalidLoadCsvUrl),
+        K::DifferentColumnsInUnion => (
+            ErrorType::SyntaxError,
+            SemanticDetail::DifferentColumnsInUnion,
+        ),
+        K::InvalidLoadCsvUrl => (ErrorType::SyntaxError, SemanticDetail::InvalidLoadCsvUrl),
         // `#[non_exhaustive]` requires this arm in a downstream crate. A new, unlisted variant
         // trips it loudly rather than passing silently; the compile-time guard is in-crate.
         other => panic!("unlisted SemanticErrorKind in the classification cross-check: {other:?}"),
@@ -189,7 +194,7 @@ fn renders_the_verbatim_tck_gherkin_triple() {
             "a {} should be raised at {}: {}",
             c.error_type, c.phase, c.detail
         ),
-        "a SemanticError should be raised at compile time: NestedAggregation"
+        "a SyntaxError should be raised at compile time: NestedAggregation"
     );
 }
 
@@ -198,11 +203,11 @@ fn renders_the_verbatim_tck_gherkin_triple() {
 #[test]
 fn every_listed_kind_is_distinct() {
     let kinds = all_kinds();
-    // 17 variants as of this writing; the assert documents the count and trips if one is dropped
+    // 18 variants as of this writing; the assert documents the count and trips if one is dropped
     // from `all_kinds` without the match also changing (the match would then fail to compile).
     assert_eq!(
         kinds.len(),
-        17,
+        18,
         "all_kinds() should list every SemanticErrorKind variant once"
     );
     let details: std::collections::HashSet<_> = kinds.iter().map(|k| k.detail()).collect();
