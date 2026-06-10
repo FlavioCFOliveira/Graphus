@@ -86,10 +86,11 @@
 //! `LOAD CSV`, DDL); (5) the two-letter Neo4j **status codes** (escalated, `02 Q2`).
 
 use crate::ast::{
-    Clause, CreateClause, DeleteClause, Expr, ExprKind, MatchClause, MergeAction, MergeClause,
-    NodePattern, PatternElement, PatternPart, ProjectionBody, ProjectionItem, Query, QueryBody,
-    RelDirection, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery,
-    SortItem, StandaloneCall, StandaloneYield, UnionPart, UnwindClause, YieldItem,
+    Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause, MatchClause,
+    MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, ProjectionBody,
+    ProjectionItem, Query, QueryBody, RelDirection, RelationshipPattern, RemoveClause, RemoveItem,
+    SetClause, SetItem, SingleQuery, SortItem, StandaloneCall, StandaloneYield, UnionPart,
+    UnwindClause, YieldItem,
 };
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck};
@@ -257,6 +258,7 @@ impl Analyzer {
             match clause {
                 Clause::Match(m) => self.check_match(m, &mut scope)?,
                 Clause::Unwind(u) => self.check_unwind(u, &mut scope)?,
+                Clause::LoadCsv(l) => self.check_load_csv(l, &mut scope)?,
                 Clause::Call(c) => self.check_in_query_call(c, &mut scope)?,
                 Clause::Create(c) => self.check_create(c, &mut scope)?,
                 Clause::Merge(m) => self.check_merge(m, &mut scope)?,
@@ -327,6 +329,27 @@ impl Analyzer {
         self.check_expr_refs(&u.expr, scope)?;
         self.reject_aggregation(&u.expr, "UNWIND")?;
         scope.bind(&u.alias.name, VarKind::Value, u.alias.span)
+    }
+
+    /// Validates a `LOAD CSV` clause: the source-URL expression is resolved in the *current* scope
+    /// (aggregation forbidden), a statically non-string literal URL is rejected, then the row
+    /// variable is bound for the downstream clauses. Like `UNWIND`, the value-typing of a *dynamic*
+    /// URL (a variable / parameter / property) is a runtime concern, not a static one.
+    fn check_load_csv(&self, l: &LoadCsvClause, scope: &mut Scope) -> Result<(), SemanticError> {
+        self.check_expr_refs(&l.url, scope)?;
+        self.reject_aggregation(&l.url, "LOAD CSV")?;
+        // The openCypher `LoadCSV` grammar requires a string URL expression. A statically-typed
+        // non-string literal (e.g. `FROM 42`) is a compile-time error; anything dynamic defers to
+        // the runtime type check in the executor.
+        if let ExprKind::Literal(lit) = &l.url.kind {
+            if !matches!(lit, Literal::String(_)) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidLoadCsvUrl,
+                    l.url.span,
+                ));
+            }
+        }
+        scope.bind(&l.alias.name, VarKind::Value, l.alias.span)
     }
 
     fn check_create(&self, c: &CreateClause, scope: &mut Scope) -> Result<(), SemanticError> {

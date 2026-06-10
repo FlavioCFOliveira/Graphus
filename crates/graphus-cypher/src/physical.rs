@@ -363,6 +363,19 @@ pub enum PhysicalOp {
         /// The element variable.
         variable: Var,
     },
+    /// Stream a CSV source, binding one row per record to `variable` (`LOAD CSV`).
+    LoadCsv {
+        /// The upstream relation.
+        input: Box<PhysicalOp>,
+        /// Whether the first record names the columns (`WITH HEADERS`).
+        with_headers: bool,
+        /// The URL expression (a string at runtime).
+        url: Expr,
+        /// The record variable.
+        variable: Var,
+        /// The optional single-character field separator (defaults to `,`).
+        field_terminator: Option<char>,
+    },
 
     // ---- joins (physical join strategy) -------------------------------------------------------
     /// **Nested-loop join** / correlated apply: for each left row, evaluate the right branch with
@@ -605,6 +618,19 @@ impl Planner<'_> {
                 input: Box::new(self.lower(input, deps)),
                 list: list.clone(),
                 variable: variable.clone(),
+            },
+            LogicalOp::LoadCsv {
+                input,
+                with_headers,
+                url,
+                variable,
+                field_terminator,
+            } => PhysicalOp::LoadCsv {
+                input: Box::new(self.lower(input, deps)),
+                with_headers: *with_headers,
+                url: url.clone(),
+                variable: variable.clone(),
+                field_terminator: *field_terminator,
             },
 
             // ---- joins: hash vs nested-loop --------------------------------------------------
@@ -866,6 +892,7 @@ fn logical_op_is_correlated(op: &LogicalOp) -> bool {
         | LogicalOp::Skip { input, .. }
         | LogicalOp::Limit { input, .. }
         | LogicalOp::Unwind { input, .. }
+        | LogicalOp::LoadCsv { input, .. }
         | LogicalOp::Expand { input, .. }
         | LogicalOp::Create { input, .. }
         | LogicalOp::Merge { input, .. }
@@ -1176,6 +1203,9 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         PhysicalOp::TopN { input, .. } => gather_bound_vars(input, out),
         PhysicalOp::Unwind {
             input, variable, ..
+        }
+        | PhysicalOp::LoadCsv {
+            input, variable, ..
         } => {
             gather_bound_vars(input, out);
             push_unique(out, variable.clone());
@@ -1398,6 +1428,24 @@ impl PhysicalOp {
                 variable,
             } => {
                 writeln!(f, "Unwind({} AS {variable})", h::expr(list))?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::LoadCsv {
+                input,
+                with_headers,
+                url,
+                variable,
+                field_terminator,
+            } => {
+                let headers = if *with_headers { " WITH HEADERS" } else { "" };
+                let term = field_terminator
+                    .map(|c| format!(" FIELDTERMINATOR {c:?}"))
+                    .unwrap_or_default();
+                writeln!(
+                    f,
+                    "LoadCsv({headers} FROM {} AS {variable}{term})",
+                    h::expr(url)
+                )?;
                 input.fmt_indented(f, depth + 1)
             }
 

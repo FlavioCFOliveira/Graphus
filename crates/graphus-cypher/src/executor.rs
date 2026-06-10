@@ -45,9 +45,9 @@ use graphus_core::Value;
 
 use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection};
 use crate::binding::BoundParameters;
-use crate::equivalence::equivalent;
 use crate::eval::{EvalError, eval, eval_value};
 use crate::graph_access::{ExpandDirection, GraphAccess, NodeId};
+use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
 use crate::ordering::cmp_values;
 use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound};
@@ -105,6 +105,13 @@ pub enum ExecError {
     },
     /// A `CREATE`/`MERGE` inline property map was not a map value at runtime.
     PropertiesNotAMap,
+    /// A `LOAD CSV` source could not be read: the URL was not a string, named a non-`file` scheme
+    /// (rejected by the Neo4j `LOAD CSV` security model), the file was missing/unreadable, or a
+    /// record failed to parse.
+    LoadCsv {
+        /// A human description of the failure (path / scheme / I/O / parse detail).
+        reason: String,
+    },
 }
 
 impl fmt::Display for ExecError {
@@ -120,6 +127,7 @@ impl fmt::Display for ExecError {
                 write!(f, "expected a node or relationship: {context}")
             }
             Self::PropertiesNotAMap => write!(f, "inline properties must be a map"),
+            Self::LoadCsv { reason } => write!(f, "LOAD CSV failed: {reason}"),
         }
     }
 }
@@ -210,6 +218,19 @@ enum Operator {
         list: Expr,
         variable: Var,
         current: Option<(Row, VecDeque<Value>)>,
+    },
+
+    /// `LoadCsv`: for each input row, resolve the URL to a local file and stream it, emitting one
+    /// output row per CSV record bound to `variable` (a `List` of fields, or a `Map{header -> field}`
+    /// when `with_headers`). The reader streams record-by-record (never slurps), so a large file does
+    /// not blow memory; `current` holds the driving row plus the open reader + decoded headers.
+    LoadCsv {
+        input: Box<Operator>,
+        with_headers: bool,
+        url: Expr,
+        variable: Var,
+        field_terminator: u8,
+        current: Option<LoadCsvState>,
     },
 
     /// `ExpandAll`/`ExpandInto`: for each input row, enumerate incident relationships.
@@ -372,6 +393,32 @@ impl Operator {
                 if !elems.is_empty() {
                     *current = Some((base, elems));
                 }
+            },
+
+            Operator::LoadCsv {
+                input,
+                with_headers,
+                url,
+                variable,
+                field_terminator,
+                current,
+            } => loop {
+                // Drain the open CSV stream first, fanning each record across the driving row.
+                if let Some(state) = current {
+                    if let Some(rv) = state.next_record()? {
+                        return Ok(Some(state.base.with(variable.name.clone(), rv)));
+                    }
+                    // Stream exhausted: close it and advance to the next driving row.
+                    *current = None;
+                }
+                let Some(base) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                // The URL is evaluated per driving row (it may reference the row's bindings), then the
+                // file is resolved and opened — transactionally, inside the statement's graph seam.
+                let url_value = eval_value(url, &base, ctx.params, ctx.graph)?;
+                let state = LoadCsvState::open(base, &url_value, *field_terminator, *with_headers)?;
+                *current = Some(state);
             },
 
             Operator::Expand {
@@ -774,6 +821,31 @@ fn build_operator(
             variable: variable.clone(),
             current: None,
         }),
+        PhysicalOp::LoadCsv {
+            input,
+            with_headers,
+            url,
+            variable,
+            field_terminator,
+        } => {
+            // The CSV delimiter is a single byte. The parser already constrains FIELDTERMINATOR to a
+            // single character; a non-ASCII one would be multiple UTF-8 bytes and cannot be a CSV
+            // delimiter, so reject it as a build-time configuration error (a runtime `LoadCsv` class).
+            let delimiter = match field_terminator {
+                Some(c) => u8::try_from(u32::from(*c)).map_err(|_| ExecError::LoadCsv {
+                    reason: format!("FIELDTERMINATOR must be a single-byte character, got {c:?}"),
+                })?,
+                None => b',',
+            };
+            Ok(Operator::LoadCsv {
+                input: Box::new(build_operator(input, arg, ctx)?),
+                with_headers: *with_headers,
+                url: url.clone(),
+                variable: variable.clone(),
+                field_terminator: delimiter,
+                current: None,
+            })
+        }
 
         // ---- joins ----------------------------------------------------------------------------
         PhysicalOp::NestedLoopJoin { left, right } => Ok(Operator::NestedLoop {
@@ -1124,7 +1196,7 @@ struct Accumulator {
     kind: AggKind,
     distinct: bool,
     count: i64,
-    seen: Vec<Value>, // for DISTINCT and for min/max/collect
+    seen: Vec<RowValue>, // distinct-set: RowValue-typed so entity references dedupe by identity
     sum: f64,
     sum_is_int: bool,
     int_sum: i64,
@@ -1184,23 +1256,35 @@ impl Accumulator {
             self.count += 1;
             return Ok(());
         }
-        // The aggregate's single argument (count/sum/.../collect take one arg).
-        let argv = match &expr.kind {
+        // The aggregate's single argument (count/sum/.../collect take one arg). Evaluate it as a
+        // `RowValue` so a bound **node/relationship** is recognised as a non-null value: `count(n)`
+        // over node bindings must count them. (`eval_value` would collapse an entity to `Value::Null`
+        // — the value-context rule — which made `count(<entity>)` wrongly return 0.)
+        let rv = match &expr.kind {
             ExprKind::FunctionCall { args, .. } if !args.is_empty() => {
-                eval_value(&args[0], row, ctx.params, ctx.graph)?
+                eval(&args[0], row, ctx.params, ctx.graph)?
             }
-            _ => Value::Null,
+            _ => RowValue::NULL,
         };
-        // count(x), sum, avg, min, max ignore nulls (Cypher); collect drops nulls too.
-        if argv.is_null() {
+        // count(x), sum, avg, min, max ignore nulls (Cypher); collect drops nulls too. An entity
+        // reference is non-null.
+        if rv.is_null() {
             return Ok(());
         }
-        if self.distinct && self.seen.iter().any(|s| equivalent(s, &argv)) {
+        if self.distinct && self.seen.iter().any(|s| row_values_equivalent(s, &rv)) {
             return Ok(());
         }
         if self.distinct {
-            self.seen.push(argv.clone());
+            self.seen.push(rv.clone());
         }
+        // The collapsed property value for the numeric / extreme / collect arms. An entity collapses
+        // to `Value::Null` here (it is not a property value): `count` and `collect` keep the
+        // RowValue-aware semantics above, while `sum`/`avg`/`min`/`max` over an entity argument are
+        // a type error / no-op exactly as before this fix.
+        let argv = match &rv {
+            RowValue::Value(v) => v.clone(),
+            RowValue::Node(_) | RowValue::Rel(_) => Value::Null,
+        };
         match self.kind {
             AggKind::Count => self.count += 1,
             AggKind::Sum | AggKind::Avg => {
@@ -1929,6 +2013,9 @@ fn result_columns(op: &PhysicalOp) -> Vec<String> {
         | PhysicalOp::Remove { input, .. } => result_columns(input),
         PhysicalOp::TopN { input, .. } => result_columns(input),
         PhysicalOp::Unwind {
+            input, variable, ..
+        }
+        | PhysicalOp::LoadCsv {
             input, variable, ..
         } => {
             let mut cols = result_columns(input);

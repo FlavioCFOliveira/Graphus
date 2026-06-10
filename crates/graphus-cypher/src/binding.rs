@@ -406,6 +406,18 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             params_in_expr(list, ParamType::Any, record);
             walk_physical(input, record);
         }
+        PhysicalOp::LoadCsv {
+            input,
+            url,
+            with_headers: _,
+            variable: _,
+            field_terminator: _,
+        } => {
+            // The URL expression may reference a `$param` (e.g. `FROM $path AS row`); it is typed as
+            // a string at runtime, but the binder only records that it is referenced.
+            params_in_expr(url, ParamType::Any, record);
+            walk_physical(input, record);
+        }
 
         // ---- traversals carry expressions only in pattern props (handled via Create/Filter) -
         PhysicalOp::ExpandAll { input, .. } | PhysicalOp::ExpandInto { input, .. } => {

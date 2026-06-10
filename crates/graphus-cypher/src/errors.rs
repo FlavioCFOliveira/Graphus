@@ -163,6 +163,11 @@ pub enum SemanticDetail {
     /// `InvalidClauseComposition` — clauses are composed in an order Cypher forbids (e.g. a
     /// `RETURN` that is not the final clause, or an empty single query).
     InvalidClauseComposition,
+    /// `InvalidLoadCsvUrl` — a `LOAD CSV ... FROM <expr>` URL is a statically-typed non-string
+    /// literal (the openCypher `LoadCSV` grammar requires a string expression). `LOAD CSV` is a
+    /// Neo4j extension absent from the openCypher TCK corpus, so this detail has **no** TCK
+    /// counterpart; its spelling is internal.
+    InvalidLoadCsvUrl,
 }
 
 impl SemanticDetail {
@@ -186,6 +191,9 @@ impl SemanticDetail {
             Self::InvalidNumberOfArguments => "InvalidNumberOfArguments",
             Self::InvalidDelete => "InvalidDelete",
             Self::InvalidClauseComposition => "InvalidClauseComposition",
+            // `LOAD CSV` is a Neo4j extension absent from the openCypher TCK; this is an internal
+            // spelling with no TCK `Then ... should be raised` counterpart.
+            Self::InvalidLoadCsvUrl => "InvalidLoadCsvUrl",
         }
     }
 }
@@ -349,6 +357,9 @@ pub enum SemanticErrorKind {
         /// A short human reason.
         reason: &'static str,
     },
+    /// A `LOAD CSV ... FROM <expr>` URL is a statically-typed non-string literal. Internal detail
+    /// `InvalidLoadCsvUrl` (no TCK counterpart — `LOAD CSV` is a Neo4j extension).
+    InvalidLoadCsvUrl,
 }
 
 /// How a pattern variable is bound — used to report [`SemanticErrorKind::VariableTypeConflict`].
@@ -393,6 +404,7 @@ impl SemanticErrorKind {
             Self::InvalidNumberOfArguments { .. } => SemanticDetail::InvalidNumberOfArguments,
             Self::InvalidDelete => SemanticDetail::InvalidDelete,
             Self::InvalidClauseComposition { .. } => SemanticDetail::InvalidClauseComposition,
+            Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
         }
     }
 
@@ -485,6 +497,9 @@ impl fmt::Display for SemanticErrorKind {
             Self::InvalidClauseComposition { reason } => {
                 write!(f, "invalid clause composition: {reason}")
             }
+            Self::InvalidLoadCsvUrl => {
+                f.write_str("the LOAD CSV source URL must be a string expression")
+            }
         }
     }
 }
@@ -532,6 +547,9 @@ mod tests {
                 SemanticDetail::InvalidClauseComposition,
                 "InvalidClauseComposition",
             ),
+            // `LOAD CSV` is a Neo4j extension with no TCK detail; the spelling is internal but pinned
+            // here for the same stability guarantee.
+            (SemanticDetail::InvalidLoadCsvUrl, "InvalidLoadCsvUrl"),
         ];
         for (detail, s) in pairs {
             assert_eq!(detail.as_tck_str(), s);
@@ -592,7 +610,8 @@ mod tests {
                 | SemanticErrorKind::UnknownFunction { .. }
                 | SemanticErrorKind::InvalidNumberOfArguments { .. }
                 | SemanticErrorKind::InvalidDelete
-                | SemanticErrorKind::InvalidClauseComposition { .. } => kind.classification(),
+                | SemanticErrorKind::InvalidClauseComposition { .. }
+                | SemanticErrorKind::InvalidLoadCsvUrl => kind.classification(),
             }
         }
 
@@ -629,6 +648,7 @@ mod tests {
             },
             SemanticErrorKind::InvalidDelete,
             SemanticErrorKind::InvalidClauseComposition { reason: "x" },
+            SemanticErrorKind::InvalidLoadCsvUrl,
         ] {
             assert_eq!(classify(&kind).phase, ErrorPhase::CompileTime, "{kind:?}");
         }

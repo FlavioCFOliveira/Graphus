@@ -220,6 +220,26 @@ pub enum LogicalOp {
         variable: Var,
     },
 
+    /// Stream a CSV source, binding one row per record to `variable` (openCypher
+    /// `LOAD CSV [WITH HEADERS] FROM <url> AS v [FIELDTERMINATOR <c>]`).
+    ///
+    /// Like [`Unwind`](Self::Unwind) this is a per-incoming-row source: for each row of `input` the
+    /// URL is evaluated and the resolved CSV file is streamed, each record becoming one output row
+    /// bound to `variable` (a `List` of fields, or a `Map{header -> field}` when `with_headers`).
+    /// A leading `LOAD CSV` has [`Empty`](Self::Empty) as its `input` (the single driving row).
+    LoadCsv {
+        /// The upstream relation.
+        input: Box<LogicalOp>,
+        /// Whether the first record names the columns (`WITH HEADERS`).
+        with_headers: bool,
+        /// The URL expression (a string at runtime; unevaluated AST).
+        url: Expr,
+        /// The variable each record is bound to.
+        variable: Var,
+        /// The optional single-character field separator (defaults to `,`).
+        field_terminator: Option<char>,
+    },
+
     /// Correlated application: for each row of `input` (the left), evaluate `subplan` (the right)
     /// with the left row's variables bound, concatenating the results (openCypher `Apply`,
     /// `04 §7.1`).
@@ -629,6 +649,24 @@ impl LogicalOp {
                 variable,
             } => {
                 writeln!(f, "Unwind({} AS {variable})", fmt_expr(list))?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::LoadCsv {
+                input,
+                with_headers,
+                url,
+                variable,
+                field_terminator,
+            } => {
+                let headers = if *with_headers { " WITH HEADERS" } else { "" };
+                let term = field_terminator
+                    .map(|c| format!(" FIELDTERMINATOR {c:?}"))
+                    .unwrap_or_default();
+                writeln!(
+                    f,
+                    "LoadCsv({headers} FROM {} AS {variable}{term})",
+                    fmt_expr(url)
+                )?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::Apply { left, right } => {

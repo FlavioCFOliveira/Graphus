@@ -95,10 +95,10 @@
 //! logical plan records the traversal without a dedicated path-build operator yet.
 
 use crate::ast::{
-    Clause, CreateClause, DeleteClause, Expr, ExprKind, MatchClause, MergeAction, MergeClause,
-    NodePattern, PatternElement, PatternPart, ProjectionBody, ProjectionItem, Query, QueryBody,
-    RelType, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery,
-    StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
+    Clause, CreateClause, DeleteClause, Expr, ExprKind, LoadCsvClause, MatchClause, MergeAction,
+    MergeClause, NodePattern, PatternElement, PatternPart, ProjectionBody, ProjectionItem, Query,
+    QueryBody, RelType, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem,
+    SingleQuery, StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -194,6 +194,7 @@ impl Planner {
         match clause {
             Clause::Match(m) => self.lower_match(m, current),
             Clause::Unwind(u) => self.lower_unwind(u, current),
+            Clause::LoadCsv(l) => self.lower_load_csv(l, current),
             Clause::Call(c) => self.lower_in_query_call(c, current),
             Clause::Create(c) => self.lower_create(c, current),
             Clause::Merge(m) => self.lower_merge(m, current),
@@ -476,6 +477,23 @@ impl Planner {
             input: Box::new(input),
             list: u.expr.clone(),
             variable: Var::named(&u.alias.name),
+        }
+    }
+
+    // ---- LOAD CSV ---------------------------------------------------------------------------
+
+    /// Lowers `LOAD CSV ... FROM e AS v` to a [`LoadCsv`](LogicalOp::LoadCsv) source over the plan so
+    /// far (the [`Empty`](LogicalOp::Empty) single row for a leading `LOAD CSV`), exactly as
+    /// [`lower_unwind`](Self::lower_unwind) treats `UNWIND` — each CSV record becomes one row bound to
+    /// `v`, fanned across the incoming rows.
+    fn lower_load_csv(&mut self, l: &LoadCsvClause, current: Option<LogicalOp>) -> LogicalOp {
+        let input = current.unwrap_or(LogicalOp::Empty);
+        LogicalOp::LoadCsv {
+            input: Box::new(input),
+            with_headers: l.with_headers,
+            url: l.url.clone(),
+            variable: Var::named(&l.alias.name),
+            field_terminator: l.field_terminator,
         }
     }
 
@@ -1016,6 +1034,9 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
         | LogicalOp::Limit { input, .. }
         | LogicalOp::Sort { input, .. } => gather_bound_vars(input, out),
         LogicalOp::Unwind {
+            input, variable, ..
+        }
+        | LogicalOp::LoadCsv {
             input, variable, ..
         } => {
             gather_bound_vars(input, out);

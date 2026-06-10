@@ -1,0 +1,34 @@
+[package]
+name = "graphus-bulk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Offline high-throughput CSV bulk import and whole-graph export for Graphus (FR-BK)."
+
+[dependencies]
+# Writes directly through the low-level record-store API, bypassing Cypher (the importer's whole
+# point — maximum offline ingestion throughput). The edge is acyclic: graphus-storage depends on
+# core/io/bufpool/wal/index, never on graphus-bulk.
+graphus-storage = { path = "../graphus-storage" }
+# `graphus_core::Value` is the typed property value the importer parses cells into and the dumper
+# serialises back; `TxnId` drives the batched commits.
+graphus-core = { path = "../graphus-core" }
+# The importer/dumper build/open a `RecordStore` over the block-device + WAL abstractions, so they
+# name their public types (devices, log sinks, the WAL manager, recovery).
+graphus-io = { path = "../graphus-io" }
+graphus-wal = { path = "../graphus-wal" }
+# Streaming CSV read (importer) and write (dumper), honoring headers and delimiters. The reader is
+# `std::io::Read`-based so a large file streams record-by-record, never slurped. Kept out of the
+# storage core deliberately (the storage crate must not depend on `csv`).
+csv = "1.4"
+
+[[bin]]
+name = "graphus-bulk"
+path = "src/bin/graphus_bulk.rs"
+
+[dev-dependencies]
+# Deterministic dataset generation for the throughput benchmark/round-trip tests.
+graphus-sim = { path = "../graphus-sim" }

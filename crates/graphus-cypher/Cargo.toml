@@ -34,6 +34,12 @@ graphus-index = { path = "../graphus-index" }
 # crate to the build graph. The edge is acyclic: graphus-bufpool depends on core/io/wal, never on
 # cypher.
 graphus-bufpool = { path = "../graphus-bufpool" }
+# `LOAD CSV` (the in-query source clause, FR-BK) streams a local CSV file with the `csv` crate,
+# honoring `WITH HEADERS` and a custom `FIELDTERMINATOR`. The reader is `std::io::Read`-based so a
+# large file is streamed record-by-record, never slurped (the executor source pulls one row per
+# record). The *offline* bulk importer/dumper live in the separate `graphus-bulk` crate, keeping the
+# same dep out of the storage core.
+csv = "1.4"
 
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.

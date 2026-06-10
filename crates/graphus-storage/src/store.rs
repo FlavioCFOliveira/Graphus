@@ -847,6 +847,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(out)
     }
 
+    /// Enumerates the physical ids of every **slot-occupied** relationship (`in_use`), in ascending
+    /// id order — the relationship analogue of [`scan_node_ids`](Self::scan_node_ids).
+    ///
+    /// As with nodes this includes MVCC tombstones not yet GC'd; *visibility* to a given reader is
+    /// decided by the snapshot/visibility layer above. The relationship store's physical-id space is
+    /// `1..high_water` (id `0` is the reserved null pointer). Used by whole-store export (`rmp` task
+    /// #22) to walk every relationship without a per-node incidence-chain traversal.
+    ///
+    /// # Errors
+    /// Returns a storage error if a relationship store page in the range cannot be read.
+    pub fn scan_rel_ids(&mut self) -> Result<Vec<u64>> {
+        let high_water = self.store(StoreKind::Rel).alloc.high_water();
+        let mut out = Vec::new();
+        for id in 1..high_water {
+            if self.read_rel(id)?.mvcc.in_use() {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// **MVCC-deletes** the node at `id` under `txn` by stamping its `xmax` tombstone (`04 §5.3`).
     ///
     /// The record keeps its slot, its label bitmap and its property chain: an older snapshot that
@@ -2380,5 +2401,35 @@ mod tests {
         let latest = s.snapshot_ts();
         gc_at(&mut s, TxnId(3), latest);
         assert_eq!(s.node_properties(n).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scan_rel_ids_enumerates_live_relationships() {
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        let (a, _) = s.create_node(txn).unwrap();
+        let (b, _) = s.create_node(txn).unwrap();
+        let (c, _) = s.create_node(txn).unwrap();
+        let t = s.intern_token(Namespace::RelType, "LINK").unwrap();
+        let (r1, _) = s.create_rel(txn, t, a, b).unwrap();
+        let (r2, _) = s.create_rel(txn, t, b, c).unwrap();
+        s.commit(txn).unwrap();
+
+        // Both relationships are slot-occupied and enumerated in ascending id order.
+        let mut ids = s.scan_rel_ids().unwrap();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![r1, r2]);
+
+        // A deleted relationship's slot is still occupied (MVCC tombstone) until GC; scan_rel_ids
+        // mirrors scan_node_ids in returning slot-occupied ids (visibility is decided above).
+        let t2 = TxnId(2);
+        s.begin(t2);
+        s.delete_rel(t2, r1).unwrap();
+        s.commit(t2).unwrap();
+        let latest = s.snapshot_ts();
+        gc_at(&mut s, TxnId(3), latest);
+        // After GC reclaims the tombstone, only the surviving relationship remains.
+        assert_eq!(s.scan_rel_ids().unwrap(), vec![r2]);
     }
 }

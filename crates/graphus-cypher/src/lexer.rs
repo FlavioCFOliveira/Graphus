@@ -1151,6 +1151,12 @@ fn is_ident_part_char(c: char) -> bool {
 /// openCypher keywords are **case-insensitive**, so we match on the lowercased ASCII form. Because
 /// the keyword set is pure ASCII, lowercasing only ASCII letters is sufficient and avoids allocation
 /// for the common (identifier) case by using `eq_ignore_ascii_case`.
+///
+/// The `LOAD CSV` clause words (`LOAD`, `CSV`, `FROM`, `HEADERS`, `FIELDTERMINATOR`) are deliberately
+/// **not** in this table: they are *contextual* keywords recognised by spelling in the parser (see
+/// `Parser::parse_load_csv`). Reserving them globally would break their long-standing use as ordinary
+/// identifiers (e.g. `RETURN a AS from`), which the openCypher grammar permits — `FROM` et al. are
+/// not reserved words. Recognising them only in the `LOAD CSV` position keeps that compatibility.
 fn keyword_or_identifier(text: &str) -> TokenKind {
     // The reserved-word table (openCypher EBNF `ReservedWord`, plus the 2024.x line additions named
     // in the task: YIELD, CALL, INDEX, ASCENDING/DESCENDING, DISTINCT, …). Each entry pairs the

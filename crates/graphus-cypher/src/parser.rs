@@ -56,12 +56,12 @@
 
 use crate::ast::{
     BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause, Expr,
-    ExprKind, Label, ListComprehension, Literal, MapKey, MatchClause, MergeAction, MergeClause,
-    NodePattern, PatternChainLink, PatternComprehension, PatternElement, PatternPart, PredicateOp,
-    ProcedureCall, ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection, RelType,
-    RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery,
-    SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause,
-    VarLengthRange, Variable, WithClause, YieldItem,
+    ExprKind, Label, ListComprehension, Literal, LoadCsvClause, MapKey, MatchClause, MergeAction,
+    MergeClause, NodePattern, PatternChainLink, PatternComprehension, PatternElement, PatternPart,
+    PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection,
+    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
+    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart,
+    UnwindClause, VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -296,6 +296,44 @@ impl<'t, 's> Parser<'t, 's> {
         }
     }
 
+    /// Whether the token at offset `ahead` from the cursor is an [`TokenKind::Identifier`] whose text
+    /// equals `word` (ASCII case-insensitive). Used to recognise **contextual** keywords (e.g. the
+    /// `LOAD CSV` clause words) that are not reserved and so lex as identifiers.
+    fn peek_keyword_ident_at(&self, ahead: usize, word: &str) -> bool {
+        matches!(
+            self.tokens.get(self.pos + ahead).map(|t| &t.kind),
+            Some(TokenKind::Identifier(name)) if name.eq_ignore_ascii_case(word)
+        )
+    }
+
+    /// Whether the current token is the contextual keyword `word` (an identifier spelled `word`,
+    /// case-insensitive).
+    fn at_keyword_ident(&self, word: &str) -> bool {
+        self.peek_keyword_ident_at(0, word)
+    }
+
+    /// Consumes the current token iff it is the contextual keyword `word`; returns whether it did.
+    fn eat_keyword_ident(&mut self, word: &str) -> bool {
+        if self.at_keyword_ident(word) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consumes the current token, which must be the contextual keyword `word`, or errors with
+    /// "expected {desc}" positioned at the offending token. `desc` is the canonical (upper-case)
+    /// spelling for the diagnostic.
+    fn expect_keyword_ident(&mut self, word: &str, desc: &str) -> Result<(), SyntaxError> {
+        if self.at_keyword_ident(word) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.expected_here(desc))
+        }
+    }
+
     /// Consumes a token that must equal `kind`, or errors with an "expected {desc}" message
     /// positioned at the offending token (or end of input).
     fn expect(&mut self, kind: &TokenKind, desc: &str) -> Result<&'t Token, SyntaxError> {
@@ -414,6 +452,13 @@ impl<'t, 's> Parser<'t, 's> {
             Some(k) => k,
             None => return Ok(None),
         };
+        // `LOAD CSV` is a contextual-keyword clause: `LOAD`/`CSV`/… are not reserved words (so they
+        // stay usable as identifiers), so the dispatch recognises the clause by the `LOAD CSV`
+        // identifier *spelling* rather than a token kind. A bare identifier `load` not followed by
+        // `csv` is left to the normal expression/clause handling.
+        if self.at_keyword_ident("load") && self.peek_keyword_ident_at(1, "csv") {
+            return Ok(Some(Clause::LoadCsv(self.parse_load_csv()?)));
+        }
         let clause = match kind {
             TokenKind::Optional | TokenKind::Match => Clause::Match(self.parse_match()?),
             TokenKind::Unwind => Clause::Unwind(self.parse_unwind()?),
@@ -464,6 +509,72 @@ impl<'t, 's> Parser<'t, 's> {
         Ok(UnwindClause {
             expr,
             alias,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parses
+    /// `LoadCSV = 'LOAD', 'CSV', ['WITH', 'HEADERS'], 'FROM', Expression, 'AS', Variable,
+    /// ['FIELDTERMINATOR', StringLiteral]` (openCypher `LoadCSV`).
+    ///
+    /// `LOAD`, `CSV`, `FROM`, `HEADERS` and `FIELDTERMINATOR` are **contextual** keywords (not
+    /// reserved words — see [`keyword_or_identifier`](crate::lexer)), so they arrive as
+    /// [`TokenKind::Identifier`] and are matched here by their (case-insensitive) spelling. `WITH` and
+    /// `AS` are genuine reserved keywords. The `FIELDTERMINATOR` argument must be a
+    /// **single-character** string literal (openCypher constrains the field terminator to one
+    /// character); a non-string or a multi-character string is a [`SyntaxErrorKind::Expected`].
+    fn parse_load_csv(&mut self) -> Result<LoadCsvClause, SyntaxError> {
+        let start = self.here_span().start;
+        self.expect_keyword_ident("load", "LOAD")?;
+        self.expect_keyword_ident("csv", "CSV")?;
+        let with_headers = if self.eat(&TokenKind::With) {
+            self.expect_keyword_ident("headers", "HEADERS")?;
+            true
+        } else {
+            false
+        };
+        self.expect_keyword_ident("from", "FROM")?;
+        let url = self.parse_expr()?;
+        self.expect(&TokenKind::As, "AS")?;
+        let alias = self.parse_variable()?;
+        let mut end = alias.span.end;
+        let field_terminator = if self.eat_keyword_ident("fieldterminator") {
+            let span = self.here_span();
+            match self.peek_kind() {
+                Some(TokenKind::String(s)) => {
+                    let mut chars = s.chars();
+                    match (chars.next(), chars.next()) {
+                        // Exactly one character: accept it.
+                        (Some(c), None) => {
+                            self.bump();
+                            end = span.end;
+                            Some(c)
+                        }
+                        // Empty or multi-character string: not a single-character terminator.
+                        _ => {
+                            return Err(SyntaxError::new(
+                                SyntaxErrorKind::Expected {
+                                    expected: "a single-character FIELDTERMINATOR string"
+                                        .to_owned(),
+                                    found: describe(&TokenKind::String(s.clone())),
+                                },
+                                span,
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(self.expected_here("a single-character FIELDTERMINATOR string"));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(LoadCsvClause {
+            with_headers,
+            url,
+            alias,
+            field_terminator,
             span: Span::new(start, end),
         })
     }

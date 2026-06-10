@@ -320,6 +320,50 @@ fn count_star_and_count_property() {
     assert_eq!(rows2[0].value("c"), i(1));
 }
 
+/// Regression: `count(<node/relationship variable>)` must count the bound entities, not 0.
+///
+/// A bound node/relationship is a non-null value; counting it is the common `MATCH (n) RETURN
+/// count(n)` idiom. The aggregation previously evaluated its argument with the *value*-collapsing
+/// path, which turns an entity reference into `Value::Null`, so `count(n)` wrongly skipped every row
+/// and returned 0 (while `count(*)` worked). This pins the entity-aware behaviour.
+#[test]
+fn count_of_entity_variable_counts_bound_entities() {
+    let (mut g, ..) = seed_social();
+    // 3 Person + 1 Company = 4 nodes.
+    let rows = run("MATCH (n) RETURN count(n) AS c", &mut g);
+    assert_eq!(rows[0].value("c"), i(4), "count(node) counts every node");
+
+    let labelled = run("MATCH (n:Person) RETURN count(n) AS c", &mut g);
+    assert_eq!(
+        labelled[0].value("c"),
+        i(3),
+        "count(node) honours the label scan"
+    );
+
+    // 3 relationships (2 KNOWS + 1 WORKS_AT). `count(r)` counts the bound relationships.
+    let rels = run("MATCH ()-[r]->() RETURN count(r) AS c", &mut g);
+    assert_eq!(
+        rels[0].value("c"),
+        i(3),
+        "count(relationship) counts every rel"
+    );
+
+    // DISTINCT must dedupe entities by identity: the same node reached twice counts once.
+    let mut g2 = MemGraph::new();
+    let a = g2.add_node(["N"], NO_PROPS);
+    let b = g2.add_node(["N"], NO_PROPS);
+    g2.add_rel("E", a, b, NO_PROPS);
+    g2.add_rel("E", b, a, NO_PROPS);
+    // `a` is the start of one edge and the end of another, so an undirected-ish double count would
+    // see it twice; DISTINCT collapses to the 2 distinct nodes.
+    let distinct = run("MATCH (x)-[]->() RETURN count(DISTINCT x) AS c", &mut g2);
+    assert_eq!(
+        distinct[0].value("c"),
+        i(2),
+        "count(DISTINCT node) dedupes by identity"
+    );
+}
+
 #[test]
 fn sum_avg_min_max_collect() {
     let (mut g, ..) = seed_social();

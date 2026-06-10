@@ -26,15 +26,19 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// As of the run that established this harness: **1094 / 3884 scenarios pass (28.17 %)**, with 0
-/// panics and 50 scenarios skipped as genuinely unsupported (all `CALL`-procedure forms — the engine
-/// has no procedure facility yet). The remaining failures are honest engine gaps, dominated by:
+/// Current ratchet: **1095 / 3884 scenarios pass (28.19 %)**, with 0 panics and 50 scenarios skipped
+/// as genuinely unsupported (all `CALL`-procedure forms — the engine has no procedure facility yet).
+/// This rose from the harness's establishing baseline of 1094 when `rmp` task #22 fixed
+/// `count(<node/relationship>)` (the aggregation evaluated its argument via the value-collapsing path,
+/// so an entity reference became `Value::Null` and `count(n)` wrongly returned 0); the fix unlocked
+/// one `count`-over-entities scenario. The remaining failures are honest engine gaps, dominated by:
 /// missing temporal builtins (`datetime`/`date`/`duration`/…), the parser not accepting quantifier /
 /// comprehension syntax (`ALL(... WHERE ...)`, `[x IN xs WHERE ...]`), un-aliased projection columns
 /// named `fn(...)` / `anon@span` instead of the verbatim expression text the TCK asserts, and
 /// boolean operands type-checked at runtime rather than compile time. See the printed
-/// `failure reasons` histogram for the live breakdown.
-const BASELINE: usize = 1094;
+/// `failure reasons` histogram for the live breakdown. (`LOAD CSV`, also added by #22, is a Neo4j
+/// extension absent from the openCypher TCK corpus, so it neither raises nor lowers this count.)
+const BASELINE: usize = 1095;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

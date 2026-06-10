@@ -120,6 +120,7 @@ pub mod function_registry;
 pub mod graph_access;
 pub mod index_set;
 pub mod lexer;
+pub mod loadcsv;
 pub mod logical;
 pub mod lower;
 pub mod ordering;

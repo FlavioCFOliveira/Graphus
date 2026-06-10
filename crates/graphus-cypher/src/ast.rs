@@ -102,6 +102,9 @@ pub enum Clause {
     Match(MatchClause),
     /// `UNWIND <expr> AS <var>` (openCypher `Unwind`).
     Unwind(UnwindClause),
+    /// `LOAD CSV [WITH HEADERS] FROM <expr> AS <var> [FIELDTERMINATOR <char>]` (openCypher
+    /// `LoadCSV`).
+    LoadCsv(LoadCsvClause),
     /// `CALL proc(...) [YIELD ...]` used inside a query (openCypher `InQueryCall`).
     Call(CallClause),
     /// `CREATE <pattern>` (openCypher `Create`).
@@ -126,6 +129,7 @@ impl Clause {
         match self {
             Self::Match(c) => c.span,
             Self::Unwind(c) => c.span,
+            Self::LoadCsv(c) => c.span,
             Self::Call(c) => c.span,
             Self::Create(c) => c.span,
             Self::Merge(c) => c.span,
@@ -161,6 +165,32 @@ pub struct UnwindClause {
     /// The variable each element is bound to.
     pub alias: Variable,
     /// Span from `UNWIND` to the alias.
+    pub span: Span,
+}
+
+/// `LOAD CSV [WITH HEADERS] FROM <url-expr> AS <var> [FIELDTERMINATOR <char>]` (openCypher
+/// `LoadCSV`).
+///
+/// A driving *source* clause, like [`UnwindClause`]: each CSV record becomes one row bound to
+/// [`alias`](Self::alias), feeding the downstream clauses. Without `WITH HEADERS` the row value is a
+/// `List` of the record's string fields; with `WITH HEADERS` it is a `Map` from each header name to
+/// the field's string value (an absent trailing field maps to `null`). The grammar mirrors the
+/// openCypher `LoadCSV` rule.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct LoadCsvClause {
+    /// `true` when `WITH HEADERS` was given: the first record names the columns and each subsequent
+    /// record is bound as a `Map{header -> value}`; otherwise each record is bound as a `List`.
+    pub with_headers: bool,
+    /// The URL expression naming the CSV source (a string at runtime — `file://` URLs and bare /
+    /// relative file paths are supported; non-`file` schemes are rejected at runtime, per the Neo4j
+    /// `LOAD CSV` security model).
+    pub url: Expr,
+    /// The variable each record is bound to.
+    pub alias: Variable,
+    /// The optional single-character field separator (`FIELDTERMINATOR '<char>'`); defaults to `,`.
+    pub field_terminator: Option<char>,
+    /// Span from `LOAD` to the last token of the clause.
     pub span: Span,
 }
 

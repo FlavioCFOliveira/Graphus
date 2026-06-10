@@ -293,6 +293,7 @@ fn collect_clause_literals(clause: &Clause, out: &mut Vec<LiteralSite>) {
             }
         }
         Clause::Unwind(u) => collect_expr_literals(&u.expr, out),
+        Clause::LoadCsv(l) => collect_expr_literals(&l.url, out),
         Clause::Call(c) => {
             if let Some(args) = &c.call.args {
                 for a in args {
