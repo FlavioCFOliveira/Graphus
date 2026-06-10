@@ -14,7 +14,6 @@
 use graphus_core::error::{GraphusError, Result};
 
 use crate::idalloc::FreeList;
-use crate::paging::PAGE_PAYLOAD;
 use crate::store::STORE_COUNT;
 use crate::tokens::TokenStore;
 
@@ -61,10 +60,16 @@ impl Meta {
         }
     }
 
-    /// Serialises the catalog into the page payload of the metadata page.
+    /// Serialises the catalog into a flat byte buffer.
+    ///
+    /// The buffer is persisted by [`RecordStore::checkpoint_meta`](crate::RecordStore) across a
+    /// singly-linked **chain** of metadata pages rooted at the metadata page (`rmp` task #51), so
+    /// the catalog is no longer bounded by a single page payload — a store can grow to many
+    /// thousands of record pages (whose device-page maps dominate this buffer) without overflow.
     ///
     /// # Errors
-    /// Returns a storage error if the encoded catalog does not fit in one page payload.
+    /// Currently infallible; returns [`Result`] for symmetry with [`decode`](Self::decode) and to
+    /// keep the signature stable if a future encoding step can fail.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.element_id_next.to_le_bytes());
@@ -82,12 +87,6 @@ impl Meta {
         let tok = self.tokens.encode();
         out.extend_from_slice(&(tok.len() as u32).to_le_bytes());
         out.extend_from_slice(&tok);
-        if out.len() > PAGE_PAYLOAD {
-            return Err(GraphusError::Storage(format!(
-                "metadata ({} B) exceeds one page payload ({PAGE_PAYLOAD} B)",
-                out.len()
-            )));
-        }
         Ok(out)
     }
 
@@ -152,6 +151,7 @@ fn read_u128(b: &[u8], cur: &mut usize) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paging::PAGE_PAYLOAD;
     use crate::tokens::Namespace;
 
     #[test]
@@ -181,6 +181,26 @@ mod tests {
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
         assert_eq!(back.tokens.id(Namespace::Label, "Person"), Some(0));
+    }
+
+    #[test]
+    fn large_device_page_map_round_trips_past_one_page() {
+        // A catalog whose device-page maps far exceed one page payload must still round-trip:
+        // the single-page cap was the `rmp` task #51 defect (it capped a store at ~1000 pages).
+        // 4000 pages/store * 8 B ≈ 128 KiB total — an order of magnitude past one 8 KiB page.
+        let mut m = Meta::new(7);
+        for (k, s) in m.stores.iter_mut().enumerate() {
+            s.high_water = 4000;
+            s.device_pages = (0..4000).map(|i| (k as u64 * 4000) + i + 1).collect();
+        }
+        let bytes = m.encode().unwrap();
+        assert!(
+            bytes.len() > PAGE_PAYLOAD,
+            "test must exceed one page payload to be meaningful: {} <= {PAGE_PAYLOAD}",
+            bytes.len()
+        );
+        let back = Meta::decode(&bytes).unwrap();
+        assert_eq!(back, m);
     }
 
     #[test]

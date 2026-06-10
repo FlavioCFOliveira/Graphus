@@ -48,8 +48,19 @@ use crate::tokens::{Namespace, TokenStore};
 use crate::valenc;
 use crate::wal_rule::SharedWal;
 
-/// The device page reserved for the durable catalog ([`crate::meta`]).
+/// The device page reserved for the head of the durable catalog chain ([`crate::meta`]).
 pub const META_PAGE: PageId = PageId(0);
+
+/// Usable catalog bytes per metadata page. The durable catalog ([`Meta::encode`]) is split into
+/// chunks of this size across a singly-linked chain of metadata pages rooted at [`META_PAGE`]
+/// (`rmp` task #51), so the catalog can grow far past one page — previously a store panicked once
+/// its device-page maps pushed the encoded catalog past a single 8 KiB page (a ~1000-page cap).
+///
+/// Each metadata page lays out, at offset [`HEADER_SIZE`], `chunk_len: u32` then `next_page: u64`
+/// (the device id of the next link, or `0` to terminate — [`META_PAGE`] is never a link target, so
+/// `0` is an unambiguous sentinel) then `chunk_len` catalog bytes. The 12-byte frame is subtracted
+/// here so a full chunk written at `HEADER_SIZE` never runs past the page.
+const META_CHUNK_CAP: usize = paging::PAGE_PAYLOAD - 12;
 
 /// Reserved system transaction id for standalone catalog writes (`04 §2.6`): a token/catalog
 /// change that must be durable on its own (e.g. at `create`) uses this transaction.
@@ -155,6 +166,13 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
     /// settle in-flight headers to the commit timestamp (`04 §5.2`).
     active: HashMap<TxnId, ActiveTxn>,
+    /// The metadata **continuation** pages (device ids of the catalog chain after [`META_PAGE`]),
+    /// in chain order (`rmp` task #51). Rebuilt from disk on open/recovery by walking the chain, and
+    /// grown on demand at [`checkpoint_meta`](Self::checkpoint_meta) when the encoded catalog needs
+    /// more than the head page. Device-page maps only ever grow, so this list never shrinks; it is
+    /// surfaced through [`mapped_pages`](Self::mapped_pages) so backup, the consistency checker and
+    /// the crash-recovery harness treat these as part of the durable image.
+    meta_chain: Vec<PageId>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
@@ -193,6 +211,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             ],
             commit_ts_hw: 0,
             active: HashMap::new(),
+            meta_chain: Vec::new(),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -208,7 +227,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn open(device: D, wal: WalManager<S>, pool_capacity: usize) -> Result<Self> {
         let shared = SharedWal::new(wal);
         let mut pool = BufferPool::with_wal(device, shared.clone(), pool_capacity);
-        let meta = Self::read_meta(&mut pool)?;
+        let (meta, meta_chain) = Self::read_meta(&mut pool)?;
         let stores = [
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0]),
             FixedStore::from_meta(StoreKind::Rel, &meta.stores[1]),
@@ -223,6 +242,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             stores,
             commit_ts_hw: meta.commit_ts_hw,
             active: HashMap::new(),
+            meta_chain,
         })
     }
 
@@ -278,25 +298,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
-    /// Reads and decodes the durable metadata catalog.
-    fn read_meta(pool: &mut BufferPool<D, SharedWal<S>>) -> Result<Meta> {
-        let f = pool.fetch(META_PAGE)?;
-        let p = pool.page(f);
-        let len = u32::from_le_bytes(
-            p[HEADER_SIZE..HEADER_SIZE + 4]
-                .try_into()
-                .expect("4-byte slice"),
-        ) as usize;
-        let start = HEADER_SIZE + 4;
-        if start + len > p.len() {
+    /// Reads and decodes the durable metadata catalog by walking the metadata-page chain from
+    /// [`META_PAGE`], concatenating each page's chunk until the terminating link (`next == 0`).
+    /// Returns the decoded catalog and the continuation-page ids (the chain after the head), which
+    /// the caller records as [`meta_chain`](Self#structfield.meta_chain).
+    ///
+    /// # Errors
+    /// Returns a storage error if a page is unreadable/fails checksum, a chunk runs past its page,
+    /// the chain is cyclic, or the concatenated payload is malformed.
+    fn read_meta(pool: &mut BufferPool<D, SharedWal<S>>) -> Result<(Meta, Vec<PageId>)> {
+        let mut payload = Vec::new();
+        let mut chain = Vec::new();
+        let mut page = META_PAGE;
+        loop {
+            let f = pool.fetch(page)?;
+            let p = pool.page(f);
+            let chunk_len = u32::from_le_bytes(
+                p[HEADER_SIZE..HEADER_SIZE + 4]
+                    .try_into()
+                    .expect("4-byte slice"),
+            ) as usize;
+            let next = u64::from_le_bytes(
+                p[HEADER_SIZE + 4..HEADER_SIZE + 12]
+                    .try_into()
+                    .expect("8-byte slice"),
+            );
+            let start = HEADER_SIZE + 12;
+            if start + chunk_len > p.len() {
+                pool.unpin(f);
+                return Err(GraphusError::Storage(
+                    "metadata chunk runs past the page".to_owned(),
+                ));
+            }
+            payload.extend_from_slice(&p[start..start + chunk_len]);
             pool.unpin(f);
-            return Err(GraphusError::Storage(
-                "metadata length runs past the page".to_owned(),
-            ));
+            if next == 0 {
+                break;
+            }
+            let next = PageId(next);
+            // Guard a corrupt/cyclic chain: a link must reach a fresh page and never the head, so a
+            // damaged metadata region fails the open rather than looping forever. Continuation pages
+            // are only ever appended, so this membership scan stays short (one entry per ~8 KiB of
+            // catalog) and runs only on open/recovery.
+            if next == META_PAGE || chain.contains(&next) {
+                return Err(GraphusError::Storage(
+                    "metadata chain is cyclic or points at the head page".to_owned(),
+                ));
+            }
+            chain.push(next);
+            page = next;
         }
-        let payload = p[start..start + len].to_vec();
-        pool.unpin(f);
-        Meta::decode(&payload)
+        Ok((Meta::decode(&payload)?, chain))
     }
 
     /// Persists the in-memory catalog to the metadata page as one WAL-logged update under `txn`.
@@ -305,16 +357,54 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn checkpoint_meta(&mut self, txn: TxnId, commit: bool) -> Result<()> {
         let meta = self.snapshot_meta();
         let payload = meta.encode()?;
-        let mut framed = Vec::with_capacity(4 + payload.len());
-        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        framed.extend_from_slice(&payload);
+        // Split the catalog into [`META_CHUNK_CAP`]-byte chunks across the metadata-page chain. At
+        // least one page (the head) is always written, even for an empty chunk.
+        let n_chunks = payload.len().div_ceil(META_CHUNK_CAP).max(1);
+        let n_cont = n_chunks - 1;
 
         if commit {
             self.wal.with(|w| {
                 w.begin(txn);
             });
         }
-        self.write_region(META_PAGE, HEADER_SIZE, &framed, txn)?;
+
+        // Grow the continuation chain on demand. A fresh continuation page is allocated like a
+        // record page (extend the device, stamp a meta-type header, flush so a later fetch verifies
+        // a valid checksum); the chunk + link bytes that follow are WAL-logged, so a crash
+        // mid-checkpoint recovers atomically — a loser's link reverts and the orphan page is left
+        // harmlessly unreferenced, exactly as for record-page growth (`04 §4.4`).
+        while self.meta_chain.len() < n_cont {
+            let (f, dev_page) = self.pool.new_page()?;
+            let p = self.pool.page_mut(f);
+            page::set_page_type(p, PAGE_TYPE_META);
+            page::set_page_id(p, dev_page.0);
+            self.pool.flush(f)?;
+            self.pool.unpin(f);
+            self.meta_chain.push(dev_page);
+        }
+
+        // Write the head plus *every* owned continuation page (copied so the loop can take
+        // `&mut self`). Chunks past the catalog's end are written empty: this keeps the whole owned
+        // chain reachable on reopen even in the rare event the catalog shrank across a page boundary
+        // (device-page maps only grow, so in practice the chain matches the catalog exactly), so no
+        // allocated page is ever orphaned by a checkpoint.
+        let total = 1 + self.meta_chain.len();
+        let mut pages = Vec::with_capacity(total);
+        pages.push(META_PAGE);
+        pages.extend_from_slice(&self.meta_chain);
+
+        for i in 0..total {
+            let lo = (i * META_CHUNK_CAP).min(payload.len());
+            let hi = ((i + 1) * META_CHUNK_CAP).min(payload.len());
+            let chunk = &payload[lo..hi];
+            let next = if i + 1 < total { pages[i + 1].0 } else { 0 };
+            let mut framed = Vec::with_capacity(12 + chunk.len());
+            framed.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            framed.extend_from_slice(&next.to_le_bytes());
+            framed.extend_from_slice(chunk);
+            self.write_region(pages[i], HEADER_SIZE, &framed, txn)?;
+        }
+
         if commit {
             self.wal.with(|w| w.commit(txn))?;
         }
@@ -668,7 +758,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Rebuilds the in-memory catalog from the durable metadata page.
     fn reload_catalog(&mut self) -> Result<()> {
-        let meta = Self::read_meta(&mut self.pool)?;
+        let (meta, meta_chain) = Self::read_meta(&mut self.pool)?;
         self.element_ids = ElementIdAllocator::new(meta.element_id_next.max(1));
         self.commit_ts_hw = meta.commit_ts_hw;
         for (i, sm) in meta.stores.iter().enumerate() {
@@ -676,6 +766,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.stores[i] = FixedStore::from_meta(kind, sm);
         }
         self.tokens = meta.tokens;
+        // The catalog is only ever checkpointed at commit, so during an open transaction the chain
+        // already matches disk; reload (rollback / recovery) restores the durable committed chain.
+        self.meta_chain = meta_chain;
         Ok(())
     }
 
@@ -1908,13 +2001,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.pool.flush_all()
     }
 
-    /// The device `PageId`s this store currently maps (the metadata page plus every allocated
+    /// The device `PageId`s this store currently maps (the metadata-page chain plus every allocated
     /// record-store page). Used by Deterministic Simulation Testing to snapshot the on-disk image
     /// after a (partial) flush so a crash + recovery can be exercised against a real disk state
     /// (`04 §11`).
     #[must_use]
     pub fn mapped_pages(&self) -> Vec<PageId> {
         let mut pages = vec![META_PAGE];
+        // The catalog's continuation pages are part of the durable image too (`rmp` task #51).
+        pages.extend_from_slice(&self.meta_chain);
         for s in &self.stores {
             pages.extend_from_slice(&s.device_pages);
         }
