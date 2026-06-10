@@ -11,19 +11,18 @@
 //!
 //! Only the three inline scalar classes are encodable here. Every other [`Value`] class — `String`,
 //! `Bytes`, `List`, `Map` and the temporal classes — needs the `strings.store` overflow heap to
-//! hold its bytes, and that heap is a **separate follow-up (#39)**. Encoding such a value returns
+//! hold its bytes, whose byte format is [`crate::valenc`] (task #43). Encoding such a value returns
 //! [`PropEncodeError::NonInline`] (a clear, documented error — never a panic and never a silently
-//! wrong inline payload), so a caller (e.g. the Cypher `RecordStoreGraph` write path) can surface it
-//! as a runtime error rather than corrupt the store. `Null` is not a stored value at all (Cypher
-//! does not persist null properties), so it is also rejected here; write callers drop nulls before
-//! reaching the codec.
+//! wrong inline payload), so the store layer routes it to the overflow codec instead — and a class
+//! *neither* codec accepts is surfaced as a runtime error rather than corrupting the store. `Null`
+//! is not a stored value at all (Cypher does not persist null properties), so it is also rejected
+//! here; write callers drop nulls before reaching the codec.
 //!
 //! # Stability
 //!
-//! The tag values are an internal encoding of this crate, **not** a frozen on-disk format yet: the
-//! frozen `05 §7` layout fixes only the *byte offsets* of `type_tag`/`value_inline`, not their
-//! meaning. When the overflow heap lands (#39) this tag space is extended (overflow classes get
-//! their own tags); the three inline tags here are chosen to stay stable across that extension.
+//! The three inline tags share one tag space with [`crate::valenc`]'s overflow class tags
+//! (`4`=String, `5`=List, `6`-`11`=temporals); the spaces never collide, and the tag values are
+//! persisted bytes that must never be renumbered.
 
 use graphus_core::Value;
 
@@ -41,8 +40,9 @@ pub const TAG_FLOAT: u8 = 3;
 #[non_exhaustive]
 pub enum PropEncodeError {
     /// The value is not one of the inline scalar classes (`Boolean`/`Integer`/`Float`). String,
-    /// bytes, list, map and temporal values require the `strings.store` overflow heap, which is a
-    /// follow-up (#39). Carries the offending class name for a precise diagnostic.
+    /// bytes, list, map and temporal values require the `strings.store` overflow heap
+    /// ([`crate::valenc`]); the store layer routes them there. Carries the offending class name for
+    /// a precise diagnostic.
     NonInline {
         /// The Cypher value-class name that cannot be stored inline (e.g. `"String"`, `"List"`).
         class: &'static str,
@@ -57,9 +57,9 @@ impl std::fmt::Display for PropEncodeError {
         match self {
             Self::NonInline { class } => write!(
                 f,
-                "property value of type {class} cannot be stored inline yet: the strings/overflow \
-                 heap for non-scalar property values is a follow-up (graphus #39); only Integer, \
-                 Float and Boolean property values are supported in this build"
+                "property value of type {class} cannot be stored inline: only Integer, Float and \
+                 Boolean property values fit the 64-bit inline payload (other classes are stored \
+                 through the strings/overflow heap codec)"
             ),
             Self::Null => write!(f, "a null property value is not persisted"),
         }
@@ -103,8 +103,8 @@ fn class_name(value: &Value) -> &'static str {
 /// returns [`PropEncodeError::Null`].
 ///
 /// # Errors
-/// - [`PropEncodeError::NonInline`] for any class that does not fit in 64 inline bits (deferred to
-///   #39's overflow heap).
+/// - [`PropEncodeError::NonInline`] for any class that does not fit in 64 inline bits (the store
+///   layer routes those to [`crate::valenc`]'s overflow heap codec).
 /// - [`PropEncodeError::Null`] for [`Value::Null`].
 pub fn encode_inline(value: &Value) -> Result<(u8, u64), PropEncodeError> {
     match value {
@@ -129,9 +129,10 @@ pub fn encode_inline(value: &Value) -> Result<(u8, u64), PropEncodeError> {
 /// [`TAG_FLOAT`]).
 ///
 /// # Errors
-/// Returns [`PropDecodeError::UnknownTag`] for any tag this build does not understand (e.g. a future
-/// overflow-class tag written by #39's heap). A boolean payload other than `0`/`1` is normalised to
-/// `true` for any non-zero value (defensive; [`encode_inline`] only ever writes `0`/`1`).
+/// Returns [`PropDecodeError::UnknownTag`] for any tag this build does not understand (a tag from a
+/// newer/foreign build, or an overflow-class tag a caller failed to route to [`crate::valenc`]). A
+/// boolean payload other than `0`/`1` is normalised to `true` for any non-zero value (defensive;
+/// [`encode_inline`] only ever writes `0`/`1`).
 pub fn decode_inline(type_tag: u8, value_inline: u64) -> Result<Value, PropDecodeError> {
     match type_tag {
         TAG_BOOL => Ok(Value::Boolean(value_inline != 0)),
@@ -152,7 +153,8 @@ pub fn decode_inline(type_tag: u8, value_inline: u64) -> Result<Value, PropDecod
 #[non_exhaustive]
 pub enum PropDecodeError {
     /// The `type_tag` is not one of this build's inline scalar tags. Such a tag can only arise from
-    /// a value written by a newer overflow-heap build (#39); this build cannot interpret it.
+    /// a value written by a newer/foreign build, or from an overflow-class tag that a caller failed
+    /// to mask and route to [`crate::valenc`].
     UnknownTag {
         /// The unrecognised tag byte.
         tag: u8,
@@ -165,7 +167,8 @@ impl std::fmt::Display for PropDecodeError {
             Self::UnknownTag { tag } => write!(
                 f,
                 "property type tag {tag} is not an inline scalar tag this build understands \
-                 (non-scalar/overflow property values are a follow-up, graphus #39)"
+                 (overflow-class values are decoded through the strings/overflow heap codec, not \
+                 inline)"
             ),
         }
     }

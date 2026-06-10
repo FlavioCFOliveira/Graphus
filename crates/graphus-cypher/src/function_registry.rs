@@ -145,6 +145,84 @@ static TABLE: &[Signature] = &[
         arity: Arity::Exact(1),
         aggregate: true,
     },
+    // ---- temporal constructors (openCypher temporal CIP; rmp #53) ----------------------------
+    // Arity 0 is the "current instant" form, which needs the transaction clock (a named
+    // deferral); arity 1 covers the string / component-map / projection forms.
+    Signature {
+        name: "date",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "datetime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "date.truncate",
+        arity: Arity::Range(2, 3),
+        aggregate: false,
+    },
+    Signature {
+        name: "datetime.truncate",
+        arity: Arity::Range(2, 3),
+        aggregate: false,
+    },
+    Signature {
+        name: "duration",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "duration.between",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "duration.indays",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "duration.inmonths",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "duration.inseconds",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "localdatetime.truncate",
+        arity: Arity::Range(2, 3),
+        aggregate: false,
+    },
+    Signature {
+        name: "localtime.truncate",
+        arity: Arity::Range(2, 3),
+        aggregate: false,
+    },
+    Signature {
+        name: "time.truncate",
+        arity: Arity::Range(2, 3),
+        aggregate: false,
+    },
+    Signature {
+        name: "localdatetime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "localtime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "time",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
     // ---- scalar functions -------------------------------------------------------------------
     Signature {
         name: "abs",

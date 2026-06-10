@@ -744,6 +744,107 @@ fn exists_subquery_tests_pattern_existence() {
 }
 
 // =================================================================================================
+// Temporal types (rmp #53): constructors, components, arithmetic, comparison
+// =================================================================================================
+
+#[test]
+fn temporal_constructors_from_strings_and_maps() {
+    let mut g = MemGraph::new();
+    let rows = run(
+        "RETURN toString(date('2015-07-21')) AS d, \
+         toString(date({year: 1984, month: 10, day: 11})) AS dm, \
+         toString(localtime('12:31:14.645')) AS t, \
+         toString(localdatetime({year: 1984, month: 10, day: 11, hour: 12, minute: 31})) AS ldt, \
+         toString(datetime({year: 1984, month: 10, day: 11, hour: 12, timezone: '+01:00'})) AS zdt, \
+         toString(duration({days: 14, hours: 16, minutes: 12})) AS dur",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("d"), s("2015-07-21"));
+    assert_eq!(rows[0].value("dm"), s("1984-10-11"));
+    assert_eq!(rows[0].value("t"), s("12:31:14.645"));
+    assert_eq!(rows[0].value("ldt"), s("1984-10-11T12:31"));
+    assert_eq!(rows[0].value("zdt"), s("1984-10-11T12:00+01:00"));
+    assert_eq!(rows[0].value("dur"), s("P14DT16H12M"));
+}
+
+#[test]
+fn temporal_component_access() {
+    let mut g = MemGraph::new();
+    let rows = run(
+        "WITH date({year: 1984, month: 10, day: 11}) AS d \
+         RETURN d.year AS y, d.quarter AS q, d.month AS m, d.week AS w, d.weekDay AS wd, \
+                d.ordinalDay AS od, d.dayOfQuarter AS dq",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("y"), i(1984));
+    assert_eq!(rows[0].value("q"), i(4));
+    assert_eq!(rows[0].value("m"), i(10));
+    assert_eq!(rows[0].value("w"), i(41));
+    assert_eq!(rows[0].value("wd"), i(4), "1984-10-11 was a Thursday");
+    assert_eq!(rows[0].value("od"), i(285));
+    assert_eq!(rows[0].value("dq"), i(11));
+    let rows = run(
+        "WITH duration({days: 1, hours: 12, minutes: 30}) AS dur \
+         RETURN dur.days AS d, dur.hours AS h, dur.minutesOfHour AS moh",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("d"), i(1));
+    assert_eq!(rows[0].value("h"), i(12));
+    assert_eq!(rows[0].value("moh"), i(30));
+}
+
+#[test]
+fn temporal_arithmetic_and_comparison() {
+    let mut g = MemGraph::new();
+    // Calendar-aware addition clamps the day-of-month (Jan 31 + 1 month = Feb 29 in a leap year).
+    let rows = run(
+        "RETURN toString(date('2020-01-31') + duration({months: 1})) AS clamped, \
+         toString(date('2015-07-21') - duration({days: 20})) AS back, \
+         toString(duration({hours: 1}) + duration({minutes: 30})) AS dsum, \
+         toString(duration({hours: 4}) / 2) AS dhalf, \
+         date('1980-12-24') < date('1984-10-11') AS lt",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("clamped"), s("2020-02-29"));
+    assert_eq!(rows[0].value("back"), s("2015-07-01"));
+    assert_eq!(rows[0].value("dsum"), s("PT1H30M"));
+    assert_eq!(rows[0].value("dhalf"), s("PT2H"));
+    assert_eq!(rows[0].value("lt"), Value::Boolean(true));
+}
+
+#[test]
+fn temporal_between_and_truncate() {
+    let mut g = MemGraph::new();
+    let rows = run(
+        "RETURN toString(duration.between(date('1984-10-11'), date('2015-07-21'))) AS between, \
+         toString(duration.inDays(date('2015-07-21'), date('2015-08-21'))) AS days, \
+         toString(date.truncate('month', date('2015-07-21'))) AS month, \
+         toString(datetime.truncate('day', datetime({year: 2015, month: 7, day: 21, hour: 14, timezone: '+02:00'}))) AS day",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("between"), s("P30Y9M10D"));
+    assert_eq!(rows[0].value("days"), s("P31D"));
+    assert_eq!(rows[0].value("month"), s("2015-07-01"));
+    assert_eq!(rows[0].value("day"), s("2015-07-21T00:00+02:00"));
+}
+
+#[test]
+fn temporal_values_round_trip_as_properties() {
+    let mut g = MemGraph::new();
+    run(
+        "CREATE (:Event {at: date('2015-07-21'), dur: duration({hours: 2})})",
+        &mut g,
+    );
+    let rows = run(
+        "MATCH (e:Event) RETURN toString(e.at) AS at, toString(e.dur) AS dur, e.at.year AS y",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("at"), s("2015-07-21"));
+    assert_eq!(rows[0].value("dur"), s("PT2H"));
+    assert_eq!(rows[0].value("y"), i(2015));
+}
+
+// =================================================================================================
 // Parameters
 // =================================================================================================
 

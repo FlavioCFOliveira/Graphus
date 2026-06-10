@@ -90,6 +90,8 @@ pub use record::{
 pub use store::{META_PAGE, RecordStore, StoreKind};
 pub use tokens::{Namespace, TokenStore};
 pub use valenc::{
-    OVERFLOW_BIT as PROP_OVERFLOW_BIT, TAG_LIST, TAG_STRING, ValueDecodeError, ValueEncodeError,
+    OVERFLOW_BIT as PROP_OVERFLOW_BIT, TAG_DATE, TAG_DURATION, TAG_LIST, TAG_LOCAL_DATE_TIME,
+    TAG_LOCAL_TIME, TAG_STRING, TAG_ZONED_DATE_TIME, TAG_ZONED_TIME, ValueDecodeError,
+    ValueEncodeError,
 };
 pub use wal_rule::SharedWal;

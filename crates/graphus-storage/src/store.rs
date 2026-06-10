@@ -1677,7 +1677,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// then prepends a fresh, in-flight version. The old version keeps its slot and its overflow
     /// chain so an older snapshot still reads the previous value; physical reclamation of the
     /// tombstoned record and its overflow blocks happens at [`gc`](Self::gc), not here. Inline
-    /// scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List` values are
+    /// scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List`/temporal values are
     /// serialized to the `strings.store` overflow heap and the property holds the head block id with
     /// the `type_tag` overflow bit set (`04 §2.3`). Returns the new property's physical id.
     ///
@@ -1732,7 +1732,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Encodes `value` into the `(type_tag, value_inline)` pair to store in a property record,
-    /// allocating an overflow chain for `String`/`List` values.
+    /// allocating an overflow chain for `String`/`List`/temporal values.
     fn encode_property_value(
         &mut self,
         txn: TxnId,
@@ -1744,8 +1744,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             Err(crate::propenc::PropEncodeError::Null) => {
                 return Err(GraphusError::from(crate::propenc::PropEncodeError::Null));
             }
-            // Not inline: fall through to the overflow heap (String / List); a class neither the
-            // inline codec nor the overflow codec accepts is surfaced by `valenc::encode` below.
+            // Not inline: fall through to the overflow heap (String / List / temporal); a class
+            // neither the inline codec nor the overflow codec accepts is surfaced by
+            // `valenc::encode` below.
             Err(crate::propenc::PropEncodeError::NonInline { .. }) => {}
         }
         let (class_tag, bytes) = valenc::encode(value).map_err(GraphusError::from)?;
@@ -1775,8 +1776,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Collects node `node_id`'s live properties as `(physical_id, key_token, Value)`, decoding both
-    /// inline scalars and overflow `String`/`List` values (`rmp` task #43). The chain is walked
-    /// head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered).
+    /// inline scalars and overflow `String`/`List`/temporal values (`rmp` task #43). The chain is
+    /// walked head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered).
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
@@ -1812,9 +1813,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Frees the overflow heap chain a property record owns, if any: a no-op for an inline scalar;
-    /// for an overflowed `String`/`List` it frees the chain whose head is `value_inline`
-    /// (`rmp` task #43). Used when a property value is overwritten or removed so its old bytes are
-    /// not leaked.
+    /// for an overflowed `String`/`List`/temporal value it frees the chain whose head is
+    /// `value_inline` (`rmp` task #43). Used when a property value is overwritten or removed so its
+    /// old bytes are not leaked.
     ///
     /// # Errors
     /// Returns a storage error if freeing the chain fails.
@@ -1831,9 +1832,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // relationship's property chain is rooted at [`RelRecord.first_prop`](crate::record::RelRecord)
     // — the relationship analogue of `NodeRecord.first_prop` — and threaded through the **same**
     // `props.store` records via `PropRecord.next_prop`, with the **same** `strings.store` overflow
-    // heap for `String`/`List` values (`rmp` task #43) and the same prepend-chain + newest-wins
-    // discipline. Every write is WAL-logged and crash-recoverable through the same ARIES machinery
-    // (`04 §4`). Index seeks + MVCC over these chains remain `rmp` task #39, untouched here.
+    // heap for `String`/`List`/temporal values (`rmp` task #43) and the same prepend-chain +
+    // newest-wins discipline. Every write is WAL-logged and crash-recoverable through the same
+    // ARIES machinery (`04 §4`). Index seeks + MVCC over these chains remain `rmp` task #39,
+    // untouched here.
 
     /// Creates a property `(key, type_tag, value_inline)` under `txn` and prepends it to relationship
     /// `rel_id`'s property chain (`rmp` task #44); returns the property's physical id. The low-level
@@ -1901,9 +1903,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `rmp` task #45), then prepends a fresh, in-flight version. The old version keeps its slot and
     /// its overflow chain so an older snapshot still reads the previous value; physical reclamation
     /// happens at [`gc`](Self::gc), not here. Inline scalars (`Integer`/`Float`/`Boolean`) stay
-    /// inline (#38); `String`/`List` values overflow to the `strings.store` heap with the `type_tag`
-    /// overflow bit set (`04 §2.3`). Returns the new property's physical id. The relationship
-    /// analogue of [`set_node_property_value`](Self::set_node_property_value).
+    /// inline (#38); `String`/`List`/temporal values overflow to the `strings.store` heap with
+    /// the `type_tag` overflow bit set (`04 §2.3`). Returns the new property's physical id. The
+    /// relationship analogue of [`set_node_property_value`](Self::set_node_property_value).
     ///
     /// # Errors
     /// - [`GraphusError::Storage`] if the relationship is not in use or a write fails.
@@ -1947,9 +1949,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`, decoding
-    /// both inline scalars and overflow `String`/`List` values (`rmp` task #44). The chain is walked
-    /// head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered). The
-    /// relationship analogue of [`node_property_values`](Self::node_property_values).
+    /// both inline scalars and overflow `String`/`List`/temporal values (`rmp` task #44). The
+    /// chain is walked head-to-tail; the caller applies newest-wins per key (the chain is
+    /// prepend-ordered). The relationship analogue of
+    /// [`node_property_values`](Self::node_property_values).
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.

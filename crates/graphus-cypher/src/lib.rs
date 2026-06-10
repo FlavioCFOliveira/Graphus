@@ -130,6 +130,7 @@ pub mod plan_cache;
 pub mod record_graph;
 pub mod runtime;
 pub mod semantics;
+pub(crate) mod temporal_fns;
 pub mod ternary;
 
 pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};

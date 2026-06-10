@@ -289,10 +289,26 @@ fn eval_binary(
             arithmetic_add(&a, &b)
         }
         BinaryOp::Sub => {
-            numeric_binop(lhs, rhs, row, params, graph, |x, y| x - y, i64::checked_sub)
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            if a.is_null() || b.is_null() {
+                return Ok(RowValue::NULL);
+            }
+            // Temporal `-`: temporal - duration and duration - duration (rmp #53).
+            if let Some(r) = crate::temporal_fns::sub(&a, &b) {
+                return r.map(RowValue::Value);
+            }
+            numeric_binop_values(&a, &b, |x, y| x - y, i64::checked_sub)
         }
         BinaryOp::Mul => {
-            numeric_binop(lhs, rhs, row, params, graph, |x, y| x * y, i64::checked_mul)
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            if a.is_null() || b.is_null() {
+                return Ok(RowValue::NULL);
+            }
+            // Temporal `*`: duration * number (commutative) (rmp #53).
+            if let Some(r) = crate::temporal_fns::mul(&a, &b) {
+                return r.map(RowValue::Value);
+            }
+            numeric_binop_values(&a, &b, |x, y| x * y, i64::checked_mul)
         }
         BinaryOp::Div => eval_div(lhs, rhs, row, params, graph),
         BinaryOp::Mod => eval_mod(lhs, rhs, row, params, graph),
@@ -356,6 +372,10 @@ fn arithmetic_add(a: &Value, b: &Value) -> EvalResult {
     if a.is_null() || b.is_null() {
         return Ok(RowValue::NULL);
     }
+    // Temporal `+`: temporal + duration (commutative) and duration + duration (rmp #53).
+    if let Some(r) = crate::temporal_fns::add(a, b) {
+        return r.map(RowValue::Value);
+    }
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x
             .checked_add(*y)
@@ -400,28 +420,21 @@ fn arithmetic_add(a: &Value, b: &Value) -> EvalResult {
     }
 }
 
-/// A numeric binary op (`-`, `*`) with integer-exact path (checked) and a float fallback; null
-/// propagates.
-fn numeric_binop(
-    lhs: &Expr,
-    rhs: &Expr,
-    row: &Row,
-    params: &BoundParameters,
-    graph: &dyn GraphAccess,
+/// A numeric binary op (`-`, `*`) over already-evaluated non-null values, with an integer-exact
+/// path (checked) and a float fallback.
+fn numeric_binop_values(
+    a: &Value,
+    b: &Value,
     float_op: impl Fn(f64, f64) -> f64,
     int_op: impl Fn(i64, i64) -> Option<i64>,
 ) -> EvalResult {
-    let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
-    if a.is_null() || b.is_null() {
-        return Ok(RowValue::NULL);
-    }
-    if let (Value::Integer(x), Value::Integer(y)) = (&a, &b) {
+    if let (Value::Integer(x), Value::Integer(y)) = (a, b) {
         return int_op(*x, *y)
             .map(Value::Integer)
             .map(RowValue::Value)
             .ok_or(EvalError::IntegerOverflow);
     }
-    match (numeric_f64(&a), numeric_f64(&b)) {
+    match (numeric_f64(a), numeric_f64(b)) {
         (Some(x), Some(y)) => Ok(RowValue::Value(Value::Float(float_op(x, y)))),
         _ => Err(EvalError::TypeError {
             context: "arithmetic requires numeric operands".to_owned(),
@@ -442,6 +455,10 @@ fn eval_div(
     let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
     if a.is_null() || b.is_null() {
         return Ok(RowValue::NULL);
+    }
+    // Temporal `/`: duration / number (rmp #53).
+    if let Some(r) = crate::temporal_fns::div(&a, &b) {
+        return r.map(RowValue::Value);
     }
     if let (Value::Integer(x), Value::Integer(y)) = (&a, &b) {
         if *y == 0 {
@@ -605,8 +622,11 @@ fn eval_property(
                 .map(|(_, v)| v)
                 .unwrap_or(Value::Null),
         )),
-        // Property of null is null (Cypher); property of any other value is null too.
-        _ => Ok(RowValue::NULL),
+        // Temporal component access: `d.year`, `t.hour`, `dur.minutesOfHour`, … (rmp #53).
+        // A non-temporal (incl. null) base yields null, Cypher's missing-property rule.
+        RowValue::Value(v) => Ok(RowValue::Value(
+            crate::temporal_fns::component(&v, key).unwrap_or(Value::Null),
+        )),
     }
 }
 
@@ -908,9 +928,24 @@ fn call_function(
         .collect::<Result<_, _>>()?;
 
     let result = match lower.as_str() {
+        // Temporal constructors (rmp #53): string / component-map / projection forms.
+        "date" | "time" | "datetime" | "localtime" | "localdatetime" | "duration" => {
+            crate::temporal_fns::construct(&lower, argv.first())?
+        }
+        // Temporal difference and truncation functions (rmp #53).
+        "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
+            crate::temporal_fns::duration_between(&lower, &argv[0], &argv[1])?
+        }
+        "date.truncate" | "time.truncate" | "localtime.truncate" | "datetime.truncate"
+        | "localdatetime.truncate" => {
+            crate::temporal_fns::truncate(&lower, &argv[0], &argv[1], argv.get(2))?
+        }
         "tostring" => match &argv[0] {
             Value::Null => Value::Null,
-            v => Value::String(stringify_scalar(v)),
+            v => match crate::temporal_fns::to_iso(v) {
+                Some(iso) => Value::String(iso),
+                None => Value::String(stringify_scalar(v)),
+            },
         },
         "tointeger" => to_integer(&argv[0]),
         "tofloat" => to_float(&argv[0]),

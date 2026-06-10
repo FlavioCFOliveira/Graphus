@@ -7,8 +7,8 @@
 //!   alloc→read round-trips for payloads spanning 1, 2 and many blocks; empty and large payloads;
 //!   and free→realloc reuse of freed block ids (no leak);
 //! * the **value-level property codec** ([`RecordStore::set_node_property_value`] /
-//!   [`node_property_values`]): `String` and `List` values round-trip through the heap, inline
-//!   scalars stay inline, and an overwrite/removal frees the old chain (asserted via
+//!   [`node_property_values`]): `String`, `List` and temporal values round-trip through the heap,
+//!   inline scalars stay inline, and an overwrite/removal frees the old chain (asserted via
 //!   [`RecordStore::heap_block_usage`]).
 //!
 //! [`read_chain`]: graphus_storage::RecordStore::read_chain
@@ -296,6 +296,142 @@ fn string_and_list_values_round_trip_through_the_property_api() {
     assert_eq!(by_key(k_s), Some(Value::String(long)));
     assert_eq!(by_key(k_l), Some(list));
     s.commit(txn).unwrap();
+}
+
+#[test]
+fn temporal_values_round_trip_through_the_property_api() {
+    use graphus_core::value::temporal::{
+        Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime,
+    };
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+
+    // One property per temporal class (negative components and an empty zone id included), plus a
+    // homogeneous list of temporals -- the full overflow temporal surface through the record store.
+    let values = [
+        (
+            "d",
+            Value::Date(Date {
+                days_since_epoch: -719_528, // 0001-01-01, a pre-epoch date
+            }),
+        ),
+        (
+            "lt",
+            Value::LocalTime(LocalTime {
+                nanos_of_day: 86_399_999_999_999,
+            }),
+        ),
+        (
+            "zt",
+            Value::ZonedTime(ZonedTime {
+                time: LocalTime {
+                    nanos_of_day: 43_200_000_000_000,
+                },
+                offset_seconds: -3600,
+            }),
+        ),
+        (
+            "ldt",
+            Value::LocalDateTime(LocalDateTime {
+                epoch_seconds: -1,
+                nanos: 999_999_999,
+            }),
+        ),
+        (
+            "zdt",
+            Value::ZonedDateTime(ZonedDateTime {
+                local: LocalDateTime {
+                    epoch_seconds: 1_700_000_000,
+                    nanos: 123_456_789,
+                },
+                offset_seconds: 3600,
+                zone_id: "Europe/Lisbon".to_owned(),
+            }),
+        ),
+        (
+            "zdt_offset_only",
+            Value::ZonedDateTime(ZonedDateTime {
+                local: LocalDateTime::default(),
+                offset_seconds: -64_800,
+                zone_id: String::new(), // offset-only (empty zone id)
+            }),
+        ),
+        (
+            "dur",
+            Value::Duration(Duration {
+                months: -1,
+                days: 40,
+                seconds: -86_400,
+                nanos: 999_999_999,
+            }),
+        ),
+        (
+            "dates",
+            Value::List(vec![
+                Value::Date(Date {
+                    days_since_epoch: -1,
+                }),
+                Value::Date(Date {
+                    days_since_epoch: 20_000,
+                }),
+            ]),
+        ),
+    ];
+
+    let mut keys = Vec::with_capacity(values.len());
+    for (name, value) in &values {
+        let k = s.intern_token(Namespace::PropKey, name).unwrap();
+        s.set_node_property_value(txn, n, k, value).unwrap();
+        keys.push(k);
+    }
+    // Every temporal value goes through the overflow heap (none fits the 64-bit inline payload).
+    assert!(s.heap_block_usage().unwrap() >= values.len() as u64);
+
+    let vals = s.node_property_values(n).unwrap();
+    for (k, (name, value)) in keys.iter().zip(&values) {
+        let got = vals
+            .iter()
+            .find(|(_, key, _)| key == k)
+            .map(|(_, _, v)| v.clone());
+        assert_eq!(got.as_ref(), Some(value), "property {name} must round-trip");
+    }
+    s.commit(txn).unwrap();
+}
+
+#[test]
+fn committed_temporal_property_survives_a_crash_and_recovers() {
+    use graphus_core::value::temporal::{LocalDateTime, ZonedDateTime};
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+    let k = s.intern_token(Namespace::PropKey, "when").unwrap();
+    let zdt = Value::ZonedDateTime(ZonedDateTime {
+        local: LocalDateTime {
+            epoch_seconds: 1_700_000_000,
+            nanos: 42,
+        },
+        offset_seconds: 3600,
+        zone_id: "Europe/Lisbon".to_owned(),
+    });
+    s.set_node_property_value(txn, n, k, &zdt).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut rec = recover_no_force(&s);
+    let vals = rec.node_property_values(n).unwrap();
+    let v = vals
+        .iter()
+        .find(|(_, key, _)| *key == k)
+        .map(|(_, _, v)| v.clone());
+    assert_eq!(
+        v,
+        Some(zdt),
+        "committed temporal property recovers byte-for-byte"
+    );
 }
 
 #[test]

@@ -4,10 +4,11 @@
 //! Relationship properties mirror the node-property path exactly: a relationship's property chain is
 //! rooted at [`RelRecord.first_prop`](graphus_storage::record::RelRecord) — the relationship analogue
 //! of `NodeRecord.first_prop` — threaded through the **same** `props.store` records and overflowing
-//! `String`/`List` values to the **same** `strings.store` heap (`rmp` task #43). These tests are the
-//! relationship counterpart of `tests/overflow_heap.rs`:
+//! `String`/`List`/temporal values to the **same** `strings.store` heap (`rmp` task #43). These tests
+//! are the relationship counterpart of `tests/overflow_heap.rs`:
 //!
-//! * **set / get / remove round-trips** for an inline scalar, a multi-block `String`, and a `List`;
+//! * **set / get / remove round-trips** for an inline scalar, a multi-block `String`, a `List`, and
+//!   temporal values;
 //! * **independence** across distinct relationships (one rel's properties never bleed into another);
 //! * **`delete_rel` frees the property chain + every overflow chain** (asserted via
 //!   [`RecordStore::heap_block_usage`] and a record-leak check — no block, no property leak);
@@ -123,6 +124,47 @@ fn string_and_list_rel_values_round_trip_through_the_heap() {
 
     assert_eq!(rel_val(&mut s, r, k_s), Some(Value::String(long)));
     assert_eq!(rel_val(&mut s, r, k_l), Some(list));
+    s.commit(txn).unwrap();
+}
+
+#[test]
+fn temporal_rel_values_round_trip_through_the_heap() {
+    use graphus_core::value::temporal::{Date, Duration, LocalDateTime, ZonedDateTime};
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let r = rel_between(&mut s, txn);
+    let k_d = s.intern_token(Namespace::PropKey, "met_on").unwrap();
+    let k_z = s.intern_token(Namespace::PropKey, "confirmed_at").unwrap();
+    let k_dur = s.intern_token(Namespace::PropKey, "lasted").unwrap();
+
+    let date = Value::Date(Date {
+        days_since_epoch: -3650, // a pre-epoch date
+    });
+    let zdt = Value::ZonedDateTime(ZonedDateTime {
+        local: LocalDateTime {
+            epoch_seconds: 1_700_000_000,
+            nanos: 999_999_999,
+        },
+        offset_seconds: -28_800,
+        zone_id: "America/Los_Angeles".to_owned(),
+    });
+    let dur = Value::Duration(Duration {
+        months: 1,
+        days: -2,
+        seconds: 3,
+        nanos: -4,
+    });
+    s.set_rel_property_value(txn, r, k_d, &date).unwrap();
+    s.set_rel_property_value(txn, r, k_z, &zdt).unwrap();
+    s.set_rel_property_value(txn, r, k_dur, &dur).unwrap();
+
+    // Temporal values go through the overflow heap (none fits the 64-bit inline payload).
+    assert!(s.heap_block_usage().unwrap() >= 3);
+    assert_eq!(rel_val(&mut s, r, k_d), Some(date));
+    assert_eq!(rel_val(&mut s, r, k_z), Some(zdt));
+    assert_eq!(rel_val(&mut s, r, k_dur), Some(dur));
     s.commit(txn).unwrap();
 }
 

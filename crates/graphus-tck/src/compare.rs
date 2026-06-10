@@ -125,6 +125,12 @@ pub fn matches(expected: &ExpectedValue, actual: &Concrete) -> bool {
 
         // ---- pure property values: defer to the engine's equivalence ---------------------------
         (_, Concrete::Value(av)) => match expected_to_value(expected) {
+            // TCK feature files write temporal cells as their canonical ISO-8601 strings
+            // (`| d | '1984-10-11' |`), so a temporal actual matches the expected string of its
+            // ISO rendering (the engine's `Display` impls are pinned to the TCK formats).
+            Some(Value::String(s)) if temporal_iso(av).is_some() => {
+                temporal_iso(av).is_some_and(|iso| iso == s)
+            }
             Some(ev) => equivalent(av, &ev),
             // A structural expected value can never equal a pure property value.
             None => false,
@@ -132,6 +138,19 @@ pub fn matches(expected: &ExpectedValue, actual: &Concrete) -> bool {
 
         // Any other cross-kind pairing is a non-match.
         _ => false,
+    }
+}
+
+/// The canonical ISO-8601 rendering of a temporal [`Value`], or `None` for non-temporals.
+fn temporal_iso(v: &Value) -> Option<String> {
+    match v {
+        Value::Date(d) => Some(d.to_string()),
+        Value::LocalTime(t) => Some(t.to_string()),
+        Value::ZonedTime(t) => Some(t.to_string()),
+        Value::LocalDateTime(dt) => Some(dt.to_string()),
+        Value::ZonedDateTime(z) => Some(z.to_string()),
+        Value::Duration(d) => Some(d.to_string()),
+        _ => None,
     }
 }
 

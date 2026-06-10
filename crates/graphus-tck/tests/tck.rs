@@ -26,19 +26,18 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **1782 / 3884 scenarios pass (45.88 %)**, with 0 panics and 50 scenarios skipped
+/// Current ratchet: **2614 / 3884 scenarios pass (67.30 %)**, with 0 panics and 50 scenarios skipped
 /// as genuinely unsupported (all `CALL`-procedure forms — the engine has no procedure facility yet).
-/// This rose from 1192 when `rmp` task #54 delivered quantifier predicates
-/// (`all`/`any`/`none`/`single` under Kleene 3VL), list/pattern-comprehension evaluation, and the
-/// pattern-form `EXISTS { ... }` existential subquery, all backed by an expression-level pattern
-/// matcher (+590 scenarios). Prior rises: 1112 → 1192 (#55, verbatim column names);
-/// 1095 → 1112 (#52, eager writes under `LIMIT`); 1094 → 1095 (#22, `count(<entity>)`). The
-/// remaining failures are honest engine gaps, dominated by: missing temporal builtins
-/// (`datetime`/`date`/`duration`/…), error-classification mismatches (SyntaxError vs SemanticError
-/// vs runtime), the full-query `EXISTS { MATCH ... RETURN ... }` form, and assorted missing
-/// builtins (`nodes`, `rand`, …). See the printed `failure reasons` histogram for the live
-/// breakdown.
-const BASELINE: usize = 1782;
+/// This rose from 1782 when `rmp` task #53 delivered the temporal type system: constructors
+/// (`date`/`time`/`datetime`/`localtime`/`localdatetime`/`duration` over strings, component maps
+/// and projections), component access (`d.year`, `dur.minutesOfHour`, …), calendar-aware
+/// arithmetic, `duration.between/inMonths/inDays/inSeconds`, `<type>.truncate`, and TCK
+/// temporal-vs-ISO-string result matching (+832 scenarios). Prior rises: 1192 → 1782 (#54,
+/// quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55, verbatim column names); 1095 → 1112
+/// (#52, eager writes under `LIMIT`). Remaining failures are honest gaps: IANA zone resolution
+/// (rmp #60, needs a tz database), error-classification mismatches (rmp #56), CALL procedures
+/// (rmp #57), the full-query `EXISTS { ... RETURN ... }` form, and assorted missing builtins.
+const BASELINE: usize = 2614;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

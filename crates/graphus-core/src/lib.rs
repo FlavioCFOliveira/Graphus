@@ -11,9 +11,15 @@
 
 pub use error::{GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
+pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 pub use version::{MAX_TIMESTAMP, VersionStamp};
+
+/// Calendar conversions, validated construction, openCypher component
+/// accessors, ISO-8601 parsing/formatting, and arithmetic for the temporal
+/// value types in [`value::temporal`].
+pub mod temporal_calc;
 
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {
