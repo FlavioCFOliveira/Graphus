@@ -9,4 +9,14 @@ authors.workspace = true
 description = "Bolt protocol and PackStream codec over UDS and TCP for Graphus."
 
 [dependencies]
+# The shared `Value` model (`04 §7.2`) and the error taxonomy this crate maps onto Bolt FAILURE.
 graphus-core = { path = "../graphus-core" }
+# Bolt native auth: HELLO/LOGON credentials resolve through `Authenticator::authenticate_password`
+# (`04 §8.4`). No socket/TLS work happens here; the listener wires the transport (rmp #20).
+graphus-auth = { path = "../graphus-auth" }
+
+[dev-dependencies]
+# Round-trip property tests for the PackStream codec (encode∘decode == id for every value class,
+# across every marker-width boundary). `default-features = false` + only `std` keeps the test-time
+# dependency tree minimal (no fork/timeout/tempfile, which we do not use).
+proptest = { version = "1", default-features = false, features = ["std"] }
