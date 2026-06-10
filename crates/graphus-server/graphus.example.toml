@@ -1,0 +1,54 @@
+# Example Graphus server configuration (see `src/config.rs` / `04-technical-design.md` §9).
+#
+# Load with: `graphus-server graphus.example.toml`
+# Every field below is optional and shown with a representative value; omit a field to take its
+# default. Environment variables (`GRAPHUS_*`) override the file at startup.
+
+# Directory holding the record-store device file + the WAL file (created if absent).
+store_path = "graphus-data"
+# Buffer-pool capacity in pages (04 §3).
+buffer_pool_pages = 4096
+# Dedicated fsync threads for the durability offload pool (04 §9.1).
+fsync_threads = 2
+
+# Listeners. Set an address to "" (or remove it) to disable that listener.
+#   - UDS (Bolt): kernel-protected local channel, peer-cred auth, no TLS.
+#   - Bolt over TCP: TLS mandatory (unless allow_insecure_network = true).
+#   - REST: TLS mandatory (unless allow_insecure_network = true), Bearer/JWT auth.
+uds_path = "graphus.sock"
+bolt_tcp_addr = "127.0.0.1:7687"
+rest_addr = "127.0.0.1:7474"
+
+# HS256 JWT signing secret for REST Bearer auth. MUST be changed from the built-in default whenever
+# the REST listener is enabled (the server refuses to start with the insecure default).
+jwt_secret = "change-me-to-a-long-random-secret-value"
+
+# Escape hatch: allow a network listener without TLS (test/dev only). Off by default.
+# allow_insecure_network = false
+
+[tls]
+# PEM certificate chain + private key for the TLS network listeners (Bolt-TCP, REST).
+cert_path = "tls/cert.pem"
+key_path = "tls/key.pem"
+
+[admission]
+# Max concurrently-executing queries; excess is fast-rejected as "server busy" (04 §9.3).
+max_concurrent_queries = 256
+# Bounded engine command-channel capacity (the submission queue).
+engine_queue_capacity = 1024
+# Bounded result-row channel capacity (egress backpressure).
+result_buffer_capacity = 256
+
+[timing]
+# Queries slower than this are written to the slow-query log (04 §9 / NFR-10).
+slow_query_threshold_ms = 500
+# Hard deadline for draining in-flight work on graceful shutdown before stragglers are rolled back.
+shutdown_drain_deadline_ms = 10000
+
+[auth]
+# The initial admin user seeded into the RBAC catalog at startup.
+admin_user = "admin"
+# Admin password for Bolt LOGON / REST Bearer minting. Empty disables admin password auth.
+admin_password = "change-me"
+# OS uid bound to the admin user for UDS SO_PEERCRED auth (optional).
+# admin_uid = 1000
