@@ -1,0 +1,4 @@
+openCypher TCK pinned snapshot
+repo:   https://github.com/opencypher/openCypher
+commit: 370fe27f417730dca2ef712dd1c0c5dadcb99ef8
+date:   2024-08-16

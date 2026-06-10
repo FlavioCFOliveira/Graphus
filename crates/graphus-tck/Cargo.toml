@@ -10,3 +10,26 @@ description = "openCypher TCK harness for Graphus."
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+# The harness drives the full Cypher pipeline (parse -> analyze -> lower -> plan -> bind -> execute)
+# and reuses the engine's value-model comparison (`equivalence` for unordered result sets,
+# `ordering` for ORDER BY) so the comparison the TCK requires is the *same* code the engine ships
+# (`CLAUDE.md`: measure to decide; never reinvent the value semantics).
+graphus-cypher = { path = "../graphus-cypher" }
+# A scenario runs over the **real** persistent record store (a `RecordStoreGraph` wrapping a
+# `RecordStore` over an in-memory device + WAL), exactly as `graphus-cypher`'s own end-to-end tests
+# construct it. These edges are acyclic (storage/io/wal never depend on cypher or tck).
+graphus-storage = { path = "../graphus-storage" }
+graphus-io = { path = "../graphus-io" }
+graphus-wal = { path = "../graphus-wal" }
+
+[dependencies.gherkin]
+# Pure-Rust Gherkin parser (no JVM, no Cucumber runtime). We hand-roll the scenario runner over its
+# parsed model (`Feature`/`Scenario`/`Step`/`Examples`/`Table`) rather than adopt the `cucumber`
+# crate, whose async world model fights our per-scenario fresh-store setup. `0.16` is the current
+# release on crates.io (verified 2026-06-10).
+version = "0.16"
+default-features = false
+# `parser` brings in `Feature::parse`/`parse_path` and `GherkinEnv`; it is the only feature we need.
+# We keep `default-features = false` so the optional `serde`/`juniper` integrations stay out of the
+# build graph.
+features = ["parser"]
