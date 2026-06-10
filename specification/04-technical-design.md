@@ -1086,6 +1086,17 @@ escalations already in `02-decision-register.md`.
    read concurrency on aarch64.
 8. **Sharded write path: single log shard + group commit vs partitioned logging** (§9.1) — measure
    on the traversal-heavy benchmark that `D-runtime-model` requires before locking the runtime shape.
+   **Resolved (SPIKE #8) — keep candidate (a): single log shard + group commit.** The Criterion
+   commit-path benchmark (`crates/graphus-bench/benches/commit_path.rs`, results in
+   `crates/graphus-bench/RESULTS.md`) measured the real `RecordStore` commit path on x86_64: sustained
+   short write transactions run at p50 3.4 µs / **p99 7.2 µs** / ~173 K commits·s⁻¹ single-thread, with
+   p99 **flat across a 1 K→50 K transaction stream** (no log-tail saturation) and bounded across a
+   1→256-ops/commit WAL-volume sweep (group commit amortizes sub-linearly per op). Partitioned logging
+   (b) is therefore **not built** — per §9.1 it is warranted "only if (a) is shown to bottleneck", and
+   nothing in the single-node envelope shows that. **Revisit (b)** only if the multi-threaded
+   group-commit benchmark (the follow-up needing the §9.1 commit queue) shows a p99 saturation knee vs
+   offered concurrency. The aarch64 run is deferred to capable hardware (the benchmark is the reusable
+   instrument). *No p99 regression vs the 1-op baseline (6.2 µs).*
 9. **Allocator** (`D-allocator`): system default first; benchmark mimalloc/jemalloc per target before
    adopting (jemalloc has Apple-Silicon friction). Decision is per-target, evidence-gated.
 10. **Dense-node promotion threshold** (§2.5) — measure the degree at which the grouped representation

@@ -7,6 +7,33 @@ license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Criterion micro-benchmarks and LDBC SNB macro harness for Graphus."
+# Benchmark targets are listed explicitly below; disable auto-discovery so the shared fixture file
+# `benches/common.rs` (included by each target via `#[path]`) is not itself built as a bench target.
+autobenches = false
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+
+[dev-dependencies]
+# The commit-path and read-path benchmarks drive the real persistent store end to end over the
+# in-memory DST device + log sink, so the WAL group-commit serialization point (`04 §4.2`/§9.1)
+# and the lock-free read path (`04 §9.1`) are exercised deterministically without disk noise.
+graphus-storage = { path = "../graphus-storage" }
+graphus-wal = { path = "../graphus-wal" }
+graphus-io = { path = "../graphus-io" }
+
+# Lean Criterion (same pin/features as `graphus-io`'s `loopback` bench): `cargo_bench_support` is
+# what lets `cargo bench` actually run the harness; gnuplot/HTML/rayon are left off to keep the dev
+# build lean. The commit/read benches are synchronous (no `async_tokio` needed) — the store API is
+# synchronous and the DST sink models the `fdatasync` inline (`04 §9.1`).
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "commit_path"
+harness = false
+
+[[bench]]
+name = "read_path"
+harness = false

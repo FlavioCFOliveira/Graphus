@@ -765,7 +765,11 @@ dependencies = [
 name = "graphus-bench"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "graphus-core",
+ "graphus-io",
+ "graphus-storage",
+ "graphus-wal",
 ]
 
 [[package]]
