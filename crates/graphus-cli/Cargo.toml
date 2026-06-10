@@ -6,7 +6,41 @@ rust-version.workspace = true
 license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Interactive shell and admin client for Graphus."
+description = "Interactive Cypher shell and admin client for Graphus, over Bolt/UDS."
+
+[lib]
+name = "graphus_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "graphus-cli"
+path = "src/main.rs"
 
 [dependencies]
+# The shared value model packed/unpacked on the Bolt wire (the "one value model", `04 §8.3`).
 graphus-core = { path = "../graphus-core" }
+# The transport-agnostic Bolt 5.4 codec. The CLI is a *client*: it reuses the symmetric wire codec
+# (handshake, framing, message, packstream) and only owns the socket I/O. No wire format is
+# reinvented here (`04 §8.1`).
+graphus-bolt = { path = "../graphus-bolt" }
+
+# Line editing + history for the interactive REPL (the expected shell UX). Pinned to 17, not 18:
+# under the workspace's MSRV-aware resolver (resolver = "3", rust-version = 1.85), rustyline 17
+# resolves a `home 0.5.11` that builds on 1.85, whereas rustyline 18 forces `home 0.5.12` which
+# requires Rust 1.88 and would break the declared MSRV. Default features (history, line editing).
+rustyline = "17"
+
+# Argument parsing for the binary (`--uds`, `--user`, `--password`, `-c`). `clap` is already in the
+# workspace lock as a transitive dependency; the `derive` feature gives the typed `Args` struct.
+clap = { version = "4", features = ["derive"] }
+
+# No-echo password prompt when `--password`/`$GRAPHUS_PASSWORD` are absent. The canonical, audited
+# Rust crate for this; on Linux it pulls only `libc` + `rtoolbox` (the windows-* deps are
+# target-gated). Avoids hand-rolling `unsafe` termios toggling for a tiny, well-trodden need.
+rpassword = "7"
+
+[dev-dependencies]
+# The AC integration test boots a REAL server in-process and drives the CLI client over its UDS
+# socket. Booting the async server needs Tokio; the CLI client itself stays synchronous.
+graphus-server = { path = "../graphus-server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
