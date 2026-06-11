@@ -76,6 +76,7 @@ impl Drop for TempStore {
 fn base_config(temp: &TempStore) -> ServerConfig {
     ServerConfig {
         store_path: temp.store_dir(),
+        default_database: "graphus".to_owned(),
         buffer_pool_pages: 256,
         fsync_threads: 1,
         bolt_tcp_addr: None,

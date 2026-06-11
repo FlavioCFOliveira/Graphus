@@ -7,6 +7,9 @@
 //!   `TxnCoordinator` over the real `RecordStore`) on a dedicated thread behind a bounded command
 //!   channel, the §9.1 "one shard" of the sharded write/ACID path. Both connectivity seams
 //!   ([`engine::BoltEngineExecutor`], [`engine::RestEngineAdapter`]) are thin clients of it.
+//! - **The database catalog** ([`dbcatalog`], decision `D-multi-db`) — the crash-safe catalog of
+//!   named databases (one independent store + engine per database) and the registry of their
+//!   running engines.
 //! - **The listeners** ([`listeners`]) — the three async accept loops (UDS-Bolt, TCP-Bolt+TLS,
 //!   REST+TLS), each accepted connection a Tokio task.
 //! - **Admission control + load shedding** ([`engine::EngineHandle::try_admit`], `04 §9.3`).
@@ -19,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod dbcatalog;
 pub mod engine;
 pub mod listeners;
 pub mod metrics;
@@ -27,4 +31,5 @@ pub mod server;
 pub mod shutdown;
 
 pub use config::{ConfigError, ServerConfig};
+pub use dbcatalog::{CatalogError, DatabaseCatalog, DbInfo, DbState};
 pub use server::{Server, ServerError, ServerHandle};

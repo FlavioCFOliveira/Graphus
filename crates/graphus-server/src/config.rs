@@ -163,7 +163,19 @@ impl Default for AuthBootstrap {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Directory holding the record-store device file and the WAL file. Created if absent.
+    ///
+    /// With multi-database support (decision `D-multi-db`, rmp #83) this directory is the
+    /// **default database's** directory and the data root: additional databases live under
+    /// `<store_path>/databases/<name>/` and the durable catalog at `<store_path>/databases.toml`
+    /// (see [`crate::dbcatalog`]).
     pub store_path: PathBuf,
+    /// The **default database's** name (decision `D-multi-db`, rmp #83). It lives directly in
+    /// [`store_path`](Self::store_path) (the backward-compatible single-db layout), always exists,
+    /// is always online while the server runs, and can never be dropped. Must satisfy the
+    /// database-name rule (`[a-z][a-z0-9_-]{0,62}`, compared case-insensitively, stored
+    /// lowercase — see [`crate::dbcatalog::normalize_db_name`]); checked by
+    /// [`validate`](Self::validate).
+    pub default_database: String,
     /// Buffer-pool capacity in pages (`04 §3`).
     pub buffer_pool_pages: usize,
     /// Number of dedicated `fsync` threads in the durability offload pool (`04 §9.1`).
@@ -202,6 +214,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             store_path: PathBuf::from("graphus-data"),
+            default_database: crate::dbcatalog::DEFAULT_DATABASE_NAME.to_owned(),
             buffer_pool_pages: 4096,
             fsync_threads: 2,
             bolt_tcp_addr: None,
@@ -271,6 +284,9 @@ impl ServerConfig {
         {
             self.uds_path = None;
         }
+        // Database names are case-insensitive and stored lowercase (`crate::dbcatalog`); normalise
+        // the configured default here so the rest of the server only ever sees the canonical form.
+        self.default_database = self.default_database.trim().to_ascii_lowercase();
     }
 
     /// Overlays the recognised `GRAPHUS_*` environment variables onto `self`.
@@ -283,6 +299,9 @@ impl ServerConfig {
 
         if let Ok(v) = var("GRAPHUS_STORE_PATH") {
             self.store_path = PathBuf::from(v);
+        }
+        if let Ok(v) = var("GRAPHUS_DEFAULT_DATABASE") {
+            self.default_database = v;
         }
         if let Ok(v) = var("GRAPHUS_BOLT_TCP_ADDR") {
             self.bolt_tcp_addr = empty_to_none(v);
@@ -340,6 +359,9 @@ impl ServerConfig {
                 "buffer_pool_pages must be > 0".to_owned(),
             ));
         }
+        if let Err(e) = crate::dbcatalog::normalize_db_name(&self.default_database) {
+            return Err(ConfigError::Invalid(format!("default_database: {e}")));
+        }
         if self.admission.max_concurrent_queries == 0 {
             return Err(ConfigError::Invalid(
                 "admission.max_concurrent_queries must be > 0".to_owned(),
@@ -377,16 +399,18 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// The path to the record-store device file within [`store_path`](Self::store_path).
+    /// The path to the **default database's** record-store device file within
+    /// [`store_path`](Self::store_path) (additional databases live under `databases/<name>/` —
+    /// see [`crate::dbcatalog`]).
     #[must_use]
     pub fn device_file(&self) -> PathBuf {
-        self.store_path.join("graphus.store")
+        self.store_path.join(crate::dbcatalog::STORE_FILE_NAME)
     }
 
-    /// The path to the WAL file within [`store_path`](Self::store_path).
+    /// The path to the **default database's** WAL file within [`store_path`](Self::store_path).
     #[must_use]
     pub fn wal_file(&self) -> PathBuf {
-        self.store_path.join("graphus.wal")
+        self.store_path.join(crate::dbcatalog::WAL_FILE_NAME)
     }
 }
 
@@ -531,5 +555,36 @@ mod tests {
         // `deny_unknown_fields` catches typos in operator config.
         let toml = "store_pathh = \"/oops\"\n";
         assert!(toml::from_str::<ServerConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn default_database_defaults_and_is_validated() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.default_database, "graphus");
+
+        // An invalid default-database name is rejected with a clear message.
+        let cfg = ServerConfig {
+            default_database: "no/slash".to_owned(),
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn normalize_lowercases_the_default_database() {
+        // Names are case-insensitive and stored lowercase (`crate::dbcatalog`).
+        let mut cfg = ServerConfig {
+            default_database: "  MyGraph ".to_owned(),
+            ..ServerConfig::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.default_database, "mygraph");
+        assert!(
+            crate::dbcatalog::normalize_db_name(&cfg.default_database).is_ok(),
+            "the normalised form passes the name rule"
+        );
     }
 }

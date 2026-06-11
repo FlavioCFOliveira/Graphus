@@ -5,11 +5,16 @@
 //!
 //! 1. Validate config; init logging + the slow-query threshold.
 //! 2. Build the [`graphus_auth::Authenticator`] (RBAC bootstrap, JWT secret, UDS uid map, TLS config).
-//! 3. Spawn the **engine thread**, which constructs the `!Send` `TxnCoordinator` *on the thread*: it
-//!    opens-or-creates the [`graphus_storage::RecordStore`], runs recovery, and — per `04 §4.6`/§4.8 —
-//!    runs [`graphus_storage::check::verify_on_open`], **refusing to serve a corrupt store**.
+//! 3. Load the **database catalog** ([`crate::dbcatalog`], decision `D-multi-db`) — a malformed
+//!    catalog fails startup closed. Start the **default database's** engine thread, which
+//!    constructs the `!Send` `TxnCoordinator` *on the thread*: it opens-or-creates the
+//!    [`graphus_storage::RecordStore`], runs recovery, and — per `04 §4.6`/§4.8 — runs
+//!    `verify_on_open`, **refusing to serve a corrupt store** (its failure fails startup, exactly
+//!    the single-db behaviour). Then start every additional catalog database whose desired state
+//!    is online; one of those failing is logged and never blocks the server.
 //! 4. Start the three listeners (each enabled one) on the Tokio runtime.
-//! 5. Mark ready; await a shutdown signal; drive graceful shutdown (`04 §9.4`).
+//! 5. Mark ready; await a shutdown signal; drive graceful shutdown (`04 §9.4`) across every
+//!    running database engine.
 //!
 //! The server is built with [`Server::new`] and run with [`Server::run`]; tests use
 //! [`Server::start`] to boot it in the background and drive it over loopback.
@@ -19,16 +24,12 @@ use std::sync::Arc;
 
 use graphus_auth::{Authenticator, Privilege};
 use graphus_core::capability::Clock;
-use graphus_cypher::TxnCoordinator;
-use graphus_io::{FileBlockDevice, FsyncPool};
-use graphus_storage::RecordStore;
-use graphus_storage::check::verify_on_open;
-use graphus_storage::recovery::recover_device;
-use graphus_wal::{FileLogSink, WalManager};
+use graphus_io::FsyncPool;
 use rustls::ServerConfig as RustlsServerConfig;
 
 use crate::config::ServerConfig;
-use crate::engine::{Engine, EngineHandle, spawn_engine};
+use crate::dbcatalog::DatabaseCatalog;
+use crate::engine::EngineHandle;
 use crate::listeners::{self, Listeners};
 use crate::metrics::Metrics;
 use crate::observability;
@@ -59,6 +60,9 @@ pub enum ServerError {
     Config(crate::config::ConfigError),
     /// Opening/recovering/verifying the store failed (e.g. integrity-check failure — `04 §4.6`).
     Storage(graphus_core::GraphusError),
+    /// Loading the durable database catalog failed (a malformed `databases.toml` fails startup
+    /// closed — `crate::dbcatalog`).
+    Catalog(crate::dbcatalog::CatalogError),
     /// Building the RBAC bootstrap or TLS config failed.
     Auth(String),
     /// Binding a listener socket failed.
@@ -70,6 +74,7 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::Config(e) => write!(f, "config error: {e}"),
             Self::Storage(e) => write!(f, "storage error: {e}"),
+            Self::Catalog(e) => write!(f, "catalog error: {e}"),
             Self::Auth(m) => write!(f, "auth setup error: {m}"),
             Self::Listener(m) => write!(f, "listener error: {m}"),
         }
@@ -94,8 +99,12 @@ pub struct ServerHandle {
     pub uds_path: Option<std::path::PathBuf>,
     /// The shared metrics registry (tests assert against it).
     pub metrics: Arc<Metrics>,
-    /// The engine client (tests can probe status / drive admin actions).
+    /// The **default database's** engine client (tests can probe status / drive admin actions).
+    /// The existing single-database consumers keep working against this handle unchanged.
     pub engine: EngineHandle,
+    /// The database catalog: named databases, their durable lifecycle state, and the registry of
+    /// running engines (decision `D-multi-db`, rmp #83 — the rmp-#84 admin surface drives it).
+    pub catalog: Arc<DatabaseCatalog>,
     /// Triggers graceful shutdown when fired.
     shutdown: ShutdownCoordinator,
     /// Per-server readiness (`/health/ready`); tests may probe it directly.
@@ -181,12 +190,20 @@ impl Server {
         let auth = Arc::new(build_authenticator(&config)?);
         let tls = build_tls(&config, &auth)?;
 
-        // 2) Engine: spawn the thread, constructing the `!Send` coordinator *on the thread* (it owns
-        //    the store; opening/recovering/verifying happens there — `04 §4.6`/§4.8).
-        let engine = spawn_store_engine(&config, Arc::clone(&metrics))?;
-        let handle = engine
-            .handle
-            .with_admission_limit(config.admission.max_concurrent_queries);
+        // 2) The database catalog + engines (`crate::dbcatalog`, decision `D-multi-db`): load the
+        //    durable catalog (malformed ⇒ fail startup closed), start the default database (its
+        //    failure fails startup — unchanged single-db behaviour; the `!Send` coordinator is
+        //    constructed *on its engine thread*, opening/recovering/verifying there — `04
+        //    §4.6`/§4.8), then start every additional database marked online (failures logged,
+        //    never fatal). The returned handle already carries the admission limit (`04 §9.3`).
+        let catalog = Arc::new(
+            DatabaseCatalog::load(&config, Arc::clone(&metrics)).map_err(ServerError::Catalog)?,
+        );
+        let handle = catalog
+            .start_default()
+            .await
+            .map_err(ServerError::Storage)?;
+        catalog.start_catalog_databases().await;
 
         // 3) Durability offload pool (`04 §9.1`). The engine thread does its own (off-runtime) syncs
         //    for the store image; the pool is the shared offload available to the runtime so no sync
@@ -222,11 +239,11 @@ impl Server {
             "graphus-server ready",
         );
 
-        // The run loop: own the engine + listeners + pool, await the shutdown trigger, drain.
+        // The run loop: own the catalog (every engine) + listeners + pool, await the shutdown
+        // trigger, drain.
         let runner = tokio::spawn(run_loop(
-            engine,
+            Arc::clone(&catalog),
             bound.clone(),
-            handle.clone(),
             fsync_pool,
             shutdown.clone(),
             readiness.clone(),
@@ -238,6 +255,7 @@ impl Server {
             uds_path: bound.uds_path,
             metrics,
             engine: handle,
+            catalog,
             shutdown,
             readiness,
             runner,
@@ -246,12 +264,12 @@ impl Server {
 }
 
 /// The run loop owned by the background task: awaits the shutdown trigger, then performs the §9.4
-/// graceful sequence — stop accepting (drop the listeners), drain + flush via the engine, join the
-/// engine thread, and tear down the fsync pool.
+/// graceful sequence — stop accepting (drop the listeners), drain + flush every database engine
+/// and join its thread (additional databases first, the default last — see
+/// [`DatabaseCatalog::shutdown_all`]), and tear down the fsync pool.
 async fn run_loop(
-    engine: Engine,
+    catalog: Arc<DatabaseCatalog>,
     bound: Listeners,
-    handle: EngineHandle,
     fsync_pool: Arc<FsyncPool>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
@@ -265,18 +283,10 @@ async fn run_loop(
     // tasks keep running until they finish or the drain deadline forces them down (`04 §9.4`).
     bound.stop_accepting();
 
-    // Drain in-flight transactions + flush + fdatasync + clean exit, on the engine thread.
-    tracing::info!("graceful shutdown: draining in-flight transactions and hardening the store");
-    match handle.shutdown().await {
-        Ok(()) => tracing::info!("store hardened and marked clean"),
-        Err(e) => tracing::error!(error = %e, "error hardening the store on shutdown"),
-    }
-
-    // Join the engine thread (it exits its loop after the Shutdown command).
-    let Engine { join, .. } = engine;
-    if let Err(e) = tokio::task::spawn_blocking(move || join.join()).await {
-        tracing::error!(error = %e, "joining engine thread");
-    }
+    // Drain in-flight transactions + flush + fdatasync + clean exit, on each engine's own thread.
+    // Durable desired states are untouched: a database online now comes back online at next boot.
+    tracing::info!("graceful shutdown: draining in-flight transactions and hardening the stores");
+    catalog.shutdown_all().await;
 
     // Tear down the durability pool last (its Drop joins the sync threads).
     drop(fsync_pool);
@@ -336,78 +346,4 @@ fn build_tls(
 fn read_to_string(path: &Path) -> Result<String, ServerError> {
     std::fs::read_to_string(path)
         .map_err(|e| ServerError::Auth(format!("reading {}: {e}", path.display())))
-}
-
-/// Spawns the engine thread, constructing the coordinator (and opening/recovering/verifying the
-/// store) **on that thread** (`04 §4.6`/§4.8). The build closure captures only `Send` data (paths +
-/// sizes), so the `!Send` coordinator never crosses the thread boundary.
-fn spawn_store_engine(config: &ServerConfig, metrics: Arc<Metrics>) -> Result<Engine, ServerError> {
-    // Ensure the store directory exists.
-    std::fs::create_dir_all(&config.store_path).map_err(|e| {
-        ServerError::Storage(graphus_core::GraphusError::Storage(format!(
-            "creating store dir {}: {e}",
-            config.store_path.display()
-        )))
-    })?;
-
-    let device_file = config.device_file();
-    let wal_file = config.wal_file();
-    let pool_pages = config.buffer_pool_pages;
-    let queue = config.admission.engine_queue_capacity;
-    let result_buf = config.admission.result_buffer_capacity;
-
-    let build = move || open_or_create_coordinator(&device_file, &wal_file, pool_pages);
-
-    spawn_engine(build, queue, result_buf, metrics).map_err(ServerError::Storage)
-}
-
-/// Opens an existing store (recovering its WAL first) or creates a fresh one, then **verifies it**
-/// (`04 §4.6`/§4.8) — refusing to serve a corrupt store. Runs on the engine thread.
-///
-/// A store is "existing" when its device file is a non-empty whole number of pages; otherwise a fresh
-/// store is created. Recovery replays the durable WAL onto the device (ARIES redo+undo, `04 §4.8`)
-/// before the catalog is read back.
-fn open_or_create_coordinator(
-    device_file: &Path,
-    wal_file: &Path,
-    pool_pages: usize,
-) -> Result<TxnCoordinator<FileBlockDevice, FileLogSink>, graphus_core::GraphusError> {
-    use graphus_core::GraphusError;
-
-    let device_existing = device_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
-
-    let mut store = if device_existing {
-        // Existing store: recover the WAL onto the device, then reopen.
-        let mut device = FileBlockDevice::open(device_file)?;
-        let mut wal = WalManager::open(
-            FileLogSink::open(wal_file)
-                .map_err(|e| GraphusError::Storage(format!("opening WAL: {e}")))?,
-        )
-        .map_err(|e| GraphusError::Storage(format!("opening WAL manager: {e}")))?;
-        recover_device(&mut wal, &mut device)?;
-        // Reopen the WAL fresh for serving (recovery consumed the recovery view).
-        let wal = WalManager::open(
-            FileLogSink::open(wal_file)
-                .map_err(|e| GraphusError::Storage(format!("reopening WAL: {e}")))?,
-        )
-        .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
-        RecordStore::open(device, wal, pool_pages)?
-    } else {
-        // Fresh store on an empty device + a freshly-created WAL.
-        let device = FileBlockDevice::open(device_file)?;
-        let wal = WalManager::create(
-            FileLogSink::open(wal_file)
-                .map_err(|e| GraphusError::Storage(format!("creating WAL: {e}")))?,
-        )
-        .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
-        // Seed element ids from 1 (`04 §2.2`).
-        RecordStore::create(device, wal, pool_pages, 1)?
-    };
-
-    // The inviolable integrity gate (`04 §4.6`/§4.8): refuse to serve a corrupt store. The
-    // coordinator's secondary index is in-memory candidate-only (rebuilt from the store), so an
-    // empty `IndexAgreement` slice checks the store alone — correct here.
-    verify_on_open(&mut store, &[])?;
-
-    Ok(TxnCoordinator::new(store))
 }

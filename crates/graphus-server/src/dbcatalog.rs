@@ -1,0 +1,1752 @@
+//! The crash-safe **database catalog** + per-database engine runtime (decision `D-multi-db`,
+//! rmp #83 — the foundation half of multi-database support; the Cypher/Bolt/REST admin surface is
+//! rmp #84).
+//!
+//! Graphus serves multiple named databases from one server process. Each database is a fully
+//! independent [`graphus_storage::RecordStore`] (its own device file, WAL, token dictionaries and
+//! element-id sequence) driven by its own dedicated engine thread (see [`crate::engine`]) — storage
+//! isolation is structural, not advisory. This module adds the three pieces storage does not have:
+//! **naming**, **durable lifecycle state**, and **engine selection**.
+//!
+//! ## On-disk layout (backward compatible)
+//!
+//! ```text
+//! <store_path>/                      ← the DEFAULT database (the unchanged single-db layout)
+//! ├── graphus.store
+//! ├── graphus.wal
+//! ├── databases.toml                 ← the durable catalog (ABSENT ⇒ no additional databases)
+//! └── databases/
+//!     └── <name>/                    ← one directory per additional database
+//!         ├── graphus.store
+//!         └── graphus.wal
+//! ```
+//!
+//! The default database lives **directly in `store_path`**, exactly where a pre-multi-db deployment
+//! put it, so an existing single-database store opens completely unchanged, with zero migration.
+//!
+//! The default database is **implicit — never stored in `databases.toml`**. Storing it would create
+//! a reconciliation problem: the file could disagree with the config's `default_database` about the
+//! name, or claim the default is `offline` when the server must always serve it. Deriving it from
+//! config keeps a single source of truth, and makes the absent-catalog case (a fresh or pre-multi-db
+//! deployment) literally identical to "the default database only".
+//!
+//! ## Crash-safe persistence (the catalog itself is ACID)
+//!
+//! Every catalog mutation rewrites `databases.toml` with the classic atomic-replace protocol:
+//!
+//! 1. write the full new contents to `databases.toml.tmp`;
+//! 2. `fsync` the temp file (the bytes are durable *before* they become visible);
+//! 3. atomically `rename` it onto `databases.toml` (POSIX rename is all-or-nothing);
+//! 4. `fsync` the parent directory (the rename's directory entry is durable).
+//!
+//! A crash at any point leaves either the complete old file or the complete new file — never a
+//! torn one. On load, a leftover `.tmp` is a crashed step-1/2 whose rename never happened; the real
+//! file (or its absence) is authoritative, so the stale temp is removed. A **malformed** catalog
+//! file fails the load **closed** with a clear error: the server refuses to start rather than
+//! silently resetting state that names real data directories.
+//!
+//! A persist **failure** is resolved by *resync, not blind rollback*: the atomic replace can fail
+//! on either side of its `rename` — before it (the old file is still published) or after it (the
+//! new file is already visible, and may survive a crash even though the parent-directory `fsync`
+//! failed). The in-memory entries are therefore reloaded from whatever file is actually published
+//! (`persist_or_resync`); only if that reload also fails does memory fall back to the caller's
+//! pre-mutation snapshot, logged at error level.
+//!
+//! ## Lifecycle state model: desired vs. actual
+//!
+//! `databases.toml` records each additional database's **desired** state (`online` / `offline` —
+//! the operator's durable intent). The in-process registry holds the **actual** state (which
+//! engines are running). The two reconcile as follows:
+//!
+//! - **Boot**: the default database starts first and its failure fails startup (unchanged
+//!   single-db behaviour). Every catalog database whose desired state is `online` is then started;
+//!   a failure is logged and recorded in memory as *failed* — it does **not** flip the durable
+//!   desired state and does **not** prevent the server (or the other databases) from starting, so
+//!   one corrupt secondary database can never take down the rest.
+//! - **`create`**: provision the directory → persist the catalog entry (`online`) → start the
+//!   engine. A crash after provisioning leaves an *orphan directory without a catalog entry* —
+//!   inert, and reclaimed (cleared) by a later `create` of the same name. A crash after the persist
+//!   leaves an `online` entry whose store files do not exist yet — the next boot simply creates the
+//!   fresh store when it starts that database. If the engine fails to start, the entry is rolled
+//!   back (and the directory removed) so a failed `create` leaves no trace.
+//! - **`start`**: persist desired `online` first, then start the engine. A spawn failure is
+//!   reported and recorded as *failed* in memory; the durable intent stays `online`, so the boot
+//!   policy retries it — exactly the semantics of a database that failed at boot.
+//! - **`stop`**: drain + harden + join the engine first, then persist desired `offline`. If the
+//!   persist fails the error is reported and memory resyncs to the published file (normally still
+//!   `online`), so a retried `stop` skips the drain (the engine is already down) and re-attempts
+//!   the persist. A stop that never became durable behaves as if it never happened: the database
+//!   comes back at the next boot.
+//! - **`drop`**: only allowed when stopped. The catalog entry is removed (persisted) **first**,
+//!   then the directory is deleted. A crash in between leaves an orphan directory — inert, and
+//!   cleared by a future `create` of the same name (so dropped data can never resurrect).
+//!
+//! ## Registry locking design
+//!
+//! - **Mutations** (`create`/`start`/`stop`/`drop`/boot/shutdown) are serialized behind one
+//!   [`tokio::sync::Mutex`]. An async-aware mutex is required because `stop`/`shutdown` await the
+//!   engine's drain while holding the guard — sound on a Tokio mutex, an anti-pattern on a std one.
+//! - **Handle lookup** (the per-request hot path the rmp-#84 routing will hit) goes through a
+//!   [`std::sync::RwLock`]`<HashMap>`: readers take a brief read lock, clone the (cheap, three
+//!   pointer-sized fields) [`EngineHandle`], and release — never across an `.await`. Writers touch
+//!   it only inside admin-locked sections, so the lock order is always admin → handles.
+//!
+//! ## Database names
+//!
+//! Names are compared case-insensitively and stored lowercase. The accepted (normalized) form is
+//! `[a-z][a-z0-9_-]{0,62}` — 1 to 63 characters, starting with a lowercase ASCII letter, then
+//! lowercase letters, digits, `_` or `-`. The conservative charset makes a name always safe to use
+//! verbatim as a directory name (no separators, no `.`/`..`, no empty string, nothing the
+//! filesystem could interpret).
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError, RwLock};
+
+use graphus_core::GraphusError;
+use graphus_cypher::TxnCoordinator;
+use graphus_io::FileBlockDevice;
+use graphus_storage::RecordStore;
+use graphus_storage::check::verify_on_open;
+use graphus_storage::recovery::recover_device;
+use graphus_wal::{FileLogSink, WalManager};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::config::ServerConfig;
+use crate::engine::{Engine, EngineHandle, spawn_engine};
+use crate::metrics::Metrics;
+
+/// The default database's name when the config does not override it.
+pub const DEFAULT_DATABASE_NAME: &str = "graphus";
+
+/// The record-store device file name inside a database directory (shared with
+/// [`crate::config::ServerConfig::device_file`] so the two can never drift).
+pub const STORE_FILE_NAME: &str = "graphus.store";
+
+/// The WAL file name inside a database directory (shared with
+/// [`crate::config::ServerConfig::wal_file`]).
+pub const WAL_FILE_NAME: &str = "graphus.wal";
+
+/// The durable catalog file name, directly under the data root.
+pub const CATALOG_FILE_NAME: &str = "databases.toml";
+
+/// The temp file the atomic-replace protocol writes before the rename (see the module docs).
+const CATALOG_TMP_NAME: &str = "databases.toml.tmp";
+
+/// The directory (under the data root) holding the additional databases' directories.
+const DATABASES_DIR_NAME: &str = "databases";
+
+/// The catalog file format version this build reads and writes. A file with any other version
+/// fails the load closed (a future format change must bump this and ship explicit migration).
+const CATALOG_FORMAT_VERSION: u32 = 1;
+
+/// The maximum (normalized) database-name length, in bytes.
+pub const MAX_DB_NAME_LEN: usize = 63;
+
+// ------------------------------------------------------------------------------------------------
+// Errors
+// ------------------------------------------------------------------------------------------------
+
+/// How a catalog operation failed.
+#[derive(Debug)]
+pub enum CatalogError {
+    /// The database name does not satisfy the name rule (see the module docs).
+    InvalidName(String),
+    /// A filesystem operation on the catalog or a database directory failed.
+    Io {
+        /// The path the operation touched.
+        path: PathBuf,
+        /// What was being done + the underlying I/O error rendering.
+        source: String,
+    },
+    /// The catalog file exists but is malformed. The load **fails closed**: the server refuses to
+    /// start rather than silently resetting a catalog that names real data directories.
+    Corrupt {
+        /// The catalog file path.
+        path: PathBuf,
+        /// Why it could not be accepted.
+        reason: String,
+    },
+    /// Serializing the catalog for persistence failed (an internal invariant violation).
+    Encode(String),
+    /// `create` of a name that already exists (including the default database's name).
+    AlreadyExists(String),
+    /// The named database is not in the catalog.
+    UnknownDatabase(String),
+    /// The operation is not allowed on the default database (it always exists, is always online
+    /// while the server runs, and is managed by the server lifecycle — not the admin API).
+    DefaultDatabase {
+        /// The default database's name.
+        name: String,
+        /// The rejected operation (`"create"`, `"start"`, `"stop"`, `"drop"`).
+        operation: &'static str,
+    },
+    /// `drop` of a database that is not stopped (drop requires desired + actual state offline).
+    NotOffline(String),
+    /// Starting or stopping the database's engine failed (e.g. an integrity-check failure).
+    Engine(GraphusError),
+}
+
+impl std::fmt::Display for CatalogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName(name) => write!(
+                f,
+                "invalid database name {name:?}: a name is 1-{MAX_DB_NAME_LEN} characters matching \
+                 [a-z][a-z0-9_-]* (compared case-insensitively, stored lowercase)"
+            ),
+            Self::Io { path, source } => {
+                write!(f, "catalog I/O error at {}: {source}", path.display())
+            }
+            Self::Corrupt { path, reason } => write!(
+                f,
+                "catalog file {} is malformed: {reason}. Refusing to start — repair or remove the \
+                 file explicitly; the server never resets a corrupt catalog",
+                path.display()
+            ),
+            Self::Encode(m) => write!(f, "encoding catalog: {m}"),
+            Self::AlreadyExists(name) => write!(f, "database {name:?} already exists"),
+            Self::UnknownDatabase(name) => write!(f, "database {name:?} does not exist"),
+            Self::DefaultDatabase { name, operation } => {
+                write!(f, "cannot {operation} the default database {name:?}")
+            }
+            Self::NotOffline(name) => write!(
+                f,
+                "database {name:?} must be stopped (offline) before it can be dropped"
+            ),
+            Self::Engine(e) => write!(f, "database engine error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CatalogError {}
+
+// ------------------------------------------------------------------------------------------------
+// Names
+// ------------------------------------------------------------------------------------------------
+
+/// Normalizes (trims + lowercases) and validates a database name, returning the canonical stored
+/// form.
+///
+/// The accepted normalized form is `[a-z][a-z0-9_-]{0,62}` (see the module docs for why the
+/// charset is deliberately conservative: a valid name is always safe verbatim as a directory
+/// name — no path separators, no `.`/`..`, never empty). Comparison is case-insensitive: callers
+/// pass any case, the catalog stores and matches lowercase.
+///
+/// # Errors
+/// [`CatalogError::InvalidName`] when the name does not satisfy the rule.
+pub fn normalize_db_name(raw: &str) -> Result<String, CatalogError> {
+    let name = raw.trim().to_ascii_lowercase();
+    let bytes = name.as_bytes();
+    let valid = match bytes {
+        [] => false,
+        [first, rest @ ..] => {
+            bytes.len() <= MAX_DB_NAME_LEN
+                && first.is_ascii_lowercase()
+                && rest.iter().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-'
+                })
+        }
+    };
+    if valid {
+        Ok(name)
+    } else {
+        Err(CatalogError::InvalidName(raw.to_owned()))
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Durable catalog file
+// ------------------------------------------------------------------------------------------------
+
+/// A database's lifecycle state. In the durable catalog it is the **desired** state (the
+/// operator's intent); in [`DbInfo`] it also describes the **actual** state (whether the engine is
+/// running right now).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbState {
+    /// The database serves queries (desired: start it at boot).
+    Online,
+    /// The database is stopped (desired: leave it stopped at boot).
+    Offline,
+}
+
+/// The serialized shape of `databases.toml`. Unknown fields are rejected (a format change must
+/// bump [`CATALOG_FORMAT_VERSION`], never silently extend version 1).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogFile {
+    /// The format version; must equal [`CATALOG_FORMAT_VERSION`].
+    version: u32,
+    /// The additional (non-default) databases. The default database is implicit (module docs).
+    #[serde(default)]
+    databases: Vec<CatalogEntry>,
+}
+
+/// One additional database in the durable catalog.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogEntry {
+    /// The (lowercase) database name.
+    name: String,
+    /// The desired lifecycle state.
+    state: DbState,
+}
+
+/// Builds a [`CatalogError::Io`] with a uniform "what failed: why" rendering.
+fn io_error(path: &Path, what: &str, e: &std::io::Error) -> CatalogError {
+    CatalogError::Io {
+        path: path.to_path_buf(),
+        source: format!("{what}: {e}"),
+    }
+}
+
+/// Persists `entries` to `<root>/databases.toml` with the atomic-replace protocol (module docs):
+/// write temp → `fsync` temp → `rename` → `fsync` parent dir. Blocking; run it off the runtime.
+///
+/// # Errors
+/// [`CatalogError::Io`] on any filesystem failure, [`CatalogError::Encode`] if serialization
+/// fails (an internal invariant violation — the entries were validated on the way in).
+fn persist_entries(root: &Path, entries: &BTreeMap<String, DbState>) -> Result<(), CatalogError> {
+    std::fs::create_dir_all(root).map_err(|e| io_error(root, "creating data root", &e))?;
+
+    let file = CatalogFile {
+        version: CATALOG_FORMAT_VERSION,
+        databases: entries
+            .iter()
+            .map(|(name, state)| CatalogEntry {
+                name: name.clone(),
+                state: *state,
+            })
+            .collect(),
+    };
+    let text = toml::to_string(&file).map_err(|e| CatalogError::Encode(e.to_string()))?;
+
+    let tmp = root.join(CATALOG_TMP_NAME);
+    let dst = root.join(CATALOG_FILE_NAME);
+    {
+        // `File::create` truncates, so a stale temp from an earlier crash is harmlessly reused.
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| io_error(&tmp, "creating catalog temp", &e))?;
+        f.write_all(text.as_bytes())
+            .map_err(|e| io_error(&tmp, "writing catalog temp", &e))?;
+        // Harden the bytes BEFORE the rename makes them visible; otherwise a crash could publish
+        // a file whose contents were never written back.
+        f.sync_all()
+            .map_err(|e| io_error(&tmp, "syncing catalog temp", &e))?;
+    }
+    // POSIX rename is atomic: readers see the complete old file or the complete new file.
+    std::fs::rename(&tmp, &dst).map_err(|e| io_error(&dst, "publishing catalog", &e))?;
+    // Harden the rename's directory entry, or a crash could roll the publish back.
+    let dir = std::fs::File::open(root).map_err(|e| io_error(root, "opening data root", &e))?;
+    dir.sync_all()
+        .map_err(|e| io_error(root, "syncing data root directory", &e))?;
+    Ok(())
+}
+
+/// Loads the durable catalog from `<root>/databases.toml`, removing a stale temp file first.
+///
+/// An absent file means "no additional databases" (a fresh or pre-multi-db deployment). A present
+/// but malformed file **fails closed** ([`CatalogError::Corrupt`]) — the catalog names real data
+/// directories, so it is never silently reset. Every entry's name is re-validated (it must already
+/// be in canonical lowercase form: the catalog is always written normalized, so divergence means
+/// tampering or corruption), duplicates are rejected, and the default database must not appear
+/// (it is implicit — a conflicting entry means the config and the catalog disagree).
+///
+/// # Errors
+/// [`CatalogError::Io`] if the file exists but cannot be read; [`CatalogError::Corrupt`] on any
+/// malformed content.
+fn load_entries(
+    root: &Path,
+    default_name: &str,
+) -> Result<BTreeMap<String, DbState>, CatalogError> {
+    // A stale temp is a crashed mutation whose rename never happened; the real file (or its
+    // absence) is authoritative. Removal is best-effort: a leftover temp is inert (the next
+    // persist truncates it), so failing to remove it must not fail the load.
+    let tmp = root.join(CATALOG_TMP_NAME);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => tracing::warn!(
+            path = %tmp.display(),
+            "removed stale catalog temp file (a catalog write crashed before publishing)"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %tmp.display(),
+            error = %e,
+            "could not remove stale catalog temp file (inert; will be reused by the next persist)"
+        ),
+    }
+
+    let path = root.join(CATALOG_FILE_NAME);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        // No catalog ⇒ no additional databases (fresh or pre-multi-db deployment).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(io_error(&path, "reading catalog", &e)),
+    };
+
+    let corrupt = |reason: String| CatalogError::Corrupt {
+        path: path.clone(),
+        reason,
+    };
+    let parsed: CatalogFile = toml::from_str(&text).map_err(|e| corrupt(e.to_string()))?;
+    if parsed.version != CATALOG_FORMAT_VERSION {
+        return Err(corrupt(format!(
+            "unsupported catalog version {} (this build supports {CATALOG_FORMAT_VERSION})",
+            parsed.version
+        )));
+    }
+
+    let mut entries = BTreeMap::new();
+    for entry in parsed.databases {
+        let name = normalize_db_name(&entry.name)
+            .map_err(|e| corrupt(format!("invalid database entry: {e}")))?;
+        if name != entry.name {
+            return Err(corrupt(format!(
+                "database name {:?} is not in canonical (lowercase) form",
+                entry.name
+            )));
+        }
+        if name == default_name {
+            return Err(corrupt(format!(
+                "the catalog lists the default database {name:?}; the default is implicit (the \
+                 config and the catalog disagree)"
+            )));
+        }
+        if entries.insert(name.clone(), entry.state).is_some() {
+            return Err(corrupt(format!("duplicate database entry {name:?}")));
+        }
+    }
+    Ok(entries)
+}
+
+// ------------------------------------------------------------------------------------------------
+// Engine spawning (one store + one engine thread per database)
+// ------------------------------------------------------------------------------------------------
+
+/// The engine-spawn knobs the catalog captures from [`ServerConfig`] at construction, so runtime
+/// `create`/`start` spawn engines with exactly the same sizing as the default database.
+#[derive(Debug, Clone)]
+pub struct EngineParams {
+    /// Buffer-pool capacity in pages, per database (`04 §3`).
+    pub buffer_pool_pages: usize,
+    /// Bounded capacity of each engine's command channel (`04 §9.3`).
+    pub engine_queue_capacity: usize,
+    /// Bounded capacity of each result row stream (`04 §9.3`).
+    pub result_buffer_capacity: usize,
+    /// Per-database admission limit (each database gets its own semaphore of this many permits,
+    /// applied via [`EngineHandle::with_admission_limit`]).
+    pub max_concurrent_queries: usize,
+}
+
+impl EngineParams {
+    /// Extracts the engine-spawn knobs from the server config.
+    #[must_use]
+    pub fn from_config(config: &ServerConfig) -> Self {
+        Self {
+            buffer_pool_pages: config.buffer_pool_pages,
+            engine_queue_capacity: config.admission.engine_queue_capacity,
+            result_buffer_capacity: config.admission.result_buffer_capacity,
+            max_concurrent_queries: config.admission.max_concurrent_queries,
+        }
+    }
+}
+
+/// Opens an existing store (recovering its WAL first) or creates a fresh one, then **verifies it**
+/// (`04 §4.6`/§4.8) — refusing to serve a corrupt store. Runs on the engine thread.
+///
+/// A store is "existing" when its device file is a non-empty whole number of pages; otherwise a
+/// fresh store is created. Recovery replays the durable WAL onto the device (ARIES redo+undo,
+/// `04 §4.8`) before the catalog is read back. This is the open path for **every** database — the
+/// default and the additional ones differ only in the directory the paths point into.
+fn open_or_create_coordinator(
+    device_file: &Path,
+    wal_file: &Path,
+    pool_pages: usize,
+) -> Result<TxnCoordinator<FileBlockDevice, FileLogSink>, GraphusError> {
+    let device_existing = device_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
+
+    let mut store = if device_existing {
+        // Existing store: recover the WAL onto the device, then reopen.
+        let mut device = FileBlockDevice::open(device_file)?;
+        let mut wal = WalManager::open(
+            FileLogSink::open(wal_file)
+                .map_err(|e| GraphusError::Storage(format!("opening WAL: {e}")))?,
+        )
+        .map_err(|e| GraphusError::Storage(format!("opening WAL manager: {e}")))?;
+        recover_device(&mut wal, &mut device)?;
+        // Reopen the WAL fresh for serving (recovery consumed the recovery view).
+        let wal = WalManager::open(
+            FileLogSink::open(wal_file)
+                .map_err(|e| GraphusError::Storage(format!("reopening WAL: {e}")))?,
+        )
+        .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
+        RecordStore::open(device, wal, pool_pages)?
+    } else {
+        // Fresh store on an empty device + a freshly-created WAL.
+        let device = FileBlockDevice::open(device_file)?;
+        let wal = WalManager::create(
+            FileLogSink::open(wal_file)
+                .map_err(|e| GraphusError::Storage(format!("creating WAL: {e}")))?,
+        )
+        .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
+        // Seed element ids from 1 (`04 §2.2`).
+        RecordStore::create(device, wal, pool_pages, 1)?
+    };
+
+    // The inviolable integrity gate (`04 §4.6`/§4.8): refuse to serve a corrupt store. The
+    // coordinator's secondary index is in-memory candidate-only (rebuilt from the store), so an
+    // empty `IndexAgreement` slice checks the store alone — correct here.
+    verify_on_open(&mut store, &[])?;
+
+    Ok(TxnCoordinator::new(store))
+}
+
+/// Spawns one database's engine thread for the store in `dir`, constructing the `!Send`
+/// coordinator **on that thread** (see [`spawn_engine`]). Creates the directory if absent;
+/// opening-or-creating + WAL recovery + `verify_on_open` happen on the engine thread via
+/// [`open_or_create_coordinator`]. Blocking (waits for the engine's startup result); run it off
+/// the runtime.
+fn spawn_db_engine(
+    dir: &Path,
+    params: &EngineParams,
+    metrics: Arc<Metrics>,
+) -> Result<Engine, GraphusError> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        GraphusError::Storage(format!("creating database dir {}: {e}", dir.display()))
+    })?;
+    let device_file = dir.join(STORE_FILE_NAME);
+    let wal_file = dir.join(WAL_FILE_NAME);
+    let pool_pages = params.buffer_pool_pages;
+    let build = move || open_or_create_coordinator(&device_file, &wal_file, pool_pages);
+    spawn_engine(
+        build,
+        params.engine_queue_capacity,
+        params.result_buffer_capacity,
+        metrics,
+    )
+}
+
+// ------------------------------------------------------------------------------------------------
+// The catalog
+// ------------------------------------------------------------------------------------------------
+
+/// One database's listing entry: name, desired + actual state, and whether it is the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbInfo {
+    /// The (lowercase) database name.
+    pub name: String,
+    /// The **actual** state: `Online` iff the engine is running right now.
+    pub state: DbState,
+    /// The durable **desired** state (always `Online` for the default database). `desired ==
+    /// Online` with `state == Offline` means the engine failed to start (see [`DbInfo::error`]).
+    pub desired: DbState,
+    /// Whether this is the (implicit, undroppable) default database.
+    pub is_default: bool,
+    /// The startup error, when the engine failed to start (boot policy / a failed `start`).
+    pub error: Option<String>,
+}
+
+/// One running database engine: the admission-limited client handle plus the engine thread's join
+/// handle (needed for a clean stop).
+struct RunningEngine {
+    /// The handle handed to consumers (already carrying the per-database admission limit).
+    handle: EngineHandle,
+    /// The engine thread, joined when the database stops.
+    join: std::thread::JoinHandle<()>,
+}
+
+/// The mutable catalog state, owned by the admin mutex (module docs: locking design).
+struct AdminState {
+    /// Durable desired state of every **additional** database. A `BTreeMap` so the persisted file
+    /// has a deterministic order (stable diffs, reproducible tests).
+    entries: BTreeMap<String, DbState>,
+    /// Running engines (including the default database), keyed by name.
+    running: HashMap<String, RunningEngine>,
+    /// Databases whose desired state is `online` but whose engine failed to start, with the error
+    /// (in-memory only — the boot policy never flips durable desired state).
+    failed: BTreeMap<String, String>,
+}
+
+/// The durable catalog of named databases + the in-process registry of their running engines
+/// (see the module docs for the on-disk layout, crash-safety protocol, lifecycle state model and
+/// locking design).
+pub struct DatabaseCatalog {
+    /// The data root (`store_path`): the default database's directory and the catalog's home.
+    root: PathBuf,
+    /// The (normalized) default database name, from config.
+    default_name: String,
+    /// Engine-spawn sizing, captured from config so every database is sized identically.
+    params: EngineParams,
+    /// The shared metrics registry every engine reports into (a per-database split is future
+    /// observability work; one registry keeps today's dashboards unchanged).
+    metrics: Arc<Metrics>,
+    /// Serializes all catalog mutations; async-aware because `stop`/`shutdown` await the engine's
+    /// drain under the guard.
+    admin: Mutex<AdminState>,
+    /// The concurrent lookup view: name → admission-limited [`EngineHandle`] for **running**
+    /// databases. Written only inside admin-locked sections; read lock-briefly by lookups.
+    handles: RwLock<HashMap<String, EngineHandle>>,
+    /// Test-only persist fault seam: how many upcoming `persist_state` calls fail *before
+    /// touching the filesystem* (the durable file is untouched — exactly a pre-`rename` I/O
+    /// failure). The field, like the seam, does not exist in production builds.
+    #[cfg(test)]
+    persist_faults: std::sync::atomic::AtomicU32,
+}
+
+impl DatabaseCatalog {
+    /// Loads the catalog for `config` (the usual server path): the data root is
+    /// [`ServerConfig::store_path`], the default name [`ServerConfig::default_database`], and the
+    /// engine sizing is captured from the config. No engine is started yet — call
+    /// [`start_default`](Self::start_default) and
+    /// [`start_catalog_databases`](Self::start_catalog_databases).
+    ///
+    /// # Errors
+    /// [`CatalogError`] if the default name is invalid or the durable catalog cannot be loaded
+    /// (a malformed file fails closed — module docs).
+    pub fn load(config: &ServerConfig, metrics: Arc<Metrics>) -> Result<Self, CatalogError> {
+        Self::open(
+            config.store_path.clone(),
+            &config.default_database,
+            EngineParams::from_config(config),
+            metrics,
+        )
+    }
+
+    /// Opens the catalog at `root` with an explicit default name and engine sizing (the test
+    /// seam; [`load`](Self::load) is the config-driven wrapper).
+    ///
+    /// # Errors
+    /// As [`load`](Self::load).
+    pub fn open(
+        root: PathBuf,
+        default_database: &str,
+        params: EngineParams,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, CatalogError> {
+        let default_name = normalize_db_name(default_database)?;
+        let entries = load_entries(&root, &default_name)?;
+        Ok(Self {
+            root,
+            default_name,
+            params,
+            metrics,
+            admin: Mutex::new(AdminState {
+                entries,
+                running: HashMap::new(),
+                failed: BTreeMap::new(),
+            }),
+            handles: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            persist_faults: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    /// The (normalized) default database's name.
+    #[must_use]
+    pub fn default_database(&self) -> &str {
+        &self.default_name
+    }
+
+    /// The directory holding an **additional** database's store: `<root>/databases/<name>`.
+    /// (The default database lives directly in the root — module docs.)
+    fn db_dir(&self, name: &str) -> PathBuf {
+        self.root.join(DATABASES_DIR_NAME).join(name)
+    }
+
+    /// Looks up the running engine handle for `name` (case-insensitive). `None` when the database
+    /// does not exist or is not online. Cheap and concurrent: a brief read lock + a handle clone,
+    /// never held across an `.await` (module docs: locking design).
+    #[must_use]
+    pub fn handle(&self, name: &str) -> Option<EngineHandle> {
+        let Ok(name) = normalize_db_name(name) else {
+            return None;
+        };
+        self.read_handles().get(&name).cloned()
+    }
+
+    /// The default database's engine handle, when it is running (it always is while the server
+    /// serves; `None` only before startup or during/after shutdown).
+    #[must_use]
+    pub fn default_handle(&self) -> Option<EngineHandle> {
+        self.read_handles().get(&self.default_name).cloned()
+    }
+
+    /// Lists every database: the default first, then the additional ones in name order, each with
+    /// desired + actual state and the startup error when the engine failed (boot policy).
+    pub async fn list(&self) -> Vec<DbInfo> {
+        let state = self.admin.lock().await;
+        let mut out = Vec::with_capacity(state.entries.len() + 1);
+        out.push(DbInfo {
+            name: self.default_name.clone(),
+            state: if state.running.contains_key(&self.default_name) {
+                DbState::Online
+            } else {
+                DbState::Offline
+            },
+            desired: DbState::Online,
+            is_default: true,
+            error: None,
+        });
+        for (name, desired) in &state.entries {
+            out.push(DbInfo {
+                name: name.clone(),
+                state: if state.running.contains_key(name) {
+                    DbState::Online
+                } else {
+                    DbState::Offline
+                },
+                desired: *desired,
+                is_default: false,
+                error: state.failed.get(name).cloned(),
+            });
+        }
+        out
+    }
+
+    /// Starts the **default** database (directly in the data root — the unchanged single-db open
+    /// path) and returns its admission-limited handle. Idempotent: returns the existing handle if
+    /// already running. The server calls this first at boot; a failure here fails startup
+    /// (preserving single-db behaviour: a corrupt default store refuses to serve).
+    ///
+    /// # Errors
+    /// [`GraphusError`] if the store cannot be opened/recovered/verified or the thread cannot be
+    /// spawned.
+    pub async fn start_default(&self) -> Result<EngineHandle, GraphusError> {
+        let mut state = self.admin.lock().await;
+        if let Some(running) = state.running.get(&self.default_name) {
+            return Ok(running.handle.clone());
+        }
+        let engine = self.spawn_in(self.root.clone()).await?;
+        let name = self.default_name.clone();
+        Ok(self.register(&mut state, &name, engine))
+    }
+
+    /// Starts every catalog database whose **desired** state is `online` (the boot
+    /// reconciliation). A database that fails to open is logged and recorded as *failed* in
+    /// memory — its durable desired state is **not** flipped, and the failure never prevents the
+    /// server or the other databases from starting (module docs: lifecycle state model). Call
+    /// after [`start_default`](Self::start_default).
+    pub async fn start_catalog_databases(&self) {
+        let mut state = self.admin.lock().await;
+        let to_start: Vec<String> = state
+            .entries
+            .iter()
+            .filter(|(name, desired)| {
+                **desired == DbState::Online && !state.running.contains_key(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in to_start {
+            match self.spawn_in(self.db_dir(&name)).await {
+                Ok(engine) => {
+                    let _ = self.register(&mut state, &name, engine);
+                    tracing::info!(db = %name, "database online");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        db = %name,
+                        error = %e,
+                        "database failed to start; it stays offline (desired state unchanged) and \
+                         the server continues",
+                    );
+                    state.failed.insert(name, e.to_string());
+                }
+            }
+        }
+    }
+
+    /// Creates a new database named `name` (case-insensitive; stored lowercase). Created
+    /// databases start **online**. Durability ordering (module docs): provision the directory →
+    /// persist the catalog entry → start the engine — success is reported only after the entry is
+    /// durable. If the engine fails to start, the entry and directory are rolled back so a failed
+    /// `create` leaves no trace.
+    ///
+    /// Any pre-existing directory under `databases/<name>` is an **inert orphan** (a crashed
+    /// `create` before its persist, or a crashed `drop` after its persist) and is cleared first —
+    /// this is what guarantees dropped data can never resurrect through a re-`create`.
+    ///
+    /// # Errors
+    /// [`CatalogError::InvalidName`], [`CatalogError::AlreadyExists`] (including the default's
+    /// name via [`CatalogError::DefaultDatabase`]), [`CatalogError::Io`] on provisioning/persist
+    /// failure, or [`CatalogError::Engine`] if the fresh store cannot be started.
+    pub async fn create(&self, name: &str) -> Result<EngineHandle, CatalogError> {
+        let name = normalize_db_name(name)?;
+        if name == self.default_name {
+            return Err(CatalogError::DefaultDatabase {
+                name,
+                operation: "create",
+            });
+        }
+        let mut state = self.admin.lock().await;
+        if state.entries.contains_key(&name) || state.running.contains_key(&name) {
+            return Err(CatalogError::AlreadyExists(name));
+        }
+
+        // 1) Provision a fresh directory (clearing an inert orphan — see the rustdoc above).
+        let dir = self.db_dir(&name);
+        run_blocking({
+            let dir = dir.clone();
+            move || provision_fresh_dir(&dir)
+        })
+        .await?;
+
+        // 2) Persist the entry (state online) BEFORE starting the engine, so success is never
+        //    reported for a database that would not survive a restart. On failure memory resyncs
+        //    to the published file (normally: no entry — the create never happened).
+        let fallback = state.entries.clone();
+        state.entries.insert(name.clone(), DbState::Online);
+        self.persist_or_resync(&mut state, fallback).await?;
+
+        // 3) Start the engine (creates the fresh store + WAL in the provisioned directory).
+        match self.spawn_in(dir.clone()).await {
+            Ok(engine) => Ok(self.register(&mut state, &name, engine)),
+            Err(e) => {
+                // Roll the entry back: a failed create must leave no trace. If the rollback
+                // persist itself fails, memory resyncs to the published file (normally the entry
+                // stays, desired online) and the boot policy will retry/report it — documented,
+                // recoverable.
+                let fallback = state.entries.clone();
+                state.entries.remove(&name);
+                if let Err(p) = self.persist_or_resync(&mut state, fallback).await {
+                    tracing::error!(
+                        db = %name,
+                        error = %p,
+                        "could not roll back the catalog entry of a failed create; the boot \
+                         policy will retry/report whatever the published catalog still claims",
+                    );
+                } else if let Err(rm) = run_blocking(move || remove_dir(&dir)).await {
+                    // The directory is an inert orphan now; a future create clears it.
+                    tracing::warn!(db = %name, error = %rm, "could not remove a failed create's directory");
+                }
+                Err(CatalogError::Engine(e))
+            }
+        }
+    }
+
+    /// Starts the database `name`. Idempotent: starting a running database returns its handle.
+    /// Desired-state-first ordering (module docs): the durable state is set `online` **before**
+    /// the engine spawn, so a spawn failure leaves the operator's intent recorded and the boot
+    /// policy retries it — exactly the semantics of a database that failed at boot.
+    ///
+    /// `start` of the default database returns its handle when running (it is managed by the
+    /// server lifecycle) and is rejected otherwise.
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownDatabase`], [`CatalogError::Io`] on persist failure, or
+    /// [`CatalogError::Engine`] when the store cannot be opened/recovered/verified.
+    pub async fn start(&self, name: &str) -> Result<EngineHandle, CatalogError> {
+        let name = normalize_db_name(name)?;
+        let mut state = self.admin.lock().await;
+        if name == self.default_name {
+            return match state.running.get(&name) {
+                Some(running) => Ok(running.handle.clone()),
+                None => Err(CatalogError::DefaultDatabase {
+                    name,
+                    operation: "start",
+                }),
+            };
+        }
+        if !state.entries.contains_key(&name) {
+            return Err(CatalogError::UnknownDatabase(name));
+        }
+        if let Some(running) = state.running.get(&name) {
+            return Ok(running.handle.clone());
+        }
+
+        // Record the durable intent first (no-op when already online, e.g. a boot-failed retry).
+        if state.entries.get(&name) != Some(&DbState::Online) {
+            // On failure memory resyncs to the published file (normally back to offline).
+            let fallback = state.entries.clone();
+            state.entries.insert(name.clone(), DbState::Online);
+            self.persist_or_resync(&mut state, fallback).await?;
+        }
+
+        match self.spawn_in(self.db_dir(&name)).await {
+            Ok(engine) => Ok(self.register(&mut state, &name, engine)),
+            Err(e) => {
+                state.failed.insert(name, e.to_string());
+                Err(CatalogError::Engine(e))
+            }
+        }
+    }
+
+    /// Stops the database `name`: drains + hardens + joins its engine, then persists desired
+    /// `offline`. Idempotent: stopping an already-stopped database is `Ok` (and reconciles a
+    /// boot-failed database's desired state to `offline`, cancelling the boot retry). Engine-first
+    /// ordering (module docs): if the persist fails after the engine stopped, the error is
+    /// reported and memory resyncs to the published file — normally still `online`, so the
+    /// database comes back at the next boot (a stop that did not become durable behaves as if it
+    /// never happened), and a **retried `stop` re-attempts the persist**: the engine is already
+    /// down, so the retry skips the drain and just persists `offline`.
+    ///
+    /// The default database cannot be stopped (the server's listeners depend on it; it is managed
+    /// by the server lifecycle).
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownDatabase`], [`CatalogError::DefaultDatabase`], or
+    /// [`CatalogError::Io`] on persist failure.
+    pub async fn stop(&self, name: &str) -> Result<(), CatalogError> {
+        let name = normalize_db_name(name)?;
+        if name == self.default_name {
+            return Err(CatalogError::DefaultDatabase {
+                name,
+                operation: "stop",
+            });
+        }
+        let mut state = self.admin.lock().await;
+        let Some(desired) = state.entries.get(&name).copied() else {
+            return Err(CatalogError::UnknownDatabase(name));
+        };
+
+        let was_running = match state.running.remove(&name) {
+            Some(engine) => {
+                self.stop_engine(&name, engine).await;
+                true
+            }
+            None => false,
+        };
+        state.failed.remove(&name);
+
+        if desired == DbState::Offline && !was_running {
+            // Fully idempotent: already stopped and already durable.
+            return Ok(());
+        }
+        // On failure memory resyncs to the published file. Normally the rename never happened, so
+        // the entry returns to `online` — the durable truth — and a retried `stop` (engine
+        // already down ⇒ `!was_running`, desired `online`) skips the drain above and re-attempts
+        // this persist. Leaving memory at `offline` here would make the retry hit the idempotency
+        // check above and report success without ever persisting — the "stopped" database would
+        // then resurrect at the next boot (regression-tested below).
+        let fallback = state.entries.clone();
+        state.entries.insert(name.clone(), DbState::Offline);
+        self.persist_or_resync(&mut state, fallback).await
+    }
+
+    /// Drops the database `name`: removes its catalog entry (persisted **first**), then deletes
+    /// its directory. Only allowed when the database is stopped (desired + actual offline) — stop
+    /// it first. The default database can never be dropped.
+    ///
+    /// Persist-first ordering (module docs): a crash between the persist and the directory
+    /// deletion leaves an orphan directory — inert (no catalog entry names it) and cleared by any
+    /// future `create` of the same name, so dropped data can never resurrect.
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownDatabase`], [`CatalogError::DefaultDatabase`],
+    /// [`CatalogError::NotOffline`] when not stopped, or [`CatalogError::Io`] on persist/delete
+    /// failure (after a failed delete the entry is already gone; the directory is an inert
+    /// orphan).
+    pub async fn drop_database(&self, name: &str) -> Result<(), CatalogError> {
+        let name = normalize_db_name(name)?;
+        if name == self.default_name {
+            return Err(CatalogError::DefaultDatabase {
+                name,
+                operation: "drop",
+            });
+        }
+        let mut state = self.admin.lock().await;
+        let Some(desired) = state.entries.get(&name).copied() else {
+            return Err(CatalogError::UnknownDatabase(name));
+        };
+        if desired == DbState::Online || state.running.contains_key(&name) {
+            return Err(CatalogError::NotOffline(name));
+        }
+
+        // Persist the removal first; only then delete the data (module docs). On failure memory
+        // resyncs to the published file: normally the entry survives and the drop can simply be
+        // retried; if the rename did land, the entry is gone and the directory is an inert
+        // orphan. Either way no data is deleted before the removal is durable.
+        let fallback = state.entries.clone();
+        state.entries.remove(&name);
+        self.persist_or_resync(&mut state, fallback).await?;
+        state.failed.remove(&name);
+
+        let dir = self.db_dir(&name);
+        run_blocking(move || remove_dir(&dir)).await
+    }
+
+    /// Stops **every** running engine for process shutdown (`04 §9.4`): additional databases
+    /// first, the default last (listeners may still be draining against it). Durable desired
+    /// states are **not** touched — a database online at shutdown comes back online at the next
+    /// boot ([`stop`](Self::stop) is the operator intent; this is process teardown). Errors are
+    /// logged, never propagated: shutdown must always complete.
+    pub async fn shutdown_all(&self) {
+        let mut state = self.admin.lock().await;
+        let mut names: Vec<String> = state.running.keys().cloned().collect();
+        names.sort_unstable();
+        if let Some(pos) = names.iter().position(|n| *n == self.default_name) {
+            let default = names.remove(pos);
+            names.push(default);
+        }
+        for name in names {
+            if let Some(engine) = state.running.remove(&name) {
+                tracing::info!(db = %name, "graceful shutdown: draining and hardening the store");
+                self.stop_engine(&name, engine).await;
+                tracing::info!(db = %name, "store hardened and marked clean");
+            }
+        }
+    }
+
+    // ---- internals ------------------------------------------------------------------------------
+
+    /// Spawns one database's engine off the runtime (the open path blocks on WAL recovery +
+    /// `verify_on_open`).
+    async fn spawn_in(&self, dir: PathBuf) -> Result<Engine, GraphusError> {
+        let params = self.params.clone();
+        let metrics = Arc::clone(&self.metrics);
+        tokio::task::spawn_blocking(move || spawn_db_engine(&dir, &params, metrics))
+            .await
+            .map_err(|e| GraphusError::Storage(format!("engine spawn task join: {e}")))?
+    }
+
+    /// Registers a freshly-spawned engine under `name` (admin lock held by the caller): applies
+    /// the per-database admission limit, tracks the join handle, publishes the lookup handle, and
+    /// clears any stale failure record.
+    fn register(&self, state: &mut AdminState, name: &str, engine: Engine) -> EngineHandle {
+        let handle = engine
+            .handle
+            .with_admission_limit(self.params.max_concurrent_queries);
+        state.running.insert(
+            name.to_owned(),
+            RunningEngine {
+                handle: handle.clone(),
+                join: engine.join,
+            },
+        );
+        state.failed.remove(name);
+        self.write_handles().insert(name.to_owned(), handle.clone());
+        handle
+    }
+
+    /// Stops one engine (admin lock held by the caller): unpublishes the lookup handle **first**
+    /// (no new consumer obtains a handle to a draining engine), drains + hardens via the engine's
+    /// `Shutdown` command, then joins its thread off the runtime. Errors are logged — at this
+    /// point the engine is going away regardless.
+    async fn stop_engine(&self, name: &str, engine: RunningEngine) {
+        self.write_handles().remove(name);
+        if let Err(e) = engine.handle.shutdown().await {
+            tracing::error!(db = %name, error = %e, "error hardening the store on stop");
+        }
+        let join = engine.join;
+        match tokio::task::spawn_blocking(move || join.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_panic)) => tracing::error!(db = %name, "engine thread panicked"),
+            Err(e) => tracing::error!(db = %name, error = %e, "joining engine thread"),
+        }
+    }
+
+    /// Persists a snapshot of `entries` off the runtime (the fsync-bearing atomic replace must
+    /// not run on a Tokio worker — `04 §9.1`).
+    async fn persist_state(&self, entries: &BTreeMap<String, DbState>) -> Result<(), CatalogError> {
+        // Test-only fault seam (`inject_persist_faults`); compiled out of production builds.
+        #[cfg(test)]
+        self.maybe_inject_persist_fault()?;
+        let root = self.root.clone();
+        let err_path = self.root.join(CATALOG_FILE_NAME);
+        let snapshot = entries.clone();
+        tokio::task::spawn_blocking(move || persist_entries(&root, &snapshot))
+            .await
+            .map_err(|e| CatalogError::Io {
+                path: err_path,
+                source: format!("persist task join: {e}"),
+            })?
+    }
+
+    /// Persists `state.entries` via [`Self::persist_state`]; on a persist **failure**, resyncs
+    /// the in-memory entries from the file actually published on disk instead of blindly rolling
+    /// back. The atomic-replace protocol can fail on either side of its `rename`: before it (the
+    /// old file is still published) or after it (the new file is already visible — and may
+    /// survive a crash even though its parent-directory `fsync` failed). A blind rollback would
+    /// diverge from disk in the second case, so memory follows whatever the filesystem says.
+    /// Best effort: when the reload itself also fails, memory falls back to `fallback` (the
+    /// caller's pre-mutation snapshot — the old rollback behaviour) and the possible divergence
+    /// is logged at error level. The original persist error is returned either way.
+    async fn persist_or_resync(
+        &self,
+        state: &mut AdminState,
+        fallback: BTreeMap<String, DbState>,
+    ) -> Result<(), CatalogError> {
+        let Err(persist_err) = self.persist_state(&state.entries).await else {
+            return Ok(());
+        };
+        match self.reload_entries().await {
+            Ok(published) => state.entries = published,
+            Err(reload_err) => {
+                tracing::error!(
+                    error = %persist_err,
+                    reload_error = %reload_err,
+                    "catalog persist failed AND the published catalog could not be reloaded; \
+                     falling back to the pre-mutation in-memory state (may diverge from disk \
+                     until the next successful persist or reboot)",
+                );
+                state.entries = fallback;
+            }
+        }
+        Err(persist_err)
+    }
+
+    /// Reloads the published catalog file off the runtime (the resync half of
+    /// [`Self::persist_or_resync`]).
+    async fn reload_entries(&self) -> Result<BTreeMap<String, DbState>, CatalogError> {
+        let root = self.root.clone();
+        let default_name = self.default_name.clone();
+        tokio::task::spawn_blocking(move || load_entries(&root, &default_name))
+            .await
+            .map_err(|e| CatalogError::Encode(format!("catalog reload task join: {e}")))?
+    }
+
+    /// Test-only: arms the persist fault seam — the next `n` [`Self::persist_state`] calls fail
+    /// *before touching the filesystem* (before the temp write and the rename), exactly like a
+    /// pre-`rename` I/O error on the catalog file. The seam (this method, its consumer and the
+    /// backing field) is `#[cfg(test)]`: production builds compile without it, byte-identical.
+    #[cfg(test)]
+    fn inject_persist_faults(&self, n: u32) {
+        self.persist_faults
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: consumes one armed persist fault, if any (see
+    /// [`Self::inject_persist_faults`]).
+    #[cfg(test)]
+    fn maybe_inject_persist_fault(&self) -> Result<(), CatalogError> {
+        use std::sync::atomic::Ordering;
+        if self
+            .persist_faults
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(CatalogError::Io {
+                path: self.root.join(CATALOG_FILE_NAME),
+                source: "injected persist fault (test seam; fails before the write/rename)"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The handles map's read guard, recovering from poisoning (the map holds only cheap handle
+    /// clones, so the data is always valid; recovering beats cascading a panic into shutdown).
+    fn read_handles(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, EngineHandle>> {
+        self.handles.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The handles map's write guard (same poisoning recovery as [`Self::read_handles`]).
+    fn write_handles(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, EngineHandle>> {
+        self.handles.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for DatabaseCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseCatalog")
+            .field("root", &self.root)
+            .field("default_database", &self.default_name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Clears any pre-existing directory at `dir` (an inert orphan — see [`DatabaseCatalog::create`])
+/// and creates it fresh, then **hardens the result with directory `fsync`s** before returning.
+///
+/// The `fsync` barrier is what stops dropped data from resurrecting. POSIX `fsync` gives **no
+/// cross-directory (or directory-vs-file) ordering guarantee**: a `drop`'s `remove_dir_all` only
+/// dirties the page cache, so without a barrier a subsequent `create` of the same name could make
+/// its `online` catalog entry durable (the catalog persist fsyncs the data root) while the
+/// *unlinks* of the old store files were still volatile. A crash can then replay the directory
+/// tree without the unlinks (e.g. a btrfs tree-log replay), and the next boot would find the OLD
+/// dropped store files under a name the catalog claims online — [`open_or_create_coordinator`]
+/// would see a non-empty device and serve the dropped data. Syncing the freshly created database
+/// directory (its empty entry list) **and** its parent (`<root>/databases/` — the entry for the
+/// directory itself) makes "the directory exists and is empty" durable *before* the catalog can
+/// claim the name online. (`<root>`'s own entry for `databases/` is hardened by the catalog
+/// persist that immediately follows in `create`, which fsyncs the data root.)
+fn provision_fresh_dir(dir: &Path) -> Result<(), CatalogError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(dir, "clearing orphan database directory", &e)),
+    }
+    // Create the parent explicitly first, so both fsync targets below exist even on the very
+    // first `create` (when `<root>/databases/` is not there yet).
+    let parent = dir.parent().ok_or_else(|| CatalogError::Io {
+        path: dir.to_path_buf(),
+        source: "database directory has no parent".to_owned(),
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| io_error(parent, "creating databases directory", &e))?;
+    std::fs::create_dir_all(dir).map_err(|e| io_error(dir, "creating database directory", &e))?;
+    // The durability barrier (see above): the fresh directory's (empty) entry list first, then
+    // the parent's entry for the directory itself.
+    fsync_dir(dir)?;
+    fsync_dir(parent)
+}
+
+/// Removes a database directory; an already-absent directory is fine (idempotent). After a
+/// successful removal the parent directory (`<root>/databases/`) is `fsync`ed, hardening the
+/// unlink: `fsync` has no cross-directory ordering, so without this barrier the removal could
+/// still be sitting in the page cache when a later mutation makes catalog state durable that
+/// assumes it happened — the belt-and-braces closing, from the drop side, of the same
+/// resurrection window [`provision_fresh_dir`] closes from the create side.
+fn remove_dir(dir: &Path) -> Result<(), CatalogError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_error(dir, "removing database directory", &e)),
+    }
+    match dir.parent() {
+        // The parent necessarily exists: a child of it was just removed.
+        Some(parent) => fsync_dir(parent),
+        None => Ok(()),
+    }
+}
+
+/// Opens `dir` and `fsync`s it, hardening its directory entries (creations and unlinks) — the
+/// standard POSIX way to make directory-level changes durable.
+fn fsync_dir(dir: &Path) -> Result<(), CatalogError> {
+    let f =
+        std::fs::File::open(dir).map_err(|e| io_error(dir, "opening directory to fsync", &e))?;
+    f.sync_all()
+        .map_err(|e| io_error(dir, "syncing directory", &e))
+}
+
+/// Runs a blocking catalog filesystem step off the runtime, mapping a task-join failure to a
+/// catalog error.
+async fn run_blocking<F>(f: F) -> Result<(), CatalogError>
+where
+    F: FnOnce() -> Result<(), CatalogError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| CatalogError::Encode(format!("catalog task join: {e}")))?
+}
+
+// ------------------------------------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp data root for one test (auto-removed on drop).
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "graphus-dbcatalog-{tag}-{nanos}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp root");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_params() -> EngineParams {
+        EngineParams {
+            buffer_pool_pages: 256,
+            engine_queue_capacity: 64,
+            result_buffer_capacity: 32,
+            max_concurrent_queries: 16,
+        }
+    }
+
+    fn open_catalog(root: &TempRoot) -> DatabaseCatalog {
+        DatabaseCatalog::open(
+            root.path.clone(),
+            DEFAULT_DATABASE_NAME,
+            test_params(),
+            Arc::new(Metrics::new()),
+        )
+        .expect("open catalog")
+    }
+
+    // ---- name validation matrix -----------------------------------------------------------------
+
+    #[test]
+    fn name_validation_matrix() {
+        // Accepted (and normalized to lowercase).
+        for (raw, normalized) in [
+            ("a", "a"),
+            ("graph", "graph"),
+            ("abc-def_1", "abc-def_1"),
+            ("Analytics", "analytics"),
+            ("  padded  ", "padded"),
+            ("z9", "z9"),
+        ] {
+            assert_eq!(
+                normalize_db_name(raw).expect("valid name"),
+                normalized,
+                "{raw:?} should normalize to {normalized:?}"
+            );
+        }
+        // Exactly the maximum length is accepted; one more is rejected.
+        let max = format!("a{}", "b".repeat(MAX_DB_NAME_LEN - 1));
+        assert_eq!(normalize_db_name(&max).expect("max-length name"), max);
+        let too_long = format!("a{}", "b".repeat(MAX_DB_NAME_LEN));
+        assert!(matches!(
+            normalize_db_name(&too_long),
+            Err(CatalogError::InvalidName(_))
+        ));
+        // Rejected: empty, bad first char, separators, traversal, spaces, non-ASCII.
+        for raw in [
+            "",
+            " ",
+            "1abc",
+            "-abc",
+            "_abc",
+            "a/b",
+            "a\\b",
+            "a.b",
+            ".",
+            "..",
+            "a b",
+            "ção",
+            "UPPER CASE",
+            "a:b",
+        ] {
+            assert!(
+                matches!(normalize_db_name(raw), Err(CatalogError::InvalidName(_))),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    // ---- durable file round-trip + crash-safety contract ------------------------------------------
+
+    #[test]
+    fn catalog_round_trips_through_the_file() {
+        let root = TempRoot::new("roundtrip");
+        let mut entries = BTreeMap::new();
+        entries.insert("alpha".to_owned(), DbState::Online);
+        entries.insert("beta".to_owned(), DbState::Offline);
+        persist_entries(&root.path, &entries).expect("persist");
+
+        let loaded = load_entries(&root.path, DEFAULT_DATABASE_NAME).expect("load");
+        assert_eq!(loaded, entries);
+        // No temp file is left behind by a successful persist.
+        assert!(!root.path.join(CATALOG_TMP_NAME).exists());
+    }
+
+    #[test]
+    fn absent_catalog_means_no_additional_databases() {
+        let root = TempRoot::new("absent");
+        let loaded = load_entries(&root.path, DEFAULT_DATABASE_NAME).expect("load");
+        assert!(loaded.is_empty());
+        // Loading never creates the file (backward compat: an old store dir stays untouched).
+        assert!(!root.path.join(CATALOG_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn stale_tmp_is_removed_and_the_valid_file_wins() {
+        let root = TempRoot::new("staletmp");
+        let mut entries = BTreeMap::new();
+        entries.insert("alpha".to_owned(), DbState::Online);
+        persist_entries(&root.path, &entries).expect("persist");
+        // Simulate a crash mid-write of a later mutation: a garbage temp next to the valid file.
+        std::fs::write(root.path.join(CATALOG_TMP_NAME), b"%% garbage %%").expect("plant tmp");
+
+        let loaded = load_entries(&root.path, DEFAULT_DATABASE_NAME).expect("load");
+        assert_eq!(loaded, entries, "the published file is authoritative");
+        assert!(
+            !root.path.join(CATALOG_TMP_NAME).exists(),
+            "the stale temp is cleaned up"
+        );
+    }
+
+    #[test]
+    fn malformed_catalog_fails_closed() {
+        let cases: &[(&str, &str)] = &[
+            ("garbage", "%% not toml %%"),
+            ("bad-version", "version = 2\n"),
+            (
+                "missing-version",
+                "[[databases]]\nname = \"a\"\nstate = \"online\"\n",
+            ),
+            (
+                "invalid-name",
+                "version = 1\n[[databases]]\nname = \"has space\"\nstate = \"online\"\n",
+            ),
+            (
+                "not-lowercase",
+                "version = 1\n[[databases]]\nname = \"Alpha\"\nstate = \"online\"\n",
+            ),
+            (
+                "duplicate",
+                "version = 1\n\
+                 [[databases]]\nname = \"alpha\"\nstate = \"online\"\n\
+                 [[databases]]\nname = \"alpha\"\nstate = \"offline\"\n",
+            ),
+            (
+                "lists-default",
+                "version = 1\n[[databases]]\nname = \"graphus\"\nstate = \"online\"\n",
+            ),
+            ("unknown-field", "version = 1\nsurprise = true\n"),
+            (
+                "bad-state",
+                "version = 1\n[[databases]]\nname = \"a\"\nstate = \"paused\"\n",
+            ),
+        ];
+        for (tag, text) in cases {
+            let root = TempRoot::new(&format!("malformed-{tag}"));
+            std::fs::write(root.path.join(CATALOG_FILE_NAME), text).expect("write file");
+            let result = load_entries(&root.path, DEFAULT_DATABASE_NAME);
+            assert!(
+                matches!(result, Err(CatalogError::Corrupt { .. })),
+                "{tag}: expected Corrupt, got {result:?}"
+            );
+            // Fail closed: the malformed file is never reset or rewritten by the failed load.
+            assert_eq!(
+                std::fs::read_to_string(root.path.join(CATALOG_FILE_NAME)).expect("file intact"),
+                *text
+            );
+        }
+    }
+
+    // ---- lifecycle state transitions ---------------------------------------------------------------
+
+    /// Reloads the durable desired states from disk through a fresh load (what the next boot
+    /// would see), without starting any engine.
+    fn durable_states(root: &TempRoot) -> BTreeMap<String, DbState> {
+        load_entries(&root.path, DEFAULT_DATABASE_NAME).expect("reload")
+    }
+
+    #[tokio::test]
+    async fn lifecycle_create_stop_start_stop_drop() {
+        let root = TempRoot::new("lifecycle");
+        let catalog = open_catalog(&root);
+
+        // create → online, durable, directory provisioned.
+        let handle = catalog.create("alpha").await.expect("create");
+        drop(handle);
+        assert!(catalog.handle("alpha").is_some());
+        assert!(
+            catalog.handle("ALPHA").is_some(),
+            "lookup is case-insensitive"
+        );
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Online));
+        let dir = root.path.join(DATABASES_DIR_NAME).join("alpha");
+        assert!(dir.join(STORE_FILE_NAME).exists(), "fresh store created");
+
+        // stop → engine gone, durable offline.
+        catalog.stop("alpha").await.expect("stop");
+        assert!(catalog.handle("alpha").is_none());
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Offline));
+        // Idempotent stop.
+        catalog.stop("alpha").await.expect("stop again");
+
+        // start → engine back (reopening the existing store), durable online.
+        let handle = catalog.start("alpha").await.expect("start");
+        drop(handle);
+        assert!(catalog.handle("alpha").is_some());
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Online));
+        // Idempotent start.
+        let _ = catalog.start("alpha").await.expect("start again");
+
+        // drop requires offline.
+        assert!(matches!(
+            catalog.drop_database("alpha").await,
+            Err(CatalogError::NotOffline(_))
+        ));
+        catalog.stop("alpha").await.expect("stop before drop");
+        catalog.drop_database("alpha").await.expect("drop");
+        assert!(!durable_states(&root).contains_key("alpha"));
+        assert!(!dir.exists(), "the database directory is deleted");
+
+        catalog.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_default_and_unknown_are_rejected() {
+        let root = TempRoot::new("rejections");
+        let catalog = open_catalog(&root);
+
+        let _ = catalog.create("alpha").await.expect("create");
+        assert!(matches!(
+            catalog.create("alpha").await,
+            Err(CatalogError::AlreadyExists(_))
+        ));
+        assert!(
+            matches!(
+                catalog.create("ALPHA").await,
+                Err(CatalogError::AlreadyExists(_)),
+            ),
+            "duplicate detection is case-insensitive"
+        );
+
+        // The default database is implicit and protected.
+        assert!(matches!(
+            catalog.create(DEFAULT_DATABASE_NAME).await,
+            Err(CatalogError::DefaultDatabase {
+                operation: "create",
+                ..
+            })
+        ));
+        assert!(matches!(
+            catalog.stop(DEFAULT_DATABASE_NAME).await,
+            Err(CatalogError::DefaultDatabase {
+                operation: "stop",
+                ..
+            })
+        ));
+        assert!(matches!(
+            catalog.drop_database(DEFAULT_DATABASE_NAME).await,
+            Err(CatalogError::DefaultDatabase {
+                operation: "drop",
+                ..
+            })
+        ));
+        // `start` of the not-running default is rejected (it is server-lifecycle-managed) …
+        assert!(matches!(
+            catalog.start(DEFAULT_DATABASE_NAME).await,
+            Err(CatalogError::DefaultDatabase {
+                operation: "start",
+                ..
+            })
+        ));
+        // … and idempotent once the server started it.
+        let _ = catalog.start_default().await.expect("start default");
+        let _ = catalog
+            .start(DEFAULT_DATABASE_NAME)
+            .await
+            .expect("idempotent start of the running default");
+
+        // Unknown names error on every lifecycle op.
+        assert!(matches!(
+            catalog.start("nope").await,
+            Err(CatalogError::UnknownDatabase(_))
+        ));
+        assert!(matches!(
+            catalog.stop("nope").await,
+            Err(CatalogError::UnknownDatabase(_))
+        ));
+        assert!(matches!(
+            catalog.drop_database("nope").await,
+            Err(CatalogError::UnknownDatabase(_))
+        ));
+        // Invalid names are rejected before any state is touched.
+        assert!(matches!(
+            catalog.create("no/slash").await,
+            Err(CatalogError::InvalidName(_))
+        ));
+
+        catalog.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn list_reports_default_desired_and_actual_states() {
+        let root = TempRoot::new("list");
+        let catalog = open_catalog(&root);
+        let _ = catalog.start_default().await.expect("start default");
+        let _ = catalog.create("alpha").await.expect("create");
+        catalog.stop("alpha").await.expect("stop");
+
+        let infos = catalog.list().await;
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, DEFAULT_DATABASE_NAME);
+        assert!(infos[0].is_default);
+        assert_eq!(infos[0].state, DbState::Online);
+        assert_eq!(infos[1].name, "alpha");
+        assert!(!infos[1].is_default);
+        assert_eq!(infos[1].state, DbState::Offline);
+        assert_eq!(infos[1].desired, DbState::Offline);
+        assert_eq!(infos[1].error, None);
+
+        catalog.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn boot_reconciliation_starts_online_databases_and_shutdown_keeps_desired_state() {
+        let root = TempRoot::new("boot");
+        {
+            let catalog = open_catalog(&root);
+            let _ = catalog.start_default().await.expect("start default");
+            let _ = catalog.create("alpha").await.expect("create alpha");
+            let _ = catalog.create("beta").await.expect("create beta");
+            catalog.stop("beta").await.expect("stop beta");
+            // Process teardown: durable desired states must survive untouched.
+            catalog.shutdown_all().await;
+        }
+        // "Next boot": alpha (desired online) starts, beta (desired offline) stays down.
+        let catalog = open_catalog(&root);
+        let _ = catalog.start_default().await.expect("start default");
+        catalog.start_catalog_databases().await;
+        assert!(catalog.handle("alpha").is_some(), "alpha reconciled online");
+        assert!(catalog.handle("beta").is_none(), "beta stays offline");
+        assert!(catalog.default_handle().is_some());
+
+        catalog.shutdown_all().await;
+    }
+
+    // ---- persist-failure crash safety (fault-injected) --------------------------------------------
+
+    /// Regression (storage audit F1 + F3): a `stop` whose persist fails must leave memory
+    /// resynced to the durable file (still `online` — the rename never happened), and a retried
+    /// `stop` must re-attempt the persist. Before the fix, the error branch left memory at
+    /// `offline`, so the retry hit the idempotency check and reported success **without ever
+    /// persisting** — the durable file still said `online` and the database resurrected at the
+    /// next boot despite a reported successful stop.
+    #[tokio::test]
+    async fn failed_stop_persist_resyncs_memory_and_retry_persists_offline() {
+        let root = TempRoot::new("stop-fault");
+        let catalog = open_catalog(&root);
+        let _ = catalog.create("alpha").await.expect("create");
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Online));
+
+        // The stop drains the engine, then its persist fails (injected before the write/rename).
+        catalog.inject_persist_faults(1);
+        let err = catalog.stop("alpha").await;
+        assert!(
+            matches!(err, Err(CatalogError::Io { .. })),
+            "stop reports the persist failure: {err:?}"
+        );
+        assert!(catalog.handle("alpha").is_none(), "the engine is down");
+        // The durable file is untouched (the rename never happened) — and memory resynced to it.
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Online));
+        let infos = catalog.list().await;
+        let alpha = infos.iter().find(|i| i.name == "alpha").expect("listed");
+        assert_eq!(
+            alpha.desired,
+            DbState::Online,
+            "memory follows the published file, not the failed mutation"
+        );
+        assert_eq!(alpha.state, DbState::Offline, "actual state: engine down");
+
+        // The retry skips the drain (the engine is already stopped) and re-attempts the persist.
+        catalog.stop("alpha").await.expect("retried stop persists");
+        assert_eq!(
+            durable_states(&root).get("alpha"),
+            Some(&DbState::Offline),
+            "the retried stop made the offline state durable"
+        );
+
+        catalog.shutdown_all().await;
+    }
+
+    /// Regression (storage audit F3): every mutating persist failure resyncs memory from the
+    /// published file (instead of a blind in-memory rollback), so memory never asserts state the
+    /// filesystem does not hold and a plain retry always re-derives the right action.
+    #[tokio::test]
+    async fn failed_persists_resync_memory_and_retries_succeed() {
+        let root = TempRoot::new("resync");
+        let catalog = open_catalog(&root);
+
+        // create: the failed persist leaves no entry (memory == published file == no "alpha").
+        catalog.inject_persist_faults(1);
+        assert!(matches!(
+            catalog.create("alpha").await,
+            Err(CatalogError::Io { .. })
+        ));
+        assert!(!durable_states(&root).contains_key("alpha"));
+        assert!(catalog.list().await.iter().all(|i| i.name != "alpha"));
+        let _ = catalog.create("alpha").await.expect("retried create");
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Online));
+
+        // start: the failed persist resyncs to offline; the retry brings it online.
+        catalog.stop("alpha").await.expect("stop");
+        catalog.inject_persist_faults(1);
+        assert!(matches!(
+            catalog.start("alpha").await,
+            Err(CatalogError::Io { .. })
+        ));
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Offline));
+        let infos = catalog.list().await;
+        let alpha = infos.iter().find(|i| i.name == "alpha").expect("listed");
+        assert_eq!(alpha.desired, DbState::Offline, "memory resynced");
+        let _ = catalog.start("alpha").await.expect("retried start");
+
+        // drop: the failed persist keeps the entry AND the data; the retry removes both.
+        catalog.stop("alpha").await.expect("stop before drop");
+        catalog.inject_persist_faults(1);
+        assert!(matches!(
+            catalog.drop_database("alpha").await,
+            Err(CatalogError::Io { .. })
+        ));
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Offline));
+        let dir = root.path.join(DATABASES_DIR_NAME).join("alpha");
+        assert!(dir.exists(), "a failed drop must not delete the data");
+        catalog.drop_database("alpha").await.expect("retried drop");
+        assert!(!durable_states(&root).contains_key("alpha"));
+        assert!(!dir.exists());
+
+        catalog.shutdown_all().await;
+    }
+
+    // ---- provisioning durability (storage audit F2) ------------------------------------------------
+
+    /// Regression (storage audit F2): after `provision_fresh_dir` the directory exists and is
+    /// **empty**, even when a stale populated directory (a crashed drop's leftovers) was present —
+    /// the precondition the catalog needs before it may claim the name `online`.
+    ///
+    /// The `fsync` barrier itself (the dir + parent `sync_all` before returning) is asserted by
+    /// code review of `provision_fresh_dir`, not by simulation: proving it would require
+    /// replaying a kernel crash that journals the directory tree without the unlinks (e.g. a
+    /// btrfs tree-log replay), which no user-space test can express. `graphus-sim` currently
+    /// models deterministic clock/RNG capabilities only — it has no directory-entry durability
+    /// model — so this test pins the observable protocol (clear → create → return only after the
+    /// syncs succeed) and the barrier argument lives in the function's rustdoc.
+    #[test]
+    fn provision_fresh_dir_clears_stale_contents_including_nested() {
+        let root = TempRoot::new("provision");
+        let dir = root.path.join(DATABASES_DIR_NAME).join("alpha");
+        std::fs::create_dir_all(dir.join("nested")).expect("stale nested dir");
+        std::fs::write(dir.join(STORE_FILE_NAME), b"old dropped store").expect("stale store");
+        std::fs::write(dir.join("nested").join("junk.bin"), b"junk").expect("stale junk");
+
+        provision_fresh_dir(&dir).expect("provision");
+
+        assert!(dir.is_dir(), "the directory exists after provisioning");
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("read dir").count(),
+            0,
+            "the directory is empty: nothing of the dropped store can resurrect"
+        );
+    }
+
+    /// `provision_fresh_dir` on a blank root (the very first `create`): the parent
+    /// `<root>/databases/` is created explicitly so both fsync targets exist.
+    #[test]
+    fn provision_fresh_dir_creates_parent_on_first_use() {
+        let root = TempRoot::new("provision-first");
+        let dir = root.path.join(DATABASES_DIR_NAME).join("alpha");
+        assert!(!root.path.join(DATABASES_DIR_NAME).exists());
+
+        provision_fresh_dir(&dir).expect("provision");
+
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).expect("read dir").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_clears_an_inert_orphan_directory() {
+        let root = TempRoot::new("orphan");
+        let catalog = open_catalog(&root);
+        // Simulate a crashed drop (entry persisted away, directory left behind with old data).
+        let dir = root.path.join(DATABASES_DIR_NAME).join("alpha");
+        std::fs::create_dir_all(&dir).expect("orphan dir");
+        std::fs::write(dir.join("leftover.bin"), b"old data").expect("orphan file");
+
+        let _ = catalog.create("alpha").await.expect("create over orphan");
+        assert!(
+            !dir.join("leftover.bin").exists(),
+            "the orphan's contents never resurrect into the new database"
+        );
+        assert!(dir.join(STORE_FILE_NAME).exists());
+
+        catalog.shutdown_all().await;
+    }
+}
