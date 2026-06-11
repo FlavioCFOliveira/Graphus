@@ -182,12 +182,17 @@ pub fn estimate_rows(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
 // =================================================================================================
 
 /// The total node count to scale against: the statistics value, or [`DEFAULT_TOTAL_NODES`].
-fn total_nodes(stats: Option<&dyn Statistics>) -> f64 {
+///
+/// Shared with the [cost model](crate::cost), which scales its physical access-path cardinalities
+/// against the same total so the two estimators stay mutually consistent.
+pub(crate) fn total_nodes(stats: Option<&dyn Statistics>) -> f64 {
     stats.map_or(DEFAULT_TOTAL_NODES, |s| s.total_nodes() as f64)
 }
 
 /// The total relationship count: the statistics value, or [`DEFAULT_TOTAL_RELATIONSHIPS`].
-fn total_relationships(stats: Option<&dyn Statistics>) -> f64 {
+///
+/// Shared with the [cost model](crate::cost) (see [`total_nodes`]).
+pub(crate) fn total_relationships(stats: Option<&dyn Statistics>) -> f64 {
     stats.map_or(DEFAULT_TOTAL_RELATIONSHIPS, |s| {
         s.total_relationships() as f64
     })
@@ -196,8 +201,10 @@ fn total_relationships(stats: Option<&dyn Statistics>) -> f64 {
 /// The average node out-degree: `total_relationships / max(1, total_nodes)`.
 ///
 /// `max(1, _)` guards against division by zero on an empty graph; with zero nodes the degree is
-/// simply the relationship total (a degenerate but finite value).
-fn average_degree(stats: Option<&dyn Statistics>) -> f64 {
+/// simply the relationship total (a degenerate but finite value). Shared with the
+/// [cost model](crate::cost), whose `ExpandAll`/`ExpandInto` cardinality multiplies by this same
+/// degree.
+pub(crate) fn average_degree(stats: Option<&dyn Statistics>) -> f64 {
     let nodes = total_nodes(stats).max(1.0);
     total_relationships(stats) / nodes
 }
@@ -207,7 +214,7 @@ fn average_degree(stats: Option<&dyn Statistics>) -> f64 {
 /// A `NaN` collapses to `0.0` (the safe, smallest sensible count); a positive infinity clamps to
 /// [`f64::MAX`] and a negative value clamps to `0.0`. This is the single choke point that upholds the
 /// "never `NaN`, never infinite, never negative" guarantee in [`estimate_rows`].
-fn clamp_estimate(x: f64) -> f64 {
+pub(crate) fn clamp_estimate(x: f64) -> f64 {
     if x.is_nan() {
         0.0
     } else if x.is_infinite() {
@@ -224,7 +231,7 @@ fn clamp_estimate(x: f64) -> f64 {
 /// computed expression cannot be evaluated at planning time without binding/constant-folding, so it
 /// returns `None` and the caller treats the operator as a pass-through. The literal's value is a
 /// `u128`; it is saturated into `f64` (an exact conversion for any realistic count).
-fn literal_row_count(expr: &crate::ast::Expr) -> Option<f64> {
+pub(crate) fn literal_row_count(expr: &crate::ast::Expr) -> Option<f64> {
     match &expr.kind {
         ExprKind::Literal(Literal::Integer(int_lit)) => Some(int_lit.value as f64),
         _ => None,
@@ -237,7 +244,7 @@ fn literal_row_count(expr: &crate::ast::Expr) -> Option<f64> {
 /// documentation). `max` defaults to `min + DEFAULT_VARLEN_MAX_HOPS` when unbounded, so an open-ended
 /// traversal still has a finite modelled length. The returned value is the midpoint `(min + max) / 2`,
 /// the average path length used as the degree exponent.
-fn average_path_length(range: &VarLengthRange) -> f64 {
+pub(crate) fn average_path_length(range: &VarLengthRange) -> f64 {
     let min = range.min.unwrap_or(1);
     // An open upper bound is clamped relative to `min` so the exponent stays small and finite.
     let max = range

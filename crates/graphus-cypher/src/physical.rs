@@ -10,11 +10,23 @@
 //! > *"physical planner → physical plan (index seeks, expand-into vs expand-all, hash vs
 //! > nested-loop join, sort, limit pushdown)"*.
 //!
-//! # The four physical decisions (and why each is sound)
+//! # Rule-based vs cost-based planning
 //!
-//! v1 is **heuristic / rule-based with index awareness** (`04 §6.6`); a cost-based optimiser with
-//! statistics is Phase 2 (`00-overview` §6). Each rule below is chosen so it is *obviously*
-//! correct — it never changes the rows a plan produces, only how they are produced.
+//! The planner has **two modes**, selected by whether graph [`Statistics`] are supplied:
+//!
+//! * [`plan_physical`] (and [`plan_physical_with_stats`] with `stats = None`) is **rule-based with
+//!   index awareness** (`04 §6.6`): it makes the four obviously-sound strategy choices below and
+//!   nothing else. This is the byte-for-byte stable plan the TCK runner and the server execute, and it
+//!   is the deterministic *fallback* the cost-based mode starts from.
+//! * [`plan_physical_with_stats`] with `stats = Some(..)` is **cost-based** (`00-overview` §6, task
+//!   #65): it first builds the rule-based tree, then applies the bag-preserving rewrites in
+//!   [the cost-based optimiser](self#cost-based-optimisation) — **join reordering**, **hash-join
+//!   build-side selection**, and **cost-based access-path (seek-vs-scan) selection** — keeping only the
+//!   cheaper alternative under the [cost model](crate::cost). Only the plan *shape* changes; the result
+//!   bag is invariant (see each rewrite's soundness argument).
+//!
+//! Each rule below is chosen so it is *obviously* correct — it never changes the rows a plan produces,
+//! only how they are produced.
 //!
 //! 1. **Index selection.** A [`NodeByLabelScan`](crate::logical::LogicalOp::NodeByLabelScan)
 //!    immediately under a [`Filter`](crate::logical::LogicalOp::Filter) whose predicate is an
@@ -63,24 +75,57 @@
 //! **range** node predicates, the **token-lookup** label scan, and single-property **relationship**
 //! predicates routed through the catalog.
 //!
-//! **Deferred, by name:** (1) **cost-based optimisation** — selectivity-driven access-path choice,
-//! join reordering, multi-predicate composite-index seeds beyond a single leading-key predicate, and
-//! general predicate pushdown (Phase 2, `00-overview` §6; `04 §6.6`); (2) **`AllRelationshipsScan`
-//! index routing** — a relationship-type-only scan keeps its logical form (the relationship-property
-//! seek requires a property predicate, lowered when a [`Filter`] supplies one over an expand, which
-//! is itself Phase-2 territory); (3) **composite multi-key seeks** — only a composite's *leading*
-//! key drives a seek here, matching the catalog's [`label_property`](crate::catalog::IndexCatalog::label_property)
-//! contract; (4) **`IN`-list / `STARTS WITH` index acceleration** — treated as residual filters in
-//! v1.
+//! **Cost-based (task #65), only when statistics are supplied:** selectivity-driven **access-path
+//! choice** (index seek vs label/token scan, [the seek-vs-scan rule](self#cost-based-optimisation)),
+//! **inner-join reordering** and **hash-join build-side selection** over independent, write-free join
+//! regions (System-R-style bottom-up dynamic programming). Expand direction stays the rule-based
+//! choice — the logical plan fixes the traversal anchor, so a cost-based *reversal* is out of scope.
+//!
+//! **Deferred, by name:** (1) **multi-predicate composite-index seeds** beyond a single leading-key
+//! predicate, and general predicate pushdown (`04 §6.6`); (2) **`AllRelationshipsScan` index
+//! routing** — a relationship-type-only scan keeps its logical form (the relationship-property seek
+//! requires a property predicate, lowered when a [`Filter`] supplies one over an expand, which is
+//! itself later territory); (3) **composite multi-key seeks** — only a composite's *leading* key
+//! drives a seek here, matching the catalog's
+//! [`label_property`](crate::catalog::IndexCatalog::label_property) contract; (4) **`IN`-list /
+//! `STARTS WITH` index acceleration** — treated as residual filters in v1.
+//!
+//! # Cost-based optimisation
+//!
+//! [`plan_physical_with_stats`] with `stats = Some(..)` runs the rule-based planner, then a single
+//! bottom-up optimisation pass over the resulting tree, applying two families of bag-preserving
+//! rewrites, each gated on the [cost model](crate::cost):
+//!
+//! 1. **Access-path selection (seek vs scan).** At a seek (or a scan+filter) that the rule-based
+//!    planner produced from a `Filter`-over-label-scan, the optimiser costs *both* realisations — the
+//!    index seek (`seek + residual filter`) and the scan (`label/token scan + full filter`) — and keeps
+//!    the cheaper. A selective predicate keeps the seek (today's behaviour); a non-selective one the
+//!    histogram says matches most rows reverts to the scan. **Soundness:** both realisations produce
+//!    exactly the rows the predicate selects — a seek returns precisely those rows; the residual filter
+//!    is preserved either way — so the result bag is identical.
+//! 2. **Join reordering + build-side selection.** A maximal connected region of *reorderable* binary
+//!    joins ([`HashJoin`](PhysicalOp::HashJoin) or **cartesian** [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin)
+//!    over **independent** — non-correlated, write-free — sides) is flattened into its leaf operands
+//!    and join graph, then re-assembled by **bottom-up dynamic programming** that minimises total cost,
+//!    left-deep, with each hash join building its lower-cardinality side. **Soundness:** inner equi-join
+//!    and cartesian product are commutative and associative, so any join order over the same operands
+//!    yields the same result multiset; build-side choice only swaps a hash join's build/probe inputs,
+//!    which the executor's symmetric `merge_rows` leaves bag-invariant. Correlated applies (an
+//!    [`Argument`](PhysicalOp::Argument) on the spine) and any write-bearing subtree are **never**
+//!    reordered.
+//!
+//! The optimiser recurses into every operand and child, so both rewrites apply throughout the tree.
+//! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
 
 use crate::ast::{BinaryOp, Expr, ExprKind, Label, RelType};
 use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
+use crate::cost::estimate_cost;
 use crate::logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
 use crate::statistics::Statistics;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// A compiled **physical plan**: the operator tree plus the catalog indexes it depends on.
@@ -125,11 +170,10 @@ impl PhysicalPlan {
     /// This is the cardinality estimator's verdict ([`crate::cardinality::estimate_rows`]) computed
     /// against the [`Statistics`] supplied to [`plan_physical_with_stats`] — exact where the backend
     /// tracks counts, and the documented `DEFAULT_*` fallbacks otherwise (so [`plan_physical`], which
-    /// passes no statistics, still yields a finite, positive estimate). The value rides **alongside**
-    /// the plan as cost-model input (the Phase-2 cost-based optimiser, task #65); **no plan-choice in
-    /// this planner branches on it**, so two plans built from the same query and statistics are equal
-    /// and the operator tree is identical to what [`plan_physical`] produces. Always finite and
-    /// `>= 0.0` (the estimator guarantees it).
+    /// passes no statistics, still yields a finite, positive estimate). It is the **root** cardinality:
+    /// the estimated size of the whole plan's result, which the cost-based rewrites preserve (they
+    /// change *how* the result is produced, never the multiset of rows). Always finite and `>= 0.0`
+    /// (the estimator guarantees it).
     #[must_use]
     pub fn estimated_rows(&self) -> f64 {
         self.estimated_rows
@@ -187,6 +231,18 @@ impl RangeBound {
             Self::GreaterOrEqual => ">=",
             Self::LessThan => "<",
             Self::LessOrEqual => "<=",
+        }
+    }
+
+    /// The [`BinaryOp`] this bound represents with the property on the **left** (`n.p <op> value`).
+    /// The inverse of [`from_property_lhs`](Self::from_property_lhs); used by the cost-based optimiser
+    /// to reconstruct a range seek's consumed predicate when costing the scan alternative.
+    const fn to_binary_op(self) -> BinaryOp {
+        match self {
+            Self::GreaterThan => BinaryOp::Gt,
+            Self::GreaterOrEqual => BinaryOp::Gte,
+            Self::LessThan => BinaryOp::Lt,
+            Self::LessOrEqual => BinaryOp::Lte,
         }
     }
 }
@@ -551,22 +607,27 @@ pub fn plan_physical(logical: &LogicalOp, catalog: &IndexCatalog) -> PhysicalPla
     plan_physical_with_stats(logical, catalog, None)
 }
 
-/// Lowers a [logical plan](LogicalOp) into a [`PhysicalPlan`] exactly as [`plan_physical`] does, and
-/// additionally annotates the plan with a [cardinality estimate](PhysicalPlan::estimated_rows)
-/// informed by the optional graph `stats` (`00-overview` §6 — the Phase-2 cost-based-optimiser
-/// foundation).
+/// Lowers a [logical plan](LogicalOp) into a [`PhysicalPlan`], **cost-based when graph `stats` are
+/// supplied** and rule-based otherwise (`00-overview` §6, task #65).
 ///
 /// The `stats` source ([`crate::statistics::Statistics`], typically obtained from
-/// [`GraphAccess::statistics`](crate::graph_access::GraphAccess::statistics)) feeds the cardinality
-/// estimator ([`estimate_rows`]); pass `None` when the backend tracks no counts (the estimator then
-/// uses its documented constant fallbacks). The estimate is computed over the **logical** plan, which
-/// has the same row-cardinality as the physical plan the executor runs.
+/// [`GraphAccess::statistics`](crate::graph_access::GraphAccess::statistics)) drives both the
+/// [cardinality estimate](PhysicalPlan::estimated_rows) ([`estimate_rows`]) and the [cost
+/// model](crate::cost) the optimiser minimises.
 ///
-/// **Statistics never change the plan.** The operator tree, the recorded index dependencies, and the
-/// query's result set are byte-for-byte identical to [`plan_physical`]; the only field that varies
-/// with `stats` is [`estimated_rows`](PhysicalPlan::estimated_rows). The estimate rides alongside the
-/// plan purely as input for the future cost model (task #65) — no access-path or join choice in this
-/// planner branches on it.
+/// * With **`stats = None`** this is exactly [`plan_physical`]: the rule-based operator tree, the
+///   recorded index dependencies, and the result set are byte-for-byte identical, and the estimate
+///   uses the estimator's documented constant fallbacks.
+/// * With **`stats = Some(..)`** the planner first builds that same rule-based tree (the sound,
+///   correct starting point) and then applies the [cost-based optimiser](self#cost-based-optimisation):
+///   it may reorder independent inner joins, flip a hash join's build side, and choose index-seek vs
+///   scan by estimated cost. **Only the plan shape changes** — every rewrite is bag-preserving (see
+///   the module docs for each soundness argument), so the executor returns the identical result
+///   multiset. The recorded [`index_dependencies`](PhysicalPlan::index_dependencies) are recomputed
+///   from the *final* tree (a plan that drops a seek for a scan no longer records that index).
+///
+/// The root [`estimated_rows`](PhysicalPlan::estimated_rows) is the cardinality estimate over the
+/// logical plan, which the rewrites preserve.
 pub fn plan_physical_with_stats(
     logical: &LogicalOp,
     catalog: &IndexCatalog,
@@ -574,10 +635,23 @@ pub fn plan_physical_with_stats(
 ) -> PhysicalPlan {
     let estimated_rows = estimate_rows(logical, stats);
     let mut deps = BTreeSet::new();
-    let root = Planner { catalog }.lower(logical, &mut deps);
+    let rule_based = Planner { catalog }.lower(logical, &mut deps);
+
+    // With statistics, refine the rule-based tree by the cost model; without, keep it verbatim (this
+    // is exactly `plan_physical`, byte-for-byte). The optimiser is bag-preserving, so only the shape
+    // changes — and the index dependencies are recomputed from the final tree it produces.
+    let (root, index_dependencies) = match stats {
+        Some(s) => {
+            let optimized = optimize(rule_based, catalog, s);
+            let deps = collect_index_dependencies(&optimized);
+            (optimized, deps)
+        }
+        None => (rule_based, deps),
+    };
+
     PhysicalPlan {
         root,
-        index_dependencies: deps,
+        index_dependencies,
         estimated_rows,
     }
 }
@@ -1053,6 +1127,804 @@ fn logical_op_is_correlated(op: &LogicalOp) -> bool {
             logical_op_is_correlated(left) || logical_op_is_correlated(right)
         }
         _ => false,
+    }
+}
+
+// =================================================================================================
+// Cost-based optimiser (task #65): join reordering, build-side selection, seek-vs-scan
+// =================================================================================================
+//
+// Entry point [`optimize`] takes the rule-based physical tree and rewrites it under the cost model
+// (`crate::cost`). Every rewrite is bag-preserving (see the soundness arguments inline and in the
+// module docs); the worst case is "no rewrite improved cost", in which the rule-based tree survives
+// unchanged. The pass is a single bottom-up recursion: children are optimised first, then this node.
+
+/// The maximum number of operands in a single join region the bottom-up DP will fully enumerate.
+///
+/// Exhaustive DP over join order is `O(3^n)` in the number of operands (the classic System-R subset
+/// enumeration), so a hard cap keeps planning time bounded on pathological inputs. Above the cap the
+/// region falls back to the rule-based (already-correct) order for that region — the result bag is
+/// identical, only the (un-optimised) shape differs. `10` operands ≈ 59 049 subset visits, a
+/// comfortable ceiling for interactive planning; real queries rarely approach it.
+const MAX_JOIN_REGION_OPERANDS: usize = 10;
+
+/// Rewrites the rule-based physical tree `op` into a cost-minimised, bag-equivalent tree, using
+/// `catalog` for access-path alternatives and `stats` for the cost model.
+///
+/// The recursion optimises children first (so costs are measured over already-optimised inputs), then
+/// applies, at this node: **(B)** cost-based access-path selection for a seek / scan-filter site, and
+/// **(A)** join-region reordering + build-side selection when the node roots a reorderable join
+/// region. Operators that are neither keep their rule-based form with optimised children.
+fn optimize(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> PhysicalOp {
+    // First, optimise all children (bottom-up): the cost of a parent depends on its inputs' shapes.
+    let op = optimize_children(op, catalog, stats);
+
+    // (B) Access-path selection: a seek the rule-based planner chose may lose to a scan when the
+    // predicate is non-selective; a scan+filter may win back a seek when selective. Handled at the
+    // seek node and at the filter-over-scan node.
+    let op = optimize_access_path(op, catalog, stats);
+
+    // (A) Join reordering: if this node roots a maximal reorderable join region, flatten and re-plan
+    // it by bottom-up DP. (If it is not such a region root, this is a no-op returning `op`.)
+    optimize_join_region(op, stats)
+}
+
+/// Optimises every child subtree of `op` in place, leaving `op`'s own shape untouched. The single
+/// place the recursion descends, so each operator variant lists its children exactly once.
+fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> PhysicalOp {
+    let opt = |b: Box<PhysicalOp>| Box::new(optimize(*b, catalog, stats));
+    match op {
+        // Leaves: nothing to descend into.
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => op,
+
+        // Single-input operators.
+        PhysicalOp::ExpandAll {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+        } => PhysicalOp::ExpandAll {
+            input: opt(input),
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+        },
+        PhysicalOp::ExpandInto {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+        } => PhysicalOp::ExpandInto {
+            input: opt(input),
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+        },
+        PhysicalOp::NamedPath {
+            input,
+            variable,
+            start,
+            steps,
+        } => PhysicalOp::NamedPath {
+            input: opt(input),
+            variable,
+            start,
+            steps,
+        },
+        PhysicalOp::Filter { input, predicate } => PhysicalOp::Filter {
+            input: opt(input),
+            predicate,
+        },
+        PhysicalOp::Projection {
+            input,
+            items,
+            distinct,
+        } => PhysicalOp::Projection {
+            input: opt(input),
+            items,
+            distinct,
+        },
+        PhysicalOp::Aggregation {
+            input,
+            group_keys,
+            aggregates,
+        } => PhysicalOp::Aggregation {
+            input: opt(input),
+            group_keys,
+            aggregates,
+        },
+        PhysicalOp::Sort { input, keys } => PhysicalOp::Sort {
+            input: opt(input),
+            keys,
+        },
+        PhysicalOp::TopN { input, keys, limit } => PhysicalOp::TopN {
+            input: opt(input),
+            keys,
+            limit,
+        },
+        PhysicalOp::Skip { input, count } => PhysicalOp::Skip {
+            input: opt(input),
+            count,
+        },
+        PhysicalOp::Limit { input, count } => PhysicalOp::Limit {
+            input: opt(input),
+            count,
+        },
+        PhysicalOp::Eager { input } => PhysicalOp::Eager { input: opt(input) },
+        PhysicalOp::Unwind {
+            input,
+            list,
+            variable,
+        } => PhysicalOp::Unwind {
+            input: opt(input),
+            list,
+            variable,
+        },
+        PhysicalOp::LoadCsv {
+            input,
+            with_headers,
+            url,
+            variable,
+            field_terminator,
+        } => PhysicalOp::LoadCsv {
+            input: opt(input),
+            with_headers,
+            url,
+            variable,
+            field_terminator,
+        },
+        PhysicalOp::Optional {
+            input,
+            null_variables,
+        } => PhysicalOp::Optional {
+            input: opt(input),
+            null_variables,
+        },
+
+        // Two-input operators.
+        PhysicalOp::NestedLoopJoin { left, right } => PhysicalOp::NestedLoopJoin {
+            left: opt(left),
+            right: opt(right),
+        },
+        PhysicalOp::HashJoin {
+            left,
+            right,
+            join_keys,
+        } => PhysicalOp::HashJoin {
+            left: opt(left),
+            right: opt(right),
+            join_keys,
+        },
+        PhysicalOp::Union { left, right, all } => PhysicalOp::Union {
+            left: opt(left),
+            right: opt(right),
+            all,
+        },
+
+        // Write operators (single input).
+        PhysicalOp::Create { input, pattern } => PhysicalOp::Create {
+            input: opt(input),
+            pattern,
+        },
+        PhysicalOp::Merge {
+            input,
+            pattern,
+            on_create,
+            on_match,
+        } => PhysicalOp::Merge {
+            input: opt(input),
+            pattern,
+            on_create,
+            on_match,
+        },
+        PhysicalOp::SetClause { input, ops } => PhysicalOp::SetClause {
+            input: opt(input),
+            ops,
+        },
+        PhysicalOp::Delete {
+            input,
+            detach,
+            exprs,
+        } => PhysicalOp::Delete {
+            input: opt(input),
+            detach,
+            exprs,
+        },
+        PhysicalOp::Remove { input, ops } => PhysicalOp::Remove {
+            input: opt(input),
+            ops,
+        },
+
+        // Procedure call (optional input).
+        PhysicalOp::ProcedureCall {
+            input,
+            name,
+            args,
+            yields,
+        } => PhysicalOp::ProcedureCall {
+            input: input.map(opt),
+            name,
+            args,
+            yields,
+        },
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// (B) Cost-based access-path selection (seek vs scan)
+// -------------------------------------------------------------------------------------------------
+
+/// Reconsiders the access path at `op` by costing the seek and the scan realisations and keeping the
+/// cheaper. Two trigger shapes (the two forms the rule-based planner can emit from a
+/// `Filter`-over-label-scan):
+///
+/// * a bare or residual-filtered **seek** — try reverting it to `(token/label scan) + filter`;
+/// * a **`Filter` over a label/token scan** — try consuming a conjunct into a seek.
+///
+/// Either way the candidate realisations are *exactly the rows the predicate selects* (a seek returns
+/// precisely the matching rows; the residual filter is preserved), so swapping between them is
+/// bag-preserving. Non-trigger nodes are returned unchanged.
+fn optimize_access_path(
+    op: PhysicalOp,
+    catalog: &IndexCatalog,
+    stats: &dyn Statistics,
+) -> PhysicalOp {
+    // Case 1: a seek, optionally wrapped in a residual Filter -> consider reverting to scan + filter.
+    if let Some(alt) = scan_alternative_for_seek(&op, catalog) {
+        return cheaper(op, alt, stats);
+    }
+    // Case 2: a Filter directly over a label/token scan -> consider consuming a conjunct into a seek.
+    if let Some(alt) = seek_alternative_for_filter(&op, catalog) {
+        return cheaper(op, alt, stats);
+    }
+    op
+}
+
+/// Returns the equivalent `scan + filter` realisation of a seek (possibly under a residual `Filter`),
+/// or `None` when `op` is not a seek site. The reconstructed predicate is the equality/range the seek
+/// consumed, AND-ed under any residual filter that already sat above it.
+fn scan_alternative_for_seek(op: &PhysicalOp, catalog: &IndexCatalog) -> Option<PhysicalOp> {
+    // Peel an optional residual Filter sitting directly over the seek.
+    let (residual, seek) = match op {
+        PhysicalOp::Filter { input, predicate } => (Some(predicate.clone()), input.as_ref()),
+        other => (None, other),
+    };
+    let (variable, label, consumed_predicate) = seek_to_predicate(seek)?;
+    // The full predicate the scan must re-apply: the seek's own predicate, plus any residual, ANDed.
+    let full = match residual {
+        Some(r) => and_exprs(consumed_predicate, r),
+        None => consumed_predicate,
+    };
+    let scan = label_or_token_scan(&variable, &label, catalog);
+    Some(PhysicalOp::Filter {
+        input: Box::new(scan),
+        predicate: full,
+    })
+}
+
+/// If `op` is a `NodeIndexSeek` / `NodeIndexRangeSeek`, reconstructs `(variable, label, predicate)`
+/// where `predicate` is the `var.prop <op> value` expression the seek consumed.
+fn seek_to_predicate(op: &PhysicalOp) -> Option<(Var, Label, Expr)> {
+    match op {
+        PhysicalOp::NodeIndexSeek {
+            variable,
+            label,
+            property,
+            value,
+            ..
+        } => {
+            let pred = property_comparison_expr(variable, property, BinaryOp::Eq, value);
+            Some((variable.clone(), label.clone(), pred))
+        }
+        PhysicalOp::NodeIndexRangeSeek {
+            variable,
+            label,
+            property,
+            bound,
+            value,
+            ..
+        } => {
+            let pred = property_comparison_expr(variable, property, bound.to_binary_op(), value);
+            Some((variable.clone(), label.clone(), pred))
+        }
+        _ => None,
+    }
+}
+
+/// Builds the predicate expression `variable.property <op> value` (property always on the left, which
+/// is how the seek stored it). Spans come from `value` so diagnostics stay anchored to real source.
+fn property_comparison_expr(variable: &Var, property: &str, op: BinaryOp, value: &Expr) -> Expr {
+    let span = value.span;
+    let var_expr = Expr::new(ExprKind::Variable(variable.name.clone()), span);
+    let prop_expr = Expr::new(
+        ExprKind::Property {
+            base: Box::new(var_expr),
+            key: property.to_owned(),
+        },
+        span,
+    );
+    Expr::new(
+        ExprKind::Binary {
+            op,
+            lhs: Box::new(prop_expr),
+            rhs: Box::new(value.clone()),
+        },
+        span,
+    )
+}
+
+/// AND-combines two predicates into one (`lhs AND rhs`), spanning both.
+fn and_exprs(lhs: Expr, rhs: Expr) -> Expr {
+    let span = crate::lexer::Span::new(lhs.span.start, rhs.span.end);
+    Expr::new(
+        ExprKind::Binary {
+            op: BinaryOp::And,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        span,
+    )
+}
+
+/// The label/token scan for a `(variable, label)` — a `TokenLookupScan` when the catalog has a
+/// token-lookup index, else a `NodeByLabelScan` (mirrors [`Planner::lower_label_scan`]).
+fn label_or_token_scan(variable: &Var, label: &Label, catalog: &IndexCatalog) -> PhysicalOp {
+    if let Some(idx) = catalog.token_lookup(label) {
+        PhysicalOp::TokenLookupScan {
+            variable: variable.clone(),
+            label: label.clone(),
+            index: idx.id,
+        }
+    } else {
+        PhysicalOp::NodeByLabelScan {
+            variable: variable.clone(),
+            label: label.clone(),
+        }
+    }
+}
+
+/// If `op` is a `Filter` over a label/token scan whose predicate can drive an index seek, returns the
+/// equivalent `seek + residual filter` realisation; else `None`. This is the same construction the
+/// rule-based [`Planner::lower_filter`] performs, lifted so the optimiser can re-derive a seek the
+/// rule-based tree did not already pick (e.g. after a scan was reconstructed elsewhere).
+fn seek_alternative_for_filter(op: &PhysicalOp, catalog: &IndexCatalog) -> Option<PhysicalOp> {
+    let PhysicalOp::Filter { input, predicate } = op else {
+        return None;
+    };
+    let (variable, label) = match input.as_ref() {
+        PhysicalOp::NodeByLabelScan { variable, label } => (variable, label),
+        PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => (variable, label),
+        _ => return None,
+    };
+    let conjuncts = split_conjuncts(predicate);
+    for (i, conj) in conjuncts.iter().enumerate() {
+        if let Some(pp) = analyze_property_predicate(conj, &variable.name) {
+            if let Some(idx) = catalog.label_property(label, &pp.property) {
+                let seek = build_seek(variable, label, &pp, idx.id);
+                let residual: Vec<&Expr> = conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, e)| *e)
+                    .collect();
+                return Some(attach_residual(seek, &residual));
+            }
+        }
+    }
+    None
+}
+
+/// Returns whichever of `a` / `b` has the lower total [cost](crate::cost), breaking ties toward `a`
+/// (the incoming rule-based shape) for determinism.
+fn cheaper(a: PhysicalOp, b: PhysicalOp, stats: &dyn Statistics) -> PhysicalOp {
+    let ca = estimate_cost(&a, Some(stats)).cost;
+    let cb = estimate_cost(&b, Some(stats)).cost;
+    // Strictly-less keeps `a` on a tie: the rule-based shape is the deterministic default.
+    if cb < ca { b } else { a }
+}
+
+// -------------------------------------------------------------------------------------------------
+// (A) Join reordering + build-side selection (System-R-style bottom-up DP)
+// -------------------------------------------------------------------------------------------------
+
+/// If `op` roots a maximal **reorderable join region**, re-plans that region by bottom-up DP and
+/// returns the cheaper of (re-planned, original); otherwise returns `op` unchanged.
+///
+/// A region is a connected tree of binary joins that are all *reorderable*: a [`HashJoin`](PhysicalOp::HashJoin),
+/// or a **cartesian** [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin) (no shared join keys), whose two
+/// sides are independent — neither correlated (no [`Argument`](PhysicalOp::Argument) on the spine) nor
+/// write-bearing. A correlated nested-loop join, or any join touching a write, is **not** reorderable
+/// and bounds the region; its operands are optimised as opaque leaves (their subtrees were already
+/// optimised bottom-up).
+fn optimize_join_region(op: PhysicalOp, stats: &dyn Statistics) -> PhysicalOp {
+    if !is_reorderable_join(&op) {
+        return op;
+    }
+
+    // Flatten the maximal region into its leaf operands and the join graph over them.
+    let mut operands: Vec<PhysicalOp> = Vec::new();
+    flatten_join_region(op.clone(), &mut operands);
+
+    // A region must have >= 2 operands to reorder; a cap keeps the DP bounded.
+    if operands.len() < 2 || operands.len() > MAX_JOIN_REGION_OPERANDS {
+        // Too large (or degenerate): keep the rule-based region shape (already correct). Logged via the
+        // cap constant's documentation; no behavioural change beyond skipping optimisation here.
+        return op;
+    }
+
+    let replanned = dp_join_order(&operands, stats);
+    // Keep whichever is cheaper; tie -> the original rule-based region (determinism).
+    cheaper(op, replanned, stats)
+}
+
+/// Whether `op` is a join the optimiser may reorder: a hash join, or a cartesian nested-loop join,
+/// with both sides independent (non-correlated, write-free).
+fn is_reorderable_join(op: &PhysicalOp) -> bool {
+    match op {
+        PhysicalOp::HashJoin { left, right, .. } => sides_reorderable(left, right),
+        PhysicalOp::NestedLoopJoin { left, right } => {
+            // A nested-loop join is reorderable only as a *cartesian* product (no shared keys); a
+            // correlated apply (the executor feeds the right branch per left row) must never move.
+            shared_keys(left, right).is_empty() && sides_reorderable(left, right)
+        }
+        _ => false,
+    }
+}
+
+/// Whether both join sides are safe to reorder: independent of a correlation argument and free of any
+/// write operator (a write's side effects must run in the planned order, never be reordered).
+fn sides_reorderable(left: &PhysicalOp, right: &PhysicalOp) -> bool {
+    !contains_argument(left)
+        && !contains_argument(right)
+        && !contains_write(left)
+        && !contains_write(right)
+}
+
+/// Whether a physical (sub)plan contains an [`Argument`](PhysicalOp::Argument) anywhere — the
+/// physical marker of correlation (the subplan reads an outer row). The cost-based reorderer must
+/// never move such a subplan, since its meaning depends on the correlated feed.
+fn contains_argument(op: &PhysicalOp) -> bool {
+    match op {
+        PhysicalOp::Argument { .. } => true,
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::Empty => false,
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::Optional { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. } => contains_argument(input),
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => {
+            contains_argument(left) || contains_argument(right)
+        }
+        PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_argument),
+    }
+}
+
+/// Flattens a maximal reorderable join region rooted at `op` into its leaf operands (depth-first,
+/// left-before-right, preserving a stable operand order for determinism). The caller guarantees `op`
+/// is a reorderable join ([`is_reorderable_join`]); each side is recursed into when it is itself a
+/// reorderable join, else pushed as an opaque region leaf.
+fn flatten_join_region(op: PhysicalOp, operands: &mut Vec<PhysicalOp>) {
+    debug_assert!(
+        is_reorderable_join(&op),
+        "flatten_join_region requires a reorderable join root"
+    );
+    match op {
+        PhysicalOp::HashJoin { left, right, .. } | PhysicalOp::NestedLoopJoin { left, right } => {
+            flatten_side(*left, operands);
+            flatten_side(*right, operands);
+        }
+        // The caller's guard makes this unreachable; treat any other shape as a single leaf.
+        other => operands.push(other),
+    }
+}
+
+/// Flattens one join side: recurse when it is itself a reorderable join, else push it as an operand.
+fn flatten_side(side: PhysicalOp, operands: &mut Vec<PhysicalOp>) {
+    if is_reorderable_join(&side) {
+        flatten_join_region(side, operands);
+    } else {
+        operands.push(side);
+    }
+}
+
+/// The set of bound-variable names shared between two subplans (their equi-join keys), sorted &
+/// de-duplicated for determinism. Empty ⇒ only a cartesian edge connects them.
+fn shared_keys(left: &PhysicalOp, right: &PhysicalOp) -> Vec<String> {
+    let left_cols: BTreeSet<String> = bound_var_names(left).into_iter().collect();
+    let right_cols: BTreeSet<String> = bound_var_names(right).into_iter().collect();
+    left_cols.intersection(&right_cols).cloned().collect()
+}
+
+/// A DP sub-result: the best (min-cost) plan over a specific subset of operands, with its cost and
+/// estimated output cardinality cached so a parent join can score it without re-walking the subtree.
+#[derive(Clone)]
+struct DpEntry {
+    /// The chosen physical plan for this operand subset.
+    plan: PhysicalOp,
+    /// Its total cost under the cost model.
+    cost: f64,
+    /// Its estimated output cardinality (drives build-side selection at the next join up).
+    rows: f64,
+}
+
+/// Bottom-up dynamic programming over join order (System-R): build the min-cost plan for every
+/// reachable subset of `operands`, combining smaller subsets, and return the plan for the full set.
+///
+/// The DP table is keyed by a **sorted operand-index set** (a `BTreeSet<usize>` inside a `BTreeMap`),
+/// so iteration and tie-breaking are deterministic. For each subset, every split into two non-empty,
+/// disjoint, covering sub-subsets is considered; the join is a [`HashJoin`](PhysicalOp::HashJoin) on
+/// the shared keys when the two sides share any bound variable, else a cartesian
+/// [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin). The lower-cardinality side becomes the hash join's
+/// **build** (left) input. Only the cheapest plan per subset is kept (pruning).
+///
+/// **Determinism:** subsets are enumerated by ascending size then by their sorted index set; among
+/// equal-cost candidates for a subset the first encountered in that stable order wins. **Soundness:**
+/// inner equi-join and cartesian product are commutative and associative, so every subset's plan
+/// computes the same multiset regardless of the split chosen.
+fn dp_join_order(operands: &[PhysicalOp], stats: &dyn Statistics) -> PhysicalOp {
+    let n = operands.len();
+
+    // Precompute each operand's leaf cost/rows once.
+    let mut table: BTreeMap<BTreeSet<usize>, DpEntry> = BTreeMap::new();
+    for (i, operand) in operands.iter().enumerate() {
+        let est = estimate_cost(operand, Some(stats));
+        let key: BTreeSet<usize> = std::iter::once(i).collect();
+        table.insert(
+            key,
+            DpEntry {
+                plan: operand.clone(),
+                cost: est.cost,
+                rows: est.rows,
+            },
+        );
+    }
+
+    // Build up subsets by increasing size. For each target subset, try every (proper, non-empty)
+    // split into two halves whose best plans are already in the table.
+    for size in 2..=n {
+        for subset in subsets_of_size(n, size) {
+            let mut best: Option<DpEntry> = None;
+            for (lhs, rhs) in proper_splits(&subset) {
+                let (Some(le), Some(re)) = (table.get(&lhs), table.get(&rhs)) else {
+                    continue;
+                };
+                let candidate = join_entries(le, re, stats);
+                // Keep the strictly-cheaper candidate; the stable split order makes ties deterministic.
+                if best.as_ref().is_none_or(|b| candidate.cost < b.cost) {
+                    best = Some(candidate);
+                }
+            }
+            if let Some(entry) = best {
+                table.insert(subset, entry);
+            }
+        }
+    }
+
+    let full: BTreeSet<usize> = (0..n).collect();
+    table
+        .get(&full)
+        .map(|e| e.plan.clone())
+        // Defensive: the DP always fills the full set for a connected region; if it somehow did not,
+        // fall back to a left-deep join of the operands in order (still bag-correct).
+        .unwrap_or_else(|| left_deep_fallback(operands))
+}
+
+/// Joins two DP sub-plans into one, choosing the strategy and build side:
+///
+/// * shared keys ⇒ [`HashJoin`](PhysicalOp::HashJoin) on those keys, building the **lower-cardinality**
+///   side (so `COST_HASH_BUILD · |build|` is minimised);
+/// * no shared key ⇒ cartesian [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin), the lower-cardinality
+///   side on the **left** (driving) so the quadratic term is computed over the smaller outer loop
+///   first — bag-identical either way, this is purely the cost-minimising orientation.
+fn join_entries(a: &DpEntry, b: &DpEntry, stats: &dyn Statistics) -> DpEntry {
+    let keys = shared_keys(&a.plan, &b.plan);
+    // Orient: the smaller side is the build/driver. On an exact tie, keep `a` left for determinism.
+    let (small, large) = if b.rows < a.rows { (b, a) } else { (a, b) };
+
+    let plan = if keys.is_empty() {
+        PhysicalOp::NestedLoopJoin {
+            left: Box::new(small.plan.clone()),
+            right: Box::new(large.plan.clone()),
+        }
+    } else {
+        PhysicalOp::HashJoin {
+            left: Box::new(small.plan.clone()),
+            right: Box::new(large.plan.clone()),
+            join_keys: keys,
+        }
+    };
+    let est = estimate_cost(&plan, Some(stats));
+    DpEntry {
+        plan,
+        cost: est.cost,
+        rows: est.rows,
+    }
+}
+
+/// A left-deep join of all operands in their given order (a defensive fallback; the DP normally
+/// supplies the optimal shape). Bag-correct: any join order over the same operands is equivalent.
+fn left_deep_fallback(operands: &[PhysicalOp]) -> PhysicalOp {
+    let mut iter = operands.iter().cloned();
+    let mut acc = iter.next().expect("a region has >= 1 operand");
+    for next in iter {
+        let keys = shared_keys(&acc, &next);
+        acc = if keys.is_empty() {
+            PhysicalOp::NestedLoopJoin {
+                left: Box::new(acc),
+                right: Box::new(next),
+            }
+        } else {
+            PhysicalOp::HashJoin {
+                left: Box::new(acc),
+                right: Box::new(next),
+                join_keys: keys,
+            }
+        };
+    }
+    acc
+}
+
+/// Every subset of `{0..n}` of exactly `size` elements, in ascending lexicographic order of the sorted
+/// index vector (deterministic enumeration). Returned as `BTreeSet`s so they key the DP table.
+fn subsets_of_size(n: usize, size: usize) -> Vec<BTreeSet<usize>> {
+    let mut out = Vec::new();
+    let mut current = Vec::with_capacity(size);
+    fn recurse(
+        start: usize,
+        n: usize,
+        size: usize,
+        current: &mut Vec<usize>,
+        out: &mut Vec<BTreeSet<usize>>,
+    ) {
+        if current.len() == size {
+            out.push(current.iter().copied().collect());
+            return;
+        }
+        for i in start..n {
+            current.push(i);
+            recurse(i + 1, n, size, current, out);
+            current.pop();
+        }
+    }
+    recurse(0, n, size, &mut current, &mut out);
+    out
+}
+
+/// Every split of `subset` into an ordered pair of non-empty, disjoint halves whose union is `subset`.
+///
+/// To avoid scoring each unordered partition twice (and to keep enumeration deterministic), only
+/// splits whose left half contains the subset's smallest element are produced; the right half is the
+/// complement. This yields each partition exactly once, with a stable order.
+fn proper_splits(subset: &BTreeSet<usize>) -> Vec<(BTreeSet<usize>, BTreeSet<usize>)> {
+    let elems: Vec<usize> = subset.iter().copied().collect();
+    let k = elems.len();
+    let mut out = Vec::new();
+    if k < 2 {
+        return out;
+    }
+    let anchor = elems[0]; // The smallest element pins the left half (each partition produced once).
+    // Enumerate non-empty proper subsets of the remaining elements to join the anchor on the left.
+    let rest = &elems[1..];
+    let m = rest.len();
+    // 2^m bitmask over `rest`; left = {anchor} ∪ chosen, right = the unchosen. Both non-empty since
+    // left always has the anchor and we skip the mask that takes *all* of rest (which would empty
+    // right).
+    for mask in 0..(1u32 << m) {
+        let mut left: BTreeSet<usize> = std::iter::once(anchor).collect();
+        let mut right: BTreeSet<usize> = BTreeSet::new();
+        for (bit, &e) in rest.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                left.insert(e);
+            } else {
+                right.insert(e);
+            }
+        }
+        if right.is_empty() {
+            continue;
+        }
+        out.push((left, right));
+    }
+    out
+}
+
+// -------------------------------------------------------------------------------------------------
+// Index-dependency recomputation (the final tree may differ from the rule-based one)
+// -------------------------------------------------------------------------------------------------
+
+/// Walks a physical plan and collects every catalog [`IndexId`] its access paths actually use,
+/// ascending & de-duplicated. Recomputed from the **final** optimised tree so a plan that dropped a
+/// seek in favour of a scan no longer records that index dependency (and vice versa).
+fn collect_index_dependencies(op: &PhysicalOp) -> BTreeSet<IndexId> {
+    let mut deps = BTreeSet::new();
+    gather_index_dependencies(op, &mut deps);
+    deps
+}
+
+fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
+    match op {
+        PhysicalOp::TokenLookupScan { index, .. }
+        | PhysicalOp::NodeIndexSeek { index, .. }
+        | PhysicalOp::NodeIndexRangeSeek { index, .. } => {
+            deps.insert(*index);
+        }
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => {}
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::Optional { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. } => gather_index_dependencies(input, deps),
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => {
+            gather_index_dependencies(left, deps);
+            gather_index_dependencies(right, deps);
+        }
+        PhysicalOp::ProcedureCall { input, .. } => {
+            if let Some(input) = input {
+                gather_index_dependencies(input, deps);
+            }
+        }
     }
 }
 
@@ -1734,13 +2606,16 @@ mod tests {
     }
 
     #[test]
-    fn statistics_never_change_the_operator_tree_or_dependencies() {
+    fn single_pattern_plan_is_stable_under_statistics() {
         use crate::graph_access::{GraphAccess, MemGraph};
         use graphus_core::Value;
 
         let catalog = IndexCatalog::builder()
             .with_label_property("Person", "age")
             .build();
+        // A single-pattern query with a *selective* equality (every age distinct): no joins to
+        // reorder, and the index seek stays the cheapest access path, so the cost-based planner keeps
+        // the rule-based tree byte-for-byte.
         let logical = logical_of("MATCH (n:Person) WHERE n.age = 30 RETURN n");
 
         let mut g = MemGraph::new();
@@ -1751,12 +2626,61 @@ mod tests {
         let without = plan_physical(&logical, &catalog);
         let with = plan_physical_with_stats(&logical, &catalog, g.statistics());
 
-        // Statistics inform the estimate only: the operator tree and the recorded index dependencies
-        // are byte-identical whether or not stats are supplied.
+        // With nothing to reorder and a selective seek, the operator tree and the recorded index
+        // dependencies are identical whether or not stats are supplied.
         assert_eq!(without.root, with.root);
         assert_eq!(
             without.index_dependencies().collect::<Vec<_>>(),
             with.index_dependencies().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multi_pattern_plan_changes_under_skewed_statistics() {
+        use crate::graph_access::{GraphAccess, MemGraph};
+        use graphus_core::Value;
+
+        // A three-component cartesian query: MATCH (a:Person), (b:Company), (c:Car) WHERE … . The
+        // logical planner lowers this to `Filter(preds) over ((Person × Company) × Car)` — a left-deep
+        // chain of cartesian NestedLoopJoins. Its *output* size is order-invariant, but the sum of the
+        // intermediate pair-costs is NOT: joining the two small relations (Company × Car) first, then
+        // the large one, dramatically shrinks the costly upper join. With skewed statistics (Person ≫
+        // Company, Car) the cost-based planner must reorder to put the small operands inermost,
+        // producing a different — and cheaper — tree.
+        let catalog = IndexCatalog::empty();
+        let logical = logical_of(
+            "MATCH (a:Person), (b:Company), (c:Car) WHERE a.k = b.k AND b.j = c.j RETURN a, b, c",
+        );
+
+        let mut g = MemGraph::new();
+        for i in 0..1000 {
+            g.add_node(["Person"], [("k", Value::Integer(i))]);
+        }
+        for i in 0..3 {
+            g.add_node(
+                ["Company"],
+                [("k", Value::Integer(i)), ("j", Value::Integer(i))],
+            );
+        }
+        for i in 0..3 {
+            g.add_node(["Car"], [("j", Value::Integer(i))]);
+        }
+        let stats = g.statistics();
+
+        let without = plan_physical(&logical, &catalog);
+        let with = plan_physical_with_stats(&logical, &catalog, stats);
+
+        // The acceptance criterion: a multi-pattern query's tree DOES change with statistics …
+        assert_ne!(
+            without.root, with.root,
+            "skewed stats must reshape the join:\nrule-based:\n{without}\ncost-based:\n{with}"
+        );
+        // … and the cost-based tree is strictly cheaper than the rule-based one (the reorder wins).
+        let rule_cost = estimate_cost(&without.root, stats).cost;
+        let opt_cost = estimate_cost(&with.root, stats).cost;
+        assert!(
+            opt_cost < rule_cost,
+            "cost-based plan ({opt_cost}) must be cheaper than rule-based ({rule_cost})"
         );
     }
 

@@ -112,6 +112,7 @@ pub mod binding;
 pub mod cardinality;
 pub mod catalog;
 pub mod coordinator;
+pub mod cost;
 pub mod equality;
 pub mod equivalence;
 pub mod errors;
@@ -147,6 +148,7 @@ pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
 pub use coordinator::TxnCoordinator;
+pub use cost::{CostEstimate, estimate_cost};
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
 pub use errors::{
