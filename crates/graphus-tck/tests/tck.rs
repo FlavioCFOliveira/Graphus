@@ -26,20 +26,26 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **2996 / 3884 scenarios pass (77.14 %)**, with 0 panics and 0 scenarios
-/// skipped as unsupported. This rose from 2944 when `rmp` task #57 implemented `CALL` procedures:
-/// a [`graphus_cypher::procedure_registry`] backs both compile-time resolution
-/// (`ProcedureError`/`ProcedureNotFound`, `InvalidNumberOfArguments`, `InvalidArgumentType`,
-/// `ParameterMissing`/`MissingParameter` for implicit calls) and execution (standalone, in-query
-/// `CALL … YIELD [field AS var]`, `YIELD *`, implicit parameter-fed arguments, void pass-through),
-/// and the harness registers each scenario's `there exists a procedure …` fixtures on a
-/// scenario-local registry that backs compile *and* execute — all 52 `clauses/call` scenarios pass
-/// (+52). Prior rises: 2614 → 2944 (#56, TCK-faithful error classification); 1782 → 2614 (#53,
-/// temporal types); 1192 → 1782 (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55,
-/// verbatim column names). Remaining failures are honest gaps: compile-time expression type
-/// checking (most of the residual TYPE mismatches), IANA zone resolution (rmp #60), and the
-/// full-query `EXISTS { ... RETURN ... }` form.
-const BASELINE: usize = 2996;
+/// Current ratchet: **3130 / 3884 scenarios pass (80.59 %)**, with 0 panics and 0 scenarios
+/// skipped as unsupported. This rose from 2996 when `rmp` task #61 added compile-time expression
+/// **type checking** ([`graphus_cypher::static_type`]): a conservative static type lattice infers
+/// the type of literal / parameter-free expressions bottom-up and raises
+/// `SyntaxError`/`InvalidArgumentType` for the statically-decidable mismatches the TCK expects at
+/// compile time — boolean operators over non-booleans, strict arithmetic over non-numerics
+/// (incl. quantifier predicates over typed list literals), `IN` over a non-list, property access
+/// over a non-graph/non-map literal, `type()`/`length()`/`properties()` over the wrong kind, and a
+/// non-integer `SKIP`/`LIMIT` literal. A dynamic operand (a non-entity variable, property access,
+/// parameter, function result, heterogeneous list) is `Unknown` and never flagged, so the runtime
+/// `TypeError` path is untouched: the gain (+134) came entirely from the *error TYPE mismatch*
+/// (−116) and *expected-an-error-but-got-rows* (−18) buckets, with every other failure bucket
+/// unchanged (measured: zero regressions). Prior rise: 2944 → 2996 (#57, `CALL` procedures via
+/// [`graphus_cypher::procedure_registry`] — all 52 `clauses/call` scenarios). Earlier:
+/// 2614 → 2944 (#56, TCK-faithful error classification); 1782 → 2614 (#53, temporal types);
+/// 1192 → 1782 (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55, verbatim column names).
+/// Remaining failures are honest gaps: property-access typing that needs `WITH`-projection
+/// type-flow (`WITH 1 AS x … x.p`), float-parameter `SKIP`/`LIMIT`, IANA zone resolution
+/// (rmp #60), and the full-query `EXISTS { ... RETURN ... }` form.
+const BASELINE: usize = 3130;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

@@ -402,6 +402,18 @@ pub enum SemanticErrorKind {
         /// The missing parameter (= procedure input) name.
         name: String,
     },
+    /// An expression whose type is **statically** known cannot satisfy the type its operator /
+    /// function / syntactic position requires (e.g. `NOT 1`, `1 IN 2`, `x % 2` over a list of
+    /// strings, `type()` on a node, `SKIP 1.5`). TCK detail `InvalidArgumentType`, type
+    /// `SyntaxError` (`tck/features/expressions/**`, `tck/features/clauses/**`). Only a provably
+    /// wrong concrete type is reported; a dynamic operand (variable of unknown type, property
+    /// access, parameter, function result) is never flagged, so the runtime `TypeError` path is
+    /// untouched.
+    InvalidExpressionType {
+        /// A short human description of the required type / context (the offending position lives on
+        /// the enclosing [`SemanticError`]'s span).
+        context: String,
+    },
     /// `DELETE` targets a non-entity expression. TCK detail `InvalidDelete`.
     InvalidDelete,
     /// Clauses are composed illegally (e.g. `RETURN` not last, an empty single query). TCK detail
@@ -461,6 +473,7 @@ impl SemanticErrorKind {
             Self::ProcedureNotFound { .. } => SemanticDetail::ProcedureNotFound,
             Self::InvalidProcedureArgumentType { .. } => SemanticDetail::InvalidArgumentType,
             Self::MissingParameter { .. } => SemanticDetail::MissingParameter,
+            Self::InvalidExpressionType { .. } => SemanticDetail::InvalidArgumentType,
             Self::InvalidDelete => SemanticDetail::InvalidDelete,
             Self::InvalidClauseComposition { .. } => SemanticDetail::InvalidClauseComposition,
             Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
@@ -574,6 +587,9 @@ impl fmt::Display for SemanticErrorKind {
                 "implicit procedure call requires the query parameter `{name}`, \
                  which was not supplied"
             ),
+            Self::InvalidExpressionType { context } => {
+                write!(f, "expression has the wrong type: {context}")
+            }
             Self::InvalidDelete => {
                 f.write_str("DELETE expects a node, relationship or path expression")
             }
@@ -723,6 +739,7 @@ mod tests {
                 | SemanticErrorKind::ProcedureNotFound { .. }
                 | SemanticErrorKind::InvalidProcedureArgumentType { .. }
                 | SemanticErrorKind::MissingParameter { .. }
+                | SemanticErrorKind::InvalidExpressionType { .. }
                 | SemanticErrorKind::InvalidDelete
                 | SemanticErrorKind::InvalidClauseComposition { .. }
                 | SemanticErrorKind::DifferentColumnsInUnion
@@ -771,6 +788,9 @@ mod tests {
             },
             SemanticErrorKind::MissingParameter {
                 name: "in".to_owned(),
+            },
+            SemanticErrorKind::InvalidExpressionType {
+                context: "x".to_owned(),
             },
             SemanticErrorKind::InvalidDelete,
             SemanticErrorKind::InvalidClauseComposition { reason: "x" },

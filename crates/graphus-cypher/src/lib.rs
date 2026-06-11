@@ -131,6 +131,7 @@ pub mod procedure_registry;
 pub mod record_graph;
 pub mod runtime;
 pub mod semantics;
+pub mod static_type;
 pub(crate) mod temporal_fns;
 pub mod ternary;
 

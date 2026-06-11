@@ -114,6 +114,7 @@ use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck};
 use crate::lexer::Span;
 use crate::procedure_registry::{self, FieldType, ProcedureRegistry, ProcedureSignature};
+use crate::static_type::{self, SType, TypeEnv};
 use graphus_core::GraphusError;
 use std::collections::{BTreeSet, HashMap};
 
@@ -477,7 +478,7 @@ impl Analyzer<'_> {
 
     fn check_unwind(&self, u: &UnwindClause, scope: &mut Scope) -> Result<(), SemanticError> {
         // The list expression is evaluated in the *current* scope, then the alias is bound.
-        self.check_expr_refs(&u.expr, scope)?;
+        self.check_expr(&u.expr, scope)?;
         self.reject_aggregation(&u.expr, "UNWIND")?;
         scope.bind(&u.alias.name, VarKind::Value, u.alias.span)
     }
@@ -534,12 +535,12 @@ impl Analyzer<'_> {
         match item {
             SetItem::Property { target, value } => {
                 self.check_expr_refs(target, scope)?;
-                self.check_expr_refs(value, scope)?;
+                self.check_expr(value, scope)?;
                 self.reject_aggregation(value, "SET")?;
             }
             SetItem::Replace { target, value } | SetItem::Merge { target, value } => {
                 self.require_defined(&target.name, target.span, scope)?;
-                self.check_expr_refs(value, scope)?;
+                self.check_expr(value, scope)?;
                 self.reject_aggregation(value, "SET")?;
             }
             SetItem::Labels { target, .. } => {
@@ -551,7 +552,7 @@ impl Analyzer<'_> {
 
     fn check_delete(&self, d: &DeleteClause, scope: &Scope) -> Result<(), SemanticError> {
         for expr in &d.exprs {
-            self.check_expr_refs(expr, scope)?;
+            self.check_expr(expr, scope)?;
             // DELETE targets must be entity references, not arbitrary literals (TCK `InvalidDelete`).
             // We statically reject the clearly-non-entity forms (literals, lists, maps, arithmetic);
             // whether a *variable* names a node/rel/path is a runtime fact, so we accept it here.
@@ -571,7 +572,7 @@ impl Analyzer<'_> {
                 RemoveItem::Labels { target, .. } => {
                     self.require_defined(&target.name, target.span, scope)?;
                 }
-                RemoveItem::Property(expr) => self.check_expr_refs(expr, scope)?,
+                RemoveItem::Property(expr) => self.check_expr(expr, scope)?,
             }
         }
         Ok(())
@@ -659,7 +660,7 @@ impl Analyzer<'_> {
             return Ok(());
         };
         for a in args {
-            self.check_expr_refs(a, scope)?;
+            self.check_expr(a, scope)?;
             self.reject_aggregation(a, "a procedure CALL argument")?;
         }
         if args.len() != sig.inputs.len() {
@@ -790,12 +791,14 @@ impl Analyzer<'_> {
             self.check_order_by_item(sort, &order_scope, aggregating)?;
         }
         if let Some(skip) = &body.skip {
-            self.check_expr_refs(skip, &new_scope)?;
+            self.check_expr(skip, &new_scope)?;
             self.reject_aggregation(skip, "SKIP")?;
+            Self::check_skip_limit_literal(skip, "SKIP")?;
         }
         if let Some(limit) = &body.limit {
-            self.check_expr_refs(limit, &new_scope)?;
+            self.check_expr(limit, &new_scope)?;
             self.reject_aggregation(limit, "LIMIT")?;
+            Self::check_skip_limit_literal(limit, "LIMIT")?;
         }
         if let Some(w) = where_clause {
             self.check_predicate(w, &new_scope, "WHERE")?;
@@ -811,7 +814,7 @@ impl Analyzer<'_> {
         aggregating: bool,
         is_final_return: bool,
     ) -> Result<(), SemanticError> {
-        self.check_expr_refs(&item.expr, scope)?;
+        self.check_expr(&item.expr, scope)?;
         // Aggregations may not be nested anywhere.
         self.reject_nested_aggregation(&item.expr)?;
 
@@ -846,7 +849,7 @@ impl Analyzer<'_> {
         scope: &Scope,
         aggregating: bool,
     ) -> Result<(), SemanticError> {
-        self.check_expr_refs(&sort.expr, scope)?;
+        self.check_expr(&sort.expr, scope)?;
         self.reject_nested_aggregation(&sort.expr)?;
         // ORDER BY may use aggregates only when the projection itself aggregates (it sorts the
         // grouped rows); in a non-aggregating projection an aggregate in ORDER BY is invalid.
@@ -988,7 +991,7 @@ impl Analyzer<'_> {
             scope.bind(&var.name, VarKind::Node, var.span)?;
         }
         if let Some(props) = &node.properties {
-            self.check_expr_refs(props, scope)?;
+            self.check_expr(props, scope)?;
             self.reject_aggregation(props, "a pattern")?;
         }
         Ok(())
@@ -1043,7 +1046,7 @@ impl Analyzer<'_> {
             scope.bind(&var.name, VarKind::Relationship, var.span)?;
         }
         if let Some(props) = &rel.properties {
-            self.check_expr_refs(props, scope)?;
+            self.check_expr(props, scope)?;
             self.reject_aggregation(props, "a pattern")?;
         }
         Ok(())
@@ -1055,6 +1058,34 @@ impl Analyzer<'_> {
     /// expression tree. Also resolves variables bound *locally* by list/pattern comprehensions
     /// (their iteration variable is in scope only inside the comprehension) and validates function
     /// calls against the registry.
+    /// Resolves variable references **and** statically type-checks `expr` (`rmp` task #61): the
+    /// every-position entry point used wherever a value expression appears. The type check is purely
+    /// additive — it raises a [`SemanticErrorKind::InvalidExpressionType`] only for a *provable*
+    /// mismatch and is otherwise a no-op (see [`crate::static_type`]).
+    fn check_expr(&self, expr: &Expr, scope: &Scope) -> Result<(), SemanticError> {
+        self.check_expr_refs(expr, scope)?;
+        static_type::check_expr(expr, &Self::scope_types(scope))
+    }
+
+    /// Builds the variable → static-type environment for a [`static_type`] check from the semantic
+    /// scope: a node/relationship binding carries its element type; every other binding (an
+    /// `UNWIND`/`WITH` value, a `YIELD` output) is [`SType::Unknown`], so it is never the basis of a
+    /// static type error (`rmp` task #61 conservatism).
+    fn scope_types(scope: &Scope) -> TypeEnv {
+        scope
+            .bindings
+            .iter()
+            .map(|(name, binding)| {
+                let ty = match binding.kind {
+                    VarKind::Node => SType::Node,
+                    VarKind::Relationship => SType::Relationship,
+                    VarKind::Value => SType::Unknown,
+                };
+                (name.clone(), ty)
+            })
+            .collect()
+    }
+
     fn check_expr_refs(&self, expr: &Expr, scope: &Scope) -> Result<(), SemanticError> {
         match &expr.kind {
             ExprKind::Variable(name) => self.require_defined(name, expr.span, scope),
@@ -1215,8 +1246,27 @@ impl Analyzer<'_> {
         scope: &Scope,
         position: &'static str,
     ) -> Result<(), SemanticError> {
-        self.check_expr_refs(expr, scope)?;
+        self.check_expr(expr, scope)?;
         self.reject_aggregation(expr, position)
+    }
+
+    /// A `SKIP`/`LIMIT` count must be a non-negative integer; a **literal** of any other scalar type
+    /// (a float, string or boolean) is a statically-decidable `SyntaxError`/`InvalidArgumentType`
+    /// (`tck/features/clauses/return-skip-limit/**`, e.g. `SKIP 1.5`, `LIMIT 1.7`). A dynamic count
+    /// (a parameter, a `toInteger(...)` call) is a runtime concern and is **not** flagged here — the
+    /// statement plan stays parameter-independent (`04 §7.5`).
+    fn check_skip_limit_literal(expr: &Expr, position: &str) -> Result<(), SemanticError> {
+        if let ExprKind::Literal(lit) = &expr.kind {
+            if !matches!(lit, Literal::Integer(_) | Literal::Null) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidExpressionType {
+                        context: format!("{position} requires an integer"),
+                    },
+                    expr.span,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Errors with [`InvalidAggregation`] if `expr` contains an aggregate anywhere (used for the

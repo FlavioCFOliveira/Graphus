@@ -815,3 +815,117 @@ mod procedures {
         );
     }
 }
+
+// =================================================================================================
+// Compile-time expression type checking (rmp #61) — static InvalidArgumentType
+// =================================================================================================
+
+/// Statically-decidable type mismatches are a compile-time `SyntaxError`/`InvalidArgumentType`.
+mod static_type_checks {
+    use super::*;
+
+    /// Asserts `src` is rejected with the `InvalidArgumentType` detail **and** the `SyntaxError`
+    /// type (the TCK classification for a statically-typable expression fault).
+    fn assert_invalid_argument_type(src: &str) {
+        let e = err(src);
+        assert_eq!(
+            e.classification().detail,
+            SemanticDetail::InvalidArgumentType,
+            "for `{src}`: expected InvalidArgumentType, got {} ({e})",
+            e.classification().detail
+        );
+        assert_eq!(
+            e.classification().error_type,
+            ErrorType::SyntaxError,
+            "for `{src}`: must be a SyntaxError"
+        );
+        assert_eq!(e.classification().phase, ErrorPhase::CompileTime);
+    }
+
+    #[test]
+    fn boolean_operators_over_non_boolean_literals_are_rejected() {
+        assert_invalid_argument_type("RETURN NOT 1");
+        assert_invalid_argument_type("RETURN NOT 'foo'");
+        assert_invalid_argument_type("RETURN NOT [true]");
+        assert_invalid_argument_type("RETURN 1 AND true");
+        assert_invalid_argument_type("RETURN true OR 2");
+        assert_invalid_argument_type("RETURN 'a' XOR false");
+    }
+
+    #[test]
+    fn strict_arithmetic_over_non_numeric_literals_is_rejected() {
+        assert_invalid_argument_type("RETURN 'a' * 2");
+        assert_invalid_argument_type("RETURN true - 1");
+        assert_invalid_argument_type("RETURN 3 % 'x'");
+        assert_invalid_argument_type("RETURN -'x'");
+    }
+
+    #[test]
+    fn in_over_a_non_list_literal_is_rejected() {
+        assert_invalid_argument_type("RETURN 1 IN 2");
+        assert_invalid_argument_type("RETURN 1 IN 'foo'");
+        assert_invalid_argument_type("RETURN 1 IN true");
+    }
+
+    #[test]
+    fn quantifier_predicate_over_a_typed_list_literal_is_rejected() {
+        // x ranges over strings; `x % 2` is arithmetic over a string (TCK Quantifier{1..4} [15/16]).
+        assert_invalid_argument_type("RETURN none(x IN ['Clara'] WHERE x % 2 = 0) AS r");
+        assert_invalid_argument_type("RETURN any(x IN [false, true] WHERE x % 2 = 0) AS r");
+        assert_invalid_argument_type("RETURN all(x IN ['a', 'b'] WHERE x % 2 = 0) AS r");
+        assert_invalid_argument_type("RETURN single(x IN ['a'] WHERE x % 2 = 0) AS r");
+    }
+
+    #[test]
+    fn graph_functions_over_the_wrong_kind_are_rejected() {
+        assert_invalid_argument_type("MATCH (n) RETURN type(n)"); // type() wants a relationship
+        assert_invalid_argument_type("MATCH (n) RETURN length(n)"); // length() wants a path
+        assert_invalid_argument_type("MATCH ()-[r]->() RETURN length(r)");
+        assert_invalid_argument_type("RETURN properties(1)");
+        assert_invalid_argument_type("RETURN properties('Cypher')");
+        assert_invalid_argument_type("RETURN properties([true, false])");
+    }
+
+    #[test]
+    fn non_integer_skip_limit_literals_are_rejected() {
+        assert_invalid_argument_type("MATCH (n) RETURN n LIMIT 1.7");
+        assert_invalid_argument_type("MATCH (n) RETURN n SKIP 1.5");
+        assert_invalid_argument_type("MATCH (n) RETURN n LIMIT 'x'");
+    }
+
+    // ---- conservatism: dynamic expressions must NEVER be flagged (no false positives) ----------
+
+    #[test]
+    fn dynamic_operands_are_not_flagged() {
+        // Property access, parameters, unknown-typed variables, and function results are `Unknown`:
+        // their value type is a runtime fact, so the runtime TypeError path must stay intact.
+        ok("MATCH (n) RETURN NOT n.flag");
+        ok("MATCH (n) RETURN n.count + 1");
+        ok("MATCH (n) RETURN n.count * 2");
+        ok("RETURN NOT $p");
+        ok("RETURN $p < 3");
+        ok("MATCH (n) RETURN 1 IN n.tags");
+        ok("UNWIND [1, 2, 3] AS x RETURN x % 2");
+        ok("MATCH (n) RETURN properties(n)");
+        ok("MATCH ()-[r]->() RETURN type(r)");
+        ok("MATCH (n) RETURN n LIMIT $count");
+    }
+
+    #[test]
+    fn heterogeneous_list_quantifier_is_not_flagged() {
+        // A heterogeneous list has an `Unknown` element type, so the predicate cannot be a provable
+        // mismatch (TCK Quantifier1 [14] passes).
+        ok("RETURN none(x IN [1, null, true, 4.5, 'abc', false] WHERE true) AS r");
+        ok("RETURN any(x IN [1, 2, 3] WHERE x % 2 = 0) AS r");
+    }
+
+    #[test]
+    fn valid_typed_expressions_are_accepted() {
+        ok("RETURN NOT true");
+        ok("RETURN true AND false");
+        ok("RETURN 1 + 2 * 3");
+        ok("RETURN 1 IN [1, 2, 3]");
+        ok("RETURN 'a' + 'b'"); // `+` is overloaded (string concat) — never flagged
+        ok("MATCH (n) RETURN n LIMIT 10");
+    }
+}
