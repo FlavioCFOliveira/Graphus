@@ -48,7 +48,7 @@ The project contains an extensive test suite to guarantee that the server behave
 1. **You are NOT authorized to make decisions on your own.** Whenever the instructions are insufficient, unclear, non-specific, non-concrete, or whenever there are contradictions or ambiguities, you MUST ALWAYS ASK the user how to proceed. When asking the user:
    - Provide multiple options (a, b, c, ...) and clearly state which one is your recommendation.
    - When there are multiple questions (clarifications needed), ask them to the user **sequentially, one at a time**.
-2. **All project documentation MUST be written in English** — flawless English, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers.
+2. **All project documentation (including CLAUDE.md and other operational documents) MUST be written in English** — flawless English, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers.
 3. **Documentation MUST be accurate and faithful to the code.**
 4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document.
 
@@ -86,6 +86,8 @@ Use the **Knowledge Graph** to help identify which tasks bring the most gains an
 
 High-gain tasks (those with the greatest gain or the greatest impact on the project), tasks that unblock other tasks or features, and foundational tasks MUST always take priority. By default, you must always seek to work from the highest-gain tasks down to the least essential ones.
 
+When the work for a task is substantially large (too much for a single task to be developed by an AI agent such as Claude Code), that task MUST be subdivided into parts, respecting the operating principles already established (for example, the self-contained-task principle).
+
 ### Task execution
 
 Task execution is the natural continuation (the next step) of planning. You MUST always use the `rmp` tool to determine:
@@ -93,10 +95,13 @@ Task execution is the natural continuation (the next step) of planning. You MUST
 1. Whether there is an open task that is not yet complete, in order to continue it;
 2. Identify which is the next task;
 3. Identify and understand the goal of the task to be started, based on its description and its functional and technical requirements;
-4. Always validate that the acceptance criteria are met before closing the task;
-5. Ensure the task is closed with a short summary of what was done;
-6. After the task is closed and before moving on to the next one, make a git commit following best practices, explaining what was done;
-7. Update the Knowledge Graph.
+4. Determine which subagent is most appropriate and delegate the task's execution to it;
+5. Always validate that the acceptance criteria are met before closing the task;
+6. Ensure the task is closed with a short summary of what was done;
+7. After the task is closed and before moving on to the next one, make a git commit following best practices, explaining what was done;
+8. Update the Knowledge Graph.
+
+Whenever possible, you MUST adapt the model and the model's effort level to the requirements of each task's individual operations.
 
 Task and sprint execution should preferably be carried out sequentially. Sprints MUST only be executed sequentially; tasks may run in parallel if there is justification for it.
 
@@ -123,3 +128,13 @@ Whenever it is necessary to evaluate performance, completeness (whether somethin
 ## Regression prevention
 
 Whenever a bug is identified, the necessary regression tests MUST be created to ensure that the same bugs do not recur as a consequence of future development.
+
+## Separation of responsibilities
+
+Every package, component, and function MUST follow a strict separation-of-responsibilities pattern in order to maximize code reuse.
+
+## Memory
+
+Use the KG as the memory of the project, of the agents, and of the skills. You MUST take advantage of the relational capabilities (of the graph database) to optimize how you read and write your memories. You MUST use this method to save the token cost of reading files.
+
+**WHENEVER** the project files are changed, you MUST update the KG so that you preserve your ability to understand the project.
