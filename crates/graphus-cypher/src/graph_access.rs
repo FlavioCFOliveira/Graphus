@@ -243,6 +243,19 @@ pub trait GraphAccess {
     /// Deletes `node` (idempotent). The caller (executor) is responsible for first removing incident
     /// relationships for a non-`DETACH` delete check (`04 §7.3`).
     fn delete_node(&mut self, node: NodeId);
+
+    // ---- statistics ---------------------------------------------------------------------------
+
+    /// An **optional** statistics view of this graph for cardinality estimation
+    /// ([`crate::cardinality`]).
+    ///
+    /// Returns `None` by default — "no statistics available; the planner uses its documented
+    /// constant fallbacks" (see [`crate::cardinality`]). A backend that tracks node/relationship
+    /// counts overrides this to return `Some(self)`; [`MemGraph`] does, since it knows its full
+    /// contents. Returning `Option<&dyn Statistics>` keeps the trait object-safe.
+    fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+        None
+    }
 }
 
 // =================================================================================================
@@ -579,6 +592,45 @@ impl GraphAccess for MemGraph {
 
     fn delete_node(&mut self, node: NodeId) {
         self.nodes.remove(&node);
+    }
+
+    fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+        // MemGraph knows its full contents, so it always provides exact counts.
+        Some(self)
+    }
+}
+
+/// Exact, point-in-time count statistics over a [`MemGraph`]'s live map.
+///
+/// Since the in-memory graph owns its full contents, every query is answered **exactly** by
+/// iterating the maps: per-label / per-type queries always return `Some(_)` (an absent label /
+/// type is an exact `Some(0)`, never the `None` "unknown" sentinel). The counts reflect the map at
+/// the instant of the call.
+impl crate::statistics::Statistics for MemGraph {
+    fn total_nodes(&self) -> u64 {
+        self.nodes.len() as u64
+    }
+
+    fn nodes_with_label(&self, label: &str) -> Option<u64> {
+        let count = self
+            .nodes
+            .values()
+            .filter(|n| n.labels.iter().any(|l| l == label))
+            .count();
+        Some(count as u64)
+    }
+
+    fn total_relationships(&self) -> u64 {
+        self.rels.len() as u64
+    }
+
+    fn relationships_with_type(&self, rel_type: &str) -> Option<u64> {
+        let count = self
+            .rels
+            .values()
+            .filter(|r| r.rel_type == rel_type)
+            .count();
+        Some(count as u64)
     }
 }
 

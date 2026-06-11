@@ -74,10 +74,12 @@
 //! v1.
 
 use crate::ast::{BinaryOp, Expr, ExprKind, Label, RelType};
+use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
 use crate::logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
+use crate::statistics::Statistics;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -98,6 +100,9 @@ pub struct PhysicalPlan {
     pub root: PhysicalOp,
     /// The catalog index ids this plan's access paths depend on, ascending and de-duplicated.
     index_dependencies: BTreeSet<IndexId>,
+    /// The estimated number of rows the plan's root emits, from the cardinality estimator
+    /// ([`crate::cardinality::estimate_rows`]) over the optional graph [`Statistics`].
+    estimated_rows: f64,
 }
 
 impl PhysicalPlan {
@@ -113,6 +118,21 @@ impl PhysicalPlan {
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
         self.index_dependencies.contains(&id)
+    }
+
+    /// The estimated number of rows this plan's root operator emits (`00-overview` §6).
+    ///
+    /// This is the cardinality estimator's verdict ([`crate::cardinality::estimate_rows`]) computed
+    /// against the [`Statistics`] supplied to [`plan_physical_with_stats`] — exact where the backend
+    /// tracks counts, and the documented `DEFAULT_*` fallbacks otherwise (so [`plan_physical`], which
+    /// passes no statistics, still yields a finite, positive estimate). The value rides **alongside**
+    /// the plan as cost-model input (the Phase-2 cost-based optimiser, task #65); **no plan-choice in
+    /// this planner branches on it**, so two plans built from the same query and statistics are equal
+    /// and the operator tree is identical to what [`plan_physical`] produces. Always finite and
+    /// `>= 0.0` (the estimator guarantees it).
+    #[must_use]
+    pub fn estimated_rows(&self) -> f64 {
+        self.estimated_rows
     }
 }
 
@@ -503,6 +523,11 @@ pub enum PhysicalOp {
 /// rule-based strategy choices, never re-checking compile-time invariants. The returned plan records
 /// every catalog [`IndexId`] it depends on (`04 §6.6`).
 ///
+/// This is the no-statistics form: it is exactly [`plan_physical_with_stats`] with `stats = None`, so
+/// the plan's [`estimated_rows`](PhysicalPlan::estimated_rows) uses the cardinality estimator's
+/// documented constant fallbacks. Pass a [`Statistics`] source to [`plan_physical_with_stats`] for an
+/// estimate informed by real counts; the operator tree and query results are identical either way.
+///
 /// # Examples
 ///
 /// ```
@@ -519,13 +544,41 @@ pub enum PhysicalOp {
 /// assert!(physical.to_string().contains("NodeIndexSeek"));
 /// // … and the plan records its dependency on the index.
 /// assert_eq!(physical.index_dependencies().count(), 1);
+/// // The plan carries a finite, positive row estimate (here from the no-stats fallbacks).
+/// assert!(physical.estimated_rows().is_finite() && physical.estimated_rows() >= 0.0);
 /// ```
 pub fn plan_physical(logical: &LogicalOp, catalog: &IndexCatalog) -> PhysicalPlan {
+    plan_physical_with_stats(logical, catalog, None)
+}
+
+/// Lowers a [logical plan](LogicalOp) into a [`PhysicalPlan`] exactly as [`plan_physical`] does, and
+/// additionally annotates the plan with a [cardinality estimate](PhysicalPlan::estimated_rows)
+/// informed by the optional graph `stats` (`00-overview` §6 — the Phase-2 cost-based-optimiser
+/// foundation).
+///
+/// The `stats` source ([`crate::statistics::Statistics`], typically obtained from
+/// [`GraphAccess::statistics`](crate::graph_access::GraphAccess::statistics)) feeds the cardinality
+/// estimator ([`estimate_rows`]); pass `None` when the backend tracks no counts (the estimator then
+/// uses its documented constant fallbacks). The estimate is computed over the **logical** plan, which
+/// has the same row-cardinality as the physical plan the executor runs.
+///
+/// **Statistics never change the plan.** The operator tree, the recorded index dependencies, and the
+/// query's result set are byte-for-byte identical to [`plan_physical`]; the only field that varies
+/// with `stats` is [`estimated_rows`](PhysicalPlan::estimated_rows). The estimate rides alongside the
+/// plan purely as input for the future cost model (task #65) — no access-path or join choice in this
+/// planner branches on it.
+pub fn plan_physical_with_stats(
+    logical: &LogicalOp,
+    catalog: &IndexCatalog,
+    stats: Option<&dyn Statistics>,
+) -> PhysicalPlan {
+    let estimated_rows = estimate_rows(logical, stats);
     let mut deps = BTreeSet::new();
     let root = Planner { catalog }.lower(logical, &mut deps);
     PhysicalPlan {
         root,
         index_dependencies: deps,
+        estimated_rows,
     }
 }
 
@@ -1669,6 +1722,84 @@ mod tests {
         let validated = analyze(&ast).expect("analyze");
         let logical = lower(&validated);
         plan_physical(&logical, catalog)
+    }
+
+    /// Compiles `src` only as far as the logical plan, so a test can plan it both with and without
+    /// statistics and compare the cardinality estimate the planner records.
+    fn logical_of(src: &str) -> LogicalOp {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        lower(&validated)
+    }
+
+    #[test]
+    fn statistics_never_change_the_operator_tree_or_dependencies() {
+        use crate::graph_access::{GraphAccess, MemGraph};
+        use graphus_core::Value;
+
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "age")
+            .build();
+        let logical = logical_of("MATCH (n:Person) WHERE n.age = 30 RETURN n");
+
+        let mut g = MemGraph::new();
+        for i in 0..50 {
+            g.add_node(["Person"], [("age", Value::Integer(i))]);
+        }
+
+        let without = plan_physical(&logical, &catalog);
+        let with = plan_physical_with_stats(&logical, &catalog, g.statistics());
+
+        // Statistics inform the estimate only: the operator tree and the recorded index dependencies
+        // are byte-identical whether or not stats are supplied.
+        assert_eq!(without.root, with.root);
+        assert_eq!(
+            without.index_dependencies().collect::<Vec<_>>(),
+            with.index_dependencies().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn estimated_rows_reflects_supplied_statistics() {
+        use crate::graph_access::{GraphAccess, MemGraph};
+        use graphus_core::Value;
+
+        let catalog = IndexCatalog::empty();
+        let logical = logical_of("MATCH (n:Person) RETURN n");
+
+        let mut g = MemGraph::new();
+        for i in 0..7 {
+            g.add_node(["Person"], [("id", Value::Integer(i))]);
+        }
+        // A non-Person node, to prove the estimate uses the exact per-label count, not the total.
+        g.add_node(["Company"], [("id", Value::Integer(0))]);
+
+        let plan = plan_physical_with_stats(&logical, &catalog, g.statistics());
+        // The label scan's exact count (7 :Person) flows unchanged through the RETURN projection.
+        assert_eq!(plan.estimated_rows(), 7.0);
+        // And the plan's estimate is exactly the estimator's verdict over the same logical plan.
+        assert_eq!(
+            plan.estimated_rows(),
+            estimate_rows(&logical, g.statistics())
+        );
+    }
+
+    #[test]
+    fn plan_physical_uses_the_no_stats_fallback_estimate() {
+        let catalog = IndexCatalog::empty();
+        let logical = logical_of("MATCH (n) RETURN n");
+
+        let plan = plan_physical(&logical, &catalog);
+        // With no statistics the estimator's documented fallbacks apply; the result is finite and
+        // positive, and equals a direct estimate with `None`.
+        assert!(plan.estimated_rows().is_finite() && plan.estimated_rows() > 0.0);
+        assert_eq!(plan.estimated_rows(), estimate_rows(&logical, None));
+
+        // `plan_physical` is exactly `plan_physical_with_stats(.., None)` — same tree, same estimate.
+        let explicit = plan_physical_with_stats(&logical, &catalog, None);
+        assert_eq!(plan.root, explicit.root);
+        assert_eq!(plan.estimated_rows(), explicit.estimated_rows());
     }
 
     #[test]

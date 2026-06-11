@@ -109,6 +109,7 @@
 
 pub mod ast;
 pub mod binding;
+pub mod cardinality;
 pub mod catalog;
 pub mod coordinator;
 pub mod equality;
@@ -132,6 +133,7 @@ pub mod record_graph;
 pub mod runtime;
 pub mod semantics;
 pub mod static_type;
+pub mod statistics;
 pub(crate) mod temporal_fns;
 pub mod ternary;
 pub(crate) mod timezone;
@@ -140,6 +142,7 @@ pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
 pub use binding::{
     BindError, BoundParameters, ParamType, Parameters, bind_parameters, referenced_parameters,
 };
+pub use cardinality::estimate_rows;
 pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
@@ -163,7 +166,7 @@ pub use logical::{
 pub use lower::lower;
 pub use ordering::cmp_values;
 pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
-pub use physical::{PhysicalOp, PhysicalPlan, RangeBound, plan_physical};
+pub use physical::{PhysicalOp, PhysicalPlan, RangeBound, plan_physical, plan_physical_with_stats};
 pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,
@@ -178,4 +181,5 @@ pub use semantics::{
     ValidatedQuery, analyze, analyze_to_graphus, analyze_with_procedures,
     check_implicit_call_parameters,
 };
+pub use statistics::Statistics;
 pub use ternary::Ternary;
