@@ -72,6 +72,7 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
         SemanticErrorKind::MissingParameter {
             name: "in".to_owned(),
         },
+        SemanticErrorKind::NonConstantExpression { position: "SKIP" },
         SemanticErrorKind::InvalidDelete,
         SemanticErrorKind::InvalidClauseComposition { reason: "test" },
         SemanticErrorKind::DifferentColumnsInUnion,
@@ -142,6 +143,10 @@ fn expected_classification(kind: &SemanticErrorKind) -> (ErrorType, SemanticDeta
         K::MissingParameter { .. } => (
             ErrorType::ParameterMissing,
             SemanticDetail::MissingParameter,
+        ),
+        K::NonConstantExpression { .. } => (
+            ErrorType::SyntaxError,
+            SemanticDetail::NonConstantExpression,
         ),
         K::InvalidDelete => (ErrorType::SyntaxError, SemanticDetail::InvalidDelete),
         K::InvalidClauseComposition { .. } => (
@@ -228,11 +233,11 @@ fn renders_the_verbatim_tck_gherkin_triple() {
 #[test]
 fn every_listed_kind_is_distinct() {
     let kinds = all_kinds();
-    // 21 variants as of this writing; the assert documents the count and trips if one is dropped
+    // 22 variants as of this writing; the assert documents the count and trips if one is dropped
     // from `all_kinds` without the match also changing (the match would then fail to compile).
     assert_eq!(
         kinds.len(),
-        21,
+        22,
         "all_kinds() should list every SemanticErrorKind variant once"
     );
     let details: std::collections::HashSet<_> = kinds.iter().map(|k| k.detail()).collect();

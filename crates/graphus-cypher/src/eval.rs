@@ -25,6 +25,7 @@
 //! folded by the [`Aggregation`](crate::physical::PhysicalOp::Aggregation) operator over a whole
 //! group, not per row (`04 §7.6`).
 
+use std::cell::Cell;
 use std::fmt;
 
 use graphus_core::Value;
@@ -811,10 +812,11 @@ fn describe(v: &RowValue) -> String {
 /// The **implemented core** covers the openCypher functions the executor's tests and common queries
 /// lean on:
 ///
-/// - **type/coercion:** `tostring`, `tointeger`, `tofloat`, `coalesce`.
+/// - **type/coercion:** `tostring`, `tointeger`, `tofloat`, `toboolean`, `tobooleanornull`,
+///   `coalesce`.
 /// - **collection/size:** `size`, `length`, `head`, `last`, `tail`, `reverse`, `range`, `keys`.
 /// - **entity:** `id`, `labels`, `type`, `properties`, `startnode`, `endnode`.
-/// - **math:** `abs`, `ceil`, `floor`, `round`, `sign`.
+/// - **math:** `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `rand`.
 /// - **string:** `toupper`, `tolower`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `split`,
 ///   `left`, `right`.
 ///
@@ -952,6 +954,8 @@ fn call_function(
         },
         "tointeger" => to_integer(&argv[0]),
         "tofloat" => to_float(&argv[0]),
+        "toboolean" => to_boolean(&argv[0], false)?,
+        "tobooleanornull" => to_boolean(&argv[0], true)?,
         "size" | "length" => match &argv[0] {
             Value::Null => Value::Null,
             Value::List(items) => Value::Integer(items.len() as i64),
@@ -991,6 +995,9 @@ fn call_function(
         "ceil" => float_unary(&argv[0], f64::ceil, "ceil")?,
         "floor" => float_unary(&argv[0], f64::floor, "floor")?,
         "round" => float_unary(&argv[0], f64::round, "round")?,
+        // `sqrt()` of a negative number is NaN (IEEE 754, which the openCypher Float is).
+        "sqrt" => float_unary(&argv[0], f64::sqrt, "sqrt")?,
+        "rand" => Value::Float(next_rand_f64()),
         "sign" => match &argv[0] {
             Value::Integer(i) => Value::Integer(i.signum()),
             Value::Float(f) => Value::Integer(if *f > 0.0 {
@@ -1079,6 +1086,80 @@ fn to_float(v: &Value) -> Value {
             .unwrap_or(Value::Null),
         _ => Value::Null,
     }
+}
+
+/// `toBoolean(v)` / `toBooleanOrNull(v)` (openCypher TCK `expressions/typeConversion/
+/// TypeConversion1.feature`): a boolean is itself; a string converts from `'true'`/`'false'`
+/// (case-insensitively, after trimming — mirroring [`to_integer`]'s string handling) and any other
+/// string is null; an integer converts as zero → `false`, non-zero → `true` (the TCK's
+/// invalid-type table — `TypeConversion1` scenario [5] — lists float/list/map/node/relationship/
+/// path but deliberately *not* integer); null is null. Every other type is non-convertible:
+/// `toBoolean` raises the runtime `TypeError` the TCK details as `InvalidArgumentValue`, while the
+/// `…OrNull` companion yields null instead (that single difference is the whole contract).
+fn to_boolean(v: &Value, null_on_invalid: bool) -> Result<Value, EvalError> {
+    Ok(match v {
+        Value::Boolean(b) => Value::Boolean(*b),
+        Value::Integer(i) => Value::Boolean(*i != 0),
+        Value::String(s) => {
+            let t = s.trim();
+            if t.eq_ignore_ascii_case("true") {
+                Value::Boolean(true)
+            } else if t.eq_ignore_ascii_case("false") {
+                Value::Boolean(false)
+            } else {
+                Value::Null
+            }
+        }
+        Value::Null => Value::Null,
+        _ if null_on_invalid => Value::Null,
+        _ => {
+            return Err(EvalError::TypeError {
+                context: "toBoolean() requires a boolean, string or integer".to_owned(),
+            });
+        }
+    })
+}
+
+thread_local! {
+    /// Per-thread `rand()` generator state, seeded lazily on the thread's first draw by
+    /// [`rand_seed`]. A `thread_local` keeps the production evaluator free of locks and `unsafe`
+    /// while staying correct under the executor's thread-per-scenario/-session usage.
+    static RAND_STATE: Cell<u64> = Cell::new(rand_seed());
+}
+
+/// A non-zero, non-deterministic 64-bit seed for [`RAND_STATE`], drawn from the standard library's
+/// own entropy: each [`RandomState`](std::collections::hash_map::RandomState) mixes OS-provided
+/// per-process randomness with a per-instance counter, so this needs no new dependency and no
+/// direct OS call. Zero is the `xorshift64*` fixed point, so it is remapped to a fixed odd
+/// constant (the same guard `graphus_sim::SimRng` applies to its seed).
+fn rand_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    if seed == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        seed
+    }
+}
+
+/// The next `rand()` draw: a Float uniform in `[0.0, 1.0)` (the openCypher `rand()` contract; the
+/// TCK scenarios that use it — `expressions/quantifier/Quantifier9–12` — only rely on the type and
+/// range, never the sequence). One `xorshift64*` step — the same generator as
+/// `graphus_sim::SimRng`, restated here because the production cypher crate must not depend on the
+/// simulation harness — then the top 53 bits are scaled by 2⁻⁵³, which is exact in an `f64` and
+/// strictly below 1.0.
+fn next_rand_f64() -> f64 {
+    RAND_STATE.with(|cell| {
+        let mut x = cell.get();
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        cell.set(x);
+        let bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    })
 }
 
 fn float_unary(v: &Value, f: impl Fn(f64) -> f64, fname: &str) -> Result<Value, EvalError> {
@@ -1771,6 +1852,69 @@ mod tests {
         let ast = parse_tokens(&toks, src).unwrap();
         let plan = plan_physical(&lower(&analyze(&ast).unwrap()), &IndexCatalog::empty());
         crate::binding::bind_parameters(&plan, params).unwrap()
+    }
+
+    #[test]
+    fn rand_is_a_float_in_the_unit_interval() {
+        // The openCypher contract (and all the TCK relies on): a Float in [0.0, 1.0). Draw enough
+        // times to also catch a stuck (fixed-point) generator state.
+        let mut distinct = std::collections::BTreeSet::new();
+        for _ in 0..1_000 {
+            match evaluate("rand()") {
+                Value::Float(f) => {
+                    assert!((0.0..1.0).contains(&f), "rand() out of [0, 1): {f}");
+                    distinct.insert(f.to_bits());
+                }
+                other => panic!("rand() must be a Float, got {other:?}"),
+            }
+        }
+        assert!(distinct.len() > 1, "rand() returned a constant");
+    }
+
+    #[test]
+    fn to_boolean_truth_table() {
+        // TCK `TypeConversion1` scenarios [1]–[4].
+        assert_eq!(evaluate("toBoolean(true)"), Value::Boolean(true));
+        assert_eq!(evaluate("toBoolean(false)"), Value::Boolean(false));
+        assert_eq!(evaluate("toBoolean('true')"), Value::Boolean(true));
+        assert_eq!(evaluate("toBoolean('FaLsE')"), Value::Boolean(false));
+        assert_eq!(evaluate("toBoolean(' true ')"), Value::Boolean(true));
+        assert_eq!(evaluate("toBoolean('')"), Value::Null);
+        assert_eq!(evaluate("toBoolean(' tru ')"), Value::Null);
+        assert_eq!(evaluate("toBoolean('f alse')"), Value::Null);
+        assert_eq!(evaluate("toBoolean(null)"), Value::Null);
+        // Integers are convertible (deliberately absent from the TCK's invalid-type table).
+        assert_eq!(evaluate("toBoolean(0)"), Value::Boolean(false));
+        assert_eq!(evaluate("toBoolean(42)"), Value::Boolean(true));
+    }
+
+    #[test]
+    fn to_boolean_invalid_type_errors_but_or_null_yields_null() {
+        // TCK `TypeConversion1` scenario [5]: a non-convertible type is a runtime TypeError for
+        // `toBoolean` — and null for the `OrNull` companion (its single behavioural difference).
+        let g = MemGraph::new();
+        for src in ["toBoolean(1.0)", "toBoolean([])", "toBoolean({})"] {
+            let expr = parse_expr(src);
+            let err = eval(&expr, &Row::empty(), &BoundParameters::empty(), &g).unwrap_err();
+            assert!(matches!(err, EvalError::TypeError { .. }), "{src}: {err:?}");
+        }
+        assert_eq!(evaluate("toBooleanOrNull(1.0)"), Value::Null);
+        assert_eq!(evaluate("toBooleanOrNull([])"), Value::Null);
+        assert_eq!(evaluate("toBooleanOrNull({})"), Value::Null);
+        assert_eq!(evaluate("toBooleanOrNull('true')"), Value::Boolean(true));
+        assert_eq!(evaluate("toBooleanOrNull(null)"), Value::Null);
+    }
+
+    #[test]
+    fn sqrt_returns_float_nan_for_negative_and_null_for_null() {
+        // TCK `Mathematical13` scenario [1] (the exact corpus value), plus the IEEE edges.
+        assert_eq!(evaluate("sqrt(12.96)"), Value::Float(3.6));
+        assert_eq!(evaluate("sqrt(4)"), Value::Float(2.0));
+        assert_eq!(evaluate("sqrt(null)"), Value::Null);
+        match evaluate("sqrt(-1.0)") {
+            Value::Float(f) => assert!(f.is_nan(), "sqrt(-1.0) must be NaN, got {f}"),
+            other => panic!("sqrt(-1.0) must be a Float, got {other:?}"),
+        }
     }
 
     #[test]

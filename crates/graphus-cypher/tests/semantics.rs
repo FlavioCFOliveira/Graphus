@@ -170,12 +170,65 @@ fn grouping_aggregation_is_valid() {
 }
 
 #[test]
+fn computed_grouping_keys_are_valid() {
+    // A non-aggregated item of *any* form is a grouping key, evaluated per row (TCK
+    // `clauses/return/Return6.feature` [16], `clauses/with/With6.feature`).
+    ok("MATCH (n) RETURN n.y + 1, count(*)");
+    ok("MATCH (n) WITH n.x + n.y AS k, count(*) AS c RETURN k, c");
+}
+
+#[test]
 fn ambiguous_aggregation_mixing_free_expression_with_aggregate() {
-    // `n.y + 1` is neither a grouping key nor aggregated, alongside `count(*)` — ambiguous.
+    // Inside an item that *contains* an aggregate, a free sub-expression must be a projected
+    // simple grouping key (TCK `Return6` [20]: `me.age + count(you.age)` with `me.age` not
+    // projected is ambiguous; [19]: projecting `me.age` legitimises it).
     assert_detail(
-        "MATCH (n) RETURN n.y + 1, count(*)",
+        "MATCH (me)--(you) RETURN me.age + count(you.age)",
         SemanticDetail::AmbiguousAggregationExpression,
     );
+    ok("MATCH (me)--(you) RETURN me.age, me.age + count(you.age)");
+    // A property of a projected key variable is determined by the key.
+    ok("MATCH (n) RETURN n, n.x + count(*)");
+    // A complex expression does not qualify, even when projected verbatim (TCK `Return6` [21]).
+    assert_detail(
+        "MATCH (me)--(you) RETURN me.age + you.age, me.age + you.age + count(*)",
+        SemanticDetail::AmbiguousAggregationExpression,
+    );
+}
+
+#[test]
+fn rand_inside_an_aggregate_is_a_non_constant_expression() {
+    // TCK `clauses/return/Return6.feature` [15].
+    assert_detail(
+        "RETURN count(rand())",
+        SemanticDetail::NonConstantExpression,
+    );
+}
+
+#[test]
+fn skip_and_limit_constancy_rules() {
+    // TCK `clauses/return-skip-limit/ReturnSkipLimit1.feature` [5]/[7]/[10]/[11] and
+    // `ReturnSkipLimit2.feature` [9]: a row-dependent count is NonConstantExpression, a negated
+    // integer literal is NegativeIntegerArgument; constant dynamic counts stay legal.
+    assert_detail(
+        "MATCH (n) RETURN n SKIP n.count",
+        SemanticDetail::NonConstantExpression,
+    );
+    assert_detail(
+        "MATCH (n) RETURN n LIMIT n.count",
+        SemanticDetail::NonConstantExpression,
+    );
+    assert_detail(
+        "MATCH (n) RETURN n SKIP -1",
+        SemanticDetail::NegativeIntegerArgument,
+    );
+    assert_detail(
+        "MATCH (n) RETURN n LIMIT -1",
+        SemanticDetail::NegativeIntegerArgument,
+    );
+    ok("MATCH (n) RETURN n SKIP toInteger(rand()*9)");
+    ok("MATCH (n) RETURN n LIMIT 3 + 2");
+    ok("MATCH (n) RETURN n SKIP $s LIMIT $l");
 }
 
 #[test]

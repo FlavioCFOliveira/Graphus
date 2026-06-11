@@ -26,27 +26,30 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **3324 / 3884 scenarios pass (85.58 %)**, with 0 panics and 0 scenarios
-/// skipped as unsupported. This rose from 3130 (+194, all in `expressions/temporal`) when `rmp`
-/// task #60 added **IANA time-zone resolution** ([`graphus_cypher::timezone`], the embedded
-/// vanilla-tzdata TZif tables of `jiff-tzdb` queried through `tz-rs`): named zones in the
-/// `datetime()`/`time()` constructors and `[Zone]` string suffixes now resolve historical
-/// offsets and DST (gap/overlap per `java.time.ZonedDateTime.ofLocal`), zone conversion
-/// preserves the instant, `duration.*` interprets a local operand in the zoned operand's named
-/// zone, and truncation re-resolves the offset. The same cycle fixed adjacent pre-existing
-/// component-map bugs the temporal triage surfaced (week/ordinal/quarter overrides over a base
-/// date, positional sub-second truncation overrides, time-axis-only `duration.between` with a
-/// time-only operand). The gain came from the *engine-raised-an-error* (−111) and
-/// *bag-mismatch* (−82) buckets plus one init-query fix, with every other failure bucket
-/// unchanged (measured: zero regressions). Prior rise: 2996 → 3130 (#61, compile-time
-/// expression type checking via [`graphus_cypher::static_type`]). Earlier: 2944 → 2996 (#57,
-/// `CALL` procedures); 2614 → 2944 (#56, TCK-faithful error classification); 1782 → 2614 (#53,
-/// temporal types); 1192 → 1782 (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55,
-/// verbatim column names). Remaining failures are honest gaps: property-access typing that
-/// needs `WITH`-projection type-flow (`WITH 1 AS x … x.p`), float-parameter `SKIP`/`LIMIT`, the
-/// transaction-clock constructors (`datetime()`, `date.statement()`, …), and the full-query
-/// `EXISTS { ... RETURN ... }` form.
-const BASELINE: usize = 3324;
+/// Current ratchet: **3413 / 3884 scenarios pass (87.87 %)**, with 0 panics and 0 scenarios
+/// skipped as unsupported. This rose from 3324 (+89 from scalar function gaps (#62)): `rand()`,
+/// `sqrt()`, `toBoolean()`/`toBooleanOrNull()` joined the function registry and the evaluator
+/// (+64 `expressions/quantifier`, +7 `expressions/typeConversion`, +1
+/// `expressions/mathematical`), and the same cycle fixed the pre-existing aggregation-grouping
+/// over-restriction those scenarios then surfaced — any non-aggregated projection item is now a
+/// grouping key, while an aggregate-containing item may compose, outside its aggregates, only
+/// constants and projected *simple* keys (`AmbiguousAggregationExpression` otherwise) — plus
+/// compile-time `SKIP`/`LIMIT` constancy (`NonConstantExpression` for row-dependent counts,
+/// `NegativeIntegerArgument` for negated literals) and `count(rand())` →
+/// `NonConstantExpression` (+8 `clauses/return-skip-limit`, +3 `clauses/with-orderBy`,
+/// +3 `clauses/match`, +2 `clauses/return`, +1 `clauses/with`; measured: zero regressions, the
+/// before/after failing-scenario set diff is strictly shrinking). Prior rises: 3130 → 3324
+/// (#60, IANA time-zone resolution); 2996 → 3130 (#61, compile-time expression type checking
+/// via [`graphus_cypher::static_type`]); 2944 → 2996 (#57, `CALL` procedures); 2614 → 2944
+/// (#56, TCK-faithful error classification); 1782 → 2614 (#53, temporal types); 1192 → 1782
+/// (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55, verbatim column names).
+/// Remaining failures are honest gaps: property-access typing that needs `WITH`-projection
+/// type-flow (`WITH 1 AS x … x.p`), float-parameter `SKIP`/`LIMIT`, the transaction-clock
+/// constructors (`datetime()`, `date.statement()`, …), the full-query
+/// `EXISTS { ... RETURN ... }` form, structural (node/relationship/path) values inside list
+/// literals (`toBoolean(n)` via `[true, n]` cannot raise its `TypeError`), and ORDER BY keys
+/// that *evaluate* aggregates (`ORDER BY sum(…)` matching a projected aggregate).
+const BASELINE: usize = 3413;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

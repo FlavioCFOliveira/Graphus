@@ -182,6 +182,10 @@ pub enum SemanticDetail {
     /// not supplied (`tck/features/clauses/call/Call1.feature`; paired with the
     /// [`ErrorType::ParameterMissing`] type).
     MissingParameter,
+    /// `NonConstantExpression` — a position requiring a constant expression got a row-dependent or
+    /// non-deterministic one (`SKIP n.count`, `LIMIT n.count`, `count(rand())`;
+    /// `tck/features/clauses/return-skip-limit/**`, `tck/features/clauses/return/Return6.feature`).
+    NonConstantExpression,
     /// `InvalidDelete` — `DELETE` targets something that is not a deletable graph entity reference.
     InvalidDelete,
     /// `InvalidClauseComposition` — clauses are composed in an order Cypher forbids (e.g. a
@@ -218,6 +222,7 @@ impl SemanticDetail {
             Self::ProcedureNotFound => "ProcedureNotFound",
             Self::InvalidArgumentType => "InvalidArgumentType",
             Self::MissingParameter => "MissingParameter",
+            Self::NonConstantExpression => "NonConstantExpression",
             Self::InvalidDelete => "InvalidDelete",
             Self::InvalidClauseComposition => "InvalidClauseComposition",
             Self::DifferentColumnsInUnion => "DifferentColumnsInUnion",
@@ -414,6 +419,16 @@ pub enum SemanticErrorKind {
         /// the enclosing [`SemanticError`]'s span).
         context: String,
     },
+    /// A position requiring a **constant** expression got a row-dependent or non-deterministic one:
+    /// a `SKIP`/`LIMIT` count referencing a variable
+    /// (`tck/features/clauses/return-skip-limit/ReturnSkipLimit1.feature`: `SKIP n.count`), or
+    /// `rand()` inside an aggregating function's arguments
+    /// (`tck/features/clauses/return/Return6.feature` \[15\]: `count(rand())`). TCK detail
+    /// `NonConstantExpression`.
+    NonConstantExpression {
+        /// Where the constant was required (e.g. `"SKIP"`, `"an aggregating function"`).
+        position: &'static str,
+    },
     /// `DELETE` targets a non-entity expression. TCK detail `InvalidDelete`.
     InvalidDelete,
     /// Clauses are composed illegally (e.g. `RETURN` not last, an empty single query). TCK detail
@@ -474,6 +489,7 @@ impl SemanticErrorKind {
             Self::InvalidProcedureArgumentType { .. } => SemanticDetail::InvalidArgumentType,
             Self::MissingParameter { .. } => SemanticDetail::MissingParameter,
             Self::InvalidExpressionType { .. } => SemanticDetail::InvalidArgumentType,
+            Self::NonConstantExpression { .. } => SemanticDetail::NonConstantExpression,
             Self::InvalidDelete => SemanticDetail::InvalidDelete,
             Self::InvalidClauseComposition { .. } => SemanticDetail::InvalidClauseComposition,
             Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
@@ -590,6 +606,9 @@ impl fmt::Display for SemanticErrorKind {
             Self::InvalidExpressionType { context } => {
                 write!(f, "expression has the wrong type: {context}")
             }
+            Self::NonConstantExpression { position } => {
+                write!(f, "{position} requires a constant expression")
+            }
             Self::InvalidDelete => {
                 f.write_str("DELETE expects a node, relationship or path expression")
             }
@@ -647,6 +666,10 @@ mod tests {
             (SemanticDetail::ProcedureNotFound, "ProcedureNotFound"),
             (SemanticDetail::InvalidArgumentType, "InvalidArgumentType"),
             (SemanticDetail::MissingParameter, "MissingParameter"),
+            (
+                SemanticDetail::NonConstantExpression,
+                "NonConstantExpression",
+            ),
             (SemanticDetail::InvalidDelete, "InvalidDelete"),
             (
                 SemanticDetail::InvalidClauseComposition,
@@ -740,6 +763,7 @@ mod tests {
                 | SemanticErrorKind::InvalidProcedureArgumentType { .. }
                 | SemanticErrorKind::MissingParameter { .. }
                 | SemanticErrorKind::InvalidExpressionType { .. }
+                | SemanticErrorKind::NonConstantExpression { .. }
                 | SemanticErrorKind::InvalidDelete
                 | SemanticErrorKind::InvalidClauseComposition { .. }
                 | SemanticErrorKind::DifferentColumnsInUnion
@@ -792,6 +816,7 @@ mod tests {
             SemanticErrorKind::InvalidExpressionType {
                 context: "x".to_owned(),
             },
+            SemanticErrorKind::NonConstantExpression { position: "SKIP" },
             SemanticErrorKind::InvalidDelete,
             SemanticErrorKind::InvalidClauseComposition { reason: "x" },
             SemanticErrorKind::DifferentColumnsInUnion,

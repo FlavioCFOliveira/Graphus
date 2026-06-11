@@ -280,6 +280,11 @@ static TABLE: &[Signature] = &[
         aggregate: false,
     },
     Signature {
+        name: "rand",
+        arity: Arity::Exact(0),
+        aggregate: false,
+    },
+    Signature {
         name: "round",
         arity: Arity::Range(1, 2),
         aggregate: false,
@@ -295,7 +300,22 @@ static TABLE: &[Signature] = &[
         aggregate: false,
     },
     Signature {
+        name: "sqrt",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
         name: "startnode",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "toboolean",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "tobooleanornull",
         arity: Arity::Exact(1),
         aggregate: false,
     },
@@ -473,6 +493,20 @@ mod tests {
         assert_eq!(Arity::Range(1, 2).check(2), ArityCheck::Ok);
         assert_eq!(Arity::Variadic.check(0), ArityCheck::Ok);
         assert_eq!(Arity::Variadic.check(9), ArityCheck::Ok);
+    }
+
+    #[test]
+    fn scalar_gap_fill_entries_are_registered() {
+        // rmp #62: the TCK-exercised scalar gaps (`rand`, `sqrt`, `toBoolean`) plus the
+        // `toBooleanOrNull` companion.
+        assert_eq!(lookup("rand").map(|s| s.arity), Some(Arity::Exact(0)));
+        assert_eq!(lookup("sqrt").map(|s| s.arity), Some(Arity::Exact(1)));
+        assert_eq!(lookup("toBoolean").map(|s| s.arity), Some(Arity::Exact(1)));
+        assert_eq!(
+            lookup("toBooleanOrNull").map(|s| s.arity),
+            Some(Arity::Exact(1))
+        );
+        assert!(!is_aggregate("rand"));
     }
 
     #[test]

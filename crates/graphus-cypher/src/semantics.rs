@@ -53,15 +53,23 @@
 //!
 //! A projection (or `WITH`) item that *contains* an aggregating function (`count`, `sum`, `avg`,
 //! `min`, `max`, `collect`, `stdev`, `stdevp`, `percentileCont`, `percentileDisc`, plus the
-//! `count(*)` atom) makes the whole projection an **aggregating projection**. Then **every other
-//! projected expression must be a pure grouping key** (no free, non-aggregated sub-expression),
-//! otherwise the grouping is ambiguous ([`AmbiguousAggregationExpression`]). Aggregates may not be
-//! **nested** ([`NestedAggregation`]) and may not appear where aggregation is forbidden — `WHERE`,
-//! pattern predicates, variable-length bounds ([`InvalidAggregation`]).
+//! `count(*)` atom) makes the whole projection an **aggregating projection**. Every item *without*
+//! an aggregate is then a **grouping key** — any expression form, evaluated per row and grouped by
+//! equivalence (TCK `clauses/with/With6.feature`, `clauses/return/Return6.feature` \[16\]). An
+//! item *with* an aggregate may compose, **outside** its aggregate calls, only constants and the
+//! projection's *simple* grouping keys (a projected bare variable or variable-rooted property
+//! path, or a property of one — `Return6` \[18\]/\[19\], `With6` \[7\]); any other free
+//! sub-expression makes the implicit grouping ambiguous ([`AmbiguousAggregationExpression`] —
+//! `Return6` \[20\]/\[21\], `With6` \[8\]/\[9\]: even a complex expression that is itself
+//! projected does not qualify). Aggregates may not be **nested** ([`NestedAggregation`]), may not
+//! appear where aggregation is forbidden — `WHERE`, pattern predicates, variable-length bounds
+//! ([`InvalidAggregation`]) — and may not take the non-deterministic `rand()` among their
+//! arguments ([`NonConstantExpression`] — `Return6` \[15\]).
 //!
 //! [`AmbiguousAggregationExpression`]: crate::errors::SemanticErrorKind::AmbiguousAggregationExpression
 //! [`NestedAggregation`]: crate::errors::SemanticErrorKind::NestedAggregation
 //! [`InvalidAggregation`]: crate::errors::SemanticErrorKind::InvalidAggregation
+//! [`NonConstantExpression`]: crate::errors::SemanticErrorKind::NonConstantExpression
 //!
 //! # Scope, and what is deferred (named, not silently dropped)
 //!
@@ -107,7 +115,7 @@ use crate::ast::{
     Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause, MatchClause,
     MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, ProjectionBody,
     ProjectionItem, Query, QueryBody, RelDirection, RelationshipPattern, RemoveClause, RemoveItem,
-    SetClause, SetItem, SingleQuery, SortItem, StandaloneCall, StandaloneYield, UnionPart,
+    SetClause, SetItem, SingleQuery, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart,
     UnwindClause, YieldItem,
 };
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
@@ -353,6 +361,20 @@ impl Scope {
         self.bindings.insert(name.to_owned(), Binding { kind });
         Ok(())
     }
+}
+
+/// The grouping-key context of one (potentially aggregating) projection body, computed once per
+/// projection and consumed by the aggregation rules (module docs *Aggregation rules*).
+struct GroupingKeys<'a> {
+    /// Path signatures of the **simple** non-aggregated items (a bare variable or variable-rooted
+    /// property path) — the keys an aggregate-containing *projection item* may re-use.
+    simple: Vec<Vec<&'a str>>,
+    /// [`Self::simple`] plus every non-aggregated item's alias (single-segment) — the keys an
+    /// aggregate-containing *ORDER BY item* may re-use (ORDER BY sees the post-projection names).
+    with_aliases: Vec<Vec<&'a str>>,
+    /// Whether some non-aggregated item is **complex** (a computed grouping key) — drives the
+    /// ORDER BY classification split (`AmbiguousAggregationExpression` vs `UndefinedVariable`).
+    has_complex: bool,
 }
 
 // =================================================================================================
@@ -745,6 +767,16 @@ impl Analyzer<'_> {
         let aggregating = self.projection_is_aggregating(body);
         let mut columns: Vec<(String, VarKind, Span)> = Vec::new();
 
+        // The grouping-key context for the aggregation rules: the simple grouping keys of this
+        // projection, plus (for `*`) every carried binding, which is a bare-variable grouping key.
+        let mut keys = Self::grouping_keys(body);
+        if body.star {
+            for name in scope.bindings.keys() {
+                keys.simple.push(vec![name.as_str()]);
+                keys.with_aliases.push(vec![name.as_str()]);
+            }
+        }
+
         // `*` carries every incoming binding through unchanged (name + kind preserved).
         if body.star {
             for (name, binding) in &scope.bindings {
@@ -753,7 +785,7 @@ impl Analyzer<'_> {
         }
 
         for item in &body.items {
-            self.check_projection_item(item, scope, aggregating, is_final_return)?;
+            self.check_projection_item(item, scope, aggregating, &keys, is_final_return)?;
             let (col_name, kind) = self.column_name_and_kind(item, scope, is_final_return)?;
             columns.push((col_name, kind, item.span));
         }
@@ -788,7 +820,7 @@ impl Analyzer<'_> {
             s
         };
         for sort in &body.order_by {
-            self.check_order_by_item(sort, &order_scope, aggregating)?;
+            self.check_order_by_item(sort, &order_scope, aggregating, &keys)?;
         }
         if let Some(skip) = &body.skip {
             self.check_expr(skip, &new_scope)?;
@@ -812,11 +844,13 @@ impl Analyzer<'_> {
         item: &ProjectionItem,
         scope: &Scope,
         aggregating: bool,
+        keys: &GroupingKeys<'_>,
         is_final_return: bool,
     ) -> Result<(), SemanticError> {
         self.check_expr(&item.expr, scope)?;
-        // Aggregations may not be nested anywhere.
+        // Aggregations may not be nested anywhere, and may not draw from `rand()`.
         self.reject_nested_aggregation(&item.expr)?;
+        Self::reject_nondeterministic_in_aggregate(&item.expr)?;
 
         // WITH requires an explicit alias for any non-trivial expression; a bare variable or a
         // bare `count(*)`-style aggregate atom is allowed unaliased in a final RETURN where a name
@@ -828,17 +862,13 @@ impl Analyzer<'_> {
             ));
         }
 
-        // In an aggregating projection, each item that does NOT itself contain an aggregate must be
-        // a pure grouping key (just a variable / property path / constant), else the grouping is
-        // ambiguous (AmbiguousAggregationExpression).
-        if aggregating
-            && !Self::contains_aggregate(&item.expr)
-            && !Self::is_grouping_key(&item.expr)
-        {
-            return Err(SemanticError::new(
-                SemanticErrorKind::AmbiguousAggregationExpression,
-                item.span,
-            ));
+        // In an aggregating projection, an item *without* an aggregate is a grouping key (any
+        // expression form — see the module docs). An item *with* an aggregate may compose, outside
+        // its aggregate calls, only constants and the projection's simple grouping keys; any other
+        // free sub-expression is an AmbiguousAggregationExpression (TCK `Return6` [18]–[21],
+        // `With6` [7]–[9]).
+        if aggregating && Self::contains_aggregate(&item.expr) {
+            Self::check_aggregate_item_references(&item.expr, &keys.simple, &mut Vec::new())?;
         }
         Ok(())
     }
@@ -848,9 +878,22 @@ impl Analyzer<'_> {
         sort: &SortItem,
         scope: &Scope,
         aggregating: bool,
+        keys: &GroupingKeys<'_>,
     ) -> Result<(), SemanticError> {
+        // An aggregate-containing sort key of an aggregating projection obeys the same in-item
+        // grouping rule as a projection item — checked *before* the scope check, and only when the
+        // projection has a computed (complex) grouping key: the TCK classifies
+        // `ORDER BY me.age + you.age + count(*)` after `WITH me.age + you.age AS ages, count(*)`
+        // as AmbiguousAggregationExpression (`WithOrderBy4` [20], `ReturnOrderBy6` [5]), but the
+        // same shape with *no* projected grouping key as UndefinedVariable (`WithOrderBy4` [19],
+        // `ReturnOrderBy6` [4]) — which the scope check below raises. ORDER BY runs post-
+        // projection, so the projected aliases also count as grouping keys here.
+        if aggregating && Self::contains_aggregate(&sort.expr) && keys.has_complex {
+            Self::check_aggregate_item_references(&sort.expr, &keys.with_aliases, &mut Vec::new())?;
+        }
         self.check_expr(&sort.expr, scope)?;
         self.reject_nested_aggregation(&sort.expr)?;
+        Self::reject_nondeterministic_in_aggregate(&sort.expr)?;
         // ORDER BY may use aggregates only when the projection itself aggregates (it sorts the
         // grouped rows); in a non-aggregating projection an aggregate in ORDER BY is invalid.
         if !aggregating && Self::contains_aggregate(&sort.expr) {
@@ -1250,12 +1293,29 @@ impl Analyzer<'_> {
         self.reject_aggregation(expr, position)
     }
 
-    /// A `SKIP`/`LIMIT` count must be a non-negative integer; a **literal** of any other scalar type
-    /// (a float, string or boolean) is a statically-decidable `SyntaxError`/`InvalidArgumentType`
-    /// (`tck/features/clauses/return-skip-limit/**`, e.g. `SKIP 1.5`, `LIMIT 1.7`). A dynamic count
-    /// (a parameter, a `toInteger(...)` call) is a runtime concern and is **not** flagged here — the
-    /// statement plan stays parameter-independent (`04 §7.5`).
-    fn check_skip_limit_literal(expr: &Expr, position: &str) -> Result<(), SemanticError> {
+    /// A `SKIP`/`LIMIT` count must be a non-negative-integer **constant** expression
+    /// (`tck/features/clauses/return-skip-limit/**`). Statically decidable here:
+    ///
+    /// - a **literal** of any other scalar type (`SKIP 1.5`) — `SyntaxError`/`InvalidArgumentType`;
+    /// - a **negated integer literal** (`SKIP -1`) — `SyntaxError`/`NegativeIntegerArgument`;
+    /// - a **row-dependent** expression (`SKIP n.count`, a free variable reference) —
+    ///   `SyntaxError`/`NonConstantExpression`.
+    ///
+    /// A *constant* dynamic count (a parameter, `SKIP toInteger(rand()*9)`) is a runtime concern
+    /// and is **not** flagged — the statement plan stays parameter-independent (`04 §7.5`).
+    fn check_skip_limit_literal(expr: &Expr, position: &'static str) -> Result<(), SemanticError> {
+        if let ExprKind::Unary {
+            op: UnaryOp::Minus,
+            operand,
+        } = &expr.kind
+        {
+            if matches!(&operand.kind, ExprKind::Literal(Literal::Integer(_))) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::NegativeIntegerArgument,
+                    expr.span,
+                ));
+            }
+        }
         if let ExprKind::Literal(lit) = &expr.kind {
             if !matches!(lit, Literal::Integer(_) | Literal::Null) {
                 return Err(SemanticError::new(
@@ -1265,6 +1325,12 @@ impl Analyzer<'_> {
                     expr.span,
                 ));
             }
+        }
+        if Self::references_free_variable(expr, &mut Vec::new()) {
+            return Err(SemanticError::new(
+                SemanticErrorKind::NonConstantExpression { position },
+                expr.span,
+            ));
         }
         Ok(())
     }
@@ -1337,17 +1403,207 @@ impl Analyzer<'_> {
         found
     }
 
-    /// A "grouping key" expression in an aggregating projection: a bare variable, a property path
-    /// rooted at a variable, an index/slice into such, a constant, a parameter, or a `HasLabels`
-    /// test. These are the forms Cypher accepts as non-aggregated terms without ambiguity.
-    fn is_grouping_key(expr: &Expr) -> bool {
+    /// The path signature of a **simple** expression — a bare variable or a property path rooted
+    /// at a variable — as the variable name followed by the property keys (`me.age` → `["me",
+    /// "age"]`). `None` for any other form. These are the only expressions that qualify as
+    /// re-usable grouping keys *inside* an aggregate-containing item (module docs; TCK `Return6`
+    /// [18]/[19] vs [21]).
+    fn simple_path_signature(expr: &Expr) -> Option<Vec<&str>> {
         match &expr.kind {
-            ExprKind::Variable(_) | ExprKind::Literal(_) | ExprKind::Parameter(_) => true,
-            ExprKind::Property { base, .. }
-            | ExprKind::Index { base, .. }
-            | ExprKind::HasLabels { operand: base, .. } => Self::is_grouping_key(base),
-            ExprKind::Slice { base, .. } => Self::is_grouping_key(base),
-            _ => false,
+            ExprKind::Variable(name) => Some(vec![name.as_str()]),
+            ExprKind::Property { base, key } => {
+                let mut sig = Self::simple_path_signature(base)?;
+                sig.push(key.as_str());
+                Some(sig)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `sig` is determined by one of the projected simple grouping `keys`: it is a key, or
+    /// a property (path) *of* a key — `n.x` is grouped when `n` is a key, but `me` is not grouped
+    /// by the key `me.age`.
+    fn signature_is_grouped(sig: &[&str], keys: &[Vec<&str>]) -> bool {
+        keys.iter()
+            .any(|k| sig.len() >= k.len() && sig[..k.len()] == k[..])
+    }
+
+    /// Collects the grouping-key context of one projection body (the non-aggregated items): the
+    /// simple keys' path signatures, the same plus the items' aliases (for the post-projection
+    /// ORDER BY variant of the rule), and whether some non-aggregated item is *complex* (a
+    /// computed grouping key — which drives the ORDER BY classification split, see
+    /// [`Self::check_order_by_item`]).
+    fn grouping_keys(body: &ProjectionBody) -> GroupingKeys<'_> {
+        let mut simple = Vec::new();
+        let mut with_aliases = Vec::new();
+        let mut has_complex = false;
+        for item in &body.items {
+            if Self::contains_aggregate(&item.expr) {
+                continue;
+            }
+            match Self::simple_path_signature(&item.expr) {
+                Some(sig) => {
+                    simple.push(sig.clone());
+                    with_aliases.push(sig);
+                }
+                None => has_complex = true,
+            }
+            if let Some(alias) = &item.alias {
+                with_aliases.push(vec![alias.name.as_str()]);
+            }
+        }
+        GroupingKeys {
+            simple,
+            with_aliases,
+            has_complex,
+        }
+    }
+
+    /// Enforces the in-item grouping rule on an **aggregate-containing** expression: outside its
+    /// aggregate calls, only constants (literals/parameters), locally-bound iteration variables,
+    /// and the projection's simple grouping `keys` (or properties of them) may appear; any other
+    /// free variable / property path raises [`AmbiguousAggregationExpression`] (TCK `Return6`
+    /// [20]/[21], `With6` [8]/[9] — even a complex expression that is itself projected does not
+    /// qualify).
+    ///
+    /// [`AmbiguousAggregationExpression`]: SemanticErrorKind::AmbiguousAggregationExpression
+    fn check_aggregate_item_references(
+        expr: &Expr,
+        keys: &[Vec<&str>],
+        locals: &mut Vec<String>,
+    ) -> Result<(), SemanticError> {
+        // The interior of an aggregate call is folded per group — free references are its point.
+        if Self::is_aggregate_call(expr) {
+            return Ok(());
+        }
+        // A bare variable / variable-rooted property path: legal iff grouped or locally bound.
+        if let Some(sig) = Self::simple_path_signature(expr) {
+            if Self::signature_is_grouped(&sig, keys) || locals.iter().any(|l| l == sig[0]) {
+                return Ok(());
+            }
+            return Err(SemanticError::new(
+                SemanticErrorKind::AmbiguousAggregationExpression,
+                expr.span,
+            ));
+        }
+        match &expr.kind {
+            // Iteration constructs bind their variable for the predicate/projection parts only.
+            ExprKind::ListComprehension(lc) => {
+                Self::check_aggregate_item_references(&lc.list, keys, locals)?;
+                locals.push(lc.variable.name.clone());
+                let result = (|| {
+                    if let Some(pred) = &lc.predicate {
+                        Self::check_aggregate_item_references(pred, keys, locals)?;
+                    }
+                    if let Some(proj) = &lc.projection {
+                        Self::check_aggregate_item_references(proj, keys, locals)?;
+                    }
+                    Ok(())
+                })();
+                locals.pop();
+                result
+            }
+            ExprKind::Quantifier(q) => {
+                Self::check_aggregate_item_references(&q.list, keys, locals)?;
+                locals.push(q.variable.name.clone());
+                let result = Self::check_aggregate_item_references(&q.predicate, keys, locals);
+                locals.pop();
+                result
+            }
+            // Pattern-scoped forms bind their own pattern variables and cannot host aggregates;
+            // they are left to the general scope checks (conservative: never flagged here).
+            ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => Ok(()),
+            _ => Self::for_each_child(expr, &mut |child| {
+                Self::check_aggregate_item_references(child, keys, locals)
+            }),
+        }
+    }
+
+    /// Rejects the non-deterministic `rand()` inside an aggregating function's arguments with
+    /// [`NonConstantExpression`] (TCK `clauses/return/Return6.feature` [15]: `RETURN count(rand())`
+    /// → `SyntaxError`/`NonConstantExpression`): the per-group fold has no defined row order, so
+    /// the draw would be observable, implementation-defined behaviour.
+    ///
+    /// [`NonConstantExpression`]: SemanticErrorKind::NonConstantExpression
+    fn reject_nondeterministic_in_aggregate(expr: &Expr) -> Result<(), SemanticError> {
+        if Self::is_aggregate_call(expr) {
+            if let ExprKind::FunctionCall { args, .. } = &expr.kind {
+                for arg in args {
+                    if let Some(span) = Self::find_rand_call(arg) {
+                        return Err(SemanticError::new(
+                            SemanticErrorKind::NonConstantExpression {
+                                position: "an aggregating function",
+                            },
+                            span,
+                        ));
+                    }
+                }
+            }
+        }
+        Self::for_each_child(expr, &mut |child| {
+            Self::reject_nondeterministic_in_aggregate(child)
+        })
+    }
+
+    /// The span of the first `rand()` call in `expr`, if any.
+    fn find_rand_call(expr: &Expr) -> Option<Span> {
+        if let ExprKind::FunctionCall { name, .. } = &expr.kind {
+            if name.len() == 1 && name[0].eq_ignore_ascii_case("rand") {
+                return Some(expr.span);
+            }
+        }
+        let mut found = None;
+        let _ = Self::for_each_child(expr, &mut |child| {
+            if found.is_none() {
+                found = Self::find_rand_call(child);
+            }
+            Ok(())
+        });
+        found
+    }
+
+    /// Whether `expr` references a **free** (non-locally-bound) variable — i.e. its value depends
+    /// on the current row. Iteration constructs bind their variable locally; pattern-scoped forms
+    /// (pattern comprehensions, `EXISTS`) read the graph and are therefore never constant.
+    fn references_free_variable(expr: &Expr, locals: &mut Vec<String>) -> bool {
+        match &expr.kind {
+            ExprKind::Variable(name) => !locals.iter().any(|l| l == name),
+            ExprKind::ListComprehension(lc) => {
+                if Self::references_free_variable(&lc.list, locals) {
+                    return true;
+                }
+                locals.push(lc.variable.name.clone());
+                let found = lc
+                    .predicate
+                    .as_ref()
+                    .is_some_and(|p| Self::references_free_variable(p, locals))
+                    || lc
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| Self::references_free_variable(p, locals));
+                locals.pop();
+                found
+            }
+            ExprKind::Quantifier(q) => {
+                if Self::references_free_variable(&q.list, locals) {
+                    return true;
+                }
+                locals.push(q.variable.name.clone());
+                let found = Self::references_free_variable(&q.predicate, locals);
+                locals.pop();
+                found
+            }
+            ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => true,
+            _ => {
+                let mut found = false;
+                let _ = Self::for_each_child(expr, &mut |child| {
+                    if !found {
+                        found = Self::references_free_variable(child, locals);
+                    }
+                    Ok(())
+                });
+                found
+            }
         }
     }
 
@@ -1533,13 +1789,36 @@ mod tests {
     }
 
     #[test]
-    fn grouping_key_recognises_property_paths() {
+    fn simple_path_signature_recognises_property_paths() {
         let q = ast("RETURN n.a.b");
         let body = if let Clause::Return(r) = &q.body_single_query().clauses[0] {
             &r.body
         } else {
             unreachable!()
         };
-        assert!(Analyzer::is_grouping_key(&body.items[0].expr));
+        assert_eq!(
+            Analyzer::simple_path_signature(&body.items[0].expr),
+            Some(vec!["n", "a", "b"])
+        );
+
+        let q = ast("RETURN n.a + 1");
+        let body = if let Clause::Return(r) = &q.body_single_query().clauses[0] {
+            &r.body
+        } else {
+            unreachable!()
+        };
+        assert_eq!(Analyzer::simple_path_signature(&body.items[0].expr), None);
+    }
+
+    #[test]
+    fn signature_prefix_rule_matches_keys_and_their_properties() {
+        let keys = vec![vec!["n"], vec!["me", "age"]];
+        // A key itself, and a property of a key, are grouped.
+        assert!(Analyzer::signature_is_grouped(&["n"], &keys));
+        assert!(Analyzer::signature_is_grouped(&["n", "x"], &keys));
+        assert!(Analyzer::signature_is_grouped(&["me", "age"], &keys));
+        // The *root* of a property key is not determined by it, nor is a sibling property.
+        assert!(!Analyzer::signature_is_grouped(&["me"], &keys));
+        assert!(!Analyzer::signature_is_grouped(&["me", "other"], &keys));
     }
 }
