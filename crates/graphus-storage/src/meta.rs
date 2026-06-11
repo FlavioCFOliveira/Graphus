@@ -11,6 +11,8 @@
 //! The metadata payload is a self-describing, length-prefixed serialization that lives entirely
 //! within one page's payload (`05 §6`); the encoder asserts it fits.
 
+use std::collections::BTreeMap;
+
 use graphus_core::error::{GraphusError, Result};
 
 use crate::idalloc::FreeList;
@@ -35,6 +37,175 @@ pub struct Meta {
     pub stores: [StoreMeta; STORE_COUNT],
     /// The token dictionaries (`04 §2.6`).
     pub tokens: TokenStore,
+    /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
+    /// (`rmp` task #79): per-label node counts and per-relationship-type counts.
+    pub statistics: Statistics,
+}
+
+/// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
+///
+/// Holds, for the planner's cardinality estimator, how many currently-**live** nodes carry each
+/// [`Label`](crate::tokens::Namespace::Label)-namespace token id, and how many currently-live
+/// relationships have each [`RelType`](crate::tokens::Namespace::RelType)-namespace token id, so the
+/// planner gets exact cardinalities by an O(1) lookup with no scan.
+///
+/// # What "live" means here, and why it is crash- and abort-safe
+///
+/// A record is *live* for counting exactly when it is the latest visible version: its slot is in use
+/// **and** it carries no MVCC expiry tombstone (`xmax == 0`) — the
+/// [`RecordStore::is_live_version`](crate::RecordStore) predicate. The store therefore adjusts these
+/// counts on the **committed transition** that changes a record's live label/type contribution:
+/// `create_rel` increments; `delete_node`/`delete_rel` (which stamp the `xmax` tombstone, `04 §5.3`)
+/// decrement; `set_node_labels`/`add_label`/`remove_label` adjust the per-label delta on a live node.
+/// GC reclamation ([`reclaim_node`](crate::RecordStore)/[`reclaim_rel`](crate::RecordStore)) does
+/// **not** touch the counts — the decrement already happened at the tombstone-stamping delete.
+///
+/// Because the whole catalog (this struct included) is persisted only at commit by
+/// [`checkpoint_meta`](crate::RecordStore) and reloaded wholesale on rollback and on
+/// [`open`](crate::RecordStore) (post-recovery) from the durable metadata page, these counts follow
+/// the **identical** durability lifecycle as the id high-water marks and free lists: an aborted
+/// transaction's in-memory increments/decrements are discarded by the catalog reload, and a crash
+/// recovers the last committed counts. No path overcounts on abort or double-counts on replay.
+///
+/// # Determinism and the zero-count invariant
+///
+/// The maps are [`BTreeMap`]s so the encoding (and [`PartialEq`]) is deterministic. A token id whose
+/// count reaches `0` is **removed** from the map rather than left at `0`, so equality against a fresh
+/// full re-scan (which only ever inserts positive counts) always holds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Statistics {
+    /// `nodes_per_label[t]` is the number of currently-live nodes carrying the `Label`-namespace
+    /// token id `t`. A node with `k` labels contributes `1` to each of its `k` entries; an unlabelled
+    /// node contributes to none. Absent key == count `0`.
+    pub nodes_per_label: BTreeMap<u32, u64>,
+    /// `rels_per_type[t]` is the number of currently-live relationships whose `RelType`-namespace
+    /// token id is `t`. Absent key == count `0`.
+    pub rels_per_type: BTreeMap<u32, u64>,
+}
+
+impl Statistics {
+    /// An empty statistics catalog (every count `0`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of currently-live nodes carrying the label `token_id` (`0` if none).
+    #[must_use]
+    pub fn node_count_for_label(&self, token_id: u32) -> u64 {
+        self.nodes_per_label.get(&token_id).copied().unwrap_or(0)
+    }
+
+    /// The number of currently-live relationships of relationship-type `token_id` (`0` if none).
+    #[must_use]
+    pub fn rel_count_for_type(&self, token_id: u32) -> u64 {
+        self.rels_per_type.get(&token_id).copied().unwrap_or(0)
+    }
+
+    /// Adds `1` to the live-node count for label `token_id`.
+    pub(crate) fn inc_label(&mut self, token_id: u32) {
+        *self.nodes_per_label.entry(token_id).or_insert(0) += 1;
+    }
+
+    /// Subtracts `1` from the live-node count for label `token_id`, removing the entry when it
+    /// reaches `0` so equality against a fresh re-scan holds (the zero-count invariant).
+    ///
+    /// # Panics
+    /// Panics (debug builds) if the count is already `0` or absent: that is an internal invariant
+    /// violation — every decrement must correspond to a prior increment of a live node's label.
+    pub(crate) fn dec_label(&mut self, token_id: u32) {
+        Self::dec(&mut self.nodes_per_label, token_id);
+    }
+
+    /// Adds `1` to the live-relationship count for relationship-type `token_id`.
+    pub(crate) fn inc_rel_type(&mut self, token_id: u32) {
+        *self.rels_per_type.entry(token_id).or_insert(0) += 1;
+    }
+
+    /// Subtracts `1` from the live-relationship count for relationship-type `token_id`, removing the
+    /// entry when it reaches `0` (the zero-count invariant).
+    ///
+    /// # Panics
+    /// Panics (debug builds) if the count is already `0` or absent (an internal invariant violation).
+    pub(crate) fn dec_rel_type(&mut self, token_id: u32) {
+        Self::dec(&mut self.rels_per_type, token_id);
+    }
+
+    /// Shared decrement-with-removal: `count -= 1`, dropping the entry at `0`. In a release build a
+    /// missing/zero entry saturates at `0` (never wraps to a huge count) so a logic slip can never
+    /// silently corrupt the catalog into an absurd cardinality; in a debug build it is caught.
+    fn dec(map: &mut BTreeMap<u32, u64>, token_id: u32) {
+        match map.get_mut(&token_id) {
+            Some(c) if *c > 1 => *c -= 1,
+            Some(_) => {
+                map.remove(&token_id);
+            }
+            None => {
+                debug_assert!(
+                    false,
+                    "statistics decrement underflow for token id {token_id}"
+                );
+            }
+        }
+    }
+
+    /// Serialises the statistics to a self-describing byte image.
+    ///
+    /// Layout: `n_labels(u32) | [ token_id(u32) | count(u64) ]* | n_types(u32) | [ token_id(u32) |
+    /// count(u64) ]*`, each map in ascending-token-id ([`BTreeMap`]) order so the image is
+    /// deterministic.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(8 + self.nodes_per_label.len() * 12 + self.rels_per_type.len() * 12);
+        Self::encode_map(&mut out, &self.nodes_per_label);
+        Self::encode_map(&mut out, &self.rels_per_type);
+        out
+    }
+
+    fn encode_map(out: &mut Vec<u8>, map: &BTreeMap<u32, u64>) {
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (&token_id, &count) in map {
+            out.extend_from_slice(&token_id.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+    }
+
+    /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
+    ///
+    /// # Errors
+    /// Returns a storage error if the image is truncated, a count is `0` (violates the zero-count
+    /// invariant — such an image was never produced by [`encode`](Self::encode)), or a token id
+    /// appears twice in one map.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut cur = 0usize;
+        let nodes_per_label = Self::decode_map(bytes, &mut cur, "nodes_per_label")?;
+        let rels_per_type = Self::decode_map(bytes, &mut cur, "rels_per_type")?;
+        Ok(Self {
+            nodes_per_label,
+            rels_per_type,
+        })
+    }
+
+    fn decode_map(bytes: &[u8], cur: &mut usize, which: &str) -> Result<BTreeMap<u32, u64>> {
+        let n = read_u32(bytes, cur)? as usize;
+        let mut map = BTreeMap::new();
+        for _ in 0..n {
+            let token_id = read_u32(bytes, cur)?;
+            let count = read_u64(bytes, cur)?;
+            if count == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "statistics {which} holds a zero count for token id {token_id}"
+                )));
+            }
+            if map.insert(token_id, count).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "statistics {which} repeats token id {token_id}"
+                )));
+            }
+        }
+        Ok(map)
+    }
 }
 
 /// Durable per-store catalog: id high-water mark, free list, and the device-page map.
@@ -57,6 +228,7 @@ impl Meta {
             commit_ts_hw: 0,
             stores: Default::default(),
             tokens: TokenStore::new(),
+            statistics: Statistics::new(),
         }
     }
 
@@ -87,6 +259,11 @@ impl Meta {
         let tok = self.tokens.encode();
         out.extend_from_slice(&(tok.len() as u32).to_le_bytes());
         out.extend_from_slice(&tok);
+        // Statistics are appended after the tokens (`rmp` task #79). Length-prefixed like the token
+        // image so a future field can follow without ambiguity.
+        let stats = self.statistics.encode();
+        out.extend_from_slice(&(stats.len() as u32).to_le_bytes());
+        out.extend_from_slice(&stats);
         Ok(out)
     }
 
@@ -113,11 +290,16 @@ impl Meta {
         let tok_len = read_u32(bytes, &mut cur)? as usize;
         let tok_end = take(bytes, &mut cur, tok_len)?;
         let tokens = TokenStore::decode(&bytes[cur - tok_len..tok_end])?;
+        // Statistics follow the tokens (`rmp` task #79).
+        let stats_len = read_u32(bytes, &mut cur)? as usize;
+        let stats_end = take(bytes, &mut cur, stats_len)?;
+        let statistics = Statistics::decode(&bytes[cur - stats_len..stats_end])?;
         Ok(Self {
             element_id_next,
             commit_ts_hw,
             stores,
             tokens,
+            statistics,
         })
     }
 }
@@ -177,10 +359,58 @@ mod tests {
         m.stores[3].device_pages = vec![6, 7];
         m.tokens.intern(Namespace::Label, "Person").unwrap();
         m.tokens.intern(Namespace::RelType, "KNOWS").unwrap();
+        // Populate the statistics catalog too (`rmp` task #79) so its round-trip is exercised here.
+        m.statistics.inc_label(0); // Person: 2 live nodes
+        m.statistics.inc_label(0);
+        m.statistics.inc_label(5); // another label token: 1 live node
+        m.statistics.inc_rel_type(0); // KNOWS: 3 live rels
+        m.statistics.inc_rel_type(0);
+        m.statistics.inc_rel_type(0);
 
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
         assert_eq!(back.tokens.id(Namespace::Label, "Person"), Some(0));
+        assert_eq!(back.statistics.node_count_for_label(0), 2);
+        assert_eq!(back.statistics.node_count_for_label(5), 1);
+        assert_eq!(back.statistics.rel_count_for_type(0), 3);
+    }
+
+    #[test]
+    fn statistics_round_trip_and_zero_count_invariant() {
+        let mut s = Statistics::new();
+        assert_eq!(s.node_count_for_label(7), 0);
+        s.inc_label(7);
+        s.inc_label(7);
+        s.inc_rel_type(3);
+        // Decrementing to 0 removes the entry (zero-count invariant): the map must not linger a 0.
+        s.dec_rel_type(3);
+        assert!(s.rels_per_type.is_empty(), "a 0 count must not linger");
+        s.dec_label(7);
+        assert_eq!(s.node_count_for_label(7), 1);
+
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.node_count_for_label(7), 1);
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_zero_count() {
+        // A hand-built image with an explicit 0 count must be rejected (encode never produces one).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 label entry
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // token id 4
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // count 0 (invalid)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_truncation() {
+        let mut s = Statistics::new();
+        s.inc_label(1);
+        let mut bytes = s.encode();
+        bytes.truncate(bytes.len() - 1);
+        assert!(Statistics::decode(&bytes).is_err());
     }
 
     #[test]

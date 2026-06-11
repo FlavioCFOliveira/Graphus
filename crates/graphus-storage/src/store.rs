@@ -38,7 +38,7 @@ use graphus_wal::{LogSink, WalManager};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
-use crate::meta::{Meta, StoreMeta};
+use crate::meta::{Meta, Statistics, StoreMeta};
 use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
@@ -213,6 +213,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// the GC transaction's [`commit`](Self::commit) and discarded at its
     /// [`rollback`](Self::rollback) (`rmp` task #59). `None` while no GC pass is pending.
     pending_gc_prune: Option<PendingGcPrune>,
+    /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
+    /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
+    /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
+    /// live label/type contribution (`create_rel`, `delete_node`/`delete_rel`, the label-set
+    /// mutators), snapshotted at [`checkpoint_meta`](Self::checkpoint_meta) and reloaded wholesale on
+    /// rollback / [`open`](Self::open), so it shares the id high-water marks' durability lifecycle and
+    /// is correct after abort and after crash recovery. See [`Statistics`].
+    statistics: Statistics,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
@@ -254,6 +262,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             meta_chain: Vec::new(),
             commit_registry: CommitRegistry::new(),
             pending_gc_prune: None,
+            statistics: Statistics::new(),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -298,6 +307,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             meta_chain,
             commit_registry,
             pending_gc_prune: None,
+            statistics: meta.statistics,
         })
     }
 
@@ -327,6 +337,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.stores[3].to_meta(),
             ],
             tokens: self.tokens.clone(),
+            statistics: self.statistics.clone(),
         }
     }
 
@@ -964,6 +975,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.stores[i] = FixedStore::from_meta(kind, sm);
         }
         self.tokens = meta.tokens;
+        // Restore the live-record cardinalities from the durable catalog (`rmp` task #79): on
+        // rollback this discards the aborting transaction's in-memory increments/decrements (it never
+        // checkpointed them), exactly as the id high-water / free-list restore above does, so a
+        // rolled-back create/delete/label-change leaves the counts at their last committed values.
+        self.statistics = meta.statistics;
         // The catalog is only ever checkpointed at commit, so during an open transaction the chain
         // already matches disk; reload (rollback / recovery) restores the durable committed chain.
         self.meta_chain = meta_chain;
@@ -1082,6 +1098,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(rec.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} is not in use")));
         }
+        // Drop this node's contribution to every per-label count before stamping the tombstone
+        // (`rmp` task #79): the labels are read from the still-live record. An overflow-form bitmap
+        // (a #39 build's, which this build never writes) contributes to no inline-label count, so it
+        // is skipped rather than erroring the delete; the inline counts only ever tracked inline
+        // labels. Reclamation at GC ([`reclaim_node`]) must NOT decrement again. On rollback the
+        // counts are restored by `reload_catalog`.
+        if let Ok(label_ids) = labels::token_ids(rec.labels) {
+            for token_id in label_ids {
+                self.statistics.dec_label(token_id);
+            }
+        }
         self.patch_header_word(
             StoreKind::Node,
             id,
@@ -1137,8 +1164,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
         }
-        node.labels = labels::encode_set(label_token_ids).map_err(GraphusError::from)?;
-        self.write_node(id, &node, txn)
+        // Encode the requested set first so an overflowing token id errors before any mutation or
+        // count change (no partial write, no count drift).
+        let new_labels = labels::encode_set(label_token_ids).map_err(GraphusError::from)?;
+        let old_labels = node.labels;
+        node.labels = new_labels;
+        self.write_node(id, &node, txn)?;
+        // Adjust the per-label counts by the membership delta of this live node (`rmp` task #79).
+        self.apply_label_count_delta(old_labels, new_labels);
+        Ok(())
+    }
+
+    /// Applies the per-label live-node count change for a single node whose label bitmap moved from
+    /// `old` to `new` (`rmp` task #79): each token id newly set is incremented, each newly cleared is
+    /// decremented. A bit unchanged in both is left alone. Only inline membership bits (`0..=62`) are
+    /// considered; the overflow flag is never a counted label. Call only after a successful node-label
+    /// write on a **live** node, so the count tracks exactly the live nodes' contributions.
+    fn apply_label_count_delta(&mut self, old: u64, new: u64) {
+        // `token_ids` cannot error here: both bitmaps come from this build's inline writes (overflow
+        // flag clear). The bit arithmetic isolates the changed bits without enumerating unchanged ones.
+        let added = new & !old;
+        let removed = old & !new;
+        if let Ok(ids) = labels::token_ids(added) {
+            for token_id in ids {
+                self.statistics.inc_label(token_id);
+            }
+        }
+        if let Ok(ids) = labels::token_ids(removed) {
+            for token_id in ids {
+                self.statistics.dec_label(token_id);
+            }
+        }
     }
 
     /// Adds the label with `label_token_id` to node `id` under `txn` (idempotent — a label already
@@ -1155,10 +1211,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
         let next = labels::with_label(node.labels, label_token_id).map_err(GraphusError::from)?;
         if next == node.labels {
-            return Ok(()); // already present: no write, no WAL churn
+            return Ok(()); // already present: no write, no WAL churn, no count change
         }
+        let old_labels = node.labels;
         node.labels = next;
-        self.write_node(id, &node, txn)
+        self.write_node(id, &node, txn)?;
+        // Exactly one bit was newly set: increment its per-label count (`rmp` task #79).
+        self.apply_label_count_delta(old_labels, next);
+        Ok(())
     }
 
     /// Removes the label with `label_token_id` from node `id` under `txn` (idempotent — removing an
@@ -1176,10 +1236,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let next =
             labels::without_label(node.labels, label_token_id).map_err(GraphusError::from)?;
         if next == node.labels {
-            return Ok(()); // already absent: no write
+            return Ok(()); // already absent: no write, no count change
         }
+        let old_labels = node.labels;
         node.labels = next;
-        self.write_node(id, &node, txn)
+        self.write_node(id, &node, txn)?;
+        // Exactly one bit was newly cleared: decrement its per-label count (`rmp` task #79).
+        self.apply_label_count_delta(old_labels, next);
+        Ok(())
     }
 
     /// The `Label`-namespace token ids of node `id`'s labels, ascending.
@@ -1246,6 +1310,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             start_node.first_rel = id;
             self.write_rel(id, &rel, txn)?;
             self.write_node(start, &start_node, txn)?;
+            // Maintain the per-relationship-type live count (`rmp` task #79): the self-loop is now a
+            // live version. Both endpoints are the (validated) live start node, so the increment is
+            // unconditional here. In-memory only; durable at the commit checkpoint, reverted by
+            // `reload_catalog` on rollback.
+            self.statistics.inc_rel_type(type_id);
             return Ok((id, eid));
         }
 
@@ -1275,6 +1344,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.write_rel(id, &rel, txn)?;
         self.write_node(start, &start_node, txn)?;
         self.write_node(end, &end_node, txn)?;
+        // Maintain the per-relationship-type live count (`rmp` task #79): the relationship is now a
+        // written, live version and both endpoints are validated. In-memory only; durable at the
+        // commit checkpoint, reverted by `reload_catalog` on rollback.
+        self.statistics.inc_rel_type(type_id);
         Ok((id, eid))
     }
 
@@ -1329,6 +1402,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             txn,
         )?;
         self.note_expired(txn, StoreKind::Rel, id);
+        // The relationship ceases to be a live version on this committed transition (`rmp` task #79):
+        // drop its contribution to the per-type count. Reclamation at GC ([`reclaim_rel`]) must NOT
+        // decrement again — the count already reflects the deletion from here. On rollback the count
+        // is restored by `reload_catalog`, so an aborted delete does not undercount.
+        self.statistics.dec_rel_type(rel.type_id);
         Ok(())
     }
 
@@ -2244,6 +2322,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn element_id_next(&self) -> u128 {
         self.element_ids.peek()
+    }
+
+    /// The durable live-record cardinalities (`rmp` task #79): per-label node counts and
+    /// per-relationship-type counts, for the planner's cardinality estimator. O(1) borrow; the maps
+    /// inside are O(log n) keyed by token id ([`Statistics::node_count_for_label`] /
+    /// [`Statistics::rel_count_for_type`]). These are exact counts of the currently-live records (a
+    /// version is live when its slot is in use and it carries no MVCC tombstone), maintained
+    /// incrementally and persisted with the catalog — equivalent to a full re-scan but without one.
+    #[must_use]
+    pub fn statistics(&self) -> &Statistics {
+        &self.statistics
+    }
+
+    /// The number of currently-live nodes carrying the label with `label_token_id` (`0` if none),
+    /// from the persisted statistics (`rmp` task #79). Convenience over [`statistics`](Self::statistics).
+    #[must_use]
+    pub fn node_count_for_label(&self, label_token_id: u32) -> u64 {
+        self.statistics.node_count_for_label(label_token_id)
+    }
+
+    /// The number of currently-live relationships of relationship-type `type_token_id` (`0` if none),
+    /// from the persisted statistics (`rmp` task #79). Convenience over [`statistics`](Self::statistics).
+    #[must_use]
+    pub fn rel_count_for_type(&self, type_token_id: u32) -> u64 {
+        self.statistics.rel_count_for_type(type_token_id)
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

@@ -80,6 +80,7 @@ pub use check::{
 pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
+pub use meta::{Meta, Statistics, StoreMeta};
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,
 };
