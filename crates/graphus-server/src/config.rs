@@ -76,6 +76,45 @@ impl TlsConfig {
     }
 }
 
+/// Encryption-at-rest configuration (rmp #85, parent #69, decision `D-security-scope`).
+///
+/// When [`key_path`](Self::key_path) is set, the record store is created/opened as an **encrypted**
+/// device (AES-256-GCM page encryption at the `BlockDevice` seam — see `graphus-crypto`). When it is
+/// **unset**, the store path is byte-identical to today (a plaintext `FileBlockDevice`). The key
+/// applies to **all databases** under the data root (per-database keys are out of scope for this
+/// sub-task). WAL and backup encryption, and key rotation, are sub-task #86 — only the record-store
+/// device is encrypted here.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// Path to the master-key file (raw 32 bytes, or 64 hex characters). When set, the record store
+    /// is encrypted; when unset, the store is plaintext. Overridable via `GRAPHUS_ENCRYPTION_KEY_PATH`.
+    pub key_path: Option<PathBuf>,
+}
+
+impl EncryptionConfig {
+    /// Whether encryption at rest is enabled (a key path is configured).
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.key_path.is_some()
+    }
+
+    /// `Err` if a key path is set but the file does not exist (a misconfiguration that must fail
+    /// fast at startup, not at first store open).
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(path) = &self.key_path {
+            if !path.is_file() {
+                return Err(ConfigError::Invalid(format!(
+                    "encryption.key_path {} does not exist or is not a file (the master key file \
+                     must be present when encryption is enabled)",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Admission control + load-shedding limits (`04 §9.3`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -223,6 +262,9 @@ pub struct ServerConfig {
     /// The initial RBAC bootstrap (the first admin user).
     pub auth: AuthBootstrap,
 
+    /// Encryption at rest (rmp #85). Unset ⇒ plaintext store (byte-identical to today).
+    pub encryption: EncryptionConfig,
+
     /// **Escape hatch (default `false`):** allow a network listener (Bolt-TCP / REST) to run
     /// **without TLS**. Off by default so production is TLS-mandatory (`04 §8.4`); intended for
     /// loopback test harnesses and trusted-network/dev setups. The name is deliberately alarming so
@@ -245,6 +287,7 @@ impl Default for ServerConfig {
             timing: TimingConfig::default(),
             jwt_secret: DEFAULT_INSECURE_JWT_SECRET.to_owned(),
             auth: AuthBootstrap::default(),
+            encryption: EncryptionConfig::default(),
             allow_insecure_network: false,
         }
     }
@@ -341,6 +384,9 @@ impl ServerConfig {
         if let Ok(v) = var("GRAPHUS_JWT_SECRET") {
             self.jwt_secret = v;
         }
+        if let Ok(v) = var("GRAPHUS_ENCRYPTION_KEY_PATH") {
+            self.encryption.key_path = empty_to_none(v).map(PathBuf::from);
+        }
         if let Ok(v) = var("GRAPHUS_MAX_CONCURRENT_QUERIES") {
             self.admission.max_concurrent_queries = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
@@ -413,6 +459,7 @@ impl ServerConfig {
         }
 
         self.tls.validate("tls")?;
+        self.encryption.validate()?;
 
         let network_listener = self.bolt_tcp_addr.is_some() || self.rest_addr.is_some();
         if network_listener && !self.tls.is_enabled() && !self.allow_insecure_network {
@@ -651,6 +698,55 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn encryption_defaults_to_disabled() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.encryption.is_enabled(), "encryption is off by default");
+        assert!(cfg.encryption.key_path.is_none());
+    }
+
+    #[test]
+    fn encryption_key_path_must_exist_when_set() {
+        // A set-but-missing key file is a misconfiguration that fails validation fast.
+        let cfg = ServerConfig {
+            encryption: EncryptionConfig {
+                key_path: Some(PathBuf::from("/nonexistent/graphus/master.key")),
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn encryption_with_an_existing_key_file_validates() {
+        // Write a temp 32-byte key file; the config should validate.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "graphus-cfg-key-{}-{}.key",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, [0x11u8; 32]).expect("write key file");
+        let cfg = ServerConfig {
+            encryption: EncryptionConfig {
+                key_path: Some(path.clone()),
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(cfg.validate().is_ok(), "an existing key file validates");
+        assert!(cfg.encryption.is_enabled());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -40,6 +40,10 @@ graphus-rest = { path = "../graphus-rest" }
 # The shared RBAC/auth core: every listener resolves identities to one `Authenticator`, and the TLS
 # 1.3 `ServerConfig` for the network listeners is built here (`04 §8.4`).
 graphus-auth = { path = "../graphus-auth" }
+# Encryption at rest (rmp #85): the keyring + AES-256-GCM `EncryptedFileDevice` the store is built on
+# when `encryption.key_path` is configured. Absent that config, the plaintext `FileBlockDevice` path
+# is byte-identical to today.
+graphus-crypto = { path = "../graphus-crypto" }
 
 # The async runtime. `full` is intentional: the server is the top-level binary that drives every
 # Tokio facility (multi-thread runtime, net, time, signal, sync, macros). The library crates keep a
@@ -72,6 +76,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # native (no JS boundary here, unlike the REST wire codec).
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# Hold the loaded master key (encryption at rest, rmp #85) in zeroizing memory so it is wiped on
+# drop. Same crate (and version line) `graphus-crypto` uses for its keyring.
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # In-test self-signed certificate generation for the TLS listener paths (`04 §8.4`; same crate

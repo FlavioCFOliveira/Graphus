@@ -100,6 +100,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
             admin_uid: Some(current_uid()),
             users: Vec::new(),
         },
+        encryption: graphus_server::config::EncryptionConfig::default(),
         // The REST test client speaks plaintext HTTP on loopback; opt into the non-TLS network path
         // (production keeps this off — `ServerConfig::validate`).
         allow_insecure_network: true,

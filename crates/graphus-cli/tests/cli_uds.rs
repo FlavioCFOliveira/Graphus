@@ -115,6 +115,7 @@ fn uds_only_config(temp: &TempStore) -> ServerConfig {
             admin_uid: Some(current_uid()),
             users: Vec::new(),
         },
+        encryption: graphus_server::config::EncryptionConfig::default(),
         allow_insecure_network: false,
     }
 }

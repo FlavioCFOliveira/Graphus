@@ -33,6 +33,7 @@ pub mod metrics;
 pub mod observability;
 pub mod server;
 pub mod shutdown;
+pub mod store_device;
 
 pub use config::{ConfigError, ServerConfig};
 pub use dbcatalog::{CatalogError, DatabaseCatalog, DbInfo, DbState};

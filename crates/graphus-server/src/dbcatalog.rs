@@ -105,6 +105,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use graphus_core::GraphusError;
+use graphus_crypto::EncryptedFileDevice;
 use graphus_cypher::TxnCoordinator;
 use graphus_io::FileBlockDevice;
 use graphus_storage::RecordStore;
@@ -117,6 +118,7 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::engine::{Engine, EngineHandle, spawn_engine};
 use crate::metrics::Metrics;
+use crate::store_device::{MasterKey, StoreDevice};
 
 /// The default database's name when the config does not override it.
 pub const DEFAULT_DATABASE_NAME: &str = "graphus";
@@ -439,18 +441,31 @@ pub struct EngineParams {
     /// Per-database admission limit (each database gets its own semaphore of this many permits,
     /// applied via [`EngineHandle::with_admission_limit`]).
     pub max_concurrent_queries: usize,
+    /// The encryption-at-rest master key (rmp #85), or `None` for the plaintext store path. When
+    /// set, every database's store is an encrypted device (a per-store salted subkey is derived at
+    /// create/open). When `None`, the store path is byte-identical to before encryption existed.
+    pub master_key: Option<MasterKey>,
 }
 
 impl EngineParams {
-    /// Extracts the engine-spawn knobs from the server config.
-    #[must_use]
-    pub fn from_config(config: &ServerConfig) -> Self {
-        Self {
+    /// Extracts the engine-spawn knobs from the server config, loading the encryption master key if
+    /// one is configured.
+    ///
+    /// # Errors
+    /// [`GraphusError`] (mapped to [`CatalogError::Storage`] by the caller) if encryption is enabled
+    /// but the key file cannot be read or contains invalid key material.
+    pub fn from_config(config: &ServerConfig) -> Result<Self, GraphusError> {
+        let master_key = match &config.encryption.key_path {
+            Some(path) => Some(MasterKey::load_from_file(path)?),
+            None => None,
+        };
+        Ok(Self {
             buffer_pool_pages: config.buffer_pool_pages,
             engine_queue_capacity: config.admission.engine_queue_capacity,
             result_buffer_capacity: config.admission.result_buffer_capacity,
             max_concurrent_queries: config.admission.max_concurrent_queries,
-        }
+            master_key,
+        })
     }
 }
 
@@ -465,12 +480,15 @@ fn open_or_create_coordinator(
     device_file: &Path,
     wal_file: &Path,
     pool_pages: usize,
-) -> Result<TxnCoordinator<FileBlockDevice, FileLogSink>, GraphusError> {
+    master_key: Option<&MasterKey>,
+) -> Result<TxnCoordinator<StoreDevice, FileLogSink>, GraphusError> {
     let device_existing = device_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
 
     let mut store = if device_existing {
-        // Existing store: recover the WAL onto the device, then reopen.
-        let mut device = FileBlockDevice::open(device_file)?;
+        // Existing store: recover the WAL onto the device, then reopen. The WAL stays plaintext for
+        // THIS sub-task (#85); WAL encryption is #86. Recovery and reopen both run over the
+        // (possibly encrypted) `StoreDevice` through the `BlockDevice` seam — transparently decrypted.
+        let mut device = open_store_device(device_file, master_key)?;
         let mut wal = WalManager::open(
             FileLogSink::open(wal_file)
                 .map_err(|e| GraphusError::Storage(format!("opening WAL: {e}")))?,
@@ -486,7 +504,7 @@ fn open_or_create_coordinator(
         RecordStore::open(device, wal, pool_pages)?
     } else {
         // Fresh store on an empty device + a freshly-created WAL.
-        let device = FileBlockDevice::open(device_file)?;
+        let device = create_store_device(device_file, master_key)?;
         let wal = WalManager::create(
             FileLogSink::open(wal_file)
                 .map_err(|e| GraphusError::Storage(format!("creating WAL: {e}")))?,
@@ -502,6 +520,48 @@ fn open_or_create_coordinator(
     verify_on_open(&mut store, &[])?;
 
     Ok(TxnCoordinator::new(store))
+}
+
+/// Creates a **fresh** record-store device for `device_file`: an encrypted file device when a master
+/// key is configured (a fresh per-store salt is generated and persisted in the header), or a
+/// plaintext file device otherwise (byte-identical to before encryption existed).
+fn create_store_device(
+    device_file: &Path,
+    master_key: Option<&MasterKey>,
+) -> Result<StoreDevice, GraphusError> {
+    match master_key {
+        None => Ok(StoreDevice::Plain(FileBlockDevice::open(device_file)?)),
+        Some(key) => {
+            // Generate a fresh random salt for THIS store, derive its subkey, and create the
+            // encrypted device (writing the header: magic, salt, KCV).
+            let salt = graphus_crypto::random_salt();
+            let keyring = key.keyring_for(&salt);
+            Ok(StoreDevice::Encrypted(Box::new(
+                EncryptedFileDevice::create_file(device_file, &keyring, salt)?,
+            )))
+        }
+    }
+}
+
+/// Opens an **existing** record-store device for `device_file`: an encrypted file device when a
+/// master key is configured (the per-store salt is read from the header, the subkey re-derived, and
+/// the KCV verified — a wrong/missing key fails closed here), or a plaintext file device otherwise.
+fn open_store_device(
+    device_file: &Path,
+    master_key: Option<&MasterKey>,
+) -> Result<StoreDevice, GraphusError> {
+    match master_key {
+        None => Ok(StoreDevice::Plain(FileBlockDevice::open(device_file)?)),
+        Some(key) => {
+            // Probe the header to recover this store's salt, then derive the keyring and open
+            // (the KCV check inside `open_file` fails closed on a wrong key, before any page read).
+            let header = EncryptedFileDevice::read_file_header(device_file)?;
+            let keyring = key.keyring_for(&header.salt);
+            Ok(StoreDevice::Encrypted(Box::new(
+                EncryptedFileDevice::open_file(device_file, &keyring)?,
+            )))
+        }
+    }
 }
 
 /// Spawns one database's engine thread for the store in `dir`, constructing the `!Send`
@@ -520,7 +580,12 @@ fn spawn_db_engine(
     let device_file = dir.join(STORE_FILE_NAME);
     let wal_file = dir.join(WAL_FILE_NAME);
     let pool_pages = params.buffer_pool_pages;
-    let build = move || open_or_create_coordinator(&device_file, &wal_file, pool_pages);
+    // The master key (if any) is cloned into the build closure (an `Arc` bump) so the `!Send`
+    // coordinator can be built on the engine thread from `Send` ingredients (paths + the key).
+    let master_key = params.master_key.clone();
+    let build = move || {
+        open_or_create_coordinator(&device_file, &wal_file, pool_pages, master_key.as_ref())
+    };
     spawn_engine(
         build,
         params.engine_queue_capacity,
@@ -607,10 +672,11 @@ impl DatabaseCatalog {
     /// [`CatalogError`] if the default name is invalid or the durable catalog cannot be loaded
     /// (a malformed file fails closed — module docs).
     pub fn load(config: &ServerConfig, metrics: Arc<Metrics>) -> Result<Self, CatalogError> {
+        let params = EngineParams::from_config(config).map_err(CatalogError::Engine)?;
         Self::open(
             config.store_path.clone(),
             &config.default_database,
-            EngineParams::from_config(config),
+            params,
             metrics,
         )
     }
@@ -1262,6 +1328,7 @@ mod tests {
             engine_queue_capacity: 64,
             result_buffer_capacity: 32,
             max_concurrent_queries: 16,
+            master_key: None,
         }
     }
 

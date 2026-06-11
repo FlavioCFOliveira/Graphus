@@ -1,0 +1,47 @@
+//! `graphus-crypto` — authenticated **encryption at rest** for the Graphus record store.
+//!
+//! This is the foundation half of encryption-at-rest (rmp #85; parent #69, ratified decision
+//! `D-security-scope`). It encrypts the record store **at the [`graphus_io::BlockDevice`] seam**, so
+//! every 8192-byte logical page is stored as one authenticated-encryption slot. Everything above the
+//! seam — the buffer pool, checkpoint, recovery and consistency checker — is untouched: it reads and
+//! writes pages through the same trait, transparently decrypted/encrypted.
+//!
+//! ## What it provides
+//!
+//! - [`Keyring`] — loads a 256-bit master key from operator-supplied key material, derives
+//!   purpose-separated subkeys via HKDF-SHA256, and exposes the store AES-256-GCM AEAD plus a
+//!   **Key-Check-Value** so a wrong or missing key fails closed immediately.
+//! - [`EncryptedBlockDevice`] / [`EncryptedFileDevice`] — a drop-in [`graphus_io::BlockDevice`] that
+//!   stores each page as `nonce(12) || tag(16) || ciphertext(8192)` in a single atomic slot, with a
+//!   non-secret header (magic, version, salt, KCV, logical page count) in physical slot 0.
+//!
+//! ## Cipher choice: AES-256-GCM
+//!
+//! AES-256-GCM is an **AEAD** (authenticated encryption with associated data): one primitive gives
+//! confidentiality, integrity, and tamper-detection. It is **AES-NI hardware-accelerated** on every
+//! Graphus target — x86-64, arm64/aarch64 (incl. Apple Silicon and Raspberry Pi 5) — so the
+//! per-page cost is small. It uses the same RustCrypto stack `graphus-auth` already depends on
+//! (`argon2`, `jsonwebtoken` with `rust_crypto`), keeping the dependency surface coherent. The nonce
+//! is 96-bit, the tag 128-bit; the AAD binds each page to its on-disk offset (a page cannot be
+//! silently relocated). The [`Keyring`] type documents the full threat model, and the slot module
+//! the crash-consistency argument.
+//!
+//! ## Scope boundary
+//!
+//! This crate encrypts the **record-store device**. WAL and backup encryption, and **key rotation**,
+//! are sub-task #86 (the `info` label `"graphus/wal/aes-256-gcm/v1"` is reserved but not derived
+//! here). This crate's own code contains **no `unsafe`** (the RustCrypto crates use `unsafe`
+//! internally for SIMD, which is their concern, not ours).
+#![forbid(unsafe_code)]
+
+mod device;
+mod header;
+mod keyring;
+mod raw;
+mod slot;
+
+pub use device::{EncryptedBlockDevice, EncryptedFileDevice};
+pub use header::{CIPHER_AES_256_GCM, HEADER_MAGIC, HEADER_SLOTS, HEADER_VERSION, Header};
+pub use keyring::{KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_SUBKEY_INFO, random_salt};
+pub use raw::{FileRawSlots, MemRawSlots, RawSlots};
+pub use slot::{NONCE_LEN, SLOT_SIZE, TAG_LEN};

@@ -1,0 +1,41 @@
+[package]
+name = "graphus-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Authenticated encryption at rest for the Graphus record store (AES-256-GCM page encryption + HKDF keyring)."
+
+[dependencies]
+# Shared error taxonomy (`GraphusError::{Storage,Security}`) and `PageId`. Encryption errors map to
+# `Security` (wrong/missing key, KCV/AEAD failure) or `Storage` (raw I/O), so the connectivity and
+# storage layers classify them exactly as they do today.
+graphus-core = { path = "../graphus-core" }
+# The `BlockDevice` seam this crate implements (transparent page encryption lives at this boundary),
+# plus `PAGE_SIZE`/`Page`. The encrypted device is a drop-in `BlockDevice`.
+graphus-io = { path = "../graphus-io" }
+
+# AES-256-GCM AEAD: confidentiality + integrity + tamper-detection in one primitive, AES-NI
+# accelerated on every Graphus target (x86-64, arm64/aarch64 incl. Apple Silicon and Raspberry Pi 5).
+# Same RustCrypto ecosystem `graphus-auth` already uses (argon2, jsonwebtoken `rust_crypto`). The
+# `getrandom` feature re-exports `aead::OsRng`, a CSPRNG nonce source, so no separate `rand` dep is
+# needed. `std` is on (this is a server crate, not `no_std`).
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "getrandom", "std"] }
+# HKDF-SHA256 for purpose-separated subkey derivation (distinct `info` labels per purpose). `hkdf`
+# 0.12 / `sha2` 0.10 are already in the workspace lockfile via the auth stack.
+hkdf = "0.12"
+sha2 = "0.10"
+# Zero key material on drop (defence in depth: keys never linger in freed memory).
+zeroize = { version = "1", features = ["derive"] }
+# Constant-time comparison for the Key-Check-Value verification (no timing oracle on key validity).
+subtle = "2"
+
+[dev-dependencies]
+# The mem-backed encrypted-device integration test drives a real `RecordStore` over the encrypted
+# device (create → flush → crash → WAL recovery → assert intact), proving crash-consistency holds
+# under encryption. `graphus-io` is already a normal dep, but the test names the `BlockDevice` trait
+# directly (for `sync_all`), so it is re-declared here for clarity of intent.
+graphus-storage = { path = "../graphus-storage" }
+graphus-wal = { path = "../graphus-wal" }

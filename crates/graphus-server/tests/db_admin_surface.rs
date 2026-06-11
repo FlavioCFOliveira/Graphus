@@ -96,6 +96,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
                 password: "pw2".to_owned(),
             }],
         },
+        encryption: graphus_server::config::EncryptionConfig::default(),
         allow_insecure_network: true,
     }
 }

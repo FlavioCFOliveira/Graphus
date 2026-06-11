@@ -87,6 +87,7 @@ fn multi_db_config(temp: &TempStore) -> ServerConfig {
             admin_uid: None,
             users: Vec::new(),
         },
+        encryption: graphus_server::config::EncryptionConfig::default(),
         allow_insecure_network: false,
     }
 }
