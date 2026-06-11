@@ -23,15 +23,17 @@ use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 
 use super::transport::AsyncToBlockingTransport;
-use crate::engine::{BoltEngineExecutor, EngineHandle};
+use crate::admin::AdminContext;
+use crate::engine::BoltEngineExecutor;
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownCoordinator;
 
 /// Runs the UDS Bolt accept loop until shutdown. Each accepted connection is admitted by peer-cred
-/// then handed to a blocking session task.
+/// then handed to a blocking session task. `context` is the shared database-targeting + admin
+/// surface every per-connection executor routes through (rmp #84).
 pub async fn run_uds_accept_loop(
     acceptor: UdsAcceptor,
-    engine: EngineHandle,
+    context: AdminContext,
     auth: Arc<Authenticator>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
@@ -65,7 +67,7 @@ pub async fn run_uds_accept_loop(
                 spawn_session(
                     conn,
                     handle.clone(),
-                    engine.clone(),
+                    context.clone(),
                     Arc::clone(&auth),
                     shutdown.clone(),
                 );
@@ -76,11 +78,12 @@ pub async fn run_uds_accept_loop(
 }
 
 /// Runs the TCP Bolt accept loop until shutdown. Each accepted connection is TLS-wrapped, then handed
-/// to a blocking session task (native LOGON auth happens inside the session).
+/// to a blocking session task (native LOGON auth happens inside the session). `context` is the
+/// shared database-targeting + admin surface (rmp #84).
 pub async fn run_tcp_accept_loop(
     acceptor: TcpAcceptor,
     tls: TlsAcceptor,
-    engine: EngineHandle,
+    context: AdminContext,
     auth: Arc<Authenticator>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
@@ -103,14 +106,14 @@ pub async fn run_tcp_accept_loop(
                 // TLS handshake on a task so a slow/abusive handshake never blocks the accept loop.
                 let tls = tls.clone();
                 let handle = handle.clone();
-                let engine = engine.clone();
+                let context = context.clone();
                 let auth = Arc::clone(&auth);
                 let shutdown = shutdown.clone();
                 let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     match tls.accept(conn).await {
                         Ok(tls_stream) => {
-                            spawn_session(tls_stream, handle, engine, auth, shutdown);
+                            spawn_session(tls_stream, handle, context, auth, shutdown);
                         }
                         Err(e) => {
                             metrics.record_auth_failure();
@@ -169,7 +172,7 @@ impl PeerCredSource for FixedPeerCred {
 fn spawn_session<S>(
     stream: S,
     handle: Handle,
-    engine: EngineHandle,
+    context: AdminContext,
     auth: Arc<Authenticator>,
     shutdown: ShutdownCoordinator,
 ) where
@@ -177,7 +180,7 @@ fn spawn_session<S>(
 {
     tokio::task::spawn_blocking(move || {
         let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, None);
-        let executor = BoltEngineExecutor::new(engine);
+        let executor = BoltEngineExecutor::new(context);
         let mut session = BoltSession::new(transport, executor, &auth);
         if let Err(e) = session.run() {
             // A transport/handshake error ends the session; a Cypher/auth FAILURE is *not* an error

@@ -320,6 +320,9 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             Request::Logon { auth } => {
                 match self.authenticate(&auth) {
                     Ok(user) => {
+                        // Announce the identity to the executor so it can authorize
+                        // identity-gated work (e.g. administrative statements — rmp #84).
+                        self.executor.set_principal(Some(&user));
                         self.principal = Some(user);
                         self.send(&Response::Success { metadata: vec![] })?;
                         self.state = State::Ready;
@@ -341,7 +344,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// `READY` / `TX_READY`: `RUN`, `BEGIN`/`COMMIT`/`ROLLBACK`, `LOGOFF`, `RESET`.
     fn dispatch_ready(&mut self, request: Request) -> BoltResult<Flow> {
         match (self.state, request) {
-            // RUN: auto-commit (READY) or in-transaction (TX_READY).
+            // RUN: auto-commit (READY) or in-transaction (TX_READY). Both carry the target
+            // database from the extra's `db` field (Bolt 5.x; absent/empty = default).
             (
                 State::Ready,
                 Request::Run {
@@ -351,10 +355,11 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 },
             ) => {
                 let mode = access_mode_from_extra(&extra);
+                let db = db_from_extra(&extra);
                 self.handle_run(
                     &query,
                     parameters,
-                    TxControl::AutoCommit { mode },
+                    TxControl::AutoCommit { mode, db },
                     State::Streaming,
                 )
             }
@@ -363,17 +368,23 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 Request::Run {
                     query,
                     parameters,
-                    extra: _,
+                    extra,
                 },
-            ) => self.handle_run(
-                &query,
-                parameters,
-                TxControl::InExplicit,
-                State::TxStreaming,
-            ),
+            ) => {
+                // The transaction is pinned to the database named at BEGIN; the executor rejects a
+                // different non-empty `db` here (cannot switch databases mid-transaction).
+                let db = db_from_extra(&extra);
+                self.handle_run(
+                    &query,
+                    parameters,
+                    TxControl::InExplicit { db },
+                    State::TxStreaming,
+                )
+            }
             (State::Ready, Request::Begin { extra }) => {
                 let mode = access_mode_from_extra(&extra);
-                match self.executor.begin(mode) {
+                let db = db_from_extra(&extra);
+                match self.executor.begin(mode, db.as_deref()) {
                     Ok(()) => {
                         self.send(&Response::Success { metadata: vec![] })?;
                         self.state = State::TxReady;
@@ -406,6 +417,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             }
             (_, Request::Logoff) => {
                 // Drop the identity; back to AUTHENTICATION (5.1+ re-auth without a new connection).
+                self.executor.set_principal(None);
                 self.principal = None;
                 self.send(&Response::Success { metadata: vec![] })?;
                 self.state = State::Authentication;
@@ -659,6 +671,15 @@ fn access_mode_from_extra(extra: &[(String, Value)]) -> AccessMode {
         Some("r") => AccessMode::Read,
         _ => AccessMode::Write,
     }
+}
+
+/// Reads the `db` field from a `RUN`/`BEGIN` extra map (Bolt 5.x database targeting). An absent or
+/// **empty** value means "the default database" and is normalised to `None` (drivers send `""` or
+/// omit the field for the home database).
+fn db_from_extra(extra: &[(String, Value)]) -> Option<String> {
+    map_str(extra, "db")
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 /// Borrows a string value from a map by key.

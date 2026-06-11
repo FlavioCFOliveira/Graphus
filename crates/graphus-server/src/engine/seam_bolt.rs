@@ -1,12 +1,33 @@
 //! [`graphus_bolt::BoltExecutor`] over the engine channel — the thin client one Bolt connection uses
-//! (`04-technical-design.md` §8.3 one executor, §9.1 the shard funnel).
+//! (`04-technical-design.md` §8.3 one executor, §9.1 the shard funnel; rmp #84 session database
+//! selection + the administrative surface).
 //!
 //! `graphus_bolt::BoltSession` owns one `BoltExecutor` for the connection's lifetime and calls it
 //! with `&mut self` as it drives `BEGIN`/`RUN`/`COMMIT`/`ROLLBACK`. So this adapter is **per
 //! connection**: it tracks the connection's single current explicit transaction (the engine keys
-//! every transaction by an opaque [`TxTicket`]). All execution is funnelled to the single engine
-//! task via the shared [`EngineHandle`]; this type adds only the per-connection transaction state and
-//! the admission gate.
+//! every transaction by an opaque [`TxTicket`]) and the session's authenticated principal (set by
+//! `LOGON`, cleared by `LOGOFF`).
+//!
+//! ## Database targeting (rmp #84, Bolt 5.x `db` field)
+//!
+//! The session resolves its target database **at transaction begin** — an explicit `BEGIN` or an
+//! auto-commit `RUN` — through the shared [`AdminContext`]: an absent/empty `db` is the configured
+//! default database (served from a captured handle, the unchanged single-db fast path); a named
+//! database resolves through the catalog's concurrent registry to that database's own
+//! admission-limited [`EngineHandle`] (so admission control and metrics stay per database). An
+//! explicit transaction is **pinned** to its database for its whole lifetime; a `RUN` inside it
+//! naming a *different* database is an error. An unknown/offline/failed database fails the request
+//! with a clear FAILURE and no side effects — the session recovers with `RESET` per the Bolt state
+//! machine.
+//!
+//! ## Administrative statements (rmp #84)
+//!
+//! Before anything touches the engine, the query text is matched against the strict admin grammar
+//! ([`crate::admin::parse_admin_statement`]). A recognised statement never reaches Cypher: it is
+//! authorized against the session principal (global `Admin` privilege) and executed on the
+//! catalog; its (buffered) result streams back through the same [`RecordStream`] mechanism as a
+//! query result. Admin statements are rejected inside an explicit transaction — they are not
+//! transactional.
 //!
 //! The Bolt session runs on a **blocking task** (see the `listeners::bolt` module), so this adapter
 //! uses the handle's `*_blocking` submit methods — they may park the blocking thread on the bounded
@@ -17,27 +38,69 @@ use graphus_bolt::executor::{
 };
 use graphus_core::{GraphusError, Value};
 
+use crate::admin::{AdminContext, AdminParse, AdminResult};
+
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
 use super::stream::RowReceiver;
 use super::{EngineHandle, RunSummary, TxTicket};
 
-/// One Bolt connection's view of the engine: the shared handle plus this connection's current
-/// explicit transaction (if a `BEGIN` is open).
+/// One Bolt connection's view of the server: the shared database-targeting/admin context, the
+/// session principal, and this connection's current explicit transaction (if a `BEGIN` is open).
 pub struct BoltEngineExecutor {
+    /// Database targeting + administrative statements, shared across connections.
+    context: AdminContext,
+    /// The authenticated principal (`LOGON` sets it, `LOGOFF` clears it).
+    principal: Option<String>,
+    /// The open explicit transaction, set on `BEGIN`, cleared on `COMMIT`/`ROLLBACK`.
+    current_tx: Option<OpenTx>,
+}
+
+/// The connection's open explicit transaction: the engine ticket plus the database it is pinned
+/// to (handle + canonical name) for its whole lifetime.
+struct OpenTx {
+    ticket: TxTicket,
     handle: EngineHandle,
-    /// The open explicit transaction's ticket, set on `BEGIN`, cleared on `COMMIT`/`ROLLBACK`.
-    current_tx: Option<TxTicket>,
+    db: String,
 }
 
 impl BoltEngineExecutor {
-    /// A fresh per-connection executor over the shared engine `handle`.
+    /// A fresh per-connection executor over the shared `context`.
     #[must_use]
-    pub fn new(handle: EngineHandle) -> Self {
+    pub fn new(context: AdminContext) -> Self {
         Self {
-            handle,
+            context,
+            principal: None,
             current_tx: None,
         }
+    }
+
+    /// Admits and runs one statement on `handle` inside `ticket`, wrapping the engine reply as the
+    /// Bolt stream. Admission is taken on the **target database's** handle (per-db limits).
+    fn run_on(
+        &self,
+        handle: &EngineHandle,
+        ticket: TxTicket,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+        auto_commit: bool,
+    ) -> Result<BoltEngineStream, GraphusError> {
+        // Admission control: fast-reject when saturated (`04 §9.3`). The permit is held by the
+        // returned stream for the whole result.
+        let permit = handle
+            .try_admit()
+            .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
+        let reply = handle.run_blocking(ticket, query.to_owned(), parameters, auto_commit)?;
+        Ok(BoltEngineStream {
+            fields: reply.fields,
+            source: RowSource::Engine {
+                rows: reply.rows,
+                _permit: permit,
+            },
+            // v1 summary: the query type is not yet surfaced by the executor; an empty summary is a
+            // valid `SUCCESS` body (`06 §3.1`). Richer summaries arrive with executor stats.
+            summary: QuerySummary::default(),
+        })
     }
 }
 
@@ -57,14 +120,37 @@ fn to_bolt_summary(s: RunSummary) -> QuerySummary {
     }
 }
 
-/// The Bolt result stream backing the engine: pulls rows from the engine's bounded channel and holds
-/// the admission permit until exhausted/dropped (so a slot is occupied for the whole result).
+/// Where a Bolt result's rows come from: the engine's bounded channel (a query) or a buffered
+/// administrative result (rmp #84) — both stream through the same [`RecordStream`] seam.
+enum RowSource {
+    /// A query result: rows pulled from the engine, the admission permit held until done.
+    Engine {
+        rows: RowReceiver,
+        /// Held for the stream's lifetime; dropping it releases the admission slot (`04 §9.3`).
+        _permit: AdmissionPermit,
+    },
+    /// A buffered administrative result (e.g. `SHOW DATABASES` rows). No permit: admin commands
+    /// never enter the engine, and the catalog serializes them itself.
+    Admin(std::vec::IntoIter<Vec<Value>>),
+}
+
+/// The Bolt result stream: engine rows (holding the admission permit until exhausted/dropped) or
+/// a buffered admin result, behind one [`RecordStream`].
 pub struct BoltEngineStream {
     fields: Vec<String>,
-    rows: RowReceiver,
+    source: RowSource,
     summary: QuerySummary,
-    /// Held for the stream's lifetime; dropping it releases the admission slot (`04 §9.3`).
-    _permit: AdmissionPermit,
+}
+
+impl BoltEngineStream {
+    /// Wraps a buffered administrative result.
+    fn admin(result: AdminResult) -> Self {
+        Self {
+            fields: result.fields,
+            source: RowSource::Admin(result.rows.into_iter()),
+            summary: QuerySummary::default(),
+        }
+    }
 }
 
 impl RecordStream for BoltEngineStream {
@@ -73,7 +159,10 @@ impl RecordStream for BoltEngineStream {
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, GraphusError> {
-        self.rows.next()
+        match &mut self.source {
+            RowSource::Engine { rows, .. } => rows.next(),
+            RowSource::Admin(rows) => Ok(rows.next()),
+        }
     }
 
     fn summary(&self) -> QuerySummary {
@@ -90,68 +179,96 @@ impl BoltExecutor for BoltEngineExecutor {
         parameters: Vec<(String, Value)>,
         tx: TxControl,
     ) -> Result<Self::Stream, GraphusError> {
-        // Admission control first: fast-reject when saturated (`04 §9.3`). The permit is held by the
-        // returned stream for the whole result.
-        let permit = self
-            .handle
-            .try_admit()
-            .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
-
-        // Resolve which transaction to run in.
-        let (ticket, auto_commit) = match tx {
-            TxControl::AutoCommit { mode } => {
-                // Open an internal auto-commit transaction the engine finalises on stream drain.
-                let ticket = self
-                    .handle
-                    .begin_auto_commit_blocking(from_bolt_mode(mode))?;
-                (ticket, true)
+        // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84): the
+        // grammar is strict, so regular Cypher always falls through to the engine untouched.
+        match crate::admin::parse_admin_statement(query) {
+            AdminParse::Command(cmd) => {
+                if matches!(tx, TxControl::InExplicit { .. }) {
+                    return Err(GraphusError::Protocol(
+                        "administrative commands cannot run inside an explicit transaction; \
+                         commit or roll back first"
+                            .to_owned(),
+                    ));
+                }
+                let result = self.context.execute(self.principal.as_deref(), &cmd)?;
+                return Ok(BoltEngineStream::admin(result));
             }
-            TxControl::InExplicit => {
-                let ticket = self.current_tx.ok_or_else(|| {
+            // Claimed by the admin grammar but malformed: a compile-time (syntax) error. The
+            // claimed prefixes are never valid Cypher, so this steals nothing from the language.
+            AdminParse::Invalid(msg) => return Err(GraphusError::Compile(msg)),
+            AdminParse::NotAdmin => {}
+        }
+
+        match tx {
+            TxControl::AutoCommit { mode, db } => {
+                // Resolve the target database at transaction begin (rmp #84): absent/empty `db`
+                // is the default database; a named one resolves through the catalog.
+                let (_name, handle) = self.context.resolve(db.as_deref())?;
+                // Open an internal auto-commit transaction the engine finalises on stream drain.
+                let ticket = handle.begin_auto_commit_blocking(from_bolt_mode(mode))?;
+                self.run_on(
+                    &handle, ticket, query, parameters, /* auto_commit */ true,
+                )
+            }
+            TxControl::InExplicit { db } => {
+                let open = self.current_tx.as_ref().ok_or_else(|| {
                     GraphusError::Transaction(
                         "RUN in explicit transaction but none is open".to_owned(),
                     )
                 })?;
-                (ticket, false)
+                // A transaction is pinned to its database: a different non-empty `db` on a RUN
+                // inside it is an error (rmp #84 — no mid-transaction database switch). The names
+                // compare case-insensitively (the catalog's rule).
+                if let Some(requested) = db.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !requested.eq_ignore_ascii_case(&open.db) {
+                        return Err(GraphusError::Protocol(format!(
+                            "cannot switch database inside an explicit transaction: the \
+                             transaction is pinned to {:?} but RUN requested {requested:?}",
+                            open.db
+                        )));
+                    }
+                }
+                let (handle, ticket) = (open.handle.clone(), open.ticket);
+                self.run_on(
+                    &handle, ticket, query, parameters, /* auto_commit */ false,
+                )
             }
-        };
-
-        let reply = self
-            .handle
-            .run_blocking(ticket, query.to_owned(), parameters, auto_commit)?;
-        Ok(BoltEngineStream {
-            fields: reply.fields,
-            rows: reply.rows,
-            // v1 summary: the query type is not yet surfaced by the executor; an empty summary is a
-            // valid `SUCCESS` body (`06 §3.1`). Richer summaries arrive with executor stats.
-            summary: QuerySummary::default(),
-            _permit: permit,
-        })
+        }
     }
 
-    fn begin(&mut self, mode: BoltAccessMode) -> Result<(), GraphusError> {
+    fn begin(&mut self, mode: BoltAccessMode, db: Option<&str>) -> Result<(), GraphusError> {
         if self.current_tx.is_some() {
             return Err(GraphusError::Transaction(
                 "a transaction is already open".to_owned(),
             ));
         }
-        let ticket = self.handle.begin_blocking(from_bolt_mode(mode))?;
-        self.current_tx = Some(ticket);
+        // Resolve at begin; the transaction stays pinned to this database (rmp #84).
+        let (name, handle) = self.context.resolve(db)?;
+        let ticket = handle.begin_blocking(from_bolt_mode(mode))?;
+        self.current_tx = Some(OpenTx {
+            ticket,
+            handle,
+            db: name,
+        });
         Ok(())
     }
 
     fn commit(&mut self) -> Result<QuerySummary, GraphusError> {
-        let ticket = self.current_tx.take().ok_or_else(|| {
+        let open = self.current_tx.take().ok_or_else(|| {
             GraphusError::Transaction("COMMIT with no open transaction".to_owned())
         })?;
-        let summary = self.handle.commit_blocking(ticket)?;
+        let summary = open.handle.commit_blocking(open.ticket)?;
         Ok(to_bolt_summary(summary))
     }
 
     fn rollback(&mut self) -> Result<(), GraphusError> {
-        let ticket = self.current_tx.take().ok_or_else(|| {
+        let open = self.current_tx.take().ok_or_else(|| {
             GraphusError::Transaction("ROLLBACK with no open transaction".to_owned())
         })?;
-        self.handle.rollback_blocking(ticket)
+        open.handle.rollback_blocking(open.ticket)
+    }
+
+    fn set_principal(&mut self, principal: Option<&str>) {
+        self.principal = principal.map(str::to_owned);
     }
 }

@@ -98,6 +98,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
             admin_user: "alice".to_owned(),
             admin_password: "pw".to_owned(),
             admin_uid: Some(current_uid()),
+            users: Vec::new(),
         },
         // The REST test client speaks plaintext HTTP on loopback; opt into the non-TLS network path
         // (production keeps this off — `ServerConfig::validate`).
@@ -203,7 +204,7 @@ async fn rest_create_then_match_hits_the_real_store() {
     let (status, body) = http_request(
         rest,
         "POST",
-        "/db/neo4j/tx",
+        "/db/graphus/tx",
         Some(&token),
         Some(r#"{"statements":[],"access_mode":"WRITE"}"#),
     )
@@ -212,7 +213,7 @@ async fn rest_create_then_match_hits_the_real_store() {
     let tx_id = extract_json_string(&body, "id").expect("tx id in begin response");
 
     // CREATE a node in the open transaction.
-    let create_path = format!("/db/neo4j/tx/{tx_id}");
+    let create_path = format!("/db/graphus/tx/{tx_id}");
     let (status, body) = http_request(
         rest,
         "POST",
@@ -224,7 +225,7 @@ async fn rest_create_then_match_hits_the_real_store() {
     assert_eq!(status, 200, "create: {body}");
 
     // Commit (empty final statement set).
-    let commit_path = format!("/db/neo4j/tx/{tx_id}/commit");
+    let commit_path = format!("/db/graphus/tx/{tx_id}/commit");
     let (status, body) = http_request(
         rest,
         "POST",
@@ -239,7 +240,7 @@ async fn rest_create_then_match_hits_the_real_store() {
     let (status, body) = http_request(
         rest,
         "POST",
-        "/db/neo4j/tx/commit",
+        "/db/graphus/tx/commit",
         Some(&token),
         Some(r#"{"statements":[{"statement":"MATCH (p:Person) RETURN p.name"}]}"#),
     )
@@ -430,7 +431,7 @@ async fn rest_rejects_bad_credentials() {
     let (status, _) = http_request(
         rest,
         "POST",
-        "/db/neo4j/tx",
+        "/db/graphus/tx",
         None,
         Some(r#"{"statements":[]}"#),
     )
@@ -441,7 +442,7 @@ async fn rest_rejects_bad_credentials() {
     let (status, _) = http_request(
         rest,
         "POST",
-        "/db/neo4j/tx",
+        "/db/graphus/tx",
         Some("not.a.real.jwt"),
         Some(r#"{"statements":[]}"#),
     )
@@ -506,7 +507,7 @@ async fn admission_control_fast_rejects_when_saturated() {
     let (status, _body) = http_request(
         rest,
         "POST",
-        "/db/neo4j/tx/commit",
+        "/db/graphus/tx/commit",
         Some(&token),
         Some(r#"{"statements":[{"statement":"RETURN 1"}]}"#),
     )
@@ -573,7 +574,7 @@ async fn graceful_shutdown_persists_and_store_reopens_clean() {
         let (status, body) = http_request(
             rest,
             "POST",
-            "/db/neo4j/tx/commit",
+            "/db/graphus/tx/commit",
             Some(&token),
             Some(r#"{"statements":[{"statement":"CREATE (:Durable {id: 1})"}]}"#),
         )
@@ -592,7 +593,7 @@ async fn graceful_shutdown_persists_and_store_reopens_clean() {
         let (status, body) = http_request(
             rest,
             "POST",
-            "/db/neo4j/tx/commit",
+            "/db/graphus/tx/commit",
             Some(&token),
             Some(r#"{"statements":[{"statement":"MATCH (d:Durable) RETURN d.id"}]}"#),
         )

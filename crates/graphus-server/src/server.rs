@@ -220,6 +220,7 @@ impl Server {
         let bound = listeners::start_all(
             &config,
             handle.clone(),
+            Arc::clone(&catalog),
             Arc::clone(&auth),
             clock,
             tls,
@@ -295,7 +296,9 @@ async fn run_loop(
 }
 
 /// Builds the [`Authenticator`]: JWT secret, the bootstrap admin user (with password + UDS uid as
-/// configured), granted global `Admin`.
+/// configured) granted global `Admin`, plus the optional non-admin bootstrap users granted
+/// database read + write only (`04 §8.4` deny-by-default; the rmp-#84 admin surface is therefore
+/// closed to them).
 fn build_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerError> {
     let mut auth = Authenticator::new(config.jwt_secret.as_bytes());
 
@@ -319,6 +322,34 @@ fn build_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerErr
     }
     if let Some(uid) = config.auth.admin_uid {
         auth.peers_mut().map_uid(uid, admin.clone());
+    }
+
+    // Non-admin bootstrap users: one shared read+write role, created lazily.
+    if !config.auth.users.is_empty() {
+        auth.catalog_mut()
+            .create_role("readwrite")
+            .map_err(|e| ServerError::Auth(format!("creating readwrite role: {e}")))?;
+        auth.catalog_mut()
+            .grant_privilege("readwrite", Privilege::read_database())
+            .map_err(|e| ServerError::Auth(format!("granting read privilege: {e}")))?;
+        auth.catalog_mut()
+            .grant_privilege("readwrite", Privilege::write_database())
+            .map_err(|e| ServerError::Auth(format!("granting write privilege: {e}")))?;
+        for user in &config.auth.users {
+            auth.catalog_mut()
+                .create_user(&user.name)
+                .map_err(|e| ServerError::Auth(format!("creating user {:?}: {e}", user.name)))?;
+            auth.catalog_mut()
+                .grant_role(&user.name, "readwrite")
+                .map_err(|e| {
+                    ServerError::Auth(format!("granting readwrite to {:?}: {e}", user.name))
+                })?;
+            if !user.password.is_empty() {
+                auth.set_password(&user.name, &user.password).map_err(|e| {
+                    ServerError::Auth(format!("setting password for {:?}: {e}", user.name))
+                })?;
+            }
+        }
     }
     Ok(auth)
 }

@@ -85,6 +85,7 @@ fn multi_db_config(temp: &TempStore) -> ServerConfig {
             admin_user: "alice".to_owned(),
             admin_password: "pw".to_owned(),
             admin_uid: None,
+            users: Vec::new(),
         },
         allow_insecure_network: false,
     }

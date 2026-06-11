@@ -10,6 +10,9 @@
 //! - **The database catalog** ([`dbcatalog`], decision `D-multi-db`) — the crash-safe catalog of
 //!   named databases (one independent store + engine per database) and the registry of their
 //!   running engines.
+//! - **The administrative surface** ([`admin`], rmp #84) — server-side interception of
+//!   `CREATE/DROP/START/STOP/SHOW DATABASE` statements (the query engine stays
+//!   database-agnostic) plus per-session database targeting for all three connection types.
 //! - **The listeners** ([`listeners`]) — the three async accept loops (UDS-Bolt, TCP-Bolt+TLS,
 //!   REST+TLS), each accepted connection a Tokio task.
 //! - **Admission control + load shedding** ([`engine::EngineHandle::try_admit`], `04 §9.3`).
@@ -21,6 +24,7 @@
 //! [`bin`](../graphus_server/index.html) `main` is a thin wrapper around [`Server::run`].
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod config;
 pub mod dbcatalog;
 pub mod engine;

@@ -622,3 +622,81 @@ fn summary_carries_query_type_and_stats() {
         other => panic!("expected trailing SUCCESS, got {other:?}"),
     }
 }
+
+#[test]
+fn db_field_from_extras_reaches_the_executor() {
+    // The `db` field of BEGIN and auto-commit RUN extras flows through to the executor; an
+    // empty/absent value is normalised to None (Bolt 5.x database targeting — rmp #84).
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let input = session_input(&[
+        Request::Hello { extra: vec![] },
+        logon_alice(),
+        // Auto-commit RUN naming a database.
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![("db".to_owned(), Value::String("sales".to_owned()))],
+        },
+        Request::Pull { n: ALL, qid: None },
+        // Auto-commit RUN with an EMPTY db → the default database (None).
+        Request::Run {
+            query: "RETURN 2".to_owned(),
+            parameters: vec![],
+            extra: vec![("db".to_owned(), Value::String(String::new()))],
+        },
+        Request::Pull { n: ALL, qid: None },
+        // BEGIN naming a database.
+        Request::Begin {
+            extra: vec![("db".to_owned(), Value::String("sales".to_owned()))],
+        },
+        Request::Rollback,
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    let mut session = BoltSession::new(&mut transport, exec, &auth);
+    session.run().unwrap();
+
+    let log = &session.executor().log;
+    assert!(
+        log.iter()
+            .any(|l| l.contains("RETURN 1") && l.contains("db: Some(\"sales\")")),
+        "RUN db reaches the executor: {log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.contains("RETURN 2") && l.contains("db: None")),
+        "empty RUN db is the default database: {log:?}"
+    );
+    assert!(
+        log.contains(&"begin(Write, db=Some(\"sales\"))".to_owned()),
+        "BEGIN db reaches the executor: {log:?}"
+    );
+}
+
+#[test]
+fn logon_announces_the_principal_and_logoff_clears_it() {
+    // LOGON → set_principal(Some), LOGOFF → set_principal(None) (rmp #84 identity plumbing).
+    let exec = MockExecutor::new();
+    let input = session_input(&[
+        Request::Hello { extra: vec![] },
+        logon_alice(),
+        Request::Logoff,
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    let mut session = BoltSession::new(&mut transport, exec, &auth);
+    session.run().unwrap();
+
+    let log = &session.executor().log;
+    assert!(
+        log.contains(&"set_principal(Some(\"alice\"))".to_owned()),
+        "LOGON announces the principal: {log:?}"
+    );
+    assert!(
+        log.contains(&"set_principal(None)".to_owned()),
+        "LOGOFF clears the principal: {log:?}"
+    );
+    assert_eq!(session.executor().principal, None, "cleared after LOGOFF");
+}

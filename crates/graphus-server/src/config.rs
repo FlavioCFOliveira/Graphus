@@ -133,9 +133,25 @@ impl TimingConfig {
     }
 }
 
+/// One additional (non-admin) bootstrap user: a name and a password.
+///
+/// Bootstrap users are granted database **read + write** (but **not** admin), so a deployment can
+/// ship an application identity that runs queries yet cannot drive the administrative surface
+/// (`CREATE DATABASE …`, `/admin/*` — rmp #84). Deny-by-default RBAC means anything beyond
+/// read/write must be granted explicitly afterwards.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UserBootstrap {
+    /// The username (must be non-empty and distinct from the admin user).
+    pub name: String,
+    /// The user's password (for Bolt `LOGON` / minting REST Bearer tokens). Empty disables
+    /// password auth for this user.
+    pub password: String,
+}
+
 /// The initial RBAC bootstrap: the admin user every fresh deployment needs so a server is usable
-/// out of the box (`04 §8.4`). In production an operator manages users via the admin API afterwards;
-/// this just seeds the first administrator.
+/// out of the box (`04 §8.4`), plus optional non-admin users. In production an operator manages
+/// users via the admin API afterwards; this just seeds the initial identities.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthBootstrap {
@@ -146,6 +162,9 @@ pub struct AuthBootstrap {
     pub admin_password: String,
     /// An OS uid bound to the admin user for UDS `SO_PEERCRED` auth, if set (`04 §8.4`).
     pub admin_uid: Option<u32>,
+    /// Additional non-admin bootstrap users, each granted database read + write only (see
+    /// [`UserBootstrap`]). Empty by default.
+    pub users: Vec<UserBootstrap>,
 }
 
 impl Default for AuthBootstrap {
@@ -154,6 +173,7 @@ impl Default for AuthBootstrap {
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             admin_uid: None,
+            users: Vec::new(),
         }
     }
 }
@@ -378,6 +398,20 @@ impl ServerConfig {
             ));
         }
 
+        for user in &self.auth.users {
+            if user.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "auth.users: a bootstrap user name must be non-empty".to_owned(),
+                ));
+            }
+            if user.name == self.auth.admin_user {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.users: {:?} collides with the admin user",
+                    user.name
+                )));
+            }
+        }
+
         self.tls.validate("tls")?;
 
         let network_listener = self.bolt_tcp_addr.is_some() || self.rest_addr.is_some();
@@ -565,6 +599,52 @@ mod tests {
         // An invalid default-database name is rejected with a clear message.
         let cfg = ServerConfig {
             default_database: "no/slash".to_owned(),
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn bootstrap_users_are_parsed_and_validated() {
+        // A TOML file can seed non-admin users (read+write only — rmp #84 privilege boundary).
+        let toml = r#"
+            uds_path = "/run/graphus.sock"
+            rest_addr = ""
+            [[auth.users]]
+            name = "app"
+            password = "s3cret"
+        "#;
+        let mut cfg: ServerConfig = toml::from_str(toml).expect("parse");
+        cfg.normalize();
+        assert_eq!(cfg.auth.users.len(), 1);
+        assert_eq!(cfg.auth.users[0].name, "app");
+        assert!(cfg.validate().is_ok());
+
+        // A bootstrap user colliding with the admin name is rejected.
+        let cfg = ServerConfig {
+            auth: AuthBootstrap {
+                users: vec![UserBootstrap {
+                    name: "admin".to_owned(),
+                    password: "x".to_owned(),
+                }],
+                ..AuthBootstrap::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        // An empty bootstrap user name is rejected.
+        let cfg = ServerConfig {
+            auth: AuthBootstrap {
+                users: vec![UserBootstrap::default()],
+                ..AuthBootstrap::default()
+            },
             rest_addr: None,
             bolt_tcp_addr: None,
             uds_path: Some(PathBuf::from("x.sock")),

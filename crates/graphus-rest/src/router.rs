@@ -65,7 +65,7 @@ use serde_json::{Value as Json, json};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
-use crate::engine::{AccessMode, RestEngine, ResultStream, RunSummary, TxHandle};
+use crate::engine::{AccessMode, RestEngine, ResultStream, RunSummary, TxHandle, TxOrigin};
 use crate::negotiate::{Decode, Wire, request_decode, response_wire};
 use crate::problem::{PROBLEM_JSON, Problem};
 use crate::protocol::{
@@ -258,7 +258,14 @@ async fn begin<E: RestEngine + 'static>(
 
         let handle = state
             .engine
-            .begin(&db, mode)
+            .begin(
+                &db,
+                mode,
+                TxOrigin {
+                    principal: &identity,
+                    explicit: true,
+                },
+            )
             .map_err(|e| Problem::from_graphus_error(&e))?;
         let now = state.now_nanos();
         let (id, expires_at_nanos) = state.registry.open(handle, &db, mode, now);
@@ -431,7 +438,14 @@ async fn auto_commit<E: RestEngine + 'static>(
         authorize_mode(&state, &identity, mode)?;
         let handle = state
             .engine
-            .begin(&db, mode)
+            .begin(
+                &db,
+                mode,
+                TxOrigin {
+                    principal: &identity,
+                    explicit: false,
+                },
+            )
             .map_err(|e| Problem::from_graphus_error(&e))?;
         Ok((req, handle))
     })();

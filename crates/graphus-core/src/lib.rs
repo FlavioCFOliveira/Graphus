@@ -416,6 +416,12 @@ pub mod error {
         Runtime(String),
         /// A protocol or connectivity error.
         Protocol(String),
+        /// An authorization failure: the authenticated principal lacks the privilege the
+        /// operation requires (`04 §8.4` deny-by-default RBAC). Distinct from
+        /// [`GraphusError::Protocol`] so the connectivity layers can classify it as a
+        /// permission-denied condition (Bolt `Neo.ClientError.Security.Forbidden`, HTTP `403`)
+        /// rather than a malformed request.
+        Security(String),
     }
 
     impl fmt::Display for GraphusError {
@@ -426,6 +432,7 @@ pub mod error {
                 Self::Compile(m) => write!(f, "compile error: {m}"),
                 Self::Runtime(m) => write!(f, "runtime error: {m}"),
                 Self::Protocol(m) => write!(f, "protocol error: {m}"),
+                Self::Security(m) => write!(f, "security error: {m}"),
             }
         }
     }

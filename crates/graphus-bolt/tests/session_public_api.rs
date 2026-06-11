@@ -54,7 +54,7 @@ impl BoltExecutor for DemoExecutor {
         })
     }
 
-    fn begin(&mut self, _mode: AccessMode) -> Result<(), GraphusError> {
+    fn begin(&mut self, _mode: AccessMode, _db: Option<&str>) -> Result<(), GraphusError> {
         self.tx_open = true;
         Ok(())
     }

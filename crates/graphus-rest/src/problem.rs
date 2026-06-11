@@ -37,6 +37,7 @@
 //! | [`GraphusError::Transaction`] | 409 | `Neo.TransientError.Transaction.Terminated` | retriable serialization/abort (`04 §5.4`) |
 //! | [`GraphusError::Storage`] | 500 | `Neo.DatabaseError.General.UnknownError` | server-side fault |
 //! | [`GraphusError::Protocol`] | 400 | `Neo.ClientError.Request.Invalid` | malformed request/protocol misuse |
+//! | [`GraphusError::Security`] | 403 | `Neo.ClientError.Security.Forbidden` | the principal lacks the required privilege (`04 §8.4`) |
 //!
 //! A 409 (Conflict) for a transaction error is the HTTP-idiomatic "retriable conflict" signal,
 //! matching the Bolt `TransientError` classification drivers act on.
@@ -140,6 +141,12 @@ impl Problem {
                 "protocol",
                 "protocol error",
                 CODE_REQUEST_INVALID,
+            ),
+            GraphusError::Security(_) => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "not authorized",
+                CODE_FORBIDDEN,
             ),
             // `#[non_exhaustive]`: an unclassified future variant defaults to a server fault.
             _ => (
@@ -261,6 +268,7 @@ fn strip_layer_prefix(s: &str) -> String {
         "compile error: ",
         "runtime error: ",
         "protocol error: ",
+        "security error: ",
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
             return rest.to_owned();
@@ -298,6 +306,19 @@ mod tests {
     fn storage_error_is_500() {
         let p = Problem::from_graphus_error(&GraphusError::Storage("disk".to_owned()));
         assert_eq!(p.status, 500);
+    }
+
+    #[test]
+    fn security_error_is_403_forbidden_with_stripped_detail() {
+        let p = Problem::from_graphus_error(&GraphusError::Security(
+            "permission denied: admin required".to_owned(),
+        ));
+        assert_eq!(p.status, 403);
+        assert_eq!(p.code.as_deref(), Some(CODE_FORBIDDEN));
+        assert_eq!(
+            p.detail.as_deref(),
+            Some("permission denied: admin required")
+        );
     }
 
     #[test]

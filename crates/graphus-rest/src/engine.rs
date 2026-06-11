@@ -100,6 +100,24 @@ pub trait ResultStream {
     fn summary(&self) -> RunSummary;
 }
 
+/// The session context the router resolves before opening a transaction: who is asking, and
+/// whether the transaction is client-managed.
+///
+/// The engine needs this for **server-side administrative statements** (rmp #84): an admin command
+/// (`CREATE DATABASE …`) is authorized against the authenticated `principal` and is rejected
+/// inside an `explicit` (client-managed) transaction because it is not transactional. The router
+/// owns authentication, so it passes the resolved identity down through [`RestEngine::begin`]; the
+/// engine associates it with the returned [`TxHandle`] for the transaction's lifetime.
+#[derive(Debug, Clone, Copy)]
+pub struct TxOrigin<'a> {
+    /// The authenticated principal (the Bearer token's subject) opening the transaction.
+    pub principal: &'a str,
+    /// `true` for a client-managed explicit transaction (`POST /db/{db}/tx`); `false` for the
+    /// auto-commit shortcut (`POST /db/{db}/tx/commit`), where the router itself opens and
+    /// finalises the transaction around one request.
+    pub explicit: bool,
+}
+
 /// An opaque handle to a transaction the engine opened, returned by [`RestEngine::begin`].
 ///
 /// REST is stateless, so the router cannot rely on an "open transaction" living inside the engine
@@ -137,12 +155,20 @@ pub trait RestEngine: Send + Sync {
     /// per-row boxing; the engine picks its cursor type.)
     type Stream: ResultStream;
 
-    /// Opens an explicit transaction against `db` in `mode`, returning its [`TxHandle`].
+    /// Opens a transaction against `db` in `mode` on behalf of `origin`, returning its
+    /// [`TxHandle`]. The transaction is pinned to `db` for its whole lifetime; `origin` carries
+    /// the authenticated principal and whether the transaction is client-managed (see
+    /// [`TxOrigin`]).
     ///
     /// # Errors
     /// [`GraphusError::Transaction`] if a transaction cannot be started, or
-    /// [`GraphusError::Storage`] if `db` does not exist.
-    fn begin(&self, db: &str, mode: AccessMode) -> Result<TxHandle, GraphusError>;
+    /// [`GraphusError::Protocol`] if `db` names no servable database.
+    fn begin(
+        &self,
+        db: &str,
+        mode: AccessMode,
+        origin: TxOrigin<'_>,
+    ) -> Result<TxHandle, GraphusError>;
 
     /// Runs `query` with `parameters` inside the transaction identified by `tx`, returning a lazy
     /// result stream.
@@ -194,7 +220,7 @@ pub(crate) mod mock {
 
     use graphus_core::{GraphusError, Value};
 
-    use super::{AccessMode, RestEngine, ResultStream, Row, RunSummary, TxHandle};
+    use super::{AccessMode, RestEngine, ResultStream, Row, RunSummary, TxHandle, TxOrigin};
 
     /// A canned result: the fields and the rows to stream (or an error to raise on `run`).
     #[derive(Clone)]
@@ -306,13 +332,19 @@ pub(crate) mod mock {
     impl RestEngine for MockEngine {
         type Stream = MockStream;
 
-        fn begin(&self, db: &str, mode: AccessMode) -> Result<TxHandle, GraphusError> {
+        fn begin(
+            &self,
+            db: &str,
+            mode: AccessMode,
+            origin: TxOrigin<'_>,
+        ) -> Result<TxHandle, GraphusError> {
             let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
             inner.next_handle += 1;
             let h = inner.next_handle;
-            inner
-                .log
-                .push(format!("begin(db={db}, mode={mode:?}) -> {h}"));
+            inner.log.push(format!(
+                "begin(db={db}, mode={mode:?}, principal={}, explicit={}) -> {h}",
+                origin.principal, origin.explicit
+            ));
             inner.txns.insert(
                 h,
                 TxState {
@@ -403,6 +435,12 @@ mod tests {
     use super::mock::{Canned, MockEngine};
     use super::*;
 
+    /// A fixed auto-commit origin for the seam unit tests.
+    const TEST_ORIGIN: TxOrigin<'static> = TxOrigin {
+        principal: "tester",
+        explicit: false,
+    };
+
     #[test]
     fn access_mode_defaults_to_write() {
         assert_eq!(AccessMode::default(), AccessMode::Write);
@@ -416,7 +454,9 @@ mod tests {
             "RETURN 1",
             Canned::rows(&["x"], vec![vec![Value::Integer(1)]]),
         );
-        let tx = engine.begin("neo4j", AccessMode::Read).unwrap();
+        let tx = engine
+            .begin("neo4j", AccessMode::Read, TEST_ORIGIN)
+            .unwrap();
         let mut stream = engine.run(tx, "RETURN 1", vec![]).unwrap();
         assert_eq!(stream.fields(), &["x".to_owned()]);
         assert_eq!(stream.next_row().unwrap(), Some(vec![Value::Integer(1)]));
@@ -427,7 +467,9 @@ mod tests {
     #[test]
     fn mock_read_tx_rejects_write_statement() {
         let engine = MockEngine::new();
-        let tx = engine.begin("neo4j", AccessMode::Read).unwrap();
+        let tx = engine
+            .begin("neo4j", AccessMode::Read, TEST_ORIGIN)
+            .unwrap();
         let err = engine.run(tx, "CREATE (n)", vec![]).unwrap_err();
         assert!(matches!(err, GraphusError::Transaction(_)));
     }
@@ -435,7 +477,9 @@ mod tests {
     #[test]
     fn mock_tracks_lifecycle_and_rollback_is_idempotent() {
         let engine = MockEngine::new();
-        let tx = engine.begin("neo4j", AccessMode::Write).unwrap();
+        let tx = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
         engine.run(tx, "RETURN 1", vec![]).unwrap();
         engine.rollback(tx).unwrap();
         // Rolling back again (e.g. the inactivity sweep racing a DELETE) is still Ok.

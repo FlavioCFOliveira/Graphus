@@ -19,7 +19,9 @@ use graphus_io::{TcpAcceptor, UdsAcceptor};
 use rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::TlsAcceptor;
 
+use crate::admin::AdminContext;
 use crate::config::ServerConfig;
+use crate::dbcatalog::DatabaseCatalog;
 use crate::engine::EngineHandle;
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownCoordinator;
@@ -53,12 +55,17 @@ impl Listeners {
 
 /// Binds and starts every enabled listener, returning the bound [`Listeners`].
 ///
+/// `engine` is the **default database's** handle; `catalog` is the database registry the
+/// per-session database targeting and the administrative statements resolve through (rmp #84) —
+/// both seams share one [`AdminContext`] built here.
+///
 /// # Errors
 /// A human-readable message if any enabled listener fails to bind.
 #[allow(clippy::too_many_arguments)] // The listeners legitimately need all the shared services.
 pub async fn start_all(
     config: &ServerConfig,
     engine: EngineHandle,
+    catalog: Arc<DatabaseCatalog>,
     auth: Arc<Authenticator>,
     clock: Arc<dyn Clock + Send + Sync>,
     tls: Option<Arc<RustlsServerConfig>>,
@@ -68,6 +75,15 @@ pub async fn start_all(
 ) -> Result<Listeners, String> {
     let tls_acceptor = tls.map(TlsAcceptor::from);
 
+    // The shared database-targeting + admin-statement context (rmp #84). One per server: both
+    // Bolt loops clone it per connection, the REST adapter holds one.
+    let context = AdminContext::new(
+        Arc::clone(&catalog),
+        Arc::clone(&auth),
+        tokio::runtime::Handle::current(),
+        engine.clone(),
+    );
+
     // ---- UDS-Bolt (peer-cred, no TLS) ----
     let uds_path = if let Some(path) = &config.uds_path {
         let acceptor =
@@ -75,7 +91,7 @@ pub async fn start_all(
         let bound = acceptor.path().to_path_buf();
         tokio::spawn(bolt::run_uds_accept_loop(
             acceptor,
-            engine.clone(),
+            context.clone(),
             Arc::clone(&auth),
             Arc::clone(&metrics),
             shutdown.clone(),
@@ -100,7 +116,7 @@ pub async fn start_all(
         tokio::spawn(bolt::run_tcp_accept_loop(
             acceptor,
             tls_acceptor,
-            engine.clone(),
+            context.clone(),
             Arc::clone(&auth),
             Arc::clone(&metrics),
             shutdown.clone(),
@@ -121,6 +137,7 @@ pub async fn start_all(
             .map_err(|e| format!("REST local_addr: {e}"))?;
         let router = build_rest_router(
             engine.clone(),
+            context.clone(),
             Arc::clone(&auth),
             Arc::clone(&clock),
             Arc::clone(&metrics),
@@ -148,9 +165,12 @@ pub async fn start_all(
 }
 
 /// Builds the full HTTP router: the `graphus_rest` transactional API merged with the server's own
-/// observability + admin routes (`04 §8.2`, §9).
+/// observability + admin routes (`04 §8.2`, §9). `engine` (the default database's handle) feeds
+/// the observability routes; the transactional API routes databases through `context` (rmp #84).
+#[allow(clippy::too_many_arguments)] // The router legitimately aggregates all the shared services.
 fn build_rest_router(
     engine: EngineHandle,
+    context: AdminContext,
     auth: Arc<Authenticator>,
     clock: Arc<dyn Clock + Send + Sync>,
     metrics: Arc<Metrics>,
@@ -160,7 +180,7 @@ fn build_rest_router(
     use graphus_rest::registry::TxRegistry;
     use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, router};
 
-    let rest_engine = Arc::new(crate::engine::RestEngineAdapter::new(engine.clone()));
+    let rest_engine = Arc::new(crate::engine::RestEngineAdapter::new(context));
     let registry = Arc::new(TxRegistry::new(DEFAULT_TX_TTL_NANOS));
     let api = router(AppState::new(
         rest_engine,

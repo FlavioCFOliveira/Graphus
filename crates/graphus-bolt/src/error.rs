@@ -109,6 +109,7 @@ impl Failure {
 /// | [`GraphusError::Transaction`] | `Neo.TransientError.Transaction.Terminated` | retriable serialization/abort (`04 §5.4` safe-retry) |
 /// | [`GraphusError::Storage`] | `Neo.DatabaseError.General.UnknownError` | server-side fault, not the client's |
 /// | [`GraphusError::Protocol`] | `Neo.ClientError.Request.Invalid` | malformed request/protocol misuse |
+/// | [`GraphusError::Security`] | `Neo.ClientError.Security.Forbidden` | the principal lacks the required privilege (`04 §8.4`) |
 ///
 /// The `Neo.ClientError` / `Neo.TransientError` / `Neo.DatabaseError` top-level *classification*
 /// (client-caused vs retriable vs server fault) is the part drivers act on (retry vs fail), and is
@@ -122,6 +123,7 @@ pub fn failure_from_error(error: &GraphusError) -> Failure {
         GraphusError::Transaction(_) => CODE_TXN_TERMINATED,
         GraphusError::Storage(_) => CODE_DB_UNKNOWN,
         GraphusError::Protocol(_) => CODE_REQUEST_INVALID,
+        GraphusError::Security(_) => CODE_FORBIDDEN,
         // `GraphusError` is `#[non_exhaustive]`: a new variant defaults to a server-fault code
         // until it is explicitly classified, which is the safe (non-retriable, owner-visible) choice.
         _ => CODE_DB_UNKNOWN,
@@ -145,6 +147,10 @@ const CODE_REQUEST_INVALID: &str = "Neo.ClientError.Request.Invalid";
 /// builds this `Failure` directly; the code is the documented best-effort placeholder.
 pub const CODE_UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
 
+/// Best-effort code for an authorization failure: the authenticated principal lacks the privilege
+/// the operation requires ([`GraphusError::Security`], `04 §8.4`).
+const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
+
 /// Removes the `GraphusError::Display` layer prefix (`"<layer> error: "`) so the `FAILURE` message
 /// is the bare human description.
 fn strip_layer_prefix(s: &str) -> String {
@@ -154,6 +160,7 @@ fn strip_layer_prefix(s: &str) -> String {
         "compile error: ",
         "runtime error: ",
         "protocol error: ",
+        "security error: ",
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
             return rest.to_owned();
@@ -196,6 +203,13 @@ mod tests {
         ));
         assert_eq!(f.code, CODE_TXN_TERMINATED);
         assert!(f.code.contains("TransientError"));
+    }
+
+    #[test]
+    fn security_error_maps_to_forbidden_without_prefix() {
+        let f = failure_from_error(&GraphusError::Security("permission denied".to_owned()));
+        assert_eq!(f.code, CODE_FORBIDDEN);
+        assert_eq!(f.message, "permission denied");
     }
 
     #[test]

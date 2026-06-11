@@ -291,13 +291,21 @@ mod tests {
 
     const TTL: u64 = 1000;
 
+    /// A fixed auto-commit origin for the registry unit tests.
+    const TEST_ORIGIN: crate::engine::TxOrigin<'static> = crate::engine::TxOrigin {
+        principal: "tester",
+        explicit: false,
+    };
+
     #[test]
     fn open_then_touch_returns_handle_and_refreshes_deadline() {
         let engine = MockEngine::new();
         let clock = TestClock::new(0);
         let reg = TxRegistry::new(TTL);
 
-        let h = engine.begin("neo4j", AccessMode::Write).unwrap();
+        let h = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
         let (id, deadline) = reg.open(h, "neo4j", AccessMode::Write, clock.now_nanos());
         assert_eq!(deadline, TTL);
         assert_eq!(reg.open_count(), 1);
@@ -315,7 +323,9 @@ mod tests {
         let clock = TestClock::new(0);
         let reg = TxRegistry::new(TTL);
 
-        let h = engine.begin("neo4j", AccessMode::Write).unwrap();
+        let h = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
         let (id, _) = reg.open(h, "neo4j", AccessMode::Write, clock.now_nanos());
 
         // Advance past the deadline; touching reaps it and returns None.
@@ -338,10 +348,14 @@ mod tests {
         let reg = TxRegistry::new(TTL);
 
         // tx A opened at t=0 (deadline 1000); tx B opened at t=900 (deadline 1900).
-        let ha = engine.begin("neo4j", AccessMode::Write).unwrap();
+        let ha = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
         let (_id_a, _) = reg.open(ha, "neo4j", AccessMode::Write, 0);
         clock.set(900);
-        let hb = engine.begin("neo4j", AccessMode::Write).unwrap();
+        let hb = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
         let (id_b, _) = reg.open(hb, "neo4j", AccessMode::Write, clock.now_nanos());
 
         // Sweep at t=1000: only A is expired.
@@ -357,7 +371,9 @@ mod tests {
     fn take_removes_and_returns_handle() {
         let engine = MockEngine::new();
         let reg = TxRegistry::new(TTL);
-        let h = engine.begin("neo4j", AccessMode::Read).unwrap();
+        let h = engine
+            .begin("neo4j", AccessMode::Read, TEST_ORIGIN)
+            .unwrap();
         let (id, _) = reg.open(h, "neo4j", AccessMode::Read, 0);
 
         let (taken, db, mode) = reg.take(&id).expect("present");
@@ -398,8 +414,8 @@ mod tests {
     fn ids_are_unique_and_opaque() {
         let reg = TxRegistry::new(TTL);
         let engine = MockEngine::new();
-        let h1 = engine.begin("g", AccessMode::Write).unwrap();
-        let h2 = engine.begin("g", AccessMode::Write).unwrap();
+        let h1 = engine.begin("g", AccessMode::Write, TEST_ORIGIN).unwrap();
+        let h2 = engine.begin("g", AccessMode::Write, TEST_ORIGIN).unwrap();
         let (id1, _) = reg.open(h1, "g", AccessMode::Write, 0);
         let (id2, _) = reg.open(h2, "g", AccessMode::Write, 0);
         assert_ne!(id1, id2);

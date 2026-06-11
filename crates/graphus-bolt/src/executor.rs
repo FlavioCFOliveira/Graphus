@@ -94,15 +94,28 @@ pub trait RecordStream {
 /// an explicit transaction commits on its own) and **explicit** (`BEGIN` … `RUN`* … `COMMIT`/`ROLLBACK`).
 /// The server tells the executor which is in play so the executor (the coordinator) manages the
 /// transaction lifecycle correctly.
+///
+/// Both shapes carry the target **database** from the message's `extra` map (Bolt 5.x `db` field):
+/// `None` means the field was absent or empty — the executor targets its default database. For
+/// [`TxControl::InExplicit`] the database is informational only — the transaction was already
+/// pinned to a database at `BEGIN` — and a *different* non-empty name is an error (a transaction
+/// cannot switch databases mid-flight); the executor enforces that rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxControl {
     /// Run as a standalone auto-commit statement in `mode` (committed when its result is consumed).
     AutoCommit {
         /// The statement's access mode.
         mode: AccessMode,
+        /// The target database from the `RUN` extra's `db` field (`None` = absent/empty = the
+        /// executor's default database).
+        db: Option<String>,
     },
     /// Run inside the currently-open explicit transaction (opened by a prior `BEGIN`).
-    InExplicit,
+    InExplicit {
+        /// The `db` field from the `RUN` extra, if any. The transaction is already pinned to the
+        /// database named at `BEGIN`; a different non-empty name here is an error.
+        db: Option<String>,
+    },
 }
 
 /// The query-execution interface the Bolt server drives (`04 §8.3`; rmp #20).
@@ -134,11 +147,14 @@ pub trait BoltExecutor {
         tx: TxControl,
     ) -> Result<Self::Stream, GraphusError>;
 
-    /// Opens an explicit transaction in `mode` (a `BEGIN`).
+    /// Opens an explicit transaction in `mode` (a `BEGIN`) against `db` (the `BEGIN` extra's `db`
+    /// field; `None` = absent/empty = the executor's default database). The transaction stays
+    /// pinned to that database for its whole lifetime (Bolt 5.x semantics).
     ///
     /// # Errors
-    /// [`GraphusError::Transaction`] if a transaction is already open or cannot be started.
-    fn begin(&mut self, mode: AccessMode) -> Result<(), GraphusError>;
+    /// [`GraphusError::Transaction`] if a transaction is already open or cannot be started, or
+    /// [`GraphusError::Protocol`] if `db` names no servable database.
+    fn begin(&mut self, mode: AccessMode, db: Option<&str>) -> Result<(), GraphusError>;
 
     /// Commits the open explicit transaction (a `COMMIT`).
     ///
@@ -152,6 +168,16 @@ pub trait BoltExecutor {
     /// # Errors
     /// [`GraphusError::Transaction`] if no transaction is open.
     fn rollback(&mut self) -> Result<(), GraphusError>;
+
+    /// Informs the executor of the session's authenticated identity: the server calls it with
+    /// `Some(principal)` after a successful `LOGON` and with `None` on `LOGOFF` (`04 §8.4`).
+    ///
+    /// The default implementation is a no-op for executors that do not act on identity. An
+    /// executor that performs authorization (e.g. the server's seam gating administrative
+    /// statements — rmp #84) overrides it to track the principal.
+    fn set_principal(&mut self, principal: Option<&str>) {
+        let _ = principal;
+    }
 }
 
 #[cfg(test)]
@@ -184,7 +210,8 @@ pub(crate) mod mock {
     }
 
     /// A mock executor: maps query text → canned result (or error), and records the
-    /// begin/commit/rollback calls it received so tests can assert the transaction lifecycle.
+    /// begin/commit/rollback/principal calls it received so tests can assert the transaction
+    /// lifecycle and the identity plumbing.
     #[derive(Default)]
     pub struct MockExecutor {
         results: HashMap<String, CannedResult>,
@@ -193,6 +220,8 @@ pub(crate) mod mock {
         pub tx_open: bool,
         pub log: Vec<String>,
         pub commit_fails_with: Option<GraphusError>,
+        /// The principal last announced via [`BoltExecutor::set_principal`] (None until LOGON).
+        pub principal: Option<String>,
     }
 
     impl MockExecutor {
@@ -267,8 +296,8 @@ pub(crate) mod mock {
             })
         }
 
-        fn begin(&mut self, mode: AccessMode) -> Result<(), GraphusError> {
-            self.log.push(format!("begin({mode:?})"));
+        fn begin(&mut self, mode: AccessMode, db: Option<&str>) -> Result<(), GraphusError> {
+            self.log.push(format!("begin({mode:?}, db={db:?})"));
             if self.tx_open {
                 return Err(GraphusError::Transaction(
                     "transaction already open".to_owned(),
@@ -298,6 +327,11 @@ pub(crate) mod mock {
             }
             self.tx_open = false;
             Ok(())
+        }
+
+        fn set_principal(&mut self, principal: Option<&str>) {
+            self.log.push(format!("set_principal({principal:?})"));
+            self.principal = principal.map(str::to_owned);
         }
     }
 
@@ -337,6 +371,7 @@ mod tests {
                 vec![],
                 TxControl::AutoCommit {
                     mode: AccessMode::Read,
+                    db: None,
                 },
             )
             .unwrap();
@@ -350,10 +385,10 @@ mod tests {
     fn mock_tracks_transaction_lifecycle() {
         let mut exec = MockExecutor::new();
         assert!(!exec.tx_open);
-        exec.begin(AccessMode::Write).unwrap();
+        exec.begin(AccessMode::Write, None).unwrap();
         assert!(exec.tx_open);
         // A second begin without commit is an error.
-        assert!(exec.begin(AccessMode::Write).is_err());
+        assert!(exec.begin(AccessMode::Write, None).is_err());
         exec.commit().unwrap();
         assert!(!exec.tx_open);
         assert!(exec.rollback().is_err()); // nothing open
@@ -369,9 +404,20 @@ mod tests {
                 vec![],
                 TxControl::AutoCommit {
                     mode: AccessMode::Write,
+                    db: None,
                 },
             )
             .unwrap_err();
         assert!(matches!(err, GraphusError::Compile(_)));
+    }
+
+    #[test]
+    fn mock_tracks_principal_announcements() {
+        let mut exec = MockExecutor::new();
+        assert_eq!(exec.principal, None);
+        exec.set_principal(Some("alice"));
+        assert_eq!(exec.principal.as_deref(), Some("alice"));
+        exec.set_principal(None); // LOGOFF clears it.
+        assert_eq!(exec.principal, None);
     }
 }
