@@ -21,7 +21,16 @@ use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
 use crate::btree::BTree;
+use crate::histogram::PropertyHistogram;
 use crate::keycodec::{self, KeyEncodeError};
+
+/// The default number of equi-depth buckets when a caller passes `0` to [`PropertyIndex::build_histogram`].
+///
+/// `64` is a common statistics default (e.g. it matches PostgreSQL's `default_statistics_target`):
+/// enough buckets to bound the range-estimate error to roughly `total/64` per open end while keeping
+/// the persisted histogram small. The exact value is not load-bearing for correctness — only for the
+/// tightness of the documented error bound — so it can be tuned later from measured plan quality.
+pub const DEFAULT_HISTOGRAM_BUCKETS: usize = 64;
 
 /// Encodes an 8-byte record-id payload.
 fn rid_payload(rid: u64) -> [u8; 8] {
@@ -219,6 +228,53 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
             .into_iter()
             .filter_map(|(_, v)| rid_decode(&v))
             .collect())
+    }
+
+    /// Builds an equi-depth [`PropertyHistogram`] over all values indexed under `token`, for the
+    /// planner's cardinality estimation.
+    ///
+    /// Scans every entry for `token` in ascending B+-tree key order (mirroring how [`Self::seek_range`]
+    /// bounds the token prefix), strips the 4-byte big-endian token prefix and the trailing 8-byte
+    /// big-endian record-id suffix from each key to recover the **encoded value** bytes (already in
+    /// ascending order, duplicates included), and feeds them to [`PropertyHistogram::from_sorted_encoded`].
+    /// A `target_buckets` of `0` uses [`DEFAULT_HISTOGRAM_BUCKETS`].
+    ///
+    /// # Errors
+    /// Propagates a B+-tree/buffer-pool fetch failure. The encoded values come straight from existing
+    /// keys, so no value re-encoding (and thus no [`KeyEncodeError`]) can occur here.
+    pub fn build_histogram(
+        &mut self,
+        token: u32,
+        target_buckets: usize,
+    ) -> Result<PropertyHistogram> {
+        let target = if target_buckets == 0 {
+            DEFAULT_HISTOGRAM_BUCKETS
+        } else {
+            target_buckets
+        };
+
+        // Bound the scan to exactly this token's key span: `[token, token+1)`. When `token == u32::MAX`
+        // there is no next token, so scan from the prefix to the end of the tree.
+        let lo = token.to_be_bytes().to_vec();
+        let entries = match token.checked_add(1) {
+            Some(next) => self.tree.range(&lo, &next.to_be_bytes())?,
+            None => self.tree.range_from(&lo)?,
+        };
+
+        // Strip the 4-byte token prefix and the 8-byte trailing rid to recover the encoded value.
+        // Every key is `token(4 BE) || encoded_value || rid(8 BE)`, so any well-formed key is at
+        // least 12 bytes; a shorter key would be a corruption we simply skip (defensive, never
+        // expected for keys this index wrote).
+        const PREFIX: usize = 4;
+        const SUFFIX: usize = 8;
+        let values: Vec<Vec<u8>> = entries
+            .into_iter()
+            .filter_map(|(k, _)| {
+                (k.len() >= PREFIX + SUFFIX).then(|| k[PREFIX..k.len() - SUFFIX].to_vec())
+            })
+            .collect();
+
+        Ok(PropertyHistogram::from_sorted_encoded(&values, target))
     }
 }
 
@@ -498,6 +554,68 @@ mod tests {
             idx.seek_eq(5, &Value::String("2020".to_owned())).unwrap(),
             vec![900]
         );
+    }
+
+    #[test]
+    fn build_histogram_matches_brute_force_oracle() {
+        use crate::keycodec::encode_single;
+
+        let mut idx = PropertyIndex::new(fresh_tree());
+        let txn = TxnId(1);
+        idx.tree_mut().with_wal(|w| w.begin(txn));
+
+        // A known multiset: 0..200 once each, plus value 50 inserted 9 extra times (10 total), under
+        // token 1; plus a couple of rows under a *different* token 2 that must NOT leak in.
+        let mut rid = 0u64;
+        let mut multiset: Vec<i64> = Vec::new();
+        for v in 0..200i64 {
+            idx.insert(txn, 1, &Value::Integer(v), rid).unwrap();
+            multiset.push(v);
+            rid += 1;
+        }
+        for _ in 0..9 {
+            idx.insert(txn, 1, &Value::Integer(50), rid).unwrap();
+            rid += 1;
+        }
+        multiset.extend(std::iter::repeat_n(50, 9));
+        idx.insert(txn, 2, &Value::Integer(999), rid).unwrap();
+        rid += 1;
+        idx.insert(txn, 2, &Value::Integer(1000), rid).unwrap();
+        idx.tree_mut().with_wal(|w| w.commit(txn).unwrap());
+
+        let hist = idx.build_histogram(1, 32).unwrap();
+
+        // Totals/distinct match the oracle exactly (token 2 excluded).
+        assert_eq!(
+            hist.total(),
+            multiset.len() as u64,
+            "209 rows under token 1"
+        );
+        let distinct: std::collections::BTreeSet<i64> = multiset.iter().copied().collect();
+        assert_eq!(
+            hist.distinct(),
+            distinct.len() as u64,
+            "200 distinct values"
+        );
+
+        // Equality on the frequent value tracks its true frequency within a small bound.
+        let enc50 = encode_single(&Value::Integer(50)).unwrap();
+        let true50 = multiset.iter().filter(|&&v| v == 50).count() as f64;
+        let est50 = hist.estimate_eq(&enc50);
+        assert!(
+            (est50 - true50).abs() <= true50, // within one frequency unit-scale; equi-depth keeps it tight
+            "frequent-value estimate {est50} vs true {true50}"
+        );
+
+        // Default-bucket path (target 0) is accepted and produces the same totals.
+        let hist_default = idx.build_histogram(1, 0).unwrap();
+        assert_eq!(hist_default.total(), multiset.len() as u64);
+        assert_eq!(hist_default.distinct(), distinct.len() as u64);
+
+        // A token with no entries yields the empty histogram.
+        let empty = idx.build_histogram(7, 16).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.total(), 0);
     }
 
     #[test]

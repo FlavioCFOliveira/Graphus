@@ -21,6 +21,9 @@
 //!   token-lookup, property (range/equality), composite, and relationship-property.
 //! - [`constraint`] — uniqueness (via a unique index, commit-time validated) and existence
 //!   (checked on write) constraints (`04 §6.5`).
+//! - [`histogram`] — equi-depth property histograms over the order-preserving encoding, plus a
+//!   builder that derives one by scanning a [`kinds::PropertyIndex`]. The planner's cardinality- and
+//!   selectivity-estimation input; decode-free because the encoding is Cypher-ordered.
 //!
 //! # MVCC awareness & the transaction-layer seam (`04 §6.3`)
 //!
@@ -53,6 +56,7 @@
 
 pub mod btree;
 pub mod constraint;
+pub mod histogram;
 pub mod keycodec;
 pub mod kinds;
 pub mod node;
@@ -60,6 +64,7 @@ pub mod recovery;
 
 pub use btree::BTree;
 pub use constraint::{ConstraintError, ExistenceConstraint, UniqueConstraint};
+pub use histogram::{HistogramDecodeError, PropertyHistogram};
 pub use keycodec::{KeyEncodeError, encode_composite, encode_single, encode_value};
 pub use kinds::{CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
 pub use recovery::{SharedWal, recover_index_device};

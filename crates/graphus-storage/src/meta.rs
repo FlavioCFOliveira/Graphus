@@ -44,19 +44,30 @@ pub struct Meta {
 
 /// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
 ///
-/// Holds, for the planner's cardinality estimator, how many currently-**live** nodes carry each
+/// Holds, for the planner's cardinality estimator, the grand-total live-node and live-relationship
+/// counts (`rmp` task #82), plus how many currently-**live** nodes carry each
 /// [`Label`](crate::tokens::Namespace::Label)-namespace token id, and how many currently-live
 /// relationships have each [`RelType`](crate::tokens::Namespace::RelType)-namespace token id, so the
 /// planner gets exact cardinalities by an O(1) lookup with no scan.
+///
+/// # Why the grand totals are stored, not derived
+///
+/// The planner's `Statistics` seam needs a **non-optional** total live-node count and total
+/// live-relationship count. Neither is recoverable from the per-label / per-type maps: a node may
+/// carry several labels (summing `nodes_per_label` overcounts) or none (summing undercounts). The
+/// grand totals are therefore maintained at the node-/relationship-creation and -deletion sites,
+/// once per record, independently of any label or type contribution.
 ///
 /// # What "live" means here, and why it is crash- and abort-safe
 ///
 /// A record is *live* for counting exactly when it is the latest visible version: its slot is in use
 /// **and** it carries no MVCC expiry tombstone (`xmax == 0`) — the
 /// [`RecordStore::is_live_version`](crate::RecordStore) predicate. The store therefore adjusts these
-/// counts on the **committed transition** that changes a record's live label/type contribution:
-/// `create_rel` increments; `delete_node`/`delete_rel` (which stamp the `xmax` tombstone, `04 §5.3`)
-/// decrement; `set_node_labels`/`add_label`/`remove_label` adjust the per-label delta on a live node.
+/// counts on the **committed transition** that changes a record's live contribution:
+/// `create_node`/`create_rel` increment (the grand totals once per record, the per-type map once per
+/// relationship); `delete_node`/`delete_rel` (which stamp the `xmax` tombstone, `04 §5.3`) decrement;
+/// `set_node_labels`/`add_label`/`remove_label` adjust the per-label delta on a live node (the grand
+/// total is unaffected — a label change never creates or destroys a node).
 /// GC reclamation ([`reclaim_node`](crate::RecordStore)/[`reclaim_rel`](crate::RecordStore)) does
 /// **not** touch the counts — the decrement already happened at the tombstone-stamping delete.
 ///
@@ -72,8 +83,29 @@ pub struct Meta {
 /// The maps are [`BTreeMap`]s so the encoding (and [`PartialEq`]) is deterministic. A token id whose
 /// count reaches `0` is **removed** from the map rather than left at `0`, so equality against a fresh
 /// full re-scan (which only ever inserts positive counts) always holds.
+///
+/// # Property histograms (`rmp` task #81)
+///
+/// Beyond the two cardinality maps, the catalog also carries opaque per-indexed-property value
+/// histograms, keyed by `(label_token, property_key_token)` — see
+/// [`node_prop_histograms`](Self#structfield.node_prop_histograms). Storage stores those bytes
+/// **verbatim** and never interprets them; they ride the exact same durability lifecycle as the
+/// counts (checkpointed at commit, reloaded on rollback and on open). Their presence invariant is
+/// "an entry exists iff a histogram exists" — there is no zero-count analogue, but a zero-length
+/// blob is rejected (a histogram is never empty).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Statistics {
+    /// The total number of currently-live nodes, **labelled or not** (`rmp` task #82). This is the
+    /// grand total the planner's `Statistics` seam requires; it is *not* derivable from
+    /// [`nodes_per_label`](Self#structfield.nodes_per_label): a node may carry several labels (so
+    /// summing the per-label counts overcounts) or none (so summing undercounts). It is therefore
+    /// maintained at the node-creation/-deletion site, once per node, independently of labels.
+    pub total_nodes: u64,
+    /// The total number of currently-live relationships (`rmp` task #82). Maintained once per
+    /// relationship at the create/delete site. Unlike a per-type sum this is exact even though a
+    /// relationship always has exactly one type — kept symmetric with [`total_nodes`](Self#structfield.total_nodes)
+    /// and a single O(1) read for the planner's grand total.
+    pub total_relationships: u64,
     /// `nodes_per_label[t]` is the number of currently-live nodes carrying the `Label`-namespace
     /// token id `t`. A node with `k` labels contributes `1` to each of its `k` entries; an unlabelled
     /// node contributes to none. Absent key == count `0`.
@@ -81,6 +113,19 @@ pub struct Statistics {
     /// `rels_per_type[t]` is the number of currently-live relationships whose `RelType`-namespace
     /// token id is `t`. Absent key == count `0`.
     pub rels_per_type: BTreeMap<u32, u64>,
+    /// Opaque, encoded per-(label-token, property-key-token) value histograms produced by the query
+    /// layer (a later sub-task of `rmp` task #81; the planner's `ANALYZE`). Stored **verbatim** —
+    /// storage never interprets the bytes (decoding would require a dependency on `graphus-index`,
+    /// which depends on this crate, so doing so would form a dependency cycle).
+    ///
+    /// The key is `(label_token, property_key_token)`. **Scope: node label properties only** for this
+    /// task; relationship-property histograms are deliberately deferred (consistent with the physical
+    /// planner deferring relationship-index routing) and will be a separate map if/when added.
+    ///
+    /// Unlike the count maps there is no zero-value invariant: an entry is present **iff** a histogram
+    /// exists for that `(label, property)` pair. The blob is always non-empty — a zero-length value is
+    /// never stored (rejected by `set_property_histogram` and by [`decode`](Self::decode)).
+    pub node_prop_histograms: BTreeMap<(u32, u32), Vec<u8>>,
 }
 
 impl Statistics {
@@ -100,6 +145,60 @@ impl Statistics {
     #[must_use]
     pub fn rel_count_for_type(&self, token_id: u32) -> u64 {
         self.rels_per_type.get(&token_id).copied().unwrap_or(0)
+    }
+
+    /// The total number of currently-live nodes, labelled or not (`rmp` task #82).
+    #[must_use]
+    pub fn total_nodes(&self) -> u64 {
+        self.total_nodes
+    }
+
+    /// The total number of currently-live relationships (`rmp` task #82).
+    #[must_use]
+    pub fn total_relationships(&self) -> u64 {
+        self.total_relationships
+    }
+
+    /// Adds `1` to the grand-total live-node count (`rmp` task #82). Called once per node created,
+    /// labelled or not — distinct from [`inc_label`](Self::inc_label), which a node triggers once per
+    /// label it carries.
+    pub(crate) fn inc_node(&mut self) {
+        self.total_nodes += 1;
+    }
+
+    /// Subtracts `1` from the grand-total live-node count (`rmp` task #82), called once per node
+    /// deleted (at the tombstone-stamping step, not at GC reclaim).
+    ///
+    /// Saturates at `0` defensively: a logic slip that decremented past zero would otherwise wrap to
+    /// `u64::MAX` and corrupt the catalog into an absurd cardinality the planner would trust. In a
+    /// debug build the slip is caught instead.
+    pub(crate) fn dec_node(&mut self) {
+        Self::dec_total(&mut self.total_nodes, "total_nodes");
+    }
+
+    /// Adds `1` to the grand-total live-relationship count (`rmp` task #82). Called once per
+    /// relationship created (covering both the self-loop and the normal branch of `create_rel`).
+    pub(crate) fn inc_rel(&mut self) {
+        self.total_relationships += 1;
+    }
+
+    /// Subtracts `1` from the grand-total live-relationship count (`rmp` task #82), called once per
+    /// relationship deleted (at the tombstone-stamping step, not at GC reclaim). Saturates at `0`
+    /// defensively for the same reason as [`dec_node`](Self::dec_node).
+    pub(crate) fn dec_rel(&mut self) {
+        Self::dec_total(&mut self.total_relationships, "total_relationships");
+    }
+
+    /// Shared grand-total decrement: `count -= 1`, saturating at `0`. In a release build an
+    /// already-zero count saturates (never wraps to a huge count) so a logic slip can never silently
+    /// corrupt the catalog; in a debug build it is caught (every decrement must match a prior
+    /// increment of a live record).
+    fn dec_total(count: &mut u64, which: &str) {
+        if *count == 0 {
+            debug_assert!(false, "statistics {which} decrement underflow");
+            return;
+        }
+        *count -= 1;
     }
 
     /// Adds `1` to the live-node count for label `token_id`.
@@ -149,17 +248,70 @@ impl Statistics {
         }
     }
 
+    /// Borrows the stored opaque histogram blob for `(label_token, prop_token)`, or [`None`] if no
+    /// histogram has been recorded for that node-label property (`rmp` task #81).
+    ///
+    /// The bytes are returned uninterpreted; only the producer/consumer in the query layer knows their
+    /// encoding.
+    #[must_use]
+    pub fn property_histogram(&self, label_token: u32, prop_token: u32) -> Option<&[u8]> {
+        self.node_prop_histograms
+            .get(&(label_token, prop_token))
+            .map(Vec::as_slice)
+    }
+
+    /// Records (or replaces) the opaque histogram blob for the node-label property
+    /// `(label_token, prop_token)` (`rmp` task #81). An **empty** `bytes` is treated as a removal: a
+    /// histogram is never zero-length, so storing one would be meaningless and would not survive the
+    /// codec round-trip (which rejects zero-length blobs). The bytes are stored verbatim.
+    pub(crate) fn set_property_histogram(
+        &mut self,
+        label_token: u32,
+        prop_token: u32,
+        bytes: Vec<u8>,
+    ) {
+        if bytes.is_empty() {
+            self.node_prop_histograms.remove(&(label_token, prop_token));
+        } else {
+            self.node_prop_histograms
+                .insert((label_token, prop_token), bytes);
+        }
+    }
+
+    /// Removes the histogram blob for `(label_token, prop_token)`, if present (`rmp` task #81).
+    pub(crate) fn remove_property_histogram(&mut self, label_token: u32, prop_token: u32) {
+        self.node_prop_histograms.remove(&(label_token, prop_token));
+    }
+
     /// Serialises the statistics to a self-describing byte image.
     ///
-    /// Layout: `n_labels(u32) | [ token_id(u32) | count(u64) ]* | n_types(u32) | [ token_id(u32) |
-    /// count(u64) ]*`, each map in ascending-token-id ([`BTreeMap`]) order so the image is
-    /// deterministic.
+    /// Layout: `total_nodes(u64) | total_relationships(u64) | n_labels(u32) | [ token_id(u32) |
+    /// count(u64) ]* | n_types(u32) | [ token_id(u32) | count(u64) ]* | n_hist(u32) | [
+    /// label_token(u32) | prop_token(u32) | blob_len(u32) | blob_bytes[blob_len] ]*`, each map in
+    /// ascending-key ([`BTreeMap`]) order so the image is deterministic. The two grand totals are a
+    /// fixed 16-byte header (`rmp` task #82) read before the maps; the histogram block follows the two
+    /// count blocks; it is length-exact and self-describing, so the whole image stays unambiguous
+    /// (`rmp` task #81).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(8 + self.nodes_per_label.len() * 12 + self.rels_per_type.len() * 12);
+        let hist_bytes: usize = self
+            .node_prop_histograms
+            .values()
+            .map(|b| 12 + b.len())
+            .sum();
+        let mut out = Vec::with_capacity(
+            16 + 8
+                + self.nodes_per_label.len() * 12
+                + self.rels_per_type.len() * 12
+                + 4
+                + hist_bytes,
+        );
+        // Grand-total header first (`rmp` task #82): two fixed-width LE u64s.
+        out.extend_from_slice(&self.total_nodes.to_le_bytes());
+        out.extend_from_slice(&self.total_relationships.to_le_bytes());
         Self::encode_map(&mut out, &self.nodes_per_label);
         Self::encode_map(&mut out, &self.rels_per_type);
+        Self::encode_histograms(&mut out, &self.node_prop_histograms);
         out
     }
 
@@ -171,19 +323,50 @@ impl Statistics {
         }
     }
 
+    fn encode_histograms(out: &mut Vec<u8>, map: &BTreeMap<(u32, u32), Vec<u8>>) {
+        // The blob length and the entry count are framed as `u32`. Both are unreachable in practice
+        // (a histogram blob is kilobytes; the token space is far below 2^32), but assert it in debug
+        // so a future regression that produced an oversized blob is caught at the source rather than
+        // silently truncating the frame — same defense-in-depth stance as `dec_total`.
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "histogram entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (&(label_token, prop_token), blob) in map {
+            debug_assert!(
+                blob.len() <= u32::MAX as usize,
+                "histogram blob exceeds u32 length"
+            );
+            out.extend_from_slice(&label_token.to_le_bytes());
+            out.extend_from_slice(&prop_token.to_le_bytes());
+            out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            out.extend_from_slice(blob);
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
     /// Returns a storage error if the image is truncated, a count is `0` (violates the zero-count
-    /// invariant — such an image was never produced by [`encode`](Self::encode)), or a token id
-    /// appears twice in one map.
+    /// invariant — such an image was never produced by [`encode`](Self::encode)), a token id appears
+    /// twice in one count map, a histogram blob is zero-length, or a `(label, property)` histogram key
+    /// appears twice.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cur = 0usize;
+        // Grand-total header first (`rmp` task #82); `read_u64` is truncation-safe, so a too-short
+        // image is rejected here before any map is read.
+        let total_nodes = read_u64(bytes, &mut cur)?;
+        let total_relationships = read_u64(bytes, &mut cur)?;
         let nodes_per_label = Self::decode_map(bytes, &mut cur, "nodes_per_label")?;
         let rels_per_type = Self::decode_map(bytes, &mut cur, "rels_per_type")?;
+        let node_prop_histograms = Self::decode_histograms(bytes, &mut cur)?;
         Ok(Self {
+            total_nodes,
+            total_relationships,
             nodes_per_label,
             rels_per_type,
+            node_prop_histograms,
         })
     }
 
@@ -201,6 +384,29 @@ impl Statistics {
             if map.insert(token_id, count).is_some() {
                 return Err(GraphusError::Storage(format!(
                     "statistics {which} repeats token id {token_id}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    fn decode_histograms(bytes: &[u8], cur: &mut usize) -> Result<BTreeMap<(u32, u32), Vec<u8>>> {
+        let n = read_u32(bytes, cur)? as usize;
+        let mut map = BTreeMap::new();
+        for _ in 0..n {
+            let label_token = read_u32(bytes, cur)?;
+            let prop_token = read_u32(bytes, cur)?;
+            let blob_len = read_u32(bytes, cur)? as usize;
+            if blob_len == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "statistics histogram for ({label_token}, {prop_token}) is zero-length"
+                )));
+            }
+            let end = take(bytes, cur, blob_len)?;
+            let blob = bytes[end - blob_len..end].to_vec();
+            if map.insert((label_token, prop_token), blob).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "statistics histogram repeats key ({label_token}, {prop_token})"
                 )));
             }
         }
@@ -366,6 +572,20 @@ mod tests {
         m.statistics.inc_rel_type(0); // KNOWS: 3 live rels
         m.statistics.inc_rel_type(0);
         m.statistics.inc_rel_type(0);
+        // Grand totals (`rmp` task #82): the node total is independent of the per-label sum (a node
+        // may carry several labels or none), and the relationship total is independent of the
+        // per-type sum, so populate both explicitly.
+        m.statistics.inc_node(); // 4 live nodes total (incl. unlabelled ones)
+        m.statistics.inc_node();
+        m.statistics.inc_node();
+        m.statistics.inc_node();
+        m.statistics.inc_rel(); // 3 live rels total
+        m.statistics.inc_rel();
+        m.statistics.inc_rel();
+        // Populate the property-histogram catalog too (`rmp` task #81) so its round-trip is exercised
+        // here alongside the counts.
+        m.statistics.set_property_histogram(0, 1, vec![1, 2, 3, 4]); // (Person, prop 1)
+        m.statistics.set_property_histogram(5, 9, vec![0xAB]); // (label 5, prop 9)
 
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
@@ -373,6 +593,14 @@ mod tests {
         assert_eq!(back.statistics.node_count_for_label(0), 2);
         assert_eq!(back.statistics.node_count_for_label(5), 1);
         assert_eq!(back.statistics.rel_count_for_type(0), 3);
+        assert_eq!(back.statistics.total_nodes(), 4);
+        assert_eq!(back.statistics.total_relationships(), 3);
+        assert_eq!(
+            back.statistics.property_histogram(0, 1),
+            Some(&[1, 2, 3, 4][..])
+        );
+        assert_eq!(back.statistics.property_histogram(5, 9), Some(&[0xAB][..]));
+        assert_eq!(back.statistics.property_histogram(0, 9), None);
     }
 
     #[test]
@@ -387,16 +615,52 @@ mod tests {
         assert!(s.rels_per_type.is_empty(), "a 0 count must not linger");
         s.dec_label(7);
         assert_eq!(s.node_count_for_label(7), 1);
+        // Grand totals (`rmp` task #82) round-trip alongside the maps.
+        s.inc_node();
+        s.inc_node();
+        s.dec_node(); // back to 1
+        s.inc_rel();
 
         let back = Statistics::decode(&s.encode()).unwrap();
         assert_eq!(back, s);
         assert_eq!(back.node_count_for_label(7), 1);
+        assert_eq!(back.total_nodes(), 1);
+        assert_eq!(back.total_relationships(), 1);
+    }
+
+    #[test]
+    fn grand_total_decrement_saturates_at_zero() {
+        // In a release build an over-decrement saturates at 0 rather than wrapping to u64::MAX, so a
+        // logic slip can never corrupt the catalog into an absurd cardinality (`rmp` task #82). A
+        // debug build catches the slip via `debug_assert!`, so this is a release-only assertion.
+        #[cfg(not(debug_assertions))]
+        {
+            let mut s = Statistics::new();
+            s.dec_node();
+            s.dec_rel();
+            assert_eq!(s.total_nodes(), 0);
+            assert_eq!(s.total_relationships(), 0);
+        }
+    }
+
+    #[test]
+    fn statistics_decode_rejects_truncation_of_the_grand_total_header() {
+        // The grand-total header is a fixed 16-byte prefix (`rmp` task #82). An image shorter than the
+        // two u64s must be rejected by the truncation-safe reader.
+        let mut s = Statistics::new();
+        s.inc_node();
+        s.inc_rel();
+        let mut bytes = s.encode();
+        bytes.truncate(15); // one byte short of the 16-byte header
+        assert!(Statistics::decode(&bytes).is_err());
     }
 
     #[test]
     fn statistics_decode_rejects_a_zero_count() {
         // A hand-built image with an explicit 0 count must be rejected (encode never produces one).
         let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes header (`rmp` task #82)
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships header
         bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 label entry
         bytes.extend_from_slice(&4u32.to_le_bytes()); // token id 4
         bytes.extend_from_slice(&0u64.to_le_bytes()); // count 0 (invalid)
@@ -410,6 +674,101 @@ mod tests {
         s.inc_label(1);
         let mut bytes = s.encode();
         bytes.truncate(bytes.len() - 1);
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_histograms_round_trip() {
+        // Empty map: the histogram block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then several entries (mixed blob sizes), keyed by (label, property).
+        let mut s = Statistics::new();
+        s.set_property_histogram(2, 3, vec![9]);
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+
+        s.set_property_histogram(0, 0, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        s.set_property_histogram(2, 1, vec![0xFF; 257]);
+        // Mixing in counts proves the histogram block is read after both count blocks.
+        s.inc_label(4);
+        s.inc_rel_type(7);
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.property_histogram(2, 3), Some(&[9][..]));
+        assert_eq!(back.property_histogram(0, 0).map(<[u8]>::len), Some(8));
+        assert_eq!(back.property_histogram(2, 1).map(<[u8]>::len), Some(257));
+        assert_eq!(back.property_histogram(9, 9), None);
+    }
+
+    #[test]
+    fn set_property_histogram_with_empty_bytes_removes_the_entry() {
+        let mut s = Statistics::new();
+        s.set_property_histogram(1, 1, vec![7, 7]);
+        assert_eq!(s.property_histogram(1, 1), Some(&[7, 7][..]));
+        // An empty blob is meaningless (a histogram is never zero-length): it removes the entry.
+        s.set_property_histogram(1, 1, Vec::new());
+        assert_eq!(s.property_histogram(1, 1), None);
+        assert!(s.node_prop_histograms.is_empty());
+        // An empty blob on an absent key is a no-op, not an inserted empty entry.
+        s.set_property_histogram(2, 2, Vec::new());
+        assert!(s.node_prop_histograms.is_empty());
+    }
+
+    #[test]
+    fn remove_property_histogram_drops_the_entry() {
+        let mut s = Statistics::new();
+        s.set_property_histogram(1, 1, vec![1]);
+        s.set_property_histogram(1, 2, vec![2]);
+        s.remove_property_histogram(1, 1);
+        assert_eq!(s.property_histogram(1, 1), None);
+        assert_eq!(s.property_histogram(1, 2), Some(&[2][..]));
+        // Removing an absent key is a harmless no-op.
+        s.remove_property_histogram(9, 9);
+        assert_eq!(s.property_histogram(1, 2), Some(&[2][..]));
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_zero_length_histogram_blob() {
+        // A hand-built image with a 0-length blob must be rejected (encode never produces one).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes header (`rmp` task #82)
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships header
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 histogram entry
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // label token 4
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // blob_len 0 (invalid)
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_duplicate_histogram_key() {
+        // Two entries with the same (label, prop) key must be rejected (encode never produces them:
+        // the BTreeMap deduplicates by key).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes header (`rmp` task #82)
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships header
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // 2 histogram entries
+        for _ in 0..2 {
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // prop token 1 (same key both times)
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // blob_len 1
+            bytes.push(0xAA); // blob byte
+        }
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_histogram_truncation() {
+        // Truncating mid-blob (the length header promises more bytes than remain) must be rejected.
+        let mut s = Statistics::new();
+        s.set_property_histogram(1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut bytes = s.encode();
+        bytes.truncate(bytes.len() - 3);
         assert!(Statistics::decode(&bytes).is_err());
     }
 

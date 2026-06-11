@@ -337,6 +337,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.stores[3].to_meta(),
             ],
             tokens: self.tokens.clone(),
+            // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
+            // the histogram blobs ride the same checkpoint-at-commit path as the counts with no
+            // special-casing — `Statistics` is cloned structurally.
             statistics: self.statistics.clone(),
         }
     }
@@ -978,7 +981,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Restore the live-record cardinalities from the durable catalog (`rmp` task #79): on
         // rollback this discards the aborting transaction's in-memory increments/decrements (it never
         // checkpointed them), exactly as the id high-water / free-list restore above does, so a
-        // rolled-back create/delete/label-change leaves the counts at their last committed values.
+        // rolled-back create/delete/label-change leaves the counts at their last committed values. The
+        // `rmp` task #81 property-histogram map is a field of `Statistics`, so this same assignment
+        // discards a rolled-back `set_property_histogram`/`remove_property_histogram` too.
         self.statistics = meta.statistics;
         // The catalog is only ever checkpointed at commit, so during an open transaction the chain
         // already matches disk; reload (rollback / recovery) restores the durable committed chain.
@@ -1025,6 +1030,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let rec = NodeRecord::new(eid, VersionStamp::in_flight(txn));
         self.write_node(id, &rec, txn)?;
         self.note_created(txn, StoreKind::Node, id);
+        // Maintain the grand-total live-node count (`rmp` task #82): once per node, labelled or not —
+        // an unlabelled node contributes to no per-label count but is still a node. In-memory only;
+        // durable at the commit checkpoint, reverted by `reload_catalog` on rollback.
+        self.statistics.inc_node();
         Ok((id, eid))
     }
 
@@ -1109,6 +1118,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.statistics.dec_label(token_id);
             }
         }
+        // Drop this node's contribution to the grand-total live-node count (`rmp` task #82): once per
+        // node, alongside the per-label decrements and independent of how many labels it carried.
+        // Reclamation at GC ([`reclaim_node`]) must NOT decrement again; rollback restores it via
+        // `reload_catalog`.
+        self.statistics.dec_node();
         self.patch_header_word(
             StoreKind::Node,
             id,
@@ -1310,11 +1324,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             start_node.first_rel = id;
             self.write_rel(id, &rel, txn)?;
             self.write_node(start, &start_node, txn)?;
-            // Maintain the per-relationship-type live count (`rmp` task #79): the self-loop is now a
-            // live version. Both endpoints are the (validated) live start node, so the increment is
-            // unconditional here. In-memory only; durable at the commit checkpoint, reverted by
-            // `reload_catalog` on rollback.
+            // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
+            // live-relationship count (`rmp` task #82): the self-loop is now a live version. Both
+            // endpoints are the (validated) live start node, so the increment is unconditional here.
+            // This branch is mutually exclusive with the normal branch below, so the grand total is
+            // incremented exactly once per relationship. In-memory only; durable at the commit
+            // checkpoint, reverted by `reload_catalog` on rollback.
             self.statistics.inc_rel_type(type_id);
+            self.statistics.inc_rel();
             return Ok((id, eid));
         }
 
@@ -1344,10 +1361,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.write_rel(id, &rel, txn)?;
         self.write_node(start, &start_node, txn)?;
         self.write_node(end, &end_node, txn)?;
-        // Maintain the per-relationship-type live count (`rmp` task #79): the relationship is now a
-        // written, live version and both endpoints are validated. In-memory only; durable at the
-        // commit checkpoint, reverted by `reload_catalog` on rollback.
+        // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
+        // live-relationship count (`rmp` task #82): the relationship is now a written, live version
+        // and both endpoints are validated. The self-loop branch above returns early, so the grand
+        // total is incremented exactly once per relationship. In-memory only; durable at the commit
+        // checkpoint, reverted by `reload_catalog` on rollback.
         self.statistics.inc_rel_type(type_id);
+        self.statistics.inc_rel();
         Ok((id, eid))
     }
 
@@ -1402,11 +1422,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             txn,
         )?;
         self.note_expired(txn, StoreKind::Rel, id);
-        // The relationship ceases to be a live version on this committed transition (`rmp` task #79):
-        // drop its contribution to the per-type count. Reclamation at GC ([`reclaim_rel`]) must NOT
-        // decrement again — the count already reflects the deletion from here. On rollback the count
-        // is restored by `reload_catalog`, so an aborted delete does not undercount.
+        // The relationship ceases to be a live version on this committed transition (`rmp` task #79 /
+        // #82): drop its contribution to the per-type count and the grand-total live-relationship
+        // count. Reclamation at GC ([`reclaim_rel`]) must NOT decrement again — the counts already
+        // reflect the deletion from here. On rollback they are restored by `reload_catalog`, so an
+        // aborted delete does not undercount.
         self.statistics.dec_rel_type(rel.type_id);
+        self.statistics.dec_rel();
         Ok(())
     }
 
@@ -2347,6 +2369,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn rel_count_for_type(&self, type_token_id: u32) -> u64 {
         self.statistics.rel_count_for_type(type_token_id)
+    }
+
+    /// The total number of currently-live nodes, **labelled or not**, from the persisted statistics
+    /// (`rmp` task #82). This is the planner's required grand total — not the sum of the per-label
+    /// counts, which would over- or under-count nodes carrying several labels or none. Convenience
+    /// over [`statistics`](Self::statistics).
+    #[must_use]
+    pub fn total_node_count(&self) -> u64 {
+        self.statistics.total_nodes()
+    }
+
+    /// The total number of currently-live relationships, from the persisted statistics
+    /// (`rmp` task #82). Convenience over [`statistics`](Self::statistics).
+    #[must_use]
+    pub fn total_relationship_count(&self) -> u64 {
+        self.statistics.total_relationships()
+    }
+
+    /// Borrows the durable opaque value histogram for the node-label property
+    /// `(label_token, prop_token)`, or [`None`] if none has been recorded (`rmp` task #81).
+    ///
+    /// The bytes are returned uninterpreted: storage stores them verbatim and never decodes them
+    /// (doing so would require depending on `graphus-index`, which depends on this crate). Only the
+    /// query-layer producer/consumer knows their encoding.
+    #[must_use]
+    pub fn property_histogram(&self, label_token: u32, prop_token: u32) -> Option<&[u8]> {
+        self.statistics.property_histogram(label_token, prop_token)
+    }
+
+    /// Records (or replaces) the opaque value histogram for the node-label property
+    /// `(label_token, prop_token)` with `bytes`, stored verbatim (`rmp` task #81).
+    ///
+    /// The mutation is purely in-memory here. Like the `rmp` task #79 count mutators, it becomes
+    /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
+    /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
+    ///
+    /// An empty `bytes` removes any existing entry: a histogram is never zero-length, so an empty
+    /// value is meaningless and would not survive the codec round-trip.
+    pub fn set_property_histogram(&mut self, label_token: u32, prop_token: u32, bytes: Vec<u8>) {
+        self.statistics
+            .set_property_histogram(label_token, prop_token, bytes);
+    }
+
+    /// Removes the durable value histogram for the node-label property `(label_token, prop_token)`,
+    /// if present (`rmp` task #81). Removing an absent entry is a harmless no-op.
+    ///
+    /// Like [`set_property_histogram`](Self::set_property_histogram), the removal is in-memory and
+    /// becomes durable at the enclosing transaction's commit, and is discarded on rollback.
+    pub fn remove_property_histogram(&mut self, label_token: u32, prop_token: u32) {
+        self.statistics
+            .remove_property_histogram(label_token, prop_token);
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

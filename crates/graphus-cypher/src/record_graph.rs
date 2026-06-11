@@ -75,6 +75,9 @@ use std::rc::Rc;
 
 use graphus_core::error::GraphusError;
 use graphus_core::{Timestamp, TxnId, Value};
+use graphus_index::histogram::PropertyHistogram;
+use graphus_index::keycodec::encode_single;
+use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_io::BlockDevice;
 use graphus_storage::{MvccHeader, Namespace, RecordStore};
 use graphus_txn::{CommitRegistry, LockOutcome, LockTable, Snapshot, SsiTracker, is_visible};
@@ -641,6 +644,264 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 }
             }
         }
+    }
+
+    /// **Recomputes** (the `ANALYZE` path) the equi-depth value histogram for the node-label property
+    /// `(label, property)` by scanning the live, snapshot-visible nodes carrying `label`, then
+    /// **persists** it in the store's durable statistics catalogue (`rmp` task #81).
+    ///
+    /// # The ANALYZE model (full scan → build → persist → commit)
+    ///
+    /// This is a deliberate **recompute-only** maintenance path, matching standard practice: an
+    /// equi-depth histogram cannot be maintained incrementally without resampling, so it is rebuilt
+    /// from a full scan on demand (`ANALYZE` / `UPDATE STATISTICS`), while the *counts*
+    /// (per-label / per-relationship-type / grand-total, `rmp` tasks #79/#82) are the cheaply,
+    /// incrementally-maintained statistics. The lifecycle is:
+    ///
+    /// 1. **Scan.** Enumerate the nodes carrying `label` **visible to this transaction's snapshot**,
+    ///    reusing the same machinery `MATCH (n:Label)` uses ([`scan_nodes_by_label`](GraphAccess::scan_nodes_by_label)),
+    ///    so the recompute observes exactly the rows a query would — no phantom rows, no rows hidden
+    ///    by MVCC.
+    /// 2. **Build.** For each visible node read the current visible value of `property`; skip a node
+    ///    whose value is absent or not index-encodable (`Null` / `List` / `Map`), since such a value
+    ///    never participates in the indexed distribution. Order-preservingly encode each present value
+    ///    ([`encode_single`]), sort the encodings ascending (the [`from_sorted_encoded`](PropertyHistogram::from_sorted_encoded)
+    ///    contract), and build the histogram with [`DEFAULT_HISTOGRAM_BUCKETS`].
+    /// 3. **Persist.** Resolve (interning if new, so a brand-new `label`/`property` gets a durable
+    ///    token) the label and property-key tokens, then store the encoded histogram via
+    ///    [`RecordStore::set_property_histogram`]. An **empty** result (no node has an index-encodable
+    ///    value) instead [`removes`](RecordStore::remove_property_histogram) any stale histogram, so a
+    ///    column that lost all its indexable values reverts cleanly to the estimator's constant
+    ///    fallback rather than reporting a stale distribution.
+    /// 4. **Commit.** The mutation is in-memory until the caller commits **this** graph's transaction
+    ///    ([`commit`](Self::commit)); on commit it is checkpointed durably, on rollback it is
+    ///    discarded — exactly the crash-consistency contract of `set_property_histogram`.
+    ///
+    /// The histogram's selectivity is then surfaced through this graph's
+    /// [`Statistics`](crate::statistics::Statistics) impl (and so to the planner via
+    /// [`plan_physical_with_stats`](crate::physical::plan_physical_with_stats)) on any *later*
+    /// transaction whose snapshot sees the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first storage error the scan or token interning hit. A captured read error (the
+    /// scan degraded to empty under [`take_error`](Self::take_error)) is surfaced as the same error,
+    /// so a faulty scan never silently persists a partial histogram.
+    pub fn recompute_property_histogram(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<(), GraphusError> {
+        // --- scan: the live, snapshot-visible nodes carrying `label` (the MATCH (n:Label) path) ---
+        let nodes = self.scan_nodes_by_label(label);
+        if let Some(err) = self.take_error() {
+            // The label scan degraded to a (possibly partial) list on a storage fault; do not persist
+            // a histogram built from an untrustworthy scan.
+            return Err(err);
+        }
+
+        // --- build: encode each present, index-encodable value of `property` ---
+        let mut encoded: Vec<Vec<u8>> = Vec::new();
+        for node in nodes {
+            // Read the current visible value of `property` for this node (newest-visible-wins).
+            let Some(value) = self.node_property(node, property) else {
+                continue; // property absent on this node — it does not participate
+            };
+            // A non-index-encodable value (Null / List / Map) is skipped, matching how the index and
+            // MemGraph's reference histogram treat it.
+            if let Ok(bytes) = encode_single(&value) {
+                encoded.push(bytes);
+            }
+        }
+        if let Some(err) = self.take_error() {
+            // A per-node property read hit a storage / decode fault: abort rather than persist a
+            // partial histogram.
+            return Err(err);
+        }
+
+        // --- persist: resolve (interning if new) the tokens, then store / clear the histogram ---
+        if encoded.is_empty() {
+            // No index-encodable value: clear any stale histogram so the estimator falls back cleanly.
+            // Resolve the tokens *without* interning — if either was never created, there is nothing
+            // stored to remove, so this is a no-op (and we avoid minting a token just to clear).
+            let (Some(label_token), Some(prop_token)) = (
+                self.label_id_existing(label),
+                self.store.borrow().token_id(Namespace::PropKey, property),
+            ) else {
+                return Ok(());
+            };
+            self.store
+                .borrow_mut()
+                .remove_property_histogram(label_token, prop_token);
+            return Ok(());
+        }
+
+        // `from_sorted_encoded` requires ascending byte order; the encoder is order-preserving, so a
+        // plain lexicographic sort of the encodings is exactly Cypher value order.
+        encoded.sort_unstable();
+        let hist = PropertyHistogram::from_sorted_encoded(&encoded, DEFAULT_HISTOGRAM_BUCKETS);
+
+        // Intern so a brand-new label / property gets a durable token (it becomes durable at commit,
+        // like the count statistics).
+        let label_token = self.label_id_intern(label).ok_or_else(|| {
+            self.take_error()
+                .unwrap_or_else(|| GraphusError::Storage("label token interning failed".to_owned()))
+        })?;
+        let prop_token = self.prop_key_id(property).ok_or_else(|| {
+            self.take_error().unwrap_or_else(|| {
+                GraphusError::Storage("property-key token interning failed".to_owned())
+            })
+        })?;
+        self.store
+            .borrow_mut()
+            .set_property_histogram(label_token, prop_token, hist.encode());
+        Ok(())
+    }
+
+    /// Recomputes the histograms for every `(label, property)` in `targets`, in order, short-circuiting
+    /// on the first error (`rmp` task #81). A convenience over [`recompute_property_histogram`](Self::recompute_property_histogram)
+    /// for an `ANALYZE` over several columns; all persist into the same transaction, so one
+    /// [`commit`](Self::commit) makes them all durable together.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error any single recompute hits (see [`recompute_property_histogram`](Self::recompute_property_histogram)).
+    pub fn recompute_property_histograms(
+        &self,
+        targets: &[(&str, &str)],
+    ) -> Result<(), GraphusError> {
+        for &(label, property) in targets {
+            self.recompute_property_histogram(label, property)?;
+        }
+        Ok(())
+    }
+
+    /// The existing [`Namespace::PropKey`] token id for `name`, **without** interning it.
+    ///
+    /// The read-side counterpart used by the [`Statistics`](crate::statistics::Statistics) histogram
+    /// lookups: a property key that was never interned cannot have a stored histogram, so a missing
+    /// token means "no histogram" (the estimator falls back) rather than minting a token by asking.
+    fn prop_key_id_existing(&self, name: &str) -> Option<u32> {
+        self.store.borrow().token_id(Namespace::PropKey, name)
+    }
+
+    /// Decodes the durable histogram stored for `(label, property)`, or `None` when the label /
+    /// property token was never interned or no histogram is recorded for the pair.
+    ///
+    /// A **decode error** (a corrupt or truncated stored histogram) is captured into this graph's
+    /// error cell — so the caller's `take_error` surfaces it — and reported as `None` (the estimator
+    /// then falls back to its constant), never a panic. This mirrors how every other read in this seam
+    /// degrades safely on a storage fault.
+    fn decode_histogram(&self, label: &str, property: &str) -> Option<PropertyHistogram> {
+        let label_token = self.label_id_existing(label)?;
+        let prop_token = self.prop_key_id_existing(property)?;
+        let store = self.store.borrow();
+        let bytes = store.property_histogram(label_token, prop_token)?;
+        match PropertyHistogram::decode(bytes) {
+            Ok(hist) => Some(hist),
+            Err(e) => {
+                drop(store);
+                self.capture(GraphusError::Storage(format!(
+                    "corrupt property histogram for ({label}.{property}): {e}"
+                )));
+                None
+            }
+        }
+    }
+}
+
+/// Exact-count + histogram-backed statistics over the **real** store's durable catalogue
+/// (`rmp` task #81), surfaced to the cardinality estimator ([`crate::cardinality`]).
+///
+/// # What is reported
+///
+/// The counts are the store's **global committed catalogue counts** (`rmp` tasks #79/#82): the
+/// grand total of live nodes / relationships and the per-label / per-relationship-type breakdowns,
+/// maintained incrementally and persisted with the catalog. They are **not** filtered by this
+/// graph's MVCC snapshot — and deliberately so: cost estimation wants the catalogue's aggregate
+/// shape of the data, not one transaction's snapshot view (statistics are inherently approximate
+/// inputs to a cost model, and the catalogue counts are the conventional, cheaply-maintained source
+/// a planner consumes). This matches how the per-label counts themselves are maintained.
+///
+/// The property-selectivity methods decode the durable equi-depth histogram for the
+/// `(label, property)` pair (built by [`recompute_property_histogram`](RecordStoreGraph::recompute_property_histogram)).
+/// Decoding returns an **owned** [`PropertyHistogram`], so no borrow of the store escapes the method
+/// — the `&self` / `RefCell` borrow is released before the histogram is queried.
+///
+/// # `None` semantics (fall back), exactly as the seam documents
+///
+/// A property method returns `None` — requesting the estimator's documented constant fallback — when
+/// **no** histogram is stored for the pair (the column was never `ANALYZE`d, or the label/property
+/// token was never interned), or when the query value / a present range bound is not index-encodable
+/// (`Null` / `List` / `Map`). A *stored* histogram over an absent value legitimately answers
+/// `Some(0.0)` (an exact "nothing matches"), distinct from the `None` "unknown" sentinel.
+impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGraph<D, S> {
+    fn total_nodes(&self) -> u64 {
+        self.store.borrow().total_node_count()
+    }
+
+    fn nodes_with_label(&self, label: &str) -> Option<u64> {
+        // The backend tracks exact per-label counts (`rmp` task #79). A label that was never interned
+        // can have no live node, so it is an exact `Some(0)` — never the `None` "unknown" sentinel.
+        let count = self
+            .label_id_existing(label)
+            .map_or(0, |token| self.store.borrow().node_count_for_label(token));
+        Some(count)
+    }
+
+    fn total_relationships(&self) -> u64 {
+        self.store.borrow().total_relationship_count()
+    }
+
+    fn relationships_with_type(&self, rel_type: &str) -> Option<u64> {
+        // Exact per-relationship-type counts (`rmp` task #79); a never-interned type is an exact 0.
+        let store = self.store.borrow();
+        let count = store
+            .token_id(Namespace::RelType, rel_type)
+            .map_or(0, |token| store.rel_count_for_type(token));
+        Some(count)
+    }
+
+    fn estimate_nodes_label_property_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<f64> {
+        // No histogram stored -> None (fall back). A decode error is captured and also reported as
+        // None (the caller must inspect `take_error`).
+        let hist = self.decode_histogram(label, property)?;
+        // An unindexable query value (Null/List/Map) cannot be placed in the histogram -> None.
+        let encoded = encode_single(value).ok()?;
+        Some(hist.estimate_eq(&encoded))
+    }
+
+    fn estimate_nodes_label_property_range(
+        &self,
+        label: &str,
+        property: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Option<f64> {
+        let hist = self.decode_histogram(label, property)?;
+        // A *present* bound that is not index-encodable makes the range unsound (we cannot place that
+        // boundary in encoded space), so return `None` and fall back rather than silently dropping it.
+        // An *absent* bound is simply open on that side. `transpose` turns `Option<Result<_>>` into
+        // `Result<Option<_>>`, so a present-but-unindexable bound short-circuits to `None` here.
+        let lo_enc = lo.map(encode_single).transpose().ok()?;
+        let hi_enc = hi.map(encode_single).transpose().ok()?;
+        Some(hist.estimate_range(
+            lo_enc.as_deref(),
+            lo_inclusive,
+            hi_enc.as_deref(),
+            hi_inclusive,
+        ))
+    }
+
+    fn distinct_label_property_values(&self, label: &str, property: &str) -> Option<u64> {
+        Some(self.decode_histogram(label, property)?.distinct())
     }
 }
 
@@ -1313,5 +1574,15 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if let Err(e) = self.store.borrow_mut().delete_node(self.txn, node.0) {
             self.capture(e);
         }
+    }
+
+    // ---- statistics ---------------------------------------------------------------------------
+
+    /// Surfaces the store's durable statistics catalogue to the cardinality estimator
+    /// (`rmp` task #81). The real backend tracks live counts (`rmp` tasks #79/#82) and per-indexed-
+    /// property equi-depth histograms (built on demand by [`recompute_property_histogram`](Self::recompute_property_histogram)),
+    /// so the planner gets real selectivities here exactly as it does over [`MemGraph`](crate::graph_access::MemGraph).
+    fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+        Some(self)
     }
 }

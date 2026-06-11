@@ -9,8 +9,23 @@
 //! ([`PhysicalPlan::estimated_rows`](crate::physical::PhysicalPlan::estimated_rows)), but **no
 //! plan-choice branches on it** (sub-task #80 keeps every operator tree byte-identical), so this
 //! module changes no query result and no plan shape — only the value carried alongside the plan. A
-//! later sub-task wires that estimate into a cost model; sub-task #81 replaces the constant predicate
-//! selectivity below with property histograms.
+//! later sub-task wires that estimate into a cost model.
+//!
+//! # Property-histogram filter selectivity (sub-task #81)
+//!
+//! A [`Filter`](LogicalOp::Filter) whose predicate is a single property comparison on a label-scanned
+//! variable — `v.prop = lit`, or `v.prop </<=/>/>=  lit` (and the mirrored `lit <op> v.prop` forms) —
+//! is estimated from a real **equi-depth histogram** read through the [`Statistics`] property-
+//! selectivity seam ([`Statistics::estimate_nodes_label_property_eq`] /
+//! [`estimate_nodes_label_property_range`](Statistics::estimate_nodes_label_property_range)), instead
+//! of the flat [`DEFAULT_PREDICATE_SELECTIVITY`]. The detected predicate shapes mirror the physical
+//! planner's index-selection detection ([`crate::physical`]) exactly, so the estimator recognises the
+//! same predicates the planner can turn into index seeks. Every other predicate shape — a non-property
+//! comparison, a non-literal operand, a filter not over a label scan, an unindexable literal, absent
+//! statistics, or a `None` from the seam — **falls back** to the documented constant (see
+//! [`estimate`]'s `Filter` arm for the full fallback matrix). The fallback is per-`Filter`: the
+//! logical lowering splits a conjunction (`AND`) into **nested** `Filter`s, so each `Filter` here
+//! carries a single conjunct, and a compound predicate composes per-filter selectivities naturally.
 //!
 //! # Why `f64`
 //!
@@ -38,9 +53,10 @@
 //! — they are not claimed to be accurate, and sub-task #81 supersedes the predicate one with real
 //! histograms.
 
-use crate::ast::{ExprKind, Literal, VarLengthRange};
+use crate::ast::{BinaryOp, Expr, ExprKind, Literal, VarLengthRange};
 use crate::logical::LogicalOp;
 use crate::statistics::Statistics;
+use graphus_core::Value;
 
 // =================================================================================================
 // Default constants (the textbook "magic numbers", used only when statistics are absent/unknown)
@@ -56,13 +72,17 @@ use crate::statistics::Statistics;
 /// model relies on), but not so small that a labelled scan looks free.
 pub const DEFAULT_LABEL_SELECTIVITY: f64 = 0.1;
 
-/// Selectivity assumed for a single [`Filter`](LogicalOp::Filter) predicate of unknown form.
+/// Selectivity assumed for a single [`Filter`](LogicalOp::Filter) predicate **when no histogram
+/// estimate is available**.
 ///
 /// `0.3` is the classic textbook default for an unknown predicate with no histogram (System R used
 /// `1/3` for an inequality and similar magic constants throughout; `0.3` is the widely-cited rounded
-/// value). It is intentionally a *guess*: sub-task #81 replaces it with property-histogram-driven
-/// selectivities. Until then it keeps a filtered estimate strictly below its input (a filter never
-/// adds rows) while leaving a meaningful fraction.
+/// value). As of sub-task #81 the estimator prefers a property-histogram-driven estimate for a
+/// recognised single-property comparison over a label-scanned variable (see [`estimate`]'s `Filter`
+/// arm); this constant is the **fallback** for every other case — a non-property predicate, a
+/// non-literal / unindexable operand, a filter not over a label scan, absent statistics, or a `None`
+/// from the [`Statistics`] seam. It keeps such a filtered estimate strictly below its input (a filter
+/// never adds rows) while leaving a meaningful fraction.
 pub const DEFAULT_PREDICATE_SELECTIVITY: f64 = 0.3;
 
 /// Assumed total node count when no [`Statistics`] source is available.
@@ -317,8 +337,12 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
 
         // ---- relational ---------------------------------------------------------------------------
 
-        // A filter keeps a documented fraction of its input (a filter never adds rows).
-        LogicalOp::Filter { input, .. } => estimate(input, stats) * DEFAULT_PREDICATE_SELECTIVITY,
+        // A filter keeps at most its input (a filter never adds rows). When the predicate is a single
+        // property comparison on a label-scanned variable AND statistics carry a histogram for that
+        // label.property, the estimate comes from the histogram (clamped to the input — a stale stat
+        // can never make a filter *grow* its input). Otherwise it falls back to a documented constant
+        // fraction. See `estimate_filter` for the full detection + fallback matrix.
+        LogicalOp::Filter { input, predicate } => estimate_filter(input, predicate, stats),
 
         // A non-distinct projection is a pure pass-through (one output row per input row). A DISTINCT
         // projection de-duplicates, so it keeps a documented fraction (<= input).
@@ -410,6 +434,279 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
             Some(inner) => estimate(inner, stats) * DEFAULT_PROCEDURE_YIELD,
             None => DEFAULT_PROCEDURE_YIELD,
         },
+    }
+}
+
+// =================================================================================================
+// Filter selectivity: histogram-driven where possible, constant fallback otherwise (sub-task #81)
+// =================================================================================================
+
+/// Estimates a [`Filter`](LogicalOp::Filter)'s output cardinality.
+///
+/// The model, in order:
+///
+/// 1. `input_rows = estimate(input)` — a filter never adds rows, so this is the ceiling.
+/// 2. If the `predicate` is a single property comparison on a variable `v` (equality or a range, with
+///    a bare, index-encodable literal operand), `v` is bound by a [`NodeByLabelScan`](LogicalOp::NodeByLabelScan)
+///    somewhere on `input`'s spine, and `stats` carries a histogram for that `label.property`, the
+///    estimate is the histogram's answer **clamped to `[0, input_rows]`** (clamping keeps the estimate
+///    sound under stale statistics — a filter can never exceed its input).
+/// 3. Otherwise (no property predicate, unresolved label, non-literal / unindexable operand, no
+///    statistics, or `None` from the seam) the estimate is `input_rows * DEFAULT_PREDICATE_SELECTIVITY`.
+///
+/// The whole result is finite and non-negative; [`estimate_rows`] additionally clamps the tree.
+fn estimate_filter(input: &LogicalOp, predicate: &Expr, stats: Option<&dyn Statistics>) -> f64 {
+    let input_rows = estimate(input, stats);
+    if let Some(count) = histogram_filter_estimate(input, predicate, stats) {
+        // A filter never adds rows; clamp to the input so a stale histogram cannot make it grow.
+        return count.clamp(0.0, input_rows);
+    }
+    input_rows * DEFAULT_PREDICATE_SELECTIVITY
+}
+
+/// Attempts a histogram-backed row estimate for a filter, returning `None` to request the constant
+/// fallback. `None` is returned when **any** precondition fails: no statistics, the predicate is not a
+/// recognised single-property comparison, the variable is not bound by a label scan on `input`, the
+/// literal does not convert to an index-encodable [`Value`], or the [`Statistics`] seam returns `None`
+/// (no histogram for this `label.property`, or an unindexable value).
+fn histogram_filter_estimate(
+    input: &LogicalOp,
+    predicate: &Expr,
+    stats: Option<&dyn Statistics>,
+) -> Option<f64> {
+    let stats = stats?;
+    let pred = analyze_property_comparison(predicate)?;
+    let label = label_for_var(input, &pred.variable)?;
+    match pred.kind {
+        ComparisonKind::Equality { value } => {
+            stats.estimate_nodes_label_property_eq(&label, &pred.property, &value)
+        }
+        ComparisonKind::Range { bound, value } => {
+            // Translate the one-sided bound into the histogram's (lo, hi, inclusive) range vocabulary.
+            let (lo, lo_inc, hi, hi_inc) = bound.as_range(&value);
+            stats.estimate_nodes_label_property_range(
+                &label,
+                &pred.property,
+                lo,
+                lo_inc,
+                hi,
+                hi_inc,
+            )
+        }
+    }
+}
+
+/// A single property comparison usable for histogram estimation: `variable.property <op> value`.
+///
+/// Mirrors the physical planner's [`PropertyPredicate`](crate::physical) detection, but carries the
+/// operand as an already-converted [`Value`] (the estimator needs the value, not the unevaluated AST)
+/// and records the variable name (the estimator must resolve the variable's label).
+struct PropertyComparison {
+    /// The compared variable (`v` in `v.prop`).
+    variable: String,
+    /// The property key (`prop` in `v.prop`).
+    property: String,
+    /// Equality or a one-sided range.
+    kind: ComparisonKind,
+}
+
+/// The two comparison shapes the histogram seam can serve.
+enum ComparisonKind {
+    /// `v.prop = value`.
+    Equality { value: Value },
+    /// `v.prop <op> value` for `<`, `<=`, `>`, `>=` (the `bound` already accounts for the side the
+    /// property appeared on).
+    Range { bound: RangeBound, value: Value },
+}
+
+/// A one-sided range bound on the property, matching the four comparison operators. Kept local to the
+/// estimator (the physical planner has its own `RangeBound` for the *plan*; this one only models the
+/// estimate) so the cardinality module has no dependency on the physical planner.
+#[derive(Clone, Copy)]
+enum RangeBound {
+    /// `v.prop > value`.
+    GreaterThan,
+    /// `v.prop >= value`.
+    GreaterOrEqual,
+    /// `v.prop < value`.
+    LessThan,
+    /// `v.prop <= value`.
+    LessOrEqual,
+}
+
+impl RangeBound {
+    /// The bound implied by `v.prop <op> value` (property on the **left**); `None` for a non-range op.
+    fn from_property_lhs(op: BinaryOp) -> Option<Self> {
+        match op {
+            BinaryOp::Gt => Some(Self::GreaterThan),
+            BinaryOp::Gte => Some(Self::GreaterOrEqual),
+            BinaryOp::Lt => Some(Self::LessThan),
+            BinaryOp::Lte => Some(Self::LessOrEqual),
+            _ => None,
+        }
+    }
+
+    /// The symmetric bound when the property is on the **right** (`value <op> v.prop`).
+    fn mirrored(self) -> Self {
+        match self {
+            Self::GreaterThan => Self::LessThan,
+            Self::GreaterOrEqual => Self::LessOrEqual,
+            Self::LessThan => Self::GreaterThan,
+            Self::LessOrEqual => Self::GreaterOrEqual,
+        }
+    }
+
+    /// Expresses this one-sided bound as the histogram's `(lo, lo_inclusive, hi, hi_inclusive)`
+    /// argument tuple over `value`. A `>`/`>=` bound is a low bound with the high side open; a
+    /// `<`/`<=` bound is a high bound with the low side open.
+    fn as_range(self, value: &Value) -> (Option<&Value>, bool, Option<&Value>, bool) {
+        match self {
+            Self::GreaterThan => (Some(value), false, None, true),
+            Self::GreaterOrEqual => (Some(value), true, None, true),
+            Self::LessThan => (None, true, Some(value), false),
+            Self::LessOrEqual => (None, true, Some(value), true),
+        }
+    }
+}
+
+/// Recognises a single property comparison `variable.property <op> literal` (or the mirrored
+/// `literal <op> variable.property`) and converts the literal to a [`Value`].
+///
+/// Returns `None` unless the expression is a binary comparison (`=`, `<`, `<=`, `>`, `>=`) with
+/// exactly one side a `variable.property` access and the other a **bare, index-encodable literal**.
+/// Mirrors the physical planner's [`analyze_property_predicate`](crate::physical) shape detection so
+/// the estimator and the planner recognise the same predicates; the estimator additionally requires
+/// the operand to be a *literal* (a parameter's value is unknown at planning time, so no histogram
+/// lookup is possible) and to convert to a `Value` (an out-of-`i64`-range integer, `null`, or any
+/// non-scalar literal is rejected).
+fn analyze_property_comparison(expr: &Expr) -> Option<PropertyComparison> {
+    let ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
+        return None;
+    };
+    // Property on the left: `var.prop <op> literal`.
+    if let Some((variable, property)) = property_access(lhs) {
+        if let Some(value) = literal_value(rhs) {
+            return comparison_from(*op, variable, property, value, false);
+        }
+    }
+    // Property on the right: `literal <op> var.prop`.
+    if let Some((variable, property)) = property_access(rhs) {
+        if let Some(value) = literal_value(lhs) {
+            return comparison_from(*op, variable, property, value, true);
+        }
+    }
+    None
+}
+
+/// Builds a [`PropertyComparison`] from a comparison operator. `property_on_right` mirrors a range
+/// bound (so `literal < v.prop` becomes the bound `v.prop > literal`). Returns `None` for a
+/// non-comparison operator.
+fn comparison_from(
+    op: BinaryOp,
+    variable: String,
+    property: String,
+    value: Value,
+    property_on_right: bool,
+) -> Option<PropertyComparison> {
+    match op {
+        BinaryOp::Eq => Some(PropertyComparison {
+            variable,
+            property,
+            kind: ComparisonKind::Equality { value },
+        }),
+        BinaryOp::Gt | BinaryOp::Gte | BinaryOp::Lt | BinaryOp::Lte => {
+            let mut bound = RangeBound::from_property_lhs(op)?;
+            if property_on_right {
+                bound = bound.mirrored();
+            }
+            Some(PropertyComparison {
+                variable,
+                property,
+                kind: ComparisonKind::Range { bound, value },
+            })
+        }
+        _ => None,
+    }
+}
+
+/// If `expr` is exactly `variable.key`, returns `(variable, key)`.
+fn property_access(expr: &Expr) -> Option<(String, String)> {
+    if let ExprKind::Property { base, key } = &expr.kind {
+        if let ExprKind::Variable(name) = &base.kind {
+            return Some((name.clone(), key.clone()));
+        }
+    }
+    None
+}
+
+/// Converts a **bare** scalar literal expression to a [`graphus_core::Value`], or `None`.
+///
+/// Only a directly-written literal is usable for a histogram lookup (a parameter or computed
+/// expression has no value at planning time). An integer beyond `i64`'s range, the `null` literal,
+/// and any non-scalar literal are rejected (`None`) — the caller then falls back to the constant
+/// selectivity. The integer magnitude is a `u128` (the lexer keeps the sign as a separate unary
+/// minus); since the property-comparison forms here have no unary minus folded in, only the
+/// non-negative magnitude is convertible, which is the overwhelmingly common literal shape.
+fn literal_value(expr: &Expr) -> Option<Value> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Integer(int_lit)) => {
+            i64::try_from(int_lit.value).ok().map(Value::Integer)
+        }
+        ExprKind::Literal(Literal::Float(f)) => Some(Value::Float(*f)),
+        ExprKind::Literal(Literal::String(s)) => Some(Value::String(s.clone())),
+        ExprKind::Literal(Literal::Boolean(b)) => Some(Value::Boolean(*b)),
+        // Null is not index-encodable; lists, maps, parameters, and computed expressions have no
+        // bare value here.
+        _ => None,
+    }
+}
+
+/// Resolves the label of `variable` by searching `op`'s subtree for the
+/// [`NodeByLabelScan`](LogicalOp::NodeByLabelScan) that binds it.
+///
+/// The estimator descends the **single-input** operator spine (filters, projections that pass the
+/// variable through, sorts, skips/limits, and the graph/write operators that thread one input): a
+/// label scan that binds `variable` may sit directly under the filter or a few hops down. Binary
+/// operators ([`Apply`](LogicalOp::Apply) / [`Union`](LogicalOp::Union)) are searched on **both**
+/// branches. Returns the first matching label found (a variable is bound by at most one scan in a
+/// validated plan), or `None` if `variable` is not bound by a label scan (e.g. it comes from an
+/// [`AllNodesScan`](LogicalOp::AllNodesScan), an expand, or `UNWIND`) — in which case no per-label
+/// histogram applies and the caller falls back.
+fn label_for_var(op: &LogicalOp, variable: &str) -> Option<String> {
+    match op {
+        LogicalOp::NodeByLabelScan { variable: v, label } if v.name == variable => {
+            Some(label.name.clone())
+        }
+        // Single-input operators: recurse into the one child.
+        LogicalOp::Filter { input, .. }
+        | LogicalOp::Projection { input, .. }
+        | LogicalOp::Aggregation { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Skip { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::Unwind { input, .. }
+        | LogicalOp::LoadCsv { input, .. }
+        | LogicalOp::Expand { input, .. }
+        | LogicalOp::NamedPath { input, .. }
+        | LogicalOp::Optional { input, .. }
+        | LogicalOp::Create { input, .. }
+        | LogicalOp::Merge { input, .. }
+        | LogicalOp::SetClause { input, .. }
+        | LogicalOp::Delete { input, .. }
+        | LogicalOp::Remove { input, .. } => label_for_var(input, variable),
+        // Binary operators: the binding may be on either side.
+        LogicalOp::Apply { left, right } | LogicalOp::Union { left, right, .. } => {
+            label_for_var(left, variable).or_else(|| label_for_var(right, variable))
+        }
+        LogicalOp::ProcedureCall { input, .. } => {
+            input.as_deref().and_then(|i| label_for_var(i, variable))
+        }
+        // Leaves that do not bind via a label scan (incl. a non-matching NodeByLabelScan).
+        LogicalOp::NodeByLabelScan { .. }
+        | LogicalOp::AllNodesScan { .. }
+        | LogicalOp::AllRelationshipsScan { .. }
+        | LogicalOp::Argument { .. }
+        | LogicalOp::Empty => None,
     }
 }
 
@@ -853,5 +1150,286 @@ mod tests {
         };
         let rows = estimate_rows(&expand, Some(&stub));
         assert!(rows.is_finite() && !rows.is_nan() && rows >= 0.0);
+    }
+
+    // =============================================================================================
+    // Filter selectivity: property-histogram path and fallback matrix (sub-task #81)
+    // =============================================================================================
+
+    /// A `var.key` property-access expression.
+    fn prop(var: &str, key: &str) -> Expr {
+        Expr::new(
+            ExprKind::Property {
+                base: Box::new(Expr::new(ExprKind::Variable(var.to_owned()), span())),
+                key: key.to_owned(),
+            },
+            span(),
+        )
+    }
+
+    /// A binary expression `lhs <op> rhs`.
+    fn binary(op: crate::ast::BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::new(
+            ExprKind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            span(),
+        )
+    }
+
+    /// A `:Person` label scan binding `p`.
+    fn person_scan() -> LogicalOp {
+        LogicalOp::NodeByLabelScan {
+            variable: Var::named("p"),
+            label: label("Person"),
+        }
+    }
+
+    /// 100 `:Person` nodes with `age` uniformly `0..100` (every value distinct, so the true equality
+    /// count is exactly 1 and a range `[lo, hi)` count is exactly `hi - lo`).
+    fn age_graph() -> MemGraph {
+        let mut g = MemGraph::new();
+        for i in 0..100 {
+            g.add_node(["Person"], [("age", Value::Integer(i))]);
+        }
+        g
+    }
+
+    #[test]
+    fn distinct_label_property_values_is_exact() {
+        // 100 distinct ages -> 100 distinct indexed values.
+        let g = age_graph();
+        assert_eq!(g.distinct_label_property_values("Person", "age"), Some(100));
+        // An absent column on a present label is an exact empty histogram (Some(0)), not unknown.
+        assert_eq!(g.distinct_label_property_values("Person", "ghost"), Some(0));
+        // A value method is None only for an unindexable query value.
+        assert_eq!(
+            g.estimate_nodes_label_property_eq("Person", "age", &Value::Null),
+            None
+        );
+        assert_eq!(
+            g.estimate_nodes_label_property_eq("Person", "age", &Value::List(vec![])),
+            None
+        );
+    }
+
+    #[test]
+    fn filter_equality_uses_histogram() {
+        let g = age_graph();
+        let stats = g.statistics();
+        // WHERE p.age = 42  over  (:Person) — 100 distinct values, true count == 1.
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), int_expr(42)),
+        };
+        let est = estimate_rows(&filter, stats);
+        let input_rows = estimate_rows(&person_scan(), stats);
+        // The histogram's equality estimate is count/distinct per bucket; with all-distinct values it
+        // is ~1, and never exceeds the input (100). Bound generously around the true count of 1.
+        assert!(
+            est <= input_rows,
+            "filter never adds rows ({est} <= {input_rows})"
+        );
+        assert!(
+            (0.5..=2.0).contains(&est),
+            "equality estimate {est} should track the true count of 1"
+        );
+        // It must differ from the flat fallback (100 * 0.3 = 30), proving the histogram path fired.
+        assert!(
+            (est - input_rows * DEFAULT_PREDICATE_SELECTIVITY).abs() > 1.0,
+            "histogram estimate {est} must not equal the constant fallback"
+        );
+    }
+
+    #[test]
+    fn filter_equality_mirrored_literal_on_left() {
+        // WHERE 42 = p.age — the mirrored form is recognised identically.
+        let g = age_graph();
+        let stats = g.statistics();
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, int_expr(42), prop("p", "age")),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            (0.5..=2.0).contains(&est),
+            "mirrored equality estimate {est} ~ 1"
+        );
+    }
+
+    #[test]
+    fn filter_range_tracks_true_filtered_count() {
+        let g = age_graph();
+        let stats = g.statistics();
+        // WHERE p.age >= 50 — true count is 50 (ages 50..100).
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Gte, prop("p", "age"), int_expr(50)),
+        };
+        let est = estimate_rows(&filter, stats);
+        let input_rows = estimate_rows(&person_scan(), stats);
+        assert!(est <= input_rows, "filter never adds rows");
+        // The equi-depth range estimate contributes half a bucket per partially-covered boundary, so
+        // it is within ~one bucket depth of the true 50. With 100 rows over <=64 buckets a bucket
+        // holds >=2 rows; allow a generous +/-15 band around the true count.
+        assert!(
+            (35.0..=65.0).contains(&est),
+            "range estimate {est} should track the true filtered count of 50"
+        );
+    }
+
+    #[test]
+    fn filter_range_mirrored_form() {
+        // WHERE 50 <= p.age  ==  p.age >= 50 — true count 50.
+        let g = age_graph();
+        let stats = g.statistics();
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Lte, int_expr(50), prop("p", "age")),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            (35.0..=65.0).contains(&est),
+            "mirrored range estimate {est} ~ 50"
+        );
+    }
+
+    #[test]
+    fn filter_equality_value_outside_range_is_zero() {
+        // WHERE p.age = 9999 — no node matches; an empty/out-of-range equality is an exact 0.
+        let g = age_graph();
+        let stats = g.statistics();
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), int_expr(9999)),
+        };
+        assert_eq!(estimate_rows(&filter, stats), 0.0);
+    }
+
+    #[test]
+    fn filter_no_stats_uses_constant_fallback() {
+        // With no statistics, the input is the default total and the filter applies the constant.
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), int_expr(42)),
+        };
+        let input_rows = estimate_rows(&person_scan(), None);
+        let expected = input_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        assert!((estimate_rows(&filter, None) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filter_stub_stats_without_histogram_falls_back() {
+        // StubStats returns None for the property methods (the default impl), so even a perfectly
+        // formed property predicate falls back to the constant selectivity.
+        let stub = StubStats {
+            nodes: 1_000,
+            rels: 0,
+        };
+        let filter = LogicalOp::Filter {
+            // Person scan over the stub: per-label count is unknown -> 1000 * 0.1 = 100.
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), int_expr(42)),
+        };
+        let input_rows = estimate_rows(&person_scan(), Some(&stub));
+        let expected = input_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        assert!((estimate_rows(&filter, Some(&stub)) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filter_non_property_predicate_falls_back() {
+        // A boolean-literal predicate is not a property comparison -> constant fallback.
+        let g = age_graph();
+        let stats = g.statistics();
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: dummy_expr(),
+        };
+        let input_rows = estimate_rows(&person_scan(), stats);
+        let expected = input_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        assert!((estimate_rows(&filter, stats) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filter_input_not_label_scan_falls_back() {
+        // The property predicate is well-formed, but the variable is bound by an AllNodesScan (no
+        // label), so no per-label histogram applies -> constant fallback.
+        let g = age_graph();
+        let stats = g.statistics();
+        let filter = LogicalOp::Filter {
+            input: Box::new(LogicalOp::AllNodesScan {
+                variable: Var::named("p"),
+            }),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), int_expr(42)),
+        };
+        let input_rows = estimate_rows(
+            &LogicalOp::AllNodesScan {
+                variable: Var::named("p"),
+            },
+            stats,
+        );
+        let expected = input_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        assert!((estimate_rows(&filter, stats) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filter_non_literal_operand_falls_back() {
+        // p.age = $param — a parameter has no value at planning time -> constant fallback.
+        let g = age_graph();
+        let stats = g.statistics();
+        let param = Expr::new(ExprKind::Parameter("p".to_owned()), span());
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), param),
+        };
+        let input_rows = estimate_rows(&person_scan(), stats);
+        let expected = input_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        assert!((estimate_rows(&filter, stats) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn filter_estimate_is_finite_nonneg_and_bounded() {
+        // The histogram path always yields a finite, non-negative estimate <= the input.
+        let g = age_graph();
+        let stats = g.statistics();
+        let input_rows = estimate_rows(&person_scan(), stats);
+        for k in [0, 1, 50, 99, 1000] {
+            let filter = LogicalOp::Filter {
+                input: Box::new(person_scan()),
+                predicate: binary(crate::ast::BinaryOp::Lt, prop("p", "age"), int_expr(k)),
+            };
+            let est = estimate_rows(&filter, stats);
+            assert!(
+                est.is_finite() && est >= 0.0,
+                "estimate {est} must be finite >= 0"
+            );
+            assert!(
+                est <= input_rows,
+                "estimate {est} must not exceed input {input_rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_resolves_label_through_intervening_op() {
+        // p is bound by a label scan two hops down (under a Sort); the label resolver must still find
+        // it, so the histogram path fires (estimate ~ 1, not the constant 30).
+        let g = age_graph();
+        let stats = g.statistics();
+        let sorted = LogicalOp::Sort {
+            input: Box::new(person_scan()),
+            keys: Vec::new(),
+        };
+        let filter = LogicalOp::Filter {
+            input: Box::new(sorted),
+            predicate: binary(crate::ast::BinaryOp::Eq, prop("p", "age"), int_expr(42)),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            (0.5..=2.0).contains(&est),
+            "label resolved through Sort; histogram estimate {est} ~ 1"
+        );
     }
 }

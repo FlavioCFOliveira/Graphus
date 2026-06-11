@@ -35,6 +35,9 @@
 use std::collections::BTreeMap;
 
 use graphus_core::Value;
+use graphus_index::histogram::PropertyHistogram;
+use graphus_index::keycodec::encode_single;
+use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 
 use crate::ast::RelDirection;
 
@@ -600,12 +603,56 @@ impl GraphAccess for MemGraph {
     }
 }
 
-/// Exact, point-in-time count statistics over a [`MemGraph`]'s live map.
+impl MemGraph {
+    /// Builds an [equi-depth histogram](graphus_index::histogram::PropertyHistogram) over the values
+    /// of `property` on the nodes carrying `label`, exercising the Stage-1 histogram exactly as the
+    /// real backend will.
+    ///
+    /// Rather than answering selectivity by exact-counting (which would bypass the histogram seam and
+    /// leave it untested), [`MemGraph`] materialises a real histogram from its live data and lets the
+    /// estimator query *that* — so the in-memory implementation integration-tests the same code path
+    /// the storage-backed graph will use.
+    ///
+    /// Construction follows the histogram's [`from_sorted_encoded`](graphus_index::histogram::PropertyHistogram::from_sorted_encoded)
+    /// contract: every qualifying node's property value is order-preservingly encoded
+    /// ([`encode_single`]), **all** encodings (including duplicates) are collected, sorted ascending
+    /// by byte order, and handed to the constructor with [`DEFAULT_HISTOGRAM_BUCKETS`]. A node whose
+    /// property is absent, `Null`, or otherwise unindexable (`List` / `Map`) is simply skipped — it
+    /// does not participate in the indexed distribution, matching how the real index treats it.
+    ///
+    /// If no qualifying node has an indexable value, the result is an **empty** histogram (which
+    /// answers `0.0` to every estimate and `0` distinct) — a valid exact-ish answer, distinct from
+    /// "no histogram exists".
+    fn property_histogram(&self, label: &str, property: &str) -> PropertyHistogram {
+        let mut encoded: Vec<Vec<u8>> = self
+            .nodes
+            .values()
+            .filter(|n| n.labels.iter().any(|l| l == label))
+            .filter_map(|n| n.props.get(property))
+            .filter_map(|v| encode_single(v).ok())
+            .collect();
+        // `from_sorted_encoded` requires ascending byte order; the encoder is order-preserving, so a
+        // plain lexicographic sort of the encodings is exactly Cypher value order.
+        encoded.sort_unstable();
+        PropertyHistogram::from_sorted_encoded(&encoded, DEFAULT_HISTOGRAM_BUCKETS)
+    }
+}
+
+/// Exact, point-in-time statistics over a [`MemGraph`]'s live map.
 ///
-/// Since the in-memory graph owns its full contents, every query is answered **exactly** by
-/// iterating the maps: per-label / per-type queries always return `Some(_)` (an absent label /
-/// type is an exact `Some(0)`, never the `None` "unknown" sentinel). The counts reflect the map at
-/// the instant of the call.
+/// Since the in-memory graph owns its full contents, the count queries are answered **exactly** by
+/// iterating the maps: per-label / per-type queries always return `Some(_)` (an absent label / type
+/// is an exact `Some(0)`, never the `None` "unknown" sentinel). The property-selectivity queries are
+/// answered through a freshly-built equi-depth histogram over the live data (see
+/// [`MemGraph::property_histogram`]), so the implementation faithfully exercises the Stage-1
+/// histogram rather than short-circuiting to an exact count. Every result reflects the map at the
+/// instant of the call.
+///
+/// [`MemGraph`] **always** has a histogram for any `label.property` — it can build one on demand from
+/// its full contents — so the property methods never return the `None` "no histogram" sentinel for a
+/// missing column; an absent column yields an *empty* histogram (`Some(0.0)` / `Some(0)`). They
+/// return `None` only when the **query value** is not index-encodable, which is the same fallback the
+/// real backend signals.
 impl crate::statistics::Statistics for MemGraph {
     fn total_nodes(&self) -> u64 {
         self.nodes.len() as u64
@@ -631,6 +678,49 @@ impl crate::statistics::Statistics for MemGraph {
             .filter(|r| r.rel_type == rel_type)
             .count();
         Some(count as u64)
+    }
+
+    fn estimate_nodes_label_property_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<f64> {
+        // An unindexable query value (Null/List/Map) cannot be placed in the histogram -> no estimate,
+        // signalling the estimator's documented constant fallback.
+        let encoded = encode_single(value).ok()?;
+        Some(
+            self.property_histogram(label, property)
+                .estimate_eq(&encoded),
+        )
+    }
+
+    fn estimate_nodes_label_property_range(
+        &self,
+        label: &str,
+        property: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Option<f64> {
+        // A *present* bound that is not index-encodable makes the whole range estimate unsound (we
+        // cannot place that boundary in encoded space), so we return `None` and let the estimator fall
+        // back rather than silently dropping the bound (which would over-count). An *absent* bound is
+        // simply open on that side. `transpose` turns `Option<Result<_>>` into `Result<Option<_>>`,
+        // so a present-but-unindexable bound short-circuits to `None` here.
+        let lo_enc = lo.map(encode_single).transpose().ok()?;
+        let hi_enc = hi.map(encode_single).transpose().ok()?;
+        Some(self.property_histogram(label, property).estimate_range(
+            lo_enc.as_deref(),
+            lo_inclusive,
+            hi_enc.as_deref(),
+            hi_inclusive,
+        ))
+    }
+
+    fn distinct_label_property_values(&self, label: &str, property: &str) -> Option<u64> {
+        Some(self.property_histogram(label, property).distinct())
     }
 }
 
@@ -757,5 +847,112 @@ mod tests {
         g.delete_node(a);
         let b = g.add_node([] as [&str; 0], [] as [(&str, Value); 0]);
         assert_ne!(a, b, "a fresh id must never collide with a deleted one");
+    }
+
+    // ---- property-selectivity (histogram seam) ------------------------------------------------
+
+    /// 100 `:Person` with `age` uniformly `0..100` (all distinct), for histogram-backed estimates.
+    fn age_graph() -> MemGraph {
+        let mut g = MemGraph::new();
+        for i in 0..100 {
+            g.add_node(["Person"], [("age", Value::Integer(i))]);
+        }
+        g
+    }
+
+    #[test]
+    fn histogram_distinct_count_is_exact() {
+        use crate::statistics::Statistics;
+        let g = age_graph();
+        assert_eq!(g.distinct_label_property_values("Person", "age"), Some(100));
+        // A present label with no such property is an exact empty histogram (Some(0)), not unknown.
+        assert_eq!(g.distinct_label_property_values("Person", "ghost"), Some(0));
+        // An absent label is likewise an empty histogram (no node carries it).
+        assert_eq!(g.distinct_label_property_values("Ghost", "age"), Some(0));
+    }
+
+    #[test]
+    fn histogram_equality_tracks_true_count() {
+        use crate::statistics::Statistics;
+        let g = age_graph();
+        // Every age is distinct, so the equality estimate is ~1 for a present value.
+        let est = g
+            .estimate_nodes_label_property_eq("Person", "age", &Value::Integer(42))
+            .expect("histogram exists for an indexable value");
+        assert!((0.5..=2.0).contains(&est), "equality estimate {est} ~ 1");
+        // A value outside the observed range is an exact 0 (Some(0.0)), not None.
+        assert_eq!(
+            g.estimate_nodes_label_property_eq("Person", "age", &Value::Integer(9999)),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn histogram_equality_unindexable_value_is_none() {
+        use crate::statistics::Statistics;
+        let g = age_graph();
+        // Null/List/Map are not index-encodable -> None (request the estimator's fallback).
+        assert_eq!(
+            g.estimate_nodes_label_property_eq("Person", "age", &Value::Null),
+            None
+        );
+        assert_eq!(
+            g.estimate_nodes_label_property_eq("Person", "age", &Value::List(vec![])),
+            None
+        );
+    }
+
+    #[test]
+    fn histogram_range_tracks_true_filtered_count() {
+        use crate::statistics::Statistics;
+        let g = age_graph();
+        // age >= 50 -> 50 nodes (ages 50..100). Equi-depth range estimate is within ~one bucket.
+        let lo = Value::Integer(50);
+        let est = g
+            .estimate_nodes_label_property_range("Person", "age", Some(&lo), true, None, true)
+            .expect("histogram exists, bound is indexable");
+        assert!((35.0..=65.0).contains(&est), "range estimate {est} ~ 50");
+        // Fully unbounded range covers the whole column exactly (100).
+        let all = g
+            .estimate_nodes_label_property_range("Person", "age", None, true, None, true)
+            .expect("unbounded range over a present histogram");
+        assert!(
+            (all - 100.0).abs() < 1e-9,
+            "unbounded range == total ({all})"
+        );
+    }
+
+    #[test]
+    fn histogram_range_unindexable_bound_is_none() {
+        use crate::statistics::Statistics;
+        let g = age_graph();
+        // A present-but-unindexable bound makes the range unsound -> None (fall back).
+        assert_eq!(
+            g.estimate_nodes_label_property_range(
+                "Person",
+                "age",
+                Some(&Value::Null),
+                true,
+                None,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn histogram_skips_absent_and_unindexable_property_values() {
+        use crate::statistics::Statistics;
+        // Two of three :Person nodes have an indexable `age`; the third has none. The histogram is
+        // built from the two present, indexable values only.
+        let mut g = MemGraph::new();
+        g.add_node(["Person"], [("age", Value::Integer(10))]);
+        g.add_node(["Person"], [("age", Value::Integer(20))]);
+        g.add_node(["Person"], [] as [(&str, Value); 0]); // no age
+        assert_eq!(g.distinct_label_property_values("Person", "age"), Some(2));
+        let est = g
+            .estimate_nodes_label_property_eq("Person", "age", &Value::Integer(10))
+            .expect("indexable value");
+        assert!((0.5..=1.5).contains(&est), "equality estimate {est} ~ 1");
     }
 }
