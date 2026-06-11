@@ -776,34 +776,24 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         Ok(())
     }
 
-    /// The existing [`Namespace::PropKey`] token id for `name`, **without** interning it.
-    ///
-    /// The read-side counterpart used by the [`Statistics`](crate::statistics::Statistics) histogram
-    /// lookups: a property key that was never interned cannot have a stored histogram, so a missing
-    /// token means "no histogram" (the estimator falls back) rather than minting a token by asking.
-    fn prop_key_id_existing(&self, name: &str) -> Option<u32> {
-        self.store.borrow().token_id(Namespace::PropKey, name)
-    }
-
     /// Decodes the durable histogram stored for `(label, property)`, or `None` when the label /
     /// property token was never interned or no histogram is recorded for the pair.
     ///
-    /// A **decode error** (a corrupt or truncated stored histogram) is captured into this graph's
-    /// error cell — so the caller's `take_error` surfaces it — and reported as `None` (the estimator
-    /// then falls back to its constant), never a panic. This mirrors how every other read in this seam
-    /// degrades safely on a storage fault.
+    /// The lookup itself is the shared [`crate::store_statistics::decode_histogram`] (`rmp` task
+    /// #82) — the same reader [`crate::coordinator::CoordinatorStatistics`] uses, so the two seams
+    /// cannot drift. This seam's policy for a **decode error** (a corrupt or truncated stored
+    /// histogram): it is captured into this graph's error cell — so the caller's `take_error`
+    /// surfaces it — and reported as `None` (the estimator then falls back to its constant), never a
+    /// panic. This mirrors how every other read in this seam degrades safely on a storage fault.
     fn decode_histogram(&self, label: &str, property: &str) -> Option<PropertyHistogram> {
-        let label_token = self.label_id_existing(label)?;
-        let prop_token = self.prop_key_id_existing(property)?;
-        let store = self.store.borrow();
-        let bytes = store.property_histogram(label_token, prop_token)?;
-        match PropertyHistogram::decode(bytes) {
-            Ok(hist) => Some(hist),
+        // The store borrow is a temporary scoped to this statement: it is released before `capture`
+        // touches the (separate) error cell.
+        let decoded =
+            crate::store_statistics::decode_histogram(&self.store.borrow(), label, property);
+        match decoded {
+            Ok(hist) => hist,
             Err(e) => {
-                drop(store);
-                self.capture(GraphusError::Storage(format!(
-                    "corrupt property histogram for ({label}.{property}): {e}"
-                )));
+                self.capture(e);
                 None
             }
         }
@@ -843,10 +833,11 @@ impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGr
     fn nodes_with_label(&self, label: &str) -> Option<u64> {
         // The backend tracks exact per-label counts (`rmp` task #79). A label that was never interned
         // can have no live node, so it is an exact `Some(0)` — never the `None` "unknown" sentinel.
-        let count = self
-            .label_id_existing(label)
-            .map_or(0, |token| self.store.borrow().node_count_for_label(token));
-        Some(count)
+        // The reader is shared with `CoordinatorStatistics` (`rmp` task #82).
+        Some(crate::store_statistics::nodes_with_label(
+            &self.store.borrow(),
+            label,
+        ))
     }
 
     fn total_relationships(&self) -> u64 {
@@ -855,11 +846,10 @@ impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGr
 
     fn relationships_with_type(&self, rel_type: &str) -> Option<u64> {
         // Exact per-relationship-type counts (`rmp` task #79); a never-interned type is an exact 0.
-        let store = self.store.borrow();
-        let count = store
-            .token_id(Namespace::RelType, rel_type)
-            .map_or(0, |token| store.rel_count_for_type(token));
-        Some(count)
+        Some(crate::store_statistics::relationships_with_type(
+            &self.store.borrow(),
+            rel_type,
+        ))
     }
 
     fn estimate_nodes_label_property_eq(
@@ -869,11 +859,10 @@ impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGr
         value: &Value,
     ) -> Option<f64> {
         // No histogram stored -> None (fall back). A decode error is captured and also reported as
-        // None (the caller must inspect `take_error`).
+        // None (the caller must inspect `take_error`). An unindexable query value (Null/List/Map)
+        // cannot be placed in the histogram -> None (`crate::store_statistics` docs).
         let hist = self.decode_histogram(label, property)?;
-        // An unindexable query value (Null/List/Map) cannot be placed in the histogram -> None.
-        let encoded = encode_single(value).ok()?;
-        Some(hist.estimate_eq(&encoded))
+        crate::store_statistics::histogram_estimate_eq(&hist, value)
     }
 
     fn estimate_nodes_label_property_range(
@@ -885,19 +874,11 @@ impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGr
         hi: Option<&Value>,
         hi_inclusive: bool,
     ) -> Option<f64> {
+        // A *present* bound that is not index-encodable makes the range unsound, so the shared
+        // estimator returns `None` (fall back) rather than silently dropping the bound; an *absent*
+        // bound is simply open on that side (`crate::store_statistics::histogram_estimate_range`).
         let hist = self.decode_histogram(label, property)?;
-        // A *present* bound that is not index-encodable makes the range unsound (we cannot place that
-        // boundary in encoded space), so return `None` and fall back rather than silently dropping it.
-        // An *absent* bound is simply open on that side. `transpose` turns `Option<Result<_>>` into
-        // `Result<Option<_>>`, so a present-but-unindexable bound short-circuits to `None` here.
-        let lo_enc = lo.map(encode_single).transpose().ok()?;
-        let hi_enc = hi.map(encode_single).transpose().ok()?;
-        Some(hist.estimate_range(
-            lo_enc.as_deref(),
-            lo_inclusive,
-            hi_enc.as_deref(),
-            hi_inclusive,
-        ))
+        crate::store_statistics::histogram_estimate_range(&hist, lo, lo_inclusive, hi, hi_inclusive)
     }
 
     fn distinct_label_property_values(&self, label: &str, property: &str) -> Option<u64> {

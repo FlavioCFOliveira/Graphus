@@ -41,8 +41,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Timestamp, TxnId};
+use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{Namespace, RecordStore};
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
@@ -51,6 +53,8 @@ use graphus_wal::LogSink;
 use crate::catalog::IndexCatalog;
 use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
+use crate::statistics::Statistics;
+use crate::store_statistics;
 
 /// Live state of an open transaction the coordinator drives.
 #[derive(Debug, Clone, Copy)]
@@ -279,6 +283,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         builder.build()
     }
 
+    /// A compile-time [`Statistics`] source over this coordinator's shared store (`rmp` task #82),
+    /// for [`plan_physical_with_stats`](crate::physical::plan_physical_with_stats).
+    ///
+    /// This is how the production compile paths (the server's per-`Run` compile, the TCK runner,
+    /// the LDBC bench driver) activate the cost-based optimiser: they hold no statement seam while
+    /// compiling, so the per-statement [`RecordStoreGraph::statistics`](crate::graph_access::GraphAccess::statistics)
+    /// seam is unavailable — this one answers from the same durable catalogue without needing an
+    /// open transaction. See [`CoordinatorStatistics`] for the snapshot and borrow contracts.
+    #[must_use]
+    pub fn statistics(&self) -> CoordinatorStatistics<D, S> {
+        CoordinatorStatistics {
+            store: Rc::clone(&self.store),
+        }
+    }
+
     /// Borrows a per-statement [`RecordStoreGraph`] seam for the open transaction `txn`: the executor
     /// runs over it, its reads/writes contribute SIREAD markers / rw-edges / write locks to the
     /// shared trackers, and it is dropped when the statement ends (the transaction stays open).
@@ -388,5 +407,113 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.locks.borrow_mut().release_all(txn);
         self.active.remove(&txn);
         Ok(())
+    }
+}
+
+/// The coordinator-level [`Statistics`] seam (`rmp` task #82): exact catalogue counts and
+/// per-indexed-property histograms over the coordinator's shared store, consumed by
+/// [`plan_physical_with_stats`](crate::physical::plan_physical_with_stats) at compile time.
+///
+/// # What is reported (snapshot semantics)
+///
+/// Each call reads the store's **current committed catalogue**: the durable grand-total and
+/// per-label / per-relationship-type counts (`rmp` task #79) and the durable equi-depth property
+/// histograms (`rmp` task #81). The planner treats the values as a consistent-enough snapshot for
+/// one compilation; the counts are advisory cost inputs, so a materially-stale histogram (or a count
+/// racing a concurrent commit) only **mis-costs** a plan — it never affects correctness, because
+/// every cost-based rewrite is bag-preserving (`rmp` task #65). This deliberately mirrors the
+/// catalogue-count semantics of [`RecordStoreGraph`]'s own [`Statistics`] impl: cost estimation
+/// wants the aggregate shape of the data, not one transaction's MVCC view.
+///
+/// # Borrow discipline (why this is safe on the single engine thread)
+///
+/// The seam holds an `Rc` clone of the coordinator's shared store and borrows it **briefly, per
+/// method call** — never across calls, and any decoded histogram is owned before the borrow is
+/// released. The other holders of this `Rc` ([`TxnCoordinator`] itself and every
+/// [`RecordStoreGraph`] statement seam) likewise borrow only for the duration of one call, so a
+/// `CoordinatorStatistics` may be held across an entire compilation — including while a transaction
+/// is open and while a statement seam exists — without ever overlapping a live borrow: the planner
+/// is pure and never re-enters the store while one of these calls is borrowing it.
+///
+/// # Error policy
+///
+/// This seam has **no error-capture channel** (compilation must not fail over an advisory
+/// statistic), so a corrupt stored histogram degrades to the `None` "fall back" sentinel — the
+/// estimator then uses its documented constants — instead of being surfaced. The per-statement
+/// [`RecordStoreGraph`] seam, which *does* have a channel, captures the same error; both read
+/// through the shared (crate-private) `store_statistics` helpers so the lookup semantics cannot
+/// drift.
+pub struct CoordinatorStatistics<D: BlockDevice, S: LogSink> {
+    /// A clone of the coordinator's shared store handle (see the borrow-discipline doc above).
+    store: Rc<RefCell<RecordStore<D, S>>>,
+}
+
+impl<D: BlockDevice, S: LogSink> CoordinatorStatistics<D, S> {
+    /// Decodes the durable histogram for `(label, property)` via the shared reader, applying this
+    /// seam's error policy: a corrupt histogram is reported as `None` (the estimator's constant
+    /// fallback) because compile-time statistics are advisory and have no error channel — never a
+    /// panic, never a failed compilation.
+    fn decode_histogram(&self, label: &str, property: &str) -> Option<PropertyHistogram> {
+        store_statistics::decode_histogram(&self.store.borrow(), label, property)
+            .ok()
+            .flatten()
+    }
+}
+
+impl<D: BlockDevice, S: LogSink> Statistics for CoordinatorStatistics<D, S> {
+    fn total_nodes(&self) -> u64 {
+        self.store.borrow().total_node_count()
+    }
+
+    fn nodes_with_label(&self, label: &str) -> Option<u64> {
+        // Exact per-label catalogue counts (`rmp` task #79): a never-interned label is an exact
+        // `Some(0)`, never the `None` "unknown" sentinel.
+        Some(store_statistics::nodes_with_label(
+            &self.store.borrow(),
+            label,
+        ))
+    }
+
+    fn total_relationships(&self) -> u64 {
+        self.store.borrow().total_relationship_count()
+    }
+
+    fn relationships_with_type(&self, rel_type: &str) -> Option<u64> {
+        // Exact per-relationship-type catalogue counts; a never-interned type is an exact 0.
+        Some(store_statistics::relationships_with_type(
+            &self.store.borrow(),
+            rel_type,
+        ))
+    }
+
+    fn estimate_nodes_label_property_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<f64> {
+        // No histogram (or a corrupt one, per this seam's error policy) -> None (fall back); an
+        // unindexable query value (Null/List/Map) likewise -> None (`store_statistics` docs).
+        let hist = self.decode_histogram(label, property)?;
+        store_statistics::histogram_estimate_eq(&hist, value)
+    }
+
+    fn estimate_nodes_label_property_range(
+        &self,
+        label: &str,
+        property: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Option<f64> {
+        // A *present* but unindexable bound -> None (fall back) rather than silently dropping the
+        // bound; an absent bound is open on that side (`store_statistics::histogram_estimate_range`).
+        let hist = self.decode_histogram(label, property)?;
+        store_statistics::histogram_estimate_range(&hist, lo, lo_inclusive, hi, hi_inclusive)
+    }
+
+    fn distinct_label_property_values(&self, label: &str, property: &str) -> Option<u64> {
+        Some(self.decode_histogram(label, property)?.distinct())
     }
 }

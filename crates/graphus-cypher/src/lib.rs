@@ -135,6 +135,7 @@ pub mod runtime;
 pub mod semantics;
 pub mod static_type;
 pub mod statistics;
+pub(crate) mod store_statistics;
 pub(crate) mod temporal_fns;
 pub mod ternary;
 pub(crate) mod timezone;
@@ -147,7 +148,7 @@ pub use cardinality::estimate_rows;
 pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
-pub use coordinator::TxnCoordinator;
+pub use coordinator::{CoordinatorStatistics, TxnCoordinator};
 pub use cost::{CostEstimate, estimate_cost};
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;

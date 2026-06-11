@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use graphus_core::error::GraphusError;
 use graphus_cypher::{
-    IndexCatalog, Parameters, TxnCoordinator, analyze, bind_parameters, execute, lower,
-    parse_tokens, plan_physical, tokenize,
+    IndexCatalog, Parameters, Statistics, TxnCoordinator, analyze, bind_parameters, execute, lower,
+    parse_tokens, plan_physical_with_stats, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
@@ -55,9 +55,17 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
 
     // Compile + bind off any store borrow (pure pipeline). A compile error is raised before any side
     // effect, exactly as the TCK requires (`04 §7.3`). The catalog reflects the coordinator's current
-    // indexes so the physical planner can pick index-accelerated strategies (`04 §6.6`).
+    // indexes so the physical planner can pick index-accelerated strategies (`04 §6.6`), and the
+    // coordinator's statistics seam activates the cost-based optimiser (`rmp` tasks #65/#82; each
+    // statistics call borrows the store briefly, never across the compile).
+    //
+    // Plan-reuse policy: the server compiles per-`Run` today (no plan cache in this path), so the
+    // statistics are as fresh as this compilation. If/when the plan cache is wired here, plans key
+    // on the schema version and a stale-stats plan stays acceptable until invalidation — statistics
+    // are advisory cost inputs only; every cost-based rewrite is bag-preserving.
     let catalog = coordinator.catalog();
-    let plan = match compile(query, &catalog) {
+    let stats = coordinator.statistics();
+    let plan = match compile(query, &catalog, Some(&stats)) {
         Ok(p) => p,
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
@@ -115,16 +123,18 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
 }
 
 /// Compiles a query string into a physical plan via the full front-end pipeline (lex → parse →
-/// analyze → lower → physical-plan), consulting `catalog` for index-aware strategy choices.
+/// analyze → lower → physical-plan), consulting `catalog` for index-aware strategy choices and
+/// `stats` (the coordinator's statistics seam, `rmp` task #82) for cost-based plan refinement.
 fn compile(
     query: &str,
     catalog: &IndexCatalog,
+    stats: Option<&dyn Statistics>,
 ) -> Result<graphus_cypher::PhysicalPlan, GraphusError> {
     let tokens = tokenize(query).map_err(|e| GraphusError::Compile(e.to_string()))?;
     let ast = parse_tokens(&tokens, query).map_err(|e| GraphusError::Compile(e.to_string()))?;
     let validated = analyze(&ast).map_err(|e| GraphusError::Compile(e.to_string()))?;
     let logical = lower(&validated);
-    Ok(plan_physical(&logical, catalog))
+    Ok(plan_physical_with_stats(&logical, catalog, stats))
 }
 
 /// Opens the cursor for `plan` over a per-statement seam for `txn`, sends the [`RunReply`] (fields +

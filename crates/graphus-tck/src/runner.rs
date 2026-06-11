@@ -37,7 +37,7 @@ use graphus_cypher::graph_access::{GraphAccess, NodeId, RelId};
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
-use graphus_cypher::physical::{PhysicalOp, plan_physical};
+use graphus_cypher::physical::{PhysicalOp, plan_physical_with_stats};
 use graphus_cypher::procedure_registry::{ProcedureRegistry, ProcedureSet};
 use graphus_cypher::runtime::{PathValue, Row, RowValue};
 use graphus_cypher::semantics::{
@@ -437,7 +437,10 @@ fn run_write_query(
     registry: &dyn ProcedureRegistry,
 ) -> Result<(), String> {
     let validated = compile(src, params, registry).map_err(|e| e.message)?;
-    let plan = plan_physical(&lower(&validated), &coord.catalog());
+    // Stats-aware planning (`rmp` task #82): the TCK exercises the production cost-based optimiser
+    // path; its rewrites are bag-preserving, so plan shape may differ but results never do.
+    let stats = coord.statistics();
+    let plan = plan_physical_with_stats(&lower(&validated), &coord.catalog(), Some(&stats));
     let bound = bind_parameters(&plan, params).map_err(|e| e.to_string())?;
 
     let txn = coord.begin_serializable();
@@ -475,7 +478,9 @@ fn run_query_resolving(
         Ok(v) => v,
         Err(e) => return QueryRun::Error(e),
     };
-    let plan = plan_physical(&lower(&validated), &coord.catalog());
+    // Stats-aware planning (`rmp` task #82): same production cost-based path as `run_write_query`.
+    let stats = coord.statistics();
+    let plan = plan_physical_with_stats(&lower(&validated), &coord.catalog(), Some(&stats));
     let bound = match bind_parameters(&plan, params) {
         Ok(b) => b,
         Err(e) => {

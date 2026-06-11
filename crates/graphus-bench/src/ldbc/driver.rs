@@ -3,9 +3,14 @@
 //! (`crates/graphus-tck/src/runner.rs`, `crates/graphus-cypher/tests/record_store_graph.rs`):
 //!
 //! ```text
-//! tokenize → parse_tokens → analyze → lower → plan_physical → bind_parameters
+//! tokenize → parse_tokens → analyze → lower → plan_physical_with_stats(coord.statistics())
+//!          → bind_parameters
 //!          → coord.begin(_serializable) → coord.statement → execute → collect_all → commit
 //! ```
+//!
+//! Planning is **stats-aware** (`rmp` task #82): the coordinator's statistics seam feeds the
+//! cost-based optimiser (`rmp` task #65) exactly as the production server does, so the benchmark
+//! measures the plans real deployments run.
 //!
 //! A statement that fails at any stage (lex / parse / analyze / bind / execute, or a captured
 //! deferred store error) is rolled back and surfaced as [`RunError`] — the harness reports such a
@@ -21,7 +26,7 @@ use graphus_cypher::executor::execute;
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
-use graphus_cypher::physical::plan_physical;
+use graphus_cypher::physical::plan_physical_with_stats;
 use graphus_cypher::runtime::Row;
 use graphus_cypher::semantics::analyze;
 use graphus_io::MemBlockDevice;
@@ -108,7 +113,9 @@ pub fn run_statement(
     let tokens = tokenize(src).map_err(|e| RunError::Compile(e.to_string()))?;
     let ast = parse_tokens(&tokens, src).map_err(|e| RunError::Compile(e.to_string()))?;
     let validated = analyze(&ast).map_err(|e| RunError::Compile(e.to_string()))?;
-    let plan = plan_physical(&lower(&validated), &coord.catalog());
+    // Stats-aware planning (`rmp` task #82): the same cost-based optimiser path the server runs.
+    let stats = coord.statistics();
+    let plan = plan_physical_with_stats(&lower(&validated), &coord.catalog(), Some(&stats));
     let bound = bind_parameters(&plan, params).map_err(|e| RunError::Bind(e.to_string()))?;
 
     // ---- run inside one transaction ------------------------------------------------------------
