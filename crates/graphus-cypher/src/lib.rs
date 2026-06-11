@@ -134,6 +134,7 @@ pub mod semantics;
 pub mod static_type;
 pub(crate) mod temporal_fns;
 pub mod ternary;
+pub(crate) mod timezone;
 
 pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
 pub use binding::{

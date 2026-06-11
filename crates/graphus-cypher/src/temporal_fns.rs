@@ -15,20 +15,26 @@
 //!   delegate to (`temporal ± duration`, `duration ± duration`, `duration */ number`).
 //! - [`to_iso`] renders a temporal value to its canonical ISO-8601 string (`toString`, results).
 //!
+//! IANA zone ids (`timezone: 'Europe/Stockholm'`, `'...[Europe/London]'`) are resolved against
+//! the embedded tz database in [`crate::timezone`] (`rmp` task #60): a named zone resolves the
+//! UTC offset in effect for the constructed *local* value (historical rules and DST, with the
+//! gap/overlap disambiguation documented there), a zone conversion preserves the instant and
+//! re-derives the local fields, and an id absent from the database is a typed
+//! [`EvalError::TypeError`].
+//!
 //! # Named deferrals
 //!
 //! - The zero-argument "current instant" constructor forms need the transaction clock; they raise
 //!   a typed [`EvalError::UnsupportedFunction`].
-//! - IANA zone-id **resolution** (`timezone: 'Europe/Stockholm'` without an explicit offset)
-//!   needs a tz database; such inputs raise a typed error rather than guessing an offset.
 
 use graphus_core::Value;
 use graphus_core::temporal_calc::{self as tc, TemporalError};
 use graphus_core::value::temporal::{
-    Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime,
+    Date, Duration, LocalDateTime, LocalTime, NANOS_PER_DAY, ZonedDateTime, ZonedTime,
 };
 
 use crate::eval::EvalError;
+use crate::timezone;
 
 /// Adapts a calendar-engine error to the evaluator's runtime error class.
 fn terr(e: TemporalError) -> EvalError {
@@ -79,7 +85,8 @@ fn construct_date(arg: &Value) -> Result<Value, EvalError> {
         Value::ZonedDateTime(z) => Ok(Value::Date(z.local.to_date_time().0)),
         Value::Map(entries) => {
             let map = ComponentMap::new(entries)?;
-            Ok(Value::Date(date_from_map(&map)?))
+            let base = base_date(&map)?;
+            Ok(Value::Date(date_from_map(&map, base)?))
         }
         other => Err(type_err(format!(
             "date() requires a string, map or temporal argument, got {}",
@@ -97,7 +104,8 @@ fn construct_local_time(arg: &Value) -> Result<Value, EvalError> {
         Value::ZonedDateTime(z) => Ok(Value::LocalTime(z.local.to_date_time().1)),
         Value::Map(entries) => {
             let map = ComponentMap::new(entries)?;
-            Ok(Value::LocalTime(time_from_map(&map)?))
+            let base = base_time(&map)?.map(|b| b.time);
+            Ok(Value::LocalTime(time_from_map(&map, base)?))
         }
         other => Err(type_err(format!(
             "localtime() requires a string, map or temporal argument, got {}",
@@ -127,8 +135,41 @@ fn construct_time(arg: &Value) -> Result<Value, EvalError> {
         )),
         Value::Map(entries) => {
             let map = ComponentMap::new(entries)?;
-            let time = time_from_map(&map)?;
-            let offset = map.offset_seconds()?.unwrap_or(0);
+            let tz = map.timezone()?;
+            let base = base_time(&map)?;
+            // With an explicit target timezone *and* a zoned base, the base wall clock is first
+            // re-expressed in the target zone — the instant is preserved, modulo 24 h — and only
+            // then are the component overrides applied (`Temporal3.feature` scenario [3]:
+            // `time({time: t12:31+01:00, second: 42, timezone: '+05:00'})` is `16:31:42+05:00`).
+            // An unzoned base keeps its wall clock under a new timezone (same scenario).
+            let (default_time, offset) = match (tz, &base) {
+                (Some(spec), Some(b)) if b.offset.is_some() => {
+                    let from = b.offset.unwrap_or_default();
+                    // A zoned *time* carries no date: a named target zone is resolved at the
+                    // epoch anchor date (openCypher `Time` stores only the resolved offset; the
+                    // TCK exercises named zones for times only via fixed-offset zones).
+                    let instant = LocalDateTime::from_date_time(Date::default(), b.time)
+                        .epoch_seconds
+                        - i64::from(from);
+                    let target = spec.offset_at_instant(instant)?;
+                    (Some(shift_time(b.time, target - from)), target)
+                }
+                (Some(TzSpec::Fixed(offset)), _) => (base.as_ref().map(|b| b.time), offset),
+                (Some(TzSpec::Named(zone)), _) => {
+                    // No instant to anchor on: resolve the named zone at the epoch anchor date.
+                    let anchor = LocalDateTime::from_date_time(
+                        Date::default(),
+                        base.as_ref().map(|b| b.time).unwrap_or_default(),
+                    );
+                    let (_, offset) = timezone::resolve_local(zone, &anchor, None)?;
+                    (base.as_ref().map(|b| b.time), offset)
+                }
+                (None, _) => (
+                    base.as_ref().map(|b| b.time),
+                    base.as_ref().and_then(|b| b.offset).unwrap_or(0),
+                ),
+            };
+            let time = time_from_map(&map, default_time)?;
             Ok(Value::ZonedTime(
                 ZonedTime::new(time, offset).map_err(terr)?,
             ))
@@ -166,12 +207,26 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
     match arg {
         Value::String(s) => {
             let (local, offset, zone) = tc::parse_zoned_date_time_parts(s).map_err(terr)?;
-            let Some(offset) = offset else {
-                return Err(zone_resolution_error(zone.as_deref().unwrap_or("?")));
-            };
-            Ok(Value::ZonedDateTime(
-                ZonedDateTime::from_local(local, offset, zone.unwrap_or_default()).map_err(terr)?,
-            ))
+            match (offset, zone) {
+                // Offset-only: the offset *is* the zone (`Temporal2.feature` scenario [5]).
+                (Some(offset), None) => Ok(Value::ZonedDateTime(
+                    ZonedDateTime::from_local(local, offset, "").map_err(terr)?,
+                )),
+                // A named zone resolves via the zone rules; an explicit offset alongside it
+                // disambiguates an overlapping local time (`Temporal2.feature` scenario [6]:
+                // `'...+02:00[Europe/Stockholm]'` keeps +02:00, `'...[Europe/London]'`
+                // resolves +01:00, and 1818 Stockholm resolves the historical +00:53:28).
+                (offset, Some(zone)) => {
+                    let zone = timezone::canonical_id(&zone)?;
+                    let (local, offset) = timezone::resolve_local(zone, &local, offset)?;
+                    Ok(Value::ZonedDateTime(
+                        ZonedDateTime::from_local(local, offset, zone).map_err(terr)?,
+                    ))
+                }
+                (None, None) => Err(type_err(format!(
+                    "datetime() string `{s}` carries neither a UTC offset nor a time zone"
+                ))),
+            }
         }
         Value::ZonedDateTime(z) => Ok(Value::ZonedDateTime(z.clone())),
         Value::LocalDateTime(dt) => Ok(Value::ZonedDateTime(
@@ -249,16 +304,37 @@ fn duration_component_number(key: &str, value: &Value) -> Result<f64, EvalError>
     }
 }
 
-/// The typed error for an IANA zone id that cannot be resolved without a tz database.
-fn zone_resolution_error(zone: &str) -> EvalError {
-    EvalError::UnsupportedFunction {
-        name: format!("IANA time-zone resolution for `{zone}` (requires a tz database)"),
-    }
-}
-
 // =================================================================================================
 // Component maps (`date({year: 1984, month: 10, day: 11})`, …)
 // =================================================================================================
+
+/// A constructor-supplied `timezone` component: a fixed UTC offset (`'+01:00'`, `'Z'`) or a
+/// named IANA zone (`'Europe/Stockholm'`, canonicalised case).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TzSpec {
+    Fixed(i32),
+    Named(&'static str),
+}
+
+impl TzSpec {
+    /// Parses a `timezone` string: anything that is not a fixed offset must name a zone in the
+    /// embedded IANA database; an unknown id is a typed runtime error.
+    fn parse(tz: &str) -> Result<Self, EvalError> {
+        match tc::parse_offset_seconds(tz) {
+            Ok(offset) => Ok(Self::Fixed(offset)),
+            Err(_) => Ok(Self::Named(timezone::canonical_id(tz)?)),
+        }
+    }
+
+    /// The offset for converting an existing instant *into* this zone (total: every instant has
+    /// exactly one offset; no gap/overlap can arise).
+    fn offset_at_instant(self, unix_seconds: i64) -> Result<i32, EvalError> {
+        match self {
+            Self::Fixed(offset) => Ok(offset),
+            Self::Named(zone) => timezone::offset_at_instant(zone, unix_seconds),
+        }
+    }
+}
 
 /// A lower-cased view over a constructor's component map, with typed integer extraction.
 struct ComponentMap<'v> {
@@ -295,15 +371,12 @@ impl<'v> ComponentMap<'v> {
         }
     }
 
-    /// The resolved UTC offset from a `timezone` entry, if present. An IANA name (anything that
-    /// does not parse as an offset) is a typed deferral.
-    fn offset_seconds(&self) -> Result<Option<i32>, EvalError> {
+    /// The parsed `timezone` entry, if present: a fixed offset or a named IANA zone (an unknown
+    /// id is a typed runtime error).
+    fn timezone(&self) -> Result<Option<TzSpec>, EvalError> {
         match self.get("timezone") {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::String(tz)) => match tc::parse_offset_seconds(tz) {
-                Ok(off) => Ok(Some(off)),
-                Err(_) => Err(zone_resolution_error(tz)),
-            },
+            Some(Value::String(tz)) => TzSpec::parse(tz).map(Some),
             Some(other) => Err(type_err(format!(
                 "temporal component `timezone` must be a string, got {}",
                 kind_name(other)
@@ -331,16 +404,57 @@ fn base_date(map: &ComponentMap<'_>) -> Result<Option<Date>, EvalError> {
     Ok(None)
 }
 
-/// The time carried by a `time:` / `datetime:` base entry, if any (with its offset when zoned).
-fn base_time(map: &ComponentMap<'_>) -> Result<Option<(LocalTime, Option<i32>)>, EvalError> {
+/// The time carried by a `time:` / `datetime:` base entry, with its offset and IANA zone id
+/// when zoned, and which entry it came from: a `datetime:` base also carries the date, so a
+/// zone conversion moves the whole local date-time, while a `time:` base converts the
+/// time-of-day modulo 24 h (`Temporal3.feature` scenarios \[3\], \[9\] and \[11\]).
+struct TimeBase {
+    time: LocalTime,
+    offset: Option<i32>,
+    /// The IANA zone id of a named-zone `DateTime` base (inherited by the result when the map
+    /// has no `timezone` entry of its own).
+    zone: Option<String>,
+    /// Whether the base came from the `datetime` entry (full-date conversion granularity).
+    from_datetime: bool,
+}
+
+/// The time carried by a `time:` / `datetime:` base entry, if any.
+fn base_time(map: &ComponentMap<'_>) -> Result<Option<TimeBase>, EvalError> {
     for key in ["time", "datetime"] {
+        let from_datetime = key == "datetime";
         match map.get(key) {
             None | Some(Value::Null) => {}
-            Some(Value::LocalTime(t)) => return Ok(Some((*t, None))),
-            Some(Value::ZonedTime(zt)) => return Ok(Some((zt.time, Some(zt.offset_seconds)))),
-            Some(Value::LocalDateTime(dt)) => return Ok(Some((dt.to_date_time().1, None))),
+            Some(Value::LocalTime(t)) => {
+                return Ok(Some(TimeBase {
+                    time: *t,
+                    offset: None,
+                    zone: None,
+                    from_datetime,
+                }));
+            }
+            Some(Value::ZonedTime(zt)) => {
+                return Ok(Some(TimeBase {
+                    time: zt.time,
+                    offset: Some(zt.offset_seconds),
+                    zone: None,
+                    from_datetime,
+                }));
+            }
+            Some(Value::LocalDateTime(dt)) => {
+                return Ok(Some(TimeBase {
+                    time: dt.to_date_time().1,
+                    offset: None,
+                    zone: None,
+                    from_datetime,
+                }));
+            }
             Some(Value::ZonedDateTime(z)) => {
-                return Ok(Some((z.local.to_date_time().1, Some(z.offset_seconds))));
+                return Ok(Some(TimeBase {
+                    time: z.local.to_date_time().1,
+                    offset: Some(z.offset_seconds),
+                    zone: (!z.zone_id.is_empty()).then(|| z.zone_id.clone()),
+                    from_datetime,
+                }));
             }
             Some(other) => {
                 return Err(type_err(format!(
@@ -353,41 +467,78 @@ fn base_time(map: &ComponentMap<'_>) -> Result<Option<(LocalTime, Option<i32>)>,
     Ok(None)
 }
 
-fn date_from_map(map: &ComponentMap<'_>) -> Result<Date, EvalError> {
-    if let Some(base) = base_date(map)? {
-        // Truncation-with-overrides form: `date({date: d, day: 28})`.
-        let (y, m, d) = base.to_ymd();
-        let year = map.int_or("year", y)?;
-        let month = map.int_or("month", i64::from(m))?;
-        let day = map.int_or("day", i64::from(d))?;
-        return Date::from_ymd(year, clamp_u32(month)?, clamp_u32(day)?).map_err(terr);
+/// Shifts a time-of-day by a whole number of seconds, wrapping modulo 24 h (zone conversion of
+/// a time value: the date, if any, is owned by the caller).
+fn shift_time(t: LocalTime, delta_seconds: i32) -> LocalTime {
+    let delta = i64::from(delta_seconds) * 1_000_000_000;
+    let nanos = (t.nanos_of_day as i64 + delta).rem_euclid(NANOS_PER_DAY as i64);
+    LocalTime {
+        nanos_of_day: nanos as u64,
     }
-    let year = match map.get("year") {
-        Some(Value::Integer(y)) => *y,
-        _ => return Err(type_err("date() from a map requires a `year` component")),
-    };
-    if map.has("week") {
-        let week = map.int_or("week", 1)?;
-        let dow = map.int_or("dayofweek", 1)?;
-        return Date::from_year_week_day(year, clamp_u32(week)?, clamp_u32(dow)?).map_err(terr);
-    }
-    if map.has("ordinalday") {
-        let ordinal = map.int_or("ordinalday", 1)?;
-        return Date::from_year_ordinal(year, clamp_u32(ordinal)?).map_err(terr);
-    }
-    if map.has("quarter") {
-        let quarter = map.int_or("quarter", 1)?;
-        let doq = map.int_or("dayofquarter", 1)?;
-        return Date::from_year_quarter_day(year, clamp_u32(quarter)?, clamp_u32(doq)?)
-            .map_err(terr);
-    }
-    let month = map.int_or("month", 1)?;
-    let day = map.int_or("day", 1)?;
-    Date::from_ymd(year, clamp_u32(month)?, clamp_u32(day)?).map_err(terr)
 }
 
-fn time_from_map(map: &ComponentMap<'_>) -> Result<LocalTime, EvalError> {
-    let base = base_time(map)?.map(|(t, _)| t);
+/// Builds a date from the map's components over an optional base date (normally
+/// `base_date(map)`; the zone-conversion paths substitute the converted date).
+///
+/// Each calendar form — week, ordinal-day, quarter, year-month-day — has its own component
+/// family; with a base date the unspecified components of the *selected* calendar default to
+/// the base's value in that calendar (`Temporal3.feature` scenario \[1\]:
+/// `date({date: 1984-11-11, week: 1})` keeps the base's week-year and week-day, giving
+/// `1984-01-08`; `{date: ..., quarter: 3}` keeps the day-of-quarter). Without a base, `year`
+/// is mandatory and the remaining components default to their first value.
+fn date_from_map(map: &ComponentMap<'_>, base: Option<Date>) -> Result<Date, EvalError> {
+    let year = match (map.get("year"), base) {
+        (Some(Value::Integer(y)), _) => Some(*y),
+        (None | Some(Value::Null), Some(_)) => None,
+        _ => return Err(type_err("date() from a map requires a `year` component")),
+    };
+    if map.has("week") || (base.is_some() && map.has("dayofweek")) {
+        let (by, bw, bd) = match base {
+            Some(b) => (b.week_year(), b.week(), b.week_day()),
+            None => (0, 1, 1),
+        };
+        let week = map.int_or("week", bw)?;
+        let dow = map.int_or("dayofweek", bd)?;
+        return Date::from_year_week_day(year.unwrap_or(by), clamp_u32(week)?, clamp_u32(dow)?)
+            .map_err(terr);
+    }
+    if map.has("ordinalday") {
+        let (by, bo) = match base {
+            Some(b) => (b.year(), b.ordinal_day()),
+            None => (0, 1),
+        };
+        let ordinal = map.int_or("ordinalday", bo)?;
+        return Date::from_year_ordinal(year.unwrap_or(by), clamp_u32(ordinal)?).map_err(terr);
+    }
+    if map.has("quarter") || (base.is_some() && map.has("dayofquarter")) {
+        let (by, bq, bd) = match base {
+            Some(b) => (b.year(), b.quarter(), b.day_of_quarter()),
+            None => (0, 1, 1),
+        };
+        let quarter = map.int_or("quarter", bq)?;
+        let doq = map.int_or("dayofquarter", bd)?;
+        return Date::from_year_quarter_day(
+            year.unwrap_or(by),
+            clamp_u32(quarter)?,
+            clamp_u32(doq)?,
+        )
+        .map_err(terr);
+    }
+    let (by, bm, bd) = match base {
+        Some(b) => {
+            let (y, m, d) = b.to_ymd();
+            (y, i64::from(m), i64::from(d))
+        }
+        None => (0, 1, 1),
+    };
+    let month = map.int_or("month", bm)?;
+    let day = map.int_or("day", bd)?;
+    Date::from_ymd(year.unwrap_or(by), clamp_u32(month)?, clamp_u32(day)?).map_err(terr)
+}
+
+/// Builds a time-of-day from the map's components over an optional base time (normally the
+/// `base_time(map)` wall clock; the zone-conversion paths substitute the converted time).
+fn time_from_map(map: &ComponentMap<'_>, base: Option<LocalTime>) -> Result<LocalTime, EvalError> {
     let (bh, bm, bs, bn) = match base {
         Some(t) => (t.hour(), t.minute(), t.second(), t.nanosecond()),
         None => (0, 0, 0, 0),
@@ -425,13 +576,15 @@ fn time_from_map(map: &ComponentMap<'_>) -> Result<LocalTime, EvalError> {
 }
 
 fn local_date_time_from_map(map: &ComponentMap<'_>) -> Result<LocalDateTime, EvalError> {
-    let date = date_from_map(map)?;
-    let time = time_from_map(map)?;
+    let date = date_from_map(map, base_date(map)?)?;
+    let time = time_from_map(map, base_time(map)?.map(|b| b.time))?;
     Ok(LocalDateTime::from_date_time(date, time))
 }
 
 fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
-    // Epoch forms: `datetime({epochSeconds: s [, nanosecond: n]})` / `{epochMillis: ms}`.
+    let tz = map.timezone()?;
+    // Epoch forms: `datetime({epochSeconds: s [, nanosecond: n]})` / `{epochMillis: ms}`. The
+    // epoch fixes the instant; a timezone only re-renders it (no gap/overlap can arise).
     if map.has("epochseconds") || map.has("epochmillis") {
         let (secs, base_nanos) = if map.has("epochseconds") {
             (map.int_or("epochseconds", 0)?, 0i64)
@@ -446,25 +599,96 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
             nanos: u32::try_from(total_nanos.rem_euclid(1_000_000_000))
                 .expect("rem_euclid(1e9) fits u32"),
         };
-        let offset = map.offset_seconds()?.unwrap_or(0);
-        // The epoch fixes the instant; the local fields shift by the offset.
+        let (offset, zone_id) = match tz {
+            None => (0, ""),
+            Some(TzSpec::Fixed(offset)) => (offset, ""),
+            Some(TzSpec::Named(zone)) => (
+                timezone::offset_at_instant(zone, local.epoch_seconds)?,
+                zone,
+            ),
+        };
+        // The local fields shift by the resolved offset.
         let shifted = LocalDateTime {
             epoch_seconds: local.epoch_seconds + i64::from(offset),
             nanos: local.nanos,
         };
         return Ok(Value::ZonedDateTime(
-            ZonedDateTime::from_local(shifted, offset, "").map_err(terr)?,
+            ZonedDateTime::from_local(shifted, offset, zone_id).map_err(terr)?,
         ));
     }
-    // Inherit the offset of a zoned base (`{datetime: zdt}` / `{time: zt}`) unless overridden.
-    let base_offset = base_time(map)?.and_then(|(_, off)| off);
-    let local = local_date_time_from_map(map)?;
-    let offset = match map.offset_seconds()? {
-        Some(off) => off,
-        None => base_offset.unwrap_or(0),
+
+    let base = base_time(map)?;
+    let base_offset = base.as_ref().and_then(|b| b.offset);
+
+    // 1. Conversion: an explicit target timezone re-expresses a *zoned* base in the target zone
+    //    (the instant is preserved) before the component overrides apply (`Temporal3.feature`
+    //    scenarios [9]/[11]: `datetime({datetime: d12:00+01:00, timezone: '+05:00'})` is
+    //    `16:00+05:00`). A `datetime:` base converts the whole local date-time; a `time:` base
+    //    converts the time-of-day modulo 24 h. An unzoned base keeps its wall clock.
+    let mut default_date = base_date(map)?;
+    let mut default_time = base.as_ref().map(|b| b.time);
+    let mut converted_offset: Option<i32> = None;
+    if let (Some(spec), Some(b), Some(from)) = (tz, &base, base_offset) {
+        if b.from_datetime {
+            let date = default_date
+                .ok_or_else(|| type_err("temporal component `datetime` must carry a date"))?;
+            let local = LocalDateTime::from_date_time(date, b.time);
+            let instant = local.epoch_seconds - i64::from(from);
+            let target = spec.offset_at_instant(instant)?;
+            let converted = LocalDateTime {
+                epoch_seconds: instant + i64::from(target),
+                nanos: local.nanos,
+            };
+            let (d, t) = converted.to_date_time();
+            default_date = Some(d);
+            default_time = Some(t);
+            converted_offset = Some(target);
+        } else {
+            // The date is owned by the date components; only the time-of-day converts. The
+            // target offset is resolved at the instant the (assembled date, base time, base
+            // offset) denote.
+            let date = date_from_map(map, default_date)?;
+            let local = LocalDateTime::from_date_time(date, b.time);
+            let instant = local.epoch_seconds - i64::from(from);
+            let target = spec.offset_at_instant(instant)?;
+            default_time = Some(shift_time(b.time, target - from));
+            converted_offset = Some(target);
+        }
+    }
+
+    // 2. Component overrides over the (possibly converted) base.
+    let date = date_from_map(map, default_date)?;
+    let time = time_from_map(map, default_time)?;
+    let local = LocalDateTime::from_date_time(date, time);
+
+    // 3. Final offset and zone id: the explicit timezone wins; otherwise the zone (or fixed
+    //    offset) is inherited from the zoned base; otherwise UTC. A named zone re-resolves the
+    //    offset from the *final* local value — overrides can move it across a DST transition
+    //    (`Temporal3.feature` scenario [10]: a Stockholm base moved from October to late March
+    //    1984 flips +01:00 to +02:00) — preferring the converted/inherited offset when the local
+    //    time is ambiguous.
+    let (local, offset, zone_id): (LocalDateTime, i32, String) = match tz {
+        Some(TzSpec::Fixed(offset)) => (local, offset, String::new()),
+        Some(TzSpec::Named(zone)) => {
+            let (local, offset) = timezone::resolve_local(zone, &local, converted_offset)?;
+            (local, offset, zone.to_owned())
+        }
+        None => match base.as_ref() {
+            Some(TimeBase {
+                zone: Some(zone), ..
+            }) => {
+                let (local, offset) = timezone::resolve_local(zone, &local, base_offset)?;
+                (local, offset, zone.clone())
+            }
+            Some(TimeBase {
+                offset: Some(offset),
+                ..
+            }) => (local, *offset, String::new()),
+            _ => (local, 0, String::new()),
+        },
     };
     Ok(Value::ZonedDateTime(
-        ZonedDateTime::from_local(local, offset, "").map_err(terr)?,
+        ZonedDateTime::from_local(local, offset, zone_id).map_err(terr)?,
     ))
 }
 
@@ -716,6 +940,8 @@ struct PointParts {
     date: Date,
     time: LocalTime,
     offset: Option<i32>,
+    /// The IANA zone id of a named-zone `DateTime` (drives zone-aware difference/truncation).
+    zone: Option<String>,
     dated: bool,
 }
 
@@ -725,6 +951,7 @@ fn point_parts(v: &Value) -> Option<PointParts> {
             date: *d,
             time: LocalTime::default(),
             offset: None,
+            zone: None,
             dated: true,
         },
         Value::LocalDateTime(dt) => {
@@ -733,6 +960,7 @@ fn point_parts(v: &Value) -> Option<PointParts> {
                 date,
                 time,
                 offset: None,
+                zone: None,
                 dated: true,
             }
         }
@@ -742,6 +970,7 @@ fn point_parts(v: &Value) -> Option<PointParts> {
                 date,
                 time,
                 offset: Some(z.offset_seconds),
+                zone: (!z.zone_id.is_empty()).then(|| z.zone_id.clone()),
                 dated: true,
             }
         }
@@ -749,12 +978,14 @@ fn point_parts(v: &Value) -> Option<PointParts> {
             date: Date::default(),
             time: *t,
             offset: None,
+            zone: None,
             dated: false,
         },
         Value::ZonedTime(zt) => PointParts {
             date: Date::default(),
             time: zt.time,
             offset: Some(zt.offset_seconds),
+            zone: None,
             dated: false,
         },
         _ => return None,
@@ -769,10 +1000,43 @@ pub(crate) fn duration_between(kind: &str, a: &Value, b: &Value) -> Result<Value
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
     }
-    let pa =
+    let mut pa =
         point_parts(a).ok_or_else(|| type_err(format!("{kind}() requires temporal arguments")))?;
     let mut pb =
         point_parts(b).ok_or_else(|| type_err(format!("{kind}() requires temporal arguments")))?;
+    // Named-zone resolution of a local operand (`Temporal10.feature` scenario [8]): when exactly
+    // one operand carries an offset and that operand is anchored to a named IANA zone, the other
+    // operand is interpreted in that zone — borrowing the zoned operand's local date when it has
+    // none — so the difference measures instants across DST transitions (e.g. Stockholm
+    // 2017-10-29T00:00 to a local 04:00 the same day is 5 hours, not 4).
+    if pa.offset.is_some() != pb.offset.is_some() {
+        let (anchor_zone, anchor_date, other) = if pa.offset.is_some() {
+            (pa.zone.clone(), pa.date, &mut pb)
+        } else {
+            (pb.zone.clone(), pb.date, &mut pa)
+        };
+        if let Some(zone) = anchor_zone {
+            if !other.dated {
+                other.date = anchor_date;
+            }
+            let local = LocalDateTime::from_date_time(other.date, other.time);
+            let (adjusted, offset) = timezone::resolve_local(&zone, &local, None)?;
+            let (date, time) = adjusted.to_date_time();
+            other.date = date;
+            other.time = time;
+            other.offset = Some(offset);
+        }
+    }
+    let dated = pa.dated && pb.dated;
+    // A time-only operand reduces the difference to the time-of-day axis: the other operand's
+    // date does not contribute (`Temporal10.feature` scenario [2]: `date × localtime('16:30')`
+    // is PT16H30M, `localtime('14:30') × localdatetime(...T21:45:22.142)` is PT7H15M22.142S).
+    // Both operands are re-anchored to the same date *before* the offset re-expression, which
+    // may legitimately carry the wall clock across midnight (java.time's OffsetTime semantics).
+    if !dated {
+        pa.date = Date::default();
+        pb.date = Date::default();
+    }
     // Re-express b at a's offset so the difference measures instants, not wall clocks.
     if let (Some(oa), Some(ob)) = (pa.offset, pb.offset) {
         let shift = i64::from(oa) - i64::from(ob);
@@ -786,7 +1050,6 @@ pub(crate) fn duration_between(kind: &str, a: &Value, b: &Value) -> Result<Value
         pb.time = time;
     }
 
-    let dated = pa.dated && pb.dated;
     let la = LocalDateTime::from_date_time(pa.date, pa.time);
     let lb = LocalDateTime::from_date_time(pb.date, pb.time);
     let total_nanos = instant_nanos(&lb) - instant_nanos(&la);
@@ -917,24 +1180,33 @@ pub(crate) fn truncate(
         .ok_or_else(|| type_err(format!("unknown truncation unit `{unit}`")))?;
 
     // Optional component overrides (`{day: 2}`-style map).
-    let (date, time, override_offset) = match overrides {
+    let (date, time, override_tz) = match overrides {
         None | Some(Value::Null) => (date, time, None),
         Some(Value::Map(entries)) => {
             let map = ComponentMap::new(entries)?;
-            let (y, m, d) = date.to_ymd();
-            let year = map.int_or("year", y)?;
-            let month = map.int_or("month", i64::from(m))?;
-            let day = map.int_or("day", i64::from(d))?;
-            let new_date =
-                Date::from_ymd(year, clamp_u32(month)?, clamp_u32(day)?).map_err(terr)?;
+            // The date overrides reuse the component-map calendars over the truncated date
+            // (`Temporal9.feature` scenario [1]: truncating to 'week' with `{dayOfWeek: 2}`
+            // lands on the Tuesday of that week).
+            let new_date = date_from_map(&map, Some(date))?;
             let hour = map.int_or("hour", time.hour())?;
             let minute = map.int_or("minute", time.minute())?;
             let second = map.int_or("second", time.second())?;
             let nanos = if map.has("millisecond") || map.has("microsecond") || map.has("nanosecond")
             {
-                map.int_or("millisecond", 0)? * 1_000_000
-                    + map.int_or("microsecond", 0)? * 1_000
-                    + map.int_or("nanosecond", 0)?
+                // Positional-field overrides over the *truncated* value: `millisecond` is the
+                // millisecond-of-second, `microsecond` the microsecond-of-millisecond and
+                // `nanosecond` the nanosecond-of-microsecond (`Temporal9.feature` scenario [2]:
+                // truncating to 'millisecond' keeps `.645`, and `{nanosecond: 2}` then yields
+                // `.645000002`). This differs from the constructors, where the sub-second
+                // components are cumulative.
+                let ms = map.int_or("millisecond", time.millisecond())?;
+                let us = map.int_or(
+                    "microsecond",
+                    time.microsecond() - time.millisecond() * 1_000,
+                )?;
+                let ns =
+                    map.int_or("nanosecond", time.nanosecond() - time.microsecond() * 1_000)?;
+                ms * 1_000_000 + us * 1_000 + ns
             } else {
                 time.nanosecond()
             };
@@ -945,7 +1217,7 @@ pub(crate) fn truncate(
                 clamp_u32(nanos)?,
             )
             .map_err(terr)?;
-            (new_date, new_time, map.offset_seconds()?)
+            (new_date, new_time, map.timezone()?)
         }
         Some(other) => {
             return Err(type_err(format!(
@@ -955,16 +1227,48 @@ pub(crate) fn truncate(
         }
     };
 
-    let offset = override_offset.or(parts.offset).unwrap_or(0);
     Ok(match func {
         "date.truncate" => Value::Date(date),
         "localtime.truncate" => Value::LocalTime(time),
-        "time.truncate" => Value::ZonedTime(ZonedTime::new(time, offset).map_err(terr)?),
+        "time.truncate" => {
+            // Truncation never converts: a timezone override replaces the offset on the
+            // truncated wall clock (`Temporal9.feature` scenario [5]). A named zone resolves at
+            // the truncated local value (the input's date when it carried one).
+            let offset = match override_tz {
+                Some(TzSpec::Fixed(offset)) => offset,
+                Some(TzSpec::Named(zone)) => {
+                    let local = LocalDateTime::from_date_time(parts.date, time);
+                    timezone::resolve_local(zone, &local, None)?.1
+                }
+                None => parts.offset.unwrap_or(0),
+            };
+            Value::ZonedTime(ZonedTime::new(time, offset).map_err(terr)?)
+        }
         "localdatetime.truncate" => Value::LocalDateTime(LocalDateTime::from_date_time(date, time)),
-        _ => Value::ZonedDateTime(
-            ZonedDateTime::from_local(LocalDateTime::from_date_time(date, time), offset, "")
-                .map_err(terr)?,
-        ),
+        _ => {
+            // datetime.truncate: a timezone override replaces the zone on the truncated wall
+            // clock (no instant conversion — `Temporal9.feature` scenario [2]: truncating a
+            // `-01:00` value to 'hour' with `{timezone: 'Europe/Stockholm'}` keeps 12:00 and
+            // resolves +01:00). Without an override, a named-zone input keeps its zone with the
+            // offset re-resolved at the truncated local value (the truncated date can sit on
+            // the other side of a DST transition).
+            let local = LocalDateTime::from_date_time(date, time);
+            let (local, offset, zone_id): (LocalDateTime, i32, String) = match override_tz {
+                Some(TzSpec::Fixed(offset)) => (local, offset, String::new()),
+                Some(TzSpec::Named(zone)) => {
+                    let (local, offset) = timezone::resolve_local(zone, &local, None)?;
+                    (local, offset, zone.to_owned())
+                }
+                None => match parts.zone {
+                    Some(zone) => {
+                        let (local, offset) = timezone::resolve_local(&zone, &local, parts.offset)?;
+                        (local, offset, zone)
+                    }
+                    None => (local, parts.offset.unwrap_or(0), String::new()),
+                },
+            };
+            Value::ZonedDateTime(ZonedDateTime::from_local(local, offset, zone_id).map_err(terr)?)
+        }
     })
 }
 
@@ -1070,5 +1374,240 @@ fn kind_name(v: &Value) -> &'static str {
         Value::LocalDateTime(_) => "LocalDateTime",
         Value::ZonedDateTime(_) => "DateTime",
         Value::Duration(_) => "Duration",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression pins for IANA zone resolution (`rmp` task #60) and the adjacent
+    //! component-map fixes, asserted on the canonical ISO renderings the TCK compares against.
+
+    use super::*;
+
+    /// Builds a `Value::Map` from `(key, value)` pairs.
+    fn map(entries: &[(&str, Value)]) -> Value {
+        Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        )
+    }
+
+    fn iso(v: &Value) -> String {
+        to_iso(v).expect("temporal value renders")
+    }
+
+    fn dt(arg: Value) -> Value {
+        construct("datetime", Some(&arg)).expect("datetime() constructs")
+    }
+
+    #[test]
+    fn named_zone_resolves_dst_summer_and_winter_offsets() {
+        // Temporal1 [10]: the same zone and year, opposite sides of the Swedish DST window.
+        let winter = dt(map(&[
+            ("year", Value::Integer(1984)),
+            ("month", Value::Integer(10)),
+            ("day", Value::Integer(11)),
+            ("hour", Value::Integer(12)),
+            ("timezone", Value::String("Europe/Stockholm".into())),
+        ]));
+        assert_eq!(iso(&winter), "1984-10-11T12:00+01:00[Europe/Stockholm]");
+        let summer = dt(map(&[
+            ("year", Value::Integer(1984)),
+            ("ordinalDay", Value::Integer(202)),
+            ("timezone", Value::String("Europe/Stockholm".into())),
+        ]));
+        assert_eq!(iso(&summer), "1984-07-20T00:00+02:00[Europe/Stockholm]");
+    }
+
+    #[test]
+    fn named_zone_string_resolves_historical_offset() {
+        // Temporal2 [6]: 1818 Stockholm is the pre-standard-time local mean time, which differs
+        // from every offset the zone has used since 1879.
+        let parsed = dt(Value::String(
+            "1818-07-21T21:40:32.142[Europe/Stockholm]".into(),
+        ));
+        assert_eq!(
+            iso(&parsed),
+            "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]"
+        );
+        // An explicit offset is kept when consistent with the zone.
+        let strict = dt(Value::String(
+            "2015-07-21T21:40:32.142+02:00[Europe/Stockholm]".into(),
+        ));
+        assert_eq!(
+            iso(&strict),
+            "2015-07-21T21:40:32.142+02:00[Europe/Stockholm]"
+        );
+    }
+
+    #[test]
+    fn zone_conversion_preserves_the_instant() {
+        // Temporal3 [11]: `{datetime: d, timezone: tz}` re-expresses the instant in the target
+        // zone before overrides apply.
+        let base = dt(map(&[
+            ("year", Value::Integer(1984)),
+            ("month", Value::Integer(10)),
+            ("day", Value::Integer(11)),
+            ("hour", Value::Integer(12)),
+            ("timezone", Value::String("Europe/Stockholm".into())),
+        ]));
+        let converted = dt(map(&[
+            ("datetime", base.clone()),
+            ("timezone", Value::String("Pacific/Honolulu".into())),
+        ]));
+        assert_eq!(iso(&converted), "1984-10-11T01:00-10:00[Pacific/Honolulu]");
+        let (Value::ZonedDateTime(b), Value::ZonedDateTime(c)) = (&base, &converted) else {
+            panic!("zoned datetimes expected");
+        };
+        assert_eq!(b.epoch_seconds(), c.epoch_seconds());
+        // Overrides over an *inherited* named zone re-resolve the offset for the new local
+        // value (Temporal3 [10]/[11]: moving a Stockholm local across the DST boundary flips
+        // the offset).
+        let moved = dt(map(&[
+            ("datetime", base),
+            ("month", Value::Integer(3)),
+            ("day", Value::Integer(28)),
+        ]));
+        assert_eq!(iso(&moved), "1984-03-28T12:00+02:00[Europe/Stockholm]");
+    }
+
+    #[test]
+    fn dst_gap_construction_moves_the_local_time_later() {
+        // Stockholm springs forward 2017-03-26 02:00 → 03:00: the skipped 02:30 is adjusted
+        // later by the gap, per java.time.ZonedDateTime.ofLocal (Neo4j's reference behaviour).
+        let gap = dt(map(&[
+            ("year", Value::Integer(2017)),
+            ("month", Value::Integer(3)),
+            ("day", Value::Integer(26)),
+            ("hour", Value::Integer(2)),
+            ("minute", Value::Integer(30)),
+            ("timezone", Value::String("Europe/Stockholm".into())),
+        ]));
+        assert_eq!(iso(&gap), "2017-03-26T03:30+02:00[Europe/Stockholm]");
+    }
+
+    #[test]
+    fn unknown_zone_id_is_a_typed_error() {
+        let err = construct(
+            "datetime",
+            Some(&map(&[
+                ("year", Value::Integer(2017)),
+                ("timezone", Value::String("Mars/Olympus_Mons".into())),
+            ])),
+        )
+        .expect_err("unknown zone must not resolve");
+        assert!(matches!(err, EvalError::TypeError { .. }), "{err:?}");
+        let err = construct(
+            "datetime",
+            Some(&Value::String("2017-01-01T12:00[Mars/Olympus_Mons]".into())),
+        )
+        .expect_err("unknown zone must not parse");
+        assert!(matches!(err, EvalError::TypeError { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn duration_in_seconds_resolves_a_local_operand_in_the_named_zone() {
+        // Temporal10 [8]: midnight is still +02:00, the local 04:00 the same day is already
+        // +01:00 after the fall-back, so the distance is 5 hours, not 4.
+        let a = dt(map(&[
+            ("year", Value::Integer(2017)),
+            ("month", Value::Integer(10)),
+            ("day", Value::Integer(29)),
+            ("hour", Value::Integer(0)),
+            ("timezone", Value::String("Europe/Stockholm".into())),
+        ]));
+        let b = construct(
+            "localdatetime",
+            Some(&map(&[
+                ("year", Value::Integer(2017)),
+                ("month", Value::Integer(10)),
+                ("day", Value::Integer(29)),
+                ("hour", Value::Integer(4)),
+            ])),
+        )
+        .expect("localdatetime() constructs");
+        let d = duration_between("duration.inseconds", &a, &b).expect("computes");
+        assert_eq!(iso(&d), "PT5H");
+    }
+
+    #[test]
+    fn truncation_with_a_named_zone_override_resolves_the_truncated_local() {
+        // Temporal9 [2]: truncation never converts; the named-zone override resolves the
+        // offset at the truncated wall clock.
+        let input = dt(map(&[
+            ("year", Value::Integer(1984)),
+            ("month", Value::Integer(10)),
+            ("day", Value::Integer(11)),
+            ("hour", Value::Integer(12)),
+            ("minute", Value::Integer(31)),
+            ("timezone", Value::String("-01:00".into())),
+        ]));
+        let truncated = truncate(
+            "datetime.truncate",
+            &Value::String("hour".into()),
+            &input,
+            Some(&map(&[(
+                "timezone",
+                Value::String("Europe/Stockholm".into()),
+            )])),
+        )
+        .expect("truncates");
+        assert_eq!(iso(&truncated), "1984-10-11T12:00+01:00[Europe/Stockholm]");
+    }
+
+    #[test]
+    fn truncation_sub_second_overrides_are_positional_fields() {
+        // Temporal9 [2] (pre-existing bug fixed in this cycle): truncating to 'millisecond'
+        // keeps `.645`; `{nanosecond: 2}` then sets the nanosecond-of-microsecond field.
+        let input = dt(map(&[
+            ("year", Value::Integer(1984)),
+            ("month", Value::Integer(10)),
+            ("day", Value::Integer(11)),
+            ("hour", Value::Integer(12)),
+            ("minute", Value::Integer(31)),
+            ("second", Value::Integer(14)),
+            ("nanosecond", Value::Integer(645_876_123)),
+            ("timezone", Value::String("+01:00".into())),
+        ]));
+        let truncated = truncate(
+            "datetime.truncate",
+            &Value::String("millisecond".into()),
+            &input,
+            Some(&map(&[("nanosecond", Value::Integer(2))])),
+        )
+        .expect("truncates");
+        assert_eq!(iso(&truncated), "1984-10-11T12:31:14.645000002+01:00");
+    }
+
+    #[test]
+    fn week_overrides_apply_over_a_base_date() {
+        // Temporal1 [1] / Temporal3 [1] (pre-existing bug fixed in this cycle): week-calendar
+        // components over a `date:` base default to the base's week-year/week/week-day.
+        let base = construct("date", Some(&Value::String("1816-12-30".into())))
+            .expect("date() constructs");
+        let picked = construct(
+            "date",
+            Some(&map(&[
+                ("date", base),
+                ("week", Value::Integer(2)),
+                ("dayOfWeek", Value::Integer(3)),
+            ])),
+        )
+        .expect("date() selects");
+        assert_eq!(iso(&picked), "1817-01-08");
+    }
+
+    #[test]
+    fn duration_between_with_a_time_only_operand_uses_the_time_axis() {
+        // Temporal10 [2] (pre-existing bug fixed in this cycle): `date × localtime` measures
+        // time-of-day only — the date contributes nothing.
+        let a = construct("date", Some(&Value::String("1984-10-11".into())))
+            .expect("date() constructs");
+        let b = construct("localtime", Some(&Value::String("16:30".into())))
+            .expect("localtime() constructs");
+        let d = duration_between("duration.between", &a, &b).expect("computes");
+        assert_eq!(iso(&d), "PT16H30M");
     }
 }

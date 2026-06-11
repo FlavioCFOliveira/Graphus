@@ -34,6 +34,18 @@ graphus-index = { path = "../graphus-index" }
 # crate to the build graph. The edge is acyclic: graphus-bufpool depends on core/io/wal, never on
 # cypher.
 graphus-bufpool = { path = "../graphus-bufpool" }
+# IANA time-zone resolution for the temporal functions (`rmp` task #60, src/timezone.rs):
+# `datetime({timezone: 'Europe/Stockholm'})` and `datetime('...[Europe/London]')` need the
+# historical offset and DST rules of the IANA tz database. `jiff-tzdb` embeds the compiled TZif
+# tables of *vanilla* tzdata as static, dependency-free data (no runtime filesystem access, so it
+# behaves identically on Linux/macOS/Raspberry Pi OS across x86-64/arm64/aarch64), and `tz-rs`
+# parses and queries them. Vanilla data matters for TCK faithfulness: the `tzdb` crate was
+# evaluated and rejected because its data is built WITH the `backzone` file, which gives
+# Europe/Stockholm its own pre-1879 history (+01:12:12) where the TCK pins the vanilla link to
+# Europe/Berlin (+00:53:28, `Temporal2.feature` scenario [6]). Deliberately NOT `chrono-tz`:
+# Graphus has its own temporal type system in graphus-core and must not pull in `chrono`.
+jiff-tzdb = "0.1.6"
+tz-rs = "0.7.3"
 # `LOAD CSV` (the in-query source clause, FR-BK) streams a local CSV file with the `csv` crate,
 # honoring `WITH HEADERS` and a custom `FIELDTERMINATOR`. The reader is `std::io::Read`-based so a
 # large file is streamed record-by-record, never slurped (the executor source pulls one row per

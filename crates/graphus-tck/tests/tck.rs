@@ -26,26 +26,27 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **3130 / 3884 scenarios pass (80.59 %)**, with 0 panics and 0 scenarios
-/// skipped as unsupported. This rose from 2996 when `rmp` task #61 added compile-time expression
-/// **type checking** ([`graphus_cypher::static_type`]): a conservative static type lattice infers
-/// the type of literal / parameter-free expressions bottom-up and raises
-/// `SyntaxError`/`InvalidArgumentType` for the statically-decidable mismatches the TCK expects at
-/// compile time — boolean operators over non-booleans, strict arithmetic over non-numerics
-/// (incl. quantifier predicates over typed list literals), `IN` over a non-list, property access
-/// over a non-graph/non-map literal, `type()`/`length()`/`properties()` over the wrong kind, and a
-/// non-integer `SKIP`/`LIMIT` literal. A dynamic operand (a non-entity variable, property access,
-/// parameter, function result, heterogeneous list) is `Unknown` and never flagged, so the runtime
-/// `TypeError` path is untouched: the gain (+134) came entirely from the *error TYPE mismatch*
-/// (−116) and *expected-an-error-but-got-rows* (−18) buckets, with every other failure bucket
-/// unchanged (measured: zero regressions). Prior rise: 2944 → 2996 (#57, `CALL` procedures via
-/// [`graphus_cypher::procedure_registry`] — all 52 `clauses/call` scenarios). Earlier:
-/// 2614 → 2944 (#56, TCK-faithful error classification); 1782 → 2614 (#53, temporal types);
-/// 1192 → 1782 (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55, verbatim column names).
-/// Remaining failures are honest gaps: property-access typing that needs `WITH`-projection
-/// type-flow (`WITH 1 AS x … x.p`), float-parameter `SKIP`/`LIMIT`, IANA zone resolution
-/// (rmp #60), and the full-query `EXISTS { ... RETURN ... }` form.
-const BASELINE: usize = 3130;
+/// Current ratchet: **3324 / 3884 scenarios pass (85.58 %)**, with 0 panics and 0 scenarios
+/// skipped as unsupported. This rose from 3130 (+194, all in `expressions/temporal`) when `rmp`
+/// task #60 added **IANA time-zone resolution** ([`graphus_cypher::timezone`], the embedded
+/// vanilla-tzdata TZif tables of `jiff-tzdb` queried through `tz-rs`): named zones in the
+/// `datetime()`/`time()` constructors and `[Zone]` string suffixes now resolve historical
+/// offsets and DST (gap/overlap per `java.time.ZonedDateTime.ofLocal`), zone conversion
+/// preserves the instant, `duration.*` interprets a local operand in the zoned operand's named
+/// zone, and truncation re-resolves the offset. The same cycle fixed adjacent pre-existing
+/// component-map bugs the temporal triage surfaced (week/ordinal/quarter overrides over a base
+/// date, positional sub-second truncation overrides, time-axis-only `duration.between` with a
+/// time-only operand). The gain came from the *engine-raised-an-error* (−111) and
+/// *bag-mismatch* (−82) buckets plus one init-query fix, with every other failure bucket
+/// unchanged (measured: zero regressions). Prior rise: 2996 → 3130 (#61, compile-time
+/// expression type checking via [`graphus_cypher::static_type`]). Earlier: 2944 → 2996 (#57,
+/// `CALL` procedures); 2614 → 2944 (#56, TCK-faithful error classification); 1782 → 2614 (#53,
+/// temporal types); 1192 → 1782 (#54, quantifiers/comprehensions/EXISTS); 1112 → 1192 (#55,
+/// verbatim column names). Remaining failures are honest gaps: property-access typing that
+/// needs `WITH`-projection type-flow (`WITH 1 AS x … x.p`), float-parameter `SKIP`/`LIMIT`, the
+/// transaction-clock constructors (`datetime()`, `date.statement()`, …), and the full-query
+/// `EXISTS { ... RETURN ... }` form.
+const BASELINE: usize = 3324;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.
