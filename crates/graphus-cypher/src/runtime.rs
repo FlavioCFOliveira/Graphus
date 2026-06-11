@@ -47,6 +47,63 @@ pub struct RelRef {
     pub id: RelId,
 }
 
+/// A **path** value carried in a result row (`04 §7.2` structural `Path`): the start node followed
+/// by the traversed hops, in traversal order.
+///
+/// Like [`NodeRef`]/[`RelRef`], a path holds opaque ids only — labels/properties resolve lazily
+/// through the seam. Two paths are equal iff they traverse the same nodes and relationships in the
+/// same order and orientation (openCypher path equality).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[must_use]
+pub struct PathValue {
+    /// The first node of the path.
+    pub start: NodeId,
+    /// The subsequent hops, in traversal order. Empty for a zero-length path (a single node).
+    pub steps: Vec<PathStep>,
+}
+
+/// One hop of a [`PathValue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[must_use]
+pub struct PathStep {
+    /// `true` when the relationship was traversed start→end (its stored direction), `false` when
+    /// traversed against it. Self-loops are always recorded as forward.
+    pub forward: bool,
+    /// The traversed relationship.
+    pub rel: RelId,
+    /// The node this hop arrives at.
+    pub node: NodeId,
+}
+
+impl PathValue {
+    /// The nodes along the path, in order (start first; `steps.len() + 1` entries).
+    #[must_use]
+    pub fn nodes(&self) -> Vec<NodeId> {
+        let mut out = Vec::with_capacity(self.steps.len() + 1);
+        out.push(self.start);
+        out.extend(self.steps.iter().map(|s| s.node));
+        out
+    }
+
+    /// The relationships along the path, in traversal order.
+    #[must_use]
+    pub fn rels(&self) -> Vec<RelId> {
+        self.steps.iter().map(|s| s.rel).collect()
+    }
+
+    /// The path's length (its number of relationships; openCypher `length()`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Whether the path is zero-length (a single node, no relationships).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
 /// A value flowing through the executor: a property [`Value`] or a structural entity reference
 /// (`04 §7.2`).
 ///
@@ -63,6 +120,13 @@ pub enum RowValue {
     Node(NodeRef),
     /// A bound relationship.
     Rel(RelRef),
+    /// A bound path (`MATCH p = …`, named paths in pattern comprehensions, var-length traversals).
+    Path(PathValue),
+    /// A **structural** list — one that (transitively) contains a node, relationship or path, which
+    /// the property [`Value::List`] cannot carry. Build through [`RowValue::list`], which keeps the
+    /// invariant that a pure-property list always collapses to [`RowValue::Value`]`(Value::List)`,
+    /// so each list has exactly one canonical representation.
+    List(Vec<RowValue>),
 }
 
 impl RowValue {
@@ -101,6 +165,53 @@ impl RowValue {
             _ => None,
         }
     }
+
+    /// The path if this is a [`RowValue::Path`].
+    #[must_use]
+    pub fn as_path(&self) -> Option<&PathValue> {
+        match self {
+            RowValue::Path(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Builds the canonical list value over `items`: a pure-property list collapses to
+    /// [`RowValue::Value`]`(Value::List)`, while a list with any structural element (node /
+    /// relationship / path / nested structural list) stays a [`RowValue::List`].
+    ///
+    /// This is the **only** sanctioned way to build a list `RowValue`, so every list has exactly
+    /// one representation and equivalence/ordering never have to unify a pure list across the two
+    /// variants.
+    pub fn list(items: Vec<RowValue>) -> RowValue {
+        if items.iter().all(|it| matches!(it, RowValue::Value(_))) {
+            RowValue::Value(Value::List(
+                items
+                    .into_iter()
+                    .map(|it| match it {
+                        RowValue::Value(v) => v,
+                        // Unreachable by the `all` check above; kept total for safety.
+                        _ => Value::Null,
+                    })
+                    .collect(),
+            ))
+        } else {
+            RowValue::List(items)
+        }
+    }
+
+    /// Borrows this value as a sequence of list elements, when it is a list of either
+    /// representation: a structural [`RowValue::List`] borrows directly; a property
+    /// [`Value::List`] lifts each element into a [`RowValue::Value`] (cloning the elements).
+    #[must_use]
+    pub fn as_list_elems(&self) -> Option<Vec<RowValue>> {
+        match self {
+            RowValue::List(items) => Some(items.clone()),
+            RowValue::Value(Value::List(items)) => {
+                Some(items.iter().cloned().map(RowValue::Value).collect())
+            }
+            _ => None,
+        }
+    }
 }
 
 impl From<Value> for RowValue {
@@ -118,7 +229,10 @@ fn row_value_rank(v: &RowValue) -> u8 {
     match v {
         RowValue::Node(_) => 0,
         RowValue::Rel(_) => 1,
-        RowValue::Value(_) => 2,
+        RowValue::Path(_) => 2,
+        // A structural list shares the property-value rank so it interleaves with `Value::List`
+        // (the two list representations must order as one class; see `cmp_row_values`).
+        RowValue::List(_) | RowValue::Value(_) => 3,
     }
 }
 
@@ -126,26 +240,74 @@ fn row_value_rank(v: &RowValue) -> u8 {
 ///
 /// Property values use the Cypher orderability [`cmp_values`]; entity references order by id with a
 /// stable cross-case rank, so the relation is total even when a column mixes entities and scalars.
+/// Lists of either representation compare elementwise (shorter is less on a common prefix); paths
+/// compare by (start, steps). A structural list against a non-list property value compares through
+/// its property collapse (structural elements become null), keeping the relation total.
 #[must_use]
 pub fn cmp_row_values(a: &RowValue, b: &RowValue) -> Ordering {
     match (a, b) {
+        // List-kind values (either representation) compare elementwise as one class.
+        _ if is_list_kind(a) && is_list_kind(b) => cmp_row_lists(a, b),
         (RowValue::Value(x), RowValue::Value(y)) => cmp_values(x, y),
         (RowValue::Node(x), RowValue::Node(y)) => x.id.cmp(&y.id),
         (RowValue::Rel(x), RowValue::Rel(y)) => x.id.cmp(&y.id),
+        (RowValue::Path(x), RowValue::Path(y)) => x.cmp(y),
+        // A structural list against a non-list property value: compare through the property
+        // collapse (structural elements become null) so the class order matches `Value::List`'s.
+        (RowValue::List(_), RowValue::Value(y)) => cmp_values(&collapse_for_ordering(a), y),
+        (RowValue::Value(x), RowValue::List(_)) => cmp_values(x, &collapse_for_ordering(b)),
         _ => row_value_rank(a).cmp(&row_value_rank(b)),
+    }
+}
+
+/// Whether `v` is a list of either representation.
+fn is_list_kind(v: &RowValue) -> bool {
+    matches!(v, RowValue::List(_) | RowValue::Value(Value::List(_)))
+}
+
+/// Elementwise list comparison across the two list representations (both args are list-kind).
+fn cmp_row_lists(a: &RowValue, b: &RowValue) -> Ordering {
+    let xs = a.as_list_elems().unwrap_or_default();
+    let ys = b.as_list_elems().unwrap_or_default();
+    for (x, y) in xs.iter().zip(ys.iter()) {
+        let ord = cmp_row_values(x, y);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    xs.len().cmp(&ys.len())
+}
+
+/// The property collapse of a structural value for ordering against non-list property values:
+/// entities/paths become null, lists collapse elementwise (mirrors `eval`'s value-context rule).
+fn collapse_for_ordering(v: &RowValue) -> Value {
+    match v {
+        RowValue::Value(x) => x.clone(),
+        RowValue::List(items) => Value::List(items.iter().map(collapse_for_ordering).collect()),
+        RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) => Value::Null,
     }
 }
 
 /// Grouping/`DISTINCT` equivalence over [`RowValue`]s (`04 §7.6`).
 ///
 /// Property values use Cypher [`equivalent`]; two entity references are equivalent iff they denote
-/// the same id. Mixed cases are never equivalent.
+/// the same id; paths are equivalent iff they traverse the same ids in the same order and
+/// orientation; lists are equivalent elementwise. Mixed cases are never equivalent (a structural
+/// [`RowValue::List`] always holds a structural element — the [`RowValue::list`] invariant — so it
+/// can never be equivalent to a pure property list).
 #[must_use]
 pub fn row_values_equivalent(a: &RowValue, b: &RowValue) -> bool {
     match (a, b) {
         (RowValue::Value(x), RowValue::Value(y)) => equivalent(x, y),
         (RowValue::Node(x), RowValue::Node(y)) => x.id == y.id,
         (RowValue::Rel(x), RowValue::Rel(y)) => x.id == y.id,
+        (RowValue::Path(x), RowValue::Path(y)) => x == y,
+        (RowValue::List(x), RowValue::List(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(ex, ey)| row_values_equivalent(ex, ey))
+        }
         _ => false,
     }
 }

@@ -43,16 +43,18 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use graphus_core::Value;
 
-use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection};
+use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection, VarLengthRange};
 use crate::binding::BoundParameters;
 use crate::eval::{EvalError, eval, eval_value};
-use crate::graph_access::{ExpandDirection, GraphAccess, NodeId};
+use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId};
 use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
 use crate::ordering::cmp_values;
 use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound};
 use crate::procedure_registry::{self, ProcedureFailure, ProcedureRegistry};
-use crate::runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
+use crate::runtime::{
+    NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent,
+};
 use crate::ternary::Ternary;
 
 /// A cooperative **cancellation token** shared between a caller and a running query (`04 §7.7`).
@@ -240,7 +242,9 @@ enum Operator {
         current: Option<LoadCsvState>,
     },
 
-    /// `ExpandAll`/`ExpandInto`: for each input row, enumerate incident relationships.
+    /// `ExpandAll`/`ExpandInto`: for each input row, enumerate incident relationships. A
+    /// variable-length `range` (`-[*m..n]->`) enumerates **trails** (relationship-unique paths)
+    /// instead, binding the relationship variable to the list of traversed relationships.
     Expand {
         input: Box<Operator>,
         from: Var,
@@ -249,7 +253,17 @@ enum Operator {
         direction: RelDirection,
         types: Vec<RelType>,
         into: bool,
+        range: Option<VarLengthRange>,
         pending: VecDeque<Row>,
+    },
+
+    /// `NamedPath`: for each input row, reconstruct the path value bound by `MATCH p = …` from the
+    /// pattern part's `start` node and `steps` relationship bindings, binding `variable` to it.
+    NamedPath {
+        input: Box<Operator>,
+        variable: Var,
+        start: Var,
+        steps: Vec<Var>,
     },
 
     /// `Optional` (left-outer guarantee): emit the input's rows, or one null-filled row if empty.
@@ -349,6 +363,21 @@ impl Operator {
             Operator::Project { input, items } => {
                 if let Some(row) = input.next(ctx)? {
                     Ok(Some(project_row(&row, items, ctx)?))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            Operator::NamedPath {
+                input,
+                variable,
+                start,
+                steps,
+            } => {
+                if let Some(mut row) = input.next(ctx)? {
+                    let path = reconstruct_named_path(&row, start, steps, &*ctx.graph);
+                    row.set(variable.name.clone(), path);
+                    Ok(Some(row))
                 } else {
                     Ok(None)
                 }
@@ -457,6 +486,7 @@ impl Operator {
                 direction,
                 types,
                 into,
+                range,
                 pending,
             } => loop {
                 if let Some(row) = pending.pop_front() {
@@ -465,17 +495,32 @@ impl Operator {
                 let Some(base) = input.next(ctx)? else {
                     return Ok(None);
                 };
-                expand_into_pending(
-                    &base,
-                    from,
-                    relationship,
-                    to,
-                    *direction,
-                    types,
-                    *into,
-                    ctx,
-                    pending,
-                )?;
+                if let Some(range) = range {
+                    var_expand_into_pending(
+                        &base,
+                        from,
+                        relationship,
+                        to,
+                        *direction,
+                        types,
+                        *into,
+                        *range,
+                        ctx,
+                        pending,
+                    )?;
+                } else {
+                    expand_into_pending(
+                        &base,
+                        from,
+                        relationship,
+                        to,
+                        *direction,
+                        types,
+                        *into,
+                        ctx,
+                        pending,
+                    )?;
+                }
             },
 
             Operator::Optional {
@@ -685,6 +730,199 @@ fn expand_into_pending(
     Ok(())
 }
 
+/// Expands one base row's **variable-length** pattern (`-[r:T*m..n]->`) into `pending`: a
+/// depth-first enumeration of the trails (relationship-unique walks, openCypher uniqueness) from
+/// the anchor whose hop count lies in `[min, max]`. Each produced row binds the relationship
+/// variable to the **list** of traversed relationships (in order) and — for expand-all — the far
+/// endpoint to `to`; for expand-into only trails ending at the already-bound `to` are kept. A
+/// `min` of 0 admits the zero-length trail (the anchor itself, an empty relationship list).
+///
+/// Trail semantics bound the search depth by the relationship count, so an unbounded `*`
+/// terminates on any graph (cycles included).
+#[allow(clippy::too_many_arguments)]
+fn var_expand_into_pending(
+    base: &Row,
+    from: &Var,
+    relationship: &Var,
+    to: &Var,
+    direction: RelDirection,
+    types: &[RelType],
+    into: bool,
+    range: VarLengthRange,
+    ctx: &mut Ctx<'_>,
+    pending: &mut VecDeque<Row>,
+) -> Result<(), ExecError> {
+    let Some(anchor) = base.get(&from.name).and_then(RowValue::as_node) else {
+        // The anchor is unbound / not a node (e.g. null from an OPTIONAL); emit nothing.
+        return Ok(());
+    };
+    let target = if into {
+        base.get(&to.name).and_then(RowValue::as_node)
+    } else {
+        None
+    };
+    let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
+    let dir = ExpandDirection::from_pattern(direction);
+    let min = range.min.unwrap_or(1);
+
+    // The DFS worker: `trail` is the relationship stack (ids, traversal order).
+    fn dfs(
+        depth: u64,
+        current: NodeId,
+        trail: &mut Vec<crate::graph_access::RelId>,
+        min: u64,
+        max: Option<u64>,
+        target: Option<NodeId>,
+        dir: ExpandDirection,
+        type_names: &[String],
+        base: &Row,
+        relationship: &Var,
+        to: &Var,
+        into: bool,
+        ctx: &mut Ctx<'_>,
+        pending: &mut VecDeque<Row>,
+    ) -> Result<(), ExecError> {
+        ctx.check_cancelled()?;
+        if depth >= min && (!into || Some(current) == target) {
+            let mut row = base.clone();
+            row.set(
+                relationship.name.clone(),
+                RowValue::list(
+                    trail
+                        .iter()
+                        .map(|&id| RowValue::Rel(RelRef { id }))
+                        .collect(),
+                ),
+            );
+            if !into {
+                row.set(to.name.clone(), RowValue::Node(NodeRef { id: current }));
+            }
+            pending.push_back(row);
+        }
+        if max.is_some_and(|m| depth >= m) {
+            return Ok(());
+        }
+        // Deduplicate self-loops reported once per side (`04 §2.4`); the trail check enforces
+        // relationship uniqueness across the whole walk.
+        let mut seen_rel = std::collections::BTreeSet::new();
+        for inc in ctx.graph.expand(current, dir, type_names) {
+            if !seen_rel.insert(inc.rel) || trail.contains(&inc.rel) {
+                continue;
+            }
+            trail.push(inc.rel);
+            dfs(
+                depth + 1,
+                inc.neighbour,
+                trail,
+                min,
+                max,
+                target,
+                dir,
+                type_names,
+                base,
+                relationship,
+                to,
+                into,
+                ctx,
+                pending,
+            )?;
+            trail.pop();
+        }
+        Ok(())
+    }
+
+    dfs(
+        0,
+        anchor,
+        &mut Vec::new(),
+        min,
+        range.max,
+        target,
+        dir,
+        &type_names,
+        base,
+        relationship,
+        to,
+        into,
+        ctx,
+        pending,
+    )
+}
+
+/// Reconstructs the [`PathValue`] a `NamedPath` operator binds (`MATCH p = …`) from the pattern
+/// part's `start` node binding and its per-link `steps` relationship bindings.
+///
+/// Each step variable binds either a single relationship (a fixed hop) or the list of traversed
+/// relationships (a variable-length hop), in pattern order. The walk recovers each hop's
+/// orientation from the relationship's stored endpoints relative to the node it leaves, mirroring
+/// the expression-side reconstruction in [`crate::eval`] so the two produce equal path values. A
+/// null / unbound `start` or step — the `OPTIONAL MATCH` no-match row — binds the path to null.
+fn reconstruct_named_path(
+    row: &Row,
+    start: &Var,
+    steps: &[Var],
+    graph: &dyn GraphAccess,
+) -> RowValue {
+    let Some(start_id) = row.get(&start.name).and_then(RowValue::as_node) else {
+        return RowValue::NULL;
+    };
+    let mut current = start_id;
+    let mut path_steps = Vec::new();
+    for step in steps {
+        // The relationships of this link, in traversal order: a single bound relationship, or the
+        // list bound by a variable-length hop. Anything else (null / non-relationship element) is
+        // the OPTIONAL no-match case and collapses the whole path to null.
+        let rels: Vec<RelId> = match row.get(&step.name) {
+            Some(RowValue::Rel(r)) => vec![r.id],
+            Some(other) => {
+                let Some(elems) = other.as_list_elems() else {
+                    return RowValue::NULL;
+                };
+                let mut ids = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    let Some(id) = e.as_rel() else {
+                        return RowValue::NULL;
+                    };
+                    ids.push(id);
+                }
+                ids
+            }
+            None => return RowValue::NULL,
+        };
+        for rel in rels {
+            let hop = hop_step_from(rel, current, graph);
+            current = hop.node;
+            path_steps.push(hop);
+        }
+    }
+    RowValue::Path(PathValue {
+        start: start_id,
+        steps: path_steps,
+    })
+}
+
+/// The [`PathStep`] for traversing `rel` leaving `from`: forward iff the relationship's stored start
+/// is `from` (a self-loop and a missing relationship record as forward), arriving at the opposite
+/// endpoint. Mirrors `eval::hop_step` so the executor and the expression evaluator agree on path
+/// orientation.
+fn hop_step_from(rel: RelId, from: NodeId, graph: &dyn GraphAccess) -> PathStep {
+    match graph.rel_data(rel) {
+        Some(d) => {
+            let forward = d.start == from;
+            PathStep {
+                forward,
+                rel,
+                node: if forward { d.end } else { d.start },
+            }
+        }
+        None => PathStep {
+            forward: true,
+            rel,
+            node: from,
+        },
+    }
+}
+
 // =================================================================================================
 // Operator construction (compile a PhysicalOp tree into an Operator tree)
 // =================================================================================================
@@ -798,7 +1036,7 @@ fn build_operator(
             to,
             direction,
             types,
-            ..
+            range,
         } => Ok(Operator::Expand {
             input: Box::new(build_operator(input, arg, ctx)?),
             from: from.clone(),
@@ -807,6 +1045,7 @@ fn build_operator(
             direction: *direction,
             types: types.clone(),
             into: false,
+            range: *range,
             pending: VecDeque::new(),
         }),
         PhysicalOp::ExpandInto {
@@ -816,7 +1055,7 @@ fn build_operator(
             to,
             direction,
             types,
-            ..
+            range,
         } => Ok(Operator::Expand {
             input: Box::new(build_operator(input, arg, ctx)?),
             from: from.clone(),
@@ -825,7 +1064,19 @@ fn build_operator(
             direction: *direction,
             types: types.clone(),
             into: true,
+            range: *range,
             pending: VecDeque::new(),
+        }),
+        PhysicalOp::NamedPath {
+            input,
+            variable,
+            start,
+            steps,
+        } => Ok(Operator::NamedPath {
+            input: Box::new(build_operator(input, arg, ctx)?),
+            variable: variable.clone(),
+            start: start.clone(),
+            steps: steps.clone(),
         }),
 
         // ---- relational -----------------------------------------------------------------------
@@ -1269,17 +1520,42 @@ fn compare_sort_keys(a: &[RowValue], b: &[RowValue], keys: &[SortKey]) -> std::c
 }
 
 /// Drains `inner` and folds aggregates per group (`04 §7.6` grouping by equivalence).
+///
+/// An aggregate column may be a **composite** expression around its aggregate call(s) —
+/// `size(collect(n))`, `head(collect(m))`, `ALL(x IN collect(y) WHERE …)` (TCK `Return6` \[5\],
+/// `Return4` \[11\], `List11` \[3\]). Each column is therefore pre-compiled into an [`AggPlan`]:
+/// the aggregate sub-calls are extracted into per-group [`Accumulator`]s and replaced by synthetic
+/// variables in the outer expression, which is then evaluated once per finished group against a
+/// representative row of that group (every grouped expression agrees across the group's rows, and
+/// the semantic pass guarantees the outer composition only uses constants, grouped keys and
+/// locally-bound variables).
 fn aggregate_rows(
     mut inner: Operator,
     group_keys: &[ProjectionColumn],
     aggregates: &[ProjectionColumn],
     ctx: &mut Ctx<'_>,
 ) -> Result<VecDeque<Row>, ExecError> {
-    // Each group: its key row-values (in group_keys order) + per-aggregate accumulators.
+    // Compile each aggregate column independently; the column index disambiguates the synthetic
+    // names so two columns' extracted aggregates never collide in the shared evaluation row.
+    let plans: Vec<AggPlan> = aggregates
+        .iter()
+        .enumerate()
+        .map(|(col, c)| AggPlan::compile(&c.expr, col))
+        .collect();
+
+    // Each group: its key row-values (in group_keys order), one accumulator per extracted
+    // aggregate sub-call of every column, and a representative input row.
     struct Group {
         keys: Vec<RowValue>,
-        accs: Vec<Accumulator>,
+        accs: Vec<Vec<Accumulator>>,
+        representative: Row,
     }
+    let new_accs = |plans: &[AggPlan]| -> Vec<Vec<Accumulator>> {
+        plans
+            .iter()
+            .map(|p| p.subs.iter().map(|(_, e)| Accumulator::new(e)).collect())
+            .collect()
+    };
     let mut groups: Vec<Group> = Vec::new();
 
     while let Some(row) = inner.next(ctx)? {
@@ -1298,48 +1574,187 @@ fn aggregate_rows(
         }) {
             Some(i) => i,
             None => {
-                let accs = aggregates
-                    .iter()
-                    .map(|c| Accumulator::new(&c.expr))
-                    .collect();
                 groups.push(Group {
                     keys: key_vals.clone(),
-                    accs,
+                    accs: new_accs(&plans),
+                    representative: row.clone(),
                 });
                 groups.len() - 1
             }
         };
         // Update each accumulator from this row.
-        for (col, acc) in aggregates.iter().zip(groups[idx].accs.iter_mut()) {
-            acc.update(&col.expr, &row, ctx)?;
+        for (plan, accs) in plans.iter().zip(groups[idx].accs.iter_mut()) {
+            for ((_, sub), acc) in plan.subs.iter().zip(accs.iter_mut()) {
+                acc.update(sub, &row, ctx)?;
+            }
         }
     }
 
     // With no input rows and no grouping keys, Cypher still emits one row (the empty group) — e.g.
     // `count(*)` over an empty match is 0. Materialise that single empty group.
     if groups.is_empty() && group_keys.is_empty() {
-        let accs = aggregates
-            .iter()
-            .map(|c| Accumulator::new(&c.expr))
-            .collect();
         groups.push(Group {
             keys: Vec::new(),
-            accs,
+            accs: new_accs(&plans),
+            representative: Row::empty(),
         });
     }
 
     let mut out = VecDeque::new();
     for g in groups {
         let mut row = Row::empty();
+        // The evaluation row for the outer expressions: the group's representative input row,
+        // the projected key aliases, and the synthetic aggregate-result bindings.
+        let mut eval_row = g.representative;
         for (col, kv) in group_keys.iter().zip(g.keys) {
+            eval_row.set(col.alias.clone(), kv.clone());
             row.set(col.alias.clone(), kv);
         }
-        for (col, acc) in aggregates.iter().zip(g.accs) {
-            row.set(col.alias.clone(), RowValue::Value(acc.finish()));
+        for (plan, accs) in plans.iter().zip(g.accs) {
+            for ((name, _), acc) in plan.subs.iter().zip(accs) {
+                eval_row.set(name.clone(), acc.finish());
+            }
+        }
+        for (col, plan) in aggregates.iter().zip(&plans) {
+            let value = eval(&plan.outer, &eval_row, ctx.params, ctx.graph)?;
+            row.set(col.alias.clone(), value);
         }
         out.push_back(row);
     }
     Ok(out)
+}
+
+/// One aggregate column, compiled for [`aggregate_rows`]: the outer expression with each aggregate
+/// sub-call replaced by a synthetic variable, plus the extracted `(synthetic name, aggregate
+/// call)` pairs in extraction order.
+struct AggPlan {
+    outer: Expr,
+    subs: Vec<(String, Expr)>,
+}
+
+impl AggPlan {
+    /// Extracts the aggregate sub-calls of `expr` (aggregates never nest — the semantic pass
+    /// rejects that), substituting synthetic variables the parser can never produce. `col` is the
+    /// column's index among the aggregate columns, woven into the synthetic names so they are
+    /// unique across the whole projection (not just within one column).
+    fn compile(expr: &Expr, col: usize) -> AggPlan {
+        let mut subs = Vec::new();
+        let outer = extract_aggregates(expr, &mut subs, col);
+        AggPlan { outer, subs }
+    }
+}
+
+/// Whether `expr` is itself an aggregate call (`count(*)` or an aggregating function).
+fn is_aggregate_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::CountStar => true,
+        ExprKind::FunctionCall { name, .. } => {
+            crate::function_registry::is_aggregate(&name.join("."))
+        }
+        _ => false,
+    }
+}
+
+/// Rewrites `expr`, replacing every aggregate call by a fresh synthetic variable recorded in
+/// `subs`. Sub-scopes (comprehension/quantifier bodies) are traversed too — an aggregate is only
+/// legal there in the **source list**, which evaluates in the outer scope, and the semantic pass
+/// has already rejected the illegal positions.
+fn extract_aggregates(expr: &Expr, subs: &mut Vec<(String, Expr)>, col: usize) -> Expr {
+    if is_aggregate_call(expr) {
+        let name = format!("#agg{col}_{}", subs.len());
+        subs.push((name.clone(), expr.clone()));
+        return Expr::new(ExprKind::Variable(name), expr.span);
+    }
+    let rewrite =
+        |e: &Expr, subs: &mut Vec<(String, Expr)>| Box::new(extract_aggregates(e, subs, col));
+    let kind = match &expr.kind {
+        k @ (ExprKind::Literal(_)
+        | ExprKind::Parameter(_)
+        | ExprKind::Variable(_)
+        | ExprKind::CountStar) => k.clone(),
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: rewrite(lhs, subs),
+            rhs: rewrite(rhs, subs),
+        },
+        ExprKind::Unary { op, operand } => ExprKind::Unary {
+            op: *op,
+            operand: rewrite(operand, subs),
+        },
+        ExprKind::Predicate { op, operand, rhs } => ExprKind::Predicate {
+            op: *op,
+            operand: rewrite(operand, subs),
+            rhs: rhs.as_deref().map(|e| rewrite(e, subs)),
+        },
+        ExprKind::HasLabels { operand, labels } => ExprKind::HasLabels {
+            operand: rewrite(operand, subs),
+            labels: labels.clone(),
+        },
+        ExprKind::Property { base, key } => ExprKind::Property {
+            base: rewrite(base, subs),
+            key: key.clone(),
+        },
+        ExprKind::Index { base, index } => ExprKind::Index {
+            base: rewrite(base, subs),
+            index: rewrite(index, subs),
+        },
+        ExprKind::Slice { base, low, high } => ExprKind::Slice {
+            base: rewrite(base, subs),
+            low: low.as_deref().map(|e| rewrite(e, subs)),
+            high: high.as_deref().map(|e| rewrite(e, subs)),
+        },
+        ExprKind::FunctionCall {
+            name,
+            distinct,
+            args,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: args
+                .iter()
+                .map(|a| extract_aggregates(a, subs, col))
+                .collect(),
+        },
+        ExprKind::List(items) => ExprKind::List(
+            items
+                .iter()
+                .map(|it| extract_aggregates(it, subs, col))
+                .collect(),
+        ),
+        ExprKind::Map(entries) => ExprKind::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), extract_aggregates(v, subs, col)))
+                .collect(),
+        ),
+        ExprKind::Case(case) => {
+            let mut case = case.clone();
+            case.subject = case.subject.take().map(|s| rewrite(&s, subs));
+            for alt in &mut case.alternatives {
+                alt.when = extract_aggregates(&alt.when, subs, col);
+                alt.then = extract_aggregates(&alt.then, subs, col);
+            }
+            case.else_expr = case.else_expr.take().map(|e| rewrite(&e, subs));
+            ExprKind::Case(case)
+        }
+        ExprKind::ListComprehension(lc) => {
+            let mut lc = lc.clone();
+            lc.list = rewrite(&lc.list, subs);
+            lc.predicate = lc.predicate.take().map(|p| rewrite(&p, subs));
+            lc.projection = lc.projection.take().map(|p| rewrite(&p, subs));
+            ExprKind::ListComprehension(lc)
+        }
+        ExprKind::Quantifier(q) => {
+            let mut q = q.clone();
+            q.list = rewrite(&q.list, subs);
+            q.predicate = rewrite(&q.predicate, subs);
+            ExprKind::Quantifier(q)
+        }
+        // Pattern comprehensions / EXISTS subqueries cannot contain aggregates (their scopes are
+        // pattern-bound; the semantic pass rejects aggregation inside them), so pass them through.
+        k @ (ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_)) => k.clone(),
+    };
+    Expr::new(kind, expr.span)
 }
 
 /// One aggregate accumulator: identifies the function from the aggregate column's expression and
@@ -1353,7 +1768,8 @@ struct Accumulator {
     sum_is_int: bool,
     int_sum: i64,
     extreme: Option<Value>,
-    collected: Vec<Value>,
+    // RowValue-typed so `collect(n)` / `collect(nodes(p))` keep their structural elements.
+    collected: Vec<RowValue>,
 }
 
 /// The aggregate function an [`Accumulator`] computes.
@@ -1429,14 +1845,17 @@ impl Accumulator {
         if self.distinct {
             self.seen.push(rv.clone());
         }
-        // The collapsed property value for the numeric / extreme / collect arms. An entity collapses
-        // to `Value::Null` here (it is not a property value): `count` and `collect` keep the
-        // RowValue-aware semantics above, while `sum`/`avg`/`min`/`max` over an entity argument are
-        // a type error / no-op exactly as before this fix.
-        let argv = match &rv {
-            RowValue::Value(v) => v.clone(),
-            RowValue::Node(_) | RowValue::Rel(_) => Value::Null,
-        };
+        // `collect` keeps the full RowValue (structural elements survive into the list).
+        if self.kind == AggKind::Collect {
+            self.collected.push(rv);
+            return Ok(());
+        }
+        // The collapsed property value for the numeric / extreme arms. An entity/path collapses to
+        // `Value::Null` here (it is not a property value) and a structural list collapses
+        // elementwise: `count` and `collect` keep the RowValue-aware semantics above, while
+        // `sum`/`avg`/`min`/`max` over an entity argument are a type error / no-op exactly as
+        // before this fix.
+        let argv = collapse_rv(&rv);
         match self.kind {
             AggKind::Count => self.count += 1,
             AggKind::Sum | AggKind::Avg => {
@@ -1475,16 +1894,16 @@ impl Accumulator {
                     self.extreme = Some(argv);
                 }
             }
-            AggKind::Collect => self.collected.push(argv),
             AggKind::Other => self.extreme = Some(argv),
-            AggKind::CountStar => unreachable!(),
+            // Handled by the early returns above.
+            AggKind::Collect | AggKind::CountStar => unreachable!(),
         }
         Ok(())
     }
 
     /// Produces the group's aggregate value.
-    fn finish(self) -> Value {
-        match self.kind {
+    fn finish(self) -> RowValue {
+        let value = match self.kind {
             AggKind::CountStar | AggKind::Count => Value::Integer(self.count),
             AggKind::Sum => {
                 if self.sum_is_int {
@@ -1501,8 +1920,21 @@ impl Accumulator {
                 }
             }
             AggKind::Min | AggKind::Max | AggKind::Other => self.extreme.unwrap_or(Value::Null),
-            AggKind::Collect => Value::List(self.collected),
-        }
+            // `collect` builds the canonical list (structural iff any element is).
+            AggKind::Collect => return RowValue::list(self.collected),
+        };
+        RowValue::Value(value)
+    }
+}
+
+/// Collapses a [`RowValue`] to its property-value projection for the numeric/extreme aggregate
+/// arms: entities/paths become null, lists collapse elementwise (mirrors `eval`'s value-context
+/// rule).
+fn collapse_rv(rv: &RowValue) -> Value {
+    match rv {
+        RowValue::Value(v) => v.clone(),
+        RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) => Value::Null,
+        RowValue::List(items) => Value::List(items.iter().map(collapse_rv).collect()),
     }
 }
 
@@ -1900,25 +2332,55 @@ fn apply_delete(
     ctx: &mut Ctx<'_>,
 ) -> Result<(), ExecError> {
     for expr in exprs {
-        match eval(expr, row, ctx.params, ctx.graph)? {
-            RowValue::Rel(r) => ctx.graph.delete_rel(r.id),
-            RowValue::Node(n) => {
-                let incident = ctx.graph.incident_rels(n.id);
-                if !incident.is_empty() {
-                    if detach {
-                        for r in incident {
-                            ctx.graph.delete_rel(r);
-                        }
-                    } else {
-                        return Err(ExecError::DeleteConnectedNode);
-                    }
-                }
-                ctx.graph.delete_node(n.id);
+        delete_row_value(detach, eval(expr, row, ctx.params, ctx.graph)?, ctx)?;
+    }
+    Ok(())
+}
+
+/// Deletes one resolved `DELETE` target: a relationship, a node (with the connectedness rule), a
+/// **path** (its relationships first, then its nodes — openCypher `DELETE p`), or a list of
+/// targets (elementwise). Null / non-entity values are a no-op (Cypher ignores null `DELETE`).
+fn delete_row_value(detach: bool, target: RowValue, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
+    match target {
+        RowValue::Rel(r) => ctx.graph.delete_rel(r.id),
+        RowValue::Node(n) => delete_node(detach, n.id, ctx)?,
+        RowValue::Path(p) => {
+            // The path's relationships go first so its interior nodes become deletable without
+            // DETACH; then each distinct node, under the usual connectedness rule.
+            for rel in p.rels() {
+                ctx.graph.delete_rel(rel);
             }
-            // Deleting null / a non-entity is a no-op (Cypher ignores null DELETE).
-            RowValue::Value(_) => {}
+            let mut seen = std::collections::BTreeSet::new();
+            for node in p.nodes() {
+                if seen.insert(node) {
+                    delete_node(detach, node, ctx)?;
+                }
+            }
+        }
+        RowValue::List(items) => {
+            for item in items {
+                delete_row_value(detach, item, ctx)?;
+            }
+        }
+        RowValue::Value(_) => {}
+    }
+    Ok(())
+}
+
+/// Deletes one node under the connectedness rule: incident relationships fail the delete unless
+/// `DETACH` removes them first.
+fn delete_node(detach: bool, id: NodeId, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
+    let incident = ctx.graph.incident_rels(id);
+    if !incident.is_empty() {
+        if detach {
+            for r in incident {
+                ctx.graph.delete_rel(r);
+            }
+        } else {
+            return Err(ExecError::DeleteConnectedNode);
         }
     }
+    ctx.graph.delete_node(id);
     Ok(())
 }
 
@@ -2221,6 +2683,9 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             input, variable, ..
         }
         | PhysicalOp::LoadCsv {
+            input, variable, ..
+        }
+        | PhysicalOp::NamedPath {
             input, variable, ..
         } => {
             let mut cols = result_columns(input, procedures);

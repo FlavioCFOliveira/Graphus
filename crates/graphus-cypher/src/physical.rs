@@ -295,6 +295,19 @@ pub enum PhysicalOp {
         /// The variable-length range, if any.
         range: Option<crate::ast::VarLengthRange>,
     },
+    /// Bind a **named path** variable from the pattern part's bound traversal variables (carried
+    /// through from [`NamedPath`](crate::logical::LogicalOp::NamedPath); `04 §7.2`).
+    NamedPath {
+        /// The upstream relation (binds `start` and every step).
+        input: Box<PhysicalOp>,
+        /// The path variable being bound.
+        variable: Var,
+        /// The pattern part's start-node variable.
+        start: Var,
+        /// The relationship variable of each chain link, in pattern order (a single relationship
+        /// for a fixed hop; the relationship list of a variable-length hop).
+        steps: Vec<Var>,
+    },
 
     // ---- relational ---------------------------------------------------------------------------
     /// Keep rows whose `predicate` is `TRUE` (residual filter; three-valued logic, `04 §7.6`).
@@ -592,6 +605,19 @@ impl Planner<'_> {
                 }
             }
 
+            // ---- named path ------------------------------------------------------------------
+            LogicalOp::NamedPath {
+                input,
+                variable,
+                start,
+                steps,
+            } => PhysicalOp::NamedPath {
+                input: Box::new(self.lower(input, deps)),
+                variable: variable.clone(),
+                start: start.clone(),
+                steps: steps.clone(),
+            },
+
             // ---- relational ------------------------------------------------------------------
             LogicalOp::Projection {
                 input,
@@ -883,6 +909,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. } => contains_write(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
@@ -1277,6 +1304,9 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         }
         | PhysicalOp::LoadCsv {
             input, variable, ..
+        }
+        | PhysicalOp::NamedPath {
+            input, variable, ..
         } => {
             gather_bound_vars(input, out);
             push_unique(out, variable.clone());
@@ -1444,6 +1474,16 @@ impl PhysicalOp {
                     h::range(range),
                     h::arrow_right(*direction),
                 )?;
+                input.fmt_indented(f, depth + 1)
+            }
+
+            Self::NamedPath {
+                input,
+                variable,
+                start,
+                steps,
+            } => {
+                writeln!(f, "NamedPath({variable} = {start}, {})", h::vars(steps))?;
                 input.fmt_indented(f, depth + 1)
             }
 

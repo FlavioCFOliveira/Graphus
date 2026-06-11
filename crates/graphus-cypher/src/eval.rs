@@ -32,11 +32,11 @@ use graphus_core::Value;
 
 use crate::ast::{BinaryOp, CaseExpr, Expr, ExprKind, Literal, MapKey, PredicateOp, UnaryOp};
 use crate::binding::BoundParameters;
-use crate::equality::{equals, is_in, not_equals};
+use crate::equality::{equals, is_in};
 use crate::graph_access::GraphAccess;
 use crate::lexer::IntLiteral;
 use crate::ordering::cmp_values;
-use crate::runtime::{NodeRef, RelRef, Row, RowValue};
+use crate::runtime::{NodeRef, PathStep, PathValue, RelRef, Row, RowValue};
 use crate::ternary::Ternary;
 
 /// A **runtime** Cypher evaluation error (`04 §7.3`).
@@ -143,14 +143,15 @@ pub fn eval(
         ExprKind::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
-                out.push(to_value(eval(it, row, params, graph)?, graph));
+                out.push(eval(it, row, params, graph)?);
             }
-            Ok(RowValue::Value(Value::List(out)))
+            // Canonical list construction: stays structural iff any element is (node/rel/path).
+            Ok(RowValue::list(out))
         }
         ExprKind::Map(entries) => {
             let mut out = Vec::with_capacity(entries.len());
             for (MapKey { name, .. }, v) in entries {
-                out.push((name.clone(), to_value(eval(v, row, params, graph)?, graph)));
+                out.push((name.clone(), to_value(eval(v, row, params, graph)?)));
             }
             Ok(RowValue::Value(Value::Map(out)))
         }
@@ -175,17 +176,21 @@ pub fn eval_value(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
 ) -> Result<Value, EvalError> {
-    Ok(to_value(eval(expr, row, params, graph)?, graph))
+    Ok(to_value(eval(expr, row, params, graph)?))
 }
 
 /// Collapses a [`RowValue`] to a property [`Value`]. An entity reference has **no** property value,
 /// so it becomes `Null` in a value context (it is only meaningful as a structural row binding).
-fn to_value(rv: RowValue, _graph: &dyn GraphAccess) -> Value {
+fn to_value(rv: RowValue) -> Value {
     match rv {
         RowValue::Value(v) => v,
-        // An entity in a pure value context is not a property value; collapse to null. (Structural
-        // comparison/ordering uses RowValue directly via the runtime helpers, not this path.)
-        RowValue::Node(_) | RowValue::Rel(_) => Value::Null,
+        // An entity/path in a pure value context is not a property value; collapse to null.
+        // (Structural comparison/ordering uses RowValue directly via the runtime helpers, not this
+        // path.)
+        RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) => Value::Null,
+        // A structural list collapses elementwise, so size/shape-sensitive value consumers (e.g.
+        // `size()`, UNWIND fallbacks) still observe the right cardinality.
+        RowValue::List(items) => Value::List(items.into_iter().map(to_value).collect()),
     }
 }
 
@@ -266,12 +271,14 @@ fn eval_binary(
 
         // ---- equality / comparison (reuse the value-model semantics) -------------------------
         BinaryOp::Eq => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
-            Ok(ternary_value(equals(&a, &b)))
+            let a = eval(lhs, row, params, graph)?;
+            let b = eval(rhs, row, params, graph)?;
+            Ok(ternary_value(row_values_equal(&a, &b)))
         }
         BinaryOp::Neq => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
-            Ok(ternary_value(not_equals(&a, &b)))
+            let a = eval(lhs, row, params, graph)?;
+            let b = eval(rhs, row, params, graph)?;
+            Ok(ternary_value(!row_values_equal(&a, &b)))
         }
         BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Lte | BinaryOp::Gte => {
             let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
@@ -338,6 +345,44 @@ fn eval_pair(
         eval_value(lhs, row, params, graph)?,
         eval_value(rhs, row, params, graph)?,
     ))
+}
+
+/// Cypher `=` over the full runtime value space, including the structural classes (`04 §7.6`).
+///
+/// Property values defer to [`equals`] (the CIP equality semantics — `NaN`, nested null
+/// propagation, …). Entities are equal iff they denote the same graph element; paths iff they
+/// traverse the same elements in the same order and orientation. Lists of either representation
+/// compare elementwise with three-valued propagation (a length mismatch is decisively `FALSE`).
+/// Mixed value classes are `FALSE`; a `null` on either side is `NULL`.
+fn row_values_equal(a: &RowValue, b: &RowValue) -> Ternary {
+    if a.is_null() || b.is_null() {
+        return Ternary::Null;
+    }
+    match (a, b) {
+        (RowValue::Value(x), RowValue::Value(y)) => equals(x, y),
+        (RowValue::Node(x), RowValue::Node(y)) => Ternary::from_bool(x.id == y.id),
+        (RowValue::Rel(x), RowValue::Rel(y)) => Ternary::from_bool(x.id == y.id),
+        (RowValue::Path(x), RowValue::Path(y)) => Ternary::from_bool(x == y),
+        // Lists (structural and/or pure) compare elementwise. The pure/pure case was already
+        // settled by `equals` above, so at least one side here is structural.
+        _ => match (a.as_list_elems(), b.as_list_elems()) {
+            (Some(xs), Some(ys)) => {
+                if xs.len() != ys.len() {
+                    return Ternary::False;
+                }
+                let mut acc = Ternary::True;
+                for (x, y) in xs.iter().zip(ys.iter()) {
+                    acc = acc.and(row_values_equal(x, y));
+                    if acc == Ternary::False {
+                        return Ternary::False;
+                    }
+                }
+                acc
+            }
+            // Different value classes (entity vs scalar, path vs list, …) are never equal.
+            _ => Ternary::False,
+        },
+    }
 }
 
 /// The 3VL result of a `<`/`>`/`<=`/`>=` comparison: `NULL` if either side is null, else the
@@ -628,6 +673,8 @@ fn eval_property(
         RowValue::Value(v) => Ok(RowValue::Value(
             crate::temporal_fns::component(&v, key).unwrap_or(Value::Null),
         )),
+        // Paths and lists have no properties; the missing-property rule yields null.
+        RowValue::Path(_) | RowValue::List(_) => Ok(RowValue::NULL),
     }
 }
 
@@ -789,6 +836,8 @@ fn describe(v: &RowValue) -> String {
     match v {
         RowValue::Node(_) => "Node".to_owned(),
         RowValue::Rel(_) => "Relationship".to_owned(),
+        RowValue::Path(_) => "Path".to_owned(),
+        RowValue::List(_) => "List".to_owned(),
         RowValue::Value(v) => match v {
             Value::Null => "null".to_owned(),
             Value::Boolean(_) => "Boolean".to_owned(),
@@ -816,12 +865,13 @@ fn describe(v: &RowValue) -> String {
 ///   `coalesce`.
 /// - **collection/size:** `size`, `length`, `head`, `last`, `tail`, `reverse`, `range`, `keys`.
 /// - **entity:** `id`, `labels`, `type`, `properties`, `startnode`, `endnode`.
+/// - **path:** `nodes`, `relationships` (plus `length` over a path).
 /// - **math:** `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `rand`.
 /// - **string:** `toupper`, `tolower`, `trim`, `ltrim`, `rtrim`, `substring`, `replace`, `split`,
 ///   `left`, `right`.
 ///
 /// Any other name that passed the compile-time arity check but has **no** runtime implementation
-/// yet (e.g. `nodes`/`relationships` on paths, `percentilecont`, temporal constructors) returns an
+/// yet (e.g. `percentilecont`) returns an
 /// [`EvalError::UnsupportedFunction`] — a documented, mechanically-extensible registry boundary, not
 /// a silent wrong answer (`CLAUDE.md`: never guess; scope and document). Aggregating functions
 /// (`count`/`sum`/`avg`/`min`/`max`/`collect`) are folded by the
@@ -920,6 +970,108 @@ fn call_function(
                 _ => RowValue::NULL,
             });
         }
+        // Path accessors (openCypher `expressions/path/**`): ordered projections of a path value.
+        "nodes" => {
+            let v = eval(&args[0], row, params, graph)?;
+            return match v {
+                RowValue::Path(p) => Ok(RowValue::list(
+                    p.nodes()
+                        .into_iter()
+                        .map(|id| RowValue::Node(NodeRef { id }))
+                        .collect(),
+                )),
+                RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                other => Err(EvalError::TypeError {
+                    context: format!("nodes() requires a path, got {}", describe(&other)),
+                }),
+            };
+        }
+        "relationships" => {
+            let v = eval(&args[0], row, params, graph)?;
+            return match v {
+                RowValue::Path(p) => Ok(RowValue::list(
+                    p.rels()
+                        .into_iter()
+                        .map(|id| RowValue::Rel(RelRef { id }))
+                        .collect(),
+                )),
+                RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                other => Err(EvalError::TypeError {
+                    context: format!("relationships() requires a path, got {}", describe(&other)),
+                }),
+            };
+        }
+        // Collection-shape functions, evaluated at the RowValue level so structural lists
+        // (`nodes(p)`, `collect(n)`, …) and paths keep their elements; the pure-property cases
+        // behave exactly as the former `Value`-level implementations.
+        "size" | "length" => {
+            let v = eval(&args[0], row, params, graph)?;
+            return match v {
+                // `length(p)` is the path's relationship count (openCypher).
+                RowValue::Path(p) if lower == "length" => {
+                    Ok(RowValue::Value(Value::Integer(p.len() as i64)))
+                }
+                RowValue::List(items) => Ok(RowValue::Value(Value::Integer(items.len() as i64))),
+                RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                RowValue::Value(Value::List(items)) => {
+                    Ok(RowValue::Value(Value::Integer(items.len() as i64)))
+                }
+                RowValue::Value(Value::String(s)) => {
+                    Ok(RowValue::Value(Value::Integer(s.chars().count() as i64)))
+                }
+                _ => Err(EvalError::TypeError {
+                    context: format!("{lower}() requires a list or string"),
+                }),
+            };
+        }
+        "head" | "last" => {
+            let v = eval(&args[0], row, params, graph)?;
+            let Some(mut items) = v.as_list_elems() else {
+                return match v {
+                    RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                    _ => Err(EvalError::TypeError {
+                        context: "expected a list argument".to_owned(),
+                    }),
+                };
+            };
+            return Ok(match lower.as_str() {
+                "head" => {
+                    if items.is_empty() {
+                        RowValue::NULL
+                    } else {
+                        items.remove(0)
+                    }
+                }
+                _ => items.pop().unwrap_or(RowValue::NULL),
+            });
+        }
+        "tail" => {
+            let v = eval(&args[0], row, params, graph)?;
+            let items = match v {
+                // `tail(null)` is the empty list (the pre-existing `list_arg` behaviour).
+                RowValue::Value(Value::Null) => Vec::new(),
+                other => other.as_list_elems().ok_or_else(|| EvalError::TypeError {
+                    context: "expected a list argument".to_owned(),
+                })?,
+            };
+            return Ok(RowValue::list(items.into_iter().skip(1).collect()));
+        }
+        "reverse" => {
+            let v = eval(&args[0], row, params, graph)?;
+            return match v {
+                RowValue::List(items) => Ok(RowValue::list(items.into_iter().rev().collect())),
+                RowValue::Value(Value::List(items)) => Ok(RowValue::Value(Value::List(
+                    items.into_iter().rev().collect(),
+                ))),
+                RowValue::Value(Value::String(s)) => {
+                    Ok(RowValue::Value(Value::String(s.chars().rev().collect())))
+                }
+                RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                _ => Err(EvalError::TypeError {
+                    context: "reverse() requires a list or string".to_owned(),
+                }),
+            };
+        }
         _ => {}
     }
 
@@ -956,32 +1108,6 @@ fn call_function(
         "tofloat" => to_float(&argv[0]),
         "toboolean" => to_boolean(&argv[0], false)?,
         "tobooleanornull" => to_boolean(&argv[0], true)?,
-        "size" | "length" => match &argv[0] {
-            Value::Null => Value::Null,
-            Value::List(items) => Value::Integer(items.len() as i64),
-            Value::String(s) => Value::Integer(s.chars().count() as i64),
-            _ => {
-                return Err(EvalError::TypeError {
-                    context: format!("{lower}() requires a list or string"),
-                });
-            }
-        },
-        "head" => list_arg(&argv[0])?.first().cloned().unwrap_or(Value::Null),
-        "last" => list_arg(&argv[0])?.last().cloned().unwrap_or(Value::Null),
-        "tail" => {
-            let items = list_arg(&argv[0])?;
-            Value::List(items.iter().skip(1).cloned().collect())
-        }
-        "reverse" => match &argv[0] {
-            Value::List(items) => Value::List(items.iter().rev().cloned().collect()),
-            Value::String(s) => Value::String(s.chars().rev().collect()),
-            Value::Null => Value::Null,
-            _ => {
-                return Err(EvalError::TypeError {
-                    context: "reverse() requires a list or string".to_owned(),
-                });
-            }
-        },
         "range" => range_fn(&argv)?,
         "abs" => match &argv[0] {
             Value::Integer(i) => i
@@ -1048,16 +1174,6 @@ fn keys_list(props: Option<Vec<(String, Value)>>) -> RowValue {
 fn num_type_error(fname: &str) -> EvalError {
     EvalError::TypeError {
         context: format!("{fname}() requires a number"),
-    }
-}
-
-fn list_arg(v: &Value) -> Result<&[Value], EvalError> {
-    match v {
-        Value::List(items) => Ok(items),
-        Value::Null => Ok(&[]),
-        _ => Err(EvalError::TypeError {
-            context: "expected a list argument".to_owned(),
-        }),
     }
 }
 
@@ -1323,29 +1439,46 @@ fn eval_list_comprehension(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
 ) -> EvalResult {
-    let items = match eval_value(&lc.list, row, params, graph)? {
-        Value::Null => return Ok(RowValue::NULL),
-        Value::List(items) => items,
-        other => {
-            return Err(EvalError::TypeError {
-                context: format!("list comprehension requires a list, got {other:?}"),
-            });
-        }
+    let items = eval_to_list_items(&lc.list, "list comprehension", row, params, graph)?;
+    let Some(items) = items else {
+        return Ok(RowValue::NULL);
     };
     let mut out = Vec::new();
     for item in items {
-        let inner = row.with(lc.variable.name.clone(), RowValue::Value(item.clone()));
+        let inner = row.with(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
             if !eval_to_ternary(pred, &inner, params, graph)?.is_true() {
                 continue;
             }
         }
         match &lc.projection {
-            Some(proj) => out.push(eval_value(proj, &inner, params, graph)?),
+            Some(proj) => out.push(eval(proj, &inner, params, graph)?),
             None => out.push(item),
         }
     }
-    Ok(RowValue::Value(Value::List(out)))
+    Ok(RowValue::list(out))
+}
+
+/// Evaluates a comprehension/quantifier **source list** to its elements at the [`RowValue`] level,
+/// so structural lists (`nodes(p)`, `collect(n)`, …) iterate with their entities intact. `None`
+/// stands for a `null` source (the comprehension/quantifier is then `null` overall).
+fn eval_to_list_items(
+    list: &Expr,
+    what: &str,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+) -> Result<Option<Vec<RowValue>>, EvalError> {
+    let v = eval(list, row, params, graph)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    match v.as_list_elems() {
+        Some(items) => Ok(Some(items)),
+        None => Err(EvalError::TypeError {
+            context: format!("{what} requires a list, got {}", describe(&v)),
+        }),
+    }
 }
 
 /// Evaluates a quantifier `all/any/none/single(x IN list WHERE p)` under Kleene 3VL with
@@ -1358,21 +1491,16 @@ fn eval_quantifier(
     graph: &dyn GraphAccess,
 ) -> EvalResult {
     use crate::ast::QuantifierKind;
-    let items = match eval_value(&q.list, row, params, graph)? {
-        Value::Null => return Ok(RowValue::NULL),
-        Value::List(items) => items,
-        other => {
-            return Err(EvalError::TypeError {
-                context: format!("quantifier requires a list, got {other:?}"),
-            });
-        }
+    let items = eval_to_list_items(&q.list, "quantifier", row, params, graph)?;
+    let Some(items) = items else {
+        return Ok(RowValue::NULL);
     };
     let yes = || Ok(RowValue::Value(Value::Boolean(true)));
     let no = || Ok(RowValue::Value(Value::Boolean(false)));
     let mut trues = 0usize;
     let mut nulls = 0usize;
     for item in items {
-        let inner = row.with(q.variable.name.clone(), RowValue::Value(item));
+        let inner = row.with(q.variable.name.clone(), item);
         match eval_to_ternary(&q.predicate, &inner, params, graph)? {
             Ternary::True => match q.kind {
                 // One satisfied element decides ANY (true) and NONE (false) outright.
@@ -1431,13 +1559,9 @@ fn eval_pattern_comprehension(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
 ) -> EvalResult {
-    if pc.var.is_some() {
-        // Named paths need the path value model (a deferral shared with MATCH paths).
-        return Err(EvalError::UnsupportedFunction {
-            name: "named path in a pattern comprehension".to_owned(),
-        });
-    }
-    let matches = pattern_element_rows(&pc.element, row, params, graph, false)?;
+    // A named path (`[p = (a)-->(b) | p]`) binds the path variable for the predicate/projection.
+    let path_var = pc.var.as_ref().map(|v| v.name.as_str());
+    let matches = pattern_element_rows(&pc.element, row, params, graph, false, path_var)?;
     let mut out = Vec::new();
     for m in matches {
         if let Some(pred) = &pc.predicate {
@@ -1445,9 +1569,9 @@ fn eval_pattern_comprehension(
                 continue;
             }
         }
-        out.push(eval_value(&pc.projection, &m, params, graph)?);
+        out.push(eval(&pc.projection, &m, params, graph)?);
     }
-    Ok(RowValue::Value(Value::List(out)))
+    Ok(RowValue::list(out))
 }
 
 /// Evaluates an existential subquery `EXISTS { [MATCH] pattern [WHERE p] }`: true iff the pattern
@@ -1462,11 +1586,8 @@ fn eval_exists_subquery(
     // Comma-separated parts join through their shared variables: each part's matches seed the next.
     let mut rows = vec![row.clone()];
     for part in &ex.pattern {
-        if part.var.is_some() {
-            return Err(EvalError::UnsupportedFunction {
-                name: "named path in an EXISTS subquery".to_owned(),
-            });
-        }
+        // A named path binds the path variable for the (joint) predicate.
+        let path_var = part.var.as_ref().map(|v| v.name.as_str());
         let mut next = Vec::new();
         for r in &rows {
             next.extend(pattern_element_rows(
@@ -1475,6 +1596,7 @@ fn eval_exists_subquery(
                 params,
                 graph,
                 false,
+                path_var,
             )?);
         }
         if next.is_empty() {
@@ -1512,6 +1634,7 @@ fn pattern_element_rows(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     first_only: bool,
+    path_var: Option<&str>,
 ) -> Result<Vec<Row>, EvalError> {
     let mut results = Vec::new();
     for start in node_candidates(&element.start, row, params, graph)? {
@@ -1519,16 +1642,22 @@ fn pattern_element_rows(
         if let Some(v) = &element.start.variable {
             seeded.set(v.name.clone(), RowValue::Node(NodeRef { id: start }));
         }
+        let cctx = ChainCtx {
+            params,
+            graph,
+            first_only,
+            path_var,
+            start,
+        };
         match_chain(
             &element.chain,
             0,
             start,
             seeded,
             &mut Vec::new(),
+            &mut Vec::new(),
             &mut results,
-            params,
-            graph,
-            first_only,
+            &cctx,
         )?;
         if first_only && !results.is_empty() {
             break;
@@ -1537,8 +1666,19 @@ fn pattern_element_rows(
     Ok(results)
 }
 
+/// The per-element invariants of one [`match_chain`] DFS: the evaluation seams, the `EXISTS`
+/// fast-path flag, and the named-path recording target (`path_var` + the element's start node).
+struct ChainCtx<'a> {
+    params: &'a BoundParameters,
+    graph: &'a dyn GraphAccess,
+    first_only: bool,
+    path_var: Option<&'a str>,
+    start: crate::graph_access::NodeId,
+}
+
 /// Depth-first chain matcher: extend the partial match at `chain[idx]` from `current`, pushing
-/// every complete match into `out`. `used_rels` enforces per-match relationship uniqueness.
+/// every complete match into `out`. `used_rels` enforces per-match relationship uniqueness (trail
+/// semantics); `steps` records the traversed hops so a named path can be bound on completion.
 #[allow(clippy::too_many_arguments)] // an internal DFS worker; bundling these adds no clarity
 fn match_chain(
     chain: &[crate::ast::PatternChainLink],
@@ -1546,20 +1686,29 @@ fn match_chain(
     current: crate::graph_access::NodeId,
     row: Row,
     used_rels: &mut Vec<crate::graph_access::RelId>,
+    steps: &mut Vec<PathStep>,
     out: &mut Vec<Row>,
-    params: &BoundParameters,
-    graph: &dyn GraphAccess,
-    first_only: bool,
+    cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
+    let (params, graph) = (cctx.params, cctx.graph);
     let Some(link) = chain.get(idx) else {
+        let mut row = row;
+        if let Some(pv) = cctx.path_var {
+            row.set(
+                pv.to_owned(),
+                RowValue::Path(PathValue {
+                    start: cctx.start,
+                    steps: steps.clone(),
+                }),
+            );
+        }
         out.push(row);
         return Ok(());
     };
-    if link.relationship.range.is_some() {
-        // Variable-length inside an expression shares MATCH's var-length machinery (deferred).
-        return Err(EvalError::UnsupportedFunction {
-            name: "variable-length pattern in an expression".to_owned(),
-        });
+    if let Some(range) = link.relationship.range {
+        return match_var_length_link(
+            chain, idx, &range, 0, current, row, used_rels, steps, out, cctx,
+        );
     }
     let types: Vec<String> = link
         .relationship
@@ -1601,19 +1750,137 @@ fn match_chain(
             }
         }
         used_rels.push(inc.rel);
+        steps.push(hop_step(inc.rel, current, inc.neighbour, graph));
         match_chain(
             chain,
             idx + 1,
             inc.neighbour,
             next_row,
             used_rels,
+            steps,
             out,
-            params,
-            graph,
-            first_only,
+            cctx,
         )?;
+        steps.pop();
         used_rels.pop();
-        if first_only && !out.is_empty() {
+        if cctx.first_only && !out.is_empty() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// The recorded [`PathStep`] for traversing `rel` from `from` to `to`: forward iff the
+/// relationship's stored start is the node we left (a self-loop is always forward).
+fn hop_step(
+    rel: crate::graph_access::RelId,
+    from: crate::graph_access::NodeId,
+    to: crate::graph_access::NodeId,
+    graph: &dyn GraphAccess,
+) -> PathStep {
+    let forward = graph.rel_data(rel).is_none_or(|d| d.start == from);
+    PathStep {
+        forward,
+        rel,
+        node: to,
+    }
+}
+
+/// The variable-length case of one chain link (`-[r:T*m..n]->`): depth-first trail enumeration.
+///
+/// At every depth within `[min, max]` whose current node satisfies the link's target node pattern,
+/// the link completes — the relationship variable (if named) binds the **list** of traversed
+/// relationships (openCypher var-length binding) and the chain continues at `idx + 1`. Trail
+/// semantics (`used_rels`) bound the recursion, so an unbounded `*` terminates on any graph.
+#[allow(clippy::too_many_arguments)] // an internal DFS worker; bundling these adds no clarity
+fn match_var_length_link(
+    chain: &[crate::ast::PatternChainLink],
+    idx: usize,
+    range: &crate::ast::VarLengthRange,
+    depth: u64,
+    current: crate::graph_access::NodeId,
+    row: Row,
+    used_rels: &mut Vec<crate::graph_access::RelId>,
+    steps: &mut Vec<PathStep>,
+    out: &mut Vec<Row>,
+    cctx: &ChainCtx<'_>,
+) -> Result<(), EvalError> {
+    let (params, graph) = (cctx.params, cctx.graph);
+    let link = &chain[idx];
+    let min = range.min.unwrap_or(1);
+    // Complete the link at this depth if allowed and the far node satisfies the target pattern.
+    if depth >= min && node_matches(current, &link.node, &row, params, graph)? {
+        let mut next_row = row.clone();
+        let mut ok = true;
+        if let Some(v) = &link.relationship.variable {
+            // A var-length relationship variable is always freshly bound (semantic analysis
+            // rejects re-use), to the list of traversed relationships in order.
+            let rels: Vec<RowValue> = steps[steps.len() - depth as usize..]
+                .iter()
+                .map(|s| RowValue::Rel(RelRef { id: s.rel }))
+                .collect();
+            next_row.set(v.name.clone(), RowValue::list(rels));
+        }
+        if let Some(v) = &link.node.variable {
+            match next_row.get(&v.name) {
+                Some(RowValue::Node(n)) if n.id == current => {}
+                Some(_) => ok = false,
+                None => next_row.set(v.name.clone(), RowValue::Node(NodeRef { id: current })),
+            }
+        }
+        if ok {
+            match_chain(
+                chain,
+                idx + 1,
+                current,
+                next_row,
+                used_rels,
+                steps,
+                out,
+                cctx,
+            )?;
+            if cctx.first_only && !out.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+    // Deepen while under the upper bound.
+    if range.max.is_some_and(|max| depth >= max) {
+        return Ok(());
+    }
+    let types: Vec<String> = link
+        .relationship
+        .types
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    let direction = crate::graph_access::ExpandDirection::from_pattern(link.relationship.direction);
+    for inc in graph.expand(current, direction, &types) {
+        if used_rels.contains(&inc.rel) {
+            continue;
+        }
+        if let Some(props) = &link.relationship.properties {
+            if !rel_props_match(inc.rel, props, &row, params, graph)? {
+                continue;
+            }
+        }
+        used_rels.push(inc.rel);
+        steps.push(hop_step(inc.rel, current, inc.neighbour, graph));
+        match_var_length_link(
+            chain,
+            idx,
+            range,
+            depth + 1,
+            inc.neighbour,
+            row.clone(),
+            used_rels,
+            steps,
+            out,
+            cctx,
+        )?;
+        steps.pop();
+        used_rels.pop();
+        if cctx.first_only && !out.is_empty() {
             return Ok(());
         }
     }
@@ -1744,7 +2011,7 @@ mod tests {
         let expr = parse_expr(src);
         let g = MemGraph::new();
         let bound = BoundParameters::empty();
-        to_value(eval(&expr, &Row::empty(), &bound, &g).unwrap(), &g)
+        to_value(eval(&expr, &Row::empty(), &bound, &g).unwrap())
     }
 
     #[test]
@@ -1834,7 +2101,7 @@ mod tests {
         let g = MemGraph::new();
         let bound = bind(&Parameters::new().with("p", Value::Integer(10)), &expr);
         assert_eq!(
-            to_value(eval(&expr, &Row::empty(), &bound, &g).unwrap(), &g),
+            to_value(eval(&expr, &Row::empty(), &bound, &g).unwrap()),
             Value::Integer(11)
         );
     }
@@ -1919,7 +2186,10 @@ mod tests {
 
     #[test]
     fn unsupported_function_is_named_error() {
-        let expr = parse_expr("nodes(null)");
+        // `percentileCont` is a registered function (compile passes) with no runtime evaluator yet
+        // — the documented, mechanically-extensible registry boundary. (`nodes`/`relationships`
+        // are now implemented, so this exercises a still-open gap.)
+        let expr = parse_expr("percentileCont(1, 0.5)");
         let g = MemGraph::new();
         let err = eval(&expr, &Row::empty(), &BoundParameters::empty(), &g).unwrap_err();
         assert!(matches!(err, EvalError::UnsupportedFunction { .. }));

@@ -420,7 +420,9 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
 
         // ---- traversals carry expressions only in pattern props (handled via Create/Filter) -
-        PhysicalOp::ExpandAll { input, .. } | PhysicalOp::ExpandInto { input, .. } => {
+        PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::NamedPath { input, .. } => {
             walk_physical(input, record);
         }
 

@@ -326,7 +326,8 @@ impl Planner {
         plan = self.filter_inline_props(plan, element.start.properties.as_ref(), &anchor_var);
 
         // Each chain link: expand to the next node, then filter the link's inline props.
-        let mut from = anchor_var;
+        let mut from = anchor_var.clone();
+        let mut step_rels = Vec::with_capacity(element.chain.len());
         for link in &element.chain {
             let rel_var = self.rel_var(&link.relationship);
             let to_var = self.node_var(&link.node);
@@ -341,7 +342,17 @@ impl Planner {
             };
             plan = self.filter_inline_props(plan, link.relationship.properties.as_ref(), &rel_var);
             plan = self.filter_inline_props(plan, link.node.properties.as_ref(), &to_var);
+            step_rels.push(rel_var);
             from = to_var;
+        }
+        // A named path (`p = …`) binds the path value over the part's traversal variables.
+        if let Some(v) = &part.var {
+            plan = LogicalOp::NamedPath {
+                input: Box::new(plan),
+                variable: Var::named(&v.name),
+                start: anchor_var,
+                steps: step_rels,
+            };
         }
         plan
     }
@@ -993,13 +1004,25 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
                     .is_some_and(expr_contains_aggregate)
         }
         ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::Variable(_) => false,
-        // Comprehensions, quantifiers and existential subqueries establish their own scope; an
-        // aggregate cannot legally appear inside (the semantic pass rejects it), so they never
-        // contribute an aggregate here.
-        ExprKind::ListComprehension(_)
-        | ExprKind::PatternComprehension(_)
-        | ExprKind::Quantifier(_)
-        | ExprKind::ExistsSubquery(_) => false,
+        // Comprehensions/quantifiers evaluate their **source list** in the enclosing scope, so an
+        // aggregate there (`ALL(x IN collect(y) WHERE …)`, `[x IN collect(p) | …]` — TCK `List11`
+        // [3], `List12` [4]) makes the item aggregating. This mirrors the semantic pass's walk
+        // (`semantics::for_each_child`), keeping compile-time classification and the executor's
+        // aggregation rewrite in agreement.
+        ExprKind::ListComprehension(lc) => {
+            expr_contains_aggregate(&lc.list)
+                || lc.predicate.as_deref().is_some_and(expr_contains_aggregate)
+                || lc
+                    .projection
+                    .as_deref()
+                    .is_some_and(expr_contains_aggregate)
+        }
+        ExprKind::Quantifier(q) => {
+            expr_contains_aggregate(&q.list) || expr_contains_aggregate(&q.predicate)
+        }
+        // Pattern comprehensions / EXISTS subqueries establish pattern-bound scopes; an aggregate
+        // cannot legally appear inside (the semantic pass rejects it).
+        ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => false,
     }
 }
 
@@ -1068,6 +1091,9 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
             input, variable, ..
         }
         | LogicalOp::LoadCsv {
+            input, variable, ..
+        }
+        | LogicalOp::NamedPath {
             input, variable, ..
         } => {
             gather_bound_vars(input, out);

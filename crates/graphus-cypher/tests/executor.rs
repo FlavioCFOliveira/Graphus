@@ -410,6 +410,98 @@ fn count_distinct() {
 }
 
 // =================================================================================================
+// Path & aggregation functions: collect(), nodes(), relationships(), named paths (#63)
+// =================================================================================================
+
+/// `collect(n)` over an entity keeps its elements **structural** (a [`RowValue::List`] of nodes),
+/// not a property list of nulls.
+#[test]
+fn collect_preserves_node_entities() {
+    let (mut g, ada, bob, cara, _) = seed_social();
+    let rows = run("MATCH (n:Person) RETURN collect(n) AS ns", &mut g);
+    let Some(RowValue::List(items)) = rows[0].get("ns") else {
+        panic!("collect(n) should be a structural list of nodes");
+    };
+    let mut ids: Vec<NodeId> = items
+        .iter()
+        .map(|it| it.as_node().expect("each element is a node"))
+        .collect();
+    ids.sort();
+    let mut want = [ada, bob, cara];
+    want.sort();
+    assert_eq!(ids, want);
+}
+
+/// `nodes(p)` / `relationships(p)` / `length(p)` over a named path bound by `MATCH p = …`.
+#[test]
+fn nodes_relationships_length_of_named_path() {
+    let (mut g, ada, bob, ..) = seed_social();
+    let rows = run(
+        "MATCH p = (a:Person {name:'Ada'})-[:KNOWS]->(b:Person) \
+         RETURN nodes(p) AS ns, relationships(p) AS rs, length(p) AS len",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+
+    let Some(RowValue::List(ns)) = rows[0].get("ns") else {
+        panic!("nodes(p) should be a structural list");
+    };
+    let node_ids: Vec<NodeId> = ns.iter().map(|n| n.as_node().expect("node")).collect();
+    assert_eq!(node_ids, vec![ada, bob]);
+
+    let Some(RowValue::List(rs)) = rows[0].get("rs") else {
+        panic!("relationships(p) should be a structural list");
+    };
+    assert_eq!(rs.len(), 1);
+    assert!(rs[0].as_rel().is_some());
+
+    assert_eq!(rows[0].value("len"), i(1));
+}
+
+/// A named path binds the structural [`RowValue::Path`] value itself: start node, one forward hop.
+#[test]
+fn named_path_binds_path_value() {
+    let (mut g, ada, bob, ..) = seed_social();
+    let rows = run(
+        "MATCH p = (a:Person {name:'Ada'})-[:KNOWS]->(b:Person) RETURN p",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    let path = rows[0]
+        .get("p")
+        .and_then(RowValue::as_path)
+        .expect("p is a path");
+    assert_eq!(path.start, ada);
+    assert_eq!(path.len(), 1);
+    assert!(path.steps[0].forward, "Ada-[:KNOWS]->Bob is a forward hop");
+    assert_eq!(path.steps[0].node, bob);
+}
+
+/// A named path bound **inside a pattern comprehension** is usable in its projection (`length(p)`).
+#[test]
+fn named_path_in_pattern_comprehension() {
+    let (mut g, ..) = seed_social();
+    let rows = run(
+        "MATCH (a:Person {name:'Ada'}) RETURN [p = (a)-[:KNOWS]->(b) | length(p)] AS lens",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("lens"), Value::List(vec![i(1)]));
+}
+
+/// A variable-length named path enumerates trails; `length(p)` reports each hop count, and the
+/// path's relationship list grows with depth (Ada→Bob, Ada→Bob→Cara).
+#[test]
+fn variable_length_named_path_lengths() {
+    let (mut g, ..) = seed_social();
+    let rows = run(
+        "MATCH p = (a:Person {name:'Ada'})-[:KNOWS*1..2]->(b:Person) \
+         RETURN length(p) AS len ORDER BY len",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "len"), vec![i(1), i(2)]);
+}
+
+// =================================================================================================
 // UNWIND, UNION / UNION ALL
 // =================================================================================================
 

@@ -211,22 +211,40 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
 /// Projects one executor [`graphus_cypher::Row`] (a `RowValue` superset) down to the public
 /// `Vec<Value>` the wire seams carry (`04 §8.3`).
 ///
-/// The structural `RowValue` variants (`Node`/`Rel`) are **deferred in `graphus_core::Value`**
-/// (`04 §7.2`); until the variants land, a bound entity is exposed as its id as a `Value::Integer`,
-/// matching how the Bolt/REST seams document the deferral. A plain `Value` cell passes through.
+/// The structural `RowValue` variants (`Node`/`Rel`/`Path`/structural `List`) are **deferred in
+/// `graphus_core::Value`** (`04 §7.2`); until the variants land, an entity is exposed as its id as a
+/// `Value::Integer`, a structural list projects element-wise into a `Value::List`, and a path
+/// projects into the `Value::List` of its element ids in traversal order (start node, then each
+/// hop's relationship and arrival node) — matching how the Bolt/REST seams document the deferral. A
+/// plain `Value` cell passes through.
 fn project_row(row: &graphus_cypher::Row) -> Vec<graphus_core::Value> {
+    row.values().iter().map(project_value).collect()
+}
+
+/// Projects one [`graphus_cypher::RowValue`] to a wire [`graphus_core::Value`] (see
+/// [`project_row`]).
+fn project_value(rv: &graphus_cypher::RowValue) -> graphus_core::Value {
     use graphus_core::Value;
     use graphus_cypher::RowValue;
-    row.values()
-        .iter()
-        .map(|rv| match rv {
-            RowValue::Value(v) => v.clone(),
-            // `NodeId`/`RelId` are `pub` newtypes over `u64`; expose the id until the structural
-            // `Value` variants land (`04 §7.2`).
-            RowValue::Node(n) => Value::Integer(n.id.0 as i64),
-            RowValue::Rel(r) => Value::Integer(r.id.0 as i64),
-        })
-        .collect()
+    match rv {
+        RowValue::Value(v) => v.clone(),
+        // `NodeId`/`RelId` are `pub` newtypes over `u64`; expose the id until the structural
+        // `Value` variants land (`04 §7.2`).
+        RowValue::Node(n) => Value::Integer(n.id.0 as i64),
+        RowValue::Rel(r) => Value::Integer(r.id.0 as i64),
+        // A structural list projects element-wise; a path flattens to its element ids in traversal
+        // order (start node, then each hop's relationship + arrival node).
+        RowValue::List(items) => Value::List(items.iter().map(project_value).collect()),
+        RowValue::Path(p) => {
+            let mut ids = Vec::with_capacity(p.steps.len() * 2 + 1);
+            ids.push(Value::Integer(p.start.0 as i64));
+            for s in &p.steps {
+                ids.push(Value::Integer(s.rel.0 as i64));
+                ids.push(Value::Integer(s.node.0 as i64));
+            }
+            Value::List(ids)
+        }
+    }
 }
 
 /// Builds a [`Parameters`] set from the `(name, value)` pairs the seam passed in.

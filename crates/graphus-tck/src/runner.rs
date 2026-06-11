@@ -39,7 +39,7 @@ use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
 use graphus_cypher::physical::{PhysicalOp, plan_physical};
 use graphus_cypher::procedure_registry::{ProcedureRegistry, ProcedureSet};
-use graphus_cypher::runtime::{Row, RowValue};
+use graphus_cypher::runtime::{PathValue, Row, RowValue};
 use graphus_cypher::semantics::{
     ValidatedQuery, analyze_with_procedures, check_implicit_call_parameters,
 };
@@ -48,7 +48,9 @@ use graphus_io::MemBlockDevice;
 use graphus_storage::RecordStore;
 use graphus_wal::{MemLogSink, WalManager};
 
-use crate::compare::{Concrete, assert_ordered, assert_unordered};
+use crate::compare::{
+    Concrete, ConcreteNode, ConcretePath, ConcretePathStep, assert_ordered, assert_unordered,
+};
 use crate::feature::{KvRows, ProcedureStep, ResultTable, Scenario, StepKind, parse_row};
 use crate::graphs::named_graph_cypher;
 
@@ -601,6 +603,47 @@ fn resolve_cell(cell: &RowValue, graph: &dyn GraphAccess) -> Concrete {
         RowValue::Value(v) => Concrete::Value(v.clone()),
         RowValue::Node(node) => resolve_node(node.id, graph),
         RowValue::Rel(rel) => resolve_rel(rel.id, graph),
+        // A structural list (`collect(n)`, `nodes(p)`, …) resolves element-wise; a path resolves
+        // into its alternating node/relationship snapshot sequence.
+        RowValue::List(items) => {
+            Concrete::List(items.iter().map(|it| resolve_cell(it, graph)).collect())
+        }
+        RowValue::Path(p) => Concrete::Path(resolve_path(p, graph)),
+    }
+}
+
+/// Resolves a [`PathValue`] into a [`ConcretePath`]: the start node followed by each hop's
+/// direction, relationship snapshot and arrival node, read through the live seam.
+fn resolve_path(p: &PathValue, graph: &dyn GraphAccess) -> ConcretePath {
+    ConcretePath {
+        start: resolve_path_node(p.start, graph),
+        steps: p
+            .steps
+            .iter()
+            .map(|s| {
+                let (rel_type, rel_properties) = match graph.rel_data(s.rel) {
+                    Some(data) => (
+                        data.rel_type,
+                        graph.rel_properties(s.rel).unwrap_or_default(),
+                    ),
+                    None => (String::new(), Vec::new()),
+                };
+                ConcretePathStep {
+                    forward: s.forward,
+                    rel_type,
+                    rel_properties,
+                    node: resolve_path_node(s.node, graph),
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Resolves a node id into the [`ConcreteNode`] used inside a [`ConcretePath`] (labels + props).
+fn resolve_path_node(id: NodeId, graph: &dyn GraphAccess) -> ConcreteNode {
+    ConcreteNode {
+        labels: graph.node_labels(id).unwrap_or_default(),
+        properties: graph.node_properties(id).unwrap_or_default(),
     }
 }
 

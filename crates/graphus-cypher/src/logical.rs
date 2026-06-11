@@ -134,6 +134,25 @@ pub enum LogicalOp {
         range: Option<VarLengthRange>,
     },
 
+    /// Bind a **named path** variable (`MATCH p = (a)-[r]->(b)`) from the pattern part's already
+    /// bound traversal variables (`04 §7.2` structural `Path`).
+    ///
+    /// Placed directly above the pattern part's scan/expand chain. The executor reconstructs the
+    /// path value from `start` and each step's relationship binding (a single relationship for a
+    /// fixed hop, the relationship **list** of a variable-length hop), recovering each hop's
+    /// orientation from the relationship's endpoints. A null/unbound `start` or step (the
+    /// `OPTIONAL MATCH` no-match row) binds the path variable to null.
+    NamedPath {
+        /// The upstream relation (the pattern part's traversal; binds `start` and every step).
+        input: Box<LogicalOp>,
+        /// The path variable being bound.
+        variable: Var,
+        /// The pattern part's start-node variable.
+        start: Var,
+        /// The relationship variable of each chain link, in pattern order.
+        steps: Vec<Var>,
+    },
+
     // ---- relational ---------------------------------------------------------------------------
     /// Keep only the input rows for which `predicate` evaluates to `TRUE` (openCypher `WHERE`, and
     /// the implicit filters from inline pattern predicates).
@@ -598,6 +617,16 @@ impl LogicalOp {
                     fmt_range(range),
                     arrow_right(*direction),
                 )?;
+                input.fmt_indented(f, depth + 1)
+            }
+
+            Self::NamedPath {
+                input,
+                variable,
+                start,
+                steps,
+            } => {
+                writeln!(f, "NamedPath({variable} = {start}, {})", fmt_vars(steps))?;
                 input.fmt_indented(f, depth + 1)
             }
 

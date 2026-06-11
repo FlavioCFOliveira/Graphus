@@ -26,8 +26,19 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **3413 / 3884 scenarios pass (87.87 %)**, with 0 panics and 0 scenarios
-/// skipped as unsupported. This rose from 3324 (+89 from scalar function gaps (#62)): `rand()`,
+/// Current ratchet: **3479 / 3884 scenarios pass (89.57 %)**, with 0 panics and 0 scenarios
+/// skipped as unsupported. This rose from 3413 (+66 from executor path & aggregation functions
+/// (#63)): `collect()`/`collect(DISTINCT …)` now folds at the `RowValue` level so structural
+/// elements survive; `nodes(path)`/`relationships(path)` and `length(path)` project a path's
+/// element sequence; and a named path (`MATCH p = …`, `[p = (a)-->(b) | p]`) binds the structural
+/// `Path` value end-to-end (executor [`NamedPath`] operator + the expression-side pattern walk),
+/// which also lifted variable-length patterns inside expressions, structural list/path equality,
+/// ordering and grouping, and `DELETE` over paths/lists. The same cycle fixed a synthetic-name
+/// collision in the composite-aggregate rewrite — every aggregate column reused `#agg0`, so a
+/// multi-aggregate projection (`RETURN sum(x), min(x), max(x)`) read every column back as the last
+/// one; the synthetic names are now disambiguated per column (the bulk of the gain). Measured: zero
+/// regressions, the before/after failing-scenario set diff is strictly shrinking. Prior rise:
+/// 3324 → 3413 (+89 from scalar function gaps (#62)): `rand()`,
 /// `sqrt()`, `toBoolean()`/`toBooleanOrNull()` joined the function registry and the evaluator
 /// (+64 `expressions/quantifier`, +7 `expressions/typeConversion`, +1
 /// `expressions/mathematical`), and the same cycle fixed the pre-existing aggregation-grouping
@@ -49,7 +60,7 @@ use graphus_tck::runner::run_scenario;
 /// `EXISTS { ... RETURN ... }` form, structural (node/relationship/path) values inside list
 /// literals (`toBoolean(n)` via `[true, n]` cannot raise its `TypeError`), and ORDER BY keys
 /// that *evaluate* aggregates (`ORDER BY sum(…)` matching a projected aggregate).
-const BASELINE: usize = 3413;
+const BASELINE: usize = 3479;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.
