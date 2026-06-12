@@ -22,8 +22,14 @@ use crate::sink::LogSink;
 /// LSN and [`Lsn(0)`](graphus_core::Lsn) is unambiguously the null LSN.
 pub const HEADER_LEN: u64 = 8;
 
-const WAL_MAGIC: u32 = 0x4757_414C; // "GWAL"
-const WAL_VERSION: u32 = 1;
+/// The WAL file-header magic (`"GWAL"`, little-endian `u32`). Public so an out-of-crate consumer
+/// reconstructing a logical WAL image (e.g. the backup-chain restore in `graphus-storage`, `rmp`
+/// task #71) can stamp a header that [`WalManager::open`] accepts.
+pub const WAL_MAGIC: u32 = 0x4757_414C; // "GWAL"
+
+/// The WAL file-header version. Public alongside [`WAL_MAGIC`] for header reconstruction; bumped on
+/// any incompatible log-header change.
+pub const WAL_VERSION: u32 = 1;
 
 /// One undoable action of an in-flight transaction, kept in memory so a live rollback never has
 /// to read back un-synced log bytes.

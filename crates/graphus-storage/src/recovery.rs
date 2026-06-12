@@ -16,7 +16,7 @@ use graphus_bufpool::page;
 use graphus_core::error::Result;
 use graphus_core::{Lsn, PageId};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page};
-use graphus_wal::{ApplyTarget, LogSink, RecoveryReport, WalManager, recover};
+use graphus_wal::{ApplyTarget, LogSink, RecoveryReport, WalManager, recover, recover_from};
 
 /// An [`ApplyTarget`] that applies WAL redo/undo intra-page patches directly to a
 /// [`BlockDevice`].
@@ -94,6 +94,28 @@ pub fn recover_device<S: LogSink, D: BlockDevice>(
 ) -> Result<RecoveryReport> {
     let mut target = DeviceTarget::new(device);
     let report = recover(wal, &mut target)?;
+    target.sync()?;
+    Ok(report)
+}
+
+/// Like [`recover_device`], but begins the WAL analysis scan at `scan_start` instead of right after
+/// the header ([`graphus_wal::recover_from`]). Used by the backup-chain point-in-time restore
+/// (`rmp` task #71), whose reconstructed logical WAL has its first record at the chain's `base_lsn`,
+/// with an unscanned gap in `[HEADER_LEN, base_lsn)`. For a normal crash recovery use
+/// [`recover_device`].
+///
+/// # Errors
+/// Propagates a WAL read, apply, or device sync failure.
+///
+/// # Panics
+/// Panics if hardening the CLRs written during undo fails (`04 §4.9`).
+pub fn recover_device_from<S: LogSink, D: BlockDevice>(
+    wal: &mut WalManager<S>,
+    device: &mut D,
+    scan_start: Lsn,
+) -> Result<RecoveryReport> {
+    let mut target = DeviceTarget::new(device);
+    let report = recover_from(wal, &mut target, scan_start)?;
     target.sync()?;
     Ok(report)
 }

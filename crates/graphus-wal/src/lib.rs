@@ -26,7 +26,7 @@ pub mod recovery;
 pub mod sink;
 
 pub use checkpoint::CheckpointSnapshot;
-pub use manager::{HEADER_LEN, WalManager};
+pub use manager::{HEADER_LEN, WAL_MAGIC, WAL_VERSION, WalManager};
 pub use record::{DecodeError, LogRecord, RecordType};
-pub use recovery::{ApplyTarget, RecoveryReport, recover};
+pub use recovery::{ApplyTarget, RecoveryReport, recover, recover_from};
 pub use sink::{FileLogSink, LogSink, MemLogSink};

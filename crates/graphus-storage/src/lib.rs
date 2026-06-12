@@ -58,6 +58,7 @@ pub mod backup;
 pub mod check;
 pub mod heap;
 pub mod idalloc;
+pub mod incremental;
 pub mod labels;
 pub mod meta;
 pub mod paging;
@@ -79,6 +80,10 @@ pub use check::{
 };
 pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
+pub use incremental::{
+    CHAIN_FORMAT_VERSION, ChainLinks, ChainManifest, IncrementMeta, LinkCodec, Plain,
+    RestoreTarget, begin_chain, capture_increment, restore_to, verify_chain,
+};
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use meta::{IndexState, Meta, Statistics, StoreMeta};
 pub use propenc::{

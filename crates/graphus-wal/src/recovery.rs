@@ -62,6 +62,11 @@ pub struct RecoveryReport {
 
 /// Replays `wal`'s durable log against `target`, leaving only committed work applied.
 ///
+/// This scans the whole durable log from just after the WAL header. For a log whose first record
+/// does not sit immediately after the header — e.g. a *logical* WAL reconstructed from a backup
+/// chain, whose records begin at the chain's `base_lsn` (`rmp` task #71) — use
+/// [`recover_from`] with that start offset.
+///
 /// # Errors
 /// Propagates an [`ApplyTarget::apply`] or sink read failure.
 ///
@@ -70,6 +75,32 @@ pub struct RecoveryReport {
 pub fn recover<S: LogSink, T: ApplyTarget>(
     wal: &mut WalManager<S>,
     target: &mut T,
+) -> Result<RecoveryReport> {
+    recover_from(wal, target, Lsn(HEADER_LEN))
+}
+
+/// Replays `wal`'s durable log against `target` exactly like [`recover`], but begins the forward
+/// analysis scan at `scan_start` (a record-boundary LSN) instead of right after the WAL header.
+///
+/// The only difference from [`recover`] is *where the forward scan begins*; every other phase — redo
+/// from the checkpoint's `redo_start` (or `HEADER_LEN` when the scanned range holds no checkpoint),
+/// and undo of all losers — is identical. This exists so a logical WAL whose records legitimately
+/// start at a non-header offset can be replayed without re-encoding it: a backup chain lays the base
+/// page images down to WAL position `base_lsn`, then concatenates the increment byte ranges starting
+/// at `base_lsn`, leaving the bytes in `[HEADER_LEN, base_lsn)` as an unscanned gap (`rmp` task #71).
+/// Pointing the scan at `base_lsn` makes recovery read exactly the chain's real records and skip the
+/// gap, so the proven three-phase semantics apply unchanged. `scan_start` must land on a record
+/// boundary (the chain guarantees this: `base_lsn` is a WAL `durable_len`, always a boundary).
+///
+/// # Errors
+/// Propagates an [`ApplyTarget::apply`] or sink read failure.
+///
+/// # Panics
+/// Panics if hardening the CLRs written during undo fails (`§4.9`).
+pub fn recover_from<S: LogSink, T: ApplyTarget>(
+    wal: &mut WalManager<S>,
+    target: &mut T,
+    scan_start: Lsn,
 ) -> Result<RecoveryReport> {
     let mut log = Vec::new();
     wal.read_durable(Lsn(0), &mut log)?;
@@ -82,7 +113,10 @@ pub fn recover<S: LogSink, T: ApplyTarget>(
     let mut last_checkpoint: Option<CheckpointSnapshot> = None;
     let mut tail_truncated = false;
 
-    let mut cursor = HEADER_LEN as usize;
+    // The scan begins at `scan_start` for a logical/chain WAL, or at `HEADER_LEN` for a normal log.
+    // Clamp to at least `HEADER_LEN` (offset 0 is the null LSN; the header is never a record) and to
+    // within the log so a degenerate input can never index out of bounds.
+    let mut cursor = (scan_start.0.max(HEADER_LEN) as usize).min(log.len());
     while cursor < log.len() {
         match LogRecord::decode(&log[cursor..]) {
             Ok((rec, n)) => {
