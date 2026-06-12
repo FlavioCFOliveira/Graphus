@@ -64,6 +64,7 @@ fn config_with_key(temp: &TempStore, key_path: Option<PathBuf>) -> ServerConfig 
         buffer_pool_pages: 256,
         fsync_threads: 1,
         bolt_tcp_addr: None,
+        advertised_bolt_address: None,
         rest_addr: None,
         uds_path: Some(temp.uds_path()),
         tls: TlsConfig::default(),

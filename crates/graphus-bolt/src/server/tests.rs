@@ -36,6 +36,23 @@ fn handshake_54() -> Vec<u8> {
     ])
 }
 
+/// A **Manifest-v1** client opening: magic + 4 slots (one is the manifest marker), then the client's
+/// chosen-version + capabilities response the server reads after sending its manifest.
+fn manifest_handshake(chosen: Version) -> Vec<u8> {
+    use crate::handshake::{MANIFEST_V1_REQUEST, ManifestChoice, encode_manifest_choice};
+    let mut out = encode_client_handshake([
+        Proposal::from_wire(MANIFEST_V1_REQUEST),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ]);
+    out.extend_from_slice(&encode_manifest_choice(ManifestChoice {
+        version: chosen,
+        capabilities: 0,
+    }));
+    out
+}
+
 /// A `LOGON` with the `basic` scheme for `alice`/`pw`.
 fn logon_alice() -> Request {
     Request::Logon {
@@ -699,4 +716,368 @@ fn logon_announces_the_principal_and_logoff_clears_it() {
         "LOGOFF clears the principal: {log:?}"
     );
     assert_eq!(session.executor().principal, None, "cleared after LOGOFF");
+}
+
+// ---- Manifest-v1 handshake, ROUTE, TELEMETRY, per-connection id (rmp #95) ---------------------
+
+#[test]
+fn manifest_handshake_negotiates_and_runs_a_full_session() {
+    // A manifest-aware client (00 00 01 FF) gets the modern exchange and ends up at 5.4, then drives
+    // a normal HELLO/LOGON/RUN/PULL session — proving the manifest path converges on the same engine.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(9)]]),
+    );
+    let mut input = manifest_handshake(Version::new(5, 4));
+    for r in [
+        Request::Hello { extra: vec![] },
+        logon_alice(),
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Goodbye,
+    ] {
+        input.extend_from_slice(&encode_request_framed(&r).unwrap());
+    }
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().expect("manifest session runs");
+        assert_eq!(session.version(), Some(Version::new(5, 4)));
+        assert_eq!(session.state(), State::Defunct);
+    }
+
+    // The server's first write is the manifest (ack 00 00 01 FF + range + capabilities), NOT a bare
+    // 4-byte legacy reply.
+    let written = transport.written();
+    assert_eq!(
+        &written[..4],
+        &crate::handshake::MANIFEST_V1_REQUEST,
+        "server replies with the manifest acknowledgment"
+    );
+    // After the manifest, the framed message stream begins. Find it: manifest is 10 bytes here
+    // (ack 4 + count 1 + range 4 + caps 1). Decode the responses past it.
+    let manifest_len = crate::handshake::graphus_manifest().len();
+    let responses = decode_responses(&written[manifest_len..]);
+    // HELLO SUCCESS, LOGON SUCCESS, RUN SUCCESS{fields}, RECORD, trailing SUCCESS.
+    assert!(matches!(responses[0], Response::Success { .. }));
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(r, Response::Record { .. }))
+    );
+}
+
+#[test]
+fn both_handshake_forms_reach_the_same_version() {
+    // Legacy and manifest handshakes against the same fixture both negotiate 5.4.
+    let auth = auth_fixture();
+    let legacy_input = session_input(&[Request::Hello { extra: vec![] }, logon_alice()]);
+    let mut legacy_transport = MemoryTransport::with_input(&legacy_input);
+    let legacy_version = {
+        let mut s = BoltSession::new(&mut legacy_transport, MockExecutor::new(), &auth);
+        s.run().unwrap();
+        s.version()
+    };
+
+    let mut manifest_input = manifest_handshake(Version::new(5, 4));
+    for r in [Request::Hello { extra: vec![] }, logon_alice()] {
+        manifest_input.extend_from_slice(&encode_request_framed(&r).unwrap());
+    }
+    let mut manifest_transport = MemoryTransport::with_input(&manifest_input);
+    let manifest_version = {
+        let mut s = BoltSession::new(&mut manifest_transport, MockExecutor::new(), &auth);
+        s.run().unwrap();
+        s.version()
+    };
+
+    assert_eq!(legacy_version, Some(Version::new(5, 4)));
+    assert_eq!(manifest_version, legacy_version, "both forms agree on 5.4");
+}
+
+#[test]
+fn manifest_client_choosing_unsupported_version_is_rejected() {
+    // A manifest client that picks 5.9 (outside our window) fails the handshake.
+    let input = manifest_handshake(Version::new(5, 9));
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+    let err = session.run().unwrap_err();
+    assert!(matches!(err, BoltError::Handshake(_)));
+    assert_eq!(session.state(), State::Defunct);
+}
+
+#[test]
+fn route_returns_a_well_formed_single_instance_routing_table() {
+    let exec = MockExecutor::new();
+    let mut input = handshake_54();
+    for r in [
+        Request::Hello { extra: vec![] },
+        logon_alice(),
+        Request::Route {
+            routing: vec![],
+            bookmarks: vec![],
+            extra: vec![("db".to_owned(), Value::String("graphus".to_owned()))],
+        },
+        Request::Goodbye,
+    ] {
+        input.extend_from_slice(&encode_request_framed(&r).unwrap());
+    }
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::with_config(
+            &mut transport,
+            exec,
+            &auth,
+            crate::server::SessionConfig {
+                advertised_bolt_address: Some("graphus.example:7687".to_owned()),
+                ..Default::default()
+            },
+        );
+        session.run().unwrap();
+        // ROUTE does not open a result; the connection stays usable (it ended via GOODBYE).
+        assert_eq!(session.state(), State::Defunct);
+    }
+
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // HELLO SUCCESS, LOGON SUCCESS, ROUTE SUCCESS{rt}.
+    let rt = match &r[2] {
+        Response::Success { metadata } => metadata
+            .iter()
+            .find(|(k, _)| k == "rt")
+            .map(|(_, v)| v)
+            .expect("ROUTE SUCCESS carries an rt map"),
+        other => panic!("expected ROUTE SUCCESS, got {other:?}"),
+    };
+    let Value::Map(rt) = rt else {
+        panic!("rt must be a map, got {rt:?}");
+    };
+    // ttl present and matches the default.
+    assert_eq!(
+        rt.iter().find(|(k, _)| k == "ttl").map(|(_, v)| v),
+        Some(&Value::Integer(crate::server::DEFAULT_ROUTING_TTL_SECS))
+    );
+    // db echoes the requested database.
+    assert_eq!(
+        rt.iter().find(|(k, _)| k == "db").map(|(_, v)| v),
+        Some(&Value::String("graphus".to_owned()))
+    );
+    // servers: exactly READ, WRITE, ROUTE, all pointing at the advertised address.
+    let Some((_, Value::List(servers))) = rt.iter().find(|(k, _)| k == "servers") else {
+        panic!("rt.servers must be a list: {rt:?}");
+    };
+    assert_eq!(servers.len(), 3, "three roles on a single instance");
+    let mut roles: Vec<String> = Vec::new();
+    for entry in servers {
+        let Value::Map(m) = entry else {
+            panic!("each server entry is a map: {entry:?}");
+        };
+        let Some((_, Value::String(role))) = m.iter().find(|(k, _)| k == "role") else {
+            panic!("server entry has a role: {m:?}");
+        };
+        roles.push(role.clone());
+        let Some((_, Value::List(addrs))) = m.iter().find(|(k, _)| k == "addresses") else {
+            panic!("server entry has addresses: {m:?}");
+        };
+        assert_eq!(
+            addrs,
+            &vec![Value::String("graphus.example:7687".to_owned())],
+            "every role advertises the configured address"
+        );
+    }
+    roles.sort();
+    assert_eq!(roles, vec!["READ", "ROUTE", "WRITE"]);
+}
+
+#[test]
+fn route_db_defaults_to_null_for_the_home_database() {
+    // ROUTE with an empty/absent db field yields a null `db` in the table (the home database).
+    let mut input = handshake_54();
+    for r in [
+        Request::Hello { extra: vec![] },
+        logon_alice(),
+        Request::Route {
+            routing: vec![],
+            bookmarks: vec![],
+            extra: vec![],
+        },
+        Request::Goodbye,
+    ] {
+        input.extend_from_slice(&encode_request_framed(&r).unwrap());
+    }
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    let Response::Success { metadata } = &r[2] else {
+        panic!("expected ROUTE SUCCESS, got {:?}", r[2]);
+    };
+    let Some((_, Value::Map(rt))) = metadata.iter().find(|(k, _)| k == "rt") else {
+        panic!("rt map missing");
+    };
+    assert_eq!(
+        rt.iter().find(|(k, _)| k == "db").map(|(_, v)| v),
+        Some(&Value::Null),
+        "absent db ⇒ null (home database)"
+    );
+    // The fallback address is well-formed even without configuration.
+    let Some((_, Value::List(servers))) = rt.iter().find(|(k, _)| k == "servers") else {
+        panic!("servers missing");
+    };
+    let Value::Map(first) = &servers[0] else {
+        panic!("server entry not a map");
+    };
+    let Some((_, Value::List(addrs))) = first.iter().find(|(k, _)| k == "addresses") else {
+        panic!("addresses missing");
+    };
+    assert_eq!(addrs, &vec![Value::String("localhost:7687".to_owned())]);
+}
+
+#[test]
+fn telemetry_is_acknowledged_with_success_and_never_fails() {
+    // TELEMETRY in READY → SUCCESS, the connection stays usable for a following RUN.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input(&[
+        Request::Hello { extra: vec![] },
+        logon_alice(),
+        Request::Telemetry { api: 2 },
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // HELLO, LOGON, TELEMETRY SUCCESS, RUN SUCCESS{fields}, RECORD, trailing SUCCESS.
+    assert!(
+        matches!(r[2], Response::Success { .. }),
+        "TELEMETRY → SUCCESS"
+    );
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Failure(_))),
+        "TELEMETRY must never produce a FAILURE: {r:?}"
+    );
+    assert!(r.iter().any(|resp| matches!(resp, Response::Record { .. })));
+}
+
+#[test]
+fn telemetry_before_logon_is_still_success_not_failure() {
+    // Even out of the usual order (sent in AUTHENTICATION), TELEMETRY is acknowledged, never failed.
+    let input = session_input(&[
+        Request::Hello { extra: vec![] },
+        Request::Telemetry { api: 1 },
+        logon_alice(),
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // HELLO SUCCESS, TELEMETRY SUCCESS, LOGON SUCCESS — no FAILURE, and LOGON still works after.
+    assert!(
+        matches!(r[1], Response::Success { .. }),
+        "TELEMETRY → SUCCESS"
+    );
+    assert!(
+        matches!(r[2], Response::Success { .. }),
+        "LOGON still works"
+    );
+    assert!(!r.iter().any(|resp| matches!(resp, Response::Failure(_))));
+}
+
+#[test]
+fn connection_id_is_unique_per_session_and_surfaced_in_hello() {
+    // Two sessions configured with distinct connection ids must each report their own in HELLO.
+    fn hello_connection_id(conn_id: &str) -> String {
+        let input = session_input(&[Request::Hello { extra: vec![] }, Request::Goodbye]);
+        let auth = auth_fixture();
+        let mut transport = MemoryTransport::with_input(&input);
+        {
+            let mut session = BoltSession::with_config(
+                &mut transport,
+                MockExecutor::new(),
+                &auth,
+                crate::server::SessionConfig {
+                    connection_id: conn_id.to_owned(),
+                    ..Default::default()
+                },
+            );
+            session.run().unwrap();
+        }
+        let (_, stream) = split_handshake(transport.written());
+        let r = decode_responses(stream);
+        match &r[0] {
+            Response::Success { metadata } => metadata
+                .iter()
+                .find(|(k, _)| k == "connection_id")
+                .map(|(_, v)| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("connection_id must be a string, got {other:?}"),
+                })
+                .expect("HELLO SUCCESS carries connection_id"),
+            other => panic!("expected HELLO SUCCESS, got {other:?}"),
+        }
+    }
+
+    let a = hello_connection_id("bolt-7");
+    let b = hello_connection_id("bolt-42");
+    assert_eq!(a, "bolt-7");
+    assert_eq!(b, "bolt-42");
+    assert_ne!(a, b, "per-connection ids are distinct");
+}
+
+#[test]
+fn hello_reports_the_server_agent_and_hints() {
+    // HELLO SUCCESS carries a Graphus server agent and a hints map (drivers probe both).
+    let input = session_input(&[Request::Hello { extra: vec![] }, Request::Goodbye]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    let Response::Success { metadata } = &r[0] else {
+        panic!("expected HELLO SUCCESS, got {:?}", r[0]);
+    };
+    match metadata.iter().find(|(k, _)| k == "server").map(|(_, v)| v) {
+        Some(Value::String(s)) => assert!(s.starts_with("Graphus/"), "server agent: {s}"),
+        other => panic!("server agent missing/!string: {other:?}"),
+    }
+    assert!(
+        metadata
+            .iter()
+            .any(|(k, v)| k == "hints" && matches!(v, Value::Map(_))),
+        "hints map present: {metadata:?}"
+    );
 }

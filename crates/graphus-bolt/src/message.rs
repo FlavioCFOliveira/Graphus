@@ -11,11 +11,12 @@
 //! `PULL`(0x3F), `BEGIN`(0x11), `COMMIT`(0x12), `ROLLBACK`(0x13), `RESET`(0x0F), `GOODBYE`(0x02).
 //! Responses: `SUCCESS`(0x70), `RECORD`(0x71), `IGNORED`(0x7E), `FAILURE`(0x7F).
 //!
-//! `TELEMETRY`(0x54) and `ROUTE`(0x66) are named in `04 §8.1` as part of the broader 5.x surface;
-//! v1 routes/telemetry are trivial on a single node (`04 §8.4` topology) and are **not** modelled as
-//! typed messages here — an unrecognised opcode decodes to [`Request::Unsupported`] so the server
-//! can answer per its state machine (`ROUTE` as single-node, telemetry acknowledged) without this
-//! layer inventing a wire shape it does not yet certify.
+//! `ROUTE`(0x66) and `TELEMETRY`(0x54) are part of the broader 5.x surface and are now modelled as
+//! typed messages (rmp #95): `ROUTE` carries the routing-table context, bookmarks, and an extra map
+//! (Bolt 4.4+ shape) so the server can answer with a single-instance routing table; `TELEMETRY`
+//! carries an advisory `api` integer the server acknowledges with an empty `SUCCESS`. Any *other*
+//! unrecognised opcode still decodes to [`Request::Unsupported`] so the server can answer per its
+//! state machine without this layer inventing a wire shape it does not certify.
 //!
 //! ## Field layout (verified against the Neo4j Bolt message spec, 2026-06)
 //!
@@ -44,6 +45,8 @@ pub mod opcode {
     pub const ROLLBACK: u8 = 0x13;
     pub const DISCARD: u8 = 0x2F;
     pub const PULL: u8 = 0x3F;
+    pub const TELEMETRY: u8 = 0x54;
+    pub const ROUTE: u8 = 0x66;
     pub const LOGON: u8 = 0x6A;
     pub const LOGOFF: u8 = 0x6B;
 
@@ -109,6 +112,23 @@ pub enum Request {
     Reset,
     /// `GOODBYE` — the client is closing the connection (no fields).
     Goodbye,
+    /// `ROUTE` — asks for the cluster routing table (Bolt 4.4+ shape: `ROUTE
+    /// routing_table_context bookmarks extra`). On a single instance every role resolves to this
+    /// server (rmp #95).
+    Route {
+        /// The routing-table context map (driver-supplied routing hints; e.g. `address`).
+        routing: Vec<(String, Value)>,
+        /// The bookmarks list the client wants the routing table to be consistent with.
+        bookmarks: Vec<Value>,
+        /// The `extra` map (`db` — the database the table is for; `imp_user` — impersonation).
+        extra: Vec<(String, Value)>,
+    },
+    /// `TELEMETRY` — an advisory message reporting which driver API the client used; the server
+    /// acknowledges it with an empty `SUCCESS` and otherwise ignores it (rmp #95).
+    Telemetry {
+        /// The driver-API code the client reports (informational only).
+        api: i64,
+    },
     /// An opcode this version does not model as a typed message (e.g. `ROUTE`, `TELEMETRY`); the
     /// server decides how to answer per its state machine without this layer guessing a shape.
     Unsupported {
@@ -207,6 +227,28 @@ impl Request {
                 expect_arity(tag, fields.len(), 0)?;
                 Ok(Request::Goodbye)
             }
+            opcode::ROUTE => {
+                expect_arity(tag, fields.len(), 3)?;
+                let mut it = fields.into_iter();
+                let routing = expect_map(it.next(), tag, "ROUTE.routing")?;
+                let bookmarks = expect_list(it.next(), tag, "ROUTE.bookmarks")?;
+                let extra = expect_map(it.next(), tag, "ROUTE.extra")?;
+                Ok(Request::Route {
+                    routing,
+                    bookmarks,
+                    extra,
+                })
+            }
+            opcode::TELEMETRY => {
+                expect_arity(tag, fields.len(), 1)?;
+                // The `api` field is an integer; a non-integer is tolerated as `0` since TELEMETRY is
+                // advisory and must never fail the connection (rmp #95).
+                let api = match fields.into_iter().next() {
+                    Some(Value::Integer(n)) => n,
+                    _ => 0,
+                };
+                Ok(Request::Telemetry { api })
+            }
             other => Ok(Request::Unsupported {
                 opcode: other,
                 fields,
@@ -245,6 +287,23 @@ impl Request {
             Request::Rollback => p.write_struct_header(opcode::ROLLBACK, 0)?,
             Request::Reset => p.write_struct_header(opcode::RESET, 0)?,
             Request::Goodbye => p.write_struct_header(opcode::GOODBYE, 0)?,
+            Request::Route {
+                routing,
+                bookmarks,
+                extra,
+            } => {
+                p.write_struct_header(opcode::ROUTE, 3)?;
+                write_map(&mut p, routing);
+                p.write_list_header(bookmarks.len());
+                for b in bookmarks {
+                    pack_value(&mut p, b);
+                }
+                write_map(&mut p, extra);
+            }
+            Request::Telemetry { api } => {
+                p.write_struct_header(opcode::TELEMETRY, 1)?;
+                pack_value(&mut p, &Value::Integer(*api));
+            }
             Request::Unsupported { opcode, fields } => {
                 p.write_struct_header(*opcode, fields.len())?;
                 for f in fields {
@@ -387,6 +446,15 @@ fn expect_map(v: Option<Value>, tag: u8, what: &str) -> BoltResult<Vec<(String, 
         Some(Value::Map(m)) => Ok(m),
         other => Err(BoltError::Decode(format!(
             "message {tag:#04x}: {what} must be a map, found {other:?}"
+        ))),
+    }
+}
+
+fn expect_list(v: Option<Value>, tag: u8, what: &str) -> BoltResult<Vec<Value>> {
+    match v {
+        Some(Value::List(l)) => Ok(l),
+        other => Err(BoltError::Decode(format!(
+            "message {tag:#04x}: {what} must be a list, found {other:?}"
         ))),
     }
 }
@@ -536,17 +604,66 @@ mod tests {
 
     #[test]
     fn unknown_opcode_decodes_as_unsupported() {
-        // ROUTE (0x66) with one map field.
+        // A genuinely unmodelled opcode (0x55) with one map field.
         let mut p = Packer::new();
-        p.write_struct_header(0x66, 1).unwrap();
+        p.write_struct_header(0x55, 1).unwrap();
         p.write_map_header(0);
         let bytes = p.into_inner();
         match Request::decode(&bytes).unwrap() {
             Request::Unsupported { opcode, fields } => {
-                assert_eq!(opcode, 0x66);
+                assert_eq!(opcode, 0x55);
                 assert_eq!(fields, vec![Value::Map(vec![])]);
             }
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_three_fields_round_trip() {
+        let r = Request::Route {
+            routing: vec![(
+                "address".to_owned(),
+                Value::String("localhost:7687".to_owned()),
+            )],
+            bookmarks: vec![Value::String("bm:1".to_owned())],
+            extra: vec![("db".to_owned(), Value::String("neo4j".to_owned()))],
+        };
+        let bytes = r.encode().unwrap();
+        assert_eq!(bytes[0], 0xB3, "ROUTE is a 3-field struct");
+        assert_eq!(bytes[1], opcode::ROUTE);
+        assert_eq!(rt_request(&r), r);
+    }
+
+    #[test]
+    fn route_with_wrong_field_count_errors() {
+        // ROUTE with a single map field (missing bookmarks + extra) is malformed.
+        let mut p = Packer::new();
+        p.write_struct_header(opcode::ROUTE, 1).unwrap();
+        p.write_map_header(0);
+        assert!(matches!(
+            Request::decode(&p.into_inner()),
+            Err(BoltError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn telemetry_carries_api_int_round_trip() {
+        let r = Request::Telemetry { api: 3 };
+        let bytes = r.encode().unwrap();
+        assert_eq!(bytes[0], 0xB1, "TELEMETRY is a 1-field struct");
+        assert_eq!(bytes[1], opcode::TELEMETRY);
+        assert_eq!(rt_request(&r), r);
+    }
+
+    #[test]
+    fn telemetry_tolerates_a_non_integer_api() {
+        // A non-integer api field decodes to 0 rather than failing (TELEMETRY is advisory).
+        let mut p = Packer::new();
+        p.write_struct_header(opcode::TELEMETRY, 1).unwrap();
+        p.write_string("oops");
+        match Request::decode(&p.into_inner()).unwrap() {
+            Request::Telemetry { api } => assert_eq!(api, 0),
+            other => panic!("expected TELEMETRY, got {other:?}"),
         }
     }
 

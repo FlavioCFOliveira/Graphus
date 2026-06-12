@@ -15,8 +15,9 @@
 //!   bytes for the graph/temporal types (`04 §8.1`).
 //! - [`framing`] — **chunked message framing**: a message is one-or-more `len`-prefixed chunks
 //!   terminated by `00 00`; a bare `00 00` is a NOOP keep-alive (`04 §8.1`).
-//! - [`handshake`] — the **legacy 4-slot handshake**: magic preamble + four range-encoded version
-//!   proposals, negotiating down to any 5.0–5.4 minor (`06 §1`).
+//! - [`handshake`] — the **legacy 4-slot handshake** *and* the **Manifest-v1 handshake** (rmp #95):
+//!   magic preamble + four range-encoded version proposals, negotiating down to any 5.0–5.4 minor
+//!   (`06 §1`); a manifest-aware client (`00 00 01 FF`) gets the modern two-round exchange instead.
 //! - [`message`] — the Bolt 5.4 **request/response set**, each a PackStream structure with the
 //!   correct opcode and field layout (`04 §8.1`, `06 §3`).
 //! - [`error`] — [`error::BoltError`] (protocol/codec faults) and the
@@ -48,8 +49,9 @@
 //!
 //! # Pins and documented deferrals
 //!
-//! - **Bolt 5.4** is the negotiated maximum (`06 §1`); the 5.7+ Manifest handshake is **deferred**
-//!   to Phase 2 (`06 §1.2`) — only the legacy handshake is implemented.
+//! - **Bolt 5.4** is the negotiated maximum (`06 §1`). Both the **legacy 4-slot** handshake and the
+//!   **Manifest-v1** handshake (`06 §1.2`; rmp #95) are implemented, and both negotiate the same
+//!   5.0–5.4 window — so a modern routing driver and an older driver connect identically.
 //! - **`FAILURE` status codes** are a documented **best-effort** `Neo.*`-shaped rendering of the
 //!   engine's classified error (the verbatim Neo4j two-letter mapping is deferred per `06 §2.4`);
 //!   see [`error::failure_from_error`].
@@ -73,8 +75,12 @@ pub mod transport;
 pub use error::{BoltError, BoltResult, Failure, failure_from_error};
 pub use executor::{AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl};
 pub use framing::{Dechunker, Frame, chunk_message};
-pub use handshake::{Proposal, Version, negotiate};
+pub use handshake::{
+    MANIFEST_V1_REQUEST, ManifestChoice, Proposal, Version, detect_manifest_request,
+    encode_manifest_choice, encode_server_manifest, graphus_manifest, negotiate,
+    parse_manifest_choice,
+};
 pub use message::{Request, Response};
 pub use packstream::{Packer, Structure, Unpacker, pack_value, unpack_value};
-pub use server::{BoltSession, State};
+pub use server::{BoltSession, SessionConfig, State};
 pub use transport::{MemoryTransport, Transport};

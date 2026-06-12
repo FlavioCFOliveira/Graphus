@@ -77,6 +77,11 @@ pub async fn start_all(
 ) -> Result<Listeners, String> {
     let tls_acceptor = tls.map(TlsAcceptor::from);
 
+    // The address routing (`neo4j://`) drivers are told to reconnect to in a `ROUTE` reply (rmp
+    // #95): the explicit advertised address, else the Bolt-TCP bind address (see
+    // `ServerConfig::resolved_advertised_bolt_address`).
+    let advertised_bolt = config.resolved_advertised_bolt_address();
+
     // The shared database-targeting + admin-statement context (rmp #84/#92). One per server: both
     // Bolt loops clone it per connection, the REST adapter holds one. It carries the live
     // `SecurityCatalog` (admin authorization + security-command execution + persistence).
@@ -96,6 +101,7 @@ pub async fn start_all(
             acceptor,
             context.clone(),
             Arc::clone(&auth),
+            advertised_bolt.clone(),
             Arc::clone(&metrics),
             shutdown.clone(),
         ));
@@ -121,6 +127,7 @@ pub async fn start_all(
             tls_acceptor,
             context.clone(),
             Arc::clone(&auth),
+            advertised_bolt.clone(),
             Arc::clone(&metrics),
             shutdown.clone(),
         ));

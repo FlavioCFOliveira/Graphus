@@ -15,9 +15,10 @@
 //! the async↔blocking [`AsyncToBlockingTransport`] bridge (`04 §9.1`).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use graphus_auth::{Authenticator, PeerCred as AuthPeerCred, PeerCredSource};
-use graphus_bolt::server::BoltSession;
+use graphus_bolt::server::{BoltSession, SessionConfig};
 use graphus_io::{TcpAcceptor, UdsAcceptor};
 use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
@@ -28,13 +29,37 @@ use crate::engine::BoltEngineExecutor;
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownCoordinator;
 
+/// A process-wide monotonic counter minting a unique `connection_id` per accepted Bolt connection
+/// (rmp #95). Shared across both the UDS and TCP accept loops so every connection's id is distinct
+/// for the server's lifetime, regardless of which transport accepted it.
+static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Mints the next unique per-connection id (`bolt-<n>`), reported in `HELLO` `SUCCESS` so a driver
+/// and the server logs can correlate one connection (rmp #95).
+fn mint_connection_id() -> String {
+    let n = CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("bolt-{n}")
+}
+
+/// Builds the per-connection [`SessionConfig`]: a freshly-minted unique `connection_id` plus the
+/// server's advertised routing address (rmp #95). The default `server_agent`/`routing_ttl` apply.
+fn session_config(advertised_bolt_address: Option<String>) -> SessionConfig {
+    SessionConfig {
+        connection_id: mint_connection_id(),
+        advertised_bolt_address,
+        ..SessionConfig::default()
+    }
+}
+
 /// Runs the UDS Bolt accept loop until shutdown. Each accepted connection is admitted by peer-cred
 /// then handed to a blocking session task. `context` is the shared database-targeting + admin
-/// surface every per-connection executor routes through (rmp #84).
+/// surface every per-connection executor routes through (rmp #84). `advertised_bolt_address` is the
+/// address routing drivers are told to reconnect to in a `ROUTE` reply (rmp #95).
 pub async fn run_uds_accept_loop(
     acceptor: UdsAcceptor,
     context: AdminContext,
     auth: Arc<Authenticator>,
+    advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
 ) {
@@ -69,6 +94,7 @@ pub async fn run_uds_accept_loop(
                     handle.clone(),
                     context.clone(),
                     Arc::clone(&auth),
+                    session_config(advertised_bolt_address.clone()),
                     shutdown.clone(),
                 );
             }
@@ -79,12 +105,14 @@ pub async fn run_uds_accept_loop(
 
 /// Runs the TCP Bolt accept loop until shutdown. Each accepted connection is TLS-wrapped, then handed
 /// to a blocking session task (native LOGON auth happens inside the session). `context` is the
-/// shared database-targeting + admin surface (rmp #84).
+/// shared database-targeting + admin surface (rmp #84). `advertised_bolt_address` is the address
+/// routing drivers are told to reconnect to in a `ROUTE` reply (rmp #95).
 pub async fn run_tcp_accept_loop(
     acceptor: TcpAcceptor,
     tls: TlsAcceptor,
     context: AdminContext,
     auth: Arc<Authenticator>,
+    advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
 ) {
@@ -110,10 +138,20 @@ pub async fn run_tcp_accept_loop(
                 let auth = Arc::clone(&auth);
                 let shutdown = shutdown.clone();
                 let metrics = Arc::clone(&metrics);
+                let advertised = advertised_bolt_address.clone();
                 tokio::spawn(async move {
                     match tls.accept(conn).await {
                         Ok(tls_stream) => {
-                            spawn_session(tls_stream, handle, context, auth, shutdown);
+                            // Mint the per-connection id only once TLS succeeds, so abandoned
+                            // handshakes do not consume ids (rmp #95).
+                            spawn_session(
+                                tls_stream,
+                                handle,
+                                context,
+                                auth,
+                                session_config(advertised),
+                                shutdown,
+                            );
                         }
                         Err(e) => {
                             metrics.record_auth_failure();
@@ -164,7 +202,8 @@ impl PeerCredSource for FixedPeerCred {
 }
 
 /// Spawns one Bolt session on a blocking task: builds the async→blocking transport bridge and the
-/// per-connection engine executor, then drives `BoltSession::run` to completion.
+/// per-connection engine executor, then drives `BoltSession::run` to completion. `session_config`
+/// carries this connection's minted id and the advertised routing address (rmp #95).
 ///
 /// The session is **blocking** (its `Transport` and engine submits block), so it runs on
 /// `spawn_blocking`, never a runtime worker (`04 §9.1`). The `Authenticator` is shared (`Arc`); the
@@ -174,6 +213,7 @@ fn spawn_session<S>(
     handle: Handle,
     context: AdminContext,
     auth: Arc<Authenticator>,
+    session_config: SessionConfig,
     shutdown: ShutdownCoordinator,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -181,7 +221,7 @@ fn spawn_session<S>(
     tokio::task::spawn_blocking(move || {
         let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, None);
         let executor = BoltEngineExecutor::new(context);
-        let mut session = BoltSession::new(transport, executor, &auth);
+        let mut session = BoltSession::with_config(transport, executor, &auth, session_config);
         if let Err(e) = session.run() {
             // A transport/handshake error ends the session; a Cypher/auth FAILURE is *not* an error
             // here (it is delivered in-band — see `BoltSession::run` docs).

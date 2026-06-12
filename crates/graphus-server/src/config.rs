@@ -242,6 +242,13 @@ pub struct ServerConfig {
 
     /// TCP address for the Bolt-over-TCP listener, or `None` to disable it. TLS required when set.
     pub bolt_tcp_addr: Option<String>,
+    /// The Bolt address (`host:port`) advertised to **routing** (`neo4j://`) drivers in the `ROUTE`
+    /// reply (rmp #95), or `None` to fall back to [`bolt_tcp_addr`](Self::bolt_tcp_addr). Set this to
+    /// the server's externally-reachable address when clients connect through a different name/port
+    /// than the bind address (e.g. behind a load balancer or NAT) — the bind address (often
+    /// `0.0.0.0:7687`) is not usable as a reconnection target. Graphus is a single instance, so all
+    /// three routing roles (read/write/route) advertise this one address.
+    pub advertised_bolt_address: Option<String>,
     /// TCP address for the REST listener, or `None` to disable it. TLS required when set.
     pub rest_addr: Option<String>,
     /// Filesystem path for the Bolt-over-UDS listener, or `None` to disable it.
@@ -280,6 +287,7 @@ impl Default for ServerConfig {
             buffer_pool_pages: 4096,
             fsync_threads: 2,
             bolt_tcp_addr: None,
+            advertised_bolt_address: None,
             rest_addr: Some("127.0.0.1:7474".to_owned()),
             uds_path: Some(PathBuf::from("graphus.sock")),
             tls: TlsConfig::default(),
@@ -334,6 +342,13 @@ impl ServerConfig {
             self.bolt_tcp_addr = None;
         }
         if self
+            .advertised_bolt_address
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty())
+        {
+            self.advertised_bolt_address = None;
+        }
+        if self
             .rest_addr
             .as_deref()
             .is_some_and(|s| s.trim().is_empty())
@@ -368,6 +383,9 @@ impl ServerConfig {
         }
         if let Ok(v) = var("GRAPHUS_BOLT_TCP_ADDR") {
             self.bolt_tcp_addr = empty_to_none(v);
+        }
+        if let Ok(v) = var("GRAPHUS_ADVERTISED_BOLT_ADDRESS") {
+            self.advertised_bolt_address = empty_to_none(v);
         }
         if let Ok(v) = var("GRAPHUS_REST_ADDR") {
             self.rest_addr = empty_to_none(v);
@@ -492,6 +510,20 @@ impl ServerConfig {
     #[must_use]
     pub fn wal_file(&self) -> PathBuf {
         self.store_path.join(crate::dbcatalog::WAL_FILE_NAME)
+    }
+
+    /// The Bolt address advertised to routing (`neo4j://`) drivers in the `ROUTE` reply (rmp #95).
+    ///
+    /// Resolves to [`advertised_bolt_address`](Self::advertised_bolt_address) when set, else to the
+    /// configured [`bolt_tcp_addr`](Self::bolt_tcp_addr) (the address Bolt-TCP binds to). `None` when
+    /// neither is set — a UDS-only deployment has no TCP address to advertise, and the Bolt session
+    /// then advertises its documented `localhost:7687` fallback so a routing table is still
+    /// well-formed.
+    #[must_use]
+    pub fn resolved_advertised_bolt_address(&self) -> Option<String> {
+        self.advertised_bolt_address
+            .clone()
+            .or_else(|| self.bolt_tcp_addr.clone())
     }
 }
 
@@ -747,6 +779,49 @@ mod tests {
         assert!(cfg.validate().is_ok(), "an existing key file validates");
         assert!(cfg.encryption.is_enabled());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn advertised_bolt_address_resolves_and_defaults() {
+        // Explicit advertised address wins.
+        let cfg = ServerConfig {
+            advertised_bolt_address: Some("public.example:7687".to_owned()),
+            bolt_tcp_addr: Some("0.0.0.0:7687".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_advertised_bolt_address().as_deref(),
+            Some("public.example:7687")
+        );
+
+        // Unset advertised address falls back to the Bolt-TCP bind address.
+        let cfg = ServerConfig {
+            advertised_bolt_address: None,
+            bolt_tcp_addr: Some("10.0.0.5:7687".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_advertised_bolt_address().as_deref(),
+            Some("10.0.0.5:7687")
+        );
+
+        // Neither set (UDS-only): None — the Bolt session uses its documented localhost fallback.
+        let cfg = ServerConfig {
+            advertised_bolt_address: None,
+            bolt_tcp_addr: None,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cfg.resolved_advertised_bolt_address(), None);
+    }
+
+    #[test]
+    fn normalize_blanks_disable_advertised_bolt_address() {
+        let mut cfg = ServerConfig {
+            advertised_bolt_address: Some("   ".to_owned()),
+            ..ServerConfig::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.advertised_bolt_address, None);
     }
 
     #[test]

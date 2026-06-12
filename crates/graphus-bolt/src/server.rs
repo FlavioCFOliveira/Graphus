@@ -37,7 +37,10 @@ use graphus_core::Value;
 use crate::error::{BoltError, BoltResult, CODE_UNAUTHORIZED, Failure, failure_from_error};
 use crate::executor::{AccessMode, BoltExecutor, Record, RecordStream, TxControl};
 use crate::framing::{Dechunker, Frame, chunk_message_into};
-use crate::handshake::{MAGIC, Version, negotiate, parse_client_handshake, server_reply};
+use crate::handshake::{
+    MAGIC, Version, detect_manifest_request, graphus_manifest, negotiate, parse_client_handshake,
+    parse_manifest_choice, server_reply,
+};
 use crate::message::{ALL, Request, Response};
 use crate::transport::Transport;
 
@@ -78,6 +81,50 @@ impl State {
     }
 }
 
+/// The default `server` agent string reported in `HELLO` `SUCCESS` (`04 §8.1`). The listener can
+/// override it with a build-stamped one via [`SessionConfig`].
+pub const DEFAULT_SERVER_AGENT: &str = concat!("Graphus/", env!("CARGO_PKG_VERSION"));
+
+/// Per-connection metadata the listener supplies to a [`BoltSession`] (rmp #95).
+///
+/// The protocol core is transport-agnostic, but two pieces of `HELLO`/`ROUTE` metadata are inherently
+/// the *listener's* to know: the **`connection_id`** the listener mints per accepted connection (so a
+/// driver and the server logs can correlate one connection — Graphus hardcoded `bolt-1` before this),
+/// and the **advertised Bolt address** a routing (`neo4j://`) driver should reconnect to (the
+/// server's externally-reachable `host:port`, which the protocol layer cannot discover on its own).
+/// Both have sensible defaults so existing call sites keep working.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// The unique id reported in `HELLO` `SUCCESS` as `connection_id`. Minted per connection by the
+    /// listener; defaults to `"bolt-1"` for call sites that do not mint one.
+    pub connection_id: String,
+    /// The `server` agent string reported in `HELLO` `SUCCESS`. Defaults to [`DEFAULT_SERVER_AGENT`].
+    pub server_agent: String,
+    /// The Bolt address (`host:port`) a routing driver should connect to, returned in the `ROUTE`
+    /// routing table for all three roles. `None` advertises the literal the client used (a driver
+    /// connected to a single node keeps using that address), which keeps a single-instance routing
+    /// driver working without any configuration.
+    pub advertised_bolt_address: Option<String>,
+    /// The routing table's time-to-live in seconds (`ROUTE` `rt.ttl`). Drivers re-fetch the table
+    /// after this; a single instance's table never really changes, so a comfortable default avoids
+    /// needless re-routing round-trips.
+    pub routing_ttl_secs: i64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            connection_id: "bolt-1".to_owned(),
+            server_agent: DEFAULT_SERVER_AGENT.to_owned(),
+            advertised_bolt_address: None,
+            routing_ttl_secs: DEFAULT_ROUTING_TTL_SECS,
+        }
+    }
+}
+
+/// The default `ROUTE` routing-table TTL in seconds (300 = 5 minutes, Neo4j's driver default).
+pub const DEFAULT_ROUTING_TTL_SECS: i64 = 300;
+
 /// A Bolt connection session: the state machine plus its in-flight result stream.
 ///
 /// Generic over the [`Transport`] (byte pipe) and the [`BoltExecutor`] (query seam) so it is
@@ -87,6 +134,8 @@ pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     transport: T,
     executor: E,
     auth: &'a Authenticator,
+    /// Per-connection metadata (connection id, server agent, advertised routing address — rmp #95).
+    config: SessionConfig,
     state: State,
     /// The negotiated protocol version (set after the handshake).
     version: Option<Version>,
@@ -153,12 +202,25 @@ enum Flow {
 
 impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// Builds a session over `transport`, running queries through `executor`, authenticating with
-    /// `auth`. The session starts in [`State::Connected`] (pre-handshake).
+    /// `auth`, with the default [`SessionConfig`]. The session starts in [`State::Connected`]
+    /// (pre-handshake).
     pub fn new(transport: T, executor: E, auth: &'a Authenticator) -> Self {
+        Self::with_config(transport, executor, auth, SessionConfig::default())
+    }
+
+    /// Builds a session with explicit per-connection [`SessionConfig`] (the listener mints the
+    /// `connection_id` and supplies the advertised routing address — rmp #95).
+    pub fn with_config(
+        transport: T,
+        executor: E,
+        auth: &'a Authenticator,
+        config: SessionConfig,
+    ) -> Self {
         Self {
             transport,
             executor,
             auth,
+            config,
             state: State::Connected,
             version: None,
             principal: None,
@@ -228,15 +290,27 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
 
     // ---- Handshake -------------------------------------------------------------------------------
 
-    /// Reads the 20-byte client handshake, negotiates a version, and replies.
+    /// Reads the 20-byte client handshake and negotiates a version, over either the **legacy** 4-slot
+    /// reply or the **Manifest-v1** exchange (rmp #95).
+    ///
+    /// The first transmission is always magic + 4 proposals (20 bytes). If one slot is the
+    /// Manifest-v1 marker (`00 00 01 FF`), the server replies with its manifest and reads the
+    /// client's chosen version + capabilities (a second round); otherwise it replies with the single
+    /// negotiated version exactly as before. Both forms converge on the same version window.
     ///
     /// # Errors
-    /// [`BoltError::Handshake`] if the magic/length is wrong or no version is acceptable (the
-    /// listener closes the connection on a handshake error).
+    /// [`BoltError::Handshake`] if the magic/length is wrong, no version is acceptable, or (manifest)
+    /// the client picks a version Graphus does not support (the listener closes the connection on a
+    /// handshake error).
     fn do_handshake(&mut self) -> BoltResult<()> {
         const HANDSHAKE_LEN: usize = MAGIC.len() + 4 * 4;
         let bytes = self.read_exact_bytes(HANDSHAKE_LEN)?;
         let proposals = parse_client_handshake(&bytes)?;
+
+        if detect_manifest_request(&proposals) {
+            return self.do_manifest_handshake();
+        }
+
         let chosen = negotiate(&proposals);
         self.transport.write_all(&server_reply(chosen))?;
         match chosen {
@@ -255,6 +329,53 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         }
     }
 
+    /// Runs the Manifest-v1 second round: send Graphus's manifest, read the client's chosen version +
+    /// capabilities, and accept it if it is in Graphus's supported window (`06 §1.2`; rmp #95).
+    ///
+    /// # Errors
+    /// [`BoltError::Handshake`] if the client's choice is unreadable or names an unsupported version.
+    fn do_manifest_handshake(&mut self) -> BoltResult<()> {
+        self.transport.write_all(&graphus_manifest())?;
+        let choice_bytes = self.read_manifest_choice()?;
+        let choice = parse_manifest_choice(&choice_bytes)?;
+        if choice.version.is_supported() {
+            self.version = Some(choice.version);
+            self.state = State::Connected;
+            Ok(())
+        } else {
+            self.state = State::Defunct;
+            Err(BoltError::Handshake(format!(
+                "client chose unsupported Bolt version {}.{} in the manifest handshake",
+                choice.version.major, choice.version.minor
+            )))
+        }
+    }
+
+    /// Reads the client's post-manifest response off the transport: 4 version bytes then a
+    /// continuation-terminated capabilities varint. The varint is read byte-by-byte (its length is
+    /// not known in advance), stopping at the first byte without the high continuation bit.
+    ///
+    /// # Errors
+    /// [`BoltError::Transport`] on EOF mid-response; [`BoltError::Handshake`] if the varint runs past
+    /// a sane bound (a malformed, never-terminating continuation).
+    fn read_manifest_choice(&mut self) -> BoltResult<Vec<u8>> {
+        // The 4-byte chosen version.
+        let mut out = self.read_exact_bytes(4)?;
+        // The capabilities varint: at most 10 bytes encode a u64; refuse a longer run as malformed.
+        const MAX_VARINT_BYTES: usize = 10;
+        for _ in 0..MAX_VARINT_BYTES {
+            let byte = self.read_exact_bytes(1)?[0];
+            out.push(byte);
+            if byte & 0x80 == 0 {
+                return Ok(out);
+            }
+        }
+        self.state = State::Defunct;
+        Err(BoltError::Handshake(
+            "manifest capabilities varint never terminates".to_owned(),
+        ))
+    }
+
     // ---- Dispatch --------------------------------------------------------------------------------
 
     /// Handles one decoded request per the current state, writing the response(s).
@@ -263,6 +384,15 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         if matches!(request, Request::Goodbye) {
             self.state = State::Defunct;
             return Ok(Flow::Stop);
+        }
+
+        // TELEMETRY is advisory: acknowledge it with an empty SUCCESS and never fail the connection
+        // over it (rmp #95). It is accepted in any non-failed state without disturbing the state
+        // machine; while FAILED it falls through to the fail-then-ignore rule below (IGNORED, also
+        // never a FAILURE), exactly like any other message.
+        if matches!(request, Request::Telemetry { .. }) && self.state != State::Failed {
+            self.send(&Response::Success { metadata: vec![] })?;
+            return Ok(Flow::Continue);
         }
 
         // Fail-then-ignore-until-RESET: in FAILED, only RESET is processed; all else is IGNORED.
@@ -293,18 +423,20 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         match request {
             Request::Hello { extra: _ } => {
                 // HELLO no longer carries credentials in 5.1+ (LOGON does). Acknowledge with server
-                // metadata and move to AUTHENTICATION. The `server` agent and `connection_id` are
-                // sensible defaults; a listener that mints per-connection ids (rmp #20) can enrich
-                // them later without changing the protocol surface.
+                // metadata and move to AUTHENTICATION. The `server` agent and the per-connection
+                // `connection_id` come from the listener's `SessionConfig` (rmp #95); `hints` is the
+                // optional driver-tuning map (empty here — Graphus advertises no hints yet, but the
+                // key's presence is what some drivers probe).
                 let meta = vec![
                     (
                         "server".to_owned(),
-                        Value::String("Graphus/0.0.0".to_owned()),
+                        Value::String(self.config.server_agent.clone()),
                     ),
                     (
                         "connection_id".to_owned(),
-                        Value::String("bolt-1".to_owned()),
+                        Value::String(self.config.connection_id.clone()),
                     ),
+                    ("hints".to_owned(), Value::Map(vec![])),
                 ];
                 self.send(&Response::Success { metadata: meta })?;
                 self.state = State::Authentication;
@@ -413,6 +545,14 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                     }
                     Err(e) => self.fail_with(&e)?,
                 }
+                Ok(Flow::Continue)
+            }
+            (State::Ready, Request::Route { extra, .. }) => {
+                // A routing (`neo4j://`) driver asks for the cluster routing table. Graphus is a
+                // single instance, so every role resolves to this one server (rmp #95). ROUTE is a
+                // READY-state request: it does not open a result, so the state is unchanged.
+                let db = db_from_extra(&extra);
+                self.handle_route(db.as_deref())?;
                 Ok(Flow::Continue)
             }
             (_, Request::Logoff) => {
@@ -539,6 +679,58 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             self.state = self.state.ready_after_stream();
         }
         Ok(Flow::Continue)
+    }
+
+    // ---- ROUTE -----------------------------------------------------------------------------------
+
+    /// Answers `ROUTE` with a **single-instance** routing table (rmp #95): every role (READ / WRITE /
+    /// ROUTE) points at this server's advertised Bolt address, with a TTL. A `neo4j://` (routing)
+    /// driver resolves the one node from it and proceeds.
+    ///
+    /// `db` is the database the table is for (from the `ROUTE` extra's `db`); it is echoed into the
+    /// table as `db` (or null for the home database). The advertised address comes from
+    /// [`SessionConfig::advertised_bolt_address`]; when unset it falls back to the routing context's
+    /// `address` hint (the literal a single-node driver already uses), then to `localhost:7687` so a
+    /// table is always well-formed.
+    fn handle_route(&mut self, db: Option<&str>) -> BoltResult<()> {
+        let address = self.advertised_address();
+        let server_entry = |role: &str| {
+            Value::Map(vec![
+                (
+                    "addresses".to_owned(),
+                    Value::List(vec![Value::String(address.clone())]),
+                ),
+                ("role".to_owned(), Value::String(role.to_owned())),
+            ])
+        };
+        // All three roles resolve to this single instance (single-instance topology, `04 §8.4`).
+        let servers = Value::List(vec![
+            server_entry("READ"),
+            server_entry("WRITE"),
+            server_entry("ROUTE"),
+        ]);
+        let db_value = db.map_or(Value::Null, |d| Value::String(d.to_owned()));
+        let rt = Value::Map(vec![
+            (
+                "ttl".to_owned(),
+                Value::Integer(self.config.routing_ttl_secs),
+            ),
+            ("db".to_owned(), db_value),
+            ("servers".to_owned(), servers),
+        ]);
+        self.send(&Response::Success {
+            metadata: vec![("rt".to_owned(), rt)],
+        })
+    }
+
+    /// The Bolt address advertised in the `ROUTE` routing table: the configured
+    /// [`SessionConfig::advertised_bolt_address`], else a documented `localhost:7687` fallback
+    /// (Bolt's default port) so the table is always usable on a single node.
+    fn advertised_address(&self) -> String {
+        self.config
+            .advertised_bolt_address
+            .clone()
+            .unwrap_or_else(|| "localhost:7687".to_owned())
     }
 
     // ---- RESET / failure -------------------------------------------------------------------------
@@ -723,6 +915,8 @@ fn request_name(r: &Request) -> &'static str {
         Request::Rollback => "ROLLBACK",
         Request::Reset => "RESET",
         Request::Goodbye => "GOODBYE",
+        Request::Route { .. } => "ROUTE",
+        Request::Telemetry { .. } => "TELEMETRY",
         Request::Unsupported { .. } => "UNSUPPORTED",
     }
 }

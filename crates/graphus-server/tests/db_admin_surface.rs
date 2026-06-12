@@ -74,6 +74,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         buffer_pool_pages: 256,
         fsync_threads: 1,
         bolt_tcp_addr: None,
+        advertised_bolt_address: None,
         rest_addr: Some("127.0.0.1:0".to_owned()),
         uds_path: Some(temp.uds_path()),
         tls: TlsConfig::default(),

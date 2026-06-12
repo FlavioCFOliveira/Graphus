@@ -80,6 +80,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         buffer_pool_pages: 256,
         fsync_threads: 1,
         bolt_tcp_addr: None,
+        advertised_bolt_address: None,
         // REST on an ephemeral port; no TLS so the test's raw HTTP client can connect.
         rest_addr: Some("127.0.0.1:0".to_owned()),
         uds_path: Some(temp.uds_path()),
@@ -289,6 +290,113 @@ async fn bolt_uds_full_session_returns_records() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+#[tokio::test]
+async fn bolt_uds_route_and_telemetry_round_trip() {
+    // Over the REAL UDS path (rmp #95): a ROUTE returns a single-instance routing table and a
+    // TELEMETRY is acknowledged with SUCCESS — proving the typed messages flow through the listener,
+    // the minted connection_id surfaces in HELLO, and neither breaks a stock routing-style driver.
+    let temp = TempStore::new("bolt-route");
+    let mut config = base_config(&temp);
+    // Advertise an explicit reconnection address the routing table must carry.
+    config.advertised_bolt_address = Some("graphus.test:7687".to_owned());
+    let server = boot(config).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut client = BoltUdsClient::connect(&uds).await;
+    // HELLO SUCCESS must carry a per-connection connection_id (not the old hardcoded sentinel only).
+    let hello = {
+        let hs = encode_client_handshake([
+            Proposal::range(5, 4, 4),
+            Proposal::exact(0, 0),
+            Proposal::exact(0, 0),
+            Proposal::exact(0, 0),
+        ]);
+        client.stream.write_all(&hs).await.unwrap();
+        let mut reply = [0u8; 4];
+        client.stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x00, 0x00, 0x04, 0x05]);
+        client
+            .request_response(Request::Hello {
+                extra: vec![("user_agent".to_owned(), Value::String("itest".to_owned()))],
+            })
+            .await
+    };
+    match &hello {
+        Response::Success { metadata } => {
+            let conn_id = metadata
+                .iter()
+                .find(|(k, _)| k == "connection_id")
+                .map(|(_, v)| v);
+            assert!(
+                matches!(conn_id, Some(Value::String(s)) if s.starts_with("bolt-")),
+                "HELLO carries a minted connection_id: {metadata:?}"
+            );
+        }
+        other => panic!("expected HELLO SUCCESS, got {other:?}"),
+    }
+
+    // LOGON.
+    let logon = client
+        .request_response(Request::Logon {
+            auth: vec![
+                ("scheme".to_owned(), Value::String("basic".to_owned())),
+                ("principal".to_owned(), Value::String("alice".to_owned())),
+                ("credentials".to_owned(), Value::String("pw".to_owned())),
+            ],
+        })
+        .await;
+    assert!(
+        matches!(logon, Response::Success { .. }),
+        "LOGON ok: {logon:?}"
+    );
+
+    // TELEMETRY → SUCCESS, never FAILURE.
+    let telemetry = client.request_response(Request::Telemetry { api: 1 }).await;
+    assert!(
+        matches!(telemetry, Response::Success { .. }),
+        "TELEMETRY acknowledged: {telemetry:?}"
+    );
+
+    // ROUTE → a routing table advertising the configured address for all three roles.
+    let route = client
+        .request_response(Request::Route {
+            routing: vec![],
+            bookmarks: vec![],
+            extra: vec![("db".to_owned(), Value::String("graphus".to_owned()))],
+        })
+        .await;
+    let Response::Success { metadata } = route else {
+        panic!("expected ROUTE SUCCESS, got {route:?}");
+    };
+    let Some((_, Value::Map(rt))) = metadata.iter().find(|(k, _)| k == "rt") else {
+        panic!("ROUTE SUCCESS missing rt map: {metadata:?}");
+    };
+    let Some((_, Value::List(servers))) = rt.iter().find(|(k, _)| k == "servers") else {
+        panic!("rt.servers missing: {rt:?}");
+    };
+    assert_eq!(
+        servers.len(),
+        3,
+        "READ + WRITE + ROUTE on a single instance"
+    );
+    for entry in servers {
+        let Value::Map(m) = entry else {
+            panic!("server entry not a map");
+        };
+        let Some((_, Value::List(addrs))) = m.iter().find(|(k, _)| k == "addresses") else {
+            panic!("server entry has no addresses");
+        };
+        assert_eq!(
+            addrs,
+            &vec![Value::String("graphus.test:7687".to_owned())],
+            "every role advertises the configured address"
+        );
+    }
+
+    client.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
 /// A minimal Bolt client over a Unix socket for the integration test.
 struct BoltUdsClient {
     stream: UnixStream,
@@ -365,6 +473,12 @@ impl BoltUdsClient {
             }
         }
         rows
+    }
+
+    /// Sends a single request and returns the single response (for ROUTE / TELEMETRY round-trips).
+    async fn request_response(&mut self, req: Request) -> Response {
+        self.send(&req).await;
+        self.recv().await
     }
 
     /// Attempts LOGON with a bad password, asserting a FAILURE.

@@ -16,8 +16,29 @@
 //! - byte 3 is the **major**.
 //!
 //! So `00 00 04 05` proposes exactly 5.4, and `00 02 04 05` proposes 5.2–5.4 (a span of three
-//! minors). The Manifest-v1 handshake (client proposes `00 00 01 FF`) is **deferred to Phase 2**
-//! (`06 §1.2`); this module implements the legacy handshake only.
+//! minors).
+//!
+//! ## The Manifest-v1 handshake (`06 §1.2`; rmp #95)
+//!
+//! A modern driver can ask for **Manifest-v1** negotiation instead of the legacy fixed reply: it
+//! substitutes the special proposal `00 00 01 FF` for one of its four slots (the other three being
+//! `00 00 00 00` or further legacy proposals — see the Neo4j Bolt handshake-manifest-v1 spec). The
+//! first transmission is still the 20-byte magic + 4 slots; the manifest exchange is then a **second
+//! round**:
+//!
+//! 1. the server replies with the manifest acknowledgment `00 00 01 FF`, then a **varint** count of
+//!    supported version ranges, then each range in the same `[00, range, minor, major]` form, then a
+//!    **varint** capabilities bitmask (`0` = no extra capabilities);
+//! 2. the client sends back its **chosen 4-byte version** followed by a **varint** of the
+//!    capabilities it accepts;
+//! 3. the connection proceeds at the chosen version exactly as the legacy path would.
+//!
+//! The varint is the Bolt LEB128 form: 7 bits per byte, least-significant group first, the high bit
+//! of each byte a continuation flag. Graphus advertises **one** range (5.0–5.4) and **no**
+//! capabilities, so its manifest is short and constant; both handshake forms negotiate the *same*
+//! version window. [`detect_manifest_request`], [`encode_server_manifest`] and
+//! [`parse_manifest_choice`] are the manifest primitives; the legacy path
+//! ([`parse_client_handshake`] / [`negotiate`] / [`server_reply`]) is unchanged.
 //!
 //! ## What Graphus negotiates
 //!
@@ -203,6 +224,142 @@ pub fn server_reply(chosen: Option<Version>) -> [u8; 4] {
     chosen.map_or(REJECTION, Version::to_wire)
 }
 
+// ---- Manifest-v1 handshake (`06 §1.2`; rmp #95) ------------------------------------------------
+
+/// The special 4-byte slot a client sends to request **Manifest-v1** negotiation: two reserved
+/// bytes, the manifest version (`01`), and the manifest marker (`FF`) (Neo4j Bolt
+/// handshake-manifest-v1 spec).
+pub const MANIFEST_V1_REQUEST: [u8; 4] = [0x00, 0x00, 0x01, 0xFF];
+
+/// Whether any of the client's legacy proposals is the Manifest-v1 request marker.
+///
+/// A manifest-aware client substitutes [`MANIFEST_V1_REQUEST`] for one of its four 32-bit slots; the
+/// other slots are unused (`00 00 00 00`) or further legacy proposals. Seeing the marker means the
+/// server must run the manifest exchange ([`encode_server_manifest`] then [`parse_manifest_choice`])
+/// rather than reply with a single legacy version.
+#[must_use]
+pub fn detect_manifest_request(proposals: &[Proposal]) -> bool {
+    proposals.iter().any(|p| p.to_wire() == MANIFEST_V1_REQUEST)
+}
+
+/// Appends a Bolt LEB128 varint of `value` to `out` (7 bits per byte, least-significant group first,
+/// the high bit a continuation flag; `0` encodes as the single byte `0x00`).
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = u8::try_from(value & 0x7F).unwrap_or(0);
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Reads a Bolt LEB128 varint from `bytes` starting at `*pos`, advancing `*pos` past it.
+///
+/// # Errors
+/// [`BoltError::Handshake`] if the bytes end mid-varint or the value would overflow `u64`.
+fn read_varint(bytes: &[u8], pos: &mut usize) -> BoltResult<u64> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let &byte = bytes.get(*pos).ok_or_else(|| {
+            BoltError::Handshake("truncated manifest varint (unexpected end of input)".to_owned())
+        })?;
+        *pos += 1;
+        let payload = u64::from(byte & 0x7F);
+        // 64-bit varints never need more than ten 7-bit groups; reject an over-long encoding rather
+        // than silently shifting bits off the top.
+        if shift >= 64 || (shift == 63 && payload > 1) {
+            return Err(BoltError::Handshake(
+                "manifest varint overflows u64".to_owned(),
+            ));
+        }
+        value |= payload << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
+/// Encodes the server's Manifest-v1 reply: the acknowledgment `00 00 01 FF`, a varint range count,
+/// each supported version range (`[00, range, minor, major]`), then a varint capabilities bitmask
+/// (Neo4j Bolt handshake-manifest-v1 spec).
+///
+/// `ranges` are advertised in the order given (drivers read them highest-first); `capabilities` is
+/// the server's bitmask of vendor amendments (Graphus advertises `0` — none).
+#[must_use]
+pub fn encode_server_manifest(ranges: &[Proposal], capabilities: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MANIFEST_V1_REQUEST.len() + ranges.len() * 4 + 2);
+    out.extend_from_slice(&MANIFEST_V1_REQUEST);
+    // The advertised-range count fits a u64 on every supported platform.
+    write_varint(&mut out, u64::try_from(ranges.len()).unwrap_or(u64::MAX));
+    for range in ranges {
+        out.extend_from_slice(&range.to_wire());
+    }
+    write_varint(&mut out, capabilities);
+    out
+}
+
+/// Graphus's advertised manifest range: the single 5.0–5.4 window (`MIN_MINOR..=MAX_MINOR`),
+/// encoded as one [`Proposal`] (top minor `MAX_MINOR`, spanning down to `MIN_MINOR`).
+#[must_use]
+pub fn supported_manifest_range() -> Proposal {
+    Proposal::range(SUPPORTED_MAJOR, MAX_MINOR, MAX_MINOR - MIN_MINOR)
+}
+
+/// The server's full Manifest-v1 reply bytes for Graphus's supported window and no capabilities.
+#[must_use]
+pub fn graphus_manifest() -> Vec<u8> {
+    encode_server_manifest(&[supported_manifest_range()], 0)
+}
+
+/// The client's chosen version + accepted capabilities, sent after the server's manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestChoice {
+    /// The 4-byte version the client picked (decoded as a single, non-range version).
+    pub version: Version,
+    /// The capabilities the client accepts (a bitmask varint; `0` = none).
+    pub capabilities: u64,
+}
+
+/// Encodes a client's post-manifest response: the chosen 4-byte version followed by a varint of the
+/// accepted capabilities (the inverse of [`parse_manifest_choice`]; used by clients and tests).
+#[must_use]
+pub fn encode_manifest_choice(choice: ManifestChoice) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6);
+    out.extend_from_slice(&choice.version.to_wire());
+    write_varint(&mut out, choice.capabilities);
+    out
+}
+
+/// Parses the client's post-manifest response: a 4-byte chosen version followed by a varint of the
+/// capabilities the client accepts (Neo4j Bolt handshake-manifest-v1 spec).
+///
+/// # Errors
+/// [`BoltError::Handshake`] if fewer than 4 version bytes are present or the trailing capabilities
+/// varint is truncated/overflowing.
+pub fn parse_manifest_choice(bytes: &[u8]) -> BoltResult<ManifestChoice> {
+    let version_bytes: [u8; 4] =
+        bytes
+            .get(..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| {
+                BoltError::Handshake(format!(
+                    "manifest choice must start with a 4-byte version, got {} bytes",
+                    bytes.len()
+                ))
+            })?;
+    let mut pos = 4;
+    let capabilities = read_varint(bytes, &mut pos)?;
+    Ok(ManifestChoice {
+        version: Version::from_wire(version_bytes),
+        capabilities,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +478,131 @@ mod tests {
         assert!(v.is_supported());
         assert!(!Version::new(5, 5).is_supported());
         assert!(!Version::new(4, 4).is_supported());
+    }
+
+    // ---- Manifest-v1 handshake (rmp #95) ------------------------------------------------------
+
+    #[test]
+    fn varint_round_trips_across_boundaries() {
+        for value in [0u64, 1, 0x7F, 0x80, 0x3FFF, 0x4000, 1_851_775, u64::MAX] {
+            let mut buf = Vec::new();
+            write_varint(&mut buf, value);
+            let mut pos = 0;
+            assert_eq!(
+                read_varint(&buf, &mut pos).unwrap(),
+                value,
+                "value {value:#x}"
+            );
+            assert_eq!(pos, buf.len(), "varint fully consumed for {value:#x}");
+        }
+        // Zero is a single 0x00 byte (capabilities "none").
+        let mut zero = Vec::new();
+        write_varint(&mut zero, 0);
+        assert_eq!(zero, [0x00]);
+        // The spec's worked example FF 82 71 decodes to 1,851,775.
+        let mut pos = 0;
+        assert_eq!(
+            read_varint(&[0xFF, 0x82, 0x71], &mut pos).unwrap(),
+            1_851_775
+        );
+    }
+
+    #[test]
+    fn truncated_or_overlong_varint_errors() {
+        // A dangling continuation bit with no following byte.
+        let mut pos = 0;
+        assert!(matches!(
+            read_varint(&[0x80], &mut pos),
+            Err(BoltError::Handshake(_))
+        ));
+        // Eleven 0x80 bytes (more than ten 7-bit groups) overflows u64.
+        let overlong = [0x80u8; 11];
+        let mut pos = 0;
+        assert!(matches!(
+            read_varint(&overlong, &mut pos),
+            Err(BoltError::Handshake(_))
+        ));
+    }
+
+    #[test]
+    fn detect_manifest_request_in_any_slot() {
+        let proposals = parse_client_handshake(&client_bytes([
+            Proposal::exact(0, 0),
+            Proposal::from_wire(MANIFEST_V1_REQUEST),
+            Proposal::exact(0, 0),
+            Proposal::exact(0, 0),
+        ]))
+        .unwrap();
+        assert!(detect_manifest_request(&proposals));
+
+        // A purely legacy handshake is not a manifest request.
+        let legacy = parse_client_handshake(&client_bytes([
+            Proposal::exact(5, 4),
+            Proposal::exact(0, 0),
+            Proposal::exact(0, 0),
+            Proposal::exact(0, 0),
+        ]))
+        .unwrap();
+        assert!(!detect_manifest_request(&legacy));
+    }
+
+    #[test]
+    fn server_manifest_advertises_the_5_0_to_5_4_window() {
+        let manifest = graphus_manifest();
+        // Acknowledgment, then varint count = 1, then the single range, then varint capabilities = 0.
+        assert_eq!(&manifest[..4], &MANIFEST_V1_REQUEST, "manifest ack");
+        assert_eq!(manifest[4], 0x01, "one advertised range");
+        // The range is 5.4 spanning down to 5.0: [00, range=4, minor=4, major=5].
+        assert_eq!(&manifest[5..9], &[0x00, 0x04, 0x04, 0x05]);
+        assert_eq!(manifest[9], 0x00, "no extra capabilities");
+        assert_eq!(manifest.len(), 10);
+
+        // The advertised range negotiates exactly Graphus's legacy window.
+        let range = supported_manifest_range();
+        assert_eq!(negotiate(&[range]), Some(Version::new(5, 4)));
+        assert_eq!(range.best_supported_minor(), Some(4));
+    }
+
+    #[test]
+    fn parse_manifest_choice_reads_version_and_capabilities() {
+        // Client picks 5.4 and accepts no capabilities.
+        let choice = parse_manifest_choice(&[0x00, 0x00, 0x04, 0x05, 0x00]).unwrap();
+        assert_eq!(choice.version, Version::new(5, 4));
+        assert_eq!(choice.capabilities, 0);
+
+        // A multi-byte capabilities varint after the version.
+        let choice = parse_manifest_choice(&[0x00, 0x00, 0x02, 0x05, 0x80, 0x01]).unwrap();
+        assert_eq!(choice.version, Version::new(5, 2));
+        assert_eq!(choice.capabilities, 128);
+    }
+
+    #[test]
+    fn manifest_choice_too_short_errors() {
+        // Only 3 version bytes.
+        assert!(matches!(
+            parse_manifest_choice(&[0x00, 0x00, 0x04]),
+            Err(BoltError::Handshake(_))
+        ));
+        // 4 version bytes but no capabilities varint.
+        assert!(matches!(
+            parse_manifest_choice(&[0x00, 0x00, 0x04, 0x05]),
+            Err(BoltError::Handshake(_))
+        ));
+    }
+
+    #[test]
+    fn both_handshake_forms_negotiate_the_same_version() {
+        // Legacy: a 5.0..=5.4 range proposal negotiates 5.4.
+        let legacy = negotiate(&[Proposal::range(5, 4, 4)]);
+        assert_eq!(legacy, Some(Version::new(5, 4)));
+
+        // Manifest: the server advertises its window, the client picks 5.4 from it. The negotiated
+        // version is identical to the legacy outcome.
+        let manifest = graphus_manifest();
+        // Confirm the server's advertised top is 5.4 (the byte the manifest carries).
+        assert_eq!(&manifest[5..9], &Proposal::range(5, 4, 4).to_wire());
+        let choice = parse_manifest_choice(&[0x00, 0x00, 0x04, 0x05, 0x00]).unwrap();
+        assert_eq!(choice.version, legacy.unwrap());
+        assert!(choice.version.is_supported());
     }
 }
