@@ -38,7 +38,7 @@ use graphus_wal::{LogSink, WalManager};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
-use crate::meta::{FulltextIndexEntry, IndexState, Meta, Statistics, StoreMeta};
+use crate::meta::{FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta};
 use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
@@ -2507,6 +2507,40 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// commit, discarded on rollback.
     pub fn remove_fulltext_index(&mut self, name: &str) {
         self.statistics.remove_fulltext_index(name);
+    }
+
+    /// The durable spatial (point) index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #98). Tokens are returned as ids; the caller resolves their names via the token
+    /// store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn spatial_index(&self, name: &str) -> Option<SpatialIndexEntry> {
+        self.statistics.spatial_index(name).cloned()
+    }
+
+    /// Lists every declared spatial index as `(name, entry)` from the durable catalog (`rmp` task
+    /// #98), ascending by name. Like [`fulltext_indexes`](Self::fulltext_indexes) this is what makes a
+    /// spatial index *registration* survive a crash: a fresh coordinator reads this to re-register the
+    /// previously-declared spatial indexes before rebuilding their grid from the store.
+    #[must_use]
+    pub fn spatial_indexes(&self) -> Vec<(String, SpatialIndexEntry)> {
+        self.statistics.spatial_indexes()
+    }
+
+    /// Declares (or replaces) the spatial index named `name` in the durable catalog (`rmp` task #98).
+    ///
+    /// The mutation is purely in-memory here; like the full-text index mutators it becomes
+    /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
+    /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
+    /// Re-recording an existing name overwrites the entry (e.g. to flip its state).
+    pub fn set_spatial_index(&mut self, name: String, entry: SpatialIndexEntry) {
+        self.statistics.set_spatial_index(name, entry);
+    }
+
+    /// Removes the spatial index named `name` from the durable catalog, if declared (`rmp` task #98).
+    /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
+    /// discarded on rollback.
+    pub fn remove_spatial_index(&mut self, name: &str) {
+        self.statistics.remove_spatial_index(name);
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

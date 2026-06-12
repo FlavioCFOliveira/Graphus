@@ -85,7 +85,7 @@ pub use incremental::{
     RestoreTarget, begin_chain, capture_increment, restore_to, verify_chain,
 };
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
-pub use meta::{FulltextIndexEntry, IndexState, Meta, Statistics, StoreMeta};
+pub use meta::{FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta};
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,
 };

@@ -47,7 +47,7 @@ use graphus_core::{Timestamp, TxnId};
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
-use graphus_storage::{FulltextIndexEntry, IndexState, Namespace, RecordStore};
+use graphus_storage::{FulltextIndexEntry, IndexState, Namespace, RecordStore, SpatialIndexEntry};
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
 use graphus_wal::LogSink;
 
@@ -99,6 +99,25 @@ struct PendingFulltextBuild {
     cursor: usize,
 }
 
+/// One in-progress **non-blocking** spatial (point) index build (`rmp` task #98), the analogue of
+/// [`PendingFulltextBuild`] for the grid spatial index. Indexes the `snapshot` nodes a bounded chunk
+/// at a time, then promotes the spatial index on `(label_token, prop_key)` to [`IndexState::Online`].
+/// The same candidate-set argument applies: writes after the snapshot are maintained by
+/// [`RecordStoreGraph::reindex_node`] and deletes / stale points are dropped by the query-time
+/// re-check, so the snapshot only needs to cover the rows that already existed at build start.
+struct PendingSpatialBuild {
+    /// The server-unique name of the spatial index being built.
+    name: String,
+    /// The label token the index covers (so the per-node indexer knows which point property to grid).
+    label_token: u32,
+    /// The property-key token the index covers (a single point property).
+    prop_key: u32,
+    /// The node-id list captured at build start.
+    snapshot: Vec<u64>,
+    /// The next index into `snapshot` to process; complete once `cursor >= snapshot.len()`.
+    cursor: usize,
+}
+
 /// Drives concurrent, serializable Cypher transactions over one shared [`RecordStore`] (`04 §5`).
 pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The one shared store, behind `Rc<RefCell<…>>` so each statement seam borrows it for the
@@ -128,6 +147,11 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// [`pending_builds`](Self#structfield.pending_builds) for the inverted index, advanced by
     /// [`advance_index_builds`](Self::advance_index_builds) alongside the node-property builds.
     pending_fulltext_builds: VecDeque<PendingFulltextBuild>,
+    /// Queue of in-progress **non-blocking** spatial (point) index builds (`rmp` task #98), the
+    /// analogue of [`pending_fulltext_builds`](Self#structfield.pending_fulltext_builds) for the grid
+    /// spatial index, advanced by [`advance_index_builds`](Self::advance_index_builds) alongside the
+    /// other build kinds.
+    pending_spatial_builds: VecDeque<PendingSpatialBuild>,
 }
 
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
@@ -169,6 +193,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             next_txn_id,
             pending_builds: VecDeque::new(),
             pending_fulltext_builds: VecDeque::new(),
+            pending_spatial_builds: VecDeque::new(),
         }
     }
 
@@ -205,7 +230,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .into_iter()
             .filter(|(_, entry)| entry.state == IndexState::Populating)
             .collect();
-        if populating.is_empty() && populating_fulltext.is_empty() {
+        // Spatial indexes left `Populating` by an interrupted `rmp` task #98 build are promoted the
+        // same way — the rebuild above has already fully repopulated their grid from the recovered
+        // store, so the durable state just needs to catch up.
+        let populating_spatial: Vec<(String, SpatialIndexEntry)> = store
+            .borrow()
+            .spatial_indexes()
+            .into_iter()
+            .filter(|(_, entry)| entry.state == IndexState::Populating)
+            .collect();
+        if populating.is_empty() && populating_fulltext.is_empty() && populating_spatial.is_empty()
+        {
             return next_txn_id;
         }
 
@@ -225,6 +260,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     },
                 );
             }
+            for (name, entry) in &populating_spatial {
+                store.set_spatial_index(
+                    name.clone(),
+                    SpatialIndexEntry {
+                        state: IndexState::Online,
+                        ..entry.clone()
+                    },
+                );
+            }
         }
         if store.borrow_mut().commit(txn).is_err() {
             // Could not make the promotion durable; leave the indexes `Populating` (still correct via
@@ -237,6 +281,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         for (name, _) in populating_fulltext {
             idx.set_fulltext_state(&name, IndexState::Online);
+        }
+        for (_, entry) in populating_spatial {
+            idx.set_spatial_state(entry.label_token, entry.property_token, IndexState::Online);
         }
         next_txn_id + 1
     }
@@ -301,6 +348,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Recover the durable spatial index catalog (`rmp` task #98) the same way: register each
+        // declared index's grid in the in-memory set (covered label/property + state), so the rebuild
+        // scan below repopulates the grid. A spatial index has no analyzer to validate; it is keyed by
+        // `(label_token, prop_key)` in the `IndexSet` (the catalog's `name` is the durable identifier).
+        let durable_spatial: Vec<(String, SpatialIndexEntry)> = store.borrow().spatial_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (_name, entry) in durable_spatial {
+                idx.register_spatial(
+                    entry.label_token,
+                    entry.property_token,
+                    graphus_index::DEFAULT_CELL_SIZE,
+                    entry.state,
+                );
+            }
+        }
+
         index.borrow_mut().clear();
 
         // The set of registered node-property indexes (any state), captured before walking the store so
@@ -317,12 +381,20 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         let has_fulltext = !index.borrow().registered_fulltext().is_empty();
+        // The registered spatial index keys `(label_token, prop_key)`, captured before the scan so the
+        // index is not borrowed across a store borrow (`rmp` task #98).
+        let registered_spatial: Vec<(u32, u32)> = index.borrow().registered_spatial();
         for id in node_ids {
             Self::index_one_node(store, index, id, &registered);
             // Repopulate the full-text inverted indexes from the same scan (`rmp` task #72), so a
             // recovered store rebuilds them store-consistently — only when at least one is declared.
             if has_fulltext {
                 Self::index_one_node_fulltext(store, index, id);
+            }
+            // Repopulate the spatial grids from the same scan (`rmp` task #98), only when at least one
+            // is declared.
+            if !registered_spatial.is_empty() {
+                Self::index_one_node_spatial(store, index, id, &registered_spatial);
             }
         }
     }
@@ -429,6 +501,59 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index
             .borrow_mut()
             .reindex_fulltext_node(id, &label_tokens, &string_props);
+    }
+
+    /// Inserts node `id`'s current point value into each `registered` `(label_token, prop_key)`
+    /// spatial index it matches (`rmp` task #98). The spatial analogue of
+    /// [`index_one_node`](Self::index_one_node) / [`index_one_node_fulltext`](Self::index_one_node_fulltext):
+    /// the same single per-node code path the full rebuild ([`rebuild_index`](Self::rebuild_index)) and
+    /// the non-blocking spatial build ([`advance_spatial_build`](Self::advance_spatial_build)) both
+    /// drive, so their per-node logic can never diverge.
+    ///
+    /// Only the **point**-valued properties a registered index covers are read; a node that does not
+    /// carry the covered label, or whose covered property is absent / non-point, contributes nothing
+    /// (the grid is a candidate set, so a missing candidate degrades to the scan fallback for that
+    /// reader — never a wrong row). The store and the index are borrowed in **separate,
+    /// non-overlapping** scopes (the load-bearing borrow discipline of this file).
+    fn index_one_node_spatial(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        let label_tokens = match store.borrow_mut().node_labels(id) {
+            Ok(tokens) => tokens,
+            Err(_) => return,
+        };
+        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only
+        // the point values a registered spatial index covers for one of this node's labels.
+        let mut values: Vec<(u32, Value)> = Vec::new();
+        {
+            let chain = match store.borrow_mut().node_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                let used = registered.iter().any(|&(reg_label, prop_key)| {
+                    prop_key == key && label_tokens.contains(&reg_label)
+                });
+                if used && matches!(value, Value::Point(_)) {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            for &lt in &label_tokens {
+                if index.has_spatial(lt, *prop_key) {
+                    index.insert_spatial_point(lt, *prop_key, value, id);
+                }
+            }
+        }
     }
 
     /// Begins a transaction at `isolation`, returning its [`TxnId`].
@@ -755,12 +880,137 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .collect()
     }
 
-    /// Whether any non-blocking index build is still in progress (`rmp` task #91/#72). The engine loop
-    /// uses this to decide between a plain blocking receive (no builds) and a timed receive that also
-    /// drives the build between commands.
+    /// Declares a **spatial (point) index** named `name` over `(label, property)`, **durably records
+    /// it**, and starts a **non-blocking** background build of it (`rmp` task #98) — the spatial
+    /// analogue of [`create_fulltext_index`](Self::create_fulltext_index).
+    ///
+    /// The label and property-key tokens are interned **durably** and the named catalog entry is
+    /// recorded as [`IndexState::Populating`] — both in one committed transaction, so the
+    /// *registration* survives a crash (an interrupted build recovers `Populating` and is completed by
+    /// the open-time rebuild). The grid is registered in the in-memory [`IndexSet`] so concurrent
+    /// writes maintain it from now on, and a pending build is enqueued; **no node is scanned here**, so
+    /// the engine stays responsive. The build is advanced in bounded chunks by
+    /// [`advance_index_builds`](Self::advance_index_builds) and promoted to [`IndexState::Online`] only
+    /// when every snapshot node has been indexed — and only an `Online` spatial index drives a
+    /// `SpatialIndexSeek` (see [`catalog`](Self::catalog) / [`IndexSet::online_spatial`]).
+    ///
+    /// Re-declaring an existing name **replaces** it (a fresh build over the new label/property).
+    ///
+    /// # Errors
+    /// Returns a storage error if interning either token, recording the catalog entry, the committing
+    /// transaction, or the initial snapshot scan fails. On any error the index is left undeclared.
+    pub fn create_point_index(&mut self, name: &str, label: &str, property: &str) -> Result<()> {
+        // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
+        // one committed transaction (so the schema change survives a crash atomically).
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            store.set_spatial_index(
+                name.to_owned(),
+                SpatialIndexEntry {
+                    label_token,
+                    property_token: prop_key,
+                    state: IndexState::Populating,
+                },
+            );
+            (label_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the grid `Populating` in the in-memory set so concurrent writes maintain it.
+        self.index.borrow_mut().register_spatial(
+            label_token,
+            prop_key,
+            graphus_index::DEFAULT_CELL_SIZE,
+            IndexState::Populating,
+        );
+
+        // Cancel any prior pending build of the same name (a re-declare), then enqueue this one.
+        self.pending_spatial_builds.retain(|b| b.name != name);
+        let snapshot = self.store.borrow_mut().scan_node_ids()?;
+        self.pending_spatial_builds.push_back(PendingSpatialBuild {
+            name: name.to_owned(),
+            label_token,
+            prop_key,
+            snapshot,
+            cursor: 0,
+        });
+        Ok(())
+    }
+
+    /// Drops the spatial (point) index named `name` (`rmp` task #98): removes its durable catalog
+    /// entry in a committed transaction, unregisters its grid from the in-memory [`IndexSet`], and
+    /// cancels any in-progress build. Idempotent on a never-declared name (a clean no-op success).
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_point_index(&mut self, name: &str) -> Result<()> {
+        // Resolve the covered `(label_token, prop_key)` from the durable entry so we can unregister the
+        // right grid from the in-memory set (which is keyed by tokens, not by name).
+        let entry = self.store.borrow().spatial_index(name);
+        let Some(entry) = entry else {
+            // Not declared: still cancel any in-flight build defensively, then succeed.
+            self.pending_spatial_builds.retain(|b| b.name != name);
+            return Ok(());
+        };
+
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_spatial_index(name);
+        self.store.borrow_mut().commit(txn)?;
+
+        self.pending_spatial_builds.retain(|b| b.name != name);
+        self.index
+            .borrow_mut()
+            .unregister_spatial(entry.label_token, entry.property_token);
+        Ok(())
+    }
+
+    /// Lists every declared spatial (point) index as `(name, label, property, state)` (`rmp` task
+    /// #98) for a `SHOW POINT INDEXES` surface. Reads the durable catalog and resolves the tokens back
+    /// to names; an entry whose tokens have no resolvable name (a defensively-skipped impossibility for
+    /// a live token) is omitted. Ordered by name.
+    #[must_use]
+    pub fn list_point_indexes(&self) -> Vec<(String, String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .spatial_indexes()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                Some((name, label.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
+    /// Whether any non-blocking index build is still in progress (`rmp` task #91/#72/#98). The engine
+    /// loop uses this to decide between a plain blocking receive (no builds) and a timed receive that
+    /// also drives the build between commands.
     #[must_use]
     pub fn has_pending_index_builds(&self) -> bool {
-        !self.pending_builds.is_empty() || !self.pending_fulltext_builds.is_empty()
+        !self.pending_builds.is_empty()
+            || !self.pending_fulltext_builds.is_empty()
+            || !self.pending_spatial_builds.is_empty()
     }
 
     /// Advances the front non-blocking index build by up to `budget` nodes (`rmp` task #91), returning
@@ -778,12 +1028,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// a positive chunk size). If the durable promotion commit fails, the build is left in place
     /// `Populating` (still correct via the scan fallback) to be retried on the next call/open.
     pub fn advance_index_builds(&mut self, budget: usize) -> bool {
-        // Drive a node-property build first if one is pending; otherwise a full-text build. Processing
-        // one queue per call keeps the per-call work bounded by `budget` for either kind.
+        // Drive a node-property build first if one is pending; then a full-text build; then a spatial
+        // build. Processing one queue per call keeps the per-call work bounded by `budget` for any kind.
         if !self.pending_builds.is_empty() {
             self.advance_node_property_build(budget);
-        } else {
+        } else if !self.pending_fulltext_builds.is_empty() {
             self.advance_fulltext_build(budget);
+        } else {
+            self.advance_spatial_build(budget);
         }
         self.has_pending_index_builds()
     }
@@ -881,6 +1133,68 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .borrow_mut()
             .set_fulltext_state(&name, IndexState::Online);
         self.pending_fulltext_builds.pop_front();
+    }
+
+    /// Advances the front **spatial** build by up to `budget` nodes (`rmp` task #98), promoting +
+    /// dequeuing it when complete. The spatial analogue of
+    /// [`advance_fulltext_build`](Self::advance_fulltext_build): each chunk indexes a bounded number of
+    /// snapshot nodes' point values into the grid via the shared
+    /// [`index_one_node_spatial`](Self::index_one_node_spatial) helper, then on completion the named
+    /// catalog entry is durably flipped to [`IndexState::Online`] (after which the planner begins
+    /// routing proximity seeks to it).
+    fn advance_spatial_build(&mut self, budget: usize) {
+        let Some(build) = self.pending_spatial_builds.front_mut() else {
+            return;
+        };
+        let total = build.snapshot.len();
+        let end = total.min(build.cursor + budget);
+        let chunk: Vec<u64> = build.snapshot[build.cursor..end].to_vec();
+        let name = build.name.clone();
+        let registered = [(build.label_token, build.prop_key)];
+        build.cursor = end;
+        let done = end >= total;
+
+        for id in chunk {
+            Self::index_one_node_spatial(&self.store, &self.index, id, &registered);
+        }
+
+        if !done {
+            return; // more of this build remains.
+        }
+
+        // The snapshot is fully indexed: durably flip the catalog entry to `Online`, then dequeue.
+        // Read the current entry in its own scope so the store borrow is released before the write.
+        let entry = self.store.borrow().spatial_index(&name);
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let promoted = if let Some(entry) = entry {
+            self.store.borrow_mut().set_spatial_index(
+                name.clone(),
+                SpatialIndexEntry {
+                    state: IndexState::Online,
+                    ..entry
+                },
+            );
+            true
+        } else {
+            // The index was dropped mid-build; nothing to promote (the build will be dequeued).
+            false
+        };
+        if promoted {
+            if self.store.borrow_mut().commit(txn).is_err() {
+                // The durable flip failed; leave the build pending `Populating` and retry next call.
+                return;
+            }
+        } else {
+            let _ = self.store.borrow_mut().rollback(txn);
+        }
+        self.index.borrow_mut().set_spatial_state(
+            registered[0].0,
+            registered[0].1,
+            IndexState::Online,
+        );
+        self.pending_spatial_builds.pop_front();
     }
 
     /// Drops the node-property index on `(label, property)` (`rmp` task #91): removes its durable

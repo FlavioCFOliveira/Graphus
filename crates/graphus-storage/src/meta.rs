@@ -112,6 +112,29 @@ pub struct FulltextIndexEntry {
     pub state: IndexState,
 }
 
+/// A durable **spatial (point) index** catalog entry (`rmp` task #98).
+///
+/// A spatial index is identified by a server-unique **name** (like a full-text index, and unlike a
+/// node-property index which `(label_token, prop_key)` identifies), covers one node label and
+/// **exactly one** point property, and — unlike the full-text index — carries **no analyzer**: a
+/// grid spatial index simply buckets the covered point property's coordinates, so only the covered
+/// label, the covered property and the build state need to be recorded.
+///
+/// This rides the **identical** durability lifecycle as the full-text index catalog and the
+/// counts/histograms: checkpointed at commit, reloaded on rollback and on open. Its presence
+/// invariant is "an entry exists iff a spatial index of that name is declared". The grid *data*
+/// itself is never persisted (it is ephemeral and rebuilt from the store on open, like the derived
+/// `IndexSet`), so only this catalog entry needs durability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpatialIndexEntry {
+    /// The node label-namespace token the index covers.
+    pub label_token: u32,
+    /// The property-key-namespace token the index covers (a single point property).
+    pub property_token: u32,
+    /// The build state of the index (the same state machine as a node-property / full-text index).
+    pub state: IndexState,
+}
+
 /// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
 ///
 /// Holds, for the planner's cardinality estimator, the grand-total live-node and live-relationship
@@ -228,6 +251,16 @@ pub struct Statistics {
     /// indexes existed and would silently lose them. An entry is present **iff** an index of that
     /// name is declared. The map rides the **identical** durability lifecycle as the other catalogs.
     pub fulltext_indexes: BTreeMap<String, FulltextIndexEntry>,
+    /// The durable **spatial (point) index catalog** (`rmp` task #98): the set of declared spatial
+    /// indexes keyed by their server-unique **name**, each carrying the covered label, the covered
+    /// point property token and the build [`IndexState`]. See [`SpatialIndexEntry`].
+    ///
+    /// Persisting this set is what makes a spatial index *registration* survive a crash: the grid
+    /// itself is ephemeral (rebuilt from the store on open, like the derived `IndexSet`), so without
+    /// this map a recovered store would have no record of which spatial indexes existed and would
+    /// silently lose them. An entry is present **iff** an index of that name is declared. The map
+    /// rides the **identical** durability lifecycle as the other catalogs.
+    pub spatial_indexes: BTreeMap<String, SpatialIndexEntry>,
 }
 
 impl Statistics {
@@ -456,6 +489,35 @@ impl Statistics {
             .collect()
     }
 
+    /// The durable spatial (point) index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #98).
+    #[must_use]
+    pub fn spatial_index(&self, name: &str) -> Option<&SpatialIndexEntry> {
+        self.spatial_indexes.get(name)
+    }
+
+    /// Declares (or replaces) the spatial index named `name` (`rmp` task #98). Idempotent on the
+    /// name: re-recording overwrites the entry (e.g. to flip its state `Populating` → `Online`).
+    pub(crate) fn set_spatial_index(&mut self, name: String, entry: SpatialIndexEntry) {
+        self.spatial_indexes.insert(name, entry);
+    }
+
+    /// Removes the spatial index named `name`, if declared (`rmp` task #98). Removing an absent entry
+    /// is a harmless no-op.
+    pub(crate) fn remove_spatial_index(&mut self, name: &str) {
+        self.spatial_indexes.remove(name);
+    }
+
+    /// Lists every declared spatial index as `(name, entry)`, ascending by name (the [`BTreeMap`]
+    /// order, deterministic) (`rmp` task #98).
+    #[must_use]
+    pub fn spatial_indexes(&self) -> Vec<(String, SpatialIndexEntry)> {
+        self.spatial_indexes
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
     /// Serialises the statistics to a self-describing byte image.
     ///
     /// Layout: `total_nodes(u64) | total_relationships(u64) | n_labels(u32) | [ token_id(u32) |
@@ -473,8 +535,10 @@ impl Statistics {
     /// catalog: [`decode`](Self::decode) treats end-of-input where the index block's count `u32`
     /// would start as "no catalog" rather than truncation. The full-text catalog block (`rmp` task
     /// #72) is appended **after** the index catalog by the same rule, so a pre-#72 image decodes to
-    /// an empty full-text catalog. No format-version byte is needed because every prior block is
-    /// length-exact and self-describing, so each parse position is unambiguous.
+    /// an empty full-text catalog. The spatial catalog block (`rmp` task #98) is appended **after**
+    /// the full-text catalog by the same rule, so a pre-#98 image decodes to an empty spatial
+    /// catalog. No format-version byte is needed because every prior block is length-exact and
+    /// self-describing, so each parse position is unambiguous.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let hist_bytes: usize = self
@@ -499,6 +563,7 @@ impl Statistics {
         Self::encode_histograms(&mut out, &self.node_prop_histograms);
         Self::encode_index_catalog(&mut out, &self.node_property_indexes);
         Self::encode_fulltext_catalog(&mut out, &self.fulltext_indexes);
+        Self::encode_spatial_catalog(&mut out, &self.spatial_indexes);
         out
     }
 
@@ -581,6 +646,33 @@ impl Statistics {
         }
     }
 
+    /// Encodes the spatial (point) index catalog block (`rmp` task #98), appended last so a pre-#98
+    /// image (ending after the full-text catalog) decodes to an empty spatial catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// property_token(u32) | state(u8) ]*`, entries in ascending-name ([`BTreeMap`]) order so the
+    /// image is deterministic. Unlike the full-text block there is no analyzer byte and exactly one
+    /// property token (a spatial index covers a single point property).
+    fn encode_spatial_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, SpatialIndexEntry>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "spatial catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "spatial index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&entry.label_token.to_le_bytes());
+            out.extend_from_slice(&entry.property_token.to_le_bytes());
+            out.push(entry.state.as_byte());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -601,6 +693,7 @@ impl Statistics {
         let node_prop_histograms = Self::decode_histograms(bytes, &mut cur)?;
         let node_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
         let fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
+        let spatial_indexes = Self::decode_spatial_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -609,6 +702,7 @@ impl Statistics {
             node_prop_histograms,
             node_property_indexes,
             fulltext_indexes,
+            spatial_indexes,
         })
     }
 
@@ -747,6 +841,60 @@ impl Statistics {
             {
                 return Err(GraphusError::Storage(format!(
                     "full-text catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the spatial (point) index catalog block (`rmp` task #98). Like the full-text catalog
+    /// this is the last block, so end-of-input where its count `u32` would start means "no spatial
+    /// catalog" (a pre-#98 image), not truncation.
+    ///
+    /// The `state` byte is range-checked. A repeated name or an empty name is rejected (neither is
+    /// ever produced by [`encode`](Self::encode)).
+    fn decode_spatial_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, SpatialIndexEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #98): a pre-#98 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("spatial catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "spatial catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let label_token = read_u32(bytes, cur)?;
+            let property_token = read_u32(bytes, cur)?;
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "spatial index {name:?} holds unknown state byte {state_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    SpatialIndexEntry {
+                        label_token,
+                        property_token,
+                        state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "spatial catalog repeats index name {name:?}"
                 )));
             }
         }
@@ -937,6 +1085,24 @@ mod tests {
             .set_node_property_index(0, 1, IndexState::Online); // (Person, prop 1): Online
         m.statistics
             .set_node_property_index(5, 9, IndexState::Populating); // (label 5, prop 9): Populating
+        // Populate the spatial index catalog too (`rmp` task #98), with both states, so its
+        // round-trip is exercised here alongside the other catalogs.
+        m.statistics.set_spatial_index(
+            "by_loc".to_owned(),
+            SpatialIndexEntry {
+                label_token: 0,
+                property_token: 3,
+                state: IndexState::Online,
+            },
+        );
+        m.statistics.set_spatial_index(
+            "by_home".to_owned(),
+            SpatialIndexEntry {
+                label_token: 5,
+                property_token: 7,
+                state: IndexState::Populating,
+            },
+        );
 
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
@@ -961,6 +1127,86 @@ mod tests {
             Some(IndexState::Populating)
         );
         assert_eq!(back.statistics.node_property_index_state(0, 9), None);
+        // Spatial index catalog (`rmp` task #98) round-trips alongside the other catalogs.
+        assert_eq!(
+            back.statistics.spatial_index("by_loc"),
+            Some(&SpatialIndexEntry {
+                label_token: 0,
+                property_token: 3,
+                state: IndexState::Online,
+            })
+        );
+        assert_eq!(
+            back.statistics.spatial_index("by_home"),
+            Some(&SpatialIndexEntry {
+                label_token: 5,
+                property_token: 7,
+                state: IndexState::Populating,
+            })
+        );
+        assert_eq!(back.statistics.spatial_index("nope"), None);
+    }
+
+    #[test]
+    fn statistics_spatial_catalog_round_trips_and_pre_98_image_decodes_empty() {
+        // Empty map: the spatial block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then several entries (mixed states), keyed by name.
+        let mut s = Statistics::new();
+        s.set_spatial_index(
+            "a".to_owned(),
+            SpatialIndexEntry {
+                label_token: 1,
+                property_token: 2,
+                state: IndexState::Online,
+            },
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+        s.set_spatial_index(
+            "b".to_owned(),
+            SpatialIndexEntry {
+                label_token: 3,
+                property_token: 4,
+                state: IndexState::Populating,
+            },
+        );
+        // Mixing in a full-text entry proves the spatial block is read AFTER the full-text block.
+        s.set_fulltext_index(
+            "ft".to_owned(),
+            FulltextIndexEntry {
+                label_token: 9,
+                property_tokens: vec![1],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.spatial_indexes().len(), 2);
+
+        // A pre-#98 image (ending exactly after the full-text catalog block) must decode to an empty
+        // spatial catalog, not a truncation error. We synthesise one by encoding a statistics value
+        // that has a full-text entry but no spatial entry, then truncating the trailing spatial block
+        // (a single `0u32` count). The reader treats end-of-input where the count would start as "no
+        // spatial catalog".
+        let mut pre98 = Statistics::new();
+        pre98.set_fulltext_index(
+            "ft".to_owned(),
+            FulltextIndexEntry {
+                label_token: 9,
+                property_tokens: vec![1],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        let mut image = pre98.encode();
+        // Drop the trailing 4-byte spatial-count word so the image ends right after the full-text block.
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert!(decoded.spatial_indexes().is_empty());
+        assert_eq!(decoded.fulltext_indexes().len(), 1);
     }
 
     #[test]

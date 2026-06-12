@@ -660,6 +660,29 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         // candidates because the seek re-checks the value), the full-text inverted index removes the
         // node's old terms here so a query never returns a node whose text no longer matches.
         index.reindex_fulltext_node(node.0, &label_tokens, &string_props);
+
+        // Spatial (point) indexes are maintained per-write the same way the inverted index is
+        // (`rmp` task #98): for every registered spatial index `(label_token, prop_key)`, if the node
+        // currently carries the covered label AND has a point value for the covered property, that
+        // point is (re)inserted into the grid; in every other case (the node lost the label, the
+        // property is absent, or it is no longer a point) the node is removed from the grid so a seek
+        // never sees a phantom. Like the full-text index this is a wholesale per-node re-index, because
+        // the grid is keyed by node id and a removed/changed point must not linger.
+        for (label_token, prop_key) in index.registered_spatial() {
+            let covered = label_tokens.contains(&label_token);
+            let point = covered.then(|| {
+                resolved_props
+                    .iter()
+                    .find(|(k, v)| *k == prop_key && matches!(v, Value::Point(_)))
+                    .map(|(_, v)| v)
+            });
+            match point {
+                Some(Some(value)) => {
+                    index.insert_spatial_point(label_token, prop_key, value, node.0);
+                }
+                _ => index.remove_spatial_point(label_token, prop_key, node.0),
+            }
+        }
     }
 
     /// **Recomputes** (the `ANALYZE` path) the equi-depth value histogram for the node-label property

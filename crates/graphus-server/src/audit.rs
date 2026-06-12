@@ -1066,6 +1066,15 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
         ),
         I::DropFulltextIndex { name } => format!("DROP FULLTEXT INDEX {name}"),
         I::ShowFulltextIndexes => "SHOW FULLTEXT INDEXES".to_owned(),
+        // Spatial (point) index DDL (`rmp` task #98) carries no secret either: the index name, label
+        // and property key are all schema identifiers.
+        I::CreatePointIndex {
+            name,
+            label,
+            property,
+        } => format!("CREATE POINT INDEX {name} FOR (:{label}) ON ({property})"),
+        I::DropPointIndex { name } => format!("DROP POINT INDEX {name}"),
+        I::ShowPointIndexes => "SHOW POINT INDEXES".to_owned(),
     }
 }
 

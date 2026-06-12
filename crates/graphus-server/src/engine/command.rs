@@ -128,6 +128,24 @@ pub enum IndexCommand {
     },
     /// `SHOW FULLTEXT INDEXES` (`rmp` task #72): lists every declared full-text index.
     ShowFulltextIndexes,
+    /// `CREATE POINT INDEX <name> FOR (n:<Label>) ON (n.<prop>)` (`rmp` task #98): starts a
+    /// **non-blocking** online build of a grid spatial (point) index over `(label, property)`.
+    CreatePointIndex {
+        /// The server-unique index name.
+        name: String,
+        /// The node label the index covers.
+        label: String,
+        /// The point property the index covers (exactly one).
+        property: String,
+    },
+    /// `DROP POINT INDEX <name>` (`rmp` task #98): removes the spatial index (durable + in-memory),
+    /// cancelling any in-progress build.
+    DropPointIndex {
+        /// The spatial index name to drop.
+        name: String,
+    },
+    /// `SHOW POINT INDEXES` (`rmp` task #98): lists every declared spatial index.
+    ShowPointIndexes,
 }
 
 /// The buffered result of an [`EngineCommand::IndexDdl`]: column names + rows, streamed back through

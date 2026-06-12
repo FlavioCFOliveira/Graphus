@@ -30,6 +30,10 @@
 //! DROP   INDEX FOR (<var>:<Label>) ON (<var>.<property>)
 //! SHOW   INDEXES
 //!
+//! CREATE POINT INDEX <name> FOR (<var>:<Label>) ON (<var>.<prop>)
+//! DROP   POINT INDEX <name>
+//! SHOW   POINT INDEXES
+//!
 //! CREATE FULLTEXT INDEX <name> FOR (<var>:<Label>) ON EACH [<var>.<prop>, …]
 //!                                                  [OPTIONS { analyzer: '<analyzer>' }]   -- rmp #72
 //! DROP   FULLTEXT INDEX <name>
@@ -526,6 +530,16 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         };
     }
 
+    // --- Spatial (point) index surface (`rmp` task #98): CREATE/DROP/SHOW POINT INDEX(ES) … ---
+    // Like FULLTEXT, `POINT` alone is never a valid Cypher statement start, so the statement is
+    // CLAIMED once the verb + POINT prefix is seen.
+    if is_keyword(&second, "POINT") {
+        return match parse_claimed_point(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
     // --- Index surface (`rmp` task #91) ---
     if is_keyword(&second, "INDEX") || is_keyword(&second, "INDEXES") {
         let plural = is_keyword(&second, "INDEXES");
@@ -789,6 +803,91 @@ fn parse_optional_fulltext_options(lex: &mut Lexer<'_>) -> Result<Option<String>
     };
     expect_symbol(lex, '}', "FULLTEXT")?;
     Ok(Some(analyzer))
+}
+
+/// Parses the remainder of a claimed **spatial (point)** index statement (`verb` + `POINT` already
+/// read), for the three shapes (`rmp` task #98):
+///
+/// ```text
+/// CREATE POINT INDEX <name> FOR (<var>:<Label>) ON (<var>.<property>)
+/// DROP   POINT INDEX <name>
+/// SHOW   POINT INDEXES
+/// ```
+///
+/// A spatial index is identified by **name** (Neo4j-compatible), like a full-text index. Unlike the
+/// full-text `ON EACH [ … ]` list, a point index covers **exactly one** property, so the create tail
+/// is the single-property `ON (<var>.<property>)` shape (and there is no analyzer / OPTIONS clause).
+fn parse_claimed_point(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    // The next token must be INDEX (CREATE/DROP) or INDEXES (SHOW). `POINT` alone never reaches
+    // Cypher, so a wrong follower is an admin syntax error.
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected INDEX or INDEXES after {verb} POINT"))?;
+    let plural = is_keyword(&kw, "INDEXES");
+    if !is_keyword(&kw, "INDEX") && !plural {
+        return Err(unexpected_generic(
+            &kw,
+            &format!("INDEX or INDEXES after {verb} POINT"),
+        ));
+    }
+
+    if plural {
+        // SHOW POINT INDEXES — nothing else allowed.
+        if verb != "SHOW" {
+            return Err(format!(
+                "expected INDEX after {verb} POINT (INDEXES is only valid in SHOW POINT INDEXES)"
+            ));
+        }
+        expect_end(lex, "SHOW POINT INDEXES")?;
+        return Ok(IndexCommand::ShowPointIndexes);
+    }
+    if verb == "SHOW" {
+        return Err(
+            "expected SHOW POINT INDEXES (the singular SHOW POINT INDEX is not supported)"
+                .to_owned(),
+        );
+    }
+
+    // Both CREATE and DROP take a name next.
+    let name = expect_name(lex, "a point index name", "POINT")?;
+
+    match verb {
+        "DROP" => {
+            expect_end(lex, "DROP POINT INDEX")?;
+            Ok(IndexCommand::DropPointIndex { name })
+        }
+        "CREATE" => {
+            let (label, property) = parse_point_create_tail(lex)?;
+            Ok(IndexCommand::CreatePointIndex {
+                name,
+                label,
+                property,
+            })
+        }
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
+        other => Err(format!("unsupported point index verb {other}")),
+    }
+}
+
+/// Parses the `FOR (<var>:<Label>) ON (<var>.<property>)` tail of a `CREATE POINT INDEX <name>`
+/// statement (`rmp` task #98). Returns `(label, property)`. Mirrors the openCypher-9 node-property
+/// `FOR … ON …` shape (a single property), reusing [`parse_property_ref`] for the property reference.
+fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+    const VERB: &str = "POINT";
+    // FOR ( <var> : <Label> )
+    expect_keyword(lex, "FOR", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    // ON ( <var>.<property> )
+    expect_keyword(lex, "ON", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let property = parse_property_ref(VERB, lex)?;
+    expect_symbol(lex, ')', VERB)?;
+    expect_end(lex, "CREATE POINT INDEX")?;
+    Ok((label, property))
 }
 
 /// Peeks whether the next token is the single symbol `sym`, without consuming it.
@@ -2123,6 +2222,77 @@ mod tests {
         invalid("DROP FULLTEXT INDEX"); // missing name
         invalid("DROP FULLTEXT INDEX ft trailing");
         invalid("CREATE FULLTEXT INDEXES ..."); // plural only for SHOW
+    }
+
+    #[test]
+    fn create_point_index_form() {
+        // The Neo4j-compatible single-property shape (`rmp` task #98).
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX by_loc FOR (n:City) ON (n.location)"),
+            IndexCommand::CreatePointIndex {
+                name: "by_loc".to_owned(),
+                label: "City".to_owned(),
+                property: "location".to_owned(),
+            }
+        );
+        // Case-insensitive keywords + whitespace + trailing `;`.
+        assert_eq!(
+            index_cmd("  create   point index  near  for ( p : Place ) on ( p.geo ) ;"),
+            IndexCommand::CreatePointIndex {
+                name: "near".to_owned(),
+                label: "Place".to_owned(),
+                property: "geo".to_owned(),
+            }
+        );
+        // Backtick-quoted name/label/property colliding with keywords still parse.
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX `INDEX` FOR (n:`Order`) ON (n.`from`)"),
+            IndexCommand::CreatePointIndex {
+                name: "INDEX".to_owned(),
+                label: "Order".to_owned(),
+                property: "from".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn drop_and_show_point() {
+        assert_eq!(
+            index_cmd("DROP POINT INDEX by_loc"),
+            IndexCommand::DropPointIndex {
+                name: "by_loc".to_owned()
+            }
+        );
+        assert_eq!(
+            index_cmd("drop point index `My Index` ;"),
+            IndexCommand::DropPointIndex {
+                name: "My Index".to_owned()
+            }
+        );
+        assert_eq!(
+            index_cmd("SHOW POINT INDEXES"),
+            IndexCommand::ShowPointIndexes
+        );
+        assert_eq!(
+            index_cmd("show point indexes ;"),
+            IndexCommand::ShowPointIndexes
+        );
+    }
+
+    #[test]
+    fn claimed_but_malformed_point_is_a_syntax_error() {
+        invalid("CREATE POINT"); // missing INDEX
+        invalid("CREATE POINT INDEX"); // missing name
+        invalid("CREATE POINT INDEX p"); // missing FOR clause
+        invalid("CREATE POINT INDEX p FOR (n:City)"); // missing ON
+        invalid("CREATE POINT INDEX p FOR (n:City) ON EACH [n.loc]"); // point uses single ON (...)
+        invalid("CREATE POINT INDEX p FOR (n:City) ON (loc)"); // ref must be var.prop
+        invalid("CREATE POINT INDEX p FOR (n:City) ON (n.loc) extra");
+        invalid("SHOW POINT INDEX"); // singular not a form
+        invalid("SHOW POINT INDEXES extra");
+        invalid("DROP POINT INDEX"); // missing name
+        invalid("DROP POINT INDEX p trailing");
+        invalid("CREATE POINT INDEXES ..."); // plural only for SHOW
     }
 
     #[test]

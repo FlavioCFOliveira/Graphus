@@ -402,12 +402,14 @@ impl RestEngine for RestEngineAdapter {
                     );
                     return Err(e);
                 }
-                // `SHOW (FULLTEXT) INDEXES` is read-only — only the mutating CREATE/DROP are schema
-                // changes (`rmp` task #72 adds the full-text SHOW to the read-only set).
+                // `SHOW (FULLTEXT|POINT) INDEXES` is read-only — only the mutating CREATE/DROP are
+                // schema changes (`rmp` task #72/#98 add the full-text / point SHOW to the read-only
+                // set).
                 let mutating = !matches!(
                     cmd,
                     crate::engine::IndexCommand::ShowIndexes
                         | crate::engine::IndexCommand::ShowFulltextIndexes
+                        | crate::engine::IndexCommand::ShowPointIndexes
                 );
                 let detail = redact_index_detail(&cmd);
                 let outcome = open.handle.index_ddl_blocking(cmd);

@@ -363,6 +363,45 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 .collect();
             Ok(IndexDdlReply { fields, rows })
         }
+        IndexCommand::CreatePointIndex {
+            name,
+            label,
+            property,
+        } => {
+            // A spatial index has no analyzer to validate (unlike the full-text index): start the
+            // non-blocking online build directly (`rmp` task #98).
+            coordinator.create_point_index(name, label, property)?;
+            Ok(IndexDdlReply::default())
+        }
+        IndexCommand::DropPointIndex { name } => {
+            coordinator.drop_point_index(name)?;
+            Ok(IndexDdlReply::default())
+        }
+        IndexCommand::ShowPointIndexes => {
+            let fields = vec![
+                "name".to_owned(),
+                "label".to_owned(),
+                "property".to_owned(),
+                "state".to_owned(),
+            ];
+            let rows = coordinator
+                .list_point_indexes()
+                .into_iter()
+                .map(|(name, label, property, state)| {
+                    let state = match state {
+                        IndexState::Online => "online",
+                        IndexState::Populating => "populating",
+                    };
+                    vec![
+                        Value::String(name),
+                        Value::String(label),
+                        Value::String(property),
+                        Value::String(state.to_owned()),
+                    ]
+                })
+                .collect();
+            Ok(IndexDdlReply { fields, rows })
+        }
     }
 }
 
