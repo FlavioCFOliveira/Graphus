@@ -49,6 +49,9 @@ use graphus_rest::engine::{
 use graphus_rest::restvalue::{RestNode, RestPath, RestRelationship, RestValue};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
+use crate::audit::{
+    AuditClass, AuditEvent, AuditOutcome, AuditSource, data_change_detail, redact_index_detail,
+};
 
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
@@ -85,6 +88,9 @@ struct OpenTx {
     db: String,
     /// Whether this is a client-managed explicit transaction (admin statements are rejected).
     explicit: bool,
+    /// The access mode the transaction was begun in — so a `RUN` inside it can be classified as a
+    /// data change (a write) for audit (rmp #70).
+    mode: AccessMode,
 }
 
 impl RestEngineAdapter {
@@ -109,6 +115,31 @@ impl RestEngineAdapter {
         self.txns().get(&tx.0).cloned().ok_or_else(|| {
             GraphusError::Transaction(format!("unknown transaction handle {}", tx.0))
         })
+    }
+
+    /// Emits a config-gated `data_change` audit event (rmp #70) for a **write** statement on REST.
+    ///
+    /// Called only when the transaction is write-mode and only when
+    /// [`crate::audit::AuditLog::data_changes_enabled`] is set, so the default-off case costs
+    /// nothing. The `detail` is a category word only (never the query text or any literal — see
+    /// [`data_change_detail`]). `DataChange` events are not `fsync`'d per event (batched).
+    fn audit_data_change_if_enabled(
+        &self,
+        principal: &str,
+        db: &str,
+        query: &str,
+        mode: AccessMode,
+        outcome: AuditOutcome,
+    ) {
+        if mode != AccessMode::Write || !self.context.audit().data_changes_enabled() {
+            return;
+        }
+        self.context.audit().record(
+            AuditEvent::new(AuditClass::DataChange, outcome, AuditSource::Rest)
+                .actor(Some(principal))
+                .database(Some(db))
+                .detail(data_change_detail(query, None)),
+        );
     }
 }
 
@@ -251,6 +282,51 @@ impl ResultStream for RestEngineStream {
     }
 }
 
+/// The server-side [`graphus_rest::router::AuthObserver`] (rmp #70): records REST Bearer-validation
+/// outcomes to the shared [`AuditLog`](crate::audit::AuditLog) with the `Rest` source.
+///
+/// Graphus REST has no login endpoint — tokens are minted out of band — so the only REST auth event
+/// is per-request Bearer validation. Per-request success events can be high-volume; that is accepted
+/// for v1 (no sampling, to keep the trail simple and complete). The attempted principal is not
+/// recoverable from a bearer token cheaply, so an `AuthFailure` carries `actor = null`.
+pub struct RestAuthObserver {
+    audit: std::sync::Arc<crate::audit::AuditLog>,
+}
+
+impl RestAuthObserver {
+    /// Builds the observer over the shared audit log.
+    #[must_use]
+    pub fn new(audit: std::sync::Arc<crate::audit::AuditLog>) -> Self {
+        Self { audit }
+    }
+}
+
+impl graphus_rest::router::AuthObserver for RestAuthObserver {
+    fn on_auth_success(&self, principal: &str) {
+        self.audit.record(
+            AuditEvent::new(
+                AuditClass::AuthSuccess,
+                AuditOutcome::Success,
+                AuditSource::Rest,
+            )
+            .actor(Some(principal))
+            .detail("REST bearer auth"),
+        );
+    }
+
+    fn on_auth_failure(&self, attempted: Option<&str>, reason: &str) {
+        self.audit.record(
+            AuditEvent::new(
+                AuditClass::AuthFailure,
+                AuditOutcome::Failure,
+                AuditSource::Rest,
+            )
+            .actor(attempted)
+            .detail(format!("REST bearer auth: {reason}")),
+        );
+    }
+}
+
 impl RestEngine for RestEngineAdapter {
     type Stream = RestEngineStream;
 
@@ -265,7 +341,8 @@ impl RestEngine for RestEngineAdapter {
         // no transaction is opened. The canonical `name` pins the transaction's database for the
         // privilege scoping of every later statement (rmp #93).
         let (name, handle) = self.context.resolve(Some(db))?;
-        let ticket = handle.begin_blocking(from_rest_mode(mode))?;
+        let engine_mode = from_rest_mode(mode);
+        let ticket = handle.begin_blocking(engine_mode)?;
         // Mint the public id only after the engine accepted the begin (no orphan table entries).
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.txns().insert(
@@ -276,6 +353,7 @@ impl RestEngine for RestEngineAdapter {
                 principal: origin.principal.to_owned(),
                 db: name,
                 explicit: origin.explicit,
+                mode: engine_mode,
             },
         );
         Ok(TxHandle(id))
@@ -296,7 +374,11 @@ impl RestEngine for RestEngineAdapter {
                 if open.explicit {
                     return Err(admin_in_explicit_tx());
                 }
-                let result = self.context.execute(Some(&open.principal), &cmd)?;
+                // `execute` audits the change/denial at the single admin funnel (rmp #70) with the
+                // REST source.
+                let result =
+                    self.context
+                        .execute(Some(&open.principal), AuditSource::Rest, &cmd)?;
                 return Ok(RestEngineStream::admin(result));
             }
             // An index-DDL statement (rmp #91): authorize like a database command, then route it to
@@ -307,8 +389,40 @@ impl RestEngine for RestEngineAdapter {
                     return Err(admin_in_explicit_tx());
                 }
                 // Authorization first — no side effects on denial (shared gate with the DB surface).
-                self.context.authorize_admin(Some(&open.principal))?;
-                let reply = open.handle.index_ddl_blocking(cmd)?;
+                // The seam audits the index-DDL denial / schema change itself (rmp #70).
+                if let Err(e) = self.context.authorize_admin(Some(&open.principal)) {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::AuthzDenied,
+                            AuditOutcome::Failure,
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(&open.principal))
+                        .detail(redact_index_detail(&cmd)),
+                    );
+                    return Err(e);
+                }
+                // `SHOW INDEXES` is read-only — only the mutating CREATE/DROP are schema changes.
+                let mutating = !matches!(cmd, crate::engine::IndexCommand::ShowIndexes);
+                let detail = redact_index_detail(&cmd);
+                let outcome = open.handle.index_ddl_blocking(cmd);
+                if mutating {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::SchemaChange,
+                            if outcome.is_ok() {
+                                AuditOutcome::Success
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(&open.principal))
+                        .database(Some(&open.db))
+                        .detail(detail),
+                    );
+                }
+                let reply = outcome?;
                 return Ok(RestEngineStream::admin(AdminResult {
                     fields: reply.fields,
                     rows: reply.rows,
@@ -336,13 +450,28 @@ impl RestEngine for RestEngineAdapter {
 
         // REST always runs against an already-open handle (the router opens the auto-commit
         // transaction itself for the commit shortcut), so this is never auto-commit at the engine.
-        let reply = open.handle.run_blocking(
+        let outcome = open.handle.run_blocking(
             open.ticket,
             query.to_owned(),
             parameters,
             /* auto_commit */ false,
             privileges,
-        )?;
+        );
+        // Data-change audit (rmp #70, config-gated): a write that the engine ACCEPTED is audited at
+        // this seam (the row stream is lazy; acceptance is the cheap, correct point). Full query
+        // text is NEVER logged — only the category. Read transactions are not data changes.
+        self.audit_data_change_if_enabled(
+            &open.principal,
+            &open.db,
+            query,
+            open.mode,
+            if outcome.is_ok() {
+                AuditOutcome::Success
+            } else {
+                AuditOutcome::Failure
+            },
+        );
+        let reply = outcome?;
         Ok(RestEngineStream {
             fields: reply.fields,
             source: RowSource::Engine {

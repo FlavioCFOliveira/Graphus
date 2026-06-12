@@ -1149,6 +1149,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "toml",

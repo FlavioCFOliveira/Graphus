@@ -45,7 +45,7 @@ pub use command::{AccessMode, EngineCommand, IndexCommand, IndexDdlReply, RunRep
 pub use handle::{EngineHandle, ServerBusy};
 pub use privileges::EffectivePrivileges;
 pub use seam_bolt::BoltEngineExecutor;
-pub use seam_rest::RestEngineAdapter;
+pub use seam_rest::{RestAuthObserver, RestEngineAdapter};
 
 use crate::metrics::Metrics;
 use command::EngineCommand as Cmd;

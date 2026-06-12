@@ -86,6 +86,7 @@ fn config_with_key(temp: &TempStore, key_path: Option<PathBuf>) -> ServerConfig 
             users: Vec::new(),
         },
         encryption: EncryptionConfig { key_path },
+        audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: false,
     }
 }

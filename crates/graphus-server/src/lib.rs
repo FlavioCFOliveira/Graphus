@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod audit;
 pub mod config;
 pub mod dbcatalog;
 pub mod engine;
@@ -37,6 +38,7 @@ pub mod server;
 pub mod shutdown;
 pub mod store_device;
 
+pub use audit::{AuditClass, AuditConfig, AuditEvent, AuditLog, AuditOutcome, AuditSource};
 pub use config::{ConfigError, ServerConfig};
 pub use dbcatalog::{CatalogError, DatabaseCatalog, DbInfo, DbState};
 pub use server::{Server, ServerError, ServerHandle};

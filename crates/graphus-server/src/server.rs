@@ -30,6 +30,7 @@ use graphus_core::capability::Clock;
 use graphus_io::FsyncPool;
 use rustls::ServerConfig as RustlsServerConfig;
 
+use crate::audit::AuditLog;
 use crate::config::ServerConfig;
 use crate::dbcatalog::DatabaseCatalog;
 use crate::engine::EngineHandle;
@@ -70,6 +71,9 @@ pub enum ServerError {
     /// Loading the durable security catalog failed (a malformed `security.toml` fails startup
     /// closed — `crate::security`).
     Security(crate::security::SecurityError),
+    /// Opening (and crash-recovering) the audit log failed (rmp #70). A configured-and-enabled
+    /// audit log that cannot be opened fails startup, since the security trail must be present.
+    Audit(std::io::Error),
     /// Building the TLS config failed.
     Auth(String),
     /// Binding a listener socket failed.
@@ -83,6 +87,7 @@ impl std::fmt::Display for ServerError {
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::Catalog(e) => write!(f, "catalog error: {e}"),
             Self::Security(e) => write!(f, "security catalog error: {e}"),
+            Self::Audit(e) => write!(f, "audit log error: {e}"),
             Self::Auth(m) => write!(f, "auth setup error: {m}"),
             Self::Listener(m) => write!(f, "listener error: {m}"),
         }
@@ -203,6 +208,13 @@ impl Server {
         let auth = Arc::new(security.snapshot_authenticator());
         let tls = build_tls(&config, &auth)?;
 
+        // 1b) Security audit log (rmp #70): open (and crash-recover) the append-only JSONL sink
+        //     under the store path. When `audit.enabled` is false this is a no-op sink (writes
+        //     nothing). A configured-and-enabled log that cannot be opened fails startup — the
+        //     security trail must be present when an operator asked for it.
+        let audit =
+            AuditLog::open(&config.audit, &config.store_path).map_err(ServerError::Audit)?;
+
         // 2) The database catalog + engines (`crate::dbcatalog`, decision `D-multi-db`): load the
         //    durable catalog (malformed ⇒ fail startup closed), start the default database (its
         //    failure fails startup — unchanged single-db behaviour; the `!Send` coordinator is
@@ -236,6 +248,7 @@ impl Server {
             Arc::clone(&catalog),
             Arc::clone(&security),
             Arc::clone(&auth),
+            Arc::clone(&audit),
             clock,
             tls,
             Arc::clone(&metrics),
@@ -260,6 +273,7 @@ impl Server {
             Arc::clone(&catalog),
             bound.clone(),
             fsync_pool,
+            Arc::clone(&audit),
             shutdown.clone(),
             readiness.clone(),
         ));
@@ -286,6 +300,7 @@ async fn run_loop(
     catalog: Arc<DatabaseCatalog>,
     bound: Listeners,
     fsync_pool: Arc<FsyncPool>,
+    audit: Arc<AuditLog>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
 ) -> Result<(), ServerError> {
@@ -302,6 +317,12 @@ async fn run_loop(
     // Durable desired states are untouched: a database online now comes back online at next boot.
     tracing::info!("graceful shutdown: draining in-flight transactions and hardening the stores");
     catalog.shutdown_all().await;
+
+    // Flush any batched (unsynced) data-change audit events so the final batch is durable before
+    // exit (rmp #70). Best-effort: a flush error is logged, never fatal.
+    if let Err(e) = audit.flush() {
+        tracing::error!(target: "graphus::audit", error = %e, "failed to flush audit log on shutdown");
+    }
 
     // Tear down the durability pool last (its Drop joins the sync threads).
     drop(fsync_pool);

@@ -138,6 +138,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
             }],
         },
         encryption: graphus_server::config::EncryptionConfig::default(),
+        audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: true,
     }
 }

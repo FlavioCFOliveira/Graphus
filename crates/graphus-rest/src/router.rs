@@ -152,6 +152,22 @@ impl From<Problem> for Built {
 
 // =============================== state =========================================================
 
+/// Observes REST authentication outcomes for audit (rmp #70). Implemented by the server (which
+/// records an audit event); the REST router stays audit-agnostic and merely notifies an observer if
+/// one is wired in.
+///
+/// The router has no login endpoint (Bearer tokens are minted out of band), so the only REST auth
+/// event is per-request Bearer validation. The attempted principal is **not** recoverable from a
+/// bearer token cheaply, so [`on_auth_failure`](Self::on_auth_failure) receives `None`. **Credentials
+/// are never passed** — only the resolved username on success.
+pub trait AuthObserver: Send + Sync {
+    /// Called when a request's Bearer token validates, with the resolved principal (subject).
+    fn on_auth_success(&self, principal: &str);
+    /// Called when Bearer validation fails, with the attempted principal (usually `None` — not
+    /// recoverable from a token) and a short, secret-free reason.
+    fn on_auth_failure(&self, attempted: Option<&str>, reason: &str);
+}
+
 /// The shared application state every handler reads (cloned per request — all fields are `Arc`).
 ///
 /// Generic over the concrete [`RestEngine`] so the seam stays boxing-free; the server constructs it
@@ -161,6 +177,9 @@ pub struct AppState<E: RestEngine> {
     auth: Arc<Authenticator>,
     registry: Arc<TxRegistry>,
     clock: Arc<dyn Clock + Send + Sync>,
+    /// An optional audit observer (rmp #70): when set, [`authenticate`] notifies it of each
+    /// Bearer-validation outcome. `None` keeps the router byte-for-byte audit-free (e.g. the tests).
+    auth_observer: Option<Arc<dyn AuthObserver>>,
 }
 
 // Manual `Clone` (deriving would wrongly require `E: Clone`; the fields are all `Arc`).
@@ -171,12 +190,15 @@ impl<E: RestEngine> Clone for AppState<E> {
             auth: Arc::clone(&self.auth),
             registry: Arc::clone(&self.registry),
             clock: Arc::clone(&self.clock),
+            auth_observer: self.auth_observer.clone(),
         }
     }
 }
 
 impl<E: RestEngine + 'static> AppState<E> {
-    /// Builds the shared state from the engine, authenticator, registry, and injected clock.
+    /// Builds the shared state from the engine, authenticator, registry, and injected clock. No
+    /// audit observer is wired by default (the router stays audit-agnostic); attach one with
+    /// [`with_auth_observer`](Self::with_auth_observer).
     pub fn new(
         engine: Arc<E>,
         auth: Arc<Authenticator>,
@@ -188,7 +210,17 @@ impl<E: RestEngine + 'static> AppState<E> {
             auth,
             registry,
             clock,
+            auth_observer: None,
         }
+    }
+
+    /// Attaches an [`AuthObserver`] so each Bearer-validation outcome is reported for audit (rmp
+    /// #70). Returns `self` for chaining at construction. Existing call sites that do not need
+    /// auditing leave it unset.
+    #[must_use]
+    pub fn with_auth_observer(mut self, observer: Arc<dyn AuthObserver>) -> Self {
+        self.auth_observer = Some(observer);
+        self
     }
 }
 
@@ -663,21 +695,43 @@ fn authenticate<E: RestEngine>(
     headers: &HeaderMap,
 ) -> Result<String, Problem> {
     let Some(value) = header_str(headers, &AUTHORIZATION) else {
+        notify_auth_failure(state, "missing Authorization header");
         return Err(Problem::from_auth_error(&AuthError::Unauthenticated));
     };
     let Some(token) = value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))
     else {
+        notify_auth_failure(state, "Authorization header is not a Bearer token");
         return Err(Problem::from_auth_error(&AuthError::BadToken {
             detail: "Authorization header is not a Bearer token".to_owned(),
         }));
     };
-    state
+    match state
         .auth
         .authenticate_bearer(token.trim(), state.now_unix_secs())
-        .map(|claims| claims.sub)
-        .map_err(|e| Problem::from_auth_error(&e))
+    {
+        Ok(claims) => {
+            // Notify the audit observer (rmp #70) of the successful Bearer validation.
+            if let Some(observer) = &state.auth_observer {
+                observer.on_auth_success(&claims.sub);
+            }
+            Ok(claims.sub)
+        }
+        Err(e) => {
+            notify_auth_failure(state, "bearer authentication failed");
+            Err(Problem::from_auth_error(&e))
+        }
+    }
+}
+
+/// Notifies the audit observer (if any) of a REST authentication failure (rmp #70). The attempted
+/// principal is not recoverable from a bearer token cheaply, so `None` is reported; the `reason` is
+/// a short, secret-free string.
+fn notify_auth_failure<E: RestEngine>(state: &AppState<E>, reason: &str) {
+    if let Some(observer) = &state.auth_observer {
+        observer.on_auth_failure(None, reason);
+    }
 }
 
 /// Authorizes `identity` for the privilege implied by `mode` (`04 §8.4`): a `WRITE` transaction

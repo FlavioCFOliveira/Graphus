@@ -75,6 +75,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # file format. Env overrides are read directly from `std::env` (no extra crate). int handling is
 # native (no JS boundary here, unlike the REST wire codec).
 serde = { version = "1", features = ["derive"] }
+# The audit log (rmp #70) serialises each event as one compact JSON object per line (JSONL) and
+# scans existing lines on reopen to recover the sequence counter + detect a torn tail. Same version
+# line `graphus-rest` already pins, so no duplicate tree enters the build.
+serde_json = "1"
 toml = "0.9"
 # Hold the loaded master key (encryption at rest, rmp #85) in zeroizing memory so it is wiped on
 # drop. Same crate (and version line) `graphus-crypto` uses for its keyring.

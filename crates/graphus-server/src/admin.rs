@@ -86,6 +86,10 @@ use graphus_auth::{AuthError, Privilege};
 use graphus_core::{GraphusError, Value};
 use tokio::runtime::Handle;
 
+use crate::audit::{
+    AuditClass, AuditEvent, AuditLog, AuditOutcome, AuditSource, admin_target_database,
+    classify_admin, is_mutating_admin, redact_admin_detail,
+};
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{EngineHandle, IndexCommand};
 use crate::security::{SecurityCatalog, SecurityError};
@@ -1145,6 +1149,9 @@ pub struct AdminContext {
     /// The live, durable security catalog: admin statements are authorized against the same RBAC
     /// model as every other operation (`04 §8.4`), and the security commands (rmp #92) mutate it.
     security: Arc<SecurityCatalog>,
+    /// The shared security audit log (rmp #70): admin/schema/security changes and their
+    /// authorization denials are recorded at this single funnel. Disabled-by-config ⇒ a no-op sink.
+    audit: Arc<AuditLog>,
     /// The server runtime, for bridging the catalogs' async APIs from the synchronous seams (module
     /// docs: why spawn + `std` channel, not `block_on`).
     runtime: Handle,
@@ -1155,17 +1162,20 @@ pub struct AdminContext {
 
 impl AdminContext {
     /// Builds the context. `default_handle` must be the default database's admission-limited
-    /// handle (the one [`crate::dbcatalog::DatabaseCatalog::start_default`] returned).
+    /// handle (the one [`crate::dbcatalog::DatabaseCatalog::start_default`] returned); `audit` is
+    /// the shared audit log (rmp #70) the admin surface records change/denial events to.
     #[must_use]
     pub fn new(
         catalog: Arc<DatabaseCatalog>,
         security: Arc<SecurityCatalog>,
+        audit: Arc<AuditLog>,
         runtime: Handle,
         default_handle: EngineHandle,
     ) -> Self {
         Self {
             catalog,
             security,
+            audit,
             runtime,
             default_handle,
         }
@@ -1176,6 +1186,14 @@ impl AdminContext {
     #[must_use]
     pub fn security(&self) -> &Arc<SecurityCatalog> {
         &self.security
+    }
+
+    /// Shared access to the security audit log (rmp #70) so the seams can record their own events
+    /// (e.g. index-DDL schema changes + their authz denials, and data-change events), at the same
+    /// single sink the admin surface uses.
+    #[must_use]
+    pub fn audit(&self) -> &Arc<AuditLog> {
+        &self.audit
     }
 
     /// The (normalized) default database's name.
@@ -1236,23 +1254,16 @@ impl AdminContext {
         GraphusError::Protocol(message)
     }
 
-    /// Executes an administrative command on behalf of `principal`.
-    ///
-    /// Authorization first (module docs): the principal must be authenticated and hold the global
-    /// `Admin` privilege — the same gate as the `/admin/*` REST endpoints. Only then is the
-    /// catalog touched, so a denied command has **no side effects**.
-    ///
-    /// # Errors
-    /// [`GraphusError::Security`] when unauthenticated/unauthorized; [`GraphusError::Runtime`]
-    /// for a client-fault catalog rejection (bad name, duplicate, unknown, not stopped, the
-    /// default database); [`GraphusError::Storage`] for a server-side catalog/engine fault.
     /// Authorizes `principal` for the administrative surface: it must be authenticated and hold the
     /// global `Admin` privilege — the same gate as the `/admin/*` REST endpoints (`04 §8.4`).
     ///
     /// This is the **single** admin-privilege gate, shared by the database surface
     /// ([`execute`](Self::execute)) and the index surface (`rmp` task #91; the seams call this before
     /// routing an index command to the engine). Authorization happens before any side effect, so a
-    /// denied command leaves the system untouched.
+    /// denied command leaves the system untouched. Audit of a denial is the **caller's**
+    /// responsibility (rmp #70): [`execute`](Self::execute) audits database/security denials, and the
+    /// seams audit index-DDL denials via [`audit`](Self::audit) — so the event carries the right
+    /// class and detail.
     ///
     /// # Errors
     /// [`GraphusError::Security`] when the principal is absent (unauthenticated) or lacks the admin
@@ -1279,13 +1290,55 @@ impl AdminContext {
         }
     }
 
+    /// Executes an administrative command on behalf of `principal`, recording the audit trail
+    /// (rmp #70): an authorization denial is always audited as `authz_denied` (with no side
+    /// effects), and a *mutating* command's outcome is audited as `admin_change`/`security_change`
+    /// (per [`classify_admin`]). Read-only `SHOW *` commands emit no change event. `source` is the
+    /// connection the command arrived on (UDS/TCP Bolt or REST).
+    ///
+    /// # Errors
+    /// As before: [`GraphusError::Security`] when unauthenticated/unauthorized; a client- or
+    /// server-fault error from the catalog/security mutation.
     pub fn execute(
         &self,
         principal: Option<&str>,
+        source: AuditSource,
         cmd: &AdminCommand,
     ) -> Result<AdminResult, GraphusError> {
-        self.authorize_admin(principal)?;
+        // Authorization first: a denial is ALWAYS audited (rmp #70) with no side effects.
+        if let Err(e) = self.authorize_admin(principal) {
+            self.audit.record(
+                AuditEvent::new(AuditClass::AuthzDenied, AuditOutcome::Failure, source)
+                    .actor(principal)
+                    .database(admin_target_database(cmd).as_deref())
+                    .detail(redact_admin_detail(cmd)),
+            );
+            return Err(e);
+        }
 
+        // Only mutating commands emit a change event; SHOW* are read-only (audited only on denial).
+        let mutating = is_mutating_admin(cmd);
+        let result = self.execute_authorized(cmd);
+        if mutating {
+            let outcome = if result.is_ok() {
+                AuditOutcome::Success
+            } else {
+                AuditOutcome::Failure
+            };
+            self.audit.record(
+                AuditEvent::new(classify_admin(cmd), outcome, source)
+                    .actor(principal)
+                    .database(admin_target_database(cmd).as_deref())
+                    .detail(redact_admin_detail(cmd)),
+            );
+        }
+        result
+    }
+
+    /// Executes an already-authorized administrative command (the mutation itself), without any
+    /// audit side effects. Split out of [`execute`](Self::execute) so the audit funnel wraps it
+    /// once, around both the success and failure paths.
+    fn execute_authorized(&self, cmd: &AdminCommand) -> Result<AdminResult, GraphusError> {
         match cmd {
             AdminCommand::CreateDatabase {
                 name,

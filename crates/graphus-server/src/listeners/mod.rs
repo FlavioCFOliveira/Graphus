@@ -20,6 +20,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 use crate::admin::AdminContext;
+use crate::audit::AuditLog;
 use crate::config::ServerConfig;
 use crate::dbcatalog::DatabaseCatalog;
 use crate::engine::EngineHandle;
@@ -69,6 +70,7 @@ pub async fn start_all(
     catalog: Arc<DatabaseCatalog>,
     security: Arc<SecurityCatalog>,
     auth: Arc<Authenticator>,
+    audit: Arc<AuditLog>,
     clock: Arc<dyn Clock + Send + Sync>,
     tls: Option<Arc<RustlsServerConfig>>,
     metrics: Arc<Metrics>,
@@ -88,6 +90,7 @@ pub async fn start_all(
     let context = AdminContext::new(
         Arc::clone(&catalog),
         Arc::clone(&security),
+        Arc::clone(&audit),
         tokio::runtime::Handle::current(),
         engine.clone(),
     );
@@ -149,6 +152,7 @@ pub async fn start_all(
             engine.clone(),
             context.clone(),
             Arc::clone(&auth),
+            Arc::clone(&audit),
             Arc::clone(&clock),
             Arc::clone(&metrics),
             shutdown.clone(),
@@ -182,6 +186,7 @@ fn build_rest_router(
     engine: EngineHandle,
     context: AdminContext,
     auth: Arc<Authenticator>,
+    audit: Arc<AuditLog>,
     clock: Arc<dyn Clock + Send + Sync>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
@@ -192,12 +197,14 @@ fn build_rest_router(
 
     let rest_engine = Arc::new(crate::engine::RestEngineAdapter::new(context));
     let registry = Arc::new(TxRegistry::new(DEFAULT_TX_TTL_NANOS));
-    let api = router(AppState::new(
-        rest_engine,
-        Arc::clone(&auth),
-        registry,
-        Arc::clone(&clock),
-    ));
+    // Wire the audit observer (rmp #70) so REST Bearer-validation outcomes are recorded with the
+    // `Rest` source. The observer is a tiny server-side adapter over the shared `AuditLog`.
+    let observer: Arc<dyn graphus_rest::router::AuthObserver> =
+        Arc::new(crate::engine::RestAuthObserver::new(Arc::clone(&audit)));
+    let api = router(
+        AppState::new(rest_engine, Arc::clone(&auth), registry, Arc::clone(&clock))
+            .with_auth_observer(observer),
+    );
 
     let extra = extra_routes::routes(metrics, engine, auth, clock, shutdown, readiness);
     api.merge(extra)

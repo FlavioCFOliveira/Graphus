@@ -25,6 +25,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::transport::AsyncToBlockingTransport;
 use crate::admin::AdminContext;
+use crate::audit::AuditSource;
 use crate::engine::BoltEngineExecutor;
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownCoordinator;
@@ -93,6 +94,7 @@ pub async fn run_uds_accept_loop(
                     conn,
                     handle.clone(),
                     context.clone(),
+                    AuditSource::BoltUds,
                     Arc::clone(&auth),
                     session_config(advertised_bolt_address.clone()),
                     shutdown.clone(),
@@ -148,6 +150,7 @@ pub async fn run_tcp_accept_loop(
                                 tls_stream,
                                 handle,
                                 context,
+                                AuditSource::BoltTcp,
                                 auth,
                                 session_config(advertised),
                                 shutdown,
@@ -203,7 +206,8 @@ impl PeerCredSource for FixedPeerCred {
 
 /// Spawns one Bolt session on a blocking task: builds the async→blocking transport bridge and the
 /// per-connection engine executor, then drives `BoltSession::run` to completion. `session_config`
-/// carries this connection's minted id and the advertised routing address (rmp #95).
+/// carries this connection's minted id and the advertised routing address (rmp #95); `source` is
+/// the connection's audit transport (`BoltUds`/`BoltTcp`) recorded on every audited event (rmp #70).
 ///
 /// The session is **blocking** (its `Transport` and engine submits block), so it runs on
 /// `spawn_blocking`, never a runtime worker (`04 §9.1`). The `Authenticator` is shared (`Arc`); the
@@ -212,6 +216,7 @@ fn spawn_session<S>(
     stream: S,
     handle: Handle,
     context: AdminContext,
+    source: AuditSource,
     auth: Arc<Authenticator>,
     session_config: SessionConfig,
     shutdown: ShutdownCoordinator,
@@ -220,7 +225,7 @@ fn spawn_session<S>(
 {
     tokio::task::spawn_blocking(move || {
         let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, None);
-        let executor = BoltEngineExecutor::new(context);
+        let executor = BoltEngineExecutor::new(context, source);
         let mut session = BoltSession::with_config(transport, executor, &auth, session_config);
         if let Err(e) = session.run() {
             // A transport/handshake error ends the session; a Cypher/auth FAILURE is *not* an error

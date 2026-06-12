@@ -450,16 +450,25 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     fn dispatch_authentication(&mut self, request: Request) -> BoltResult<Flow> {
         match request {
             Request::Logon { auth } => {
+                // Capture the attempted principal BEFORE authenticating, so a failure can be
+                // audited with the attempted username (the username is not a secret; the
+                // credentials in `auth` ARE — they are never passed to the audit hook — rmp #70).
+                let attempted = map_str(&auth, "principal").map(str::to_owned);
                 match self.authenticate(&auth) {
                     Ok(user) => {
                         // Announce the identity to the executor so it can authorize
-                        // identity-gated work (e.g. administrative statements — rmp #84).
+                        // identity-gated work (e.g. administrative statements — rmp #84) and record
+                        // an `auth_success` audit event (rmp #70).
+                        self.executor.on_auth_success(&user);
                         self.executor.set_principal(Some(&user));
                         self.principal = Some(user);
                         self.send(&Response::Success { metadata: vec![] })?;
                         self.state = State::Ready;
                     }
                     Err(failure) => {
+                        // Record the failed attempt for audit (rmp #70) before the FAILURE goes out.
+                        self.executor
+                            .on_auth_failure(attempted.as_deref(), "authentication failed");
                         // A failed auth is delivered as FAILURE; the connection enters FAILED and
                         // the listener closes it (`04 §8.4`: failed auth → FAILURE + close). We stay
                         // in the fail-state so a stray follow-up is IGNORED until the socket drops.

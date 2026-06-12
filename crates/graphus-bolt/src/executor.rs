@@ -176,6 +176,27 @@ pub trait BoltExecutor {
     fn set_principal(&mut self, principal: Option<&str>) {
         let _ = principal;
     }
+
+    /// **Audit-observation hook (rmp #70):** the session calls this at `LOGON` resolution when
+    /// authentication **succeeds**, with the authenticated `principal`, so an audit-aware executor
+    /// (the server's seam) can record an `auth_success` event.
+    ///
+    /// The default implementation is a no-op, keeping the protocol core audit-agnostic — only an
+    /// executor that wants the trail overrides it. The credential is **never** passed; only the
+    /// username (which is not a secret).
+    fn on_auth_success(&mut self, principal: &str) {
+        let _ = principal;
+    }
+
+    /// **Audit-observation hook (rmp #70):** the session calls this at `LOGON` resolution when
+    /// authentication **fails**, with the attempted `principal` (if the client supplied one) and a
+    /// short, secret-free `reason`, so an audit-aware executor can record an `auth_failure` event.
+    ///
+    /// The default implementation is a no-op (protocol core stays audit-agnostic). The attempted
+    /// username is not a secret and may be `None`; **credentials are never passed**.
+    fn on_auth_failure(&mut self, principal: Option<&str>, reason: &str) {
+        let _ = (principal, reason);
+    }
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ use graphus_core::{GraphusError, Value};
 use graphus_cypher::{MaterializedPath, MaterializedValue};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
+use crate::audit::{
+    AuditClass, AuditEvent, AuditOutcome, AuditSource, data_change_detail, redact_index_detail,
+};
 
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
@@ -53,6 +56,9 @@ use super::{EngineHandle, RunSummary, TxTicket};
 pub struct BoltEngineExecutor {
     /// Database targeting + administrative statements, shared across connections.
     context: AdminContext,
+    /// The connection's audit source (rmp #70): `BoltUds` or `BoltTcp`, set at construction by the
+    /// accept loop so every audited event records the right transport.
+    source: AuditSource,
     /// The authenticated principal (`LOGON` sets it, `LOGOFF` clears it).
     principal: Option<String>,
     /// The open explicit transaction, set on `BEGIN`, cleared on `COMMIT`/`ROLLBACK`.
@@ -65,17 +71,47 @@ struct OpenTx {
     ticket: TxTicket,
     handle: EngineHandle,
     db: String,
+    /// The access mode the transaction was begun in — so a `RUN` inside it can be classified as a
+    /// data change (a write) for audit (rmp #70).
+    mode: AccessMode,
 }
 
 impl BoltEngineExecutor {
-    /// A fresh per-connection executor over the shared `context`.
+    /// A fresh per-connection executor over the shared `context`. `source` is the connection's
+    /// transport (`BoltUds`/`BoltTcp`), recorded on every audit event this connection emits (rmp
+    /// #70).
     #[must_use]
-    pub fn new(context: AdminContext) -> Self {
+    pub fn new(context: AdminContext, source: AuditSource) -> Self {
         Self {
             context,
+            source,
             principal: None,
             current_tx: None,
         }
+    }
+
+    /// Emits a config-gated `data_change` audit event (rmp #70) for a **write** statement.
+    ///
+    /// Called only when the run is a write (an auto-commit write or an explicit-tx write) and only
+    /// when [`crate::audit::AuditLog::data_changes_enabled`] is set, so the default-off case costs
+    /// nothing. The `detail` is a category word only (never the query text or any literal — see
+    /// [`data_change_detail`]). `DataChange` events are not `fsync`'d per event (batched).
+    fn audit_data_change_if_enabled(
+        &self,
+        db: &str,
+        query: &str,
+        mode: AccessMode,
+        outcome: AuditOutcome,
+    ) {
+        if mode != AccessMode::Write || !self.context.audit().data_changes_enabled() {
+            return;
+        }
+        self.context.audit().record(
+            AuditEvent::new(AuditClass::DataChange, outcome, self.source)
+                .actor(self.principal.as_deref())
+                .database(Some(db))
+                .detail(data_change_detail(query, None)),
+        );
     }
 
     /// The "admin command inside an explicit transaction" rejection, shared by the database (rmp
@@ -278,7 +314,11 @@ impl BoltExecutor for BoltEngineExecutor {
                 if matches!(tx, TxControl::InExplicit { .. }) {
                     return Err(Self::admin_in_explicit_tx());
                 }
-                let result = self.context.execute(self.principal.as_deref(), &cmd)?;
+                // `execute` audits the change/denial at the single admin funnel (rmp #70), with this
+                // connection's source.
+                let result = self
+                    .context
+                    .execute(self.principal.as_deref(), self.source, &cmd)?;
                 return Ok(BoltEngineStream::admin(result));
             }
             // An index-DDL statement (rmp #91): authorize like a database command, then route it to
@@ -290,15 +330,48 @@ impl BoltExecutor for BoltEngineExecutor {
                     return Err(Self::admin_in_explicit_tx());
                 }
                 // Authorization first — no side effects on denial (shared gate with the DB surface).
-                self.context.authorize_admin(self.principal.as_deref())?;
+                // The index command isn't an `AdminCommand`, so the seam audits its own denial /
+                // schema change (rmp #70) via `context.audit()`.
+                if let Err(e) = self.context.authorize_admin(self.principal.as_deref()) {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::AuthzDenied,
+                            AuditOutcome::Failure,
+                            self.source,
+                        )
+                        .actor(self.principal.as_deref())
+                        .detail(redact_index_detail(&cmd)),
+                    );
+                    return Err(e);
+                }
                 // The index command runs against the database this auto-commit RUN targets.
                 let db = match &tx {
                     TxControl::AutoCommit { db, .. } => db.as_deref(),
                     // Rejected above; this arm is unreachable, but keep it total.
                     TxControl::InExplicit { .. } => None,
                 };
-                let (_name, handle) = self.context.resolve(db)?;
-                let reply = handle.index_ddl_blocking(cmd)?;
+                let (name, handle) = self.context.resolve(db)?;
+                // `SHOW INDEXES` is read-only — only the mutating CREATE/DROP are schema changes.
+                let mutating = !matches!(cmd, crate::engine::IndexCommand::ShowIndexes);
+                let detail = redact_index_detail(&cmd);
+                let outcome = handle.index_ddl_blocking(cmd);
+                if mutating {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::SchemaChange,
+                            if outcome.is_ok() {
+                                AuditOutcome::Success
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            self.source,
+                        )
+                        .actor(self.principal.as_deref())
+                        .database(Some(&name))
+                        .detail(detail),
+                    );
+                }
+                let reply = outcome?;
                 return Ok(BoltEngineStream::admin(AdminResult {
                     fields: reply.fields,
                     rows: reply.rows,
@@ -315,11 +388,27 @@ impl BoltExecutor for BoltEngineExecutor {
                 // Resolve the target database at transaction begin (rmp #84): absent/empty `db`
                 // is the default database; a named one resolves through the catalog.
                 let (name, handle) = self.context.resolve(db.as_deref())?;
+                let engine_mode = from_bolt_mode(mode);
                 // Open an internal auto-commit transaction the engine finalises on stream drain.
-                let ticket = handle.begin_auto_commit_blocking(from_bolt_mode(mode))?;
-                self.run_on(
+                let ticket = handle.begin_auto_commit_blocking(engine_mode)?;
+                let stream = self.run_on(
                     &handle, ticket, &name, query, parameters, /* auto_commit */ true,
-                )
+                );
+                // Data-change audit (rmp #70, config-gated): a write that the engine ACCEPTED is
+                // audited at this seam (the row stream is lazy; acceptance is the correct,
+                // cheap point). A failed run is outcome=Failure. Full query text is NEVER logged —
+                // only the category. Read runs are not data changes.
+                self.audit_data_change_if_enabled(
+                    &name,
+                    query,
+                    engine_mode,
+                    if stream.is_ok() {
+                        AuditOutcome::Success
+                    } else {
+                        AuditOutcome::Failure
+                    },
+                );
+                stream
             }
             TxControl::InExplicit { db } => {
                 let open = self.current_tx.as_ref().ok_or_else(|| {
@@ -339,11 +428,24 @@ impl BoltExecutor for BoltEngineExecutor {
                         )));
                     }
                 }
-                let (handle, ticket, pinned_db) =
-                    (open.handle.clone(), open.ticket, open.db.clone());
-                self.run_on(
+                let (handle, ticket, pinned_db, tx_mode) =
+                    (open.handle.clone(), open.ticket, open.db.clone(), open.mode);
+                let stream = self.run_on(
                     &handle, ticket, &pinned_db, query, parameters, /* auto_commit */ false,
-                )
+                );
+                // Data-change audit (rmp #70, config-gated): a write inside a write-mode explicit
+                // transaction is a data change at acceptance, exactly as the auto-commit path.
+                self.audit_data_change_if_enabled(
+                    &pinned_db,
+                    query,
+                    tx_mode,
+                    if stream.is_ok() {
+                        AuditOutcome::Success
+                    } else {
+                        AuditOutcome::Failure
+                    },
+                );
+                stream
             }
         }
     }
@@ -356,11 +458,13 @@ impl BoltExecutor for BoltEngineExecutor {
         }
         // Resolve at begin; the transaction stays pinned to this database (rmp #84).
         let (name, handle) = self.context.resolve(db)?;
-        let ticket = handle.begin_blocking(from_bolt_mode(mode))?;
+        let engine_mode = from_bolt_mode(mode);
+        let ticket = handle.begin_blocking(engine_mode)?;
         self.current_tx = Some(OpenTx {
             ticket,
             handle,
             db: name,
+            mode: engine_mode,
         });
         Ok(())
     }
@@ -382,5 +486,25 @@ impl BoltExecutor for BoltEngineExecutor {
 
     fn set_principal(&mut self, principal: Option<&str>) {
         self.principal = principal.map(str::to_owned);
+    }
+
+    fn on_auth_success(&mut self, principal: &str) {
+        // Record the successful LOGON (rmp #70). Security-relevant ⇒ fsync'd before returning. Only
+        // the username is recorded; credentials are never seen here.
+        self.context.audit().record(
+            AuditEvent::new(AuditClass::AuthSuccess, AuditOutcome::Success, self.source)
+                .actor(Some(principal))
+                .detail("LOGON basic"),
+        );
+    }
+
+    fn on_auth_failure(&mut self, principal: Option<&str>, reason: &str) {
+        // Record the failed LOGON (rmp #70). ALWAYS audited (security-relevant ⇒ fsync'd). The
+        // attempted username may be `None`; credentials are NEVER passed/logged.
+        self.context.audit().record(
+            AuditEvent::new(AuditClass::AuthFailure, AuditOutcome::Failure, self.source)
+                .actor(principal)
+                .detail(format!("LOGON basic: {reason}")),
+        );
     }
 }

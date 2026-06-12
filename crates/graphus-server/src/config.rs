@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::audit::AuditConfig;
+
 /// How a fallible config step failed.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -272,6 +274,12 @@ pub struct ServerConfig {
     /// Encryption at rest (rmp #85). Unset ⇒ plaintext store (byte-identical to today).
     pub encryption: EncryptionConfig,
 
+    /// Security audit logging (rmp #70). **Disabled by default**; when enabled, every
+    /// security-relevant event (auth outcomes, authorization denials, admin/schema/security/data
+    /// changes) is written to a crash-safe, append-only JSONL log at `<store_path>/audit.log` (or
+    /// the configured override). Security-critical deployments enable it — see [`AuditConfig`].
+    pub audit: AuditConfig,
+
     /// **Escape hatch (default `false`):** allow a network listener (Bolt-TCP / REST) to run
     /// **without TLS**. Off by default so production is TLS-mandatory (`04 §8.4`); intended for
     /// loopback test harnesses and trusted-network/dev setups. The name is deliberately alarming so
@@ -296,6 +304,7 @@ impl Default for ServerConfig {
             jwt_secret: DEFAULT_INSECURE_JWT_SECRET.to_owned(),
             auth: AuthBootstrap::default(),
             encryption: EncryptionConfig::default(),
+            audit: AuditConfig::default(),
             allow_insecure_network: false,
         }
     }
@@ -478,6 +487,7 @@ impl ServerConfig {
 
         self.tls.validate("tls")?;
         self.encryption.validate()?;
+        self.audit.validate().map_err(ConfigError::Invalid)?;
 
         let network_listener = self.bolt_tcp_addr.is_some() || self.rest_addr.is_some();
         if network_listener && !self.tls.is_enabled() && !self.allow_insecure_network {
@@ -822,6 +832,55 @@ mod tests {
         };
         cfg.normalize();
         assert_eq!(cfg.advertised_bolt_address, None);
+    }
+
+    #[test]
+    fn audit_config_validates() {
+        // An enabled audit with an explicitly-empty path is rejected (likely a typo).
+        let cfg = ServerConfig {
+            audit: AuditConfig {
+                enabled: true,
+                path: Some(PathBuf::new()),
+                ..AuditConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        // Rotation enabled but zero retained files is rejected.
+        let cfg = ServerConfig {
+            audit: AuditConfig {
+                enabled: true,
+                rotate_max_bytes: 1024,
+                retain_files: 0,
+                ..AuditConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        // A sane enabled audit validates (UDS-only so no TLS/secret needed).
+        let cfg = ServerConfig {
+            audit: AuditConfig {
+                enabled: true,
+                ..AuditConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(cfg.validate().is_ok(), "a sane enabled audit validates");
+        assert!(
+            !ServerConfig::default().audit.enabled,
+            "audit is off by default"
+        );
     }
 
     #[test]
