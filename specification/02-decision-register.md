@@ -56,6 +56,15 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 3. **D-graph-algos → full library.** A complete graph-algorithms library plus an in-memory projection
    engine is committed as a dedicated workstream (its own phase), in addition to the ACID/TCK core.
 
+> **Post-ratification note (2026-06-12) — `D-v1-index-types`.** The ratified outcome remains
+> **option (a)** (token-lookup + range/B-tree + composite incl. relationship-property), and the v1
+> index baseline is **not** re-ratified. The **full-text** capability of option (b) was nevertheless
+> **delivered early by rmp #72**, ahead of its Phase-2 schedule, in the same manner as the other
+> Phase-2 capabilities already shipped in this codebase without re-baselining (encryption at rest,
+> fine-grained RBAC, and incremental backup + PITR). It is specified in `04-technical-design.md` §6.7
+> and tracked as `FR-IX-7` (still `[ADV]`); it adds a capability without altering the four-kind core
+> set that option (a) ratifies.
+
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 
 The "100% Cypher TCK" target is pinned to the **openCypher `2024.3`** tag (commit `677cbaf`,

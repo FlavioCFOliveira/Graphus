@@ -221,7 +221,12 @@ format: **Bolt over UDS**, **Bolt over TCP**, and the **Web REST API**.
 - **FR-IX-4** [CORE] **Relationship-property index** (type + property), required for a multigraph engine.
 - **FR-IX-5** [CORE] **Index-backed lookups:** the planner rewrites `MATCH`+`WHERE` to index seeks.
 - **FR-IX-6** [ADV] **Online/concurrent index build** (no write blocking).
-- **FR-IX-7** [ADV] **Full-text index** (analyzers; phrase/fuzzy/boolean queries).
+- **FR-IX-7** [ADV] **Full-text index** (analyzers; phrase/fuzzy/boolean queries). **Delivered
+  (rmp #72)** ahead of Phase 2: standard/keyword analyzers, an ephemeral inverted index rebuilt from
+  the store on open, a durable name-keyed catalog, online Populating→Online build, MVCC + RBAC
+  filtering, the `db.index.fulltext.queryNodes` procedure, and the `CREATE`/`DROP`/`SHOW FULLTEXT
+  INDEX` DDL; specified in `04-technical-design.md` §6.7. (Tier stays `[ADV]`; the v1 index baseline
+  is unchanged.)
 - **FR-IX-8** [ADV] **Point/spatial index** (distance, bounding-box).
 - **FR-IX-9** [ADV] **Vector/similarity index** (ANN/HNSW) — decision `D-vector-index`.
 - **FR-IX-10** [ADV] **Index hints** (`USING INDEX`).

@@ -418,6 +418,28 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         )
     }
 
+    fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {
+        let ids = self.inner.fulltext_query(name, search)?;
+        if self.oracle.is_unrestricted() {
+            return Some(ids);
+        }
+        // A full-text query is a read path (`rmp` task #72): filter the candidate ids exactly like a
+        // scan, so an RBAC-invisible node never reaches the result. The procedure body additionally
+        // re-checks each candidate's current label through this same decorator, so the two filters
+        // compose (visibility + label + RBAC).
+        Some(
+            ids.into_iter()
+                .filter(|&id| self.node_visible(id))
+                .collect(),
+        )
+    }
+
+    fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {
+        // The score is advisory and only ever requested for an already-visible candidate (the
+        // procedure filters first), so forwarding to the inner seam is sufficient.
+        self.inner.fulltext_score(name, node, search)
+    }
+
     // ---- writes ----------------------------------------------------------------------------------
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {

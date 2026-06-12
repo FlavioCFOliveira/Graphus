@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 use graphus_bufpool::BufferPool;
 use graphus_core::{TxnId, Value};
+use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
 use graphus_index::{BTree, PropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
@@ -79,6 +80,11 @@ pub struct IndexSet {
     /// [`online_node_properties`](Self::online_node_properties) so the planner never routes a seek to a
     /// half-built index — it falls back to a label-scan + filter until the index is promoted `Online`.
     node_props: HashMap<(u32, u32), NodePropertyIndex>,
+    /// Declared **full-text** indexes (`rmp` task #72), keyed by their server-unique **name**. Each
+    /// value carries the covered label, the covered property keys, the analyzer, the build state and
+    /// the in-memory [`InvertedIndex`]. Like the property indexes the inverted index is **ephemeral**
+    /// (rebuilt from the store on open); only the *registration* is durable (the storage catalog).
+    fulltext: HashMap<String, FulltextEntry>,
 }
 
 /// A declared node-property index plus its durable build [`IndexState`] (`rmp` task #90).
@@ -90,6 +96,23 @@ struct NodePropertyIndex {
     state: IndexState,
 }
 
+/// A declared full-text index plus its build [`IndexState`] and the in-memory inverted index
+/// (`rmp` task #72). The `label_token` + `prop_keys` + `analyzer` mirror the durable catalog entry;
+/// the `index` is ephemeral (rebuilt from the store on open).
+struct FulltextEntry {
+    /// The label-namespace token the index covers.
+    label_token: u32,
+    /// The property-key tokens the index covers, in declared order (one or more).
+    prop_keys: Vec<u32>,
+    /// The analyzer applied at both index time and query time (same instance, by construction).
+    analyzer: Analyzer,
+    /// The build state, mirrored from the durable catalog. A [`IndexState::Populating`] index is
+    /// maintained but not yet "complete"; a query still works against it (candidate-set contract).
+    state: IndexState,
+    /// The backing in-memory inverted index (term → sorted postings + forward map).
+    index: InvertedIndex,
+}
+
 impl IndexSet {
     /// An empty index set: a single label [`TokenIndex`] (always present, auto-maintained) and no
     /// property indexes yet.
@@ -98,6 +121,7 @@ impl IndexSet {
         Self {
             labels: TokenIndex::new(fresh_tree()),
             node_props: HashMap::new(),
+            fulltext: HashMap::new(),
         }
     }
 
@@ -170,6 +194,11 @@ impl IndexSet {
         self.labels = TokenIndex::new(fresh_tree());
         for np in self.node_props.values_mut() {
             np.index = PropertyIndex::new(fresh_tree());
+        }
+        // Full-text indexes: drop the inverted-index entries but keep the registration + state
+        // (`rmp` task #72), mirroring the node-property handling.
+        for ft in self.fulltext.values_mut() {
+            ft.index.clear();
         }
     }
 
@@ -342,6 +371,198 @@ impl IndexSet {
             .collect();
         keys.sort_unstable();
         keys
+    }
+
+    // ============================================================================================
+    // Full-text indexes (`rmp` task #72)
+    // ============================================================================================
+
+    /// Declares (or replaces) a full-text index named `name` over `(label_token, prop_keys)` with
+    /// `analyzer`, at `state` (`rmp` task #72). Idempotent on the name: re-declaring **replaces** the
+    /// entry (covered label/properties/analyzer and state) and **resets** its inverted index, so a
+    /// recovered declaration starts from a clean, about-to-be-rebuilt index.
+    ///
+    /// # Panics
+    /// Panics if `prop_keys` is empty (a full-text index covers at least one property — the surface
+    /// and the durable catalog both enforce this before reaching here).
+    pub fn register_fulltext(
+        &mut self,
+        name: &str,
+        label_token: u32,
+        prop_keys: Vec<u32>,
+        analyzer: Analyzer,
+        state: IndexState,
+    ) {
+        assert!(
+            !prop_keys.is_empty(),
+            "full-text index needs at least one property"
+        );
+        self.fulltext.insert(
+            name.to_owned(),
+            FulltextEntry {
+                label_token,
+                prop_keys,
+                analyzer,
+                state,
+                index: InvertedIndex::new(),
+            },
+        );
+    }
+
+    /// Sets the build [`IndexState`] of the full-text index named `name` (`rmp` task #72), e.g.
+    /// promoting `Populating` → `Online`. A no-op if no such index is registered.
+    pub fn set_fulltext_state(&mut self, name: &str, state: IndexState) {
+        if let Some(ft) = self.fulltext.get_mut(name) {
+            ft.state = state;
+        }
+    }
+
+    /// Unregisters the full-text index named `name`, dropping its inverted index (`rmp` task #72,
+    /// `DROP INDEX`). A no-op if no such index is registered.
+    pub fn unregister_fulltext(&mut self, name: &str) {
+        self.fulltext.remove(name);
+    }
+
+    /// Whether a full-text index named `name` is registered (in any state).
+    #[must_use]
+    pub fn has_fulltext(&self, name: &str) -> bool {
+        self.fulltext.contains_key(name)
+    }
+
+    /// The build [`IndexState`] of the full-text index named `name`, or [`None`] if unregistered.
+    #[must_use]
+    pub fn fulltext_state(&self, name: &str) -> Option<IndexState> {
+        self.fulltext.get(name).map(|ft| ft.state)
+    }
+
+    /// The covered `(label_token, prop_keys, analyzer)` of the full-text index named `name`, or
+    /// [`None`] if unregistered. The coordinator's rebuild/maintenance uses this to know which
+    /// property values to analyze for a node.
+    #[must_use]
+    pub fn fulltext_target(&self, name: &str) -> Option<(u32, Vec<u32>, Analyzer)> {
+        self.fulltext
+            .get(name)
+            .map(|ft| (ft.label_token, ft.prop_keys.clone(), ft.analyzer))
+    }
+
+    /// The registered full-text index names (in any state), ascending. Used by the coordinator's
+    /// rebuild to know which indexes to repopulate and by `SHOW FULLTEXT INDEXES`.
+    #[must_use]
+    pub fn registered_fulltext(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.fulltext.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// All full-text indexes that cover `label_token`, as `(name, prop_keys, analyzer)`, ascending by
+    /// name (`rmp` task #72). The coordinator's per-write maintenance uses this: for each index a
+    /// written node's label matches, it re-analyzes the node's covered property values.
+    #[must_use]
+    pub fn fulltext_indexes_for_label(
+        &self,
+        label_token: u32,
+    ) -> Vec<(String, Vec<u32>, Analyzer)> {
+        let mut out: Vec<(String, Vec<u32>, Analyzer)> = self
+            .fulltext
+            .iter()
+            .filter(|(_, ft)| ft.label_token == label_token)
+            .map(|(name, ft)| (name.clone(), ft.prop_keys.clone(), ft.analyzer))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Indexes (or **re-indexes**) `node_id` in the full-text index named `name` with `terms` (the
+    /// node's already-analyzed covered text). Replaces the node's previous terms wholesale; an empty
+    /// `terms` removes the node from the index. A no-op if no such index is registered.
+    pub fn index_fulltext_document(&mut self, name: &str, node_id: u64, terms: &[String]) {
+        if let Some(ft) = self.fulltext.get_mut(name) {
+            ft.index.index_document(node_id, terms);
+        }
+    }
+
+    /// Removes `node_id` from the full-text index named `name` (a delete, or a node that lost the
+    /// covered label). A no-op if no such index is registered.
+    pub fn remove_fulltext_document(&mut self, name: &str, node_id: u64) {
+        if let Some(ft) = self.fulltext.get_mut(name) {
+            ft.index.remove_document(node_id);
+        }
+    }
+
+    /// Re-derives `node_id`'s entries in **every** registered full-text index from the node's current
+    /// label tokens and string property values (`rmp` task #72). The single maintenance entry point
+    /// the coordinator drives per write, mirroring [`insert_node_property`](Self::insert_node_property)
+    /// for the property indexes.
+    ///
+    /// For each full-text index: if `label_tokens` contains the index's covered label, the node's
+    /// covered property values (the `(prop_key, text)` pairs in `string_props` whose key the index
+    /// covers, **in the index's declared property order**) are concatenated, analyzed with the
+    /// index's analyzer, and the document is (re-)indexed — replacing the node's previous terms
+    /// wholesale (so an update is reflected). If the node does **not** carry the covered label (e.g.
+    /// the label was just removed), the node is **removed** from that index. A non-string covered
+    /// property is skipped (a full-text index covers text); a node with no covered text is removed.
+    pub fn reindex_fulltext_node(
+        &mut self,
+        node_id: u64,
+        label_tokens: &[u32],
+        string_props: &[(u32, String)],
+    ) {
+        // Collect the work first (immutable borrows) so the mutable per-index calls do not alias.
+        let names: Vec<String> = self.fulltext.keys().cloned().collect();
+        for name in names {
+            let Some(ft) = self.fulltext.get(&name) else {
+                continue;
+            };
+            if !label_tokens.contains(&ft.label_token) {
+                // The node does not (or no longer) carries the covered label: drop it from this index.
+                self.fulltext
+                    .get_mut(&name)
+                    .expect("index present")
+                    .index
+                    .remove_document(node_id);
+                continue;
+            }
+            // Gather the covered text in the index's declared property order, then analyze it.
+            let analyzer = ft.analyzer;
+            let prop_keys = ft.prop_keys.clone();
+            let mut terms: Vec<String> = Vec::new();
+            for pk in &prop_keys {
+                if let Some((_, text)) = string_props.iter().find(|(k, _)| k == pk) {
+                    terms.extend(analyzer.analyze(text));
+                }
+            }
+            self.fulltext
+                .get_mut(&name)
+                .expect("index present")
+                .index
+                .index_document(node_id, &terms);
+        }
+    }
+
+    /// Analyzes `search` with the analyzer of the full-text index named `name` and returns the
+    /// **candidate** node ids matching it under `semantics`, ascending (`rmp` task #72). [`None`] if
+    /// no such index is registered. The caller re-checks visibility, the current label, and the
+    /// current text against the transaction snapshot (the candidate-set contract).
+    #[must_use]
+    pub fn query_fulltext(
+        &self,
+        name: &str,
+        search: &str,
+        semantics: MatchSemantics,
+    ) -> Option<Vec<u64>> {
+        let ft = self.fulltext.get(name)?;
+        let terms = ft.analyzer.analyze(search);
+        Some(ft.index.query(&terms, semantics))
+    }
+
+    /// The per-distinct-term overlap **score** of `node_id` against `search` for the full-text index
+    /// named `name`, using the index's analyzer (`rmp` task #72). [`None`] if unregistered. A
+    /// best-effort relevance score (see [`InvertedIndex::score`]).
+    #[must_use]
+    pub fn fulltext_score(&self, name: &str, node_id: u64, search: &str) -> Option<u64> {
+        let ft = self.fulltext.get(name)?;
+        let terms = ft.analyzer.analyze(search);
+        Some(ft.index.score(node_id, &terms))
     }
 
     /// All candidate ids for `token` in `idx`, regardless of value. Used as the correct
@@ -691,5 +912,126 @@ mod tests {
             set.seek_node_property_eq(1, 2, &Value::Integer(5)),
             Some(Vec::<u64>::new())
         );
+    }
+
+    // ---- full-text (`rmp` task #72) --------------------------------------------------------
+
+    #[test]
+    fn fulltext_register_index_query_and_state() {
+        let mut set = IndexSet::new();
+        assert!(!set.has_fulltext("ft"));
+        set.register_fulltext("ft", 1, vec![5, 6], Analyzer::Standard, IndexState::Online);
+        assert!(set.has_fulltext("ft"));
+        assert_eq!(set.fulltext_state("ft"), Some(IndexState::Online));
+        assert_eq!(
+            set.fulltext_target("ft"),
+            Some((1, vec![5, 6], Analyzer::Standard))
+        );
+        assert_eq!(set.registered_fulltext(), vec!["ft".to_owned()]);
+
+        // Index documents through the SAME analyzer used at query time.
+        let terms_a = Analyzer::Standard.analyze("The Quick Brown Fox");
+        let terms_b = Analyzer::Standard.analyze("A slow brown bear");
+        set.index_fulltext_document("ft", 100, &terms_a);
+        set.index_fulltext_document("ft", 200, &terms_b);
+
+        // OR query "brown" -> both; "fox" -> only 100.
+        assert_eq!(
+            set.query_fulltext("ft", "brown", MatchSemantics::Or),
+            Some(vec![100, 200])
+        );
+        assert_eq!(
+            set.query_fulltext("ft", "FOX", MatchSemantics::Or),
+            Some(vec![100])
+        );
+        // A stop-word-only search matches nothing.
+        assert_eq!(
+            set.query_fulltext("ft", "the a", MatchSemantics::Or),
+            Some(Vec::<u64>::new())
+        );
+        // Unregistered index -> None.
+        assert_eq!(set.query_fulltext("nope", "x", MatchSemantics::Or), None);
+    }
+
+    #[test]
+    fn fulltext_update_delete_and_unregister() {
+        let mut set = IndexSet::new();
+        set.register_fulltext("ft", 1, vec![5], Analyzer::Standard, IndexState::Populating);
+        set.index_fulltext_document("ft", 100, &Analyzer::Standard.analyze("graph database"));
+        assert_eq!(
+            set.query_fulltext("ft", "database", MatchSemantics::Or),
+            Some(vec![100])
+        );
+
+        // Update: re-index with new text replaces the old terms wholesale.
+        set.index_fulltext_document("ft", 100, &Analyzer::Standard.analyze("graph theory"));
+        assert_eq!(
+            set.query_fulltext("ft", "database", MatchSemantics::Or),
+            Some(Vec::<u64>::new())
+        );
+        assert_eq!(
+            set.query_fulltext("ft", "theory", MatchSemantics::Or),
+            Some(vec![100])
+        );
+
+        // Delete the document.
+        set.remove_fulltext_document("ft", 100);
+        assert_eq!(
+            set.query_fulltext("ft", "graph", MatchSemantics::Or),
+            Some(Vec::<u64>::new())
+        );
+
+        // Promote then unregister.
+        set.set_fulltext_state("ft", IndexState::Online);
+        assert_eq!(set.fulltext_state("ft"), Some(IndexState::Online));
+        set.unregister_fulltext("ft");
+        assert!(!set.has_fulltext("ft"));
+        assert_eq!(set.query_fulltext("ft", "graph", MatchSemantics::Or), None);
+    }
+
+    #[test]
+    fn fulltext_indexes_for_label_filters_by_label_token() {
+        let mut set = IndexSet::new();
+        set.register_fulltext("a", 1, vec![5], Analyzer::Standard, IndexState::Online);
+        set.register_fulltext("b", 1, vec![6], Analyzer::Keyword, IndexState::Online);
+        set.register_fulltext("c", 2, vec![7], Analyzer::Standard, IndexState::Online);
+        let for_1 = set.fulltext_indexes_for_label(1);
+        assert_eq!(for_1.len(), 2);
+        assert_eq!(for_1[0].0, "a");
+        assert_eq!(for_1[1].0, "b");
+        assert_eq!(set.fulltext_indexes_for_label(2).len(), 1);
+        assert_eq!(set.fulltext_indexes_for_label(9).len(), 0);
+    }
+
+    #[test]
+    fn fulltext_clear_preserves_registration_drops_entries() {
+        let mut set = IndexSet::new();
+        set.register_fulltext("ft", 1, vec![5], Analyzer::Standard, IndexState::Online);
+        set.index_fulltext_document("ft", 100, &Analyzer::Standard.analyze("graph"));
+        set.clear();
+        // Registration + state survive; entries are gone.
+        assert!(set.has_fulltext("ft"));
+        assert_eq!(set.fulltext_state("ft"), Some(IndexState::Online));
+        assert_eq!(
+            set.query_fulltext("ft", "graph", MatchSemantics::Or),
+            Some(Vec::<u64>::new())
+        );
+    }
+
+    #[test]
+    fn fulltext_score_uses_index_analyzer() {
+        let mut set = IndexSet::new();
+        set.register_fulltext("ft", 1, vec![5], Analyzer::Standard, IndexState::Online);
+        set.index_fulltext_document(
+            "ft",
+            100,
+            &Analyzer::Standard.analyze("graph database fast"),
+        );
+        // "graph database slow" overlaps on 2 distinct terms.
+        assert_eq!(
+            set.fulltext_score("ft", 100, "graph database slow"),
+            Some(2)
+        );
+        assert_eq!(set.fulltext_score("nope", 100, "x"), None);
     }
 }

@@ -164,6 +164,9 @@ pub use executor::{
     CancellationToken, Cursor, ExecError, Executor, execute, execute_with_procedures,
 };
 pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId};
+/// The full-text [`Analyzer`](graphus_index::fulltext::Analyzer) (`rmp` task #72), re-exported so the
+/// server's index-DDL surface can validate / name analyzers without a direct `graphus-index` dep.
+pub use graphus_index::fulltext::Analyzer;
 pub use index_set::IndexSet;
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use logical::{

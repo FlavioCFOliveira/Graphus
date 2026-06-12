@@ -2192,9 +2192,14 @@ impl<'t, 's> Parser<'t, 's> {
     /// in a `StandaloneCall`); when `false`, parentheses are required (`ExplicitProcedureInvocation`).
     fn parse_procedure_call(&mut self, allow_implicit: bool) -> Result<ProcedureCall, SyntaxError> {
         let start = self.here_span().start;
-        let mut name = vec![self.parse_symbolic_name("a procedure name")?];
+        // A procedure name's segments accept a `SchemaName` (a `SymbolicName` **or** a reserved
+        // word), not just a plain identifier, so a namespaced procedure whose segment collides with a
+        // Cypher keyword parses — e.g. Neo4j's `db.index.fulltext.queryNodes` (`index` is a keyword).
+        // This mirrors how labels / property keys already accept keyword spellings
+        // ([`parse_schema_name`]) and matches the driver-ecosystem procedure names (`rmp` task #72).
+        let mut name = vec![self.parse_schema_name("a procedure name")?];
         while self.eat(&TokenKind::Dot) {
-            name.push(self.parse_symbolic_name("a procedure name segment after '.'")?);
+            name.push(self.parse_schema_name("a procedure name segment after '.'")?);
         }
 
         if self.at(&TokenKind::LParen) {

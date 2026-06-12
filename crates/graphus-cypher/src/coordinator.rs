@@ -44,9 +44,10 @@ use std::rc::Rc;
 use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Timestamp, TxnId};
+use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
-use graphus_storage::{IndexState, Namespace, RecordStore};
+use graphus_storage::{FulltextIndexEntry, IndexState, Namespace, RecordStore};
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
 use graphus_wal::LogSink;
 
@@ -83,6 +84,21 @@ struct PendingIndexBuild {
     cursor: usize,
 }
 
+/// One in-progress **non-blocking** full-text index build (`rmp` task #72), the analogue of
+/// [`PendingIndexBuild`] for the inverted index. Indexes the `snapshot` nodes a bounded chunk at a
+/// time, then promotes the named full-text index to [`IndexState::Online`]. The same candidate-set
+/// argument applies: writes after the snapshot are maintained by
+/// [`RecordStoreGraph::reindex_node`] and deletes are dropped by the query-time re-check, so the
+/// snapshot only needs to cover the rows that already existed at build start.
+struct PendingFulltextBuild {
+    /// The server-unique name of the full-text index being built.
+    name: String,
+    /// The node-id list captured at build start.
+    snapshot: Vec<u64>,
+    /// The next index into `snapshot` to process; complete once `cursor >= snapshot.len()`.
+    cursor: usize,
+}
+
 /// Drives concurrent, serializable Cypher transactions over one shared [`RecordStore`] (`04 §5`).
 pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The one shared store, behind `Rc<RefCell<…>>` so each statement seam borrows it for the
@@ -108,6 +124,10 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// front build is the one currently being populated; each completes (durably promoted to
     /// [`IndexState::Online`]) before the next starts, so the queue is processed in declaration order.
     pending_builds: VecDeque<PendingIndexBuild>,
+    /// Queue of in-progress **non-blocking** full-text index builds (`rmp` task #72), the analogue of
+    /// [`pending_builds`](Self#structfield.pending_builds) for the inverted index, advanced by
+    /// [`advance_index_builds`](Self::advance_index_builds) alongside the node-property builds.
+    pending_fulltext_builds: VecDeque<PendingFulltextBuild>,
 }
 
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
@@ -148,6 +168,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             active: HashMap::new(),
             next_txn_id,
             pending_builds: VecDeque::new(),
+            pending_fulltext_builds: VecDeque::new(),
         }
     }
 
@@ -175,7 +196,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .filter(|(_, _, state)| *state == IndexState::Populating)
             .map(|(label_token, prop_key, _)| (label_token, prop_key))
             .collect();
-        if populating.is_empty() {
+        // Full-text indexes left `Populating` by an interrupted `rmp` task #72 build are promoted the
+        // same way — the rebuild above has already fully repopulated their inverted index from the
+        // recovered store, so the durable state just needs to catch up.
+        let populating_fulltext: Vec<(String, FulltextIndexEntry)> = store
+            .borrow()
+            .fulltext_indexes()
+            .into_iter()
+            .filter(|(_, entry)| entry.state == IndexState::Populating)
+            .collect();
+        if populating.is_empty() && populating_fulltext.is_empty() {
             return next_txn_id;
         }
 
@@ -186,6 +216,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             for &(label_token, prop_key) in &populating {
                 store.set_node_property_index(label_token, prop_key, IndexState::Online);
             }
+            for (name, entry) in &populating_fulltext {
+                store.set_fulltext_index(
+                    name.clone(),
+                    FulltextIndexEntry {
+                        state: IndexState::Online,
+                        ..entry.clone()
+                    },
+                );
+            }
         }
         if store.borrow_mut().commit(txn).is_err() {
             // Could not make the promotion durable; leave the indexes `Populating` (still correct via
@@ -195,6 +234,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let mut idx = index.borrow_mut();
         for (label_token, prop_key) in populating {
             idx.set_node_property_state(label_token, prop_key, IndexState::Online);
+        }
+        for (name, _) in populating_fulltext {
+            idx.set_fulltext_state(&name, IndexState::Online);
         }
         next_txn_id + 1
     }
@@ -237,6 +279,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Recover the durable full-text index catalog (`rmp` task #72) the same way: register each
+        // declared index in the in-memory set (analyzer + covered label/properties), so the rebuild
+        // scan below populates its inverted index. An entry whose analyzer byte is unknown
+        // (forward-incompatible) is skipped defensively — its inverted index stays empty and the
+        // procedure surface returns no matches rather than mis-analyzing.
+        let durable_fulltext: Vec<(String, FulltextIndexEntry)> = store.borrow().fulltext_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (name, entry) in durable_fulltext {
+                let Some(analyzer) = Analyzer::from_byte(entry.analyzer) else {
+                    continue;
+                };
+                idx.register_fulltext(
+                    &name,
+                    entry.label_token,
+                    entry.property_tokens,
+                    analyzer,
+                    entry.state,
+                );
+            }
+        }
+
         index.borrow_mut().clear();
 
         // The set of registered node-property indexes (any state), captured before walking the store so
@@ -252,8 +316,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Err(_) => return,
         };
 
+        let has_fulltext = !index.borrow().registered_fulltext().is_empty();
         for id in node_ids {
             Self::index_one_node(store, index, id, &registered);
+            // Repopulate the full-text inverted indexes from the same scan (`rmp` task #72), so a
+            // recovered store rebuilds them store-consistently — only when at least one is declared.
+            if has_fulltext {
+                Self::index_one_node_fulltext(store, index, id);
+            }
         }
     }
 
@@ -315,6 +385,50 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             }
         }
+    }
+
+    /// Re-indexes node `id` in **every** registered full-text index from its current label tokens and
+    /// **string** property values (`rmp` task #72). The full-text analogue of
+    /// [`index_one_node`](Self::index_one_node): the same single per-node code path the full rebuild
+    /// ([`rebuild_index`](Self::rebuild_index)) and the non-blocking full-text build
+    /// ([`advance_index_builds`](Self::advance_index_builds)) both drive, so their per-node logic can
+    /// never diverge.
+    ///
+    /// Unlike `index_one_node` it reads **all** of the node's string property values (not just those a
+    /// registered property index uses), because which properties a full-text index covers is a
+    /// per-index decision the [`IndexSet`] applies; the value class is filtered to strings here (a
+    /// full-text index covers text). The store and the index are borrowed in **separate,
+    /// non-overlapping** scopes, the load-bearing discipline of this file. A read fault on the node
+    /// skips it best-effort (the candidate-set contract: a missing candidate degrades to the
+    /// scan-and-filter fallback for that reader, never a wrong row).
+    fn index_one_node_fulltext(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+    ) {
+        let label_tokens = match store.borrow_mut().node_labels(id) {
+            Ok(tokens) => tokens,
+            Err(_) => return,
+        };
+        // The node's current string property values, keyed by prop-key (newest-wins per key).
+        let mut string_props: Vec<(u32, String)> = Vec::new();
+        {
+            let chain = match store.borrow_mut().node_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if string_props.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                if let graphus_core::Value::String(s) = value {
+                    string_props.push((key, s));
+                }
+            }
+        }
+        index
+            .borrow_mut()
+            .reindex_fulltext_node(id, &label_tokens, &string_props);
     }
 
     /// Begins a transaction at `isolation`, returning its [`TxnId`].
@@ -501,12 +615,152 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// Whether any non-blocking index build is still in progress (`rmp` task #91). The engine loop
+    /// Declares a **full-text index** named `name` over `(label, properties)` analyzed with
+    /// `analyzer`, **durably records it**, and starts a **non-blocking** background build of it
+    /// (`rmp` task #72) — the full-text analogue of
+    /// [`begin_online_node_property_index`](Self::begin_online_node_property_index).
+    ///
+    /// The label and property-key tokens are interned **durably** and the named catalog entry is
+    /// recorded as [`IndexState::Populating`] — both in one committed transaction, so the
+    /// *registration* survives a crash (an interrupted build recovers `Populating` and is completed by
+    /// the open-time rebuild). The index is registered in the in-memory [`IndexSet`] so concurrent
+    /// writes maintain it from now on, and a pending build is enqueued; **no node is scanned here**, so
+    /// the engine stays responsive. The build is advanced in bounded chunks by
+    /// [`advance_index_builds`](Self::advance_index_builds) and promoted to [`IndexState::Online`] only
+    /// when every snapshot node has been indexed.
+    ///
+    /// Re-declaring an existing name **replaces** it (a fresh build over the new label/properties).
+    ///
+    /// # Errors
+    /// Returns a storage error if `properties` is empty, interning any token, recording the catalog
+    /// entry, the committing transaction, or the initial snapshot scan fails. On any error the index
+    /// is left undeclared.
+    pub fn create_fulltext_index(
+        &mut self,
+        name: &str,
+        label: &str,
+        properties: &[String],
+        analyzer: Analyzer,
+    ) -> Result<()> {
+        if properties.is_empty() {
+            return Err(GraphusError::Storage(
+                "a full-text index must cover at least one property".to_owned(),
+            ));
+        }
+
+        // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
+        // one committed transaction (so the schema change survives a crash atomically).
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let entry = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let mut property_tokens = Vec::with_capacity(properties.len());
+            for property in properties {
+                match store.intern_token(Namespace::PropKey, property) {
+                    Ok(t) => property_tokens.push(t),
+                    Err(e) => {
+                        drop(store);
+                        let _ = self.store.borrow_mut().rollback(txn);
+                        return Err(e);
+                    }
+                }
+            }
+            let entry = FulltextIndexEntry {
+                label_token,
+                property_tokens,
+                analyzer: analyzer.as_byte(),
+                state: IndexState::Populating,
+            };
+            store.set_fulltext_index(name.to_owned(), entry.clone());
+            entry
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the index `Populating` in the in-memory set so concurrent writes maintain it.
+        self.index.borrow_mut().register_fulltext(
+            name,
+            entry.label_token,
+            entry.property_tokens,
+            analyzer,
+            IndexState::Populating,
+        );
+
+        // Cancel any prior pending build of the same name (a re-declare), then enqueue this one.
+        self.pending_fulltext_builds.retain(|b| b.name != name);
+        let snapshot = self.store.borrow_mut().scan_node_ids()?;
+        self.pending_fulltext_builds
+            .push_back(PendingFulltextBuild {
+                name: name.to_owned(),
+                snapshot,
+                cursor: 0,
+            });
+        Ok(())
+    }
+
+    /// Drops the full-text index named `name` (`rmp` task #72): removes its durable catalog entry in a
+    /// committed transaction, unregisters it from the in-memory [`IndexSet`], and cancels any
+    /// in-progress build. Idempotent on a never-declared name (a clean no-op success).
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_fulltext_index(&mut self, name: &str) -> Result<()> {
+        // A no-op when the index is not declared (avoids an empty committed transaction).
+        if self.store.borrow().fulltext_index(name).is_none() {
+            // Still cancel any in-flight build + in-memory registration defensively, then succeed.
+            self.pending_fulltext_builds.retain(|b| b.name != name);
+            self.index.borrow_mut().unregister_fulltext(name);
+            return Ok(());
+        }
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_fulltext_index(name);
+        self.store.borrow_mut().commit(txn)?;
+
+        self.pending_fulltext_builds.retain(|b| b.name != name);
+        self.index.borrow_mut().unregister_fulltext(name);
+        Ok(())
+    }
+
+    /// Lists every declared full-text index as `(name, label, properties, analyzer, state)`
+    /// (`rmp` task #72) for a `SHOW FULLTEXT INDEXES` surface. Reads the durable catalog and resolves
+    /// the tokens back to names; an entry whose tokens have no resolvable name (a defensively-skipped
+    /// impossibility for a live token) or an unknown analyzer byte is omitted. Ordered by name.
+    #[must_use]
+    pub fn list_fulltext_indexes(
+        &self,
+    ) -> Vec<(String, String, Vec<String>, Analyzer, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .fulltext_indexes()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                let mut properties = Vec::with_capacity(entry.property_tokens.len());
+                for pk in &entry.property_tokens {
+                    properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
+                }
+                let analyzer = Analyzer::from_byte(entry.analyzer)?;
+                Some((name, label.to_owned(), properties, analyzer, entry.state))
+            })
+            .collect()
+    }
+
+    /// Whether any non-blocking index build is still in progress (`rmp` task #91/#72). The engine loop
     /// uses this to decide between a plain blocking receive (no builds) and a timed receive that also
     /// drives the build between commands.
     #[must_use]
     pub fn has_pending_index_builds(&self) -> bool {
-        !self.pending_builds.is_empty()
+        !self.pending_builds.is_empty() || !self.pending_fulltext_builds.is_empty()
     }
 
     /// Advances the front non-blocking index build by up to `budget` nodes (`rmp` task #91), returning
@@ -524,8 +778,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// a positive chunk size). If the durable promotion commit fails, the build is left in place
     /// `Populating` (still correct via the scan fallback) to be retried on the next call/open.
     pub fn advance_index_builds(&mut self, budget: usize) -> bool {
+        // Drive a node-property build first if one is pending; otherwise a full-text build. Processing
+        // one queue per call keeps the per-call work bounded by `budget` for either kind.
+        if !self.pending_builds.is_empty() {
+            self.advance_node_property_build(budget);
+        } else {
+            self.advance_fulltext_build(budget);
+        }
+        self.has_pending_index_builds()
+    }
+
+    /// Advances the front **node-property** build by up to `budget` nodes (`rmp` task #91), promoting
+    /// + dequeuing it when complete.
+    fn advance_node_property_build(&mut self, budget: usize) {
         let Some(build) = self.pending_builds.front_mut() else {
-            return false;
+            return;
         };
 
         // Index up to `budget` nodes from the snapshot, starting at the cursor.
@@ -537,8 +804,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         build.cursor = end;
 
         if build.cursor < build.snapshot.len() {
-            // More of this build remains; nothing else is processed this call.
-            return true;
+            return; // more of this build remains.
         }
 
         // The front build's snapshot is fully indexed: promote it durably to `Online`, then dequeue.
@@ -550,15 +816,71 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .borrow_mut()
             .set_node_property_index(label_token, prop_key, IndexState::Online);
         if self.store.borrow_mut().commit(txn).is_err() {
-            // The durable flip failed; leave the build pending `Populating` and retry next call. The
-            // index stays withheld from the planner (correct, just unaccelerated) until then.
-            return true;
+            // The durable flip failed; leave the build pending `Populating` and retry next call.
+            return;
         }
         self.index
             .borrow_mut()
             .set_node_property_state(label_token, prop_key, IndexState::Online);
         self.pending_builds.pop_front();
-        !self.pending_builds.is_empty()
+    }
+
+    /// Advances the front **full-text** build by up to `budget` nodes (`rmp` task #72), promoting +
+    /// dequeuing it when complete. The full-text analogue of
+    /// [`advance_node_property_build`](Self::advance_node_property_build): each chunk re-indexes a
+    /// bounded number of snapshot nodes' text into the inverted index via the shared
+    /// [`index_one_node_fulltext`](Self::index_one_node_fulltext) helper, then on completion the named
+    /// catalog entry is durably flipped to [`IndexState::Online`].
+    fn advance_fulltext_build(&mut self, budget: usize) {
+        let Some(build) = self.pending_fulltext_builds.front_mut() else {
+            return;
+        };
+        let total = build.snapshot.len();
+        let end = total.min(build.cursor + budget);
+        let chunk: Vec<u64> = build.snapshot[build.cursor..end].to_vec();
+        let name = build.name.clone();
+        build.cursor = end;
+        let done = end >= total;
+
+        for id in chunk {
+            Self::index_one_node_fulltext(&self.store, &self.index, id);
+        }
+
+        if !done {
+            return; // more of this build remains.
+        }
+
+        // The snapshot is fully indexed: durably flip the catalog entry to `Online`, then dequeue.
+        // Read the current entry in its own scope so the store borrow is released before the write.
+        let entry = self.store.borrow().fulltext_index(&name);
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let promoted = if let Some(entry) = entry {
+            self.store.borrow_mut().set_fulltext_index(
+                name.clone(),
+                FulltextIndexEntry {
+                    state: IndexState::Online,
+                    ..entry
+                },
+            );
+            true
+        } else {
+            // The index was dropped mid-build; nothing to promote (the build will be dequeued).
+            false
+        };
+        if promoted {
+            if self.store.borrow_mut().commit(txn).is_err() {
+                // The durable flip failed; leave the build pending `Populating` and retry next call.
+                return;
+            }
+        } else {
+            let _ = self.store.borrow_mut().rollback(txn);
+        }
+        self.index
+            .borrow_mut()
+            .set_fulltext_state(&name, IndexState::Online);
+        self.pending_fulltext_builds.pop_front();
     }
 
     /// Drops the node-property index on `(label, property)` (`rmp` task #91): removes its durable

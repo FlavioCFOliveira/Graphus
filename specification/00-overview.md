@@ -76,7 +76,8 @@ Phase 1 correctness core:
 Out of scope for v1 (deferred — see `01-needs-survey.md` and the phased roadmap):
 
 - Clustering, replication, sharding, distributed transactions.
-- Full-text, spatial, and vector/similarity indexes.
+- Spatial and vector/similarity indexes. (The **full-text index** was a Phase-2 item but is
+  **delivered early — rmp #72**, see `04-technical-design.md` §6.7.)
 - Multiple databases / multi-tenancy (the catalog abstraction is designed in, not shipped).
 - User-defined functions/procedures and a plugin mechanism.
 - Fine-grained access control, encryption at rest, auditing (Phase 2).
@@ -122,9 +123,14 @@ Out of scope for v1 (deferred — see `01-needs-survey.md` and the phased roadma
 - **Phase 1 — Single-node correctness core:** the v1 scope in §3; the first solid deliverable,
   fully ACID, fully recoverable, targeting 100% TCK on the pinned snapshot.
 - **Phase 2 — Production hardening & ecosystem:** cost-based optimizer with statistics;
-  full-text/spatial indexes; online index builds; node-key/type constraints; online/hot and
+  full-text (**delivered early — rmp #72**, see `04-technical-design.md` §6.7) / spatial indexes;
+  online index builds; node-key/type constraints; online/hot and
   incremental backup + PITR; fine-grained access control, encryption at rest, auditing;
   UDFs/UDPs + extension mechanism; multi-database; visualization; full LDBC SNB.
+  > Several Phase-2 capabilities were delivered ahead of schedule without re-baselining v1:
+  > encryption at rest, fine-grained RBAC, incremental backup + PITR, and the **full-text index**
+  > (rmp #72). They remain part of the Phase-2 narrative; their early delivery does not change the
+  > v1 scope boundaries in §3.
 - **Graph-algorithms workstream (committed, dedicated phase):** a full GDS-style algorithms
   library and in-memory projection engine (`D-graph-algos`); may run in parallel after Phase 1.
 - **Phase 3 — Distribution & advanced analytics:** replication, read replicas, consensus,

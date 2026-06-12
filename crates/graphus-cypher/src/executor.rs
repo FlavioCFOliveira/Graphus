@@ -300,9 +300,12 @@ enum Operator {
         /// The argument expressions, evaluated per driving row (semantic analysis already resolved
         /// the implicit form to parameter expressions).
         args: Vec<Expr>,
-        /// The output bindings, resolved at build time: `(variable name, index into the
-        /// procedure's result row)`.
-        bindings: Vec<(String, usize)>,
+        /// The output bindings, resolved at build time: `(variable name, index into the procedure's
+        /// result row, is_node)`. `is_node` is `true` when the bound output column's declared class is
+        /// [`ValueClass::Node`](crate::procedure_registry::ValueClass::Node) (`rmp` task #72): the
+        /// yielded id [`Value`] is then bound as a structural [`RowValue::Node`] (so result egress
+        /// materializes it, composing MVCC + RBAC), instead of a plain [`RowValue::Value`].
+        bindings: Vec<(String, usize, bool)>,
         /// `true` when the signature declares no outputs (the void pass-through case).
         void: bool,
         /// The driving row plus its pending procedure result rows.
@@ -599,12 +602,22 @@ impl Operator {
                 if let Some((base, queue)) = current {
                     if let Some(out) = queue.pop_front() {
                         let mut row = base.clone();
-                        for (variable, idx) in bindings.iter() {
+                        for (variable, idx, is_node) in bindings.iter() {
                             // `idx` was resolved against the signature's outputs at build time and
                             // the registry contract aligns each result row with them, so a short
                             // row is a registry bug — surface `null` rather than panic.
                             let value = out.get(*idx).cloned().unwrap_or(Value::Null);
-                            row.set(variable.clone(), RowValue::Value(value));
+                            // A `NODE`-classed output (`rmp` task #72) carries the node id as a
+                            // `Value::Integer`; bind it as a structural `RowValue::Node` so result
+                            // egress materializes it (labels/properties through the same seam,
+                            // composing MVCC + RBAC). A `null` id (no node) stays a null cell.
+                            let cell = match (is_node, &value) {
+                                (true, Value::Integer(id)) => RowValue::Node(NodeRef {
+                                    id: NodeId(*id as u64),
+                                }),
+                                _ => RowValue::Value(value),
+                            };
+                            row.set(variable.clone(), cell);
                         }
                         return Ok(Some(row));
                     }
@@ -1272,7 +1285,10 @@ fn build_operator(
             // Resolve the output bindings once: `YIELD [field AS] var` columns by declared result
             // field, or — for the standalone / `YIELD *` form (`yields: None`) — every declared
             // output verbatim.
-            let bindings: Vec<(String, usize)> = match yields {
+            let is_node_output = |idx: usize| {
+                sig.outputs[idx].ty.class == crate::procedure_registry::ValueClass::Node
+            };
+            let bindings: Vec<(String, usize, bool)> = match yields {
                 Some(items) => {
                     let mut out = Vec::with_capacity(items.len());
                     for y in items {
@@ -1283,7 +1299,7 @@ fn build_operator(
                                 format!("YIELD names unknown result field `{field}`"),
                             )));
                         };
-                        out.push((y.variable.name.clone(), idx));
+                        out.push((y.variable.name.clone(), idx, is_node_output(idx)));
                     }
                     out
                 }
@@ -1291,7 +1307,7 @@ fn build_operator(
                     .outputs
                     .iter()
                     .enumerate()
-                    .map(|(i, o)| (o.name.clone(), i))
+                    .map(|(i, o)| (o.name.clone(), i, is_node_output(i)))
                     .collect(),
             };
             // The implicit form was resolved to parameter expressions by semantic analysis; a

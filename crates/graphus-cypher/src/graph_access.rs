@@ -195,6 +195,29 @@ pub trait GraphAccess {
         None
     }
 
+    /// A **full-text** index query (`rmp` task #72): the **candidate** node ids matching the
+    /// `search` string against the full-text index named `name`, analyzed with the index's own
+    /// analyzer (OR-of-terms by default).
+    ///
+    /// Returns `None` when **no full-text index of that name is declared** (the procedure surface
+    /// turns this into a `ProcedureFailure` so a typo is a clear error, not silently-empty results).
+    /// `Some(ids)` is a **candidate** set — the caller (the `db.index.fulltext.queryNodes` procedure)
+    /// re-checks each id's visibility and current label through this same seam, so a deleted /
+    /// invisible / re-labelled node never reaches the result, and (when this seam is an
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph)) RBAC composes for free. The
+    /// default returns `None` (no full-text index available).
+    fn fulltext_query(&self, _name: &str, _search: &str) -> Option<Vec<NodeId>> {
+        None
+    }
+
+    /// The **best-effort relevance score** of `node` against `search` for the full-text index named
+    /// `name` (`rmp` task #72): the count of distinct analyzed query terms the node contains. Returns
+    /// `None` when no such index is declared, or when the node is not in the index. Documented as a
+    /// simple term-overlap count, not TF-IDF/BM25. The default returns `None`.
+    fn fulltext_score(&self, _name: &str, _node: NodeId, _search: &str) -> Option<u64> {
+        None
+    }
+
     // ---- writes -------------------------------------------------------------------------------
 
     /// Creates a node with `labels` and `properties`, returning its new id.
@@ -311,6 +334,21 @@ pub struct MemGraph {
     rels: BTreeMap<RelId, MemRel>,
     next_node: u64,
     next_rel: u64,
+    /// Declared full-text indexes for executor/procedure tests (`rmp` task #72), keyed by name. The
+    /// reference implementation computes matches **on the fly** from the live nodes at query time
+    /// (re-analyzing the covered property text), so updates and deletes are reflected with no
+    /// maintenance hooks — exactly the candidate-set behaviour the real backend produces after its
+    /// per-write maintenance + MVCC re-check.
+    fulltext: BTreeMap<String, MemFulltextIndex>,
+}
+
+/// A declared full-text index in [`MemGraph`] (`rmp` task #72): the covered label, properties and
+/// analyzer. The reference impl holds no inverted index — it analyzes nodes lazily at query time.
+#[derive(Debug, Clone)]
+struct MemFulltextIndex {
+    label: String,
+    properties: Vec<String>,
+    analyzer: graphus_index::fulltext::Analyzer,
 }
 
 impl MemGraph {
@@ -352,6 +390,46 @@ impl MemGraph {
         let props: Vec<(String, Value)> =
             properties.into_iter().map(|(k, v)| (k.into(), v)).collect();
         self.create_rel(&rel_type.into(), start, end, &props)
+    }
+
+    /// Declares a full-text index named `name` over `(label, properties)` with `analyzer`
+    /// (`rmp` task #72; test/setup helper). The index computes matches lazily at query time, so it
+    /// immediately covers existing and future nodes. Re-declaring the same name replaces it.
+    pub fn create_fulltext_index<P, S>(
+        &mut self,
+        name: impl Into<String>,
+        label: impl Into<String>,
+        properties: P,
+        analyzer: graphus_index::fulltext::Analyzer,
+    ) where
+        P: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let properties: Vec<String> = properties.into_iter().map(Into::into).collect();
+        self.fulltext.insert(
+            name.into(),
+            MemFulltextIndex {
+                label: label.into(),
+                properties,
+                analyzer,
+            },
+        );
+    }
+
+    /// The analyzed terms of node `id`'s covered properties for the full-text index `idx`. The same
+    /// analyzer is applied here (index time) and in [`fulltext_query`](GraphAccess::fulltext_query)
+    /// (query time). Skips a non-string property value (a full-text index covers string text).
+    fn mem_fulltext_terms(&self, idx: &MemFulltextIndex, id: NodeId) -> Vec<String> {
+        let Some(node) = self.nodes.get(&id) else {
+            return Vec::new();
+        };
+        let mut terms = Vec::new();
+        for prop in &idx.properties {
+            if let Some(Value::String(text)) = node.props.get(prop) {
+                terms.extend(idx.analyzer.analyze(text));
+            }
+        }
+        terms
     }
 
     /// The number of live nodes.
@@ -460,6 +538,43 @@ impl GraphAccess for MemGraph {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         })
+    }
+
+    fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {
+        let idx = self.fulltext.get(name)?;
+        let query_terms = idx.analyzer.analyze(search);
+        if query_terms.is_empty() {
+            return Some(Vec::new());
+        }
+        // OR-of-terms over the live nodes carrying the index's label (the reference impl computes the
+        // candidate set directly from current state — updates/deletes are reflected automatically).
+        let mut out: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.labels.iter().any(|l| l == &idx.label))
+            .filter(|(id, _)| {
+                let terms = self.mem_fulltext_terms(idx, **id);
+                query_terms.iter().any(|q| terms.contains(q))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        out.sort_unstable();
+        Some(out)
+    }
+
+    fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {
+        let idx = self.fulltext.get(name)?;
+        let query_terms = idx.analyzer.analyze(search);
+        let doc_terms = self.mem_fulltext_terms(idx, node);
+        // Distinct-query-term overlap count (mirrors `InvertedIndex::score`).
+        let mut seen = std::collections::BTreeSet::new();
+        let mut score = 0u64;
+        for term in &query_terms {
+            if seen.insert(term) && doc_terms.contains(term) {
+                score += 1;
+            }
+        }
+        Some(score)
     }
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {

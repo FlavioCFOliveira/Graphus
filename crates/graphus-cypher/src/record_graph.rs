@@ -632,6 +632,16 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 .collect()
         };
 
+        // The node's current string property values, by prop-key token, for full-text maintenance
+        // (`rmp` task #72): a full-text index covers string text, so only string values participate.
+        let string_props: Vec<(u32, String)> = resolved_props
+            .iter()
+            .filter_map(|(prop_key, value)| match value {
+                Value::String(s) => Some((*prop_key, s.clone())),
+                _ => None,
+            })
+            .collect();
+
         // --- (re)insert the node's current entries into the index (index borrow only) ---
         let mut index = index.borrow_mut();
         for &lt in &label_tokens {
@@ -644,6 +654,12 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 }
             }
         }
+        // Full-text indexes are maintained by a wholesale per-node re-index (`rmp` task #72): each
+        // covering index replaces the node's terms with the freshly-analyzed current text, and a node
+        // that lost the covered label is removed. Unlike the property indexes (which tolerate stale
+        // candidates because the seek re-checks the value), the full-text inverted index removes the
+        // node's old terms here so a query never returns a node whose text no longer matches.
+        index.reindex_fulltext_node(node.0, &label_tokens, &string_props);
     }
 
     /// **Recomputes** (the `ANALYZE` path) the equi-depth value histogram for the node-label property
@@ -1263,6 +1279,39 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         out.sort_unstable();
         out.dedup();
         Some(out)
+    }
+
+    fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {
+        // Only the coordinated path carries the derived `IndexSet` that holds the full-text index
+        // (`rmp` task #72). Without one there is no full-text index at all, so `None` (the procedure
+        // turns that into a "no such full-text index" error).
+        let index = self.index.as_ref()?;
+        // The full-text index must be declared (by name). If it is not, return `None` so the
+        // procedure raises a clear error rather than silently empty results.
+        let (label_token, _props, _analyzer) = index.borrow().fulltext_target(name)?;
+
+        // SSI predicate footprint: a full-text query reads the candidate documents; preserve the same
+        // read footprint as the scan fallback would by marking every live node of the covered label
+        // (so the query and any future scan are indistinguishable to SSI, `04 §5.4`).
+        self.mark_all_live_nodes();
+
+        // Candidate ids from the inverted index (analyzed with the index's analyzer). Candidate-only,
+        // so re-check visibility + current label via `filter_label_candidates` (which also records the
+        // SIREAD markers). The inverted index is maintained on every write (`reindex_node`), so a
+        // surviving candidate's terms are the node's current committed/own-transaction text.
+        let candidates = index
+            .borrow()
+            .query_fulltext(name, search, graphus_index::fulltext::MatchSemantics::Or)
+            .unwrap_or_default();
+        let mut out = self.filter_label_candidates(label_token, candidates);
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {
+        let index = self.index.as_ref()?;
+        index.borrow().fulltext_score(name, node.0, search)
     }
 
     // ---- writes -------------------------------------------------------------------------------

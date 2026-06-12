@@ -29,6 +29,11 @@
 //! DROP   INDEX ON :<Label>(<property>)                     -- (and the FOR … ON … form)
 //! DROP   INDEX FOR (<var>:<Label>) ON (<var>.<property>)
 //! SHOW   INDEXES
+//!
+//! CREATE FULLTEXT INDEX <name> FOR (<var>:<Label>) ON EACH [<var>.<prop>, …]
+//!                                                  [OPTIONS { analyzer: '<analyzer>' }]   -- rmp #72
+//! DROP   FULLTEXT INDEX <name>
+//! SHOW   FULLTEXT INDEXES
 //! ```
 //!
 //! The matcher claims a statement **only** when its first two tokens are exactly an admin verb
@@ -511,6 +516,16 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         };
     }
 
+    // --- Full-text index surface (`rmp` task #72): CREATE/DROP/SHOW FULLTEXT INDEX(ES) … ---
+    // The third token must be INDEX/INDEXES; `FULLTEXT` alone is never valid Cypher, so the statement
+    // is CLAIMED once the verb + FULLTEXT prefix is seen.
+    if is_keyword(&second, "FULLTEXT") {
+        return match parse_claimed_fulltext(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
     // --- Index surface (`rmp` task #91) ---
     if is_keyword(&second, "INDEX") || is_keyword(&second, "INDEXES") {
         let plural = is_keyword(&second, "INDEXES");
@@ -638,6 +653,150 @@ fn parse_property_ref(verb: &str, lex: &mut Lexer<'_>) -> Result<String, String>
             "expected `variable.property` after {verb} INDEX FOR (n:Label) ON (got `{head}`)"
         )),
     }
+}
+
+/// Parses the remainder of a claimed **full-text** index statement (`verb` + `FULLTEXT` already
+/// read), for the three shapes (`rmp` task #72):
+///
+/// ```text
+/// CREATE FULLTEXT INDEX <name> FOR (<var>:<Label>) ON EACH [<var>.<prop>, …]
+///                                                          [OPTIONS { analyzer: '<analyzer>' }]
+/// DROP   FULLTEXT INDEX <name>
+/// SHOW   FULLTEXT INDEXES
+/// ```
+///
+/// A full-text index is identified by **name** (Neo4j-compatible), unlike a node-property index
+/// (`(label, property)`). The `OPTIONS { analyzer: '<name>' }` clause is optional; the analyzer name
+/// is validated by the engine (`standard` / `keyword`), `standard` by default. `ON EACH [ … ]` lists
+/// one or more `<var>.<property>` references (the `<var>` text is irrelevant — single-variable shape).
+fn parse_claimed_fulltext(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    // The next token must be INDEX (CREATE/DROP) or INDEXES (SHOW). `FULLTEXT` alone never reaches
+    // Cypher, so a wrong follower is an admin syntax error.
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected INDEX or INDEXES after {verb} FULLTEXT"))?;
+    let plural = is_keyword(&kw, "INDEXES");
+    if !is_keyword(&kw, "INDEX") && !plural {
+        return Err(unexpected_generic(
+            &kw,
+            &format!("INDEX or INDEXES after {verb} FULLTEXT"),
+        ));
+    }
+
+    if plural {
+        // SHOW FULLTEXT INDEXES — nothing else allowed.
+        if verb != "SHOW" {
+            return Err(format!(
+                "expected INDEX after {verb} FULLTEXT (INDEXES is only valid in SHOW FULLTEXT INDEXES)"
+            ));
+        }
+        expect_end(lex, "SHOW FULLTEXT INDEXES")?;
+        return Ok(IndexCommand::ShowFulltextIndexes);
+    }
+    if verb == "SHOW" {
+        return Err(
+            "expected SHOW FULLTEXT INDEXES (the singular SHOW FULLTEXT INDEX is not supported)"
+                .to_owned(),
+        );
+    }
+
+    // Both CREATE and DROP take a name next.
+    let name = expect_name(lex, "a full-text index name", "FULLTEXT")?;
+
+    match verb {
+        "DROP" => {
+            expect_end(lex, "DROP FULLTEXT INDEX")?;
+            Ok(IndexCommand::DropFulltextIndex { name })
+        }
+        "CREATE" => {
+            let (label, properties, analyzer) = parse_fulltext_create_tail(lex)?;
+            Ok(IndexCommand::CreateFulltextIndex {
+                name,
+                label,
+                properties,
+                analyzer,
+            })
+        }
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
+        other => Err(format!("unsupported full-text index verb {other}")),
+    }
+}
+
+/// Parses the `FOR (<var>:<Label>) ON EACH [<var>.<prop>, …] [OPTIONS { analyzer: '<name>' }]` tail
+/// of a `CREATE FULLTEXT INDEX <name>` statement (`rmp` task #72). Returns
+/// `(label, properties, analyzer_name)`; the analyzer defaults to `"standard"` when no `OPTIONS`
+/// clause is present.
+fn parse_fulltext_create_tail(
+    lex: &mut Lexer<'_>,
+) -> Result<(String, Vec<String>, String), String> {
+    const VERB: &str = "FULLTEXT";
+    // FOR ( <var> : <Label> )
+    expect_keyword(lex, "FOR", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    // ON EACH [ <var>.<prop> , … ]
+    expect_keyword(lex, "ON", VERB)?;
+    expect_keyword(lex, "EACH", VERB)?;
+    expect_symbol(lex, '[', VERB)?;
+    let mut properties = Vec::new();
+    properties.push(parse_property_ref(VERB, lex)?);
+    while peek_symbol(lex, ',')? {
+        expect_symbol(lex, ',', VERB)?;
+        properties.push(parse_property_ref(VERB, lex)?);
+    }
+    expect_symbol(lex, ']', VERB)?;
+    // Optional OPTIONS { analyzer: '<name>' }
+    let analyzer = parse_optional_fulltext_options(lex)?.unwrap_or_else(|| "standard".to_owned());
+    expect_end(lex, "CREATE FULLTEXT INDEX")?;
+    Ok((label, properties, analyzer))
+}
+
+/// Parses an optional `OPTIONS { analyzer: '<name>' }` clause (only consumed when the next token is
+/// `OPTIONS`). Returns the analyzer name if the clause was present. Any other recognised option key
+/// is rejected (only `analyzer` is supported in v1); a malformed clause is a syntax error.
+fn parse_optional_fulltext_options(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    // Peek: only consume if the next token is OPTIONS.
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    match peek.next_tok()? {
+        Some(t) if is_keyword(&t, "OPTIONS") => {
+            lex.rest = peek.rest.clone();
+        }
+        _ => return Ok(None),
+    }
+    expect_symbol(lex, '{', "FULLTEXT")?;
+    // key : 'value'  (only `analyzer` is supported).
+    let key = expect_name(lex, "an option key (analyzer)", "FULLTEXT")?;
+    if !key.eq_ignore_ascii_case("analyzer") {
+        return Err(format!(
+            "unsupported full-text index option {key:?}; only 'analyzer' is supported"
+        ));
+    }
+    expect_symbol(lex, ':', "FULLTEXT")?;
+    let analyzer = match lex.next_tok()? {
+        Some(Tok::Str(s)) => s,
+        Some(other) => {
+            return Err(unexpected_generic(
+                &other,
+                "a quoted analyzer name after OPTIONS { analyzer:",
+            ));
+        }
+        None => return Err("expected a quoted analyzer name after OPTIONS { analyzer:".to_owned()),
+    };
+    expect_symbol(lex, '}', "FULLTEXT")?;
+    Ok(Some(analyzer))
+}
+
+/// Peeks whether the next token is the single symbol `sym`, without consuming it.
+fn peek_symbol(lex: &mut Lexer<'_>, sym: char) -> Result<bool, String> {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    Ok(matches!(peek.next_tok()?, Some(Tok::Symbol(c)) if c == sym))
 }
 
 /// Parses the legacy `ON :<Label>(<property>)` tail (the `ON` already consumed).
@@ -1882,6 +2041,88 @@ mod tests {
         invalid("DROP INDEX"); // missing target
         invalid("DROP INDEX ON :Person(age) trailing");
         invalid("CREATE INDEX ON :`unterminated(age)"); // unterminated backtick name
+    }
+
+    #[test]
+    fn create_fulltext_index_default_and_with_options() {
+        // Single property, default analyzer (standard).
+        assert_eq!(
+            index_cmd("CREATE FULLTEXT INDEX articles FOR (n:Article) ON EACH [n.title]"),
+            IndexCommand::CreateFulltextIndex {
+                name: "articles".to_owned(),
+                label: "Article".to_owned(),
+                properties: vec!["title".to_owned()],
+                analyzer: "standard".to_owned(),
+            }
+        );
+        // Multiple properties + explicit analyzer, case-insensitive keywords + whitespace + `;`.
+        assert_eq!(
+            index_cmd(
+                "  create   fulltext index  books  for ( b : Book ) on each [ b.title , b.summary ] \
+                 options { analyzer: 'keyword' } ;"
+            ),
+            IndexCommand::CreateFulltextIndex {
+                name: "books".to_owned(),
+                label: "Book".to_owned(),
+                properties: vec!["title".to_owned(), "summary".to_owned()],
+                analyzer: "keyword".to_owned(),
+            }
+        );
+        // Backtick-quoted name/label/property colliding with keywords still parse.
+        assert_eq!(
+            index_cmd("CREATE FULLTEXT INDEX `INDEX` FOR (n:`Order`) ON EACH [n.`from`]"),
+            IndexCommand::CreateFulltextIndex {
+                name: "INDEX".to_owned(),
+                label: "Order".to_owned(),
+                properties: vec!["from".to_owned()],
+                analyzer: "standard".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn drop_and_show_fulltext() {
+        assert_eq!(
+            index_cmd("DROP FULLTEXT INDEX articles"),
+            IndexCommand::DropFulltextIndex {
+                name: "articles".to_owned()
+            }
+        );
+        assert_eq!(
+            index_cmd("drop fulltext index `My Index` ;"),
+            IndexCommand::DropFulltextIndex {
+                name: "My Index".to_owned()
+            }
+        );
+        assert_eq!(
+            index_cmd("SHOW FULLTEXT INDEXES"),
+            IndexCommand::ShowFulltextIndexes
+        );
+        assert_eq!(
+            index_cmd("show fulltext indexes ;"),
+            IndexCommand::ShowFulltextIndexes
+        );
+    }
+
+    #[test]
+    fn claimed_but_malformed_fulltext_is_a_syntax_error() {
+        invalid("CREATE FULLTEXT"); // missing INDEX
+        invalid("CREATE FULLTEXT INDEX"); // missing name
+        invalid("CREATE FULLTEXT INDEX ft"); // missing FOR clause
+        invalid("CREATE FULLTEXT INDEX ft FOR (n:Article)"); // missing ON EACH
+        invalid("CREATE FULLTEXT INDEX ft FOR (n:Article) ON [n.title]"); // ON must be ON EACH
+        invalid("CREATE FULLTEXT INDEX ft FOR (n:Article) ON EACH []"); // at least one property
+        invalid("CREATE FULLTEXT INDEX ft FOR (n:Article) ON EACH [title]"); // ref must be var.prop
+        invalid("CREATE FULLTEXT INDEX ft FOR (n:Article) ON EACH [n.title] extra");
+        invalid("CREATE FULLTEXT INDEX ft FOR (n:Article) ON EACH [n.title] OPTIONS { bad: 'x' }");
+        invalid(
+            "CREATE FULLTEXT INDEX ft FOR (n:Article) ON EACH [n.title] OPTIONS { analyzer: x }",
+        ); // unquoted
+        invalid("SHOW FULLTEXT INDEX"); // singular not a form
+        invalid("SHOW FULLTEXT INDEXES extra");
+        invalid("DROP FULLTEXT INDEX"); // missing name
+        invalid("DROP FULLTEXT INDEX ft trailing");
+        invalid("CREATE FULLTEXT INDEXES ..."); // plural only for SHOW
     }
 
     #[test]

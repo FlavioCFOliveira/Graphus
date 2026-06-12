@@ -1053,6 +1053,19 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             format!("DROP INDEX ON :{label}({property})")
         }
         I::ShowIndexes => "SHOW INDEXES".to_owned(),
+        // Full-text index DDL (`rmp` task #72) carries no secret either: the index name, label,
+        // property keys and analyzer are all schema identifiers.
+        I::CreateFulltextIndex {
+            name,
+            label,
+            properties,
+            analyzer,
+        } => format!(
+            "CREATE FULLTEXT INDEX {name} FOR (:{label}) ON EACH [{}] (analyzer={analyzer})",
+            properties.join(", ")
+        ),
+        I::DropFulltextIndex { name } => format!("DROP FULLTEXT INDEX {name}"),
+        I::ShowFulltextIndexes => "SHOW FULLTEXT INDEXES".to_owned(),
     }
 }
 

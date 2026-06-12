@@ -65,6 +65,13 @@ pub enum ValueClass {
     Float,
     /// `NUMBER` — accepts both `INTEGER` and `FLOAT` (TCK `Call3.feature`).
     Number,
+    /// `NODE` — a **structural node** result column (`rmp` task #72). This class is **output-only**:
+    /// a procedure that declares a `NODE` output yields the node's id as a [`Value::Integer`] (the
+    /// only id-carrying property value), and the executor's `ProcedureCall` operator converts that
+    /// id into a [`RowValue::Node`](crate::runtime::RowValue::Node) so the result-egress boundary
+    /// materializes it into a full structural node (rmp #96) — composing MVCC visibility + RBAC for
+    /// free. No procedure declares a `NODE` **input** (entity-valued arguments remain deferred).
+    Node,
 }
 
 impl ValueClass {
@@ -78,6 +85,7 @@ impl ValueClass {
             Self::Integer => "INTEGER",
             Self::Float => "FLOAT",
             Self::Number => "NUMBER",
+            Self::Node => "NODE",
         }
     }
 }
@@ -128,6 +136,9 @@ impl FieldType {
                 self.class,
                 ValueClass::Any | ValueClass::Float | ValueClass::Number
             ),
+            // A node id rides as an `Integer` (the only id-carrying property value); a `NODE`-typed
+            // field accepts it. This only matters for the defensive runtime check on a procedure that
+            // re-feeds an output — no procedure declares a `NODE` *input*.
             _ => matches!(self.class, ValueClass::Any),
         }
     }
@@ -350,6 +361,48 @@ impl ProcedureSet {
             ),
             Box::new(|_args, graph| Ok(string_rows(distinct_property_keys(graph)))),
         );
+        // `db.index.fulltext.queryNodes(indexName, queryString) YIELD node, score` — the full-text
+        // search procedure (`rmp` task #72), Neo4j-compatible. `node` is a **structural NODE** result
+        // (rmp #96 materialization composes MVCC + RBAC at egress); `score` is the best-effort
+        // term-overlap relevance count (a FLOAT, as Neo4j returns).
+        set.register(
+            ProcedureSignature::new(
+                "db.index.fulltext.queryNodes",
+                vec![
+                    FieldSpec::new(
+                        "indexName",
+                        FieldType {
+                            class: ValueClass::String,
+                            nullable: false,
+                        },
+                    ),
+                    FieldSpec::new(
+                        "queryString",
+                        FieldType {
+                            class: ValueClass::String,
+                            nullable: false,
+                        },
+                    ),
+                ],
+                vec![
+                    FieldSpec::new(
+                        "node",
+                        FieldType {
+                            class: ValueClass::Node,
+                            nullable: false,
+                        },
+                    ),
+                    FieldSpec::new(
+                        "score",
+                        FieldType {
+                            class: ValueClass::Float,
+                            nullable: false,
+                        },
+                    ),
+                ],
+            ),
+            Box::new(|args, graph| fulltext_query_nodes(args, graph)),
+        );
         set
     }
 
@@ -499,6 +552,76 @@ fn distinct_rel_types(graph: &dyn GraphAccess) -> Vec<String> {
         }
     }
     types.into_iter().collect()
+}
+
+/// The `db.index.fulltext.queryNodes(indexName, queryString)` body (`rmp` task #72).
+///
+/// Resolves candidate node ids from the named full-text index (analyzed with the index's own
+/// analyzer), **MVCC-/RBAC-filters** them by re-checking each through the same [`GraphAccess`] seam
+/// the cursor holds (a deleted / invisible / unauthorized node is dropped — when `graph` is an
+/// `AuthorizedGraph` the filtering composes for free), computes a best-effort relevance `score`, and
+/// emits one row `[node_id (Value::Integer, bound to a structural NODE), score (Value::Float)]` per
+/// match. Rows are ordered by descending score then ascending id (a deterministic, relevance-first
+/// order).
+///
+/// # Errors
+/// Returns a [`ProcedureFailure`] if an argument is not a string, or — crucially — if **no full-text
+/// index of that name is declared** (so a typo is a clear error, not silently-empty results).
+fn fulltext_query_nodes(
+    args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    const NAME: &str = "db.index.fulltext.queryNodes";
+    let index_name = match args.first() {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(ProcedureFailure::new(
+                NAME,
+                "the first argument (indexName) must be a string",
+            ));
+        }
+    };
+    let query_string = match args.get(1) {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(ProcedureFailure::new(
+                NAME,
+                "the second argument (queryString) must be a string",
+            ));
+        }
+    };
+
+    // Candidate ids from the index; `None` means no such index is declared (a clear error).
+    let Some(candidates) = graph.fulltext_query(index_name, query_string) else {
+        return Err(ProcedureFailure::new(
+            NAME,
+            format!("there is no full-text index named {index_name:?}"),
+        ));
+    };
+
+    // Re-check each candidate's visibility through the same seam (composes MVCC + RBAC), compute its
+    // score, and collect `(score, id)` so we can order relevance-first.
+    let mut scored: Vec<(u64, u64)> = candidates
+        .into_iter()
+        .filter(|&id| graph.node_exists(id))
+        .map(|id| {
+            let score = graph
+                .fulltext_score(index_name, id, query_string)
+                .unwrap_or(0);
+            (score, id.0)
+        })
+        .collect();
+    // Order: descending score (more relevant first), then ascending id (deterministic tie-break).
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    Ok(scored
+        .into_iter()
+        .map(|(score, id)| {
+            // The node id rides as an Integer; the `node` output is `NODE`-classed, so the executor
+            // binds it as a structural node. The score is a Float (Neo4j-compatible).
+            vec![Value::Integer(id as i64), Value::Float(score as f64)]
+        })
+        .collect())
 }
 
 /// Every distinct property key on any node or relationship, ascending.
@@ -678,6 +801,80 @@ mod tests {
         let mut g = MemGraph::new();
         assert!(set.invoke("no.such.proc", &[], &mut g).is_err());
         assert!(set.invoke("db.labels", &[Value::Null], &mut g).is_err());
+    }
+
+    #[test]
+    fn fulltext_query_nodes_is_registered_with_node_and_score_outputs() {
+        let set = ProcedureSet::with_builtins();
+        let sig = set
+            .signature("db.index.fulltext.queryNodes")
+            .expect("registered");
+        assert_eq!(sig.inputs.len(), 2);
+        assert_eq!(sig.outputs.len(), 2);
+        assert_eq!(sig.outputs[0].name, "node");
+        assert_eq!(sig.outputs[0].ty.class, ValueClass::Node);
+        assert_eq!(sig.outputs[1].name, "score");
+        assert_eq!(sig.outputs[1].ty.class, ValueClass::Float);
+        // Case-insensitive resolution like the other built-ins.
+        assert!(set.signature("DB.Index.Fulltext.QueryNodes").is_some());
+    }
+
+    #[test]
+    fn fulltext_query_nodes_returns_ids_and_scores_ordered_by_relevance() {
+        use crate::graph_access::MemGraph;
+        use graphus_index::fulltext::Analyzer;
+
+        let mut g = MemGraph::new();
+        let a = g.add_node(
+            ["Doc"],
+            [("t", Value::String("graph database fast".into()))],
+        );
+        let b = g.add_node(["Doc"], [("t", Value::String("graph theory".into()))]);
+        g.create_fulltext_index("ix", "Doc", ["t"], Analyzer::Standard);
+
+        // "graph database": a matches both terms (score 2), b matches one (score 1) -> a first.
+        let rows = builtins()
+            .invoke(
+                "db.index.fulltext.queryNodes",
+                &[
+                    Value::String("ix".into()),
+                    Value::String("graph database".into()),
+                ],
+                &mut g,
+            )
+            .expect("invoke");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Value::Integer(a.0 as i64), Value::Float(2.0)]);
+        assert_eq!(rows[1], vec![Value::Integer(b.0 as i64), Value::Float(1.0)]);
+    }
+
+    #[test]
+    fn fulltext_query_nodes_errors_on_unknown_index() {
+        use crate::graph_access::MemGraph;
+        let mut g = MemGraph::new();
+        let err = builtins()
+            .invoke(
+                "db.index.fulltext.queryNodes",
+                &[Value::String("nope".into()), Value::String("x".into())],
+                &mut g,
+            )
+            .expect_err("unknown index must error");
+        assert!(format!("{err}").contains("nope"));
+    }
+
+    #[test]
+    fn fulltext_query_nodes_rejects_non_string_args() {
+        use crate::graph_access::MemGraph;
+        let mut g = MemGraph::new();
+        assert!(
+            builtins()
+                .invoke(
+                    "db.index.fulltext.queryNodes",
+                    &[Value::Integer(1), Value::String("x".into())],
+                    &mut g,
+                )
+                .is_err()
+        );
     }
 
     #[test]

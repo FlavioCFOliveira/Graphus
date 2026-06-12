@@ -19,6 +19,10 @@
 //!   [`ApplyTarget`](graphus_wal::ApplyTarget) that replays index pages on crash recovery.
 //! - [`kinds`] — the four v1 index kinds as thin key-composition layers over [`BTree`]:
 //!   token-lookup, property (range/equality), composite, and relationship-property.
+//! - [`fulltext`] — the full-text index (`rmp` task #72): a documented text [`Analyzer`] and an
+//!   in-memory [`InvertedIndex`] (term → sorted postings + forward map). Unlike the B+-tree kinds it
+//!   is a self-contained, store-independent data structure; its catalog durability and MVCC re-check
+//!   are layered on in `graphus-cypher`/`graphus-storage`, mirroring the derived `IndexSet`.
 //! - [`constraint`] — uniqueness (via a unique index, commit-time validated) and existence
 //!   (checked on write) constraints (`04 §6.5`).
 //! - [`histogram`] — equi-depth property histograms over the order-preserving encoding, plus a
@@ -56,6 +60,7 @@
 
 pub mod btree;
 pub mod constraint;
+pub mod fulltext;
 pub mod histogram;
 pub mod keycodec;
 pub mod kinds;
@@ -64,6 +69,7 @@ pub mod recovery;
 
 pub use btree::BTree;
 pub use constraint::{ConstraintError, ExistenceConstraint, UniqueConstraint};
+pub use fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 pub use histogram::{HistogramDecodeError, PropertyHistogram};
 pub use keycodec::{KeyEncodeError, encode_composite, encode_single, encode_value};
 pub use kinds::{CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};

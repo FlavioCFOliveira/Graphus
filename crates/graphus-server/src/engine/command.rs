@@ -106,6 +106,28 @@ pub enum IndexCommand {
     },
     /// `SHOW INDEXES`: lists every declared node-property index with its build state.
     ShowIndexes,
+    /// `CREATE FULLTEXT INDEX <name> FOR (n:<Label>) ON EACH [n.<prop>, …]` (`rmp` task #72): starts
+    /// a **non-blocking** online build of a full-text index over `(label, properties)` analyzed with
+    /// `analyzer` (a lower-cased analyzer name; `standard` by default).
+    CreateFulltextIndex {
+        /// The server-unique index name.
+        name: String,
+        /// The node label the index covers.
+        label: String,
+        /// The property keys the index covers, in declared order (one or more).
+        properties: Vec<String>,
+        /// The analyzer name (`standard` / `keyword`); validated by the engine against the supported
+        /// set so an unknown analyzer is a clear error.
+        analyzer: String,
+    },
+    /// `DROP INDEX <name>` of a full-text index (`rmp` task #72): removes it (durable + in-memory),
+    /// cancelling any in-progress build.
+    DropFulltextIndex {
+        /// The full-text index name to drop.
+        name: String,
+    },
+    /// `SHOW FULLTEXT INDEXES` (`rmp` task #72): lists every declared full-text index.
+    ShowFulltextIndexes,
 }
 
 /// The buffered result of an [`EngineCommand::IndexDdl`]: column names + rows, streamed back through

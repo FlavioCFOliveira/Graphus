@@ -315,6 +315,54 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 .collect();
             Ok(IndexDdlReply { fields, rows })
         }
+        IndexCommand::CreateFulltextIndex {
+            name,
+            label,
+            properties,
+            analyzer,
+        } => {
+            // Validate the analyzer name against the supported set; an unknown one is a clear,
+            // side-effect-free error (`rmp` task #72).
+            let analyzer = graphus_cypher::Analyzer::from_name(analyzer).ok_or_else(|| {
+                GraphusError::Compile(format!(
+                    "unknown full-text analyzer {analyzer:?}; expected 'standard' or 'keyword'"
+                ))
+            })?;
+            coordinator.create_fulltext_index(name, label, properties, analyzer)?;
+            Ok(IndexDdlReply::default())
+        }
+        IndexCommand::DropFulltextIndex { name } => {
+            coordinator.drop_fulltext_index(name)?;
+            Ok(IndexDdlReply::default())
+        }
+        IndexCommand::ShowFulltextIndexes => {
+            let fields = vec![
+                "name".to_owned(),
+                "label".to_owned(),
+                "properties".to_owned(),
+                "analyzer".to_owned(),
+                "state".to_owned(),
+            ];
+            let rows = coordinator
+                .list_fulltext_indexes()
+                .into_iter()
+                .map(|(name, label, properties, analyzer, state)| {
+                    let state = match state {
+                        IndexState::Online => "online",
+                        IndexState::Populating => "populating",
+                    };
+                    vec![
+                        Value::String(name),
+                        Value::String(label),
+                        // The covered properties as a Cypher list of strings.
+                        Value::List(properties.into_iter().map(Value::String).collect()),
+                        Value::String(analyzer.name().to_owned()),
+                        Value::String(state.to_owned()),
+                    ]
+                })
+                .collect();
+            Ok(IndexDdlReply { fields, rows })
+        }
     }
 }
 

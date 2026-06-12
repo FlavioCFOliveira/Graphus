@@ -612,9 +612,11 @@ back; this is surfaced as an observability metric (NFR-10) so a stuck reader pin
 
 ## 6. Indexing
 
-`graphus-index` provides four index kinds in v1 (`D-v1-index-types`): **token-lookup**,
+`graphus-index` provides four core v1 index kinds (`D-v1-index-types`): **token-lookup**,
 **range/B-tree**, **composite**, and **relationship-property** indexes; plus uniqueness/existence
-**constraints**.
+**constraints**. A **full-text index** — a Phase-2 capability under `D-v1-index-types` option (b) —
+was delivered ahead of schedule alongside the core set and is specified separately in §6.7; it does
+not change the four-kind core baseline.
 
 ### 6.1 B+-tree — recommendation and rationale
 
@@ -680,6 +682,113 @@ and selectivity hints) during physical planning to choose index seeks/scans over
 **heuristic/rule-based** planning with index awareness; a cost-based optimizer with statistics is
 Phase 2 (`00-overview.md` §6). Plans record which indexes they depend on so the **plan cache** is
 invalidated on schema/index change (§7.5).
+
+### 6.7 Full-text index (advanced; delivered ahead of Phase 2, rmp #72)
+
+> **Status.** The full-text index is an **advanced capability delivered ahead of Phase 2** (rmp
+> task #72). It corresponds to `D-v1-index-types` option (b); the ratified outcome remains option (a)
+> (the four core kinds of §6), and this delivery does **not** re-baseline the v1 index set. It was
+> shipped early in the same spirit as the other Phase-2 capabilities already in the codebase
+> (encryption at rest, fine-grained RBAC, and incremental backup + PITR). The description below is
+> faithful to the implementation; it documents only behavior that exists.
+
+A full-text index maps a single node **label** plus an ordered list of string **properties** to the
+nodes whose text matches a query string. It is built from two cooperating halves — an in-memory
+inverted index that does the matching and a durable name-keyed catalog that records the index's
+existence — and it is exposed through a Cypher **procedure** for querying and a server **DDL** surface
+for lifecycle management.
+
+**Analyzers.** Two analyzers are supported, selected per index at creation time:
+
+- **`standard`** (the default): tokenizes on Unicode non-alphanumeric boundaries (each maximal run of
+  alphanumeric characters is one token; every other character — whitespace, punctuation, symbols,
+  including `_`, `-`, `.`, `@` — is a separator and is discarded), then **lowercases** each token with
+  full Unicode case folding, then **removes stop words**. The stop-word filter applies **only** to the
+  standard analyzer and **after** lowercasing; the set is a fixed list of 35 common English words
+  (`a, an, and, are, as, at, be, but, by, for, if, in, into, is, it, no, not, of, on, or, such, that,
+  the, their, then, there, these, they, this, to, was, will, with`).
+- **`keyword`**: trims the input and treats the **entire** trimmed string as a **single lowercased
+  term**; it performs no tokenization and no stop-word removal. Whitespace-only input yields no terms.
+
+The same analyzer is applied at index time and at query time, so the indexed and queried term sets are
+produced identically.
+
+**In-memory ephemeral inverted index.** Matching is served by an in-memory inverted index (a term →
+sorted node-id postings map, plus a forward node → terms map so that updates and deletes are bounded
+by the node's term count). This structure is **ephemeral**: it is never persisted as a structure and
+needs no separate crash-recovery path. On open it is **rebuilt from the record store** — when at least
+one full-text index is declared, the engine scans every in-use node and re-indexes its covered label
+and string property values, reconstructing the inverted index from durable data.
+
+**Durable name-keyed catalog.** The existence of each full-text index is recorded in a **durable,
+server-unique-name-keyed catalog** held in the `graphus-storage` `Statistics`/meta image (the metadata
+page), mirroring the rmp #90 node-property index catalog. Each entry records the label token, the
+ordered covered-property tokens, the analyzer (stored as its raw discriminant byte, so storage does
+not depend on `graphus-index`), and the build state. The catalog block is appended last in the
+`Statistics` image, so a pre-#72 database decodes to an empty full-text catalog (backward-compatible
+by end-of-input detection), and it rides the same durability lifecycle as the rest of the metadata
+(checkpointed at commit, reloaded on rollback and on open).
+
+**Transactional maintenance (`reindex_node`).** On every node write the engine's `reindex_node`
+path — which already maintains the label and property indexes at the transaction's snapshot — also
+maintains **every** registered full-text index for the node. For each index, if the node carries the
+covered label, the covered string properties are concatenated in the index's declared property order,
+analyzed with the index's analyzer, and the node is re-indexed wholesale (its stale terms are
+replaced); if the node no longer carries the covered label, it is **removed** from that index.
+Stale-term removal is eager, so a full-text query never returns a node whose text no longer matches.
+
+**MVCC + RBAC candidate filtering.** A query first obtains candidate node ids from the inverted index,
+then filters them so that results are both **transactionally** and **authorization** correct. The
+record-store layer re-checks each candidate against the reader's **MVCC** snapshot (and that the node
+still carries the covered label) and registers the SIREAD/read markers needed for SSI; the
+authorization layer additionally drops any candidate that is **not RBAC-visible** to the caller, so an
+RBAC-invisible node never reaches the result. The procedure body re-checks node existence through the
+same graph seam, so MVCC and RBAC compose.
+
+**Online background build (Populating → Online).** Creating a full-text index does **not** scan the
+graph synchronously. The catalog entry is committed in the **`Populating`** state, the index is
+registered in memory, and a background build is enqueued over a snapshot of the node ids. The build
+advances in bounded chunks; on completion it **durably flips the catalog entry to `Online`** in a
+committed transaction and promotes the in-memory state, keeping the engine responsive throughout. This
+mirrors the rmp #91 non-blocking incremental index population. On crash recovery, any entry recovered
+as `Populating` is promoted to `Online` after the in-memory inverted index has been fully rebuilt from
+the recovered store.
+
+**Query procedure `db.index.fulltext.queryNodes`.** Querying is exposed as the built-in procedure
+`db.index.fulltext.queryNodes(indexName :: STRING, queryString :: STRING)` (name resolution is
+case-insensitive), yielding two columns:
+
+- **`node`** — a structural `Node` (bound to the materialized node at the result-egress boundary, so
+  it composes with MVCC + RBAC materialization).
+- **`score`** — a **best-effort** relevance score of type `FLOAT`. The score is a simple
+  **term-overlap count**: the number of distinct query terms the node contains. A repeated query term
+  counts once; it is explicitly **not** a TF-IDF/BM25 relevance score.
+
+An unknown index name is a clear procedure failure (not an empty result), so a typo surfaces as an
+error. Rows are ordered by **descending score, then ascending node id**, for relevance-first,
+deterministic output.
+
+**DDL surface.** Full-text indexes are managed through an admin/index statement surface in the server
+(Neo4j-compatible, case-insensitive keywords, backtick-quotable names):
+
+```
+CREATE FULLTEXT INDEX <name> FOR (<var>:<Label>) ON EACH [<var>.<prop>, …]
+                                                  [OPTIONS { analyzer: '<analyzer>' }]
+DROP   FULLTEXT INDEX  <name>
+SHOW   FULLTEXT INDEXES
+```
+
+`ON EACH [ … ]` requires at least one `<var>.<prop>` reference. `OPTIONS` accepts only the `analyzer`
+key with a quoted string value; the default analyzer is `standard`, and an unknown analyzer name is
+rejected as a compile error with no side effect. `CREATE`/`DROP` take the singular `INDEX`; `SHOW`
+takes the plural `INDEXES` and returns `name`, `label`, `properties`, `analyzer`, and `state`
+(`online`/`populating`).
+
+**Procedure-name parser refinement.** Because `db.index.fulltext.queryNodes` contains the Cypher
+keyword `index` as a name segment, the procedure-name parser was refined so each dotted segment of a
+namespaced procedure name accepts a **keyword-spelled** segment (a reserved word as well as a plain
+identifier), mirroring how labels and property keys already accept keyword spellings. The original
+source spelling of a keyword-spelled segment is preserved.
 
 ---
 

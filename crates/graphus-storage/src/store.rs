@@ -38,7 +38,7 @@ use graphus_wal::{LogSink, WalManager};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
-use crate::meta::{IndexState, Meta, Statistics, StoreMeta};
+use crate::meta::{FulltextIndexEntry, IndexState, Meta, Statistics, StoreMeta};
 use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
@@ -2471,6 +2471,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn remove_node_property_index(&mut self, label_token: u32, prop_token: u32) {
         self.statistics
             .remove_node_property_index(label_token, prop_token);
+    }
+
+    /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #72). Tokens are returned as ids; the caller resolves their names via the token
+    /// store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn fulltext_index(&self, name: &str) -> Option<FulltextIndexEntry> {
+        self.statistics.fulltext_index(name).cloned()
+    }
+
+    /// Lists every declared full-text index as `(name, entry)` from the durable catalog (`rmp` task
+    /// #72), ascending by name. Like [`node_property_indexes`](Self::node_property_indexes) this is
+    /// what makes a full-text index *registration* survive a crash: a fresh coordinator reads this to
+    /// re-register the previously-declared full-text indexes before rebuilding their inverted index
+    /// from the store.
+    #[must_use]
+    pub fn fulltext_indexes(&self) -> Vec<(String, FulltextIndexEntry)> {
+        self.statistics.fulltext_indexes()
+    }
+
+    /// Declares (or replaces) the full-text index named `name` in the durable catalog (`rmp` task
+    /// #72).
+    ///
+    /// The mutation is purely in-memory here; like the node-property index mutators it becomes
+    /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
+    /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
+    /// Re-recording an existing name overwrites the entry (e.g. to flip its state).
+    pub fn set_fulltext_index(&mut self, name: String, entry: FulltextIndexEntry) {
+        self.statistics.set_fulltext_index(name, entry);
+    }
+
+    /// Removes the full-text index named `name` from the durable catalog, if declared (`rmp` task
+    /// #72). Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's
+    /// commit, discarded on rollback.
+    pub fn remove_fulltext_index(&mut self, name: &str) {
+        self.statistics.remove_fulltext_index(name);
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

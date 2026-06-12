@@ -87,6 +87,31 @@ impl IndexState {
     }
 }
 
+/// A durable **full-text index** catalog entry (`rmp` task #72).
+///
+/// A full-text index is identified by a server-unique **name** (unlike a node-property index, which
+/// `(label_token, prop_key)` identifies), covers one node label and **one or more** string
+/// properties, and is analyzed by a fixed analyzer recorded as a single byte (the
+/// [`graphus_index::Analyzer`] discriminant — storage does not depend on `graphus-index`, so the
+/// byte is stored verbatim and interpreted by the query layer, exactly as the histogram blobs are).
+///
+/// This rides the **identical** durability lifecycle as the node-property index catalog and the
+/// counts/histograms: checkpointed at commit, reloaded on rollback and on open. Its presence
+/// invariant is "an entry exists iff a full-text index of that name is declared". The inverted index
+/// *data* itself is never persisted (it is ephemeral and rebuilt from the store on open, like the
+/// derived `IndexSet`), so only this catalog entry needs durability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FulltextIndexEntry {
+    /// The node label-namespace token the index covers.
+    pub label_token: u32,
+    /// The property-key-namespace tokens the index covers, in declared order (one or more).
+    pub property_tokens: Vec<u32>,
+    /// The analyzer discriminant byte (the [`graphus_index::Analyzer`] `as_byte`, stored verbatim).
+    pub analyzer: u8,
+    /// The build state of the index (the same state machine as a node-property index).
+    pub state: IndexState,
+}
+
 /// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
 ///
 /// Holds, for the planner's cardinality estimator, the grand-total live-node and live-relationship
@@ -193,6 +218,16 @@ pub struct Statistics {
     /// index is declared; the value is its current build state. **Scope: node label properties only**
     /// (the same scope as [`node_prop_histograms`](Self#structfield.node_prop_histograms)).
     pub node_property_indexes: BTreeMap<(u32, u32), IndexState>,
+    /// The durable **full-text index catalog** (`rmp` task #72): the set of declared full-text
+    /// indexes keyed by their server-unique **name**, each carrying the covered label, the covered
+    /// property tokens, the analyzer byte and the build [`IndexState`]. See [`FulltextIndexEntry`].
+    ///
+    /// Persisting this set is what makes a full-text index *registration* survive a crash: the
+    /// inverted index itself is ephemeral (rebuilt from the store on open, like the derived
+    /// `IndexSet`), so without this map a recovered store would have no record of which full-text
+    /// indexes existed and would silently lose them. An entry is present **iff** an index of that
+    /// name is declared. The map rides the **identical** durability lifecycle as the other catalogs.
+    pub fulltext_indexes: BTreeMap<String, FulltextIndexEntry>,
 }
 
 impl Statistics {
@@ -392,6 +427,35 @@ impl Statistics {
             .collect()
     }
 
+    /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #72).
+    #[must_use]
+    pub fn fulltext_index(&self, name: &str) -> Option<&FulltextIndexEntry> {
+        self.fulltext_indexes.get(name)
+    }
+
+    /// Declares (or replaces) the full-text index named `name` (`rmp` task #72). Idempotent on the
+    /// name: re-recording overwrites the entry (e.g. to flip its state `Populating` → `Online`).
+    pub(crate) fn set_fulltext_index(&mut self, name: String, entry: FulltextIndexEntry) {
+        self.fulltext_indexes.insert(name, entry);
+    }
+
+    /// Removes the full-text index named `name`, if declared (`rmp` task #72). Removing an absent
+    /// entry is a harmless no-op.
+    pub(crate) fn remove_fulltext_index(&mut self, name: &str) {
+        self.fulltext_indexes.remove(name);
+    }
+
+    /// Lists every declared full-text index as `(name, entry)`, ascending by name (the [`BTreeMap`]
+    /// order, deterministic) (`rmp` task #72).
+    #[must_use]
+    pub fn fulltext_indexes(&self) -> Vec<(String, FulltextIndexEntry)> {
+        self.fulltext_indexes
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
     /// Serialises the statistics to a self-describing byte image.
     ///
     /// Layout: `total_nodes(u64) | total_relationships(u64) | n_labels(u32) | [ token_id(u32) |
@@ -404,12 +468,13 @@ impl Statistics {
     ///
     /// # Backward compatibility with pre-#90 images
     ///
-    /// The index-catalog block is **appended after** the histogram block and is the last block, so an
-    /// image written before `rmp` task #90 (which ends after the histograms) is decoded as having an
-    /// **empty** index catalog: [`decode`](Self::decode) treats end-of-input where the index block's
-    /// count `u32` would start as "no catalog" rather than truncation. No format-version byte is
-    /// needed because every prior block is length-exact and self-describing, so the parse position
-    /// after the histograms is unambiguous.
+    /// The index-catalog block is **appended after** the histogram block, so an image written before
+    /// `rmp` task #90 (which ends after the histograms) is decoded as having an **empty** index
+    /// catalog: [`decode`](Self::decode) treats end-of-input where the index block's count `u32`
+    /// would start as "no catalog" rather than truncation. The full-text catalog block (`rmp` task
+    /// #72) is appended **after** the index catalog by the same rule, so a pre-#72 image decodes to
+    /// an empty full-text catalog. No format-version byte is needed because every prior block is
+    /// length-exact and self-describing, so each parse position is unambiguous.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let hist_bytes: usize = self
@@ -433,6 +498,7 @@ impl Statistics {
         Self::encode_map(&mut out, &self.rels_per_type);
         Self::encode_histograms(&mut out, &self.node_prop_histograms);
         Self::encode_index_catalog(&mut out, &self.node_property_indexes);
+        Self::encode_fulltext_catalog(&mut out, &self.fulltext_indexes);
         out
     }
 
@@ -481,6 +547,40 @@ impl Statistics {
         }
     }
 
+    /// Encodes the full-text index catalog block (`rmp` task #72), appended last so a pre-#72 image
+    /// (ending after the node-property index catalog) decodes to an empty full-text catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// n_props(u32) | prop_token(u32)*n_props | analyzer(u8) | state(u8) ]*`, entries in
+    /// ascending-name ([`BTreeMap`]) order so the image is deterministic.
+    fn encode_fulltext_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, FulltextIndexEntry>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "full-text catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "full-text index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&entry.label_token.to_le_bytes());
+            debug_assert!(
+                entry.property_tokens.len() <= u32::MAX as usize,
+                "full-text property-token count exceeds u32"
+            );
+            out.extend_from_slice(&(entry.property_tokens.len() as u32).to_le_bytes());
+            for &prop in &entry.property_tokens {
+                out.extend_from_slice(&prop.to_le_bytes());
+            }
+            out.push(entry.analyzer);
+            out.push(entry.state.as_byte());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -500,6 +600,7 @@ impl Statistics {
         let rels_per_type = Self::decode_map(bytes, &mut cur, "rels_per_type")?;
         let node_prop_histograms = Self::decode_histograms(bytes, &mut cur)?;
         let node_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
+        let fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -507,6 +608,7 @@ impl Statistics {
             rels_per_type,
             node_prop_histograms,
             node_property_indexes,
+            fulltext_indexes,
         })
     }
 
@@ -579,6 +681,72 @@ impl Statistics {
             if map.insert((label_token, prop_token), state).is_some() {
                 return Err(GraphusError::Storage(format!(
                     "statistics index catalog repeats key ({label_token}, {prop_token})"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the full-text index catalog block (`rmp` task #72). Like the node-property index
+    /// catalog this is the last block, so end-of-input where its count `u32` would start means "no
+    /// full-text catalog" (a pre-#72 image), not truncation.
+    ///
+    /// The analyzer byte is **not** validated here (it is the query layer's domain, stored verbatim
+    /// like a histogram blob); the `state` byte is range-checked. A repeated name, an empty name, or
+    /// a zero property-token count is rejected (none is ever produced by [`encode`](Self::encode)).
+    fn decode_fulltext_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, FulltextIndexEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #72): a pre-#72 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("full-text catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "full-text catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let label_token = read_u32(bytes, cur)?;
+            let n_props = read_u32(bytes, cur)? as usize;
+            if n_props == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "full-text index {name:?} declares no properties"
+                )));
+            }
+            let mut property_tokens = Vec::with_capacity(n_props);
+            for _ in 0..n_props {
+                property_tokens.push(read_u32(bytes, cur)?);
+            }
+            let analyzer = read_u8(bytes, cur)?;
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "full-text index {name:?} holds unknown state byte {state_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    FulltextIndexEntry {
+                        label_token,
+                        property_tokens,
+                        analyzer,
+                        state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "full-text catalog repeats index name {name:?}"
                 )));
             }
         }
@@ -1091,6 +1259,133 @@ mod tests {
         let mut bytes = s.encode();
         bytes.truncate(bytes.len() - 1); // drop the state byte of the only entry
         assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_fulltext_catalog_round_trips() {
+        // A full-text catalog with multiple indexes (varied analyzers, property arities, states)
+        // round-trips, and rides after the node-property index catalog (set one to prove ordering).
+        let mut s = Statistics::new();
+        s.set_node_property_index(1, 2, IndexState::Online);
+        s.set_fulltext_index(
+            "articles".to_owned(),
+            FulltextIndexEntry {
+                label_token: 3,
+                property_tokens: vec![7, 8],
+                analyzer: 0, // standard
+                state: IndexState::Online,
+            },
+        );
+        s.set_fulltext_index(
+            "tags".to_owned(),
+            FulltextIndexEntry {
+                label_token: 5,
+                property_tokens: vec![9],
+                analyzer: 1, // keyword
+                state: IndexState::Populating,
+            },
+        );
+        // Mix in counts/histograms to prove the full-text block is read after every prior block.
+        s.inc_label(4);
+        s.set_property_histogram(0, 0, vec![1, 2, 3]);
+
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            back.fulltext_index("articles")
+                .map(|e| e.property_tokens.clone()),
+            Some(vec![7, 8])
+        );
+        assert_eq!(back.fulltext_index("tags").map(|e| e.analyzer), Some(1));
+        assert_eq!(
+            back.fulltext_index("tags").map(|e| e.state),
+            Some(IndexState::Populating)
+        );
+        assert_eq!(back.fulltext_index("missing"), None);
+        assert_eq!(back.fulltext_indexes().len(), 2);
+    }
+
+    #[test]
+    fn statistics_decode_accepts_a_pre_task_72_image_as_empty_fulltext_catalog() {
+        // A pre-`rmp`-task-#72 image ends after the node-property index-catalog block. Build exactly
+        // such an image and confirm decode accepts it with an empty full-text catalog.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 index-catalog entry
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        bytes.push(1); // Online -- image ends here (pre-#72)
+        let back = Statistics::decode(&bytes).unwrap();
+        assert_eq!(back.total_nodes(), 2);
+        assert_eq!(back.node_property_indexes().len(), 1);
+        assert!(back.fulltext_indexes.is_empty());
+        // It re-encodes with an explicit (empty) full-text block appended and stays stable.
+        assert_eq!(Statistics::decode(&back.encode()).unwrap(), back);
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_duplicate_fulltext_name() {
+        // Two full-text entries with the same name must be rejected (encode never produces them).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 index-catalog entries
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // 2 full-text entries
+        for _ in 0..2 {
+            bytes.extend_from_slice(&2u32.to_le_bytes()); // name_len 2
+            bytes.extend_from_slice(b"ft"); // name "ft" (same both times)
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 property token
+            bytes.extend_from_slice(&5u32.to_le_bytes()); // prop token 5
+            bytes.push(0); // analyzer standard
+            bytes.push(1); // Online
+        }
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_fulltext_with_no_properties() {
+        // A full-text index must declare at least one property; a zero count is rejected.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 index-catalog entries
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 full-text entry
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // name_len 1
+        bytes.extend_from_slice(b"x"); // name "x"
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 property tokens (invalid)
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_fulltext_remove_drops_the_entry() {
+        let mut s = Statistics::new();
+        s.set_fulltext_index(
+            "a".to_owned(),
+            FulltextIndexEntry {
+                label_token: 1,
+                property_tokens: vec![2],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        assert!(s.fulltext_index("a").is_some());
+        s.remove_fulltext_index("a");
+        assert!(s.fulltext_index("a").is_none());
+        // Removing an absent name is a harmless no-op.
+        s.remove_fulltext_index("nope");
+        assert!(s.fulltext_indexes.is_empty());
     }
 
     #[test]
