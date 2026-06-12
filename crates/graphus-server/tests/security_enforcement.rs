@@ -14,15 +14,12 @@
 //!
 //! ## Why enforcement is tested via an existing user whose grants change
 //!
-//! The connectivity layers' *authentication* path still takes a startup `Authenticator` **snapshot**
-//! (`server.rs`: `security.snapshot_authenticator()`), so a user *created* at runtime cannot yet
-//! LOGON until the next boot — a cross-crate seam follow-up that #92 documented and #93 does not
-//! close (it would require threading the live catalog into the per-listener authentication path).
-//! Enforcement itself, by contrast, already resolves against the **live** catalog. So these tests use
-//! the bootstrap user `bob` (present in the startup snapshot, hence able to authenticate) and change
-//! *his* grants at runtime: that exercises both fine-grained enforcement and the grant/revoke-takes-
-//! effect-next-statement guarantee end-to-end, without depending on the still-deferred runtime-login
-//! path. The unrestricted/admin path is unchanged, so the TCK ratchet is unaffected.
+//! These tests use the bootstrap user `bob` and change *his* grants at runtime, which exercises both
+//! fine-grained enforcement and the grant/revoke-takes-effect-next-statement guarantee end-to-end.
+//! (The complementary property — that a user *created* at runtime can immediately LOGON / present a
+//! Bearer token, and a runtime password change / `DROP USER` takes effect for authentication without
+//! a reboot — is now live as of rmp #94 and is proved by `security_live_auth.rs`.) The
+//! unrestricted/admin path here is unchanged, so the TCK ratchet is unaffected.
 
 use std::path::PathBuf;
 

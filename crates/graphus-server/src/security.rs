@@ -48,9 +48,9 @@
 //! only when the mutation is safe.
 
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
-use graphus_auth::{Action, AuthError, Authenticator, Privilege, Resource};
+use graphus_auth::{Action, AuthError, AuthProvider, Authenticator, Claims, Privilege, Resource};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ServerConfig;
@@ -586,21 +586,6 @@ impl SecurityCatalog {
         f(&guard)
     }
 
-    /// Returns a **clone** of the live [`Authenticator`] (a point-in-time snapshot of the RBAC
-    /// model + JWT/peer config). The connectivity seams' authentication path (`graphus-bolt` /
-    /// `graphus-rest`) takes an owned `Arc<Authenticator>`; this builds it from the loaded model so
-    /// a fresh boot is consistent.
-    ///
-    /// Note: the snapshot does **not** track later live mutations (a `CREATE USER` issued at runtime
-    /// is visible to the admin-authorization path, which reads the live model via
-    /// [`with_auth`](Self::with_auth), but a brand-new user cannot authenticate until the next boot
-    /// reloads the persisted file). Propagating live mutations into the bolt/rest authentication hot
-    /// path is the cross-crate seam follow-up that rmp #93's enforcement work will carry.
-    #[must_use]
-    pub fn snapshot_authenticator(&self) -> Authenticator {
-        self.with_auth(Authenticator::clone)
-    }
-
     // ---- Listing (read-locked) ----------------------------------------------------------------
 
     /// Lists every user's name and role memberships, name-sorted. For `SHOW USERS`.
@@ -885,6 +870,63 @@ impl std::fmt::Debug for SecurityCatalog {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// The live authentication provider (rmp #94)
+// ------------------------------------------------------------------------------------------------
+
+/// A **live** [`AuthProvider`] over the [`SecurityCatalog`]: the implementation `graphus-server`
+/// hands to the connectivity seams (`graphus-bolt`, `graphus-rest`) so their authentication path
+/// consults the *current* security model rather than a startup snapshot (rmp #94).
+///
+/// Before this, the seams held a point-in-time `Authenticator` clone, so a user created at runtime
+/// could not `LOGON` / present a Bearer token, and a runtime password change or `DROP USER` did not
+/// affect authentication, until the next reboot. `LiveAuth` closes that gap: each call resolves
+/// through [`SecurityCatalog::with_auth`], which takes a **brief read lock** on the live model — the
+/// same lock the per-statement RBAC enforcement path already uses. Authentication happens once per
+/// connection/handshake (not per query), so one read lock per call is amply cheap; the lock is never
+/// held across an `.await`.
+pub struct LiveAuth(Arc<SecurityCatalog>);
+
+impl LiveAuth {
+    /// Wraps the live `catalog` as an [`AuthProvider`] for the connectivity seams.
+    #[must_use]
+    pub fn new(catalog: Arc<SecurityCatalog>) -> Self {
+        Self(catalog)
+    }
+}
+
+impl std::fmt::Debug for LiveAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveAuth").finish_non_exhaustive()
+    }
+}
+
+impl AuthProvider for LiveAuth {
+    fn authenticate_password(
+        &self,
+        user: &str,
+        plaintext: &str,
+    ) -> std::result::Result<String, AuthError> {
+        // One brief read lock on the live model: a runtime-created user logs on at once, a
+        // password change / DROP USER takes effect at once.
+        self.0
+            .with_auth(|auth| auth.authenticate_password(user, plaintext))
+    }
+
+    fn authenticate_bearer(
+        &self,
+        token: &str,
+        now_unix_secs: u64,
+    ) -> std::result::Result<Claims, AuthError> {
+        self.0
+            .with_auth(|auth| auth.authenticate_bearer(token, now_unix_secs))
+    }
+
+    fn require(&self, user: &str, wanted: &Privilege) -> std::result::Result<(), AuthError> {
+        self.0.with_auth(|auth| auth.require(user, wanted))
+    }
+}
+
 /// The persist entry point used by [`SecurityCatalog::mutate`] (a free fn so it captures only
 /// `Send` data into `spawn_blocking`).
 fn persist_file(root: &Path, file: &SecurityFile) -> Result<()> {
@@ -1021,8 +1063,6 @@ pub fn scope_string(resource: &Resource) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
     /// A unique temp data root for one test (auto-removed on drop).

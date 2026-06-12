@@ -34,14 +34,15 @@
 //! # The two seams the server (rmp #20) wires
 //!
 //! ```no_run
-//! use graphus_auth::Authenticator;
+//! use graphus_auth::AuthProvider;
 //! use graphus_bolt::executor::BoltExecutor;
 //! use graphus_bolt::server::BoltSession;
 //! use graphus_bolt::transport::Transport;
 //!
 //! // The listener owns a real `Transport` (a UDS/TCP-TLS byte pipe) and a real `BoltExecutor`
-//! // (graphus-cypher's coordinator), plus the shared `Authenticator`, and drives one session:
-//! fn serve_connection(transport: impl Transport, executor: impl BoltExecutor, auth: &Authenticator) {
+//! // (graphus-cypher's coordinator), plus the authentication seam (`AuthProvider` — the server
+//! // backs it with a LIVE security-catalog view, rmp #94), and drives one session:
+//! fn serve_connection(transport: impl Transport, executor: impl BoltExecutor, auth: &dyn AuthProvider) {
 //!     let mut session = BoltSession::new(transport, executor, auth);
 //!     let _ = session.run(); // handshake → message loop until GOODBYE/EOF
 //! }

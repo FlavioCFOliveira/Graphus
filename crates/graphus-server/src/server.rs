@@ -6,8 +6,9 @@
 //! 1. Validate config; init logging + the slow-query threshold.
 //! 2. Load the durable **security catalog** ([`crate::security`], rmp #92) — a present
 //!    `security.toml` is authoritative, an absent one seeds from config bootstrap and is persisted,
-//!    a malformed one fails startup closed. Derive the per-listener [`graphus_auth::Authenticator`]
-//!    snapshot (authentication) + TLS config from it.
+//!    a malformed one fails startup closed. The per-listener authentication seam is a **live**
+//!    [`graphus_auth::AuthProvider`] over that catalog ([`crate::security::LiveAuth`], rmp #94), so
+//!    runtime security mutations affect authentication immediately; the TLS config is built from it.
 //! 3. Load the **database catalog** ([`crate::dbcatalog`], decision `D-multi-db`) — a malformed
 //!    catalog fails startup closed. Start the **default database's** engine thread, which
 //!    constructs the `!Send` `TxnCoordinator` *on the thread*: it opens-or-creates the
@@ -25,7 +26,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use graphus_auth::Authenticator;
+use graphus_auth::AuthProvider;
 use graphus_core::capability::Clock;
 use graphus_io::FsyncPool;
 use rustls::ServerConfig as RustlsServerConfig;
@@ -202,11 +203,14 @@ impl Server {
         // 1) Security: load the durable, live RBAC model (rmp #92). A present `security.toml` is
         //    authoritative; an absent one seeds from config bootstrap and is persisted; a malformed
         //    one fails startup CLOSED (never silently resets the security model). The connectivity
-        //    seams' authentication path takes a point-in-time `Authenticator` snapshot of it; the
-        //    admin-statement + `/admin/*` surfaces hold the live `SecurityCatalog` and mutate it.
+        //    seams' **authentication** path now consults the LIVE catalog through a `LiveAuth`
+        //    provider (rmp #94) — no longer a startup snapshot — so a user created/changed/dropped at
+        //    runtime authenticates (or is refused) immediately. The admin-statement + `/admin/*`
+        //    surfaces hold the same live `SecurityCatalog` and mutate it.
         let security = Arc::new(SecurityCatalog::load(&config).map_err(ServerError::Security)?);
-        let auth = Arc::new(security.snapshot_authenticator());
-        let tls = build_tls(&config, &auth)?;
+        let auth: Arc<dyn AuthProvider> =
+            Arc::new(crate::security::LiveAuth::new(Arc::clone(&security)));
+        let tls = build_tls(&config, &security)?;
 
         // 1b) Security audit log (rmp #70): open (and crash-recover) the append-only JSONL sink
         //     under the store path. When `audit.enabled` is false this is a no-op sink (writes
@@ -332,9 +336,13 @@ async fn run_loop(
 
 /// Builds the shared rustls [`RustlsServerConfig`] from the configured PEM material, or `None` if no
 /// TLS is configured (UDS-only deployment).
+///
+/// Building the TLS config only reads the PEM material from disk (no RBAC state is consulted), so it
+/// takes a single brief startup read lock on the live [`SecurityCatalog`] via
+/// [`SecurityCatalog::with_auth`] — the catalog owns the `tls_server_config` builder.
 fn build_tls(
     config: &ServerConfig,
-    auth: &Authenticator,
+    security: &SecurityCatalog,
 ) -> Result<Option<Arc<RustlsServerConfig>>, ServerError> {
     if !config.tls.is_enabled() {
         return Ok(None);
@@ -343,8 +351,8 @@ fn build_tls(
     let key_path = config.tls.key_path.as_ref().expect("is_enabled checked");
     let cert_pem = read_to_string(cert_path)?;
     let key_pem = read_to_string(key_path)?;
-    let server_config = auth
-        .tls_server_config(&cert_pem, &key_pem)
+    let server_config = security
+        .with_auth(|auth| auth.tls_server_config(&cert_pem, &key_pem))
         .map_err(|e| ServerError::Auth(format!("building TLS config: {e}")))?;
     Ok(Some(Arc::new(server_config)))
 }

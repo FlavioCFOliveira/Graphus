@@ -81,7 +81,7 @@ pub mod rbac;
 pub mod tls;
 pub mod token;
 
-pub use auth::Authenticator;
+pub use auth::{AuthProvider, Authenticator};
 pub use error::{AuthError, Result};
 pub use limits::{RateLimiter, RequestLimits};
 pub use peercred::{PeerCred, PeerCredMap, PeerCredSource};

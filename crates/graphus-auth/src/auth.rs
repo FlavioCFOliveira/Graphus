@@ -29,6 +29,46 @@ use crate::{password, tls};
 use graphus_core::capability::Clock;
 use rustls::ServerConfig;
 
+/// The authentication operations the connectivity seams (`graphus-bolt`, `graphus-rest`) resolve
+/// through their stored auth handle — the **live-vs-snapshot seam**.
+///
+/// `graphus-bolt` and `graphus-rest` are deliberately transport-agnostic and must not depend on
+/// `graphus-server`, so they cannot hold a `SecurityCatalog` directly. Instead they hold a
+/// `&dyn AuthProvider` (Bolt) / `Arc<dyn AuthProvider>` (REST) and call only the three methods
+/// below. [`Authenticator`] implements this trait by delegating to its inherent methods, which lets
+/// a *snapshot* satisfy the seam; `graphus-server` supplies a **live** implementation that resolves
+/// every call through its read-locked `SecurityCatalog`, so a runtime `CREATE USER` /
+/// password change / `DROP USER` takes effect for authentication immediately (no reboot).
+///
+/// Every method is non-generic, so the trait is fully object-safe (`dyn`-compatible) **by design**:
+/// the seams store it behind a trait object. The generic UDS peer path
+/// ([`Authenticator::authenticate_peer`], generic over [`PeerCredSource`]) is *not* on this trait;
+/// that path is handled inside `graphus-server` directly, which can read the live catalog without a
+/// trait object.
+pub trait AuthProvider: Send + Sync {
+    /// Bolt native (`LOGON`): authenticates `user` by password, returning the username on success.
+    ///
+    /// # Errors
+    /// - [`AuthError::Unauthenticated`] on a wrong/missing password or unknown user.
+    /// - [`AuthError::PasswordHash`] only if the stored hash is corrupt (operational fault).
+    fn authenticate_password(&self, user: &str, plaintext: &str) -> Result<String>;
+
+    /// REST Bearer: verifies a JWT (signature + expiry against `now_unix_secs`) and maps its subject
+    /// back to a current catalog user, returning the validated [`Claims`].
+    ///
+    /// # Errors
+    /// - [`AuthError::BadToken`] / [`AuthError::TokenExpired`] on an invalid/expired token.
+    /// - [`AuthError::Unauthenticated`] if the subject names no current catalog user.
+    fn authenticate_bearer(&self, token: &str, now_unix_secs: u64) -> Result<Claims>;
+
+    /// Coarse authorization (the REST `READ`/`WRITE` access-mode gate): `Ok(())` if `user` holds
+    /// `wanted`, else [`AuthError::Unauthorized`].
+    ///
+    /// # Errors
+    /// [`AuthError::Unauthorized`] if `user` lacks `wanted`.
+    fn require(&self, user: &str, wanted: &Privilege) -> Result<()>;
+}
+
 /// The shared authentication + authorization service for all listeners.
 ///
 /// Construct it with a JWT signing secret, then populate the [`Catalog`] (users/roles/privileges)
@@ -247,6 +287,24 @@ impl Authenticator {
         request_timeout: std::time::Duration,
     ) -> Result<RequestLimits> {
         RequestLimits::new(max_body_bytes, request_timeout)
+    }
+}
+
+/// A point-in-time [`Authenticator`] (a clone/snapshot) satisfies the seam by delegating each method
+/// to its inherent implementation. `graphus-server` supplies a *live* [`AuthProvider`] that resolves
+/// the same three calls through its read-locked `SecurityCatalog`; both are interchangeable behind
+/// the trait object the seams hold.
+impl AuthProvider for Authenticator {
+    fn authenticate_password(&self, user: &str, plaintext: &str) -> Result<String> {
+        Authenticator::authenticate_password(self, user, plaintext)
+    }
+
+    fn authenticate_bearer(&self, token: &str, now_unix_secs: u64) -> Result<Claims> {
+        Authenticator::authenticate_bearer(self, token, now_unix_secs)
+    }
+
+    fn require(&self, user: &str, wanted: &Privilege) -> Result<()> {
+        Authenticator::require(self, user, wanted)
     }
 }
 

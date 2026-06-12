@@ -13,7 +13,7 @@ mod transport;
 
 use std::sync::Arc;
 
-use graphus_auth::Authenticator;
+use graphus_auth::AuthProvider;
 use graphus_core::capability::Clock;
 use graphus_io::{TcpAcceptor, UdsAcceptor};
 use rustls::ServerConfig as RustlsServerConfig;
@@ -69,7 +69,7 @@ pub async fn start_all(
     engine: EngineHandle,
     catalog: Arc<DatabaseCatalog>,
     security: Arc<SecurityCatalog>,
-    auth: Arc<Authenticator>,
+    auth: Arc<dyn AuthProvider>,
     audit: Arc<AuditLog>,
     clock: Arc<dyn Clock + Send + Sync>,
     tls: Option<Arc<RustlsServerConfig>>,
@@ -152,6 +152,7 @@ pub async fn start_all(
             engine.clone(),
             context.clone(),
             Arc::clone(&auth),
+            Arc::clone(&security),
             Arc::clone(&audit),
             Arc::clone(&clock),
             Arc::clone(&metrics),
@@ -181,11 +182,16 @@ pub async fn start_all(
 /// Builds the full HTTP router: the `graphus_rest` transactional API merged with the server's own
 /// observability + admin routes (`04 §8.2`, §9). `engine` (the default database's handle) feeds
 /// the observability routes; the transactional API routes databases through `context` (rmp #84).
+///
+/// Authentication is LIVE everywhere (rmp #94): the transactional API holds the `AuthProvider`
+/// (`auth`, a `LiveAuth` over the catalog), and the server's own `/admin/*` routes hold the
+/// `SecurityCatalog` directly (`security`) and resolve each Bearer check through it.
 #[allow(clippy::too_many_arguments)] // The router legitimately aggregates all the shared services.
 fn build_rest_router(
     engine: EngineHandle,
     context: AdminContext,
-    auth: Arc<Authenticator>,
+    auth: Arc<dyn AuthProvider>,
+    security: Arc<SecurityCatalog>,
     audit: Arc<AuditLog>,
     clock: Arc<dyn Clock + Send + Sync>,
     metrics: Arc<Metrics>,
@@ -202,11 +208,10 @@ fn build_rest_router(
     let observer: Arc<dyn graphus_rest::router::AuthObserver> =
         Arc::new(crate::engine::RestAuthObserver::new(Arc::clone(&audit)));
     let api = router(
-        AppState::new(rest_engine, Arc::clone(&auth), registry, Arc::clone(&clock))
-            .with_auth_observer(observer),
+        AppState::new(rest_engine, auth, registry, Arc::clone(&clock)).with_auth_observer(observer),
     );
 
-    let extra = extra_routes::routes(metrics, engine, auth, clock, shutdown, readiness);
+    let extra = extra_routes::routes(metrics, engine, security, clock, shutdown, readiness);
     api.merge(extra)
 }
 

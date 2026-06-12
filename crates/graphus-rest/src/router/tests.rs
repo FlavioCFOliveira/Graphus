@@ -16,7 +16,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value as Json, json};
 use tower::ServiceExt;
 
-use graphus_auth::{Authenticator, Privilege};
+use graphus_auth::{AuthProvider, Authenticator, Privilege};
 use graphus_core::Value;
 use graphus_core::capability::Clock;
 
@@ -90,7 +90,11 @@ impl Harness {
         let clock = Arc::new(TestClock::new(1_000_000_000)); // start at t=1s
         let state = AppState::new(
             Arc::clone(&engine),
-            Arc::clone(&auth),
+            // `AppState::new` now takes `Arc<dyn AuthProvider>` (rmp #94); the fixture is a concrete
+            // `Authenticator`, so the unsizing coercion is spelled out explicitly here (it is not
+            // inferred through `Arc::clone`'s `Self`-determined return type). The harness keeps its
+            // own `Arc<Authenticator>` for `issue_token`, which is not on the seam trait.
+            Arc::clone(&auth) as Arc<dyn AuthProvider>,
             Arc::clone(&registry),
             Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>,
         );

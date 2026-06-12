@@ -9,10 +9,10 @@
 //!
 //! ## Admin surface scope
 //!
-//! These REST routes hold an `Arc<Authenticator>` **snapshot** for the Bearer-token auth check
-//! (the same point-in-time snapshot the Bolt/REST authentication path uses — see
-//! [`crate::security::SecurityCatalog::snapshot_authenticator`]). They cover inspection + process
-//! control:
+//! These REST routes hold the **live** [`crate::security::SecurityCatalog`] and resolve every
+//! Bearer-token auth check + RBAC read through it (a brief read lock per call, rmp #94), so a user
+//! created/changed/dropped at runtime is reflected here immediately — exactly as on the Bolt/REST
+//! transactional authentication path. They cover inspection + process control:
 //!
 //! - `GET  /admin/status` — server status (open transactions, readiness).
 //! - `GET  /admin/users/{name}` — inspect a named user's roles (RBAC inspection).
@@ -20,11 +20,11 @@
 //!
 //! All `/admin/*` routes require an authenticated principal with the global `Admin` privilege.
 //!
-//! **Live user/role *mutation*** (create/drop/grant) is delivered by the durable, lock-guarded
+//! **Live user/role *mutation*** (create/drop/grant) is delivered by the same durable, lock-guarded
 //! [`crate::security::SecurityCatalog`] and the administrative-statement surface
 //! ([`crate::admin`], rmp #92): `CREATE USER`, `GRANT`, … run over Bolt/UDS/REST and persist to
-//! `security.toml`. (Those live mutations are not yet reflected in *this* snapshot until the next
-//! boot reloads the file — the authentication-hot-path propagation is the rmp #93 follow-up.)
+//! `security.toml`, and — since these routes read the live catalog — take effect for this surface's
+//! authentication immediately.
 
 use std::sync::Arc;
 
@@ -33,10 +33,11 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use graphus_auth::{Authenticator, Privilege};
+use graphus_auth::Privilege;
 
 use crate::engine::EngineHandle;
 use crate::metrics::Metrics;
+use crate::security::SecurityCatalog;
 use crate::shutdown::ShutdownCoordinator;
 
 /// Shared state for the server's own routes.
@@ -44,7 +45,9 @@ use crate::shutdown::ShutdownCoordinator;
 struct ExtraState {
     metrics: Arc<Metrics>,
     engine: EngineHandle,
-    auth: Arc<Authenticator>,
+    /// The LIVE security catalog (rmp #94): every `/admin/*` Bearer check + RBAC read resolves
+    /// through it under a brief read lock, so runtime user/role mutations are visible at once.
+    security: Arc<SecurityCatalog>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
@@ -55,7 +58,7 @@ struct ExtraState {
 pub fn routes(
     metrics: Arc<Metrics>,
     engine: EngineHandle,
-    auth: Arc<Authenticator>,
+    security: Arc<SecurityCatalog>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
@@ -63,7 +66,7 @@ pub fn routes(
     let state = ExtraState {
         metrics,
         engine,
-        auth,
+        security,
         clock,
         shutdown,
         readiness,
@@ -126,16 +129,18 @@ fn require_admin(state: &ExtraState, headers: &HeaderMap) -> Result<String, Box<
         )
     })?;
     let now_unix_secs = state.clock.now_nanos() / 1_000_000_000;
+    // Resolve the Bearer check + admin gate through the LIVE catalog (one brief read lock, rmp #94),
+    // so a runtime-created admin is accepted at once and a just-dropped one is refused at once.
     let claims = state
-        .auth
-        .authenticate_bearer(token, now_unix_secs)
+        .security
+        .with_auth(|auth| auth.authenticate_bearer(token, now_unix_secs))
         .map_err(|_| {
             state.metrics.record_auth_failure();
             Box::new((StatusCode::UNAUTHORIZED, "invalid or expired token").into_response())
         })?;
     state
-        .auth
-        .require(&claims.sub, &Privilege::admin_database())
+        .security
+        .with_auth(|auth| auth.require(&claims.sub, &Privilege::admin_database()))
         .map_err(|_| {
             Box::new((StatusCode::FORBIDDEN, "admin privilege required").into_response())
         })?;
@@ -180,14 +185,18 @@ async fn admin_user(
     if let Err(resp) = require_admin(&state, &headers) {
         return *resp;
     }
-    match state.auth.catalog().user(&name) {
-        Some(user) => {
+    // Read the user's roles/name/password-presence off the LIVE catalog under a brief read lock
+    // (rmp #94), returning owned data so nothing borrows across the lock boundary.
+    let found = state.security.with_auth(|auth| {
+        auth.catalog().user(&name).map(|user| {
             let roles: Vec<String> = user.roles.iter().cloned().collect();
+            (user.name.clone(), roles, user.password_hash.is_some())
+        })
+    });
+    match found {
+        Some((user_name, roles, has_password)) => {
             let body = format!(
-                "{{\"user\":{:?},\"roles\":{:?},\"has_password\":{}}}",
-                user.name,
-                roles,
-                user.password_hash.is_some()
+                "{{\"user\":{user_name:?},\"roles\":{roles:?},\"has_password\":{has_password}}}"
             );
             (
                 StatusCode::OK,

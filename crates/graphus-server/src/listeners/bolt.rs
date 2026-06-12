@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use graphus_auth::{Authenticator, PeerCred as AuthPeerCred, PeerCredSource};
+use graphus_auth::{AuthProvider, PeerCred as AuthPeerCred, PeerCredSource};
 use graphus_bolt::server::{BoltSession, SessionConfig};
 use graphus_io::{TcpAcceptor, UdsAcceptor};
 use tokio::runtime::Handle;
@@ -28,6 +28,7 @@ use crate::admin::AdminContext;
 use crate::audit::AuditSource;
 use crate::engine::BoltEngineExecutor;
 use crate::metrics::Metrics;
+use crate::security::SecurityCatalog;
 use crate::shutdown::ShutdownCoordinator;
 
 /// A process-wide monotonic counter minting a unique `connection_id` per accepted Bolt connection
@@ -59,7 +60,7 @@ fn session_config(advertised_bolt_address: Option<String>) -> SessionConfig {
 pub async fn run_uds_accept_loop(
     acceptor: UdsAcceptor,
     context: AdminContext,
-    auth: Arc<Authenticator>,
+    auth: Arc<dyn AuthProvider>,
     advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
@@ -79,10 +80,12 @@ pub async fn run_uds_accept_loop(
                 };
                 metrics.record_bolt_uds_conn();
 
-                // Peer-cred admission gate (`04 §8.4`): resolve the uid to a known RBAC user. A
-                // connection from an unmapped/unknown uid is refused before any protocol bytes.
+                // Peer-cred admission gate (`04 §8.4`): resolve the uid to a known RBAC user against
+                // the LIVE security catalog (rmp #94), so a uid mapping created at runtime admits
+                // immediately and a removed/renamed mapping is refused immediately. A connection from
+                // an unmapped/unknown uid is refused before any protocol bytes.
                 let peer = conn.peer_cred();
-                if let Err(reason) = admit_peer(&auth, peer) {
+                if let Err(reason) = admit_peer(context.security(), peer) {
                     metrics.record_auth_failure();
                     tracing::warn!(reason, "UDS connection refused by peer-cred gate");
                     // Drop the connection: closing the socket is the refusal.
@@ -113,7 +116,7 @@ pub async fn run_tcp_accept_loop(
     acceptor: TcpAcceptor,
     tls: TlsAcceptor,
     context: AdminContext,
-    auth: Arc<Authenticator>,
+    auth: Arc<dyn AuthProvider>,
     advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
@@ -168,13 +171,16 @@ pub async fn run_tcp_accept_loop(
     tracing::info!("Bolt-TCP accept loop stopped");
 }
 
-/// Resolves a UDS connection's peer credentials to a known RBAC user, returning `Ok(())` to admit or
-/// `Err(reason)` to refuse (`04 §8.4`). A platform that does not surface peer-cred (`None`) is
-/// refused on the Bolt path: the spec keys UDS identity on `SO_PEERCRED`, so without it the channel
-/// cannot establish an identity (the listener could instead fall back to filesystem permissions; we
-/// fail closed, which is the safe default).
+/// Resolves a UDS connection's peer credentials to a known RBAC user against the **live** security
+/// catalog (rmp #94), returning `Ok(())` to admit or `Err(reason)` to refuse (`04 §8.4`). Resolving
+/// through `security.with_auth(...)` (a brief read lock) means a uid mapping added at runtime admits
+/// at once, and a removed/renamed mapping is refused at once — no reboot.
+///
+/// A platform that does not surface peer-cred (`None`) is refused on the Bolt path: the spec keys
+/// UDS identity on `SO_PEERCRED`, so without it the channel cannot establish an identity (the
+/// listener could instead fall back to filesystem permissions; we fail closed, the safe default).
 fn admit_peer(
-    auth: &Authenticator,
+    security: &SecurityCatalog,
     peer: Option<graphus_io::PeerCred>,
 ) -> Result<(), &'static str> {
     let Some(peer) = peer else {
@@ -187,7 +193,9 @@ fn admit_peer(
         // The auth layer wants a concrete pid; default 0 when the kernel did not report one.
         pid: peer.pid.unwrap_or(0),
     });
-    match auth.authenticate_peer(&source) {
+    // One brief read lock on the live model: the peer path is not on the `AuthProvider` trait (it is
+    // generic over `PeerCredSource`), so it resolves directly through the catalog here.
+    match security.with_auth(|auth| auth.authenticate_peer(&source)) {
         Ok(_user) => Ok(()),
         Err(_) => Err("uid not mapped to a known user"),
     }
@@ -210,14 +218,15 @@ impl PeerCredSource for FixedPeerCred {
 /// the connection's audit transport (`BoltUds`/`BoltTcp`) recorded on every audited event (rmp #70).
 ///
 /// The session is **blocking** (its `Transport` and engine submits block), so it runs on
-/// `spawn_blocking`, never a runtime worker (`04 §9.1`). The `Authenticator` is shared (`Arc`); the
-/// session borrows it for its lifetime, so we move the `Arc` into the task and borrow from there.
+/// `spawn_blocking`, never a runtime worker (`04 §9.1`). The [`AuthProvider`] seam is shared (`Arc`);
+/// the session borrows it for its lifetime, so we move the `Arc` into the task and borrow from there.
+/// Backed by `LiveAuth` (rmp #94), each `LOGON` resolves against the current security model.
 fn spawn_session<S>(
     stream: S,
     handle: Handle,
     context: AdminContext,
     source: AuditSource,
-    auth: Arc<Authenticator>,
+    auth: Arc<dyn AuthProvider>,
     session_config: SessionConfig,
     shutdown: ShutdownCoordinator,
 ) where
@@ -226,7 +235,8 @@ fn spawn_session<S>(
     tokio::task::spawn_blocking(move || {
         let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, None);
         let executor = BoltEngineExecutor::new(context, source);
-        let mut session = BoltSession::with_config(transport, executor, &auth, session_config);
+        let mut session =
+            BoltSession::with_config(transport, executor, auth.as_ref(), session_config);
         if let Err(e) = session.run() {
             // A transport/handshake error ends the session; a Cypher/auth FAILURE is *not* an error
             // here (it is delivered in-band — see `BoltSession::run` docs).

@@ -2,9 +2,17 @@
 //! §8.1; `06-bolt-and-error-shapes.md` §3).
 //!
 //! [`BoltSession`] drives one connection end-to-end over a [`Transport`] (the byte pipe) and a
-//! [`BoltExecutor`] (the query seam), authenticating through a shared [`Authenticator`]. It owns no
+//! [`BoltExecutor`] (the query seam), authenticating through an [`AuthProvider`] seam. It owns no
 //! sockets and no runtime: the listener (rmp #20) constructs the three pieces and calls
 //! [`BoltSession::run`].
+//!
+//! ## Authentication is live, not a snapshot (rmp #94)
+//!
+//! The session holds the auth seam as a `&dyn AuthProvider` (not a concrete `Authenticator`), so
+//! the listener decides what backs it. `graphus-server` supplies a *live* implementation that
+//! resolves each `LOGON` through its read-locked security catalog, so a user created/changed/dropped
+//! at runtime authenticates (or is refused) immediately, without a reboot. `graphus-bolt` itself
+//! stays transport-agnostic — it depends only on the [`AuthProvider`] trait in `graphus-auth`.
 //!
 //! ## States (`04 §8.1`)
 //!
@@ -31,7 +39,7 @@
 //! the trailing `SUCCESS` carries `has_more = true` and the connection stays in `STREAMING`
 //! (`06 §3.1`). `DISCARD` drops the remaining rows and emits only the trailing `SUCCESS`.
 
-use graphus_auth::Authenticator;
+use graphus_auth::AuthProvider;
 use graphus_core::Value;
 
 use crate::error::{BoltError, BoltResult, CODE_UNAUTHORIZED, Failure, failure_from_error};
@@ -133,7 +141,7 @@ pub const DEFAULT_ROUTING_TTL_SECS: i64 = 300;
 pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     transport: T,
     executor: E,
-    auth: &'a Authenticator,
+    auth: &'a dyn AuthProvider,
     /// Per-connection metadata (connection id, server agent, advertised routing address — rmp #95).
     config: SessionConfig,
     state: State,
@@ -202,9 +210,9 @@ enum Flow {
 
 impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// Builds a session over `transport`, running queries through `executor`, authenticating with
-    /// `auth`, with the default [`SessionConfig`]. The session starts in [`State::Connected`]
-    /// (pre-handshake).
-    pub fn new(transport: T, executor: E, auth: &'a Authenticator) -> Self {
+    /// `auth` (the [`AuthProvider`] seam), with the default [`SessionConfig`]. The session starts in
+    /// [`State::Connected`] (pre-handshake).
+    pub fn new(transport: T, executor: E, auth: &'a dyn AuthProvider) -> Self {
         Self::with_config(transport, executor, auth, SessionConfig::default())
     }
 
@@ -213,7 +221,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     pub fn with_config(
         transport: T,
         executor: E,
-        auth: &'a Authenticator,
+        auth: &'a dyn AuthProvider,
         config: SessionConfig,
     ) -> Self {
         Self {
@@ -789,7 +797,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
 
     // ---- Auth ------------------------------------------------------------------------------------
 
-    /// Resolves `LOGON` credentials through [`Authenticator::authenticate_password`] (Bolt native
+    /// Resolves `LOGON` credentials through [`AuthProvider::authenticate_password`] (Bolt native
     /// auth, `04 §8.4`). Returns the principal username, or a `FAILURE` to send on rejection.
     fn authenticate(&self, auth: &[(String, Value)]) -> Result<String, Failure> {
         let scheme = map_str(auth, "scheme").unwrap_or("");

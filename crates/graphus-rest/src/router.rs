@@ -3,7 +3,7 @@
 //!
 //! This is the connectivity surface: it owns no query/storage logic (that is the [`RestEngine`]
 //! seam), no value-encoding logic ([`crate::value`]), and no error-shape logic
-//! ([`crate::problem`]) — it only routes HTTP, authenticates ([`Authenticator`]), drives the
+//! ([`crate::problem`]) — it only routes HTTP, authenticates (the [`AuthProvider`] seam), drives the
 //! transaction lifecycle through the [`TxRegistry`], and negotiates the wire format. The same
 //! executor and `Value` model sit behind it as behind Bolt (`04 §8.3`).
 //!
@@ -57,7 +57,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use graphus_auth::{AuthError, Authenticator, Privilege};
+use graphus_auth::{AuthError, AuthProvider, Privilege};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -175,7 +175,10 @@ pub trait AuthObserver: Send + Sync {
 /// with `graphus-cypher`'s coordinator (rmp #20) and the tests with the mock engine.
 pub struct AppState<E: RestEngine> {
     engine: Arc<E>,
-    auth: Arc<Authenticator>,
+    /// The authentication seam (rmp #94): a `dyn` so the server can back it with a **live**
+    /// security-catalog view (a runtime user create/change/drop takes effect for Bearer auth at
+    /// once), while the tests back it with a plain snapshot `Authenticator`.
+    auth: Arc<dyn AuthProvider>,
     registry: Arc<TxRegistry>,
     clock: Arc<dyn Clock + Send + Sync>,
     /// An optional audit observer (rmp #70): when set, [`authenticate`] notifies it of each
@@ -202,7 +205,7 @@ impl<E: RestEngine + 'static> AppState<E> {
     /// [`with_auth_observer`](Self::with_auth_observer).
     pub fn new(
         engine: Arc<E>,
-        auth: Arc<Authenticator>,
+        auth: Arc<dyn AuthProvider>,
         registry: Arc<TxRegistry>,
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Self {
@@ -839,7 +842,7 @@ fn stream_single_statement_ndjson<E: RestEngine>(
 
 // =============================== auth + decode helpers =========================================
 
-/// Authenticates the request's `Authorization: Bearer` token against the [`Authenticator`],
+/// Authenticates the request's `Authorization: Bearer` token against the [`AuthProvider`] seam,
 /// returning the principal's username, or an RFC 9457 [`Problem`] (`401`/`403`) on failure
 /// (`04 §8.4`, `06 §3.3`).
 fn authenticate<E: RestEngine>(

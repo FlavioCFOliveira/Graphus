@@ -34,17 +34,18 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use graphus_auth::Authenticator;
+//! use graphus_auth::AuthProvider;
 //! use graphus_core::capability::Clock;
 //! use graphus_rest::engine::RestEngine;
 //! use graphus_rest::registry::TxRegistry;
 //! use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, router};
 //!
 //! // The listener owns the real `RestEngine` (graphus-cypher's coordinator), the shared
-//! // `Authenticator`, and the production `Clock`, builds the router, and serves it over TLS:
+//! // authentication seam (`AuthProvider` — the server backs it with a LIVE security-catalog view,
+//! // rmp #94), and the production `Clock`, builds the router, and serves it over TLS:
 //! fn build<E: RestEngine + 'static>(
 //!     engine: Arc<E>,
-//!     auth: Arc<Authenticator>,
+//!     auth: Arc<dyn AuthProvider>,
 //!     clock: Arc<dyn Clock + Send + Sync>,
 //! ) -> axum::Router {
 //!     let registry = Arc::new(TxRegistry::new(DEFAULT_TX_TTL_NANOS));
