@@ -452,7 +452,7 @@ impl EngineParams {
     /// one is configured.
     ///
     /// # Errors
-    /// [`GraphusError`] (mapped to [`CatalogError::Storage`] by the caller) if encryption is enabled
+    /// [`GraphusError`] (mapped to [`CatalogError::Engine`] by the caller) if encryption is enabled
     /// but the key file cannot be read or contains invalid key material.
     pub fn from_config(config: &ServerConfig) -> Result<Self, GraphusError> {
         let master_key = match &config.encryption.key_path {
@@ -631,6 +631,15 @@ fn spawn_db_engine(
     let device_file = dir.join(STORE_FILE_NAME);
     let wal_file = dir.join(WAL_FILE_NAME);
     let pool_pages = params.buffer_pool_pages;
+    // Crash-safe key-rotation recovery (rmp #89): complete or discard any pending master-key
+    // rotation for this database BEFORE its store is opened. It is a pure filesystem operation
+    // (rename/cleanup of `.rot-new` temps under a commit marker — no key needed) and a cheap no-op
+    // when no rotation is pending. Only meaningful for the encrypted path: a plaintext store cannot
+    // be key-rotated, so it never has rotation artifacts. Idempotent and crash-safe (see
+    // [`crate::key_rotation`]). Runs on this blocking (off-runtime) thread, ahead of the engine.
+    if params.master_key.is_some() {
+        crate::key_rotation::recover_pending_rotation(dir, &device_file, &wal_file)?;
+    }
     // The master key (if any) is cloned into the build closure (an `Arc` bump) so the `!Send`
     // coordinator can be built on the engine thread from `Send` ingredients (paths + the key).
     let master_key = params.master_key.clone();

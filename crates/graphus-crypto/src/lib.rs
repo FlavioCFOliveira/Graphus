@@ -34,12 +34,16 @@
 //!
 //! ## Scope boundary
 //!
-//! This crate encrypts the **record-store device** (rmp #85) and the **write-ahead log** (rmp #88,
-//! via [`EncryptedLogSink`]). Backup encryption and **key rotation** are sub-task #89. This crate's
-//! own code contains **no `unsafe`** (the RustCrypto crates use `unsafe` internally for SIMD, which
-//! is their concern, not ours).
+//! This crate encrypts the **record-store device** (rmp #85), the **write-ahead log** (rmp #88, via
+//! [`EncryptedLogSink`]), and **backup artifacts** (rmp #89, via [`seal_backup`]/[`open_backup`] —
+//! a portable, self-describing AEAD envelope independent of any store's salt). Crash-safe **master-
+//! key rotation** of an encrypted store directory lives in `graphus-server` (rmp #89), one layer up
+//! where the device/WAL files and their swap protocol are owned. This crate's own code contains
+//! **no `unsafe`** (the RustCrypto crates use `unsafe` internally for SIMD, which is their concern,
+//! not ours).
 #![forbid(unsafe_code)]
 
+mod backup_envelope;
 mod device;
 mod header;
 mod keyring;
@@ -47,6 +51,9 @@ mod raw;
 mod slot;
 mod wal_sink;
 
+pub use backup_envelope::{
+    BACKUP_ENVELOPE_MAGIC, BACKUP_ENVELOPE_VERSION, BACKUP_SUBKEY_INFO, open_backup, seal_backup,
+};
 pub use device::{EncryptedBlockDevice, EncryptedFileDevice};
 pub use header::{CIPHER_AES_256_GCM, HEADER_MAGIC, HEADER_SLOTS, HEADER_VERSION, Header};
 pub use keyring::{

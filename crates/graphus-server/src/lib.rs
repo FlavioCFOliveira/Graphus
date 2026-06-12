@@ -28,6 +28,7 @@ pub mod admin;
 pub mod config;
 pub mod dbcatalog;
 pub mod engine;
+pub mod key_rotation;
 pub mod listeners;
 pub mod metrics;
 pub mod observability;
