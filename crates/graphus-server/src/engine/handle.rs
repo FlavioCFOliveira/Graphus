@@ -18,8 +18,8 @@ use tokio::sync::Semaphore;
 
 use super::TxTicket;
 use super::command::{
-    AccessMode, EngineCommand, IndexCommand, IndexDdlReply, ReplyReceiver, RunReply, RunSummary,
-    reply_channel,
+    AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, ReplyReceiver,
+    RunReply, RunSummary, reply_channel,
 };
 use super::privileges::EffectivePrivileges;
 use crate::metrics::Metrics;
@@ -230,6 +230,24 @@ impl EngineHandle {
         recv_async(rx).await?
     }
 
+    /// Executes a **constraint-DDL** statement (`CREATE/DROP CONSTRAINT`, `SHOW CONSTRAINTS`) against
+    /// the coordinator's constraint catalog (`rmp` task #99). Like [`index_ddl`](Self::index_ddl) this
+    /// takes **no admission permit** (it is schema control, not a query) and the caller is responsible
+    /// for the admin-privilege gate before calling it.
+    ///
+    /// # Errors
+    /// [`GraphusError::Runtime`] (constraint-validation class) if existing data violates a `CREATE`,
+    /// a storage fault while declaring/dropping/listing, or if the engine is shut down.
+    pub async fn constraint_ddl(
+        &self,
+        command: ConstraintCommand,
+    ) -> Result<IndexDdlReply, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::ConstraintDdl { command, reply })
+            .await?;
+        recv_async(rx).await?
+    }
+
     // ---- Blocking submit (the Bolt session, on a blocking task, uses these) ----------------------
 
     /// Blocking variant of [`begin`](Self::begin) for the synchronous Bolt seam (called on a
@@ -305,6 +323,20 @@ impl EngineHandle {
     pub fn index_ddl_blocking(&self, command: IndexCommand) -> Result<IndexDdlReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit_blocking(EngineCommand::IndexDdl { command, reply })?;
+        recv_blocking(rx)?
+    }
+
+    /// Blocking variant of [`constraint_ddl`](Self::constraint_ddl) for the synchronous Bolt/REST
+    /// seams (called on a `spawn_blocking` thread / inside a `Handle::block_on`).
+    ///
+    /// # Errors
+    /// As [`constraint_ddl`](Self::constraint_ddl).
+    pub fn constraint_ddl_blocking(
+        &self,
+        command: ConstraintCommand,
+    ) -> Result<IndexDdlReply, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit_blocking(EngineCommand::ConstraintDdl { command, reply })?;
         recv_blocking(rx)?
     }
 

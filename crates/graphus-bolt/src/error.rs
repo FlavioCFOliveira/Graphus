@@ -24,7 +24,7 @@
 
 use std::fmt;
 
-use graphus_core::GraphusError;
+use graphus_core::{CONSTRAINT_VIOLATION_PREFIX, GraphusError};
 
 /// The crate-wide result alias for protocol/codec operations.
 pub type BoltResult<T> = std::result::Result<T, BoltError>;
@@ -117,6 +117,22 @@ impl Failure {
 /// best-effort placeholders the `06 §2.4` flag will pin verbatim.
 #[must_use]
 pub fn failure_from_error(error: &GraphusError) -> Failure {
+    // The human message renders verbatim, but strip the `GraphusError` layer prefix
+    // ("compile error: ", …) the engine's `Display` adds — the classification already conveys the
+    // layer, and Neo4j `FAILURE` messages do not carry that prefix.
+    let message = strip_layer_prefix(&error.to_string());
+
+    // A constraint violation (`rmp` task #99) is a `GraphusError::Runtime` whose message carries the
+    // internal sentinel `graphus_cypher::CONSTRAINT_VIOLATION_PREFIX`. Detect it and emit the precise
+    // openCypher/Neo4j schema class — `Neo.ClientError.Schema.ConstraintValidationFailed` — instead of
+    // the generic runtime class, stripping the sentinel from the message the wire carries. This is the
+    // TCK-faithful class the driver ecosystem asserts for a unique/existence-constraint breach.
+    if let GraphusError::Runtime(_) = error
+        && let Some(stripped) = message.strip_prefix(CONSTRAINT_VIOLATION_PREFIX)
+    {
+        return Failure::new(CODE_CONSTRAINT_VALIDATION, stripped.to_owned());
+    }
+
     let code = match error {
         GraphusError::Compile(_) => CODE_COMPILE_SYNTAX,
         GraphusError::Runtime(_) => CODE_RUNTIME_ARGUMENT,
@@ -128,10 +144,6 @@ pub fn failure_from_error(error: &GraphusError) -> Failure {
         // until it is explicitly classified, which is the safe (non-retriable, owner-visible) choice.
         _ => CODE_DB_UNKNOWN,
     };
-    // The human message renders verbatim, but strip the `GraphusError` layer prefix
-    // ("compile error: ", …) the engine's `Display` adds — the classification already conveys the
-    // layer, and Neo4j `FAILURE` messages do not carry that prefix.
-    let message = strip_layer_prefix(&error.to_string());
     Failure::new(code, message)
 }
 
@@ -141,6 +153,11 @@ const CODE_RUNTIME_ARGUMENT: &str = "Neo.ClientError.Statement.ArgumentError";
 const CODE_TXN_TERMINATED: &str = "Neo.TransientError.Transaction.Terminated";
 const CODE_DB_UNKNOWN: &str = "Neo.DatabaseError.General.UnknownError";
 const CODE_REQUEST_INVALID: &str = "Neo.ClientError.Request.Invalid";
+/// The constraint-validation class (`rmp` task #99): a unique/existence-constraint breach. This is
+/// the verbatim openCypher/Neo4j class the driver ecosystem asserts for such a failure, so it is
+/// emitted as-is (not a best-effort placeholder) — detected via the
+/// [`CONSTRAINT_VIOLATION_PREFIX`] sentinel on a [`GraphusError::Runtime`] message.
+const CODE_CONSTRAINT_VALIDATION: &str = "Neo.ClientError.Schema.ConstraintValidationFailed";
 
 /// Best-effort code for a failed authentication (`04 §8.4`). Authentication failures are not a
 /// `GraphusError` variant (they are an `AuthError` resolved before any engine call), so the server
@@ -210,6 +227,24 @@ mod tests {
         let f = failure_from_error(&GraphusError::Security("permission denied".to_owned()));
         assert_eq!(f.code, CODE_FORBIDDEN);
         assert_eq!(f.message, "permission denied");
+    }
+
+    #[test]
+    fn constraint_violation_maps_to_schema_class_and_strips_the_sentinel() {
+        // A constraint violation is a Runtime error whose message carries the sentinel prefix; the
+        // renderer must emit the schema class and strip BOTH the layer prefix and the sentinel.
+        let msg = format!(
+            "{CONSTRAINT_VIOLATION_PREFIX}Node(:Person) already exists with property `email`"
+        );
+        let f = failure_from_error(&GraphusError::Runtime(msg));
+        assert_eq!(f.code, "Neo.ClientError.Schema.ConstraintValidationFailed");
+        assert_eq!(
+            f.message,
+            "Node(:Person) already exists with property `email`"
+        );
+        // A plain runtime error (no sentinel) still maps to the generic argument class.
+        let plain = failure_from_error(&GraphusError::Runtime("/ by zero".to_owned()));
+        assert_eq!(plain.code, CODE_RUNTIME_ARGUMENT);
     }
 
     #[test]

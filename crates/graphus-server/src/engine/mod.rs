@@ -41,7 +41,9 @@ use graphus_storage::RecordStore;
 use graphus_txn::IsolationLevel;
 use graphus_wal::LogSink;
 
-pub use command::{AccessMode, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary};
+pub use command::{
+    AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary,
+};
 pub use handle::{EngineHandle, ServerBusy};
 pub use privileges::EffectivePrivileges;
 pub use seam_bolt::BoltEngineExecutor;
@@ -50,7 +52,7 @@ pub use seam_rest::{RestAuthObserver, RestEngineAdapter};
 use crate::metrics::Metrics;
 use command::EngineCommand as Cmd;
 use graphus_core::{TxnId, Value};
-use graphus_storage::IndexState;
+use graphus_storage::{ConstraintKind, IndexState};
 
 /// How many nodes a single [`TxnCoordinator::advance_index_builds`] call indexes per tick while a
 /// non-blocking index build is in progress (`rmp` task #91).
@@ -253,6 +255,10 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
             let out = handle_index_ddl(coord, &command);
             let _ = reply.send(out);
         }
+        Cmd::ConstraintDdl { command, reply } => {
+            let out = handle_constraint_ddl(coord, &command);
+            let _ = reply.send(out);
+        }
         Cmd::Shutdown { reply } => {
             // Drain stragglers through `&mut`, then consume the coordinator for the final flush. An
             // in-flight index build is left durably `Populating`: it resumes and completes on the
@@ -397,6 +403,68 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                         Value::String(label),
                         Value::String(property),
                         Value::String(state.to_owned()),
+                    ]
+                })
+                .collect();
+            Ok(IndexDdlReply { fields, rows })
+        }
+    }
+}
+
+/// Executes one constraint-DDL command against the coordinator's constraint catalog (`rmp` task
+/// #99). `CREATE` validates existing data and declares the constraint synchronously (no rows; an
+/// error without side effects if existing data violates it); `DROP` removes it (no rows);
+/// `SHOW CONSTRAINTS` lists every declared constraint.
+///
+/// Runs on the engine thread, so it may touch the (`!Send`) coordinator directly. Unlike index DDL
+/// there is no non-blocking build: a uniqueness constraint's backing index is (re)built synchronously
+/// inside `create_constraint`, which is acceptable because schema DDL is rare and serialised.
+fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
+    coordinator: &mut TxnCoordinator<D, S>,
+    command: &ConstraintCommand,
+) -> Result<IndexDdlReply> {
+    match command {
+        ConstraintCommand::CreateUnique {
+            name,
+            label,
+            property,
+        } => {
+            coordinator.create_constraint(name, label, property, ConstraintKind::Unique)?;
+            Ok(IndexDdlReply::default())
+        }
+        ConstraintCommand::CreateExistence {
+            name,
+            label,
+            property,
+        } => {
+            coordinator.create_constraint(name, label, property, ConstraintKind::Existence)?;
+            Ok(IndexDdlReply::default())
+        }
+        ConstraintCommand::Drop { name } => {
+            coordinator.drop_constraint(name)?;
+            Ok(IndexDdlReply::default())
+        }
+        ConstraintCommand::Show => {
+            let fields = vec![
+                "name".to_owned(),
+                "label".to_owned(),
+                "property".to_owned(),
+                "type".to_owned(),
+            ];
+            let rows = coordinator
+                .list_constraints()
+                .into_iter()
+                .map(|(name, label, property, kind)| {
+                    // Neo4j-compatible `type` strings for `SHOW CONSTRAINTS`.
+                    let kind = match kind {
+                        ConstraintKind::Unique => "UNIQUENESS",
+                        ConstraintKind::Existence => "NODE_PROPERTY_EXISTENCE",
+                    };
+                    vec![
+                        Value::String(name),
+                        Value::String(label),
+                        Value::String(property),
+                        Value::String(kind.to_owned()),
                     ]
                 })
                 .collect();

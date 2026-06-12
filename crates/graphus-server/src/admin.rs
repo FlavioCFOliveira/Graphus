@@ -100,7 +100,7 @@ use crate::audit::{
     classify_admin, is_mutating_admin, redact_admin_detail,
 };
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
-use crate::engine::{EngineHandle, IndexCommand};
+use crate::engine::{ConstraintCommand, EngineHandle, IndexCommand};
 use crate::security::{SecurityCatalog, SecurityError};
 
 // ------------------------------------------------------------------------------------------------
@@ -335,6 +335,12 @@ pub enum AdminParse {
     /// [`EngineHandle`] (not the off-engine catalog), because the index catalog lives on the engine.
     /// The seams route it after the same admin-privilege gate as the database commands.
     Index(IndexCommand),
+    /// A well-formed **constraint** administrative statement (`rmp` task #99): `CREATE/DROP
+    /// CONSTRAINT` or `SHOW CONSTRAINTS`. Like an index command it is executed on the
+    /// [`graphus_cypher::TxnCoordinator`] via the target database's [`EngineHandle`] (the constraint
+    /// catalog lives on the engine), after the same admin-privilege gate. The seams route it
+    /// identically to [`Index`](Self::Index).
+    Constraint(ConstraintCommand),
     /// The statement is unambiguously claimed by the admin grammar (its first two tokens are an
     /// admin verb + the `DATABASE`/`DATABASES`/`INDEX`/`INDEXES` keyword) but the remainder is
     /// malformed; the payload is the syntax-error message. The seams surface it as a compile-time
@@ -536,6 +542,23 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
     if is_keyword(&second, "POINT") {
         return match parse_claimed_point(&verb, &mut lex) {
             Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // --- Constraint surface (`rmp` task #99): CREATE/DROP/SHOW CONSTRAINT(S) … ---
+    // `CONSTRAINT`/`CONSTRAINTS` directly after a verb is never valid Cypher, so the statement is
+    // CLAIMED once the verb + the keyword is seen (mirroring the INDEX surface).
+    if is_keyword(&second, "CONSTRAINT") || is_keyword(&second, "CONSTRAINTS") {
+        let plural = is_keyword(&second, "CONSTRAINTS");
+        if plural && verb != "SHOW" {
+            // e.g. `CREATE CONSTRAINTS …` — claimed by shape, but only SHOW takes the plural.
+            return AdminParse::Invalid(format!(
+                "expected CONSTRAINT after {verb} (CONSTRAINTS is only valid in SHOW CONSTRAINTS)"
+            ));
+        }
+        return match parse_claimed_constraint(&verb, plural, &mut lex) {
+            Ok(cmd) => AdminParse::Constraint(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
     }
@@ -888,6 +911,121 @@ fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), Stri
     expect_symbol(lex, ')', VERB)?;
     expect_end(lex, "CREATE POINT INDEX")?;
     Ok((label, property))
+}
+
+/// Parses the remainder of a claimed **constraint** statement (`verb` + `CONSTRAINT`/`CONSTRAINTS`
+/// already read), for the four shapes (`rmp` task #99):
+///
+/// ```text
+/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS UNIQUE
+/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS NOT NULL
+/// DROP   CONSTRAINT <name>
+/// SHOW   CONSTRAINTS
+/// ```
+///
+/// A constraint is identified by **name** (Neo4j-compatible), like a full-text / point index. The
+/// `REQUIRE <var>.<prop> IS (UNIQUE | NOT NULL)` tail distinguishes a uniqueness from an existence
+/// constraint; the `<var>` text is irrelevant (single-variable shape, reusing [`parse_property_ref`]).
+fn parse_claimed_constraint(
+    verb: &str,
+    plural: bool,
+    lex: &mut Lexer<'_>,
+) -> Result<ConstraintCommand, String> {
+    if plural {
+        // SHOW CONSTRAINTS — nothing else allowed.
+        expect_end(lex, "SHOW CONSTRAINTS")?;
+        return Ok(ConstraintCommand::Show);
+    }
+    if verb == "SHOW" {
+        // `SHOW CONSTRAINT` (singular) is not a recognised form; only the plural `SHOW CONSTRAINTS`.
+        return Err(
+            "expected SHOW CONSTRAINTS (the singular SHOW CONSTRAINT is not supported)".to_owned(),
+        );
+    }
+
+    // Both CREATE and DROP take a name next.
+    let name = expect_name(lex, "a constraint name", "CONSTRAINT")?;
+
+    match verb {
+        "DROP" => {
+            expect_end(lex, "DROP CONSTRAINT")?;
+            Ok(ConstraintCommand::Drop { name })
+        }
+        "CREATE" => {
+            let (label, property, unique) = parse_constraint_create_tail(lex)?;
+            if unique {
+                Ok(ConstraintCommand::CreateUnique {
+                    name,
+                    label,
+                    property,
+                })
+            } else {
+                Ok(ConstraintCommand::CreateExistence {
+                    name,
+                    label,
+                    property,
+                })
+            }
+        }
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
+        other => Err(format!("unsupported constraint verb {other}")),
+    }
+}
+
+/// Parses the `FOR (<var>:<Label>) REQUIRE <var>.<property> IS (UNIQUE | NOT NULL)` tail of a
+/// `CREATE CONSTRAINT <name>` statement (`rmp` task #99). Returns `(label, property, is_unique)`,
+/// where `is_unique == false` means an existence (`NOT NULL`) constraint. Mirrors the openCypher-9
+/// `FOR (n:Label) … (n.prop)` node-property shape, reusing [`parse_property_ref`].
+fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String, bool), String> {
+    const VERB: &str = "CONSTRAINT";
+    // FOR ( <var> : <Label> )
+    expect_keyword(lex, "FOR", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    // REQUIRE <var>.<property>  — Neo4j uses `REQUIRE`; `ASSERT` is the legacy spelling, also accepted.
+    let req = lex
+        .next_tok()?
+        .ok_or_else(|| "expected REQUIRE in CONSTRAINT".to_owned())?;
+    if !is_keyword(&req, "REQUIRE") && !is_keyword(&req, "ASSERT") {
+        return Err(unexpected_generic(&req, "REQUIRE in CONSTRAINT"));
+    }
+    // The property may be wrapped in parentheses (`REQUIRE (n.prop)`) or bare (`REQUIRE n.prop`);
+    // accept both (Neo4j accepts the parenthesised single-property form).
+    let parenthesised = peek_symbol(lex, '(')?;
+    if parenthesised {
+        expect_symbol(lex, '(', VERB)?;
+    }
+    let property = parse_property_ref(VERB, lex)?;
+    if parenthesised {
+        expect_symbol(lex, ')', VERB)?;
+    }
+    // IS (UNIQUE | NOT NULL)
+    expect_keyword(lex, "IS", VERB)?;
+    let next = lex
+        .next_tok()?
+        .ok_or_else(|| "expected UNIQUE or NOT NULL after IS in CONSTRAINT".to_owned())?;
+    let is_unique = if is_keyword(&next, "UNIQUE") {
+        true
+    } else if is_keyword(&next, "NOT") {
+        // NOT NULL
+        let null = lex
+            .next_tok()?
+            .ok_or_else(|| "expected NULL after NOT in CONSTRAINT".to_owned())?;
+        if !is_keyword(&null, "NULL") {
+            return Err(unexpected_generic(&null, "NULL after NOT in CONSTRAINT"));
+        }
+        false
+    } else {
+        return Err(unexpected_generic(
+            &next,
+            "UNIQUE or NOT NULL after IS in CONSTRAINT",
+        ));
+    };
+    expect_end(lex, "CREATE CONSTRAINT")?;
+    Ok((label, property, is_unique))
 }
 
 /// Peeks whether the next token is the single symbol `sym`, without consuming it.
@@ -1951,6 +2089,13 @@ mod tests {
         }
     }
 
+    fn constraint_cmd(query: &str) -> ConstraintCommand {
+        match parse_admin_statement(query) {
+            AdminParse::Constraint(c) => c,
+            other => panic!("expected a constraint command for {query:?}, got {other:?}"),
+        }
+    }
+
     fn invalid(query: &str) -> String {
         match parse_admin_statement(query) {
             AdminParse::Invalid(m) => m,
@@ -2066,7 +2211,13 @@ mod tests {
         not_admin("CREATE INDEX_X");
         not_admin("MATCH (n:Index) RETURN n");
         not_admin("showindexes"); // single token, not the two-token prefix
-        not_admin("SHOW CONSTRAINTS"); // a different SHOW target
+        // `SHOW CONSTRAINTS` is now claimed by the constraint surface (`rmp` task #99), tested in the
+        // constraint-grammar tests below. A node labelled `Constraint`, a query merely mentioning the
+        // word, and a prefixed identifier still pass through untouched.
+        not_admin("CREATE (n:Constraint)");
+        not_admin("CREATE CONSTRAINT_X");
+        not_admin("MATCH (n:Constraint) RETURN n");
+        not_admin("showconstraints"); // single token, not the two-token prefix
     }
 
     #[test]
@@ -2293,6 +2444,65 @@ mod tests {
         invalid("DROP POINT INDEX"); // missing name
         invalid("DROP POINT INDEX p trailing");
         invalid("CREATE POINT INDEXES ..."); // plural only for SHOW
+    }
+
+    #[test]
+    fn create_constraint_unique_and_not_null() {
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c1 FOR (n:Person) REQUIRE n.email IS UNIQUE"),
+            ConstraintCommand::CreateUnique {
+                name: "c1".to_owned(),
+                label: "Person".to_owned(),
+                property: "email".to_owned(),
+            }
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c2 FOR (n:Person) REQUIRE n.name IS NOT NULL"),
+            ConstraintCommand::CreateExistence {
+                name: "c2".to_owned(),
+                label: "Person".to_owned(),
+                property: "name".to_owned(),
+            }
+        );
+        // Case-insensitive keywords, the legacy `ASSERT` spelling, and a parenthesised property all
+        // parse to the same command.
+        assert_eq!(
+            constraint_cmd("create constraint c3 for (x:Account) assert (x.iban) is unique"),
+            ConstraintCommand::CreateUnique {
+                name: "c3".to_owned(),
+                label: "Account".to_owned(),
+                property: "iban".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn drop_and_show_constraints() {
+        assert_eq!(
+            constraint_cmd("DROP CONSTRAINT c1"),
+            ConstraintCommand::Drop {
+                name: "c1".to_owned()
+            }
+        );
+        assert_eq!(constraint_cmd("SHOW CONSTRAINTS"), ConstraintCommand::Show);
+    }
+
+    #[test]
+    fn claimed_but_malformed_constraint_is_a_syntax_error() {
+        invalid("CREATE CONSTRAINT"); // missing name
+        invalid("CREATE CONSTRAINT c"); // missing FOR clause
+        invalid("CREATE CONSTRAINT c FOR (n:Person)"); // missing REQUIRE
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email"); // missing IS …
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS"); // missing UNIQUE/NOT NULL
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS NOT"); // partial NOT NULL
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS WEIRD"); // unknown rule
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE email IS UNIQUE"); // ref must be var.prop
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS UNIQUE extra");
+        invalid("SHOW CONSTRAINT"); // singular not a form
+        invalid("SHOW CONSTRAINTS extra");
+        invalid("DROP CONSTRAINT"); // missing name
+        invalid("DROP CONSTRAINT c trailing");
+        invalid("CREATE CONSTRAINTS ..."); // plural only for SHOW
     }
 
     #[test]
@@ -2529,7 +2739,6 @@ mod tests {
         not_admin("RETURN 'CREATE USER alice'");
         not_admin("CREATE USER_X"); // second token is not the keyword
         not_admin("CREATE ROLE_X");
-        not_admin("SHOW CONSTRAINTS");
         not_admin("showusers");
         // GRANT/REVOKE are claimed by the first token (never valid Cypher), so a bare/garbled one
         // is an Invalid admin syntax error, not passed through — verified below.

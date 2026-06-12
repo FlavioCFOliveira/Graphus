@@ -148,6 +148,47 @@ pub enum IndexCommand {
     ShowPointIndexes,
 }
 
+/// A **constraint-DDL** statement routed to the engine thread (`rmp` task #99), where the constraint
+/// catalog lives (on the single-threaded coordinator). Like [`IndexCommand`] — and unlike the
+/// DATABASE admin commands, which act on the off-engine async catalog — constraint DDL must reach the
+/// [`graphus_cypher::TxnCoordinator`], so it travels as its own engine command.
+///
+/// The name/label/property are validated/normalized by the admin matcher before this is built; the
+/// engine looks them up / interns them through the coordinator. Unlike an index, a constraint
+/// `CREATE` is **synchronous and validated** (it scans existing data and may fail) — there is no
+/// non-blocking build phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintCommand {
+    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE n.<prop> IS UNIQUE` (`rmp` task #99):
+    /// declares a **uniqueness** constraint after validating existing data conforms.
+    CreateUnique {
+        /// The server-unique constraint name.
+        name: String,
+        /// The node label the constraint covers.
+        label: String,
+        /// The property the constraint covers (exactly one in v1).
+        property: String,
+    },
+    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE n.<prop> IS NOT NULL` (`rmp` task #99):
+    /// declares an **existence** (`NOT NULL`) constraint after validating existing data conforms.
+    CreateExistence {
+        /// The server-unique constraint name.
+        name: String,
+        /// The node label the constraint covers.
+        label: String,
+        /// The property the constraint covers (exactly one).
+        property: String,
+    },
+    /// `DROP CONSTRAINT <name>` (`rmp` task #99): removes the constraint (durable + in-memory), so the
+    /// write path stops enforcing it.
+    Drop {
+        /// The constraint name to drop.
+        name: String,
+    },
+    /// `SHOW CONSTRAINTS` (`rmp` task #99): lists every declared constraint.
+    Show,
+}
+
 /// The buffered result of an [`EngineCommand::IndexDdl`]: column names + rows, streamed back through
 /// each seam's normal admin-result mechanism. `CREATE`/`DROP` return no rows; `SHOW INDEXES` returns
 /// one row per index.
@@ -248,6 +289,18 @@ pub enum EngineCommand {
         /// The index-DDL statement to execute.
         command: IndexCommand,
         /// Reply channel: the buffered fields + rows, or an engine error.
+        reply: Reply<Result<IndexDdlReply, GraphusError>>,
+    },
+    /// Execute a **constraint-DDL** statement (`CREATE/DROP CONSTRAINT`, `SHOW CONSTRAINTS`) against
+    /// the coordinator's constraint catalog (`rmp` task #99). Routed to the engine — not the async
+    /// database catalog — because the constraint catalog lives on the single-threaded coordinator.
+    /// Unlike index DDL, `CREATE` is **synchronous and validated**: it scans existing data and fails
+    /// (without side effects) if any node violates the new constraint, otherwise it persists the
+    /// declaration and the rule is enforced from then on.
+    ConstraintDdl {
+        /// The constraint-DDL statement to execute.
+        command: ConstraintCommand,
+        /// Reply channel: the buffered fields + rows (reusing [`IndexDdlReply`]), or an engine error.
         reply: Reply<Result<IndexDdlReply, GraphusError>>,
     },
 }

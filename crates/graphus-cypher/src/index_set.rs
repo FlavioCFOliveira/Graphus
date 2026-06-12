@@ -34,7 +34,7 @@ use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
 use graphus_index::{BTree, PropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
-use graphus_storage::IndexState;
+use graphus_storage::{ConstraintKind, IndexState};
 use graphus_wal::{MemLogSink, WalManager};
 
 /// The in-memory block device the derived indexes are built on.
@@ -90,6 +90,27 @@ pub struct IndexSet {
     /// carries the build state and the in-memory [`SpatialIndex`] grid over the covered point
     /// property. Ephemeral and rebuilt on open, exactly like the property and full-text indexes.
     spatial: HashMap<(u32, u32), SpatialEntry>,
+    /// Declared **constraints** (`rmp` task #99), keyed by their server-unique **name**. Each value
+    /// is a [`ConstraintRule`] carrying the covered label token, the covered property tokens and the
+    /// [`ConstraintKind`]. Unlike the index maps this holds no backing tree of its own: a uniqueness
+    /// constraint reuses the node-property index on its `(label, property)` (a unique constraint
+    /// ensures one exists), so write-time enforcement is just a registry of *which* rules apply,
+    /// re-checked against the store + index by the `RecordStoreGraph` write path. Ephemeral and
+    /// rebuilt from the durable catalog on open, exactly like the indexes.
+    constraints: HashMap<String, ConstraintRule>,
+}
+
+/// A declared constraint's in-memory rule (`rmp` task #99): the covered label token, the covered
+/// property tokens (one in v1) and the [`ConstraintKind`]. Mirrors the durable
+/// [`graphus_storage::ConstraintEntry`]; this is the value the write-path enforcement consults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintRule {
+    /// The label-namespace token the constraint covers.
+    pub label_token: u32,
+    /// The property-key tokens the constraint covers, in declared order (exactly one in v1).
+    pub property_tokens: Vec<u32>,
+    /// Whether the constraint is a uniqueness or an existence (`NOT NULL`) rule.
+    pub kind: ConstraintKind,
 }
 
 /// A declared node-property index plus its durable build [`IndexState`] (`rmp` task #90).
@@ -139,6 +160,7 @@ impl IndexSet {
             node_props: HashMap::new(),
             fulltext: HashMap::new(),
             spatial: HashMap::new(),
+            constraints: HashMap::new(),
         }
     }
 
@@ -204,9 +226,75 @@ impl IndexSet {
             .map(|np| np.state)
     }
 
+    // ---- Constraints (`rmp` task #99) ---------------------------------------------------------
+
+    /// Registers (or replaces) the constraint named `name` over `(label_token, property_tokens)` of
+    /// `kind` (`rmp` task #99). Idempotent on the name: re-registering overwrites the rule. Holds no
+    /// backing tree — a uniqueness constraint reuses the node-property index on its `(label,
+    /// property)`; this map only records *which* rules the write path must enforce.
+    pub fn register_constraint(
+        &mut self,
+        name: &str,
+        label_token: u32,
+        property_tokens: Vec<u32>,
+        kind: ConstraintKind,
+    ) {
+        self.constraints.insert(
+            name.to_owned(),
+            ConstraintRule {
+                label_token,
+                property_tokens,
+                kind,
+            },
+        );
+    }
+
+    /// Unregisters the constraint named `name`, if registered (`rmp` task #99, `DROP CONSTRAINT`). A
+    /// no-op if absent. After this the rule is no longer enforced by the write path. The backing
+    /// node-property index of a uniqueness constraint is **not** dropped here — the coordinator owns
+    /// that decision (a property index may still be wanted for query routing).
+    pub fn unregister_constraint(&mut self, name: &str) {
+        self.constraints.remove(name);
+    }
+
+    /// Whether a constraint named `name` is registered (`rmp` task #99).
+    #[must_use]
+    pub fn has_constraint(&self, name: &str) -> bool {
+        self.constraints.contains_key(name)
+    }
+
+    /// The constraint rules that apply to `label_token` (`rmp` task #99): every registered constraint
+    /// whose covered label is `label_token`. Used by the write path to enforce only the relevant rules
+    /// for a node carrying that label. Returned by value (cloned) so the caller does not hold the
+    /// `IndexSet` borrow across the per-rule store re-checks.
+    #[must_use]
+    pub fn constraints_for_label(&self, label_token: u32) -> Vec<ConstraintRule> {
+        self.constraints
+            .values()
+            .filter(|rule| rule.label_token == label_token)
+            .cloned()
+            .collect()
+    }
+
+    /// Every registered constraint as `(name, rule)`, ascending by name (deterministic) (`rmp` task
+    /// #99). Used by `SHOW CONSTRAINTS`.
+    #[must_use]
+    pub fn registered_constraints(&self) -> Vec<(String, ConstraintRule)> {
+        let mut out: Vec<(String, ConstraintRule)> = self
+            .constraints
+            .iter()
+            .map(|(name, rule)| (name.clone(), rule.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Drops all entries from every index, keeping the registered `(label_token, prop_key)` set **and
     /// each one's state**, for a full rebuild from the store. Implemented by recreating each backing
     /// tree (the simplest correct reset for an ephemeral in-memory index).
+    ///
+    /// The constraint registry (`rmp` task #99) is left untouched: it holds *declarations*, not data,
+    /// and a uniqueness constraint's data lives in the node-property index that `clear` resets above.
     pub fn clear(&mut self) {
         self.labels = TokenIndex::new(fresh_tree());
         for np in self.node_props.values_mut() {
@@ -1073,6 +1161,47 @@ mod tests {
             set.seek_node_property_eq(1, 2, &Value::Integer(5)),
             Some(Vec::<u64>::new())
         );
+    }
+
+    // ---- constraints (`rmp` task #99) ------------------------------------------------------
+
+    #[test]
+    fn constraint_register_lookup_by_label_and_unregister() {
+        let mut set = IndexSet::new();
+        assert!(!set.has_constraint("uniq"));
+        // Two constraints on label token 1, one on label token 2.
+        set.register_constraint("uniq", 1, vec![10], ConstraintKind::Unique);
+        set.register_constraint("exists", 1, vec![11], ConstraintKind::Existence);
+        set.register_constraint("other", 2, vec![12], ConstraintKind::Unique);
+        assert!(set.has_constraint("uniq"));
+
+        // `constraints_for_label` returns only the rules covering that label.
+        let mut for_1 = set.constraints_for_label(1);
+        for_1.sort_by_key(|r| r.property_tokens[0]);
+        assert_eq!(for_1.len(), 2);
+        assert_eq!(for_1[0].kind, ConstraintKind::Unique);
+        assert_eq!(for_1[0].property_tokens, vec![10]);
+        assert_eq!(for_1[1].kind, ConstraintKind::Existence);
+        assert_eq!(set.constraints_for_label(2).len(), 1);
+        assert!(set.constraints_for_label(99).is_empty());
+
+        // `registered_constraints` lists all, ascending by name.
+        let names: Vec<String> = set
+            .registered_constraints()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["exists", "other", "uniq"]);
+
+        // A clear keeps the constraint registrations (they are declarations, not data).
+        set.clear();
+        assert!(set.has_constraint("uniq"));
+        assert_eq!(set.constraints_for_label(1).len(), 2);
+
+        // Unregister removes only that constraint.
+        set.unregister_constraint("uniq");
+        assert!(!set.has_constraint("uniq"));
+        assert_eq!(set.constraints_for_label(1).len(), 1);
     }
 
     // ---- full-text (`rmp` task #72) --------------------------------------------------------

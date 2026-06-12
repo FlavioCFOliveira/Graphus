@@ -79,7 +79,7 @@ use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::encode_single;
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_io::BlockDevice;
-use graphus_storage::{MvccHeader, Namespace, RecordStore};
+use graphus_storage::{ConstraintKind, MvccHeader, Namespace, RecordStore};
 use graphus_txn::{CommitRegistry, LockOutcome, LockTable, Snapshot, SsiTracker, is_visible};
 use graphus_wal::LogSink;
 
@@ -98,8 +98,18 @@ fn rel_ssi_key(id: u64) -> u64 {
     id | REL_SSI_KEY_TAG
 }
 
+/// Renders a [`Value`] compactly for a constraint-violation message (`rmp` task #99): a string is
+/// single-quoted, everything else uses its `Debug` form. Only for the human message.
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{s}'"),
+        other => format!("{other:?}"),
+    }
+}
+
+use crate::constraint::ConstraintViolation;
 use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
-use crate::index_set::IndexSet;
+use crate::index_set::{ConstraintRule, IndexSet};
 
 /// A [`GraphAccess`] implementation over a real [`RecordStore`], scoped to one transaction
 /// (`rmp` task #38; see the module docs for the supported-vs-deferred matrix).
@@ -150,6 +160,14 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// scan (the index lives in the coordinator, rebuilt from the store). The index is in-memory and
     /// candidate-only, so it is never committed or recovered — see [`IndexSet`].
     index: Option<Rc<RefCell<IndexSet>>>,
+    /// While `true`, the per-property constraint check in
+    /// [`set_node_property`](Self::set_node_property) is **suppressed** (`rmp` task #99). Set by
+    /// [`create_node`](Self::create_node) and [`replace_node_properties`](Self::replace_node_properties)
+    /// for the duration of applying a node's full property map, so constraints are checked **once**,
+    /// after every property is written — never against a half-built node where a not-yet-set required
+    /// property would spuriously trip an existence check, or a soon-to-be-overwritten value would trip
+    /// a uniqueness check. The enclosing method runs the single deferred check itself.
+    defer_constraint_check: std::cell::Cell<bool>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
@@ -185,6 +203,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // full scan (`rmp` task #48). This keeps the standalone `record_store_graph.rs` path
             // behaviour byte-for-byte unchanged.
             index: None,
+            defer_constraint_check: std::cell::Cell::new(false),
         }
     }
 
@@ -218,6 +237,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // Coordinated path: the shared derived index is present, so label scans and node-property
             // predicates seek candidates from it and re-check them here (`rmp` task #48).
             index: Some(index),
+            defer_constraint_check: std::cell::Cell::new(false),
         }
     }
 
@@ -266,6 +286,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             error: RefCell::new(None),
             // Standalone snapshot path: no derived index (the index lives in the coordinator).
             index: None,
+            defer_constraint_check: std::cell::Cell::new(false),
         }
     }
 
@@ -683,6 +704,172 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 _ => index.remove_spatial_point(label_token, prop_key, node.0),
             }
         }
+    }
+
+    /// Enforces every declared constraint (`rmp` task #99) that applies to `node`'s **current**
+    /// labels, capturing a [`ConstraintViolation`] runtime error on the first breach so the statement
+    /// aborts and the transaction rolls back **before commit** (the captured-error channel — see the
+    /// module docs and `graphus_server::engine::exec::stream_rows`, which surfaces `take_error` as a
+    /// terminal row error). A no-op on the standalone path (no coordinator ⇒ no constraint registry)
+    /// and when no error-free constraint applies.
+    ///
+    /// Called after a node write has been applied to the store but **before** the matching
+    /// `reindex_node`, at every site that can introduce a violation: `create_node` (new node),
+    /// `set_node_property` (a value change), and `add_labels` (a node that gains a constrained label).
+    /// Existing data is checked at `CREATE CONSTRAINT` time by the coordinator, so this only guards
+    /// **incremental** writes.
+    ///
+    /// # Uniqueness — index-backed, candidate-set re-checked
+    ///
+    /// A uniqueness constraint registers a backing node-property index (see
+    /// [`TxnCoordinator::create_constraint`](crate::coordinator::TxnCoordinator::create_constraint)),
+    /// so the duplicate search reuses [`index_seek_eq`](Self::index_seek_eq)'s machinery: candidate
+    /// ids of the label holding the same value are re-checked against the store (visibility + current
+    /// label + current value), then `node` itself is excluded. Any **other** visible node of the label
+    /// holding the value is a violation. If no index is registered (a defensive fallback) a label scan
+    /// is used — correctness first.
+    ///
+    /// # Existence — a pure per-node predicate
+    ///
+    /// An existence (`NOT NULL`) constraint is satisfied iff `node` currently carries the covered
+    /// property with a non-null value, read straight from `node`'s own state.
+    fn enforce_constraints_for_node(&self, node: NodeId) {
+        // No coordinator ⇒ no constraint registry (standalone path); nothing to enforce.
+        let Some(index) = &self.index else {
+            return;
+        };
+
+        // The node's current label tokens (store borrow, released before consulting the registry).
+        let label_tokens: Vec<u32> = {
+            let mut store = self.store.borrow_mut();
+            match store.node_labels(node.0) {
+                Ok(ids) => ids,
+                Err(_) => return, // cannot enumerate labels: skip (a captured store error already aborts)
+            }
+        };
+        if label_tokens.is_empty() {
+            return;
+        }
+
+        // Gather the applicable rules (index borrow released before the per-rule store re-checks). A
+        // rule may apply via several of the node's labels; de-duplicate by name so a constraint is
+        // checked once.
+        let mut rules: Vec<ConstraintRule> = Vec::new();
+        {
+            let idx = index.borrow();
+            for &lt in &label_tokens {
+                for rule in idx.constraints_for_label(lt) {
+                    if !rules.contains(&rule) {
+                        rules.push(rule);
+                    }
+                }
+            }
+        }
+        if rules.is_empty() {
+            return;
+        }
+
+        for rule in rules {
+            // v1 covers exactly one property; a forward-incompatible composite is skipped defensively.
+            let [prop_key] = rule.property_tokens.as_slice() else {
+                continue;
+            };
+            // Resolve the covered label + property names for a precise message (and the seek API,
+            // which is name-keyed). A token with no resolvable name cannot apply to a live node.
+            let (label_name, property_name) = {
+                let store = self.store.borrow();
+                let label = store
+                    .token_name(Namespace::Label, rule.label_token)
+                    .map(ToOwned::to_owned);
+                let property = store
+                    .token_name(Namespace::PropKey, *prop_key)
+                    .map(ToOwned::to_owned);
+                match (label, property) {
+                    (Some(l), Some(p)) => (l, p),
+                    _ => continue,
+                }
+            };
+            // The constraint name (for the message): the first registered constraint matching this
+            // rule. (`registered_constraints` is small; this is off the hot write path only when a
+            // constraint applies.)
+            let constraint_name = index
+                .borrow()
+                .registered_constraints()
+                .into_iter()
+                .find(|(_, r)| *r == rule)
+                .map(|(name, _)| name)
+                .unwrap_or_default();
+
+            // The node's own current value for the covered property.
+            let own_value = self.node_property(node, &property_name);
+
+            match rule.kind {
+                ConstraintKind::Existence => {
+                    if own_value.as_ref().is_none_or(Value::is_null) {
+                        self.capture(
+                            ConstraintViolation::Existence {
+                                name: constraint_name,
+                                label: label_name,
+                                property: property_name,
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                ConstraintKind::Unique => {
+                    // A null/absent value never participates in uniqueness (Cypher equality: null is
+                    // never equal), matching the index's treatment — so it can never collide.
+                    let Some(value) = own_value.filter(|v| !v.is_null()) else {
+                        continue;
+                    };
+                    if let Some(other) =
+                        self.unique_conflict(&label_name, &property_name, &value, node)
+                    {
+                        let _ = other; // the conflicting id is implied by the violation; message names value
+                        self.capture(
+                            ConstraintViolation::Uniqueness {
+                                name: constraint_name,
+                                label: label_name,
+                                property: property_name,
+                                value: render_value(&value),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Finds **another** visible node carrying `label_token` whose current value for `property` equals
+    /// `value` by Cypher equality, excluding `self_node` (`rmp` task #99). Returns the conflicting id,
+    /// or [`None`] when `self_node` is the unique holder. Index-backed when a node-property index on
+    /// `(label, property)` exists (a uniqueness constraint registers one), else a label scan — both
+    /// re-check the store, so the result is exact.
+    fn unique_conflict(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        self_node: NodeId,
+    ) -> Option<u64> {
+        // Prefer the index path (`index_seek_eq` returns store-re-checked matching ids); fall back to
+        // a full label scan + value re-check when no index is registered. Either way the candidates
+        // are exact matches, so the first one that is not `self_node` is a genuine duplicate.
+        let matches: Vec<NodeId> =
+            self.index_seek_eq(label, property, value)
+                .unwrap_or_else(|| {
+                    self.scan_nodes_by_label(label)
+                        .into_iter()
+                        .filter(|id| {
+                            self.node_property(*id, property)
+                                .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                        })
+                        .collect()
+                });
+        matches.into_iter().find(|id| *id != self_node).map(|n| n.0)
     }
 
     /// **Recomputes** (the `ANALYZE` path) the equi-depth value histogram for the node-label property
@@ -1391,8 +1578,20 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // Apply labels via the inline label bitmap (`05 §9`, `rmp` task #42). An overflowing label
         // (token id `≥ 63`) captures the documented deferred error rather than dropping it silently.
         self.apply_add_labels(node, labels);
+        // Defer the per-property constraint check while building the node: a not-yet-set required
+        // property or a soon-to-be-overwritten value must not trip a constraint mid-construction
+        // (`rmp` task #99). A single check after every property is written is correct and complete.
+        self.defer_constraint_check.set(true);
         for (k, v) in properties {
             self.set_node_property(node, k, v.clone());
+        }
+        self.defer_constraint_check.set(false);
+        // Enforce constraints (`rmp` task #99) BEFORE indexing: a uniqueness / existence violation on
+        // the freshly-created node is captured as a runtime error, which aborts the statement and
+        // rolls the transaction back before commit (the captured-error channel). Only run when the
+        // write so far is clean — a doomed write is already being rolled back.
+        if !self.has_error() {
+            self.enforce_constraints_for_node(node);
         }
         // Index the node's now-current labels and property values, once all writes succeeded
         // (`rmp` task #48). On any captured error the node is untrustworthy and the caller rolls
@@ -1461,6 +1660,15 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
                 .remove_node_property_value(self.txn, node.0, key_id)
             {
                 self.capture(e);
+                return;
+            }
+            // A removal can only *relax* a uniqueness rule, but it **violates an existence (NOT NULL)
+            // rule** if the node carries the constrained label (`rmp` task #99). Enforce after the
+            // removal so the now-absent property is detected; the captured error aborts the statement
+            // before commit. No reindex is needed on a removal (dropping a key never adds a candidate).
+            // Suppressed while a multi-property write is mid-flight (the caller checks once at the end).
+            if !self.defer_constraint_check.get() {
+                self.enforce_constraints_for_node(node);
             }
             return;
         }
@@ -1475,6 +1683,14 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         {
             self.capture(e);
             return;
+        }
+        // Enforce constraints on the now-current value (`rmp` task #99) before indexing: a `SET` that
+        // makes the node's covered property duplicate another node's of the same label (uniqueness) is
+        // captured as a runtime error, so the statement aborts and rolls back before commit. (The
+        // `SET n.p = null` removal path above enforces existence separately.) Suppressed while a
+        // multi-property write (CREATE / SET n = map) is mid-flight — the caller checks once at the end.
+        if !self.defer_constraint_check.get() {
+            self.enforce_constraints_for_node(node);
         }
         // The store write succeeded: index the node's now-current value (`rmp` task #48). A removal
         // (`SET n.p = null`, handled above) needs no reindex — dropping a key never adds a candidate,
@@ -1522,6 +1738,13 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
         self.note_write(node_ssi_key(node.0));
         self.apply_add_labels(node, labels);
+        // Adding a label can bring the node under a constraint declared on that label (`rmp` task
+        // #99): a node that now carries a uniqueness-/existence-constrained label is checked against
+        // its current value, so `SET n:Label` that would create a duplicate or expose a missing
+        // required property is rejected before commit. Run only on a clean write.
+        if !self.has_error() {
+            self.enforce_constraints_for_node(node);
+        }
         // Index the node's now-current labels (and, for any newly-matched label-property index, its
         // values) once the store write succeeded and no error was captured (`rmp` task #48).
         if !self.has_error() {
@@ -1606,10 +1829,18 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             self.capture(e);
             return;
         }
+        // Defer the per-property constraint check across the whole map replace, then check once on the
+        // final state (`rmp` task #99) — a transient state where a required property is momentarily
+        // absent (just cleared, not yet re-set) must not spuriously trip an existence check.
+        self.defer_constraint_check.set(true);
         for (k, v) in properties {
             if !v.is_null() {
                 self.set_node_property(node, k, v.clone());
             }
+        }
+        self.defer_constraint_check.set(false);
+        if !self.has_error() {
+            self.enforce_constraints_for_node(node);
         }
     }
 
@@ -1620,8 +1851,16 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if !self.node_exists(node) {
             return;
         }
+        // Defer the per-property check across the overlay, then check once (`rmp` task #99): across
+        // several keys an interim value could momentarily match another node, so a single final check
+        // on the settled state is the correct granularity.
+        self.defer_constraint_check.set(true);
         for (k, v) in properties {
             self.set_node_property(node, k, v.clone());
+        }
+        self.defer_constraint_check.set(false);
+        if !self.has_error() {
+            self.enforce_constraints_for_node(node);
         }
     }
 

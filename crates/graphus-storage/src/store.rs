@@ -38,7 +38,9 @@ use graphus_wal::{LogSink, WalManager};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
-use crate::meta::{FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta};
+use crate::meta::{
+    ConstraintEntry, FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta,
+};
 use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
@@ -2541,6 +2543,41 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// discarded on rollback.
     pub fn remove_spatial_index(&mut self, name: &str) {
         self.statistics.remove_spatial_index(name);
+    }
+
+    /// The durable constraint entry named `name`, or [`None`] if no such constraint is declared
+    /// (`rmp` task #99). Tokens are returned as ids; the caller resolves their names via the token
+    /// store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn constraint(&self, name: &str) -> Option<ConstraintEntry> {
+        self.statistics.constraint(name).cloned()
+    }
+
+    /// Lists every declared constraint as `(name, entry)` from the durable catalog (`rmp` task #99),
+    /// ascending by name. Like [`spatial_indexes`](Self::spatial_indexes) this is what makes a
+    /// constraint *declaration* survive a crash: a fresh coordinator reads this to re-register the
+    /// previously-declared constraints (and rebuild a uniqueness constraint's backing index from the
+    /// store) on open.
+    #[must_use]
+    pub fn constraints(&self) -> Vec<(String, ConstraintEntry)> {
+        self.statistics.constraints()
+    }
+
+    /// Declares (or replaces) the constraint named `name` in the durable catalog (`rmp` task #99).
+    ///
+    /// The mutation is purely in-memory here; like the index mutators it becomes **durable when the
+    /// enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded on
+    /// rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
+    /// existing name overwrites the entry.
+    pub fn set_constraint(&mut self, name: String, entry: ConstraintEntry) {
+        self.statistics.set_constraint(name, entry);
+    }
+
+    /// Removes the constraint named `name` from the durable catalog, if declared (`rmp` task #99).
+    /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
+    /// discarded on rollback.
+    pub fn remove_constraint(&mut self, name: &str) {
+        self.statistics.remove_constraint(name);
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

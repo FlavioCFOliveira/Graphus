@@ -1078,6 +1078,28 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
     }
 }
 
+/// Builds the audited `detail` for a constraint-DDL command (rmp #70/#99) — concise and secret-free
+/// (constraint DDL carries no secret: the name, label and property are all schema identifiers). E.g.
+/// `"CREATE CONSTRAINT c1 FOR (:Person) REQUIRE email IS UNIQUE"`.
+#[must_use]
+pub fn redact_constraint_detail(cmd: &crate::engine::ConstraintCommand) -> String {
+    use crate::engine::ConstraintCommand as C;
+    match cmd {
+        C::CreateUnique {
+            name,
+            label,
+            property,
+        } => format!("CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS UNIQUE"),
+        C::CreateExistence {
+            name,
+            label,
+            property,
+        } => format!("CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS NOT NULL"),
+        C::Drop { name } => format!("DROP CONSTRAINT {name}"),
+        C::Show => "SHOW CONSTRAINTS".to_owned(),
+    }
+}
+
 /// Builds the audited `detail` for a **data-change** (write) query (rmp #70): a category word only,
 /// **never** the query text, parameters or literals (they may carry sensitive data).
 ///

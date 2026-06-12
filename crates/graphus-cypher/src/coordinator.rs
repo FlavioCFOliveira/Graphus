@@ -47,15 +47,29 @@ use graphus_core::{Timestamp, TxnId};
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
-use graphus_storage::{FulltextIndexEntry, IndexState, Namespace, RecordStore, SpatialIndexEntry};
+use graphus_storage::{
+    ConstraintEntry, ConstraintKind, FulltextIndexEntry, IndexState, Namespace, RecordStore,
+    SpatialIndexEntry,
+};
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
 use graphus_wal::LogSink;
 
 use crate::catalog::IndexCatalog;
+use crate::constraint::ConstraintViolation;
 use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
 use crate::statistics::Statistics;
 use crate::store_statistics;
+
+/// Renders a [`Value`] compactly for a constraint-violation message (`rmp` task #99): a string is
+/// single-quoted, everything else uses its `Debug` form. Kept small and side-effect-free — this is
+/// only for the human message, never for comparison or persistence.
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("'{s}'"),
+        other => format!("{other:?}"),
+    }
+}
 
 /// Live state of an open transaction the coordinator drives.
 #[derive(Debug, Clone, Copy)]
@@ -362,6 +376,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     graphus_index::DEFAULT_CELL_SIZE,
                     entry.state,
                 );
+            }
+        }
+
+        // Recover the durable constraint catalog (`rmp` task #99) the same way: register each declared
+        // constraint's rule in the in-memory set, and — for a UNIQUENESS constraint — also register a
+        // node-property index on its `(label, property)` at `Online` so the write-path uniqueness check
+        // is backed by an index (the rebuild scan below populates it). An existence constraint needs no
+        // backing index (it is a pure per-node predicate). A constraint covering an unexpected number
+        // of properties (a forward-incompatible composite) is registered as a rule but its v1 single-
+        // property backing index is skipped defensively.
+        let durable_constraints: Vec<(String, ConstraintEntry)> = store.borrow().constraints();
+        {
+            let mut idx = index.borrow_mut();
+            for (name, entry) in durable_constraints {
+                idx.register_constraint(
+                    &name,
+                    entry.label_token,
+                    entry.property_tokens.clone(),
+                    entry.kind,
+                );
+                if entry.kind == ConstraintKind::Unique
+                    && let [prop_key] = entry.property_tokens.as_slice()
+                {
+                    idx.register_node_property_with_state(
+                        entry.label_token,
+                        *prop_key,
+                        IndexState::Online,
+                    );
+                }
             }
         }
 
@@ -999,6 +1042,229 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let label = store.token_name(Namespace::Label, entry.label_token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
                 Some((name, label.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
+    /// Declares a **constraint** named `name` over `(label, property)` of `kind`, **validating it
+    /// against existing data first** and only then **durably recording it** (`rmp` task #99) — the
+    /// constraint analogue of [`create_point_index`](Self::create_point_index), but synchronous and
+    /// validated (a constraint has no `Populating` phase — it is in force the instant it is created).
+    ///
+    /// Order of operations (so a rejected creation has **zero** side effects):
+    ///
+    /// 1. **Intern** the label + property-key tokens (in a dedicated transaction).
+    /// 2. **Validate** every currently-live node carrying the label against the rule
+    ///    ([`validate_existing_against_constraint`](Self::validate_existing_against_constraint)):
+    ///    a uniqueness constraint rejects if two nodes share a value; an existence constraint rejects
+    ///    if a node lacks the property. On any violation the transaction is **rolled back** (no token,
+    ///    no catalog entry, no registration) and a [`ConstraintViolation`] runtime error is returned.
+    /// 3. **Persist** the catalog entry, **register** the in-memory rule, and — for a uniqueness
+    ///    constraint — **register + populate** the backing node-property index, all in the committed
+    ///    transaction. After commit the durable catalog and the in-memory set agree, and the write
+    ///    path enforces the rule.
+    ///
+    /// Re-declaring an existing name **replaces** it (re-validated against current data).
+    ///
+    /// # Errors
+    /// Returns a [`ConstraintViolation`]-wrapped [`GraphusError::Runtime`] if existing data violates
+    /// the constraint, or a storage error if interning a token, recording the catalog entry, or the
+    /// committing transaction fails. On any error the constraint is left undeclared.
+    pub fn create_constraint(
+        &mut self,
+        name: &str,
+        label: &str,
+        property: &str,
+        kind: ConstraintKind,
+    ) -> Result<()> {
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+
+        // Intern the label + property-key tokens (rolled back with the transaction on any failure).
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            (label_token, prop_key)
+        };
+
+        // Validate existing data BEFORE recording anything. A violation rolls back the whole
+        // transaction (so the interned tokens never become durable for a rejected create) and reports
+        // the offending node precisely.
+        if let Err(e) = self.validate_existing_against_constraint(
+            name,
+            label,
+            property,
+            label_token,
+            prop_key,
+            kind,
+        ) {
+            let _ = self.store.borrow_mut().rollback(txn);
+            return Err(e);
+        }
+
+        // Conforming: record the durable catalog entry and commit (tokens + entry atomically).
+        self.store.borrow_mut().set_constraint(
+            name.to_owned(),
+            ConstraintEntry {
+                label_token,
+                property_tokens: vec![prop_key],
+                kind,
+            },
+        );
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the rule in the in-memory set so the write path enforces it from now on. For a
+        // uniqueness constraint also register + populate the backing node-property index so the
+        // write-time duplicate check is index-backed (a full rebuild repopulates it from the store).
+        {
+            let mut idx = self.index.borrow_mut();
+            idx.register_constraint(name, label_token, vec![prop_key], kind);
+            if kind == ConstraintKind::Unique {
+                idx.register_node_property_with_state(label_token, prop_key, IndexState::Online);
+            }
+        }
+        if kind == ConstraintKind::Unique {
+            Self::rebuild_index(&self.store, &self.index);
+        }
+        Ok(())
+    }
+
+    /// Scans every currently-live node carrying `label_token` and rejects if any violates the
+    /// constraint of `kind` on `prop_key` (`rmp` task #99). Used by
+    /// [`create_constraint`](Self::create_constraint) to refuse a constraint that existing data does
+    /// not satisfy. No-op success when no node carries the label.
+    ///
+    /// # Errors
+    /// Returns a [`ConstraintViolation`]-wrapped runtime error naming the first offending node /
+    /// duplicate value (uniqueness) or the first node missing the property (existence). A store-read
+    /// fault on a node is treated as "skip that node" (best-effort), consistent with the rebuild path.
+    fn validate_existing_against_constraint(
+        &self,
+        name: &str,
+        label: &str,
+        property: &str,
+        label_token: u32,
+        prop_key: u32,
+        kind: ConstraintKind,
+    ) -> Result<()> {
+        let node_ids = self.store.borrow_mut().scan_node_ids()?;
+        // For uniqueness: remember which values have been seen (rendered) to detect a duplicate.
+        let mut seen: Vec<(Value, u64)> = Vec::new();
+        for id in node_ids {
+            // Read this node's label tokens; skip a read-faulting node best-effort.
+            let label_tokens = match self.store.borrow_mut().node_labels(id) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !label_tokens.contains(&label_token) {
+                continue; // node does not carry the covered label
+            }
+            let value = self.node_value_for_key(id, prop_key);
+            match kind {
+                ConstraintKind::Existence => {
+                    // A missing or null value violates the existence (NOT NULL) constraint.
+                    if value.as_ref().is_none_or(graphus_core::Value::is_null) {
+                        return Err(ConstraintViolation::Existence {
+                            name: name.to_owned(),
+                            label: label.to_owned(),
+                            property: property.to_owned(),
+                        }
+                        .into_error());
+                    }
+                }
+                ConstraintKind::Unique => {
+                    // A null/absent value never participates in uniqueness (Cypher equality treats
+                    // null as never-equal), matching the index's treatment.
+                    let Some(value) = value.filter(|v| !v.is_null()) else {
+                        continue;
+                    };
+                    if seen
+                        .iter()
+                        .any(|(v, _)| crate::equality::equals(v, &value).is_true())
+                    {
+                        return Err(ConstraintViolation::Uniqueness {
+                            name: name.to_owned(),
+                            label: label.to_owned(),
+                            property: property.to_owned(),
+                            value: render_value(&value),
+                        }
+                        .into_error());
+                    }
+                    seen.push((value, id));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The newest value node `id` holds for property-key token `prop_key`, or [`None`] if the node
+    /// has no such property (or a read fault occurs). Reads the property chain newest-first and keeps
+    /// the first occurrence — the same newest-wins discipline the index rebuild uses (`rmp` task #99).
+    fn node_value_for_key(&self, id: u64, prop_key: u32) -> Option<Value> {
+        let chain = self.store.borrow_mut().node_property_values(id).ok()?;
+        chain
+            .into_iter()
+            .find(|(_pid, key, _value)| *key == prop_key)
+            .map(|(_pid, _key, value)| value)
+    }
+
+    /// Drops the constraint named `name` (`rmp` task #99): removes its durable catalog entry in a
+    /// committed transaction and unregisters its in-memory rule, so the write path stops enforcing it.
+    /// Idempotent on a never-declared name (a clean no-op success).
+    ///
+    /// The backing node-property index of a uniqueness constraint is **left registered** (a query may
+    /// still benefit from it, and a plain `CREATE INDEX` may have independently declared it); only the
+    /// constraint *rule* is removed. A future `DROP INDEX` removes the index proper.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_constraint(&mut self, name: &str) -> Result<()> {
+        // A no-op when the constraint is not declared (avoids an empty committed transaction).
+        if self.store.borrow().constraint(name).is_none() {
+            self.index.borrow_mut().unregister_constraint(name);
+            return Ok(());
+        }
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_constraint(name);
+        self.store.borrow_mut().commit(txn)?;
+        self.index.borrow_mut().unregister_constraint(name);
+        Ok(())
+    }
+
+    /// Lists every declared constraint as `(name, label, property, kind)` (`rmp` task #99) for a
+    /// `SHOW CONSTRAINTS` surface. Reads the durable catalog and resolves the tokens back to names; an
+    /// entry whose tokens have no resolvable name (a defensively-skipped impossibility for a live
+    /// token) is omitted. Ordered by name.
+    #[must_use]
+    pub fn list_constraints(&self) -> Vec<(String, String, String, ConstraintKind)> {
+        let store = self.store.borrow();
+        store
+            .constraints()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                // v1 covers exactly one property; resolve the first token's name.
+                let prop_token = *entry.property_tokens.first()?;
+                let property = store.token_name(Namespace::PropKey, prop_token)?;
+                Some((name, label.to_owned(), property.to_owned(), entry.kind))
             })
             .collect()
     }

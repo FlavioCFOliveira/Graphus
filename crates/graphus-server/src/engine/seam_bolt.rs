@@ -42,7 +42,8 @@ use graphus_cypher::{MaterializedPath, MaterializedValue};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
 use crate::audit::{
-    AuditClass, AuditEvent, AuditOutcome, AuditSource, data_change_detail, redact_index_detail,
+    AuditClass, AuditEvent, AuditOutcome, AuditSource, data_change_detail,
+    redact_constraint_detail, redact_index_detail,
 };
 
 use super::command::AccessMode;
@@ -362,6 +363,58 @@ impl BoltExecutor for BoltEngineExecutor {
                 );
                 let detail = redact_index_detail(&cmd);
                 let outcome = handle.index_ddl_blocking(cmd);
+                if mutating {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::SchemaChange,
+                            if outcome.is_ok() {
+                                AuditOutcome::Success
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            self.source,
+                        )
+                        .actor(self.principal.as_deref())
+                        .database(Some(&name))
+                        .detail(detail),
+                    );
+                }
+                let reply = outcome?;
+                return Ok(BoltEngineStream::admin(AdminResult {
+                    fields: reply.fields,
+                    rows: reply.rows,
+                }));
+            }
+            // A constraint-DDL statement (`rmp` task #99): routed exactly like an index command — same
+            // admin-privilege gate, same target-database resolution, same schema-change audit — but
+            // submitted as a constraint command (the constraint catalog lives on the coordinator). A
+            // `CREATE CONSTRAINT` over violating existing data fails with a constraint-validation error.
+            AdminParse::Constraint(cmd) => {
+                if matches!(tx, TxControl::InExplicit { .. }) {
+                    return Err(Self::admin_in_explicit_tx());
+                }
+                // Authorization first — no side effects on denial (shared gate with the DB surface).
+                if let Err(e) = self.context.authorize_admin(self.principal.as_deref()) {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::AuthzDenied,
+                            AuditOutcome::Failure,
+                            self.source,
+                        )
+                        .actor(self.principal.as_deref())
+                        .detail(redact_constraint_detail(&cmd)),
+                    );
+                    return Err(e);
+                }
+                let db = match &tx {
+                    TxControl::AutoCommit { db, .. } => db.as_deref(),
+                    TxControl::InExplicit { .. } => None,
+                };
+                let (name, handle) = self.context.resolve(db)?;
+                // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
+                let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
+                let detail = redact_constraint_detail(&cmd);
+                let outcome = handle.constraint_ddl_blocking(cmd);
                 if mutating {
                     self.context.audit().record(
                         AuditEvent::new(

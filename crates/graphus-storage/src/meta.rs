@@ -135,6 +135,79 @@ pub struct SpatialIndexEntry {
     pub state: IndexState,
 }
 
+/// The kind of a declared constraint (`rmp` task #99).
+///
+/// A constraint is one of two schema rules over the nodes of a label:
+///
+/// - [`Unique`](Self::Unique) — a **uniqueness** constraint: no two nodes carrying the label may
+///   share the same value for the covered property (a duplicate write is rejected before commit).
+/// - [`Existence`](Self::Existence) — an **existence** (`NOT NULL`) constraint: every node carrying
+///   the label must carry the covered property with a non-null value (a write that omits or nulls it
+///   is rejected before commit).
+///
+/// # Wire encoding
+///
+/// Encoded as a single byte (see [`Statistics::encode`]). Future kinds (a composite node-key, a
+/// relationship-property constraint) are reserved by leaving the unused discriminants free;
+/// [`from_byte`](Self::from_byte) rejects any unknown byte so a forward-incompatible image is caught
+/// rather than silently mis-decoded — the same defensive stance as [`IndexState::from_byte`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[must_use]
+pub enum ConstraintKind {
+    /// A uniqueness constraint: the covered property's value is unique across all nodes of the label.
+    Unique,
+    /// An existence (`NOT NULL`) constraint: every node of the label must carry the covered property.
+    Existence,
+}
+
+impl ConstraintKind {
+    /// The single-byte wire discriminant (`rmp` task #99). Discriminants `2..` are reserved for a
+    /// future composite-key / relationship-property constraint kind.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Unique => 0,
+            Self::Existence => 1,
+        }
+    }
+
+    /// Decodes a single-byte wire discriminant, or [`None`] for an unknown (reserved/future) byte.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Unique),
+            1 => Some(Self::Existence),
+            _ => None,
+        }
+    }
+}
+
+/// A durable **constraint** catalog entry (`rmp` task #99).
+///
+/// A constraint is identified by a server-unique **name** (like a full-text or spatial index, and
+/// unlike a node-property index which `(label_token, prop_key)` identifies), covers one node label
+/// and **one or more** properties (v1 declares exactly one property per constraint; the field is a
+/// `Vec` so a future composite node-key fits the same record), and carries its [`ConstraintKind`].
+///
+/// This rides the **identical** durability lifecycle as the index catalogs and the
+/// counts/histograms: checkpointed at commit, reloaded on rollback and on open. Its presence
+/// invariant is "an entry exists iff a constraint of that name is declared". Unlike an index there is
+/// **no build state**: a constraint is validated against existing data **synchronously** at creation
+/// time (creation fails if any existing node violates it), so a successfully-created constraint is
+/// always fully in force — there is no `Populating` analogue. For a uniqueness constraint the
+/// coordinator additionally maintains a backing in-memory unique index (rebuilt from the store on
+/// open, like every derived index), so only this catalog entry needs durability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintEntry {
+    /// The node label-namespace token the constraint covers.
+    pub label_token: u32,
+    /// The property-key-namespace tokens the constraint covers, in declared order (one or more;
+    /// exactly one in v1).
+    pub property_tokens: Vec<u32>,
+    /// Whether the constraint is a uniqueness or an existence (`NOT NULL`) rule.
+    pub kind: ConstraintKind,
+}
+
 /// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
 ///
 /// Holds, for the planner's cardinality estimator, the grand-total live-node and live-relationship
@@ -261,6 +334,17 @@ pub struct Statistics {
     /// silently lose them. An entry is present **iff** an index of that name is declared. The map
     /// rides the **identical** durability lifecycle as the other catalogs.
     pub spatial_indexes: BTreeMap<String, SpatialIndexEntry>,
+    /// The durable **constraint catalog** (`rmp` task #99): the set of declared constraints keyed by
+    /// their server-unique **name**, each carrying the covered label, the covered property tokens and
+    /// the [`ConstraintKind`]. See [`ConstraintEntry`].
+    ///
+    /// Persisting this set is what makes a constraint *declaration* survive a crash: write-time
+    /// enforcement consults the live constraints, and a uniqueness constraint's backing index is
+    /// ephemeral (rebuilt from the store on open, like the derived indexes), so without this map a
+    /// recovered store would have no record of which constraints existed and would silently stop
+    /// enforcing them. An entry is present **iff** a constraint of that name is declared. The map
+    /// rides the **identical** durability lifecycle as the other catalogs.
+    pub constraints: BTreeMap<String, ConstraintEntry>,
 }
 
 impl Statistics {
@@ -518,6 +602,35 @@ impl Statistics {
             .collect()
     }
 
+    /// The durable constraint entry named `name`, or [`None`] if no such constraint is declared
+    /// (`rmp` task #99).
+    #[must_use]
+    pub fn constraint(&self, name: &str) -> Option<&ConstraintEntry> {
+        self.constraints.get(name)
+    }
+
+    /// Declares (or replaces) the constraint named `name` (`rmp` task #99). Idempotent on the name:
+    /// re-recording overwrites the entry.
+    pub(crate) fn set_constraint(&mut self, name: String, entry: ConstraintEntry) {
+        self.constraints.insert(name, entry);
+    }
+
+    /// Removes the constraint named `name`, if declared (`rmp` task #99). Removing an absent entry is
+    /// a harmless no-op.
+    pub(crate) fn remove_constraint(&mut self, name: &str) {
+        self.constraints.remove(name);
+    }
+
+    /// Lists every declared constraint as `(name, entry)`, ascending by name (the [`BTreeMap`] order,
+    /// deterministic) (`rmp` task #99).
+    #[must_use]
+    pub fn constraints(&self) -> Vec<(String, ConstraintEntry)> {
+        self.constraints
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
     /// Serialises the statistics to a self-describing byte image.
     ///
     /// Layout: `total_nodes(u64) | total_relationships(u64) | n_labels(u32) | [ token_id(u32) |
@@ -537,8 +650,10 @@ impl Statistics {
     /// #72) is appended **after** the index catalog by the same rule, so a pre-#72 image decodes to
     /// an empty full-text catalog. The spatial catalog block (`rmp` task #98) is appended **after**
     /// the full-text catalog by the same rule, so a pre-#98 image decodes to an empty spatial
-    /// catalog. No format-version byte is needed because every prior block is length-exact and
-    /// self-describing, so each parse position is unambiguous.
+    /// catalog. The constraint catalog block (`rmp` task #99) is appended **after** the spatial
+    /// catalog by the same rule, so a pre-#99 image decodes to an empty constraint catalog. No
+    /// format-version byte is needed because every prior block is length-exact and self-describing,
+    /// so each parse position is unambiguous.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let hist_bytes: usize = self
@@ -564,6 +679,7 @@ impl Statistics {
         Self::encode_index_catalog(&mut out, &self.node_property_indexes);
         Self::encode_fulltext_catalog(&mut out, &self.fulltext_indexes);
         Self::encode_spatial_catalog(&mut out, &self.spatial_indexes);
+        Self::encode_constraint_catalog(&mut out, &self.constraints);
         out
     }
 
@@ -673,6 +789,41 @@ impl Statistics {
         }
     }
 
+    /// Encodes the constraint catalog block (`rmp` task #99), appended last so a pre-#99 image
+    /// (ending after the spatial catalog) decodes to an empty constraint catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// n_props(u32) | prop_token(u32)*n_props | kind(u8) ]*`, entries in ascending-name
+    /// ([`BTreeMap`]) order so the image is deterministic. Mirrors the full-text block (one or more
+    /// property tokens) but carries a [`ConstraintKind`] byte in place of the analyzer + state bytes
+    /// (a constraint has no build state — see [`ConstraintEntry`]).
+    fn encode_constraint_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, ConstraintEntry>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "constraint catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "constraint name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&entry.label_token.to_le_bytes());
+            debug_assert!(
+                entry.property_tokens.len() <= u32::MAX as usize,
+                "constraint property-token count exceeds u32"
+            );
+            out.extend_from_slice(&(entry.property_tokens.len() as u32).to_le_bytes());
+            for &prop in &entry.property_tokens {
+                out.extend_from_slice(&prop.to_le_bytes());
+            }
+            out.push(entry.kind.as_byte());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -694,6 +845,7 @@ impl Statistics {
         let node_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
         let fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
         let spatial_indexes = Self::decode_spatial_catalog(bytes, &mut cur)?;
+        let constraints = Self::decode_constraint_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -703,6 +855,7 @@ impl Statistics {
             node_property_indexes,
             fulltext_indexes,
             spatial_indexes,
+            constraints,
         })
     }
 
@@ -895,6 +1048,69 @@ impl Statistics {
             {
                 return Err(GraphusError::Storage(format!(
                     "spatial catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the constraint catalog block (`rmp` task #99). Like the spatial catalog this is the
+    /// last block, so end-of-input where its count `u32` would start means "no constraint catalog" (a
+    /// pre-#99 image), not truncation.
+    ///
+    /// The `kind` byte is range-checked. A repeated name, an empty name, or a zero property-token
+    /// count is rejected (none is ever produced by [`encode`](Self::encode)).
+    fn decode_constraint_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, ConstraintEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #99): a pre-#99 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("constraint catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "constraint catalog holds an empty constraint name".to_owned(),
+                ));
+            }
+            let label_token = read_u32(bytes, cur)?;
+            let n_props = read_u32(bytes, cur)? as usize;
+            if n_props == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "constraint {name:?} covers no properties"
+                )));
+            }
+            let mut property_tokens = Vec::with_capacity(n_props);
+            for _ in 0..n_props {
+                property_tokens.push(read_u32(bytes, cur)?);
+            }
+            let kind_byte = read_u8(bytes, cur)?;
+            let kind = ConstraintKind::from_byte(kind_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "constraint {name:?} holds unknown kind byte {kind_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    ConstraintEntry {
+                        label_token,
+                        property_tokens,
+                        kind,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "constraint catalog repeats constraint name {name:?}"
                 )));
             }
         }
@@ -1103,6 +1319,24 @@ mod tests {
                 state: IndexState::Populating,
             },
         );
+        // Populate the constraint catalog too (`rmp` task #99), with both kinds, so its round-trip is
+        // exercised here alongside the other catalogs.
+        m.statistics.set_constraint(
+            "person_email_unique".to_owned(),
+            ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![1],
+                kind: ConstraintKind::Unique,
+            },
+        );
+        m.statistics.set_constraint(
+            "person_name_exists".to_owned(),
+            ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![2],
+                kind: ConstraintKind::Existence,
+            },
+        );
 
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
@@ -1145,6 +1379,75 @@ mod tests {
             })
         );
         assert_eq!(back.statistics.spatial_index("nope"), None);
+        // Constraint catalog (`rmp` task #99) round-trips alongside the other catalogs.
+        assert_eq!(
+            back.statistics.constraint("person_email_unique"),
+            Some(&ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![1],
+                kind: ConstraintKind::Unique,
+            })
+        );
+        assert_eq!(
+            back.statistics.constraint("person_name_exists"),
+            Some(&ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![2],
+                kind: ConstraintKind::Existence,
+            })
+        );
+        assert_eq!(back.statistics.constraint("nope"), None);
+    }
+
+    #[test]
+    fn statistics_constraint_catalog_round_trips_and_pre_99_image_decodes_empty() {
+        // Empty map: the constraint block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then several entries (mixed kinds), keyed by name.
+        let mut s = Statistics::new();
+        s.set_constraint(
+            "a".to_owned(),
+            ConstraintEntry {
+                label_token: 1,
+                property_tokens: vec![2],
+                kind: ConstraintKind::Unique,
+            },
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+        s.set_constraint(
+            "b".to_owned(),
+            ConstraintEntry {
+                label_token: 3,
+                property_tokens: vec![4],
+                kind: ConstraintKind::Existence,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.constraints().len(), 2);
+
+        // A pre-#99 image (a spatial-catalog-terminated image with NO constraint block) decodes to an
+        // empty constraint catalog, not a truncation error. Build such an image by encoding a
+        // statistics value that carries a spatial index, then truncating off the trailing
+        // (zero-count) constraint block — a 4-byte `u32` of `0`.
+        let mut pre99 = Statistics::new();
+        pre99.set_spatial_index(
+            "loc".to_owned(),
+            SpatialIndexEntry {
+                label_token: 1,
+                property_token: 2,
+                state: IndexState::Online,
+            },
+        );
+        let mut image = pre99.encode();
+        // The last 4 bytes are the empty-constraint-block count (`0u32`); dropping them yields the
+        // exact byte image a pre-#99 build would have written.
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert!(decoded.constraints().is_empty());
+        assert_eq!(decoded.spatial_indexes().len(), 1);
     }
 
     #[test]

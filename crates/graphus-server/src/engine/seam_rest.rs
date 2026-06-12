@@ -50,7 +50,8 @@ use graphus_rest::restvalue::{RestNode, RestPath, RestRelationship, RestValue};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
 use crate::audit::{
-    AuditClass, AuditEvent, AuditOutcome, AuditSource, data_change_detail, redact_index_detail,
+    AuditClass, AuditEvent, AuditOutcome, AuditSource, data_change_detail,
+    redact_constraint_detail, redact_index_detail,
 };
 
 use super::command::AccessMode;
@@ -413,6 +414,50 @@ impl RestEngine for RestEngineAdapter {
                 );
                 let detail = redact_index_detail(&cmd);
                 let outcome = open.handle.index_ddl_blocking(cmd);
+                if mutating {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::SchemaChange,
+                            if outcome.is_ok() {
+                                AuditOutcome::Success
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(&open.principal))
+                        .database(Some(&open.db))
+                        .detail(detail),
+                    );
+                }
+                let reply = outcome?;
+                return Ok(RestEngineStream::admin(AdminResult {
+                    fields: reply.fields,
+                    rows: reply.rows,
+                }));
+            }
+            // A constraint-DDL statement (`rmp` task #99): routed identically to an index command.
+            AdminParse::Constraint(cmd) => {
+                if open.explicit {
+                    return Err(admin_in_explicit_tx());
+                }
+                // Authorization first — no side effects on denial (shared gate with the DB surface).
+                if let Err(e) = self.context.authorize_admin(Some(&open.principal)) {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::AuthzDenied,
+                            AuditOutcome::Failure,
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(&open.principal))
+                        .detail(redact_constraint_detail(&cmd)),
+                    );
+                    return Err(e);
+                }
+                // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
+                let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
+                let detail = redact_constraint_detail(&cmd);
+                let outcome = open.handle.constraint_ddl_blocking(cmd);
                 if mutating {
                     self.context.audit().record(
                         AuditEvent::new(

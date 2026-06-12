@@ -112,6 +112,7 @@ pub mod authorized_graph;
 pub mod binding;
 pub mod cardinality;
 pub mod catalog;
+pub mod constraint;
 pub mod coordinator;
 pub mod cost;
 pub mod equality;
@@ -152,6 +153,7 @@ pub use cardinality::estimate_rows;
 pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
+pub use constraint::{CONSTRAINT_VIOLATION_PREFIX, ConstraintViolation};
 pub use coordinator::{CoordinatorStatistics, TxnCoordinator};
 pub use cost::{CostEstimate, estimate_cost};
 pub use equality::{equals, is_in, not_equals};
@@ -168,7 +170,8 @@ pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId,
 /// The full-text [`Analyzer`](graphus_index::fulltext::Analyzer) (`rmp` task #72), re-exported so the
 /// server's index-DDL surface can validate / name analyzers without a direct `graphus-index` dep.
 pub use graphus_index::fulltext::Analyzer;
-pub use index_set::IndexSet;
+pub use graphus_storage::ConstraintKind;
+pub use index_set::{ConstraintRule, IndexSet};
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,

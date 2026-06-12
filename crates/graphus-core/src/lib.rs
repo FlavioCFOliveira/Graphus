@@ -9,7 +9,7 @@
 //! detail is filled in just-in-time by the owning Phase 1 tasks.
 #![forbid(unsafe_code)]
 
-pub use error::{GraphusError, Result};
+pub use error::{CONSTRAINT_VIOLATION_PREFIX, GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
@@ -428,6 +428,18 @@ pub mod error {
 
     /// The crate-wide result alias.
     pub type Result<T> = std::result::Result<T, GraphusError>;
+
+    /// The stable internal sentinel that prefixes a **constraint-violation** runtime-error message
+    /// (`rmp` task #99; `04-technical-design.md` §6.5, §7.3).
+    ///
+    /// A unique/existence-constraint breach is a [`GraphusError::Runtime`] (its docs already name
+    /// "constraint" as a runtime cause). To let the Bolt error renderer emit the precise schema class
+    /// `Neo.ClientError.Schema.ConstraintValidationFailed` **without** widening this
+    /// `#[non_exhaustive]` enum, the query layer prefixes the violation message with this sentinel and
+    /// the Bolt layer detects + strips it. It lives in `graphus-core` so the producer (`graphus-cypher`)
+    /// and the consumer (`graphus-bolt`) share one definition with **no** crate dependency between them
+    /// (both depend on `graphus-core`). Chosen so a genuine user message can never start with it.
+    pub const CONSTRAINT_VIOLATION_PREFIX: &str = "\u{1}constraint-violation\u{1} ";
 
     /// Top-level error type for Graphus.
     ///
