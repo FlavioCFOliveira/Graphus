@@ -1281,6 +1281,44 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         Some(out)
     }
 
+    fn index_seek_spatial(
+        &self,
+        label: &str,
+        property: &str,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<NodeId>> {
+        // Only the coordinated path has the derived `IndexSet` holding the grid spatial index;
+        // otherwise the executor falls back to a label scan (`rmp` task #73).
+        let index = self.index.as_ref()?;
+        let label_token = self.label_id_existing(label)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        if !index.borrow().has_spatial(label_token, prop_key) {
+            return None; // no usable spatial index: scan fallback
+        }
+
+        // SSI predicate footprint: an indexed proximity predicate replaces the label-scan + filter
+        // fallback (which read every node via `scan_nodes_by_label`). Preserve that exact read
+        // footprint so the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
+        self.mark_all_live_nodes();
+
+        // Candidate ids whose point lies within the radius of the centre's 2D projection — a geometric
+        // superset (the grid buckets by `(x, y)`). The caller's residual `distance(...) <op> r` filter
+        // re-checks the exact predicate, CRS, current value, visibility, and current label per
+        // candidate, so this need only narrow to nodes that currently carry the label.
+        let candidates = index
+            .borrow()
+            .seek_spatial_within(label_token, prop_key, center_x, center_y, radius)
+            .unwrap_or_default();
+        let labelled = self.filter_label_candidates(label_token, candidates);
+
+        let mut out = labelled;
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
     fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {
         // Only the coordinated path carries the derived `IndexSet` that holds the full-text index
         // (`rmp` task #72). Without one there is no full-text index at all, so `None` (the procedure

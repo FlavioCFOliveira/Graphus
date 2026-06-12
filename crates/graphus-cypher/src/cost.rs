@@ -259,6 +259,17 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A spatial proximity seek (`rmp` task #73): the grid returns a geometric superset of the
+        // matching nodes, so — absent dedicated spatial histograms — we estimate its candidate count
+        // with the same constant predicate-selectivity fallback a `label-scan + filter` would use,
+        // and pay the seek setup plus a cheap per-candidate stream. This keeps the seek cheaper than
+        // the full label scan it replaces while staying conservative (the residual `distance` filter
+        // above it then trims the superset to the exact result).
+        PhysicalOp::SpatialIndexSeek { label, .. } => {
+            let rows = label_scan_rows(&label.name, stats) * DEFAULT_PREDICATE_SELECTIVITY;
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // A relationship scan: one row per relationship (refined by listed types), a scan-row each.
         PhysicalOp::AllRelationshipsScan { types, .. } => {
             let rows = rel_scan_rows(types, stats);

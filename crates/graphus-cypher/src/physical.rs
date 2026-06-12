@@ -125,6 +125,7 @@ use crate::logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
 use crate::statistics::Statistics;
+use graphus_core::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -308,6 +309,35 @@ pub enum PhysicalOp {
         bound: RangeBound,
         /// The bound value expression (unevaluated AST).
         value: Expr,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
+    /// **Spatial proximity seek** (`rmp` task #73): records of `label` whose point `property` lies
+    /// within `radius` of the constant centre `(center_x, center_y)`, served by the grid spatial
+    /// index instead of a full label scan.
+    ///
+    /// The seek is the **2D projection** the grid buckets by — `(x, y)` — so it returns a *geometric
+    /// **superset*** of the matching records (every node whose point could be within the radius, plus
+    /// grid-cell false positives). The exact `distance(prop, centre) <op> radius` predicate is
+    /// therefore **always retained as a residual [`Filter`](PhysicalOp::Filter) above this operator**
+    /// (see [`Planner::lower_filter`]); the index only narrows the candidate set, never the result.
+    /// Because the centre and radius are *constant* (evaluated at plan time), they are stored as
+    /// plain `f64`s rather than as unevaluated [`Expr`](crate::ast::Expr)s — a proximity predicate
+    /// whose operands are not compile-time constants never reaches this operator (the planner falls
+    /// back to scan + filter).
+    SpatialIndexSeek {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label the spatial index covers.
+        label: Label,
+        /// The indexed point property key.
+        property: String,
+        /// The constant centre's `x` coordinate (the grid's first projected axis).
+        center_x: f64,
+        /// The constant centre's `y` coordinate (the grid's second projected axis).
+        center_y: f64,
+        /// The constant proximity radius (in the property CRS's distance units).
+        radius: f64,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -928,6 +958,28 @@ impl Planner<'_> {
                     return attach_residual(seek, &residual);
                 }
             }
+            // A proximity conjunct `distance(var.prop, <const point>) <op> <const r>` can drive the
+            // spatial index when one is declared on `(label, prop)`. Unlike a property seek, the grid
+            // returns only a geometric **superset** (it buckets the 2D projection), so the exact
+            // `distance(...) <op> r` predicate MUST be re-checked — we re-attach **all** conjuncts
+            // (including this one) as the residual filter. See [`PhysicalOp::SpatialIndexSeek`].
+            if let Some(sp) = analyze_spatial_predicate(conj, &variable.name) {
+                if let Some(idx) = self.catalog.label_spatial(label, &sp.property) {
+                    deps.insert(idx.id);
+                    let seek = PhysicalOp::SpatialIndexSeek {
+                        variable: variable.clone(),
+                        label: label.clone(),
+                        property: sp.property,
+                        center_x: sp.center_x,
+                        center_y: sp.center_y,
+                        radius: sp.radius,
+                        index: idx.id,
+                    };
+                    // Re-attach EVERY conjunct (the proximity predicate included) as the residual
+                    // filter: the index is a superset, the filter restores exactness.
+                    return attach_residual(seek, &conjuncts);
+                }
+            }
         }
 
         // No index applied: label scan (possibly token-lookup) + the full predicate as a filter.
@@ -1047,6 +1099,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
@@ -1180,6 +1233,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => op,
@@ -1612,6 +1666,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Empty => false,
         PhysicalOp::Filter { input, .. }
@@ -1887,7 +1942,8 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
     match op {
         PhysicalOp::TokenLookupScan { index, .. }
         | PhysicalOp::NodeIndexSeek { index, .. }
-        | PhysicalOp::NodeIndexRangeSeek { index, .. } => {
+        | PhysicalOp::NodeIndexRangeSeek { index, .. }
+        | PhysicalOp::SpatialIndexSeek { index, .. } => {
             deps.insert(*index);
         }
         PhysicalOp::AllNodesScan { .. }
@@ -2154,6 +2210,177 @@ fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 }
 
 // =================================================================================================
+// Spatial proximity predicate analysis (for the spatial index seek, `rmp` task #73)
+// =================================================================================================
+
+/// A proximity predicate `distance(var.<prop>, <const point>) <op> <const r>` recognised for a
+/// [`SpatialIndexSeek`](PhysicalOp::SpatialIndexSeek): the property the index covers, the **constant**
+/// centre's 2D projection, and the **constant** radius. Centre and radius are resolved to `f64`s at
+/// plan time (see [`analyze_spatial_predicate`]).
+struct SpatialPredicate {
+    /// The point property key (`loc` in `n.loc`).
+    property: String,
+    /// The constant centre's `x` coordinate.
+    center_x: f64,
+    /// The constant centre's `y` coordinate.
+    center_y: f64,
+    /// The constant proximity radius.
+    radius: f64,
+}
+
+/// Analyses a conjunct: is it a proximity predicate the spatial index can serve as a candidate seek?
+///
+/// Recognised shapes (with `<op>` one of `<`, `<=` — an upper-bounded distance, the only shape a grid
+/// proximity query accelerates; a `>`/`>=` proximity is unbounded and keeps the scan):
+///
+/// - `distance(var.prop, <const point>) <op> <const r>`
+/// - `distance(<const point>, var.prop) <op> <const r>` (`distance` is symmetric)
+/// - either of the above spelled with the namespaced `point.distance(...)` function (both names lower
+///   to the same two-argument `FunctionCall`).
+///
+/// The centre point expression must evaluate to a **constant** `Value::Point` and the radius to a
+/// **constant** number, both at plan time (no variable / parameter / property reference). When either
+/// side is not a compile-time constant — or the centre is not a 2D-projectable point — this returns
+/// [`None`] and the planner keeps the scan + filter (still correct, just not index-accelerated).
+fn analyze_spatial_predicate(expr: &Expr, variable: &str) -> Option<SpatialPredicate> {
+    let ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
+        return None;
+    };
+    // Only an *upper-bounded* distance is a grid proximity query (`distance(...) < r` / `<= r`). With
+    // the comparison written `distance(...) <op> r`, accept `Lt`/`Lte` directly.
+    if !matches!(op, BinaryOp::Lt | BinaryOp::Lte) {
+        return None;
+    }
+    // Left side must be a `distance(...)` call over `var.prop` and a constant point; right side the
+    // constant radius. (The radius-on-the-left form `r > distance(...)` is normalised by the parser to
+    // property-on-left comparisons elsewhere; here we only recognise the canonical distance-on-left
+    // shape, which is what `WHERE distance(n.p, c) < r` parses to.)
+    let (property, center) = distance_call_over_var(lhs, variable)?;
+    let radius = const_number(rhs)?;
+    Some(SpatialPredicate {
+        property,
+        center_x: center.0,
+        center_y: center.1,
+        radius,
+    })
+}
+
+/// If `expr` is a `distance(...)` (or `point.distance(...)`) call relating `var.<prop>` to a constant
+/// point, returns `(prop, (center_x, center_y))`. Accepts the two-argument symmetric forms (either
+/// argument may be the property or the constant point). Returns [`None`] otherwise.
+fn distance_call_over_var(expr: &Expr, variable: &str) -> Option<(String, (f64, f64))> {
+    let ExprKind::FunctionCall { name, args, .. } = &expr.kind else {
+        return None;
+    };
+    let fname = name.join(".").to_ascii_lowercase();
+    if fname != "distance" && fname != "point.distance" {
+        return None;
+    }
+    if args.len() != 2 {
+        return None;
+    }
+    // One argument must be `var.prop`; the other a constant point. Try both orderings (distance is
+    // symmetric). The property argument must reference *only* the seek variable; the centre argument
+    // must reference no row data at all (a plan-time constant).
+    let try_sides = |prop_side: &Expr, center_side: &Expr| -> Option<(String, (f64, f64))> {
+        let prop = property_of(prop_side, variable)?;
+        let center = const_point_xy(center_side)?;
+        Some((prop, center))
+    };
+    try_sides(&args[0], &args[1]).or_else(|| try_sides(&args[1], &args[0]))
+}
+
+/// Evaluates a **constant** expression to its 2D `(x, y)` projection iff it is a constant
+/// `Value::Point` (`rmp` task #73). Returns [`None`] for any non-constant or non-point expression, so
+/// the planner declines a spatial seek it cannot pin to a literal centre.
+fn const_point_xy(expr: &Expr) -> Option<(f64, f64)> {
+    match const_value(expr)? {
+        Value::Point(p) => Some((p.x(), p.y())),
+        _ => None,
+    }
+}
+
+/// Evaluates a **constant** expression to an `f64` iff it is a constant integer or float (including a
+/// unary-minus literal). Returns [`None`] for any non-constant or non-numeric expression.
+fn const_number(expr: &Expr) -> Option<f64> {
+    match const_value(expr)? {
+        Value::Integer(i) => Some(i as f64),
+        Value::Float(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// A pure, **graph-free** constant folder for the spatial-seek operands: evaluates `expr` to a
+/// [`Value`] iff it is composed only of compile-time-constant pieces — literals, unary `+`/`-` over
+/// numbers, list/map literals of constants, and the `point()` constructor over a constant map. Any
+/// reference to a variable, parameter, property, or non-constant call yields [`None`].
+///
+/// This mirrors the runtime evaluation of these same operands ([`crate::spatial_fns::construct_point`]
+/// is reused verbatim for `point()`), so the centre the planner folds is **identical** to the one the
+/// residual filter recomputes at run time — which is what makes the seek's candidate set a true
+/// superset of the filter's exact result. Anything it cannot fold is simply declined (the planner
+/// then keeps the scan), so it never needs to be exhaustive over the expression grammar.
+fn const_value(expr: &Expr) -> Option<Value> {
+    match &expr.kind {
+        ExprKind::Literal(lit) => const_literal(lit),
+        ExprKind::Unary { op, operand } => {
+            let v = const_value(operand)?;
+            match (op, v) {
+                (crate::ast::UnaryOp::Plus, v) => Some(v),
+                (crate::ast::UnaryOp::Minus, Value::Integer(i)) => {
+                    i.checked_neg().map(Value::Integer)
+                }
+                (crate::ast::UnaryOp::Minus, Value::Float(f)) => Some(Value::Float(-f)),
+                _ => None,
+            }
+        }
+        ExprKind::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(const_value(it)?);
+            }
+            Some(Value::List(out))
+        }
+        ExprKind::Map(entries) => {
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, v) in entries {
+                out.push((key.name.clone(), const_value(v)?));
+            }
+            Some(Value::Map(out))
+        }
+        ExprKind::FunctionCall { name, args, .. } => {
+            // Only the `point()` constructor is folded (the one needed for a constant centre); fold its
+            // single constant-map argument and reuse the runtime constructor so plan-time and run-time
+            // points agree exactly.
+            if name.join(".").eq_ignore_ascii_case("point") && args.len() == 1 {
+                let arg = const_value(&args[0])?;
+                crate::spatial_fns::construct_point(&arg).ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Folds an AST [`Literal`] into a constant [`Value`] (the const-eval subset of
+/// [`crate::eval`]'s `literal_value`): an out-of-range integer or a `null` declines (a centre/radius
+/// built from `null` cannot drive a seek), keeping the planner on the scan path.
+fn const_literal(lit: &crate::ast::Literal) -> Option<Value> {
+    use crate::ast::Literal;
+    use crate::lexer::IntLiteral;
+    match lit {
+        Literal::Integer(IntLiteral { value, .. }) => {
+            i64::try_from(*value).ok().map(Value::Integer)
+        }
+        Literal::Float(x) => Some(Value::Float(*x)),
+        Literal::String(s) => Some(Value::String(s.clone())),
+        Literal::Boolean(b) => Some(Value::Boolean(*b)),
+        Literal::Null => None,
+    }
+}
+
+// =================================================================================================
 // Bound-variable analysis (for expand-into and join-key inference)
 // =================================================================================================
 
@@ -2185,7 +2412,8 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
-        | PhysicalOp::NodeIndexRangeSeek { variable, .. } => push_unique(out, variable.clone()),
+        | PhysicalOp::NodeIndexRangeSeek { variable, .. }
+        | PhysicalOp::SpatialIndexSeek { variable, .. } => push_unique(out, variable.clone()),
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -2346,6 +2574,19 @@ impl PhysicalOp {
                 label.name,
                 bound.symbol(),
                 h::expr(value),
+            ),
+            Self::SpatialIndexSeek {
+                variable,
+                label,
+                property,
+                center_x,
+                center_y,
+                radius,
+                index,
+            } => writeln!(
+                f,
+                "SpatialIndexSeek({variable}:{} {property} within {radius} of ({center_x}, {center_y}) via {index})",
+                label.name,
             ),
             Self::AllRelationshipsScan {
                 relationship,
@@ -2799,6 +3040,94 @@ mod tests {
             .build();
         let plan = physical("MATCH (n:Person) WHERE n.age > 18 RETURN n", &catalog);
         assert!(plan.to_string().contains("NodeIndexRangeSeek"), "{plan}");
+    }
+
+    #[test]
+    fn proximity_on_spatial_indexed_property_becomes_spatial_seek() {
+        // `rmp` task #73: a `distance(n.loc, <const point>) < r` predicate over a `(label, property)`
+        // that has a spatial index lowers to a `SpatialIndexSeek` — with the exact `distance` predicate
+        // RETAINED as a residual `Filter` (the grid is a geometric superset, so the filter restores
+        // exactness).
+        let catalog = IndexCatalog::builder()
+            .with_label_spatial("City", "loc")
+            .build();
+        let plan = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) < 5 RETURN n",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("SpatialIndexSeek"), "{rendered}");
+        // The exact predicate is re-checked above the seek (never dropped).
+        assert!(rendered.contains("Filter"), "{rendered}");
+        assert!(rendered.contains("distance"), "{rendered}");
+        assert!(!rendered.contains("NodeByLabelScan"), "{rendered}");
+        assert_eq!(plan.index_dependencies().count(), 1);
+    }
+
+    #[test]
+    fn proximity_recognises_symmetric_namespaced_and_lte_forms() {
+        // `rmp` task #73: the symmetric argument order, the namespaced `point.distance(...)` function,
+        // and the `<=` bound all drive the spatial seek (centre and radius are still plan-time
+        // constants).
+        let catalog = IndexCatalog::builder()
+            .with_label_spatial("City", "loc")
+            .build();
+        // Symmetric: const point as the FIRST argument.
+        let plan = physical(
+            "MATCH (n:City) WHERE distance(point({x:1, y:2}), n.loc) < 3 RETURN n",
+            &catalog,
+        );
+        assert!(plan.to_string().contains("SpatialIndexSeek"), "{plan}");
+        // `<=` bound.
+        let plan = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) <= 5 RETURN n",
+            &catalog,
+        );
+        assert!(plan.to_string().contains("SpatialIndexSeek"), "{plan}");
+        // The namespaced `point.distance(...)` spelling.
+        let plan = physical(
+            "MATCH (n:City) WHERE point.distance(n.loc, point({x:0, y:0})) < 5 RETURN n",
+            &catalog,
+        );
+        assert!(plan.to_string().contains("SpatialIndexSeek"), "{plan}");
+    }
+
+    #[test]
+    fn proximity_without_spatial_index_falls_back_to_scan_filter() {
+        // No spatial index declared: the proximity predicate stays a residual `Filter` over a label
+        // scan (still correct, just not index-accelerated) — never a seek.
+        let catalog = IndexCatalog::empty();
+        let plan = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) < 5 RETURN n",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeByLabelScan"), "{rendered}");
+        assert!(rendered.contains("Filter"), "{rendered}");
+        assert!(!rendered.contains("SpatialIndexSeek"), "{rendered}");
+        assert_eq!(plan.index_dependencies().count(), 0);
+    }
+
+    #[test]
+    fn proximity_with_non_constant_operands_declines_the_seek() {
+        // The centre / radius must be plan-time constants: a `>`/`>=` (unbounded) proximity, a
+        // non-constant radius, or a property-referencing centre all keep the scan + filter, never a
+        // spatial seek (`rmp` task #73).
+        let catalog = IndexCatalog::builder()
+            .with_label_spatial("City", "loc")
+            .build();
+        // `>` is unbounded — not a grid proximity query.
+        let plan = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) > 5 RETURN n",
+            &catalog,
+        );
+        assert!(!plan.to_string().contains("SpatialIndexSeek"), "{plan}");
+        // A radius that references the row is not a constant.
+        let plan = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) < n.r RETURN n",
+            &catalog,
+        );
+        assert!(!plan.to_string().contains("SpatialIndexSeek"), "{plan}");
     }
 
     #[test]

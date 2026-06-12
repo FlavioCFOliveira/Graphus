@@ -195,6 +195,30 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional** spatial proximity seek (`rmp` task #73): the **candidate** node ids of `label`
+    /// whose point `property` lies within `radius` of the centre `(center_x, center_y)`, projected to
+    /// 2D (the grid's `(x, y)` buckets).
+    ///
+    /// Returns `None` when no spatial index covers `(label, property)` — the executor then falls back
+    /// to a label scan (the residual `distance(...) <op> r` filter above the seek restores exactness
+    /// either way). `Some(ids)` is a **geometric superset**: the caller (the
+    /// [`SpatialIndexSeek`](crate::physical::PhysicalOp::SpatialIndexSeek) operator's residual filter)
+    /// re-checks every candidate's visibility, current label, current point value, CRS, and the exact
+    /// `distance(...) <op> radius` predicate, so a deleted / invisible / re-labelled / out-of-radius
+    /// node never reaches the result, and RBAC composes for free through the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The default returns
+    /// `None` (no spatial index available).
+    fn index_seek_spatial(
+        &self,
+        _label: &str,
+        _property: &str,
+        _center_x: f64,
+        _center_y: f64,
+        _radius: f64,
+    ) -> Option<Vec<NodeId>> {
+        None
+    }
+
     /// A **full-text** index query (`rmp` task #72): the **candidate** node ids matching the
     /// `search` string against the full-text index named `name`, analyzed with the index's own
     /// analyzer (OR-of-terms by default).
@@ -340,6 +364,12 @@ pub struct MemGraph {
     /// maintenance hooks — exactly the candidate-set behaviour the real backend produces after its
     /// per-write maintenance + MVCC re-check.
     fulltext: BTreeMap<String, MemFulltextIndex>,
+    /// Declared spatial indexes for executor tests (`rmp` task #73), keyed by `(label, property)`.
+    /// Like the full-text reference impl, candidates are computed on the fly from the live nodes at
+    /// query time (a bounding-box superset over the point property), so the seek behaves exactly like
+    /// the real grid index from the executor's perspective: a geometric superset re-checked exactly by
+    /// the residual `distance` filter above the seek.
+    spatial: std::collections::BTreeSet<(String, String)>,
 }
 
 /// A declared full-text index in [`MemGraph`] (`rmp` task #72): the covered label, properties and
@@ -414,6 +444,14 @@ impl MemGraph {
                 analyzer,
             },
         );
+    }
+
+    /// Declares a spatial index over `(label, property)` (`rmp` task #73; test/setup helper). The
+    /// index computes candidates lazily at query time (a bounding-box superset over the live nodes'
+    /// point property), so it immediately covers existing and future nodes. Re-declaring is
+    /// idempotent.
+    pub fn create_spatial_index(&mut self, label: impl Into<String>, property: impl Into<String>) {
+        self.spatial.insert((label.into(), property.into()));
     }
 
     /// The analyzed terms of node `id`'s covered properties for the full-text index `idx`. The same
@@ -575,6 +613,45 @@ impl GraphAccess for MemGraph {
             }
         }
         Some(score)
+    }
+
+    fn index_seek_spatial(
+        &self,
+        label: &str,
+        property: &str,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<NodeId>> {
+        // Only serve the seek when a spatial index is declared on `(label, property)`; else `None` so
+        // the executor falls back to a label scan (`rmp` task #73).
+        if !self
+            .spatial
+            .contains(&(label.to_owned(), property.to_owned()))
+        {
+            return None;
+        }
+        // The candidate superset: live nodes carrying `label` whose point `property` projects into the
+        // radius's bounding box `[cx-r, cx+r] × [cy-r, cy+r]` (a superset of the disk — and, like the
+        // grid, deliberately broader than the exact predicate, which the residual `distance` filter
+        // then trims). A non-point or missing value is not a candidate.
+        let (min_x, max_x) = (center_x - radius, center_x + radius);
+        let (min_y, max_y) = (center_y - radius, center_y + radius);
+        let mut out: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.labels.iter().any(|l| l == label))
+            .filter(|(_, n)| match n.props.get(property) {
+                Some(Value::Point(p)) => {
+                    let (x, y) = (p.x(), p.y());
+                    x >= min_x && x <= max_x && y >= min_y && y <= max_y
+                }
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        out.sort_unstable();
+        Some(out)
     }
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {

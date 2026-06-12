@@ -978,6 +978,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             };
             builder = builder.with_label_property(label, property);
         }
+        // Spatial indexes (`rmp` task #73): surface every **`Online`** spatial index so the physical
+        // planner can route a proximity predicate to a `SpatialIndexSeek`. Like node-property indexes,
+        // only `Online` ones are exposed (`online_spatial` filters by state), so a half-built spatial
+        // index never drives a seek — the planner keeps the scan + filter until it is promoted.
+        for (label_token, prop_key) in self.index.borrow().online_spatial() {
+            let (Some(label), Some(property)) = (
+                store.token_name(Namespace::Label, label_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) else {
+                continue;
+            };
+            builder = builder.with_label_spatial(label, property);
+        }
         builder.build()
     }
 

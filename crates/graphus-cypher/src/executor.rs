@@ -1012,6 +1012,28 @@ fn build_operator(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::SpatialIndexSeek {
+            variable,
+            label,
+            property,
+            center_x,
+            center_y,
+            radius,
+            ..
+        } => {
+            // Ask the spatial index for the candidate superset within the radius; if the seam has no
+            // such index at run time, fall back to a label scan so the result is still correct (the
+            // residual `distance(...) <op> r` filter above this operator does the exact trimming, and
+            // MVCC visibility / current-value / current-label re-checks, in BOTH paths — so the
+            // index-accelerated and scan paths return the identical node set, `rmp` task #73).
+            let ids = ctx
+                .graph
+                .index_seek_spatial(&label.name, property, *center_x, *center_y, *radius)
+                .unwrap_or_else(|| ctx.graph.scan_nodes_by_label(&label.name));
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, ids),
+            })
+        }
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -2815,7 +2837,8 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
-        | PhysicalOp::NodeIndexRangeSeek { variable, .. } => vec![variable.name.clone()],
+        | PhysicalOp::NodeIndexRangeSeek { variable, .. }
+        | PhysicalOp::SpatialIndexSeek { variable, .. } => vec![variable.name.clone()],
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -3052,6 +3075,84 @@ mod tests {
             columns_of("CREATE (a:Person {name: 'Ada'}) RETURN a"),
             vec!["a".to_owned()],
             "the projection above the write declares the result column",
+        );
+    }
+
+    #[test]
+    fn spatial_index_seek_returns_exactly_the_scan_result() {
+        // `rmp` task #73: the spatial index must NEVER change results — only speed. Seed Cartesian
+        // points whose Euclidean distances from the origin are exact (0, 3, 4, 5), then assert the
+        // proximity query returns the IDENTICAL node set whether or not a spatial index is present.
+        use crate::catalog::IndexCatalog;
+        use graphus_core::value::spatial::{Crs, Point};
+
+        let point = |x: f64, y: f64| Value::Point(Point::new_2d(Crs::Cartesian, x, y));
+
+        // The sorted node-id set a proximity query returns over `graph` with `catalog`.
+        fn ids(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<u64> {
+            let mut out: Vec<u64> = run_with_catalog(src, graph, catalog)
+                .iter()
+                .filter_map(|r| r.get("n").and_then(RowValue::as_node))
+                .map(|id| id.0)
+                .collect();
+            out.sort_unstable();
+            out
+        }
+
+        // Two identically-seeded graphs: one indexed, one not. (A graph carries its own declared
+        // spatial index; the catalog is what routes the planner to the seek — both must agree.)
+        let seed = |g: &mut MemGraph| {
+            g.add_node(["City"], [("loc", point(0.0, 0.0))]); // d = 0
+            g.add_node(["City"], [("loc", point(3.0, 0.0))]); // d = 3
+            g.add_node(["City"], [("loc", point(0.0, 4.0))]); // d = 4 (boundary)
+            g.add_node(["City"], [("loc", point(3.0, 4.0))]); // d = 5 (inside the bbox, outside r=4)
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        indexed.create_spatial_index("City", "loc");
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_spatial("City", "loc")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        // `< 4`: nodes at d = 0 and d = 3 only (the hit set). The d = 4 node is excluded (strict), and
+        // the d = 5 node — a grid bbox false positive — is excluded by the residual `distance` filter.
+        let q_lt = "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) < 4 RETURN n";
+        let seek_lt = ids(q_lt, &mut indexed, &with_index);
+        let scan_lt = ids(q_lt, &mut plain, &no_index);
+        assert_eq!(seek_lt, scan_lt, "index must not change results (< r)");
+        assert_eq!(seek_lt.len(), 2, "only d=0 and d=3 are within r=4 (strict)");
+
+        // `<= 4.0`: the boundary node at d = 4 is now included (a float radius so `distance` — always
+        // a `Value::Float` — compares numerically against it). The d = 5 bbox false positive stays out.
+        let q_le = "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) <= 4.0 RETURN n";
+        let seek_le = ids(q_le, &mut indexed, &with_index);
+        let scan_le = ids(q_le, &mut plain, &no_index);
+        assert_eq!(seek_le, scan_le, "index must not change results (<= r)");
+        assert_eq!(
+            seek_le.len(),
+            3,
+            "d=0, d=3 and the boundary d=4 are within r=4 inclusive"
+        );
+
+        // The grid bbox false positive (d = 5, node id 3) is never returned by either path.
+        assert!(
+            !seek_le.contains(&3),
+            "the d=5 node (same bbox, outside the radius) must be excluded by the residual re-check"
+        );
+
+        // Sanity: the indexed plan really does use the seek (else the test proves nothing about it).
+        let plan = {
+            let toks = tokenize(q_lt).expect("lex");
+            let ast = parse_tokens(&toks, q_lt).expect("parse");
+            plan_physical(&lower(&analyze(&ast).expect("analyze")), &with_index)
+        };
+        assert!(
+            plan.to_string().contains("SpatialIndexSeek"),
+            "the indexed plan must route through the spatial seek:\n{plan}"
         );
     }
 }
