@@ -46,6 +46,7 @@ use graphus_core::Value;
 use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection, VarLengthRange};
 use crate::binding::BoundParameters;
 use crate::eval::{EvalError, eval, eval_value};
+use crate::function_registry::{self, FunctionRegistry};
 use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId};
 use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
@@ -156,7 +157,8 @@ impl From<ExecError> for graphus_core::GraphusError {
 }
 
 /// The shared, per-execution context every operator threads through `next`: the bound parameters,
-/// the cancellation token, the live graph seam, and the procedure registry.
+/// the cancellation token, the live graph seam, the extension-function registry, and the procedure
+/// registry.
 ///
 /// The graph is a `&mut dyn GraphAccess` so write operators can mutate it; read operators take it
 /// by shared reborrow. Bundling it keeps the operator `next` signature small.
@@ -164,6 +166,9 @@ struct Ctx<'a> {
     params: &'a BoundParameters,
     token: &'a CancellationToken,
     graph: &'a mut dyn GraphAccess,
+    /// The extension-function registry (`rmp` task #75): consulted by [`crate::eval`] for a
+    /// user-defined scalar function call (after the built-ins, which take precedence).
+    functions: &'a dyn FunctionRegistry,
     procedures: &'a dyn ProcedureRegistry,
 }
 
@@ -442,7 +447,7 @@ impl Operator {
                 let Some(base) = input.next(ctx)? else {
                     return Ok(None);
                 };
-                let listv = eval_value(list, &base, ctx.params, ctx.graph)?;
+                let listv = eval_value(list, &base, ctx.params, ctx.graph, ctx.functions)?;
                 let elems = match listv {
                     Value::List(items) => VecDeque::from(items),
                     // UNWIND null produces no rows for that input row (Cypher).
@@ -476,7 +481,7 @@ impl Operator {
                 };
                 // The URL is evaluated per driving row (it may reference the row's bindings), then the
                 // file is resolved and opened — transactionally, inside the statement's graph seam.
-                let url_value = eval_value(url, &base, ctx.params, ctx.graph)?;
+                let url_value = eval_value(url, &base, ctx.params, ctx.graph, ctx.functions)?;
                 let state = LoadCsvState::open(base, &url_value, *field_terminator, *with_headers)?;
                 *current = Some(state);
             },
@@ -630,7 +635,7 @@ impl Operator {
                 // collapsed to property values — the v1 procedure argument domain.
                 let mut arg_values = Vec::with_capacity(args.len());
                 for a in args.iter() {
-                    arg_values.push(eval_value(a, &base, ctx.params, ctx.graph)?);
+                    arg_values.push(eval_value(a, &base, ctx.params, ctx.graph, ctx.functions)?);
                 }
                 let rows = ctx
                     .procedures
@@ -651,7 +656,7 @@ impl Operator {
 
 /// Evaluates a `SKIP`/`LIMIT`/`TopN` count expression to a non-negative `i64` (binding validated it).
 fn eval_count(expr: &Expr, ctx: &mut Ctx<'_>) -> Result<i64, ExecError> {
-    match eval_value(expr, &Row::empty(), ctx.params, ctx.graph)? {
+    match eval_value(expr, &Row::empty(), ctx.params, ctx.graph, ctx.functions)? {
         Value::Integer(n) if n >= 0 => Ok(n),
         // A negative or non-integer count is a runtime type error (binding catches the param case;
         // a literal/expression case is caught here).
@@ -663,7 +668,7 @@ fn eval_count(expr: &Expr, ctx: &mut Ctx<'_>) -> Result<i64, ExecError> {
 
 /// Evaluates a predicate to a [`Ternary`] (3VL): non-boolean non-null is a runtime type error.
 fn predicate_truth(expr: &Expr, row: &Row, ctx: &mut Ctx<'_>) -> Result<Ternary, ExecError> {
-    match eval(expr, row, ctx.params, ctx.graph)? {
+    match eval(expr, row, ctx.params, ctx.graph, ctx.functions)? {
         RowValue::Value(Value::Boolean(b)) => Ok(Ternary::from_bool(b)),
         RowValue::Value(Value::Null) => Ok(Ternary::Null),
         _ => Err(ExecError::Eval(EvalError::TypeError {
@@ -676,7 +681,7 @@ fn predicate_truth(expr: &Expr, row: &Row, ctx: &mut Ctx<'_>) -> Result<Ternary,
 fn project_row(row: &Row, items: &[ProjectionColumn], ctx: &mut Ctx<'_>) -> Result<Row, ExecError> {
     let mut out = Row::empty();
     for col in items {
-        let v = eval(&col.expr, row, ctx.params, ctx.graph)?;
+        let v = eval(&col.expr, row, ctx.params, ctx.graph, ctx.functions)?;
         out.set(col.alias.clone(), v);
     }
     Ok(out)
@@ -981,7 +986,7 @@ fn build_operator(
             value,
             ..
         } => {
-            let seek = eval_value(value, &Row::empty(), ctx.params, ctx.graph)?;
+            let seek = eval_value(value, &Row::empty(), ctx.params, ctx.graph, ctx.functions)?;
             let ids = match ctx.graph.index_seek_eq(&label.name, property, &seek) {
                 Some(ids) => ids,
                 // No index in the seam: fall back to a label scan + equality residual.
@@ -999,7 +1004,7 @@ fn build_operator(
             value,
             ..
         } => {
-            let bound_val = eval_value(value, &Row::empty(), ctx.params, ctx.graph)?;
+            let bound_val = eval_value(value, &Row::empty(), ctx.params, ctx.graph, ctx.functions)?;
             let (lower, upper) = range_bounds(*bound, &bound_val);
             let ids = match ctx
                 .graph
@@ -1529,7 +1534,7 @@ fn sort_rows(
     for row in rows {
         let mut kvs = Vec::with_capacity(keys.len());
         for k in keys {
-            kvs.push(eval(&k.expr, &row, ctx.params, ctx.graph)?);
+            kvs.push(eval(&k.expr, &row, ctx.params, ctx.graph, ctx.functions)?);
         }
         keyed.push((kvs, row));
     }
@@ -1601,7 +1606,7 @@ fn aggregate_rows(
         // Compute the group key.
         let mut key_vals = Vec::with_capacity(group_keys.len());
         for col in group_keys {
-            key_vals.push(eval(&col.expr, &row, ctx.params, ctx.graph)?);
+            key_vals.push(eval(&col.expr, &row, ctx.params, ctx.graph, ctx.functions)?);
         }
         let idx = match groups.iter().position(|g| {
             g.keys.len() == key_vals.len()
@@ -1654,7 +1659,7 @@ fn aggregate_rows(
             }
         }
         for (col, plan) in aggregates.iter().zip(&plans) {
-            let value = eval(&plan.outer, &eval_row, ctx.params, ctx.graph)?;
+            let value = eval(&plan.outer, &eval_row, ctx.params, ctx.graph, ctx.functions)?;
             row.set(col.alias.clone(), value);
         }
         out.push_back(row);
@@ -1868,7 +1873,7 @@ impl Accumulator {
         // — the value-context rule — which made `count(<entity>)` wrongly return 0.)
         let rv = match &expr.kind {
             ExprKind::FunctionCall { args, .. } if !args.is_empty() => {
-                eval(&args[0], row, ctx.params, ctx.graph)?
+                eval(&args[0], row, ctx.params, ctx.graph, ctx.functions)?
             }
             _ => RowValue::NULL,
         };
@@ -2270,7 +2275,7 @@ fn eval_properties(
     let Some(expr) = props else {
         return Ok(Vec::new());
     };
-    match eval_value(expr, row, ctx.params, ctx.graph)? {
+    match eval_value(expr, row, ctx.params, ctx.graph, ctx.functions)? {
         Value::Map(entries) => Ok(entries),
         Value::Null => Ok(Vec::new()),
         _ => Err(ExecError::PropertiesNotAMap),
@@ -2283,12 +2288,12 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
         match op {
             SetOp::Property { target, value } => {
                 let (entity, key) = resolve_property_target(target, row)?;
-                let v = eval_value(value, row, ctx.params, ctx.graph)?;
+                let v = eval_value(value, row, ctx.params, ctx.graph, ctx.functions)?;
                 set_entity_property(entity, &key, v, ctx);
             }
             SetOp::ReplaceProperties { target, value } => {
                 let id = entity_node(target, row)?;
-                let props = match eval_value(value, row, ctx.params, ctx.graph)? {
+                let props = match eval_value(value, row, ctx.params, ctx.graph, ctx.functions)? {
                     Value::Map(entries) => entries,
                     Value::Null => Vec::new(),
                     _ => return Err(ExecError::PropertiesNotAMap),
@@ -2297,7 +2302,7 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
             }
             SetOp::MergeProperties { target, value } => {
                 let id = entity_node(target, row)?;
-                let props = match eval_value(value, row, ctx.params, ctx.graph)? {
+                let props = match eval_value(value, row, ctx.params, ctx.graph, ctx.functions)? {
                     Value::Map(entries) => entries,
                     Value::Null => Vec::new(),
                     _ => return Err(ExecError::PropertiesNotAMap),
@@ -2370,7 +2375,11 @@ fn apply_delete(
     ctx: &mut Ctx<'_>,
 ) -> Result<(), ExecError> {
     for expr in exprs {
-        delete_row_value(detach, eval(expr, row, ctx.params, ctx.graph)?, ctx)?;
+        delete_row_value(
+            detach,
+            eval(expr, row, ctx.params, ctx.graph, ctx.functions)?,
+            ctx,
+        )?;
     }
     Ok(())
 }
@@ -2459,6 +2468,7 @@ pub struct Cursor<'a> {
     params: BoundParameters,
     token: CancellationToken,
     graph: &'a mut dyn GraphAccess,
+    functions: &'a dyn FunctionRegistry,
     procedures: &'a dyn ProcedureRegistry,
     columns: Vec<String>,
     finished: bool,
@@ -2494,6 +2504,7 @@ impl<'a> Cursor<'a> {
             params: &self.params,
             token: &self.token,
             graph: self.graph,
+            functions: self.functions,
             procedures: self.procedures,
         };
         // A write statement with no `RETURN` yields zero rows (openCypher write cardinality), but
@@ -2651,12 +2662,41 @@ impl Executor {
         token: CancellationToken,
         procedures: &'a dyn ProcedureRegistry,
     ) -> Result<Cursor<'a>, ExecError> {
+        // A pure pass-through to the extensions form with an empty function registry: the
+        // function-less callers (this one, used by the TCK harness, and `open`) see only the
+        // built-in functions, so their behaviour is byte-identical to before the extension
+        // mechanism (`rmp` task #75).
+        self.open_with_extensions(graph, token, function_registry::no_functions(), procedures)
+    }
+
+    /// [`open`](Self::open) against caller-supplied **function** and **procedure** registries (`rmp`
+    /// task #75).
+    ///
+    /// Both registries must be the **same** ones the statement was compiled against
+    /// ([`crate::semantics::analyze_with_extensions`]); a swap between the phases voids the
+    /// compile-time guarantees. [`open`](Self::open) and [`open_with_procedures`](Self::open_with_procedures)
+    /// are thin wrappers over this with an empty
+    /// [`FunctionRegistry`](crate::function_registry::no_functions).
+    ///
+    /// # Errors
+    ///
+    /// As [`open_with_procedures`](Self::open_with_procedures); additionally, a user-defined-function
+    /// body failure surfaces (during streaming) as
+    /// [`ExecError::Eval`]`(`[`EvalError::ExtensionFunction`]`)`.
+    pub fn open_with_extensions<'a>(
+        &self,
+        graph: &'a mut dyn GraphAccess,
+        token: CancellationToken,
+        functions: &'a dyn FunctionRegistry,
+        procedures: &'a dyn ProcedureRegistry,
+    ) -> Result<Cursor<'a>, ExecError> {
         let columns = result_columns(&self.plan.root, procedures);
         let root = {
             let mut ctx = Ctx {
                 params: &self.params,
                 token: &token,
                 graph,
+                functions,
                 procedures,
             };
             build_operator(&self.plan.root, None, &mut ctx)?
@@ -2666,6 +2706,7 @@ impl Executor {
             params: self.params.clone(),
             token,
             graph,
+            functions,
             procedures,
             columns,
             finished: false,
@@ -2735,6 +2776,31 @@ pub fn execute_with_procedures<'a>(
     Executor::new(plan.clone(), params.clone()).open_with_procedures(
         graph,
         CancellationToken::new(),
+        procedures,
+    )
+}
+
+/// [`execute`] against caller-supplied **function** and **procedure** registries (`rmp` task #75): a
+/// convenience wrapping [`Executor::open_with_extensions`] with a fresh [`CancellationToken`].
+///
+/// Both registries must be the **same** ones the statement was compiled against
+/// ([`crate::semantics::analyze_with_extensions`]).
+///
+/// # Errors
+///
+/// As [`execute_with_procedures`]; additionally a user-defined-function body failure surfaces during
+/// streaming as [`ExecError::Eval`]`(`[`EvalError::ExtensionFunction`]`)`.
+pub fn execute_with_extensions<'a>(
+    plan: &PhysicalPlan,
+    params: &BoundParameters,
+    graph: &'a mut dyn GraphAccess,
+    functions: &'a dyn FunctionRegistry,
+    procedures: &'a dyn ProcedureRegistry,
+) -> Result<Cursor<'a>, ExecError> {
+    Executor::new(plan.clone(), params.clone()).open_with_extensions(
+        graph,
+        CancellationToken::new(),
+        functions,
         procedures,
     )
 }

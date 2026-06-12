@@ -33,6 +33,7 @@ use graphus_core::Value;
 use crate::ast::{BinaryOp, CaseExpr, Expr, ExprKind, Literal, MapKey, PredicateOp, UnaryOp};
 use crate::binding::BoundParameters;
 use crate::equality::{equals, is_in};
+use crate::function_registry::FunctionRegistry;
 use crate::graph_access::GraphAccess;
 use crate::lexer::IntLiteral;
 use crate::ordering::cmp_values;
@@ -62,6 +63,19 @@ pub enum EvalError {
         /// The dotted function name.
         name: String,
     },
+    /// A **user-defined function** (`rmp` task #75) — registered as an extension — failed at
+    /// runtime: its body returned a
+    /// [`FunctionFailure`](crate::function_registry::FunctionFailure), typically because an argument
+    /// had the wrong type (function argument *types* are checked at runtime, like the built-ins) or
+    /// the computation itself failed. This maps (via `From<EvalError>`) to
+    /// [`GraphusError::Runtime`](graphus_core::GraphusError::Runtime) and thus the Bolt
+    /// `ArgumentError` class — the same class a built-in's runtime type error takes.
+    ExtensionFunction {
+        /// The dotted function name.
+        name: String,
+        /// The handler's failure message.
+        message: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -75,6 +89,9 @@ impl fmt::Display for EvalError {
                     f,
                     "function `{name}` is not implemented in the executor yet"
                 )
+            }
+            Self::ExtensionFunction { name, message } => {
+                write!(f, "function `{name}` failed: {message}")
             }
         }
     }
@@ -104,6 +121,7 @@ pub fn eval(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     match &expr.kind {
         ExprKind::Literal(lit) => literal_value(lit).map(RowValue::Value),
@@ -112,19 +130,27 @@ pub fn eval(
         )),
         ExprKind::Variable(name) => Ok(row.get(name).cloned().unwrap_or(RowValue::NULL)),
 
-        ExprKind::Binary { op, lhs, rhs } => eval_binary(*op, lhs, rhs, row, params, graph),
-        ExprKind::Unary { op, operand } => eval_unary(*op, operand, row, params, graph),
+        ExprKind::Binary { op, lhs, rhs } => {
+            eval_binary(*op, lhs, rhs, row, params, graph, functions)
+        }
+        ExprKind::Unary { op, operand } => eval_unary(*op, operand, row, params, graph, functions),
         ExprKind::Predicate { op, operand, rhs } => {
-            eval_predicate(*op, operand, rhs.as_deref(), row, params, graph)
+            eval_predicate(*op, operand, rhs.as_deref(), row, params, graph, functions)
         }
 
-        ExprKind::Property { base, key } => eval_property(base, key, row, params, graph),
-        ExprKind::Index { base, index } => eval_index(base, index, row, params, graph),
-        ExprKind::Slice { base, low, high } => {
-            eval_slice(base, low.as_deref(), high.as_deref(), row, params, graph)
-        }
+        ExprKind::Property { base, key } => eval_property(base, key, row, params, graph, functions),
+        ExprKind::Index { base, index } => eval_index(base, index, row, params, graph, functions),
+        ExprKind::Slice { base, low, high } => eval_slice(
+            base,
+            low.as_deref(),
+            high.as_deref(),
+            row,
+            params,
+            graph,
+            functions,
+        ),
         ExprKind::HasLabels { operand, labels } => {
-            let base = eval(operand, row, params, graph)?;
+            let base = eval(operand, row, params, graph, functions)?;
             let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
             Ok(ternary_value(has_labels(&base, &names, graph)))
         }
@@ -133,7 +159,7 @@ pub fn eval(
             name,
             distinct: _,
             args,
-        } => call_function(&name.join("."), args, row, params, graph),
+        } => call_function(&name.join("."), args, row, params, graph, functions),
         // `count(*)` only appears as an aggregate (handled by the Aggregation operator); reaching
         // here as a scalar would be a planner bug, so produce a typed runtime error rather than panic.
         ExprKind::CountStar => Err(EvalError::TypeError {
@@ -143,7 +169,7 @@ pub fn eval(
         ExprKind::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
-                out.push(eval(it, row, params, graph)?);
+                out.push(eval(it, row, params, graph, functions)?);
             }
             // Canonical list construction: stays structural iff any element is (node/rel/path).
             Ok(RowValue::list(out))
@@ -151,17 +177,24 @@ pub fn eval(
         ExprKind::Map(entries) => {
             let mut out = Vec::with_capacity(entries.len());
             for (MapKey { name, .. }, v) in entries {
-                out.push((name.clone(), to_value(eval(v, row, params, graph)?)));
+                out.push((
+                    name.clone(),
+                    to_value(eval(v, row, params, graph, functions)?),
+                ));
             }
             Ok(RowValue::Value(Value::Map(out)))
         }
 
-        ExprKind::Case(case) => eval_case(case, row, params, graph),
+        ExprKind::Case(case) => eval_case(case, row, params, graph, functions),
 
-        ExprKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params, graph),
-        ExprKind::PatternComprehension(pc) => eval_pattern_comprehension(pc, row, params, graph),
-        ExprKind::Quantifier(q) => eval_quantifier(q, row, params, graph),
-        ExprKind::ExistsSubquery(ex) => eval_exists_subquery(ex, row, params, graph),
+        ExprKind::ListComprehension(lc) => {
+            eval_list_comprehension(lc, row, params, graph, functions)
+        }
+        ExprKind::PatternComprehension(pc) => {
+            eval_pattern_comprehension(pc, row, params, graph, functions)
+        }
+        ExprKind::Quantifier(q) => eval_quantifier(q, row, params, graph, functions),
+        ExprKind::ExistsSubquery(ex) => eval_exists_subquery(ex, row, params, graph, functions),
     }
 }
 
@@ -175,8 +208,9 @@ pub fn eval_value(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<Value, EvalError> {
-    Ok(to_value(eval(expr, row, params, graph)?))
+    Ok(to_value(eval(expr, row, params, graph, functions)?))
 }
 
 /// Collapses a [`RowValue`] to a property [`Value`]. An entity reference has **no** property value,
@@ -224,8 +258,9 @@ fn eval_to_ternary(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<Ternary, EvalError> {
-    match eval(expr, row, params, graph)? {
+    match eval(expr, row, params, graph, functions)? {
         RowValue::Value(Value::Boolean(b)) => Ok(Ternary::from_bool(b)),
         RowValue::Value(Value::Null) => Ok(Ternary::Null),
         other => Err(EvalError::TypeError {
@@ -242,46 +277,47 @@ fn eval_binary(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     match op {
         // ---- boolean connectives (Kleene 3VL via Ternary) ------------------------------------
         BinaryOp::And => {
-            let a = eval_to_ternary(lhs, row, params, graph)?;
+            let a = eval_to_ternary(lhs, row, params, graph, functions)?;
             // Short-circuit FALSE without evaluating rhs is sound; but to surface a rhs type error
             // consistently we evaluate rhs too unless `a` already settles it to FALSE.
             if a == Ternary::False {
                 return Ok(ternary_value(Ternary::False));
             }
-            let b = eval_to_ternary(rhs, row, params, graph)?;
+            let b = eval_to_ternary(rhs, row, params, graph, functions)?;
             Ok(ternary_value(a.and(b)))
         }
         BinaryOp::Or => {
-            let a = eval_to_ternary(lhs, row, params, graph)?;
+            let a = eval_to_ternary(lhs, row, params, graph, functions)?;
             if a == Ternary::True {
                 return Ok(ternary_value(Ternary::True));
             }
-            let b = eval_to_ternary(rhs, row, params, graph)?;
+            let b = eval_to_ternary(rhs, row, params, graph, functions)?;
             Ok(ternary_value(a.or(b)))
         }
         BinaryOp::Xor => {
-            let a = eval_to_ternary(lhs, row, params, graph)?;
-            let b = eval_to_ternary(rhs, row, params, graph)?;
+            let a = eval_to_ternary(lhs, row, params, graph, functions)?;
+            let b = eval_to_ternary(rhs, row, params, graph, functions)?;
             Ok(ternary_value(a.xor(b)))
         }
 
         // ---- equality / comparison (reuse the value-model semantics) -------------------------
         BinaryOp::Eq => {
-            let a = eval(lhs, row, params, graph)?;
-            let b = eval(rhs, row, params, graph)?;
+            let a = eval(lhs, row, params, graph, functions)?;
+            let b = eval(rhs, row, params, graph, functions)?;
             Ok(ternary_value(row_values_equal(&a, &b)))
         }
         BinaryOp::Neq => {
-            let a = eval(lhs, row, params, graph)?;
-            let b = eval(rhs, row, params, graph)?;
+            let a = eval(lhs, row, params, graph, functions)?;
+            let b = eval(rhs, row, params, graph, functions)?;
             Ok(ternary_value(!row_values_equal(&a, &b)))
         }
         BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Lte | BinaryOp::Gte => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
             Ok(ternary_value(compare(op, &a, &b)))
         }
         BinaryOp::RegexMatch => {
@@ -293,11 +329,11 @@ fn eval_binary(
 
         // ---- arithmetic ----------------------------------------------------------------------
         BinaryOp::Add => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
             arithmetic_add(&a, &b)
         }
         BinaryOp::Sub => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
             if a.is_null() || b.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -308,7 +344,7 @@ fn eval_binary(
             numeric_binop_values(&a, &b, |x, y| x - y, i64::checked_sub)
         }
         BinaryOp::Mul => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
             if a.is_null() || b.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -318,10 +354,10 @@ fn eval_binary(
             }
             numeric_binop_values(&a, &b, |x, y| x * y, i64::checked_mul)
         }
-        BinaryOp::Div => eval_div(lhs, rhs, row, params, graph),
-        BinaryOp::Mod => eval_mod(lhs, rhs, row, params, graph),
+        BinaryOp::Div => eval_div(lhs, rhs, row, params, graph, functions),
+        BinaryOp::Mod => eval_mod(lhs, rhs, row, params, graph, functions),
         BinaryOp::Pow => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
             match (numeric_f64(&a), numeric_f64(&b)) {
                 (Some(x), Some(y)) => Ok(RowValue::Value(Value::Float(x.powf(y)))),
                 _ if a.is_null() || b.is_null() => Ok(RowValue::NULL),
@@ -340,10 +376,11 @@ fn eval_pair(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<(Value, Value), EvalError> {
     Ok((
-        eval_value(lhs, row, params, graph)?,
-        eval_value(rhs, row, params, graph)?,
+        eval_value(lhs, row, params, graph, functions)?,
+        eval_value(rhs, row, params, graph, functions)?,
     ))
 }
 
@@ -497,8 +534,9 @@ fn eval_div(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+    let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
     if a.is_null() || b.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -527,8 +565,9 @@ fn eval_mod(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    let (a, b) = eval_pair(lhs, rhs, row, params, graph)?;
+    let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
     if a.is_null() || b.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -553,14 +592,15 @@ fn eval_unary(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     match op {
         UnaryOp::Not => {
-            let t = eval_to_ternary(operand, row, params, graph)?;
+            let t = eval_to_ternary(operand, row, params, graph, functions)?;
             Ok(ternary_value(!t))
         }
         UnaryOp::Plus => {
-            let v = eval_value(operand, row, params, graph)?;
+            let v = eval_value(operand, row, params, graph, functions)?;
             if v.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -572,7 +612,7 @@ fn eval_unary(
             }
         }
         UnaryOp::Minus => {
-            let v = eval_value(operand, row, params, graph)?;
+            let v = eval_value(operand, row, params, graph, functions)?;
             if v.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -600,28 +640,29 @@ fn eval_predicate(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     match op {
         PredicateOp::IsNull => {
-            let v = eval(operand, row, params, graph)?;
+            let v = eval(operand, row, params, graph, functions)?;
             Ok(RowValue::Value(Value::Boolean(v.is_null())))
         }
         PredicateOp::IsNotNull => {
-            let v = eval(operand, row, params, graph)?;
+            let v = eval(operand, row, params, graph, functions)?;
             Ok(RowValue::Value(Value::Boolean(!v.is_null())))
         }
         PredicateOp::In => {
-            let value = eval_value(operand, row, params, graph)?;
+            let value = eval_value(operand, row, params, graph, functions)?;
             let list = match rhs {
-                Some(r) => eval_value(r, row, params, graph)?,
+                Some(r) => eval_value(r, row, params, graph, functions)?,
                 None => Value::Null,
             };
             Ok(ternary_value(is_in(&value, &list)))
         }
         PredicateOp::StartsWith | PredicateOp::EndsWith | PredicateOp::Contains => {
-            let a = eval_value(operand, row, params, graph)?;
+            let a = eval_value(operand, row, params, graph, functions)?;
             let b = match rhs {
-                Some(r) => eval_value(r, row, params, graph)?,
+                Some(r) => eval_value(r, row, params, graph, functions)?,
                 None => Value::Null,
             };
             if a.is_null() || b.is_null() {
@@ -653,8 +694,9 @@ fn eval_property(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    match eval(base, row, params, graph)? {
+    match eval(base, row, params, graph, functions)? {
         RowValue::Node(NodeRef { id }) => Ok(RowValue::Value(
             graph.node_property(id, key).unwrap_or(Value::Null),
         )),
@@ -690,9 +732,10 @@ fn eval_index(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    let base = eval_value(base, row, params, graph)?;
-    let idx = eval_value(index, row, params, graph)?;
+    let base = eval_value(base, row, params, graph, functions)?;
+    let idx = eval_value(index, row, params, graph, functions)?;
     if base.is_null() || idx.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -727,8 +770,9 @@ fn eval_slice(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    let base = eval_value(base, row, params, graph)?;
+    let base = eval_value(base, row, params, graph, functions)?;
     if base.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -741,7 +785,7 @@ fn eval_slice(
     let resolve = |bound: Option<&Expr>, default: i64| -> Result<Option<i64>, EvalError> {
         match bound {
             None => Ok(Some(default)),
-            Some(e) => match eval_value(e, row, params, graph)? {
+            Some(e) => match eval_value(e, row, params, graph, functions)? {
                 Value::Null => Ok(None),
                 Value::Integer(i) => Ok(Some(if i < 0 { len + i } else { i })),
                 _ => Err(EvalError::TypeError {
@@ -768,29 +812,30 @@ fn eval_case(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     match &case.subject {
         // Simple CASE: compare the subject against each WHEN value with Cypher `=`.
         Some(subject) => {
-            let subj = eval_value(subject, row, params, graph)?;
+            let subj = eval_value(subject, row, params, graph, functions)?;
             for alt in &case.alternatives {
-                let when = eval_value(&alt.when, row, params, graph)?;
+                let when = eval_value(&alt.when, row, params, graph, functions)?;
                 if equals(&subj, &when).is_true() {
-                    return eval(&alt.then, row, params, graph);
+                    return eval(&alt.then, row, params, graph, functions);
                 }
             }
         }
         // Searched CASE: each WHEN is a predicate; the first TRUE wins.
         None => {
             for alt in &case.alternatives {
-                if eval_to_ternary(&alt.when, row, params, graph)?.is_true() {
-                    return eval(&alt.then, row, params, graph);
+                if eval_to_ternary(&alt.when, row, params, graph, functions)?.is_true() {
+                    return eval(&alt.then, row, params, graph, functions);
                 }
             }
         }
     }
     match &case.else_expr {
-        Some(e) => eval(e, row, params, graph),
+        Some(e) => eval(e, row, params, graph, functions),
         None => Ok(RowValue::NULL),
     }
 }
@@ -886,13 +931,14 @@ fn call_function(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     let lower = name.to_ascii_lowercase();
 
     // `coalesce` is special: it returns its first non-null argument, evaluated left to right.
     if lower == "coalesce" {
         for a in args {
-            let v = eval(a, row, params, graph)?;
+            let v = eval(a, row, params, graph, functions)?;
             if !v.is_null() {
                 return Ok(v);
             }
@@ -903,7 +949,7 @@ fn call_function(
     // Entity functions take the un-collapsed RowValue (they need the reference).
     match lower.as_str() {
         "id" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => RowValue::Value(Value::Integer(id.0 as i64)),
                 RowValue::Rel(RelRef { id }) => RowValue::Value(Value::Integer(id.0 as i64)),
@@ -911,7 +957,7 @@ fn call_function(
             });
         }
         "labels" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => RowValue::Value(Value::List(
                     graph
@@ -925,7 +971,7 @@ fn call_function(
             });
         }
         "type" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Rel(RelRef { id }) => graph
                     .rel_data(id)
@@ -935,7 +981,7 @@ fn call_function(
             });
         }
         "properties" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => map_from_props(graph.node_properties(id)),
                 RowValue::Rel(RelRef { id }) => map_from_props(graph.rel_properties(id)),
@@ -944,7 +990,7 @@ fn call_function(
             });
         }
         "keys" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => keys_list(graph.node_properties(id)),
                 RowValue::Rel(RelRef { id }) => keys_list(graph.rel_properties(id)),
@@ -955,7 +1001,7 @@ fn call_function(
             });
         }
         "startnode" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Rel(RelRef { id }) => graph
                     .rel_data(id)
@@ -965,7 +1011,7 @@ fn call_function(
             });
         }
         "endnode" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return Ok(match v {
                 RowValue::Rel(RelRef { id }) => graph
                     .rel_data(id)
@@ -976,7 +1022,7 @@ fn call_function(
         }
         // Path accessors (openCypher `expressions/path/**`): ordered projections of a path value.
         "nodes" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return match v {
                 RowValue::Path(p) => Ok(RowValue::list(
                     p.nodes()
@@ -991,7 +1037,7 @@ fn call_function(
             };
         }
         "relationships" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return match v {
                 RowValue::Path(p) => Ok(RowValue::list(
                     p.rels()
@@ -1009,7 +1055,7 @@ fn call_function(
         // (`nodes(p)`, `collect(n)`, …) and paths keep their elements; the pure-property cases
         // behave exactly as the former `Value`-level implementations.
         "size" | "length" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return match v {
                 // `length(p)` is the path's relationship count (openCypher).
                 RowValue::Path(p) if lower == "length" => {
@@ -1029,7 +1075,7 @@ fn call_function(
             };
         }
         "head" | "last" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             let Some(mut items) = v.as_list_elems() else {
                 return match v {
                     RowValue::Value(Value::Null) => Ok(RowValue::NULL),
@@ -1050,7 +1096,7 @@ fn call_function(
             });
         }
         "tail" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             let items = match v {
                 // `tail(null)` is the empty list (the pre-existing `list_arg` behaviour).
                 RowValue::Value(Value::Null) => Vec::new(),
@@ -1061,7 +1107,7 @@ fn call_function(
             return Ok(RowValue::list(items.into_iter().skip(1).collect()));
         }
         "reverse" => {
-            let v = eval(&args[0], row, params, graph)?;
+            let v = eval(&args[0], row, params, graph, functions)?;
             return match v {
                 RowValue::List(items) => Ok(RowValue::list(items.into_iter().rev().collect())),
                 RowValue::Value(Value::List(items)) => Ok(RowValue::Value(Value::List(
@@ -1082,7 +1128,7 @@ fn call_function(
     // The remaining functions operate on collapsed property values.
     let argv: Vec<Value> = args
         .iter()
-        .map(|a| eval_value(a, row, params, graph))
+        .map(|a| eval_value(a, row, params, graph, functions))
         .collect::<Result<_, _>>()?;
 
     let result = match lower.as_str() {
@@ -1155,6 +1201,25 @@ fn call_function(
         "left" => left_right_fn(&argv, true)?,
         "right" => left_right_fn(&argv, false)?,
         other => {
+            // Not a built-in (every built-in is matched above, including the entity functions that
+            // returned early). Consult the **extension** function registry (`rmp` task #75): a
+            // registered scalar UDF is invoked over the already-collapsed `argv`. A built-in can
+            // never reach here, so a UDF can never shadow a built-in at runtime — consistent with
+            // registration-time rejection of built-in-colliding names. A handler failure (including
+            // its own argument-type rejection) becomes the runtime
+            // [`EvalError::ExtensionFunction`], which maps to `GraphusError::Runtime` →
+            // `ArgumentError` at the Bolt boundary (the same class a built-in's runtime type error
+            // takes). Only when no UDF is registered do we return the documented
+            // `UnsupportedFunction` (an un-implemented built-in like `percentileCont`).
+            if functions.signature(other).is_some() {
+                return functions
+                    .invoke(other, &argv)
+                    .map(RowValue::Value)
+                    .map_err(|failure| EvalError::ExtensionFunction {
+                        name: failure.name,
+                        message: failure.message,
+                    });
+            }
             return Err(EvalError::UnsupportedFunction {
                 name: other.to_owned(),
             });
@@ -1446,8 +1511,16 @@ fn eval_list_comprehension(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    let items = eval_to_list_items(&lc.list, "list comprehension", row, params, graph)?;
+    let items = eval_to_list_items(
+        &lc.list,
+        "list comprehension",
+        row,
+        params,
+        graph,
+        functions,
+    )?;
     let Some(items) = items else {
         return Ok(RowValue::NULL);
     };
@@ -1455,12 +1528,12 @@ fn eval_list_comprehension(
     for item in items {
         let inner = row.with(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
-            if !eval_to_ternary(pred, &inner, params, graph)?.is_true() {
+            if !eval_to_ternary(pred, &inner, params, graph, functions)?.is_true() {
                 continue;
             }
         }
         match &lc.projection {
-            Some(proj) => out.push(eval(proj, &inner, params, graph)?),
+            Some(proj) => out.push(eval(proj, &inner, params, graph, functions)?),
             None => out.push(item),
         }
     }
@@ -1476,8 +1549,9 @@ fn eval_to_list_items(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<Option<Vec<RowValue>>, EvalError> {
-    let v = eval(list, row, params, graph)?;
+    let v = eval(list, row, params, graph, functions)?;
     if v.is_null() {
         return Ok(None);
     }
@@ -1497,9 +1571,10 @@ fn eval_quantifier(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     use crate::ast::QuantifierKind;
-    let items = eval_to_list_items(&q.list, "quantifier", row, params, graph)?;
+    let items = eval_to_list_items(&q.list, "quantifier", row, params, graph, functions)?;
     let Some(items) = items else {
         return Ok(RowValue::NULL);
     };
@@ -1509,7 +1584,7 @@ fn eval_quantifier(
     let mut nulls = 0usize;
     for item in items {
         let inner = row.with(q.variable.name.clone(), item);
-        match eval_to_ternary(&q.predicate, &inner, params, graph)? {
+        match eval_to_ternary(&q.predicate, &inner, params, graph, functions)? {
             Ternary::True => match q.kind {
                 // One satisfied element decides ANY (true) and NONE (false) outright.
                 QuantifierKind::Any => return yes(),
@@ -1566,18 +1641,20 @@ fn eval_pattern_comprehension(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     // A named path (`[p = (a)-->(b) | p]`) binds the path variable for the predicate/projection.
     let path_var = pc.var.as_ref().map(|v| v.name.as_str());
-    let matches = pattern_element_rows(&pc.element, row, params, graph, false, path_var)?;
+    let matches =
+        pattern_element_rows(&pc.element, row, params, graph, functions, false, path_var)?;
     let mut out = Vec::new();
     for m in matches {
         if let Some(pred) = &pc.predicate {
-            if !eval_to_ternary(pred, &m, params, graph)?.is_true() {
+            if !eval_to_ternary(pred, &m, params, graph, functions)?.is_true() {
                 continue;
             }
         }
-        out.push(eval(&pc.projection, &m, params, graph)?);
+        out.push(eval(&pc.projection, &m, params, graph, functions)?);
     }
     Ok(RowValue::list(out))
 }
@@ -1590,6 +1667,7 @@ fn eval_exists_subquery(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     // Comma-separated parts join through their shared variables: each part's matches seed the next.
     let mut rows = vec![row.clone()];
@@ -1603,6 +1681,7 @@ fn eval_exists_subquery(
                 r,
                 params,
                 graph,
+                functions,
                 false,
                 path_var,
             )?);
@@ -1616,7 +1695,7 @@ fn eval_exists_subquery(
         None => Ok(RowValue::Value(Value::Boolean(true))),
         Some(pred) => {
             for r in &rows {
-                if eval_to_ternary(pred, r, params, graph)?.is_true() {
+                if eval_to_ternary(pred, r, params, graph, functions)?.is_true() {
                     return Ok(RowValue::Value(Value::Boolean(true)));
                 }
             }
@@ -1641,11 +1720,12 @@ fn pattern_element_rows(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
     first_only: bool,
     path_var: Option<&str>,
 ) -> Result<Vec<Row>, EvalError> {
     let mut results = Vec::new();
-    for start in node_candidates(&element.start, row, params, graph)? {
+    for start in node_candidates(&element.start, row, params, graph, functions)? {
         let mut seeded = row.clone();
         if let Some(v) = &element.start.variable {
             seeded.set(v.name.clone(), RowValue::Node(NodeRef { id: start }));
@@ -1653,6 +1733,7 @@ fn pattern_element_rows(
         let cctx = ChainCtx {
             params,
             graph,
+            functions,
             first_only,
             path_var,
             start,
@@ -1679,6 +1760,7 @@ fn pattern_element_rows(
 struct ChainCtx<'a> {
     params: &'a BoundParameters,
     graph: &'a dyn GraphAccess,
+    functions: &'a dyn FunctionRegistry,
     first_only: bool,
     path_var: Option<&'a str>,
     start: crate::graph_access::NodeId,
@@ -1698,7 +1780,7 @@ fn match_chain(
     out: &mut Vec<Row>,
     cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
-    let (params, graph) = (cctx.params, cctx.graph);
+    let (params, graph, functions) = (cctx.params, cctx.graph, cctx.functions);
     let Some(link) = chain.get(idx) else {
         let mut row = row;
         if let Some(pv) = cctx.path_var {
@@ -1739,12 +1821,12 @@ fn match_chain(
             }
         }
         if let Some(props) = &link.relationship.properties {
-            if !rel_props_match(inc.rel, props, &row, params, graph)? {
+            if !rel_props_match(inc.rel, props, &row, params, graph, functions)? {
                 continue;
             }
         }
         // Target node: label/property filters plus the identity constraint when already bound.
-        if !node_matches(inc.neighbour, &link.node, &row, params, graph)? {
+        if !node_matches(inc.neighbour, &link.node, &row, params, graph, functions)? {
             continue;
         }
         if let Some(v) = &link.node.variable {
@@ -1813,11 +1895,11 @@ fn match_var_length_link(
     out: &mut Vec<Row>,
     cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
-    let (params, graph) = (cctx.params, cctx.graph);
+    let (params, graph, functions) = (cctx.params, cctx.graph, cctx.functions);
     let link = &chain[idx];
     let min = range.min.unwrap_or(1);
     // Complete the link at this depth if allowed and the far node satisfies the target pattern.
-    if depth >= min && node_matches(current, &link.node, &row, params, graph)? {
+    if depth >= min && node_matches(current, &link.node, &row, params, graph, functions)? {
         let mut next_row = row.clone();
         let mut ok = true;
         if let Some(v) = &link.relationship.variable {
@@ -1868,7 +1950,7 @@ fn match_var_length_link(
             continue;
         }
         if let Some(props) = &link.relationship.properties {
-            if !rel_props_match(inc.rel, props, &row, params, graph)? {
+            if !rel_props_match(inc.rel, props, &row, params, graph, functions)? {
                 continue;
             }
         }
@@ -1903,11 +1985,14 @@ fn node_candidates(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<Vec<crate::graph_access::NodeId>, EvalError> {
     if let Some(v) = &np.variable {
         if let Some(rv) = row.get(&v.name) {
             return match rv {
-                RowValue::Node(n) if node_matches(n.id, np, row, params, graph)? => Ok(vec![n.id]),
+                RowValue::Node(n) if node_matches(n.id, np, row, params, graph, functions)? => {
+                    Ok(vec![n.id])
+                }
                 _ => Ok(Vec::new()),
             };
         }
@@ -1918,7 +2003,7 @@ fn node_candidates(
     };
     let mut out = Vec::new();
     for id in ids {
-        if node_matches(id, np, row, params, graph)? {
+        if node_matches(id, np, row, params, graph, functions)? {
             out.push(id);
         }
     }
@@ -1933,6 +2018,7 @@ fn node_matches(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<bool, EvalError> {
     if !np.labels.is_empty() {
         let Some(labels) = graph.node_labels(id) else {
@@ -1947,7 +2033,7 @@ fn node_matches(
         }
     }
     if let Some(props) = &np.properties {
-        let entries = eval_props_map(props, row, params, graph)?;
+        let entries = eval_props_map(props, row, params, graph, functions)?;
         for (k, want) in entries {
             let actual = graph.node_property(id, &k).unwrap_or(Value::Null);
             if !equals(&actual, &want).is_true() {
@@ -1965,8 +2051,9 @@ fn rel_props_match(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<bool, EvalError> {
-    let entries = eval_props_map(props, row, params, graph)?;
+    let entries = eval_props_map(props, row, params, graph, functions)?;
     for (k, want) in entries {
         let actual = graph.rel_property(id, &k).unwrap_or(Value::Null);
         if !equals(&actual, &want).is_true() {
@@ -1983,8 +2070,9 @@ fn eval_props_map(
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
 ) -> Result<Vec<(String, Value)>, EvalError> {
-    match eval_value(props, row, params, graph)? {
+    match eval_value(props, row, params, graph, functions)? {
         Value::Map(entries) => Ok(entries),
         other => Err(EvalError::TypeError {
             context: format!("pattern properties must be a map, got {other:?}"),
@@ -1996,6 +2084,7 @@ fn eval_props_map(
 mod tests {
     use super::*;
     use crate::binding::Parameters;
+    use crate::function_registry::{Arity, FunctionFailure, FunctionSet, no_functions};
     use crate::graph_access::MemGraph;
     use crate::lexer::tokenize;
     use crate::parser::parse_tokens;
@@ -2019,7 +2108,7 @@ mod tests {
         let expr = parse_expr(src);
         let g = MemGraph::new();
         let bound = BoundParameters::empty();
-        to_value(eval(&expr, &Row::empty(), &bound, &g).unwrap())
+        to_value(eval(&expr, &Row::empty(), &bound, &g, no_functions()).unwrap())
     }
 
     #[test]
@@ -2036,7 +2125,14 @@ mod tests {
     fn division_by_zero_is_runtime_error() {
         let expr = parse_expr("1 / 0");
         let g = MemGraph::new();
-        let err = eval(&expr, &Row::empty(), &BoundParameters::empty(), &g).unwrap_err();
+        let err = eval(
+            &expr,
+            &Row::empty(),
+            &BoundParameters::empty(),
+            &g,
+            no_functions(),
+        )
+        .unwrap_err();
         assert_eq!(err, EvalError::DivisionByZero);
     }
 
@@ -2109,7 +2205,7 @@ mod tests {
         let g = MemGraph::new();
         let bound = bind(&Parameters::new().with("p", Value::Integer(10)), &expr);
         assert_eq!(
-            to_value(eval(&expr, &Row::empty(), &bound, &g).unwrap()),
+            to_value(eval(&expr, &Row::empty(), &bound, &g, no_functions()).unwrap()),
             Value::Integer(11)
         );
     }
@@ -2170,7 +2266,14 @@ mod tests {
         let g = MemGraph::new();
         for src in ["toBoolean(1.0)", "toBoolean([])", "toBoolean({})"] {
             let expr = parse_expr(src);
-            let err = eval(&expr, &Row::empty(), &BoundParameters::empty(), &g).unwrap_err();
+            let err = eval(
+                &expr,
+                &Row::empty(),
+                &BoundParameters::empty(),
+                &g,
+                no_functions(),
+            )
+            .unwrap_err();
             assert!(matches!(err, EvalError::TypeError { .. }), "{src}: {err:?}");
         }
         assert_eq!(evaluate("toBooleanOrNull(1.0)"), Value::Null);
@@ -2199,7 +2302,106 @@ mod tests {
         // are now implemented, so this exercises a still-open gap.)
         let expr = parse_expr("percentileCont(1, 0.5)");
         let g = MemGraph::new();
-        let err = eval(&expr, &Row::empty(), &BoundParameters::empty(), &g).unwrap_err();
+        let err = eval(
+            &expr,
+            &Row::empty(),
+            &BoundParameters::empty(),
+            &g,
+            no_functions(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EvalError::UnsupportedFunction { .. }));
+    }
+
+    // ---- user-defined function dispatch in `call_function` (`rmp` task #75) ------------------
+
+    /// A `FunctionSet` with `ext.double` (doubles a number, rejects other types) and `ext.boom`
+    /// (always fails).
+    fn udf_set() -> FunctionSet {
+        let mut set = FunctionSet::new();
+        set.register(
+            "ext.double",
+            Arity::Exact(1),
+            false,
+            Box::new(|args| match args.first() {
+                Some(Value::Integer(i)) => Ok(Value::Integer(i * 2)),
+                Some(Value::Float(f)) => Ok(Value::Float(f * 2.0)),
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(other) => Err(FunctionFailure::new(
+                    "ext.double",
+                    format!("expected a number, got {other:?}"),
+                )),
+            }),
+        )
+        .expect("register ext.double");
+        set.register(
+            "ext.boom",
+            Arity::Exact(0),
+            false,
+            Box::new(|_args| Err(FunctionFailure::new("ext.boom", "always fails"))),
+        )
+        .expect("register ext.boom");
+        set
+    }
+
+    /// Evaluates `src` against a UDF registry, returning the runtime result.
+    fn eval_with_udfs(src: &str, set: &FunctionSet) -> EvalResult {
+        let expr = parse_expr(src);
+        let g = MemGraph::new();
+        eval(&expr, &Row::empty(), &BoundParameters::empty(), &g, set)
+    }
+
+    #[test]
+    fn scalar_udf_is_invoked_by_call_function() {
+        let set = udf_set();
+        assert_eq!(
+            to_value(eval_with_udfs("ext.double(21)", &set).unwrap()),
+            Value::Integer(42)
+        );
+        // Case-insensitive at runtime.
+        assert_eq!(
+            to_value(eval_with_udfs("EXT.Double(2.5)", &set).unwrap()),
+            Value::Float(5.0)
+        );
+        assert_eq!(
+            to_value(eval_with_udfs("ext.double(null)", &set).unwrap()),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn udf_body_failure_is_extension_function_error() {
+        let set = udf_set();
+        let err = eval_with_udfs("ext.boom()", &set).unwrap_err();
+        match err {
+            EvalError::ExtensionFunction { name, message } => {
+                assert_eq!(name, "ext.boom");
+                assert!(message.contains("always fails"));
+            }
+            other => panic!("expected ExtensionFunction, got {other:?}"),
+        }
+        // Wrong-type argument: a runtime ExtensionFunction error (function arg types are runtime).
+        let err = eval_with_udfs("ext.double('x')", &set).unwrap_err();
+        assert!(matches!(err, EvalError::ExtensionFunction { .. }));
+    }
+
+    #[test]
+    fn unknown_function_with_no_udf_is_unsupported() {
+        // With no UDF registered, a non-built-in falls through to UnsupportedFunction (the
+        // documented boundary), not ExtensionFunction.
+        let set = FunctionSet::new();
+        let err = eval_with_udfs("percentileCont(1, 0.5)", &set).unwrap_err();
+        assert!(matches!(err, EvalError::UnsupportedFunction { .. }));
+    }
+
+    #[test]
+    fn builtins_are_not_shadowed_by_runtime_udf_lookup() {
+        // A built-in is matched before the UDF fallthrough, so even with UDFs present `abs` is the
+        // built-in. (Registration also rejects built-in-colliding names, so this is belt-and-braces.)
+        let set = udf_set();
+        assert_eq!(
+            to_value(eval_with_udfs("abs(-7)", &set).unwrap()),
+            Value::Integer(7)
+        );
     }
 }

@@ -123,6 +123,10 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
 ) {
     let mut open: HashMap<u64, OpenTx> = HashMap::new();
     let mut next_ticket: u64 = 0;
+    // The extension registry (user-defined functions/procedures, `rmp` task #75). Built **once** on
+    // the engine thread (so it need not be `Send`), it lives for the engine's lifetime and is
+    // borrowed immutably for each `Run` — sound because the engine handles commands serially.
+    let extensions = exec::install_extensions();
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
@@ -145,6 +149,7 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
                         &mut coordinator,
                         &mut open,
                         &mut next_ticket,
+                        &extensions,
                         result_buffer_capacity,
                         &metrics,
                     ) {
@@ -171,6 +176,7 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
                 &mut coordinator,
                 &mut open,
                 &mut next_ticket,
+                &extensions,
                 result_buffer_capacity,
                 &metrics,
             ) {
@@ -194,11 +200,13 @@ fn drive_index_build<D: BlockDevice, S: LogSink>(coordinator: &mut Option<TxnCoo
 ///
 /// Factored out of [`run_engine_loop`] so the loop can choose its receive strategy (blocking vs.
 /// build-driving timed receive) without duplicating the command-dispatch arm.
+#[allow(clippy::too_many_arguments)] // The engine loop threads all execution context through here.
 fn dispatch_command<D: BlockDevice, S: LogSink>(
     cmd: EngineCommand,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     open: &mut HashMap<u64, OpenTx>,
     next_ticket: &mut u64,
+    extensions: &graphus_cypher::extension::ExtensionRegistry,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
 ) -> bool {
@@ -232,6 +240,7 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
                 params,
                 auto_commit,
                 privileges.map(|p| *p),
+                extensions,
                 result_buffer_capacity,
                 metrics,
                 reply,

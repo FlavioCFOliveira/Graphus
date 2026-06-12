@@ -10,11 +10,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use graphus_core::Value;
 use graphus_core::error::GraphusError;
+use graphus_cypher::extension::ExtensionRegistry;
+use graphus_cypher::function_registry::{Arity, FunctionFailure};
+use graphus_cypher::procedure_registry::{FieldSpec, FieldType, ProcedureFailure, ValueClass};
 use graphus_cypher::{
-    AuthorizedGraph, GraphAccess, IndexCatalog, Parameters, PrivilegeOracle, Statistics,
-    TxnCoordinator, analyze, bind_parameters, execute, lower, parse_tokens,
-    plan_physical_with_stats, tokenize,
+    AuthorizedGraph, GraphAccess, IndexCatalog, Parameters, PrivilegeOracle, ProcedureSignature,
+    Statistics, TxnCoordinator, analyze_with_extensions, bind_parameters, execute_with_extensions,
+    lower, parse_tokens, plan_physical_with_stats, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
@@ -24,6 +28,94 @@ use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, RowSender};
 use super::{OpenTx, RunReply, TxTicket};
 use crate::metrics::Metrics;
+
+/// Builds the engine's [`ExtensionRegistry`] — the **v1 compiled-in registration hook** for
+/// user-defined functions/procedures (`rmp` task #75).
+///
+/// This is the single place a deployment adds its own UDFs/UDPs: register them here (a safe Rust
+/// API, type-checked at registration, no dynamic code loading — see the
+/// [`graphus_cypher::extension`] module docs for why dynamic native loading is out of scope and WASM
+/// is the recommended future direction). The registry is built **once per engine**, on the engine
+/// thread, and lives for the engine's lifetime; the engine handles commands serially, so it is
+/// borrowed immutably for the duration of each `Run`.
+///
+/// The registry ships two sample extensions so the feature is reachable and testable end-to-end:
+///
+/// - `ext.double(n)` — a scalar UDF returning `2 * n` (integer or float; `null` passes through; a
+///   non-number is a runtime [`FunctionFailure`]).
+/// - `ext.range(a, b) YIELD value` — a UDP yielding the inclusive integer range `a..=b` as one
+///   `value` column per row.
+///
+/// [`FunctionFailure`]: graphus_cypher::function_registry::FunctionFailure
+pub(super) fn install_extensions() -> ExtensionRegistry {
+    let mut reg = ExtensionRegistry::new();
+    register_builtin_extensions(&mut reg);
+    reg
+}
+
+/// Registers the engine's compiled-in sample extensions into `reg` (`rmp` task #75). Split from
+/// [`install_extensions`] so a future deployment build can call it on its own registry, or extend it
+/// with its own registrations, in one obvious place.
+fn register_builtin_extensions(reg: &mut ExtensionRegistry) {
+    // Scalar UDF: `ext.double(n)`.
+    reg.register_function(
+        "ext.double",
+        Arity::Exact(1),
+        false,
+        Box::new(|args: &[Value]| match args.first() {
+            Some(Value::Integer(i)) => Ok(Value::Integer(i.wrapping_mul(2))),
+            Some(Value::Float(f)) => Ok(Value::Float(f * 2.0)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(other) => Err(FunctionFailure::new(
+                "ext.double",
+                format!("expected a number, got {other:?}"),
+            )),
+        }),
+    )
+    // An INVARIANT: `ext.double` is a fixed name registered once into a fresh registry, so it can
+    // never collide. A failure here is a programming error in this hook, surfaced loudly.
+    .expect("INVARIANT: sample UDF `ext.double` registers into a fresh registry");
+
+    // UDP: `ext.range(a, b) YIELD value` — yields the inclusive integer range as rows.
+    reg.register_procedure(
+        ProcedureSignature::new(
+            "ext.range",
+            vec![
+                FieldSpec::new(
+                    "a",
+                    FieldType {
+                        class: ValueClass::Integer,
+                        nullable: false,
+                    },
+                ),
+                FieldSpec::new(
+                    "b",
+                    FieldType {
+                        class: ValueClass::Integer,
+                        nullable: false,
+                    },
+                ),
+            ],
+            vec![FieldSpec::new(
+                "value",
+                FieldType {
+                    class: ValueClass::Integer,
+                    nullable: false,
+                },
+            )],
+        ),
+        Box::new(|args: &[Value], _graph: &mut dyn GraphAccess| {
+            let (Some(Value::Integer(a)), Some(Value::Integer(b))) = (args.first(), args.get(1))
+            else {
+                return Err(ProcedureFailure::new(
+                    "ext.range",
+                    "expected two integer arguments",
+                ));
+            };
+            Ok((*a..=*b).map(|n| vec![Value::Integer(n)]).collect())
+        }),
+    );
+}
 
 /// Handles a [`super::EngineCommand::Run`]: resolves the transaction, compiles + binds the query,
 /// then streams its rows.
@@ -41,6 +133,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     params: Vec<(String, graphus_core::Value)>,
     auto_commit: bool,
     privileges: Option<EffectivePrivileges>,
+    extensions: &ExtensionRegistry,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     reply: Reply<Result<RunReply, GraphusError>>,
@@ -68,7 +161,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     // are advisory cost inputs only; every cost-based rewrite is bag-preserving.
     let catalog = coordinator.catalog();
     let stats = coordinator.statistics();
-    let plan = match compile(query, &catalog, Some(&stats)) {
+    let plan = match compile(query, &catalog, Some(&stats), extensions) {
         Ok(p) => p,
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
@@ -109,6 +202,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         &plan,
         &bound,
         privileges,
+        extensions,
         row_tx,
         row_rx,
         reply,
@@ -141,10 +235,19 @@ fn compile(
     query: &str,
     catalog: &IndexCatalog,
     stats: Option<&dyn Statistics>,
+    extensions: &ExtensionRegistry,
 ) -> Result<graphus_cypher::PhysicalPlan, GraphusError> {
     let tokens = tokenize(query).map_err(|e| GraphusError::Compile(e.to_string()))?;
     let ast = parse_tokens(&tokens, query).map_err(|e| GraphusError::Compile(e.to_string()))?;
-    let validated = analyze(&ast).map_err(|e| GraphusError::Compile(e.to_string()))?;
+    // Resolve callables (extension functions + procedures) against the engine's registry so a
+    // registered UDF/UDP is found at compile time (`rmp` task #75); the **same** registry backs
+    // execution (`run_cursor`), or the compile-time guarantees would be void.
+    let validated = analyze_with_extensions(
+        &ast,
+        extensions.functions_dyn(),
+        extensions.procedures_dyn(),
+    )
+    .map_err(|e| GraphusError::Compile(e.to_string()))?;
     let logical = lower(&validated);
     Ok(plan_physical_with_stats(&logical, catalog, stats))
 }
@@ -168,6 +271,7 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
     plan: &graphus_cypher::PhysicalPlan,
     bound: &graphus_cypher::BoundParameters,
     privileges: Option<EffectivePrivileges>,
+    extensions: &ExtensionRegistry,
     row_tx: RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     reply: Reply<Result<RunReply, GraphusError>>,
@@ -196,13 +300,13 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
     let produced_ok = match privileges {
         Some(privileges) if !privileges.is_unrestricted() => {
             let mut authz = AuthorizedGraph::new(&mut graph, privileges);
-            let ok = run_cursor(plan, bound, &mut authz, &row_tx, row_rx, reply);
+            let ok = run_cursor(plan, bound, &mut authz, extensions, &row_tx, row_rx, reply);
             // Capture the decorator's write-denial (if any) before it is dropped at end of scope.
             auth_error = authz.take_auth_error();
             ok
         }
         // No restriction (no principal, or an admin): run the bare seam, byte-identically to today.
-        _ => run_cursor(plan, bound, &mut graph, &row_tx, row_rx, reply),
+        _ => run_cursor(plan, bound, &mut graph, extensions, &row_tx, row_rx, reply),
     };
 
     if !produced_ok {
@@ -237,15 +341,25 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
 /// row goes through `reply`; a runtime error mid-stream goes through `row_tx`. Authorization denials
 /// and seam-captured deferral errors are surfaced by the caller after this returns (they live on the
 /// `graph`/wrapper, not in the runtime error channel).
+#[allow(clippy::too_many_arguments)] // Threads the seam + extension registry + egress channel.
 fn run_cursor(
     plan: &graphus_cypher::PhysicalPlan,
     bound: &graphus_cypher::BoundParameters,
     graph: &mut dyn GraphAccess,
+    extensions: &ExtensionRegistry,
     row_tx: &RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> bool {
-    let mut cursor = match execute(plan, bound, graph) {
+    // The **same** registry that backed `compile` must back execution (`rmp` task #75), or the
+    // compile-time function/procedure guarantees are void.
+    let mut cursor = match execute_with_extensions(
+        plan,
+        bound,
+        graph,
+        extensions.functions_dyn(),
+        extensions.procedures_dyn(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             let _ = reply.send(Err(GraphusError::Runtime(e.to_string())));

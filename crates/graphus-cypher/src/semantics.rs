@@ -119,7 +119,7 @@ use crate::ast::{
     UnwindClause, YieldItem,
 };
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
-use crate::function_registry::{self, ArityCheck};
+use crate::function_registry::{self, ArityCheck, FunctionRegistry};
 use crate::lexer::Span;
 use crate::procedure_registry::{self, FieldType, ProcedureRegistry, ProcedureSignature};
 use crate::static_type::{self, SType, TypeEnv};
@@ -206,7 +206,41 @@ pub fn analyze_with_procedures(
     query: &Query,
     procedures: &dyn ProcedureRegistry,
 ) -> Result<ValidatedQuery, SemanticError> {
-    Analyzer { procedures }.check_query(query)?;
+    // A pure pass-through to the extensions form with an empty function registry: the function-less
+    // callers (this one, used by the TCK harness, and `analyze`) see only the built-in functions, so
+    // their behaviour is byte-identical to before the extension mechanism (`rmp` task #75).
+    analyze_with_extensions(query, function_registry::no_functions(), procedures)
+}
+
+/// [`analyze`] against caller-supplied **function** and **procedure** registries (`rmp` task #75).
+///
+/// The full extension form: extension *functions* are resolved against `functions` (after the
+/// built-ins, which always take precedence) and procedures against `procedures`. The **same** two
+/// registries must back execution
+/// ([`execute_with_extensions`](crate::executor::execute_with_extensions)), or the compile-time
+/// guarantees are void. [`analyze`] and [`analyze_with_procedures`] are thin wrappers over this with
+/// an empty [`FunctionRegistry`](crate::function_registry::no_functions).
+///
+/// Compile-time function checks: a function name that is neither a built-in nor a registered UDF is
+/// [`UnknownFunction`](SemanticErrorKind::UnknownFunction); a wrong argument count for a built-in or
+/// a UDF is [`InvalidNumberOfArguments`](SemanticErrorKind::InvalidNumberOfArguments). Both classify
+/// as `SyntaxError` (TCK-faithful). Argument *types* are a runtime concern (see
+/// [`crate::function_registry`]).
+///
+/// # Errors
+///
+/// Returns a [`SemanticError`] exactly as [`analyze_with_procedures`] does, plus an
+/// `UnknownFunction`/`InvalidNumberOfArguments` for a registered UDF call shape that is wrong.
+pub fn analyze_with_extensions(
+    query: &Query,
+    functions: &dyn FunctionRegistry,
+    procedures: &dyn ProcedureRegistry,
+) -> Result<ValidatedQuery, SemanticError> {
+    Analyzer {
+        functions,
+        procedures,
+    }
+    .check_query(query)?;
     let mut query = query.clone();
     resolve_implicit_call_arguments(&mut query, procedures);
     Ok(ValidatedQuery { query })
@@ -381,9 +415,15 @@ struct GroupingKeys<'a> {
 // The analyzer
 // =================================================================================================
 
-/// The analysis driver. Stateless beyond per-call locals and the procedure catalogue it resolves
-/// `CALL` invocations against.
+/// The analysis driver. Stateless beyond per-call locals and the catalogues it resolves callable
+/// invocations against: the **function** registry (extension UDFs; `rmp` #75) and the **procedure**
+/// registry (`CALL` invocations; `rmp` #57). Built-in functions/procedures always take precedence
+/// over these caller-supplied sets.
 struct Analyzer<'a> {
+    /// The extension-function catalogue (`rmp` #75). Consulted only when a name is **not** a
+    /// built-in (built-ins win), for the compile-time unknown-function / wrong-arity / aggregate
+    /// checks.
+    functions: &'a dyn FunctionRegistry,
     /// The procedure catalogue (`04 §7.3`; rmp #57).
     procedures: &'a dyn ProcedureRegistry,
 }
@@ -769,7 +809,7 @@ impl Analyzer<'_> {
 
         // The grouping-key context for the aggregation rules: the simple grouping keys of this
         // projection, plus (for `*`) every carried binding, which is a bare-variable grouping key.
-        let mut keys = Self::grouping_keys(body);
+        let mut keys = self.grouping_keys(body);
         if body.star {
             for name in scope.bindings.keys() {
                 keys.simple.push(vec![name.as_str()]);
@@ -850,7 +890,7 @@ impl Analyzer<'_> {
         self.check_expr(&item.expr, scope)?;
         // Aggregations may not be nested anywhere, and may not draw from `rand()`.
         self.reject_nested_aggregation(&item.expr)?;
-        Self::reject_nondeterministic_in_aggregate(&item.expr)?;
+        self.reject_nondeterministic_in_aggregate(&item.expr)?;
 
         // WITH requires an explicit alias for any non-trivial expression; a bare variable or a
         // bare `count(*)`-style aggregate atom is allowed unaliased in a final RETURN where a name
@@ -867,8 +907,8 @@ impl Analyzer<'_> {
         // its aggregate calls, only constants and the projection's simple grouping keys; any other
         // free sub-expression is an AmbiguousAggregationExpression (TCK `Return6` [18]–[21],
         // `With6` [7]–[9]).
-        if aggregating && Self::contains_aggregate(&item.expr) {
-            Self::check_aggregate_item_references(&item.expr, &keys.simple, &mut Vec::new())?;
+        if aggregating && self.contains_aggregate(&item.expr) {
+            self.check_aggregate_item_references(&item.expr, &keys.simple, &mut Vec::new())?;
         }
         Ok(())
     }
@@ -888,15 +928,15 @@ impl Analyzer<'_> {
         // same shape with *no* projected grouping key as UndefinedVariable (`WithOrderBy4` [19],
         // `ReturnOrderBy6` [4]) — which the scope check below raises. ORDER BY runs post-
         // projection, so the projected aliases also count as grouping keys here.
-        if aggregating && Self::contains_aggregate(&sort.expr) && keys.has_complex {
-            Self::check_aggregate_item_references(&sort.expr, &keys.with_aliases, &mut Vec::new())?;
+        if aggregating && self.contains_aggregate(&sort.expr) && keys.has_complex {
+            self.check_aggregate_item_references(&sort.expr, &keys.with_aliases, &mut Vec::new())?;
         }
         self.check_expr(&sort.expr, scope)?;
         self.reject_nested_aggregation(&sort.expr)?;
-        Self::reject_nondeterministic_in_aggregate(&sort.expr)?;
+        self.reject_nondeterministic_in_aggregate(&sort.expr)?;
         // ORDER BY may use aggregates only when the projection itself aggregates (it sorts the
         // grouped rows); in a non-aggregating projection an aggregate in ORDER BY is invalid.
-        if !aggregating && Self::contains_aggregate(&sort.expr) {
+        if !aggregating && self.contains_aggregate(&sort.expr) {
             return Err(SemanticError::new(
                 SemanticErrorKind::InvalidAggregation {
                     position: "ORDER BY of a non-aggregating projection",
@@ -1249,8 +1289,11 @@ impl Analyzer<'_> {
         span: Span,
     ) -> Result<(), SemanticError> {
         let dotted = name.join(".");
-        match function_registry::lookup(&dotted) {
-            Some(sig) => match sig.arity.check(args.len()) {
+        // 1) Built-ins take precedence (they may not be shadowed by a UDF — see
+        //    `function_registry::FunctionSet::register`). A built-in with a wrong arity is the TCK
+        //    `SyntaxError`/`InvalidNumberOfArguments`, unchanged.
+        if let Some(sig) = function_registry::lookup(&dotted) {
+            return match sig.arity.check(args.len()) {
                 ArityCheck::Ok => Ok(()),
                 ArityCheck::Wrong => Err(SemanticError::new(
                     SemanticErrorKind::InvalidNumberOfArguments {
@@ -1260,12 +1303,29 @@ impl Analyzer<'_> {
                     },
                     span,
                 )),
-            },
-            None => Err(SemanticError::new(
-                SemanticErrorKind::UnknownFunction { name: dotted },
-                span,
-            )),
+            };
         }
+        // 2) Not a built-in: try the extension-function registry (`rmp` #75). A registered UDF with
+        //    a wrong arity is the **same** class as a built-in's — `SyntaxError`/
+        //    `InvalidNumberOfArguments` — the correct compile-time class for a function arity error.
+        if let Some(sig) = self.functions.signature(&dotted) {
+            return match sig.arity.check(args.len()) {
+                ArityCheck::Ok => Ok(()),
+                ArityCheck::Wrong => Err(SemanticError::new(
+                    SemanticErrorKind::InvalidNumberOfArguments {
+                        name: dotted,
+                        expected: sig.arity.describe(),
+                        got: args.len(),
+                    },
+                    span,
+                )),
+            };
+        }
+        // 3) Neither a built-in nor a UDF: the TCK `SyntaxError`/`UnknownFunction`, unchanged.
+        Err(SemanticError::new(
+            SemanticErrorKind::UnknownFunction { name: dotted },
+            span,
+        ))
     }
 
     fn require_defined(&self, name: &str, span: Span, scope: &Scope) -> Result<(), SemanticError> {
@@ -1340,7 +1400,7 @@ impl Analyzer<'_> {
     ///
     /// [`InvalidAggregation`]: SemanticErrorKind::InvalidAggregation
     fn reject_aggregation(&self, expr: &Expr, position: &'static str) -> Result<(), SemanticError> {
-        if Self::contains_aggregate(expr) {
+        if self.contains_aggregate(expr) {
             return Err(SemanticError::new(
                 SemanticErrorKind::InvalidAggregation { position },
                 expr.span,
@@ -1354,11 +1414,15 @@ impl Analyzer<'_> {
     ///
     /// [`NestedAggregation`]: SemanticErrorKind::NestedAggregation
     fn reject_nested_aggregation(&self, expr: &Expr) -> Result<(), SemanticError> {
-        Self::find_nested_aggregate(expr, false)
+        self.find_nested_aggregate(expr, false)
     }
 
-    fn find_nested_aggregate(expr: &Expr, inside_aggregate: bool) -> Result<(), SemanticError> {
-        let here_is_aggregate = Self::is_aggregate_call(expr);
+    fn find_nested_aggregate(
+        &self,
+        expr: &Expr,
+        inside_aggregate: bool,
+    ) -> Result<(), SemanticError> {
+        let here_is_aggregate = self.is_aggregate_call(expr);
         if here_is_aggregate && inside_aggregate {
             return Err(SemanticError::new(
                 SemanticErrorKind::NestedAggregation,
@@ -1367,7 +1431,7 @@ impl Analyzer<'_> {
         }
         let child_inside = inside_aggregate || here_is_aggregate;
         Self::for_each_child(expr, &mut |child| {
-            Self::find_nested_aggregate(child, child_inside)
+            self.find_nested_aggregate(child, child_inside)
         })
     }
 
@@ -1376,26 +1440,38 @@ impl Analyzer<'_> {
     fn projection_is_aggregating(&self, body: &ProjectionBody) -> bool {
         body.items
             .iter()
-            .any(|it| Self::contains_aggregate(&it.expr))
+            .any(|it| self.contains_aggregate(&it.expr))
     }
 
     /// `true` if `expr` is itself an aggregating function call (or the `count(*)` atom).
-    fn is_aggregate_call(expr: &Expr) -> bool {
+    ///
+    /// A built-in aggregate is recognised by [`function_registry::is_aggregate`]; an **aggregate
+    /// UDF** (`rmp` #75) is recognised by its registered signature's `aggregate` flag, so it
+    /// participates in the aggregation-placement rules. (Registration is supported; the per-group
+    /// fold of a custom aggregate is a named v1 deferral — see [`crate::function_registry`].)
+    fn is_aggregate_call(&self, expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::CountStar => true,
-            ExprKind::FunctionCall { name, .. } => function_registry::is_aggregate(&name.join(".")),
+            ExprKind::FunctionCall { name, .. } => {
+                let dotted = name.join(".");
+                function_registry::is_aggregate(&dotted)
+                    || self
+                        .functions
+                        .signature(&dotted)
+                        .is_some_and(|s| s.aggregate)
+            }
             _ => false,
         }
     }
 
     /// `true` if `expr` contains an aggregate anywhere in its tree.
-    fn contains_aggregate(expr: &Expr) -> bool {
-        if Self::is_aggregate_call(expr) {
+    fn contains_aggregate(&self, expr: &Expr) -> bool {
+        if self.is_aggregate_call(expr) {
             return true;
         }
         let mut found = false;
         let _ = Self::for_each_child(expr, &mut |child| {
-            if Self::contains_aggregate(child) {
+            if self.contains_aggregate(child) {
                 found = true;
             }
             Ok(())
@@ -1433,12 +1509,12 @@ impl Analyzer<'_> {
     /// ORDER BY variant of the rule), and whether some non-aggregated item is *complex* (a
     /// computed grouping key — which drives the ORDER BY classification split, see
     /// [`Self::check_order_by_item`]).
-    fn grouping_keys(body: &ProjectionBody) -> GroupingKeys<'_> {
+    fn grouping_keys<'b>(&self, body: &'b ProjectionBody) -> GroupingKeys<'b> {
         let mut simple = Vec::new();
         let mut with_aliases = Vec::new();
         let mut has_complex = false;
         for item in &body.items {
-            if Self::contains_aggregate(&item.expr) {
+            if self.contains_aggregate(&item.expr) {
                 continue;
             }
             match Self::simple_path_signature(&item.expr) {
@@ -1468,12 +1544,13 @@ impl Analyzer<'_> {
     ///
     /// [`AmbiguousAggregationExpression`]: SemanticErrorKind::AmbiguousAggregationExpression
     fn check_aggregate_item_references(
+        &self,
         expr: &Expr,
         keys: &[Vec<&str>],
         locals: &mut Vec<String>,
     ) -> Result<(), SemanticError> {
         // The interior of an aggregate call is folded per group — free references are its point.
-        if Self::is_aggregate_call(expr) {
+        if self.is_aggregate_call(expr) {
             return Ok(());
         }
         // A bare variable / variable-rooted property path: legal iff grouped or locally bound.
@@ -1489,14 +1566,14 @@ impl Analyzer<'_> {
         match &expr.kind {
             // Iteration constructs bind their variable for the predicate/projection parts only.
             ExprKind::ListComprehension(lc) => {
-                Self::check_aggregate_item_references(&lc.list, keys, locals)?;
+                self.check_aggregate_item_references(&lc.list, keys, locals)?;
                 locals.push(lc.variable.name.clone());
                 let result = (|| {
                     if let Some(pred) = &lc.predicate {
-                        Self::check_aggregate_item_references(pred, keys, locals)?;
+                        self.check_aggregate_item_references(pred, keys, locals)?;
                     }
                     if let Some(proj) = &lc.projection {
-                        Self::check_aggregate_item_references(proj, keys, locals)?;
+                        self.check_aggregate_item_references(proj, keys, locals)?;
                     }
                     Ok(())
                 })();
@@ -1504,9 +1581,9 @@ impl Analyzer<'_> {
                 result
             }
             ExprKind::Quantifier(q) => {
-                Self::check_aggregate_item_references(&q.list, keys, locals)?;
+                self.check_aggregate_item_references(&q.list, keys, locals)?;
                 locals.push(q.variable.name.clone());
-                let result = Self::check_aggregate_item_references(&q.predicate, keys, locals);
+                let result = self.check_aggregate_item_references(&q.predicate, keys, locals);
                 locals.pop();
                 result
             }
@@ -1514,7 +1591,7 @@ impl Analyzer<'_> {
             // they are left to the general scope checks (conservative: never flagged here).
             ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => Ok(()),
             _ => Self::for_each_child(expr, &mut |child| {
-                Self::check_aggregate_item_references(child, keys, locals)
+                self.check_aggregate_item_references(child, keys, locals)
             }),
         }
     }
@@ -1525,8 +1602,8 @@ impl Analyzer<'_> {
     /// the draw would be observable, implementation-defined behaviour.
     ///
     /// [`NonConstantExpression`]: SemanticErrorKind::NonConstantExpression
-    fn reject_nondeterministic_in_aggregate(expr: &Expr) -> Result<(), SemanticError> {
-        if Self::is_aggregate_call(expr) {
+    fn reject_nondeterministic_in_aggregate(&self, expr: &Expr) -> Result<(), SemanticError> {
+        if self.is_aggregate_call(expr) {
             if let ExprKind::FunctionCall { args, .. } = &expr.kind {
                 for arg in args {
                     if let Some(span) = Self::find_rand_call(arg) {
@@ -1541,7 +1618,7 @@ impl Analyzer<'_> {
             }
         }
         Self::for_each_child(expr, &mut |child| {
-            Self::reject_nondeterministic_in_aggregate(child)
+            self.reject_nondeterministic_in_aggregate(child)
         })
     }
 
@@ -1783,6 +1860,7 @@ mod tests {
             unreachable!()
         };
         let analyzer = Analyzer {
+            functions: function_registry::no_functions(),
             procedures: procedure_registry::builtins(),
         };
         assert!(analyzer.projection_is_aggregating(body));

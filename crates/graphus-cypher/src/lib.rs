@@ -120,6 +120,7 @@ pub mod equivalence;
 pub mod errors;
 pub mod eval;
 pub mod executor;
+pub mod extension;
 pub mod function_registry;
 pub mod graph_access;
 pub mod index_set;
@@ -164,7 +165,13 @@ pub use errors::{
 };
 pub use eval::{EvalError, EvalResult, eval, eval_value};
 pub use executor::{
-    CancellationToken, Cursor, ExecError, Executor, execute, execute_with_procedures,
+    CancellationToken, Cursor, ExecError, Executor, execute, execute_with_extensions,
+    execute_with_procedures,
+};
+pub use extension::{ExtensionRegistry, function_handler};
+pub use function_registry::{
+    Arity, FunctionFailure, FunctionHandler, FunctionRegistry, FunctionSet, FunctionSignature,
+    no_functions,
 };
 pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId};
 /// The full-text [`Analyzer`](graphus_index::fulltext::Analyzer) (`rmp` task #72), re-exported so the
@@ -194,7 +201,7 @@ pub use result::{
 };
 pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 pub use semantics::{
-    ValidatedQuery, analyze, analyze_to_graphus, analyze_with_procedures,
+    ValidatedQuery, analyze, analyze_to_graphus, analyze_with_extensions, analyze_with_procedures,
     check_implicit_call_parameters,
 };
 pub use statistics::Statistics;
