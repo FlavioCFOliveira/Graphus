@@ -2424,6 +2424,9 @@ pub struct Cursor<'a> {
     procedures: &'a dyn ProcedureRegistry,
     columns: Vec<String>,
     finished: bool,
+    /// `false` for a write statement with no `RETURN`: the cursor drains its operator tree to apply
+    /// the side effects but presents an empty result (openCypher write cardinality).
+    emits_rows: bool,
 }
 
 impl<'a> Cursor<'a> {
@@ -2455,6 +2458,19 @@ impl<'a> Cursor<'a> {
             graph: self.graph,
             procedures: self.procedures,
         };
+        // A write statement with no `RETURN` yields zero rows (openCypher write cardinality), but
+        // its side effects must still happen: drain the operator tree once so every write `next()`
+        // fires (e.g. `MATCH (n) SET n.x = 1` applies all N updates), then present an empty result.
+        if !self.emits_rows {
+            self.finished = true;
+            loop {
+                match self.root.next(&mut ctx) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         match self.root.next(&mut ctx) {
             Ok(Some(row)) => Ok(Some(row)),
             Ok(None) => {
@@ -2615,6 +2631,7 @@ impl Executor {
             procedures,
             columns,
             finished: false,
+            emits_rows: !root_is_write(&self.plan.root),
         })
     }
 }
@@ -2684,12 +2701,29 @@ pub fn execute_with_procedures<'a>(
     )
 }
 
+/// Whether `op` is a top-level write operator (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`).
+/// A query whose physical-plan **root** is such an operator has no `RETURN` and therefore yields
+/// zero result rows (openCypher: a write's effect is a summary-only side effect). When a `RETURN`
+/// follows the write, the plan root is the projection above it, not the write, so this is false.
+fn root_is_write(op: &PhysicalOp) -> bool {
+    matches!(
+        op,
+        PhysicalOp::Create { .. }
+            | PhysicalOp::Merge { .. }
+            | PhysicalOp::SetClause { .. }
+            | PhysicalOp::Delete { .. }
+            | PhysicalOp::Remove { .. }
+    )
+}
+
 /// The result column names a plan produces, derived from its root operator's output schema.
 ///
-/// A `Projection`/`Aggregation` root names its columns explicitly; a write/`Optional`/`Skip`/`Limit`
-/// root delegates to its input's columns. Leaves name their introduced variable(s). A
-/// `ProcedureCall` without `YIELD` (the standalone / `YIELD *` form) names the procedure's declared
-/// outputs, resolved through `procedures`.
+/// A `Projection`/`Aggregation` root names its columns explicitly; an `Optional`/`Skip`/`Limit`/
+/// `Sort`/`Eager`/`Filter` root delegates to its input's columns. A write root (`Create`/`Merge`/
+/// `SetClause`/`Delete`/`Remove`) declares **no** result columns: it has no `RETURN` (a `RETURN`
+/// would put a projection above it), so the query yields zero rows. Leaves name their introduced
+/// variable(s). A `ProcedureCall` without `YIELD` (the standalone / `YIELD *` form) names the
+/// procedure's declared outputs, resolved through `procedures`.
 fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<String> {
     match op {
         PhysicalOp::Projection { items, .. } => items.iter().map(|c| c.alias.clone()).collect(),
@@ -2707,12 +2741,14 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
         | PhysicalOp::Sort { input, .. }
-        | PhysicalOp::Optional { input, .. }
-        | PhysicalOp::Create { input, .. }
-        | PhysicalOp::Merge { input, .. }
-        | PhysicalOp::SetClause { input, .. }
-        | PhysicalOp::Delete { input, .. }
-        | PhysicalOp::Remove { input, .. } => result_columns(input, procedures),
+        | PhysicalOp::Optional { input, .. } => result_columns(input, procedures),
+        // A write root has no `RETURN` (a `RETURN` would put a projection above it), so it declares
+        // no result columns — the query yields zero rows (openCypher write cardinality).
+        PhysicalOp::Create { .. }
+        | PhysicalOp::Merge { .. }
+        | PhysicalOp::SetClause { .. }
+        | PhysicalOp::Delete { .. }
+        | PhysicalOp::Remove { .. } => Vec::new(),
         PhysicalOp::TopN { input, .. } => result_columns(input, procedures),
         PhysicalOp::Unwind {
             input, variable, ..
@@ -2896,5 +2932,110 @@ mod tests {
         }
         let rows = run("MATCH (n) RETURN n LIMIT 3", &mut g);
         assert_eq!(rows.len(), 3);
+    }
+
+    /// The result column names this plan declares (the executor's wire schema); for a write without
+    /// `RETURN` this is empty — a sibling of [`run`] used by the rmp #97 cardinality regressions.
+    /// Needs no graph: [`Executor::columns`] resolves the schema against the built-in procedures.
+    fn columns_of(src: &str) -> Vec<String> {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let plan = plan_physical(
+            &lower(&analyze(&ast).expect("analyze")),
+            &IndexCatalog::empty(),
+        );
+        let params = crate::binding::bind_parameters(&plan, &crate::binding::Parameters::new())
+            .expect("bind");
+        Executor::new(plan, params).columns()
+    }
+
+    // ---- rmp #97: a write with no `RETURN` yields zero rows but still applies its side effect -----
+
+    #[test]
+    fn create_without_return_yields_no_rows_but_persists() {
+        let mut g = MemGraph::new();
+        let rows = run(
+            "CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person)",
+            &mut g,
+        );
+        assert!(rows.is_empty(), "a write without RETURN echoes no rows");
+        assert!(
+            columns_of("CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person)").is_empty(),
+            "a write root declares no result columns",
+        );
+
+        // The side effect happened: two Person nodes and one KNOWS relationship.
+        let names = run("MATCH (n:Person) RETURN n.name AS name", &mut g);
+        assert_eq!(names.len(), 2, "both nodes were created");
+        let rels = run("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r", &mut g);
+        assert_eq!(rels.len(), 1, "the relationship was created");
+    }
+
+    #[test]
+    fn set_without_return_yields_no_rows_but_applies_to_every_match() {
+        let mut g = MemGraph::new();
+        for _ in 0..3 {
+            let _ = g.add_node(["N"], NO_PROPS);
+        }
+        let rows = run("MATCH (n:N) SET n.x = 1", &mut g);
+        assert!(rows.is_empty(), "a write without RETURN echoes no rows");
+
+        // The drain applied the write to all three matched nodes.
+        let xs = run("MATCH (n:N) RETURN n.x AS x", &mut g);
+        assert_eq!(xs.len(), 3);
+        assert!(
+            xs.iter().all(|r| r.value("x") == Value::Integer(1)),
+            "every matched node received x = 1",
+        );
+    }
+
+    #[test]
+    fn delete_without_return_yields_no_rows_but_removes() {
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["Doomed"], NO_PROPS);
+        let _ = g.add_node(["Doomed"], NO_PROPS);
+        let rows = run("MATCH (n:Doomed) DELETE n", &mut g);
+        assert!(rows.is_empty(), "a write without RETURN echoes no rows");
+
+        let survivors = run("MATCH (n:Doomed) RETURN n", &mut g);
+        assert!(survivors.is_empty(), "both nodes were deleted");
+    }
+
+    #[test]
+    fn merge_without_return_yields_no_rows_but_creates() {
+        let mut g = MemGraph::new();
+        let rows = run("MERGE (n:Account {id: 7})", &mut g);
+        assert!(rows.is_empty(), "a write without RETURN echoes no rows");
+
+        let accts = run("MATCH (n:Account) RETURN n.id AS id", &mut g);
+        assert_eq!(accts.len(), 1, "MERGE created the missing node");
+        assert_eq!(accts[0].value("id"), Value::Integer(7));
+    }
+
+    #[test]
+    fn remove_without_return_yields_no_rows_but_strips_property() {
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["P"], [("doomed", Value::Integer(1))]);
+        let rows = run("MATCH (n:P) REMOVE n.doomed", &mut g);
+        assert!(rows.is_empty(), "a write without RETURN echoes no rows");
+
+        let after = run("MATCH (n:P) RETURN n.doomed AS d", &mut g);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].value("d"), Value::Null, "the property was removed");
+    }
+
+    #[test]
+    fn returning_write_still_yields_its_row() {
+        // A write *followed by* `RETURN` has a projection root, not a write root, so it returns rows.
+        let mut g = MemGraph::new();
+        let rows = run("CREATE (a:Person {name: 'Ada'}) RETURN a", &mut g);
+        assert_eq!(rows.len(), 1, "a returning write yields exactly one row");
+        assert_eq!(rows[0].len(), 1, "with a single column");
+        assert!(rows[0].get("a").and_then(RowValue::as_node).is_some());
+        assert_eq!(
+            columns_of("CREATE (a:Person {name: 'Ada'}) RETURN a"),
+            vec!["a".to_owned()],
+            "the projection above the write declares the result column",
+        );
     }
 }

@@ -290,6 +290,43 @@ async fn bolt_uds_full_session_returns_records() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// rmp #97 — a write statement with no `RETURN` must be **zero-cardinality on the wire**: RUN
+/// advertises empty `fields`, and the following PULL streams **no** RECORD before the trailing
+/// SUCCESS. Advertising N fields but streaming a RECORD with M ≠ N values is a fields-vs-values
+/// mismatch a real Neo4j driver rejects, so this guards the Bolt-protocol guarantee (req 3). The
+/// follow-up read proves the write still persisted — the rows are suppressed, not the side effect.
+#[tokio::test]
+async fn bolt_write_without_return_advertises_no_fields_and_streams_no_records() {
+    let temp = TempStore::new("bolt-write-no-return");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut client = BoltUdsClient::connect(&uds).await;
+    client.handshake_and_logon("alice", "pw").await;
+
+    // A bare `CREATE` with no `RETURN`: RUN must advertise no fields and PULL must stream no records.
+    let (fields, records) = client.run_fields_then_pull("CREATE (:N {x: 1})").await;
+    assert!(
+        fields.is_empty(),
+        "a write without RETURN advertises empty fields, got {fields:?}"
+    );
+    assert!(
+        records.is_empty(),
+        "a write without RETURN streams zero records, got {records:?}"
+    );
+
+    // The write persisted regardless: a following read returns the value.
+    let read = client.run_pull("MATCH (n:N) RETURN n.x").await;
+    assert!(
+        read.iter()
+            .any(|r| r.iter().any(|v| matches!(v, Value::Integer(1)))),
+        "the suppressed-row write must still have persisted: {read:?}"
+    );
+    client.goodbye().await;
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
 /// End-to-end **structural-result conformance** (rmp #96): a query that returns nodes,
 /// relationships and paths must deliver them on the wire as the Bolt 5.x `Node` (tag `0x4E`),
 /// `Relationship` (`0x52`) and `Path` (`0x50`) structures — not as flattened ids — covering
@@ -634,6 +671,44 @@ impl BoltUdsClient {
             }
         }
         rows
+    }
+
+    /// Runs `query` as an auto-commit statement, returning the **advertised `fields`** from the RUN
+    /// SUCCESS metadata together with every RECORD streamed by the following PULL. Used to assert the
+    /// RUN-advertised schema and the PULL-streamed row count agree (rmp #97: a write without `RETURN`
+    /// must advertise empty `fields` and stream zero records — a length match a real driver enforces).
+    async fn run_fields_then_pull(&mut self, query: &str) -> (Vec<String>, Vec<Vec<BoltValue>>) {
+        self.send(&Request::Run {
+            query: query.to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        })
+        .await;
+        let run_reply = self.recv().await;
+        let Response::Success { metadata } = run_reply else {
+            panic!("RUN ok expected: {run_reply:?}");
+        };
+        let fields = match metadata.iter().find(|(k, _)| k == "fields") {
+            Some((_, Value::List(items))) => items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("a `fields` entry must be a string, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("RUN SUCCESS must advertise a `fields` list, got {other:?}"),
+        };
+
+        self.send(&Request::Pull { n: -1, qid: None }).await;
+        let mut rows = Vec::new();
+        loop {
+            match self.recv().await {
+                Response::Record { values } => rows.push(values),
+                Response::Success { .. } => break, // trailing summary
+                other => panic!("unexpected response during PULL: {other:?}"),
+            }
+        }
+        (fields, rows)
     }
 
     /// Sends a single request and returns the single response (for ROUTE / TELEMETRY round-trips).

@@ -152,11 +152,11 @@ fn load_csv_no_headers_ingests_list_rows_into_the_store() {
         "LOAD CSV FROM {} AS row CREATE (:Person {{name: row[0], age: toInteger(row[1])}})",
         cypher_str(&csv)
     );
-    // `LOAD CSV ... CREATE` has the `LoadCsv` *source* op as its plan root (not a bare `CREATE`), so
-    // it streams one row per record — each carrying the bound `row` List and the created node. This
-    // is the same shape as `UNWIND xs AS x CREATE (...)` (a source-rooted write).
+    // `LOAD CSV ... CREATE` has a `Create` plan root (the `CREATE` clause wraps the `LoadCsv` source
+    // as its input), so it is a write with no `RETURN` and yields **zero** rows (openCypher write
+    // cardinality, rmp #97) — the ingest of one node per record is a summary-only side effect.
     let (created, store) = run_commit(&src, store, 1);
-    assert_eq!(created.len(), 3, "one row per ingested CSV record");
+    assert_eq!(created.len(), 0, "a write without RETURN echoes no rows");
 
     // The three rows were really persisted: read them back in a new transaction.
     let (rows, store) = run_commit("MATCH (p:Person) RETURN p.name AS name", store, 2);
@@ -182,16 +182,18 @@ fn load_csv_streams_a_large_file_without_slurping() {
         "LOAD CSV FROM {} AS row CREATE (:Item {{k: toInteger(row[1])}})",
         cypher_str(&csv)
     );
+    // A write without `RETURN` echoes no rows (rmp #97); the 5_000-record ingest is a side effect,
+    // verified below by counting the persisted nodes.
     let (created, store) = run_commit(&src, store, 1);
-    assert_eq!(
-        created.len(),
-        5_000,
-        "all records ingested in one transaction"
-    );
+    assert_eq!(created.len(), 0, "a write without RETURN echoes no rows");
 
     let (rows, _store) = run_commit("MATCH (n:Item) RETURN count(n) AS c", store, 2);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].value("c"), Value::Integer(5_000));
+    assert_eq!(
+        rows[0].value("c"),
+        Value::Integer(5_000),
+        "all records ingested in one transaction"
+    );
 }
 
 // =================================================================================================
