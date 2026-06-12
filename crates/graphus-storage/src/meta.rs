@@ -42,6 +42,51 @@ pub struct Meta {
     pub statistics: Statistics,
 }
 
+/// The durable build state of a declared node-property index (`rmp` task #90).
+///
+/// An index is created [`Populating`](Self::Populating) and promoted to [`Online`](Self::Online)
+/// once its backing entries are fully built; only an `Online` index may serve query seeks (a
+/// `Populating` one falls back to a label-scan + filter). Population is **synchronous** in `rmp`
+/// task #90 — a successful `create` ends `Online` — but the two-state distinction is recorded
+/// durably now so the non-blocking incremental build (`rmp` task #91) can persist an in-progress
+/// `Populating` index across a crash and resume it.
+///
+/// # Wire encoding
+///
+/// Encoded as a single byte (see [`Statistics::encode`]). A future `Failed` (or `Dropping`) state
+/// is reserved by leaving the unused discriminants free; [`from_byte`](Self::from_byte) rejects any
+/// unknown byte so a forward-incompatible image is caught rather than silently mis-decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[must_use]
+pub enum IndexState {
+    /// The index is declared but its entries are still being built; it must **not** serve seeks.
+    Populating,
+    /// The index is fully built and usable for query seeks.
+    Online,
+}
+
+impl IndexState {
+    /// The single-byte wire discriminant (`rmp` task #90). Discriminants `2..` are reserved for a
+    /// future `Failed` / `Dropping` state.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Populating => 0,
+            Self::Online => 1,
+        }
+    }
+
+    /// Decodes a single-byte wire discriminant, or [`None`] for an unknown (reserved/future) byte.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Populating),
+            1 => Some(Self::Online),
+            _ => None,
+        }
+    }
+}
+
 /// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
 ///
 /// Holds, for the planner's cardinality estimator, the grand-total live-node and live-relationship
@@ -93,6 +138,19 @@ pub struct Meta {
 /// counts (checkpointed at commit, reloaded on rollback and on open). Their presence invariant is
 /// "an entry exists iff a histogram exists" — there is no zero-count analogue, but a zero-length
 /// blob is rejected (a histogram is never empty).
+///
+/// # Node-property index catalog (`rmp` task #90)
+///
+/// The catalog also records the **set of declared node-property indexes** and each one's build
+/// [`IndexState`], keyed by `(label_token, property_key_token)` — see
+/// [`node_property_indexes`](Self#structfield.node_property_indexes). This is what makes index
+/// *registration* durable: before this task the set of registered node-property indexes lived only
+/// in the in-memory `IndexSet`, so after a crash + reopen the rebuilt empty `IndexSet` found no
+/// registered indexes and the index was silently lost. Persisting the catalog here lets a recovered
+/// store repopulate its indexes automatically. The map rides the **identical** durability lifecycle
+/// as the counts and histograms (checkpointed at commit, reloaded on rollback and on open). Its
+/// presence invariant is "an entry exists iff an index is declared"; the value is the index's
+/// current state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Statistics {
     /// The total number of currently-live nodes, **labelled or not** (`rmp` task #82). This is the
@@ -126,6 +184,15 @@ pub struct Statistics {
     /// exists for that `(label, property)` pair. The blob is always non-empty — a zero-length value is
     /// never stored (rejected by `set_property_histogram` and by [`decode`](Self::decode)).
     pub node_prop_histograms: BTreeMap<(u32, u32), Vec<u8>>,
+    /// The durable **node-property index catalog** (`rmp` task #90): the set of declared node-property
+    /// indexes and each one's build [`IndexState`], keyed by `(label_token, property_key_token)`.
+    ///
+    /// Persisting this set is what makes index *registration* survive a crash: the in-memory `IndexSet`
+    /// holding the registered set is rebuilt empty on open, so without this map a recovered store had no
+    /// record of which property indexes existed and silently lost them. An entry is present **iff** the
+    /// index is declared; the value is its current build state. **Scope: node label properties only**
+    /// (the same scope as [`node_prop_histograms`](Self#structfield.node_prop_histograms)).
+    pub node_property_indexes: BTreeMap<(u32, u32), IndexState>,
 }
 
 impl Statistics {
@@ -283,15 +350,66 @@ impl Statistics {
         self.node_prop_histograms.remove(&(label_token, prop_token));
     }
 
+    /// The durable build [`IndexState`] of the node-property index on `(label_token, prop_token)`, or
+    /// [`None`] if no such index is declared (`rmp` task #90).
+    #[must_use]
+    pub fn node_property_index_state(
+        &self,
+        label_token: u32,
+        prop_token: u32,
+    ) -> Option<IndexState> {
+        self.node_property_indexes
+            .get(&(label_token, prop_token))
+            .copied()
+    }
+
+    /// Declares (or updates the state of) the node-property index on `(label_token, prop_token)`
+    /// (`rmp` task #90). Idempotent on the key: re-recording flips the stored state.
+    pub(crate) fn set_node_property_index(
+        &mut self,
+        label_token: u32,
+        prop_token: u32,
+        state: IndexState,
+    ) {
+        self.node_property_indexes
+            .insert((label_token, prop_token), state);
+    }
+
+    /// Removes the node-property index on `(label_token, prop_token)`, if declared (`rmp` task #90).
+    /// Removing an absent entry is a harmless no-op.
+    pub(crate) fn remove_node_property_index(&mut self, label_token: u32, prop_token: u32) {
+        self.node_property_indexes
+            .remove(&(label_token, prop_token));
+    }
+
+    /// Lists every declared node-property index as `(label_token, prop_token, state)`, ascending by
+    /// key (the [`BTreeMap`] order, deterministic) (`rmp` task #90).
+    #[must_use]
+    pub fn node_property_indexes(&self) -> Vec<(u32, u32, IndexState)> {
+        self.node_property_indexes
+            .iter()
+            .map(|(&(label_token, prop_token), &state)| (label_token, prop_token, state))
+            .collect()
+    }
+
     /// Serialises the statistics to a self-describing byte image.
     ///
     /// Layout: `total_nodes(u64) | total_relationships(u64) | n_labels(u32) | [ token_id(u32) |
     /// count(u64) ]* | n_types(u32) | [ token_id(u32) | count(u64) ]* | n_hist(u32) | [
-    /// label_token(u32) | prop_token(u32) | blob_len(u32) | blob_bytes[blob_len] ]*`, each map in
-    /// ascending-key ([`BTreeMap`]) order so the image is deterministic. The two grand totals are a
-    /// fixed 16-byte header (`rmp` task #82) read before the maps; the histogram block follows the two
-    /// count blocks; it is length-exact and self-describing, so the whole image stays unambiguous
-    /// (`rmp` task #81).
+    /// label_token(u32) | prop_token(u32) | blob_len(u32) | blob_bytes[blob_len] ]* | n_idx(u32) | [
+    /// label_token(u32) | prop_token(u32) | state(u8) ]*`, each map in ascending-key ([`BTreeMap`])
+    /// order so the image is deterministic. The two grand totals are a fixed 16-byte header
+    /// (`rmp` task #82) read before the maps; the histogram block follows the two count blocks
+    /// (`rmp` task #81); the node-property index catalog (`rmp` task #90) is appended last.
+    ///
+    /// # Backward compatibility with pre-#90 images
+    ///
+    /// The index-catalog block is **appended after** the histogram block and is the last block, so an
+    /// image written before `rmp` task #90 (which ends after the histograms) is decoded as having an
+    /// **empty** index catalog: [`decode`](Self::decode) treats end-of-input where the index block's
+    /// count `u32` would start as "no catalog" rather than truncation. No format-version byte is
+    /// needed because every prior block is length-exact and self-describing, so the parse position
+    /// after the histograms is unambiguous.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let hist_bytes: usize = self
@@ -304,7 +422,9 @@ impl Statistics {
                 + self.nodes_per_label.len() * 12
                 + self.rels_per_type.len() * 12
                 + 4
-                + hist_bytes,
+                + hist_bytes
+                + 4
+                + self.node_property_indexes.len() * 9,
         );
         // Grand-total header first (`rmp` task #82): two fixed-width LE u64s.
         out.extend_from_slice(&self.total_nodes.to_le_bytes());
@@ -312,6 +432,7 @@ impl Statistics {
         Self::encode_map(&mut out, &self.nodes_per_label);
         Self::encode_map(&mut out, &self.rels_per_type);
         Self::encode_histograms(&mut out, &self.node_prop_histograms);
+        Self::encode_index_catalog(&mut out, &self.node_property_indexes);
         out
     }
 
@@ -345,13 +466,30 @@ impl Statistics {
         }
     }
 
+    fn encode_index_catalog(out: &mut Vec<u8>, map: &BTreeMap<(u32, u32), IndexState>) {
+        // The entry count is framed as a `u32`; the token space is far below 2^32, so this is
+        // unreachable in practice — asserted in debug, mirroring `encode_histograms`.
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "index-catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (&(label_token, prop_token), &state) in map {
+            out.extend_from_slice(&label_token.to_le_bytes());
+            out.extend_from_slice(&prop_token.to_le_bytes());
+            out.push(state.as_byte());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
     /// Returns a storage error if the image is truncated, a count is `0` (violates the zero-count
     /// invariant — such an image was never produced by [`encode`](Self::encode)), a token id appears
-    /// twice in one count map, a histogram blob is zero-length, or a `(label, property)` histogram key
-    /// appears twice.
+    /// twice in one count map, a histogram blob is zero-length, a `(label, property)` histogram key
+    /// appears twice, an index-catalog state byte is unknown (reserved/future), or an index-catalog
+    /// `(label, property)` key appears twice. A pre-`rmp`-task-#90 image (ending after the histogram
+    /// block) is accepted and decodes to an empty index catalog.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cur = 0usize;
         // Grand-total header first (`rmp` task #82); `read_u64` is truncation-safe, so a too-short
@@ -361,12 +499,14 @@ impl Statistics {
         let nodes_per_label = Self::decode_map(bytes, &mut cur, "nodes_per_label")?;
         let rels_per_type = Self::decode_map(bytes, &mut cur, "rels_per_type")?;
         let node_prop_histograms = Self::decode_histograms(bytes, &mut cur)?;
+        let node_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
             nodes_per_label,
             rels_per_type,
             node_prop_histograms,
+            node_property_indexes,
         })
     }
 
@@ -407,6 +547,38 @@ impl Statistics {
             if map.insert((label_token, prop_token), blob).is_some() {
                 return Err(GraphusError::Storage(format!(
                     "statistics histogram repeats key ({label_token}, {prop_token})"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    fn decode_index_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<(u32, u32), IndexState>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #90): a pre-#90 image ends exactly here (after the
+        // histogram block), so end-of-input where the count `u32` would start means "no index
+        // catalog", not truncation. Any *partial* count word that follows is still a genuine
+        // truncation and is rejected by `read_u32` below.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let label_token = read_u32(bytes, cur)?;
+            let prop_token = read_u32(bytes, cur)?;
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "statistics index catalog holds unknown state byte {state_byte} for \
+                     ({label_token}, {prop_token})"
+                ))
+            })?;
+            if map.insert((label_token, prop_token), state).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "statistics index catalog repeats key ({label_token}, {prop_token})"
                 )));
             }
         }
@@ -519,6 +691,11 @@ fn take(bytes: &[u8], cur: &mut usize, len: usize) -> Result<usize> {
     Ok(end)
 }
 
+fn read_u8(b: &[u8], cur: &mut usize) -> Result<u8> {
+    let end = take(b, cur, 1)?;
+    Ok(b[end - 1])
+}
+
 fn read_u32(b: &[u8], cur: &mut usize) -> Result<u32> {
     let end = take(b, cur, 4)?;
     Ok(u32::from_le_bytes(b[end - 4..end].try_into().expect("4")))
@@ -586,6 +763,12 @@ mod tests {
         // here alongside the counts.
         m.statistics.set_property_histogram(0, 1, vec![1, 2, 3, 4]); // (Person, prop 1)
         m.statistics.set_property_histogram(5, 9, vec![0xAB]); // (label 5, prop 9)
+        // Populate the node-property index catalog too (`rmp` task #90), with both states, so its
+        // round-trip is exercised here alongside the histograms and counts.
+        m.statistics
+            .set_node_property_index(0, 1, IndexState::Online); // (Person, prop 1): Online
+        m.statistics
+            .set_node_property_index(5, 9, IndexState::Populating); // (label 5, prop 9): Populating
 
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
@@ -601,6 +784,15 @@ mod tests {
         );
         assert_eq!(back.statistics.property_histogram(5, 9), Some(&[0xAB][..]));
         assert_eq!(back.statistics.property_histogram(0, 9), None);
+        assert_eq!(
+            back.statistics.node_property_index_state(0, 1),
+            Some(IndexState::Online)
+        );
+        assert_eq!(
+            back.statistics.node_property_index_state(5, 9),
+            Some(IndexState::Populating)
+        );
+        assert_eq!(back.statistics.node_property_index_state(0, 9), None);
     }
 
     #[test]
@@ -769,6 +961,135 @@ mod tests {
         s.set_property_histogram(1, 2, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let mut bytes = s.encode();
         bytes.truncate(bytes.len() - 3);
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_index_catalog_round_trips() {
+        // Empty catalog: the index block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then mixed states and mixed keys.
+        let mut s = Statistics::new();
+        s.set_node_property_index(2, 3, IndexState::Online);
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+
+        s.set_node_property_index(0, 0, IndexState::Populating);
+        s.set_node_property_index(7, 1, IndexState::Online);
+        // Mixing in counts and a histogram proves the index block is read after both count blocks and
+        // the histogram block (parse-position is unambiguous).
+        s.inc_label(4);
+        s.inc_rel_type(7);
+        s.set_property_histogram(2, 3, vec![0xCD, 0xEF]);
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            back.node_property_index_state(2, 3),
+            Some(IndexState::Online)
+        );
+        assert_eq!(
+            back.node_property_index_state(0, 0),
+            Some(IndexState::Populating)
+        );
+        assert_eq!(
+            back.node_property_index_state(7, 1),
+            Some(IndexState::Online)
+        );
+        assert_eq!(back.node_property_index_state(9, 9), None);
+        // Listing is ascending by key and reports the state.
+        assert_eq!(
+            back.node_property_indexes(),
+            vec![
+                (0, 0, IndexState::Populating),
+                (2, 3, IndexState::Online),
+                (7, 1, IndexState::Online),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_and_remove_node_property_index() {
+        let mut s = Statistics::new();
+        assert_eq!(s.node_property_index_state(1, 2), None);
+        s.set_node_property_index(1, 2, IndexState::Populating);
+        assert_eq!(
+            s.node_property_index_state(1, 2),
+            Some(IndexState::Populating)
+        );
+        // Re-recording flips the state (idempotent on the key).
+        s.set_node_property_index(1, 2, IndexState::Online);
+        assert_eq!(s.node_property_index_state(1, 2), Some(IndexState::Online));
+        // Removal drops the entry; removing an absent key is a harmless no-op.
+        s.remove_node_property_index(1, 2);
+        assert_eq!(s.node_property_index_state(1, 2), None);
+        s.remove_node_property_index(9, 9);
+        assert!(s.node_property_indexes.is_empty());
+    }
+
+    #[test]
+    fn statistics_decode_accepts_a_pre_task_90_image_as_empty_index_catalog() {
+        // A pre-`rmp`-task-#90 image ends after the histogram block (no index-catalog block). Build
+        // exactly such an image by hand and confirm decode accepts it with an empty index catalog.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries -- image ends here (pre-#90)
+        let back = Statistics::decode(&bytes).unwrap();
+        assert_eq!(back.total_nodes(), 3);
+        assert_eq!(back.total_relationships(), 1);
+        assert!(back.node_property_indexes.is_empty());
+        // And it re-encodes with an explicit (empty) index-catalog block appended.
+        assert_eq!(Statistics::decode(&back.encode()).unwrap(), back);
+    }
+
+    #[test]
+    fn statistics_decode_rejects_an_unknown_index_state_byte() {
+        // A hand-built image with a reserved/unknown state byte (2) must be rejected: encode only ever
+        // produces 0 (Populating) or 1 (Online), and accepting an unknown byte would silently lose the
+        // forward-incompatible state.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 index-catalog entry
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        bytes.push(2); // state byte 2 (unknown / reserved)
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_duplicate_index_catalog_key() {
+        // Two entries with the same (label, prop) key must be rejected (encode never produces them).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // 2 index-catalog entries
+        for _ in 0..2 {
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // prop token 1 (same key both times)
+            bytes.push(1); // Online
+        }
+        assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_index_catalog_truncation() {
+        // Truncating mid-entry (the count word promises an entry the bytes do not hold) must be
+        // rejected — distinct from the clean pre-#90 end-of-input, which lands exactly on the count
+        // word's start.
+        let mut s = Statistics::new();
+        s.set_node_property_index(1, 2, IndexState::Online);
+        let mut bytes = s.encode();
+        bytes.truncate(bytes.len() - 1); // drop the state byte of the only entry
         assert!(Statistics::decode(&bytes).is_err());
     }
 

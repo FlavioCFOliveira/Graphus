@@ -422,24 +422,46 @@ fn recover_no_force(store: &Store) -> Store {
 }
 
 #[test]
-fn index_rebuilt_after_crash_recovery_equals_scan() {
-    // Drive committed inserts through one coordinator, crash, recover the store, build a NEW
-    // coordinator over the recovered store, register the same index, and assert seeks/scans match
-    // the scan path over the recovered graph (the rebuild makes the index consistent by
-    // construction).
+fn index_survives_crash_recovery_without_re_registration() {
+    // `rmp` task #90: the durable index catalog makes index *registration* survive a crash. Declare
+    // the index, drive committed inserts, crash, recover the store, build a NEW coordinator — and do
+    // NOT re-create the index. The fresh coordinator must recover the declared index from the durable
+    // catalog, repopulate it from the recovered rows, and answer seeks identically to the scan path.
     let mut coord = fresh_coord();
+    // Declare the index FIRST (it is now durable), then seed the rows it must index.
+    coord
+        .create_node_property_index("Person", "age")
+        .expect("create index");
     seed_people(&mut coord);
 
     // Crash: reclaim the store with no open transaction, then recover from the durable WAL alone.
     let store = coord.into_store();
     let recovered = recover_no_force(&store);
 
+    // Build a fresh coordinator over the recovered store. Crucially, we do NOT re-register the index:
+    // `TxnCoordinator::new` -> `rebuild_index` recovers the durable catalog entry and repopulates it.
     let mut coord2 = TxnCoordinator::new(recovered);
-    // Register the index AFTER recovery: `create_node_property_index` rebuilds it from the recovered
-    // rows, and `new` already rebuilt the always-present label index.
-    coord2
-        .create_node_property_index("Person", "age")
-        .expect("create index post-recovery");
+
+    // The recovered index must be Online and planner-visible: the index-aware catalog must actually
+    // route a seek (otherwise we would only be comparing the scan path against itself, and the
+    // crash-survival claim would be vacuous).
+    let indexed = coord2.catalog();
+    let seek_plan = compile(
+        "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",
+        &indexed,
+    );
+    assert!(
+        has_index_seek(&seek_plan),
+        "the recovered index must be Online and drive a NodeIndexSeek (no re-registration):\n{seek_plan}"
+    );
+    let range_plan = compile(
+        "MATCH (n:Person) WHERE n.age > 30 RETURN n.age AS a",
+        &indexed,
+    );
+    assert!(
+        has_index_range_seek(&range_plan),
+        "the recovered index must drive a NodeIndexRangeSeek:\n{range_plan}"
+    );
 
     for src in [
         "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",
@@ -465,4 +487,105 @@ fn index_rebuilt_after_crash_recovery_equals_scan() {
         "a",
     );
     assert_eq!(any, vec![30, 30], "the committed seed survived recovery");
+}
+
+// =================================================================================================
+// Planner state gating (`rmp` task #90): only an Online index serves seeks; a Populating one falls
+// back to a label-scan + filter, but still returns the same rows.
+// =================================================================================================
+
+#[test]
+fn populating_index_is_not_used_by_planner_while_online_is() {
+    use graphus_core::TxnId;
+    use graphus_storage::{IndexState, Namespace};
+
+    // Seed a graph, then commit a *Populating* `(Person, age)` index directly into the durable catalog
+    // (the coordinator's `create_node_property_index` always ends Online; population is synchronous in
+    // `rmp` task #90, so a Populating index is otherwise only an in-progress `rmp` task #91 build). A
+    // fresh coordinator over this store recovers the index as Populating and must NOT route a seek to
+    // it.
+    let mut coord = fresh_coord();
+    seed_people(&mut coord);
+    let mut store = coord.into_store();
+
+    // Intern the tokens and record the index as Populating, in one committed transaction.
+    let txn = TxnId(10_000);
+    store.begin(txn);
+    let person = store
+        .intern_token(Namespace::Label, "Person")
+        .expect("intern label");
+    let age = store
+        .intern_token(Namespace::PropKey, "age")
+        .expect("intern prop");
+    store.set_node_property_index(person, age, IndexState::Populating);
+    store.commit(txn).expect("commit populating index");
+
+    let mut coord = TxnCoordinator::new(store);
+
+    // The catalog must withhold the Populating index: an equality / range predicate on `Person.age`
+    // must fall back to a label-scan (TokenLookupScan) + Filter, NOT a NodeIndexSeek.
+    let indexed = coord.catalog();
+    for (src, kind) in [
+        ("MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a", "eq"),
+        (
+            "MATCH (n:Person) WHERE n.age > 30 RETURN n.age AS a",
+            "range",
+        ),
+    ] {
+        let plan = compile(src, &indexed);
+        assert!(
+            !has_index_seek(&plan) && !has_index_range_seek(&plan),
+            "`{src}` ({kind}): a Populating index must NOT drive an index seek:\n{plan}"
+        );
+        // It still uses the always-present label token-lookup (that index is unaffected by state).
+        assert!(
+            has_token_lookup(&plan),
+            "`{src}` ({kind}): must fall back to a TokenLookupScan + Filter:\n{plan}"
+        );
+        // And the fallback returns exactly the scan+filter rows.
+        let via_catalog = read_sorted_ints(&mut coord, &indexed, src, "a");
+        let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+        assert_eq!(
+            via_catalog, via_scan,
+            "`{src}` ({kind}): Populating fallback must equal scan+filter"
+        );
+    }
+
+    // Now promote the same index to Online (the synchronous build's end-state) by re-creating it
+    // through the coordinator: it re-records the catalog entry Online and rebuilds. The planner must
+    // now route a seek, proving the gating is state-driven (Online -> seek; Populating -> scan).
+    coord
+        .create_node_property_index("Person", "age")
+        .expect("promote to Online");
+    let indexed = coord.catalog();
+    let seek_plan = compile(
+        "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",
+        &indexed,
+    );
+    assert!(
+        has_index_seek(&seek_plan),
+        "after promotion to Online the planner must use a NodeIndexSeek:\n{seek_plan}"
+    );
+    let range_plan = compile(
+        "MATCH (n:Person) WHERE n.age > 30 RETURN n.age AS a",
+        &indexed,
+    );
+    assert!(
+        has_index_range_seek(&range_plan),
+        "after promotion to Online the planner must use a NodeIndexRangeSeek:\n{range_plan}"
+    );
+    // Equivalence still holds on the Online path.
+    let via_index = read_sorted_ints(
+        &mut coord,
+        &indexed,
+        "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",
+        "a",
+    );
+    let via_scan = read_sorted_ints(
+        &mut coord,
+        &IndexCatalog::empty(),
+        "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",
+        "a",
+    );
+    assert_eq!(via_index, via_scan, "Online seek must equal scan+filter");
 }

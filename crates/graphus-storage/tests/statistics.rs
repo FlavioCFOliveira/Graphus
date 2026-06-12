@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use graphus_core::TxnId;
 use graphus_io::{MemBlockDevice, Page};
 use graphus_storage::recovery::recover_device;
-use graphus_storage::{Namespace, RecordStore};
+use graphus_storage::{IndexState, Namespace, RecordStore};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -988,4 +988,199 @@ fn an_empty_blob_is_treated_as_a_removal() {
     let (device, wal) = into_parts(s);
     let reopened = RecordStore::open(device, wal, 64).expect("reopen");
     assert_eq!(reopened.property_histogram(person, age), None);
+}
+
+// =================================================================================================
+// Node-property index catalog (`rmp` task #90): the durable set of declared property indexes and
+// each one's build state, riding the same commit/rollback/recovery lifecycle as the histograms.
+// =================================================================================================
+
+#[test]
+fn fresh_store_has_empty_index_catalog() {
+    let s = fresh(64);
+    assert!(s.node_property_indexes().is_empty());
+    assert_eq!(s.node_property_index_state(0, 0), None);
+}
+
+#[test]
+fn node_property_index_persists_across_reopen() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    let name = s.intern_token(Namespace::PropKey, "name").unwrap();
+    // Mixed state: one Online, one Populating (the latter is what `rmp` task #91 will resume).
+    s.set_node_property_index(person, age, IndexState::Online);
+    s.set_node_property_index(person, name, IndexState::Populating);
+    s.commit(txn).unwrap();
+    s.flush().unwrap();
+
+    // Reopen over the same device + log (clean shutdown then restart): the catalog survives.
+    let (device, wal) = into_parts(s);
+    let reopened = RecordStore::open(device, wal, 64).expect("reopen");
+    assert_eq!(
+        reopened.node_property_index_state(person, age),
+        Some(IndexState::Online)
+    );
+    assert_eq!(
+        reopened.node_property_index_state(person, name),
+        Some(IndexState::Populating)
+    );
+    assert_eq!(reopened.node_property_index_state(person, 999), None);
+    assert_eq!(
+        reopened.node_property_indexes(),
+        vec![
+            (person, age, IndexState::Online),
+            (person, name, IndexState::Populating),
+        ]
+    );
+}
+
+#[test]
+fn node_property_index_recovers_after_a_no_force_crash() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    s.set_node_property_index(person, age, IndexState::Populating);
+    s.commit(txn).unwrap();
+
+    // Promote it to Online in a second committed txn so the recovered state is the *latest* committed.
+    let t2 = TxnId(2);
+    s.begin(t2);
+    s.set_node_property_index(person, age, IndexState::Online);
+    s.commit(t2).unwrap();
+
+    let rec = recover_no_force(&s);
+    assert_eq!(
+        rec.node_property_index_state(person, age),
+        Some(IndexState::Online)
+    );
+}
+
+#[test]
+fn node_property_index_recovers_after_a_steal_crash() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    s.set_node_property_index(person, age, IndexState::Online);
+    s.commit(txn).unwrap();
+
+    let rec = recover_steal(&mut s);
+    assert_eq!(
+        rec.node_property_index_state(person, age),
+        Some(IndexState::Online)
+    );
+}
+
+#[test]
+fn an_uncommitted_index_declaration_does_not_survive_recovery() {
+    let mut s = fresh(64);
+    // Committed baseline: one declared index.
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    s.set_node_property_index(person, age, IndexState::Online);
+    s.commit(t1).unwrap();
+
+    // T2 declares a second index but never commits (a loser); harden the WAL tail so undo runs.
+    let t2 = TxnId(2);
+    s.begin(t2);
+    let name = s.intern_token(Namespace::PropKey, "name").unwrap();
+    s.set_node_property_index(person, name, IndexState::Populating);
+    s.with_wal(graphus_wal::WalManager::flush);
+
+    // Only T1's committed declaration survives — the catalog is checkpointed only at commit. The
+    // uncommitted `name` token never interned durably, so re-resolving it is `None`; assert on the
+    // listed catalog instead, which must hold exactly the one committed `(person, age)` entry.
+    let rec = recover_no_force(&s);
+    assert_eq!(
+        rec.node_property_index_state(person, age),
+        Some(IndexState::Online)
+    );
+    assert_eq!(
+        rec.node_property_indexes(),
+        vec![(person, age, IndexState::Online)],
+        "an uncommitted index declaration must not survive recovery"
+    );
+}
+
+#[test]
+fn rolled_back_index_declaration_is_discarded() {
+    let mut s = fresh(64);
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    s.set_node_property_index(person, age, IndexState::Online);
+    s.commit(t1).unwrap();
+
+    // T2: flip the committed entry's state and add a new one, then ROLL BACK. Both must vanish.
+    let t2 = TxnId(2);
+    s.begin(t2);
+    let name = s.intern_token(Namespace::PropKey, "name").unwrap();
+    s.set_node_property_index(person, age, IndexState::Populating); // would flip the committed state
+    s.set_node_property_index(person, name, IndexState::Online); // would add a new entry
+    s.rollback(t2).unwrap();
+
+    assert_eq!(
+        s.node_property_index_state(person, age),
+        Some(IndexState::Online),
+        "a rolled-back state flip must leave the committed state untouched"
+    );
+    assert_eq!(
+        s.node_property_index_state(person, name),
+        None,
+        "a rolled-back declaration must not leave a new entry"
+    );
+
+    // A committed declaration must survive a *later* aborted removal (proves the revert restored disk
+    // state, not merely left it stale).
+    let t3 = TxnId(3);
+    s.begin(t3);
+    s.remove_node_property_index(person, age);
+    s.rollback(t3).unwrap();
+    assert_eq!(
+        s.node_property_index_state(person, age),
+        Some(IndexState::Online)
+    );
+}
+
+#[test]
+fn removed_node_property_index_stays_removed_across_reopen() {
+    let mut s = fresh(64);
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    let name = s.intern_token(Namespace::PropKey, "name").unwrap();
+    s.set_node_property_index(person, age, IndexState::Online);
+    s.set_node_property_index(person, name, IndexState::Online);
+    s.commit(t1).unwrap();
+
+    // Drop one index in a committed txn.
+    let t2 = TxnId(2);
+    s.begin(t2);
+    s.remove_node_property_index(person, age);
+    s.commit(t2).unwrap();
+    s.flush().unwrap();
+    assert_eq!(s.node_property_index_state(person, age), None);
+    assert_eq!(
+        s.node_property_index_state(person, name),
+        Some(IndexState::Online)
+    );
+
+    // The removal is durable: it must stay removed across a clean reopen.
+    let (device, wal) = into_parts(s);
+    let reopened = RecordStore::open(device, wal, 64).expect("reopen");
+    assert_eq!(reopened.node_property_index_state(person, age), None);
+    assert_eq!(
+        reopened.node_property_index_state(person, name),
+        Some(IndexState::Online)
+    );
 }

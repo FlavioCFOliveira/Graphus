@@ -32,6 +32,7 @@ use graphus_core::{TxnId, Value};
 use graphus_index::recovery::SharedWal;
 use graphus_index::{BTree, PropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
+use graphus_storage::IndexState;
 use graphus_wal::{MemLogSink, WalManager};
 
 /// The in-memory block device the derived indexes are built on.
@@ -69,10 +70,24 @@ fn fresh_tree() -> BTree<Dev, Sink> {
 pub struct IndexSet {
     /// The always-present label scan index, keyed `(label_token, node_id)`.
     labels: TokenIndex<Dev, Sink>,
-    /// Declared node-property indexes, keyed by `(label_token, prop_key)`. Each value is keyed
-    /// internally on `(prop_key, property_value, node_id)` (`prop_key` is the `PropertyIndex`
-    /// token), which is sufficient because the map already partitions by `label_token`.
-    node_props: HashMap<(u32, u32), PropertyIndex<Dev, Sink>>,
+    /// Declared node-property indexes, keyed by `(label_token, prop_key)`. Each value is the backing
+    /// [`PropertyIndex`] (keyed internally on `(prop_key, property_value, node_id)`, sufficient because
+    /// the map already partitions by `label_token`) **plus its build [`IndexState`]** (`rmp` task #90).
+    ///
+    /// The state gates *exposure to the planner*, not maintenance: a `Populating` index is kept up to
+    /// date by [`insert_node_property`](Self::insert_node_property) (harmless), but is omitted from
+    /// [`online_node_properties`](Self::online_node_properties) so the planner never routes a seek to a
+    /// half-built index — it falls back to a label-scan + filter until the index is promoted `Online`.
+    node_props: HashMap<(u32, u32), NodePropertyIndex>,
+}
+
+/// A declared node-property index plus its durable build [`IndexState`] (`rmp` task #90).
+struct NodePropertyIndex {
+    /// The backing in-memory property B+-tree.
+    index: PropertyIndex<Dev, Sink>,
+    /// The build state, mirrored from the durable catalog. Only an [`IndexState::Online`] index is
+    /// surfaced to the planner; a [`IndexState::Populating`] one falls back to a scan + filter.
+    state: IndexState,
 }
 
 impl IndexSet {
@@ -86,27 +101,66 @@ impl IndexSet {
         }
     }
 
-    /// Declares a node-property index on `(label_token, prop_key)`. Idempotent: a no-op if one is
-    /// already registered, otherwise creates the backing [`PropertyIndex`].
+    /// Declares a node-property index on `(label_token, prop_key)` at [`IndexState::Online`].
+    /// Idempotent: a no-op if one is already registered (its state is left unchanged), otherwise
+    /// creates the backing [`PropertyIndex`].
+    ///
+    /// This is the convenience entry point for callers that build an index synchronously and have no
+    /// `Populating` phase. The state-aware [`register_node_property_with_state`](Self::register_node_property_with_state)
+    /// is the path the durable catalog (`rmp` task #90) drives.
     pub fn register_node_property(&mut self, label_token: u32, prop_key: u32) {
-        self.node_props
-            .entry((label_token, prop_key))
-            .or_insert_with(|| PropertyIndex::new(fresh_tree()));
+        self.register_node_property_with_state(label_token, prop_key, IndexState::Online);
     }
 
-    /// Whether a node-property index is registered for `(label_token, prop_key)`.
+    /// Declares a node-property index on `(label_token, prop_key)` at `state` (`rmp` task #90).
+    /// Idempotent on the key: if one is already registered its backing tree is kept, but its state is
+    /// updated to `state` (so a recovered `Online` declaration promotes a freshly-created entry).
+    pub fn register_node_property_with_state(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        state: IndexState,
+    ) {
+        self.node_props
+            .entry((label_token, prop_key))
+            .and_modify(|np| np.state = state)
+            .or_insert_with(|| NodePropertyIndex {
+                index: PropertyIndex::new(fresh_tree()),
+                state,
+            });
+    }
+
+    /// Sets the build [`IndexState`] of an already-registered `(label_token, prop_key)` index
+    /// (`rmp` task #90), e.g. promoting `Populating` → `Online` after a synchronous build. A no-op if
+    /// no such index is registered.
+    pub fn set_node_property_state(&mut self, label_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(np) = self.node_props.get_mut(&(label_token, prop_key)) {
+            np.state = state;
+        }
+    }
+
+    /// Whether a node-property index is registered for `(label_token, prop_key)` (in **any** state).
     #[must_use]
     pub fn has_node_property(&self, label_token: u32, prop_key: u32) -> bool {
         self.node_props.contains_key(&(label_token, prop_key))
     }
 
-    /// Drops all entries from every index, keeping the registered `(label_token, prop_key)` set, for
-    /// a full rebuild from the store. Implemented by recreating each backing tree (the simplest
-    /// correct reset for an ephemeral in-memory index).
+    /// The build [`IndexState`] of the `(label_token, prop_key)` index, or [`None`] if unregistered
+    /// (`rmp` task #90).
+    #[must_use]
+    pub fn node_property_state(&self, label_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.node_props
+            .get(&(label_token, prop_key))
+            .map(|np| np.state)
+    }
+
+    /// Drops all entries from every index, keeping the registered `(label_token, prop_key)` set **and
+    /// each one's state**, for a full rebuild from the store. Implemented by recreating each backing
+    /// tree (the simplest correct reset for an ephemeral in-memory index).
     pub fn clear(&mut self) {
         self.labels = TokenIndex::new(fresh_tree());
-        for idx in self.node_props.values_mut() {
-            *idx = PropertyIndex::new(fresh_tree());
+        for np in self.node_props.values_mut() {
+            np.index = PropertyIndex::new(fresh_tree());
         }
     }
 
@@ -127,11 +181,13 @@ impl IndexSet {
         value: &Value,
         node_id: u64,
     ) {
-        if let Some(idx) = self.node_props.get_mut(&(label_token, prop_key)) {
+        if let Some(np) = self.node_props.get_mut(&(label_token, prop_key)) {
             // in-memory index: a BTree op cannot fail in practice. A `Null` value is unindexable
             // (`PropertyIndex::insert` errors) and is correctly skipped — `Null` properties are
             // absent for index purposes, matching Cypher's treatment in equality/range predicates.
-            let _ = idx.insert(EPHEMERAL_TXN, prop_key, value, node_id);
+            // Maintained regardless of state: keeping a `Populating` index up to date is harmless (it
+            // is simply not yet exposed to the planner, see `online_node_properties`).
+            let _ = np.index.insert(EPHEMERAL_TXN, prop_key, value, node_id);
         }
     }
 
@@ -151,11 +207,11 @@ impl IndexSet {
         prop_key: u32,
         value: &Value,
     ) -> Option<Vec<u64>> {
-        let idx = self.node_props.get_mut(&(label_token, prop_key))?;
+        let np = self.node_props.get_mut(&(label_token, prop_key))?;
         // in-memory index: a BTree op cannot fail in practice; a seek error degrades to an empty
         // candidate list. Note this is `Some(vec![])`, not `None`: the index *is* registered, it
         // simply has no matching candidate.
-        Some(idx.seek_eq(prop_key, value).unwrap_or_default())
+        Some(np.index.seek_eq(prop_key, value).unwrap_or_default())
     }
 
     /// Candidate node ids for `(label_token, prop_key)` within a range, ascending. `None` if no such
@@ -200,7 +256,7 @@ impl IndexSet {
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
     ) -> Option<Vec<u64>> {
-        let idx = self.node_props.get_mut(&(label_token, prop_key))?;
+        let np = self.node_props.get_mut(&(label_token, prop_key))?;
 
         // Map the upper bound: exclusive maps exactly; inclusive widens to unbounded-above (a
         // superset); `None` is unbounded-above.
@@ -212,11 +268,11 @@ impl IndexSet {
 
         let candidates = match lower {
             // Inclusive lower maps exactly; exclusive lower widens to inclusive (superset).
-            Some((v, _)) => idx.seek_range(prop_key, v, hi),
+            Some((v, _)) => np.index.seek_range(prop_key, v, hi),
             // Unbounded below cannot be expressed against the inclusive-lower backing range without
             // risking a subset (values may sort below the integer floor). Return all candidates for
             // the token — always a superset of any `< upper` request.
-            None => Self::all_candidates(idx, prop_key),
+            None => Self::all_candidates(&mut np.index, prop_key),
         };
 
         // in-memory index: a BTree op cannot fail in practice; a seek error degrades to an empty
@@ -249,11 +305,32 @@ impl IndexSet {
         tokens
     }
 
-    /// The registered node-property index keys `(label_token, prop_key)`, ascending and
-    /// de-duplicated. Used to build the planner's label-property catalog.
+    /// The registered node-property index keys `(label_token, prop_key)` in **any** state, ascending
+    /// and de-duplicated.
+    ///
+    /// Used by the coordinator's index rebuild to decide which property values to index for each node;
+    /// a `Populating` index *is* maintained (so its entries are ready the instant it is promoted), so
+    /// the rebuild must see it here. The planner instead consumes
+    /// [`online_node_properties`](Self::online_node_properties), which omits non-`Online` indexes.
     #[must_use]
     pub fn registered_node_properties(&self) -> Vec<(u32, u32)> {
         let mut keys: Vec<(u32, u32)> = self.node_props.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** node-property index keys `(label_token, prop_key)`, ascending and de-duplicated
+    /// (`rmp` task #90). Used to build the planner's label-property catalog: only an `Online` index may
+    /// serve a seek, so a `Populating` index is omitted here and the planner falls back to a label-scan
+    /// + filter for that `(label, property)` until it is promoted.
+    #[must_use]
+    pub fn online_node_properties(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .node_props
+            .iter()
+            .filter(|(_, np)| np.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
         keys.sort_unstable();
         keys
     }
@@ -513,6 +590,75 @@ mod tests {
         assert_eq!(
             set.registered_node_properties(),
             vec![(1, 3), (1, 9), (2, 5)]
+        );
+    }
+
+    #[test]
+    fn register_defaults_to_online() {
+        let mut set = IndexSet::new();
+        set.register_node_property(1, 2);
+        assert_eq!(set.node_property_state(1, 2), Some(IndexState::Online));
+        assert_eq!(set.node_property_state(9, 9), None);
+    }
+
+    #[test]
+    fn online_node_properties_omits_populating_indexes() {
+        let mut set = IndexSet::new();
+        set.register_node_property_with_state(1, 2, IndexState::Online);
+        set.register_node_property_with_state(3, 4, IndexState::Populating);
+        // Both are *registered*; only the Online one is exposed to the planner.
+        assert_eq!(
+            set.registered_node_properties(),
+            vec![(1, 2), (3, 4)],
+            "registered set must include both states"
+        );
+        assert_eq!(
+            set.online_node_properties(),
+            vec![(1, 2)],
+            "only the Online index is planner-visible"
+        );
+
+        // A Populating index still maintains entries and answers a *direct* seek (the candidate-set
+        // model is intact) — it is merely withheld from the planner's catalog.
+        set.insert_node_property(3, 4, &Value::Integer(7), 100);
+        assert_eq!(
+            set.seek_node_property_eq(3, 4, &Value::Integer(7)),
+            Some(vec![100])
+        );
+
+        // Promote it: now it is planner-visible too.
+        set.set_node_property_state(3, 4, IndexState::Online);
+        assert_eq!(set.node_property_state(3, 4), Some(IndexState::Online));
+        assert_eq!(set.online_node_properties(), vec![(1, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn register_with_state_is_idempotent_and_updates_state() {
+        let mut set = IndexSet::new();
+        set.register_node_property_with_state(1, 2, IndexState::Populating);
+        set.insert_node_property(1, 2, &Value::Integer(5), 9);
+        assert_eq!(set.node_property_state(1, 2), Some(IndexState::Populating));
+        // Re-registering Online keeps the entries (idempotent on the backing tree) but promotes state.
+        set.register_node_property_with_state(1, 2, IndexState::Online);
+        assert_eq!(set.node_property_state(1, 2), Some(IndexState::Online));
+        assert_eq!(
+            set.seek_node_property_eq(1, 2, &Value::Integer(5)),
+            Some(vec![9]),
+            "re-registering must not drop the existing entries"
+        );
+    }
+
+    #[test]
+    fn clear_preserves_registered_set_and_state() {
+        let mut set = IndexSet::new();
+        set.register_node_property_with_state(1, 2, IndexState::Populating);
+        set.insert_node_property(1, 2, &Value::Integer(5), 9);
+        set.clear();
+        // The registered set and its state survive a clear (only the entries are wiped).
+        assert_eq!(set.node_property_state(1, 2), Some(IndexState::Populating));
+        assert_eq!(
+            set.seek_node_property_eq(1, 2, &Value::Integer(5)),
+            Some(Vec::<u64>::new())
         );
     }
 }

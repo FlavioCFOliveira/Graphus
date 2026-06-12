@@ -38,7 +38,7 @@ use graphus_wal::{LogSink, WalManager};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
-use crate::meta::{Meta, Statistics, StoreMeta};
+use crate::meta::{IndexState, Meta, Statistics, StoreMeta};
 use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
@@ -2420,6 +2420,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn remove_property_histogram(&mut self, label_token: u32, prop_token: u32) {
         self.statistics
             .remove_property_histogram(label_token, prop_token);
+    }
+
+    /// Lists every declared node-property index as `(label_token, prop_token, state)` from the durable
+    /// catalog (`rmp` task #90), ascending by key.
+    ///
+    /// This is what makes index *registration* survive a crash: a fresh coordinator over a recovered
+    /// store reads this to re-register the previously-declared property indexes before its index
+    /// rebuild, so a recovered store's indexes are repopulated automatically (the gap fixed by `rmp`
+    /// task #90). Tokens are returned as ids; the caller resolves their names via the token store.
+    #[must_use]
+    pub fn node_property_indexes(&self) -> Vec<(u32, u32, IndexState)> {
+        self.statistics.node_property_indexes()
+    }
+
+    /// The durable build [`IndexState`] of the node-property index on `(label_token, prop_token)`, or
+    /// [`None`] if no such index is declared (`rmp` task #90).
+    #[must_use]
+    pub fn node_property_index_state(
+        &self,
+        label_token: u32,
+        prop_token: u32,
+    ) -> Option<IndexState> {
+        self.statistics
+            .node_property_index_state(label_token, prop_token)
+    }
+
+    /// Declares (or updates the state of) the node-property index on `(label_token, prop_token)` in the
+    /// durable catalog (`rmp` task #90).
+    ///
+    /// The mutation is purely in-memory here. Like the `rmp` task #79 count mutators and the
+    /// `rmp` task #81 histogram mutators, it becomes **durable when the enclosing transaction commits**
+    /// (the catalog is checkpointed at commit) and is **discarded on rollback** (the catalog is
+    /// reloaded from the last committed metadata page). Re-recording an existing key flips its state.
+    pub fn set_node_property_index(
+        &mut self,
+        label_token: u32,
+        prop_token: u32,
+        state: IndexState,
+    ) {
+        self.statistics
+            .set_node_property_index(label_token, prop_token, state);
+    }
+
+    /// Removes the node-property index on `(label_token, prop_token)` from the durable catalog, if
+    /// declared (`rmp` task #90). Removing an absent entry is a harmless no-op.
+    ///
+    /// Like [`set_node_property_index`](Self::set_node_property_index), the removal is in-memory and
+    /// becomes durable at the enclosing transaction's commit, and is discarded on rollback.
+    pub fn remove_node_property_index(&mut self, label_token: u32, prop_token: u32) {
+        self.statistics
+            .remove_node_property_index(label_token, prop_token);
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

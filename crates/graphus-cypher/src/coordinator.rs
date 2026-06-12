@@ -46,7 +46,7 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Timestamp, TxnId};
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
-use graphus_storage::{Namespace, RecordStore};
+use graphus_storage::{IndexState, Namespace, RecordStore};
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
 use graphus_wal::LogSink;
 
@@ -107,9 +107,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
-    /// Clears `index` and repopulates it from every in-use node in `store` (`rmp` task #48): each
-    /// node's label tokens go into the label index, and for each **registered** node-property index
-    /// the node matches, its current property value is inserted.
+    /// Reloads the durable node-property index catalog into `index` (`rmp` task #90), then clears and
+    /// repopulates `index` from every in-use node in `store` (`rmp` task #48): each node's label
+    /// tokens go into the label index, and for each **registered** node-property index the node
+    /// matches, its current property value is inserted.
+    ///
+    /// # Durable registration reload (the crash-recovery fix, `rmp` task #90)
+    ///
+    /// The set of declared node-property indexes is recovered from the store's durable index catalog
+    /// **before** the rebuild scan, so a fresh coordinator over a recovered store re-registers exactly
+    /// the indexes that were committed — no manual re-registration after recovery. A catalog entry
+    /// recorded `Online` is registered `Online`; a `Populating` one is registered, populated by the
+    /// scan below, and — since population is synchronous in this task — left registered (its promotion
+    /// to `Online` is the coordinator's caller path; `rmp` task #91 owns the non-blocking flip). Any
+    /// indexes already registered in `index` (e.g. one just declared via
+    /// [`create_node_property_index`](Self::create_node_property_index)) are preserved: the reload only
+    /// *adds* the durable set, and [`IndexSet::register_node_property_with_state`] is idempotent.
     ///
     /// This is the store-side analogue of [`RecordStoreGraph::reindex_node`], but it reads directly
     /// off the store (no MVCC snapshot) because the index is a **candidate** set: an entry for a
@@ -121,10 +134,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// only degrades that node to the full-scan fallback for that reader, never to a wrong row. The
     /// store and the index are borrowed in separate, non-overlapping scopes.
     fn rebuild_index(store: &Rc<RefCell<RecordStore<D, S>>>, index: &Rc<RefCell<IndexSet>>) {
+        // Recover the durable index catalog (`rmp` task #90) into the in-memory set first: this is
+        // what makes registration survive a crash. Done before `clear` (which keeps the registered set
+        // but wipes entries) so the rebuild scan below indexes the recovered indexes too.
+        let durable: Vec<(u32, u32, IndexState)> = store.borrow().node_property_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (label_token, prop_key, state) in durable {
+                idx.register_node_property_with_state(label_token, prop_key, state);
+            }
+        }
+
         index.borrow_mut().clear();
 
-        // The set of registered node-property indexes, captured before walking the store so the
-        // index is not borrowed across a store borrow.
+        // The set of registered node-property indexes (any state), captured before walking the store so
+        // the index is not borrowed across a store borrow. A `Populating` index is maintained too (so
+        // its entries are ready the instant it is promoted), so the rebuild reads the full set here;
+        // the planner only ever sees the `Online` subset via `catalog()`.
         let registered: Vec<(u32, u32)> = index.borrow().registered_node_properties();
 
         let node_ids = match store.borrow_mut().scan_node_ids() {
@@ -209,22 +235,30 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.begin(IsolationLevel::Serializable)
     }
 
-    /// Declares a node-property index on `(label, property)` and populates it from the current graph
-    /// (`rmp` task #48).
+    /// Declares a node-property index on `(label, property)`, **durably records it** in the store's
+    /// index catalog, and populates it from the current graph (`rmp` tasks #48 / #90).
     ///
-    /// The label and property-key tokens are interned **durably** in their own committed transaction
-    /// (a token becomes persistent on commit, `04 §2.6`), the `(label_token, prop_key)` index is
-    /// registered in the shared [`IndexSet`], and the index is then rebuilt so every existing node is
-    /// indexed. Subsequent writes maintain it incrementally via the statement seam. The index data
-    /// itself is in-memory and candidate-only (never committed), so only the *token interning* needs
-    /// durability.
+    /// The label and property-key tokens are interned **durably** and the `(label_token, prop_key)`
+    /// index is recorded in the durable index catalog (`rmp` task #90) — both in one committed
+    /// transaction, so the *registration* survives a crash. Before `rmp` task #90 only the tokens were
+    /// durable and the registered-index set lived only in the in-memory [`IndexSet`], so after a crash
+    /// and reopen the index was silently lost; persisting the catalog entry fixes that. The index is
+    /// then registered in the shared [`IndexSet`] and rebuilt so every existing node is indexed, and
+    /// subsequent writes maintain it incrementally via the statement seam.
+    ///
+    /// Population is **synchronous** in this task (the non-blocking incremental build is `rmp`
+    /// task #91), so the durable end-state of a successful create is [`IndexState::Online`]: the
+    /// catalog entry is written `Online` in the same committed transaction as the tokens, and the
+    /// in-memory index is registered `Online`. The index *data* itself is in-memory and candidate-only
+    /// (never committed); only the token interning and the catalog entry need durability.
     ///
     /// # Errors
-    /// Returns a storage error if interning either token, or its committing transaction, fails.
+    /// Returns a storage error if interning either token, recording the catalog entry, or the
+    /// committing transaction fails.
     pub fn create_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
-        // Intern the label + prop-key tokens durably in a dedicated transaction so the catalog can
-        // map them back to names, and so the schema change survives a crash even if no node yet uses
-        // them.
+        // Intern the label + prop-key tokens and record the durable catalog entry in one dedicated
+        // transaction so the schema change (tokens + registration) survives a crash atomically, even
+        // if no node yet uses them.
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
@@ -246,22 +280,40 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return Err(e);
                 }
             };
+            // Record the index in the durable catalog at `Online` (population is synchronous here, so a
+            // successful create ends `Online`). This becomes durable at the commit below, alongside the
+            // tokens; a crash mid-create recovers to the last committed catalog (no entry), and the
+            // failed create leaves no orphan registration.
+            store.set_node_property_index(label_token, prop_key, IndexState::Online);
             (label_token, prop_key)
         };
         self.store.borrow_mut().commit(txn)?;
 
-        // Register the index and (re)build it so existing rows are indexed.
-        self.index
-            .borrow_mut()
-            .register_node_property(label_token, prop_key);
+        // Register the index `Online` in the in-memory set and (re)build it so existing rows are
+        // indexed. The durable catalog and the in-memory set now agree.
+        self.index.borrow_mut().register_node_property_with_state(
+            label_token,
+            prop_key,
+            IndexState::Online,
+        );
         Self::rebuild_index(&self.store, &self.index);
         Ok(())
     }
 
     /// The physical planner's [`IndexCatalog`] reflecting the indexes this coordinator currently
     /// holds (`rmp` task #48, `04 §6.6`): a token-lookup entry for every label that has at least one
-    /// indexed node, and a single-property entry for every registered node-property index. Tokens
+    /// indexed node, and a single-property entry for every **`Online`** node-property index. Tokens
     /// with no resolvable name (a defensively-skipped impossibility for a live token) are omitted.
+    ///
+    /// # State gating (`rmp` task #90)
+    ///
+    /// Only an [`IndexState::Online`] node-property index is surfaced to the planner: a `Populating`
+    /// one is **withheld** so the planner never routes a seek to a half-built index — it falls back to
+    /// a label-scan + filter for that `(label, property)` until the index is promoted. The filtering
+    /// happens here ([`IndexSet::online_node_properties`]), so the `IndexCatalog` only ever contains
+    /// usable indexes and the physical planner needs no state awareness — the lowest-friction path.
+    /// The token-lookup (label) entries are unaffected: they come from the always-present label index,
+    /// not from any declared node-property index.
     pub fn catalog(&self) -> IndexCatalog {
         let mut builder = IndexCatalog::builder();
         let store = self.store.borrow();
@@ -271,7 +323,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 builder = builder.with_token_lookup(name);
             }
         }
-        for (label_token, prop_key) in self.index.borrow().registered_node_properties() {
+        for (label_token, prop_key) in self.index.borrow().online_node_properties() {
             let (Some(label), Some(property)) = (
                 store.token_name(Namespace::Label, label_token),
                 store.token_name(Namespace::PropKey, prop_key),
