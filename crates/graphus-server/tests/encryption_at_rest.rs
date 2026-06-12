@@ -102,7 +102,8 @@ async fn run_query(handle: &EngineHandle, query: &str) -> Vec<Vec<Value>> {
         .await
         .expect("begin auto-commit");
     let reply = handle
-        .run(ticket, query.to_owned(), Vec::new(), true)
+        // `None` privileges: the test harness runs unrestricted (no RBAC enforcement, rmp #93).
+        .run(ticket, query.to_owned(), Vec::new(), true, None)
         .await
         .expect("run statement");
     tokio::task::spawn_blocking(move || {

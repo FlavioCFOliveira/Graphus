@@ -12,13 +12,15 @@ use std::time::Instant;
 
 use graphus_core::error::GraphusError;
 use graphus_cypher::{
-    IndexCatalog, Parameters, Statistics, TxnCoordinator, analyze, bind_parameters, execute, lower,
-    parse_tokens, plan_physical_with_stats, tokenize,
+    AuthorizedGraph, GraphAccess, IndexCatalog, Parameters, PrivilegeOracle, Statistics,
+    TxnCoordinator, analyze, bind_parameters, execute, lower, parse_tokens,
+    plan_physical_with_stats, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
 use super::command::{AccessMode, Reply};
+use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, RowSender};
 use super::{OpenTx, RunReply, TxTicket};
 use crate::metrics::Metrics;
@@ -38,6 +40,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     query: &str,
     params: Vec<(String, graphus_core::Value)>,
     auto_commit: bool,
+    privileges: Option<EffectivePrivileges>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     reply: Reply<Result<RunReply, GraphusError>>,
@@ -100,7 +103,16 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     // the first row (so the consumer can drain concurrently), then streams. A compile/runtime error
     // before the first row is delivered through `reply` instead.
     let started = Instant::now();
-    let produced_ok = stream_rows(coordinator, txn, &plan, &bound, row_tx, row_rx, reply);
+    let produced_ok = stream_rows(
+        coordinator,
+        txn,
+        &plan,
+        &bound,
+        privileges,
+        row_tx,
+        row_rx,
+        reply,
+    );
 
     let elapsed = started.elapsed();
     metrics.observe_query_latency(elapsed);
@@ -149,11 +161,13 @@ fn compile(
 /// Returns `true` if execution completed with no runtime error (including the seam's captured-error
 /// channel being clean), `false` otherwise. A full bounded `row_tx` blocks here — the intended egress
 /// backpressure (`04 §9.3`).
+#[allow(clippy::too_many_arguments)] // Threads the per-statement seam + privileges + egress channel.
 fn stream_rows<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     txn: graphus_core::TxnId,
     plan: &graphus_cypher::PhysicalPlan,
     bound: &graphus_cypher::BoundParameters,
+    privileges: Option<EffectivePrivileges>,
     row_tx: RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     reply: Reply<Result<RunReply, GraphusError>>,
@@ -167,7 +181,71 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
             return false;
         }
     };
-    let mut cursor = match execute(plan, bound, &mut graph) {
+
+    // RBAC enforcement (rmp #93): when a restricted principal's privileges are present, wrap the seam
+    // in an `AuthorizedGraph` so every read/traversal is filtered and every denied write rejected at
+    // the `GraphAccess` boundary — uniformly for all connection types. When `privileges` is `None`
+    // (the internal/TCK/direct path) or the principal is unrestricted (an admin), no wrapper is
+    // installed and the seam runs verbatim (zero overhead). The decorator's own write-denial error is
+    // surfaced **in addition** to the seam's captured deferral error.
+    //
+    // The cursor borrows the graph (bare or wrapped) for the whole stream, so the streaming loop runs
+    // inside a scope that drops the cursor (and the wrapper) before we inspect the seam's
+    // `take_error`. `auth_error` carries any write denial back out of that scope.
+    let mut auth_error: Option<GraphusError> = None;
+    let produced_ok = match privileges {
+        Some(privileges) if !privileges.is_unrestricted() => {
+            let mut authz = AuthorizedGraph::new(&mut graph, privileges);
+            let ok = run_cursor(plan, bound, &mut authz, &row_tx, row_rx, reply);
+            // Capture the decorator's write-denial (if any) before it is dropped at end of scope.
+            auth_error = authz.take_auth_error();
+            ok
+        }
+        // No restriction (no principal, or an admin): run the bare seam, byte-identically to today.
+        _ => run_cursor(plan, bound, &mut graph, &row_tx, row_rx, reply),
+    };
+
+    if !produced_ok {
+        // A runtime error (or a disconnected consumer signalled as success) was already handled inside
+        // `run_cursor`; nothing more to surface.
+        return produced_ok;
+    }
+
+    // A denied write is a hard authorization failure: surface it as a terminal error item so the
+    // statement is rolled back (never committed with a half-applied or skipped write). Checked before
+    // the seam's deferral error because an authz denial is the more specific cause.
+    if let Some(err) = auth_error {
+        let _ = row_tx.send(Err(err));
+        return false;
+    }
+
+    // The seam captures deferral errors rather than emitting silently-wrong rows (the load-bearing
+    // `RecordStoreGraph` invariant); surface any as a runtime error terminal item.
+    if let Some(err) = graph.take_error() {
+        let _ = row_tx.send(Err(err));
+        return false;
+    }
+    // `row_tx` drops here, closing the channel so the consumer's `recv` ends.
+    true
+}
+
+/// Opens the cursor for `plan` over `graph` (the bare seam or an [`AuthorizedGraph`] wrapper), sends
+/// the [`RunReply`] before the first row, then streams each row into `row_tx`.
+///
+/// Returns `true` if streaming completed with no **runtime** error (a consumer disconnect counts as
+/// success — the caller handles the orphaned transaction). A compile/runtime error before the first
+/// row goes through `reply`; a runtime error mid-stream goes through `row_tx`. Authorization denials
+/// and seam-captured deferral errors are surfaced by the caller after this returns (they live on the
+/// `graph`/wrapper, not in the runtime error channel).
+fn run_cursor(
+    plan: &graphus_cypher::PhysicalPlan,
+    bound: &graphus_cypher::BoundParameters,
+    graph: &mut dyn GraphAccess,
+    row_tx: &RowSender,
+    row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
+    reply: Reply<Result<RunReply, GraphusError>>,
+) -> bool {
+    let mut cursor = match execute(plan, bound, graph) {
         Ok(c) => c,
         Err(e) => {
             let _ = reply.send(Err(GraphusError::Runtime(e.to_string())));
@@ -207,14 +285,6 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
             }
         }
     }
-
-    // The seam captures deferral errors rather than emitting silently-wrong rows (the load-bearing
-    // `RecordStoreGraph` invariant); surface any as a runtime error terminal item.
-    if let Some(err) = graph.take_error() {
-        let _ = row_tx.send(Err(err));
-        return false;
-    }
-    // `row_tx` drops here, closing the channel so the consumer's `recv` ends.
     true
 }
 

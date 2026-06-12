@@ -42,6 +42,7 @@ use crate::admin::{AdminContext, AdminParse, AdminResult};
 
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
+use super::privileges::EffectivePrivileges;
 use super::stream::RowReceiver;
 use super::{EngineHandle, RunSummary, TxTicket};
 
@@ -85,12 +86,18 @@ impl BoltEngineExecutor {
         )
     }
 
-    /// Admits and runs one statement on `handle` inside `ticket`, wrapping the engine reply as the
-    /// Bolt stream. Admission is taken on the **target database's** handle (per-db limits).
+    /// Admits and runs one statement on `handle` inside `ticket` against database `db`, wrapping the
+    /// engine reply as the Bolt stream. Admission is taken on the **target database's** handle (per-db
+    /// limits).
+    ///
+    /// `db` is the canonical session database the statement runs against; it scopes the principal's
+    /// fine-grained privileges (rmp #93), resolved once here from the shared live security catalog and
+    /// threaded into the engine so the executor enforces label/relationship/property access uniformly.
     fn run_on(
         &self,
         handle: &EngineHandle,
         ticket: TxTicket,
+        db: &str,
         query: &str,
         parameters: Vec<(String, Value)>,
         auto_commit: bool,
@@ -100,7 +107,21 @@ impl BoltEngineExecutor {
         let permit = handle
             .try_admit()
             .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
-        let reply = handle.run_blocking(ticket, query.to_owned(), parameters, auto_commit)?;
+        // Resolve the principal's effective privileges for this database once per statement, against
+        // the LIVE security catalog (rmp #93). A grant/revoke an admin just applied is therefore in
+        // effect on this very next statement. No principal / admin ⇒ an unrestricted pass-through.
+        let privileges = Some(EffectivePrivileges::resolve(
+            std::sync::Arc::clone(self.context.security()),
+            self.principal.as_deref(),
+            db,
+        ));
+        let reply = handle.run_blocking(
+            ticket,
+            query.to_owned(),
+            parameters,
+            auto_commit,
+            privileges,
+        )?;
         Ok(BoltEngineStream {
             fields: reply.fields,
             source: RowSource::Engine {
@@ -232,11 +253,11 @@ impl BoltExecutor for BoltEngineExecutor {
             TxControl::AutoCommit { mode, db } => {
                 // Resolve the target database at transaction begin (rmp #84): absent/empty `db`
                 // is the default database; a named one resolves through the catalog.
-                let (_name, handle) = self.context.resolve(db.as_deref())?;
+                let (name, handle) = self.context.resolve(db.as_deref())?;
                 // Open an internal auto-commit transaction the engine finalises on stream drain.
                 let ticket = handle.begin_auto_commit_blocking(from_bolt_mode(mode))?;
                 self.run_on(
-                    &handle, ticket, query, parameters, /* auto_commit */ true,
+                    &handle, ticket, &name, query, parameters, /* auto_commit */ true,
                 )
             }
             TxControl::InExplicit { db } => {
@@ -257,9 +278,10 @@ impl BoltExecutor for BoltEngineExecutor {
                         )));
                     }
                 }
-                let (handle, ticket) = (open.handle.clone(), open.ticket);
+                let (handle, ticket, pinned_db) =
+                    (open.handle.clone(), open.ticket, open.db.clone());
                 self.run_on(
-                    &handle, ticket, query, parameters, /* auto_commit */ false,
+                    &handle, ticket, &pinned_db, query, parameters, /* auto_commit */ false,
                 )
             }
         }

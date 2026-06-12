@@ -13,6 +13,7 @@
 
 use graphus_core::{GraphusError, Value};
 
+use super::privileges::EffectivePrivileges;
 use super::stream::RowReceiver;
 use crate::engine::TxTicket;
 
@@ -143,6 +144,20 @@ pub enum EngineCommand {
         params: Vec<(String, Value)>,
         /// Whether this is an auto-commit statement (commit on stream exhaustion).
         auto_commit: bool,
+        /// The principal's resolved fine-grained privileges for this statement, scoped to the
+        /// session database (rmp #93). `None` means **no RBAC enforcement** for this statement — the
+        /// internal / TCK / direct-test path, which behaves byte-identically to a server without
+        /// access control. `Some(_)` whose
+        /// [`is_unrestricted`](graphus_cypher::PrivilegeOracle::is_unrestricted) is `true` (an
+        /// admin) is likewise a pass-through; only a restricted principal triggers filtering. Built
+        /// once per statement in the connection seam (where the principal + database are known), the
+        /// engine wraps its [`graphus_cypher::GraphAccess`] seam in a
+        /// [`graphus_cypher::AuthorizedGraph`] when this is `Some`.
+        ///
+        /// Boxed so this (the only large) field does not inflate every `EngineCommand` variant on the
+        /// command channel (it is `None` on the common unrestricted path; one heap allocation per
+        /// restricted statement is negligible against compiling and executing the query).
+        privileges: Option<Box<EffectivePrivileges>>,
         /// Reply channel: the result stream, or a compile/runtime/transaction error.
         reply: Reply<Result<RunReply, GraphusError>>,
     },

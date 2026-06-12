@@ -50,6 +50,7 @@ use crate::admin::{AdminContext, AdminParse, AdminResult};
 
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
+use super::privileges::EffectivePrivileges;
 use super::stream::RowReceiver;
 use super::{EngineHandle, RunSummary, TxTicket};
 
@@ -74,8 +75,12 @@ pub struct RestEngineAdapter {
 struct OpenTx {
     handle: EngineHandle,
     ticket: TxTicket,
-    /// The principal that opened the transaction — authorizes admin statements at `run` time.
+    /// The principal that opened the transaction — authorizes admin statements at `run` time and
+    /// scopes the fine-grained query privileges resolved per statement (rmp #93).
     principal: String,
+    /// The canonical database the transaction is pinned to (resolved at `begin`). Scopes the
+    /// principal's label/relationship/property privileges for every statement (rmp #93).
+    db: String,
     /// Whether this is a client-managed explicit transaction (admin statements are rejected).
     explicit: bool,
 }
@@ -192,8 +197,9 @@ impl RestEngine for RestEngineAdapter {
     ) -> Result<TxHandle, GraphusError> {
         // Resolve the `{db}` segment (rmp #84): the configured default name is the default
         // database; anything else goes through the catalog. Unknown/offline → a clear error, and
-        // no transaction is opened.
-        let (_name, handle) = self.context.resolve(Some(db))?;
+        // no transaction is opened. The canonical `name` pins the transaction's database for the
+        // privilege scoping of every later statement (rmp #93).
+        let (name, handle) = self.context.resolve(Some(db))?;
         let ticket = handle.begin_blocking(from_rest_mode(mode))?;
         // Mint the public id only after the engine accepted the begin (no orphan table entries).
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -203,6 +209,7 @@ impl RestEngine for RestEngineAdapter {
                 handle,
                 ticket,
                 principal: origin.principal.to_owned(),
+                db: name,
                 explicit: origin.explicit,
             },
         );
@@ -253,6 +260,15 @@ impl RestEngine for RestEngineAdapter {
             .try_admit()
             .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
 
+        // Resolve the principal's effective privileges for the pinned database once per statement,
+        // against the LIVE security catalog (rmp #93) — a runtime grant/revoke is in effect on the
+        // next statement. No principal / admin ⇒ unrestricted pass-through.
+        let privileges = Some(EffectivePrivileges::resolve(
+            std::sync::Arc::clone(self.context.security()),
+            Some(&open.principal),
+            &open.db,
+        ));
+
         // REST always runs against an already-open handle (the router opens the auto-commit
         // transaction itself for the commit shortcut), so this is never auto-commit at the engine.
         let reply = open.handle.run_blocking(
@@ -260,6 +276,7 @@ impl RestEngine for RestEngineAdapter {
             query.to_owned(),
             parameters,
             /* auto_commit */ false,
+            privileges,
         )?;
         Ok(RestEngineStream {
             fields: reply.fields,

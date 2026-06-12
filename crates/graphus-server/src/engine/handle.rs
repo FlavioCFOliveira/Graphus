@@ -21,6 +21,7 @@ use super::command::{
     AccessMode, EngineCommand, IndexCommand, IndexDdlReply, ReplyReceiver, RunReply, RunSummary,
     reply_channel,
 };
+use super::privileges::EffectivePrivileges;
 use crate::metrics::Metrics;
 
 /// A permit proving a query has been admitted; releasing it (on drop) frees a slot and decrements
@@ -144,6 +145,9 @@ impl EngineHandle {
 
     /// Runs `query` with `params` inside `ticket`, returning the result stream.
     ///
+    /// `privileges` carries the principal's resolved fine-grained RBAC for this statement (rmp #93);
+    /// `None` (or an admin/unrestricted set) disables filtering. See [`EngineCommand::Run`].
+    ///
     /// # Errors
     /// [`GraphusError`] for a compile/runtime/transaction error raised before the first row.
     pub async fn run(
@@ -152,6 +156,7 @@ impl EngineHandle {
         query: String,
         params: Vec<(String, Value)>,
         auto_commit: bool,
+        privileges: Option<EffectivePrivileges>,
     ) -> Result<RunReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit(EngineCommand::Run {
@@ -159,6 +164,7 @@ impl EngineHandle {
             query,
             params,
             auto_commit,
+            privileges: privileges.map(Box::new),
             reply,
         })
         .await?;
@@ -257,6 +263,7 @@ impl EngineHandle {
         query: String,
         params: Vec<(String, Value)>,
         auto_commit: bool,
+        privileges: Option<EffectivePrivileges>,
     ) -> Result<RunReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit_blocking(EngineCommand::Run {
@@ -264,6 +271,7 @@ impl EngineHandle {
             query,
             params,
             auto_commit,
+            privileges: privileges.map(Box::new),
             reply,
         })?;
         recv_blocking(rx)?

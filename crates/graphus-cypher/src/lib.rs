@@ -108,6 +108,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod authorized_graph;
 pub mod binding;
 pub mod cardinality;
 pub mod catalog;
@@ -141,6 +142,7 @@ pub mod ternary;
 pub(crate) mod timezone;
 
 pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
+pub use authorized_graph::{AuthorizedGraph, PrivilegeOracle};
 pub use binding::{
     BindError, BoundParameters, ParamType, Parameters, bind_parameters, referenced_parameters,
 };

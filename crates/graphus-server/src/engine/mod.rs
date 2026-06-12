@@ -26,6 +26,7 @@
 pub mod command;
 mod exec;
 mod handle;
+pub mod privileges;
 mod seam_bolt;
 mod seam_rest;
 pub mod stream;
@@ -42,6 +43,7 @@ use graphus_wal::LogSink;
 
 pub use command::{AccessMode, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary};
 pub use handle::{EngineHandle, ServerBusy};
+pub use privileges::EffectivePrivileges;
 pub use seam_bolt::BoltEngineExecutor;
 pub use seam_rest::RestEngineAdapter;
 
@@ -217,6 +219,7 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
             query,
             params,
             auto_commit,
+            privileges,
             reply,
         } => {
             exec::handle_run(
@@ -226,6 +229,7 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
                 &query,
                 params,
                 auto_commit,
+                privileges.map(|p| *p),
                 result_buffer_capacity,
                 metrics,
                 reply,
