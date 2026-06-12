@@ -14,6 +14,12 @@
 //! - [`EncryptedBlockDevice`] / [`EncryptedFileDevice`] — a drop-in [`graphus_io::BlockDevice`] that
 //!   stores each page as `nonce(12) || tag(16) || ciphertext(8192)` in a single atomic slot, with a
 //!   non-secret header (magic, version, salt, KCV, logical page count) in physical slot 0.
+//! - [`EncryptedLogSink`] / [`EncryptedFileLogSink`] — a drop-in [`graphus_wal::LogSink`] (rmp #88)
+//!   that encrypts every synced batch of WAL bytes into one authenticated frame while presenting
+//!   **plaintext logical byte offsets upward**, so the WAL byte-offset == LSN invariant and the WAL
+//!   manager / recovery above the seam are byte-identical. A wrong/missing key fails closed at open
+//!   via a WAL Key-Check-Value, and a torn tail frame is dropped (the un-synced-tail-lost crash
+//!   semantics the plaintext sink already has).
 //!
 //! ## Cipher choice: AES-256-GCM
 //!
@@ -28,10 +34,10 @@
 //!
 //! ## Scope boundary
 //!
-//! This crate encrypts the **record-store device**. WAL and backup encryption, and **key rotation**,
-//! are sub-task #86 (the `info` label `"graphus/wal/aes-256-gcm/v1"` is reserved but not derived
-//! here). This crate's own code contains **no `unsafe`** (the RustCrypto crates use `unsafe`
-//! internally for SIMD, which is their concern, not ours).
+//! This crate encrypts the **record-store device** (rmp #85) and the **write-ahead log** (rmp #88,
+//! via [`EncryptedLogSink`]). Backup encryption and **key rotation** are sub-task #89. This crate's
+//! own code contains **no `unsafe`** (the RustCrypto crates use `unsafe` internally for SIMD, which
+//! is their concern, not ours).
 #![forbid(unsafe_code)]
 
 mod device;
@@ -39,9 +45,16 @@ mod header;
 mod keyring;
 mod raw;
 mod slot;
+mod wal_sink;
 
 pub use device::{EncryptedBlockDevice, EncryptedFileDevice};
 pub use header::{CIPHER_AES_256_GCM, HEADER_MAGIC, HEADER_SLOTS, HEADER_VERSION, Header};
-pub use keyring::{KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_SUBKEY_INFO, random_salt};
+pub use keyring::{
+    KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_SUBKEY_INFO, WAL_SUBKEY_INFO, random_salt,
+};
 pub use raw::{FileRawSlots, MemRawSlots, RawSlots};
 pub use slot::{NONCE_LEN, SLOT_SIZE, TAG_LEN};
+pub use wal_sink::{
+    EncryptedFileLogSink, EncryptedLogSink, WAL_CIPHER_AES_256_GCM, WAL_SINK_MAGIC,
+    WAL_SINK_VERSION,
+};

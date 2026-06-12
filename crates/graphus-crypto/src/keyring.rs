@@ -51,13 +51,23 @@ pub const KEY_LEN: usize = 32;
 pub const SALT_LEN: usize = 16;
 
 /// The HKDF `info` label for the record-store subkey (versioned, so a future scheme change is a new
-/// label rather than a silent reinterpretation of the same bytes). The WAL subkey label
-/// (`"graphus/wal/aes-256-gcm/v1"`) is reserved for sub-task #86 and intentionally not derived here.
+/// label rather than a silent reinterpretation of the same bytes).
 pub const STORE_SUBKEY_INFO: &[u8] = b"graphus/store/aes-256-gcm/v1";
+
+/// The HKDF `info` label for the write-ahead-log subkey (rmp #88). Distinct from
+/// [`STORE_SUBKEY_INFO`], so the WAL and store subkeys are independent even under the same master
+/// key + salt: a compromise of one derivation context cannot be replayed against the other. The
+/// version suffix means a future scheme change is a new label, never a silent reinterpretation.
+pub const WAL_SUBKEY_INFO: &[u8] = b"graphus/wal/aes-256-gcm/v1";
 
 /// The fixed plaintext encrypted under the store subkey to form the Key-Check-Value. Any fixed,
 /// non-secret constant works; this string documents its own purpose if ever seen in a hex dump.
 const KCV_PLAINTEXT: &[u8] = b"graphus-store-kcv-v1";
+
+/// The fixed plaintext encrypted under the WAL subkey to form the WAL Key-Check-Value. Distinct
+/// from [`KCV_PLAINTEXT`] so the two KCVs are visibly different artefacts in a hex dump (though the
+/// subkey separation already makes them cryptographically independent).
+const WAL_KCV_PLAINTEXT: &[u8] = b"graphus-wal-kcv-v1";
 
 /// The fixed nonce used for the KCV. A fixed nonce is safe here because the KCV plaintext is itself
 /// fixed and public: there is exactly one (plaintext, nonce) pair per key, so the GCM
@@ -82,6 +92,9 @@ pub struct Keyring {
     /// The derived record-store subkey (the master key is consumed into the HKDF and not retained
     /// beyond construction). Zeroized on drop.
     store_subkey: Zeroizing<[u8; KEY_LEN]>,
+    /// The derived write-ahead-log subkey (rmp #88), independent of [`Self::store_subkey`] via a
+    /// distinct HKDF `info` label. Zeroized on drop.
+    wal_subkey: Zeroizing<[u8; KEY_LEN]>,
 }
 
 impl std::fmt::Debug for Keyring {
@@ -105,7 +118,15 @@ impl Keyring {
         // HKDF-Expand cannot fail for a 32-byte output (well under the 255*HashLen ceiling).
         hkdf.expand(STORE_SUBKEY_INFO, store_subkey.as_mut_slice())
             .expect("INVARIANT: 32-byte HKDF output is always within the HKDF length bound");
-        Self { store_subkey }
+        // The WAL subkey shares the master key + salt (one salt source per store, rmp #88) but a
+        // distinct `info` label, so it is cryptographically independent of the store subkey.
+        let mut wal_subkey = Zeroizing::new([0u8; KEY_LEN]);
+        hkdf.expand(WAL_SUBKEY_INFO, wal_subkey.as_mut_slice())
+            .expect("INVARIANT: 32-byte HKDF output is always within the HKDF length bound");
+        Self {
+            store_subkey,
+            wal_subkey,
+        }
     }
 
     /// Parses operator-supplied key-file bytes into a 32-byte master key, then derives the keyring.
@@ -160,6 +181,49 @@ impl Keyring {
             Err(GraphusError::Security(
                 "wrong or missing encryption key: the store key-check-value does not match (the \
                  store cannot be opened with this key)"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    /// The AES-256-GCM AEAD primitive for write-ahead-log frames (rmp #88).
+    #[must_use]
+    pub fn wal_cipher(&self) -> Aes256Gcm {
+        // `new` cannot fail: the subkey is exactly the 32-byte AES-256 key length.
+        Aes256Gcm::new_from_slice(self.wal_subkey.as_slice())
+            .expect("INVARIANT: WAL subkey is exactly KEY_LEN (32) bytes — a valid AES-256 key")
+    }
+
+    /// Computes the Key-Check-Value for the WAL subkey: the GCM sealing of a fixed known constant
+    /// under a fixed nonce. Deterministic for a given key. Used by the encrypted WAL sink header so
+    /// a wrong or missing key fails closed at open, before any frame is decrypted.
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] if the AEAD seal fails (not expected for this fixed input).
+    pub fn compute_wal_kcv(&self) -> Result<Kcv> {
+        let cipher = self.wal_cipher();
+        let nonce = Nonce::from(KCV_NONCE);
+        cipher
+            .encrypt(&nonce, WAL_KCV_PLAINTEXT)
+            .map_err(|_| GraphusError::Security("computing WAL key-check-value failed".to_owned()))
+    }
+
+    /// Verifies a stored WAL KCV against this keyring **constant-time**, failing closed on mismatch
+    /// (the WAL analogue of [`Self::verify_store_kcv`]).
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] if the stored KCV does not match the one this key produces — i.e.
+    /// the configured key is wrong for this WAL (or the sink header is corrupt). The comparison is
+    /// constant-time (no timing oracle on key validity).
+    pub fn verify_wal_kcv(&self, stored: &[u8]) -> Result<()> {
+        let expected = self.compute_wal_kcv()?;
+        let ok = expected.len() == stored.len() && bool::from(expected.as_slice().ct_eq(stored));
+        if ok {
+            Ok(())
+        } else {
+            Err(GraphusError::Security(
+                "wrong or missing encryption key: the WAL key-check-value does not match (the \
+                 encrypted WAL cannot be opened with this key)"
                     .to_owned(),
             ))
         }
@@ -316,5 +380,57 @@ mod tests {
         // Vanishingly unlikely to be all zero; guards a broken RNG wiring.
         let s = random_salt();
         assert!(s.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn wal_kcv_round_trips() {
+        let kr = Keyring::from_key_file_bytes(&[0x44u8; KEY_LEN], &salt()).expect("keyring");
+        let kcv = kr.compute_wal_kcv().expect("wal kcv");
+        kr.verify_wal_kcv(&kcv).expect("verify own wal kcv");
+    }
+
+    #[test]
+    fn wrong_key_fails_wal_kcv_verification() {
+        let kr_a = Keyring::from_key_file_bytes(&[0x01u8; KEY_LEN], &salt()).expect("a");
+        let kr_b = Keyring::from_key_file_bytes(&[0x02u8; KEY_LEN], &salt()).expect("b");
+        let kcv_a = kr_a.compute_wal_kcv().expect("wal kcv a");
+        let err = kr_b
+            .verify_wal_kcv(&kcv_a)
+            .expect_err("wrong key must fail");
+        assert!(matches!(err, GraphusError::Security(_)));
+    }
+
+    #[test]
+    fn wal_and_store_subkeys_are_independent() {
+        // Same key + salt, but the WAL and store subkeys derive under distinct `info` labels, so
+        // their KCVs must differ and neither verifies the other's KCV. This is the purpose
+        // separation that keeps a compromise of one context from being replayed against the other.
+        let kr = Keyring::from_key_file_bytes(&[0x55u8; KEY_LEN], &salt()).expect("keyring");
+        let store_kcv = kr.compute_store_kcv().expect("store kcv");
+        let wal_kcv = kr.compute_wal_kcv().expect("wal kcv");
+        assert_ne!(
+            store_kcv, wal_kcv,
+            "the two subkeys must produce distinct KCVs"
+        );
+        assert!(
+            kr.verify_wal_kcv(&store_kcv).is_err(),
+            "the store KCV must not validate as a WAL KCV"
+        );
+        assert!(
+            kr.verify_store_kcv(&wal_kcv).is_err(),
+            "the WAL KCV must not validate as a store KCV"
+        );
+    }
+
+    #[test]
+    fn different_salt_derives_a_different_wal_subkey() {
+        let master = [0x77u8; KEY_LEN];
+        let kr1 = Keyring::from_key_file_bytes(&master, &[0xA0; SALT_LEN]).expect("kr1");
+        let kr2 = Keyring::from_key_file_bytes(&master, &[0xB0; SALT_LEN]).expect("kr2");
+        let kcv1 = kr1.compute_wal_kcv().expect("wal kcv1");
+        assert!(
+            kr2.verify_wal_kcv(&kcv1).is_err(),
+            "a different salt must not validate the other WAL's KCV"
+        );
     }
 }

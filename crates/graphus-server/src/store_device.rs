@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
-use graphus_crypto::{EncryptedFileDevice, Keyring};
+use graphus_crypto::{EncryptedFileDevice, EncryptedFileLogSink, Keyring};
 use graphus_io::{BlockDevice, FileBlockDevice, Page};
+use graphus_wal::{FileLogSink, LogSink};
 use zeroize::Zeroizing;
 
 /// The 256-bit master key for encryption at rest, loaded once at startup and shared (read-only)
@@ -180,6 +181,60 @@ impl BlockDevice for StoreDevice {
         match self {
             Self::Plain(d) => d.extend(additional),
             Self::Encrypted(d) => d.extend(additional),
+        }
+    }
+}
+
+/// The write-ahead-log sink: either a plaintext file sink (today's path, byte-identical) or an
+/// AES-256-GCM encrypted file sink (rmp #88). One enum so the engine stays single-monomorphised
+/// over its [`graphus_wal::LogSink`] parameter, exactly as [`StoreDevice`] does for the device.
+///
+/// The encrypted variant presents **plaintext logical byte offsets upward**, so the WAL byte-offset
+/// == LSN invariant is preserved and the plaintext path is byte-identical when no key is configured.
+/// The encrypted variant is boxed (it carries the expanded AES-GCM cipher state + the frame index),
+/// keeping the enum small so the plaintext path pays no size penalty.
+#[derive(Debug)]
+pub enum WalSink {
+    /// The plaintext path — unchanged from before WAL encryption existed.
+    Plain(FileLogSink),
+    /// The encrypted path — every synced batch is one AES-256-GCM frame (`graphus-crypto`). Boxed
+    /// to keep the enum small (see the type docs).
+    Encrypted(Box<EncryptedFileLogSink>),
+}
+
+impl LogSink for WalSink {
+    fn append(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Plain(s) => s.append(bytes),
+            Self::Encrypted(s) => s.append(bytes),
+        }
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        match self {
+            Self::Plain(s) => s.sync(),
+            Self::Encrypted(s) => s.sync(),
+        }
+    }
+
+    fn durable_len(&self) -> u64 {
+        match self {
+            Self::Plain(s) => s.durable_len(),
+            Self::Encrypted(s) => s.durable_len(),
+        }
+    }
+
+    fn buffered_len(&self) -> u64 {
+        match self {
+            Self::Plain(s) => s.buffered_len(),
+            Self::Encrypted(s) => s.buffered_len(),
+        }
+    }
+
+    fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::Plain(s) => s.read_durable(from, into),
+            Self::Encrypted(s) => s.read_durable(from, into),
         }
     }
 }

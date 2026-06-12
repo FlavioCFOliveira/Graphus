@@ -105,7 +105,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use graphus_core::GraphusError;
-use graphus_crypto::EncryptedFileDevice;
+use graphus_crypto::{EncryptedFileDevice, EncryptedFileLogSink, Keyring};
 use graphus_cypher::TxnCoordinator;
 use graphus_io::FileBlockDevice;
 use graphus_storage::RecordStore;
@@ -118,7 +118,7 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::engine::{Engine, EngineHandle, spawn_engine};
 use crate::metrics::Metrics;
-use crate::store_device::{MasterKey, StoreDevice};
+use crate::store_device::{MasterKey, StoreDevice, WalSink};
 
 /// The default database's name when the config does not override it.
 pub const DEFAULT_DATABASE_NAME: &str = "graphus";
@@ -481,35 +481,36 @@ fn open_or_create_coordinator(
     wal_file: &Path,
     pool_pages: usize,
     master_key: Option<&MasterKey>,
-) -> Result<TxnCoordinator<StoreDevice, FileLogSink>, GraphusError> {
+) -> Result<TxnCoordinator<StoreDevice, WalSink>, GraphusError> {
     let device_existing = device_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
 
     let mut store = if device_existing {
-        // Existing store: recover the WAL onto the device, then reopen. The WAL stays plaintext for
-        // THIS sub-task (#85); WAL encryption is #86. Recovery and reopen both run over the
-        // (possibly encrypted) `StoreDevice` through the `BlockDevice` seam — transparently decrypted.
+        // Existing store: recover the WAL onto the device, then reopen. Both the device and the WAL
+        // are (when a key is configured) encrypted; recovery and reopen run over the `BlockDevice`
+        // and `LogSink` seams — transparently decrypted. The WAL subkey is derived from the SAME
+        // master key + the store's salt (read from the device header), so the WAL and store share
+        // one salt source (rmp #88).
+        let keyring = wal_keyring_for_existing(device_file, master_key)?;
         let mut device = open_store_device(device_file, master_key)?;
-        let mut wal = WalManager::open(
-            FileLogSink::open(wal_file)
-                .map_err(|e| GraphusError::Storage(format!("opening WAL: {e}")))?,
-        )
-        .map_err(|e| GraphusError::Storage(format!("opening WAL manager: {e}")))?;
+        let mut wal = WalManager::open(open_wal_sink(wal_file, keyring.as_ref())?)
+            .map_err(|e| GraphusError::Storage(format!("opening WAL manager: {e}")))?;
         recover_device(&mut wal, &mut device)?;
         // Reopen the WAL fresh for serving (recovery consumed the recovery view).
-        let wal = WalManager::open(
-            FileLogSink::open(wal_file)
-                .map_err(|e| GraphusError::Storage(format!("reopening WAL: {e}")))?,
-        )
-        .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
+        let wal = WalManager::open(open_wal_sink(wal_file, keyring.as_ref())?)
+            .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
         RecordStore::open(device, wal, pool_pages)?
     } else {
-        // Fresh store on an empty device + a freshly-created WAL.
-        let device = create_store_device(device_file, master_key)?;
-        let wal = WalManager::create(
-            FileLogSink::open(wal_file)
-                .map_err(|e| GraphusError::Storage(format!("creating WAL: {e}")))?,
-        )
-        .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
+        // Fresh store on an empty device + a freshly-created WAL. Both share one freshly-generated
+        // per-store salt: the device persists it in its header; the WAL subkey is derived from it.
+        let salt = master_key.map(|_| graphus_crypto::random_salt());
+        let device = create_store_device(device_file, master_key, salt)?;
+        let keyring = salt.map(|s| {
+            master_key
+                .expect("INVARIANT: a salt is generated only when a master key is configured")
+                .keyring_for(&s)
+        });
+        let wal = WalManager::create(create_wal_sink(wal_file, keyring.as_ref())?)
+            .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
         // Seed element ids from 1 (`04 §2.2`).
         RecordStore::create(device, wal, pool_pages, 1)?
     };
@@ -522,19 +523,40 @@ fn open_or_create_coordinator(
     Ok(TxnCoordinator::new(store))
 }
 
+/// Derives the WAL keyring for an **existing** store by reading the per-store salt from the device
+/// header (the WAL and store share one salt source, rmp #88). Returns `None` for the plaintext path.
+///
+/// # Errors
+/// [`GraphusError`] if the device header cannot be read (the salt is needed to derive the WAL
+/// subkey). A wrong key is caught later by the WAL KCV at [`open_wal_sink`].
+fn wal_keyring_for_existing(
+    device_file: &Path,
+    master_key: Option<&MasterKey>,
+) -> Result<Option<Keyring>, GraphusError> {
+    match master_key {
+        None => Ok(None),
+        Some(key) => {
+            let header = EncryptedFileDevice::read_file_header(device_file)?;
+            Ok(Some(key.keyring_for(&header.salt)))
+        }
+    }
+}
+
 /// Creates a **fresh** record-store device for `device_file`: an encrypted file device when a master
-/// key is configured (a fresh per-store salt is generated and persisted in the header), or a
-/// plaintext file device otherwise (byte-identical to before encryption existed).
+/// key is configured (the given per-store `salt` is persisted in the header), or a plaintext file
+/// device otherwise (byte-identical to before encryption existed).
 fn create_store_device(
     device_file: &Path,
     master_key: Option<&MasterKey>,
+    salt: Option<[u8; graphus_crypto::SALT_LEN]>,
 ) -> Result<StoreDevice, GraphusError> {
     match master_key {
         None => Ok(StoreDevice::Plain(FileBlockDevice::open(device_file)?)),
         Some(key) => {
-            // Generate a fresh random salt for THIS store, derive its subkey, and create the
-            // encrypted device (writing the header: magic, salt, KCV).
-            let salt = graphus_crypto::random_salt();
+            // Use the shared per-store salt (also the WAL subkey's salt source), derive the subkey,
+            // and create the encrypted device (writing the header: magic, salt, KCV).
+            let salt =
+                salt.expect("INVARIANT: a salt is provided whenever a master key is configured");
             let keyring = key.keyring_for(&salt);
             Ok(StoreDevice::Encrypted(Box::new(
                 EncryptedFileDevice::create_file(device_file, &keyring, salt)?,
@@ -561,6 +583,35 @@ fn open_store_device(
                 EncryptedFileDevice::open_file(device_file, &keyring)?,
             )))
         }
+    }
+}
+
+/// Creates a **fresh** WAL sink for `wal_file`: an encrypted file sink when a `keyring` is given
+/// (writing the sink header: magic, version, WAL KCV), or a plaintext file sink otherwise
+/// (byte-identical to before WAL encryption existed). The keyring's WAL subkey was derived from the
+/// store's salt by the caller, so the WAL and store share one salt source (rmp #88).
+fn create_wal_sink(wal_file: &Path, keyring: Option<&Keyring>) -> Result<WalSink, GraphusError> {
+    let backing = FileLogSink::open(wal_file)
+        .map_err(|e| GraphusError::Storage(format!("creating WAL: {e}")))?;
+    match keyring {
+        None => Ok(WalSink::Plain(backing)),
+        Some(kr) => Ok(WalSink::Encrypted(Box::new(EncryptedFileLogSink::create(
+            backing, kr,
+        )?))),
+    }
+}
+
+/// Opens an **existing** WAL sink for `wal_file`: an encrypted file sink when a `keyring` is given
+/// (the sink header's magic + WAL KCV are validated — a wrong/missing key fails closed here, before
+/// any frame is decrypted, and a torn tail frame is dropped), or a plaintext file sink otherwise.
+fn open_wal_sink(wal_file: &Path, keyring: Option<&Keyring>) -> Result<WalSink, GraphusError> {
+    let backing = FileLogSink::open(wal_file)
+        .map_err(|e| GraphusError::Storage(format!("opening WAL: {e}")))?;
+    match keyring {
+        None => Ok(WalSink::Plain(backing)),
+        Some(kr) => Ok(WalSink::Encrypted(Box::new(EncryptedFileLogSink::open(
+            backing, kr,
+        )?))),
     }
 }
 

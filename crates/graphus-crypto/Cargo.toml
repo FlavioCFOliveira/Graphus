@@ -16,6 +16,11 @@ graphus-core = { path = "../graphus-core" }
 # The `BlockDevice` seam this crate implements (transparent page encryption lives at this boundary),
 # plus `PAGE_SIZE`/`Page`. The encrypted device is a drop-in `BlockDevice`.
 graphus-io = { path = "../graphus-io" }
+# The `LogSink` seam the WAL writes through (rmp #88): `EncryptedLogSink<S>` wraps a backing sink and
+# is itself a drop-in `LogSink`, so WAL encryption is transparent to `WalManager`/recovery. The
+# dependency direction is `graphus-crypto -> graphus-wal` ONLY (graphus-wal never depends on
+# graphus-crypto), keeping the graph acyclic.
+graphus-wal = { path = "../graphus-wal" }
 
 # AES-256-GCM AEAD: confidentiality + integrity + tamper-detection in one primitive, AES-NI
 # accelerated on every Graphus target (x86-64, arm64/aarch64 incl. Apple Silicon and Raspberry Pi 5).

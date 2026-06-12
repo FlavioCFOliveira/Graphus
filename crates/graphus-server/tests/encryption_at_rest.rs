@@ -1,11 +1,11 @@
-//! Server-level encryption-at-rest tests (rmp #85): a fresh server configured with an encryption
-//! key creates an **encrypted** store, writes data, and on restart with the **correct** key reads it
-//! back; with a **wrong** key, startup fails closed. A server with **no** key configured behaves
-//! exactly as before (plaintext store).
+//! Server-level encryption-at-rest tests (rmp #85, #88): a fresh server configured with an
+//! encryption key creates an **encrypted** store **and an encrypted WAL**, writes data, and on
+//! restart with the **correct** key reads it back; with a **wrong** key, startup fails closed. A
+//! server with **no** key configured behaves exactly as before (plaintext store + plaintext WAL).
 //!
 //! These boot a real in-process server over a fresh tempdir (UDS-only: no TLS, no network), mirroring
-//! `multi_database.rs`. WAL + backup encryption and key rotation are sub-task #86 — only the
-//! record-store device is encrypted here.
+//! `multi_database.rs`. Backup encryption and key rotation are sub-task #89 — the record-store device
+//! (#85) and the write-ahead log (#88) are both encrypted here.
 
 use std::path::PathBuf;
 
@@ -154,6 +154,19 @@ async fn encrypted_store_persists_and_reopens_with_the_correct_key() {
         "the label name must not appear in cleartext in the encrypted store file"
     );
 
+    // The WAL file is encrypted too (rmp #88): the label written through the WAL must not appear in
+    // cleartext, and the file must carry the encrypted-WAL sink magic ("GRAPHUSW") at its start.
+    let wal_file = temp.store_dir().join("graphus.wal");
+    let wal_bytes = std::fs::read(&wal_file).expect("read wal file");
+    assert!(
+        !wal_bytes.windows(b"Secret".len()).any(|w| w == b"Secret"),
+        "the label name must not appear in cleartext in the encrypted WAL file"
+    );
+    assert!(
+        wal_bytes.starts_with(b"GRAPHUSW"),
+        "the encrypted WAL begins with the encrypted-WAL sink magic"
+    );
+
     // Boot #2: with the SAME key the data reads back.
     let handle = boot(config_with_key(&temp, Some(key))).await;
     assert_eq!(
@@ -213,5 +226,19 @@ async fn plaintext_path_is_unchanged_without_a_key() {
     assert!(
         bytes.windows(b"Plain".len()).any(|w| w == b"Plain"),
         "a plaintext store stores label names in the clear (the encrypted store must not)"
+    );
+
+    // The plaintext WAL is byte-identical to before WAL encryption existed: no encrypted-WAL magic,
+    // and it carries the plaintext WAL magic ("GWAL", little-endian 0x4757414C) in its header.
+    let wal_file = temp.store_dir().join("graphus.wal");
+    let wal_bytes = std::fs::read(&wal_file).expect("read wal file");
+    assert!(
+        !wal_bytes.starts_with(b"GRAPHUSW"),
+        "a plaintext WAL must not carry the encrypted-WAL sink magic"
+    );
+    assert_eq!(
+        &wal_bytes[0..4],
+        &0x4757_414Cu32.to_le_bytes(),
+        "a plaintext WAL begins with the unchanged plaintext WAL magic"
     );
 }
