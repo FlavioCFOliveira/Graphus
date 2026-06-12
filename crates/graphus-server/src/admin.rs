@@ -82,12 +82,13 @@
 
 use std::sync::Arc;
 
-use graphus_auth::{Authenticator, Privilege};
+use graphus_auth::{AuthError, Privilege};
 use graphus_core::{GraphusError, Value};
 use tokio::runtime::Handle;
 
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{EngineHandle, IndexCommand};
+use crate::security::{SecurityCatalog, SecurityError};
 
 // ------------------------------------------------------------------------------------------------
 // Statement grammar
@@ -127,6 +128,185 @@ pub enum AdminCommand {
         /// The database name, as written.
         name: String,
     },
+
+    // ---- Security surface (rmp #92) ----
+    /// `CREATE USER <name> [SET PASSWORD '<pw>'] [IF NOT EXISTS]`.
+    CreateUser {
+        /// The username.
+        name: String,
+        /// The plaintext password from the `SET PASSWORD '<pw>'` clause, if present. Hashed (never
+        /// stored or logged in the clear) by the security catalog before persistence.
+        password: Option<String>,
+        /// Whether `IF NOT EXISTS` was present (an existing user becomes a no-op success).
+        if_not_exists: bool,
+    },
+    /// `DROP USER <name> [IF EXISTS]`.
+    DropUser {
+        /// The username.
+        name: String,
+        /// Whether `IF EXISTS` was present (a missing user becomes a no-op success).
+        if_exists: bool,
+    },
+    /// `CREATE ROLE <name> [IF NOT EXISTS]`.
+    CreateRole {
+        /// The role name.
+        name: String,
+        /// Whether `IF NOT EXISTS` was present.
+        if_not_exists: bool,
+    },
+    /// `DROP ROLE <name> [IF EXISTS]`.
+    DropRole {
+        /// The role name.
+        name: String,
+        /// Whether `IF EXISTS` was present.
+        if_exists: bool,
+    },
+    /// `GRANT ROLE <role> TO <user>`.
+    GrantRole {
+        /// The role to grant.
+        role: String,
+        /// The user to grant it to.
+        user: String,
+    },
+    /// `REVOKE ROLE <role> FROM <user>`.
+    RevokeRole {
+        /// The role to revoke.
+        role: String,
+        /// The user to revoke it from.
+        user: String,
+    },
+    /// `GRANT <action> ON <scope> TO <role>`.
+    GrantPrivilege {
+        /// The parsed action.
+        action: PrivAction,
+        /// The parsed scope.
+        scope: PrivScope,
+        /// The role to grant to.
+        role: String,
+    },
+    /// `REVOKE <action> ON <scope> FROM <role>`.
+    RevokePrivilege {
+        /// The parsed action.
+        action: PrivAction,
+        /// The parsed scope.
+        scope: PrivScope,
+        /// The role to revoke from.
+        role: String,
+    },
+    /// `SHOW USERS`.
+    ShowUsers,
+    /// `SHOW ROLES`.
+    ShowRoles,
+    /// `SHOW PRIVILEGES`.
+    ShowPrivileges,
+}
+
+/// A grantable action in the `GRANT`/`REVOKE` grammar (mirrors [`graphus_auth::Action`] but kept
+/// separate so the grammar is decoupled from the auth crate's `#[non_exhaustive]` enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivAction {
+    /// `TRAVERSE`.
+    Traverse,
+    /// `READ`.
+    Read,
+    /// `WRITE`.
+    Write,
+    /// `SCHEMA`.
+    Schema,
+    /// `ADMIN`.
+    Admin,
+}
+
+impl PrivAction {
+    /// Parses an action keyword (case-insensitive); `None` if it is not one of the five.
+    fn from_keyword(word: &str) -> Option<Self> {
+        match word.to_ascii_uppercase().as_str() {
+            "TRAVERSE" => Some(Self::Traverse),
+            "READ" => Some(Self::Read),
+            "WRITE" => Some(Self::Write),
+            "SCHEMA" => Some(Self::Schema),
+            "ADMIN" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+
+    /// Maps onto the auth crate's [`graphus_auth::Action`].
+    #[must_use]
+    pub fn to_action(self) -> graphus_auth::Action {
+        match self {
+            Self::Traverse => graphus_auth::Action::Traverse,
+            Self::Read => graphus_auth::Action::Read,
+            Self::Write => graphus_auth::Action::Write,
+            Self::Schema => graphus_auth::Action::Schema,
+            Self::Admin => graphus_auth::Action::Admin,
+        }
+    }
+}
+
+/// A grantable scope in the `GRANT`/`REVOKE` grammar. The accepted forms map 1:1 onto
+/// [`graphus_auth::Resource`]: `DATABASE`, `GRAPH <db>`, `LABEL <db>.<label>`,
+/// `RELATIONSHIP <db>.<rel_type>`, `PROPERTY <db>.<label>.<property>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivScope {
+    /// `DATABASE` — the whole server (every database).
+    Database,
+    /// `GRAPH <db>` — a whole named database.
+    Graph {
+        /// The database name.
+        db: String,
+    },
+    /// `LABEL <db>.<label>` — all nodes of one label in one database.
+    Label {
+        /// The database name.
+        db: String,
+        /// The node label.
+        label: String,
+    },
+    /// `RELATIONSHIP <db>.<rel_type>` — all relationships of one type in one database.
+    RelType {
+        /// The database name.
+        db: String,
+        /// The relationship type.
+        rel_type: String,
+    },
+    /// `PROPERTY <db>.<label>.<property>` — one property of one label's nodes in one database.
+    Property {
+        /// The database name.
+        db: String,
+        /// The node label.
+        label: String,
+        /// The property key.
+        property: String,
+    },
+}
+
+impl PrivScope {
+    /// Maps onto the auth crate's [`graphus_auth::Resource`].
+    #[must_use]
+    pub fn to_resource(&self) -> graphus_auth::Resource {
+        use graphus_auth::Resource;
+        match self {
+            Self::Database => Resource::Database,
+            Self::Graph { db } => Resource::Graph(db.clone()),
+            Self::Label { db, label } => Resource::Label {
+                db: db.clone(),
+                label: label.clone(),
+            },
+            Self::RelType { db, rel_type } => Resource::RelType {
+                db: db.clone(),
+                rel_type: rel_type.clone(),
+            },
+            Self::Property {
+                db,
+                label,
+                property,
+            } => Resource::Property {
+                db: db.clone(),
+                label: label.clone(),
+                property: property.clone(),
+            },
+        }
+    }
 }
 
 /// The outcome of matching a query string against the administrative grammar.
@@ -156,8 +336,11 @@ enum Tok {
     Word(String),
     /// A `` `backtick-quoted` `` name (taken verbatim, no keyword meaning).
     Quoted(String),
-    /// Any other single character (`(`, `:`, `'`, …) — never part of the admin grammar, so its
-    /// presence in a claimed statement is a syntax error and before claiming means "not admin".
+    /// A `'single'`- or `"double"`-quoted string literal — used for the `SET PASSWORD '<pw>'`
+    /// clause (the security surface). Taken verbatim, with `\\` and the matching quote escapable.
+    Str(String),
+    /// Any other single character (`(`, `:`, …) — never part of the admin grammar, so its presence
+    /// in a claimed statement is a syntax error and before claiming means "not admin".
     Symbol(char),
 }
 
@@ -201,6 +384,27 @@ impl<'a> Lexer<'a> {
             }
             self.rest = chars;
             return Ok(Some(Tok::Quoted(name)));
+        }
+
+        if first == '\'' || first == '"' {
+            // Quoted string literal (the `SET PASSWORD '<pw>'` clause). The closing delimiter is the
+            // same quote; `\\` escapes a backslash and `\<quote>` escapes the delimiter, so a
+            // password may contain the quote character.
+            let quote = first;
+            let mut s = String::new();
+            loop {
+                match chars.next() {
+                    Some('\\') => match chars.next() {
+                        Some(c) => s.push(c),
+                        None => return Err("unterminated string literal".to_owned()),
+                    },
+                    Some(c) if c == quote => break,
+                    Some(c) => s.push(c),
+                    None => return Err("unterminated string literal".to_owned()),
+                }
+            }
+            self.rest = chars;
+            return Ok(Some(Tok::Str(s)));
         }
 
         if is_word_char(first) {
@@ -251,18 +455,41 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         Tok::Word(w) => w.to_ascii_uppercase(),
         _ => return AdminParse::NotAdmin,
     };
+
+    // GRANT / REVOKE are never valid Cypher statement starts, so they are CLAIMED on the first token
+    // alone (the security surface, rmp #92). Their remainder must then parse exactly.
+    if verb == "GRANT" || verb == "REVOKE" {
+        return match parse_grant_revoke(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
     if !matches!(verb.as_str(), "CREATE" | "DROP" | "START" | "STOP" | "SHOW") {
         return AdminParse::NotAdmin;
     }
 
-    // Token 2: the DATABASE / DATABASES (database surface) or INDEX / INDEXES (index surface)
-    // keyword. (Reading it cannot legitimately fail for real Cypher here — a backtick directly after
-    // these verbs is not valid Cypher either — but an unterminated quote is still just "not ours" at
-    // this point.)
+    // Token 2: the surface keyword — DATABASE(S) (database surface), INDEX(ES) (index surface), or
+    // USER(S)/ROLE(S)/PRIVILEGES (security surface). (Reading it cannot legitimately fail for real
+    // Cypher here — a backtick directly after these verbs is not valid Cypher either — but an
+    // unterminated quote is still just "not ours" at this point.)
     let second = match lex.next_tok() {
         Ok(Some(t)) => t,
         _ => return AdminParse::NotAdmin,
     };
+
+    // --- Security surface (rmp #92): CREATE/DROP USER, CREATE/DROP ROLE, SHOW USERS/ROLES/PRIVILEGES ---
+    if is_keyword(&second, "USER")
+        || is_keyword(&second, "USERS")
+        || is_keyword(&second, "ROLE")
+        || is_keyword(&second, "ROLES")
+        || is_keyword(&second, "PRIVILEGES")
+    {
+        return match parse_claimed_security(&verb, &second, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
 
     // --- Database surface ---
     if is_keyword(&second, "DATABASE") || is_keyword(&second, "DATABASES") {
@@ -420,6 +647,331 @@ fn parse_index_legacy_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, Str
     Ok((label, property))
 }
 
+// ------------------------------------------------------------------------------------------------
+// Security surface (rmp #92): users, roles, grants
+// ------------------------------------------------------------------------------------------------
+
+/// Parses the remainder of a claimed **security** statement whose first two tokens are
+/// `verb` (`CREATE`/`DROP`/`SHOW`) + the surface keyword `second`
+/// (`USER`/`USERS`/`ROLE`/`ROLES`/`PRIVILEGES`):
+///
+/// ```text
+/// CREATE USER <name> [SET PASSWORD '<pw>'] [IF NOT EXISTS]
+/// DROP   USER <name> [IF EXISTS]
+/// CREATE ROLE <name> [IF NOT EXISTS]
+/// DROP   ROLE <name> [IF EXISTS]
+/// SHOW   USERS
+/// SHOW   ROLES
+/// SHOW   PRIVILEGES
+/// ```
+///
+/// A `<name>` is a bare word or a `` `backtick-quoted` `` name (the same rule as the database
+/// surface); a password is a `'single'`- or `"double"`-quoted string literal.
+fn parse_claimed_security(
+    verb: &str,
+    second: &Tok,
+    lex: &mut Lexer<'_>,
+) -> Result<AdminCommand, String> {
+    // The SHOW plurals are nullary.
+    if is_keyword(second, "USERS")
+        || is_keyword(second, "ROLES")
+        || is_keyword(second, "PRIVILEGES")
+    {
+        if verb != "SHOW" {
+            let kw = keyword_text(second);
+            return Err(format!(
+                "expected the singular form after {verb} ({kw} is only valid in SHOW {kw})"
+            ));
+        }
+        let what = format!("SHOW {}", keyword_text(second));
+        expect_end(lex, &what)?;
+        return Ok(if is_keyword(second, "USERS") {
+            AdminCommand::ShowUsers
+        } else if is_keyword(second, "ROLES") {
+            AdminCommand::ShowRoles
+        } else {
+            AdminCommand::ShowPrivileges
+        });
+    }
+
+    // Singular USER / ROLE: only CREATE and DROP (SHOW USER/ROLE singular is not a form).
+    let is_user = is_keyword(second, "USER");
+    let entity = if is_user { "USER" } else { "ROLE" };
+    if verb == "SHOW" {
+        return Err(format!(
+            "expected SHOW {entity}S (the singular SHOW {entity} is not supported)"
+        ));
+    }
+
+    // <name> next (bare word or backtick-quoted).
+    let name = expect_security_name(
+        lex,
+        &format!(
+            "a {} name after {verb} {entity}",
+            entity.to_ascii_lowercase()
+        ),
+    )?;
+
+    match (verb, is_user) {
+        ("CREATE", true) => {
+            // Optional SET PASSWORD '<pw>' then optional IF NOT EXISTS.
+            let password = parse_optional_set_password(lex)?;
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
+            expect_end(lex, "CREATE USER")?;
+            Ok(AdminCommand::CreateUser {
+                name,
+                password,
+                if_not_exists,
+            })
+        }
+        ("DROP", true) => {
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
+            expect_end(lex, "DROP USER")?;
+            Ok(AdminCommand::DropUser { name, if_exists })
+        }
+        ("CREATE", false) => {
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
+            expect_end(lex, "CREATE ROLE")?;
+            Ok(AdminCommand::CreateRole {
+                name,
+                if_not_exists,
+            })
+        }
+        ("DROP", false) => {
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
+            expect_end(lex, "DROP ROLE")?;
+            Ok(AdminCommand::DropRole { name, if_exists })
+        }
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here.
+        (other, _) => Err(format!("unsupported security verb {other}")),
+    }
+}
+
+/// Parses an optional `SET PASSWORD '<pw>'` clause (only consumed when the next token is `SET`).
+/// Returns the plaintext password if the clause was present. A partial clause is a syntax error.
+fn parse_optional_set_password(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    // Peek: only consume if the next token is SET.
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    match peek.next_tok()? {
+        Some(t) if is_keyword(&t, "SET") => {
+            lex.rest = peek.rest.clone();
+        }
+        _ => return Ok(None),
+    }
+    // PASSWORD '<pw>'
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, "PASSWORD") => {}
+        _ => return Err("expected PASSWORD after SET".to_owned()),
+    }
+    match lex.next_tok()? {
+        Some(Tok::Str(pw)) => Ok(Some(pw)),
+        Some(other) => Err(unexpected_generic(
+            &other,
+            "a quoted password after SET PASSWORD",
+        )),
+        None => Err("expected a quoted password after SET PASSWORD".to_owned()),
+    }
+}
+
+/// Parses `GRANT`/`REVOKE` (the verb already read, the statement already CLAIMED — GRANT/REVOKE are
+/// never valid Cypher). Two shapes:
+///
+/// ```text
+/// GRANT  ROLE <role> TO   <user>      REVOKE ROLE <role> FROM <user>
+/// GRANT  <action> ON <scope> TO <role>
+/// REVOKE <action> ON <scope> FROM <role>
+/// ```
+///
+/// `<action>` is `TRAVERSE`/`READ`/`WRITE`/`SCHEMA`/`ADMIN`; `<scope>` is parsed by
+/// [`parse_priv_scope`]. The trailing keyword is `TO` for `GRANT`, `FROM` for `REVOKE`.
+fn parse_grant_revoke(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
+    let granting = verb == "GRANT";
+    let connective = if granting { "TO" } else { "FROM" };
+
+    let second = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected ROLE or an action after {verb}"))?;
+
+    // GRANT/REVOKE ROLE <role> TO/FROM <user>
+    if is_keyword(&second, "ROLE") {
+        let role = expect_security_name(lex, &format!("a role name after {verb} ROLE"))?;
+        expect_security_keyword(lex, connective, verb)?;
+        let user = expect_security_name(lex, &format!("a user name after {connective}"))?;
+        expect_end(lex, &format!("{verb} ROLE"))?;
+        return Ok(if granting {
+            AdminCommand::GrantRole { role, user }
+        } else {
+            AdminCommand::RevokeRole { role, user }
+        });
+    }
+
+    // GRANT/REVOKE <action> ON <scope> TO/FROM <role>
+    let action = match &second {
+        Tok::Word(w) => PrivAction::from_keyword(w).ok_or_else(|| {
+            format!("unknown privilege action `{w}`; expected ROLE, TRAVERSE, READ, WRITE, SCHEMA or ADMIN")
+        })?,
+        other => {
+            return Err(unexpected_generic(
+                other,
+                &format!("ROLE or an action after {verb}"),
+            ));
+        }
+    };
+    expect_security_keyword(lex, "ON", verb)?;
+    let scope = parse_priv_scope(lex)?;
+    expect_security_keyword(lex, connective, verb)?;
+    let role = expect_security_name(lex, &format!("a role name after {connective}"))?;
+    expect_end(lex, verb)?;
+    Ok(if granting {
+        AdminCommand::GrantPrivilege {
+            action,
+            scope,
+            role,
+        }
+    } else {
+        AdminCommand::RevokePrivilege {
+            action,
+            scope,
+            role,
+        }
+    })
+}
+
+/// Parses a privilege `<scope>` in `GRANT`/`REVOKE`. The accepted forms map 1:1 onto the
+/// [`graphus_auth::Resource`] containment tree:
+///
+/// ```text
+/// DATABASE                                  -> Resource::Database  (server-wide)
+/// GRAPH <db>                                -> Resource::Graph
+/// LABEL <db>.<label>                        -> Resource::Label
+/// RELATIONSHIP <db>.<rel_type>              -> Resource::RelType
+/// PROPERTY <db>.<label>.<property>          -> Resource::Property
+/// ```
+///
+/// Each dotted form is read as the matching number of `.`-separated name segments. A segment is a
+/// bare word (no `.` — `.` is the segment separator) or a `` `backtick-quoted` `` name (which may
+/// contain a `.`). The grammar is deliberately small and unambiguous; it does not attempt to mirror
+/// Neo4j's full `GRANT … ON GRAPH … NODES …` surface, only the scopes the model represents.
+fn parse_priv_scope(lex: &mut Lexer<'_>) -> Result<PrivScope, String> {
+    let kw = lex.next_tok()?.ok_or_else(|| {
+        "expected a scope (DATABASE, GRAPH, LABEL, RELATIONSHIP or PROPERTY)".to_owned()
+    })?;
+    let kw_word = match &kw {
+        Tok::Word(w) => w.to_ascii_uppercase(),
+        other => {
+            return Err(unexpected_generic(
+                other,
+                "a scope (DATABASE, GRAPH, LABEL, RELATIONSHIP or PROPERTY)",
+            ));
+        }
+    };
+    match kw_word.as_str() {
+        "DATABASE" => Ok(PrivScope::Database),
+        "GRAPH" => {
+            let segments = parse_dotted_segments(lex, "GRAPH <db>")?;
+            let [db] = exactly(segments, 1, "GRAPH <db>")?;
+            Ok(PrivScope::Graph { db })
+        }
+        "LABEL" => {
+            let segments = parse_dotted_segments(lex, "LABEL <db>.<label>")?;
+            let [db, label] = exactly(segments, 2, "LABEL <db>.<label>")?;
+            Ok(PrivScope::Label { db, label })
+        }
+        "RELATIONSHIP" => {
+            let segments = parse_dotted_segments(lex, "RELATIONSHIP <db>.<rel_type>")?;
+            let [db, rel_type] = exactly(segments, 2, "RELATIONSHIP <db>.<rel_type>")?;
+            Ok(PrivScope::RelType { db, rel_type })
+        }
+        "PROPERTY" => {
+            let segments = parse_dotted_segments(lex, "PROPERTY <db>.<label>.<property>")?;
+            let [db, label, property] = exactly(segments, 3, "PROPERTY <db>.<label>.<property>")?;
+            Ok(PrivScope::Property {
+                db,
+                label,
+                property,
+            })
+        }
+        other => Err(format!(
+            "unknown scope `{other}`; expected DATABASE, GRAPH, LABEL, RELATIONSHIP or PROPERTY"
+        )),
+    }
+}
+
+/// Reads a dotted name path (`a.b.c`) as its `.`-separated segments. A bare word containing `.`
+/// (the lexer treats `.` as a word char) is split on `.`; a `` `backtick-quoted` `` segment keeps a
+/// literal `.` (it is one segment). Mixed forms are not supported — the whole path must be a single
+/// bare word OR a single backtick-quoted name; anything else is a syntax error naming `what`.
+///
+/// (This keeps the surface unambiguous: the common case `sales.Person.name` is one bare word the
+/// lexer hands back whole, and a name containing a literal dot must be fully backtick-quoted.)
+fn parse_dotted_segments(lex: &mut Lexer<'_>, what: &str) -> Result<Vec<String>, String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) => {
+            if w.is_empty() {
+                return Err(format!("expected {what}"));
+            }
+            Ok(w.split('.').map(str::to_owned).collect())
+        }
+        Some(Tok::Quoted(q)) => Ok(vec![q]),
+        Some(other) => Err(unexpected_generic(&other, what)),
+        None => Err(format!("expected {what}")),
+    }
+}
+
+/// Asserts a segment vector has exactly `n` non-empty segments, returning them as a fixed array.
+fn exactly<const N: usize>(
+    segments: Vec<String>,
+    n: usize,
+    what: &str,
+) -> Result<[String; N], String> {
+    if segments.len() != n || segments.iter().any(String::is_empty) {
+        return Err(format!("expected {what}"));
+    }
+    <[String; N]>::try_from(segments).map_err(|_| format!("expected {what}"))
+}
+
+/// Consumes a `<name>` for the security surface: a bare word or a `` `backtick-quoted` `` name.
+fn expect_security_name(lex: &mut Lexer<'_>, what: &str) -> Result<String, String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) => Ok(w),
+        Some(Tok::Quoted(q)) => Ok(q),
+        Some(other) => Err(unexpected_generic(&other, what)),
+        None => Err(format!("expected {what}")),
+    }
+}
+
+/// Consumes the (case-insensitive) keyword `kw`, with a generic (non-INDEX) error message.
+fn expect_security_keyword(lex: &mut Lexer<'_>, kw: &str, verb: &str) -> Result<(), String> {
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, kw) => Ok(()),
+        Some(t) => Err(unexpected_generic(&t, &format!("`{kw}` in {verb}"))),
+        None => Err(format!("expected `{kw}` in {verb}")),
+    }
+}
+
+/// The display text of a keyword token (for error messages); upper-cased for keywords.
+fn keyword_text(tok: &Tok) -> String {
+    match tok {
+        Tok::Word(w) => w.to_ascii_uppercase(),
+        Tok::Quoted(q) => q.clone(),
+        Tok::Str(s) => format!("'{s}'"),
+        Tok::Symbol(c) => c.to_string(),
+    }
+}
+
+/// Renders an "unexpected token" error without the INDEX-specific framing of [`unexpected`].
+fn unexpected_generic(tok: &Tok, expected: &str) -> String {
+    let got = match tok {
+        Tok::Word(w) => format!("`{w}`"),
+        Tok::Quoted(q) => format!("`{q}`"),
+        Tok::Str(s) => format!("'{s}'"),
+        Tok::Symbol(c) => format!("`{c}`"),
+    };
+    format!("unexpected {got}; expected {expected}")
+}
+
 /// Parses the remainder of a claimed statement (`verb` + `DATABASE`/`DATABASES` already read).
 fn parse_claimed(verb: &str, plural: bool, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
     if plural {
@@ -553,14 +1105,10 @@ fn expect_name(lex: &mut Lexer<'_>, what: &str, verb: &str) -> Result<String, St
     }
 }
 
-/// Renders an "unexpected token" syntax error.
+/// Renders an "unexpected token" syntax error (the index/database surface's framing; identical to
+/// [`unexpected_generic`], kept as the name those call sites read).
 fn unexpected(tok: &Tok, expected: &str) -> String {
-    let got = match tok {
-        Tok::Word(w) => format!("`{w}`"),
-        Tok::Quoted(q) => format!("`{q}`"),
-        Tok::Symbol(c) => format!("`{c}`"),
-    };
-    format!("unexpected {got}; expected {expected}")
+    unexpected_generic(tok, expected)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -587,17 +1135,18 @@ impl AdminResult {
 }
 
 /// The shared multi-database context of one server: **database targeting** (session `db` →
-/// [`EngineHandle`]) plus **administrative-statement execution** against the catalog, used by both
-/// connectivity seams. Cheap to clone (three `Arc`-shaped fields + a runtime handle).
+/// [`EngineHandle`]) plus **administrative-statement execution** against the database and security
+/// catalogs, used by both connectivity seams. Cheap to clone (`Arc`-shaped fields + a runtime
+/// handle).
 #[derive(Clone)]
 pub struct AdminContext {
     /// The database catalog (naming + lifecycle + the running-engine registry).
     catalog: Arc<DatabaseCatalog>,
-    /// The shared authenticator: admin statements are authorized against the same RBAC catalog as
-    /// every other operation (`04 §8.4`).
-    auth: Arc<Authenticator>,
-    /// The server runtime, for bridging the catalog's async lifecycle API from the synchronous
-    /// seams (module docs: why spawn + `std` channel, not `block_on`).
+    /// The live, durable security catalog: admin statements are authorized against the same RBAC
+    /// model as every other operation (`04 §8.4`), and the security commands (rmp #92) mutate it.
+    security: Arc<SecurityCatalog>,
+    /// The server runtime, for bridging the catalogs' async APIs from the synchronous seams (module
+    /// docs: why spawn + `std` channel, not `block_on`).
     runtime: Handle,
     /// The default database's engine handle — the fast path for sessions that never name a
     /// database, guaranteeing the single-db experience is byte-for-byte today's behaviour.
@@ -610,16 +1159,23 @@ impl AdminContext {
     #[must_use]
     pub fn new(
         catalog: Arc<DatabaseCatalog>,
-        auth: Arc<Authenticator>,
+        security: Arc<SecurityCatalog>,
         runtime: Handle,
         default_handle: EngineHandle,
     ) -> Self {
         Self {
             catalog,
-            auth,
+            security,
             runtime,
             default_handle,
         }
+    }
+
+    /// Shared access to the live security catalog (the listeners' authentication path resolves
+    /// through it so a `DROP USER` immediately invalidates that user's sessions).
+    #[must_use]
+    pub fn security(&self) -> &Arc<SecurityCatalog> {
+        &self.security
     }
 
     /// The (normalized) default database's name.
@@ -708,14 +1264,19 @@ impl AdminContext {
                 "administrative commands require an authenticated principal".to_owned(),
             )
         })?;
-        self.auth
-            .require(principal, &Privilege::admin_database())
-            .map_err(|_| {
-                GraphusError::Security(format!(
-                    "permission denied: administrative commands require the admin privilege \
-                     (user {principal:?} does not hold it)"
-                ))
-            })
+        // Read through the live security catalog (a brief read lock), so a just-revoked admin is
+        // denied immediately rather than against a stale snapshot.
+        let authorized = self
+            .security
+            .with_auth(|auth| auth.authorize(principal, &Privilege::admin_database()));
+        if authorized {
+            Ok(())
+        } else {
+            Err(GraphusError::Security(format!(
+                "permission denied: administrative commands require the admin privilege \
+                 (user {principal:?} does not hold it)"
+            )))
+        }
     }
 
     pub fn execute(
@@ -793,6 +1354,96 @@ impl AdminContext {
                     .collect();
                 Ok(show_result(filtered))
             }
+
+            // ---- Security surface (rmp #92) ----
+            AdminCommand::CreateUser {
+                name,
+                password,
+                if_not_exists,
+            } => self.run_security(*if_not_exists, false, {
+                let security = Arc::clone(&self.security);
+                let name = name.clone();
+                let password = password.clone();
+                move || async move { security.create_user(&name, password.as_deref()).await }
+            }),
+            AdminCommand::DropUser { name, if_exists } => self.run_security(false, *if_exists, {
+                let security = Arc::clone(&self.security);
+                let name = name.clone();
+                move || async move { security.drop_user(&name).await }
+            }),
+            AdminCommand::CreateRole {
+                name,
+                if_not_exists,
+            } => self.run_security(*if_not_exists, false, {
+                let security = Arc::clone(&self.security);
+                let name = name.clone();
+                move || async move { security.create_role(&name).await }
+            }),
+            AdminCommand::DropRole { name, if_exists } => self.run_security(false, *if_exists, {
+                let security = Arc::clone(&self.security);
+                let name = name.clone();
+                move || async move { security.drop_role(&name).await }
+            }),
+            AdminCommand::GrantRole { role, user } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let (role, user) = (role.clone(), user.clone());
+                move || async move { security.grant_role(&user, &role).await }
+            }),
+            AdminCommand::RevokeRole { role, user } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let (role, user) = (role.clone(), user.clone());
+                move || async move { security.revoke_role(&user, &role).await }
+            }),
+            AdminCommand::GrantPrivilege {
+                action,
+                scope,
+                role,
+            } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let role = role.clone();
+                let privilege = Privilege::new(action.to_action(), scope.to_resource());
+                move || async move { security.grant_privilege(&role, privilege).await }
+            }),
+            AdminCommand::RevokePrivilege {
+                action,
+                scope,
+                role,
+            } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let role = role.clone();
+                let privilege = Privilege::new(action.to_action(), scope.to_resource());
+                move || async move { security.revoke_privilege(&role, privilege).await }
+            }),
+            AdminCommand::ShowUsers => Ok(show_users(&self.security.list_users())),
+            AdminCommand::ShowRoles => Ok(show_roles(&self.security.list_roles())),
+            AdminCommand::ShowPrivileges => Ok(show_privileges(&self.security.list_privileges())),
+        }
+    }
+
+    /// Runs a security-catalog mutation on the runtime, applying the `IF [NOT] EXISTS` idempotency
+    /// rules: an `AlreadyExists` becomes a no-op success under `if_not_exists`, a `NotFound` becomes
+    /// a no-op success under `if_exists`. Every other [`SecurityError`] is mapped onto the engine
+    /// error model (client vs. server fault) by [`graphus_error_from_security`].
+    fn run_security<F, Fut>(
+        &self,
+        if_not_exists: bool,
+        if_exists: bool,
+        op: F,
+    ) -> Result<AdminResult, GraphusError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<(), SecurityError>> + Send + 'static,
+    {
+        let outcome = self.run_on_runtime(op())?;
+        match outcome {
+            Ok(()) => Ok(AdminResult::empty()),
+            Err(SecurityError::Rbac(AuthError::AlreadyExists { .. })) if if_not_exists => {
+                Ok(AdminResult::empty())
+            }
+            Err(SecurityError::Rbac(AuthError::NotFound { .. })) if if_exists => {
+                Ok(AdminResult::empty())
+            }
+            Err(e) => Err(graphus_error_from_security(&e)),
         }
     }
 
@@ -879,6 +1530,73 @@ fn show_result(infos: Vec<crate::dbcatalog::DbInfo>) -> AdminResult {
         })
         .collect();
     AdminResult { fields, rows }
+}
+
+/// Builds the `SHOW USERS` result: `user` (string), `roles` (comma-joined string), `passwordSet`
+/// (bool).
+fn show_users(users: &[crate::security::UserListing]) -> AdminResult {
+    let fields = vec![
+        "user".to_owned(),
+        "roles".to_owned(),
+        "passwordSet".to_owned(),
+    ];
+    let rows = users
+        .iter()
+        .map(|u| {
+            vec![
+                Value::String(u.name.clone()),
+                Value::String(u.roles.join(", ")),
+                Value::Boolean(u.has_password),
+            ]
+        })
+        .collect();
+    AdminResult { fields, rows }
+}
+
+/// Builds the `SHOW ROLES` result: `role` (string), `privilegeCount` (integer).
+fn show_roles(roles: &[crate::security::RoleListing]) -> AdminResult {
+    let fields = vec!["role".to_owned(), "privilegeCount".to_owned()];
+    let rows = roles
+        .iter()
+        .map(|r| {
+            vec![
+                Value::String(r.name.clone()),
+                Value::Integer(i64::try_from(r.privilege_count).unwrap_or(i64::MAX)),
+            ]
+        })
+        .collect();
+    AdminResult { fields, rows }
+}
+
+/// Builds the `SHOW PRIVILEGES` result: `role` (string), `action` (string), `scope` (string).
+fn show_privileges(privs: &[crate::security::PrivilegeListing]) -> AdminResult {
+    let fields = vec!["role".to_owned(), "action".to_owned(), "scope".to_owned()];
+    let rows = privs
+        .iter()
+        .map(|p| {
+            vec![
+                Value::String(p.role.clone()),
+                Value::String(p.action.clone()),
+                Value::String(p.scope.clone()),
+            ]
+        })
+        .collect();
+    AdminResult { fields, rows }
+}
+
+/// Maps a [`SecurityError`] onto the engine error model with the same client/server fault split as
+/// [`graphus_error_from_catalog`]: a client-fault RBAC rejection (unknown/duplicate user or role)
+/// and a lock-out refusal are [`GraphusError::Runtime`] (Bolt `Neo.ClientError.*`, HTTP 400); an
+/// I/O / corruption / encode fault is [`GraphusError::Storage`] (`Neo.DatabaseError.*`, HTTP 500).
+fn graphus_error_from_security(e: &SecurityError) -> GraphusError {
+    match e {
+        SecurityError::Rbac(_) | SecurityError::WouldLockOutAdmin { .. } => {
+            GraphusError::Runtime(e.to_string())
+        }
+        SecurityError::Io { .. } | SecurityError::Corrupt { .. } | SecurityError::Encode(_) => {
+            GraphusError::Storage(e.to_string())
+        }
+    }
 }
 
 /// Maps a [`CatalogError`] onto the engine error model with the client/server fault split the
@@ -1140,5 +1858,246 @@ mod tests {
             }
         );
         invalid("CREATE DATABASE sales;;");
+    }
+
+    // ---- security surface (rmp #92) -----------------------------------------------------------
+
+    #[test]
+    fn create_drop_user_forms() {
+        assert_eq!(
+            cmd("CREATE USER alice"),
+            AdminCommand::CreateUser {
+                name: "alice".to_owned(),
+                password: None,
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            cmd("CREATE USER alice SET PASSWORD 'hunter2'"),
+            AdminCommand::CreateUser {
+                name: "alice".to_owned(),
+                password: Some("hunter2".to_owned()),
+                if_not_exists: false,
+            }
+        );
+        // Double-quoted password, IF NOT EXISTS, trailing `;`, case-insensitive keywords.
+        assert_eq!(
+            cmd("  create user `Alice-2`  set password \"p w\"  if not exists ; "),
+            AdminCommand::CreateUser {
+                name: "Alice-2".to_owned(),
+                password: Some("p w".to_owned()),
+                if_not_exists: true,
+            }
+        );
+        // An escaped quote inside the password is taken literally.
+        assert_eq!(
+            cmd(r"CREATE USER bob SET PASSWORD 'a\'b'"),
+            AdminCommand::CreateUser {
+                name: "bob".to_owned(),
+                password: Some("a'b".to_owned()),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            cmd("DROP USER alice"),
+            AdminCommand::DropUser {
+                name: "alice".to_owned(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            cmd("drop user alice if exists"),
+            AdminCommand::DropUser {
+                name: "alice".to_owned(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn create_drop_role_forms() {
+        assert_eq!(
+            cmd("CREATE ROLE reader"),
+            AdminCommand::CreateRole {
+                name: "reader".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            cmd("create role reader if not exists"),
+            AdminCommand::CreateRole {
+                name: "reader".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            cmd("DROP ROLE reader IF EXISTS"),
+            AdminCommand::DropRole {
+                name: "reader".to_owned(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn grant_revoke_role_forms() {
+        assert_eq!(
+            cmd("GRANT ROLE reader TO alice"),
+            AdminCommand::GrantRole {
+                role: "reader".to_owned(),
+                user: "alice".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("revoke role reader from alice"),
+            AdminCommand::RevokeRole {
+                role: "reader".to_owned(),
+                user: "alice".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn grant_revoke_privilege_all_scopes() {
+        assert_eq!(
+            cmd("GRANT READ ON DATABASE TO reader"),
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Read,
+                scope: PrivScope::Database,
+                role: "reader".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("GRANT WRITE ON GRAPH sales TO writer"),
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Write,
+                scope: PrivScope::Graph {
+                    db: "sales".to_owned()
+                },
+                role: "writer".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("GRANT TRAVERSE ON LABEL sales.Person TO reader"),
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Traverse,
+                scope: PrivScope::Label {
+                    db: "sales".to_owned(),
+                    label: "Person".to_owned()
+                },
+                role: "reader".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("GRANT READ ON RELATIONSHIP sales.KNOWS TO reader"),
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Read,
+                scope: PrivScope::RelType {
+                    db: "sales".to_owned(),
+                    rel_type: "KNOWS".to_owned()
+                },
+                role: "reader".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("REVOKE READ ON PROPERTY sales.Person.ssn FROM reader"),
+            AdminCommand::RevokePrivilege {
+                action: PrivAction::Read,
+                scope: PrivScope::Property {
+                    db: "sales".to_owned(),
+                    label: "Person".to_owned(),
+                    property: "ssn".to_owned(),
+                },
+                role: "reader".to_owned(),
+            }
+        );
+        // Schema + Admin actions.
+        assert_eq!(
+            cmd("GRANT SCHEMA ON DATABASE TO dba"),
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Schema,
+                scope: PrivScope::Database,
+                role: "dba".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("GRANT ADMIN ON DATABASE TO dba"),
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Admin,
+                scope: PrivScope::Database,
+                role: "dba".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn priv_action_and_scope_map_onto_the_auth_model() {
+        // The grammar types lower exactly onto the auth crate's model.
+        assert_eq!(PrivAction::Read.to_action(), graphus_auth::Action::Read);
+        assert_eq!(PrivAction::Schema.to_action(), graphus_auth::Action::Schema);
+        assert_eq!(
+            PrivScope::Label {
+                db: "db".to_owned(),
+                label: "L".to_owned()
+            }
+            .to_resource(),
+            graphus_auth::Resource::Label {
+                db: "db".to_owned(),
+                label: "L".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn show_users_roles_privileges() {
+        assert_eq!(cmd("SHOW USERS"), AdminCommand::ShowUsers);
+        assert_eq!(cmd("show users ;"), AdminCommand::ShowUsers);
+        assert_eq!(cmd("SHOW ROLES"), AdminCommand::ShowRoles);
+        assert_eq!(cmd("SHOW PRIVILEGES"), AdminCommand::ShowPrivileges);
+    }
+
+    #[test]
+    fn security_grammar_never_swallows_cypher() {
+        // A node labelled User/Role, queries merely mentioning the words, prefixed identifiers.
+        not_admin("CREATE (n:User)");
+        not_admin("CREATE (n:User {name: 'x'}) RETURN n");
+        not_admin("MATCH (n:Role) RETURN n");
+        not_admin("RETURN 'CREATE USER alice'");
+        not_admin("CREATE USER_X"); // second token is not the keyword
+        not_admin("CREATE ROLE_X");
+        not_admin("SHOW CONSTRAINTS");
+        not_admin("showusers");
+        // GRANT/REVOKE are claimed by the first token (never valid Cypher), so a bare/garbled one
+        // is an Invalid admin syntax error, not passed through — verified below.
+    }
+
+    #[test]
+    fn claimed_but_malformed_security_is_a_syntax_error() {
+        invalid("CREATE USER"); // missing name
+        invalid("CREATE USER alice SET"); // partial SET PASSWORD
+        invalid("CREATE USER alice SET PASSWORD"); // missing the quoted password
+        invalid("CREATE USER alice SET PASSWORD secret"); // password must be quoted
+        invalid("CREATE USER alice IF EXISTS"); // CREATE takes IF NOT EXISTS
+        invalid("DROP USER alice IF NOT EXISTS"); // DROP takes IF EXISTS
+        invalid("DROP USER"); // missing name
+        invalid("SHOW USER"); // singular is not a form
+        invalid("SHOW ROLE");
+        invalid("SHOW USERS extra");
+        invalid("CREATE USERS alice"); // plural only valid for SHOW
+        invalid("CREATE USER alice SET PASSWORD 'unterminated"); // unterminated string literal
+
+        invalid("GRANT"); // missing everything
+        invalid("GRANT ROLE reader"); // missing TO <user>
+        invalid("GRANT ROLE reader FROM alice"); // GRANT uses TO, not FROM
+        invalid("REVOKE ROLE reader TO alice"); // REVOKE uses FROM, not TO
+        invalid("GRANT BOGUS ON DATABASE TO reader"); // unknown action
+        invalid("GRANT READ DATABASE TO reader"); // missing ON
+        invalid("GRANT READ ON BOGUS TO reader"); // unknown scope
+        invalid("GRANT READ ON GRAPH TO reader"); // GRAPH needs a db
+        invalid("GRANT READ ON LABEL sales TO reader"); // LABEL needs db.label
+        invalid("GRANT READ ON PROPERTY sales.Person TO reader"); // PROPERTY needs db.label.prop
+        invalid("GRANT READ ON LABEL sales.Person.extra TO reader"); // too many segments
+        invalid("GRANT READ ON DATABASE reader"); // missing TO
+        invalid("GRANT READ ON DATABASE TO reader extra"); // trailing
     }
 }

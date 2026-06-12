@@ -24,6 +24,7 @@ use crate::config::ServerConfig;
 use crate::dbcatalog::DatabaseCatalog;
 use crate::engine::EngineHandle;
 use crate::metrics::Metrics;
+use crate::security::SecurityCatalog;
 use crate::shutdown::ShutdownCoordinator;
 
 /// The bound listeners: their public addresses and the handles that keep the accept loops alive.
@@ -66,6 +67,7 @@ pub async fn start_all(
     config: &ServerConfig,
     engine: EngineHandle,
     catalog: Arc<DatabaseCatalog>,
+    security: Arc<SecurityCatalog>,
     auth: Arc<Authenticator>,
     clock: Arc<dyn Clock + Send + Sync>,
     tls: Option<Arc<RustlsServerConfig>>,
@@ -75,11 +77,12 @@ pub async fn start_all(
 ) -> Result<Listeners, String> {
     let tls_acceptor = tls.map(TlsAcceptor::from);
 
-    // The shared database-targeting + admin-statement context (rmp #84). One per server: both
-    // Bolt loops clone it per connection, the REST adapter holds one.
+    // The shared database-targeting + admin-statement context (rmp #84/#92). One per server: both
+    // Bolt loops clone it per connection, the REST adapter holds one. It carries the live
+    // `SecurityCatalog` (admin authorization + security-command execution + persistence).
     let context = AdminContext::new(
         Arc::clone(&catalog),
-        Arc::clone(&auth),
+        Arc::clone(&security),
         tokio::runtime::Handle::current(),
         engine.clone(),
     );

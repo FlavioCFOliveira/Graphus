@@ -32,6 +32,7 @@ pub mod key_rotation;
 pub mod listeners;
 pub mod metrics;
 pub mod observability;
+pub mod security;
 pub mod server;
 pub mod shutdown;
 pub mod store_device;

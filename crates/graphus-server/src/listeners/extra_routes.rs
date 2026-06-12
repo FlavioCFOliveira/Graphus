@@ -7,21 +7,24 @@
 //! are server-process concerns. They are merged onto the `graphus_rest` router so a single TCP+TLS
 //! listener serves the whole HTTP surface.
 //!
-//! ## Admin surface scope (honest minimalism)
+//! ## Admin surface scope
 //!
-//! The shared [`graphus_auth::Authenticator`] is held as `Arc<Authenticator>` because every auth
-//! check (Bolt, REST, UDS) borrows it immutably and the connectivity seams fix that shape. So the
-//! admin surface here covers what the immutable-shared catalog allows plus process control:
+//! These REST routes hold an `Arc<Authenticator>` **snapshot** for the Bearer-token auth check
+//! (the same point-in-time snapshot the Bolt/REST authentication path uses — see
+//! [`crate::security::SecurityCatalog::snapshot_authenticator`]). They cover inspection + process
+//! control:
 //!
 //! - `GET  /admin/status` — server status (open transactions, readiness).
 //! - `GET  /admin/users/{name}` — inspect a named user's roles (RBAC inspection).
 //! - `POST /admin/shutdown` — trigger graceful shutdown (`04 §9.4`).
 //!
 //! All `/admin/*` routes require an authenticated principal with the global `Admin` privilege.
-//! **Live user/role *mutation*** (create/drop/grant) needs the auth core behind a lock so the
-//! running, shared authenticator can be mutated; that is a documented follow-up requiring a
-//! `graphus-auth`/`graphus-rest` seam change (out of this crate's boundary). The inspection +
-//! shutdown surface is real and authenticated.
+//!
+//! **Live user/role *mutation*** (create/drop/grant) is delivered by the durable, lock-guarded
+//! [`crate::security::SecurityCatalog`] and the administrative-statement surface
+//! ([`crate::admin`], rmp #92): `CREATE USER`, `GRANT`, … run over Bolt/UDS/REST and persist to
+//! `security.toml`. (Those live mutations are not yet reflected in *this* snapshot until the next
+//! boot reloads the file — the authentication-hot-path propagation is the rmp #93 follow-up.)
 
 use std::sync::Arc;
 

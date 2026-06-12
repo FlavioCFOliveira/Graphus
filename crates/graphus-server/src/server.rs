@@ -4,7 +4,10 @@
 //! ## Startup sequence
 //!
 //! 1. Validate config; init logging + the slow-query threshold.
-//! 2. Build the [`graphus_auth::Authenticator`] (RBAC bootstrap, JWT secret, UDS uid map, TLS config).
+//! 2. Load the durable **security catalog** ([`crate::security`], rmp #92) — a present
+//!    `security.toml` is authoritative, an absent one seeds from config bootstrap and is persisted,
+//!    a malformed one fails startup closed. Derive the per-listener [`graphus_auth::Authenticator`]
+//!    snapshot (authentication) + TLS config from it.
 //! 3. Load the **database catalog** ([`crate::dbcatalog`], decision `D-multi-db`) — a malformed
 //!    catalog fails startup closed. Start the **default database's** engine thread, which
 //!    constructs the `!Send` `TxnCoordinator` *on the thread*: it opens-or-creates the
@@ -22,7 +25,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use graphus_auth::{Authenticator, Privilege};
+use graphus_auth::Authenticator;
 use graphus_core::capability::Clock;
 use graphus_io::FsyncPool;
 use rustls::ServerConfig as RustlsServerConfig;
@@ -33,6 +36,7 @@ use crate::engine::EngineHandle;
 use crate::listeners::{self, Listeners};
 use crate::metrics::Metrics;
 use crate::observability;
+use crate::security::SecurityCatalog;
 use crate::shutdown::ShutdownCoordinator;
 
 /// A monotonic-nanoseconds [`Clock`] backed by the OS clock, for REST tx expiry + JWT validity.
@@ -63,7 +67,10 @@ pub enum ServerError {
     /// Loading the durable database catalog failed (a malformed `databases.toml` fails startup
     /// closed — `crate::dbcatalog`).
     Catalog(crate::dbcatalog::CatalogError),
-    /// Building the RBAC bootstrap or TLS config failed.
+    /// Loading the durable security catalog failed (a malformed `security.toml` fails startup
+    /// closed — `crate::security`).
+    Security(crate::security::SecurityError),
+    /// Building the TLS config failed.
     Auth(String),
     /// Binding a listener socket failed.
     Listener(String),
@@ -75,6 +82,7 @@ impl std::fmt::Display for ServerError {
             Self::Config(e) => write!(f, "config error: {e}"),
             Self::Storage(e) => write!(f, "storage error: {e}"),
             Self::Catalog(e) => write!(f, "catalog error: {e}"),
+            Self::Security(e) => write!(f, "security catalog error: {e}"),
             Self::Auth(m) => write!(f, "auth setup error: {m}"),
             Self::Listener(m) => write!(f, "listener error: {m}"),
         }
@@ -186,8 +194,13 @@ impl Server {
         let config = self.config;
         let metrics = Arc::new(Metrics::new());
 
-        // 1) Auth: RBAC bootstrap + JWT secret + UDS uid map + (optional) TLS config.
-        let auth = Arc::new(build_authenticator(&config)?);
+        // 1) Security: load the durable, live RBAC model (rmp #92). A present `security.toml` is
+        //    authoritative; an absent one seeds from config bootstrap and is persisted; a malformed
+        //    one fails startup CLOSED (never silently resets the security model). The connectivity
+        //    seams' authentication path takes a point-in-time `Authenticator` snapshot of it; the
+        //    admin-statement + `/admin/*` surfaces hold the live `SecurityCatalog` and mutate it.
+        let security = Arc::new(SecurityCatalog::load(&config).map_err(ServerError::Security)?);
+        let auth = Arc::new(security.snapshot_authenticator());
         let tls = build_tls(&config, &auth)?;
 
         // 2) The database catalog + engines (`crate::dbcatalog`, decision `D-multi-db`): load the
@@ -221,6 +234,7 @@ impl Server {
             &config,
             handle.clone(),
             Arc::clone(&catalog),
+            Arc::clone(&security),
             Arc::clone(&auth),
             clock,
             tls,
@@ -293,65 +307,6 @@ async fn run_loop(
     drop(fsync_pool);
     tracing::info!("graphus-server shutdown complete");
     Ok(())
-}
-
-/// Builds the [`Authenticator`]: JWT secret, the bootstrap admin user (with password + UDS uid as
-/// configured) granted global `Admin`, plus the optional non-admin bootstrap users granted
-/// database read + write only (`04 §8.4` deny-by-default; the rmp-#84 admin surface is therefore
-/// closed to them).
-fn build_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerError> {
-    let mut auth = Authenticator::new(config.jwt_secret.as_bytes());
-
-    let admin = &config.auth.admin_user;
-    auth.catalog_mut()
-        .create_user(admin)
-        .map_err(|e| ServerError::Auth(format!("creating admin user: {e}")))?;
-    auth.catalog_mut()
-        .create_role("admin")
-        .map_err(|e| ServerError::Auth(format!("creating admin role: {e}")))?;
-    auth.catalog_mut()
-        .grant_privilege("admin", Privilege::admin_database())
-        .map_err(|e| ServerError::Auth(format!("granting admin privilege: {e}")))?;
-    auth.catalog_mut()
-        .grant_role(admin, "admin")
-        .map_err(|e| ServerError::Auth(format!("granting admin role: {e}")))?;
-
-    if !config.auth.admin_password.is_empty() {
-        auth.set_password(admin, &config.auth.admin_password)
-            .map_err(|e| ServerError::Auth(format!("setting admin password: {e}")))?;
-    }
-    if let Some(uid) = config.auth.admin_uid {
-        auth.peers_mut().map_uid(uid, admin.clone());
-    }
-
-    // Non-admin bootstrap users: one shared read+write role, created lazily.
-    if !config.auth.users.is_empty() {
-        auth.catalog_mut()
-            .create_role("readwrite")
-            .map_err(|e| ServerError::Auth(format!("creating readwrite role: {e}")))?;
-        auth.catalog_mut()
-            .grant_privilege("readwrite", Privilege::read_database())
-            .map_err(|e| ServerError::Auth(format!("granting read privilege: {e}")))?;
-        auth.catalog_mut()
-            .grant_privilege("readwrite", Privilege::write_database())
-            .map_err(|e| ServerError::Auth(format!("granting write privilege: {e}")))?;
-        for user in &config.auth.users {
-            auth.catalog_mut()
-                .create_user(&user.name)
-                .map_err(|e| ServerError::Auth(format!("creating user {:?}: {e}", user.name)))?;
-            auth.catalog_mut()
-                .grant_role(&user.name, "readwrite")
-                .map_err(|e| {
-                    ServerError::Auth(format!("granting readwrite to {:?}: {e}", user.name))
-                })?;
-            if !user.password.is_empty() {
-                auth.set_password(&user.name, &user.password).map_err(|e| {
-                    ServerError::Auth(format!("setting password for {:?}: {e}", user.name))
-                })?;
-            }
-        }
-    }
-    Ok(auth)
 }
 
 /// Builds the shared rustls [`RustlsServerConfig`] from the configured PEM material, or `None` if no

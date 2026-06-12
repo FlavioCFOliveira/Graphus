@@ -3,8 +3,7 @@
 //!
 //! An identity has the **same authorization regardless of entry point** (UDS / Bolt-TCP / REST),
 //! so the [`Catalog`] is the single source of truth that every listener resolves to. The model is
-//! deliberately small and enum-based (`D-security-scope` defers fine-grained access control to
-//! Phase 2):
+//! enum-based and **fine-grained** (rmp #92, the foundation half of `D-auth-scheme`):
 //!
 //! - A [`Privilege`] is an [`Action`] over a [`Resource`].
 //! - A [`Role`] owns a set of privileges.
@@ -13,9 +12,50 @@
 //! - [`Catalog::authorize`] unions the privileges of all the user's roles and answers a single
 //!   `(user, privilege)` question. **Deny by default**: anything not explicitly granted is denied.
 //!
-//! [`Action::Admin`] is a super-action: holding `Admin` over a resource implies every other action
-//! over that resource, and `Admin` over [`Resource::Database`] implies everything everywhere. This
-//! keeps the common "DBA can do anything" grant a single privilege rather than an enumeration.
+//! ## Actions (operation semantics, `04 §8.4`)
+//!
+//! The model separates the read pipeline into two graded actions, matching the Cypher access
+//! model (and Neo4j's): seeing that an element *exists / can be traversed* is weaker than reading
+//! its *properties*.
+//!
+//! - [`Action::Traverse`] — follow a relationship, and see that a node/relationship **exists**
+//!   (its identity and labels/type), without reading any property value.
+//! - [`Action::Read`] — read **property** values (and implies [`Action::Traverse`]: you cannot
+//!   read a node's properties without first being allowed to see the node).
+//! - [`Action::Write`] — create / set / delete data (`CREATE`/`SET`/`DELETE`/`MERGE`). A writer
+//!   must also be able to see and read what it mutates, so `Write` implies `Read` (and therefore
+//!   `Traverse`).
+//! - [`Action::Schema`] — manage indexes, constraints and other DDL (formerly `CreateIndex`).
+//! - [`Action::Admin`] — security + database administration; the super-action. Holding `Admin`
+//!   over a resource implies every other action over that resource, and `Admin` over
+//!   [`Resource::Database`] implies authority over everything, everywhere (the global root).
+//!
+//! The non-`Admin` ordering `Traverse ⊂ Read ⊂ Write` is a **graded** chain: a broader action
+//! implies the narrower read-side ones. `Schema` is orthogonal (DDL is neither a read nor a write
+//! of data) and is implied only by `Admin`.
+//!
+//! ## Resources (scope containment)
+//!
+//! Graphus is a multi-database server; a "graph" **is** a database (`D-multi-db`). Resources form a
+//! containment tree, broadest first:
+//!
+//! ```text
+//! Database                          (server-wide; Admin here is the global super-grant)
+//! └── Graph(db)                     (a whole named database)
+//!     ├── Label { db, label }       (all nodes of one label in that database)
+//!     ├── RelType { db, rel_type }  (all relationships of one type in that database)
+//!     └── Property { db, label, property }
+//!                                   (one property of one label's nodes in that database)
+//! ```
+//!
+//! A broader grant covers every narrower resource **within the same database**: `Graph(db)` covers
+//! any `Label`/`RelType`/`Property` whose `db` matches, and `Label { db, label }` covers
+//! `Property { db, label, .. }`. `Database` covers everything (it is database-agnostic — the
+//! server-wide scope). Scopes never cross database boundaries: a grant on `Graph("a")` says nothing
+//! about `Graph("b")`.
+//!
+//! **This module owns the model and its containment only.** It does **not** filter query results:
+//! the Cypher executor's enforcement of `Traverse`/`Read`/`Write` at element granularity is rmp #93.
 //!
 //! Password storage lives on the [`User`] but the hashing/verification primitives are in
 //! [`crate::password`]; this module only holds the opaque hash string.
@@ -24,33 +64,149 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{AuthError, Result};
 
-/// What an actor may do. [`Action::Admin`] implies all the others over the same resource.
+/// What an actor may do. [`Action::Admin`] implies all the others over the same resource; the
+/// read-side actions form the graded chain `Traverse ⊂ Read ⊂ Write` (module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Action {
-    /// Read data (`MATCH`, `RETURN`, traversals).
+    /// Follow a relationship and see that a node/relationship exists (identity + labels/type), but
+    /// **not** read its property values. The weakest data action.
+    Traverse,
+    /// Read property values (`MATCH … RETURN n.prop`). Implies [`Action::Traverse`].
     Read,
-    /// Mutate data (`CREATE`/`SET`/`DELETE`/`MERGE`).
+    /// Mutate data (`CREATE`/`SET`/`DELETE`/`MERGE`). Implies [`Action::Read`] (and so `Traverse`):
+    /// a writer must be able to see and read what it changes.
     Write,
-    /// Create or drop indexes and constraints (schema/DDL).
-    CreateIndex,
-    /// Administrative authority: implies every other action over the same resource, and over
-    /// [`Resource::Database`] implies authority over every named graph too.
+    /// Manage indexes, constraints and other schema/DDL. Orthogonal to the read/write chain; only
+    /// [`Action::Admin`] implies it. (Formerly `CreateIndex`.)
+    Schema,
+    /// Administrative authority (security + database administration): implies every other action
+    /// over the same resource, and over [`Resource::Database`] implies authority over everything,
+    /// everywhere (the global root).
     Admin,
 }
 
-/// What a [`Privilege`] applies to.
+impl Action {
+    /// Returns `true` if holding `self` (over a covered resource) is sufficient to satisfy a request
+    /// for `wanted`. Encodes the graded read-side chain `Traverse ⊂ Read ⊂ Write` plus the
+    /// `Admin`-implies-everything rule; `Schema` is implied only by `Admin` (and itself).
+    ///
+    /// This is action-only containment: the *resource* must already be covered by the caller
+    /// ([`Privilege::implies`] checks the resource first).
+    #[must_use]
+    fn implies(self, wanted: Action) -> bool {
+        if self == Action::Admin {
+            // Admin is the super-action over a covered resource: it implies every other action.
+            return true;
+        }
+        match wanted {
+            // The graded read chain: Write ⊇ Read ⊇ Traverse.
+            Action::Traverse => matches!(self, Action::Traverse | Action::Read | Action::Write),
+            Action::Read => matches!(self, Action::Read | Action::Write),
+            Action::Write => self == Action::Write,
+            // Schema and Admin are not implied by any non-Admin action; only an exact match works
+            // (Admin was handled above, so for `wanted == Admin` only `self == Admin` reaches here,
+            // which it never does — the early return covered it; an exact `Schema` is the case).
+            Action::Schema => self == Action::Schema,
+            Action::Admin => false,
+        }
+    }
+}
+
+/// What a [`Privilege`] applies to (the containment tree — see the module docs).
 ///
 /// `Ord`/`Hash` make a `(Action, Resource)` pair usable directly as a `BTreeSet` key, which is how
-/// a [`Role`] stores its grants.
+/// a [`Role`] stores its grants. Names (`db`, `label`, `rel_type`, `property`) are stored verbatim;
+/// the catalog normalizes a database name at the lifecycle layer, so a grant's `db` is expected to
+/// already be the canonical (lowercase) database name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Resource {
-    /// The whole database (server-wide scope). `Admin` here is the global super-grant.
+    /// The whole server (every database). `Admin` here is the global super-grant; any other action
+    /// here applies to every database.
     Database,
-    /// A single named graph. Graphus is a multigraph server, so most data privileges are scoped to
-    /// a graph by name.
+    /// A whole named database (a "graph", `D-multi-db`). Covers every label, relationship type and
+    /// property within that database.
     Graph(String),
+    /// All nodes of one label in one database. Covers [`Resource::Property`] of that same label.
+    Label {
+        /// The (canonical) database name.
+        db: String,
+        /// The node label.
+        label: String,
+    },
+    /// All relationships of one type in one database.
+    RelType {
+        /// The (canonical) database name.
+        db: String,
+        /// The relationship type.
+        rel_type: String,
+    },
+    /// One property of one label's nodes in one database — the narrowest scope.
+    Property {
+        /// The (canonical) database name.
+        db: String,
+        /// The node label the property belongs to.
+        label: String,
+        /// The property key.
+        property: String,
+    },
+}
+
+impl Resource {
+    /// Returns `true` if holding a grant scoped to `self` covers a request scoped to `wanted`
+    /// (the resource containment tree — module docs). Database-agnostic [`Resource::Database`]
+    /// covers everything; otherwise scopes never cross database boundaries.
+    #[must_use]
+    fn covers(&self, wanted: &Resource) -> bool {
+        match self {
+            // The server-wide scope covers every resource in every database.
+            Resource::Database => true,
+            // A whole database covers anything within that same database.
+            Resource::Graph(db) => wanted.database() == Some(db.as_str()),
+            // A label covers itself and its properties, within the same database.
+            Resource::Label { db, label } => match wanted {
+                Resource::Label {
+                    db: wdb,
+                    label: wlabel,
+                } => db == wdb && label == wlabel,
+                Resource::Property {
+                    db: wdb,
+                    label: wlabel,
+                    ..
+                } => db == wdb && label == wlabel,
+                _ => false,
+            },
+            // A relationship-type scope covers only the exact same relationship type.
+            Resource::RelType { db, rel_type } => matches!(
+                wanted,
+                Resource::RelType { db: wdb, rel_type: wrt } if db == wdb && rel_type == wrt
+            ),
+            // A property is the leaf: it covers only itself.
+            Resource::Property {
+                db,
+                label,
+                property,
+            } => matches!(
+                wanted,
+                Resource::Property { db: wdb, label: wlabel, property: wprop }
+                    if db == wdb && label == wlabel && property == wprop
+            ),
+        }
+    }
+
+    /// The database name a resource is scoped to, or `None` for the database-agnostic
+    /// server-wide [`Resource::Database`] scope.
+    #[must_use]
+    pub fn database(&self) -> Option<&str> {
+        match self {
+            Resource::Database => None,
+            Resource::Graph(db)
+            | Resource::Label { db, .. }
+            | Resource::RelType { db, .. }
+            | Resource::Property { db, .. } => Some(db.as_str()),
+        }
+    }
 }
 
 /// A single grantable privilege: an [`Action`] over a [`Resource`].
@@ -69,52 +225,89 @@ impl Privilege {
         Self { action, resource }
     }
 
-    /// `Read` over the whole database.
+    /// `Read` over the whole server (every database).
     #[must_use]
     pub fn read_database() -> Self {
         Self::new(Action::Read, Resource::Database)
     }
 
-    /// `Write` over the whole database.
+    /// `Write` over the whole server (every database).
     #[must_use]
     pub fn write_database() -> Self {
         Self::new(Action::Write, Resource::Database)
     }
 
-    /// `Admin` over the whole database — the global super-grant.
+    /// `Admin` over the whole server — the global super-grant.
     #[must_use]
     pub fn admin_database() -> Self {
         Self::new(Action::Admin, Resource::Database)
     }
 
+    /// An action over a whole named database (`Graph(db)`).
+    #[must_use]
+    pub fn on_graph(action: Action, db: impl Into<String>) -> Self {
+        Self::new(action, Resource::Graph(db.into()))
+    }
+
+    /// An action over all nodes of one label in one database.
+    #[must_use]
+    pub fn on_label(action: Action, db: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::new(
+            action,
+            Resource::Label {
+                db: db.into(),
+                label: label.into(),
+            },
+        )
+    }
+
+    /// An action over all relationships of one type in one database.
+    #[must_use]
+    pub fn on_rel_type(action: Action, db: impl Into<String>, rel_type: impl Into<String>) -> Self {
+        Self::new(
+            action,
+            Resource::RelType {
+                db: db.into(),
+                rel_type: rel_type.into(),
+            },
+        )
+    }
+
+    /// An action over one property of one label's nodes in one database (the narrowest scope).
+    #[must_use]
+    pub fn on_property(
+        action: Action,
+        db: impl Into<String>,
+        label: impl Into<String>,
+        property: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            action,
+            Resource::Property {
+                db: db.into(),
+                label: label.into(),
+                property: property.into(),
+            },
+        )
+    }
+
     /// Returns `true` if holding `self` is sufficient to satisfy a request for `wanted`.
     ///
-    /// This encodes the implication rules (deny-by-default is enforced by the *caller* iterating
-    /// only over granted privileges, never here):
+    /// This composes the two containment dimensions (deny-by-default is enforced by the *caller*
+    /// iterating only over granted privileges, never here):
     ///
-    /// 1. An exact match always implies.
-    /// 2. `Admin` over the same resource implies any action over that resource.
-    /// 3. `Admin` over [`Resource::Database`] implies any action over any resource (global root).
-    /// 4. A *database-wide* grant of an action implies that same action on any named graph
-    ///    (database scope contains graph scope), e.g. database `Read` covers `Read` on `Graph(g)`.
+    /// 1. **Resource containment**: `self`'s scope must cover `wanted`'s —
+    ///    `Database ⊇ Graph(db) ⊇ {Label, RelType, Property}` within that `db`, and
+    ///    `Label ⊇ Property` of the same label (module docs). Scopes never cross databases.
+    /// 2. **Action containment**: over a covered resource, `Admin` implies every action and the
+    ///    read-side chain grades `Traverse ⊂ Read ⊂ Write`; `Schema` is implied only by `Admin` or
+    ///    an exact `Schema`.
+    ///
+    /// In particular `Admin` over [`Resource::Database`] implies everything, everywhere (the global
+    /// root), because `Resource::Database` covers every resource and `Admin` implies every action.
     #[must_use]
     pub fn implies(&self, wanted: &Privilege) -> bool {
-        // Rule 3: global Admin is root over everything.
-        if self.action == Action::Admin && self.resource == Resource::Database {
-            return true;
-        }
-        // Resource containment: a Database-scoped grant covers the same-or-narrower resource;
-        // a Graph-scoped grant covers only that exact graph.
-        let resource_covers = match (&self.resource, &wanted.resource) {
-            (Resource::Database, _) => true,
-            (Resource::Graph(a), Resource::Graph(b)) => a == b,
-            (Resource::Graph(_), Resource::Database) => false,
-        };
-        if !resource_covers {
-            return false;
-        }
-        // Rule 2: Admin over a covered resource implies any action; otherwise actions must match.
-        self.action == Action::Admin || self.action == wanted.action
+        self.resource.covers(&wanted.resource) && self.action.implies(wanted.action)
     }
 }
 
@@ -233,6 +426,31 @@ impl Catalog {
         self.users.contains_key(name)
     }
 
+    /// Iterates over every user (name → [`User`]) in deterministic (name) order. Used by the
+    /// durable security-catalog serializer in `graphus-server`.
+    pub fn users(&self) -> impl Iterator<Item = (&str, &User)> {
+        self.users.iter().map(|(name, user)| (name.as_str(), user))
+    }
+
+    /// Sets (or clears) a user's stored password **hash** directly, without re-hashing — the load
+    /// path of the durable security catalog (a hash read back from disk is restored verbatim;
+    /// re-hashing a plaintext is [`crate::Authenticator::set_password`]).
+    ///
+    /// Never accepts a plaintext: the argument is already a PHC hash string (or `None` to clear).
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if the user does not exist.
+    pub fn set_user_password_hash(&mut self, name: &str, hash: Option<String>) -> Result<()> {
+        let user = self
+            .users
+            .get_mut(name)
+            .ok_or_else(|| AuthError::NotFound {
+                what: format!("user {name}"),
+            })?;
+        user.password_hash = hash;
+        Ok(())
+    }
+
     // ---- Role CRUD ---------------------------------------------------------------------------
 
     /// Creates a new, empty role.
@@ -273,6 +491,18 @@ impl Catalog {
     #[must_use]
     pub fn role(&self, name: &str) -> Option<&Role> {
         self.roles.get(name)
+    }
+
+    /// Returns `true` if a role of that name exists.
+    #[must_use]
+    pub fn has_role(&self, name: &str) -> bool {
+        self.roles.contains_key(name)
+    }
+
+    /// Iterates over every role (name → [`Role`]) in deterministic (name) order. Used by the
+    /// durable security-catalog serializer in `graphus-server`.
+    pub fn roles(&self) -> impl Iterator<Item = (&str, &Role)> {
+        self.roles.iter().map(|(name, role)| (name.as_str(), role))
     }
 
     // ---- Grants ------------------------------------------------------------------------------
@@ -442,17 +672,23 @@ mod tests {
         c.grant_privilege("dba", Privilege::admin_database())
             .unwrap();
         c.grant_role("root", "dba").unwrap();
-        // Global Admin satisfies Read, Write, CreateIndex on the DB...
+        // Global Admin satisfies Traverse, Read, Write, Schema on the server...
+        assert!(c.authorize(
+            "root",
+            &Privilege::new(Action::Traverse, Resource::Database)
+        ));
         assert!(c.authorize("root", &Privilege::read_database()));
         assert!(c.authorize("root", &Privilege::write_database()));
+        assert!(c.authorize("root", &Privilege::new(Action::Schema, Resource::Database)));
+        // ...and any action on any narrower resource (database scope contains everything within).
+        assert!(c.authorize("root", &Privilege::on_graph(Action::Write, "social")));
         assert!(c.authorize(
             "root",
-            &Privilege::new(Action::CreateIndex, Resource::Database)
+            &Privilege::on_label(Action::Read, "social", "Person")
         ));
-        // ...and any action on any named graph (database scope contains graph scope).
         assert!(c.authorize(
             "root",
-            &Privilege::new(Action::Write, Resource::Graph("social".to_owned()))
+            &Privilege::on_property(Action::Write, "social", "Person", "name")
         ));
     }
 
@@ -465,15 +701,19 @@ mod tests {
             .unwrap();
         c.grant_role("dave", "reader").unwrap();
         // Database-wide Read covers Read on a specific graph...
+        assert!(c.authorize("dave", &Privilege::on_graph(Action::Read, "g")));
+        // ...and Read on a label/property within it (read implies traverse, scope contains scope).
+        assert!(c.authorize("dave", &Privilege::on_label(Action::Read, "g", "Person")));
         assert!(c.authorize(
             "dave",
-            &Privilege::new(Action::Read, Resource::Graph("g".to_owned()))
+            &Privilege::on_label(Action::Traverse, "g", "Person")
+        ));
+        assert!(c.authorize(
+            "dave",
+            &Privilege::on_property(Action::Read, "g", "Person", "name")
         ));
         // ...but not Write on that graph.
-        assert!(!c.authorize(
-            "dave",
-            &Privilege::new(Action::Write, Resource::Graph("g".to_owned()))
-        ));
+        assert!(!c.authorize("dave", &Privilege::on_graph(Action::Write, "g")));
     }
 
     #[test]
@@ -481,23 +721,19 @@ mod tests {
         let mut c = Catalog::new();
         c.create_user("erin").unwrap();
         c.create_role("g_reader").unwrap();
-        c.grant_privilege(
-            "g_reader",
-            Privilege::new(Action::Read, Resource::Graph("g".to_owned())),
-        )
-        .unwrap();
+        c.grant_privilege("g_reader", Privilege::on_graph(Action::Read, "g"))
+            .unwrap();
         c.grant_role("erin", "g_reader").unwrap();
-        // Read on graph "g" does NOT grant database-wide Read...
+        // Read on graph "g" does NOT grant server-wide Read...
         assert!(!c.authorize("erin", &Privilege::read_database()));
         // ...nor Read on a different graph.
-        assert!(!c.authorize(
-            "erin",
-            &Privilege::new(Action::Read, Resource::Graph("other".to_owned()))
-        ));
-        // ...but does grant Read on "g".
+        assert!(!c.authorize("erin", &Privilege::on_graph(Action::Read, "other")));
+        // ...but does grant Read on "g" and on labels/properties within "g".
+        assert!(c.authorize("erin", &Privilege::on_graph(Action::Read, "g")));
+        assert!(c.authorize("erin", &Privilege::on_label(Action::Read, "g", "Person")));
         assert!(c.authorize(
             "erin",
-            &Privilege::new(Action::Read, Resource::Graph("g".to_owned()))
+            &Privilege::on_property(Action::Read, "g", "Person", "name")
         ));
     }
 
@@ -506,23 +742,223 @@ mod tests {
         let mut c = Catalog::new();
         c.create_user("frank").unwrap();
         c.create_role("g_admin").unwrap();
-        c.grant_privilege(
-            "g_admin",
-            Privilege::new(Action::Admin, Resource::Graph("g".to_owned())),
-        )
-        .unwrap();
+        c.grant_privilege("g_admin", Privilege::on_graph(Action::Admin, "g"))
+            .unwrap();
         c.grant_role("frank", "g_admin").unwrap();
-        // Admin on "g" implies Write/CreateIndex on "g"...
+        // Admin on "g" implies Write/Schema/Traverse on "g" and on everything within "g"...
+        assert!(c.authorize("frank", &Privilege::on_graph(Action::Write, "g")));
+        assert!(c.authorize("frank", &Privilege::on_graph(Action::Schema, "g")));
+        assert!(c.authorize("frank", &Privilege::on_label(Action::Write, "g", "Person")));
         assert!(c.authorize(
             "frank",
-            &Privilege::new(Action::Write, Resource::Graph("g".to_owned()))
+            &Privilege::on_property(Action::Write, "g", "Person", "name")
         ));
-        // ...but not anything database-wide, and not Admin-as-root.
+        // ...but not anything server-wide, and not Admin-as-root.
         assert!(!c.authorize("frank", &Privilege::read_database()));
-        assert!(!c.authorize(
-            "frank",
-            &Privilege::new(Action::Write, Resource::Graph("other".to_owned()))
+        assert!(!c.authorize("frank", &Privilege::on_graph(Action::Write, "other")));
+    }
+
+    // ---- exhaustive containment matrix --------------------------------------------------------
+
+    /// Every resource scope used in the matrix, broadest → narrowest, within database "db" (plus a
+    /// sibling database / label / property to prove scopes never widen).
+    fn scopes() -> Vec<Resource> {
+        vec![
+            Resource::Database,
+            Resource::Graph("db".to_owned()),
+            Resource::Label {
+                db: "db".to_owned(),
+                label: "Person".to_owned(),
+            },
+            Resource::RelType {
+                db: "db".to_owned(),
+                rel_type: "KNOWS".to_owned(),
+            },
+            Resource::Property {
+                db: "db".to_owned(),
+                label: "Person".to_owned(),
+                property: "name".to_owned(),
+            },
+        ]
+    }
+
+    /// All five actions.
+    fn actions() -> [Action; 5] {
+        [
+            Action::Traverse,
+            Action::Read,
+            Action::Write,
+            Action::Schema,
+            Action::Admin,
+        ]
+    }
+
+    /// The expected resource-containment relation, independent of action (mirrors
+    /// [`Resource::covers`] but written out by hand so the test is an independent oracle).
+    fn resource_covers_expected(grant: &Resource, wanted: &Resource) -> bool {
+        use Resource::{Database, Graph, Label, Property, RelType};
+        match (grant, wanted) {
+            (Database, _) => true,
+            (Graph(g), w) => w.database() == Some(g.as_str()),
+            (Label { db, label }, Label { db: wd, label: wl }) => db == wd && label == wl,
+            (
+                Label { db, label },
+                Property {
+                    db: wd, label: wl, ..
+                },
+            ) => db == wd && label == wl,
+            (Label { .. }, _) => false,
+            (
+                RelType { db, rel_type },
+                RelType {
+                    db: wd,
+                    rel_type: wr,
+                },
+            ) => db == wd && rel_type == wr,
+            (RelType { .. }, _) => false,
+            (
+                Property {
+                    db,
+                    label,
+                    property,
+                },
+                Property {
+                    db: wd,
+                    label: wl,
+                    property: wp,
+                },
+            ) => db == wd && label == wl && property == wp,
+            (Property { .. }, _) => false,
+        }
+    }
+
+    /// The expected action-containment relation (independent oracle for [`Action::implies`]).
+    fn action_implies_expected(grant: Action, wanted: Action) -> bool {
+        use Action::{Admin, Read, Schema, Traverse, Write};
+        matches!(
+            (grant, wanted),
+            (Admin, _)
+                | (Write, Write | Read | Traverse)
+                | (Read, Read | Traverse)
+                | (Traverse, Traverse)
+                | (Schema, Schema)
+        )
+    }
+
+    #[test]
+    fn implies_matrix_is_exhaustive_and_composed() {
+        // For every (grant action × grant scope) vs (wanted action × wanted scope): a grant
+        // implies a request iff BOTH the action and the resource contain it. This pins the full
+        // 25×25 cross-product against two independent oracles.
+        for &ga in &actions() {
+            for grant_scope in scopes() {
+                let grant = Privilege::new(ga, grant_scope.clone());
+                for &wa in &actions() {
+                    for wanted_scope in scopes() {
+                        let wanted = Privilege::new(wa, wanted_scope.clone());
+                        let expected = action_implies_expected(ga, wa)
+                            && resource_covers_expected(&grant_scope, &wanted_scope);
+                        assert_eq!(
+                            grant.implies(&wanted),
+                            expected,
+                            "grant {ga:?}@{grant_scope:?} vs wanted {wa:?}@{wanted_scope:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scopes_never_cross_database_boundaries() {
+        // A grant on database "a" must not cover ANY resource of database "b", for any action.
+        let a = Privilege::on_graph(Action::Admin, "a"); // Admin: the most permissive action.
+        for wanted in [
+            Privilege::on_graph(Action::Traverse, "b"),
+            Privilege::on_label(Action::Traverse, "b", "Person"),
+            Privilege::on_rel_type(Action::Traverse, "b", "KNOWS"),
+            Privilege::on_property(Action::Traverse, "b", "Person", "name"),
+        ] {
+            assert!(
+                !a.implies(&wanted),
+                "{a:?} must not cross into db b: {wanted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_implies_traverse_but_not_vice_versa() {
+        // The graded read chain at a concrete scope.
+        let read = Privilege::on_label(Action::Read, "db", "Person");
+        let traverse = Privilege::on_label(Action::Traverse, "db", "Person");
+        assert!(read.implies(&traverse), "Read implies Traverse");
+        assert!(!traverse.implies(&read), "Traverse does not imply Read");
+        // Write implies both.
+        let write = Privilege::on_label(Action::Write, "db", "Person");
+        assert!(write.implies(&read));
+        assert!(write.implies(&traverse));
+        assert!(!read.implies(&write));
+    }
+
+    #[test]
+    fn schema_is_orthogonal_to_the_read_write_chain() {
+        let schema = Privilege::on_graph(Action::Schema, "db");
+        // Schema does not grant data actions...
+        assert!(!schema.implies(&Privilege::on_graph(Action::Read, "db")));
+        assert!(!schema.implies(&Privilege::on_graph(Action::Write, "db")));
+        assert!(!schema.implies(&Privilege::on_graph(Action::Traverse, "db")));
+        // ...and no data action grants Schema; only Admin (and exact Schema) does.
+        assert!(!Privilege::on_graph(Action::Write, "db").implies(&schema));
+        assert!(Privilege::on_graph(Action::Admin, "db").implies(&schema));
+        assert!(schema.implies(&schema));
+    }
+
+    #[test]
+    fn property_scope_is_the_leaf() {
+        let prop = Privilege::on_property(Action::Read, "db", "Person", "name");
+        // Covers only itself: not the label, not another property.
+        assert!(prop.implies(&Privilege::on_property(
+            Action::Read,
+            "db",
+            "Person",
+            "name"
+        )));
+        assert!(!prop.implies(&Privilege::on_property(Action::Read, "db", "Person", "age")));
+        assert!(!prop.implies(&Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(!prop.implies(&Privilege::on_graph(Action::Read, "db")));
+        // ...and the label covers the property (the other direction), but not relationship types.
+        let label = Privilege::on_label(Action::Read, "db", "Person");
+        assert!(label.implies(&prop));
+        assert!(!label.implies(&Privilege::on_rel_type(Action::Read, "db", "KNOWS")));
+    }
+
+    #[test]
+    fn deny_by_default_for_ungranted_fine_grained_scopes() {
+        // A reader with only `Label Read` is denied everything outside that exact scope.
+        let mut c = Catalog::new();
+        c.create_user("gwen").unwrap();
+        c.create_role("person_reader").unwrap();
+        c.grant_privilege(
+            "person_reader",
+            Privilege::on_label(Action::Read, "db", "Person"),
+        )
+        .unwrap();
+        c.grant_role("gwen", "person_reader").unwrap();
+        // Granted: Read/Traverse on Person and its properties.
+        assert!(c.authorize("gwen", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(c.authorize(
+            "gwen",
+            &Privilege::on_label(Action::Traverse, "db", "Person")
         ));
+        assert!(c.authorize(
+            "gwen",
+            &Privilege::on_property(Action::Read, "db", "Person", "name")
+        ));
+        // Denied: a different label, the whole graph, a relationship type, and Write on Person.
+        assert!(!c.authorize("gwen", &Privilege::on_label(Action::Read, "db", "Company")));
+        assert!(!c.authorize("gwen", &Privilege::on_graph(Action::Read, "db")));
+        assert!(!c.authorize("gwen", &Privilege::on_rel_type(Action::Read, "db", "KNOWS")));
+        assert!(!c.authorize("gwen", &Privilege::on_label(Action::Write, "db", "Person")));
     }
 
     // ---- CRUD edge cases ---------------------------------------------------------------------
