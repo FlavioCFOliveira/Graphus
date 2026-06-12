@@ -18,7 +18,8 @@ use tokio::sync::Semaphore;
 
 use super::TxTicket;
 use super::command::{
-    AccessMode, EngineCommand, ReplyReceiver, RunReply, RunSummary, reply_channel,
+    AccessMode, EngineCommand, IndexCommand, IndexDdlReply, ReplyReceiver, RunReply, RunSummary,
+    reply_channel,
 };
 use crate::metrics::Metrics;
 
@@ -205,6 +206,24 @@ impl EngineHandle {
         recv_async(rx).await
     }
 
+    /// Submits an index-DDL statement (`CREATE/DROP INDEX`, `SHOW INDEXES`) to the engine, returning
+    /// its buffered fields + rows (`rmp` task #91). `CREATE` starts a **non-blocking** background
+    /// build and returns promptly, so the await completes without waiting for the index to populate.
+    ///
+    /// Index DDL takes **no admission permit**: like the DATABASE admin commands it is a control
+    /// operation, not a query, and the engine serialises it itself. The caller is responsible for the
+    /// admin-privilege gate **before** calling this (see [`crate::admin::AdminContext::authorize_admin`]).
+    ///
+    /// # Errors
+    /// [`GraphusError`] for a storage fault while declaring/dropping/listing the index, or if the
+    /// engine is shut down.
+    pub async fn index_ddl(&self, command: IndexCommand) -> Result<IndexDdlReply, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::IndexDdl { command, reply })
+            .await?;
+        recv_async(rx).await?
+    }
+
     // ---- Blocking submit (the Bolt session, on a blocking task, uses these) ----------------------
 
     /// Blocking variant of [`begin`](Self::begin) for the synchronous Bolt seam (called on a
@@ -267,6 +286,17 @@ impl EngineHandle {
     pub fn rollback_blocking(&self, ticket: TxTicket) -> Result<(), GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit_blocking(EngineCommand::Rollback { ticket, reply })?;
+        recv_blocking(rx)?
+    }
+
+    /// Blocking variant of [`index_ddl`](Self::index_ddl) for the synchronous Bolt/REST seams (called
+    /// on a `spawn_blocking` thread / inside a `Handle::block_on`).
+    ///
+    /// # Errors
+    /// As [`index_ddl`](Self::index_ddl).
+    pub fn index_ddl_blocking(&self, command: IndexCommand) -> Result<IndexDdlReply, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit_blocking(EngineCommand::IndexDdl { command, reply })?;
         recv_blocking(rx)?
     }
 

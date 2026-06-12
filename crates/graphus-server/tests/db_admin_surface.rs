@@ -452,6 +452,178 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
+/// One `SHOW INDEXES` row, decoded from the wire shape (`label`, `property`, `state`).
+#[derive(Debug)]
+struct IndexRow {
+    label: String,
+    property: String,
+    state: String,
+}
+
+/// Runs `SHOW INDEXES` on `client` (against the default database) and decodes the rows.
+async fn show_indexes(client: &mut BoltClient) -> Vec<IndexRow> {
+    let rows = client.run_ok("SHOW INDEXES", None).await;
+    rows.into_iter()
+        .map(|row| {
+            assert_eq!(row.len(), 3, "label, property, state: {row:?}");
+            let mut it = row.into_iter();
+            let mut next_string = |what: &str| match it.next() {
+                Some(Value::String(s)) => s,
+                other => panic!("{what} must be a string: {other:?}"),
+            };
+            IndexRow {
+                label: next_string("label"),
+                property: next_string("property"),
+                state: next_string("state"),
+            }
+        })
+        .collect()
+}
+
+// ================================================================================================
+// Bolt: online index builds (rmp #91) over the wire.
+// ================================================================================================
+
+/// `CREATE INDEX` is non-blocking: it returns immediately, concurrent queries keep working while the
+/// index builds, the index reaches `online` in `SHOW INDEXES`, an index-accelerated query then
+/// returns the correct rows, and `DROP INDEX` removes it.
+#[tokio::test]
+async fn bolt_create_index_is_non_blocking_and_reaches_online() {
+    let temp = TempStore::new("bolt-online-index");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "pw").await;
+
+    // Seed a populated graph (so the build has work to do).
+    for age in 20..30 {
+        c.run_ok(&format!("CREATE (:Person {{age: {age}}})"), None)
+            .await;
+    }
+    c.run_ok("CREATE (:Person {age: 25})", None).await; // duplicate value 25
+
+    // CREATE INDEX returns promptly with no rows (the build runs in the background).
+    let rows = c
+        .run_ok("CREATE INDEX FOR (n:Person) ON (n.age)", None)
+        .await;
+    assert!(rows.is_empty(), "CREATE INDEX returns no rows");
+
+    // Concurrent queries keep working while the index builds — writes are not blocked.
+    c.run_ok("CREATE (:Person {age: 99})", None).await;
+    assert_eq!(
+        c.count("MATCH (n:Person) RETURN count(n)", None).await,
+        12,
+        "reads/writes work while the index builds"
+    );
+
+    // The index reaches `online` (it is `populating` or `online` throughout; never absent). Poll
+    // SHOW INDEXES — the build is driven between engine commands, so each query advances it.
+    let mut state = String::new();
+    for _ in 0..200 {
+        let idx = show_indexes(&mut c).await;
+        let row = idx
+            .iter()
+            .find(|r| r.label == "Person" && r.property == "age")
+            .expect("the index is listed throughout the build");
+        state = row.state.clone();
+        assert!(
+            state == "online" || state == "populating",
+            "unexpected index state {state:?}"
+        );
+        if state == "online" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(state, "online", "the index must reach online");
+
+    // The online index answers an equality query correctly (two Persons aged 25).
+    assert_eq!(
+        c.count("MATCH (n:Person) WHERE n.age = 25 RETURN count(n)", None)
+            .await,
+        2
+    );
+
+    // DROP INDEX removes it.
+    let rows = c.run_ok("DROP INDEX FOR (n:Person) ON (n.age)", None).await;
+    assert!(rows.is_empty(), "DROP INDEX returns no rows");
+    let idx = show_indexes(&mut c).await;
+    assert!(
+        !idx.iter()
+            .any(|r| r.label == "Person" && r.property == "age"),
+        "the dropped index is gone: {idx:?}"
+    );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// Index DDL is on the admin surface: a non-admin principal is denied, and the index commands are
+/// rejected inside an explicit transaction (they are not transactional) — with no side effects.
+#[tokio::test]
+async fn index_ddl_privilege_and_transaction_rules() {
+    let temp = TempStore::new("index-ddl-rules");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // A non-admin (bob) is denied CREATE INDEX and SHOW INDEXES — the Security classification.
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "pw2").await;
+    let f = bob
+        .run_on_db("CREATE INDEX FOR (n:Person) ON (n.age)", None)
+        .await
+        .expect_err("non-admin denied CREATE INDEX");
+    assert!(f.code.contains("Security.Forbidden"), "{f:?}");
+    assert!(f.message.contains("permission denied"), "{f:?}");
+    bob.reset().await;
+    let f = bob
+        .run_on_db("SHOW INDEXES", None)
+        .await
+        .expect_err("non-admin denied SHOW INDEXES");
+    assert!(f.code.contains("Security.Forbidden"), "{f:?}");
+    bob.reset().await;
+    bob.goodbye().await;
+
+    // Admin (alice): index DDL inside an explicit transaction is rejected, with no side effect.
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "pw").await;
+    c.begin(None).await.expect("BEGIN");
+    let f = c
+        .run_on_db("CREATE INDEX FOR (n:Person) ON (n.age)", None)
+        .await
+        .expect_err("index DDL inside an explicit transaction");
+    assert!(f.message.contains("explicit transaction"), "{f:?}");
+    c.reset().await;
+    // No side effect: the index was not created.
+    let idx = show_indexes(&mut c).await;
+    assert!(
+        !idx.iter()
+            .any(|r| r.label == "Person" && r.property == "age"),
+        "rejected index DDL must create nothing: {idx:?}"
+    );
+
+    // A malformed-but-claimed index statement is a syntax error (never sent to Cypher).
+    let f = c
+        .run_on_db("CREATE INDEX FOR (n:Person)", None)
+        .await
+        .expect_err("malformed index statement");
+    assert!(f.code.contains("SyntaxError"), "{f:?}");
+    c.reset().await;
+
+    // Real Cypher that merely resembles index DDL runs normally (a node labelled Index).
+    c.run_ok("CREATE (n:Index {name: 'not-an-index'})", None)
+        .await;
+    assert_eq!(
+        c.count("MATCH (n:Index) RETURN count(n)", None).await,
+        1,
+        "the Cypher statement executed as Cypher"
+    );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
 // ================================================================================================
 // Bolt: admin lifecycle + session isolation.
 // ================================================================================================

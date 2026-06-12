@@ -40,14 +40,37 @@ use graphus_storage::RecordStore;
 use graphus_txn::IsolationLevel;
 use graphus_wal::LogSink;
 
-pub use command::{AccessMode, EngineCommand, RunReply, RunSummary};
+pub use command::{AccessMode, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary};
 pub use handle::{EngineHandle, ServerBusy};
 pub use seam_bolt::BoltEngineExecutor;
 pub use seam_rest::RestEngineAdapter;
 
 use crate::metrics::Metrics;
 use command::EngineCommand as Cmd;
-use graphus_core::TxnId;
+use graphus_core::{TxnId, Value};
+use graphus_storage::IndexState;
+
+/// How many nodes a single [`TxnCoordinator::advance_index_builds`] call indexes per tick while a
+/// non-blocking index build is in progress (`rmp` task #91).
+///
+/// Chosen as a balance between throughput and responsiveness on the single engine thread: large
+/// enough that the per-call fixed overhead (a `front_mut`, the slice bounds) is negligible against
+/// the per-node store reads, yet small enough that a chunk completes in well under a millisecond on
+/// commodity hardware — so a command arriving mid-build waits at most one chunk, not a whole index.
+/// 512 lands in the documented 256–1024 window; a build of `N` nodes completes in `ceil(N/512)`
+/// ticks of work interleaved with command handling.
+const INDEX_BUILD_CHUNK: usize = 512;
+
+/// How long the engine loop waits for a command before stealing a slice of build work, while a
+/// non-blocking index build is in progress (`rmp` task #91).
+///
+/// On an idle-but-building engine this bounds the build's wall-clock progress rate to roughly one
+/// [`INDEX_BUILD_CHUNK`] per tick; on a busy engine the timeout rarely fires (commands arrive first)
+/// and the post-command `advance_index_builds` drives progress instead. 2 ms keeps a fully idle
+/// build progressing briskly without a tight spin, and is short enough that a build of a populated
+/// store finishes in a fraction of a second even with no traffic. When **no** build is pending the
+/// loop reverts to a plain blocking `recv()` — zero idle wakeups (no busy-loop).
+const INDEX_BUILD_TICK: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// An opaque handle to a transaction the engine opened.
 ///
@@ -101,66 +124,192 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
     // is processing commands.
     let mut coordinator = Some(coordinator);
 
-    while let Ok(cmd) = rx.recv() {
-        let coord = coordinator
-            .as_mut()
-            .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
-        match cmd {
-            Cmd::Begin { mode, reply } => {
-                let ticket = open_tx(coord, &mut open, &mut next_ticket, mode);
-                metrics.set_active_txns(coord.active_count() as u64);
-                let _ = reply.send(Ok(ticket));
+    loop {
+        // While a non-blocking index build is in progress (`rmp` task #91), use a *timed* receive so
+        // the build makes progress even when no command arrives; otherwise block plainly (no idle
+        // wakeups — a fully idle, build-free engine parks on `recv` exactly as before).
+        let building = coordinator
+            .as_ref()
+            .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
+            .has_pending_index_builds();
+
+        if building {
+            match rx.recv_timeout(INDEX_BUILD_TICK) {
+                Ok(cmd) => {
+                    if !dispatch_command(
+                        cmd,
+                        &mut coordinator,
+                        &mut open,
+                        &mut next_ticket,
+                        result_buffer_capacity,
+                        &metrics,
+                    ) {
+                        break; // Shutdown handled (drained + hardened) inside the dispatch.
+                    }
+                    // Steal a chunk after the command so a burst of commands still advances the build.
+                    drive_index_build(&mut coordinator);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No command this tick: advance the build, then loop and re-check.
+                    drive_index_build(&mut coordinator);
+                }
+                // Channel closed (all senders dropped) — the same end condition the old `while let
+                // Ok(..)` loop ended on. The in-flight build is durably `Populating`; it resumes on
+                // the next open (the `TxnCoordinator::new` crash-recovery path).
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            Cmd::BeginAutoCommit { mode, reply } => {
-                let ticket = open_tx(coord, &mut open, &mut next_ticket, mode);
-                metrics.set_active_txns(coord.active_count() as u64);
-                let _ = reply.send(Ok(ticket));
-            }
-            Cmd::Run {
-                ticket,
-                query,
-                params,
-                auto_commit,
-                reply,
-            } => {
-                exec::handle_run(
-                    coord,
-                    &mut open,
-                    ticket,
-                    &query,
-                    params,
-                    auto_commit,
-                    result_buffer_capacity,
-                    &metrics,
-                    reply,
-                );
-                metrics.set_active_txns(coord.active_count() as u64);
-            }
-            Cmd::Commit { ticket, reply } => {
-                let out = commit_tx(coord, &mut open, ticket, &metrics);
-                metrics.set_active_txns(coord.active_count() as u64);
-                let _ = reply.send(out);
-            }
-            Cmd::Rollback { ticket, reply } => {
-                let out = rollback_tx(coord, &mut open, ticket, &metrics);
-                metrics.set_active_txns(coord.active_count() as u64);
-                let _ = reply.send(out);
-            }
-            Cmd::Status { reply } => {
-                let _ = reply.send(coord.active_count());
-            }
-            Cmd::Shutdown { reply } => {
-                // Drain stragglers through `&mut`, then consume the coordinator for the final flush.
-                drain_inflight(coord, &mut open, &metrics);
-                let coordinator = coordinator
-                    .take()
-                    .expect("INVARIANT: coordinator is Some at Shutdown");
-                let out = harden_store(coordinator);
-                metrics.set_active_txns(0);
-                let _ = reply.send(out);
-                // Drained + durable: leave the loop so the thread can join.
+        } else {
+            // No build pending: a plain blocking receive (the original behaviour). `Err` is the
+            // closed-channel EOF the old `while let Ok(..)` terminated on.
+            let Ok(cmd) = rx.recv() else { break };
+            if !dispatch_command(
+                cmd,
+                &mut coordinator,
+                &mut open,
+                &mut next_ticket,
+                result_buffer_capacity,
+                &metrics,
+            ) {
                 break;
             }
+        }
+    }
+}
+
+/// Advances the front non-blocking index build by one [`INDEX_BUILD_CHUNK`] (`rmp` task #91). A
+/// no-op when no build is pending. Kept tiny and inline-friendly so the loop's two call sites read
+/// clearly.
+fn drive_index_build<D: BlockDevice, S: LogSink>(coordinator: &mut Option<TxnCoordinator<D, S>>) {
+    if let Some(coord) = coordinator.as_mut() {
+        let _remaining = coord.advance_index_builds(INDEX_BUILD_CHUNK);
+    }
+}
+
+/// Dispatches one [`EngineCommand`] against the coordinator. Returns `true` to keep the loop running,
+/// `false` once a [`EngineCommand::Shutdown`] has drained + hardened the store (the loop then exits).
+///
+/// Factored out of [`run_engine_loop`] so the loop can choose its receive strategy (blocking vs.
+/// build-driving timed receive) without duplicating the command-dispatch arm.
+fn dispatch_command<D: BlockDevice, S: LogSink>(
+    cmd: EngineCommand,
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    next_ticket: &mut u64,
+    result_buffer_capacity: usize,
+    metrics: &Arc<Metrics>,
+) -> bool {
+    let coord = coordinator
+        .as_mut()
+        .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
+    match cmd {
+        Cmd::Begin { mode, reply } => {
+            let ticket = open_tx(coord, open, next_ticket, mode);
+            metrics.set_active_txns(coord.active_count() as u64);
+            let _ = reply.send(Ok(ticket));
+        }
+        Cmd::BeginAutoCommit { mode, reply } => {
+            let ticket = open_tx(coord, open, next_ticket, mode);
+            metrics.set_active_txns(coord.active_count() as u64);
+            let _ = reply.send(Ok(ticket));
+        }
+        Cmd::Run {
+            ticket,
+            query,
+            params,
+            auto_commit,
+            reply,
+        } => {
+            exec::handle_run(
+                coord,
+                open,
+                ticket,
+                &query,
+                params,
+                auto_commit,
+                result_buffer_capacity,
+                metrics,
+                reply,
+            );
+            metrics.set_active_txns(coord.active_count() as u64);
+        }
+        Cmd::Commit { ticket, reply } => {
+            let out = commit_tx(coord, open, ticket, metrics);
+            metrics.set_active_txns(coord.active_count() as u64);
+            let _ = reply.send(out);
+        }
+        Cmd::Rollback { ticket, reply } => {
+            let out = rollback_tx(coord, open, ticket, metrics);
+            metrics.set_active_txns(coord.active_count() as u64);
+            let _ = reply.send(out);
+        }
+        Cmd::Status { reply } => {
+            let _ = reply.send(coord.active_count());
+        }
+        Cmd::IndexDdl { command, reply } => {
+            let out = handle_index_ddl(coord, &command);
+            let _ = reply.send(out);
+        }
+        Cmd::Shutdown { reply } => {
+            // Drain stragglers through `&mut`, then consume the coordinator for the final flush. An
+            // in-flight index build is left durably `Populating`: it resumes and completes on the
+            // next open via `TxnCoordinator::new`'s crash-recovery path (no force-drain needed —
+            // re-deriving the candidate index is cheap and always correct).
+            drain_inflight(coord, open, metrics);
+            let coordinator = coordinator
+                .take()
+                .expect("INVARIANT: coordinator is Some at Shutdown");
+            let out = harden_store(coordinator);
+            metrics.set_active_txns(0);
+            let _ = reply.send(out);
+            // Drained + durable: signal the loop to exit so the thread can join.
+            return false;
+        }
+    }
+    true
+}
+
+/// Executes one index-DDL command against the coordinator's node-property index catalog (`rmp` task
+/// #91). `CREATE` starts a non-blocking background build (returning promptly, no rows); `DROP`
+/// removes the index (no rows); `SHOW INDEXES` lists every declared index with its build state.
+///
+/// Runs on the engine thread, so it may touch the (`!Send`) coordinator directly. The non-blocking
+/// `CREATE` is what keeps the engine responsive: it enqueues the build and returns, and the loop
+/// drives the build between subsequent commands.
+fn handle_index_ddl<D: BlockDevice, S: LogSink>(
+    coordinator: &mut TxnCoordinator<D, S>,
+    command: &IndexCommand,
+) -> Result<IndexDdlReply> {
+    match command {
+        IndexCommand::CreateNodePropertyIndex { label, property } => {
+            coordinator.begin_online_node_property_index(label, property)?;
+            Ok(IndexDdlReply::default())
+        }
+        IndexCommand::DropNodePropertyIndex { label, property } => {
+            coordinator.drop_node_property_index(label, property)?;
+            Ok(IndexDdlReply::default())
+        }
+        IndexCommand::ShowIndexes => {
+            let fields = vec![
+                "label".to_owned(),
+                "property".to_owned(),
+                "state".to_owned(),
+            ];
+            let rows = coordinator
+                .list_node_property_indexes()
+                .into_iter()
+                .map(|(label, property, state)| {
+                    let state = match state {
+                        IndexState::Online => "online",
+                        IndexState::Populating => "populating",
+                    };
+                    vec![
+                        Value::String(label),
+                        Value::String(property),
+                        Value::String(state.to_owned()),
+                    ]
+                })
+                .collect();
+            Ok(IndexDdlReply { fields, rows })
         }
     }
 }

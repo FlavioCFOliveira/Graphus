@@ -23,15 +23,33 @@
 //! STOP   DATABASE <name>
 //! SHOW   DATABASES
 //! SHOW   DATABASE <name>
+//!
+//! CREATE INDEX FOR (<var>:<Label>) ON (<var>.<property>)   -- openCypher 9 form
+//! CREATE INDEX ON :<Label>(<property>)                     -- legacy form
+//! DROP   INDEX ON :<Label>(<property>)                     -- (and the FOR … ON … form)
+//! DROP   INDEX FOR (<var>:<Label>) ON (<var>.<property>)
+//! SHOW   INDEXES
 //! ```
 //!
 //! The matcher claims a statement **only** when its first two tokens are exactly an admin verb
-//! followed by the `DATABASE`/`DATABASES` keyword — so `CREATE (n:Database)` (second token `(`),
-//! `MATCH … RETURN 'CREATE DATABASE x'` (first token `MATCH`), or `CREATE DATABASE_X` (second
-//! token is not the keyword) all pass through to Cypher untouched. Once claimed, the remainder
-//! must parse exactly; a malformed remainder is a clear admin-syntax error rather than a
-//! confusing Cypher one (`CREATE DATABASE` is never valid Cypher, so nothing is stolen from the
+//! followed by the `DATABASE`/`DATABASES` keyword (the database surface) or the `INDEX`/`INDEXES`
+//! keyword (the index surface, `rmp` task #91) — so `CREATE (n:Database)` (second token `(`),
+//! `MATCH … RETURN 'CREATE DATABASE x'` (first token `MATCH`), `CREATE DATABASE_X` /
+//! `CREATE INDEX_X` (second token is not the keyword), or `CREATE (n:Index)` (second token `(`)
+//! all pass through to Cypher untouched. Once claimed, the remainder must parse exactly; a
+//! malformed remainder is a clear admin-syntax error rather than a confusing Cypher one
+//! (`CREATE DATABASE` / `CREATE INDEX` are never valid Cypher, so nothing is stolen from the
 //! language).
+//!
+//! ## Database vs. index surfaces (`rmp` task #91)
+//!
+//! The two surfaces share the strict matcher but execute in different places. **Database** commands
+//! act on the off-engine async [`DatabaseCatalog`] ([`AdminContext::execute`]). **Index** commands
+//! act on the [`graphus_cypher::TxnCoordinator`]'s node-property index catalog, which lives on the
+//! single-threaded engine — so they are returned as [`AdminParse::Index`] and the seams route them
+//! to the target database's [`EngineHandle`] (after the same admin-privilege gate). `CREATE INDEX`
+//! starts a **non-blocking** background build: it returns promptly and never stalls concurrent
+//! queries.
 //!
 //! ## Semantics
 //!
@@ -69,7 +87,7 @@ use graphus_core::{GraphusError, Value};
 use tokio::runtime::Handle;
 
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
-use crate::engine::EngineHandle;
+use crate::engine::{EngineHandle, IndexCommand};
 
 // ------------------------------------------------------------------------------------------------
 // Statement grammar
@@ -116,12 +134,18 @@ pub enum AdminCommand {
 pub enum AdminParse {
     /// Not an administrative statement: hand the query to the Cypher engine untouched.
     NotAdmin,
-    /// A well-formed administrative statement.
+    /// A well-formed **database** administrative statement (executed on the off-engine catalog via
+    /// [`AdminContext::execute`]).
     Command(AdminCommand),
+    /// A well-formed **index** administrative statement (`rmp` task #91): `CREATE/DROP INDEX` or
+    /// `SHOW INDEXES`. Executed on the [`graphus_cypher::TxnCoordinator`] via the target database's
+    /// [`EngineHandle`] (not the off-engine catalog), because the index catalog lives on the engine.
+    /// The seams route it after the same admin-privilege gate as the database commands.
+    Index(IndexCommand),
     /// The statement is unambiguously claimed by the admin grammar (its first two tokens are an
-    /// admin verb + the `DATABASE`/`DATABASES` keyword) but the remainder is malformed; the
-    /// payload is the syntax-error message. The seams surface it as a compile-time error — the
-    /// claimed prefixes are never valid Cypher, so nothing is taken from the language.
+    /// admin verb + the `DATABASE`/`DATABASES`/`INDEX`/`INDEXES` keyword) but the remainder is
+    /// malformed; the payload is the syntax-error message. The seams surface it as a compile-time
+    /// error — the claimed prefixes are never valid Cypher, so nothing is taken from the language.
     Invalid(String),
 }
 
@@ -231,29 +255,169 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         return AdminParse::NotAdmin;
     }
 
-    // Token 2: the DATABASE / DATABASES keyword. (Reading it cannot legitimately fail for real
-    // Cypher here — a backtick directly after these verbs is not valid Cypher either — but an
-    // unterminated quote is still just "not ours" at this point.)
+    // Token 2: the DATABASE / DATABASES (database surface) or INDEX / INDEXES (index surface)
+    // keyword. (Reading it cannot legitimately fail for real Cypher here — a backtick directly after
+    // these verbs is not valid Cypher either — but an unterminated quote is still just "not ours" at
+    // this point.)
     let second = match lex.next_tok() {
         Ok(Some(t)) => t,
         _ => return AdminParse::NotAdmin,
     };
-    let plural = is_keyword(&second, "DATABASES");
-    if !plural && !is_keyword(&second, "DATABASE") {
-        return AdminParse::NotAdmin;
-    }
-    if plural && verb != "SHOW" {
-        // e.g. `CREATE DATABASES x` — claimed by shape, but only SHOW takes the plural.
-        return AdminParse::Invalid(format!(
-            "expected DATABASE after {verb} (DATABASES is only valid in SHOW DATABASES)"
-        ));
+
+    // --- Database surface ---
+    if is_keyword(&second, "DATABASE") || is_keyword(&second, "DATABASES") {
+        let plural = is_keyword(&second, "DATABASES");
+        if plural && verb != "SHOW" {
+            // e.g. `CREATE DATABASES x` — claimed by shape, but only SHOW takes the plural.
+            return AdminParse::Invalid(format!(
+                "expected DATABASE after {verb} (DATABASES is only valid in SHOW DATABASES)"
+            ));
+        }
+        // From here on the statement is CLAIMED: parse strictly, errors are admin syntax errors.
+        return match parse_claimed(&verb, plural, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
     }
 
-    // From here on the statement is CLAIMED: parse strictly, errors are admin syntax errors.
-    match parse_claimed(&verb, plural, &mut lex) {
-        Ok(cmd) => AdminParse::Command(cmd),
-        Err(msg) => AdminParse::Invalid(msg),
+    // --- Index surface (`rmp` task #91) ---
+    if is_keyword(&second, "INDEX") || is_keyword(&second, "INDEXES") {
+        let plural = is_keyword(&second, "INDEXES");
+        if plural && verb != "SHOW" {
+            // e.g. `CREATE INDEXES …` — claimed by shape, but only SHOW takes the plural.
+            return AdminParse::Invalid(format!(
+                "expected INDEX after {verb} (INDEXES is only valid in SHOW INDEXES)"
+            ));
+        }
+        // CLAIMED by the index surface: parse strictly.
+        return match parse_claimed_index(&verb, plural, &mut lex) {
+            Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
     }
+
+    AdminParse::NotAdmin
+}
+
+/// Parses the remainder of a claimed **index** statement (`verb` + `INDEX`/`INDEXES` already read),
+/// for the two `CREATE`/`DROP` shapes and `SHOW INDEXES` (`rmp` task #91):
+///
+/// ```text
+/// CREATE INDEX FOR (n:Label) ON (n.property)   -- openCypher 9
+/// CREATE INDEX ON :Label(property)             -- legacy
+/// DROP   INDEX FOR (n:Label) ON (n.property)
+/// DROP   INDEX ON :Label(property)
+/// SHOW   INDEXES
+/// ```
+///
+/// A label/property name is a bare word or a `` `backtick-quoted` `` name (so a name colliding with a
+/// keyword still works); a variable is any bare word (its actual text is irrelevant — both shapes are
+/// single-variable). `CREATE/DROP INDEX` without a name (openCypher's named-index `DROP INDEX name`)
+/// is **not** supported here: Graphus identifies a node-property index by `(label, property)`, not by
+/// a server-assigned name, so the label/property shapes are the canonical surface.
+fn parse_claimed_index(
+    verb: &str,
+    plural: bool,
+    lex: &mut Lexer<'_>,
+) -> Result<IndexCommand, String> {
+    if plural {
+        // SHOW INDEXES — nothing else allowed.
+        expect_end(lex, "SHOW INDEXES")?;
+        return Ok(IndexCommand::ShowIndexes);
+    }
+    if verb == "SHOW" {
+        // `SHOW INDEX` (singular) is not a recognised form; only the plural `SHOW INDEXES`.
+        return Err("expected SHOW INDEXES (the singular SHOW INDEX is not supported)".to_owned());
+    }
+
+    // CREATE / DROP INDEX: parse the `(label, property)` from either the `FOR … ON …` or the
+    // `ON :Label(property)` shape.
+    let (label, property) = parse_index_target(verb, lex)?;
+    match verb {
+        "CREATE" => Ok(IndexCommand::CreateNodePropertyIndex { label, property }),
+        "DROP" => Ok(IndexCommand::DropNodePropertyIndex { label, property }),
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
+        other => Err(format!("unsupported index verb {other}")),
+    }
+}
+
+/// Parses an index target `(label, property)` from either supported shape after `verb INDEX`:
+///
+/// - **openCypher 9:** `FOR (<var>:<Label>) ON (<var>.<property>)`
+/// - **legacy:** `ON :<Label>(<property>)`
+///
+/// The leading keyword (`FOR` vs `ON`) disambiguates; anything else is a syntax error naming both
+/// accepted shapes.
+fn parse_index_target(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, "FOR") => parse_index_for_on(verb, lex),
+        Some(t) if is_keyword(&t, "ON") => parse_index_legacy_on(verb, lex),
+        Some(other) => Err(unexpected(
+            &other,
+            &format!("FOR (n:Label) ON (n.property) or ON :Label(property) after {verb} INDEX"),
+        )),
+        None => Err(format!(
+            "expected FOR (n:Label) ON (n.property) or ON :Label(property) after {verb} INDEX"
+        )),
+    }
+}
+
+/// Parses the openCypher-9 `FOR (<var>:<Label>) ON (<var>.<property>)` tail (the `FOR` already
+/// consumed).
+///
+/// # Tokenization note
+///
+/// The lexer treats `.` and `-` as word characters (so a hyphenated/dotted name is one token), so
+/// `n.property` lexes as a **single** [`Tok::Word`] (`"n.property"`), not `n` `.` `property`. We
+/// therefore read that one word and split it on the first `.` into `(variable, property)`. The
+/// `(n:Label)` part, by contrast, splits naturally because `:` is a symbol.
+fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+    // FOR ( <var> : <Label> )
+    expect_symbol(lex, '(', verb)?;
+    let _var = expect_word(lex, "a variable", verb)?;
+    expect_symbol(lex, ':', verb)?;
+    let label = expect_name(lex, "a label", verb)?;
+    expect_symbol(lex, ')', verb)?;
+    // ON ( <var>.<property> )
+    expect_keyword(lex, "ON", verb)?;
+    expect_symbol(lex, '(', verb)?;
+    let property = parse_property_ref(verb, lex)?;
+    expect_symbol(lex, ')', verb)?;
+    expect_end(lex, &format!("{verb} INDEX"))?;
+    Ok((label, property))
+}
+
+/// Parses the `<var>.<property>` reference inside an openCypher `ON ( … )` clause.
+///
+/// # Tokenization
+///
+/// `.` is a word character, so `n.age` lexes as the **single** word `"n.age"` and we split it on the
+/// first `.`. But a **backtick-quoted** property keeps the dot outside the quotes — `n.`age`` lexes
+/// as the word `"n."` (trailing dot) followed by the quoted token — so when the word ends in `.` we
+/// take the following [`Tok::Quoted`] (or word) as the property. Either way the variable text is
+/// discarded (single-variable shape).
+fn parse_property_ref(verb: &str, lex: &mut Lexer<'_>) -> Result<String, String> {
+    let head = expect_word(lex, "a `variable.property` reference", verb)?;
+    match head.split_once('.') {
+        // `var.prop` in one word — the common case. Reject an embedded second dot (`a.b.c`).
+        Some((_var, prop)) if !prop.is_empty() && !prop.contains('.') => Ok(prop.to_owned()),
+        // `var.` then a separate (quoted or bare) property token: a backtick-quoted property.
+        Some((_var, "")) => expect_name(lex, "a property", verb),
+        _ => Err(format!(
+            "expected `variable.property` after {verb} INDEX FOR (n:Label) ON (got `{head}`)"
+        )),
+    }
+}
+
+/// Parses the legacy `ON :<Label>(<property>)` tail (the `ON` already consumed).
+fn parse_index_legacy_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+    expect_symbol(lex, ':', verb)?;
+    let label = expect_name(lex, "a label", verb)?;
+    expect_symbol(lex, '(', verb)?;
+    let property = expect_name(lex, "a property", verb)?;
+    expect_symbol(lex, ')', verb)?;
+    expect_end(lex, &format!("{verb} INDEX"))?;
+    Ok((label, property))
 }
 
 /// Parses the remainder of a claimed statement (`verb` + `DATABASE`/`DATABASES` already read).
@@ -347,6 +511,45 @@ fn expect_end(lex: &mut Lexer<'_>, what: &str) -> Result<(), String> {
             Some(t) => Err(unexpected(&t, &format!("end of {what} statement"))),
         },
         Some(t) => Err(unexpected(&t, &format!("end of {what} statement"))),
+    }
+}
+
+/// Consumes the next token, requiring it to be the single symbol `sym`.
+fn expect_symbol(lex: &mut Lexer<'_>, sym: char, verb: &str) -> Result<(), String> {
+    match lex.next_tok()? {
+        Some(Tok::Symbol(c)) if c == sym => Ok(()),
+        Some(t) => Err(unexpected(&t, &format!("`{sym}` in {verb} INDEX"))),
+        None => Err(format!("expected `{sym}` in {verb} INDEX")),
+    }
+}
+
+/// Consumes the next token, requiring it to be the (case-insensitive) keyword `kw`.
+fn expect_keyword(lex: &mut Lexer<'_>, kw: &str, verb: &str) -> Result<(), String> {
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, kw) => Ok(()),
+        Some(t) => Err(unexpected(&t, &format!("`{kw}` in {verb} INDEX"))),
+        None => Err(format!("expected `{kw}` in {verb} INDEX")),
+    }
+}
+
+/// Consumes the next token, requiring it to be a bare [`Tok::Word`] (e.g. a variable). A quoted name
+/// or a symbol here is a syntax error.
+fn expect_word(lex: &mut Lexer<'_>, what: &str, verb: &str) -> Result<String, String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) => Ok(w),
+        Some(t) => Err(unexpected(&t, &format!("{what} in {verb} INDEX"))),
+        None => Err(format!("expected {what} in {verb} INDEX")),
+    }
+}
+
+/// Consumes the next token, requiring it to be a **name**: a bare word or a `` `backtick-quoted` ``
+/// name (so a label/property colliding with a keyword still works, mirroring the database surface).
+fn expect_name(lex: &mut Lexer<'_>, what: &str, verb: &str) -> Result<String, String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) => Ok(w),
+        Some(Tok::Quoted(q)) => Ok(q),
+        Some(t) => Err(unexpected(&t, &format!("{what} in {verb} INDEX"))),
+        None => Err(format!("expected {what} in {verb} INDEX")),
     }
 }
 
@@ -487,11 +690,19 @@ impl AdminContext {
     /// [`GraphusError::Security`] when unauthenticated/unauthorized; [`GraphusError::Runtime`]
     /// for a client-fault catalog rejection (bad name, duplicate, unknown, not stopped, the
     /// default database); [`GraphusError::Storage`] for a server-side catalog/engine fault.
-    pub fn execute(
-        &self,
-        principal: Option<&str>,
-        cmd: &AdminCommand,
-    ) -> Result<AdminResult, GraphusError> {
+    /// Authorizes `principal` for the administrative surface: it must be authenticated and hold the
+    /// global `Admin` privilege — the same gate as the `/admin/*` REST endpoints (`04 §8.4`).
+    ///
+    /// This is the **single** admin-privilege gate, shared by the database surface
+    /// ([`execute`](Self::execute)) and the index surface (`rmp` task #91; the seams call this before
+    /// routing an index command to the engine). Authorization happens before any side effect, so a
+    /// denied command leaves the system untouched.
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] when the principal is absent (unauthenticated) or lacks the admin
+    /// privilege — with the same messages the database surface uses, so the wire renderers classify
+    /// both surfaces identically (`Neo.ClientError.Security.Forbidden` / HTTP 403).
+    pub fn authorize_admin(&self, principal: Option<&str>) -> Result<(), GraphusError> {
         let principal = principal.ok_or_else(|| {
             GraphusError::Security(
                 "administrative commands require an authenticated principal".to_owned(),
@@ -504,7 +715,15 @@ impl AdminContext {
                     "permission denied: administrative commands require the admin privilege \
                      (user {principal:?} does not hold it)"
                 ))
-            })?;
+            })
+    }
+
+    pub fn execute(
+        &self,
+        principal: Option<&str>,
+        cmd: &AdminCommand,
+    ) -> Result<AdminResult, GraphusError> {
+        self.authorize_admin(principal)?;
 
         match cmd {
             AdminCommand::CreateDatabase {
@@ -696,6 +915,13 @@ mod tests {
         }
     }
 
+    fn index_cmd(query: &str) -> IndexCommand {
+        match parse_admin_statement(query) {
+            AdminParse::Index(c) => c,
+            other => panic!("expected an index command for {query:?}, got {other:?}"),
+        }
+    }
+
     fn invalid(query: &str) -> String {
         match parse_admin_statement(query) {
             AdminParse::Invalid(m) => m,
@@ -798,10 +1024,93 @@ mod tests {
         not_admin("WITH 1 AS x CREATE (n) RETURN x");
         not_admin("CREATE\n(n)");
         not_admin("showdatabases");
-        not_admin("SHOW INDEXES"); // SHOW of something else is not (yet) ours
         not_admin(""); // empty input
         not_admin("   "); // blank input
         not_admin("`create` database x"); // a quoted first token is not a keyword
+
+        // The index surface (rmp #91) must likewise never swallow regular Cypher: a node labelled
+        // `Index`, a query merely mentioning the words, a prefixed identifier, and `SHOW` of
+        // something unrelated all pass through. `SHOW INDEXES` itself is now ours (tested below).
+        not_admin("CREATE (n:Index)");
+        not_admin("CREATE (n:Index {name: 'x'}) RETURN n");
+        not_admin("RETURN 'CREATE INDEX ON :Person(age)'");
+        not_admin("CREATE INDEX_X");
+        not_admin("MATCH (n:Index) RETURN n");
+        not_admin("showindexes"); // single token, not the two-token prefix
+        not_admin("SHOW CONSTRAINTS"); // a different SHOW target
+    }
+
+    #[test]
+    fn create_index_both_shapes() {
+        // openCypher 9 form.
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR (n:Person) ON (n.age)"),
+            IndexCommand::CreateNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+            }
+        );
+        // Legacy form.
+        assert_eq!(
+            index_cmd("CREATE INDEX ON :Person(age)"),
+            IndexCommand::CreateNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+            }
+        );
+        // Case-insensitive keywords, surrounding whitespace, trailing `;`, backtick-quoted names.
+        assert_eq!(
+            index_cmd("  create   index   for ( p : `Sales-Rep` )  on ( p.`first.name` ) ;"),
+            IndexCommand::CreateNodePropertyIndex {
+                label: "Sales-Rep".to_owned(),
+                property: "first.name".to_owned(),
+            }
+        );
+        // A different variable letter in the ON clause is fine (the variable text is irrelevant).
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR (a:Tag) ON (a.name)"),
+            IndexCommand::CreateNodePropertyIndex {
+                label: "Tag".to_owned(),
+                property: "name".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn drop_index_both_shapes_and_show_indexes() {
+        assert_eq!(
+            index_cmd("DROP INDEX ON :Person(age)"),
+            IndexCommand::DropNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+            }
+        );
+        assert_eq!(
+            index_cmd("drop index for (n:Person) on (n.age)"),
+            IndexCommand::DropNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+            }
+        );
+        assert_eq!(index_cmd("SHOW INDEXES"), IndexCommand::ShowIndexes);
+        assert_eq!(index_cmd("show indexes ;"), IndexCommand::ShowIndexes);
+    }
+
+    #[test]
+    fn claimed_but_malformed_index_is_a_syntax_error() {
+        // Claimed by the two-token `<verb> INDEX[ES]` prefix; the remainder must parse exactly.
+        invalid("CREATE INDEX"); // missing target
+        invalid("CREATE INDEX FOR (n:Person)"); // missing ON clause
+        invalid("CREATE INDEX FOR (n:Person) ON (n.age) extra");
+        invalid("CREATE INDEX ON Person(age)"); // legacy needs the leading `:`
+        invalid("CREATE INDEX ON :Person"); // missing (property)
+        invalid("CREATE INDEX FOR (n:Person) ON (age)"); // ON ref must be `var.property`
+        invalid("CREATE INDEXES FOR (n:Person) ON (n.age)"); // plural only for SHOW
+        invalid("SHOW INDEX"); // the singular is not a form
+        invalid("SHOW INDEXES extra");
+        invalid("DROP INDEX"); // missing target
+        invalid("DROP INDEX ON :Person(age) trailing");
+        invalid("CREATE INDEX ON :`unterminated(age)"); // unterminated backtick name
     }
 
     #[test]

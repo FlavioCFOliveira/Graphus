@@ -491,36 +491,28 @@ fn index_survives_crash_recovery_without_re_registration() {
 
 // =================================================================================================
 // Planner state gating (`rmp` task #90): only an Online index serves seeks; a Populating one falls
-// back to a label-scan + filter, but still returns the same rows.
+// back to a label-scan + filter, but still returns the same rows. (`rmp` task #91 reaches the
+// genuine Populating state via a partially-advanced non-blocking build — a fabricated-then-reopened
+// Populating index is now completed on reopen by the crash-recovery promotion path, so the live
+// in-progress build is the faithful way to observe the Populating planner gating.)
 // =================================================================================================
 
 #[test]
 fn populating_index_is_not_used_by_planner_while_online_is() {
-    use graphus_core::TxnId;
-    use graphus_storage::{IndexState, Namespace};
-
-    // Seed a graph, then commit a *Populating* `(Person, age)` index directly into the durable catalog
-    // (the coordinator's `create_node_property_index` always ends Online; population is synchronous in
-    // `rmp` task #90, so a Populating index is otherwise only an in-progress `rmp` task #91 build). A
-    // fresh coordinator over this store recovers the index as Populating and must NOT route a seek to
-    // it.
+    // Seed a graph, then start a NON-BLOCKING build and advance it only partway so the index is a
+    // genuine in-progress `Populating` (`rmp` task #91): a build over a multi-node snapshot left
+    // un-promoted. The planner must NOT route a seek to it.
     let mut coord = fresh_coord();
     seed_people(&mut coord);
-    let mut store = coord.into_store();
-
-    // Intern the tokens and record the index as Populating, in one committed transaction.
-    let txn = TxnId(10_000);
-    store.begin(txn);
-    let person = store
-        .intern_token(Namespace::Label, "Person")
-        .expect("intern label");
-    let age = store
-        .intern_token(Namespace::PropKey, "age")
-        .expect("intern prop");
-    store.set_node_property_index(person, age, IndexState::Populating);
-    store.commit(txn).expect("commit populating index");
-
-    let mut coord = TxnCoordinator::new(store);
+    coord
+        .begin_online_node_property_index("Person", "age")
+        .expect("begin online build");
+    // Advance a single tiny chunk: the snapshot has many nodes, so the build stays Populating.
+    coord.advance_index_builds(2);
+    assert!(
+        coord.has_pending_index_builds(),
+        "the build must still be in progress (partial advance keeps it Populating)"
+    );
 
     // The catalog must withhold the Populating index: an equality / range predicate on `Person.age`
     // must fall back to a label-scan (TokenLookupScan) + Filter, NOT a NodeIndexSeek.
@@ -551,12 +543,12 @@ fn populating_index_is_not_used_by_planner_while_online_is() {
         );
     }
 
-    // Now promote the same index to Online (the synchronous build's end-state) by re-creating it
-    // through the coordinator: it re-records the catalog entry Online and rebuilds. The planner must
-    // now route a seek, proving the gating is state-driven (Online -> seek; Populating -> scan).
-    coord
-        .create_node_property_index("Person", "age")
-        .expect("promote to Online");
+    // Now drive the same non-blocking build to completion: at the final chunk it flips the catalog
+    // entry to Online. The planner must now route a seek, proving the gating is state-driven
+    // (Online -> seek; Populating -> scan).
+    while coord.has_pending_index_builds() {
+        coord.advance_index_builds(4);
+    }
     let indexed = coord.catalog();
     let seek_plan = compile(
         "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",

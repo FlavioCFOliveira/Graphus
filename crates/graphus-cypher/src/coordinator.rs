@@ -38,7 +38,7 @@
 //! coordinator's shared trackers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use graphus_core::Value;
@@ -63,6 +63,26 @@ struct ActiveTxn {
     isolation: IsolationLevel,
 }
 
+/// One in-progress **non-blocking** node-property index build (`rmp` task #91).
+///
+/// A build indexes the nodes captured in `snapshot` (the store's live node-id list at build
+/// start), a bounded chunk at a time, advancing `cursor` until it reaches the end; the index is
+/// then promoted to [`IndexState::Online`]. Nodes created *after* the snapshot, value changes,
+/// and deletes are all handled outside this snapshot by [`RecordStoreGraph::reindex_node`] /
+/// the candidate-set re-check (see [`TxnCoordinator::advance_index_builds`] for the full
+/// consistency argument), so the snapshot only needs to cover the rows that already existed.
+struct PendingIndexBuild {
+    /// The label token the index is declared on.
+    label_token: u32,
+    /// The property-key token the index is declared on.
+    prop_key: u32,
+    /// The node-id list captured at build start (`store.scan_node_ids()`). Indexing walks this in
+    /// order; a since-deleted id simply inserts a stale candidate (harmless — the re-check drops it).
+    snapshot: Vec<u64>,
+    /// The next index into `snapshot` to process; the build is complete once `cursor >= snapshot.len()`.
+    cursor: usize,
+}
+
 /// Drives concurrent, serializable Cypher transactions over one shared [`RecordStore`] (`04 §5`).
 pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The one shared store, behind `Rc<RefCell<…>>` so each statement seam borrows it for the
@@ -83,6 +103,11 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
     next_txn_id: u64,
+    /// Queue of in-progress **non-blocking** index builds (`rmp` task #91), advanced in bounded
+    /// chunks by [`advance_index_builds`](Self::advance_index_builds) between engine commands. The
+    /// front build is the one currently being populated; each completes (durably promoted to
+    /// [`IndexState::Online`]) before the next starts, so the queue is processed in declaration order.
+    pending_builds: VecDeque<PendingIndexBuild>,
 }
 
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
@@ -92,19 +117,86 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// with the persisted graph by construction (`rmp` task #48). Over a freshly-recovered store this
     /// is precisely the crash-recovery requirement: a new coordinator's index reflects exactly the
     /// recovered, committed graph — nothing to commit or replay for the index itself.
+    ///
+    /// # Resuming an interrupted non-blocking build (the `rmp` task #91 crash path)
+    ///
+    /// A non-blocking index build ([`begin_online_node_property_index`](Self::begin_online_node_property_index))
+    /// records its catalog entry durably as [`IndexState::Populating`] and only flips it to
+    /// [`IndexState::Online`] once every snapshot node is indexed. If a crash interrupts a build, its
+    /// catalog entry recovers `Populating`. But `rebuild_index` above has just **synchronously and
+    /// fully** repopulated *every registered index* — `Populating` ones included — from the recovered
+    /// store, so an interrupted build is now actually complete. We therefore **promote every
+    /// durable-`Populating` index to `Online`** here, in one committed transaction, and mirror the
+    /// promotion in the in-memory set. Startup is allowed to block: the server is not yet serving when
+    /// the coordinator is constructed (see `graphus_server::engine::spawn_engine`). After this, no
+    /// build is left pending — they either completed online before the crash or are completed by the
+    /// rebuild here.
     #[must_use]
     pub fn new(store: RecordStore<D, S>) -> Self {
         let store = Rc::new(RefCell::new(store));
         let index = Rc::new(RefCell::new(IndexSet::new()));
         Self::rebuild_index(&store, &index);
+        // Promote any index left `Populating` by an interrupted `rmp` task #91 build: the rebuild
+        // above already fully populated it from the recovered store, so it is complete. Done with a
+        // local txn-id of 0 (no transaction is open yet, and `begin` only ever issues ids `>= 1`).
+        let next_txn_id = Self::promote_recovered_populating_indexes(&store, &index, 0);
         Self {
             store,
             ssi: Rc::new(RefCell::new(SsiTracker::new())),
             locks: Rc::new(RefCell::new(LockTable::new())),
             index,
             active: HashMap::new(),
-            next_txn_id: 0,
+            next_txn_id,
+            pending_builds: VecDeque::new(),
         }
+    }
+
+    /// Promotes every durable-[`IndexState::Populating`] node-property index to
+    /// [`IndexState::Online`] (catalog + in-memory set), in one committed transaction minted from
+    /// `next_txn_id`. Returns the advanced `next_txn_id` (so [`new`](Self::new) keeps its monotonic
+    /// id source consistent). A no-op (no commit) when no index is `Populating`.
+    ///
+    /// This is the crash-recovery completion of an interrupted non-blocking build (`rmp` task #91):
+    /// by the time this runs the rebuild has already fully populated the in-memory index, so the
+    /// durable state simply needs to catch up. The candidate-set contract makes this sound regardless:
+    /// even if some node were missed, a seek re-checks the store, so promoting can only ever expose a
+    /// fully-populated index. Errors interning/committing are swallowed best-effort: a failed promotion
+    /// leaves the index `Populating` (withheld from the planner, scan-and-filter fallback stays
+    /// correct), to be retried on the next open.
+    fn promote_recovered_populating_indexes(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        next_txn_id: u64,
+    ) -> u64 {
+        let populating: Vec<(u32, u32)> = store
+            .borrow()
+            .node_property_indexes()
+            .into_iter()
+            .filter(|(_, _, state)| *state == IndexState::Populating)
+            .map(|(label_token, prop_key, _)| (label_token, prop_key))
+            .collect();
+        if populating.is_empty() {
+            return next_txn_id;
+        }
+
+        let txn = TxnId(next_txn_id + 1);
+        store.borrow_mut().begin(txn);
+        {
+            let mut store = store.borrow_mut();
+            for &(label_token, prop_key) in &populating {
+                store.set_node_property_index(label_token, prop_key, IndexState::Online);
+            }
+        }
+        if store.borrow_mut().commit(txn).is_err() {
+            // Could not make the promotion durable; leave the indexes `Populating` (still correct via
+            // the scan fallback) and reconcile on the next open.
+            return next_txn_id + 1;
+        }
+        let mut idx = index.borrow_mut();
+        for (label_token, prop_key) in populating {
+            idx.set_node_property_state(label_token, prop_key, IndexState::Online);
+        }
+        next_txn_id + 1
     }
 
     /// Reloads the durable node-property index catalog into `index` (`rmp` task #90), then clears and
@@ -161,46 +253,65 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         for id in node_ids {
-            // Read this node's current label tokens (store borrow, released before the index borrow).
-            let label_tokens = match store.borrow_mut().node_labels(id) {
-                Ok(tokens) => tokens,
-                Err(_) => continue, // overflow-form bitmap or read fault: skip this node's entries.
-            };
+            Self::index_one_node(store, index, id, &registered);
+        }
+    }
 
-            // Resolve the node's current property values, keyed by prop-key, so the index borrow
-            // below never overlaps a store borrow. `node_property_values` decodes the whole chain
-            // newest-first (`rmp` task #50); the first occurrence per key is the newest value. No MVCC
-            // snapshot is needed — the index is a candidate set and every seek re-checks visibility.
-            let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
-            {
-                let chain = match store.borrow_mut().node_property_values(id) {
-                    Ok(chain) => chain,
-                    Err(_) => continue, // a non-storable / read fault: skip this node's properties.
-                };
-                for (_pid, key, value) in chain {
-                    // Newest-wins: keep only the first occurrence of each key.
-                    if values.iter().any(|(k, _)| *k == key) {
-                        continue;
-                    }
-                    // Only keep keys that a registered index over one of this node's labels uses.
-                    let used = registered.iter().any(|&(reg_label, prop_key)| {
-                        prop_key == key && label_tokens.contains(&reg_label)
-                    });
-                    if used {
-                        values.push((key, value));
-                    }
+    /// Inserts node `id`'s current label tokens and indexed property values into `index`, for the
+    /// set of `registered` `(label_token, prop_key)` indexes. The store and the index are borrowed in
+    /// **separate, non-overlapping** scopes (the load-bearing borrow discipline of this file).
+    ///
+    /// Extracted so the full-store rebuild ([`rebuild_index`](Self::rebuild_index)) and the
+    /// incremental non-blocking build ([`advance_index_builds`](Self::advance_index_builds)) index a
+    /// node through **exactly one** code path — the per-node logic cannot drift between them. A
+    /// store-read fault on this node (an overflow-form bitmap, a non-storable value, a reclaimed slot)
+    /// skips that node's entries best-effort: a missing candidate degrades that node to the full-scan
+    /// fallback for a reader, never to a wrong row (the candidate-set contract).
+    fn index_one_node(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        // Read this node's current label tokens (store borrow, released before the index borrow).
+        let label_tokens = match store.borrow_mut().node_labels(id) {
+            Ok(tokens) => tokens,
+            Err(_) => return, // overflow-form bitmap or read fault: skip this node's entries.
+        };
+
+        // Resolve the node's current property values, keyed by prop-key, so the index borrow
+        // below never overlaps a store borrow. `node_property_values` decodes the whole chain
+        // newest-first (`rmp` task #50); the first occurrence per key is the newest value. No MVCC
+        // snapshot is needed — the index is a candidate set and every seek re-checks visibility.
+        let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
+        {
+            let chain = match store.borrow_mut().node_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return, // a non-storable / read fault: skip this node's properties.
+            };
+            for (_pid, key, value) in chain {
+                // Newest-wins: keep only the first occurrence of each key.
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue;
+                }
+                // Only keep keys that a registered index over one of this node's labels uses.
+                let used = registered.iter().any(|&(reg_label, prop_key)| {
+                    prop_key == key && label_tokens.contains(&reg_label)
+                });
+                if used {
+                    values.push((key, value));
                 }
             }
+        }
 
-            let mut index = index.borrow_mut();
+        let mut index = index.borrow_mut();
+        for &lt in &label_tokens {
+            index.insert_label(lt, id);
+        }
+        for (prop_key, value) in &values {
             for &lt in &label_tokens {
-                index.insert_label(lt, id);
-            }
-            for (prop_key, value) in &values {
-                for &lt in &label_tokens {
-                    if index.has_node_property(lt, *prop_key) {
-                        index.insert_node_property(lt, *prop_key, value, id);
-                    }
+                if index.has_node_property(lt, *prop_key) {
+                    index.insert_node_property(lt, *prop_key, value, id);
                 }
             }
         }
@@ -298,6 +409,219 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         );
         Self::rebuild_index(&self.store, &self.index);
         Ok(())
+    }
+
+    /// Declares a node-property index on `(label, property)` and starts a **non-blocking** background
+    /// build of it (`rmp` task #91): the catalog entry is recorded durably as [`IndexState::Populating`]
+    /// and a pending build is enqueued, but **no node is scanned here** — the call returns promptly so
+    /// the single-threaded engine stays responsive to other commands. The build is advanced in bounded
+    /// chunks by [`advance_index_builds`](Self::advance_index_builds) and promoted to
+    /// [`IndexState::Online`] only when every snapshot node has been indexed.
+    ///
+    /// In contrast, [`create_node_property_index`](Self::create_node_property_index) populates the
+    /// index **synchronously** before returning (`Online` on success) — keep it for the
+    /// startup/recovery path and any caller that can tolerate a blocking full-store scan; use *this*
+    /// for a live `CREATE INDEX` over a populated store, where blocking the engine thread for the scan
+    /// would stall every concurrent query.
+    ///
+    /// # Build snapshot and the no-missed-results guarantee
+    ///
+    /// At build start the current live node-id list is snapshotted ([`RecordStore::scan_node_ids`]).
+    /// The build later indexes each snapshot node's *current* state. Concurrent writes between chunks
+    /// are covered without any extra bookkeeping because the index is a **candidate set** and writes
+    /// already maintain it (`RecordStoreGraph::reindex_node` inserts into *every* registered index in
+    /// *any* state):
+    ///
+    /// - A node **deleted** before the scan reaches it → indexed as a stale candidate → harmless (the
+    ///   seek's re-check drops the now-invisible version).
+    /// - A node **created** after build start → not in the snapshot, but `reindex_node` inserts its
+    ///   current label/value on the creating write → covered.
+    /// - A value **changed** mid-build → `reindex_node` inserts the new value as a candidate; the
+    ///   snapshot scan may also insert the old value; both are candidates and the re-check keeps only
+    ///   the current one → covered.
+    ///
+    /// So at completion every node that should match is a candidate (zero missed results), and only
+    /// harmless stale candidates may exist — exactly the contract the executor's re-check already
+    /// assumes.
+    ///
+    /// While `Populating`, the planner withholds the index (it is absent from
+    /// [`catalog`](Self::catalog)), so reads fall back to a label-scan + filter and observe correct
+    /// results throughout the build.
+    ///
+    /// # Errors
+    /// Returns a storage error if interning either token, recording the catalog entry, the committing
+    /// transaction, or the initial snapshot scan fails. On any error the index is left undeclared.
+    pub fn begin_online_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
+        // Intern the tokens and record the durable catalog entry as `Populating`, in one committed
+        // transaction — exactly like `create_node_property_index` but for the in-progress state, so an
+        // interrupted build recovers `Populating` and is completed by the open-time rebuild.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            store.set_node_property_index(label_token, prop_key, IndexState::Populating);
+            (label_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the index `Populating` in the in-memory set so concurrent writes maintain it from
+        // now on (the planner still withholds it until it is promoted `Online`).
+        self.index.borrow_mut().register_node_property_with_state(
+            label_token,
+            prop_key,
+            IndexState::Populating,
+        );
+
+        // Snapshot the current live node-id list and enqueue the pending build. The scan is the only
+        // store walk here; the per-node indexing is deferred to `advance_index_builds`.
+        let snapshot = self.store.borrow_mut().scan_node_ids()?;
+        self.pending_builds.push_back(PendingIndexBuild {
+            label_token,
+            prop_key,
+            snapshot,
+            cursor: 0,
+        });
+        Ok(())
+    }
+
+    /// Whether any non-blocking index build is still in progress (`rmp` task #91). The engine loop
+    /// uses this to decide between a plain blocking receive (no builds) and a timed receive that also
+    /// drives the build between commands.
+    #[must_use]
+    pub fn has_pending_index_builds(&self) -> bool {
+        !self.pending_builds.is_empty()
+    }
+
+    /// Advances the front non-blocking index build by up to `budget` nodes (`rmp` task #91), returning
+    /// whether **any** build remains pending afterwards.
+    ///
+    /// For the front build it indexes the next `budget` snapshot nodes (each via the shared
+    /// `index_one_node` helper, so the per-node logic matches the full
+    /// rebuild). When the front build's cursor reaches the end of its snapshot it is **complete**: the
+    /// catalog entry is durably flipped to [`IndexState::Online`] in a committed transaction, the
+    /// in-memory state is promoted, and the build is dequeued — after which the planner begins routing
+    /// seeks to it. Per-call work is bounded by `budget` so a build never monopolises the engine
+    /// thread (the responsiveness guarantee).
+    ///
+    /// A `budget` of `0` performs no indexing but still returns the pending state (callers should pass
+    /// a positive chunk size). If the durable promotion commit fails, the build is left in place
+    /// `Populating` (still correct via the scan fallback) to be retried on the next call/open.
+    pub fn advance_index_builds(&mut self, budget: usize) -> bool {
+        let Some(build) = self.pending_builds.front_mut() else {
+            return false;
+        };
+
+        // Index up to `budget` nodes from the snapshot, starting at the cursor.
+        let registered = [(build.label_token, build.prop_key)];
+        let end = build.snapshot.len().min(build.cursor + budget);
+        for &id in &build.snapshot[build.cursor..end] {
+            Self::index_one_node(&self.store, &self.index, id, &registered);
+        }
+        build.cursor = end;
+
+        if build.cursor < build.snapshot.len() {
+            // More of this build remains; nothing else is processed this call.
+            return true;
+        }
+
+        // The front build's snapshot is fully indexed: promote it durably to `Online`, then dequeue.
+        let (label_token, prop_key) = (build.label_token, build.prop_key);
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store
+            .borrow_mut()
+            .set_node_property_index(label_token, prop_key, IndexState::Online);
+        if self.store.borrow_mut().commit(txn).is_err() {
+            // The durable flip failed; leave the build pending `Populating` and retry next call. The
+            // index stays withheld from the planner (correct, just unaccelerated) until then.
+            return true;
+        }
+        self.index
+            .borrow_mut()
+            .set_node_property_state(label_token, prop_key, IndexState::Online);
+        self.pending_builds.pop_front();
+        !self.pending_builds.is_empty()
+    }
+
+    /// Drops the node-property index on `(label, property)` (`rmp` task #91): removes its durable
+    /// catalog entry in a committed transaction and unregisters it from the in-memory [`IndexSet`],
+    /// cancelling any in-progress non-blocking build of the same index.
+    ///
+    /// Idempotent on a never-declared index: the durable removal is a no-op and the in-memory
+    /// unregister is a no-op, so dropping an absent index succeeds. The tokens are looked up (not
+    /// interned): an unknown label/property means no such index can exist, so the call is a clean
+    /// no-op success.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
+        // Resolve the tokens by lookup only; a missing token means the index cannot exist.
+        let tokens = {
+            let store = self.store.borrow();
+            match (
+                store.token_id(Namespace::Label, label),
+                store.token_id(Namespace::PropKey, property),
+            ) {
+                (Some(label_token), Some(prop_key)) => Some((label_token, prop_key)),
+                _ => None,
+            }
+        };
+        let Some((label_token, prop_key)) = tokens else {
+            return Ok(()); // no such tokens → no such index → clean no-op.
+        };
+
+        // Remove the durable catalog entry in its own committed transaction (mirrors the create path).
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store
+            .borrow_mut()
+            .remove_node_property_index(label_token, prop_key);
+        self.store.borrow_mut().commit(txn)?;
+
+        // Cancel any in-progress build for this index and unregister it from the in-memory set.
+        self.pending_builds
+            .retain(|b| !(b.label_token == label_token && b.prop_key == prop_key));
+        self.index
+            .borrow_mut()
+            .unregister_node_property(label_token, prop_key);
+        Ok(())
+    }
+
+    /// Lists every declared node-property index as `(label, property, state)` (`rmp` task #91), for a
+    /// `SHOW INDEXES` surface. Reads the durable catalog and resolves the tokens back to names; an
+    /// index whose tokens have no resolvable name (a defensively-skipped impossibility for a live
+    /// token) is omitted. Ordered by the catalog's ascending `(label_token, prop_key)` key.
+    #[must_use]
+    pub fn list_node_property_indexes(&self) -> Vec<(String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .node_property_indexes()
+            .into_iter()
+            .filter_map(|(label_token, prop_key, state)| {
+                let label = store.token_name(Namespace::Label, label_token)?;
+                let property = store.token_name(Namespace::PropKey, prop_key)?;
+                Some((label.to_owned(), property.to_owned(), state))
+            })
+            .collect()
     }
 
     /// The physical planner's [`IndexCatalog`] reflecting the indexes this coordinator currently

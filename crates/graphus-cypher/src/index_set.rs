@@ -139,6 +139,15 @@ impl IndexSet {
         }
     }
 
+    /// Unregisters the node-property index on `(label_token, prop_key)`, dropping its backing tree and
+    /// all its entries (`rmp` task #91, `DROP INDEX`). A no-op if no such index is registered. After
+    /// this the pair is no longer maintained, no longer answers a seek, and is absent from
+    /// [`registered_node_properties`](Self::registered_node_properties) /
+    /// [`online_node_properties`](Self::online_node_properties).
+    pub fn unregister_node_property(&mut self, label_token: u32, prop_key: u32) {
+        self.node_props.remove(&(label_token, prop_key));
+    }
+
     /// Whether a node-property index is registered for `(label_token, prop_key)` (in **any** state).
     #[must_use]
     pub fn has_node_property(&self, label_token: u32, prop_key: u32) -> bool {
@@ -646,6 +655,28 @@ mod tests {
             Some(vec![9]),
             "re-registering must not drop the existing entries"
         );
+    }
+
+    #[test]
+    fn unregister_drops_index_and_entries() {
+        let mut set = IndexSet::new();
+        set.register_node_property_with_state(1, 2, IndexState::Populating);
+        set.insert_node_property(1, 2, &Value::Integer(5), 9);
+        assert!(set.has_node_property(1, 2));
+
+        // Unregister: the pair is gone from every registry and answers no seek.
+        set.unregister_node_property(1, 2);
+        assert!(!set.has_node_property(1, 2));
+        assert_eq!(set.node_property_state(1, 2), None);
+        assert_eq!(set.registered_node_properties(), Vec::<(u32, u32)>::new());
+        assert_eq!(set.online_node_properties(), Vec::<(u32, u32)>::new());
+        // A seek on the now-unregistered pair is `None` (unregistered), not `Some(empty)`.
+        assert_eq!(set.seek_node_property_eq(1, 2, &Value::Integer(5)), None);
+
+        // Idempotent: unregistering an absent pair is a harmless no-op.
+        set.unregister_node_property(1, 2);
+        set.unregister_node_property(9, 9);
+        assert!(!set.has_node_property(1, 2));
     }
 
     #[test]

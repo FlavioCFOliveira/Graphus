@@ -78,6 +78,46 @@ pub struct RunReply {
     pub rows: RowReceiver,
 }
 
+/// An **index-DDL** statement routed to the engine thread (`rmp` task #91), where the
+/// node-property index catalog lives (on the single-threaded coordinator). Unlike the DATABASE
+/// admin commands — which act on the off-engine async [`crate::dbcatalog::DatabaseCatalog`] — index
+/// DDL must reach the [`graphus_cypher::TxnCoordinator`], so it travels as its own engine command.
+///
+/// The names are validated/normalized by the admin matcher before this is built; the engine looks
+/// them up / interns them through the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexCommand {
+    /// `CREATE INDEX …` on `(label, property)`: starts a **non-blocking** build (the index is
+    /// `Populating` and built in the background; the command returns promptly).
+    CreateNodePropertyIndex {
+        /// The node label the index is declared on.
+        label: String,
+        /// The property key the index is declared on.
+        property: String,
+    },
+    /// `DROP INDEX …` on `(label, property)`: removes the index (durable + in-memory), cancelling
+    /// any in-progress build.
+    DropNodePropertyIndex {
+        /// The node label of the index to drop.
+        label: String,
+        /// The property key of the index to drop.
+        property: String,
+    },
+    /// `SHOW INDEXES`: lists every declared node-property index with its build state.
+    ShowIndexes,
+}
+
+/// The buffered result of an [`EngineCommand::IndexDdl`]: column names + rows, streamed back through
+/// each seam's normal admin-result mechanism. `CREATE`/`DROP` return no rows; `SHOW INDEXES` returns
+/// one row per index.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexDdlReply {
+    /// The result column names (empty for `CREATE`/`DROP`).
+    pub fields: Vec<String>,
+    /// The result rows (one per index for `SHOW INDEXES`).
+    pub rows: Vec<Vec<Value>>,
+}
+
 /// One request to the engine task. Every variant carries a `oneshot` sender for its reply, so the
 /// submitting (async) task awaits the engine's serial execution without blocking a runtime worker.
 pub enum EngineCommand {
@@ -143,6 +183,17 @@ pub enum EngineCommand {
     Status {
         /// Reply channel: the number of currently-open transactions.
         reply: Reply<usize>,
+    },
+    /// Execute an **index-DDL** statement (`CREATE/DROP INDEX`, `SHOW INDEXES`) against the
+    /// coordinator's node-property index catalog (`rmp` task #91). Routed to the engine — not the
+    /// async database catalog — because the index catalog lives on the single-threaded coordinator.
+    /// `CREATE` starts a non-blocking background build and returns promptly; the engine loop then
+    /// drives that build between commands so concurrent reads/writes are never blocked.
+    IndexDdl {
+        /// The index-DDL statement to execute.
+        command: IndexCommand,
+        /// Reply channel: the buffered fields + rows, or an engine error.
+        reply: Reply<Result<IndexDdlReply, GraphusError>>,
     },
 }
 

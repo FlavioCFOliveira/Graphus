@@ -4,6 +4,10 @@ Operating instructions for the AI agent working on **Graphus**, a Label Property
 
 These rules are mandatory. Read them in full before starting any task and follow them at all times.
 
+## Roadmap
+
+**Name:** graphus
+
 ## Project definition
 
 Graphus is an **LPG (Label Property Graph) database server**. The server is built to operate **exemplarily and without failure** under extreme load and concurrency (highly demanding environments). By default, the graph uses a **multigraph** architecture.

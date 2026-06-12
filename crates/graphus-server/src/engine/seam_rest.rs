@@ -105,6 +105,16 @@ impl RestEngineAdapter {
     }
 }
 
+/// The "admin command inside an explicit transaction" rejection, shared by the database (rmp #84)
+/// and index (rmp #91) surfaces — neither is transactional.
+fn admin_in_explicit_tx() -> GraphusError {
+    GraphusError::Protocol(
+        "administrative commands cannot run inside an explicit transaction; \
+         commit or roll back first"
+            .to_owned(),
+    )
+}
+
 /// Maps the REST crate's access mode onto the engine's neutral one.
 fn from_rest_mode(mode: RestAccessMode) -> AccessMode {
     match mode {
@@ -207,19 +217,30 @@ impl RestEngine for RestEngineAdapter {
     ) -> Result<Self::Stream, GraphusError> {
         let open = self.lookup(tx)?;
 
-        // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84); see the
+        // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84/#91); see the
         // module docs for the explicit-vs-auto-commit rule.
         match crate::admin::parse_admin_statement(query) {
             AdminParse::Command(cmd) => {
                 if open.explicit {
-                    return Err(GraphusError::Protocol(
-                        "administrative commands cannot run inside an explicit transaction; \
-                         commit or roll back first"
-                            .to_owned(),
-                    ));
+                    return Err(admin_in_explicit_tx());
                 }
                 let result = self.context.execute(Some(&open.principal), &cmd)?;
                 return Ok(RestEngineStream::admin(result));
+            }
+            // An index-DDL statement (rmp #91): authorize like a database command, then route it to
+            // the engine the transaction was opened against (the index catalog lives on the
+            // coordinator). Rejected inside an explicit transaction, behind the admin-privilege gate.
+            AdminParse::Index(cmd) => {
+                if open.explicit {
+                    return Err(admin_in_explicit_tx());
+                }
+                // Authorization first — no side effects on denial (shared gate with the DB surface).
+                self.context.authorize_admin(Some(&open.principal))?;
+                let reply = open.handle.index_ddl_blocking(cmd)?;
+                return Ok(RestEngineStream::admin(AdminResult {
+                    fields: reply.fields,
+                    rows: reply.rows,
+                }));
             }
             AdminParse::Invalid(msg) => return Err(GraphusError::Compile(msg)),
             AdminParse::NotAdmin => {}

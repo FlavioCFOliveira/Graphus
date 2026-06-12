@@ -75,6 +75,16 @@ impl BoltEngineExecutor {
         }
     }
 
+    /// The "admin command inside an explicit transaction" rejection, shared by the database (rmp
+    /// #84) and index (rmp #91) surfaces — neither is transactional.
+    fn admin_in_explicit_tx() -> GraphusError {
+        GraphusError::Protocol(
+            "administrative commands cannot run inside an explicit transaction; \
+             commit or roll back first"
+                .to_owned(),
+        )
+    }
+
     /// Admits and runs one statement on `handle` inside `ticket`, wrapping the engine reply as the
     /// Bolt stream. Admission is taken on the **target database's** handle (per-db limits).
     fn run_on(
@@ -179,19 +189,38 @@ impl BoltExecutor for BoltEngineExecutor {
         parameters: Vec<(String, Value)>,
         tx: TxControl,
     ) -> Result<Self::Stream, GraphusError> {
-        // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84): the
+        // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84/#91): the
         // grammar is strict, so regular Cypher always falls through to the engine untouched.
         match crate::admin::parse_admin_statement(query) {
             AdminParse::Command(cmd) => {
                 if matches!(tx, TxControl::InExplicit { .. }) {
-                    return Err(GraphusError::Protocol(
-                        "administrative commands cannot run inside an explicit transaction; \
-                         commit or roll back first"
-                            .to_owned(),
-                    ));
+                    return Err(Self::admin_in_explicit_tx());
                 }
                 let result = self.context.execute(self.principal.as_deref(), &cmd)?;
                 return Ok(BoltEngineStream::admin(result));
+            }
+            // An index-DDL statement (rmp #91): authorize like a database command, then route it to
+            // the target database's engine (the index catalog lives on the coordinator, not the
+            // off-engine database catalog). Rejected inside an explicit transaction (not
+            // transactional), behind the same admin-privilege gate, results streamed as admin rows.
+            AdminParse::Index(cmd) => {
+                if matches!(tx, TxControl::InExplicit { .. }) {
+                    return Err(Self::admin_in_explicit_tx());
+                }
+                // Authorization first — no side effects on denial (shared gate with the DB surface).
+                self.context.authorize_admin(self.principal.as_deref())?;
+                // The index command runs against the database this auto-commit RUN targets.
+                let db = match &tx {
+                    TxControl::AutoCommit { db, .. } => db.as_deref(),
+                    // Rejected above; this arm is unreachable, but keep it total.
+                    TxControl::InExplicit { .. } => None,
+                };
+                let (_name, handle) = self.context.resolve(db)?;
+                let reply = handle.index_ddl_blocking(cmd)?;
+                return Ok(BoltEngineStream::admin(AdminResult {
+                    fields: reply.fields,
+                    rows: reply.rows,
+                }));
             }
             // Claimed by the admin grammar but malformed: a compile-time (syntax) error. The
             // claimed prefixes are never valid Cypher, so this steals nothing from the language.
