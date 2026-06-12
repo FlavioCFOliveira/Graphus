@@ -280,3 +280,88 @@ cargo run -p graphus-bench --release --bin bench_gate -- --tolerance 0.30
 
 The gate **must** be run in `--release`: the baseline is a release measurement, so a debug run (~10×
 slower) deliberately trips it (a useful self-check that the gate has teeth). See `VERIFICATION.md` §6.
+
+---
+
+## 9. LDBC-SNB-flavoured macro harness — broadened query set + offline correctness (`rmp` #78)
+
+This section records the macro harness baseline after `rmp` #78 broadened the operation catalog
+toward the official LDBC SNB Interactive-Short (IS), Interactive-Complex (IC), and
+Business-Intelligence (BI) query *shapes* and added an offline **correctness** harness. See
+`crates/graphus-bench/LDBC.md` for the full provenance and the explicit **offline scope**.
+
+> **Offline scope (read this first).** The official LDBC Datagen (Hadoop/Spark), the official
+> dataset, and the audited validation parameters are **not used** (they are not available offline).
+> Correctness is verified against the **deterministic synthetic generator's known ground truth**
+> (`src/ldbc/correctness.rs`): every operation's Cypher answer (through the real engine pipeline) is
+> asserted equal to an answer computed independently in Rust from the same generation parameters. The
+> latency/throughput numbers below are a **relative Graphus-vs-Graphus regression signal**, *not*
+> comparable to published LDBC results.
+
+### 9.1 Correctness (the headline deliverable)
+
+`cargo test -p graphus-bench` runs `every_operation_matches_ground_truth_at_micro_scale`: it
+generates the deterministic micro-scale graph, builds the standard `id` property indexes, and for
+**every** one of the 24 catalog operations runs its Cypher through the real
+`tokenize → … → execute → commit` pipeline and asserts the result equals the ground truth computed
+from the [`SnbModel`]. Reads are checked across 16 anchor invocations each; the write op is verified
+by reading the inserted comment back and asserting it links the right post + author.
+
+**Result: 24/24 operations match ground truth (0 disagreements, 0 engine correctness bugs found).**
+
+### 9.2 Operation catalog and SNB provenance (24 operations, 0 deferred)
+
+| family | operations |
+| ------ | ---------- |
+| IS (short reads) | `IS1-profile`, `IS2-authored`, `IS3-friends`, `IS5-creator`, `IS6-forum` |
+| IC (complex traversal/aggregate) | `IC-fof`, `IC-fof-strict`, `IC2-friend-msgs`, `IC-degree`, `IC-top-degree`, `IC-common-friends`, `IC-reach-2`, `IC-collect-friends`, `DEG-forum` |
+| BI (aggregates) | `BI-pop`, `BI-popular-posts`, `BI-forum-sizes`, `BI-prolific-authors`, `BI-top-commenters`, `BI-replied-posts`, `BI-age-bands`, `BI-forum-views`, `BI-isolated` |
+| write | `IU-comment` (insert, verified by read-back) |
+
+The official queries the offline harness does **not** attempt (and why) are listed in the report
+footer and in `LDBC.md` §"Deferred official queries" — chiefly: `shortestPath`/`allShortestPaths`
+(IC13/IC14), `creationDate`-windowed analytics (IC3/4/5/6/9, IS4/7), and the
+Organisation/Place/Tag/Country dimensions (IC1 full search, BI tag/country correlations) the
+synthetic schema omits.
+
+### 9.3 Baseline numbers (tiny scale, release, machine class §1)
+
+Captured with `cargo run -p graphus-bench --release --bin ldbc_snb` on the §1 host
+(`rustc 1.96.0`, AMD Ryzen 9 5900HX, Linux 6.8). Each operation timed over 200 invocations; the
+graph is the deterministic **174 nodes / 670 rels** tiny graph (built in 337 committed write txns,
+plus 3 `id` property indexes). Property-index seeks are active, so id-anchored point reads
+(`IS1-profile`) are now sub-millisecond.
+
+| operation            | rw | p50 (µs) | p99 (µs) | ops/s | rows |
+| -------------------- | -- | -------: | -------: | ----: | ---: |
+| IS1-profile          | R  |    779.0 |   1079.1 |  1270 |    1 |
+| IS3-friends          | R  |    969.7 |   1144.3 |  1017 |    7 |
+| IS2-authored         | R  |   8029.1 |   8797.6 |   124 |    2 |
+| IS5-creator          | R  |   1731.9 |   1961.7 |   575 |    1 |
+| IS6-forum            | R  |   1433.5 |   1692.5 |   692 |    1 |
+| IC-fof               | R  |   2129.4 |   3172.4 |   445 |   37 |
+| IC-fof-strict        | R  |  11481.8 |  33877.1 |    71 |   30 |
+| IC2-friend-msgs      | R  |   2792.0 |   4104.1 |   354 |   20 |
+| IC-degree            | R  |  12765.5 |  13697.6 |    78 |   60 |
+| IC-top-degree        | R  |  13013.7 |  14414.4 |    76 |    5 |
+| IC-common-friends    | R  |   4049.5 |   5832.8 |   233 |   36 |
+| IC-reach-2           | R  |   3900.4 |   5631.4 |   244 |   38 |
+| BI-pop               | R  |   4232.9 |   4569.6 |   239 |    1 |
+| BI-popular-posts     | R  |   3024.3 |   4174.2 |   329 |    1 |
+| BI-forum-sizes       | R  |   2961.1 |   3237.4 |   335 |    6 |
+| BI-prolific-authors  | R  |   4957.2 |   5315.5 |   203 |   10 |
+| BI-top-commenters    | R  |   7148.9 |   9430.0 |   138 |   10 |
+| BI-replied-posts     | R  |   8386.1 |  10087.7 |   118 |   10 |
+| BI-age-bands         | R  |   5618.6 |   6653.2 |   176 |    3 |
+| BI-forum-views       | R  |   4929.9 |   6668.0 |   194 |    6 |
+| BI-isolated          | R  |  21577.6 |  27355.2 |    45 |    0 |
+| DEG-forum            | R  |   3160.8 |   3810.2 |   310 |    1 |
+| IC-collect-friends   | R  |   3561.3 |   4246.5 |   275 |    1 |
+| IU-comment           | W  |  13606.8 |  18295.0 |    75 |    0 |
+
+A condensed, machine-readable form of three representative slices is recorded in `baseline.toml`
+under `[ldbc_snb]` (a documented **relative** signal, not a CI gate — the `bench_gate` `[metrics]`
+section remains the only gated micro-baseline). The cost is still dominated by full label/relationship
+scans where a query lacks an `id` anchor (the aggregates and the multi-hop traversals); the harness is
+the instrument that will show those drop as more index seeks and join strategies are wired into
+planning.

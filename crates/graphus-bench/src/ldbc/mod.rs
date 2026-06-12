@@ -18,13 +18,14 @@
 //! cargo run -p graphus-bench --release --bin ldbc_snb -- --medium
 //! ```
 
+pub mod correctness;
 pub mod driver;
 pub mod generator;
 pub mod operations;
 
 use std::time::{Duration, Instant};
 
-use generator::{GraphStats, ScaleFactor};
+use generator::{GraphStats, ScaleFactor, SnbModel};
 use graphus_cypher::binding::Parameters;
 use graphus_txn::IsolationLevel;
 use operations::Operation;
@@ -59,7 +60,7 @@ pub struct Report {
     pub scale: ScaleFactor,
     pub stats: GraphStats,
     pub load_latency: Duration,
-    /// Time to build the standard SNB-style property indexes ([`INDEXES`]) after the load.
+    /// Time to build the standard SNB-style `id` property indexes after the load.
     pub index_build_latency: Duration,
     pub ops: Vec<OpReport>,
 }
@@ -74,10 +75,21 @@ pub struct Report {
 /// generator statement outside the engine's subset). Per-operation failures are captured in
 /// [`OpReport::outcome`], never propagated, so the macro benchmark always runs to completion.
 pub fn run(scale: ScaleFactor) -> Result<Report, RunError> {
+    run_with(scale, INVOCATIONS_PER_OP)
+}
+
+/// As [`run`], but with an explicit per-operation invocation count. Used by the standing completion
+/// test with a small count (so the unoptimized test build stays fast while still exercising every
+/// operation end to end); the `ldbc_snb` binary and a release run use [`INVOCATIONS_PER_OP`] via
+/// [`run`].
+///
+/// # Errors
+/// Same contract as [`run`]: only graph generation / index creation failures propagate.
+pub fn run_with(scale: ScaleFactor, invocations: u64) -> Result<Report, RunError> {
     let mut coord = fresh_coord();
 
     let load_start = Instant::now();
-    let stats = generator::generate(&mut coord, scale)?;
+    let (model, stats) = generator::generate(&mut coord, scale)?;
     let load_latency = load_start.elapsed();
 
     let index_start = Instant::now();
@@ -90,7 +102,7 @@ pub fn run(scale: ScaleFactor) -> Result<Report, RunError> {
 
     let mut ops = Vec::new();
     for op in operations::catalog() {
-        ops.push(time_operation(&mut coord, &op, &stats));
+        ops.push(time_operation(&mut coord, &op, &model, invocations));
     }
 
     Ok(Report {
@@ -102,10 +114,15 @@ pub fn run(scale: ScaleFactor) -> Result<Report, RunError> {
     })
 }
 
-/// Times one operation over [`INVOCATIONS_PER_OP`] invocations. The first failure short-circuits to
-/// a deferred outcome (if the engine rejects this query form, it rejects every invocation of it).
-fn time_operation(coord: &mut Coord, op: &Operation, stats: &GraphStats) -> OpReport {
-    let mut latencies = Vec::with_capacity(INVOCATIONS_PER_OP as usize);
+/// Times one operation over `invocations` invocations. The first failure short-circuits to a
+/// deferred outcome (if the engine rejects this query form, it rejects every invocation of it).
+fn time_operation(
+    coord: &mut Coord,
+    op: &Operation,
+    model: &SnbModel,
+    invocations: u64,
+) -> OpReport {
+    let mut latencies = Vec::with_capacity(invocations as usize);
     let mut sample_rows = 0usize;
     let isolation = if op.is_write {
         IsolationLevel::Serializable
@@ -115,8 +132,8 @@ fn time_operation(coord: &mut Coord, op: &Operation, stats: &GraphStats) -> OpRe
         IsolationLevel::Snapshot
     };
 
-    for i in 0..INVOCATIONS_PER_OP {
-        let src = (op.build)(i, stats);
+    for i in 0..invocations {
+        let src = (op.build)(i, model);
         match run_statement(coord, &src, &Parameters::new(), isolation) {
             Ok(result) => {
                 if i == 0 {
@@ -272,7 +289,41 @@ pub fn render(report: &Report) -> String {
     );
     let _ = writeln!(
         out,
+        " Correctness: every operation is checked against the deterministic generator's ground truth"
+    );
+    let _ = writeln!(
+        out,
+        "   by `cargo test -p graphus-bench` (the offline substitute for official LDBC validation)."
+    );
+
+    // Transparently list the official queries this offline harness does not attempt, and why.
+    let deferred = operations::deferred_official_queries();
+    if !deferred.is_empty() {
+        let _ = writeln!(
+            out,
+            "----------------------------------------------------------------"
+        );
+        let _ = writeln!(out, " Deferred official LDBC queries (offline scope):");
+        for (query, reason) in &deferred {
+            let _ = writeln!(out, "   - {query}: {reason}");
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "----------------------------------------------------------------"
+    );
+    let _ = writeln!(
+        out,
         " Provenance: inspired, scaled SNB workload — NOT the official LDBC driver (see LDBC.md)."
+    );
+    let _ = writeln!(
+        out,
+        " Offline scope: no official Datagen/dataset/audited validation; numbers are a RELATIVE"
+    );
+    let _ = writeln!(
+        out,
+        "   Graphus-vs-Graphus regression signal, not comparable to published LDBC results."
     );
     let _ = writeln!(
         out,
@@ -285,17 +336,23 @@ pub fn render(report: &Report) -> String {
 mod tests {
     use super::*;
 
-    /// The harness runs to completion at the tiny scale, builds a non-trivial graph, and measures the
-    /// core operations — including the canonical 2-hop friends-of-friends traversal. This is the test
+    /// A small invocation count for the standing completion test, so the unoptimized test build stays
+    /// fast across all 24 operations (the full [`INVOCATIONS_PER_OP`] is the perf-run default used by
+    /// the `ldbc_snb` binary). Correctness is verified separately by [`crate::ldbc::correctness`].
+    const TEST_INVOCATIONS: u64 = 8;
+
+    /// The harness runs to completion at the micro scale, builds a non-trivial graph, and measures
+    /// every operation — including the canonical 2-hop friends-of-friends traversal. This is the test
     /// embodiment of the AC "LDBC SNB runs".
     ///
-    /// One `run()` builds the whole graph (an O(persons²) label-scan load), so every assertion shares
-    /// that single run. Uses the `micro` scale so the unoptimized test build stays fast; the larger
-    /// `tiny`/`medium` scales are for the `ldbc_snb` binary in release.
+    /// One `run_with()` builds the whole graph (an O(persons²) label-scan load), so every assertion
+    /// shares that single run. Uses the `micro` scale + a small invocation count so the unoptimized
+    /// test build stays fast; the larger `tiny`/`medium` scales and the full invocation count are for
+    /// the `ldbc_snb` binary in release.
     #[test]
     fn ldbc_harness_runs_to_completion_at_micro_scale() {
         let scale = ScaleFactor::micro();
-        let report = run(scale).expect("harness runs");
+        let report = run_with(scale, TEST_INVOCATIONS).expect("harness runs");
 
         // The graph was actually built at the configured scale.
         assert_eq!(
@@ -315,7 +372,7 @@ mod tests {
         // The core read operations the engine supports — incl. the 2-hop friends-of-friends traversal
         // (`IC-fof`), proving the harness exercises real multi-hop traversal, not just point reads —
         // must have measured (not deferred) and timed every invocation.
-        for id in ["IS1-profile", "IS3-friends", "IC-fof", "AGG-persons"] {
+        for id in ["IS1-profile", "IS3-friends", "IC-fof", "BI-pop"] {
             let op = by_id(id);
             assert!(
                 op.outcome.is_ok(),
@@ -325,21 +382,46 @@ mod tests {
             let lat = op.outcome.as_ref().unwrap();
             assert_eq!(
                 lat.len() as u64,
-                INVOCATIONS_PER_OP,
+                TEST_INVOCATIONS,
                 "{id} timed every invocation"
             );
         }
 
-        // The aggregate over all persons returns exactly one row.
+        // Every catalog operation must be supported and measured at this scale (0 deferred) — the
+        // broadened set is fully exercised, not partially.
+        for op in &report.ops {
+            assert!(
+                op.outcome.is_ok(),
+                "operation {} must be supported (not deferred), got: {:?}",
+                op.id,
+                op.outcome.as_ref().err().map(ToString::to_string)
+            );
+        }
+
+        // The population aggregate over all persons returns exactly one row.
         assert_eq!(
-            by_id("AGG-persons").sample_rows,
+            by_id("BI-pop").sample_rows,
             1,
             "an aggregate returns exactly one row"
         );
 
-        // The rendered report is non-empty and mentions the provenance disclaimer + the scale.
+        // The rendered report is non-empty and mentions the provenance disclaimer + the scale, plus
+        // the offline-scope transparency: the deferred official queries and the "relative signal"
+        // caveat (so the honest-scope requirement is regression-guarded).
         let text = render(&report);
         assert!(text.contains("NOT the official LDBC driver"));
         assert!(text.contains(&format!("persons={}", scale.persons)));
+        assert!(
+            text.contains("Deferred official LDBC queries"),
+            "report lists the deferred official queries"
+        );
+        assert!(
+            text.contains("RELATIVE"),
+            "report states the numbers are a relative regression signal"
+        );
+        assert!(
+            text.contains("ground truth"),
+            "report points at the ground-truth correctness check"
+        );
     }
 }
