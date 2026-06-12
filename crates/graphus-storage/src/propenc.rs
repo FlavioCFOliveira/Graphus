@@ -93,6 +93,7 @@ fn class_name(value: &Value) -> &'static str {
         Value::LocalDateTime(_) => "LocalDateTime",
         Value::ZonedDateTime(_) => "ZonedDateTime",
         Value::Duration(_) => "Duration",
+        Value::Point(_) => "Point",
     }
 }
 

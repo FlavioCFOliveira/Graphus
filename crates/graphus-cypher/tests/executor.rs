@@ -1553,3 +1553,88 @@ mod procedures {
         assert_eq!(col(&rows, "label"), vec![s("A"), s("B")]);
     }
 }
+
+// =================================================================================================
+// Spatial: point() / distance() / accessors end to end (`rmp` task #73)
+// =================================================================================================
+
+#[test]
+fn point_constructor_and_accessors_run_end_to_end() {
+    use graphus_core::value::spatial::{Crs, Point};
+    let mut g = MemGraph::new();
+
+    // A Cartesian 2D point, projected back with its accessors.
+    let rows = run(
+        "RETURN point({x: 3, y: 4}) AS p, point({x: 3, y: 4}).x AS x, point({x: 3, y: 4}).srid AS srid",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].value("p"),
+        Value::Point(Point::new_2d(Crs::Cartesian, 3.0, 4.0))
+    );
+    assert_eq!(rows[0].value("x"), Value::Float(3.0));
+    assert_eq!(rows[0].value("srid"), Value::Integer(7203));
+
+    // A WGS-84 point from longitude/latitude with its named accessors.
+    let rows = run(
+        "RETURN point({longitude: -8.61, latitude: 41.15}).crs AS crs, \
+         point({longitude: -8.61, latitude: 41.15}).longitude AS lon",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("crs"), s("wgs-84"));
+    assert_eq!(rows[0].value("lon"), Value::Float(-8.61));
+}
+
+#[test]
+fn distance_runs_end_to_end_for_both_crs() {
+    let mut g = MemGraph::new();
+    // Cartesian Euclidean.
+    let rows = run(
+        "RETURN distance(point({x: 0, y: 0}), point({x: 3, y: 4})) AS d",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("d"), Value::Float(5.0));
+
+    // Cross-CRS distance is null.
+    let rows = run(
+        "RETURN distance(point({x: 0, y: 0}), point({longitude: 0, latitude: 0})) AS d",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("d"), Value::Null);
+
+    // WGS-84 great-circle distance is a positive number in metres (London → Paris ~343 km).
+    let rows = run(
+        "RETURN distance(point({longitude: -0.1278, latitude: 51.5074}), \
+         point({longitude: 2.3522, latitude: 48.8566})) AS d",
+        &mut g,
+    );
+    let Value::Float(d) = rows[0].value("d") else {
+        panic!("expected a float distance, got {:?}", rows[0].value("d"));
+    };
+    assert!(
+        (d - 343_556.0).abs() < 1_000.0,
+        "London–Paris distance was {d} m"
+    );
+}
+
+#[test]
+fn a_point_property_round_trips_through_a_node() {
+    use graphus_core::value::spatial::{Crs, Point};
+    // A point stored as a node property is read back identically (the MemGraph property path).
+    let mut g = MemGraph::new();
+    let _ = g.add_node(
+        ["City"],
+        [("loc", Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15)))],
+    );
+    let rows = run(
+        "MATCH (c:City) RETURN c.loc AS loc, c.loc.latitude AS lat",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].value("loc"),
+        Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15))
+    );
+    assert_eq!(rows[0].value("lat"), Value::Float(41.15));
+}

@@ -31,11 +31,13 @@
 //! | `List(xs)` | `[ <typed> … ]` | plain JSON array of typed elements |
 //! | `Map(kv)` | `{"{}": { k: <typed> … }}` | sigil `{}`; insertion order preserved |
 //! | temporal | `{"T": "<ISO-8601>"}` | sigil `T`; ISO-8601 string (Neo4j Jolt convention) |
+//! | `Point(p)` | `{"@": { "crs", "srid", "coordinates": [ … ] }}` | sigil `@`; self-describing point object |
 //!
-//! The structural `$N`/`$R`/`$P` (node / relationship / path) and `@` (point) sigils are **not**
-//! emitted: those `Value` variants do not exist yet in `graphus_core::Value` (`04 §7.2` defers them
-//! to their owning subsystems), exactly as `graphus-bolt`'s PackStream encoder documents. They are
-//! added here when the variants land; the seam does not change.
+//! The structural `$N`/`$R`/`$P` (node / relationship / path) sigils are **not** emitted: those
+//! `Value` variants do not exist yet in `graphus_core::Value` (`04 §7.2` defers them to their owning
+//! subsystems), exactly as `graphus-bolt`'s PackStream encoder documents. They are added here when
+//! the variants land; the seam does not change. The `@` (point) sigil **is** emitted (`rmp` task
+//! #73).
 //!
 //! ## Decoding accepts plain JSON too (Jolt "sparse" input)
 //!
@@ -100,6 +102,10 @@ const SIGIL_STR: &str = "U";
 const SIGIL_BYTES: &str = "#";
 const SIGIL_MAP: &str = "{}";
 const SIGIL_TEMPORAL: &str = "T";
+/// Spatial point sigil (`@`, the Neo4j Jolt convention for a point; `rmp` task #73). The payload is
+/// a **self-describing object** `{ "crs": <name>, "srid": <int>, "coordinates": [ <num>… ] }` so a
+/// REST client recovers the CRS and every coordinate without parsing a WKT string.
+const SIGIL_POINT: &str = "@";
 
 // =============================== JSON / Jolt ===================================================
 
@@ -132,7 +138,28 @@ pub fn value_to_jolt(value: &Value) -> Json {
         | Value::LocalDateTime(_)
         | Value::ZonedDateTime(_)
         | Value::Duration(_) => sigil(SIGIL_TEMPORAL, Json::String(temporal_to_iso(value))),
+        // A point is a self-describing object under the `@` sigil (`rmp` task #73).
+        Value::Point(p) => sigil(SIGIL_POINT, point_to_json(p)),
     }
+}
+
+/// Encodes a [`graphus_core::Point`] as the self-describing `@`-sigil payload object: its CRS name,
+/// SRID and coordinate list. The coordinates are plain JSON numbers (a point coordinate is a
+/// geometric quantity, not subject to the property int53 contract that strings 64-bit integers).
+fn point_to_json(p: &graphus_core::Point) -> Json {
+    let mut obj = JsonMap::with_capacity(3);
+    obj.insert("crs".to_owned(), Json::String(p.crs.name().to_owned()));
+    obj.insert("srid".to_owned(), Json::from(p.crs.srid()));
+    obj.insert(
+        "coordinates".to_owned(),
+        Json::Array(
+            p.coords()
+                .iter()
+                .map(|&c| serde_json::Number::from_f64(c).map_or(Json::Null, Json::Number))
+                .collect(),
+        ),
+    );
+    Json::Object(obj)
 }
 
 /// Decodes a Jolt typed-JSON value (strict *or* sparse) into a [`Value`] (`04 §8.2`).
@@ -174,6 +201,7 @@ fn object_to_value(obj: &JsonMap<String, Json>) -> Result<Value, ValueCodecError
             SIGIL_BYTES => return decode_bytes(payload),
             SIGIL_MAP => return decode_map(payload),
             SIGIL_TEMPORAL => return decode_temporal(payload),
+            SIGIL_POINT => return decode_point(payload),
             // Not a recognised sigil → fall through to the sparse map interpretation.
             _ => {}
         }
@@ -272,6 +300,52 @@ fn decode_temporal(payload: &Json) -> Result<Value, ValueCodecError> {
     }
 }
 
+/// Decodes the `@`-sigil point payload (`rmp` task #73). The CRS is taken from an explicit `srid`
+/// (preferred) or `crs` name; the `coordinates` array supplies the 2 or 3 numbers, validated against
+/// the CRS dimensionality. Malformed input is a controlled [`ValueCodecError::BadSigilPayload`].
+fn decode_point(payload: &Json) -> Result<Value, ValueCodecError> {
+    use graphus_core::value::spatial::{Crs, Point};
+    let Json::Object(obj) = payload else {
+        return Err(bad_payload(SIGIL_POINT, payload, "expected an object"));
+    };
+    // Resolve the CRS from `srid` (preferred) or `crs` name.
+    let crs = if let Some(srid) = obj.get("srid").and_then(serde_json::Value::as_i64) {
+        Crs::from_srid(srid).ok_or_else(|| bad_payload(SIGIL_POINT, payload, "unknown SRID"))?
+    } else if let Some(name) = obj.get("crs").and_then(serde_json::Value::as_str) {
+        Crs::from_name(name).ok_or_else(|| bad_payload(SIGIL_POINT, payload, "unknown CRS name"))?
+    } else {
+        return Err(bad_payload(SIGIL_POINT, payload, "missing `srid`/`crs`"));
+    };
+    let coords: Vec<f64> =
+        match obj.get("coordinates") {
+            Some(Json::Array(arr)) => {
+                let mut out = Vec::with_capacity(arr.len());
+                for c in arr {
+                    out.push(c.as_f64().ok_or_else(|| {
+                        bad_payload(SIGIL_POINT, payload, "non-numeric coordinate")
+                    })?);
+                }
+                out
+            }
+            _ => {
+                return Err(bad_payload(
+                    SIGIL_POINT,
+                    payload,
+                    "missing `coordinates` array",
+                ));
+            }
+        };
+    Point::from_crs_coords(crs, &coords)
+        .map(Value::Point)
+        .ok_or_else(|| {
+            bad_payload(
+                SIGIL_POINT,
+                payload,
+                "coordinate count does not match the CRS",
+            )
+        })
+}
+
 // =============================== CBOR (RFC 8949) ===============================================
 
 /// Encodes a [`Value`] into a CBOR data item (RFC 8949).
@@ -301,6 +375,22 @@ pub fn value_to_cbor(value: &Value) -> ciborium::Value {
         | Value::LocalDateTime(_)
         | Value::ZonedDateTime(_)
         | Value::Duration(_) => Cbor::Text(temporal_to_iso(value)),
+        // A point is a self-describing CBOR map mirroring the Jolt `@` payload (`rmp` task #73); the
+        // distinguished `crs`/`srid`/`coordinates` keys let `cbor_to_value` recover it as a point.
+        Value::Point(p) => Cbor::Map(vec![
+            (
+                Cbor::Text("crs".to_owned()),
+                Cbor::Text(p.crs.name().to_owned()),
+            ),
+            (
+                Cbor::Text("srid".to_owned()),
+                Cbor::Integer(p.crs.srid().into()),
+            ),
+            (
+                Cbor::Text("coordinates".to_owned()),
+                Cbor::Array(p.coords().iter().map(|&c| Cbor::Float(c)).collect()),
+            ),
+        ]),
     }
 }
 
@@ -339,6 +429,11 @@ pub fn cbor_to_value(cbor: &ciborium::Value) -> Result<Value, ValueCodecError> {
                 };
                 out.push((key.clone(), cbor_to_value(v)?));
             }
+            // A self-describing point map (the `crs`/`srid`/`coordinates` shape `value_to_cbor`
+            // emits) re-decodes as a `Value::Point` (`rmp` task #73); any other map stays a map.
+            if let Some(point) = point_from_decoded_map(&out) {
+                return Ok(point);
+            }
             Ok(Value::Map(out))
         }
         other => Err(ValueCodecError::UnsupportedCbor {
@@ -348,6 +443,40 @@ pub fn cbor_to_value(cbor: &ciborium::Value) -> Result<Value, ValueCodecError> {
 }
 
 // =============================== helpers =======================================================
+
+/// Recognises a decoded CBOR map as a spatial point: exactly the `srid`/`crs` + `coordinates` keys
+/// `value_to_cbor` emits (`rmp` task #73). Returns the [`Value::Point`] on a clean match, else
+/// [`None`] so the caller keeps it a plain [`Value::Map`]. Conservative: any ambiguity (an unknown
+/// SRID, a coordinate count that does not fit the CRS, an extra/foreign key) declines the match.
+fn point_from_decoded_map(entries: &[(String, Value)]) -> Option<Value> {
+    use graphus_core::value::spatial::{Crs, Point};
+    // The map must have exactly the point keys (3 entries) so we never mis-read a user map.
+    if entries.len() != 3 {
+        return None;
+    }
+    let get = |k: &str| entries.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+    let coords_val = get("coordinates")?;
+    let Value::List(items) = coords_val else {
+        return None;
+    };
+    let mut coords = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Value::Float(f) => coords.push(*f),
+            Value::Integer(i) => coords.push(*i as f64),
+            _ => return None,
+        }
+    }
+    // Prefer `srid`, fall back to the `crs` name.
+    let crs = match get("srid") {
+        Some(Value::Integer(srid)) => Crs::from_srid(*srid)?,
+        _ => match get("crs") {
+            Some(Value::String(name)) => Crs::from_name(name)?,
+            _ => return None,
+        },
+    };
+    Point::from_crs_coords(crs, &coords).map(Value::Point)
+}
 
 fn sigil(key: &str, payload: Json) -> Json {
     let mut obj = JsonMap::with_capacity(1);
@@ -836,5 +965,69 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days, "failed at {days}");
         }
+    }
+
+    // ---- Spatial points (`rmp` task #73) ------------------------------------------------------
+
+    #[test]
+    fn jolt_point_has_self_describing_shape() {
+        use graphus_core::value::spatial::{Crs, Point};
+        let v = Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15));
+        let json = value_to_jolt(&v);
+        assert_eq!(json["@"]["crs"], serde_json::json!("wgs-84"));
+        assert_eq!(json["@"]["srid"], serde_json::json!(4326));
+        assert_eq!(json["@"]["coordinates"], serde_json::json!([-8.61, 41.15]));
+    }
+
+    #[test]
+    fn point_round_trips_through_jolt_and_cbor_for_every_crs() {
+        use graphus_core::value::spatial::{Crs, Point};
+        let points = [
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.5, -2.5)),
+            Value::Point(Point::new_3d(Crs::Cartesian3D, 1.0, 2.0, 3.0)),
+            Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15)),
+            Value::Point(Point::new_3d(Crs::Wgs84_3D, 12.5, -7.25, 100.0)),
+        ];
+        for v in &points {
+            assert_eq!(jolt_round_trip(v), *v, "jolt round-trip for {v:?}");
+            assert_eq!(cbor_round_trip(v), *v, "cbor round-trip for {v:?}");
+        }
+    }
+
+    #[test]
+    fn jolt_point_accepts_srid_or_crs_name_and_rejects_bad_input() {
+        use graphus_core::value::spatial::{Crs, Point};
+        // By SRID.
+        let by_srid = serde_json::json!({ "@": { "srid": 7203, "coordinates": [1.0, 2.0] } });
+        assert_eq!(
+            jolt_to_value(&by_srid).unwrap(),
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0))
+        );
+        // By CRS name (no srid).
+        let by_name = serde_json::json!({ "@": { "crs": "cartesian", "coordinates": [3.0, 4.0] } });
+        assert_eq!(
+            jolt_to_value(&by_name).unwrap(),
+            Value::Point(Point::new_2d(Crs::Cartesian, 3.0, 4.0))
+        );
+        // Wrong coordinate count for the CRS → controlled error.
+        let bad_dims = serde_json::json!({ "@": { "srid": 7203, "coordinates": [1.0] } });
+        assert!(jolt_to_value(&bad_dims).is_err());
+        // Unknown SRID → controlled error.
+        let bad_srid = serde_json::json!({ "@": { "srid": 9999, "coordinates": [1.0, 2.0] } });
+        assert!(jolt_to_value(&bad_srid).is_err());
+    }
+
+    #[test]
+    fn a_plain_user_map_is_not_misread_as_a_point() {
+        // A user map that merely happens to carry a `coordinates` key but not the full point shape
+        // stays a `Value::Map` (the point recogniser is conservative).
+        let m = Value::Map(vec![
+            (
+                "coordinates".to_owned(),
+                Value::List(vec![Value::Integer(1)]),
+            ),
+            ("note".to_owned(), Value::String("hi".to_owned())),
+        ]);
+        assert_eq!(cbor_round_trip(&m), m);
     }
 }

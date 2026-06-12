@@ -13,6 +13,7 @@ pub use error::{GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
+pub use value::spatial::{Crs, Point};
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 pub use version::{MAX_TIMESTAMP, VersionStamp};
 
@@ -198,10 +199,10 @@ pub mod version {
 
 /// The Cypher value model (`01-needs-survey.md` FR-DM-6, FR-QL-5).
 ///
-/// Covers the scalar, list, map and **temporal** value classes here. The spatial
-/// (`Point`) and structural (node / relationship / path) variants are introduced
-/// together with their owning subsystems. Cypher equality and ordering are
-/// three-valued and are implemented in `graphus-cypher` (FR-QL-8); the derived
+/// Covers the scalar, list, map, **temporal** and **spatial** (`Point`) value
+/// classes here. The structural (node / relationship / path) variants are
+/// introduced together with their owning subsystems. Cypher equality and ordering
+/// are three-valued and are implemented in `graphus-cypher` (FR-QL-8); the derived
 /// [`PartialEq`] here is structural and is **not** the Cypher equality operator.
 ///
 /// The temporal variants ([`Date`](Value::Date), [`LocalTime`](Value::LocalTime),
@@ -213,7 +214,13 @@ pub mod version {
 /// temporal CIP). Their cross-class ordering rank is defined in `graphus-cypher`'s
 /// `ordering` module and mirrored in `graphus-index`'s `keycodec`.
 pub mod value {
+    pub use spatial::{Crs, Point};
     pub use temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
+
+    /// The spatial **point** value class (CRS + 2D/3D `f64` coordinates), its equality and its total
+    /// ordering. Modelled on [`temporal`] (storage-shaped, fixed-width components); see
+    /// `04-technical-design.md` §7.2 and `rmp` task #73.
+    pub mod spatial;
 
     /// Fixed-width temporal component types used by the temporal [`Value`] variants.
     ///
@@ -337,7 +344,12 @@ pub mod value {
         ZonedDateTime(ZonedDateTime),
         /// A Cypher duration (months / days / seconds / nanoseconds).
         Duration(Duration),
-        // Point, Node, Relationship, and Path variants are added with their owning
+        /// A spatial point (Cartesian / WGS-84, 2D or 3D; openCypher `Point`, `rmp` task #73). Its
+        /// derived [`PartialEq`] is [`Point`]'s Cypher value equality (same CRS *and* equal
+        /// coordinates); ordering lives in `graphus-cypher`'s `ordering` module and the index key
+        /// codec, both consistent with [`Point::total_cmp`](spatial::Point::total_cmp).
+        Point(Point),
+        // Node, Relationship, and Path variants are added with their owning
         // subsystems (see specification/04-technical-design.md §7.2).
     }
 
@@ -387,6 +399,25 @@ pub mod value {
                 zone_id: "Europe/Lisbon".to_owned(),
             });
             assert!(!Value::Duration(Duration::default()).is_null());
+        }
+
+        #[test]
+        fn point_variants_construct() {
+            use super::spatial::{Crs, Point};
+            let p2 = Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0));
+            let p3 = Value::Point(Point::new_3d(Crs::Wgs84_3D, 10.0, 20.0, 30.0));
+            assert!(!p2.is_null());
+            assert!(!p3.is_null());
+            // Cypher value equality is the derived `PartialEq`: same CRS and coordinates.
+            assert_eq!(
+                Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)),
+                Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0))
+            );
+            // Same coordinates, different CRS ⇒ not equal.
+            assert_ne!(
+                Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)),
+                Value::Point(Point::new_2d(Crs::Wgs84, 1.0, 2.0))
+            );
         }
     }
 }

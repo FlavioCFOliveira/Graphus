@@ -23,6 +23,10 @@
 //!   in-memory [`InvertedIndex`] (term → sorted postings + forward map). Unlike the B+-tree kinds it
 //!   is a self-contained, store-independent data structure; its catalog durability and MVCC re-check
 //!   are layered on in `graphus-cypher`/`graphus-storage`, mirroring the derived `IndexSet`.
+//! - [`spatial`] — the spatial index (`rmp` task #73): a uniform [`SpatialIndex`] grid over indexed
+//!   points for proximity (`distance(n.loc, $p) <= r`) and bounding-box predicates. Like
+//!   [`fulltext`] it is a self-contained, store-independent data structure whose catalog durability
+//!   and MVCC re-check are layered on in `graphus-cypher`/`graphus-storage`.
 //! - [`constraint`] — uniqueness (via a unique index, commit-time validated) and existence
 //!   (checked on write) constraints (`04 §6.5`).
 //! - [`histogram`] — equi-depth property histograms over the order-preserving encoding, plus a
@@ -66,6 +70,7 @@ pub mod keycodec;
 pub mod kinds;
 pub mod node;
 pub mod recovery;
+pub mod spatial;
 
 pub use btree::BTree;
 pub use constraint::{ConstraintError, ExistenceConstraint, UniqueConstraint};
@@ -74,3 +79,4 @@ pub use histogram::{HistogramDecodeError, PropertyHistogram};
 pub use keycodec::{KeyEncodeError, encode_composite, encode_single, encode_value};
 pub use kinds::{CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
 pub use recovery::{SharedWal, recover_index_device};
+pub use spatial::{DEFAULT_CELL_SIZE, SpatialIndex};

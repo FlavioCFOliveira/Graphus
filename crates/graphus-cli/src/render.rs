@@ -206,6 +206,18 @@ fn write_value(out: &mut String, value: &Value) {
                 d.months, d.days, d.seconds, d.nanos
             );
         }
+        // A point renders as a Cypher-ish `point({srid, x, y[, z]})` (`rmp` task #73).
+        Value::Point(p) => {
+            let _ = write!(out, "point({{srid: {}, x: ", p.crs.srid());
+            write_float(out, p.x());
+            out.push_str(", y: ");
+            write_float(out, p.y());
+            if let Some(z) = p.z() {
+                out.push_str(", z: ");
+                write_float(out, z);
+            }
+            out.push_str("})");
+        }
     }
 }
 

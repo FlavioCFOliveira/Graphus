@@ -1374,6 +1374,7 @@ fn kind_name(v: &Value) -> &'static str {
         Value::LocalDateTime(_) => "LocalDateTime",
         Value::ZonedDateTime(_) => "DateTime",
         Value::Duration(_) => "Duration",
+        Value::Point(_) => "Point",
     }
 }
 

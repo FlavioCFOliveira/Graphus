@@ -79,6 +79,11 @@ fn deep_equals(a: &Value, b: &Value) -> Ternary {
         (Value::LocalDateTime(x), Value::LocalDateTime(y)) => Ternary::from_bool(x == y),
         (Value::ZonedDateTime(x), Value::ZonedDateTime(y)) => Ternary::from_bool(x == y),
         (Value::Duration(x), Value::Duration(y)) => Ternary::from_bool(x == y),
+        // Two points are equal iff same CRS and equal coordinates (openCypher; `rmp` task #73).
+        // `Point::value_eq` is the CRS-aware coordinate comparison; a cross-CRS pair is `false`. (A
+        // `NaN` coordinate is already excluded — `is_nan` in `equals` makes a `NaN`-bearing operand
+        // `FALSE` before reaching here.)
+        (Value::Point(x), Value::Point(y)) => Ternary::from_bool(x.value_eq(y)),
         // Different value classes are never equal (e.g. a string is not a number).
         _ => Ternary::False,
     }

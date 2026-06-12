@@ -7,7 +7,7 @@
 //! two-valued). The ascending global order is, verbatim from the CIP:
 //!
 //! ```text
-//! MAP < NODE < RELATIONSHIP < LIST < PATH < {temporals} < STRING < BOOLEAN < NUMBER < NaN < null
+//! MAP < NODE < RELATIONSHIP < LIST < PATH < POINT < {temporals} < STRING < BOOLEAN < NUMBER < NaN < null
 //! ```
 //!
 //! with the temporal block ascending
@@ -57,17 +57,20 @@ fn class_rank(v: &Value) -> u8 {
         // 1 = NODE, 2 = RELATIONSHIP (deferred to the executor sub-task).
         Value::List(_) => 3,
         // 4 = PATH (deferred).
-        Value::ZonedDateTime(_) => 5,
-        Value::LocalDateTime(_) => 6,
-        Value::Date(_) => 7,
-        Value::ZonedTime(_) => 8,
-        Value::LocalTime(_) => 9,
-        Value::Duration(_) => 10,
-        Value::String(_) => 11,
-        Value::Bytes(_) => 12, // non-CIP extension, just above STRING
-        Value::Boolean(_) => 13,
-        Value::Integer(_) | Value::Float(_) => 14, // NaN handled within, as the largest number
-        Value::Null => 15,                         // null is larger than any other value
+        // POINT sits between PATH and the temporal block per the CIP global order
+        // `… < LIST < PATH < POINT < {temporals} < STRING < …` (`rmp` task #73).
+        Value::Point(_) => 5,
+        Value::ZonedDateTime(_) => 6,
+        Value::LocalDateTime(_) => 7,
+        Value::Date(_) => 8,
+        Value::ZonedTime(_) => 9,
+        Value::LocalTime(_) => 10,
+        Value::Duration(_) => 11,
+        Value::String(_) => 12,
+        Value::Bytes(_) => 13, // non-CIP extension, just above STRING
+        Value::Boolean(_) => 14,
+        Value::Integer(_) | Value::Float(_) => 15, // NaN handled within, as the largest number
+        Value::Null => 16,                         // null is larger than any other value
     }
 }
 
@@ -173,6 +176,9 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::List(x), Value::List(y)) => cmp_lists(x, y),
         (Value::Map(x), Value::Map(y)) => cmp_maps(x, y),
+        // Points order by CRS (SRID) then coordinates — `Point::cmp`, the same total order the index
+        // key codec encodes (`rmp` task #73).
+        (Value::Point(x), Value::Point(y)) => x.total_cmp(y),
         // Any same-class temporal pair.
         (Value::Date(_), _)
         | (Value::LocalTime(_), _)
@@ -229,6 +235,7 @@ fn cmp_maps(x: &[(String, Value)], y: &[(String, Value)]) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graphus_core::value::spatial::{Crs, Point};
     use graphus_core::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 
     fn lt(a: Value, b: Value) {
@@ -246,11 +253,12 @@ mod tests {
 
     #[test]
     fn global_class_order_matches_cip() {
-        // MAP < LIST < temporal < STRING < BOOLEAN < NUMBER < NaN < null
+        // MAP < LIST < POINT < temporal < STRING < BOOLEAN < NUMBER < NaN < null
         // (NODE/RELATIONSHIP/PATH deferred; Bytes is between String and Boolean as an extension).
         let chain = [
             Value::Map(vec![]),
             Value::List(vec![]),
+            Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0)),
             Value::ZonedDateTime(ZonedDateTime::default()),
             Value::LocalDateTime(LocalDateTime::default()),
             Value::Date(Date::default()),
@@ -412,6 +420,35 @@ mod tests {
     }
 
     #[test]
+    fn points_order_by_crs_then_coordinates() {
+        // Cross-CRS: by SRID (WGS-84 4326 < Cartesian 7203 < Cartesian-3D 9157).
+        lt(
+            Value::Point(Point::new_2d(Crs::Wgs84, 9.0, 9.0)),
+            Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0)),
+        );
+        lt(
+            Value::Point(Point::new_2d(Crs::Cartesian, 9.0, 9.0)),
+            Value::Point(Point::new_3d(Crs::Cartesian3D, 0.0, 0.0, 0.0)),
+        );
+        // Within a CRS, lexicographic by coordinate.
+        lt(
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)),
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 3.0)),
+        );
+        // The whole point class sorts above LIST and below the temporal block.
+        lt(
+            Value::List(vec![Value::Integer(1)]),
+            Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0)),
+        );
+        lt(
+            Value::Point(Point::new_2d(Crs::Cartesian, f64::MAX, f64::MAX)),
+            Value::Date(Date {
+                days_since_epoch: i32::MIN,
+            }),
+        );
+    }
+
+    #[test]
     fn total_order_properties_hold_over_random_values() {
         // Antisymmetry, transitivity and totality over a deterministic spread of values, including
         // every class, cross-class pairs, signed zeros, NaN, null and nested lists.
@@ -464,6 +501,9 @@ mod tests {
             Value::List(vec![Value::List(vec![Value::Integer(2)])]),
             Value::Map(vec![]),
             Value::Map(vec![("a".to_owned(), Value::Integer(1))]),
+            Value::Point(Point::new_2d(Crs::Wgs84, 0.0, 0.0)),
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)),
+            Value::Point(Point::new_3d(Crs::Cartesian3D, 1.0, 2.0, 3.0)),
             Value::Date(Date {
                 days_since_epoch: -1,
             }),

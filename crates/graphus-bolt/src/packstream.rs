@@ -24,10 +24,11 @@
 //! ## The `Value` ↔ PackStream mapping
 //!
 //! `04 §7.2` states the `Value` enum maps one-to-one onto PackStream. The scalar, string, bytes,
-//! list, map and temporal variants map directly. The **structural** classes (`Node`,
-//! `Relationship`, `Path`, `Point`) are still **deferred in `graphus_core::Value`** (the enum
-//! comments mark them as added with their owning subsystems), so this codec cannot yet *decode* a
-//! wire `Node` into a `Value` variant that does not exist. The structure *encoders* are nonetheless
+//! list, map, temporal and **spatial** (`Point2D`/`Point3D`, `rmp` task #73) variants map directly.
+//! The **structural** classes (`Node`, `Relationship`, `Path`) are still **deferred in
+//! `graphus_core::Value`** (the enum comments mark them as added with their owning subsystems), so
+//! this codec cannot yet *decode* a wire `Node` into a `Value` variant that does not exist. The
+//! structure *encoders* are nonetheless
 //! provided ([`Structure`] + the [`tag`] bytes) because the Bolt server emits them for `RECORD`
 //! values from the entity ids/labels/properties the executor exposes (`04 §8.3`); see
 //! [`crate::message`] and the executor seam ([`crate::executor`]) for where that happens, and the
@@ -41,6 +42,7 @@
 //! nanoseconds-of-day, and [`Duration`] is `(months, days, seconds, nanos)`.
 
 use graphus_core::Value;
+use graphus_core::value::spatial::{Crs, Point};
 use graphus_core::value::temporal::{
     Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime,
 };
@@ -537,10 +539,16 @@ pub fn pack_value(packer: &mut Packer, value: &Value) {
         Value::LocalDateTime(dt) => pack_local_date_time(packer, *dt),
         Value::ZonedDateTime(dt) => pack_zoned_date_time(packer, dt),
         Value::Duration(d) => pack_duration(packer, *d),
+        // A spatial point maps onto the Bolt `Point2D` (0x58) or `Point3D` (0x59) structure by
+        // dimensionality, carrying the CRS's SRID and its coordinates (`rmp` task #73).
+        Value::Point(p) => match p.z() {
+            None => pack_point_2d(packer, p.crs.srid(), p.x(), p.y()),
+            Some(z) => pack_point_3d(packer, p.crs.srid(), p.x(), p.y(), z),
+        },
         // This match is intentionally **exhaustive** over `graphus_core::Value`. When a new variant
-        // is added there (the deferred structural `Node`/`Relationship`/`Path`/`Point`, `04 §7.2`),
-        // this becomes a compile error here — forcing its PackStream encoding to be written rather
-        // than silently dropped. That compile-time enforcement is stronger than a runtime guard.
+        // is added there (the deferred structural `Node`/`Relationship`/`Path`, `04 §7.2`), this
+        // becomes a compile error here — forcing its PackStream encoding to be written rather than
+        // silently dropped. That compile-time enforcement is stronger than a runtime guard.
     }
 }
 
@@ -726,9 +734,9 @@ fn pack_properties(packer: &mut Packer, properties: &[(String, Value)]) {
 
 // ---- Spatial point encoders (tags 0x58 / 0x59) -----------------------------------------------
 //
-// The spatial `Point` value class is not a `graphus_core::Value` variant yet (task #73), so no
-// value reaches these encoders today. They are provided now so the wire layer is ready: when #73
-// lands a `Value::Point`, it maps onto one of these by dimensionality with no codec change.
+// A `Value::Point` (task #73) maps onto one of these structures by dimensionality (`pack_value`):
+// a 2D CRS packs as `Point2D` (0x58), a 3D CRS as `Point3D` (0x59), each carrying the CRS's SRID
+// and its coordinates. The inverse decode lives in `unpack_structured_value`.
 
 /// Packs a Bolt `Point2D` structure (tag `0x58`): `srid` (int), `x` (float), `y` (float).
 pub fn pack_point_2d(packer: &mut Packer, srid: i64, x: f64, y: f64) {
@@ -755,7 +763,7 @@ pub fn pack_point_3d(packer: &mut Packer, srid: i64, x: f64, y: f64, z: f64) {
 ///
 /// # Errors
 /// [`BoltError::Decode`] on a truncated stream, an unknown marker, or a structure tag whose target
-/// `Value` variant does not yet exist (`Node`/`Relationship`/`Path`/`Point` are deferred in
+/// `Value` variant does not yet exist (`Node`/`Relationship`/`Path` are deferred in
 /// `graphus_core::Value`, `04 §7.2`) — decoding such a wire structure into a `Value` is not yet
 /// possible and is reported rather than guessed.
 pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
@@ -891,6 +899,21 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
                 seconds,
                 nanos,
             }))
+        }
+        tag::POINT_2D => {
+            expect_fields(t, field_count, 3)?;
+            let srid = unpacker.read_int()?;
+            let x = read_float_field(unpacker, "Point2D.x")?;
+            let y = read_float_field(unpacker, "Point2D.y")?;
+            decode_point(srid, &[x, y])
+        }
+        tag::POINT_3D => {
+            expect_fields(t, field_count, 4)?;
+            let srid = unpacker.read_int()?;
+            let x = read_float_field(unpacker, "Point3D.x")?;
+            let y = read_float_field(unpacker, "Point3D.y")?;
+            let z = read_float_field(unpacker, "Point3D.z")?;
+            decode_point(srid, &[x, y, z])
         }
         tag::NODE | tag::RELATIONSHIP | tag::UNBOUND_RELATIONSHIP | tag::PATH => {
             Err(BoltError::Decode(format!(
@@ -1173,6 +1196,37 @@ fn read_u32_field(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<u32> {
 fn read_i32_field(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<i32> {
     let n = unpacker.read_int()?;
     i32::try_from(n).map_err(|_| BoltError::Decode(format!("{what} out of i32 range")))
+}
+
+/// Builds a [`Value::Point`] from a wire SRID and coordinate slice (`rmp` task #73). An unknown SRID
+/// or a coordinate count that does not match the CRS dimensionality is a controlled
+/// [`BoltError::Decode`].
+fn decode_point(srid: i64, coords: &[f64]) -> BoltResult<Value> {
+    let crs = Crs::from_srid(srid)
+        .ok_or_else(|| BoltError::Decode(format!("unknown spatial SRID {srid}")))?;
+    Point::from_crs_coords(crs, coords)
+        .map(Value::Point)
+        .ok_or_else(|| {
+            BoltError::Decode(format!(
+                "SRID {srid} ({}) expects {} coordinates, found {}",
+                crs.name(),
+                crs.dimensions(),
+                coords.len()
+            ))
+        })
+}
+
+/// Reads a PackStream `float64` coordinate field (a `Point2D`/`Point3D` `x`/`y`/`z`). Decoding a
+/// non-float (the wrong wire shape) is a controlled [`BoltError::Decode`], never a panic.
+fn read_float_field(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<f64> {
+    match unpack_value(unpacker)? {
+        Value::Float(f) => Ok(f),
+        // A Bolt sender may legitimately pack a whole-number coordinate as an integer; accept it.
+        Value::Integer(i) => Ok(i as f64),
+        other => Err(BoltError::Decode(format!(
+            "{what} must be a float, found {other:?}"
+        ))),
+    }
 }
 
 /// Saturating `u64 -> i64` for nanosecond-of-day fields (always `< NANOS_PER_DAY`, well within
@@ -1619,7 +1673,6 @@ mod tests {
 
     #[test]
     fn point_2d_and_3d_exact_layout() {
-        // No `Value::Point` exists yet (#73), so the encoders are exercised directly.
         let mut p = Packer::new();
         pack_point_2d(&mut p, 7203, 1.5, -2.5);
         let bytes = p.into_inner();
@@ -1639,6 +1692,44 @@ mod tests {
         let (_t, fc) = u.read_struct_header().unwrap();
         assert_eq!(fc, 4);
         assert_eq!(u.read_int().unwrap(), 9157);
+    }
+
+    #[test]
+    fn value_point_round_trips_through_pack_and_unpack() {
+        use graphus_core::value::spatial::{Crs, Point};
+
+        // 2D Cartesian: packs as a Point2D (0x58) struct and round-trips bit-exactly.
+        let p2 = Value::Point(Point::new_2d(Crs::Cartesian, 1.5, -2.5));
+        let mut p = Packer::new();
+        pack_value(&mut p, &p2);
+        let bytes = p.into_inner();
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 3);
+        assert_eq!(bytes[1], tag::POINT_2D, "2D point packs as Point2D (0x58)");
+        assert_eq!(round_trip(&p2), p2);
+
+        // 3D WGS-84: packs as a Point3D (0x59) struct and round-trips.
+        let p3 = Value::Point(Point::new_3d(Crs::Wgs84_3D, 12.5, -7.25, 100.0));
+        let mut p = Packer::new();
+        pack_value(&mut p, &p3);
+        let bytes = p.into_inner();
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 4);
+        assert_eq!(bytes[1], tag::POINT_3D, "3D point packs as Point3D (0x59)");
+        assert_eq!(round_trip(&p3), p3);
+
+        // Every CRS round-trips with its SRID preserved.
+        for p in [
+            Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15)),
+            Value::Point(Point::new_3d(Crs::Cartesian3D, 1.0, 2.0, 3.0)),
+        ] {
+            assert_eq!(round_trip(&p), p);
+        }
+
+        // An unknown SRID is a controlled decode error, not a panic.
+        let mut bad = Packer::new();
+        pack_point_2d(&mut bad, 9999, 1.0, 2.0);
+        let bytes = bad.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        assert!(unpack_value(&mut u).is_err());
     }
 
     #[test]

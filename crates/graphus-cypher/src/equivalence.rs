@@ -47,6 +47,10 @@ pub fn equivalent(a: &Value, b: &Value) -> bool {
         (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x == y,
         (Value::ZonedDateTime(x), Value::ZonedDateTime(y)) => x == y,
         (Value::Duration(x), Value::Duration(y)) => x == y,
+        // Two points are equivalent iff same CRS and each coordinate is *number-equivalent* — so,
+        // consistent with `NaN ≡ NaN` and `-0.0 ≡ +0.0` for plain numbers, a `NaN` coordinate is
+        // equivalent to itself and signed zeros group together (`rmp` task #73).
+        (Value::Point(x), Value::Point(y)) => point_equivalent(x, y),
         _ => false, // distinct classes are never equivalent
     }
 }
@@ -70,6 +74,21 @@ fn num_f64(v: &Value) -> f64 {
         Value::Float(f) => *f,
         _ => unreachable!("num_f64 on a non-number"),
     }
+}
+
+/// Grouping equivalence of two points (`rmp` task #73): same CRS and each coordinate
+/// number-equivalent (`NaN ≡ NaN`, `-0.0 ≡ +0.0`), mirroring [`num_equivalent`] per coordinate.
+fn point_equivalent(x: &graphus_core::Point, y: &graphus_core::Point) -> bool {
+    if x.crs != y.crs {
+        return false;
+    }
+    x.coords().iter().zip(y.coords().iter()).all(|(a, b)| {
+        if a.is_nan() || b.is_nan() {
+            a.is_nan() && b.is_nan()
+        } else {
+            a == b
+        }
+    })
 }
 
 /// Order-independent map equivalence under [`equivalent`].

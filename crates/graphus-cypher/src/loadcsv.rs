@@ -246,6 +246,7 @@ fn value_kind(v: &Value) -> &'static str {
         | Value::LocalDateTime(_)
         | Value::ZonedDateTime(_)
         | Value::Duration(_) => "temporal value",
+        Value::Point(_) => "point",
     }
 }
 

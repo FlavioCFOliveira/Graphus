@@ -51,6 +51,16 @@
 //!                            nanos: i32 LE                                         (28 bytes)
 //! ```
 //!
+//! # Spatial format (`rmp` task #73)
+//!
+//! A spatial `Point` serializes as its one-byte **CRS discriminant** (`graphus_core::Crs::as_byte`)
+//! followed by the CRS-determined number of **little-endian `f64` coordinates** (2 for a 2D CRS, 3
+//! for a 3D CRS). The CRS byte fixes the coordinate count, so the body is self-delimiting:
+//!
+//! ```text
+//!   TAG_POINT           (12) crs: u8 ++ coord: f64 LE × {2 | 3}             (9 or 17 bytes)
+//! ```
+//!
 //! Every component round-trips **bit-exactly**; component-range invariants (e.g. `nanos_of_day <
 //! NANOS_PER_DAY`) are owned by `graphus-core`'s constructors, not re-validated by this codec —
 //! exactly as the float codec round-trips every bit pattern. Decode still rejects *structural*
@@ -81,6 +91,7 @@
 //! follow-up that extends this format, not a redesign of it.
 
 use graphus_core::Value;
+use graphus_core::value::spatial::{Crs, Point};
 use graphus_core::value::temporal::{
     Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime,
 };
@@ -110,6 +121,10 @@ pub const TAG_ZONED_DATE_TIME: u8 = 10;
 /// `type_tag` low-bits class for a `Duration` (body: `months: i64 LE ++ days: i64 LE ++
 /// seconds: i64 LE ++ nanos: i32 LE`).
 pub const TAG_DURATION: u8 = 11;
+/// `type_tag` low-bits class for a spatial `Point` (`rmp` task #73; body: `crs: u8 (CRS
+/// discriminant) ++ coord: f64 LE × CRS-dimensionality`). The CRS byte fixes the coordinate count
+/// (2 or 3), so the body is self-delimiting.
+pub const TAG_POINT: u8 = 12;
 
 /// `elem_tag` sentinel inside a serialized **empty** list (it has no element class to record).
 const TAG_LIST_EMPTY: u8 = 0;
@@ -227,6 +242,7 @@ fn class_name(value: &Value) -> &'static str {
         Value::LocalDateTime(_) => "LocalDateTime",
         Value::ZonedDateTime(_) => "ZonedDateTime",
         Value::Duration(_) => "Duration",
+        Value::Point(_) => "Point",
     }
 }
 
@@ -242,6 +258,7 @@ pub fn encode(value: &Value) -> Result<(u8, Vec<u8>), ValueEncodeError> {
     match value {
         Value::String(s) => Ok((TAG_STRING, s.as_bytes().to_vec())),
         Value::List(items) => Ok((TAG_LIST, encode_list(items)?)),
+        Value::Point(p) => Ok((TAG_POINT, encode_point_body(p))),
         other => match temporal_tag(other) {
             Some(tag) => {
                 // The largest fixed-width temporal body (Duration) is 28 bytes; a ZonedDateTime's
@@ -305,6 +322,19 @@ fn encode_temporal_body(v: &Value, out: &mut Vec<u8>) {
         // Unreachable: callers always pass a class `temporal_tag` accepted.
         _ => {}
     }
+}
+
+/// Serializes a spatial [`Point`] to its byte body (`rmp` task #73): the one-byte CRS discriminant
+/// ([`Crs::as_byte`]) followed by the **significant** coordinates ([`Point::dimensions`]) as little-
+/// endian `f64`s. The CRS byte fixes the coordinate count, so the body is self-delimiting.
+fn encode_point_body(p: &Point) -> Vec<u8> {
+    // 1 CRS byte + up to 3 × 8 coordinate bytes.
+    let mut out = Vec::with_capacity(1 + p.dimensions() * 8);
+    out.push(p.crs.as_byte());
+    for &c in p.coords() {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    out
 }
 
 /// Serializes a homogeneous list of supported scalar/string/temporal elements (`05 §7.2`).
@@ -389,6 +419,16 @@ pub fn decode(class_tag: u8, bytes: &[u8]) -> Result<Value, ValueDecodeError> {
             Ok(Value::String(s))
         }
         TAG_LIST => decode_list(bytes),
+        TAG_POINT => {
+            let mut cur = Cursor::new(bytes);
+            let v = decode_point_body(&mut cur)?;
+            if !cur.is_empty() {
+                return Err(ValueDecodeError::Malformed {
+                    what: "trailing bytes after the point value",
+                });
+            }
+            Ok(v)
+        }
         tag @ (TAG_DATE | TAG_LOCAL_TIME | TAG_ZONED_TIME | TAG_LOCAL_DATE_TIME
         | TAG_ZONED_DATE_TIME | TAG_DURATION) => {
             let mut cur = Cursor::new(bytes);
@@ -467,6 +507,26 @@ fn decode_temporal_body(class_tag: u8, cur: &mut Cursor<'_>) -> Result<Value, Va
             what: "unknown temporal class tag",
         }),
     }
+}
+
+/// Decodes a spatial [`Point`] body produced by [`encode_point_body`] (`rmp` task #73): a one-byte
+/// CRS discriminant then the CRS-determined number of little-endian `f64` coordinates. An unknown
+/// CRS byte or a truncated coordinate is [`ValueDecodeError::Malformed`] (never a panic).
+fn decode_point_body(cur: &mut Cursor<'_>) -> Result<Value, ValueDecodeError> {
+    let crs_byte = cur.u8()?;
+    let crs = Crs::from_byte(crs_byte).ok_or(ValueDecodeError::Malformed {
+        what: "unknown spatial CRS discriminant",
+    })?;
+    let mut coords = [0.0_f64; 3];
+    for slot in coords.iter_mut().take(crs.dimensions()) {
+        *slot = f64::from_bits(cur.u64()?);
+    }
+    let point = Point::from_crs_coords(crs, &coords[..crs.dimensions()]).ok_or(
+        ValueDecodeError::Malformed {
+            what: "spatial coordinate count does not match the CRS",
+        },
+    )?;
+    Ok(Value::Point(point))
 }
 
 /// Deserializes a homogeneous list image produced by [`encode_list`].
@@ -588,7 +648,7 @@ mod tests {
     }
 
     /// All class tags, inline and overflow, in tag order.
-    const ALL_TAGS: [u8; 11] = [
+    const ALL_TAGS: [u8; 12] = [
         TAG_BOOL,
         TAG_INT,
         TAG_FLOAT,
@@ -600,6 +660,7 @@ mod tests {
         TAG_LOCAL_DATE_TIME,
         TAG_ZONED_DATE_TIME,
         TAG_DURATION,
+        TAG_POINT,
     ];
 
     #[test]
@@ -621,7 +682,7 @@ mod tests {
     fn class_tag_values_are_frozen() {
         assert_eq!(
             ALL_TAGS,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             "class tags are persisted bytes and must never be renumbered"
         );
     }
@@ -855,6 +916,81 @@ mod tests {
         }
         let (class, _) = encode(&Value::Duration(Duration::default())).unwrap();
         assert_eq!(class, TAG_DURATION);
+    }
+
+    // =============================================================================================
+    // Spatial points (TAG_POINT)
+    // =============================================================================================
+
+    #[test]
+    fn points_round_trip_for_every_crs_2d_and_3d() {
+        use graphus_core::value::spatial::{Crs, Point};
+        let points = [
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.5, -2.5)),
+            Value::Point(Point::new_3d(Crs::Cartesian3D, 1.0, 2.0, 3.0)),
+            Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15)), // Porto, lon/lat
+            Value::Point(Point::new_3d(Crs::Wgs84_3D, 12.5, -7.25, 100.0)),
+            // Bit-exact extremes round-trip (incl. signed zeros and the named non-finite values).
+            Value::Point(Point::new_2d(Crs::Cartesian, -0.0, 0.0)),
+            Value::Point(Point::new_3d(
+                Crs::Cartesian3D,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::MAX,
+            )),
+        ];
+        for v in &points {
+            assert_eq!(round_trip(v), *v);
+        }
+        let (class, _) = encode(&Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0))).unwrap();
+        assert_eq!(class, TAG_POINT);
+    }
+
+    #[test]
+    fn point_byte_layout_is_frozen() {
+        use graphus_core::value::spatial::{Crs, Point};
+        // 2D Cartesian: crs byte 0 then x=1.0, y=2.0 little-endian.
+        let (tag, bytes) = encode(&Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0))).unwrap();
+        let mut expected = vec![0u8]; // Crs::Cartesian discriminant
+        expected.extend_from_slice(&1.0_f64.to_le_bytes());
+        expected.extend_from_slice(&2.0_f64.to_le_bytes());
+        assert_eq!((tag, bytes.as_slice()), (TAG_POINT, expected.as_slice()));
+        assert_eq!(bytes.len(), 1 + 2 * 8);
+
+        // 3D WGS-84: crs byte 3 then three coordinates.
+        let (tag, bytes) =
+            encode(&Value::Point(Point::new_3d(Crs::Wgs84_3D, 4.0, 5.0, 6.0))).unwrap();
+        assert_eq!(tag, TAG_POINT);
+        assert_eq!(bytes[0], 3); // Crs::Wgs84_3D discriminant
+        assert_eq!(bytes.len(), 1 + 3 * 8);
+    }
+
+    #[test]
+    fn decode_rejects_unknown_crs_and_truncated_coordinates() {
+        use graphus_core::value::spatial::{Crs, Point};
+        // Unknown CRS byte.
+        assert_eq!(
+            decode(TAG_POINT, &[99, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(ValueDecodeError::Malformed {
+                what: "unknown spatial CRS discriminant",
+            })
+        );
+        // Truncate a valid image by one byte.
+        let (class, bytes) =
+            encode(&Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0))).unwrap();
+        assert!(matches!(
+            decode(class, &bytes[..bytes.len() - 1]),
+            Err(ValueDecodeError::Malformed { .. })
+        ));
+        // Trailing byte after a complete image.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(
+            decode(class, &extra),
+            Err(ValueDecodeError::Malformed {
+                what: "trailing bytes after the point value",
+            })
+        );
     }
 
     /// The temporal byte layouts are an **on-disk format** (they go to pages and through the WAL):

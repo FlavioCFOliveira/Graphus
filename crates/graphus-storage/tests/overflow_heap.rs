@@ -435,6 +435,85 @@ fn committed_temporal_property_survives_a_crash_and_recovers() {
 }
 
 #[test]
+fn spatial_point_values_round_trip_through_the_property_api() {
+    use graphus_core::value::spatial::{Crs, Point};
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+
+    // One property per CRS (2D and 3D), with negative and extreme coordinates included.
+    let values = [
+        (
+            "cart2",
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.5, -2.5)),
+        ),
+        (
+            "cart3",
+            Value::Point(Point::new_3d(Crs::Cartesian3D, -1.0, 2.0, 3.0)),
+        ),
+        (
+            "wgs2",
+            Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15)),
+        ),
+        (
+            "wgs3",
+            Value::Point(Point::new_3d(Crs::Wgs84_3D, 12.5, -7.25, 100.0)),
+        ),
+    ];
+
+    let mut keys = Vec::with_capacity(values.len());
+    for (name, value) in &values {
+        let k = s.intern_token(Namespace::PropKey, name).unwrap();
+        s.set_node_property_value(txn, n, k, value).unwrap();
+        keys.push(k);
+    }
+    // A point does not fit the 64-bit inline payload, so each goes through the overflow heap.
+    assert!(s.heap_block_usage().unwrap() >= values.len() as u64);
+
+    let vals = s.node_property_values(n).unwrap();
+    for (k, (name, value)) in keys.iter().zip(&values) {
+        let got = vals
+            .iter()
+            .find(|(_, key, _)| key == k)
+            .map(|(_, _, v)| v.clone());
+        assert_eq!(
+            got.as_ref(),
+            Some(value),
+            "point property {name} must round-trip"
+        );
+    }
+    s.commit(txn).unwrap();
+}
+
+#[test]
+fn committed_point_property_survives_a_crash_and_recovers() {
+    use graphus_core::value::spatial::{Crs, Point};
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+    let k = s.intern_token(Namespace::PropKey, "loc").unwrap();
+    let point = Value::Point(Point::new_2d(Crs::Wgs84, -8.61, 41.15));
+    s.set_node_property_value(txn, n, k, &point).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut rec = recover_no_force(&s);
+    let vals = rec.node_property_values(n).unwrap();
+    let v = vals
+        .iter()
+        .find(|(_, key, _)| *key == k)
+        .map(|(_, _, v)| v.clone());
+    assert_eq!(
+        v,
+        Some(point),
+        "committed point property recovers byte-for-byte after a crash"
+    );
+}
+
+#[test]
 fn overwriting_an_overflow_value_frees_the_old_chain() {
     let mut s = fresh();
     let txn = TxnId(1);

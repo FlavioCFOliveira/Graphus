@@ -77,6 +77,11 @@ pub enum IndexKind {
     /// Range/B-tree property index over **relationship** records, keyed `(reltype, value)`
     /// (`04 §6.2`, required by `D-v1-index-types`).
     RelProperty,
+    /// Spatial grid index over a **node** point property, keyed `(label, point-property)`: backs
+    /// proximity (`distance(n.loc, $p) <= r`) and bounding-box predicates (`rmp` task #73). Like a
+    /// full-text index its backing structure is derived/ephemeral (`graphus_index::SpatialIndex`);
+    /// the descriptor records only its shape for planning.
+    Spatial,
 }
 
 impl IndexKind {
@@ -88,6 +93,7 @@ impl IndexKind {
             Self::Property => "property",
             Self::Composite => "composite",
             Self::RelProperty => "rel-property",
+            Self::Spatial => "spatial",
         }
     }
 }
@@ -240,6 +246,18 @@ impl IndexCatalog {
         })
     }
 
+    /// A spatial index on `(label, point-property)` usable for a proximity / bounding-box predicate
+    /// (`rmp` task #73). The planner consults this for a `distance(n.prop, $p) <= r` or
+    /// coordinate-range predicate on a labelled point property.
+    #[must_use]
+    pub fn label_spatial(&self, label: &Label, property: &str) -> Option<&IndexDescriptor> {
+        self.indexes.iter().find(|d| {
+            d.kind == IndexKind::Spatial
+                && d.covers_label(&label.name)
+                && d.properties.first().map(String::as_str) == Some(property)
+        })
+    }
+
     /// A relationship-property index on `(rel_type, property)` for an equality or range predicate
     /// (`04 §6.2`).
     #[must_use]
@@ -349,6 +367,15 @@ impl IndexCatalogBuilder {
         )
     }
 
+    /// Appends a spatial index over `(label, point-property)` (`rmp` task #73).
+    pub fn with_label_spatial(self, label: impl Into<String>, property: impl Into<String>) -> Self {
+        self.with_descriptor(
+            IndexKind::Spatial,
+            IndexTarget::label(label),
+            vec![property.into()],
+        )
+    }
+
     /// Finalises the catalog.
     pub fn build(self) -> IndexCatalog {
         IndexCatalog {
@@ -432,6 +459,22 @@ mod tests {
         let catalog = IndexCatalog::empty();
         assert!(catalog.token_lookup(&label("A")).is_none());
         assert!(catalog.label_property(&label("A"), "p").is_none());
+        assert!(catalog.label_spatial(&label("A"), "loc").is_none());
         assert!(catalog.indexes().is_empty());
+    }
+
+    #[test]
+    fn spatial_index_is_found_by_label_and_property() {
+        let catalog = IndexCatalog::builder()
+            .with_label_spatial("City", "loc")
+            .build();
+        let chosen = catalog.label_spatial(&label("City"), "loc").unwrap();
+        assert_eq!(chosen.kind, IndexKind::Spatial);
+        assert_eq!(chosen.kind.tag(), "spatial");
+        // Not matched for a different label or property.
+        assert!(catalog.label_spatial(&label("Other"), "loc").is_none());
+        assert!(catalog.label_spatial(&label("City"), "name").is_none());
+        // A spatial index is NOT returned by the (B-tree) property lookup.
+        assert!(catalog.label_property(&label("City"), "loc").is_none());
     }
 }

@@ -26,8 +26,20 @@ use graphus_tck::runner::run_scenario;
 /// here). A future engine improvement that raises the pass count should bump this so the gain is
 /// locked in; a regression that drops below it fails the build.
 ///
-/// Current ratchet: **3479 / 3884 scenarios pass (89.57 %)**, with 0 panics and 0 scenarios
-/// skipped as unsupported. This rose from 3413 (+66 from executor path & aggregation functions
+/// Current ratchet: **3496 / 3901 scenarios pass (89.62 %)**, with 0 panics and 0 scenarios
+/// skipped as unsupported. This rose from 3479 (+17 from the spatial point type (#73)): a new
+/// `expressions/spatial/Spatial1.feature` exercises `point()` construction (both CRSs, 2D/3D), the
+/// accessors (`.x`/`.y`/`.z`/`.longitude`/`.latitude`/`.height`/`.crs`/`.srid`), `distance()` /
+/// `point.distance()` (Cartesian Euclidean and the cross-CRS-is-null rule), point equality
+/// (same-CRS true, cross-CRS false), point orderability (`ORDER BY` by CRS/srid then coordinates),
+/// and a point property round-tripping through a node — all through the real engine. **Provenance
+/// note (`rmp` task #73):** the pinned upstream openCypher corpus has **no** `expressions/spatial`
+/// directory (spatial was never standardised into the public TCK feature set; see `tck/PINNED.txt`
+/// and the feature file's header), so these 17 are **Graphus-authored** scenarios that mirror the
+/// openCypher spatial CIP / Neo4j spatial semantics, run through the same harness as the vendored
+/// corpus. They are transparently labelled as such; the gain is genuine, engine-verified spatial
+/// coverage, not a borrowed upstream count. Measured: zero regressions (failures held at 405).
+/// Prior rise: 3413 → 3479 (+66 from executor path & aggregation functions
 /// (#63)): `collect()`/`collect(DISTINCT …)` now folds at the `RowValue` level so structural
 /// elements survive; `nodes(path)`/`relationships(path)` and `length(path)` project a path's
 /// element sequence; and a named path (`MATCH p = …`, `[p = (a)-->(b) | p]`) binds the structural
@@ -60,7 +72,7 @@ use graphus_tck::runner::run_scenario;
 /// `EXISTS { ... RETURN ... }` form, structural (node/relationship/path) values inside list
 /// literals (`toBoolean(n)` via `[true, n]` cannot raise its `TypeError`), and ORDER BY keys
 /// that *evaluate* aggregates (`ORDER BY sum(…)` matching a projected aggregate).
-const BASELINE: usize = 3479;
+const BASELINE: usize = 3496;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

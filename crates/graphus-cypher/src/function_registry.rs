@@ -223,6 +223,22 @@ static TABLE: &[Signature] = &[
         arity: Arity::Range(0, 1),
         aggregate: false,
     },
+    // ---- spatial functions (openCypher spatial; rmp #73) ------------------------------------
+    Signature {
+        name: "point",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "distance",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "point.distance",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
     // ---- scalar functions -------------------------------------------------------------------
     Signature {
         name: "abs",

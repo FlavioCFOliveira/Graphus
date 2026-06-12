@@ -135,6 +135,7 @@ pub mod record_graph;
 pub mod result;
 pub mod runtime;
 pub mod semantics;
+pub(crate) mod spatial_fns;
 pub mod static_type;
 pub mod statistics;
 pub(crate) mod store_statistics;

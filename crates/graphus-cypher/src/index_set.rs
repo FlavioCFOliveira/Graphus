@@ -31,6 +31,7 @@ use graphus_bufpool::BufferPool;
 use graphus_core::{TxnId, Value};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
+use graphus_index::spatial::SpatialIndex;
 use graphus_index::{BTree, PropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
 use graphus_storage::IndexState;
@@ -85,6 +86,10 @@ pub struct IndexSet {
     /// the in-memory [`InvertedIndex`]. Like the property indexes the inverted index is **ephemeral**
     /// (rebuilt from the store on open); only the *registration* is durable (the storage catalog).
     fulltext: HashMap<String, FulltextEntry>,
+    /// Declared **spatial** indexes (`rmp` task #73), keyed by `(label_token, prop_key)`. Each value
+    /// carries the build state and the in-memory [`SpatialIndex`] grid over the covered point
+    /// property. Ephemeral and rebuilt on open, exactly like the property and full-text indexes.
+    spatial: HashMap<(u32, u32), SpatialEntry>,
 }
 
 /// A declared node-property index plus its durable build [`IndexState`] (`rmp` task #90).
@@ -113,6 +118,17 @@ struct FulltextEntry {
     index: InvertedIndex,
 }
 
+/// A declared spatial index plus its build [`IndexState`] and the in-memory grid (`rmp` task #73).
+/// The `(label_token, prop_key)` key (the map key) mirrors the durable catalog entry; the grid is
+/// ephemeral (rebuilt from the store on open).
+struct SpatialEntry {
+    /// The build state, mirrored from the durable catalog. A `Populating` index is maintained but not
+    /// yet surfaced to the planner; a query still works against it (candidate-set contract).
+    state: IndexState,
+    /// The backing in-memory uniform grid over the covered point property.
+    index: SpatialIndex,
+}
+
 impl IndexSet {
     /// An empty index set: a single label [`TokenIndex`] (always present, auto-maintained) and no
     /// property indexes yet.
@@ -122,6 +138,7 @@ impl IndexSet {
             labels: TokenIndex::new(fresh_tree()),
             node_props: HashMap::new(),
             fulltext: HashMap::new(),
+            spatial: HashMap::new(),
         }
     }
 
@@ -199,6 +216,10 @@ impl IndexSet {
         // (`rmp` task #72), mirroring the node-property handling.
         for ft in self.fulltext.values_mut() {
             ft.index.clear();
+        }
+        // Spatial indexes: clear the grid entries, keep the registration + state (`rmp` task #73).
+        for sp in self.spatial.values_mut() {
+            sp.index.clear();
         }
     }
 
@@ -563,6 +584,146 @@ impl IndexSet {
         let ft = self.fulltext.get(name)?;
         let terms = ft.analyzer.analyze(search);
         Some(ft.index.score(node_id, &terms))
+    }
+
+    // ============================================================================================
+    // Spatial indexes (`rmp` task #73)
+    // ============================================================================================
+
+    /// Declares a spatial index on `(label_token, prop_key)` at `state` with `cell_size` (`rmp` task
+    /// #73). Idempotent on the key: if one is already registered its grid is kept but its state is
+    /// updated (so a recovered `Online` declaration promotes a freshly-created entry); otherwise a
+    /// fresh grid is created.
+    pub fn register_spatial(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        cell_size: f64,
+        state: IndexState,
+    ) {
+        self.spatial
+            .entry((label_token, prop_key))
+            .and_modify(|sp| sp.state = state)
+            .or_insert_with(|| SpatialEntry {
+                state,
+                index: SpatialIndex::new(cell_size),
+            });
+    }
+
+    /// Sets the build [`IndexState`] of the `(label_token, prop_key)` spatial index, e.g. promoting
+    /// `Populating` → `Online`. A no-op if no such index is registered.
+    pub fn set_spatial_state(&mut self, label_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
+            sp.state = state;
+        }
+    }
+
+    /// Unregisters the spatial index on `(label_token, prop_key)`, dropping its grid (`rmp` task #73,
+    /// `DROP INDEX`). A no-op if no such index is registered.
+    pub fn unregister_spatial(&mut self, label_token: u32, prop_key: u32) {
+        self.spatial.remove(&(label_token, prop_key));
+    }
+
+    /// Whether a spatial index is registered for `(label_token, prop_key)` (in any state).
+    #[must_use]
+    pub fn has_spatial(&self, label_token: u32, prop_key: u32) -> bool {
+        self.spatial.contains_key(&(label_token, prop_key))
+    }
+
+    /// The build [`IndexState`] of the `(label_token, prop_key)` spatial index, or [`None`] if
+    /// unregistered.
+    #[must_use]
+    pub fn spatial_state(&self, label_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.spatial
+            .get(&(label_token, prop_key))
+            .map(|sp| sp.state)
+    }
+
+    /// The registered spatial index keys `(label_token, prop_key)` in any state, ascending. Used by
+    /// the coordinator's rebuild to know which point properties to (re-)index.
+    #[must_use]
+    pub fn registered_spatial(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.spatial.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** spatial index keys `(label_token, prop_key)`, ascending. Used to build the
+    /// planner's catalog: only an `Online` spatial index may serve a proximity/range seek.
+    #[must_use]
+    pub fn online_spatial(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .spatial
+            .iter()
+            .filter(|(_, sp)| sp.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that node `node_id` has point `value` for the `(label_token, prop_key)` spatial index,
+    /// if such an index is registered (else a no-op). A non-point `value` is skipped (a spatial index
+    /// covers points only) — exactly mirroring the property index's `Null`-is-absent handling.
+    /// Maintained regardless of state (a `Populating` index is kept up to date, harmlessly).
+    pub fn insert_spatial_point(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+        node_id: u64,
+    ) {
+        if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
+            if let Value::Point(p) = value {
+                sp.index.index_point(node_id, *p);
+            } else {
+                // The property is no longer a point (e.g. an update changed its type) — drop the
+                // stale grid entry so a re-check never sees a phantom.
+                sp.index.remove(node_id);
+            }
+        }
+    }
+
+    /// Removes `node_id` from the `(label_token, prop_key)` spatial index (a delete, a type change, or
+    /// a node that lost the covered label). A no-op if no such index is registered.
+    pub fn remove_spatial_point(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
+        if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
+            sp.index.remove(node_id);
+        }
+    }
+
+    /// Candidate node ids whose `(label_token, prop_key)` point lies within `radius` of `(center_x,
+    /// center_y)`, ascending. `None` if no such index is registered; otherwise a **geometric
+    /// superset** (`rmp` task #73). The caller re-checks visibility, current label, current value,
+    /// CRS, and the exact `distance(loc, center) <= radius` predicate.
+    #[must_use]
+    pub fn seek_spatial_within(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<u64>> {
+        let sp = self.spatial.get(&(label_token, prop_key))?;
+        Some(sp.index.query_within(center_x, center_y, radius))
+    }
+
+    /// Candidate node ids whose `(label_token, prop_key)` point lies within the bounding box
+    /// `[min_x, max_x] × [min_y, max_y]`, ascending. `None` if no such index is registered; otherwise
+    /// a **geometric superset** (`rmp` task #73). The caller re-checks the exact predicate.
+    #[must_use]
+    pub fn seek_spatial_bbox(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        min_x: f64,
+        max_x: f64,
+        min_y: f64,
+        max_y: f64,
+    ) -> Option<Vec<u64>> {
+        let sp = self.spatial.get(&(label_token, prop_key))?;
+        Some(sp.index.query_bbox(min_x, max_x, min_y, max_y))
     }
 
     /// All candidate ids for `token` in `idx`, regardless of value. Used as the correct
@@ -1033,5 +1194,131 @@ mod tests {
             Some(2)
         );
         assert_eq!(set.fulltext_score("nope", 100, "x"), None);
+    }
+
+    // ---- Spatial index (`rmp` task #73) -------------------------------------------------------
+
+    fn pt(x: f64, y: f64) -> Value {
+        use graphus_core::value::spatial::{Crs, Point};
+        Value::Point(Point::new_2d(Crs::Cartesian, x, y))
+    }
+
+    #[test]
+    fn spatial_register_insert_seek_and_maintenance() {
+        let mut set = IndexSet::new();
+        set.register_spatial(1, 5, 1.0, IndexState::Online);
+        assert!(set.has_spatial(1, 5));
+        assert_eq!(set.spatial_state(1, 5), Some(IndexState::Online));
+
+        set.insert_spatial_point(1, 5, &pt(0.5, 0.5), 100);
+        set.insert_spatial_point(1, 5, &pt(0.7, 0.2), 101); // same cell
+        set.insert_spatial_point(1, 5, &pt(50.0, 50.0), 102); // far away
+        // A non-point value is skipped (not indexed).
+        set.insert_spatial_point(1, 5, &Value::Integer(7), 103);
+
+        // Proximity around the origin returns the two near points as candidates, not the far one.
+        let mut got = set.seek_spatial_within(1, 5, 0.0, 0.0, 1.5).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![100, 101]);
+        // The non-point node was never indexed.
+        assert!(!got.contains(&103));
+
+        // Update: move 101 far away → it leaves the origin cell.
+        set.insert_spatial_point(1, 5, &pt(60.0, 60.0), 101);
+        assert_eq!(
+            set.seek_spatial_within(1, 5, 0.0, 0.0, 1.5).unwrap(),
+            vec![100]
+        );
+
+        // Delete 100.
+        set.remove_spatial_point(1, 5, 100);
+        assert!(
+            set.seek_spatial_within(1, 5, 0.0, 0.0, 1.5)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A bbox seek works too.
+        let mut bbox = set.seek_spatial_bbox(1, 5, 49.0, 61.0, 49.0, 61.0).unwrap();
+        bbox.sort_unstable();
+        assert_eq!(bbox, vec![101, 102]);
+
+        // No such index → None (distinct from an empty candidate list).
+        assert_eq!(set.seek_spatial_within(9, 9, 0.0, 0.0, 1.0), None);
+    }
+
+    #[test]
+    fn spatial_state_gates_planner_exposure() {
+        let mut set = IndexSet::new();
+        set.register_spatial(1, 5, 1.0, IndexState::Populating);
+        // Maintained while populating...
+        set.insert_spatial_point(1, 5, &pt(0.0, 0.0), 100);
+        assert_eq!(
+            set.seek_spatial_within(1, 5, 0.0, 0.0, 1.0).unwrap(),
+            vec![100]
+        );
+        // ...but not surfaced to the planner until Online.
+        assert_eq!(set.registered_spatial(), vec![(1, 5)]);
+        assert!(set.online_spatial().is_empty());
+        set.set_spatial_state(1, 5, IndexState::Online);
+        assert_eq!(set.online_spatial(), vec![(1, 5)]);
+        // Drop removes it entirely.
+        set.unregister_spatial(1, 5);
+        assert!(!set.has_spatial(1, 5));
+        assert!(set.registered_spatial().is_empty());
+    }
+
+    #[test]
+    fn spatial_index_candidates_are_a_superset_of_a_full_scan() {
+        // The inviolable property: the index candidate set must be a SUPERSET of the brute-force
+        // exact answer, so a re-check yields the SAME result as a full scan (`rmp` task #73 AC).
+        use graphus_core::value::spatial::{Crs, Point};
+        let mut set = IndexSet::new();
+        set.register_spatial(1, 5, 3.0, IndexState::Online);
+        let mut all: Vec<(u64, f64, f64)> = Vec::new();
+        let mut id = 0u64;
+        for gx in -8..=8 {
+            for gy in -8..=8 {
+                let (x, y) = (gx as f64 * 1.3, gy as f64 * 1.1);
+                set.insert_spatial_point(1, 5, &pt(x, y), id);
+                all.push((id, x, y));
+                id += 1;
+            }
+        }
+        for (cx, cy, r) in [(0.0, 0.0, 2.0), (5.0, -3.0, 4.0), (-7.0, 7.0, 1.0)] {
+            let candidates: std::collections::BTreeSet<u64> = set
+                .seek_spatial_within(1, 5, cx, cy, r)
+                .unwrap()
+                .into_iter()
+                .collect();
+            // The exact answer a full scan + `distance(...) <= r` re-check would compute.
+            let exact: std::collections::BTreeSet<u64> = all
+                .iter()
+                .filter(|(_, x, y)| {
+                    let p = Point::new_2d(Crs::Cartesian, *x, *y);
+                    let c = Point::new_2d(Crs::Cartesian, cx, cy);
+                    let dx = p.x() - c.x();
+                    let dy = p.y() - c.y();
+                    (dx * dx + dy * dy).sqrt() <= r
+                })
+                .map(|(i, _, _)| *i)
+                .collect();
+            assert!(
+                exact.is_subset(&candidates),
+                "index missed a true match: exact={exact:?} candidates={candidates:?}"
+            );
+            // And re-checking the candidates reproduces the exact answer (index never changes a result).
+            let rechecked: std::collections::BTreeSet<u64> = candidates
+                .iter()
+                .filter(|id| {
+                    let (_, x, y) = all[**id as usize];
+                    let dx = x - cx;
+                    let dy = y - cy;
+                    (dx * dx + dy * dy).sqrt() <= r
+                })
+                .copied()
+                .collect();
+            assert_eq!(rechecked, exact, "re-checked index == full scan");
+        }
     }
 }

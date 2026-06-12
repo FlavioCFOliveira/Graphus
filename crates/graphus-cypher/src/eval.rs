@@ -668,6 +668,10 @@ fn eval_property(
                 .map(|(_, v)| v)
                 .unwrap_or(Value::Null),
         )),
+        // Point component access: `p.x`, `p.longitude`, `p.crs`, `p.srid`, … (rmp #73).
+        RowValue::Value(Value::Point(p)) => Ok(RowValue::Value(
+            crate::spatial_fns::component(&p, key).unwrap_or(Value::Null),
+        )),
         // Temporal component access: `d.year`, `t.hour`, `dur.minutesOfHour`, … (rmp #53).
         // A non-temporal (incl. null) base yields null, Cypher's missing-property rule.
         RowValue::Value(v) => Ok(RowValue::Value(
@@ -1086,6 +1090,10 @@ fn call_function(
         "date" | "time" | "datetime" | "localtime" | "localdatetime" | "duration" => {
             crate::temporal_fns::construct(&lower, argv.first())?
         }
+        // Spatial point constructor and distance (rmp #73). `distance` and `point.distance` are
+        // the two openCypher spellings of the same two-point distance.
+        "point" => crate::spatial_fns::construct_point(&argv[0])?,
+        "distance" | "point.distance" => crate::spatial_fns::distance(&argv[0], &argv[1])?,
         // Temporal difference and truncation functions (rmp #53).
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
             crate::temporal_fns::duration_between(&lower, &argv[0], &argv[1])?

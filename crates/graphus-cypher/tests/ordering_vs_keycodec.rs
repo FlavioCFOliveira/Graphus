@@ -16,6 +16,7 @@
 
 use std::cmp::Ordering;
 
+use graphus_core::value::spatial::{Crs, Point};
 use graphus_core::value::temporal::NANOS_PER_DAY;
 use graphus_core::{
     Date, Duration, LocalDateTime, LocalTime, Value, ZonedDateTime, ZonedTime, capability::Rng,
@@ -58,10 +59,30 @@ fn gen_offset(rng: &mut SimRng) -> i32 {
     }
 }
 
+/// A random spatial point (any CRS, edge-biased coordinates) — `rmp` task #73.
+fn gen_point(rng: &mut SimRng) -> Value {
+    let coord = |rng: &mut SimRng| match rng.next_u64() % 7 {
+        0 => 0.0,
+        1 => -0.0,
+        2 => f64::NEG_INFINITY,
+        3 => f64::INFINITY,
+        4 => f64::NAN,
+        5 => 1.5,
+        _ => f64::from_bits(rng.next_u64()),
+    };
+    let p = match rng.next_u64() % 4 {
+        0 => Point::new_2d(Crs::Cartesian, coord(rng), coord(rng)),
+        1 => Point::new_3d(Crs::Cartesian3D, coord(rng), coord(rng), coord(rng)),
+        2 => Point::new_2d(Crs::Wgs84, coord(rng), coord(rng)),
+        _ => Point::new_3d(Crs::Wgs84_3D, coord(rng), coord(rng), coord(rng)),
+    };
+    Value::Point(p)
+}
+
 /// Generates a random **index-encodable** value across every encodable class, biased to edges.
 fn gen_encodable(rng: &mut SimRng) -> Value {
     let r = rng.next_u64();
-    match r % 14 {
+    match r % 15 {
         0 => Value::Boolean(r & 0x100 != 0),
         1 | 2 => Value::Integer(gen_i64(rng)),
         3 | 4 => {
@@ -127,12 +148,13 @@ fn gen_encodable(rng: &mut SimRng) -> Value {
                 _ => "Z".to_owned(),
             },
         }),
-        _ => Value::Duration(Duration {
+        13 => Value::Duration(Duration {
             months: gen_i64(rng) / 1_000_000,
             days: gen_i64(rng) / 1_000_000,
             seconds: gen_i64(rng),
             nanos: (rng.next_u64() % 2_000_000_000) as i32 - 1_000_000_000,
         }),
+        _ => gen_point(rng),
     }
 }
 
@@ -158,6 +180,8 @@ fn cross_class_pairs_agree_at_the_class_boundary() {
     // One representative per encodable class, in the CIP ascending order, then assert *both*
     // cmp_values and the byte order agree on every ordered pair (a strict-increasing chain).
     let chain = [
+        // POINT is the lowest encodable class (`… < PATH < POINT < {temporals} < STRING < …`).
+        Value::Point(Point::new_3d(Crs::Wgs84_3D, f64::MAX, f64::MAX, f64::MAX)),
         Value::ZonedDateTime(ZonedDateTime::default()),
         Value::LocalDateTime(LocalDateTime::default()),
         Value::Date(Date::default()),

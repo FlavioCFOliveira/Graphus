@@ -88,6 +88,13 @@ use graphus_core::Value;
 /// The numeric values only need to be *monotonic* in that order; the specific bytes are chosen with
 /// gaps so future, currently-unindexable classes can be slotted in without a re-encoding.
 pub mod tag {
+    // --- Spatial point (below the temporal block per the CIP global order). ---
+    /// `Value::Point` (openCypher `Point`). The full openCypher orderability places
+    /// `LIST < PATH < POINT < {temporals}`, so the point tag sorts **below** every temporal tag
+    /// (`rmp` task #73). Within the class the payload (SRID then coordinates) preserves
+    /// [`graphus_core::Point::total_cmp`] order.
+    pub const POINT: u8 = 0x08;
+
     // --- Temporal block (lowest among encodable values), in CIP sub-order. ---
     /// `Value::ZonedDateTime` (openCypher `DateTime`) — lowest temporal.
     pub const ZONED_DATE_TIME: u8 = 0x10;
@@ -305,6 +312,29 @@ pub fn encode_temporal(into: &mut Vec<u8>, v: &Value) -> Result<(), KeyEncodeErr
     Ok(())
 }
 
+/// Encodes a spatial [`Value::Point`] order-preservingly (its tag is pushed by [`encode_value`];
+/// this pushes the payload), consistent with [`graphus_core::Point::total_cmp`] (`rmp` task #73).
+///
+/// A point orders first by CRS (by **SRID**), then lexicographically by coordinate. The payload is
+/// therefore the SRID as an order-preserving big-endian `i64` ([`encode_i64_bits`]), followed by the
+/// **significant** coordinates ([`graphus_core::Point::dimensions`]) each as the total-order `f64`
+/// key ([`encode_f64_bits`]). The SRID byte-count is fixed (8) and each CRS has a fixed coordinate
+/// count, so the encoding is self-delimiting per CRS; across CRSs the leading SRID already separates
+/// the (necessarily different) dimensionalities, so no length terminator is needed.
+///
+/// # Errors
+/// Returns [`KeyEncodeError::Unindexable`] if `v` is not a point.
+pub fn encode_point(into: &mut Vec<u8>, v: &Value) -> Result<(), KeyEncodeError> {
+    let Value::Point(p) = v else {
+        return Err(KeyEncodeError::Unindexable("non-point"));
+    };
+    into.extend_from_slice(&encode_i64_bits(p.crs.srid()));
+    for &c in p.coords() {
+        into.extend_from_slice(&encode_f64_bits(c));
+    }
+    Ok(())
+}
+
 /// Appends a variable-width payload (string / bytes) with prefix-free escape-and-terminate framing
 /// (`04 §6.2`, see module docs): every `0x00` is escaped to `0x00 0xFF`, then a `0x00 0x00`
 /// terminator closes the field so no field can be a prefix of another.
@@ -373,6 +403,10 @@ pub fn encode_value(into: &mut Vec<u8>, v: &Value) -> Result<(), KeyEncodeError>
         Value::Duration(_) => {
             into.push(tag::DURATION);
             encode_temporal(into, v)?;
+        }
+        Value::Point(_) => {
+            into.push(tag::POINT);
+            encode_point(into, v)?;
         }
         Value::Null => return Err(KeyEncodeError::Unindexable("Null")),
         Value::List(_) => return Err(KeyEncodeError::Unindexable("List")),
@@ -549,6 +583,67 @@ mod tests {
         assert!(enc(&date) < enc(&zt));
         assert!(enc(&zt) < enc(&lt));
         assert!(enc(&lt) < enc(&dur));
+    }
+
+    #[test]
+    fn point_key_order_matches_point_cmp() {
+        use graphus_core::value::spatial::{Crs, Point};
+        use std::cmp::Ordering;
+
+        // The encoded byte order must equal `Point::cmp` for every pair (the index/Cypher-order
+        // agreement contract, `rmp` task #73). A deterministic spread covering both 2D/3D CRSs,
+        // signed zeros, NaN and the named non-finite coordinates.
+        let pool = [
+            Point::new_2d(Crs::Wgs84, -8.61, 41.15), // SRID 4326 (smallest)
+            Point::new_2d(Crs::Wgs84, -8.61, 41.16),
+            Point::new_3d(Crs::Wgs84_3D, 0.0, 0.0, -10.0), // SRID 4979
+            Point::new_3d(Crs::Wgs84_3D, 0.0, 0.0, 10.0),
+            Point::new_2d(Crs::Cartesian, -0.0, 0.0), // SRID 7203
+            Point::new_2d(Crs::Cartesian, 0.0, 0.0),
+            Point::new_2d(Crs::Cartesian, f64::INFINITY, 0.0),
+            Point::new_2d(Crs::Cartesian, f64::NAN, 0.0),
+            Point::new_3d(Crs::Cartesian3D, 1.0, 2.0, 3.0), // SRID 9157 (largest)
+        ];
+        for a in &pool {
+            for b in &pool {
+                let key_cmp = enc(&Value::Point(*a)).cmp(&enc(&Value::Point(*b)));
+                let point_cmp = a.total_cmp(b);
+                assert_eq!(
+                    key_cmp, point_cmp,
+                    "key order disagrees with Point::cmp for {a:?} vs {b:?}"
+                );
+            }
+        }
+
+        // The whole point class sorts BELOW every temporal (the CIP global order
+        // `LIST < PATH < POINT < {temporals}`): a point's tag (0x08) precedes the lowest temporal
+        // tag (ZONED_DATE_TIME = 0x10).
+        let point = Value::Point(Point::new_3d(
+            Crs::Cartesian3D,
+            f64::MAX,
+            f64::MAX,
+            f64::MAX,
+        ));
+        let lowest_temporal = Value::ZonedDateTime(graphus_core::ZonedDateTime {
+            local: graphus_core::LocalDateTime {
+                epoch_seconds: i64::MIN,
+                nanos: 0,
+            },
+            offset_seconds: 0,
+            zone_id: String::new(),
+        });
+        assert!(enc(&point) < enc(&lowest_temporal));
+        // And a point cannot be encoded equal to a different point class member.
+        assert_eq!(
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)).eq(&Value::Point(Point::new_2d(
+                Crs::Cartesian,
+                1.0,
+                2.0
+            ))),
+            enc(&Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)))
+                .cmp(&enc(&Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0))))
+                == Ordering::Equal
+        );
     }
 
     #[test]
