@@ -2498,6 +2498,41 @@ impl<'a> Cursor<'a> {
         }
         Ok(out)
     }
+
+    /// Pulls the next row and **materializes** it for the wire (`04 §8.3`): each cell becomes a
+    /// [`MaterializedValue`](crate::result::MaterializedValue) with every entity's labels / type /
+    /// endpoints / properties resolved through the cursor's graph seam. `None` at end of stream.
+    ///
+    /// This is the egress counterpart to [`next`](Self::next): the lazy [`RowValue`] ids are kept
+    /// inside the engine (operators, equality/ordering, the TCK comparison path all run on
+    /// [`Row`]/[`RowValue`] unchanged), and resolution to a full structural value happens **only**
+    /// here, at the boundary, reading through the same `&mut dyn GraphAccess` the cursor holds. RBAC
+    /// (rmp #93) and MVCC visibility therefore compose for free — a hidden property is already
+    /// `None` and an invisible entity already filtered before this resolves anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Cancelled`] if the cancellation token tripped, or another [`ExecError`]
+    /// for a runtime failure during row production (materialization itself is infallible — an absent
+    /// entity resolves to an empty stub, never an error).
+    pub fn next_materialized(
+        &mut self,
+    ) -> Result<Option<Vec<crate::result::MaterializedValue>>, ExecError> {
+        match self.next()? {
+            Some(row) => Ok(Some(crate::result::materialize_row(self.graph, &row))),
+            None => Ok(None),
+        }
+    }
+
+    /// Materializes an already-pulled [`Row`] through the cursor's graph seam (`04 §8.3`).
+    ///
+    /// The row-at-a-time counterpart to [`next_materialized`](Self::next_materialized) for callers
+    /// that hold a [`Row`] (e.g. a `pull(n)` batch) and want its wire form. Resolution reads through
+    /// the cursor's `&mut dyn GraphAccess`, so RBAC/MVCC apply exactly as for `next_materialized`.
+    #[must_use]
+    pub fn materialize_row(&mut self, row: &Row) -> Vec<crate::result::MaterializedValue> {
+        crate::result::materialize_row(self.graph, row)
+    }
 }
 
 /// The compiled executor for one plan: holds the plan + parameters and opens [`Cursor`]s over a

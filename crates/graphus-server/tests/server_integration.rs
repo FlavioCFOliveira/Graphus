@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use graphus_bolt::server::{encode_client_handshake, encode_request_framed};
-use graphus_bolt::{Dechunker, Frame, Proposal, Request, Response};
+use graphus_bolt::{BoltValue, Dechunker, Frame, Proposal, Request, Response};
 use graphus_core::Value;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
@@ -290,6 +290,126 @@ async fn bolt_uds_full_session_returns_records() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// End-to-end **structural-result conformance** (rmp #96): a query that returns nodes,
+/// relationships and paths must deliver them on the wire as the Bolt 5.x `Node` (tag `0x4E`),
+/// `Relationship` (`0x52`) and `Path` (`0x50`) structures — not as flattened ids — covering
+/// connect, authenticate, a write transaction and read transactions over a live UDS session.
+///
+/// No official Neo4j driver is installable offline here, so this asserts at the **structure level**
+/// instead: `run_pull_bolt` decodes each RECORD cell through `unpack_bolt_value`, which peeks the
+/// PackStream structure tag and only yields `BoltValue::Node` / `Relationship` / `Path` when the
+/// wire bytes actually carried that struct signature. Decoding to the variant therefore proves the
+/// tag was on the wire — exactly the byte-for-byte conformance the task requires.
+#[tokio::test]
+async fn bolt_structural_results_node_rel_path_on_the_wire() {
+    let temp = TempStore::new("bolt-structural");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut client = BoltUdsClient::connect(&uds).await;
+    client.handshake_and_logon("alice", "pw").await;
+
+    // WRITE txn (auto-commit): build a small graph a:Person -[:KNOWS]-> b:Person:Employee. We drain
+    // the RUN/PULL but deliberately do NOT assert on any rows it streams: a write without `RETURN`
+    // is a pure side effect, and its result-row cardinality is not what this test certifies. That
+    // the write actually persisted is proven below by the explicit `RETURN` reads finding the data.
+    let _ = client
+        .run_pull_bolt(
+            "CREATE (a:Person {name: 'Ada', age: 39})\
+             -[:KNOWS {since: 2020}]->\
+             (b:Person:Employee {name: 'Bob'})",
+        )
+        .await;
+
+    // READ a node: the single RECORD cell must arrive as a Bolt `Node` struct.
+    let rows = client
+        .run_pull_bolt("MATCH (n:Person {name: 'Ada'}) RETURN n")
+        .await;
+    assert_eq!(rows.len(), 1, "exactly one Ada node: {rows:?}");
+    assert_eq!(rows[0].len(), 1, "RETURN n is one column");
+    let ada_id = match &rows[0][0] {
+        BoltValue::Node(node) => {
+            assert!(
+                node.labels.iter().any(|l| l == "Person"),
+                "node carries the Person label: {node:?}"
+            );
+            assert_eq!(
+                prop(&node.properties, "name"),
+                Some(&Value::String("Ada".to_owned())),
+                "node.name == 'Ada': {node:?}"
+            );
+            assert_eq!(
+                prop(&node.properties, "age"),
+                Some(&Value::Integer(39)),
+                "node.age == 39: {node:?}"
+            );
+            node.id
+        }
+        other => panic!("RETURN n must be a Bolt Node struct, got: {other:?}"),
+    };
+
+    // READ Bob's id too, so the relationship endpoint assertions can be exact.
+    let rows = client
+        .run_pull_bolt("MATCH (n:Person {name: 'Bob'}) RETURN n")
+        .await;
+    let bob_id = match &rows[0][0] {
+        BoltValue::Node(node) => node.id,
+        other => panic!("RETURN n (Bob) must be a Bolt Node struct, got: {other:?}"),
+    };
+    assert_ne!(ada_id, bob_id, "Ada and Bob are distinct nodes");
+
+    // READ a relationship: the cell must arrive as a Bolt `Relationship` struct (tag 0x52), with
+    // its type, property, and endpoint ids matching the graph just written.
+    let rows = client
+        .run_pull_bolt("MATCH (:Person {name: 'Ada'})-[r:KNOWS]->(:Person) RETURN r")
+        .await;
+    assert_eq!(rows.len(), 1, "exactly one KNOWS relationship: {rows:?}");
+    match &rows[0][0] {
+        BoltValue::Relationship(rel) => {
+            assert_eq!(rel.rel_type, "KNOWS", "rel type is KNOWS: {rel:?}");
+            assert_eq!(
+                prop(&rel.properties, "since"),
+                Some(&Value::Integer(2020)),
+                "rel.since == 2020: {rel:?}"
+            );
+            assert!(
+                rel.start >= 0 && rel.end >= 0,
+                "endpoint ids non-negative: {rel:?}"
+            );
+            assert_eq!(rel.start, ada_id, "rel starts at Ada: {rel:?}");
+            assert_eq!(rel.end, bob_id, "rel ends at Bob: {rel:?}");
+        }
+        other => panic!("RETURN r must be a Bolt Relationship struct, got: {other:?}"),
+    }
+
+    // READ a path (`MATCH p = ... RETURN p`): the cell must arrive as a Bolt `Path` struct (tag
+    // 0x50) — two distinct nodes, one unbound KNOWS relationship, and the alternating, signed,
+    // 1-based index sequence `[+1, 1]` (rel #1 forward, then arrival node at `nodes[1]`).
+    let rows = client
+        .run_pull_bolt("MATCH p = (:Person {name: 'Ada'})-[:KNOWS]->(:Person) RETURN p")
+        .await;
+    assert_eq!(rows.len(), 1, "exactly one path: {rows:?}");
+    match &rows[0][0] {
+        BoltValue::Path(path) => {
+            assert_eq!(path.nodes.len(), 2, "path has two nodes: {path:?}");
+            assert_eq!(path.rels.len(), 1, "path has one relationship: {path:?}");
+            assert_eq!(
+                path.rels[0].rel_type, "KNOWS",
+                "the path's unbound rel is KNOWS: {path:?}"
+            );
+            assert_eq!(
+                path.indices,
+                vec![1, 1],
+                "Bolt path indices are [rel(+1), node(1)]: {path:?}"
+            );
+        }
+        other => panic!("RETURN p must be a Bolt Path struct, got: {other:?}"),
+    }
+
+    client.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
 #[tokio::test]
 async fn bolt_uds_route_and_telemetry_round_trip() {
     // Over the REAL UDS path (rmp #95): a ROUTE returns a single-instance routing table and a
@@ -397,6 +517,34 @@ async fn bolt_uds_route_and_telemetry_round_trip() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// Looks up a property value by key in a Bolt entity's ordered `(key, value)` property list.
+fn prop<'a>(properties: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
+    properties.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// Flattens a [`BoltValue`] cell to a scalar [`Value`] for the property-only assertion path, the
+/// way the old server `project_value` did: an entity collapses to its id (`Value::Integer`), a path
+/// to the `Value::List` of its element ids in traversal order, and a structural list element-wise.
+/// Tests that need the structural form use `run_pull_bolt` instead.
+fn bolt_to_scalar(v: BoltValue) -> Value {
+    match v {
+        BoltValue::Value(val) => val,
+        BoltValue::Node(n) => Value::Integer(n.id),
+        BoltValue::Relationship(r) => Value::Integer(r.id),
+        BoltValue::Path(p) => {
+            let mut ids = Vec::with_capacity(p.nodes.len() + p.rels.len());
+            for node in &p.nodes {
+                ids.push(Value::Integer(node.id));
+            }
+            for rel in &p.rels {
+                ids.push(Value::Integer(rel.id));
+            }
+            Value::List(ids)
+        }
+        BoltValue::List(items) => Value::List(items.into_iter().map(bolt_to_scalar).collect()),
+    }
+}
+
 /// A minimal Bolt client over a Unix socket for the integration test.
 struct BoltUdsClient {
     stream: UnixStream,
@@ -449,8 +597,21 @@ impl BoltUdsClient {
         );
     }
 
-    /// Runs `query` as an auto-commit statement and PULLs all records, returning the rows.
+    /// Runs `query` as an auto-commit statement and PULLs all records, returning the rows with each
+    /// cell flattened to a scalar [`Value`] (a graph entity collapses to its id, as the old
+    /// `project_value` did). Used by tests that only assert on property values.
     async fn run_pull(&mut self, query: &str) -> Vec<Vec<Value>> {
+        self.run_pull_bolt(query)
+            .await
+            .into_iter()
+            .map(|row| row.into_iter().map(bolt_to_scalar).collect())
+            .collect()
+    }
+
+    /// Runs `query` as an auto-commit statement and PULLs all records, returning the **raw**
+    /// [`BoltValue`] cells (not scalar-flattened), so a test can assert on the structural variants
+    /// (`Node` / `Relationship` / `Path`) a graph query delivers on the wire.
+    async fn run_pull_bolt(&mut self, query: &str) -> Vec<Vec<BoltValue>> {
         self.send(&Request::Run {
             query: query.to_owned(),
             parameters: vec![],

@@ -576,7 +576,11 @@ fn run_one<E: RestEngine>(
     let fields = stream.fields().to_vec();
     let mut data = Vec::new();
     while let Some(row) = stream.next_row()? {
-        data.push(Json::Array(row.iter().map(value::value_to_jolt).collect()));
+        data.push(Json::Array(
+            row.iter()
+                .map(crate::restvalue::restvalue_to_jolt)
+                .collect(),
+        ));
     }
     let summary = encode_summary(&stream.summary());
     Ok(StatementResult {
@@ -616,7 +620,10 @@ fn stream_single_statement_ndjson<E: RestEngine>(
     loop {
         match stream.next_row() {
             Ok(Some(row)) => {
-                let encoded: Vec<Json> = row.iter().map(value::value_to_jolt).collect();
+                let encoded: Vec<Json> = row
+                    .iter()
+                    .map(crate::restvalue::restvalue_to_jolt)
+                    .collect();
                 push_ndjson_line(&mut out, &json!({ "row": encoded }));
             }
             Ok(None) => break,

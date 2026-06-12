@@ -50,8 +50,9 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
    built in-house from the start; this is the highest-risk work and is the reason DST (D-dst-investment)
    and the full verification arsenal are scaffolded immediately.
 2. **D-wire-protocol → Bolt directly**, and **D-bolt-compat → add a Bolt TCP listener.** Graphus now
-   exposes **three interfaces**: Bolt over UDS, Bolt over TCP (`bolt://`), and the Web REST API. This
-   extends the two-interface model in the project definition (`CLAUDE.md`); see the note in `00-overview.md`.
+   exposes **three interfaces**: Bolt over UDS, Bolt over TCP (`bolt://`), and the Web REST API. These
+   decisions extended the two-interface model in the original project definition; `CLAUDE.md` now
+   records the three-interface model (see the note in `00-overview.md`).
 3. **D-graph-algos → full library.** A complete graph-algorithms library plus an in-memory projection
    engine is committed as a dedicated workstream (its own phase), in addition to the ACID/TCK core.
 
@@ -113,7 +114,9 @@ SPIKE #9 (`06-bolt-and-error-shapes.md` §2–§3; resolves open question 2 and 
 - **Measurement-gated:** `D-runtime-model`, `D-io-backend`, and `D-allocator` must be confirmed by
   benchmark on a representative workload before being locked (project rule: "measure to decide").
 - **Verification is a deliverable, not an afterthought:** `D-tck-harness` + `D-dst-investment` are
-  how the two inviolable requirements are *proven empirically* rather than asserted.
+  how the ACID and Cypher TCK inviolable requirements are *proven empirically* rather than
+  asserted; protocol-conformance and driver-interoperability tests against the official driver
+  ecosystem prove the Bolt protocol and PackStream requirements the same way.
 
 ## Open questions for the owner to close before locking the spec
 

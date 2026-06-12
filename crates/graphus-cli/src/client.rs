@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use graphus_bolt::handshake::{MAX_MINOR, Proposal, SUPPORTED_MAJOR, Version};
 use graphus_bolt::message::ALL;
 use graphus_bolt::server::{encode_client_handshake, encode_request_framed};
-use graphus_bolt::{Dechunker, Failure, Frame, Request, Response};
+use graphus_bolt::{BoltValue, Dechunker, Failure, Frame, Request, Response};
 use graphus_core::Value;
 
 /// The user agent the CLI advertises in `HELLO` (`name/version`, per the Bolt convention).
@@ -286,7 +286,7 @@ impl<S: Read + Write> BoltClient<S> {
         let mut records = Vec::new();
         let summary = loop {
             match self.recv()? {
-                Response::Record { values } => records.push(values),
+                Response::Record { values } => records.push(scalar_row(values)),
                 Response::Success { metadata } => break metadata, // trailing summary
                 Response::Failure(f) => return Err(ClientError::Failure(f)),
                 other => return Err(unexpected("PULL", &other)),
@@ -361,6 +361,36 @@ fn extract_fields(metadata: &[(String, Value)]) -> Vec<String> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// Flattens a RECORD's cells to scalar [`Value`]s for the CLI's text renderer, which formats
+/// `Value`s. A graph entity collapses to its id (`Value::Integer`), a path to the `Value::List` of
+/// its element ids in traversal order (start node, then each hop's relationship and arrival node),
+/// and a structural list element-wise — the same projection the server's old `project_value` used
+/// while `graphus_core::Value` defers the structural classes (`04 §7.2`).
+fn scalar_row(values: Vec<BoltValue>) -> Vec<Value> {
+    values.into_iter().map(bolt_to_scalar).collect()
+}
+
+/// Flattens one [`BoltValue`] cell to a scalar [`Value`] (entity → id, path → list of element ids,
+/// list → element-wise).
+fn bolt_to_scalar(v: BoltValue) -> Value {
+    match v {
+        BoltValue::Value(val) => val,
+        BoltValue::Node(n) => Value::Integer(n.id),
+        BoltValue::Relationship(r) => Value::Integer(r.id),
+        BoltValue::Path(p) => {
+            let mut ids = Vec::with_capacity(p.nodes.len() + p.rels.len());
+            for node in &p.nodes {
+                ids.push(Value::Integer(node.id));
+            }
+            for rel in &p.rels {
+                ids.push(Value::Integer(rel.id));
+            }
+            Value::List(ids)
+        }
+        BoltValue::List(items) => Value::List(items.into_iter().map(bolt_to_scalar).collect()),
+    }
 }
 
 /// Looks up a string-valued key in a Bolt metadata map.
@@ -516,10 +546,16 @@ mod tests {
         }));
         // Two records, then the trailing summary.
         script.extend(framed(&Response::Record {
-            values: vec![Value::Integer(1), Value::String("a".to_owned())],
+            values: vec![
+                BoltValue::Value(Value::Integer(1)),
+                BoltValue::Value(Value::String("a".to_owned())),
+            ],
         }));
         script.extend(framed(&Response::Record {
-            values: vec![Value::Integer(2), Value::String("b".to_owned())],
+            values: vec![
+                BoltValue::Value(Value::Integer(2)),
+                BoltValue::Value(Value::String("b".to_owned())),
+            ],
         }));
         script.extend(framed(&Response::Success {
             metadata: vec![("type".to_owned(), Value::String("r".to_owned()))],

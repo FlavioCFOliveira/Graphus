@@ -16,8 +16,10 @@ The server implements, in an exemplary manner, all official software-development
 
 1. **100% ACID COMPLIANT** — guarantees full reliability and safety when processing transactions, even in the event of power failures, errors, or system faults; that is, it guarantees that the data will never become corrupted or left in an invalid state after an operation.
 2. **100% CYPHER TCK COMPLIANT** — fully compliant with the official specifications of the **Cypher** language; that is, it guarantees that any query written in Cypher will behave exactly as expected, with no unexpected behavior or syntax failures.
+3. **100% BOLT PROTOCOL COMPLIANT** — fully compliant with the official specifications of the **Bolt** protocol (handshake and version negotiation, message types, connection states, transaction semantics, and error handling); that is, it guarantees that any Bolt client — including the official Neo4j driver ecosystem — can communicate with the server exactly as the specification mandates, with no deviations or unexpected behavior.
+4. **100% PACKSTREAM COMPLIANT** — fully compliant with the official specifications of **PackStream**, the binary serialization format used by the Bolt protocol; that is, it guarantees that every value and structure is encoded and decoded byte-for-byte exactly as the specification mandates, ensuring full wire-level interoperability with the official driver ecosystem.
 
-**These two requirements (100% ACID COMPLIANT and 100% CYPHER TCK COMPLIANT) MUST be considered absolutely inviolable.**
+**These four requirements (100% ACID COMPLIANT, 100% CYPHER TCK COMPLIANT, 100% BOLT PROTOCOL COMPLIANT, and 100% PACKSTREAM COMPLIANT) MUST be considered absolutely inviolable.**
 
 The Graphus server is developed with a focus on maximizing performance without leaving out any functionality, taking advantage of the available hardware capabilities (from the most basic to the most advanced).
 

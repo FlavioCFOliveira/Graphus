@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use graphus_core::Value;
+use graphus_cypher::MaterializedValue;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, EncryptionConfig, ServerConfig, TimingConfig, TlsConfig,
 };
@@ -96,8 +97,8 @@ async fn boot(config: ServerConfig) -> ServerHandle {
         .expect("server should boot")
 }
 
-/// Runs one auto-commit statement and returns all result rows.
-async fn run_query(handle: &EngineHandle, query: &str) -> Vec<Vec<Value>> {
+/// Runs one auto-commit statement and returns all result rows (materialized cells).
+async fn run_query(handle: &EngineHandle, query: &str) -> Vec<Vec<MaterializedValue>> {
     let ticket = handle
         .begin_auto_commit(AccessMode::Write)
         .await
@@ -127,7 +128,7 @@ async fn count(handle: &EngineHandle, query: &str) -> i64 {
     let rows = run_query(handle, query).await;
     assert_eq!(rows.len(), 1, "count query returns exactly one row");
     match rows[0].first() {
-        Some(Value::Integer(n)) => *n,
+        Some(MaterializedValue::Value(Value::Integer(n))) => *n,
         other => panic!("expected an integer count, got {other:?}"),
     }
 }

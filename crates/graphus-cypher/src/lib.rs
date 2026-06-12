@@ -132,6 +132,7 @@ pub mod physical;
 pub mod plan_cache;
 pub mod procedure_registry;
 pub mod record_graph;
+pub mod result;
 pub mod runtime;
 pub mod semantics;
 pub mod static_type;
@@ -181,6 +182,9 @@ pub use procedure_registry::{
     ValueClass,
 };
 pub use record_graph::RecordStoreGraph;
+pub use result::{
+    MaterializedNode, MaterializedPath, MaterializedRel, MaterializedStep, MaterializedValue,
+};
 pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
 pub use semantics::{
     ValidatedQuery, analyze, analyze_to_graphus, analyze_with_procedures,

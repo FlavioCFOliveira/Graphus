@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use graphus_core::Value;
+use graphus_cypher::MaterializedValue;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
 };
@@ -101,6 +102,41 @@ async fn boot(config: ServerConfig) -> ServerHandle {
         .expect("server should boot")
 }
 
+/// Flattens each result-row cell to a scalar [`Value`] for the property-only assertion path, the
+/// way the old server `project_value` did: a graph entity (which a bound-variable `CREATE`/`MATCH`
+/// streams back even with no `RETURN`) collapses to its id, a path to the list of its element ids
+/// in traversal order, and a structural list element-wise. These multi-db/scalar tests assert only
+/// on scalars; the entity ids are inert here.
+fn scalar_row(values: Vec<MaterializedValue>) -> Vec<Value> {
+    values.into_iter().map(materialized_to_scalar).collect()
+}
+
+/// Flattens one [`MaterializedValue`] cell to a scalar [`Value`] (entity → id, path → list of
+/// element ids in traversal order, list → element-wise).
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "entity ids are well within i64; this mirrors the old project_value flattening"
+)]
+fn materialized_to_scalar(v: MaterializedValue) -> Value {
+    match v {
+        MaterializedValue::Value(val) => val,
+        MaterializedValue::Node(n) => Value::Integer(n.id as i64),
+        MaterializedValue::Relationship(r) => Value::Integer(r.id as i64),
+        MaterializedValue::Path(p) => {
+            let mut ids = Vec::with_capacity(p.steps.len() * 2 + 1);
+            ids.push(Value::Integer(p.start.id as i64));
+            for step in &p.steps {
+                ids.push(Value::Integer(step.rel.id as i64));
+                ids.push(Value::Integer(step.node.id as i64));
+            }
+            Value::List(ids)
+        }
+        MaterializedValue::List(items) => {
+            Value::List(items.into_iter().map(materialized_to_scalar).collect())
+        }
+    }
+}
+
 /// Runs one auto-commit statement against `handle` and returns all result rows. The row stream is
 /// drained on a blocking task (`RowReceiver::next` blocks by design — `04 §9.1`); draining it is
 /// what commits the auto-commit transaction.
@@ -119,7 +155,7 @@ async fn run_query(handle: &EngineHandle, query: &str) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         loop {
             match rx.next() {
-                Ok(Some(row)) => rows.push(row),
+                Ok(Some(row)) => rows.push(scalar_row(row)),
                 Ok(None) => break,
                 Err(e) => panic!("row stream error: {e}"),
             }

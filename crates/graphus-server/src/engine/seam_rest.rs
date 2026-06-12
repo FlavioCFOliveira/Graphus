@@ -41,10 +41,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use graphus_core::{GraphusError, Value};
+use graphus_cypher::{MaterializedPath, MaterializedValue};
 use graphus_rest::engine::{
     AccessMode as RestAccessMode, RestEngine, ResultStream, Row, RunSummary as RestRunSummary,
     TxHandle, TxOrigin,
 };
+use graphus_rest::restvalue::{RestNode, RestPath, RestRelationship, RestValue};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
 
@@ -136,6 +138,61 @@ fn to_rest_summary(s: RunSummary) -> RestRunSummary {
     }
 }
 
+/// Maps a materialized result cell ([`MaterializedValue`], entity already resolved through the
+/// cursor's graph seam) onto the REST structural value ([`RestValue`]) the router encodes as a
+/// self-describing JSON object (`04 §8.3`; rmp #76/#96/#77). A property value passes through.
+fn materialized_to_rest(value: &MaterializedValue) -> RestValue {
+    match value {
+        MaterializedValue::Value(v) => RestValue::Value(v.clone()),
+        MaterializedValue::Node(n) => RestValue::Node(RestNode {
+            id: i64::try_from(n.id).unwrap_or(i64::MAX),
+            labels: n.labels.clone(),
+            properties: n.properties.clone(),
+        }),
+        MaterializedValue::Relationship(r) => RestValue::Relationship(materialized_rel_to_rest(r)),
+        MaterializedValue::Path(p) => RestValue::Path(materialized_path_to_rest(p)),
+        MaterializedValue::List(items) => {
+            RestValue::List(items.iter().map(materialized_to_rest).collect())
+        }
+    }
+}
+
+/// Maps a materialized relationship onto a REST relationship.
+fn materialized_rel_to_rest(r: &graphus_cypher::MaterializedRel) -> RestRelationship {
+    RestRelationship {
+        id: i64::try_from(r.id).unwrap_or(i64::MAX),
+        start: i64::try_from(r.start).unwrap_or(i64::MAX),
+        end: i64::try_from(r.end).unwrap_or(i64::MAX),
+        rel_type: r.rel_type.clone(),
+        properties: r.properties.clone(),
+    }
+}
+
+/// Maps a materialized path onto a REST path: nodes and relationships in traversal order (the REST
+/// shape is the ordered walk, not the Bolt distinct-lists-plus-indices form).
+fn materialized_path_to_rest(p: &MaterializedPath) -> RestPath {
+    let mut nodes = Vec::with_capacity(p.steps.len() + 1);
+    nodes.push(node_to_rest(&p.start));
+    let mut relationships = Vec::with_capacity(p.steps.len());
+    for step in &p.steps {
+        relationships.push(materialized_rel_to_rest(&step.rel));
+        nodes.push(node_to_rest(&step.node));
+    }
+    RestPath {
+        nodes,
+        relationships,
+    }
+}
+
+/// Maps a materialized node onto a REST node.
+fn node_to_rest(n: &graphus_cypher::MaterializedNode) -> RestNode {
+    RestNode {
+        id: i64::try_from(n.id).unwrap_or(i64::MAX),
+        labels: n.labels.clone(),
+        properties: n.properties.clone(),
+    }
+}
+
 /// Where a REST result's rows come from: the engine's bounded channel (a query) or a buffered
 /// administrative result (rmp #84) — both stream through the same [`ResultStream`] seam.
 enum RowSource {
@@ -176,8 +233,16 @@ impl ResultStream for RestEngineStream {
 
     fn next_row(&mut self) -> Result<Option<Row>, GraphusError> {
         match &mut self.source {
-            RowSource::Engine { rows, .. } => rows.next(),
-            RowSource::Admin(rows) => Ok(rows.next()),
+            // A query row arrives as materialized cells (entities already resolved through the
+            // cursor's graph seam, so RBAC/MVCC are applied — rmp #93); map each onto the REST
+            // structural value the router serialises.
+            RowSource::Engine { rows, .. } => Ok(rows
+                .next()?
+                .map(|cells| cells.iter().map(materialized_to_rest).collect())),
+            // A buffered admin row is plain property values; lift each into a `RestValue::Value`.
+            RowSource::Admin(rows) => Ok(rows
+                .next()
+                .map(|row| row.into_iter().map(RestValue::Value).collect())),
         }
     }
 

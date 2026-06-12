@@ -7,23 +7,18 @@
 //! implicit transaction. That contract is [`BoltExecutor`]. The engine (rmp #20, via
 //! `graphus-cypher`'s `TxnCoordinator`) implements it; tests here implement a mock.
 //!
-//! ## Why rows are `graphus_core::Value`
+//! ## The result-cell model
 //!
-//! `04 §8.3` mandates **one `Value` model** behind every listener: parameters in and result cells
-//! out are the same `graphus_core::Value`. The executor (`graphus-cypher`) carries a richer internal
-//! cell type (`RowValue`, with bound `Node`/`Relationship` references) through its operators, but it
-//! **projects** those down to the public `Value` model at the result boundary — which is exactly the
-//! seam this trait sits on. So [`Record`] rows are `Vec<Value>`.
-//!
-//! ### `Value::Node` is deferred (documented)
-//!
-//! `graphus_core::Value` does **not** yet have `Node`/`Relationship`/`Path`/`Point` variants
-//! (`04 §7.2` defers them to their owning subsystems). Until it does, an executor projecting a bound
-//! node into a result row can only expose what the `Value` model can represent — e.g. the node's id
-//! as a [`Value::Integer`], or its properties as a [`Value::Map`]. When the structural `Value`
-//! variants land, the executor will yield them and [`crate::packstream`] already has the structure
-//! encoders ([`crate::packstream::tag`]) to put a real Bolt `Node`/`Relationship`/`Path` on the
-//! wire. The seam itself does not change.
+//! `04 §8.3` mandates **one value model** behind every listener: query *parameters* in are
+//! `graphus_core::Value`. Result *cells* out are a small superset, [`crate::packstream::BoltValue`]:
+//! a property `Value` **or** a graph entity (`Node`/`Relationship`/`Path`). The structural classes
+//! are not `graphus_core::Value` variants (`04 §7.2` defers them to their owning subsystems), so the
+//! executor (`graphus-cypher`) resolves a bound entity's labels / type / endpoints / properties at
+//! the result boundary (`graphus_cypher::MaterializedValue`) and the server seam maps that onto a
+//! [`crate::packstream::BoltValue`]. A stock Neo4j driver thus receives a proper Bolt
+//! `Node`/`Relationship`/`Path` (rmp #76/#96), not a flattened id. A scalar/temporal/list/map cell is
+//! carried unchanged as `BoltValue::Value` and packs exactly as before. So [`Record`] rows are
+//! `Vec<BoltValue>`.
 //!
 //! ## Streaming and fetch size (`04 §7.7`)
 //!
@@ -32,6 +27,8 @@
 //! and the result summary so the server can emit the trailing `SUCCESS` (`06 §3.1`).
 
 use graphus_core::{GraphusError, Value};
+
+use crate::packstream::BoltValue;
 
 /// The access mode of a transaction (`04 §8.4`; `06 §4` for the REST mirror). Bolt `BEGIN`/`RUN`
 /// carry this in their `mode` field (`"r"` / `"w"`); it defaults to write.
@@ -45,8 +42,9 @@ pub enum AccessMode {
 }
 
 /// A single result row: the row's cells in the order declared by the query's `fields` metadata
-/// (`06 §3.1`).
-pub type Record = Vec<Value>;
+/// (`06 §3.1`). Each cell is a [`BoltValue`] — a property `Value` or a graph entity
+/// (`Node`/`Relationship`/`Path`), so a result row may carry structural values (rmp #76/#96).
+pub type Record = Vec<BoltValue>;
 
 /// The summary metadata for a finished result, emitted in the trailing `SUCCESS` (`06 §3.1`).
 ///
@@ -185,6 +183,7 @@ pub(crate) mod mock {
     //! A scriptable in-memory [`BoltExecutor`] for the state-machine tests.
 
     use super::{AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl};
+    use crate::packstream::BoltValue;
     use graphus_core::{GraphusError, Value};
     use std::collections::HashMap;
 
@@ -197,7 +196,13 @@ pub(crate) mod mock {
     }
 
     impl CannedResult {
-        pub fn rows(fields: &[&str], rows: Vec<Record>) -> Self {
+        /// Builds a canned scalar result. Rows are given as plain [`Value`] cells (the common test
+        /// case) and lifted into the [`Record`]'s [`BoltValue`] cells.
+        pub fn rows(fields: &[&str], rows: Vec<Vec<Value>>) -> Self {
+            let rows: Vec<Record> = rows
+                .into_iter()
+                .map(|row| row.into_iter().map(BoltValue::Value).collect())
+                .collect();
             Self {
                 fields: fields.iter().map(|s| (*s).to_owned()).collect(),
                 rows,
@@ -376,7 +381,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stream.fields(), &["x".to_owned()]);
-        assert_eq!(stream.next_record().unwrap(), Some(vec![Value::Integer(1)]));
+        assert_eq!(
+            stream.next_record().unwrap(),
+            Some(vec![BoltValue::Value(Value::Integer(1))])
+        );
         assert_eq!(stream.next_record().unwrap(), None);
         assert_eq!(stream.summary().query_type.as_deref(), Some("r"));
     }

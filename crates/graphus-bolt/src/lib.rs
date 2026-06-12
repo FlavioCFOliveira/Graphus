@@ -81,6 +81,10 @@ pub use handshake::{
     parse_manifest_choice,
 };
 pub use message::{Request, Response};
-pub use packstream::{Packer, Structure, Unpacker, pack_value, unpack_value};
+pub use packstream::{
+    BoltNode, BoltPath, BoltRelationship, BoltValue, Packer, Structure, Unpacker, pack_bolt_value,
+    pack_node, pack_path, pack_point_2d, pack_point_3d, pack_relationship, pack_value,
+    unpack_bolt_value, unpack_value,
+};
 pub use server::{BoltSession, SessionConfig, State};
 pub use transport::{MemoryTransport, Transport};

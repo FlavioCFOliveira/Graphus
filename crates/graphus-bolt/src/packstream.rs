@@ -124,6 +124,11 @@ pub mod tag {
     pub const LOCAL_DATE_TIME: u8 = 0x64;
     /// `Duration` — months, days, seconds, nanoseconds.
     pub const DURATION: u8 = 0x45;
+
+    /// `Point2D` — srid, x, y (Cartesian/WGS-84 2D spatial point).
+    pub const POINT_2D: u8 = 0x58;
+    /// `Point3D` — srid, x, y, z (Cartesian/WGS-84 3D spatial point).
+    pub const POINT_3D: u8 = 0x59;
 }
 
 // ---- A decoded structure ---------------------------------------------------------------------
@@ -539,6 +544,213 @@ pub fn pack_value(packer: &mut Packer, value: &Value) {
     }
 }
 
+// ---- Structural (graph) result values --------------------------------------------------------
+//
+// `graphus_core::Value` has no `Node`/`Relationship`/`Path`/`Point` variant yet (`04 §7.2` defers
+// them). But a RECORD value *may* be a graph entity, and a stock Neo4j driver expects the proper
+// Bolt structures — not a flattened id. So a result cell is carried as a [`BoltValue`]: either a
+// property [`Value`] (packed by [`pack_value`]) or a graph entity packed here from the ids / labels
+// / type / endpoints / properties the executor resolved (`04 §8.3`). This keeps the structural
+// classes out of the shared core type while still emitting spec-correct wire bytes.
+
+/// A node as a Bolt `Node` structure (tag `0x4E`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoltNode {
+    /// The node id.
+    pub id: i64,
+    /// The node's labels.
+    pub labels: Vec<String>,
+    /// The node's properties (ordered `(key, value)`).
+    pub properties: Vec<(String, Value)>,
+}
+
+/// A relationship as a Bolt `Relationship` structure (tag `0x52`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoltRelationship {
+    /// The relationship id.
+    pub id: i64,
+    /// The start (source) node id.
+    pub start: i64,
+    /// The end (target) node id.
+    pub end: i64,
+    /// The relationship type name.
+    pub rel_type: String,
+    /// The relationship's properties (ordered `(key, value)`).
+    pub properties: Vec<(String, Value)>,
+}
+
+/// A path as a Bolt `Path` structure (tag `0x50`): the distinct nodes and **unbound**
+/// relationships on the path plus the alternating, signed, 1-based index sequence (see
+/// [`pack_path`]). The `nodes`/`rels` are the path's distinct entities in first-appearance order;
+/// `indices` is `[rel, node, rel, node, …]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoltPath {
+    /// The distinct nodes on the path, in first-appearance order (start node first).
+    pub nodes: Vec<BoltNode>,
+    /// The distinct relationships on the path, in first-appearance order (packed as
+    /// `UnboundRelationship`s — id, type, properties — since the node sequence supplies endpoints).
+    pub rels: Vec<BoltRelationship>,
+    /// The alternating, signed, 1-based index sequence (`2 * hops` entries).
+    pub indices: Vec<i64>,
+}
+
+/// A **result-row cell** for a RECORD: a property value or a graph entity (`04 §8.3`).
+///
+/// Scalars/temporals/lists/maps stay [`BoltValue::Value`] and pack exactly as before; the structural
+/// variants pack the Bolt 5.x graph structures. A [`BoltValue::List`] is a *structural* list (one
+/// that contains an entity); a pure-property list stays inside a `Value::List`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoltValue {
+    /// A property value (scalar/string/bytes/list/map/temporal/null).
+    Value(Value),
+    /// A node (tag `0x4E`).
+    Node(BoltNode),
+    /// A relationship (tag `0x52`).
+    Relationship(BoltRelationship),
+    /// A path (tag `0x50`).
+    Path(BoltPath),
+    /// A structural list whose elements are packed each as a [`BoltValue`].
+    List(Vec<BoltValue>),
+}
+
+impl From<Value> for BoltValue {
+    fn from(v: Value) -> Self {
+        BoltValue::Value(v)
+    }
+}
+
+/// The Bolt 5.x `element_id` (and `start_element_id`/`end_element_id`) string for an entity.
+///
+/// Bolt 5.0 added a string `element_id` alongside the legacy integer id. Graphus is single-instance,
+/// so its stable string element id is simply the **decimal of the integer id** — a documented
+/// convention (`04 §8.3`): a stock driver reads it as an opaque string and round-trips it unchanged.
+fn element_id(id: i64) -> String {
+    id.to_string()
+}
+
+/// Packs a [`BoltValue`] result-row cell into `packer`: a property [`Value`] via [`pack_value`], or
+/// the matching Bolt graph structure.
+pub fn pack_bolt_value(packer: &mut Packer, value: &BoltValue) {
+    match value {
+        BoltValue::Value(v) => pack_value(packer, v),
+        BoltValue::Node(n) => pack_node(packer, n),
+        BoltValue::Relationship(r) => pack_relationship(packer, r),
+        BoltValue::Path(p) => pack_path(packer, p),
+        BoltValue::List(items) => {
+            packer.write_list_header(items.len());
+            for item in items {
+                pack_bolt_value(packer, item);
+            }
+        }
+    }
+}
+
+/// Packs a Bolt 5.x `Node` structure (tag `0x4E`): `id`, `labels`, `properties`, `element_id`
+/// (Source: the Neo4j Bolt specification, Node since 5.0 carries the trailing string `element_id`).
+pub fn pack_node(packer: &mut Packer, node: &BoltNode) {
+    // 4 fields <= 15; infallible. The `expect` documents the invariant per the API guidelines.
+    packer
+        .write_struct_header(tag::NODE, 4)
+        .expect("INVARIANT: Node has 4 fields");
+    packer.write_int(node.id);
+    packer.write_list_header(node.labels.len());
+    for label in &node.labels {
+        packer.write_string(label);
+    }
+    pack_properties(packer, &node.properties);
+    packer.write_string(&element_id(node.id));
+}
+
+/// Packs a Bolt 5.x `Relationship` structure (tag `0x52`): `id`, `start`, `end`, `type`,
+/// `properties`, `element_id`, `start_element_id`, `end_element_id` (the three element-id strings
+/// added in 5.0).
+pub fn pack_relationship(packer: &mut Packer, rel: &BoltRelationship) {
+    packer
+        .write_struct_header(tag::RELATIONSHIP, 8)
+        .expect("INVARIANT: Relationship has 8 fields");
+    packer.write_int(rel.id);
+    packer.write_int(rel.start);
+    packer.write_int(rel.end);
+    packer.write_string(&rel.rel_type);
+    pack_properties(packer, &rel.properties);
+    packer.write_string(&element_id(rel.id));
+    packer.write_string(&element_id(rel.start));
+    packer.write_string(&element_id(rel.end));
+}
+
+/// Packs a Bolt 5.x `UnboundRelationship` structure (tag `0x72`): `id`, `type`, `properties`,
+/// `element_id`. Used inside a `Path`'s `rels` list, where endpoints come from the node sequence.
+fn pack_unbound_relationship(packer: &mut Packer, rel: &BoltRelationship) {
+    packer
+        .write_struct_header(tag::UNBOUND_RELATIONSHIP, 4)
+        .expect("INVARIANT: UnboundRelationship has 4 fields");
+    packer.write_int(rel.id);
+    packer.write_string(&rel.rel_type);
+    pack_properties(packer, &rel.properties);
+    packer.write_string(&element_id(rel.id));
+}
+
+/// Packs a Bolt `Path` structure (tag `0x50`): `nodes`, `rels` (as `UnboundRelationship`s),
+/// `indices`.
+///
+/// The `indices` list alternates `[rel, node, rel, node, …]`: a node index is 0-based into `nodes`,
+/// a relationship index is **1-based** into `rels` and **signed** by traversal direction (positive =
+/// forward, negative = backward). This is the exact Bolt encoding the driver re-walks to rebuild the
+/// path (Source: the Neo4j Bolt/PackStream specification).
+pub fn pack_path(packer: &mut Packer, path: &BoltPath) {
+    packer
+        .write_struct_header(tag::PATH, 3)
+        .expect("INVARIANT: Path has 3 fields");
+    packer.write_list_header(path.nodes.len());
+    for node in &path.nodes {
+        pack_node(packer, node);
+    }
+    packer.write_list_header(path.rels.len());
+    for rel in &path.rels {
+        pack_unbound_relationship(packer, rel);
+    }
+    packer.write_list_header(path.indices.len());
+    for &idx in &path.indices {
+        packer.write_int(idx);
+    }
+}
+
+/// Packs an ordered `(key, value)` property list as a PackStream map.
+fn pack_properties(packer: &mut Packer, properties: &[(String, Value)]) {
+    packer.write_map_header(properties.len());
+    for (key, value) in properties {
+        packer.write_string(key);
+        pack_value(packer, value);
+    }
+}
+
+// ---- Spatial point encoders (tags 0x58 / 0x59) -----------------------------------------------
+//
+// The spatial `Point` value class is not a `graphus_core::Value` variant yet (task #73), so no
+// value reaches these encoders today. They are provided now so the wire layer is ready: when #73
+// lands a `Value::Point`, it maps onto one of these by dimensionality with no codec change.
+
+/// Packs a Bolt `Point2D` structure (tag `0x58`): `srid` (int), `x` (float), `y` (float).
+pub fn pack_point_2d(packer: &mut Packer, srid: i64, x: f64, y: f64) {
+    packer
+        .write_struct_header(tag::POINT_2D, 3)
+        .expect("INVARIANT: Point2D has 3 fields");
+    packer.write_int(srid);
+    packer.write_float(x);
+    packer.write_float(y);
+}
+
+/// Packs a Bolt `Point3D` structure (tag `0x59`): `srid` (int), `x`, `y`, `z` (floats).
+pub fn pack_point_3d(packer: &mut Packer, srid: i64, x: f64, y: f64, z: f64) {
+    packer
+        .write_struct_header(tag::POINT_3D, 4)
+        .expect("INVARIANT: Point3D has 4 fields");
+    packer.write_int(srid);
+    packer.write_float(x);
+    packer.write_float(y);
+    packer.write_float(z);
+}
+
 /// Decodes one [`Value`] from `unpacker`.
 ///
 /// # Errors
@@ -690,6 +902,149 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             "unknown PackStream structure tag {other:#04x}"
         ))),
     }
+}
+
+/// Decodes one **result-row cell** ([`BoltValue`]) from `unpacker`: a property [`Value`] (via
+/// [`unpack_value`]) or a graph structure (`Node`/`Relationship`/`Path`).
+///
+/// Unlike [`unpack_value`] (which rejects the deferred graph tags — they have no `Value` variant),
+/// this decodes those tags into the corresponding [`BoltValue`] structural variant. It is the
+/// inverse of [`pack_bolt_value`] and is what a client/test uses to read RECORD cells that may carry
+/// entities.
+///
+/// # Errors
+/// [`BoltError::Decode`] on a truncated/malformed stream or an unknown structure tag.
+pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
+    let marker = unpacker
+        .peek_marker()
+        .ok_or_else(|| BoltError::Decode("unexpected end of PackStream input".to_owned()))?;
+
+    if is_struct_marker(marker) {
+        // Peek the tag without consuming the header, so a temporal/unknown tag can fall through to
+        // `unpack_value`'s richer handling. The struct marker is 1 byte; the tag is the next.
+        let tag = unpacker
+            .buf
+            .get(unpacker.pos + 1)
+            .copied()
+            .ok_or_else(|| BoltError::Decode("structure header truncated".to_owned()))?;
+        match tag {
+            tag::NODE => return Ok(BoltValue::Node(unpack_node(unpacker)?)),
+            tag::RELATIONSHIP => {
+                return Ok(BoltValue::Relationship(unpack_relationship(unpacker)?));
+            }
+            tag::PATH => return Ok(BoltValue::Path(unpack_path(unpacker)?)),
+            // A temporal (or any other) structure: defer to the Value decoder.
+            _ => return Ok(BoltValue::Value(unpack_value(unpacker)?)),
+        }
+    }
+
+    // A list may be structural (contain an entity), so decode element-wise as BoltValues.
+    if is_list_marker(marker) {
+        let n = unpacker.read_list_header()?;
+        let mut items = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            items.push(unpack_bolt_value(unpacker)?);
+        }
+        return Ok(BoltValue::List(items));
+    }
+
+    Ok(BoltValue::Value(unpack_value(unpacker)?))
+}
+
+/// Decodes the property map of a graph structure as `(key, value)` pairs.
+fn unpack_properties(unpacker: &mut Unpacker<'_>) -> BoltResult<Vec<(String, Value)>> {
+    let n = unpacker.read_map_header()?;
+    let mut props = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let k = unpacker.read_string()?;
+        let v = unpack_value(unpacker)?;
+        props.push((k, v));
+    }
+    Ok(props)
+}
+
+/// Decodes a Bolt 5.x `Node` (tag `0x4E`, 4 fields: id, labels, properties, element_id).
+fn unpack_node(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltNode> {
+    let (t, field_count) = unpacker.read_struct_header()?;
+    expect_fields(t, field_count, 4)?;
+    let id = unpacker.read_int()?;
+    let label_count = unpacker.read_list_header()?;
+    let mut labels = Vec::with_capacity(label_count.min(64));
+    for _ in 0..label_count {
+        labels.push(unpacker.read_string()?);
+    }
+    let properties = unpack_properties(unpacker)?;
+    let _element_id = unpacker.read_string()?; // round-tripped, not modelled separately
+    Ok(BoltNode {
+        id,
+        labels,
+        properties,
+    })
+}
+
+/// Decodes a Bolt 5.x `Relationship` (tag `0x52`, 8 fields).
+fn unpack_relationship(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltRelationship> {
+    let (t, field_count) = unpacker.read_struct_header()?;
+    expect_fields(t, field_count, 8)?;
+    let id = unpacker.read_int()?;
+    let start = unpacker.read_int()?;
+    let end = unpacker.read_int()?;
+    let rel_type = unpacker.read_string()?;
+    let properties = unpack_properties(unpacker)?;
+    let _element_id = unpacker.read_string()?;
+    let _start_element_id = unpacker.read_string()?;
+    let _end_element_id = unpacker.read_string()?;
+    Ok(BoltRelationship {
+        id,
+        start,
+        end,
+        rel_type,
+        properties,
+    })
+}
+
+/// Decodes a Bolt 5.x `UnboundRelationship` (tag `0x72`, 4 fields). The path's node sequence
+/// supplies endpoints, so they are left at 0 here.
+fn unpack_unbound_relationship(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltRelationship> {
+    let (t, field_count) = unpacker.read_struct_header()?;
+    expect_fields(t, field_count, 4)?;
+    let id = unpacker.read_int()?;
+    let rel_type = unpacker.read_string()?;
+    let properties = unpack_properties(unpacker)?;
+    let _element_id = unpacker.read_string()?;
+    Ok(BoltRelationship {
+        id,
+        start: 0,
+        end: 0,
+        rel_type,
+        properties,
+    })
+}
+
+/// Decodes a Bolt `Path` (tag `0x50`, 3 fields: nodes, rels, indices).
+fn unpack_path(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltPath> {
+    let (t, field_count) = unpacker.read_struct_header()?;
+    expect_fields(t, field_count, 3)?;
+    let node_count = unpacker.read_list_header()?;
+    let mut nodes = Vec::with_capacity(node_count.min(1024));
+    for _ in 0..node_count {
+        nodes.push(unpack_node(unpacker)?);
+    }
+    let rel_count = unpacker.read_list_header()?;
+    let mut rels = Vec::with_capacity(rel_count.min(1024));
+    for _ in 0..rel_count {
+        rels.push(unpack_unbound_relationship(unpacker)?);
+    }
+    let idx_count = unpacker.read_list_header()?;
+    let mut indices = Vec::with_capacity(idx_count.min(1024));
+    for _ in 0..idx_count {
+        indices.push(unpacker.read_int()?);
+    }
+    Ok(BoltPath {
+        nodes,
+        rels,
+        indices,
+    })
 }
 
 /// Reconstructs a [`ZonedDateTime`] (whose `local` field stores the *local* instant) from the
@@ -1107,5 +1462,195 @@ mod tests {
             p.write_struct_header(0x4E, 16),
             Err(BoltError::Encode(_))
         ));
+    }
+
+    // ---- structural (graph) value tests -------------------------------------------------------
+
+    /// Round-trips a [`BoltValue`] through `pack_bolt_value`/`unpack_bolt_value`.
+    fn bolt_round_trip(v: &BoltValue) -> BoltValue {
+        let mut p = Packer::new();
+        pack_bolt_value(&mut p, v);
+        let bytes = p.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        let out = unpack_bolt_value(&mut u).expect("decode bolt value");
+        assert!(u.is_empty(), "decode left {} trailing bytes", u.remaining());
+        out
+    }
+
+    #[test]
+    fn node_structure_exact_layout_and_round_trip() {
+        let node = BoltNode {
+            id: 7,
+            labels: vec!["Person".to_owned(), "Admin".to_owned()],
+            properties: vec![("name".to_owned(), Value::String("Ada".to_owned()))],
+        };
+        let mut p = Packer::new();
+        pack_node(&mut p, &node);
+        let bytes = p.into_inner();
+        // Tiny-struct marker carrying 4 fields, then the Node tag.
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 4);
+        assert_eq!(bytes[1], tag::NODE);
+        // Field 0: id (tiny int 7).
+        assert_eq!(bytes[2], 0x07);
+        // Field 1: labels — a 2-element tiny list.
+        assert_eq!(bytes[3], TINY_LIST_BASE + 2);
+        // Round-trip preserves id/labels/properties (element_id is round-tripped, not modelled).
+        let mut u = Unpacker::new(&bytes);
+        assert_eq!(unpack_node(&mut u).unwrap(), node);
+        // The element_id field is the stringified id (single-instance convention).
+        let mut u2 = Unpacker::new(&bytes);
+        let _ = u2.read_struct_header().unwrap();
+        let _id = u2.read_int().unwrap();
+        // Skip the labels list to reach the trailing element_id field.
+        let n = u2.read_list_header().unwrap();
+        for _ in 0..n {
+            let _ = u2.read_string().unwrap();
+        }
+        let _props = unpack_properties(&mut u2).unwrap();
+        assert_eq!(u2.read_string().unwrap(), "7");
+    }
+
+    #[test]
+    fn relationship_structure_has_eight_fields_and_element_ids() {
+        let rel = BoltRelationship {
+            id: 3,
+            start: 1,
+            end: 2,
+            rel_type: "KNOWS".to_owned(),
+            properties: vec![("since".to_owned(), Value::Integer(2010))],
+        };
+        let mut p = Packer::new();
+        pack_relationship(&mut p, &rel);
+        let bytes = p.into_inner();
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 8);
+        assert_eq!(bytes[1], tag::RELATIONSHIP);
+        // Walk the structure to confirm the three element-id strings: "3", "1", "2".
+        let mut u = Unpacker::new(&bytes);
+        let (_t, fc) = u.read_struct_header().unwrap();
+        assert_eq!(fc, 8);
+        assert_eq!(u.read_int().unwrap(), 3); // id
+        assert_eq!(u.read_int().unwrap(), 1); // start
+        assert_eq!(u.read_int().unwrap(), 2); // end
+        assert_eq!(u.read_string().unwrap(), "KNOWS"); // type
+        let _props = unpack_properties(&mut u).unwrap();
+        assert_eq!(u.read_string().unwrap(), "3"); // element_id
+        assert_eq!(u.read_string().unwrap(), "1"); // start_element_id
+        assert_eq!(u.read_string().unwrap(), "2"); // end_element_id
+        // And it round-trips through the high-level decoder.
+        assert_eq!(
+            bolt_round_trip(&BoltValue::Relationship(rel.clone())),
+            BoltValue::Relationship(rel)
+        );
+    }
+
+    #[test]
+    fn path_structure_packs_nodes_unbound_rels_and_indices() {
+        let n0 = BoltNode {
+            id: 10,
+            labels: vec!["P".to_owned()],
+            properties: vec![],
+        };
+        let n1 = BoltNode {
+            id: 11,
+            labels: vec!["P".to_owned()],
+            properties: vec![],
+        };
+        let r0 = BoltRelationship {
+            id: 100,
+            start: 10,
+            end: 11,
+            rel_type: "R".to_owned(),
+            properties: vec![],
+        };
+        let path = BoltPath {
+            nodes: vec![n0, n1],
+            rels: vec![r0],
+            indices: vec![1, 1], // forward rel #1, arrive at node index 1
+        };
+        let mut p = Packer::new();
+        pack_path(&mut p, &path);
+        let bytes = p.into_inner();
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 3);
+        assert_eq!(bytes[1], tag::PATH);
+        // Inner rels must be UnboundRelationship (tag 0x72), not full Relationship.
+        let mut u = Unpacker::new(&bytes);
+        let (_t, fc) = u.read_struct_header().unwrap();
+        assert_eq!(fc, 3);
+        let node_count = u.read_list_header().unwrap();
+        assert_eq!(node_count, 2);
+        for _ in 0..node_count {
+            let _ = unpack_node(&mut u).unwrap();
+        }
+        let rel_count = u.read_list_header().unwrap();
+        assert_eq!(rel_count, 1);
+        let (rel_tag, rel_fc) = u.read_struct_header().unwrap();
+        assert_eq!(rel_tag, tag::UNBOUND_RELATIONSHIP);
+        assert_eq!(rel_fc, 4);
+        // Round-trip: the inner rels are UnboundRelationships, so endpoints come back as 0 (the
+        // node sequence supplies them on the driver side) — id/type/properties/indices are exact.
+        let mut expected = path.clone();
+        expected.rels[0].start = 0;
+        expected.rels[0].end = 0;
+        assert_eq!(
+            bolt_round_trip(&BoltValue::Path(path)),
+            BoltValue::Path(expected)
+        );
+    }
+
+    #[test]
+    fn structural_list_round_trips_with_an_entity() {
+        let node = BoltNode {
+            id: 1,
+            labels: vec!["L".to_owned()],
+            properties: vec![],
+        };
+        let list = BoltValue::List(vec![
+            BoltValue::Value(Value::Integer(42)),
+            BoltValue::Node(node),
+        ]);
+        assert_eq!(bolt_round_trip(&list), list);
+    }
+
+    #[test]
+    fn scalar_bolt_value_round_trips() {
+        let v = BoltValue::Value(Value::String("hi".to_owned()));
+        assert_eq!(bolt_round_trip(&v), v);
+    }
+
+    #[test]
+    fn point_2d_and_3d_exact_layout() {
+        // No `Value::Point` exists yet (#73), so the encoders are exercised directly.
+        let mut p = Packer::new();
+        pack_point_2d(&mut p, 7203, 1.5, -2.5);
+        let bytes = p.into_inner();
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 3);
+        assert_eq!(bytes[1], tag::POINT_2D);
+        let mut u = Unpacker::new(&bytes);
+        let (_t, fc) = u.read_struct_header().unwrap();
+        assert_eq!(fc, 3);
+        assert_eq!(u.read_int().unwrap(), 7203);
+
+        let mut p = Packer::new();
+        pack_point_3d(&mut p, 9157, 1.0, 2.0, 3.0);
+        let bytes = p.into_inner();
+        assert_eq!(bytes[0], TINY_STRUCT_BASE + 4);
+        assert_eq!(bytes[1], tag::POINT_3D);
+        let mut u = Unpacker::new(&bytes);
+        let (_t, fc) = u.read_struct_header().unwrap();
+        assert_eq!(fc, 4);
+        assert_eq!(u.read_int().unwrap(), 9157);
+    }
+
+    #[test]
+    fn unpack_bolt_value_still_decodes_temporals_and_scalars() {
+        // A temporal structure goes through the Value path inside a BoltValue.
+        let v = Value::Date(Date {
+            days_since_epoch: 20_000,
+        });
+        let mut p = Packer::new();
+        pack_value(&mut p, &v);
+        let bytes = p.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        assert_eq!(unpack_bolt_value(&mut u).unwrap(), BoltValue::Value(v));
     }
 }

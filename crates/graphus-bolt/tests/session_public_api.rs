@@ -4,6 +4,7 @@
 //! usable from another crate and that a whole session works over the public surface.
 
 use graphus_auth::{Authenticator, Privilege};
+use graphus_bolt::BoltValue;
 use graphus_bolt::executor::{
     AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
 };
@@ -50,7 +51,11 @@ impl BoltExecutor for DemoExecutor {
     ) -> Result<Self::Stream, GraphusError> {
         Ok(DemoStream {
             fields: vec!["x".to_owned()],
-            rows: vec![vec![Value::Integer(10)], vec![Value::Integer(20)]].into_iter(),
+            rows: vec![
+                vec![BoltValue::Value(Value::Integer(10))],
+                vec![BoltValue::Value(Value::Integer(20))],
+            ]
+            .into_iter(),
         })
     }
 
@@ -146,13 +151,13 @@ fn full_session_over_public_api() {
     assert_eq!(
         r[3],
         Response::Record {
-            values: vec![Value::Integer(10)]
+            values: vec![BoltValue::Value(Value::Integer(10))]
         }
     );
     assert_eq!(
         r[4],
         Response::Record {
-            values: vec![Value::Integer(20)]
+            values: vec![BoltValue::Value(Value::Integer(20))]
         }
     );
     assert!(matches!(r[5], Response::Success { .. }));

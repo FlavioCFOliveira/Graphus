@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use graphus_bolt::server::{encode_client_handshake, encode_request_framed};
-use graphus_bolt::{Dechunker, Frame, Proposal, Request, Response};
+use graphus_bolt::{BoltValue, Dechunker, Frame, Proposal, Request, Response};
 use graphus_core::Value;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig, UserBootstrap,
@@ -24,6 +24,36 @@ use graphus_server::config::{
 use graphus_server::{Server, ServerHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+/// Flattens each RECORD cell to a scalar [`Value`] for the property-only assertion path, the way
+/// the old server `project_value` did: a graph entity (which a bound-variable `CREATE`/`MATCH`
+/// streams back even with no `RETURN`) collapses to its id, a path to the list of its element ids,
+/// and a structural list element-wise. These admin/scalar tests assert only on scalars; the entity
+/// ids are inert here.
+fn scalar_row(values: Vec<BoltValue>) -> Vec<Value> {
+    values.into_iter().map(bolt_to_scalar).collect()
+}
+
+/// Flattens one [`BoltValue`] cell to a scalar [`Value`] (entity → id, path → list of element ids,
+/// list → element-wise).
+fn bolt_to_scalar(v: BoltValue) -> Value {
+    match v {
+        BoltValue::Value(val) => val,
+        BoltValue::Node(n) => Value::Integer(n.id),
+        BoltValue::Relationship(r) => Value::Integer(r.id),
+        BoltValue::Path(p) => {
+            let mut ids = Vec::with_capacity(p.nodes.len() + p.rels.len());
+            for node in &p.nodes {
+                ids.push(Value::Integer(node.id));
+            }
+            for rel in &p.rels {
+                ids.push(Value::Integer(rel.id));
+            }
+            Value::List(ids)
+        }
+        BoltValue::List(items) => Value::List(items.into_iter().map(bolt_to_scalar).collect()),
+    }
+}
 
 /// The JWT secret shared between the test config and the token-minting helper.
 const JWT_SECRET: &str = "secadmin-itest-jwt-secret-32-bytes!!";
@@ -269,7 +299,7 @@ impl BoltClient {
         let mut rows = Vec::new();
         loop {
             match self.recv().await {
-                Response::Record { values } => rows.push(values),
+                Response::Record { values } => rows.push(scalar_row(values)),
                 Response::Success { .. } => return Ok(rows),
                 Response::Failure(f) => {
                     return Err(WireFailure {

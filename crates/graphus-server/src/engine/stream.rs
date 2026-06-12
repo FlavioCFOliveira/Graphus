@@ -15,12 +15,18 @@
 
 use std::sync::mpsc::{Receiver, SyncSender};
 
-use graphus_core::{GraphusError, Value};
+use graphus_core::GraphusError;
+use graphus_cypher::MaterializedValue;
 
 /// One item the engine streams: a successfully-produced row, or a runtime error that aborted row
 /// production (delivered as the stream's terminal item — `06 §3.2`: a runtime error may arrive after
 /// some rows have already streamed).
-pub type RowItem = Result<Vec<Value>, GraphusError>;
+///
+/// A row's cells are [`MaterializedValue`]s — each entity already resolved to its labels / type /
+/// endpoints / properties through the cursor's graph seam (so RBAC and MVCC visibility are already
+/// applied). The two wire seams (`seam_bolt`/`seam_rest`) map each cell onto their protocol-native
+/// structural type (`BoltValue` / `RestValue`).
+pub type RowItem = Result<Vec<MaterializedValue>, GraphusError>;
 
 /// The engine's end of a result stream: a bounded sender it pushes rows into.
 pub type RowSender = SyncSender<RowItem>;
@@ -53,7 +59,7 @@ impl RowReceiver {
     // Not `Iterator::next`: it returns a `Result` and pulls from a fallible channel, mirroring
     // `graphus_cypher::Cursor::next` (which carries the same allow for the same reason).
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<Option<Vec<Value>>, GraphusError> {
+    pub fn next(&mut self) -> Result<Option<Vec<MaterializedValue>>, GraphusError> {
         if self.done {
             return Ok(None);
         }

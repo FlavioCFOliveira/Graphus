@@ -269,10 +269,14 @@ fn run_cursor(
     }
 
     loop {
-        match cursor.next() {
-            Ok(Some(row)) => {
-                // Project the executor's `RowValue` row down to the public `Value` model (`04 §8.3`).
-                let cells = project_row(&row);
+        // Materialize the executor's `RowValue` row at the egress boundary (`04 §8.3`): each entity
+        // is resolved (labels/type/endpoints/properties) through the cursor's graph seam, so the wire
+        // form carries full structural values, not flattened ids (rmp #76/#96). Because resolution
+        // reads through the *same* `&mut dyn GraphAccess` the cursor holds — including the
+        // `AuthorizedGraph` decorator (rmp #93) — RBAC filtering and MVCC visibility compose
+        // automatically: a hidden property is already `None`, an invisible entity already filtered.
+        match cursor.next_materialized() {
+            Ok(Some(cells)) => {
                 // A closed channel (consumer gone) ends streaming early; not an error.
                 if row_tx.send(Ok(cells)).is_err() {
                     return true;
@@ -286,45 +290,6 @@ fn run_cursor(
         }
     }
     true
-}
-
-/// Projects one executor [`graphus_cypher::Row`] (a `RowValue` superset) down to the public
-/// `Vec<Value>` the wire seams carry (`04 §8.3`).
-///
-/// The structural `RowValue` variants (`Node`/`Rel`/`Path`/structural `List`) are **deferred in
-/// `graphus_core::Value`** (`04 §7.2`); until the variants land, an entity is exposed as its id as a
-/// `Value::Integer`, a structural list projects element-wise into a `Value::List`, and a path
-/// projects into the `Value::List` of its element ids in traversal order (start node, then each
-/// hop's relationship and arrival node) — matching how the Bolt/REST seams document the deferral. A
-/// plain `Value` cell passes through.
-fn project_row(row: &graphus_cypher::Row) -> Vec<graphus_core::Value> {
-    row.values().iter().map(project_value).collect()
-}
-
-/// Projects one [`graphus_cypher::RowValue`] to a wire [`graphus_core::Value`] (see
-/// [`project_row`]).
-fn project_value(rv: &graphus_cypher::RowValue) -> graphus_core::Value {
-    use graphus_core::Value;
-    use graphus_cypher::RowValue;
-    match rv {
-        RowValue::Value(v) => v.clone(),
-        // `NodeId`/`RelId` are `pub` newtypes over `u64`; expose the id until the structural
-        // `Value` variants land (`04 §7.2`).
-        RowValue::Node(n) => Value::Integer(n.id.0 as i64),
-        RowValue::Rel(r) => Value::Integer(r.id.0 as i64),
-        // A structural list projects element-wise; a path flattens to its element ids in traversal
-        // order (start node, then each hop's relationship + arrival node).
-        RowValue::List(items) => Value::List(items.iter().map(project_value).collect()),
-        RowValue::Path(p) => {
-            let mut ids = Vec::with_capacity(p.steps.len() * 2 + 1);
-            ids.push(Value::Integer(p.start.0 as i64));
-            for s in &p.steps {
-                ids.push(Value::Integer(s.rel.0 as i64));
-                ids.push(Value::Integer(s.node.0 as i64));
-            }
-            Value::List(ids)
-        }
-    }
 }
 
 /// Builds a [`Parameters`] set from the `(name, value)` pairs the seam passed in.

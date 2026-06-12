@@ -10,7 +10,8 @@ It is written to be **prescriptive**. Where a choice is still gated on measureme
 "measure to decide" and "never guess"), it is flagged inline and collected in §12. Decision IDs
 (`D-…`) refer to `02-decision-register.md`; source short-names refer to §13 and to `03-sources.md`.
 
-> **Inviolable constraints that gate every design here:** 100% ACID and 100% openCypher TCK.
+> **Inviolable constraints that gate every design here:** 100% ACID, 100% openCypher TCK,
+> 100% Bolt protocol, and 100% PackStream.
 > Wherever this document and those constraints could diverge, the constraint wins, and the
 > divergence is escalated rather than silently resolved.
 
@@ -996,8 +997,10 @@ No SIMD path is assumed present; the scalar path is always correct and tested.
 ## 11. Testing & verification architecture
 
 Verification is a **deliverable**, not an afterthought (Sources: DST/Antithesis/madsim; Jepsen/Elle;
-loom; Miri; proptest; cargo-fuzz; Criterion). The two inviolable requirements are **proven**, not
-asserted.
+loom; Miri; proptest; cargo-fuzz; Criterion). The four inviolable requirements are **proven**, not
+asserted: ACID by DST and Elle (§11.1, §11.3), Cypher TCK by the TCK harness (§11.2), and the Bolt
+protocol and PackStream by protocol-conformance and driver-interoperability tests against the
+certified driver matrix (§12 item 11), with PackStream round-trip and fuzz coverage in §11.4.
 
 ### 11.1 Deterministic Simulation Testing — built in from the start (`D-dst-investment`)
 

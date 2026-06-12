@@ -36,7 +36,9 @@
 use graphus_bolt::executor::{
     AccessMode as BoltAccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
 };
+use graphus_bolt::packstream::{BoltNode, BoltPath, BoltRelationship, BoltValue};
 use graphus_core::{GraphusError, Value};
+use graphus_cypher::{MaterializedPath, MaterializedValue};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
 
@@ -151,6 +153,57 @@ fn to_bolt_summary(s: RunSummary) -> QuerySummary {
     }
 }
 
+/// Maps a materialized result cell ([`MaterializedValue`], entity already resolved through the
+/// cursor's graph seam) onto the Bolt structural value ([`BoltValue`]) the PackStream encoder packs
+/// (`04 §8.3`; rmp #76/#96). A property value passes through; a structural list recurses.
+fn materialized_to_bolt(value: &MaterializedValue) -> BoltValue {
+    match value {
+        MaterializedValue::Value(v) => BoltValue::Value(v.clone()),
+        MaterializedValue::Node(n) => BoltValue::Node(BoltNode {
+            // The opaque id is a `u64`; Bolt ids are `i64`. The id is a small internal handle, so the
+            // saturating cast never actually clamps in practice — defensive only.
+            id: i64::try_from(n.id).unwrap_or(i64::MAX),
+            labels: n.labels.clone(),
+            properties: n.properties.clone(),
+        }),
+        MaterializedValue::Relationship(r) => BoltValue::Relationship(materialized_rel_to_bolt(r)),
+        MaterializedValue::Path(p) => BoltValue::Path(materialized_path_to_bolt(p)),
+        MaterializedValue::List(items) => {
+            BoltValue::List(items.iter().map(materialized_to_bolt).collect())
+        }
+    }
+}
+
+/// Maps a materialized relationship onto a Bolt relationship.
+fn materialized_rel_to_bolt(r: &graphus_cypher::MaterializedRel) -> BoltRelationship {
+    BoltRelationship {
+        id: i64::try_from(r.id).unwrap_or(i64::MAX),
+        start: i64::try_from(r.start).unwrap_or(i64::MAX),
+        end: i64::try_from(r.end).unwrap_or(i64::MAX),
+        rel_type: r.rel_type.clone(),
+        properties: r.properties.clone(),
+    }
+}
+
+/// Maps a materialized path onto a Bolt `Path`, decomposing it into the distinct nodes, distinct
+/// unbound relationships, and the signed/1-based index sequence the Bolt `Path` structure packs
+/// (delegated to [`MaterializedPath::bolt_path_components`]).
+fn materialized_path_to_bolt(p: &MaterializedPath) -> BoltPath {
+    let (nodes, rels, indices) = p.bolt_path_components();
+    BoltPath {
+        nodes: nodes
+            .into_iter()
+            .map(|n| BoltNode {
+                id: i64::try_from(n.id).unwrap_or(i64::MAX),
+                labels: n.labels.clone(),
+                properties: n.properties.clone(),
+            })
+            .collect(),
+        rels: rels.into_iter().map(materialized_rel_to_bolt).collect(),
+        indices,
+    }
+}
+
 /// Where a Bolt result's rows come from: the engine's bounded channel (a query) or a buffered
 /// administrative result (rmp #84) — both stream through the same [`RecordStream`] seam.
 enum RowSource {
@@ -191,8 +244,16 @@ impl RecordStream for BoltEngineStream {
 
     fn next_record(&mut self) -> Result<Option<Record>, GraphusError> {
         match &mut self.source {
-            RowSource::Engine { rows, .. } => rows.next(),
-            RowSource::Admin(rows) => Ok(rows.next()),
+            // A query row arrives as materialized cells (entities already resolved through the
+            // cursor's graph seam, so RBAC/MVCC are applied — rmp #93); map each onto the Bolt
+            // structural value the PackStream encoder packs.
+            RowSource::Engine { rows, .. } => Ok(rows
+                .next()?
+                .map(|cells| cells.iter().map(materialized_to_bolt).collect())),
+            // A buffered admin row is plain property values; lift each into a `BoltValue::Value`.
+            RowSource::Admin(rows) => Ok(rows
+                .next()
+                .map(|row| row.into_iter().map(BoltValue::Value).collect())),
         }
     }
 

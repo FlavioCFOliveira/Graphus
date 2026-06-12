@@ -19,12 +19,16 @@
 //! "currently-open transaction" the Bolt session owns. Both seams speak the same
 //! [`graphus_core::Value`] and [`GraphusError`], so the engine behind them is one.
 //!
-//! ## Why rows are `graphus_core::Value`
+//! ## The result-cell model
 //!
-//! `04 §8.3` mandates **one `Value` model** behind every listener: parameters in and result cells
-//! out are the same [`graphus_core::Value`]. The executor carries a richer internal cell type
-//! through its operators but **projects** down to the public `Value` model at the result boundary —
-//! which is exactly the seam this trait sits on. So a [`ResultStream`] row is a `Vec<Value>`.
+//! `04 §8.3` mandates **one value model** behind every listener: query *parameters* in are
+//! [`graphus_core::Value`]. Result *cells* out are a small superset, [`crate::restvalue::RestValue`]:
+//! a property `Value` **or** a graph entity (`Node`/`Relationship`/`Path`). The structural classes
+//! are not `graphus_core::Value` variants (`04 §7.2` defers them), so the executor resolves a bound
+//! entity at the result boundary (`graphus_cypher::MaterializedValue`) and the server seam maps that
+//! onto a [`RestValue`], which the router encodes as a self-describing structural JSON object (rmp
+//! #76/#96/#77). A scalar/temporal/list/map cell stays `RestValue::Value` and encodes exactly as
+//! before. So a [`ResultStream`] row is a `Vec<RestValue>`.
 //!
 //! ## Streaming (`04 §7.7`, §8.2)
 //!
@@ -34,6 +38,8 @@
 //! whole.
 
 use graphus_core::{GraphusError, Value};
+
+use crate::restvalue::RestValue;
 
 /// The access mode of a transaction (`06 §4`; mirrors `graphus_bolt`'s `AccessMode`).
 ///
@@ -60,8 +66,10 @@ impl AccessMode {
     }
 }
 
-/// A single result row: the row's cells in the order declared by [`ResultStream::fields`].
-pub type Row = Vec<Value>;
+/// A single result row: the row's cells in the order declared by [`ResultStream::fields`]. Each cell
+/// is a [`RestValue`] — a property `Value` or a graph entity (`Node`/`Relationship`/`Path`), so a
+/// result row may carry structural values (rmp #76/#96).
+pub type Row = Vec<RestValue>;
 
 /// The summary metadata for a finished result, surfaced after the rows (the REST analogue of the
 /// trailing Bolt `SUCCESS` summary — `06 §3.1`).
@@ -221,6 +229,7 @@ pub(crate) mod mock {
     use graphus_core::{GraphusError, Value};
 
     use super::{AccessMode, RestEngine, ResultStream, Row, RunSummary, TxHandle, TxOrigin};
+    use crate::restvalue::RestValue;
 
     /// A canned result: the fields and the rows to stream (or an error to raise on `run`).
     #[derive(Clone)]
@@ -231,8 +240,14 @@ pub(crate) mod mock {
     }
 
     impl Canned {
-        /// Canned rows with the given field names and a default read summary.
-        pub fn rows(fields: &[&str], rows: Vec<Row>) -> Self {
+        /// Canned scalar rows with the given field names and a default read summary. Rows are given
+        /// as plain [`Value`] cells (the common test case) and lifted into the [`Row`]'s
+        /// [`RestValue`] cells.
+        pub fn rows(fields: &[&str], rows: Vec<Vec<Value>>) -> Self {
+            let rows: Vec<Row> = rows
+                .into_iter()
+                .map(|row| row.into_iter().map(RestValue::Value).collect())
+                .collect();
             Self {
                 fields: fields.iter().map(|s| (*s).to_owned()).collect(),
                 rows,
@@ -434,6 +449,7 @@ pub(crate) mod mock {
 mod tests {
     use super::mock::{Canned, MockEngine};
     use super::*;
+    use crate::restvalue::RestValue;
 
     /// A fixed auto-commit origin for the seam unit tests.
     const TEST_ORIGIN: TxOrigin<'static> = TxOrigin {
@@ -459,7 +475,10 @@ mod tests {
             .unwrap();
         let mut stream = engine.run(tx, "RETURN 1", vec![]).unwrap();
         assert_eq!(stream.fields(), &["x".to_owned()]);
-        assert_eq!(stream.next_row().unwrap(), Some(vec![Value::Integer(1)]));
+        assert_eq!(
+            stream.next_row().unwrap(),
+            Some(vec![RestValue::Value(Value::Integer(1))])
+        );
         assert_eq!(stream.next_row().unwrap(), None);
         assert_eq!(stream.summary().query_type.as_deref(), Some("r"));
     }

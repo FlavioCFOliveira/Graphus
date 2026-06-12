@@ -31,7 +31,9 @@
 use graphus_core::Value;
 
 use crate::error::{BoltError, BoltResult, Failure};
-use crate::packstream::{Packer, Unpacker, pack_value, unpack_value};
+use crate::packstream::{
+    BoltValue, Packer, Unpacker, pack_bolt_value, pack_value, unpack_bolt_value, unpack_value,
+};
 
 /// Message opcode (signature) bytes (`04 §8.1`).
 pub mod opcode {
@@ -147,10 +149,12 @@ pub enum Response {
         /// The metadata map.
         metadata: Vec<(String, Value)>,
     },
-    /// `RECORD` — one result row, a list of the row's values in field order.
+    /// `RECORD` — one result row, a list of the row's values in field order. Each value is a
+    /// [`BoltValue`] so a cell may be a graph entity (`Node`/`Relationship`/`Path`), not only a
+    /// property `Value` (rmp #76/#96).
     Record {
         /// The row values.
-        values: Vec<Value>,
+        values: Vec<BoltValue>,
     },
     /// `IGNORED` — the request was ignored (the connection is in `FAILED`; `04 §8.1`).
     Ignored,
@@ -330,7 +334,7 @@ impl Response {
                 p.write_struct_header(opcode::RECORD, 1)?;
                 p.write_list_header(values.len());
                 for v in values {
-                    pack_value(&mut p, v);
+                    pack_bolt_value(&mut p, v);
                 }
             }
             Response::Ignored => p.write_struct_header(opcode::IGNORED, 0)?,
@@ -353,18 +357,23 @@ impl Response {
     pub fn decode(payload: &[u8]) -> BoltResult<Self> {
         let mut u = Unpacker::new(payload);
         let (tag, field_count) = u.read_struct_header()?;
+        // RECORD's single field is the row's value list, whose cells may be **structural** graph
+        // entities (Node/Relationship/Path) that have no `Value` variant — so it is decoded directly
+        // as a list of [`BoltValue`]s rather than through the generic `Value` field reader.
+        if tag == opcode::RECORD {
+            expect_arity(tag, field_count, 1)?;
+            let count = u.read_list_header()?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(unpack_bolt_value(&mut u)?);
+            }
+            return Ok(Response::Record { values });
+        }
         let mut fields = read_fields(&mut u, field_count)?;
         match tag {
             opcode::SUCCESS => Ok(Response::Success {
                 metadata: take_map(&mut fields, 0, tag, "SUCCESS.metadata")?,
             }),
-            opcode::RECORD => {
-                expect_arity(tag, fields.len(), 1)?;
-                match fields.into_iter().next() {
-                    Some(Value::List(values)) => Ok(Response::Record { values }),
-                    _ => Err(BoltError::Decode("RECORD field must be a list".to_owned())),
-                }
-            }
             opcode::IGNORED => {
                 expect_arity(tag, fields.len(), 0)?;
                 Ok(Response::Ignored)
@@ -678,7 +687,10 @@ mod tests {
         assert_eq!(rt_response(&success), success);
 
         let record = Response::Record {
-            values: vec![Value::Integer(1), Value::String("a".to_owned())],
+            values: vec![
+                BoltValue::Value(Value::Integer(1)),
+                BoltValue::Value(Value::String("a".to_owned())),
+            ],
         };
         let bytes = record.encode().unwrap();
         assert_eq!(bytes[1], opcode::RECORD);

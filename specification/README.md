@@ -23,7 +23,7 @@ in the project Knowledge Graph (`rmp` roadmap `graphus`).
 
 ## How to read this
 
-1. Start with `00-overview.md` for the project frame and the two inviolable requirements.
+1. Start with `00-overview.md` for the project frame and the four inviolable requirements.
 2. Read `01-needs-survey.md` for the complete enumeration of what Graphus must do.
 3. Review `02-decision-register.md` and ratify each decision; ratified decisions unblock
    the detailed, per-domain functional specification (one document per domain) and the
@@ -42,6 +42,7 @@ Knowledge Graph.
 - **Next:** per-domain detailed functional specification (one document per domain), consistent
   with the ratified decisions; then Phase 1 implementation planning in `rmp`.
 - **Roadmap / KG:** `rmp` roadmap `graphus` (the queryable project map; updated on every commit).
-- **Inviolable requirements:** 100% ACID compliant, 100% Cypher TCK compliant.
+- **Inviolable requirements:** 100% ACID compliant, 100% Cypher TCK compliant,
+  100% Bolt protocol compliant, 100% PackStream compliant.
 - **Interfaces:** Bolt over UDS, Bolt over TCP, and the Web REST API (three; the Bolt-over-TCP
   interface is an owner-ratified extension of the project definition).

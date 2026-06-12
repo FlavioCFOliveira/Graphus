@@ -6,7 +6,7 @@
 It is designed to operate **exemplarily and without failure under extreme load and
 concurrency**. By default the graph is a **multigraph**.
 
-Graphus has two inviolable requirements:
+Graphus has four inviolable requirements:
 
 - **100% ACID compliant** — full reliability and safety when processing transactions,
   even under power failure, errors, or system faults. Data must **never** become corrupted
@@ -14,25 +14,35 @@ Graphus has two inviolable requirements:
 - **100% Cypher TCK compliant** — fully compliant with the official openCypher
   specification: any query written in Cypher behaves exactly as expected, with no
   unexpected behavior or syntax failure.
+- **100% Bolt protocol compliant** — fully compliant with the official Bolt specification
+  (handshake and version negotiation, message types, connection states, transaction
+  semantics, and error handling): any Bolt client, including the official Neo4j driver
+  ecosystem, communicates with the server exactly as the specification mandates, with no
+  deviations or unexpected behavior.
+- **100% PackStream compliant** — fully compliant with the official specification of
+  PackStream, the binary serialization format used by the Bolt protocol: every value and
+  structure is encoded and decoded byte-for-byte exactly as the specification mandates,
+  ensuring full wire-level interoperability with the official driver ecosystem.
 
-Both requirements are **absolutely inviolable** and constrain every design decision.
+All four requirements are **absolutely inviolable** and constrain every design decision.
 
 ## 2. Goals
 
 - A correct, durable, high-performance **single-node** LPG server (distribution is a later phase).
 - Connection interfaces, all following official industry standards. The project definition
-  states two (UDS + REST); a ratified owner decision (`D-bolt-compat`) extends this to **three**
-  by adopting the **Bolt** protocol and exposing it over both UDS and TCP:
+  states **three**, with the **Bolt** protocol exposed over both UDS and TCP (ratified decisions
+  `D-wire-protocol` and `D-bolt-compat`):
   - **UDS** — Unix Domain Sockets (IPC) for clients on the same operating system, speaking **Bolt**.
   - **Bolt over TCP** (`bolt://`) — for the standard Neo4j driver ecosystem (requires TLS).
   - **Web REST API** — HTTP for standardized, remote, interoperable access.
-  > Note: the Bolt-over-TCP interface is an owner-ratified extension of the two-interface model in
-  > `CLAUDE.md`; the project definition there should be updated to record the three-interface model.
+  > Note: the original project definition listed two interfaces (UDS + REST); the third interface
+  > (Bolt over TCP) and the adoption of Bolt as the UDS protocol were ratified as decisions
+  > `D-wire-protocol` and `D-bolt-compat`, and `CLAUDE.md` now records the three-interface model.
 - Runs flawlessly on **Linux, macOS, and Raspberry Pi OS** across **x86_64, arm64, and
   aarch64**, explicitly including **Apple Silicon, x86 processors, and Raspberry Pi 5+**.
 - Maximum performance across all supported hardware, from the most basic to the most advanced.
 - An extensive test suite proving correctness as a whole and per component (unit, E2E,
-  stress/load), and empirically proving the two inviolable requirements.
+  stress/load), and empirically proving the four inviolable requirements.
 
 ## 3. Scope boundaries (v1)
 
