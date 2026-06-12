@@ -86,6 +86,8 @@ pub use protocol::{
     BeginResponse, RunRequest, RunResponse, Statement, StatementResult, parse_access_mode,
 };
 pub use registry::{CachedResponse, TxRegistry};
-pub use restvalue::{RestNode, RestPath, RestRelationship, RestValue, restvalue_to_jolt};
+pub use restvalue::{
+    GraphProjection, RestNode, RestPath, RestRelationship, RestValue, restvalue_to_jolt,
+};
 pub use router::{AppState, DEFAULT_TX_TTL_NANOS, router};
 pub use value::{ValueCodecError, cbor_to_value, jolt_to_value, value_to_cbor, value_to_jolt};

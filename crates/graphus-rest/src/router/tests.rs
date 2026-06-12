@@ -20,8 +20,9 @@ use graphus_auth::{Authenticator, Privilege};
 use graphus_core::Value;
 use graphus_core::capability::Clock;
 
-use crate::engine::{mock::Canned, mock::MockEngine};
+use crate::engine::{Row, RunSummary, mock::Canned, mock::MockEngine};
 use crate::registry::TxRegistry;
+use crate::restvalue::{RestNode, RestPath, RestRelationship, RestValue};
 use crate::router::{AppState, router};
 
 // ---- deterministic clock ----------------------------------------------------------------------
@@ -766,4 +767,272 @@ async fn openapi_doc_is_valid_31_and_declares_tx_paths() {
     assert!(doc["paths"].get("/db/{db}/tx").is_some());
     assert!(doc["paths"].get("/db/{db}/tx/{id}/commit").is_some());
     assert!(doc["paths"].get("/db/{db}/tx/commit").is_some());
+    // The graph-projection path (rmp #77) is declared too.
+    assert!(doc["paths"].get("/db/{db}/graph").is_some());
+}
+
+// =============================== graph projection (rmp #77) =====================================
+
+/// A node `RestValue` with one `name` property, for the viz tests.
+fn viz_node(id: i64, label: &str, name: &str) -> RestValue {
+    RestValue::Node(RestNode {
+        id,
+        labels: vec![label.to_owned()],
+        properties: vec![("name".to_owned(), Value::String(name.to_owned()))],
+    })
+}
+
+/// A relationship `RestValue` between `start` and `end`, for the viz tests.
+fn viz_rel(id: i64, start: i64, end: i64, ty: &str) -> RestValue {
+    RestValue::Relationship(RestRelationship {
+        id,
+        start,
+        end,
+        rel_type: ty.to_owned(),
+        properties: vec![],
+    })
+}
+
+/// A `Canned` result from already-built structural rows (the `Canned::rows` helper only lifts
+/// scalar `Value`s; the viz tests need `Node`/`Relationship`/`Path` cells).
+fn canned_structural(fields: &[&str], rows: Vec<Row>) -> Canned {
+    Canned {
+        fields: fields.iter().map(|s| (*s).to_owned()).collect(),
+        rows,
+        summary: RunSummary {
+            query_type: Some("r".to_owned()),
+            stats: Vec::new(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn graph_viz_projects_nodes_and_relationships() {
+    // A row `(a)-[r]->(b)` projects to two nodes + one relationship with correct endpoints.
+    let query = "MATCH (a)-[r]->(b) RETURN a, r, b";
+    let engine = MockEngine::new().on_query(
+        query,
+        canned_structural(
+            &["a", "r", "b"],
+            vec![vec![
+                viz_node(1, "Person", "Ada"),
+                viz_rel(100, 1, 2, "KNOWS"),
+                viz_node(2, "Person", "Bob"),
+            ]],
+        ),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/graph",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let graph = body_json(resp).await;
+
+    let nodes = graph["nodes"].as_array().unwrap();
+    let rels = graph["relationships"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(rels.len(), 1);
+    // Node shape: id / labels / strict-Jolt properties.
+    assert_eq!(nodes[0]["id"], json!(1));
+    assert_eq!(nodes[0]["labels"], json!(["Person"]));
+    assert_eq!(nodes[0]["properties"]["name"], json!({ "U": "Ada" }));
+    // Relationship endpoints are present and correct (startNode/endNode).
+    assert_eq!(rels[0]["id"], json!(100));
+    assert_eq!(rels[0]["type"], json!("KNOWS"));
+    assert_eq!(rels[0]["startNode"], json!(1));
+    assert_eq!(rels[0]["endNode"], json!(2));
+
+    // It ran as a READ auto-commit through the same seam (begin READ → run → commit).
+    let log = h.engine.log();
+    assert!(log.iter().any(|l| l.contains("mode=Read")));
+    assert!(log.iter().any(|l| l.starts_with("commit")));
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+#[tokio::test]
+async fn graph_viz_dedups_shared_node_across_rows() {
+    // Node 1 is returned in two rows; it must collapse to a single projected node.
+    let query = "MATCH (a)-->(b) RETURN a, b";
+    let engine = MockEngine::new().on_query(
+        query,
+        canned_structural(
+            &["a", "b"],
+            vec![
+                vec![viz_node(1, "P", "hub"), viz_node(2, "P", "x")],
+                vec![viz_node(1, "P", "hub"), viz_node(3, "P", "y")],
+            ],
+        ),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/graph",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let graph = body_json(resp).await;
+    let ids: Vec<i64> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "node 1 appears once, in first-seen order"
+    );
+    assert_eq!(graph["relationships"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn graph_viz_projects_a_path_with_all_nodes_and_rels() {
+    // A single `path` cell contributes all its nodes + relationships.
+    let query = "MATCH p = (a)-[*]->(z) RETURN p";
+    let path = RestValue::Path(RestPath {
+        nodes: vec![
+            RestNode {
+                id: 10,
+                labels: vec!["P".to_owned()],
+                properties: vec![],
+            },
+            RestNode {
+                id: 11,
+                labels: vec!["P".to_owned()],
+                properties: vec![],
+            },
+            RestNode {
+                id: 12,
+                labels: vec!["P".to_owned()],
+                properties: vec![],
+            },
+        ],
+        relationships: vec![
+            RestRelationship {
+                id: 100,
+                start: 10,
+                end: 11,
+                rel_type: "R".to_owned(),
+                properties: vec![],
+            },
+            RestRelationship {
+                id: 101,
+                start: 11,
+                end: 12,
+                rel_type: "R".to_owned(),
+                properties: vec![],
+            },
+        ],
+    });
+    let engine = MockEngine::new().on_query(query, canned_structural(&["p"], vec![vec![path]]));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/graph",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let graph = body_json(resp).await;
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!(graph["relationships"].as_array().unwrap().len(), 2);
+    assert_eq!(graph["relationships"][1]["startNode"], json!(11));
+    assert_eq!(graph["relationships"][1]["endNode"], json!(12));
+}
+
+#[tokio::test]
+async fn graph_viz_scalar_only_result_is_empty_graph() {
+    let query = "RETURN 1 AS x";
+    let engine =
+        MockEngine::new().on_query(query, Canned::rows(&["x"], vec![vec![Value::Integer(1)]]));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/graph",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let graph = body_json(resp).await;
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 0);
+    assert_eq!(graph["relationships"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn graph_viz_forces_read_so_a_write_is_rejected() {
+    // The handler forces READ; a write statement is rejected by the engine (→ 409 problem).
+    let h = Harness::new();
+    let token = h.token("alice"); // alice may write; the READ forcing still rejects the statement.
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/graph",
+            &token,
+            json!({ "statements": [{ "statement": "CREATE (n)" }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    // The transaction was opened READ then rolled back; nothing leaks.
+    let log = h.engine.log();
+    assert!(log.iter().any(|l| l.contains("mode=Read")));
+    assert!(log.iter().any(|l| l.starts_with("rollback")));
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+#[tokio::test]
+async fn graph_viz_requires_bearer() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/db/neo4j/graph")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "statements": [{ "statement": "MATCH (n) RETURN n" }] }))
+                .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    // No transaction was opened without a valid principal.
+    assert!(h.engine.log().is_empty());
+}
+
+#[tokio::test]
+async fn graph_viz_compile_error_is_problem_json() {
+    let query = "MATCH";
+    let engine = MockEngine::new().on_query_error(
+        query,
+        graphus_core::GraphusError::Compile("Unexpected end of input".to_owned()),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/graph",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    // The read transaction was rolled back after the error.
+    assert!(h.engine.log().iter().any(|l| l.starts_with("rollback")));
+    assert_eq!(h.registry.open_count(), 0);
 }

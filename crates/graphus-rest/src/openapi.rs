@@ -35,7 +35,10 @@ pub fn document() -> Json {
         },
         "servers": [ { "url": "/", "description": "This Graphus server (TLS-terminated by the listener)." } ],
         "security": [ { "bearerAuth": [] } ],
-        "tags": [ { "name": "transaction", "description": "The Cypher transaction lifecycle." } ],
+        "tags": [
+            { "name": "transaction", "description": "The Cypher transaction lifecycle." },
+            { "name": "graph", "description": "Graph projection for visualisation front-ends." }
+        ],
         "paths": {
             "/db/{db}/tx": {
                 "post": {
@@ -123,6 +126,37 @@ pub fn document() -> Json {
                     "requestBody": { "$ref": "#/components/requestBodies/RunRequest" },
                     "responses": {
                         "200": { "$ref": "#/components/responses/RunResponse" },
+                        "400": { "$ref": "#/components/responses/Problem" },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "403": { "$ref": "#/components/responses/Problem" },
+                        "409": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
+            "/db/{db}/graph": {
+                "post": {
+                    "tags": ["graph"],
+                    "summary": "Run a read query and return a deduplicated graph projection.",
+                    "description": "Runs the request's statements in one auto-managed READ \
+                        transaction (the access mode is forced to READ; any `access_mode` in the \
+                        body is ignored), then projects every result row into a deduplicated graph \
+                        for rendering front-ends: distinct nodes (by node id) and distinct \
+                        relationships (by relationship id), walking recursively into lists and \
+                        paths. A node shared across rows or paths appears once. Scalar-only results \
+                        project to empty `nodes`/`relationships`. Fine-grained RBAC filtering is \
+                        inherited: an entity or property the principal may not see never reaches \
+                        the projection. See specification/04-technical-design.md §8.2.",
+                    "operationId": "graphProjection",
+                    "parameters": [ { "$ref": "#/components/parameters/Db" } ],
+                    "requestBody": { "$ref": "#/components/requestBodies/RunRequest" },
+                    "responses": {
+                        "200": {
+                            "description": "The deduplicated graph projection.",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/GraphProjection" } },
+                                "application/cbor": { "schema": { "$ref": "#/components/schemas/GraphProjection" } }
+                            }
+                        },
                         "400": { "$ref": "#/components/responses/Problem" },
                         "401": { "$ref": "#/components/responses/Problem" },
                         "403": { "$ref": "#/components/responses/Problem" },
@@ -270,6 +304,40 @@ pub fn document() -> Json {
                         "detail": { "type": "string" },
                         "code": { "type": "string", "description": "Engine error code (specification/06 §2.4)." }
                     }
+                },
+                "GraphNode": {
+                    "type": "object",
+                    "description": "A node in a graph projection (specification/04 §8.2; rmp #77).",
+                    "required": ["id", "labels", "properties"],
+                    "properties": {
+                        "id": { "type": "integer", "description": "The node id (an internal handle; plain JSON number)." },
+                        "labels": { "type": "array", "items": { "type": "string" } },
+                        "properties": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/TypedValue" } }
+                    }
+                },
+                "GraphRelationship": {
+                    "type": "object",
+                    "description": "A relationship in a graph projection, with its endpoint node ids \
+                        (rmp #77).",
+                    "required": ["id", "type", "startNode", "endNode", "properties"],
+                    "properties": {
+                        "id": { "type": "integer", "description": "The relationship id (plain JSON number)." },
+                        "type": { "type": "string", "description": "The relationship type name." },
+                        "startNode": { "type": "integer", "description": "The id of the start (source) node." },
+                        "endNode": { "type": "integer", "description": "The id of the end (target) node." },
+                        "properties": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/TypedValue" } }
+                    }
+                },
+                "GraphProjection": {
+                    "type": "object",
+                    "description": "A deduplicated graph projection of a query result: distinct nodes \
+                        (by id) and distinct relationships (by id) gathered from every result cell, \
+                        walking into lists and paths (rmp #77).",
+                    "required": ["nodes", "relationships"],
+                    "properties": {
+                        "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/GraphNode" } },
+                        "relationships": { "type": "array", "items": { "$ref": "#/components/schemas/GraphRelationship" } }
+                    }
                 }
             }
         }
@@ -299,6 +367,24 @@ mod tests {
         assert!(paths.get("/db/{db}/tx/commit").is_some());
         // The rollback verb is present on the {id} path.
         assert!(paths["/db/{db}/tx/{id}"].get("delete").is_some());
+    }
+
+    #[test]
+    fn document_declares_the_graph_projection_path_and_schema() {
+        let doc = document();
+        // The viz endpoint is declared (rmp #77).
+        assert!(doc["paths"].get("/db/{db}/graph").is_some());
+        let op = &doc["paths"]["/db/{db}/graph"]["post"];
+        assert_eq!(op["operationId"], "graphProjection");
+        // The 200 body references the GraphProjection schema.
+        let schemas = &doc["components"]["schemas"];
+        assert!(schemas.get("GraphProjection").is_some());
+        assert!(schemas.get("GraphNode").is_some());
+        assert!(schemas.get("GraphRelationship").is_some());
+        // The relationship endpoints are named startNode/endNode (the viz convention).
+        let rel = &schemas["GraphRelationship"]["properties"];
+        assert!(rel.get("startNode").is_some());
+        assert!(rel.get("endNode").is_some());
     }
 
     #[test]

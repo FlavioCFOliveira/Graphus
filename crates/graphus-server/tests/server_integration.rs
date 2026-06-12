@@ -257,6 +257,93 @@ async fn rest_create_then_match_hits_the_real_store() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+#[tokio::test]
+async fn rest_graph_projection_dedups_nodes_and_edges() {
+    // rmp #77: create a tiny graph, POST the graph-visualisation endpoint, and assert the
+    // deduplicated `{ nodes, relationships }` projection (endpoints + dedup), plus auth + db
+    // selection, all over the REAL booted server and persistent store.
+    let temp = TempStore::new("rest-graph-viz");
+    let server = boot(base_config(&temp)).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(&server, "alice").await;
+
+    // Build a small graph: (Ada)-[:KNOWS]->(Bob), committed to the real store.
+    let (status, body) = http_request(
+        rest,
+        "POST",
+        "/db/graphus/tx/commit",
+        Some(&token),
+        Some(
+            r#"{"statements":[{"statement":"CREATE (a:Person {name:'Ada'})-[:KNOWS]->(b:Person {name:'Bob'})"}]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "seed graph: {body}");
+
+    // The viz query mentions the SAME node `a` twice (so dedup is exercised end-to-end): once as a
+    // bound entity, and again inside a list cell (`[a]`) — distinct result columns, one node id.
+    let (status, body) = http_request(
+        rest,
+        "POST",
+        "/db/graphus/graph",
+        Some(&token),
+        Some(
+            r#"{"statements":[{"statement":"MATCH (a:Person {name:'Ada'})-[r:KNOWS]->(b:Person) RETURN a, r, b, [a] AS again"}]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "graph projection: {body}");
+    let graph: serde_json::Value = serde_json::from_str(&body).expect("graph JSON");
+
+    // Exactly two distinct nodes (Ada deduped despite appearing twice) and one relationship.
+    let nodes = graph["nodes"].as_array().expect("nodes array");
+    let rels = graph["relationships"]
+        .as_array()
+        .expect("relationships array");
+    assert_eq!(nodes.len(), 2, "Ada must be deduped: {body}");
+    assert_eq!(rels.len(), 1, "one KNOWS edge: {body}");
+
+    // The relationship carries its endpoints (startNode/endNode) and they reference real node ids.
+    let rel = &rels[0];
+    assert_eq!(rel["type"], "KNOWS", "rel type: {body}");
+    let start = rel["startNode"].as_i64().expect("startNode id");
+    let end = rel["endNode"].as_i64().expect("endNode id");
+    let node_ids: Vec<i64> = nodes.iter().map(|n| n["id"].as_i64().unwrap()).collect();
+    assert!(node_ids.contains(&start), "startNode in nodes: {body}");
+    assert!(node_ids.contains(&end), "endNode in nodes: {body}");
+
+    // Both names are present (RBAC for the admin user hides nothing).
+    assert!(
+        body.contains("Ada") && body.contains("Bob"),
+        "names: {body}"
+    );
+
+    // Auth: the same endpoint without a Bearer token is rejected (401), exactly as the tx endpoints.
+    let (status, _) = http_request(
+        rest,
+        "POST",
+        "/db/graphus/graph",
+        None,
+        Some(r#"{"statements":[{"statement":"MATCH (n) RETURN n"}]}"#),
+    )
+    .await;
+    assert_eq!(status, 401, "viz endpoint rejects a missing Bearer");
+
+    // Database selection: an unknown database name fails the same way the tx endpoints do (400
+    // problem from the seam's `begin`), with no projection.
+    let (status, _) = http_request(
+        rest,
+        "POST",
+        "/db/no-such-db/graph",
+        Some(&token),
+        Some(r#"{"statements":[{"statement":"MATCH (n) RETURN n"}]}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown database is rejected");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
 // ----------------------------------------------------------------------------------------------
 // Bolt end-to-end over UDS.
 // ----------------------------------------------------------------------------------------------

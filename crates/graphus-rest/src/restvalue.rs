@@ -28,6 +28,16 @@
 //! The whole REST response is serialised once by the router (to JSON or CBOR via serde over the
 //! `Json` tree), so a structural cell needs **no** separate CBOR path: the `Json` object this module
 //! produces serialises uniformly into either wire format.
+//!
+//! # Graph projection (rmp #77)
+//!
+//! For the graph-visualisation endpoint, the same resolved structural values are folded into a
+//! **deduplicated graph**: distinct nodes (by id) and distinct relationships (by id), regardless of
+//! how many rows, lists, or paths mentioned them. [`GraphProjection`] is the accumulator; it walks
+//! every cell of every row recursively (into [`RestValue::List`] and [`RestValue::Path`]) and emits
+//! the rendering-friendly `{ nodes, relationships }` object documented on [`GraphProjection::to_json`].
+
+use std::collections::HashSet;
 
 use graphus_core::Value;
 use serde_json::{Map as JsonMap, Value as Json};
@@ -162,6 +172,157 @@ fn path_to_json(path: &RestPath) -> Json {
     Json::Object(obj)
 }
 
+// =============================== graph projection (rmp #77) ====================================
+
+/// A **deduplicated graph projection** of a query result, for graph-rendering front-ends (rmp #77).
+///
+/// It accumulates the distinct graph entities mentioned anywhere in a result: feed it every cell of
+/// every row with [`add_value`](Self::add_value) (which recurses into [`RestValue::List`] and
+/// [`RestValue::Path`]), then render the rendering-friendly JSON object with
+/// [`to_json`](Self::to_json).
+///
+/// ## Deduplication
+///
+/// A node is keyed by its [`RestNode::id`] and a relationship by its [`RestRelationship::id`]: the
+/// **first** occurrence is kept and every later occurrence of the same id is ignored. So a node
+/// shared by many rows, list elements, or path positions appears exactly once, and the entity's
+/// labels/type/properties are those of its first sighting (a given id resolves to one entity, so all
+/// sightings agree). Insertion order is preserved (a node/relationship appears in the output in the
+/// order it was first seen), which keeps the projection stable and diff-friendly for a front-end.
+///
+/// ## What is *not* collected
+///
+/// Scalar/temporal/map cells ([`RestValue::Value`]) carry no graph entity and contribute nothing —
+/// a scalar-only result projects to empty `nodes` and `relationships`. A path contributes **all**
+/// its nodes and relationships (in traversal order), each subject to the same dedup.
+#[derive(Debug, Default)]
+pub struct GraphProjection {
+    /// Distinct nodes in first-seen order.
+    nodes: Vec<RestNode>,
+    /// The ids of nodes already collected (dedup guard for `nodes`).
+    seen_nodes: HashSet<i64>,
+    /// Distinct relationships in first-seen order.
+    relationships: Vec<RestRelationship>,
+    /// The ids of relationships already collected (dedup guard for `relationships`).
+    seen_relationships: HashSet<i64>,
+}
+
+impl GraphProjection {
+    /// An empty projection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Folds one result cell into the projection, recursing into lists and paths.
+    ///
+    /// - [`RestValue::Node`] / [`RestValue::Relationship`] add that entity (deduplicated by id).
+    /// - [`RestValue::Path`] adds every node and relationship along the path.
+    /// - [`RestValue::List`] recurses into each element (so nested structural lists are walked).
+    /// - [`RestValue::Value`] (a scalar/temporal/map property value) contributes nothing.
+    pub fn add_value(&mut self, value: &RestValue) {
+        match value {
+            RestValue::Node(node) => self.add_node(node),
+            RestValue::Relationship(rel) => self.add_relationship(rel),
+            RestValue::Path(path) => {
+                for node in &path.nodes {
+                    self.add_node(node);
+                }
+                for rel in &path.relationships {
+                    self.add_relationship(rel);
+                }
+            }
+            RestValue::List(items) => {
+                for item in items {
+                    self.add_value(item);
+                }
+            }
+            // A property value carries no graph entity.
+            RestValue::Value(_) => {}
+        }
+    }
+
+    /// Folds one whole result row (each cell) into the projection.
+    pub fn add_row(&mut self, row: &[RestValue]) {
+        for cell in row {
+            self.add_value(cell);
+        }
+    }
+
+    /// Adds a node unless its id was already collected (keeping the first sighting).
+    fn add_node(&mut self, node: &RestNode) {
+        if self.seen_nodes.insert(node.id) {
+            self.nodes.push(node.clone());
+        }
+    }
+
+    /// Adds a relationship unless its id was already collected (keeping the first sighting).
+    fn add_relationship(&mut self, rel: &RestRelationship) {
+        if self.seen_relationships.insert(rel.id) {
+            self.relationships.push(rel.clone());
+        }
+    }
+
+    /// The number of distinct nodes collected so far.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The number of distinct relationships collected so far.
+    #[must_use]
+    pub fn relationship_count(&self) -> usize {
+        self.relationships.len()
+    }
+
+    /// Renders the deduplicated graph as the documented JSON object (rmp #77):
+    ///
+    /// ```json
+    /// {
+    ///   "nodes": [
+    ///     { "id": <int>, "labels": [ <str>… ], "properties": { <k>: <jolt-value>… } }
+    ///   ],
+    ///   "relationships": [
+    ///     { "id": <int>, "type": <str>, "startNode": <int>, "endNode": <int>,
+    ///       "properties": { <k>: <jolt-value>… } }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Property values inside `properties` use the same **strict-Jolt** codec
+    /// ([`crate::value::value_to_jolt`]) as every other REST value (so the int53 contract, the
+    /// temporal `T` sigil, etc. all hold). Entity `id`/`startNode`/`endNode` are plain JSON numbers
+    /// (internal handles, not subject to the property int53 contract) — consistent with how a
+    /// structural [`RestValue`] renders entity ids ([`restvalue_to_jolt`]). The relationship
+    /// endpoints are named `startNode`/`endNode` (the id of the start/end node), the convention
+    /// graph-rendering front-ends expect.
+    #[must_use]
+    pub fn to_json(&self) -> Json {
+        let nodes: Vec<Json> = self.nodes.iter().map(node_to_json).collect();
+        let relationships: Vec<Json> = self
+            .relationships
+            .iter()
+            .map(relationship_to_viz_json)
+            .collect();
+        let mut obj = JsonMap::with_capacity(2);
+        obj.insert("nodes".to_owned(), Json::Array(nodes));
+        obj.insert("relationships".to_owned(), Json::Array(relationships));
+        Json::Object(obj)
+    }
+}
+
+/// Encodes a relationship for the **graph-projection** shape: like [`relationship_to_json`] but with
+/// the endpoints named `startNode`/`endNode` (rmp #77), the convention rendering front-ends expect.
+fn relationship_to_viz_json(rel: &RestRelationship) -> Json {
+    let mut obj = JsonMap::with_capacity(5);
+    obj.insert("id".to_owned(), Json::from(rel.id));
+    obj.insert("type".to_owned(), Json::String(rel.rel_type.clone()));
+    obj.insert("startNode".to_owned(), Json::from(rel.start));
+    obj.insert("endNode".to_owned(), Json::from(rel.end));
+    obj.insert("properties".to_owned(), properties_to_json(&rel.properties));
+    Json::Object(obj)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +413,110 @@ mod tests {
         let arr = j.as_array().unwrap();
         assert_eq!(arr[0], json!({ "Z": "42" }));
         assert_eq!(arr[1]["id"], json!(1));
+    }
+
+    // ---- graph projection (rmp #77) -----------------------------------------------------------
+
+    fn node(id: i64, label: &str) -> RestNode {
+        RestNode {
+            id,
+            labels: vec![label.to_owned()],
+            properties: vec![("name".to_owned(), Value::String(format!("n{id}")))],
+        }
+    }
+
+    fn rel(id: i64, start: i64, end: i64) -> RestRelationship {
+        RestRelationship {
+            id,
+            start,
+            end,
+            rel_type: "KNOWS".to_owned(),
+            properties: vec![("since".to_owned(), Value::Integer(2020))],
+        }
+    }
+
+    #[test]
+    fn projection_collects_nodes_and_relationships() {
+        // A row `(a)-[r]->(b)` projects to two nodes + one relationship with correct endpoints.
+        let mut proj = GraphProjection::new();
+        proj.add_row(&[
+            RestValue::Node(node(1, "Person")),
+            RestValue::Relationship(rel(100, 1, 2)),
+            RestValue::Node(node(2, "Person")),
+        ]);
+        let j = proj.to_json();
+        assert_eq!(j["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(j["relationships"].as_array().unwrap().len(), 1);
+        // The relationship endpoints use the `startNode`/`endNode` viz convention.
+        let r = &j["relationships"][0];
+        assert_eq!(r["id"], json!(100));
+        assert_eq!(r["type"], json!("KNOWS"));
+        assert_eq!(r["startNode"], json!(1));
+        assert_eq!(r["endNode"], json!(2));
+        // Properties carry strict-Jolt values.
+        assert_eq!(r["properties"]["since"], json!({ "Z": "2020" }));
+        assert_eq!(j["nodes"][0]["properties"]["name"], json!({ "U": "n1" }));
+    }
+
+    #[test]
+    fn projection_dedups_shared_node_across_rows() {
+        // The same node id appears in two rows; it must collapse to one entry.
+        let mut proj = GraphProjection::new();
+        proj.add_row(&[RestValue::Node(node(7, "A")), RestValue::Node(node(8, "B"))]);
+        proj.add_row(&[RestValue::Node(node(7, "A")), RestValue::Node(node(9, "C"))]);
+        assert_eq!(proj.node_count(), 3, "node 7 collapses to one entry");
+        let ids: Vec<i64> = proj
+            .to_json()
+            .get("nodes")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_i64().unwrap())
+            .collect();
+        // First-seen order is preserved.
+        assert_eq!(ids, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn projection_dedups_shared_relationship() {
+        let mut proj = GraphProjection::new();
+        proj.add_value(&RestValue::Relationship(rel(100, 1, 2)));
+        proj.add_value(&RestValue::Relationship(rel(100, 1, 2)));
+        assert_eq!(proj.relationship_count(), 1);
+    }
+
+    #[test]
+    fn projection_walks_paths_and_lists() {
+        // A path contributes all its nodes + rels; a node also present in a sibling list dedups.
+        let path = RestPath {
+            nodes: vec![node(1, "P"), node(2, "P"), node(3, "P")],
+            relationships: vec![rel(10, 1, 2), rel(11, 2, 3)],
+        };
+        let mut proj = GraphProjection::new();
+        proj.add_row(&[
+            RestValue::Path(path),
+            // A list re-mentioning node 2 (dedup) and adding node 4.
+            RestValue::List(vec![
+                RestValue::Node(node(2, "P")),
+                RestValue::Node(node(4, "P")),
+            ]),
+        ]);
+        assert_eq!(proj.node_count(), 4, "nodes 1,2,3,4 (2 deduped)");
+        assert_eq!(proj.relationship_count(), 2, "rels 10,11 from the path");
+    }
+
+    #[test]
+    fn projection_of_scalar_only_result_is_empty() {
+        let mut proj = GraphProjection::new();
+        proj.add_row(&[
+            RestValue::Value(Value::Integer(1)),
+            RestValue::Value(Value::String("hello".to_owned())),
+            // A non-structural list of scalars contributes nothing either.
+            RestValue::List(vec![RestValue::Value(Value::Integer(2))]),
+        ]);
+        let j = proj.to_json();
+        assert_eq!(j["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(j["relationships"].as_array().unwrap().len(), 0);
     }
 }

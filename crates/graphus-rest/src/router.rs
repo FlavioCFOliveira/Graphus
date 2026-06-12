@@ -16,6 +16,7 @@
 //! | `POST /db/{db}/tx/{id}/commit` | `commit_tx` | run final statements + commit |
 //! | `DELETE /db/{db}/tx/{id}` | `rollback_tx` | roll back |
 //! | `POST /db/{db}/tx/commit` | `auto_commit` | single-shot auto-commit (reads `access_mode`) |
+//! | `POST /db/{db}/graph` | `graph_viz` | run a read query, return a deduplicated graph projection (rmp #77) |
 //! | `GET /openapi.json` | `openapi_doc` | the static OpenAPI 3.1 document |
 //!
 //! # No sockets here
@@ -250,6 +251,7 @@ pub fn router<E: RestEngine + 'static>(state: AppState<E>) -> Router {
         .route("/openapi.json", get(openapi_doc))
         .route("/db/{db}/tx", post(begin::<E>))
         .route("/db/{db}/tx/commit", post(auto_commit::<E>))
+        .route("/db/{db}/graph", post(graph_viz::<E>))
         .route(
             "/db/{db}/tx/{id}",
             post(run_in_tx::<E>).delete(rollback_tx::<E>),
@@ -513,6 +515,156 @@ async fn auto_commit<E: RestEngine + 'static>(
     )
     .unwrap_or_else(Built::problem);
     cache_and_respond(&state, &headers, built)
+}
+
+/// `POST /db/{db}/graph` → run a read query and return a **deduplicated graph projection** of its
+/// result, for graph-rendering front-ends (rmp #77).
+///
+/// # Behaviour
+///
+/// The request body is a [`RunRequest`] (the same `{ statements: [{ statement, parameters }] }` shape
+/// the transactional endpoints accept). All statements run inside **one auto-managed `READ`
+/// transaction** — the access mode is **forced to `READ`** (this is a visualisation read; an
+/// `access_mode` member in the body is ignored), so a write statement is rejected by the engine
+/// exactly as in any read transaction (`06 §4`). On success the transaction is committed (a read
+/// commit has no side effects) and the projection is returned; on the first statement error the
+/// transaction is rolled back and an RFC 9457 problem is returned (`06 §3.3`) — the same error model
+/// as every other endpoint.
+///
+/// # Projection (the documented response shape)
+///
+/// Every cell of every result row is walked recursively (into `List`s and `Path`s) and folded into a
+/// graph of **distinct** entities — nodes deduplicated by node id, relationships by relationship id,
+/// so a node shared across rows/paths appears once ([`GraphProjection`]). The response body is:
+///
+/// ```json
+/// {
+///   "nodes": [
+///     { "id": <int>, "labels": [ <str>… ], "properties": { <k>: <jolt-value>… } }
+///   ],
+///   "relationships": [
+///     { "id": <int>, "type": <str>, "startNode": <int>, "endNode": <int>,
+///       "properties": { <k>: <jolt-value>… } }
+///   ]
+/// }
+/// ```
+///
+/// Property values use the strict-Jolt codec (int53-safe), exactly as the transactional results do;
+/// entity `id`/`startNode`/`endNode` are plain JSON numbers (see [`GraphProjection::to_json`]). The
+/// response is content-negotiated (JSON by default, CBOR via `Accept: application/cbor`); it is a
+/// single buffered aggregate, so it is not streamed as NDJSON and is not idempotency-cached (a read
+/// projection is naturally repeatable).
+///
+/// # Access control, database selection, and RBAC
+///
+/// Authentication, the `{db}` database selection, and fine-grained RBAC are honoured **identically**
+/// to [`auto_commit`]: the request is Bearer-authenticated, `READ` is authorized against the
+/// database, and the transaction is opened on the named database through the same [`RestEngine`]
+/// seam. An RBAC-hidden node, relationship, or property is already absent from the resolved
+/// [`RestValue`] cells the engine yields (the seam applies fine-grained filtering before the result
+/// boundary), so the projection inherits that filtering for free — a forbidden entity simply never
+/// reaches the accumulator.
+async fn graph_viz<E: RestEngine + 'static>(
+    State(state): State<AppState<E>>,
+    Path(db): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Resolve the wire format up front (the projection is always a buffered aggregate — JSON or
+    // CBOR; an NDJSON `Accept` falls back to JSON, since there is no row stream to frame).
+    let wire = match response_wire(header_str(&headers, &ACCEPT)) {
+        Some(Wire::Ndjson) | None => Wire::Json,
+        Some(w) => w,
+    };
+
+    let outcome: Result<(RunRequest, TxHandle), Problem> = (|| {
+        let identity = authenticate(&state, &headers)?;
+        let req = decode_request(&headers, &body)?;
+        // A visualisation query is always a READ (the safe, spec-consistent default — Neo4j's viz
+        // surfaces run read). Any `access_mode` in the body is ignored.
+        authorize_mode(&state, &identity, AccessMode::Read)?;
+        let handle = state
+            .engine
+            .begin(
+                &db,
+                AccessMode::Read,
+                TxOrigin {
+                    principal: &identity,
+                    explicit: false,
+                },
+            )
+            .map_err(|e| Problem::from_graphus_error(&e))?;
+        Ok((req, handle))
+    })();
+
+    let (req, handle) = match outcome {
+        Ok(v) => v,
+        Err(p) => return Built::from(p).into_response(),
+    };
+
+    let built = project_graph(&state, handle, &req.statements, wire).unwrap_or_else(Built::problem);
+    built.into_response()
+}
+
+/// Runs `statements` in the (read) transaction `handle`, folding every row of every statement into
+/// one [`GraphProjection`], then commits and returns the projection as a [`Built`] response in
+/// `wire`. On the first statement/runtime error the transaction is rolled back and the error is
+/// surfaced as a [`Problem`] (no partial result — `06 §3.3`).
+fn project_graph<E: RestEngine>(
+    state: &AppState<E>,
+    handle: TxHandle,
+    statements: &[Statement],
+    wire: Wire,
+) -> Result<Built, Problem> {
+    let mut projection = crate::restvalue::GraphProjection::new();
+    for stmt in statements {
+        if let Err(e) = collect_into_projection(state, handle, stmt, &mut projection) {
+            let _ = state.engine.rollback(handle);
+            return Err(Problem::from_graphus_error(&e));
+        }
+    }
+
+    // A read transaction commit has no side effects; do it so the engine releases the handle.
+    state
+        .engine
+        .commit(handle)
+        .map_err(|e| Problem::from_graphus_error(&e))?;
+
+    Ok(graph_built(projection.to_json(), wire))
+}
+
+/// Runs one statement and folds each of its rows into `projection` (pulling rows lazily from the
+/// [`ResultStream`] seam, the same pull the transactional path uses).
+fn collect_into_projection<E: RestEngine>(
+    state: &AppState<E>,
+    handle: TxHandle,
+    stmt: &Statement,
+    projection: &mut crate::restvalue::GraphProjection,
+) -> Result<(), GraphusError> {
+    let params = bind_parameters(stmt).map_err(|e| GraphusError::Runtime(e.to_string()))?;
+    let mut stream = state.engine.run(handle, &stmt.statement, params)?;
+    while let Some(row) = stream.next_row()? {
+        projection.add_row(&row);
+    }
+    Ok(())
+}
+
+/// Serialises the graph-projection JSON object into a [`Built`] in the negotiated `wire` (JSON or
+/// CBOR). A serialisation failure (an internal invariant) degrades to a `500` problem.
+fn graph_built(graph: Json, wire: Wire) -> Built {
+    match wire {
+        Wire::Cbor => {
+            let mut buf = Vec::new();
+            if ciborium::into_writer(&graph, &mut buf).is_err() {
+                return Built::problem(Problem::from_graphus_error(&GraphusError::Protocol(
+                    "failed to encode CBOR graph projection".to_owned(),
+                )));
+            }
+            Built::new(StatusCode::OK, Wire::Cbor.content_type(), buf)
+        }
+        // NDJSON never reaches here (the handler maps it to JSON); JSON is the default.
+        _ => Built::json(StatusCode::OK, &graph),
+    }
 }
 
 // =============================== run + finalise ================================================
