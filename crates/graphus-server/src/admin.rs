@@ -914,18 +914,21 @@ fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), Stri
 }
 
 /// Parses the remainder of a claimed **constraint** statement (`verb` + `CONSTRAINT`/`CONSTRAINTS`
-/// already read), for the four shapes (`rmp` task #99):
+/// already read), for the six shapes (`rmp` tasks #99, #100):
 ///
 /// ```text
 /// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS UNIQUE
 /// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS NOT NULL
+/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE (<var>.a, <var>.b, …) IS NODE KEY
+/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS :: <TYPE>
 /// DROP   CONSTRAINT <name>
 /// SHOW   CONSTRAINTS
 /// ```
 ///
 /// A constraint is identified by **name** (Neo4j-compatible), like a full-text / point index. The
-/// `REQUIRE <var>.<prop> IS (UNIQUE | NOT NULL)` tail distinguishes a uniqueness from an existence
-/// constraint; the `<var>` text is irrelevant (single-variable shape, reusing [`parse_property_ref`]).
+/// `REQUIRE … IS …` tail distinguishes the kind; the `<var>` text is irrelevant (single-variable
+/// shape, reusing [`parse_property_ref`]). `<TYPE>` is an openCypher type name — `INTEGER`, `FLOAT`,
+/// `STRING`, `BOOLEAN`, or `LIST<…>` — parsed by [`parse_constraint_type`].
 fn parse_claimed_constraint(
     verb: &str,
     plural: bool,
@@ -952,31 +955,63 @@ fn parse_claimed_constraint(
             Ok(ConstraintCommand::Drop { name })
         }
         "CREATE" => {
-            let (label, property, unique) = parse_constraint_create_tail(lex)?;
-            if unique {
-                Ok(ConstraintCommand::CreateUnique {
+            let (label, tail) = parse_constraint_create_tail(lex)?;
+            Ok(match tail {
+                ConstraintTail::Unique { property } => ConstraintCommand::CreateUnique {
                     name,
                     label,
                     property,
-                })
-            } else {
-                Ok(ConstraintCommand::CreateExistence {
+                },
+                ConstraintTail::Existence { property } => ConstraintCommand::CreateExistence {
                     name,
                     label,
                     property,
-                })
-            }
+                },
+                ConstraintTail::NodeKey { properties } => ConstraintCommand::CreateNodeKey {
+                    name,
+                    label,
+                    properties,
+                },
+                ConstraintTail::PropertyType {
+                    property,
+                    declared_type,
+                } => ConstraintCommand::CreatePropertyType {
+                    name,
+                    label,
+                    property,
+                    declared_type,
+                },
+            })
         }
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported constraint verb {other}")),
     }
 }
 
-/// Parses the `FOR (<var>:<Label>) REQUIRE <var>.<property> IS (UNIQUE | NOT NULL)` tail of a
-/// `CREATE CONSTRAINT <name>` statement (`rmp` task #99). Returns `(label, property, is_unique)`,
-/// where `is_unique == false` means an existence (`NOT NULL`) constraint. Mirrors the openCypher-9
-/// `FOR (n:Label) … (n.prop)` node-property shape, reusing [`parse_property_ref`].
-fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String, bool), String> {
+/// The parsed `REQUIRE … IS …` body of a `CREATE CONSTRAINT` statement (`rmp` tasks #99, #100), one per
+/// constraint kind. The label is returned separately by [`parse_constraint_create_tail`].
+enum ConstraintTail {
+    /// `IS UNIQUE` over a single property.
+    Unique { property: String },
+    /// `IS NOT NULL` over a single property.
+    Existence { property: String },
+    /// `IS NODE KEY` over a composite property tuple (one or more, in declared order).
+    NodeKey { properties: Vec<String> },
+    /// `IS :: <TYPE>` over a single property, with the declared value type.
+    PropertyType {
+        property: String,
+        declared_type: graphus_storage::ConstraintTypeDescriptor,
+    },
+}
+
+/// Parses the `FOR (<var>:<Label>) REQUIRE … IS …` tail of a `CREATE CONSTRAINT <name>` statement
+/// (`rmp` tasks #99, #100). Returns `(label, tail)`. Mirrors the openCypher `FOR (n:Label) … (n.prop)`
+/// node-property shape, reusing [`parse_property_ref`].
+///
+/// The `REQUIRE` target is a single bare/parenthesised property (`UNIQUE` / `NOT NULL` / `:: TYPE`) or
+/// a parenthesised composite tuple `(n.a, n.b, …)` (only valid with `NODE KEY`). The closing keyword
+/// after `IS` selects the kind. A multi-property tuple with any kind other than `NODE KEY` is rejected.
+fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, ConstraintTail), String> {
     const VERB: &str = "CONSTRAINT";
     // FOR ( <var> : <Label> )
     expect_keyword(lex, "FOR", VERB)?;
@@ -992,23 +1027,61 @@ fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String, 
     if !is_keyword(&req, "REQUIRE") && !is_keyword(&req, "ASSERT") {
         return Err(unexpected_generic(&req, "REQUIRE in CONSTRAINT"));
     }
-    // The property may be wrapped in parentheses (`REQUIRE (n.prop)`) or bare (`REQUIRE n.prop`);
-    // accept both (Neo4j accepts the parenthesised single-property form).
+    // The property target may be bare (`REQUIRE n.prop`), a parenthesised single property
+    // (`REQUIRE (n.prop)`), or a parenthesised composite tuple (`REQUIRE (n.a, n.b, …)`). Read a
+    // comma-separated property list; a single bare property is the common single-property case.
     let parenthesised = peek_symbol(lex, '(')?;
+    let mut properties = Vec::new();
     if parenthesised {
         expect_symbol(lex, '(', VERB)?;
-    }
-    let property = parse_property_ref(VERB, lex)?;
-    if parenthesised {
+        loop {
+            properties.push(parse_property_ref(VERB, lex)?);
+            // A comma continues the tuple; a close-paren ends it.
+            if peek_symbol(lex, ',')? {
+                expect_symbol(lex, ',', VERB)?;
+            } else {
+                break;
+            }
+        }
         expect_symbol(lex, ')', VERB)?;
+    } else {
+        properties.push(parse_property_ref(VERB, lex)?);
     }
-    // IS (UNIQUE | NOT NULL)
+    // IS (UNIQUE | NOT NULL | NODE KEY | :: <TYPE>)
     expect_keyword(lex, "IS", VERB)?;
+
+    // `::` opens a property-type clause (`IS :: <TYPE>`); it is two adjacent `:` symbols.
+    if peek_symbol(lex, ':')? {
+        expect_symbol(lex, ':', VERB)?;
+        expect_symbol(lex, ':', VERB)?;
+        let declared_type = parse_constraint_type(lex)?;
+        expect_end(lex, "CREATE CONSTRAINT")?;
+        let [property] = properties.as_slice() else {
+            return Err(
+                "a property-type constraint (IS :: <TYPE>) covers exactly one property".to_owned(),
+            );
+        };
+        return Ok((
+            label,
+            ConstraintTail::PropertyType {
+                property: property.clone(),
+                declared_type,
+            },
+        ));
+    }
+
     let next = lex
         .next_tok()?
-        .ok_or_else(|| "expected UNIQUE or NOT NULL after IS in CONSTRAINT".to_owned())?;
-    let is_unique = if is_keyword(&next, "UNIQUE") {
-        true
+        .ok_or_else(|| "expected UNIQUE, NOT NULL, NODE KEY or :: <TYPE> after IS".to_owned())?;
+    let tail = if is_keyword(&next, "UNIQUE") {
+        let [property] = properties.as_slice() else {
+            return Err(
+                "a uniqueness constraint (IS UNIQUE) covers exactly one property".to_owned(),
+            );
+        };
+        ConstraintTail::Unique {
+            property: property.clone(),
+        }
     } else if is_keyword(&next, "NOT") {
         // NOT NULL
         let null = lex
@@ -1017,15 +1090,70 @@ fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String, 
         if !is_keyword(&null, "NULL") {
             return Err(unexpected_generic(&null, "NULL after NOT in CONSTRAINT"));
         }
-        false
+        let [property] = properties.as_slice() else {
+            return Err(
+                "an existence constraint (IS NOT NULL) covers exactly one property".to_owned(),
+            );
+        };
+        ConstraintTail::Existence {
+            property: property.clone(),
+        }
+    } else if is_keyword(&next, "NODE") {
+        // NODE KEY
+        let key = lex
+            .next_tok()?
+            .ok_or_else(|| "expected KEY after NODE in CONSTRAINT".to_owned())?;
+        if !is_keyword(&key, "KEY") {
+            return Err(unexpected_generic(&key, "KEY after NODE in CONSTRAINT"));
+        }
+        ConstraintTail::NodeKey {
+            properties: properties.clone(),
+        }
     } else {
         return Err(unexpected_generic(
             &next,
-            "UNIQUE or NOT NULL after IS in CONSTRAINT",
+            "UNIQUE, NOT NULL, NODE KEY or :: <TYPE> after IS in CONSTRAINT",
         ));
     };
     expect_end(lex, "CREATE CONSTRAINT")?;
-    Ok((label, property, is_unique))
+    Ok((label, tail))
+}
+
+/// Parses an openCypher constraint **type name** for a `IS :: <TYPE>` clause (`rmp` task #100):
+/// `INTEGER`, `FLOAT`, `STRING`, `BOOLEAN`, or `LIST<<TYPE>>` (recursively). The `LIST<…>` angle
+/// brackets are the single `<` / `>` symbols of the lexer. A bare `LIST` (no element type) is rejected
+/// — the openCypher surface for a property-type constraint always names the element type.
+fn parse_constraint_type(
+    lex: &mut Lexer<'_>,
+) -> Result<graphus_storage::ConstraintTypeDescriptor, String> {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    const VERB: &str = "CONSTRAINT";
+    let tok = lex
+        .next_tok()?
+        .ok_or_else(|| "expected a type after IS :: in CONSTRAINT".to_owned())?;
+    let Tok::Word(word) = &tok else {
+        return Err(unexpected_generic(
+            &tok,
+            "a type name after IS :: in CONSTRAINT",
+        ));
+    };
+    let upper = word.to_ascii_uppercase();
+    match upper.as_str() {
+        "INTEGER" | "INT" => Ok(T::Integer),
+        "FLOAT" => Ok(T::Float),
+        "STRING" => Ok(T::String),
+        "BOOLEAN" | "BOOL" => Ok(T::Boolean),
+        "LIST" => {
+            // LIST < <element type> >
+            expect_symbol(lex, '<', VERB)?;
+            let inner = parse_constraint_type(lex)?;
+            expect_symbol(lex, '>', VERB)?;
+            Ok(T::List(Box::new(inner)))
+        }
+        other => Err(format!(
+            "unsupported constraint type `{other}` (expected INTEGER, FLOAT, STRING, BOOLEAN or LIST<…>)"
+        )),
+    }
 }
 
 /// Peeks whether the next token is the single symbol `sym`, without consuming it.
@@ -2474,6 +2602,103 @@ mod tests {
                 property: "iban".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn create_constraint_node_key() {
+        // A composite node key over a parenthesised property tuple.
+        assert_eq!(
+            constraint_cmd(
+                "CREATE CONSTRAINT pk FOR (n:Person) REQUIRE (n.first, n.last) IS NODE KEY"
+            ),
+            ConstraintCommand::CreateNodeKey {
+                name: "pk".to_owned(),
+                label: "Person".to_owned(),
+                properties: vec!["first".to_owned(), "last".to_owned()],
+            }
+        );
+        // A single-property node key is also valid (the degenerate composite); case-insensitive.
+        assert_eq!(
+            constraint_cmd("create constraint k for (a:Account) require (a.iban) is node key"),
+            ConstraintCommand::CreateNodeKey {
+                name: "k".to_owned(),
+                label: "Account".to_owned(),
+                properties: vec!["iban".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn create_constraint_property_type() {
+        use graphus_storage::ConstraintTypeDescriptor as T;
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT t FOR (n:Person) REQUIRE n.age IS :: INTEGER"),
+            ConstraintCommand::CreatePropertyType {
+                name: "t".to_owned(),
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+                declared_type: T::Integer,
+            }
+        );
+        // Each scalar type, case-insensitive, and a parenthesised property.
+        for (src, expected) in [
+            ("REQUIRE n.x IS :: FLOAT", T::Float),
+            ("REQUIRE n.x IS :: STRING", T::String),
+            ("require n.x is :: boolean", T::Boolean),
+            ("REQUIRE (n.x) IS :: STRING", T::String),
+        ] {
+            let q = format!("CREATE CONSTRAINT t FOR (n:Person) {src}");
+            assert_eq!(
+                constraint_cmd(&q),
+                ConstraintCommand::CreatePropertyType {
+                    name: "t".to_owned(),
+                    label: "Person".to_owned(),
+                    property: "x".to_owned(),
+                    declared_type: expected,
+                },
+                "{q}"
+            );
+        }
+        // A LIST<…> type, including a nested list.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT t FOR (n:Person) REQUIRE n.tags IS :: LIST<STRING>"),
+            ConstraintCommand::CreatePropertyType {
+                name: "t".to_owned(),
+                label: "Person".to_owned(),
+                property: "tags".to_owned(),
+                declared_type: T::List(Box::new(T::String)),
+            }
+        );
+        assert_eq!(
+            constraint_cmd(
+                "CREATE CONSTRAINT t FOR (n:Person) REQUIRE n.matrix IS :: LIST<LIST<INTEGER>>"
+            ),
+            ConstraintCommand::CreatePropertyType {
+                name: "t".to_owned(),
+                label: "Person".to_owned(),
+                property: "matrix".to_owned(),
+                declared_type: T::List(Box::new(T::List(Box::new(T::Integer)))),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_node_key_and_property_type_are_syntax_errors() {
+        // A composite tuple is only valid with NODE KEY.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS UNIQUE");
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS NOT NULL");
+        // NODE without KEY.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a) IS NODE");
+        // An unterminated tuple.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, IS NODE KEY");
+        // Property-type with an unknown / missing type.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.x IS :: WEIRD");
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.x IS ::");
+        // A LIST without an element type or an unbalanced angle bracket.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.x IS :: LIST");
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.x IS :: LIST<STRING");
+        // A property-type clause must cover exactly one property.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS :: INTEGER");
     }
 
     #[test]

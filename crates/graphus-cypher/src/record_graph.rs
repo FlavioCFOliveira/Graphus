@@ -107,6 +107,27 @@ fn render_value(value: &Value) -> String {
     }
 }
 
+/// Renders a composite-tuple value list as `(v1, v2, …)` for a node-key violation message (`rmp` task
+/// #100), reusing [`render_value`] per element.
+fn render_tuple(values: &[Value]) -> String {
+    let inner = values
+        .iter()
+        .map(render_value)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({inner})")
+}
+
+/// Whether two composite tuples are equal by **Cypher value equality**, element-wise (`rmp` task
+/// #100), used to confirm a candidate node holds the same node-key tuple. Unequal lengths are never
+/// equal; a null element would make a tuple incomplete and never reaches here.
+fn tuples_match(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| crate::equality::equals(x, y).is_true())
+}
+
 use crate::constraint::ConstraintViolation;
 use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
 use crate::index_set::{ConstraintRule, IndexSet};
@@ -704,6 +725,39 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 _ => index.remove_spatial_point(label_token, prop_key, node.0),
             }
         }
+
+        // Composite indexes — a node-key constraint's backing index (`rmp` task #100) — are maintained
+        // the same candidate-only way as the property indexes: for every registered composite index
+        // `(label_token, property tuple)`, if the node currently carries the covered label AND holds the
+        // whole tuple (every covered property present and non-null), the current tuple is **inserted**.
+        // Stale entries from a prior value are tolerated because the node-key duplicate check re-reads
+        // each candidate's *current* tuple and excludes the node itself — so an over-broad candidate set
+        // is always correct (a subset never is). A node missing a covered property is simply not indexed
+        // for that key (it is not a uniqueness candidate, matching the node-key existence rule).
+        for (label_token, property_tokens) in index.registered_composite() {
+            if !label_tokens.contains(&label_token) {
+                continue;
+            }
+            let mut tuple = Vec::with_capacity(property_tokens.len());
+            let mut complete = true;
+            for prop_key in &property_tokens {
+                match resolved_props
+                    .iter()
+                    .find(|(k, _)| k == prop_key)
+                    .map(|(_, v)| v)
+                    .filter(|v| !v.is_null())
+                {
+                    Some(v) => tuple.push(v.clone()),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                index.insert_composite(label_token, &property_tokens, &tuple, node.0);
+            }
+        }
     }
 
     /// Enforces every declared constraint (`rmp` task #99) that applies to `node`'s **current**
@@ -770,25 +824,34 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         }
 
         for rule in rules {
-            // v1 covers exactly one property; a forward-incompatible composite is skipped defensively.
-            let [prop_key] = rule.property_tokens.as_slice() else {
-                continue;
-            };
-            // Resolve the covered label + property names for a precise message (and the seek API,
-            // which is name-keyed). A token with no resolvable name cannot apply to a live node.
-            let (label_name, property_name) = {
+            // Resolve the covered label name + every covered property name for a precise message (and
+            // the seek API, which is name-keyed). A token with no resolvable name cannot apply to a live
+            // node, so the whole rule is skipped defensively.
+            let (label_name, property_names) = {
                 let store = self.store.borrow();
-                let label = store
+                let Some(label) = store
                     .token_name(Namespace::Label, rule.label_token)
-                    .map(ToOwned::to_owned);
-                let property = store
-                    .token_name(Namespace::PropKey, *prop_key)
-                    .map(ToOwned::to_owned);
-                match (label, property) {
-                    (Some(l), Some(p)) => (l, p),
-                    _ => continue,
+                    .map(ToOwned::to_owned)
+                else {
+                    continue;
+                };
+                let mut names = Vec::with_capacity(rule.property_tokens.len());
+                let mut ok = true;
+                for &prop_key in &rule.property_tokens {
+                    match store.token_name(Namespace::PropKey, prop_key) {
+                        Some(p) => names.push(p.to_owned()),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
+                if !ok {
+                    continue;
+                }
+                (label, names)
             };
+
             // The constraint name (for the message): the first registered constraint matching this
             // rule. (`registered_constraints` is small; this is off the hot write path only when a
             // constraint applies.)
@@ -800,17 +863,16 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 .map(|(name, _)| name)
                 .unwrap_or_default();
 
-            // The node's own current value for the covered property.
-            let own_value = self.node_property(node, &property_name);
-
             match rule.kind {
                 ConstraintKind::Existence => {
+                    let property_name = &property_names[0];
+                    let own_value = self.node_property(node, property_name);
                     if own_value.as_ref().is_none_or(Value::is_null) {
                         self.capture(
                             ConstraintViolation::Existence {
                                 name: constraint_name,
                                 label: label_name,
-                                property: property_name,
+                                property: property_name.clone(),
                             }
                             .into_error(),
                         );
@@ -818,21 +880,66 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                     }
                 }
                 ConstraintKind::Unique => {
+                    let property_name = &property_names[0];
                     // A null/absent value never participates in uniqueness (Cypher equality: null is
                     // never equal), matching the index's treatment — so it can never collide.
-                    let Some(value) = own_value.filter(|v| !v.is_null()) else {
+                    let Some(value) = self
+                        .node_property(node, property_name)
+                        .filter(|v| !v.is_null())
+                    else {
                         continue;
                     };
-                    if let Some(other) =
-                        self.unique_conflict(&label_name, &property_name, &value, node)
+                    if self
+                        .unique_conflict(&label_name, property_name, &value, node)
+                        .is_some()
                     {
-                        let _ = other; // the conflicting id is implied by the violation; message names value
                         self.capture(
                             ConstraintViolation::Uniqueness {
                                 name: constraint_name,
                                 label: label_name,
-                                property: property_name,
+                                property: property_name.clone(),
                                 value: render_value(&value),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                ConstraintKind::NodeKey => {
+                    if let Some(violation) = self.node_key_conflict(
+                        &constraint_name,
+                        &label_name,
+                        &property_names,
+                        &rule,
+                        node,
+                    ) {
+                        self.capture(violation.into_error());
+                        return;
+                    }
+                }
+                ConstraintKind::PropertyType => {
+                    let property_name = &property_names[0];
+                    // Only a present, non-null value is type-checked: a missing/null value is allowed
+                    // (a property-type constraint does not imply existence).
+                    let Some(value) = self
+                        .node_property(node, property_name)
+                        .filter(|v| !v.is_null())
+                    else {
+                        continue;
+                    };
+                    // A `PropertyType` rule always carries its descriptor (set at registration); a
+                    // missing one is a defensive skip rather than a panic on the write path.
+                    let Some(descriptor) = rule.type_descriptor.as_ref() else {
+                        continue;
+                    };
+                    if !crate::constraint::value_matches_descriptor(&value, descriptor) {
+                        self.capture(
+                            ConstraintViolation::PropertyType {
+                                name: constraint_name,
+                                label: label_name,
+                                property: property_name.clone(),
+                                expected: crate::constraint::type_descriptor_name(descriptor),
+                                actual: crate::constraint::value_type_name(&value),
                             }
                             .into_error(),
                         );
@@ -841,6 +948,127 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 }
             }
         }
+    }
+
+    /// Checks a node-key constraint for `node` (`rmp` task #100): the covered composite tuple of
+    /// `property_names` must be (a) **complete** — every covered property present and non-null — and
+    /// (b) **unique** among the other nodes carrying the label. Returns the [`ConstraintViolation`] to
+    /// capture on the first breach, or [`None`] when `node` conforms.
+    ///
+    /// The uniqueness search reuses the backing **composite** index when one is registered (a node-key
+    /// constraint registers one in [`TxnCoordinator::create_constraint_general`]): candidate ids holding
+    /// the same tuple are re-checked against the store (visibility + current label + current tuple) and
+    /// `node` itself is excluded. With no index a label scan + per-node tuple re-check is the (correct,
+    /// slower) fallback. Either way every candidate is an exact match, so the first one that is not
+    /// `node` is a genuine duplicate.
+    fn node_key_conflict(
+        &self,
+        constraint_name: &str,
+        label_name: &str,
+        property_names: &[String],
+        rule: &ConstraintRule,
+        node: NodeId,
+    ) -> Option<ConstraintViolation> {
+        // Build `node`'s own current tuple; a single absent/null covered property is an existence breach.
+        let mut tuple = Vec::with_capacity(property_names.len());
+        for property_name in property_names {
+            match self
+                .node_property(node, property_name)
+                .filter(|v| !v.is_null())
+            {
+                Some(v) => tuple.push(v),
+                None => {
+                    return Some(ConstraintViolation::NodeKeyMissing {
+                        name: constraint_name.to_owned(),
+                        label: label_name.to_owned(),
+                        properties: property_names.to_vec(),
+                    });
+                }
+            }
+        }
+
+        // Uniqueness over the complete tuple, excluding `node`.
+        if self
+            .node_key_tuple_conflict(label_name, rule, &tuple, node)
+            .is_some()
+        {
+            return Some(ConstraintViolation::NodeKeyDuplicate {
+                name: constraint_name.to_owned(),
+                label: label_name.to_owned(),
+                properties: property_names.to_vec(),
+                values: render_tuple(&tuple),
+            });
+        }
+        None
+    }
+
+    /// Finds **another** visible node carrying `label_name` whose current covered tuple equals `tuple`,
+    /// excluding `self_node` (`rmp` task #100). Index-backed via the composite index when registered,
+    /// else a label scan + per-node tuple re-check — both re-check the store, so the first non-self
+    /// match is a genuine node-key duplicate. Returns the conflicting id, or [`None`].
+    fn node_key_tuple_conflict(
+        &self,
+        label_name: &str,
+        rule: &ConstraintRule,
+        tuple: &[Value],
+        self_node: NodeId,
+    ) -> Option<u64> {
+        let candidates: Vec<NodeId> = self
+            .composite_seek_eq(rule, tuple)
+            .unwrap_or_else(|| self.scan_nodes_by_label(label_name));
+        candidates
+            .into_iter()
+            .filter(|id| *id != self_node)
+            .find(|id| {
+                self.node_tuple(*id, &rule.property_tokens)
+                    .is_some_and(|other| tuples_match(&other, tuple))
+            })
+            .map(|n| n.0)
+    }
+
+    /// Candidate node ids whose composite tuple for `rule`'s `(label, property tuple)` equals `tuple`,
+    /// re-checked for visibility + current label (`rmp` task #100). [`None`] when no composite index is
+    /// registered (the caller falls back to a label scan). The composite index is candidate-only, so the
+    /// caller re-checks the exact tuple per candidate.
+    fn composite_seek_eq(&self, rule: &ConstraintRule, tuple: &[Value]) -> Option<Vec<NodeId>> {
+        let index = self.index.as_ref()?;
+        if !index
+            .borrow()
+            .has_composite(rule.label_token, &rule.property_tokens)
+        {
+            return None; // no usable composite index: scan fallback
+        }
+        // SSI predicate footprint: a composite-tuple equality replaces the label-scan fallback, so
+        // preserve that exact read footprint (`04 §5.4`).
+        self.mark_all_live_nodes();
+        let candidates = index
+            .borrow_mut()
+            .seek_composite_eq(rule.label_token, &rule.property_tokens, tuple)
+            .unwrap_or_default();
+        Some(self.filter_label_candidates(rule.label_token, candidates))
+    }
+
+    /// The current composite tuple node `id` holds for the property-key tokens `property_tokens`, or
+    /// [`None`] if any covered property is absent or null on the node (`rmp` task #100). Reads the
+    /// node's current properties once; a non-existent node yields [`None`].
+    fn node_tuple(&self, id: NodeId, property_tokens: &[u32]) -> Option<Vec<Value>> {
+        let props = self.node_properties(id)?;
+        let mut tuple = Vec::with_capacity(property_tokens.len());
+        for &prop_key in property_tokens {
+            // Resolve the property name once per token via the store (token → name), then read it.
+            let name = self
+                .store
+                .borrow()
+                .token_name(Namespace::PropKey, prop_key)
+                .map(ToOwned::to_owned)?;
+            let value = props
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .filter(|v| !v.is_null())?;
+            tuple.push(value);
+        }
+        Some(tuple)
     }
 
     /// Finds **another** visible node carrying `label_token` whose current value for `property` equals

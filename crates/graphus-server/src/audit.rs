@@ -1095,6 +1095,23 @@ pub fn redact_constraint_detail(cmd: &crate::engine::ConstraintCommand) -> Strin
             label,
             property,
         } => format!("CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS NOT NULL"),
+        C::CreateNodeKey {
+            name,
+            label,
+            properties,
+        } => format!(
+            "CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE ({}) IS NODE KEY",
+            properties.join(", ")
+        ),
+        C::CreatePropertyType {
+            name,
+            label,
+            property,
+            declared_type,
+        } => format!(
+            "CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS :: {}",
+            graphus_cypher::constraint::type_descriptor_name(declared_type)
+        ),
         C::Drop { name } => format!("DROP CONSTRAINT {name}"),
         C::Show => "SHOW CONSTRAINTS".to_owned(),
     }

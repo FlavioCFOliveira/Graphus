@@ -32,9 +32,9 @@ use graphus_core::{TxnId, Value};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
-use graphus_index::{BTree, PropertyIndex, TokenIndex};
+use graphus_index::{BTree, CompositeIndex, PropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
-use graphus_storage::{ConstraintKind, IndexState};
+use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
 use graphus_wal::{MemLogSink, WalManager};
 
 /// The in-memory block device the derived indexes are built on.
@@ -90,27 +90,42 @@ pub struct IndexSet {
     /// carries the build state and the in-memory [`SpatialIndex`] grid over the covered point
     /// property. Ephemeral and rebuilt on open, exactly like the property and full-text indexes.
     spatial: HashMap<(u32, u32), SpatialEntry>,
-    /// Declared **constraints** (`rmp` task #99), keyed by their server-unique **name**. Each value
-    /// is a [`ConstraintRule`] carrying the covered label token, the covered property tokens and the
-    /// [`ConstraintKind`]. Unlike the index maps this holds no backing tree of its own: a uniqueness
-    /// constraint reuses the node-property index on its `(label, property)` (a unique constraint
-    /// ensures one exists), so write-time enforcement is just a registry of *which* rules apply,
-    /// re-checked against the store + index by the `RecordStoreGraph` write path. Ephemeral and
-    /// rebuilt from the durable catalog on open, exactly like the indexes.
+    /// Declared **constraints** (`rmp` tasks #99, #100), keyed by their server-unique **name**. Each
+    /// value is a [`ConstraintRule`] carrying the covered label token, the covered property tokens, the
+    /// [`ConstraintKind`] and (for a property-type constraint) the declared type descriptor. Unlike the
+    /// index maps this holds no backing tree of its own: a uniqueness constraint reuses the
+    /// node-property index on its `(label, property)`, and a node-key constraint reuses the **composite**
+    /// index on its `(label, property tuple)` (see [`composite`](Self#structfield.composite)), so
+    /// write-time enforcement is just a registry of *which* rules apply, re-checked against the store +
+    /// index by the `RecordStoreGraph` write path. Ephemeral and rebuilt from the durable catalog on
+    /// open, exactly like the indexes.
     constraints: HashMap<String, ConstraintRule>,
+    /// Declared **composite** indexes (`rmp` task #100), keyed by `(label_token, property_tokens)` (the
+    /// covered tuple in declared order). A node-key constraint registers one here so the write-path
+    /// composite-uniqueness check is index-accelerated (a scan fallback covers the no-index case). Like
+    /// every other backing structure the tree is **ephemeral** (rebuilt from the store on open); only
+    /// the constraint *declaration* is durable. The map key carries the whole property tuple because a
+    /// label may host several node keys over different property tuples.
+    composite: HashMap<(u32, Vec<u32>), CompositeIndex<Dev, Sink>>,
 }
 
-/// A declared constraint's in-memory rule (`rmp` task #99): the covered label token, the covered
-/// property tokens (one in v1) and the [`ConstraintKind`]. Mirrors the durable
-/// [`graphus_storage::ConstraintEntry`]; this is the value the write-path enforcement consults.
+/// A declared constraint's in-memory rule (`rmp` tasks #99, #100): the covered label token, the
+/// covered property tokens (one for `Unique`/`Existence`/`PropertyType`, one-or-more for a composite
+/// `NodeKey`), the [`ConstraintKind`] and (for a property-type constraint) the declared type
+/// descriptor. Mirrors the durable [`graphus_storage::ConstraintEntry`]; this is the value the
+/// write-path enforcement consults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstraintRule {
     /// The label-namespace token the constraint covers.
     pub label_token: u32,
-    /// The property-key tokens the constraint covers, in declared order (exactly one in v1).
+    /// The property-key tokens the constraint covers, in declared order (exactly one except for a
+    /// composite node-key, which carries the whole tuple).
     pub property_tokens: Vec<u32>,
-    /// Whether the constraint is a uniqueness or an existence (`NOT NULL`) rule.
+    /// Whether the constraint is a uniqueness, existence, node-key or property-type rule.
     pub kind: ConstraintKind,
+    /// The declared value type of a [`ConstraintKind::PropertyType`] constraint (`rmp` task #100), or
+    /// [`None`] for every other kind. Consulted by the write path to type-check the covered value.
+    pub type_descriptor: Option<ConstraintTypeDescriptor>,
 }
 
 /// A declared node-property index plus its durable build [`IndexState`] (`rmp` task #90).
@@ -161,6 +176,7 @@ impl IndexSet {
             fulltext: HashMap::new(),
             spatial: HashMap::new(),
             constraints: HashMap::new(),
+            composite: HashMap::new(),
         }
     }
 
@@ -229,15 +245,18 @@ impl IndexSet {
     // ---- Constraints (`rmp` task #99) ---------------------------------------------------------
 
     /// Registers (or replaces) the constraint named `name` over `(label_token, property_tokens)` of
-    /// `kind` (`rmp` task #99). Idempotent on the name: re-registering overwrites the rule. Holds no
-    /// backing tree — a uniqueness constraint reuses the node-property index on its `(label,
-    /// property)`; this map only records *which* rules the write path must enforce.
+    /// `kind`, carrying the property-type `type_descriptor` for a [`ConstraintKind::PropertyType`]
+    /// (`None` for every other kind) (`rmp` tasks #99, #100). Idempotent on the name: re-registering
+    /// overwrites the rule. Holds no backing tree itself — a uniqueness constraint reuses the
+    /// node-property index, a node-key constraint reuses the composite index; this map only records
+    /// *which* rules the write path must enforce.
     pub fn register_constraint(
         &mut self,
         name: &str,
         label_token: u32,
         property_tokens: Vec<u32>,
         kind: ConstraintKind,
+        type_descriptor: Option<ConstraintTypeDescriptor>,
     ) {
         self.constraints.insert(
             name.to_owned(),
@@ -245,8 +264,92 @@ impl IndexSet {
                 label_token,
                 property_tokens,
                 kind,
+                type_descriptor,
             },
         );
+    }
+
+    // ---- Composite indexes (`rmp` task #100, node-key backing) --------------------------------
+
+    /// Declares a composite index over `(label_token, property_tokens)` if absent (`rmp` task #100).
+    /// Idempotent on the key: a no-op if one is already registered (its entries are kept). The backing
+    /// [`CompositeIndex`] keys on the property tuple; the node-key write-path uniqueness check seeks it.
+    ///
+    /// # Panics
+    /// Panics if `property_tokens` is empty (a node key covers at least one property — the surface and
+    /// the durable catalog both enforce this before reaching here).
+    pub fn register_composite(&mut self, label_token: u32, property_tokens: Vec<u32>) {
+        assert!(
+            !property_tokens.is_empty(),
+            "composite index needs at least one property"
+        );
+        let arity = property_tokens.len();
+        self.composite
+            .entry((label_token, property_tokens))
+            .or_insert_with(|| CompositeIndex::new(fresh_tree(), arity));
+    }
+
+    /// Unregisters the composite index over `(label_token, property_tokens)`, dropping its backing tree
+    /// (`rmp` task #100, `DROP CONSTRAINT` of a node key). A no-op if absent.
+    pub fn unregister_composite(&mut self, label_token: u32, property_tokens: &[u32]) {
+        self.composite
+            .remove(&(label_token, property_tokens.to_vec()));
+    }
+
+    /// Whether a composite index is registered for `(label_token, property_tokens)` (`rmp` task #100).
+    #[must_use]
+    pub fn has_composite(&self, label_token: u32, property_tokens: &[u32]) -> bool {
+        self.composite
+            .contains_key(&(label_token, property_tokens.to_vec()))
+    }
+
+    /// The registered composite-index keys `(label_token, property_tokens)`, ascending and
+    /// de-duplicated (`rmp` task #100). Used by the coordinator's index rebuild to know which composite
+    /// tuples to (re)index for each node.
+    #[must_use]
+    pub fn registered_composite(&self) -> Vec<(u32, Vec<u32>)> {
+        let mut keys: Vec<(u32, Vec<u32>)> = self.composite.keys().cloned().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that node `node_id` has the composite tuple `values` for the `(label_token,
+    /// property_tokens)` composite index, if such an index is registered (else a no-op) (`rmp` task
+    /// #100). The whole tuple must be present and non-null — a node missing any covered property is not
+    /// indexed (and is therefore not a uniqueness candidate, matching the node-key existence rule).
+    pub fn insert_composite(
+        &mut self,
+        label_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+        node_id: u64,
+    ) {
+        if let Some(idx) = self
+            .composite
+            .get_mut(&(label_token, property_tokens.to_vec()))
+        {
+            // The synthetic per-index token is `label_token` (the map key already partitions by the
+            // full tuple, so any fixed token is sufficient). An in-memory composite op cannot fail in
+            // practice; a failure leaves the entry absent (the caller re-checks via a scan fallback,
+            // degrading to correctness, never to a wrong answer).
+            let _ = idx.insert(EPHEMERAL_TXN, label_token, values, node_id);
+        }
+    }
+
+    /// Candidate node ids whose composite tuple for `(label_token, property_tokens)` equals `values`,
+    /// ascending (`rmp` task #100). [`None`] if no such composite index is registered; otherwise a
+    /// candidate set the caller re-checks (visibility, current label, current tuple). `Some(vec![])` —
+    /// "registered but no candidate" — is distinct from `None`.
+    pub fn seek_composite_eq(
+        &mut self,
+        label_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+    ) -> Option<Vec<u64>> {
+        let idx = self
+            .composite
+            .get_mut(&(label_token, property_tokens.to_vec()))?;
+        Some(idx.seek_eq(label_token, values).unwrap_or_default())
     }
 
     /// Unregisters the constraint named `name`, if registered (`rmp` task #99, `DROP CONSTRAINT`). A
@@ -308,6 +411,11 @@ impl IndexSet {
         // Spatial indexes: clear the grid entries, keep the registration + state (`rmp` task #73).
         for sp in self.spatial.values_mut() {
             sp.index.clear();
+        }
+        // Composite indexes (`rmp` task #100): recreate each backing tree to drop its entries while
+        // keeping the registered `(label_token, property_tokens)` set, exactly like the property indexes.
+        for (key, idx) in &mut self.composite {
+            *idx = CompositeIndex::new(fresh_tree(), key.1.len());
         }
     }
 
@@ -1170,9 +1278,9 @@ mod tests {
         let mut set = IndexSet::new();
         assert!(!set.has_constraint("uniq"));
         // Two constraints on label token 1, one on label token 2.
-        set.register_constraint("uniq", 1, vec![10], ConstraintKind::Unique);
-        set.register_constraint("exists", 1, vec![11], ConstraintKind::Existence);
-        set.register_constraint("other", 2, vec![12], ConstraintKind::Unique);
+        set.register_constraint("uniq", 1, vec![10], ConstraintKind::Unique, None);
+        set.register_constraint("exists", 1, vec![11], ConstraintKind::Existence, None);
+        set.register_constraint("other", 2, vec![12], ConstraintKind::Unique, None);
         assert!(set.has_constraint("uniq"));
 
         // `constraints_for_label` returns only the rules covering that label.
@@ -1202,6 +1310,67 @@ mod tests {
         set.unregister_constraint("uniq");
         assert!(!set.has_constraint("uniq"));
         assert_eq!(set.constraints_for_label(1).len(), 1);
+    }
+
+    #[test]
+    fn constraint_register_carries_type_descriptor() {
+        let mut set = IndexSet::new();
+        set.register_constraint(
+            "typed",
+            1,
+            vec![10],
+            ConstraintKind::PropertyType,
+            Some(ConstraintTypeDescriptor::Integer),
+        );
+        let rule = set.constraints_for_label(1).pop().expect("one rule");
+        assert_eq!(rule.kind, ConstraintKind::PropertyType);
+        assert_eq!(
+            rule.type_descriptor,
+            Some(ConstraintTypeDescriptor::Integer)
+        );
+    }
+
+    // ---- composite indexes (`rmp` task #100, node-key backing) ----------------------------
+
+    #[test]
+    fn composite_register_insert_seek_and_clear() {
+        let mut set = IndexSet::new();
+        assert!(!set.has_composite(1, &[10, 11]));
+        set.register_composite(1, vec![10, 11]);
+        assert!(set.has_composite(1, &[10, 11]));
+        assert_eq!(set.registered_composite(), vec![(1u32, vec![10, 11])]);
+
+        // Two nodes share the same composite tuple; a third differs in the second field.
+        let tuple_a = [Value::Integer(7), Value::String("x".to_owned())];
+        let tuple_b = [Value::Integer(7), Value::String("y".to_owned())];
+        set.insert_composite(1, &[10, 11], &tuple_a, 100);
+        set.insert_composite(1, &[10, 11], &tuple_a, 101);
+        set.insert_composite(1, &[10, 11], &tuple_b, 102);
+
+        let mut hits = set.seek_composite_eq(1, &[10, 11], &tuple_a).unwrap();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![100, 101]);
+        assert_eq!(
+            set.seek_composite_eq(1, &[10, 11], &tuple_b).unwrap(),
+            vec![102]
+        );
+
+        // An unregistered tuple seeks to `None` (scan fallback), not an empty candidate set.
+        assert_eq!(set.seek_composite_eq(1, &[10], &tuple_a), None);
+        assert_eq!(set.seek_composite_eq(9, &[10, 11], &tuple_a), None);
+
+        // A clear keeps the registration but drops entries.
+        set.clear();
+        assert!(set.has_composite(1, &[10, 11]));
+        assert_eq!(
+            set.seek_composite_eq(1, &[10, 11], &tuple_a),
+            Some(Vec::<u64>::new())
+        );
+
+        // Unregister drops it entirely.
+        set.unregister_composite(1, &[10, 11]);
+        assert!(!set.has_composite(1, &[10, 11]));
+        assert_eq!(set.seek_composite_eq(1, &[10, 11], &tuple_a), None);
     }
 
     // ---- full-text (`rmp` task #72) --------------------------------------------------------

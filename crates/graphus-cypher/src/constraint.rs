@@ -23,7 +23,8 @@
 //! human message unchanged. The sentinel is an internal marker, stripped from the message the wire
 //! actually carries — see `graphus_bolt::failure_from_error`.
 
-use graphus_storage::ConstraintKind;
+use graphus_core::Value;
+use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor};
 
 /// The stable sentinel that prefixes every constraint-violation message so the Bolt error renderer
 /// can classify it as `Neo.ClientError.Schema.ConstraintValidationFailed` (`rmp` task #99).
@@ -60,6 +61,43 @@ pub enum ConstraintViolation {
         /// The required property key.
         property: String,
     },
+    /// A **node-key** constraint was violated because the covered composite tuple is **incomplete**: a
+    /// node carrying `label` lacks (or nulled) at least one of the key's `properties` (`rmp` task #100).
+    NodeKeyMissing {
+        /// The declared constraint's name.
+        name: String,
+        /// The covered node label.
+        label: String,
+        /// The key's covered properties, in declared order.
+        properties: Vec<String>,
+    },
+    /// A **node-key** constraint was violated because the covered composite tuple is **not unique**:
+    /// another node carrying `label` already holds the same tuple of `properties` values (`rmp` task
+    /// #100).
+    NodeKeyDuplicate {
+        /// The declared constraint's name.
+        name: String,
+        /// The covered node label.
+        label: String,
+        /// The key's covered properties, in declared order.
+        properties: Vec<String>,
+        /// A short rendering of the duplicate composite tuple (for the human message).
+        values: String,
+    },
+    /// A **property-type** constraint was violated: a node carrying `label` holds a value for
+    /// `property` whose type is `actual`, but the constraint requires `expected` (`rmp` task #100).
+    PropertyType {
+        /// The declared constraint's name.
+        name: String,
+        /// The covered node label.
+        label: String,
+        /// The covered property key.
+        property: String,
+        /// The required type's openCypher rendering (e.g. `INTEGER`, `LIST<STRING>`).
+        expected: String,
+        /// The offending value's actual type rendering.
+        actual: String,
+    },
 }
 
 impl ConstraintViolation {
@@ -68,6 +106,8 @@ impl ConstraintViolation {
         match self {
             Self::Uniqueness { .. } => ConstraintKind::Unique,
             Self::Existence { .. } => ConstraintKind::Existence,
+            Self::NodeKeyMissing { .. } | Self::NodeKeyDuplicate { .. } => ConstraintKind::NodeKey,
+            Self::PropertyType { .. } => ConstraintKind::PropertyType,
         }
     }
 
@@ -93,6 +133,35 @@ impl ConstraintViolation {
                 "Node(:{label}) must have the property `{property}` \
                  (existence constraint `{name}`)"
             ),
+            Self::NodeKeyMissing {
+                name,
+                label,
+                properties,
+            } => format!(
+                "Node(:{label}) must have all properties {} \
+                 (node-key constraint `{name}`)",
+                render_property_list(properties)
+            ),
+            Self::NodeKeyDuplicate {
+                name,
+                label,
+                properties,
+                values,
+            } => format!(
+                "Node(:{label}) already exists with properties {} = {values} \
+                 (node-key constraint `{name}`)",
+                render_property_list(properties)
+            ),
+            Self::PropertyType {
+                name,
+                label,
+                property,
+                expected,
+                actual,
+            } => format!(
+                "Node(:{label}) property `{property}` must be of type {expected} but was {actual} \
+                 (property-type constraint `{name}`)"
+            ),
         }
     }
 
@@ -109,6 +178,88 @@ impl ConstraintViolation {
     #[must_use]
     pub fn into_error(self) -> graphus_core::GraphusError {
         graphus_core::GraphusError::Runtime(self.wire_message())
+    }
+}
+
+/// Renders a backtick-quoted, comma-separated property list (e.g. ``` `a`, `b` ```) for a node-key
+/// violation message (`rmp` task #100).
+fn render_property_list(properties: &[String]) -> String {
+    properties
+        .iter()
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The openCypher type-name rendering of a declared [`ConstraintTypeDescriptor`] (`rmp` task #100),
+/// e.g. `INTEGER`, `LIST<STRING>`, `LIST<ANY>` — used in a property-type violation message and by
+/// `SHOW CONSTRAINTS`.
+#[must_use]
+pub fn type_descriptor_name(descriptor: &ConstraintTypeDescriptor) -> String {
+    match descriptor {
+        ConstraintTypeDescriptor::Integer => "INTEGER".to_owned(),
+        ConstraintTypeDescriptor::Float => "FLOAT".to_owned(),
+        ConstraintTypeDescriptor::String => "STRING".to_owned(),
+        ConstraintTypeDescriptor::Boolean => "BOOLEAN".to_owned(),
+        ConstraintTypeDescriptor::List(inner) => {
+            format!("LIST<{}>", type_descriptor_name(inner))
+        }
+        ConstraintTypeDescriptor::Any => "ANY".to_owned(),
+    }
+}
+
+/// The openCypher type-name rendering of a [`Value`] (`rmp` task #100), used in a property-type
+/// violation message. Mirrors the spelling of [`type_descriptor_name`] for the comparable types.
+#[must_use]
+pub fn value_type_name(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_owned(),
+        Value::Boolean(_) => "BOOLEAN".to_owned(),
+        Value::Integer(_) => "INTEGER".to_owned(),
+        Value::Float(_) => "FLOAT".to_owned(),
+        Value::String(_) => "STRING".to_owned(),
+        Value::Bytes(_) => "BYTES".to_owned(),
+        Value::List(_) => "LIST".to_owned(),
+        Value::Map(_) => "MAP".to_owned(),
+        Value::Date(_) => "DATE".to_owned(),
+        Value::LocalTime(_) => "LOCAL TIME".to_owned(),
+        Value::ZonedTime(_) => "ZONED TIME".to_owned(),
+        Value::LocalDateTime(_) => "LOCAL DATETIME".to_owned(),
+        Value::ZonedDateTime(_) => "ZONED DATETIME".to_owned(),
+        Value::Duration(_) => "DURATION".to_owned(),
+        Value::Point(_) => "POINT".to_owned(),
+    }
+}
+
+/// Whether `value` satisfies the declared property type `descriptor` (`rmp` task #100).
+///
+/// The type check the property-type constraint enforces, applied **only** when the property is present
+/// and non-null (a missing / null value never triggers a property-type violation — that is the
+/// existence constraint's job, not the type constraint's). The mapping onto the [`Value`] model:
+///
+/// - [`Integer`](ConstraintTypeDescriptor::Integer) ⇔ [`Value::Integer`]; [`Float`] ⇔ [`Value::Float`]
+///   (no integer↔float widening — openCypher `IS :: FLOAT` is exact); [`String`] ⇔ [`Value::String`];
+///   [`Boolean`] ⇔ [`Value::Boolean`].
+/// - [`List(inner)`](ConstraintTypeDescriptor::List) ⇔ a [`Value::List`] **every** element of which
+///   matches `inner`; an empty list trivially matches (every element matches), and a bare `LIST` (its
+///   `inner` is [`Any`](ConstraintTypeDescriptor::Any)) matches any list.
+/// - [`Any`](ConstraintTypeDescriptor::Any) matches every non-null value (the list-element wildcard).
+#[must_use]
+pub fn value_matches_descriptor(value: &Value, descriptor: &ConstraintTypeDescriptor) -> bool {
+    match descriptor {
+        ConstraintTypeDescriptor::Integer => matches!(value, Value::Integer(_)),
+        ConstraintTypeDescriptor::Float => matches!(value, Value::Float(_)),
+        ConstraintTypeDescriptor::String => matches!(value, Value::String(_)),
+        ConstraintTypeDescriptor::Boolean => matches!(value, Value::Boolean(_)),
+        ConstraintTypeDescriptor::List(inner) => match value {
+            Value::List(items) => items
+                .iter()
+                .all(|item| value_matches_descriptor(item, inner)),
+            _ => false,
+        },
+        // The list-element wildcard: matches any non-null value. (A null never reaches this function —
+        // the caller short-circuits a null/absent value before type-checking.)
+        ConstraintTypeDescriptor::Any => !value.is_null(),
     }
 }
 
@@ -171,5 +322,120 @@ mod tests {
             graphus_core::GraphusError::Runtime(m) => assert_eq!(m, wire),
             other => panic!("expected Runtime, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn node_key_and_property_type_messages_and_kinds() {
+        let missing = ConstraintViolation::NodeKeyMissing {
+            name: "k".to_owned(),
+            label: "Person".to_owned(),
+            properties: vec!["first".to_owned(), "last".to_owned()],
+        };
+        let m = missing.message();
+        assert!(
+            m.contains("Person") && m.contains("`first`") && m.contains("`last`"),
+            "{m}"
+        );
+        assert_eq!(missing.kind(), ConstraintKind::NodeKey);
+
+        let dup = ConstraintViolation::NodeKeyDuplicate {
+            name: "k".to_owned(),
+            label: "Person".to_owned(),
+            properties: vec!["first".to_owned(), "last".to_owned()],
+            values: "('Ada', 'Byron')".to_owned(),
+        };
+        assert!(
+            dup.message().contains("('Ada', 'Byron')"),
+            "{}",
+            dup.message()
+        );
+        assert_eq!(dup.kind(), ConstraintKind::NodeKey);
+
+        let ty = ConstraintViolation::PropertyType {
+            name: "t".to_owned(),
+            label: "Person".to_owned(),
+            property: "age".to_owned(),
+            expected: "INTEGER".to_owned(),
+            actual: "STRING".to_owned(),
+        };
+        let m = ty.message();
+        assert!(
+            m.contains("INTEGER") && m.contains("STRING") && m.contains("`age`"),
+            "{m}"
+        );
+        assert_eq!(ty.kind(), ConstraintKind::PropertyType);
+    }
+
+    #[test]
+    fn type_descriptor_names_render_opencypher_spelling() {
+        use ConstraintTypeDescriptor as T;
+        assert_eq!(type_descriptor_name(&T::Integer), "INTEGER");
+        assert_eq!(type_descriptor_name(&T::Float), "FLOAT");
+        assert_eq!(type_descriptor_name(&T::String), "STRING");
+        assert_eq!(type_descriptor_name(&T::Boolean), "BOOLEAN");
+        assert_eq!(
+            type_descriptor_name(&T::List(Box::new(T::String))),
+            "LIST<STRING>"
+        );
+        assert_eq!(
+            type_descriptor_name(&T::List(Box::new(T::Any))),
+            "LIST<ANY>"
+        );
+    }
+
+    #[test]
+    fn value_matches_descriptor_is_exact_with_recursive_lists() {
+        use ConstraintTypeDescriptor as T;
+        assert!(value_matches_descriptor(&Value::Integer(1), &T::Integer));
+        assert!(value_matches_descriptor(&Value::Float(1.5), &T::Float));
+        assert!(value_matches_descriptor(
+            &Value::String("x".to_owned()),
+            &T::String
+        ));
+        assert!(value_matches_descriptor(&Value::Boolean(true), &T::Boolean));
+
+        // No integer↔float widening — `IS :: FLOAT` is exact (openCypher).
+        assert!(!value_matches_descriptor(&Value::Integer(1), &T::Float));
+        assert!(!value_matches_descriptor(&Value::Float(1.0), &T::Integer));
+        // A string is not an integer.
+        assert!(!value_matches_descriptor(
+            &Value::String("1".to_owned()),
+            &T::Integer
+        ));
+
+        // LIST<INTEGER>: every element must be an integer; an empty list trivially matches.
+        let li = T::List(Box::new(T::Integer));
+        assert!(value_matches_descriptor(&Value::List(vec![]), &li));
+        assert!(value_matches_descriptor(
+            &Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+            &li
+        ));
+        assert!(!value_matches_descriptor(
+            &Value::List(vec![Value::Integer(1), Value::String("x".to_owned())]),
+            &li
+        ));
+        // A non-list never matches a LIST type.
+        assert!(!value_matches_descriptor(&Value::Integer(1), &li));
+
+        // LIST<ANY> (a bare list) matches any list, including a heterogeneous one.
+        let la = T::List(Box::new(T::Any));
+        assert!(value_matches_descriptor(
+            &Value::List(vec![Value::Integer(1), Value::String("x".to_owned())]),
+            &la
+        ));
+
+        // Nested LIST<LIST<INTEGER>>.
+        let lli = T::List(Box::new(T::List(Box::new(T::Integer))));
+        assert!(value_matches_descriptor(
+            &Value::List(vec![
+                Value::List(vec![Value::Integer(1)]),
+                Value::List(vec![]),
+            ]),
+            &lli
+        ));
+        assert!(!value_matches_descriptor(
+            &Value::List(vec![Value::List(vec![Value::String("x".to_owned())])]),
+            &lli
+        ));
     }
 }

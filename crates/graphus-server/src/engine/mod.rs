@@ -440,6 +440,36 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
             coordinator.create_constraint(name, label, property, ConstraintKind::Existence)?;
             Ok(IndexDdlReply::default())
         }
+        ConstraintCommand::CreateNodeKey {
+            name,
+            label,
+            properties,
+        } => {
+            let props: Vec<&str> = properties.iter().map(String::as_str).collect();
+            coordinator.create_constraint_general(
+                name,
+                label,
+                &props,
+                ConstraintKind::NodeKey,
+                None,
+            )?;
+            Ok(IndexDdlReply::default())
+        }
+        ConstraintCommand::CreatePropertyType {
+            name,
+            label,
+            property,
+            declared_type,
+        } => {
+            coordinator.create_constraint_general(
+                name,
+                label,
+                &[property],
+                ConstraintKind::PropertyType,
+                Some(declared_type.clone()),
+            )?;
+            Ok(IndexDdlReply::default())
+        }
         ConstraintCommand::Drop { name } => {
             coordinator.drop_constraint(name)?;
             Ok(IndexDdlReply::default())
@@ -454,17 +484,29 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
             let rows = coordinator
                 .list_constraints()
                 .into_iter()
-                .map(|(name, label, property, kind)| {
-                    // Neo4j-compatible `type` strings for `SHOW CONSTRAINTS`.
-                    let kind = match kind {
-                        ConstraintKind::Unique => "UNIQUENESS",
-                        ConstraintKind::Existence => "NODE_PROPERTY_EXISTENCE",
+                .map(|info| {
+                    // Neo4j-compatible `type` strings for `SHOW CONSTRAINTS`. A property-type constraint
+                    // additionally appends its declared type (e.g. `NODE_PROPERTY_TYPE INTEGER`) so the
+                    // declared type is visible in the listing.
+                    let kind = match info.kind {
+                        ConstraintKind::Unique => "UNIQUENESS".to_owned(),
+                        ConstraintKind::Existence => "NODE_PROPERTY_EXISTENCE".to_owned(),
+                        ConstraintKind::NodeKey => "NODE_KEY".to_owned(),
+                        ConstraintKind::PropertyType => match &info.type_descriptor {
+                            Some(d) => format!(
+                                "NODE_PROPERTY_TYPE {}",
+                                graphus_cypher::constraint::type_descriptor_name(d)
+                            ),
+                            None => "NODE_PROPERTY_TYPE".to_owned(),
+                        },
                     };
+                    // A composite node key lists its whole tuple, comma-separated.
+                    let property = info.properties.join(", ");
                     vec![
-                        Value::String(name),
-                        Value::String(label),
+                        Value::String(info.name),
+                        Value::String(info.label),
                         Value::String(property),
-                        Value::String(kind.to_owned()),
+                        Value::String(kind),
                     ]
                 })
                 .collect();

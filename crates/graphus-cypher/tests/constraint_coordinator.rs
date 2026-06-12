@@ -21,8 +21,8 @@ use graphus_cypher::runtime::Row;
 use graphus_cypher::semantics::analyze;
 use graphus_cypher::{CONSTRAINT_VIOLATION_PREFIX, ConstraintKind};
 use graphus_io::MemBlockDevice;
-use graphus_storage::RecordStore;
 use graphus_storage::recovery::recover_device;
+use graphus_storage::{ConstraintTypeDescriptor, RecordStore};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -250,26 +250,18 @@ fn list_constraints_reports_declared_constraints() {
         .expect("create existence");
 
     let mut listed = coord.list_constraints();
-    listed.sort_by(|a, b| a.0.cmp(&b.0));
+    listed.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(listed.len(), 2);
-    assert_eq!(
-        listed[0],
-        (
-            "name_exists".to_owned(),
-            "Person".to_owned(),
-            "name".to_owned(),
-            ConstraintKind::Existence
-        )
-    );
-    assert_eq!(
-        listed[1],
-        (
-            "uniq_email".to_owned(),
-            "Person".to_owned(),
-            "email".to_owned(),
-            ConstraintKind::Unique
-        )
-    );
+    assert_eq!(listed[0].name, "name_exists");
+    assert_eq!(listed[0].label, "Person");
+    assert_eq!(listed[0].properties, vec!["name".to_owned()]);
+    assert_eq!(listed[0].kind, ConstraintKind::Existence);
+    assert_eq!(listed[0].type_descriptor, None);
+    assert_eq!(listed[1].name, "uniq_email");
+    assert_eq!(listed[1].label, "Person");
+    assert_eq!(listed[1].properties, vec!["email".to_owned()]);
+    assert_eq!(listed[1].kind, ConstraintKind::Unique);
+    assert_eq!(listed[1].type_descriptor, None);
 }
 
 #[test]
@@ -334,4 +326,234 @@ fn constraints_survive_a_crash_and_still_enforce_after_reopen() {
     // A fully-conforming CREATE still succeeds after restart.
     run_write(&mut coord, "CREATE (:Person {email: 'b@x.com', name: 'B'})");
     assert_eq!(person_count(&mut coord), 2);
+}
+
+// =================================================================================================
+// NODE KEY (composite uniqueness + existence) — `rmp` task #100
+// =================================================================================================
+
+/// Declares a composite node key over `(Person.first, Person.last)`.
+fn create_person_node_key(coord: &mut Coord, name: &str) {
+    coord
+        .create_constraint_general(
+            name,
+            "Person",
+            &["first", "last"],
+            ConstraintKind::NodeKey,
+            None,
+        )
+        .expect("create node key over conforming data");
+}
+
+#[test]
+fn node_key_rejects_missing_component_and_duplicate_tuple() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    create_person_node_key(&mut coord, "person_key");
+
+    // A CREATE missing one key component (existence half) is rejected.
+    let err = try_write(&mut coord, "CREATE (:Person {first: 'Grace'})")
+        .expect_err("missing key component must be rejected");
+    assert_constraint_violation(&err);
+
+    // A CREATE whose full tuple duplicates an existing one (uniqueness half) is rejected.
+    let err = try_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    )
+    .expect_err("duplicate composite tuple must be rejected");
+    assert_constraint_violation(&err);
+    assert_eq!(person_count(&mut coord), 1);
+
+    // A tuple that differs in only one component is allowed (the key is composite).
+    run_write(&mut coord, "CREATE (:Person {first: 'Ada', last: 'Byron'})");
+    run_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Grace', last: 'Hopper'})",
+    );
+    assert_eq!(person_count(&mut coord), 3);
+
+    // A SET that makes a tuple collide is rejected.
+    let err = try_write(
+        &mut coord,
+        "MATCH (p:Person {first: 'Grace', last: 'Hopper'}) SET p.first = 'Ada', p.last = 'Byron'",
+    )
+    .expect_err("SET to a duplicate tuple must be rejected");
+    assert_constraint_violation(&err);
+}
+
+#[test]
+fn node_key_creation_time_validation() {
+    // Existing data with a duplicate composite tuple: the node key cannot be created.
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    run_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    let err = coord
+        .create_constraint_general(
+            "person_key",
+            "Person",
+            &["first", "last"],
+            ConstraintKind::NodeKey,
+            None,
+        )
+        .expect_err("node key over duplicate tuples must be rejected");
+    assert_constraint_violation(&err);
+    assert!(coord.list_constraints().is_empty());
+
+    // Existing data missing a component: the node key cannot be created.
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {first: 'Grace'})");
+    let err = coord
+        .create_constraint_general(
+            "person_key",
+            "Person",
+            &["first", "last"],
+            ConstraintKind::NodeKey,
+            None,
+        )
+        .expect_err("node key over data missing a component must be rejected");
+    assert_constraint_violation(&err);
+    assert!(coord.list_constraints().is_empty());
+
+    // Conforming data: the node key is created and listed with its whole tuple.
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    create_person_node_key(&mut coord, "person_key");
+    let listed = coord.list_constraints();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].kind, ConstraintKind::NodeKey);
+    assert_eq!(
+        listed[0].properties,
+        vec!["first".to_owned(), "last".to_owned()]
+    );
+}
+
+#[test]
+fn node_key_survives_a_crash_and_still_enforces() {
+    let recovered = {
+        let mut coord = fresh_coord();
+        run_write(
+            &mut coord,
+            "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+        );
+        create_person_node_key(&mut coord, "person_key");
+        let store = coord.into_store();
+        recover_no_force(&store)
+    };
+    let mut coord = TxnCoordinator::new(recovered);
+    assert_eq!(coord.list_constraints().len(), 1);
+
+    // The duplicate tuple must still be rejected (the backing composite index was rebuilt).
+    let err = try_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    )
+    .expect_err("node key must still enforce after restart");
+    assert_constraint_violation(&err);
+
+    // A missing component must still be rejected.
+    let err = try_write(&mut coord, "CREATE (:Person {first: 'Solo'})")
+        .expect_err("node-key existence must still enforce after restart");
+    assert_constraint_violation(&err);
+
+    // A distinct, complete tuple still succeeds.
+    run_write(
+        &mut coord,
+        "CREATE (:Person {first: 'Grace', last: 'Hopper'})",
+    );
+    assert_eq!(person_count(&mut coord), 2);
+}
+
+// =================================================================================================
+// PROPERTY TYPE — `rmp` task #100
+// =================================================================================================
+
+#[test]
+fn property_type_rejects_wrong_type_and_allows_correct_or_absent() {
+    let mut coord = fresh_coord();
+    coord
+        .create_constraint_general(
+            "age_int",
+            "Person",
+            &["age"],
+            ConstraintKind::PropertyType,
+            Some(ConstraintTypeDescriptor::Integer),
+        )
+        .expect("create property-type constraint");
+
+    // A STRING where INTEGER is required is rejected.
+    let err = try_write(&mut coord, "CREATE (:Person {age: 'old'})")
+        .expect_err("wrong type must be rejected");
+    assert_constraint_violation(&err);
+
+    // The correct type succeeds.
+    run_write(&mut coord, "CREATE (:Person {age: 42})");
+    // A node that omits the property entirely is allowed (property-type does not imply existence).
+    run_write(&mut coord, "CREATE (:Person {name: 'No Age'})");
+    assert_eq!(person_count(&mut coord), 2);
+
+    // A SET that stores the wrong type is rejected.
+    let err = try_write(&mut coord, "MATCH (p:Person {age: 42}) SET p.age = 'nope'")
+        .expect_err("SET to wrong type must be rejected");
+    assert_constraint_violation(&err);
+}
+
+#[test]
+fn property_type_creation_time_validation_and_restart() {
+    // Existing wrong-typed data: the constraint cannot be created.
+    let recovered = {
+        let mut coord = fresh_coord();
+        run_write(&mut coord, "CREATE (:Person {score: 'high'})");
+        let err = coord
+            .create_constraint_general(
+                "score_int",
+                "Person",
+                &["score"],
+                ConstraintKind::PropertyType,
+                Some(ConstraintTypeDescriptor::Integer),
+            )
+            .expect_err("property-type over wrong-typed data must be rejected");
+        assert_constraint_violation(&err);
+        assert!(coord.list_constraints().is_empty());
+
+        // Now seed only conforming data and create the constraint, then crash + reopen.
+        let mut coord = fresh_coord();
+        run_write(&mut coord, "CREATE (:Person {score: 99})");
+        coord
+            .create_constraint_general(
+                "score_int",
+                "Person",
+                &["score"],
+                ConstraintKind::PropertyType,
+                Some(ConstraintTypeDescriptor::Integer),
+            )
+            .expect("create over conforming data");
+        let store = coord.into_store();
+        recover_no_force(&store)
+    };
+
+    let mut coord = TxnCoordinator::new(recovered);
+    assert_eq!(coord.list_constraints().len(), 1);
+    assert_eq!(
+        coord.list_constraints()[0].type_descriptor,
+        Some(ConstraintTypeDescriptor::Integer)
+    );
+
+    // The type rule still enforces after the restart.
+    let err = try_write(&mut coord, "CREATE (:Person {score: 'bad'})")
+        .expect_err("property-type must still enforce after restart");
+    assert_constraint_violation(&err);
+    run_write(&mut coord, "CREATE (:Person {score: 7})");
 }

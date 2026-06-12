@@ -48,8 +48,8 @@ use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
-    ConstraintEntry, ConstraintKind, FulltextIndexEntry, IndexState, Namespace, RecordStore,
-    SpatialIndexEntry,
+    ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextIndexEntry, IndexState,
+    Namespace, RecordStore, SpatialIndexEntry,
 };
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
 use graphus_wal::LogSink;
@@ -69,6 +69,46 @@ fn render_value(value: &Value) -> String {
         Value::String(s) => format!("'{s}'"),
         other => format!("{other:?}"),
     }
+}
+
+/// Renders a composite-tuple value list as `(v1, v2, …)` for a node-key violation message (`rmp` task
+/// #100), reusing [`render_value`] per element.
+fn render_tuple(values: &[Value]) -> String {
+    let inner = values
+        .iter()
+        .map(render_value)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({inner})")
+}
+
+/// Whether two composite tuples are equal by **Cypher value equality**, element-wise (`rmp` task
+/// #100). Used to detect a node-key duplicate; the tuples always have equal length (the same covered
+/// property count). A null element would make the tuple incomplete and never reach here.
+fn tuples_equal(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| crate::equality::equals(x, y).is_true())
+}
+
+/// A declared constraint resolved to human-readable names, for the `SHOW CONSTRAINTS` surface
+/// (`rmp` tasks #99, #100). Carries the covered label, the **whole** covered property tuple (one for a
+/// non-composite kind, several for a node key), the [`ConstraintKind`] and (for a property-type
+/// constraint) the declared [`ConstraintTypeDescriptor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintInfo {
+    /// The server-unique constraint name.
+    pub name: String,
+    /// The covered node label.
+    pub label: String,
+    /// The covered properties, in declared order (one for `Unique`/`Existence`/`PropertyType`,
+    /// one-or-more for a `NodeKey`).
+    pub properties: Vec<String>,
+    /// The constraint kind.
+    pub kind: ConstraintKind,
+    /// The declared value type of a [`ConstraintKind::PropertyType`] constraint, or [`None`] otherwise.
+    pub type_descriptor: Option<ConstraintTypeDescriptor>,
 }
 
 /// Live state of an open transaction the coordinator drives.
@@ -379,13 +419,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
-        // Recover the durable constraint catalog (`rmp` task #99) the same way: register each declared
-        // constraint's rule in the in-memory set, and — for a UNIQUENESS constraint — also register a
-        // node-property index on its `(label, property)` at `Online` so the write-path uniqueness check
-        // is backed by an index (the rebuild scan below populates it). An existence constraint needs no
-        // backing index (it is a pure per-node predicate). A constraint covering an unexpected number
-        // of properties (a forward-incompatible composite) is registered as a rule but its v1 single-
-        // property backing index is skipped defensively.
+        // Recover the durable constraint catalog (`rmp` tasks #99, #100) the same way: register each
+        // declared constraint's rule (carrying its type descriptor) in the in-memory set, and register
+        // the right backing index so the write-path duplicate check stays index-accelerated after a
+        // crash:
+        //   - UNIQUENESS  → a node-property index on its single `(label, property)` at `Online`;
+        //   - NODE KEY    → a COMPOSITE index over its whole `(label, property tuple)`.
+        // Existence and property-type need no backing index (pure per-node predicates). The rebuild
+        // scan below repopulates whichever backing indexes were registered here.
         let durable_constraints: Vec<(String, ConstraintEntry)> = store.borrow().constraints();
         {
             let mut idx = index.borrow_mut();
@@ -395,15 +436,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     entry.label_token,
                     entry.property_tokens.clone(),
                     entry.kind,
+                    entry.type_descriptor.clone(),
                 );
-                if entry.kind == ConstraintKind::Unique
-                    && let [prop_key] = entry.property_tokens.as_slice()
-                {
-                    idx.register_node_property_with_state(
-                        entry.label_token,
-                        *prop_key,
-                        IndexState::Online,
-                    );
+                match entry.kind {
+                    ConstraintKind::Unique => {
+                        if let [prop_key] = entry.property_tokens.as_slice() {
+                            idx.register_node_property_with_state(
+                                entry.label_token,
+                                *prop_key,
+                                IndexState::Online,
+                            );
+                        }
+                    }
+                    ConstraintKind::NodeKey => {
+                        idx.register_composite(entry.label_token, entry.property_tokens.clone());
+                    }
+                    ConstraintKind::Existence | ConstraintKind::PropertyType => {}
                 }
             }
         }
@@ -427,6 +475,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The registered spatial index keys `(label_token, prop_key)`, captured before the scan so the
         // index is not borrowed across a store borrow (`rmp` task #98).
         let registered_spatial: Vec<(u32, u32)> = index.borrow().registered_spatial();
+        // The registered composite index keys `(label_token, property tuple)` — a node-key constraint's
+        // backing index (`rmp` task #100). Captured before the scan so the index is not borrowed across
+        // a store borrow.
+        let registered_composite: Vec<(u32, Vec<u32>)> = index.borrow().registered_composite();
         for id in node_ids {
             Self::index_one_node(store, index, id, &registered);
             // Repopulate the full-text inverted indexes from the same scan (`rmp` task #72), so a
@@ -438,6 +490,69 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // is declared.
             if !registered_spatial.is_empty() {
                 Self::index_one_node_spatial(store, index, id, &registered_spatial);
+            }
+            // Repopulate the composite indexes from the same scan (`rmp` task #100), only when at least
+            // one node-key constraint is declared.
+            if !registered_composite.is_empty() {
+                Self::index_one_node_composite(store, index, id, &registered_composite);
+            }
+        }
+    }
+
+    /// Inserts node `id`'s current composite tuples into every registered composite index whose covered
+    /// label it carries and whose covered property tuple it holds **in full** (`rmp` task #100). The
+    /// composite analogue of [`index_one_node`](Self::index_one_node): a node missing any covered
+    /// property (or carrying a null for one) is **not** indexed for that key — matching the node-key
+    /// rule that an incomplete tuple never participates in uniqueness. Store and index are borrowed in
+    /// separate, non-overlapping scopes (the file's borrow discipline). Read faults skip best-effort.
+    fn index_one_node_composite(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, Vec<u32>)],
+    ) {
+        // The node's current label tokens + its property values, read in one store-borrow scope.
+        let (label_tokens, props): (Vec<u32>, Vec<(u32, Value)>) = {
+            let mut store = store.borrow_mut();
+            let labels = match store.node_labels(id) {
+                Ok(l) => l,
+                Err(_) => return,
+            };
+            let props = match store.node_property_values(id) {
+                Ok(chain) => chain
+                    .into_iter()
+                    .map(|(_pid, key, value)| (key, value))
+                    .collect(),
+                Err(_) => return,
+            };
+            (labels, props)
+        };
+
+        let mut idx = index.borrow_mut();
+        for (label_token, property_tokens) in registered {
+            if !label_tokens.contains(label_token) {
+                continue; // node does not carry this composite index's label
+            }
+            // Build the tuple newest-wins; bail on the first absent/null covered property (the tuple is
+            // incomplete, so the node is not a uniqueness candidate and is left unindexed for this key).
+            let mut tuple = Vec::with_capacity(property_tokens.len());
+            let mut complete = true;
+            for prop_key in property_tokens {
+                match props
+                    .iter()
+                    .find(|(k, _)| k == prop_key)
+                    .map(|(_, v)| v)
+                    .filter(|v| !v.is_null())
+                {
+                    Some(v) => tuple.push(v.clone()),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                idx.insert_composite(*label_token, property_tokens, &tuple, id);
             }
         }
     }
@@ -1077,30 +1192,63 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         property: &str,
         kind: ConstraintKind,
     ) -> Result<()> {
+        // The single-property convenience entry point (uniqueness / existence / property-type): forward
+        // to the general composite-aware path with one property and no declared type.
+        self.create_constraint_general(name, label, &[property], kind, None)
+    }
+
+    /// Declares a constraint over a (possibly composite) property tuple, validating existing data and
+    /// durably recording it (`rmp` tasks #99, #100). The general form behind
+    /// [`create_constraint`](Self::create_constraint) (single-property) and the NODE KEY / PROPERTY
+    /// TYPE engine paths:
+    ///
+    /// - `properties` is the covered tuple in declared order — one property for `Unique` / `Existence`
+    ///   / `PropertyType`, one-or-more for a composite `NodeKey`.
+    /// - `type_descriptor` is the declared value type of a `PropertyType` constraint (`None` for every
+    ///   other kind).
+    ///
+    /// The order of operations is identical to the single-property path (intern → validate existing →
+    /// persist + register), so a rejected creation has **zero** side effects. For a `Unique` constraint
+    /// a backing node-property index is registered + populated; for a `NodeKey` a backing **composite**
+    /// index over the whole tuple is registered + populated (the composite analogue), so the write-time
+    /// duplicate check is index-accelerated.
+    ///
+    /// # Errors
+    /// Returns a [`ConstraintViolation`]-wrapped runtime error if existing data violates the
+    /// constraint, or a storage error if interning a token, recording the entry, or committing fails.
+    /// On any error the constraint is left undeclared.
+    pub fn create_constraint_general(
+        &mut self,
+        name: &str,
+        label: &str,
+        properties: &[&str],
+        kind: ConstraintKind,
+        type_descriptor: Option<ConstraintTypeDescriptor>,
+    ) -> Result<()> {
+        debug_assert!(
+            !properties.is_empty(),
+            "a constraint covers at least one property"
+        );
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
 
-        // Intern the label + property-key tokens (rolled back with the transaction on any failure).
-        let (label_token, prop_key) = {
+        // Intern the label + every property-key token (rolled back with the transaction on any failure).
+        let intern = (|| -> Result<(u32, Vec<u32>)> {
             let mut store = self.store.borrow_mut();
-            let label_token = match store.intern_token(Namespace::Label, label) {
-                Ok(t) => t,
-                Err(e) => {
-                    drop(store);
-                    let _ = self.store.borrow_mut().rollback(txn);
-                    return Err(e);
-                }
-            };
-            let prop_key = match store.intern_token(Namespace::PropKey, property) {
-                Ok(t) => t,
-                Err(e) => {
-                    drop(store);
-                    let _ = self.store.borrow_mut().rollback(txn);
-                    return Err(e);
-                }
-            };
-            (label_token, prop_key)
+            let label_token = store.intern_token(Namespace::Label, label)?;
+            let mut prop_keys = Vec::with_capacity(properties.len());
+            for property in properties {
+                prop_keys.push(store.intern_token(Namespace::PropKey, property)?);
+            }
+            Ok((label_token, prop_keys))
+        })();
+        let (label_token, prop_keys) = match intern {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.store.borrow_mut().rollback(txn);
+                return Err(e);
+            }
         };
 
         // Validate existing data BEFORE recording anything. A violation rolls back the whole
@@ -1109,10 +1257,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if let Err(e) = self.validate_existing_against_constraint(
             name,
             label,
-            property,
+            properties,
             label_token,
-            prop_key,
+            &prop_keys,
             kind,
+            type_descriptor.as_ref(),
         ) {
             let _ = self.store.borrow_mut().rollback(txn);
             return Err(e);
@@ -1123,23 +1272,40 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             name.to_owned(),
             ConstraintEntry {
                 label_token,
-                property_tokens: vec![prop_key],
+                property_tokens: prop_keys.clone(),
                 kind,
+                type_descriptor: type_descriptor.clone(),
             },
         );
         self.store.borrow_mut().commit(txn)?;
 
-        // Register the rule in the in-memory set so the write path enforces it from now on. For a
-        // uniqueness constraint also register + populate the backing node-property index so the
-        // write-time duplicate check is index-backed (a full rebuild repopulates it from the store).
-        {
+        // Register the rule in the in-memory set so the write path enforces it from now on. A uniqueness
+        // constraint registers + populates a backing node-property index; a node-key constraint
+        // registers + populates a backing COMPOSITE index over the whole tuple — both make the write-time
+        // duplicate check index-backed (a full rebuild repopulates them from the store). Existence and
+        // property-type need no backing index (they are pure per-node predicates).
+        let needs_rebuild = {
             let mut idx = self.index.borrow_mut();
-            idx.register_constraint(name, label_token, vec![prop_key], kind);
-            if kind == ConstraintKind::Unique {
-                idx.register_node_property_with_state(label_token, prop_key, IndexState::Online);
+            idx.register_constraint(name, label_token, prop_keys.clone(), kind, type_descriptor);
+            match kind {
+                ConstraintKind::Unique => {
+                    if let [prop_key] = prop_keys.as_slice() {
+                        idx.register_node_property_with_state(
+                            label_token,
+                            *prop_key,
+                            IndexState::Online,
+                        );
+                    }
+                    true
+                }
+                ConstraintKind::NodeKey => {
+                    idx.register_composite(label_token, prop_keys.clone());
+                    true
+                }
+                ConstraintKind::Existence | ConstraintKind::PropertyType => false,
             }
-        }
-        if kind == ConstraintKind::Unique {
+        };
+        if needs_rebuild {
             Self::rebuild_index(&self.store, &self.index);
         }
         Ok(())
@@ -1154,18 +1320,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Returns a [`ConstraintViolation`]-wrapped runtime error naming the first offending node /
     /// duplicate value (uniqueness) or the first node missing the property (existence). A store-read
     /// fault on a node is treated as "skip that node" (best-effort), consistent with the rebuild path.
+    #[allow(clippy::too_many_arguments)]
     fn validate_existing_against_constraint(
         &self,
         name: &str,
         label: &str,
-        property: &str,
+        properties: &[&str],
         label_token: u32,
-        prop_key: u32,
+        prop_keys: &[u32],
         kind: ConstraintKind,
+        type_descriptor: Option<&ConstraintTypeDescriptor>,
     ) -> Result<()> {
         let node_ids = self.store.borrow_mut().scan_node_ids()?;
-        // For uniqueness: remember which values have been seen (rendered) to detect a duplicate.
+        // For single-property uniqueness: remember the values seen to detect a duplicate.
         let mut seen: Vec<(Value, u64)> = Vec::new();
+        // For composite node-key uniqueness: remember the full tuples seen.
+        let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
         for id in node_ids {
             // Read this node's label tokens; skip a read-faulting node best-effort.
             let label_tokens = match self.store.borrow_mut().node_labels(id) {
@@ -1175,15 +1345,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if !label_tokens.contains(&label_token) {
                 continue; // node does not carry the covered label
             }
-            let value = self.node_value_for_key(id, prop_key);
             match kind {
                 ConstraintKind::Existence => {
                     // A missing or null value violates the existence (NOT NULL) constraint.
+                    let value = self.node_value_for_key(id, prop_keys[0]);
                     if value.as_ref().is_none_or(graphus_core::Value::is_null) {
                         return Err(ConstraintViolation::Existence {
                             name: name.to_owned(),
                             label: label.to_owned(),
-                            property: property.to_owned(),
+                            property: properties[0].to_owned(),
                         }
                         .into_error());
                     }
@@ -1191,7 +1361,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 ConstraintKind::Unique => {
                     // A null/absent value never participates in uniqueness (Cypher equality treats
                     // null as never-equal), matching the index's treatment.
-                    let Some(value) = value.filter(|v| !v.is_null()) else {
+                    let Some(value) = self
+                        .node_value_for_key(id, prop_keys[0])
+                        .filter(|v| !v.is_null())
+                    else {
                         continue;
                     };
                     if seen
@@ -1201,12 +1374,70 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         return Err(ConstraintViolation::Uniqueness {
                             name: name.to_owned(),
                             label: label.to_owned(),
-                            property: property.to_owned(),
+                            property: properties[0].to_owned(),
                             value: render_value(&value),
                         }
                         .into_error());
                     }
                     seen.push((value, id));
+                }
+                ConstraintKind::NodeKey => {
+                    // Existence half: every covered property must be present and non-null.
+                    let mut tuple = Vec::with_capacity(prop_keys.len());
+                    let mut complete = true;
+                    for &prop_key in prop_keys {
+                        match self
+                            .node_value_for_key(id, prop_key)
+                            .filter(|v| !v.is_null())
+                        {
+                            Some(v) => tuple.push(v),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        return Err(ConstraintViolation::NodeKeyMissing {
+                            name: name.to_owned(),
+                            label: label.to_owned(),
+                            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+                        }
+                        .into_error());
+                    }
+                    // Uniqueness half: the complete tuple must not have been seen before.
+                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                        return Err(ConstraintViolation::NodeKeyDuplicate {
+                            name: name.to_owned(),
+                            label: label.to_owned(),
+                            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+                            values: render_tuple(&tuple),
+                        }
+                        .into_error());
+                    }
+                    seen_tuples.push(tuple);
+                }
+                ConstraintKind::PropertyType => {
+                    // Only a present, non-null value is type-checked (a missing/null value is allowed —
+                    // property-type does not imply existence).
+                    let Some(value) = self
+                        .node_value_for_key(id, prop_keys[0])
+                        .filter(|v| !v.is_null())
+                    else {
+                        continue;
+                    };
+                    let descriptor = type_descriptor
+                        .expect("INVARIANT: a PropertyType constraint always carries a descriptor");
+                    if !crate::constraint::value_matches_descriptor(&value, descriptor) {
+                        return Err(ConstraintViolation::PropertyType {
+                            name: name.to_owned(),
+                            label: label.to_owned(),
+                            property: properties[0].to_owned(),
+                            expected: crate::constraint::type_descriptor_name(descriptor),
+                            actual: crate::constraint::value_type_name(&value),
+                        }
+                        .into_error());
+                    }
                 }
             }
         }
@@ -1224,47 +1455,66 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .map(|(_pid, _key, value)| value)
     }
 
-    /// Drops the constraint named `name` (`rmp` task #99): removes its durable catalog entry in a
-    /// committed transaction and unregisters its in-memory rule, so the write path stops enforcing it.
+    /// Drops the constraint named `name` (`rmp` tasks #99, #100): removes its durable catalog entry in
+    /// a committed transaction and unregisters its in-memory rule, so the write path stops enforcing it.
     /// Idempotent on a never-declared name (a clean no-op success).
     ///
     /// The backing node-property index of a uniqueness constraint is **left registered** (a query may
     /// still benefit from it, and a plain `CREATE INDEX` may have independently declared it); only the
-    /// constraint *rule* is removed. A future `DROP INDEX` removes the index proper.
+    /// constraint *rule* is removed. A node-key constraint's backing **composite** index, by contrast,
+    /// exists only to serve the constraint (no `CREATE INDEX` surface declares one), so it is
+    /// **unregistered** here to release its in-memory tree.
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
     pub fn drop_constraint(&mut self, name: &str) -> Result<()> {
-        // A no-op when the constraint is not declared (avoids an empty committed transaction).
-        if self.store.borrow().constraint(name).is_none() {
+        // Resolve the entry first so a node key's backing composite index can be unregistered by its
+        // covered `(label, property tuple)` after the durable removal.
+        let entry = self.store.borrow().constraint(name);
+        let Some(entry) = entry else {
+            // A no-op when the constraint is not declared (avoids an empty committed transaction).
             self.index.borrow_mut().unregister_constraint(name);
             return Ok(());
-        }
+        };
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_constraint(name);
         self.store.borrow_mut().commit(txn)?;
-        self.index.borrow_mut().unregister_constraint(name);
+        let mut idx = self.index.borrow_mut();
+        idx.unregister_constraint(name);
+        if entry.kind == ConstraintKind::NodeKey {
+            idx.unregister_composite(entry.label_token, &entry.property_tokens);
+        }
         Ok(())
     }
 
-    /// Lists every declared constraint as `(name, label, property, kind)` (`rmp` task #99) for a
+    /// Lists every declared constraint as a [`ConstraintInfo`] (`rmp` tasks #99, #100) for a
     /// `SHOW CONSTRAINTS` surface. Reads the durable catalog and resolves the tokens back to names; an
-    /// entry whose tokens have no resolvable name (a defensively-skipped impossibility for a live
-    /// token) is omitted. Ordered by name.
+    /// entry whose tokens have no resolvable name (a defensively-skipped impossibility for a live token)
+    /// is omitted. A node-key constraint reports its **whole** property tuple in declared order; a
+    /// property-type constraint reports its declared type. Ordered by name.
     #[must_use]
-    pub fn list_constraints(&self) -> Vec<(String, String, String, ConstraintKind)> {
+    pub fn list_constraints(&self) -> Vec<ConstraintInfo> {
         let store = self.store.borrow();
         store
             .constraints()
             .into_iter()
             .filter_map(|(name, entry)| {
                 let label = store.token_name(Namespace::Label, entry.label_token)?;
-                // v1 covers exactly one property; resolve the first token's name.
-                let prop_token = *entry.property_tokens.first()?;
-                let property = store.token_name(Namespace::PropKey, prop_token)?;
-                Some((name, label.to_owned(), property.to_owned(), entry.kind))
+                // Resolve every covered property token's name (one for non-composite kinds, the whole
+                // tuple for a node key). A token with no resolvable name skips the whole entry.
+                let mut properties = Vec::with_capacity(entry.property_tokens.len());
+                for &prop_token in &entry.property_tokens {
+                    properties.push(store.token_name(Namespace::PropKey, prop_token)?.to_owned());
+                }
+                Some(ConstraintInfo {
+                    name,
+                    label: label.to_owned(),
+                    properties,
+                    kind: entry.kind,
+                    type_descriptor: entry.type_descriptor,
+                })
             })
             .collect()
     }

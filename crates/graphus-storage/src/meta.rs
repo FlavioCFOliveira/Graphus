@@ -135,22 +135,32 @@ pub struct SpatialIndexEntry {
     pub state: IndexState,
 }
 
-/// The kind of a declared constraint (`rmp` task #99).
+/// The kind of a declared constraint (`rmp` tasks #99, #100).
 ///
-/// A constraint is one of two schema rules over the nodes of a label:
+/// A constraint is one of four schema rules over the nodes of a label:
 ///
 /// - [`Unique`](Self::Unique) — a **uniqueness** constraint: no two nodes carrying the label may
 ///   share the same value for the covered property (a duplicate write is rejected before commit).
 /// - [`Existence`](Self::Existence) — an **existence** (`NOT NULL`) constraint: every node carrying
 ///   the label must carry the covered property with a non-null value (a write that omits or nulls it
 ///   is rejected before commit).
+/// - [`NodeKey`](Self::NodeKey) — a **node-key** constraint (`rmp` task #100): the combination of the
+///   covered (one or more) properties must be both **present** (every property non-null — existence)
+///   **and unique** as a tuple across all nodes carrying the label. It is the composite generalisation
+///   of `Unique` + `Existence` over the property *tuple* (a single-property node key is the common
+///   degenerate case).
+/// - [`PropertyType`](Self::PropertyType) — a **property-type** constraint (`rmp` task #100): when the
+///   covered property is present on a node carrying the label, its value's type must match the
+///   constraint's declared [`ConstraintTypeDescriptor`] (a write storing a value of the wrong type is
+///   rejected before commit). It does **not** require the property to be present — only that, *if*
+///   present, it conforms to the declared type.
 ///
 /// # Wire encoding
 ///
-/// Encoded as a single byte (see [`Statistics::encode`]). Future kinds (a composite node-key, a
-/// relationship-property constraint) are reserved by leaving the unused discriminants free;
-/// [`from_byte`](Self::from_byte) rejects any unknown byte so a forward-incompatible image is caught
-/// rather than silently mis-decoded — the same defensive stance as [`IndexState::from_byte`].
+/// Encoded as a single byte (see [`Statistics::encode`]). Future kinds (a relationship-property
+/// constraint) are reserved by leaving the unused discriminants free; [`from_byte`](Self::from_byte)
+/// rejects any unknown byte so a forward-incompatible image is caught rather than silently
+/// mis-decoded — the same defensive stance as [`IndexState::from_byte`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[must_use]
 pub enum ConstraintKind {
@@ -158,16 +168,24 @@ pub enum ConstraintKind {
     Unique,
     /// An existence (`NOT NULL`) constraint: every node of the label must carry the covered property.
     Existence,
+    /// A node-key constraint (`rmp` task #100): the covered property *tuple* is present on, and unique
+    /// across, every node of the label.
+    NodeKey,
+    /// A property-type constraint (`rmp` task #100): the covered property, when present on a node of
+    /// the label, has a value matching the declared [`ConstraintTypeDescriptor`].
+    PropertyType,
 }
 
 impl ConstraintKind {
-    /// The single-byte wire discriminant (`rmp` task #99). Discriminants `2..` are reserved for a
-    /// future composite-key / relationship-property constraint kind.
+    /// The single-byte wire discriminant (`rmp` tasks #99, #100). Discriminants `4..` are reserved for
+    /// a future relationship-property constraint kind.
     #[must_use]
     pub const fn as_byte(self) -> u8 {
         match self {
             Self::Unique => 0,
             Self::Existence => 1,
+            Self::NodeKey => 2,
+            Self::PropertyType => 3,
         }
     }
 
@@ -177,7 +195,87 @@ impl ConstraintKind {
         match byte {
             0 => Some(Self::Unique),
             1 => Some(Self::Existence),
+            2 => Some(Self::NodeKey),
+            3 => Some(Self::PropertyType),
             _ => None,
+        }
+    }
+}
+
+/// The declared value type a [`ConstraintKind::PropertyType`] constraint enforces (`rmp` task #100).
+///
+/// Models the subset of the openCypher type system a `IS :: <TYPE>` property-type constraint can
+/// declare: the scalar types `INTEGER`, `FLOAT`, `STRING`, `BOOLEAN`, and a `LIST<...>` of an
+/// (optional) element type. Storage carries this descriptor **verbatim** and never matches a value
+/// against it — the query layer (`graphus-cypher`) maps each variant onto the
+/// [`graphus_core::Value`](graphus_core::Value) model and performs the type check (exactly as it
+/// interprets the opaque analyzer / histogram bytes). Defining it here keeps the durable
+/// [`ConstraintEntry`] self-contained and lets the byte encoding live beside the other catalog blocks.
+///
+/// # Wire encoding
+///
+/// A scalar is a single tag byte; a list is the [`List`](Self::List) tag byte followed by its element
+/// descriptor's own encoding (so `LIST<INTEGER>` is two bytes and a bare `LIST` — element type
+/// unconstrained — is the list tag followed by the [`Any`](Self::Any) tag). [`Any`](Self::Any) exists
+/// only as a list element placeholder ("any element type"); it is never a top-level constraint type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintTypeDescriptor {
+    /// openCypher `INTEGER` — a [`Value::Integer`](graphus_core::Value::Integer).
+    Integer,
+    /// openCypher `FLOAT` — a [`Value::Float`](graphus_core::Value::Float).
+    Float,
+    /// openCypher `STRING` — a [`Value::String`](graphus_core::Value::String).
+    String,
+    /// openCypher `BOOLEAN` — a [`Value::Boolean`](graphus_core::Value::Boolean).
+    Boolean,
+    /// openCypher `LIST<inner>` — a [`Value::List`](graphus_core::Value::List) whose every element
+    /// matches `inner` (a boxed element descriptor). A bare `LIST` (no element type) carries
+    /// [`Any`](Self::Any) as `inner`.
+    List(Box<ConstraintTypeDescriptor>),
+    /// "Any type" — only ever a [`List`](Self::List) element placeholder, never a top-level type.
+    Any,
+}
+
+impl ConstraintTypeDescriptor {
+    /// The single tag byte for a scalar / list / any descriptor (`rmp` task #100). For a
+    /// [`List`](Self::List) this is just the list tag; its element descriptor is encoded separately by
+    /// [`encode`](Self::encode).
+    const fn tag_byte(&self) -> u8 {
+        match self {
+            Self::Integer => 0,
+            Self::Float => 1,
+            Self::String => 2,
+            Self::Boolean => 3,
+            Self::List(_) => 4,
+            Self::Any => 5,
+        }
+    }
+
+    /// Appends the self-describing byte encoding of this descriptor to `out` (`rmp` task #100): the tag
+    /// byte, followed — for a [`List`](Self::List) — by its element descriptor's own encoding.
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(self.tag_byte());
+        if let Self::List(inner) = self {
+            inner.encode(out);
+        }
+    }
+
+    /// Decodes a descriptor from `bytes` starting at `cur`, advancing past it (`rmp` task #100).
+    ///
+    /// # Errors
+    /// Returns a storage error on truncation or an unknown tag byte (a forward-incompatible image).
+    fn decode(bytes: &[u8], cur: &mut usize) -> Result<Self> {
+        let tag = read_u8(bytes, cur)?;
+        match tag {
+            0 => Ok(Self::Integer),
+            1 => Ok(Self::Float),
+            2 => Ok(Self::String),
+            3 => Ok(Self::Boolean),
+            4 => Ok(Self::List(Box::new(Self::decode(bytes, cur)?))),
+            5 => Ok(Self::Any),
+            other => Err(GraphusError::Storage(format!(
+                "constraint type descriptor holds unknown tag byte {other}"
+            ))),
         }
     }
 }
@@ -194,18 +292,31 @@ impl ConstraintKind {
 /// invariant is "an entry exists iff a constraint of that name is declared". Unlike an index there is
 /// **no build state**: a constraint is validated against existing data **synchronously** at creation
 /// time (creation fails if any existing node violates it), so a successfully-created constraint is
-/// always fully in force — there is no `Populating` analogue. For a uniqueness constraint the
-/// coordinator additionally maintains a backing in-memory unique index (rebuilt from the store on
-/// open, like every derived index), so only this catalog entry needs durability.
+/// always fully in force — there is no `Populating` analogue. For a uniqueness or node-key constraint
+/// the coordinator additionally maintains a backing in-memory index (rebuilt from the store on open,
+/// like every derived index), so only this catalog entry needs durability.
+///
+/// # Composite & typed kinds (`rmp` task #100)
+///
+/// `property_tokens` is a [`Vec`] so a [`ConstraintKind::NodeKey`] node-key constraint records its
+/// whole composite property tuple in declared order. The [`type_descriptor`](Self::type_descriptor)
+/// field carries the declared value type of a [`ConstraintKind::PropertyType`] constraint and is
+/// [`None`] for every other kind — see its docs for the backward-compatible encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstraintEntry {
     /// The node label-namespace token the constraint covers.
     pub label_token: u32,
-    /// The property-key-namespace tokens the constraint covers, in declared order (one or more;
-    /// exactly one in v1).
+    /// The property-key-namespace tokens the constraint covers, in declared order (one or more; one
+    /// for `Unique`/`Existence`/`PropertyType`, one-or-more for a composite `NodeKey`).
     pub property_tokens: Vec<u32>,
-    /// Whether the constraint is a uniqueness or an existence (`NOT NULL`) rule.
+    /// Whether the constraint is a uniqueness, existence, node-key or property-type rule.
     pub kind: ConstraintKind,
+    /// The declared value type of a [`ConstraintKind::PropertyType`] constraint (`rmp` task #100), or
+    /// [`None`] for every other kind. Encoded in a **backward-compatible trailing block** of the
+    /// constraint catalog (a per-entry presence byte + the descriptor), so a pre-#100 image — written
+    /// before this field existed and ending after the per-entry `kind` byte — decodes every entry with
+    /// `type_descriptor: None`. See [`Statistics::encode`].
+    pub type_descriptor: Option<ConstraintTypeDescriptor>,
 }
 
 /// Exact live-record cardinalities maintained in the durable catalog (`rmp` task #79).
@@ -651,9 +762,20 @@ impl Statistics {
     /// an empty full-text catalog. The spatial catalog block (`rmp` task #98) is appended **after**
     /// the full-text catalog by the same rule, so a pre-#98 image decodes to an empty spatial
     /// catalog. The constraint catalog block (`rmp` task #99) is appended **after** the spatial
-    /// catalog by the same rule, so a pre-#99 image decodes to an empty constraint catalog. No
-    /// format-version byte is needed because every prior block is length-exact and self-describing,
-    /// so each parse position is unambiguous.
+    /// catalog by the same rule, so a pre-#99 image decodes to an empty constraint catalog. The
+    /// constraint type-descriptor block (`rmp` task #100) is appended **after** the constraint catalog
+    /// by the same rule, so a pre-#100 image (ending after the constraint catalog) decodes with every
+    /// constraint's `type_descriptor` left `None`. No format-version byte is needed because every prior
+    /// block is length-exact and self-describing, so each parse position is unambiguous.
+    ///
+    /// # Why the property-type descriptors are a *separate* trailing block (`rmp` task #100)
+    ///
+    /// The per-entry `kind` byte of the constraint catalog block is the byte a pre-#100 image ends each
+    /// constraint entry on. Rather than widen that entry (which a pre-#100 reader could not skip), the
+    /// property-type descriptors live in their own appended block keyed by constraint name: a pre-#100
+    /// image ends right after the constraint catalog, so the descriptor block decodes empty and every
+    /// entry keeps `type_descriptor: None`. Only the named `PropertyType` constraints contribute an
+    /// entry to this block.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let hist_bytes: usize = self
@@ -680,6 +802,7 @@ impl Statistics {
         Self::encode_fulltext_catalog(&mut out, &self.fulltext_indexes);
         Self::encode_spatial_catalog(&mut out, &self.spatial_indexes);
         Self::encode_constraint_catalog(&mut out, &self.constraints);
+        Self::encode_constraint_type_block(&mut out, &self.constraints);
         out
     }
 
@@ -824,6 +947,38 @@ impl Statistics {
         }
     }
 
+    /// Encodes the constraint **type-descriptor** block (`rmp` task #100), appended after the
+    /// constraint catalog so a pre-#100 image (ending after that catalog) decodes with every
+    /// constraint's `type_descriptor` left `None`.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | descriptor ]*`, one entry **per
+    /// named constraint that carries a `type_descriptor`** (only [`ConstraintKind::PropertyType`]
+    /// constraints do), entries in ascending-name ([`BTreeMap`]) order so the image is deterministic.
+    /// The `descriptor` is the self-describing byte encoding from
+    /// [`ConstraintTypeDescriptor::encode`]. Constraints without a descriptor contribute nothing, so a
+    /// store using only #99-era kinds writes an empty (`0`-count) block.
+    fn encode_constraint_type_block(out: &mut Vec<u8>, map: &BTreeMap<String, ConstraintEntry>) {
+        let typed: Vec<(&String, &ConstraintTypeDescriptor)> = map
+            .iter()
+            .filter_map(|(name, entry)| entry.type_descriptor.as_ref().map(|d| (name, d)))
+            .collect();
+        debug_assert!(
+            typed.len() <= u32::MAX as usize,
+            "constraint type-descriptor entry count exceeds u32"
+        );
+        out.extend_from_slice(&(typed.len() as u32).to_le_bytes());
+        for (name, descriptor) in typed {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "constraint name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            descriptor.encode(out);
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -845,7 +1000,11 @@ impl Statistics {
         let node_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
         let fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
         let spatial_indexes = Self::decode_spatial_catalog(bytes, &mut cur)?;
-        let constraints = Self::decode_constraint_catalog(bytes, &mut cur)?;
+        let mut constraints = Self::decode_constraint_catalog(bytes, &mut cur)?;
+        // Merge the trailing property-type descriptor block (`rmp` task #100) back onto its named
+        // constraints. A pre-#100 image ends after the constraint catalog, so this block decodes empty
+        // and every entry keeps the `type_descriptor: None` the catalog decode already set.
+        Self::decode_constraint_type_block(bytes, &mut cur, &mut constraints)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -1105,6 +1264,8 @@ impl Statistics {
                         label_token,
                         property_tokens,
                         kind,
+                        // The descriptor (if any) is merged in by `decode_constraint_type_block`.
+                        type_descriptor: None,
                     },
                 )
                 .is_some()
@@ -1115,6 +1276,56 @@ impl Statistics {
             }
         }
         Ok(map)
+    }
+
+    /// Decodes the trailing constraint **type-descriptor** block (`rmp` task #100) and merges each
+    /// descriptor onto its named constraint in `constraints`. Like every later block, end-of-input
+    /// where its count `u32` would start means "no descriptor block" (a pre-#100 image), not
+    /// truncation — leaving every entry's `type_descriptor` as the `None` the catalog decode set.
+    ///
+    /// # Errors
+    /// Returns a storage error on truncation, a repeated/empty name, a name with no matching
+    /// constraint, or an unknown descriptor tag byte (none is ever produced by [`encode`](Self::encode)).
+    fn decode_constraint_type_block(
+        bytes: &[u8],
+        cur: &mut usize,
+        constraints: &mut BTreeMap<String, ConstraintEntry>,
+    ) -> Result<()> {
+        // Backward compatibility (`rmp` task #100): a pre-#100 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(());
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage(
+                    "constraint type-descriptor name is not valid UTF-8".to_owned(),
+                )
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "constraint type-descriptor block holds an empty constraint name".to_owned(),
+                ));
+            }
+            let descriptor = ConstraintTypeDescriptor::decode(bytes, cur)?;
+            if seen.insert(name.clone(), ()).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "constraint type-descriptor block repeats constraint name {name:?}"
+                )));
+            }
+            match constraints.get_mut(&name) {
+                Some(entry) => entry.type_descriptor = Some(descriptor),
+                None => {
+                    return Err(GraphusError::Storage(format!(
+                        "constraint type-descriptor block names unknown constraint {name:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1327,6 +1538,7 @@ mod tests {
                 label_token: 0,
                 property_tokens: vec![1],
                 kind: ConstraintKind::Unique,
+                type_descriptor: None,
             },
         );
         m.statistics.set_constraint(
@@ -1335,6 +1547,29 @@ mod tests {
                 label_token: 0,
                 property_tokens: vec![2],
                 kind: ConstraintKind::Existence,
+                type_descriptor: None,
+            },
+        );
+        // A composite node-key and a typed property-type constraint (`rmp` task #100) round-trip too,
+        // exercising the multi-property `Vec` and the trailing type-descriptor block.
+        m.statistics.set_constraint(
+            "person_id_key".to_owned(),
+            ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![1, 2],
+                kind: ConstraintKind::NodeKey,
+                type_descriptor: None,
+            },
+        );
+        m.statistics.set_constraint(
+            "person_age_int".to_owned(),
+            ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![2],
+                kind: ConstraintKind::PropertyType,
+                type_descriptor: Some(ConstraintTypeDescriptor::List(Box::new(
+                    ConstraintTypeDescriptor::Integer,
+                ))),
             },
         );
 
@@ -1386,6 +1621,7 @@ mod tests {
                 label_token: 0,
                 property_tokens: vec![1],
                 kind: ConstraintKind::Unique,
+                type_descriptor: None,
             })
         );
         assert_eq!(
@@ -1394,6 +1630,28 @@ mod tests {
                 label_token: 0,
                 property_tokens: vec![2],
                 kind: ConstraintKind::Existence,
+                type_descriptor: None,
+            })
+        );
+        // The composite node-key keeps its whole property tuple; the property-type keeps its descriptor.
+        assert_eq!(
+            back.statistics.constraint("person_id_key"),
+            Some(&ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![1, 2],
+                kind: ConstraintKind::NodeKey,
+                type_descriptor: None,
+            })
+        );
+        assert_eq!(
+            back.statistics.constraint("person_age_int"),
+            Some(&ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![2],
+                kind: ConstraintKind::PropertyType,
+                type_descriptor: Some(ConstraintTypeDescriptor::List(Box::new(
+                    ConstraintTypeDescriptor::Integer,
+                ))),
             })
         );
         assert_eq!(back.statistics.constraint("nope"), None);
@@ -1413,6 +1671,7 @@ mod tests {
                 label_token: 1,
                 property_tokens: vec![2],
                 kind: ConstraintKind::Unique,
+                type_descriptor: None,
             },
         );
         assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
@@ -1422,6 +1681,7 @@ mod tests {
                 label_token: 3,
                 property_tokens: vec![4],
                 kind: ConstraintKind::Existence,
+                type_descriptor: None,
             },
         );
         let back = Statistics::decode(&s.encode()).unwrap();
@@ -1430,8 +1690,9 @@ mod tests {
 
         // A pre-#99 image (a spatial-catalog-terminated image with NO constraint block) decodes to an
         // empty constraint catalog, not a truncation error. Build such an image by encoding a
-        // statistics value that carries a spatial index, then truncating off the trailing
-        // (zero-count) constraint block — a 4-byte `u32` of `0`.
+        // statistics value that carries a spatial index, then truncating off BOTH trailing zero-count
+        // blocks: the empty constraint catalog (`rmp` task #99) and the empty constraint type-descriptor
+        // block (`rmp` task #100), each a 4-byte `u32` of `0` (8 bytes total).
         let mut pre99 = Statistics::new();
         pre99.set_spatial_index(
             "loc".to_owned(),
@@ -1442,12 +1703,89 @@ mod tests {
             },
         );
         let mut image = pre99.encode();
-        // The last 4 bytes are the empty-constraint-block count (`0u32`); dropping them yields the
-        // exact byte image a pre-#99 build would have written.
-        image.truncate(image.len() - 4);
+        // The last 8 bytes are the empty-constraint-block count + the empty type-descriptor-block count
+        // (`0u32` each); dropping them yields the exact byte image a pre-#99 build would have written.
+        image.truncate(image.len() - 8);
         let decoded = Statistics::decode(&image).unwrap();
         assert!(decoded.constraints().is_empty());
         assert_eq!(decoded.spatial_indexes().len(), 1);
+    }
+
+    #[test]
+    fn statistics_constraint_type_descriptor_round_trips_and_pre_100_image_decodes_none() {
+        // Every descriptor variant (including a nested LIST<LIST<...>> and a bare LIST<Any>) round-trips
+        // through a `PropertyType` constraint.
+        for descriptor in [
+            ConstraintTypeDescriptor::Integer,
+            ConstraintTypeDescriptor::Float,
+            ConstraintTypeDescriptor::String,
+            ConstraintTypeDescriptor::Boolean,
+            ConstraintTypeDescriptor::List(Box::new(ConstraintTypeDescriptor::String)),
+            ConstraintTypeDescriptor::List(Box::new(ConstraintTypeDescriptor::Any)),
+            ConstraintTypeDescriptor::List(Box::new(ConstraintTypeDescriptor::List(Box::new(
+                ConstraintTypeDescriptor::Integer,
+            )))),
+        ] {
+            let mut s = Statistics::new();
+            s.set_constraint(
+                "t".to_owned(),
+                ConstraintEntry {
+                    label_token: 1,
+                    property_tokens: vec![2],
+                    kind: ConstraintKind::PropertyType,
+                    type_descriptor: Some(descriptor.clone()),
+                },
+            );
+            let back = Statistics::decode(&s.encode()).unwrap();
+            assert_eq!(back, s);
+            assert_eq!(
+                back.constraint("t").unwrap().type_descriptor,
+                Some(descriptor)
+            );
+        }
+
+        // A composite NODE KEY constraint (multi-property, no type descriptor) round-trips, proving the
+        // `property_tokens` Vec carries the whole tuple and the type-descriptor block stays empty for it.
+        let mut s = Statistics::new();
+        s.set_constraint(
+            "k".to_owned(),
+            ConstraintEntry {
+                label_token: 7,
+                property_tokens: vec![10, 11, 12],
+                kind: ConstraintKind::NodeKey,
+                type_descriptor: None,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            back.constraint("k").unwrap().property_tokens,
+            vec![10, 11, 12]
+        );
+
+        // A pre-#100 image: a #99-era store that has a Unique constraint but NO type-descriptor block.
+        // We synthesise it by encoding a Unique constraint, then dropping the trailing 4-byte
+        // empty-type-descriptor-block count (`0u32`). The reader must decode the constraint with
+        // `type_descriptor: None`, not raise a truncation error.
+        let mut pre100 = Statistics::new();
+        pre100.set_constraint(
+            "u".to_owned(),
+            ConstraintEntry {
+                label_token: 1,
+                property_tokens: vec![2],
+                kind: ConstraintKind::Unique,
+                type_descriptor: None,
+            },
+        );
+        let mut image = pre100.encode();
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert_eq!(decoded.constraints().len(), 1);
+        assert_eq!(decoded.constraint("u").unwrap().type_descriptor, None);
+        assert_eq!(
+            decoded.constraint("u").unwrap().kind,
+            ConstraintKind::Unique
+        );
     }
 
     #[test]

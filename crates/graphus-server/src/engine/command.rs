@@ -179,6 +179,30 @@ pub enum ConstraintCommand {
         /// The property the constraint covers (exactly one).
         property: String,
     },
+    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE (n.a, n.b, …) IS NODE KEY` (`rmp` task #100):
+    /// declares a **node-key** constraint over a composite property tuple (present + unique) after
+    /// validating existing data conforms.
+    CreateNodeKey {
+        /// The server-unique constraint name.
+        name: String,
+        /// The node label the constraint covers.
+        label: String,
+        /// The properties forming the key, in declared order (one or more).
+        properties: Vec<String>,
+    },
+    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE n.<prop> IS :: <TYPE>` (`rmp` task #100):
+    /// declares a **property-type** constraint requiring the covered property — when present — to hold
+    /// a value of `declared_type`, after validating existing data conforms.
+    CreatePropertyType {
+        /// The server-unique constraint name.
+        name: String,
+        /// The node label the constraint covers.
+        label: String,
+        /// The property the constraint covers (exactly one).
+        property: String,
+        /// The declared value type the property must match.
+        declared_type: graphus_storage::ConstraintTypeDescriptor,
+    },
     /// `DROP CONSTRAINT <name>` (`rmp` task #99): removes the constraint (durable + in-memory), so the
     /// write path stops enforcing it.
     Drop {

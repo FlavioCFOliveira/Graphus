@@ -154,7 +154,7 @@ pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
 pub use constraint::{CONSTRAINT_VIOLATION_PREFIX, ConstraintViolation};
-pub use coordinator::{CoordinatorStatistics, TxnCoordinator};
+pub use coordinator::{ConstraintInfo, CoordinatorStatistics, TxnCoordinator};
 pub use cost::{CostEstimate, estimate_cost};
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;

@@ -174,6 +174,28 @@ fn create_existence(name: &str, label: &str, property: &str) -> ConstraintComman
     }
 }
 
+fn create_node_key(name: &str, label: &str, properties: &[&str]) -> ConstraintCommand {
+    ConstraintCommand::CreateNodeKey {
+        name: name.to_owned(),
+        label: label.to_owned(),
+        properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+    }
+}
+
+fn create_property_type(
+    name: &str,
+    label: &str,
+    property: &str,
+    declared_type: graphus_storage::ConstraintTypeDescriptor,
+) -> ConstraintCommand {
+    ConstraintCommand::CreatePropertyType {
+        name: name.to_owned(),
+        label: label.to_owned(),
+        property: property.to_owned(),
+        declared_type,
+    }
+}
+
 async fn show_constraints(handle: &EngineHandle) -> IndexDdlReply {
     handle
         .constraint_ddl(ConstraintCommand::Show)
@@ -419,4 +441,258 @@ async fn constraints_survive_a_full_server_restart() {
     assert_eq!(person_count(&engine).await, 2);
 
     handle.shutdown().await.expect("shutdown");
+}
+
+// =================================================================================================
+// NODE KEY — `rmp` task #100
+// =================================================================================================
+
+#[tokio::test]
+async fn node_key_enforced_on_create_set_and_merge() {
+    let temp = TempStore::new("nodekey");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
+    engine
+        .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+        .await
+        .expect("create node key over conforming data");
+
+    // A CREATE missing one key component is rejected (existence half).
+    let err = try_run(&engine, "CREATE (:Person {first: 'Grace'})")
+        .await
+        .expect_err("missing key component must be rejected");
+    assert_constraint_violation(&err);
+
+    // A CREATE duplicating the full tuple is rejected (uniqueness half).
+    let err = try_run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})")
+        .await
+        .expect_err("duplicate composite tuple must be rejected");
+    assert_constraint_violation(&err);
+    assert_eq!(person_count(&engine).await, 1);
+
+    // A tuple differing in one component is allowed.
+    run(&engine, "CREATE (:Person {first: 'Ada', last: 'Byron'})").await;
+    assert_eq!(person_count(&engine).await, 2);
+
+    // A MERGE that creates a colliding tuple is rejected.
+    let err = try_run(
+        &engine,
+        "MERGE (:Person {first: 'Ada', last: 'Lovelace', note: 'x'})",
+    )
+    .await
+    .expect_err("MERGE creating a duplicate tuple must be rejected");
+    assert_constraint_violation(&err);
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn node_key_creation_time_validation() {
+    let temp = TempStore::new("nodekeyvalidate");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // Two nodes share a composite tuple: the node key cannot be created.
+    run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
+    run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
+    let err = engine
+        .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+        .await
+        .expect_err("node key over duplicate tuples must be rejected");
+    assert_constraint_violation(&err);
+    assert_eq!(show_constraints(&engine).await.rows.len(), 0);
+
+    // A node missing a component: the node key cannot be created.
+    run(&engine, "CREATE (:Person {first: 'Solo'})").await;
+    let err = engine
+        .constraint_ddl(create_node_key("person_key2", "Person", &["first", "last"]))
+        .await
+        .expect_err("node key over data missing a component must be rejected");
+    assert_constraint_violation(&err);
+    assert_eq!(show_constraints(&engine).await.rows.len(), 0);
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn node_key_survives_a_full_server_restart() {
+    let temp = TempStore::new("nodekeyrestart");
+    let cfg = config(&temp);
+
+    {
+        let handle = boot(cfg.clone()).await;
+        let engine = handle.engine.clone();
+        run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
+        engine
+            .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+            .await
+            .expect("create node key");
+        try_run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})")
+            .await
+            .expect_err("node key enforced before restart");
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    let handle = boot(cfg).await;
+    let engine = handle.engine.clone();
+    assert_eq!(
+        show_constraints(&engine).await.rows.len(),
+        1,
+        "the node key must survive the restart"
+    );
+
+    // The duplicate tuple is still rejected (the backing composite index was rebuilt).
+    let err = try_run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})")
+        .await
+        .expect_err("node key must still enforce after restart");
+    assert_constraint_violation(&err);
+
+    // A missing component is still rejected.
+    let err = try_run(&engine, "CREATE (:Person {first: 'Lone'})")
+        .await
+        .expect_err("node-key existence must still enforce after restart");
+    assert_constraint_violation(&err);
+
+    // A distinct, complete tuple still succeeds.
+    run(&engine, "CREATE (:Person {first: 'Grace', last: 'Hopper'})").await;
+    assert_eq!(person_count(&engine).await, 2);
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+// =================================================================================================
+// PROPERTY TYPE — `rmp` task #100
+// =================================================================================================
+
+#[tokio::test]
+async fn property_type_enforced_on_create_and_set() {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    let temp = TempStore::new("proptype");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:Person {age: 30})").await;
+    engine
+        .constraint_ddl(create_property_type("age_int", "Person", "age", T::Integer))
+        .await
+        .expect("create property-type constraint over conforming data");
+
+    // A STRING where INTEGER is required is rejected with the right class.
+    let err = try_run(&engine, "CREATE (:Person {age: 'old'})")
+        .await
+        .expect_err("wrong type must be rejected");
+    assert_constraint_violation(&err);
+
+    // The correct type succeeds; an absent property succeeds (type does not imply existence).
+    run(&engine, "CREATE (:Person {age: 25})").await;
+    run(&engine, "CREATE (:Person {name: 'NoAge'})").await;
+    assert_eq!(person_count(&engine).await, 3);
+
+    // A SET storing the wrong type is rejected.
+    let err = try_run(&engine, "MATCH (p:Person {age: 25}) SET p.age = 'nope'")
+        .await
+        .expect_err("SET to wrong type must be rejected");
+    assert_constraint_violation(&err);
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn property_type_creation_time_validation_and_restart() {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    let temp = TempStore::new("proptyperestart");
+    let cfg = config(&temp);
+
+    {
+        let handle = boot(cfg.clone()).await;
+        let engine = handle.engine.clone();
+
+        // Existing wrong-typed data: the constraint cannot be created.
+        run(&engine, "CREATE (:Person {score: 'high'})").await;
+        let err = engine
+            .constraint_ddl(create_property_type(
+                "score_int",
+                "Person",
+                "score",
+                T::Integer,
+            ))
+            .await
+            .expect_err("property-type over wrong-typed data must be rejected");
+        assert_constraint_violation(&err);
+        assert_eq!(show_constraints(&engine).await.rows.len(), 0);
+
+        // Overwrite with a conforming value, then declare the constraint.
+        run(&engine, "MATCH (p:Person {score: 'high'}) SET p.score = 99").await;
+        engine
+            .constraint_ddl(create_property_type(
+                "score_int",
+                "Person",
+                "score",
+                T::Integer,
+            ))
+            .await
+            .expect("create over conforming data");
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    let handle = boot(cfg).await;
+    let engine = handle.engine.clone();
+    assert_eq!(show_constraints(&engine).await.rows.len(), 1);
+
+    // The type rule still enforces after the restart.
+    let err = try_run(&engine, "CREATE (:Person {score: 'bad'})")
+        .await
+        .expect_err("property-type must still enforce after restart");
+    assert_constraint_violation(&err);
+    run(&engine, "CREATE (:Person {score: 7})").await;
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn show_constraints_lists_all_four_kinds() {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    let temp = TempStore::new("showall");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    engine
+        .constraint_ddl(create_unique("u", "Person", "email"))
+        .await
+        .expect("unique");
+    engine
+        .constraint_ddl(create_existence("e", "Person", "name"))
+        .await
+        .expect("existence");
+    engine
+        .constraint_ddl(create_node_key("k", "Person", &["first", "last"]))
+        .await
+        .expect("node key");
+    engine
+        .constraint_ddl(create_property_type("t", "Person", "age", T::Integer))
+        .await
+        .expect("property type");
+
+    let reply = show_constraints(&engine).await;
+    assert_eq!(reply.rows.len(), 4);
+    // Rows are ordered by name: e, k, t, u.
+    assert_eq!(reply.rows[0][0], Value::String("e".to_owned()));
+    assert_eq!(
+        reply.rows[0][3],
+        Value::String("NODE_PROPERTY_EXISTENCE".to_owned())
+    );
+    assert_eq!(reply.rows[1][0], Value::String("k".to_owned()));
+    assert_eq!(reply.rows[1][2], Value::String("first, last".to_owned()));
+    assert_eq!(reply.rows[1][3], Value::String("NODE_KEY".to_owned()));
+    assert_eq!(reply.rows[2][0], Value::String("t".to_owned()));
+    assert_eq!(
+        reply.rows[2][3],
+        Value::String("NODE_PROPERTY_TYPE INTEGER".to_owned())
+    );
+    assert_eq!(reply.rows[3][0], Value::String("u".to_owned()));
+    assert_eq!(reply.rows[3][3], Value::String("UNIQUENESS".to_owned()));
+
+    handle.shutdown().await.expect("graceful shutdown");
 }
