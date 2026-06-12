@@ -32,8 +32,16 @@ pub const HEADER_SLOTS: u64 = 1;
 /// Encrypted). Distinct from the plaintext store magic so the two formats can never be confused.
 pub const HEADER_MAGIC: [u8; 8] = *b"GRAPHUSE";
 
-/// The encrypted on-disk format version. Bumped on any incompatible header/slot layout change.
-pub const HEADER_VERSION: u32 = 1;
+/// The encrypted on-disk format version. Bumped on any incompatible header/slot layout change, or
+/// any change to how the persisted KCV bytes are computed.
+///
+/// - **v1**: KCV sealed under the *store* page-encryption subkey.
+/// - **v2** (rmp #87): KCV sealed under a dedicated, independent *store-KCV* subkey (the fixed KCV
+///   nonce now shares no nonce space with page encryption). This changes the persisted KCV bytes, so
+///   a v1 file's KCV would not validate under v2 anyway; the version check fails it closed first with
+///   a clear "unsupported version" error. This is a pre-1.0 greenfield database with **no persisted
+///   production encrypted stores**, so no migration path is needed.
+pub const HEADER_VERSION: u32 = 2;
 
 /// Cipher identifier for AES-256-GCM with a 96-bit nonce and 128-bit tag.
 pub const CIPHER_AES_256_GCM: u32 = 1;

@@ -61,8 +61,16 @@ use crate::slot::{NONCE_LEN, TAG_LEN};
 /// from the store's `"GRAPHUSE"` so the two encrypted formats can never be confused.
 pub const WAL_SINK_MAGIC: [u8; 8] = *b"GRAPHUSW";
 
-/// The encrypted-WAL sink format version. Bumped on any incompatible header/frame layout change.
-pub const WAL_SINK_VERSION: u32 = 1;
+/// The encrypted-WAL sink format version. Bumped on any incompatible header/frame layout change, or
+/// any change to how the persisted WAL KCV bytes are computed. Bumped in lock-step with the store's
+/// [`crate::HEADER_VERSION`].
+///
+/// - **v1**: WAL KCV sealed under the *WAL* frame-encryption subkey.
+/// - **v2** (rmp #87): WAL KCV sealed under a dedicated, independent *WAL-KCV* subkey (the fixed KCV
+///   nonce now shares no nonce space with frame encryption). This changes the persisted WAL KCV
+///   bytes; a v1 sink fails closed at open on the version check. No migration is needed (pre-1.0,
+///   no persisted production encrypted WALs).
+pub const WAL_SINK_VERSION: u32 = 2;
 
 /// Cipher identifier for AES-256-GCM with a 96-bit nonce and 128-bit tag (matches the store).
 pub const WAL_CIPHER_AES_256_GCM: u32 = 1;

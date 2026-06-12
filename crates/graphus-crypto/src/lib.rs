@@ -57,7 +57,8 @@ pub use backup_envelope::{
 pub use device::{EncryptedBlockDevice, EncryptedFileDevice};
 pub use header::{CIPHER_AES_256_GCM, HEADER_MAGIC, HEADER_SLOTS, HEADER_VERSION, Header};
 pub use keyring::{
-    KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_SUBKEY_INFO, WAL_SUBKEY_INFO, random_salt,
+    KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_KCV_SUBKEY_INFO, STORE_SUBKEY_INFO, WAL_KCV_SUBKEY_INFO,
+    WAL_SUBKEY_INFO, random_salt,
 };
 pub use raw::{FileRawSlots, MemRawSlots, RawSlots};
 pub use slot::{NONCE_LEN, SLOT_SIZE, TAG_LEN};

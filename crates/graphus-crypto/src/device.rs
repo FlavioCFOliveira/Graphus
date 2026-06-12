@@ -44,6 +44,18 @@
 //! re-initialises them. The header is therefore written exactly once (at create) and never again, which
 //! also removes a latent whole-store-corruption risk: a torn write to slot 0 (magic/salt/KCV — needed
 //! to open the *whole* store) on every `extend`.
+//!
+//! This derived-page-count invariant is exactly **why the bare-zero read path in [`read_page`] is
+//! retained** (rmp #87): because a crash mid-`extend` can leave durable-but-all-zero slots that the
+//! count includes and recovery's read-modify-write must read back as zeros (not fail closed), the
+//! all-zero slot cannot be made a real AEAD slot without either syncing inside `extend` (unacceptable)
+//! or redesigning the crash-consistency model. Writing `enc(zero-page)` on `extend` would re-open that
+//! crash window (the `set_len` is durable before the content writes are synced) while adding ~2x write
+//! amplification per allocation — so it is *not* done. The residual integrity gap (an active live-disk
+//! attacker zeroing a real slot reads back as zeros, bypassing the tag) is **outside** the at-rest
+//! (stolen-disk *confidentiality*) threat model and is **defeated in practice** for the real consumer:
+//! the storage layer verifies each page's CRC32C header on read, which an all-zero page fails. See the
+//! KNOWN LIMITATION block in [`read_page`] for the full bound and the regression tests that pin it.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -213,17 +225,41 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         // disagree with the tag), so it still fails AEAD verification below. Only the genuinely
         // pristine zero slot takes this path.
         //
-        // KNOWN LIMITATION (documented, outside the at-rest threat model): because an all-zero slot
-        // is read as a zero page WITHOUT AEAD verification, an *active* attacker with write access to
-        // the disk could overwrite a real page's slot with zeros and have it read back as a zero page
-        // — the tag is bypassed for an all-zero slot, so AEAD does not detect this substitution. This
-        // is explicitly out of scope for the documented at-rest (stolen-disk *confidentiality*) threat
-        // model, which assumes an attacker who can read but not actively tamper with the live disk. It
-        // is further mitigated in practice because the storage layer validates each page's own
-        // CRC32C/header on read, which rejects a zeroed-out real page. A fully-authenticated
-        // alternative — writing `enc(zero-page)` for every extended page so no slot is ever a bare
-        // zero — is possible future hardening, at the cost of I/O on `extend`. We keep the bare-zero
-        // shortcut here because the never-written-page-reads-zeros contract depends on it.
+        // KNOWN LIMITATION (documented + bounded, rmp #87; outside the at-rest threat model):
+        // because an all-zero slot is read as a zero page WITHOUT AEAD verification, an *active*
+        // attacker with write access to the live disk could overwrite a real page's slot with zeros
+        // and have it read back as a zero page — the tag is bypassed for an all-zero slot, so AEAD
+        // does not detect this *one* substitution (zeroing). This is explicitly out of scope for the
+        // documented at-rest (stolen-disk *confidentiality*) threat model, which assumes an attacker
+        // who can read but not actively tamper with the live disk.
+        //
+        // Residual-risk bound — it is *defeated in practice for the real consumer*: the storage layer
+        // never reads a page through this device without verifying that page's own CRC32C header
+        // (`graphus_bufpool::BufferPool::fetch` / `ConcurrentBufferPool::load_into`). An all-zero
+        // page fails that check, because `crc32c` of an all-zero page body is `0xfc1c38a5` (non-zero)
+        // while the stored checksum field of a zero page is `0` — so a zeroed-out *real* page is
+        // rejected as "page N failed checksum verification" before any use. (The encrypted-crate
+        // regression `storage_rejects_a_zeroed_out_real_page_via_crc32c` proves exactly this.) The
+        // only slot that legitimately reaches this bare-zero path is a genuinely pristine
+        // never-written page, whose CRC the storage layer never trusts (allocation builds a fresh
+        // page in memory with a valid checksum; it does not read the bare slot).
+        //
+        // Why we do NOT replace this with `enc(zero-page)`-on-extend (which would seem to remove the
+        // bare-zero slot entirely): it cannot, and it would cost ~2x write amplification on every
+        // page allocation for no security gain. `RawSlots::write_slot` rejects out-of-range indices,
+        // so writing `enc(zero-page)` for a new page first requires `backing.extend` (a `set_len`).
+        // That `set_len` (file `i_size` growth) becomes durable INDEPENDENTLY of the buffered content
+        // writes, which `extend` must NOT sync (durability/perf). The logical page count is DERIVED
+        // (`backing.slot_count() - HEADER_SLOTS`), deliberately not stored (see the module's
+        // crash-consistency note). So a crash after `extend` returns but before the content writes are
+        // synced leaves the slot_count durably grown with the new slots still ALL-ZERO; on reopen
+        // those durable-but-zero slots are counted and read — and recovery's read-modify-write
+        // (`DeviceTarget::apply`, which reads a page before patching it) would fail AEAD on them if
+        // the bare-zero path were removed. The bare-zero path is therefore load-bearing for
+        // crash-consistency: it is exactly what makes a crash mid-`extend` recoverable (regression
+        // `reopen_recovers_when_extend_outlived_a_crash_before_header_sync`). `enc(zero-page)` would
+        // re-open that crash window unless `extend` synced (unacceptable) or the derived-page-count
+        // model were redesigned — so it adds I/O without closing the hole.
         if s.iter().all(|&b| b == 0) {
             buf.fill(0);
             return Ok(());
@@ -331,6 +367,17 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         // Grow the backing first (zero-filled slots). Newly-extended logical pages are zero slots
         // until written; the storage layer always writes a page before reading it (it initialises
         // pages on allocation), exactly as on the plaintext device where a fresh page is zero bytes.
+        //
+        // COST (rmp #87, on the record here): this is an O(1) `set_len` (one `i_size` metadata
+        // change) regardless of `additional` — it does NOT write `additional` slots of content. The
+        // alternative considered and rejected — writing `enc(zero-page)` for each extended page so no
+        // slot is ever a bare zero — would be O(additional) authenticated 8 KiB slot writes per
+        // allocation, i.e. roughly 2x write amplification on page allocation (one `enc(zero-page)`
+        // write now, then the real `write_page` later), and would still NOT close the active-tamper
+        // hole (see `read_page`'s KNOWN LIMITATION: a crash after this `set_len` but before those
+        // content writes are synced re-creates the durable-but-zero slots, which the derived
+        // page-count model counts and reads on reopen). So the cheap `set_len` is also the correct
+        // choice for crash-consistency, not merely for performance.
         //
         // The header is NOT rewritten here: the backing slot count is the single source of truth for
         // the logical page count, so a reopen derives the count from the backing. This is what closes

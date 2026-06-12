@@ -44,3 +44,9 @@ subtle = "2"
 # directly (for `sync_all`), so it is re-declared here for clarity of intent.
 graphus-storage = { path = "../graphus-storage" }
 graphus-wal = { path = "../graphus-wal" }
+# The pristine-page bound regression (rmp #87) drives the *real* storage-layer consumer —
+# `graphus_bufpool::BufferPool::fetch`, which verifies each page's CRC32C header on load — to prove
+# empirically that a zeroed-out real encrypted slot is rejected (the residual-risk bound documented
+# in `device::read_page`). It also uses the `page` header/checksum helpers to build a realistic
+# checksummed page, exactly as `new_page`/`write_back` produce.
+graphus-bufpool = { path = "../graphus-bufpool" }

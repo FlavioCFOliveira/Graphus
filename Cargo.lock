@@ -1043,6 +1043,7 @@ name = "graphus-crypto"
 version = "0.0.0"
 dependencies = [
  "aes-gcm",
+ "graphus-bufpool",
  "graphus-core",
  "graphus-io",
  "graphus-storage",
