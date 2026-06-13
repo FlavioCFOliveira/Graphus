@@ -32,6 +32,7 @@
 mod block;
 mod file;
 mod mem;
+mod replace;
 
 // The async/network half is built on Tokio. Tokio's own `net`/runtime modules are
 // `#![cfg(not(loom))]`, so under `--cfg loom` `tokio::net` does not exist and these modules cannot
@@ -55,6 +56,7 @@ mod uring;
 pub use block::{BlockDevice, PAGE_SIZE, Page};
 pub use file::FileBlockDevice;
 pub use mem::MemBlockDevice;
+pub use replace::atomic_replace_file;
 
 #[cfg(not(loom))]
 pub use backend::{IoBackend, probe_io_uring, select_backend};

@@ -63,8 +63,10 @@
 use graphus_bufpool::page;
 use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
-use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
-use graphus_wal::{LogSink, WalManager};
+use std::path::Path;
+
+use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page, atomic_replace_file};
+use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 use crate::check::{IndexAgreement, verify_on_open};
 use crate::store::RecordStore;
@@ -336,6 +338,64 @@ pub fn restore<S: LogSink>(
     let indexes: &[IndexAgreement] = &[];
     verify_on_open(&mut store, indexes)?;
     Ok(store)
+}
+
+/// **Atomic, verified file restore** of a backup artifact onto the store file at `target`
+/// (`04 §4.6`, storage audit F2/F7/F11).
+///
+/// Unlike the low-level [`restore_onto`] (which writes pages **in place** over whatever device it is
+/// given), this restores into a fresh sibling temp file, **proves the restored image is consistent**
+/// ([`verify_on_open`]) before it is allowed to replace anything, and only then atomically
+/// `rename(2)`s the temp over `target` and `fsync`s the directory ([`atomic_replace_file`]). The
+/// consequences:
+///
+/// * **Atomicity (F2):** a crash mid-restore leaves `target` as the old whole image or the new whole
+///   image — never an in-place torn mixture of both, and an aborted restore (e.g. a failed verify)
+///   leaves the original byte-for-byte intact.
+/// * **Verification (F7):** an artifact that frames an internally-inconsistent image (one that still
+///   passes the per-page and whole-payload digests) is **rejected** before it can replace the target.
+/// * **No stale pages (F11):** the image is built in a fresh temp of exactly the artifact's extent,
+///   so no page outside the artifact's set survives from a previous, larger occupant.
+///
+/// `open_device` creates the restore device over the temp path — pass `|p| FileBlockDevice::open(p)`
+/// for a plaintext store, or a closure creating an encrypted device for an encrypted store (the page
+/// images are plaintext above the device seam, so the device encrypts them on write). `pool_capacity`
+/// sizes the buffer pool used for the verification open; the verification uses a throwaway in-memory
+/// WAL (the artifact captures the data at a clean checkpoint, so no replay is needed).
+///
+/// # Errors
+/// Returns a storage error if the artifact fails verification, a device write/sync fails, the
+/// restored image fails the consistency check, or the temp/rename/directory-`fsync` fails. On any
+/// error `target` is left untouched.
+pub fn restore_file_atomic<D, FD>(
+    artifact: &[u8],
+    target: &Path,
+    open_device: FD,
+    pool_capacity: usize,
+) -> Result<()>
+where
+    D: BlockDevice,
+    FD: FnOnce(&Path) -> Result<D>,
+{
+    atomic_replace_file(target, |tmp| {
+        // Write the artifact's pages into a device over the temp file (the device hardens its own
+        // content in `restore_onto`'s trailing `sync_all`).
+        let mut device = open_device(tmp)?;
+        restore_onto(artifact, &mut device)?;
+        // Prove the just-written image is internally consistent BEFORE it is allowed to replace the
+        // target. Open a store over the same device with a throwaway in-memory WAL (clean checkpoint
+        // ⇒ no replay) and run the full checker; the open + check are read-only, so the temp's
+        // on-disk bytes remain the durable image `restore_onto` synced. Dropping the store closes the
+        // temp file descriptor before `atomic_replace_file` renames it.
+        let mut store = RecordStore::open(
+            device,
+            WalManager::create(MemLogSink::new())?,
+            pool_capacity,
+        )?;
+        verify_on_open(&mut store, &[])?;
+        drop(store);
+        Ok(())
+    })
 }
 
 /// The element-id-next creation marker embedded in a backup artifact (the value the source store

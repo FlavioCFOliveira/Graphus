@@ -29,8 +29,8 @@ use graphus_io::{MemBlockDevice, PAGE_SIZE, Page};
 use graphus_sim::SimRng;
 use graphus_storage::record::NODE_RECORD_SIZE;
 use graphus_storage::{
-    Namespace, RecordStore, backup_creation_marker, backup_store, restore, restore_onto,
-    verify_backup, verify_on_open,
+    Namespace, RecordStore, backup_creation_marker, backup_store, restore, restore_file_atomic,
+    restore_onto, verify_backup, verify_on_open,
 };
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -515,6 +515,155 @@ fn refresh_artifact_digest(artifact: &mut [u8]) {
 fn mvcc_plus_eid() -> usize {
     use graphus_storage::MVCC_HEADER_SIZE;
     MVCC_HEADER_SIZE + 16
+}
+
+// ============================================================================================
+// Atomic, verified file restore (storage audit F2/F7/F11) — `restore_file_atomic`.
+// ============================================================================================
+
+/// A unique temp file path for one test (no collisions across tests / processes).
+fn unique_blk_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "graphus-atomic-restore-{tag}-{}-{n}.blk",
+        std::process::id()
+    ))
+}
+
+/// Opens a store from a file at `path` (plaintext) and snapshots its durable graph.
+fn snapshot_file(path: &std::path::Path) -> GraphSnapshot {
+    use graphus_io::FileBlockDevice;
+    let dev = FileBlockDevice::open(path).expect("open file device");
+    let mut store = RecordStore::open(dev, fresh_wal(), 64).expect("open store from file");
+    verify_on_open(&mut store, &[]).expect("restored store is consistent");
+    snapshot(&mut store)
+}
+
+/// The temp file `restore_file_atomic` writes into is a sibling of the target — assert it is cleaned
+/// up so a successful or aborted restore leaves no residue.
+fn temp_residue(path: &std::path::Path) -> std::path::PathBuf {
+    let name = path.file_name().unwrap().to_os_string();
+    let mut tmp = name;
+    tmp.push(".graphus-replace-tmp");
+    path.with_file_name(tmp)
+}
+
+/// Happy path: an atomic restore to a path that does not yet exist creates a consistent store
+/// byte-equivalent to the in-memory restore, and leaves no temp residue.
+#[test]
+fn restore_file_atomic_creates_and_round_trips() {
+    use graphus_io::FileBlockDevice;
+    let path = unique_blk_path("create");
+
+    let mut original = build_graph(7, 120);
+    let artifact = backup_store(&mut original).expect("backup");
+    let expected = snapshot(&mut restore(&artifact, fresh_wal(), 64).expect("in-memory restore"));
+
+    assert!(!path.exists(), "target should not pre-exist");
+    restore_file_atomic(&artifact, &path, |p| FileBlockDevice::open(p), 64)
+        .expect("atomic restore");
+
+    assert!(path.exists(), "atomic restore must create the target");
+    assert!(
+        !temp_residue(&path).exists(),
+        "a successful restore must leave no temp residue"
+    );
+    assert_eq!(
+        expected,
+        snapshot_file(&path),
+        "atomic file restore must match the in-memory restore"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Abort path (F2 atomicity + F7 verification): restoring an internally-inconsistent artifact over a
+/// valid existing image fails AND leaves the original byte-for-byte intact, with no temp residue —
+/// there is never an in-place torn mixture of the two images.
+#[test]
+fn restore_file_atomic_abort_leaves_the_original_intact() {
+    use graphus_io::FileBlockDevice;
+    let path = unique_blk_path("abort");
+
+    // Seed the target with a valid ORIGINAL image (graph A) via a baseline atomic restore.
+    let mut graph_a = build_graph(11, 100);
+    let artifact_a = backup_store(&mut graph_a).expect("backup A");
+    restore_file_atomic(&artifact_a, &path, |p| FileBlockDevice::open(p), 64)
+        .expect("seed original");
+    let original_bytes = std::fs::read(&path).expect("read original");
+    let original_snapshot = snapshot_file(&path);
+
+    // Build an internally-inconsistent-but-CRC-valid artifact (graph B with a broken incidence chain).
+    let mut graph_b = fresh(64);
+    let txn = TxnId(1);
+    graph_b.begin(txn);
+    let rt = graph_b.intern_token(Namespace::RelType, "E").unwrap();
+    let (a, eid_a) = graph_b.create_node(txn).unwrap();
+    let (b, _) = graph_b.create_node(txn).unwrap();
+    let _r = graph_b.create_rel(txn, rt, a, b).unwrap();
+    graph_b.commit(txn).unwrap();
+    let mut bad = backup_store(&mut graph_b).expect("backup B");
+    let (page_body_start, in_page) = locate_record(&bad, eid_a.0, NODE_RECORD_SIZE);
+    let first_rel_off = page_body_start + in_page + mvcc_plus_eid();
+    bad[first_rel_off..first_rel_off + 8].copy_from_slice(&0u64.to_le_bytes());
+    refresh_page_checksum(&mut bad, page_body_start);
+    refresh_artifact_digest(&mut bad);
+    verify_backup(&bad).expect("the bad artifact still passes both digests");
+
+    // The atomic restore of the inconsistent artifact over the original must FAIL...
+    let err = restore_file_atomic(&bad, &path, |p| FileBlockDevice::open(p), 64)
+        .expect_err("an inconsistent image must be rejected");
+    assert!(
+        err.to_string().contains("integrity check failed"),
+        "must be rejected by the consistency checker; got: {err}"
+    );
+    // ...and leave the original byte-for-byte intact, with no temp residue.
+    assert_eq!(
+        original_bytes,
+        std::fs::read(&path).expect("read after abort"),
+        "an aborted restore must not modify the target"
+    );
+    assert_eq!(
+        original_snapshot,
+        snapshot_file(&path),
+        "the original still opens"
+    );
+    assert!(
+        !temp_residue(&path).exists(),
+        "an aborted restore must leave no temp residue"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// No-stale-pages (F11): atomically restoring a SMALL backup over a previously-restored LARGER image
+/// yields exactly the small graph — the fresh temp carries no page from the larger occupant.
+#[test]
+fn restore_file_atomic_over_a_larger_image_leaves_no_stale_pages() {
+    use graphus_io::FileBlockDevice;
+    let path = unique_blk_path("stale");
+
+    // First lay down a LARGE image.
+    let mut large = build_graph(3, 400);
+    let artifact_large = backup_store(&mut large).expect("backup large");
+    restore_file_atomic(&artifact_large, &path, |p| FileBlockDevice::open(p), 64)
+        .expect("restore large");
+
+    // Then atomically restore a SMALL image over it.
+    let mut small = build_graph(99, 20);
+    let artifact_small = backup_store(&mut small).expect("backup small");
+    let expected_small =
+        snapshot(&mut restore(&artifact_small, fresh_wal(), 64).expect("restore small mem"));
+    restore_file_atomic(&artifact_small, &path, |p| FileBlockDevice::open(p), 64)
+        .expect("restore small over large");
+
+    // The result is exactly the small graph: no stale large-graph record survives.
+    assert_eq!(
+        expected_small,
+        snapshot_file(&path),
+        "restoring a small image over a larger one must leave no stale pages"
+    );
+    std::fs::remove_file(&path).ok();
 }
 
 // Keep `restore_onto` exercised directly (the device-agnostic primitive) so its path is covered.

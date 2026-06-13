@@ -84,15 +84,18 @@
 //!   target timestamp). Anything not committed by the cut is a loser and is undone, so the restored
 //!   state equals the live state at that exact point.
 
+use std::path::Path;
+
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, Timestamp};
-use graphus_io::BlockDevice;
+use graphus_io::{BlockDevice, atomic_replace_file};
 use graphus_wal::{
-    HEADER_LEN as WAL_HEADER_LEN, LogRecord, LogSink, RecordType, WAL_MAGIC, WAL_VERSION,
-    WalManager,
+    HEADER_LEN as WAL_HEADER_LEN, LogRecord, LogSink, MemLogSink, RecordType, WAL_MAGIC,
+    WAL_VERSION, WalManager,
 };
 
 use crate::backup::{backup_creation_marker, backup_store, verify_backup};
+use crate::check::verify_on_open;
 use crate::recovery::recover_device_from;
 use crate::store::RecordStore;
 
@@ -581,6 +584,57 @@ pub fn restore_to<D: BlockDevice, C: LinkCodec>(
     let mut wal = WalManager::open(sink)?;
     recover_device_from(&mut wal, device, manifest.base_lsn)?;
     Ok(())
+}
+
+/// **Atomic, verified point-in-time file restore** of a backup chain onto the store file at
+/// `target_path` (`04 §4.6`, storage audit F2/F7/F11) — the chain counterpart of
+/// [`restore_file_atomic`](crate::restore_file_atomic).
+///
+/// Unlike the low-level [`restore_to`] (which lays the chain down **in place** over whatever device
+/// it is given), this restores into a fresh sibling temp file, **proves the restored image is
+/// consistent** ([`verify_on_open`]) before it is allowed to replace anything, and only then
+/// atomically `rename(2)`s the temp over `target_path` and `fsync`s the directory
+/// ([`atomic_replace_file`]). A crash mid-restore therefore leaves `target_path` as the old whole
+/// image or the new whole image (never a torn mixture), an aborted restore leaves the original
+/// intact, and the fresh temp carries no stale page from a previous, larger occupant.
+///
+/// `open_device` creates the restore device over the temp path (plaintext or encrypted, as for
+/// [`restore_file_atomic`](crate::restore_file_atomic)); the verification uses a throwaway in-memory
+/// WAL (the chain restore leaves the device at a consistent committed state with no pending replay).
+///
+/// # Errors
+/// Returns a storage error (or a `codec.open` security error) if the chain fails [`verify_chain`],
+/// laying it down fails, the restored image fails the consistency check, or the temp/rename/
+/// directory-`fsync` fails. On any error `target_path` is left untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_chain_file_atomic<D, FD, C>(
+    manifest: &ChainManifest,
+    links: &ChainLinks,
+    target: RestoreTarget,
+    codec: &C,
+    target_path: &Path,
+    open_device: FD,
+    pool_capacity: usize,
+) -> Result<()>
+where
+    D: BlockDevice,
+    FD: FnOnce(&Path) -> Result<D>,
+    C: LinkCodec,
+{
+    atomic_replace_file(target_path, |tmp| {
+        let mut device = open_device(tmp)?;
+        restore_to(manifest, links, target, &mut device, codec)?;
+        // Prove the restored image is consistent before it replaces the target (read-only open over
+        // the just-hardened device with a throwaway WAL; dropping it closes the temp fd pre-rename).
+        let mut store = RecordStore::open(
+            device,
+            WalManager::create(MemLogSink::new())?,
+            pool_capacity,
+        )?;
+        verify_on_open(&mut store, &[])?;
+        drop(store);
+        Ok(())
+    })
 }
 
 /// Reconstructs the full logical WAL byte image for a chain: a valid WAL header, a zero gap covering

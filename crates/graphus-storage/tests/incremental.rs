@@ -27,7 +27,8 @@ use graphus_core::{PageId, TxnId};
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_storage::{
     ChainLinks, ChainManifest, LinkCodec, Namespace, Plain, RecordStore, RestoreTarget,
-    backup_store, begin_chain, capture_increment, restore_onto, restore_to, verify_chain,
+    backup_store, begin_chain, capture_increment, restore_chain_file_atomic, restore_onto,
+    restore_to, verify_chain,
 };
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -364,6 +365,53 @@ fn build_two_increment_chain() -> (ChainManifest, ChainLinks) {
 fn untampered_chain_verifies() {
     let (manifest, links) = build_two_increment_chain();
     verify_chain(&manifest, &links, &Plain).expect("a well-formed chain must verify");
+}
+
+/// Atomic, verified PITR file restore of a chain (storage audit F2/F7/F11): restoring a chain at
+/// `Latest` into a fresh file yields exactly the same committed image as the in-memory `restore_to`,
+/// and the on-disk image passes the consistency check. Proves `restore_chain_file_atomic` wraps the
+/// chain restore in the same atomic temp+rename+verify machinery as the full-backup path.
+#[test]
+fn restore_chain_file_atomic_round_trips_at_latest() {
+    use graphus_io::FileBlockDevice;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "graphus-atomic-chain-{}-{n}.blk",
+        std::process::id()
+    ));
+
+    let (manifest, links) = build_two_increment_chain();
+
+    // Expected: in-memory chain restore -> backup -> page section.
+    let mut mem = MemBlockDevice::new(0);
+    restore_to(&manifest, &links, RestoreTarget::Latest, &mut mem, &Plain).expect("mem restore");
+    let expected = artifact_of_device(mem, 64);
+
+    // Actual: atomic file restore -> reopen -> backup -> page section.
+    restore_chain_file_atomic(
+        &manifest,
+        &links,
+        RestoreTarget::Latest,
+        &Plain,
+        &path,
+        |p| FileBlockDevice::open(p),
+        64,
+    )
+    .expect("atomic chain restore");
+    let dev = FileBlockDevice::open(&path).expect("reopen file");
+    let mut store = RecordStore::open(dev, WalManager::create(MemLogSink::new()).unwrap(), 64)
+        .expect("open restored store");
+    let actual = backup_store(&mut store).expect("backup restored store");
+
+    assert_eq!(
+        page_section(&expected),
+        page_section(&actual),
+        "atomic chain file restore must be byte-identical to the in-memory chain restore"
+    );
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]
