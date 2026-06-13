@@ -93,7 +93,27 @@ use graphus_tck::runner::run_scenario;
 /// `WHERE (n)` self-pattern type check), `expressions/list/List6` +1 (`size()` on a pattern
 /// predicate now rejected), and `clauses/match-where/MatchWhere4` / `clauses/with-where/WithWhere4`
 /// +1 each (disjunctive multi-part predicates including patterns). Measured: zero regressions.
-const BASELINE: usize = 3562;
+///
+/// 3562 → 3589 (#127, multi-block scenarios): a TCK scenario is an ordered sequence of
+/// `(When query → Then expectation → [And side effects])` blocks executed against the *same* graph
+/// (`tck/README.adoc`); a `When executing control query:` reads back the committed effect of the
+/// preceding block. The harness had collapsed the plan to a *single* `(query, expectation,
+/// side_effects)`, so for a two-block scenario (`CREATE …` then a control `MATCH … RETURN …`) only
+/// the last query survived — the CREATE never ran and the control query read an empty graph
+/// (`row count mismatch: expected 1, got 0`). The runner now collects an ordered `Vec<QueryBlock>`,
+/// runs each against the shared coordinator (committed between blocks like a real session), and
+/// measures each block's side effects as the delta around *that block alone*. Wins:
+/// `expressions/temporal/Temporal4` 6/39 → 24/39 (+18), `clauses/create/Create2` 20/24 → 24/24
+/// (+4), `clauses/create/Create5` 0/5 → 4/5 (+4), `clauses/merge/Merge6` 2/6 → 3/6 (+1). Measured:
+/// zero regressions (the net +27 equals the sum of the affected-feature gains exactly). The harness
+/// fix proved temporal *storage* already works: Temporal4 [1]–[12] (date/time/datetime/duration
+/// scalars **and arrays** round-tripping through a node property) all pass. The 15 remaining
+/// Temporal4 failures are one *honest engine gap*: scenario [13] uses the transaction-clock
+/// constructors `date.transaction` / `date.statement` / `date.realtime` (and the `localtime` /
+/// `time` / `localdatetime` / `datetime` equivalents), which the function registry does not yet
+/// know (`unknown function …` at compile time) — input for a follow-up engine task, deliberately
+/// left failing rather than masked.
+const BASELINE: usize = 3589;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

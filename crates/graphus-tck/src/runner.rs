@@ -7,10 +7,15 @@
 //! 2. Apply the `Given` step: empty / any graph (nothing to do), or seed a named graph.
 //! 3. Run every `having executed:` initialisation query (committed).
 //! 4. Snapshot the graph state (for the side-effect diff).
-//! 5. Run the `When` query; resolve its result cells into self-contained [`Concrete`] snapshots
+//! 5. Run each `When` query **block** in order against the *same* coordinator (a shared session): a
+//!    scenario is a sequence of `(query → Then expectation → [And side effects])` blocks, where a
+//!    follow-up `When executing control query:` observes the committed effect of the preceding
+//!    block(s). For each block: resolve its result cells into self-contained [`Concrete`] snapshots
 //!    **while the statement seam is still live**, then commit (or roll back on a runtime error).
-//! 6. Compare against the `Then` step: a result-set assertion, or an error assertion.
-//! 7. Snapshot again and diff to compute observed side effects; compare to the side-effect step.
+//! 6. Compare each block against its `Then` step: a result-set assertion, or an error assertion.
+//! 7. Snapshot before and after *each block* and diff to compute that block's own observed side
+//!    effects; compare to the block's side-effect step. The scenario passes only if every block
+//!    passes; it fails at the first block that does not.
 //!
 //! Steps 5–7 are the subtle parts: entity references in a result row carry only an id, so the runner
 //! resolves labels/properties/paths through the [`GraphAccess`] seam before the transaction ends; and
@@ -168,9 +173,9 @@ fn run_scenario_inner(scenario: &Scenario, graphs_root: &Path) -> Outcome {
     if let Err(form) = plan.collect(scenario) {
         return Outcome::Unsupported(form);
     }
-    let Some(query) = plan.query.as_deref() else {
+    if plan.blocks.is_empty() {
         return Outcome::Unsupported("scenario has no `When executing query:` step".to_owned());
-    };
+    }
 
     // ---- fixture procedures: the registry that backs compile AND execute for this scenario -----
     let mut registry = ProcedureSet::with_builtins();
@@ -201,22 +206,54 @@ fn run_scenario_inner(scenario: &Scenario, graphs_root: &Path) -> Outcome {
     }
 
     // ---- parameters for the query under test ---------------------------------------------------
+    // The TCK parameter table applies to every query block of the scenario; build it once.
     let params = match build_parameters(&plan.parameters) {
         Ok(p) => p,
         Err(e) => return Outcome::Failed(format!("parameter table: {e}")),
     };
 
-    // ---- snapshot before the When query (for the side-effect diff) -----------------------------
-    let before = match snapshot(&mut coord) {
+    // ---- run each query block in order against the shared coordinator ---------------------------
+    // A scenario is a sequence of `(query → Then → [And side effects])` blocks sharing one graph; a
+    // follow-up `When executing control query:` sees the committed effect of the prior block(s). The
+    // scenario passes only if every block passes, and fails at the first block that does not. Each
+    // block's side effects are measured as the delta around *that block alone* (its own before/after
+    // snapshot), so a CREATE block reports `+nodes 1` independently of a later read block reporting
+    // none.
+    let multi = plan.blocks.len() > 1;
+    for (idx, block) in plan.blocks.iter().enumerate() {
+        let outcome = run_query_block(&mut coord, block, &params, &registry);
+        if !matches!(outcome, Outcome::Passed) {
+            // For a multi-block scenario, prefix the failure with which block failed so the report
+            // pinpoints it; a single-block scenario keeps the exact pre-sequence message verbatim.
+            return if multi {
+                annotate_block_failure(outcome, idx + 1, plan.blocks.len(), &block.query)
+            } else {
+                outcome
+            };
+        }
+    }
+    Outcome::Passed
+}
+
+/// Runs one [`QueryBlock`] against the shared coordinator and decides it against its `Then` step.
+///
+/// Snapshots the graph immediately before and after the block so the reported side effects are the
+/// delta of this block's query alone (never accumulated across blocks).
+fn run_query_block(
+    coord: &mut Coord,
+    block: &QueryBlock,
+    params: &Parameters,
+    registry: &dyn ProcedureRegistry,
+) -> Outcome {
+    // Snapshot before this block (for its own side-effect diff).
+    let before = match snapshot(coord) {
         Ok(s) => s,
         Err(e) => return Outcome::Errored(format!("pre-snapshot failed: {e}")),
     };
 
-    // ---- run the When query --------------------------------------------------------------------
-    let run = run_query_resolving(&mut coord, query, &params, &registry);
+    let run = run_query_resolving(coord, &block.query, params, registry);
 
-    // ---- decide against the Then step ----------------------------------------------------------
-    match &plan.expectation {
+    match &block.expectation {
         Expectation::Error {
             error_type,
             phase,
@@ -228,18 +265,31 @@ fn run_scenario_inner(scenario: &Scenario, graphs_root: &Path) -> Outcome {
                 return outcome;
             }
             // Side effects only matter when the query succeeded and produced rows.
-            check_side_effects(&mut coord, &before, &plan.side_effects)
+            check_side_effects(coord, &before, &block.side_effects)
         }
         Expectation::Empty => {
             let outcome = check_empty_expectation(&run);
             if !matches!(outcome, Outcome::Passed) {
                 return outcome;
             }
-            check_side_effects(&mut coord, &before, &plan.side_effects)
+            check_side_effects(coord, &before, &block.side_effects)
         }
         Expectation::None => {
             Outcome::Unsupported("scenario has no `Then` result/error assertion".to_owned())
         }
+    }
+}
+
+/// Prefixes a failing block's outcome with which block (1-based) in the sequence failed, preserving
+/// the failure kind (`Failed` / `Errored` / `Unsupported`).
+fn annotate_block_failure(outcome: Outcome, block_no: usize, total: usize, query: &str) -> Outcome {
+    let head = query.lines().next().unwrap_or("").trim();
+    let prefix = format!("block {block_no}/{total} (`{head}`): ");
+    match outcome {
+        Outcome::Failed(m) => Outcome::Failed(format!("{prefix}{m}")),
+        Outcome::Errored(m) => Outcome::Errored(format!("{prefix}{m}")),
+        Outcome::Unsupported(m) => Outcome::Unsupported(format!("{prefix}{m}")),
+        Outcome::Passed => Outcome::Passed,
     }
 }
 
@@ -278,6 +328,20 @@ enum SideEffectSpec {
     Unspecified,
 }
 
+/// One `(query → Then expectation → [And side effects])` block of a scenario.
+///
+/// A TCK scenario is an ordered sequence of these blocks executed against the *same* shared graph
+/// (`tck/README.adoc` §"Format of a TCK scenario": a `When executing control query:` observes the
+/// committed effect of the preceding `When executing query:`). Each block carries its own query, its
+/// own `Then` assertion, and its own side-effect expectation; the side effects are the delta of *that
+/// block's* query alone (a before/after snapshot taken around the block), never accumulated.
+#[derive(Debug, Clone, Default)]
+struct QueryBlock {
+    query: String,
+    expectation: Expectation,
+    side_effects: SideEffectSpec,
+}
+
 /// A scenario flattened into the pieces the runner needs.
 #[derive(Debug, Clone, Default)]
 struct ScenarioPlan {
@@ -285,14 +349,20 @@ struct ScenarioPlan {
     init_queries: Vec<String>,
     parameters: KvRows,
     procedures: Vec<ProcedureStep>,
-    query: Option<String>,
-    expectation: Expectation,
-    side_effects: SideEffectSpec,
+    /// The ordered query blocks (length ≥ 1 for a runnable scenario). A single-query scenario yields
+    /// a sequence of length 1 — behaviourally identical to the pre-sequence runner.
+    blocks: Vec<QueryBlock>,
 }
 
 impl ScenarioPlan {
     /// Folds a scenario's classified steps into the plan, returning `Err(form)` if a step is an
     /// unsupported form the runner cannot proceed past.
+    ///
+    /// `When executing query:` (and `When executing control query:`, both classified as
+    /// [`StepKind::Query`]) opens a new [`QueryBlock`]; the following `Then`/`And` result, error and
+    /// side-effect steps bind to the block currently open. Setup steps (`Given` / `having executed:` /
+    /// `parameters` / `procedure`) apply to the scenario as a whole and may appear only before the
+    /// first query block.
     fn collect(&mut self, scenario: &Scenario) -> Result<(), String> {
         for step in &scenario.steps {
             match &step.kind {
@@ -301,40 +371,55 @@ impl ScenarioPlan {
                 StepKind::InitQuery(q) => self.init_queries.push(q.clone()),
                 StepKind::Parameters(rows) => self.parameters = rows.clone(),
                 StepKind::Procedure(step) => self.procedures.push(step.clone()),
-                StepKind::Query(q) => self.query = Some(q.clone()),
+                // A new query (the `When` query, or a follow-up `When executing control query:`)
+                // opens a fresh block; subsequent Then/And steps bind to it.
+                StepKind::Query(q) => self.blocks.push(QueryBlock {
+                    query: q.clone(),
+                    ..QueryBlock::default()
+                }),
                 StepKind::ResultUnordered(t) => {
-                    self.expectation = Expectation::Rows {
+                    self.current_block()?.expectation = Expectation::Rows {
                         ordered: false,
                         table: t.clone(),
                     };
                 }
                 StepKind::ResultOrdered(t) => {
-                    self.expectation = Expectation::Rows {
+                    self.current_block()?.expectation = Expectation::Rows {
                         ordered: true,
                         table: t.clone(),
                     };
                 }
-                StepKind::ResultEmpty => self.expectation = Expectation::Empty,
+                StepKind::ResultEmpty => self.current_block()?.expectation = Expectation::Empty,
                 StepKind::Error {
                     error_type,
                     phase,
                     detail,
                 } => {
-                    self.expectation = Expectation::Error {
+                    self.current_block()?.expectation = Expectation::Error {
                         error_type: error_type.clone(),
                         phase: phase.clone(),
                         detail: detail.clone(),
                     };
                 }
                 StepKind::SideEffects(rows) => {
-                    self.side_effects = SideEffectSpec::Table(rows.clone());
+                    self.current_block()?.side_effects = SideEffectSpec::Table(rows.clone());
                 }
-                StepKind::NoSideEffects => self.side_effects = SideEffectSpec::None,
+                StepKind::NoSideEffects => {
+                    self.current_block()?.side_effects = SideEffectSpec::None;
+                }
                 // An unsupported step form gates the whole scenario.
                 StepKind::Unsupported(raw) => return Err(raw.clone()),
             }
         }
         Ok(())
+    }
+
+    /// The block currently being built (the last one opened by a `When` query). A `Then`/`And` step
+    /// with no preceding query is a malformed scenario the runner cannot interpret.
+    fn current_block(&mut self) -> Result<&mut QueryBlock, String> {
+        self.blocks.last_mut().ok_or_else(|| {
+            "a `Then`/`And` assertion appears before any `When executing query:` step".to_owned()
+        })
     }
 }
 
@@ -1088,6 +1173,58 @@ mod tests {
                  \x20   And having executed:\n      \"\"\"\n      CREATE (:A:B {n: 1})\n      \"\"\"\n\
                  \x20   When executing query:\n      \"\"\"\n      MATCH (n) RETURN n\n      \"\"\"\n\
                  \x20   Then the result should be, in any order:\n      | n              |\n      | (:A:B {n: 1}) |\n\
+                 \x20   And no side effects\n";
+        assert_eq!(run_one(f), Outcome::Passed);
+    }
+
+    /// A scenario with two query blocks — a `CREATE` then a `When executing control query:` that
+    /// reads it back — must run both against the *same* graph, in order. Regression for `rmp` #127:
+    /// the plan kept only the last query, so the CREATE never ran and the control query saw an empty
+    /// graph (`row count mismatch: expected 1, got 0`).
+    #[test]
+    fn two_query_blocks_share_state_and_each_is_checked() {
+        let f = "Feature: F\n\n  Scenario: S\n\
+                 \x20   Given an empty graph\n\
+                 \x20   When executing query:\n      \"\"\"\n      CREATE ({created: 7})\n      \"\"\"\n\
+                 \x20   Then the result should be empty\n\
+                 \x20   And the side effects should be:\n      | +nodes | 1 |\n      | +properties | 1 |\n\
+                 \x20   When executing control query:\n      \"\"\"\n      MATCH (n) RETURN n.created\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | n.created |\n      | 7         |\n\
+                 \x20   And no side effects\n";
+        assert_eq!(run_one(f), Outcome::Passed);
+    }
+
+    /// The first failing block stops the scenario and the message names which block failed.
+    #[test]
+    fn first_failing_block_fails_the_scenario_and_is_named() {
+        // The control query expects the wrong value, so block 2/2 fails.
+        let f = "Feature: F\n\n  Scenario: S\n\
+                 \x20   Given an empty graph\n\
+                 \x20   When executing query:\n      \"\"\"\n      CREATE ({created: 7})\n      \"\"\"\n\
+                 \x20   Then the result should be empty\n\
+                 \x20   And the side effects should be:\n      | +nodes | 1 |\n      | +properties | 1 |\n\
+                 \x20   When executing control query:\n      \"\"\"\n      MATCH (n) RETURN n.created\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | n.created |\n      | 999       |\n";
+        match run_one(f) {
+            Outcome::Failed(m) => assert!(
+                m.starts_with("block 2/2"),
+                "the failing block must be identified, got: {m}"
+            ),
+            other => panic!("expected a Failed outcome, got {other:?}"),
+        }
+    }
+
+    /// A block whose side-effect delta is measured per-block: the CREATE block reports `+nodes 1`
+    /// while the following read block reports none (not accumulated).
+    #[test]
+    fn per_block_side_effects_are_not_accumulated() {
+        let f = "Feature: F\n\n  Scenario: S\n\
+                 \x20   Given an empty graph\n\
+                 \x20   When executing query:\n      \"\"\"\n      CREATE (:Person)\n      \"\"\"\n\
+                 \x20   Then the result should be empty\n\
+                 \x20   And the side effects should be:\n      | +nodes | 1 |\n      | +labels | 1 |\n\
+                 \x20   When executing control query:\n      \"\"\"\n      MATCH (n) RETURN n\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | n         |\n      | (:Person) |\n\
                  \x20   And no side effects\n";
         assert_eq!(run_one(f), Outcome::Passed);
     }
