@@ -1216,6 +1216,12 @@ fn logical_op_is_correlated(op: &LogicalOp) -> bool {
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::LoadCsv { input, .. }
         | LogicalOp::Expand { input, .. }
+        // A var-length/shortest pattern bound to a path variable wraps its correlated traversal in
+        // `NamedPath`/`ShortestPath`; both must be descended or a correlated `Apply` whose right branch
+        // is `OPTIONAL MATCH p = (a)-[*]-(b)` (both endpoints pre-bound) would be mistaken for an
+        // uncorrelated equi-join and planned as a `HashJoin`, dropping the driving row entirely (rmp #104).
+        | LogicalOp::NamedPath { input, .. }
+        | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::Create { input, .. }
         | LogicalOp::Merge { input, .. }
         | LogicalOp::SetClause { input, .. }

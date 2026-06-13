@@ -140,12 +140,13 @@ fn shortest_path_disconnected_yields_no_row() {
     );
 }
 
-/// `shortestPath` composes with `OPTIONAL MATCH` **identically** to a variable-length expand. This
-/// engine's handling of `OPTIONAL MATCH` connecting two already-bound nodes (a comma pattern, so the
-/// optional pattern introduces no new node) is a pre-existing, engine-wide behaviour — independent of
-/// `shortestPath`. The test asserts the two compose the same way for both a connected and a
-/// disconnected pre-bound pair, so `shortestPath` introduces no divergence and a future fix to the
-/// optional-correlation handling updates both in lock-step.
+/// `OPTIONAL MATCH p = (a)-[:R*1..n]-(b)` / `... = shortestPath(...)` connecting **two already-bound
+/// nodes** (a comma pattern, so the optional pattern introduces only the path variable) must obey
+/// openCypher left-outer semantics: exactly one row per driving `(a, b)`, with `p` **bound** when the
+/// pair connects within the bounds and **null** when it does not. Regression for `rmp` #104: the
+/// physical planner lowered this correlated `Apply` to a `HashJoin` (because `logical_op_is_correlated`
+/// did not descend through `NamedPath`/`ShortestPath`), which dropped the driving row entirely
+/// (zero rows). `shortestPath` and a plain var-length expand must behave identically.
 #[test]
 fn optional_match_shortest_path_mirrors_varlength() {
     let mut g = MemGraph::new();
@@ -154,35 +155,46 @@ fn optional_match_shortest_path_mirrors_varlength() {
     let _z = node(&mut g, "z"); // isolated
     g.add_rel("R", a, b, NO_PROPS);
 
-    // Connected pre-bound pair (a, b).
-    let vl_conn = run(
+    // Connected pre-bound pair (a, b): one row, with `p` bound to a length-1 path.
+    for src in [
         "MATCH (a:N {name:'a'}), (b:N {name:'b'}) OPTIONAL MATCH p = (a)-[:R*1..3]-(b) RETURN p",
-        &mut g,
-    );
-    let sp_conn = run(
         "MATCH (a:N {name:'a'}), (b:N {name:'b'}) OPTIONAL MATCH p = shortestPath((a)-[:R*]-(b)) RETURN p",
-        &mut g,
-    );
-    assert_eq!(
-        sp_conn.len(),
-        vl_conn.len(),
-        "connected: shortestPath composes with OPTIONAL MATCH exactly like a var-length expand"
-    );
+    ] {
+        let rows = run(src, &mut g);
+        assert_eq!(
+            rows.len(),
+            1,
+            "connected: the driving row is preserved ({src})"
+        );
+        match rows[0].get("p") {
+            Some(RowValue::Path(p)) => {
+                assert_eq!(
+                    p.steps.len(),
+                    1,
+                    "connected: p binds the length-1 path ({src})"
+                );
+            }
+            other => panic!("connected: p must be bound to a Path, got {other:?} ({src})"),
+        }
+    }
 
-    // Disconnected pre-bound pair (a, z).
-    let vl_disc = run(
+    // Disconnected pre-bound pair (a, z): one row preserved, with `p` null-filled.
+    for src in [
         "MATCH (a:N {name:'a'}), (z:N {name:'z'}) OPTIONAL MATCH p = (a)-[:R*1..3]-(z) RETURN p",
-        &mut g,
-    );
-    let sp_disc = run(
         "MATCH (a:N {name:'a'}), (z:N {name:'z'}) OPTIONAL MATCH p = shortestPath((a)-[:R*]-(z)) RETURN p",
-        &mut g,
-    );
-    assert_eq!(
-        sp_disc.len(),
-        vl_disc.len(),
-        "disconnected: shortestPath composes with OPTIONAL MATCH exactly like a var-length expand"
-    );
+    ] {
+        let rows = run(src, &mut g);
+        assert_eq!(
+            rows.len(),
+            1,
+            "disconnected: the driving row is preserved ({src})"
+        );
+        let p = rows[0].get("p");
+        assert!(
+            p.is_none() || p.is_some_and(RowValue::is_null),
+            "disconnected: p is null-filled ({src}), got {p:?}"
+        );
+    }
 }
 
 #[test]
