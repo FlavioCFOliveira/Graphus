@@ -8,8 +8,6 @@
 store_path = "graphus-data"
 # Buffer-pool capacity in pages (04 §3).
 buffer_pool_pages = 4096
-# Dedicated fsync threads for the durability offload pool (04 §9.1).
-fsync_threads = 2
 
 # Listeners. Set an address to "" (or remove it) to disable that listener.
 #   - UDS (Bolt): kernel-protected local channel, peer-cred auth, no TLS.
@@ -32,6 +30,10 @@ cert_path = "tls/cert.pem"
 key_path = "tls/key.pem"
 
 [admission]
+# Max concurrently-open connections across ALL listeners (UDS+Bolt-TCP+REST); enforced at accept
+# time before any protocol bytes, so a hostile peer cannot exhaust FDs/tasks ahead of the query
+# admission gate. Excess connections are shed (closed) and counted in graphus_connections_shed_total.
+max_connections = 1024
 # Max concurrently-executing queries; excess is fast-rejected as "server busy" (04 §9.3).
 max_concurrent_queries = 256
 # Bounded engine command-channel capacity (the submission queue).
@@ -44,6 +46,12 @@ result_buffer_capacity = 256
 slow_query_threshold_ms = 500
 # Hard deadline for draining in-flight work on graceful shutdown before stragglers are rolled back.
 shutdown_drain_deadline_ms = 10000
+# Max time a TLS handshake may take on a network listener before the connection is dropped (and
+# counted in graphus_handshake_timeouts_total). Guards against slow-loris handshake stalls.
+handshake_timeout_ms = 10000
+# Idle/read timeout for Bolt sessions: a connection with no bytes within this window is reaped.
+# 0 disables idle reaping (the default).
+idle_timeout_ms = 0
 
 [auth]
 # The initial admin user seeded into the RBAC catalog at startup.

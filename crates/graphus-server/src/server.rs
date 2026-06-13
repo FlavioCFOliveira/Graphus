@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use graphus_auth::AuthProvider;
 use graphus_core::capability::Clock;
-use graphus_io::FsyncPool;
 use rustls::ServerConfig as RustlsServerConfig;
 
 use crate::audit::AuditLog;
@@ -234,13 +233,11 @@ impl Server {
             .map_err(ServerError::Storage)?;
         catalog.start_catalog_databases().await;
 
-        // 3) Durability offload pool (`04 §9.1`). The engine thread does its own (off-runtime) syncs
-        //    for the store image; the pool is the shared offload available to the runtime so no sync
-        //    ever lands on a runtime worker. Sized from config.
-        let fsync_pool = Arc::new(FsyncPool::new(
-            config.fsync_threads,
-            config.admission.engine_queue_capacity,
-        ));
+        // 3) Durability model (`04 §9.1`). Each database engine performs its own `fdatasync`/`fsync`
+        //    on its dedicated OS thread, which is *not* a Tokio runtime worker — so a durable sync
+        //    never blocks an async worker, and no separate offload pool is needed on this path. (The
+        //    reusable `graphus_io::FsyncPool` primitive remains available for the concurrent-pool path
+        //    that is deferred by design — the production engine is single-writer.)
 
         // 4) Listeners.
         let shutdown = ShutdownCoordinator::new();
@@ -271,12 +268,10 @@ impl Server {
             "graphus-server ready",
         );
 
-        // The run loop: own the catalog (every engine) + listeners + pool, await the shutdown
-        // trigger, drain.
+        // The run loop: own the catalog (every engine) + listeners, await the shutdown trigger, drain.
         let runner = tokio::spawn(run_loop(
             Arc::clone(&catalog),
             bound.clone(),
-            fsync_pool,
             Arc::clone(&audit),
             shutdown.clone(),
             readiness.clone(),
@@ -297,13 +292,12 @@ impl Server {
 }
 
 /// The run loop owned by the background task: awaits the shutdown trigger, then performs the §9.4
-/// graceful sequence — stop accepting (drop the listeners), drain + flush every database engine
+/// graceful sequence — stop accepting (drop the listeners), then drain + flush every database engine
 /// and join its thread (additional databases first, the default last — see
-/// [`DatabaseCatalog::shutdown_all`]), and tear down the fsync pool.
+/// [`DatabaseCatalog::shutdown_all`]). Each engine fsyncs on its own dedicated OS thread.
 async fn run_loop(
     catalog: Arc<DatabaseCatalog>,
     bound: Listeners,
-    fsync_pool: Arc<FsyncPool>,
     audit: Arc<AuditLog>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
@@ -328,8 +322,6 @@ async fn run_loop(
         tracing::error!(target: "graphus::audit", error = %e, "failed to flush audit log on shutdown");
     }
 
-    // Tear down the durability pool last (its Drop joins the sync threads).
-    drop(fsync_pool);
     tracing::info!("graphus-server shutdown complete");
     Ok(())
 }

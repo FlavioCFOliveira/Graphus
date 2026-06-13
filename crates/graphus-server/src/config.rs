@@ -278,8 +278,6 @@ pub struct ServerConfig {
     pub default_database: String,
     /// Buffer-pool capacity in pages (`04 §3`).
     pub buffer_pool_pages: usize,
-    /// Number of dedicated `fsync` threads in the durability offload pool (`04 §9.1`).
-    pub fsync_threads: usize,
 
     /// TCP address for the Bolt-over-TCP listener, or `None` to disable it. TLS required when set.
     pub bolt_tcp_addr: Option<String>,
@@ -332,7 +330,6 @@ impl Default for ServerConfig {
             store_path: PathBuf::from("graphus-data"),
             default_database: crate::dbcatalog::DEFAULT_DATABASE_NAME.to_owned(),
             buffer_pool_pages: 4096,
-            fsync_threads: 2,
             bolt_tcp_addr: None,
             advertised_bolt_address: None,
             rest_addr: Some("127.0.0.1:7474".to_owned()),
