@@ -34,15 +34,19 @@
 //! `LIMIT`, `DISTINCT` (including `count(DISTINCT …)`/`collect(DISTINCT …)`), all standard aggregates
 //! and `collect`, **variable-length patterns** (`-[:KNOWS*1..3]->`), `CASE`, list comprehensions,
 //! string/math functions, `EXISTS { … }` subqueries, relationship-type disjunction, relationship
-//! variables, temporal types, and the write clauses (`CREATE`/`SET`/`MERGE`/`DELETE`). It does **not**
-//! support `shortestPath`/`allShortestPaths` or `FOREACH`; operations needing those are documented as
-//! deferred in `LDBC.md` (and listed in [`deferred_official_queries`]).
+//! variables, temporal types, **`shortestPath`/`allShortestPaths`** (`rmp` #102), and the write
+//! clauses (`CREATE`/`SET`/`MERGE`/`DELETE`). It does **not** support `FOREACH`. As of `rmp` #103 the
+//! synthetic schema also carries per-message `creationDate`/`content`, `Tag`s, `Place`s (countries)
+//! and `Organisation`s, so the previously-deferred shortest-path (IC13/IC14), time-windowed
+//! (IC3/IC4/IC6/IC9, IS4/IS7) and tag/country-correlation (BI) shapes are now expressed and
+//! ground-truth-checked here. The remaining honest deferrals are listed in
+//! [`deferred_official_queries`].
 
 use std::collections::{BTreeMap, HashSet};
 
 use graphus_core::Value;
 
-use crate::ldbc::generator::SnbModel;
+use crate::ldbc::generator::{MessageKind, SnbModel, message_creation_date};
 
 /// One column of an expected row: a column name and its expected [`Value`].
 pub type ExpectedCell = (&'static str, Value);
@@ -236,6 +240,65 @@ pub fn catalog() -> Vec<Operation> {
                     }
                     None => vec![],
                 }
+            },
+            verify: None,
+        },
+        // --- IS4: a message's content + creationDate (point lookup, `rmp` #103) ------------------
+        //     Official IS4 returns a message's content and creation date. Now expressible: every Post
+        //     carries a `content` string and an integer `creationDate` (see the generator's #103
+        //     dimensions). Anchored on a Post id.
+        Operation {
+            id: "IS4-content",
+            label: "Message content + creationDate by id (IS4)",
+            inspired_by: "IS4 (MessageContent)",
+            is_write: false,
+            build: |i, m| {
+                let post = pick(i, m.post_count().max(1));
+                format!(
+                    "MATCH (p:Post {{id: {post}}}) \
+                     RETURN p.content AS content, p.creationDate AS date"
+                )
+            },
+            expected: |i, m| match m.post(pick(i, m.post_count().max(1))) {
+                Some(p) => vec![vec![
+                    ("content", Value::String(p.content.clone())),
+                    ("date", Value::Integer(p.creation_date as i64)),
+                ]],
+                None => vec![],
+            },
+            verify: None,
+        },
+        // --- IS7: the replies of a message — its REPLY_OF comments with content/date (`rmp` #103) -
+        //     Official IS7 returns the (one-hop) replies of a message with their content and creation
+        //     date. The synthetic thread is `(:Comment)-[:REPLY_OF]->(:Post)`; we project each reply's
+        //     id/content/creationDate, ordered by comment id (a unique total order).
+        Operation {
+            id: "IS7-replies",
+            label: "Replies of a post: their content + creationDate (IS7)",
+            inspired_by: "IS7 (RepliesOfMessage)",
+            is_write: false,
+            build: |i, m| {
+                let post = pick(i, m.post_count().max(1));
+                format!(
+                    "MATCH (c:Comment)-[:REPLY_OF]->(p:Post {{id: {post}}}) \
+                     RETURN c.id AS cid, c.content AS content, c.creationDate AS date \
+                     ORDER BY cid ASC"
+                )
+            },
+            expected: |i, m| {
+                let post = pick(i, m.post_count().max(1));
+                let mut replies: Vec<&_> = m.comments().iter().filter(|c| c.post == post).collect();
+                replies.sort_by_key(|c| c.id);
+                replies
+                    .into_iter()
+                    .map(|c| {
+                        vec![
+                            ("cid", Value::Integer(c.id as i64)),
+                            ("content", Value::String(c.content.clone())),
+                            ("date", Value::Integer(c.creation_date as i64)),
+                        ]
+                    })
+                    .collect()
             },
             verify: None,
         },
@@ -486,6 +549,174 @@ pub fn catalog() -> Vec<Operation> {
                 ids.sort_unstable();
                 ids.into_iter()
                     .map(|id| vec![("id", Value::Integer(id as i64))])
+                    .collect()
+            },
+            verify: None,
+        },
+        // --- IC13: single-pair shortest path between two persons over KNOWS (`rmp` #102/#103) -----
+        //     The official IC13 returns the length of the shortest KNOWS path between two given people
+        //     (or no result if disconnected). Expressed with `shortestPath`, both endpoints bound (a
+        //     requirement of the operator). Ground truth: a plain BFS over the model's friendship
+        //     adjacency. A connected pair yields exactly one row `{len: distance}`; a disconnected pair
+        //     yields NO row (matching the operator's documented semantics) — and the ground truth then
+        //     is the empty result, so the assertion stays honest either way. We pick distinct,
+        //     well-spread anchor pairs; the synthetic graph is well-connected, so the result is
+        //     overwhelmingly a meaningful non-empty length.
+        Operation {
+            id: "IC13-shortest-path",
+            label: "Shortest KNOWS path length between two persons (shortestPath)",
+            inspired_by: "IC13 (SinglePairShortestPath)",
+            is_write: false,
+            build: |i, m| {
+                let (a, b) = pick_pair(i, m.persons());
+                format!(
+                    "MATCH (a:Person {{id: {a}}}), (b:Person {{id: {b}}}), \
+                           p = shortestPath((a)-[:KNOWS*]-(b)) \
+                     RETURN length(p) AS len"
+                )
+            },
+            expected: |i, m| {
+                let (a, b) = pick_pair(i, m.persons());
+                match m.shortest_knows_distance(a, b) {
+                    Some(d) => vec![vec![("len", Value::Integer(d as i64))]],
+                    None => vec![],
+                }
+            },
+            verify: None,
+        },
+        // --- IC14: paths between two persons — allShortestPaths, asserting the shortest length -----
+        //     The official IC14 returns the shortest paths between two people. We exercise
+        //     `allShortestPaths` and project `RETURN DISTINCT length(p) AS len`: the engine enumerates
+        //     every minimal-length path (over the *multigraph* KNOWS, where each symmetric friendship
+        //     is two directed edges, so the raw path multiplicity is an engine artefact, not a clean
+        //     structural count), but the *distinct length* of those paths is exactly the BFS distance.
+        //     So the faithful, precise assertion is: a connected pair yields exactly ONE row with the
+        //     shortest-path length; a disconnected pair yields no row. (This is the documented
+        //     "assert the length" rendering — see the deferral note's resolution.)
+        Operation {
+            id: "IC14-path-between",
+            label: "Distinct shortest-path length between two persons (allShortestPaths)",
+            inspired_by: "IC14 (PathBetweenPersons)",
+            is_write: false,
+            build: |i, m| {
+                let (a, b) = pick_pair(i, m.persons());
+                format!(
+                    "MATCH (a:Person {{id: {a}}}), (b:Person {{id: {b}}}), \
+                           p = allShortestPaths((a)-[:KNOWS*]-(b)) \
+                     RETURN DISTINCT length(p) AS len"
+                )
+            },
+            expected: |i, m| {
+                let (a, b) = pick_pair(i, m.persons());
+                match m.shortest_knows_distance(a, b) {
+                    Some(d) => vec![vec![("len", Value::Integer(d as i64))]],
+                    None => vec![],
+                }
+            },
+            verify: None,
+        },
+        // --- IC3-window: friends' messages in a creationDate window (`rmp` #103) ------------------
+        //     Official IC3/IC9 family: messages authored by a person's friends, filtered by a
+        //     creationDate window. Now expressible via the per-message integer `creationDate`. We
+        //     anchor on a person, expand to friends, take messages they authored whose creationDate
+        //     falls in `[lo, hi)`, and project (friend, message) ordered by (fid, mid). Ground truth
+        //     mirrors the window filter over the model.
+        Operation {
+            id: "IC3-window-msgs",
+            label: "Friends' messages within a creationDate window (IC3/IC9)",
+            inspired_by: "IC3/IC9 (time-windowed messages by friends)",
+            is_write: false,
+            build: |i, m| {
+                let pid = pick(i, m.persons());
+                let (lo, hi) = message_window(i, m);
+                format!(
+                    "MATCH (p:Person {{id: {pid}}})-[:KNOWS]->(f:Person)<-[:HAS_CREATOR]-(msg) \
+                     WHERE msg.creationDate >= {lo} AND msg.creationDate < {hi} \
+                     RETURN f.id AS fid, msg.id AS mid ORDER BY fid ASC, mid ASC"
+                )
+            },
+            expected: |i, m| {
+                let pid = pick(i, m.persons());
+                let (lo, hi) = message_window(i, m);
+                let friends: HashSet<u64> = m.friends(pid).iter().copied().collect();
+                let mut pairs: Vec<(u64, u64)> = Vec::new();
+                for p in m.posts() {
+                    if friends.contains(&p.author) && p.creation_date >= lo && p.creation_date < hi
+                    {
+                        pairs.push((p.author, p.id));
+                    }
+                }
+                for c in m.comments() {
+                    if friends.contains(&c.author) && c.creation_date >= lo && c.creation_date < hi
+                    {
+                        pairs.push((c.author, c.id));
+                    }
+                }
+                pairs.sort_unstable();
+                pairs
+                    .into_iter()
+                    .map(|(fid, mid)| {
+                        vec![
+                            ("fid", Value::Integer(fid as i64)),
+                            ("mid", Value::Integer(mid as i64)),
+                        ]
+                    })
+                    .collect()
+            },
+            verify: None,
+        },
+        // --- IC4/IC6-tag-window: tags on friends' messages in a window, ranked (`rmp` #103) -------
+        //     Official IC4/IC6 family: the tags used by a person's friends' messages within a time
+        //     window, ranked by frequency. Expressible now via `HAS_TAG` + the creationDate window.
+        //     A 4-hop pattern (person → friend → their message → its tag) with a window filter, grouped
+        //     and ranked. Ground truth replays the same join + window + group.
+        Operation {
+            id: "IC4-tag-window",
+            label: "Tags on friends' messages within a creationDate window, ranked (IC4/IC6)",
+            inspired_by: "IC4/IC6 (time-windowed tag analytics)",
+            is_write: false,
+            build: |i, m| {
+                let pid = pick(i, m.persons());
+                let (lo, hi) = message_window(i, m);
+                format!(
+                    "MATCH (p:Person {{id: {pid}}})-[:KNOWS]->(:Person)<-[:HAS_CREATOR]-(msg)\
+                           -[:HAS_TAG]->(t:Tag) \
+                     WHERE msg.creationDate >= {lo} AND msg.creationDate < {hi} \
+                     RETURN t.name AS tag, count(msg) AS n ORDER BY n DESC, tag ASC"
+                )
+            },
+            expected: |i, m| {
+                let pid = pick(i, m.persons());
+                let (lo, hi) = message_window(i, m);
+                let friends: HashSet<u64> = m.friends(pid).iter().copied().collect();
+                // Count tagged messages per tag NAME (the projection groups by name). A message can be
+                // authored by several of the anchor's friends? No — each message has a single author;
+                // but the pattern fans out over the anchor's KNOWS edges to that author. Since each
+                // friend is reached once (the friendship is a single undirected hop) and the author is
+                // exactly one friend, each qualifying message contributes once per matching friend —
+                // and an author is a single friend, so once. We mirror that: one count per qualifying
+                // message whose author is a friend.
+                let mut by_tag: BTreeMap<String, u64> = BTreeMap::new();
+                let mut tally = |author: u64, creation_date: u64, tag: u64| {
+                    if friends.contains(&author) && creation_date >= lo && creation_date < hi {
+                        if let Some(name) = m.tag_name(tag) {
+                            *by_tag.entry(name.to_owned()).or_default() += 1;
+                        }
+                    }
+                };
+                for p in m.posts() {
+                    tally(p.author, p.creation_date, p.tag);
+                }
+                for c in m.comments() {
+                    tally(c.author, c.creation_date, c.tag);
+                }
+                let mut ranked: Vec<(String, u64)> = by_tag.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(tag, n)| {
+                        vec![("tag", Value::String(tag)), ("n", Value::Integer(n as i64))]
+                    })
                     .collect()
             },
             verify: None,
@@ -754,6 +985,158 @@ pub fn catalog() -> Vec<Operation> {
             },
             verify: None,
         },
+        // --- BI-tag-popularity: messages per Tag, ranked (`rmp` #103) ----------------------------
+        //     Official BI tag-correlation family (BI2, …): rank tags by how many messages carry them.
+        //     Expressible now via `HAS_TAG`. `(msg)-[:HAS_TAG]->(t:Tag)` matches every Post and Comment
+        //     (untyped message node), grouped by tag name. Ground truth: tally each message's tag.
+        Operation {
+            id: "BI-tag-popularity",
+            label: "Messages per tag, ranked (HAS_TAG group + ORDER BY)",
+            inspired_by: "BI2/BI-style tag popularity correlation",
+            is_write: false,
+            build: |_i, _m| {
+                "MATCH (msg)-[:HAS_TAG]->(t:Tag) \
+                 RETURN t.name AS tag, count(msg) AS n ORDER BY n DESC, tag ASC"
+                    .to_owned()
+            },
+            expected: |_i, m| {
+                let mut by_tag: BTreeMap<String, u64> = BTreeMap::new();
+                for p in m.posts() {
+                    if let Some(name) = m.tag_name(p.tag) {
+                        *by_tag.entry(name.to_owned()).or_default() += 1;
+                    }
+                }
+                for c in m.comments() {
+                    if let Some(name) = m.tag_name(c.tag) {
+                        *by_tag.entry(name.to_owned()).or_default() += 1;
+                    }
+                }
+                let mut ranked: Vec<(String, u64)> = by_tag.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(tag, n)| {
+                        vec![("tag", Value::String(tag)), ("n", Value::Integer(n as i64))]
+                    })
+                    .collect()
+            },
+            verify: None,
+        },
+        // --- BI-country-population: persons per country, ranked (`rmp` #103) ----------------------
+        //     Official BI country-correlation family (BI5/BI10, …): aggregate people by their country.
+        //     Expressible now via `IS_LOCATED_IN` to a `Country`-typed `Place`. Group by country name.
+        Operation {
+            id: "BI-country-population",
+            label: "Persons per country, ranked (IS_LOCATED_IN group + ORDER BY)",
+            inspired_by: "BI5/BI10-style country correlation",
+            is_write: false,
+            build: |_i, _m| {
+                "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:Place) \
+                 RETURN c.name AS country, count(p) AS people ORDER BY people DESC, country ASC"
+                    .to_owned()
+            },
+            expected: |_i, m| {
+                let mut by_country: BTreeMap<String, u64> = BTreeMap::new();
+                for pid in 0..m.persons() {
+                    if let Some(place) = m.person_place_id(pid) {
+                        if let Some(name) = m.place_name(place) {
+                            *by_country.entry(name.to_owned()).or_default() += 1;
+                        }
+                    }
+                }
+                let mut ranked: Vec<(String, u64)> = by_country.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(country, people)| {
+                        vec![
+                            ("country", Value::String(country)),
+                            ("people", Value::Integer(people as i64)),
+                        ]
+                    })
+                    .collect()
+            },
+            verify: None,
+        },
+        // --- BI-country-messages: messages whose author is in each country, ranked (`rmp` #103) ---
+        //     A country *correlation* over messages: count messages per author-country (the BI shape
+        //     that ties message activity to geography). A 3-hop join (message → author → country),
+        //     grouped by country name. Ground truth replays it over the model.
+        Operation {
+            id: "BI-country-messages",
+            label: "Messages per author-country, ranked (HAS_CREATOR + IS_LOCATED_IN)",
+            inspired_by: "BI5/BI10-style country/message correlation",
+            is_write: false,
+            build: |_i, _m| {
+                "MATCH (msg)-[:HAS_CREATOR]->(a:Person)-[:IS_LOCATED_IN]->(c:Place) \
+                 RETURN c.name AS country, count(msg) AS msgs ORDER BY msgs DESC, country ASC"
+                    .to_owned()
+            },
+            expected: |_i, m| {
+                let mut by_country: BTreeMap<String, u64> = BTreeMap::new();
+                let mut tally = |author: u64| {
+                    if let Some(place) = m.person_place_id(author) {
+                        if let Some(name) = m.place_name(place) {
+                            *by_country.entry(name.to_owned()).or_default() += 1;
+                        }
+                    }
+                };
+                for p in m.posts() {
+                    tally(p.author);
+                }
+                for c in m.comments() {
+                    tally(c.author);
+                }
+                let mut ranked: Vec<(String, u64)> = by_country.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(country, msgs)| {
+                        vec![
+                            ("country", Value::String(country)),
+                            ("msgs", Value::Integer(msgs as i64)),
+                        ]
+                    })
+                    .collect()
+            },
+            verify: None,
+        },
+        // --- BI-org-distribution: persons per organisation type, ranked (`rmp` #103) --------------
+        //     Aggregates the workforce by organisation TYPE (University/Company) — the
+        //     Organisation dimension's BI correlation (IC1 needs orgs too; this exercises the data).
+        Operation {
+            id: "BI-org-distribution",
+            label: "Persons per organisation type, ranked (WORK_AT group)",
+            inspired_by: "BI/IC1-style organisation correlation",
+            is_write: false,
+            build: |_i, _m| {
+                "MATCH (p:Person)-[:WORK_AT]->(o:Organisation) \
+                 RETURN o.type AS kind, count(p) AS people ORDER BY people DESC, kind ASC"
+                    .to_owned()
+            },
+            expected: |_i, m| {
+                let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
+                for pid in 0..m.persons() {
+                    if let Some(org) = m.person_org_id(pid) {
+                        if let Some((_, kind)) = m.org(org) {
+                            *by_kind.entry(kind.clone()).or_default() += 1;
+                        }
+                    }
+                }
+                let mut ranked: Vec<(String, u64)> = by_kind.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(kind, people)| {
+                        vec![
+                            ("kind", Value::String(kind)),
+                            ("people", Value::Integer(people as i64)),
+                        ]
+                    })
+                    .collect()
+            },
+            verify: None,
+        },
         // --- DEG-forum: a single forum's post count (point expand + count) -----------------------
         Operation {
             id: "DEG-forum",
@@ -858,31 +1241,32 @@ fn view_threshold(i: u64) -> i64 {
 /// surfaced in the report and `LDBC.md` so the offline scope is transparent (no fake conformance).
 #[must_use]
 pub fn deferred_official_queries() -> Vec<(&'static str, &'static str)> {
+    // As of `rmp` #103 the engine has shortestPath/allShortestPaths (#102) and the synthetic schema
+    // carries per-message creationDate/content, Tags, Places (countries) and Organisations, so the
+    // shortest-path (IC13/IC14), time-windowed (IC3/IC4/IC6/IC9, IS4/IS7) and tag/country-correlation
+    // (BI) shapes are now translated and ground-truth-checked. What remains deferred is genuinely out
+    // of scope for an *offline, synthetic* harness — not an engine or simple-schema gap:
     vec![
         (
-            "IC13 (SinglePairShortestPath) / IC14 (PathBetweenPersons)",
-            "need shortestPath/allShortestPaths, which the engine does not implement; \
-             bounded variable-length reachability is exercised instead (see IC-reach-2).",
+            "Official audited validation (all IC/IS/BI parameters + expected result sets)",
+            "needs the official LDBC Datagen dataset and audited validation parameters, which are \
+             not available offline; we substitute a self-consistent ground-truth check against the \
+             deterministic generator (see correctness.rs / LDBC.md). This is the one inviolable \
+             offline limitation — every individual query *shape* below is now expressed.",
         ),
         (
-            "IC3/IC4/IC5/IC6/IC9 (time-windowed message/tag analytics)",
-            "filter messages by a creationDate window; the synthetic schema has no per-message \
-             timestamp property, so the time predicate cannot be expressed faithfully.",
+            "BI hierarchical TagClass roll-ups (BI tag-class drill-downs)",
+            "the official BI tag queries roll tags up a TagClass hierarchy (isSubclassOf chains); the \
+             synthetic schema models flat Tags only, so the hierarchical roll-up is not modelled. \
+             Flat per-Tag correlation IS exercised (BI-tag-popularity); a TagClass tree is a \
+             schema-enrichment follow-up, not an engine gap.",
         ),
         (
-            "IS4 (MessageContent) / IS7 (RepliesOfMessage thread)",
-            "need a message `content`/`creationDate` and reply-thread chains the synthetic schema \
-             omits (posts/comments carry only an id/views).",
-        ),
-        (
-            "IC1 (full friend search with workplaces/universities)",
-            "needs Organisation/Place dimensions (universities, companies, cities) absent from the \
-             synthetic schema; the friendship-distance core is exercised by IC-fof / IC-reach-2.",
-        ),
-        (
-            "BI tag/country correlations (BI2, BI5, BI10, …)",
-            "need Tag/TagClass/Country dimensions and message timestamps the synthetic schema omits; \
-             the structural BI aggregates (forum sizes, view sums, contributor rankings) are kept.",
+            "Power-law / correlated distributions and official SF scale factors",
+            "the synthetic generator draws a uniform, deterministically-seeded graph (not the \
+             official power-law degree / correlated-dimension distributions at SF1/SF3/SF10); the \
+             query shapes are faithful, the data distribution is not, so absolute numbers are a \
+             relative Graphus-vs-Graphus signal only.",
         ),
     ]
 }
@@ -894,4 +1278,40 @@ fn pick(i: u64, n: u64) -> u64 {
         return 0;
     }
     i.wrapping_mul(0x9E37_79B9_7F4A_7C15) % n
+}
+
+/// Two **distinct** anchor person ids in `0..n` for the shortest-path operations (IC13/IC14). `a` is
+/// the usual [`pick`]; `b` is a second hash, nudged to differ from `a` so the pair is never the
+/// self-pair (which would need a `*0..` lower bound). Returns `(0, 0)` only if there is a single
+/// person (in which case the operations harmlessly anchor a self-pair the model also reports as
+/// distance 0 — though every harness scale has ≥ 20 persons, so this degenerate case never arises).
+fn pick_pair(i: u64, n: u64) -> (u64, u64) {
+    if n <= 1 {
+        return (0, 0);
+    }
+    let a = pick(i, n);
+    let mut b = i.wrapping_mul(0xD6E8_FEB8_6659_FD93) % n;
+    if b == a {
+        b = (b + 1) % n;
+    }
+    (a, b)
+}
+
+/// A `[lo, hi)` integer `creationDate` window for the time-windowed operations (IC3/IC4/IC9). It
+/// genuinely *excludes* some messages at both ends: it skips the first few posts (lower bound inside
+/// the post band) and admits only the leading part of the comment band (upper bound inside the
+/// comment band), so the engine must filter both posts and comments. It is varied per invocation so
+/// the predicate is not constant-folded, and is shared by `build` and `expected` so they cannot
+/// diverge. (Posts occupy `[POST_DATE_BASE, POST_DATE_BASE+num_posts)`, comments
+/// `[COMMENT_DATE_BASE, COMMENT_DATE_BASE+num_comments)` — see the generator's date bands.)
+fn message_window(i: u64, m: &SnbModel) -> (u64, u64) {
+    let posts = m.post_count().max(1);
+    let comments = m.comment_count().max(1);
+    // Lower bound: skip a varying prefix of the post band (admits the post tail).
+    let lo_post = (i % posts) / 3;
+    let lo = message_creation_date(MessageKind::Post, lo_post);
+    // Upper bound: admit only a varying leading slice of the comment band (excludes the comment tail).
+    let hi_comment = comments - (i % comments) / 3;
+    let hi = message_creation_date(MessageKind::Comment, hi_comment);
+    (lo, hi)
 }

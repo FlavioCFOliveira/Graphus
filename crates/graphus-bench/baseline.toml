@@ -16,13 +16,24 @@ commit_short_txn_ns = 4330
 scan_1k_nodes_ns = 21651
 
 # ----------------------------------------------------------------------------
-# LDBC-SNB-flavoured macro harness baseline (`rmp` task #78).
+# LDBC-SNB-flavoured macro harness baseline (`rmp` tasks #78 + #103).
 #
 # A documented, RELATIVE Graphus-vs-Graphus regression signal for representative
 # operations of the broadened IS/IC/BI catalog, captured with
 #   cargo run -p graphus-bench --release --bin ldbc_snb
 # on the machine class in RESULTS.md §1 (rustc 1.96.0, Ryzen 9 5900HX, Linux 6.8),
-# tiny scale (174 nodes / 670 rels), each operation timed over 200 invocations.
+# tiny scale (191 nodes / 898 rels after the #103 dimension enrichment), each
+# operation timed over 200 invocations.
+#
+# NOTE (#103 re-capture): these p50s are HIGHER than the #78 baseline for two
+# honest reasons, neither an engine regression: (a) the load is heavier (the #103
+# Tag/Place/Organisation dimensions add nodes + ~one extra edge per message/person,
+# so 506 vs 337 load txns and more pages for the index-free scans to walk), and
+# (b) this re-capture ran under the `powersave` CPU governor with light background
+# load, ~1.6-1.7x slower than the #78 capture's quieter run. The relative ordering
+# of the shapes is unchanged. Re-capture on a quiet `performance`-governor box for
+# a tighter signal; the numbers are reproducible run-to-run thanks to the
+# deterministic generator.
 #
 # OFFLINE SCOPE: these are NOT official LDBC results and are NOT a CI gate (the
 # `[metrics]` section above is the only gated micro-baseline). Correctness is
@@ -30,10 +41,14 @@ scan_1k_nodes_ns = 21651
 # `cargo test -p graphus-bench` (src/ldbc/correctness.rs). See RESULTS.md §9 and
 # LDBC.md. Re-capture after an intentional engine change and update p50 below.
 [ldbc_snb]
-# p50 latency (microseconds) for three representative shapes of the catalog.
+# p50 latency (microseconds) for representative shapes of the 34-operation catalog.
 # IS1-profile: id-anchored point read (property-index seek active).
-is1_profile_p50_us = 779.0
+is1_profile_p50_us = 1284.3
 # IC-fof: 2-hop friends-of-friends DISTINCT traversal (the canonical SNB shape).
-ic_fof_p50_us = 2129.4
+ic_fof_p50_us = 4965.4
+# IC13-shortest-path: single-pair shortest KNOWS path (shortestPath, #102/#103).
+ic13_shortest_path_p50_us = 10272.0
+# BI-tag-popularity: messages per Tag, ranked (a #103 tag-correlation aggregate).
+bi_tag_popularity_p50_us = 49569.8
 # IU-comment: insert a comment on a post (the short write transaction).
-iu_comment_p50_us = 13606.8
+iu_comment_p50_us = 21131.0

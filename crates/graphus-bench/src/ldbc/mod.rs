@@ -201,12 +201,15 @@ pub fn render(report: &Report) -> String {
     );
     let _ = writeln!(
         out,
-        " graph: {} nodes ({} persons, {} forums, {} posts, {} comments), {} rels ({} KNOWS)",
+        " graph: {} nodes ({} persons, {} forums, {} posts, {} comments, {} tags, {} places, {} orgs), {} rels ({} KNOWS)",
         st.nodes(),
         st.persons,
         st.forums,
         st.posts,
         st.comments,
+        st.tags,
+        st.places,
+        st.orgs,
         st.rels(),
         st.knows_edges
     );

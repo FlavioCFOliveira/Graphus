@@ -29,17 +29,54 @@
 //!
 //! # Schema
 //!
-//! | Label     | Properties                          | Edges                                            |
-//! | --------- | ----------------------------------- | ------------------------------------------------ |
-//! | `Person`  | `id:int`, `name:string`, `age:int`  | `(:Person)-[:KNOWS]->(:Person)` (symmetric pair) |
-//! | `Forum`   | `id:int`, `title:string`            | `(:Forum)-[:CONTAINER_OF]->(:Post)`              |
-//! | `Post`    | `id:int`, `views:int`               | `(:Post)-[:HAS_CREATOR]->(:Person)`              |
-//! | `Comment` | `id:int`                            | `(:Comment)-[:HAS_CREATOR]->(:Person)`, `(:Comment)-[:REPLY_OF]->(:Post)` |
+//! | Label          | Properties                                                   | Edges                                                                              |
+//! | -------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+//! | `Person`       | `id:int`, `name:string`, `age:int`                           | `(:Person)-[:KNOWS]->(:Person)` (symmetric pair), `-[:IS_LOCATED_IN]->(:Place)`, `-[:WORK_AT]->(:Organisation)` |
+//! | `Forum`        | `id:int`, `title:string`                                     | `(:Forum)-[:CONTAINER_OF]->(:Post)`                                                |
+//! | `Post`         | `id:int`, `views:int`, `creationDate:int`, `content:string`  | `(:Post)-[:HAS_CREATOR]->(:Person)`, `(:Post)-[:HAS_TAG]->(:Tag)`                  |
+//! | `Comment`      | `id:int`, `creationDate:int`, `content:string`               | `(:Comment)-[:HAS_CREATOR]->(:Person)`, `(:Comment)-[:REPLY_OF]->(:Post)`, `(:Comment)-[:HAS_TAG]->(:Tag)` |
+//! | `Tag`          | `id:int`, `name:string`                                      | (target of `HAS_TAG`)                                                              |
+//! | `Place`        | `id:int`, `name:string`, `type:string` (all `'Country'`)     | (target of `IS_LOCATED_IN`)                                                        |
+//! | `Organisation` | `id:int`, `name:string`, `type:string` (`'University'`/`'Company'`) | (target of `WORK_AT`)                                                      |
 //!
 //! Every value is an inline scalar or a short `String`, all within the engine's stored-property
 //! subtype (`05 §7.2`). All `CREATE`s go through the real commit path in batches.
+//!
+//! # The dimension extensions (`rmp` #103) and *why they preserve determinism*
+//!
+//! The original schema (Person/Forum/Post/Comment + KNOWS/CONTAINER_OF/HAS_CREATOR/REPLY_OF) is
+//! drawn from a PRNG whose **draw order is load-bearing** (see [`build_model`]). The #103 dimensions —
+//! per-message `creationDate`/`content`, `Tag`s, `Place`s (countries) and `Organisation`s — are all
+//! **pure deterministic functions of a node's `id`** ([`message_creation_date`], [`message_content`],
+//! [`message_tag`], [`person_place`], [`person_org`]). They draw **no** PRNG values, so they are
+//! appended to the model *without touching a single existing draw*: the Person/KNOWS/Post/Comment
+//! structure is byte-identical to before #103, and every pre-#103 operation keeps passing unchanged.
+//! The small fixed dimension cardinalities ([`NUM_TAGS`]/[`NUM_PLACES`]/[`NUM_ORGS`]) keep the load
+//! cheap (a handful of extra nodes + one extra edge per message/person), preserving the tiny/micro
+//! scales' speed.
 
 use crate::ldbc::driver::{Coord, RunError, run_write};
+
+/// The number of `Tag` nodes (a small fixed dimension). Every message links to exactly one tag via
+/// `message_tag(id)`, so tag-popularity correlations have a handful of buckets to aggregate over.
+pub const NUM_TAGS: u64 = 8;
+
+/// The number of `Place` nodes (all `Country`-typed). Every person `IS_LOCATED_IN` exactly one place
+/// via `person_place(id)`, so a country correlation has a few buckets.
+pub const NUM_PLACES: u64 = 5;
+
+/// The number of `Organisation` nodes (alternating `University`/`Company`). Every person `WORK_AT`s
+/// exactly one via `person_org(id)`.
+pub const NUM_ORGS: u64 = 4;
+
+/// The base `creationDate` ordinal for posts. Messages carry an integer `creationDate` (a faithful,
+/// cleanly-indexable epoch-like ordinal — see the module docs) so time-window predicates
+/// (`WHERE m.creationDate >= a AND m.creationDate < b`) are expressible without any temporal-function
+/// overhead. Posts and comments occupy distinct, interleaving ordinal bands.
+const POST_DATE_BASE: u64 = 1_000_000;
+
+/// The base `creationDate` ordinal for comments (comments are "newer" replies, so a higher band).
+const COMMENT_DATE_BASE: u64 = 2_000_000;
 
 /// A SplitMix64 PRNG — tiny, fast, and fully deterministic from its seed. Used only to shape the
 /// synthetic graph (which person knows whom, how many posts a forum has); never security-sensitive.
@@ -147,42 +184,86 @@ pub struct GraphStats {
     pub forums: u64,
     pub posts: u64,
     pub comments: u64,
+    /// `Tag` nodes (`rmp` #103 dimension).
+    pub tags: u64,
+    /// `Place` (country) nodes (`rmp` #103 dimension).
+    pub places: u64,
+    /// `Organisation` nodes (`rmp` #103 dimension).
+    pub orgs: u64,
     /// Total committed write transactions used to build the graph.
     pub load_txns: u64,
 }
 
 impl GraphStats {
-    /// Total nodes created.
+    /// Total nodes created (includes the #103 Tag/Place/Organisation dimension nodes).
     #[must_use]
     pub fn nodes(&self) -> u64 {
-        self.persons + self.forums + self.posts + self.comments
+        self.persons
+            + self.forums
+            + self.posts
+            + self.comments
+            + self.tags
+            + self.places
+            + self.orgs
     }
 
     /// Total relationships created.
     #[must_use]
     pub fn rels(&self) -> u64 {
         // KNOWS + CONTAINER_OF(forum->post) + HAS_CREATOR(post->person) + HAS_CREATOR(comment->person)
-        // + REPLY_OF(comment->post).
-        self.knows_edges + self.posts + self.posts + self.comments + self.comments
+        // + REPLY_OF(comment->post) + HAS_TAG(post->tag) + HAS_TAG(comment->tag)
+        // + IS_LOCATED_IN(person->place) + WORK_AT(person->org).
+        self.knows_edges
+            + self.posts        // CONTAINER_OF
+            + self.posts        // HAS_CREATOR (post)
+            + self.comments     // HAS_CREATOR (comment)
+            + self.comments     // REPLY_OF
+            + self.posts        // HAS_TAG (post)
+            + self.comments     // HAS_TAG (comment)
+            + self.persons      // IS_LOCATED_IN
+            + self.persons // WORK_AT
     }
 }
 
 /// A `Post` in the structural model: its stable `id`, its containing forum, its author, and its view
-/// count. Captured exactly as the generator drew them.
-#[derive(Debug, Clone, Copy)]
+/// count, plus the #103 dimensions: an integer `creation_date`, a `tag` (one of [`NUM_TAGS`]) and a
+/// `content` string. The view count and author are PRNG-drawn (in [`build_model`]); the dimensions
+/// are pure functions of the id, so they add no draw and do not perturb the structure.
+#[derive(Debug, Clone)]
 pub struct Post {
     pub id: u64,
     pub forum: u64,
     pub author: u64,
     pub views: u64,
+    /// Integer `creationDate` ordinal (`message_creation_date(MessageKind::Post, id)`).
+    pub creation_date: u64,
+    /// The id of the single `Tag` this post links to (`message_tag(id)`).
+    pub tag: u64,
+    /// The post's `content` string (`message_content(MessageKind::Post, id)`).
+    pub content: String,
 }
 
-/// A `Comment` in the structural model: its stable `id`, the post it replies to, and its author.
-#[derive(Debug, Clone, Copy)]
+/// A `Comment` in the structural model: its stable `id`, the post it replies to, and its author, plus
+/// the #103 dimensions (`creation_date`, `tag`, `content`) — pure functions of the id, like `Post`.
+#[derive(Debug, Clone)]
 pub struct Comment {
     pub id: u64,
     pub post: u64,
     pub author: u64,
+    /// Integer `creationDate` ordinal (`message_creation_date(MessageKind::Comment, id)`).
+    pub creation_date: u64,
+    /// The id of the single `Tag` this comment links to (`message_tag(id)`).
+    pub tag: u64,
+    /// The comment's `content` string (`message_content(MessageKind::Comment, id)`).
+    pub content: String,
+}
+
+/// Which kind of message a `creationDate`/`content` is for — they occupy distinct ordinal bands so a
+/// time-window predicate can target posts, comments, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Post,
+    Comment,
 }
 
 /// The **pure-Rust structural model** of the generated graph — the offline ground-truth oracle.
@@ -210,6 +291,12 @@ pub struct SnbModel {
     posts: Vec<Post>,
     /// Comments in creation order (comment id == index).
     comments: Vec<Comment>,
+    /// Tag ids `0..NUM_TAGS`; each `tags[t]` holds the tag name. A fixed small dimension (`rmp` #103).
+    tags: Vec<String>,
+    /// Place ids `0..NUM_PLACES`; each holds the country name (all places are `Country`-typed).
+    places: Vec<String>,
+    /// Organisation ids `0..NUM_ORGS`; each holds `(name, type)` where type is `University`/`Company`.
+    orgs: Vec<(String, String)>,
 }
 
 impl SnbModel {
@@ -267,6 +354,108 @@ impl SnbModel {
         self.forums.get(id as usize).map(String::as_str)
     }
 
+    /// The number of `Tag` nodes.
+    #[must_use]
+    pub fn tag_count(&self) -> u64 {
+        self.tags.len() as u64
+    }
+
+    /// The name of tag `id`, if it exists.
+    #[must_use]
+    pub fn tag_name(&self, id: u64) -> Option<&str> {
+        self.tags.get(id as usize).map(String::as_str)
+    }
+
+    /// The number of `Place` (country) nodes.
+    #[must_use]
+    pub fn place_count(&self) -> u64 {
+        self.places.len() as u64
+    }
+
+    /// The name of place (country) `id`, if it exists.
+    #[must_use]
+    pub fn place_name(&self, id: u64) -> Option<&str> {
+        self.places.get(id as usize).map(String::as_str)
+    }
+
+    /// The country (`Place`) id person `pid` is located in (`person_place(pid)`), or `None` if `pid`
+    /// is out of range.
+    #[must_use]
+    pub fn person_place_id(&self, pid: u64) -> Option<u64> {
+        (pid < self.persons()).then(|| person_place(pid))
+    }
+
+    /// The number of `Organisation` nodes.
+    #[must_use]
+    pub fn org_count(&self) -> u64 {
+        self.orgs.len() as u64
+    }
+
+    /// The `(name, type)` of organisation `id`, if it exists.
+    #[must_use]
+    pub fn org(&self, id: u64) -> Option<&(String, String)> {
+        self.orgs.get(id as usize)
+    }
+
+    /// The `Organisation` id person `pid` works at (`person_org(pid)`), or `None` if out of range.
+    #[must_use]
+    pub fn person_org_id(&self, pid: u64) -> Option<u64> {
+        (pid < self.persons()).then(|| person_org(pid))
+    }
+
+    /// The post with the given id, if it exists.
+    #[must_use]
+    pub fn post(&self, id: u64) -> Option<&Post> {
+        self.posts.get(id as usize)
+    }
+
+    /// The comment with the given id, if it exists.
+    #[must_use]
+    pub fn comment(&self, id: u64) -> Option<&Comment> {
+        self.comments.get(id as usize)
+    }
+
+    /// The shortest `KNOWS` distance from `src` to `dst` over the symmetric friendship adjacency, or
+    /// `None` if they are disconnected. A plain BFS — the offline ground truth for the
+    /// `shortestPath`-based IC13/IC14 operations. Self-distance is `0`.
+    #[must_use]
+    pub fn shortest_knows_distance(&self, src: u64, dst: u64) -> Option<u64> {
+        if src >= self.persons() || dst >= self.persons() {
+            return None;
+        }
+        if src == dst {
+            return Some(0);
+        }
+        let mut visited = vec![false; self.persons() as usize];
+        let mut frontier = vec![src];
+        visited[src as usize] = true;
+        let mut dist = 0u64;
+        while !frontier.is_empty() {
+            dist += 1;
+            let mut next = Vec::new();
+            for &node in &frontier {
+                for &nbr in self.friends(node) {
+                    if nbr == dst {
+                        return Some(dist);
+                    }
+                    if !visited[nbr as usize] {
+                        visited[nbr as usize] = true;
+                        next.push(nbr);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        None
+    }
+
+    // Note: a shortest-*path-count* oracle was deliberately NOT added. The IC14 operation projects
+    // `RETURN DISTINCT length(p)` over `allShortestPaths`, because the symmetric `KNOWS` multigraph
+    // (two directed edges per friendship) makes the raw `allShortestPaths` cardinality an engine
+    // artefact (≈ 2^length), not a clean structural count — so a Rust path-count would not match the
+    // engine and would be a misleading oracle. The *distinct length* is the BFS distance, which
+    // `shortest_knows_distance` above provides. See operations.rs IC14 / LDBC.md for the rationale.
+
     /// The [`GraphStats`] this model corresponds to (counts only; `load_txns` is filled by the
     /// loader, since it depends on batching, not structure).
     #[must_use]
@@ -278,6 +467,9 @@ impl SnbModel {
             forums: self.forums(),
             posts: self.post_count(),
             comments: self.comment_count(),
+            tags: self.tag_count(),
+            places: self.place_count(),
+            orgs: self.org_count(),
             load_txns: 0,
         }
     }
@@ -294,7 +486,11 @@ impl SnbModel {
 ///      duplicates skipped via a `seen` set keyed on the unordered pair.
 ///   3. `Forum` ids `0..forums` (titles are pure functions of the id — no PRNG draw).
 ///   4. For each forum, for each of `posts_per_forum` posts: a `views` draw then an `author` draw.
+///      (The #103 `creationDate`/`tag`/`content` are pure functions of the id — no draw.)
 ///   5. For each of `total_posts * comments_per_post` comments: a `post` draw then an `author` draw.
+///      (The #103 `creationDate`/`tag`/`content` are pure functions of the id — no draw.)
+///   6. `Tag`/`Place`/`Organisation` dimension nodes (`rmp` #103) — all pure functions of their id,
+///      appended after every structural draw, so steps 1-5 are byte-identical to the pre-#103 model.
 #[must_use]
 pub fn build_model(sf: ScaleFactor) -> SnbModel {
     let mut rng = SplitMix64::new(0x1DBC_5EED_u64.wrapping_add(sf.persons));
@@ -304,6 +500,9 @@ pub fn build_model(sf: ScaleFactor) -> SnbModel {
         forums: Vec::with_capacity(sf.forums as usize),
         posts: Vec::new(),
         comments: Vec::new(),
+        tags: Vec::with_capacity(NUM_TAGS as usize),
+        places: Vec::with_capacity(NUM_PLACES as usize),
+        orgs: Vec::with_capacity(NUM_ORGS as usize),
     };
 
     // -- 1. Person nodes -------------------------------------------------------------------------
@@ -346,6 +545,9 @@ pub fn build_model(sf: ScaleFactor) -> SnbModel {
         for _ in 0..sf.posts_per_forum {
             let post_id = next_post_id;
             next_post_id += 1;
+            // The two PRNG draws are UNCHANGED from pre-#103 (views then author) and in the same
+            // order, so the structure is byte-identical. The dimensions below are pure functions of
+            // the id — no draw.
             let views = rng.below(10_000);
             let author = rng.below(sf.persons);
             model.posts.push(Post {
@@ -353,13 +555,17 @@ pub fn build_model(sf: ScaleFactor) -> SnbModel {
                 forum: fid,
                 author,
                 views,
+                creation_date: message_creation_date(MessageKind::Post, post_id),
+                tag: message_tag(post_id),
+                content: message_content(MessageKind::Post, post_id),
             });
         }
     }
 
     // -- 4. Comments (reply to a post, with an author) -------------------------------------------
     //     The comment id is the creation index; the `post`/`author` draws happen in that index order
-    //     (load-bearing for determinism — see the draw-order contract above).
+    //     (load-bearing for determinism — see the draw-order contract above). The #103 dimensions are
+    //     pure functions of the id, so they add no draw.
     let total_posts = next_post_id;
     if total_posts > 0 {
         for comment_id in 0..(total_posts * sf.comments_per_post) {
@@ -369,8 +575,24 @@ pub fn build_model(sf: ScaleFactor) -> SnbModel {
                 id: comment_id,
                 post,
                 author,
+                creation_date: message_creation_date(MessageKind::Comment, comment_id),
+                tag: message_tag(comment_id),
+                content: message_content(MessageKind::Comment, comment_id),
             });
         }
+    }
+
+    // -- 5. Dimension nodes (`rmp` #103): Tags, Places (countries), Organisations. ----------------
+    //     All are pure functions of their id (no PRNG draw), appended after every structural draw, so
+    //     the Person/KNOWS/Post/Comment structure above is identical to pre-#103.
+    for tid in 0..NUM_TAGS {
+        model.tags.push(tag_name(tid));
+    }
+    for pid in 0..NUM_PLACES {
+        model.places.push(place_name(pid));
+    }
+    for oid in 0..NUM_ORGS {
+        model.orgs.push((org_name(oid), org_type(oid).to_owned()));
     }
 
     model
@@ -432,6 +654,8 @@ impl<'a> Batcher<'a> {
 ///   2. `KNOWS` edges between persons (the model's symmetric neighbour sets, each friendship once).
 ///   3. `Forum` nodes, their `Post`s (`CONTAINER_OF`), each post's author (`HAS_CREATOR`).
 ///   4. `Comment`s replying to posts (`REPLY_OF`), each with an author (`HAS_CREATOR`).
+///   5. (`rmp` #103) `Tag`/`Place`/`Organisation` dimension nodes, then `HAS_TAG` (message→tag),
+///      `IS_LOCATED_IN` (person→country) and `WORK_AT` (person→organisation) edges.
 ///
 /// Edges are created with a `MATCH … MATCH … CREATE` statement keyed on the `id` properties (the
 /// engine supports multi-`MATCH` + `CREATE` of a relationship between bound nodes), so the harness
@@ -492,12 +716,17 @@ pub fn generate(coord: &mut Coord, sf: ScaleFactor) -> Result<(SnbModel, GraphSt
             forum,
             author,
             views,
-        } = *post;
+            creation_date,
+            content,
+            ..
+        } = post;
+        let content = escape_cypher_string(content);
         run_write(
             coord,
             &format!(
                 "MATCH (f:Forum {{id: {forum}}}), (a:Person {{id: {author}}}) \
-                 CREATE (p:Post {{id: {id}, views: {views}}}), \
+                 CREATE (p:Post {{id: {id}, views: {views}, creationDate: {creation_date}, \
+                                  content: '{content}'}}), \
                         (f)-[:CONTAINER_OF]->(p), (p)-[:HAS_CREATOR]->(a)"
             ),
         )?;
@@ -506,13 +735,85 @@ pub fn generate(coord: &mut Coord, sf: ScaleFactor) -> Result<(SnbModel, GraphSt
 
     // -- 4. Comments: each replies to a post and has an author ------------------------------------
     for comment in model.comments() {
-        let Comment { id, post, author } = *comment;
+        let Comment {
+            id,
+            post,
+            author,
+            creation_date,
+            content,
+            ..
+        } = comment;
+        let content = escape_cypher_string(content);
         run_write(
             coord,
             &format!(
                 "MATCH (p:Post {{id: {post}}}), (a:Person {{id: {author}}}) \
-                 CREATE (c:Comment {{id: {id}}}), \
+                 CREATE (c:Comment {{id: {id}, creationDate: {creation_date}, \
+                                     content: '{content}'}}), \
                         (c)-[:REPLY_OF]->(p), (c)-[:HAS_CREATOR]->(a)"
+            ),
+        )?;
+        stats.load_txns += 1;
+    }
+
+    // -- 5. Dimension nodes (`rmp` #103): Tag / Place / Organisation, then the edges that link --
+    //     messages to tags and persons to a place + organisation. The dimension nodes are created
+    //     first (batched bare CREATEs), then each edge is a `MATCH … MATCH … CREATE` keyed on the id
+    //     properties — the same pattern the structural edges use.
+    {
+        let mut b = Batcher::new(coord, sf.batch);
+        for (tid, name) in model.tags.iter().enumerate() {
+            let name = escape_cypher_string(name);
+            b.push(format!("(:Tag {{id: {tid}, name: '{name}'}})"))?;
+        }
+        for (pid, name) in model.places.iter().enumerate() {
+            let name = escape_cypher_string(name);
+            b.push(format!(
+                "(:Place {{id: {pid}, name: '{name}', type: 'Country'}})"
+            ))?;
+        }
+        for (oid, (name, kind)) in model.orgs.iter().enumerate() {
+            let name = escape_cypher_string(name);
+            b.push(format!(
+                "(:Organisation {{id: {oid}, name: '{name}', type: '{kind}'}})"
+            ))?;
+        }
+        b.flush()?;
+        stats.load_txns += b.txns;
+    }
+
+    // 5a. HAS_TAG edges: every message links to exactly one tag.
+    for post in model.posts() {
+        run_write(
+            coord,
+            &format!(
+                "MATCH (p:Post {{id: {}}}), (t:Tag {{id: {}}}) CREATE (p)-[:HAS_TAG]->(t)",
+                post.id, post.tag
+            ),
+        )?;
+        stats.load_txns += 1;
+    }
+    for comment in model.comments() {
+        run_write(
+            coord,
+            &format!(
+                "MATCH (c:Comment {{id: {}}}), (t:Tag {{id: {}}}) CREATE (c)-[:HAS_TAG]->(t)",
+                comment.id, comment.tag
+            ),
+        )?;
+        stats.load_txns += 1;
+    }
+
+    // 5b. IS_LOCATED_IN + WORK_AT edges: every person links to exactly one place + organisation.
+    for pid in 0..model.persons() {
+        let place = person_place(pid);
+        let org = person_org(pid);
+        run_write(
+            coord,
+            &format!(
+                "MATCH (p:Person {{id: {pid}}}), (c:Place {{id: {place}}}), \
+                       (o:Organisation {{id: {org}}}) \
+                 CREATE (p)-[:IS_LOCATED_IN]->(c), (p)-[:WORK_AT]->(o)"
             ),
         )?;
         stats.load_txns += 1;
@@ -529,4 +830,96 @@ fn person_name(pid: u64) -> String {
     ];
     let first = FIRST[(pid as usize) % FIRST.len()];
     format!("{first}{pid}")
+}
+
+/// The integer `creationDate` ordinal for a message — a pure function of its kind + id, so it adds no
+/// PRNG draw (see the module docs on determinism). Posts and comments occupy distinct, monotonically
+/// increasing bands ([`POST_DATE_BASE`]/[`COMMENT_DATE_BASE`]), so a window predicate
+/// `WHERE m.creationDate >= a AND m.creationDate < b` selects a deterministic, easily-computed subset.
+#[must_use]
+pub fn message_creation_date(kind: MessageKind, id: u64) -> u64 {
+    match kind {
+        MessageKind::Post => POST_DATE_BASE + id,
+        MessageKind::Comment => COMMENT_DATE_BASE + id,
+    }
+}
+
+/// The single `Tag` id a message links to — a pure function of its id (`id % NUM_TAGS`), so tag
+/// popularity is a deterministic, easily-aggregated distribution and the assignment adds no draw.
+#[must_use]
+pub fn message_tag(id: u64) -> u64 {
+    id % NUM_TAGS
+}
+
+/// The `content` string for a message — a pure, stable function of kind + id (a real `String`
+/// property the IS4 content read projects). No PRNG draw.
+#[must_use]
+pub fn message_content(kind: MessageKind, id: u64) -> String {
+    match kind {
+        MessageKind::Post => format!("Post content #{id}"),
+        MessageKind::Comment => format!("Comment content #{id}"),
+    }
+}
+
+/// The `Place` (country) a person is located in — `pid % NUM_PLACES`, a pure function (no draw).
+#[must_use]
+pub fn person_place(pid: u64) -> u64 {
+    pid % NUM_PLACES
+}
+
+/// The `Organisation` a person works at — `pid % NUM_ORGS`, a pure function (no draw).
+#[must_use]
+pub fn person_org(pid: u64) -> u64 {
+    pid % NUM_ORGS
+}
+
+/// A stable tag name for tag id `tid` (a small fixed vocabulary).
+fn tag_name(tid: u64) -> String {
+    const TAGS: [&str; NUM_TAGS as usize] = [
+        "Graphs",
+        "Databases",
+        "Rust",
+        "Algorithms",
+        "Distributed",
+        "Storage",
+        "Concurrency",
+        "Networking",
+    ];
+    TAGS[(tid % NUM_TAGS) as usize].to_owned()
+}
+
+/// A stable country name for place id `pid` (all places are `Country`-typed).
+fn place_name(pid: u64) -> String {
+    const COUNTRIES: [&str; NUM_PLACES as usize] =
+        ["Portugal", "Germany", "Japan", "Brazil", "Canada"];
+    COUNTRIES[(pid % NUM_PLACES) as usize].to_owned()
+}
+
+/// A stable organisation name for organisation id `oid`.
+fn org_name(oid: u64) -> String {
+    const ORGS: [&str; NUM_ORGS as usize] = [
+        "University of Lisbon",
+        "TU Munich",
+        "Acme Corp",
+        "Globex Inc",
+    ];
+    ORGS[(oid % NUM_ORGS) as usize].to_owned()
+}
+
+/// The organisation `type` for organisation id `oid` — even ids are `University`, odd ids `Company`,
+/// so both official kinds exist in the small set.
+fn org_type(oid: u64) -> &'static str {
+    if oid % 2 == 0 {
+        "University"
+    } else {
+        "Company"
+    }
+}
+
+/// Escapes a string for inlining inside a single-quoted Cypher literal: backslash first, then the
+/// single-quote delimiter (the engine's lexer accepts `\\` and `\'` — see `graphus-cypher` lexer).
+/// The synthetic content/name strings are ASCII and contain none of these, but escaping keeps the
+/// loader robust if the vocabulary ever grows an apostrophe.
+fn escape_cypher_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
