@@ -61,6 +61,9 @@ struct TxnConflict {
     out_conflict: bool,
     /// Transactions this one has an outbound rw-edge to (`self --rw--> target`).
     out_edges: HashSet<TxnId>,
+    /// Transactions that have an inbound rw-edge into this one (`source --rw--> self`). Tracked so a
+    /// dangerous structure whose pivot has already committed can be broken at edge-formation time.
+    in_edges: HashSet<TxnId>,
     /// Commit timestamp once committed (`None` while in flight).
     commit_ts: Option<Timestamp>,
     /// Begin timestamp (snapshot), to decide concurrency.
@@ -74,6 +77,12 @@ pub struct SsiTracker {
     /// For each key, the set of transactions that currently hold a SIREAD marker on it. A reverse
     /// index so a write can find concurrent readers in O(readers-of-key).
     readers_of: HashMap<Key, HashSet<TxnId>>,
+    /// Transactions condemned to abort at their commit. Populated when a dangerous structure
+    /// completes around a pivot that has **already committed** (so the pivot itself cannot be the
+    /// victim): the still-active endpoint that just closed the structure is doomed instead. This is
+    /// the eager counterpart of the commit-time [`detect_pivot_abort`](Self::detect_pivot_abort),
+    /// which alone cannot catch a pivot whose two rw-edges form only after it commits (`rmp` audit F9).
+    doomed: HashSet<TxnId>,
 }
 
 impl SsiTracker {
@@ -148,6 +157,11 @@ impl SsiTracker {
     }
 
     /// Adds the rw-antidependency edge `from --rw--> to` and updates the conflict flags.
+    ///
+    /// If this edge completes a dangerous structure whose **pivot has already committed** (so it can
+    /// no longer be aborted), the still-active endpoint that just closed the structure is added to the
+    /// [`doomed`](Self::doomed) set, breaking the would-be cycle before it can fully commit. (When the
+    /// pivot is still active, the structure is left to the commit-time [`detect_pivot_abort`].)
     fn add_edge(&mut self, from: TxnId, to: TxnId) {
         if from == to {
             return;
@@ -158,6 +172,25 @@ impl SsiTracker {
         }
         if let Some(t) = self.txns.get_mut(&to) {
             t.in_conflict = true;
+            t.in_edges.insert(from);
+        }
+
+        // Eager committed-pivot break. The just-added edge can make either endpoint a pivot (in +
+        // out). If that pivot has already committed, neither commit-time case can abort it, so doom
+        // the *other* endpoint of this edge — the active transaction that just closed the structure.
+        let pivot_committed = |s: &Self, p: TxnId| {
+            s.txns
+                .get(&p)
+                .is_some_and(|t| t.in_conflict && t.out_conflict && t.commit_ts.is_some())
+        };
+        let active = |s: &Self, p: TxnId| s.txns.get(&p).is_some_and(|t| t.commit_ts.is_none());
+        // `to` became a committed pivot ⇒ its in-partner `from` (the active reader) is the victim.
+        if pivot_committed(self, to) && active(self, from) {
+            self.doomed.insert(from);
+        }
+        // `from` became a committed pivot ⇒ its out-partner `to` (the active writer) is the victim.
+        if pivot_committed(self, from) && active(self, to) {
+            self.doomed.insert(to);
         }
     }
 
@@ -171,6 +204,13 @@ impl SsiTracker {
     /// safe-retry guarantee.
     #[must_use]
     pub fn detect_pivot_abort(&self, txn: TxnId) -> Option<TxnId> {
+        // Eagerly-condemned victim: a dangerous structure completed around an already-committed pivot
+        // and this transaction was chosen to break it (`add_edge`). Abort it (self) — a retriable
+        // serialization failure, like any other SSI abort.
+        if self.doomed.contains(&txn) {
+            return Some(txn);
+        }
+
         let t = self.txns.get(&txn)?;
 
         // Read-only optimization: a transaction that wrote nothing cannot be the pivot of a
@@ -224,6 +264,7 @@ impl SsiTracker {
 
     /// Forgets `txn` entirely (aborted, or GC'd after no live snapshot can observe it).
     pub fn forget(&mut self, txn: TxnId) {
+        self.doomed.remove(&txn);
         if let Some(t) = self.txns.remove(&txn) {
             for key in t.reads {
                 if let Some(set) = self.readers_of.get_mut(&key) {

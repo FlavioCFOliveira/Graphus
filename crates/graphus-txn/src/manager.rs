@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use graphus_core::{GraphusError, Result, Timestamp, TxnId};
+use graphus_core::{GraphusError, Result, Timestamp, TxnId, VersionStamp};
 
 use crate::gc::{GcReport, collect};
 use crate::lock::{LockOutcome, LockTable};
@@ -161,6 +161,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     pub fn write(&mut self, txn: TxnId, key: Key, payload: Vec<u8>) -> Result<()> {
         self.ensure_active(txn)?;
         self.acquire_write(txn, key)?;
+        self.ensure_no_concurrent_committed_write(txn, key)?;
         self.store.create_version(key, txn, payload)?;
         self.ssi.record_write(txn, key);
         Ok(())
@@ -176,6 +177,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     pub fn delete(&mut self, txn: TxnId, key: Key) -> Result<()> {
         self.ensure_active(txn)?;
         self.acquire_write(txn, key)?;
+        self.ensure_no_concurrent_committed_write(txn, key)?;
         self.store.expire_version(key, txn)?;
         self.ssi.record_write(txn, key);
         Ok(())
@@ -319,6 +321,36 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     /// detection. On a conflict that is not a deadlock, the *waiter* fails fast with a retriable
     /// serialization error (the single-threaded model has no thread to park; a multi-threaded
     /// promotion would block here and retry on release).
+    /// Enforces Snapshot Isolation **first-committer-wins** (`04 §5.3`): a writer may not overwrite a
+    /// version it cannot see. After the write lock is held (which already serialises concurrent
+    /// *in-flight* writers of `key`), this rejects the case the lock cannot — a transaction that
+    /// **committed** a write to `key` *after* this transaction's snapshot. Overwriting it would be a
+    /// lost update; under SI the later writer aborts with a retriable conflict. This is the property
+    /// the SSI dangerous-structure detector *assumes* SI already provides (it only tracks
+    /// rw-antidependencies); without it a ww/rw cycle escapes serializability (`rmp` storage audit F9).
+    ///
+    /// A head version this transaction itself authored (an in-flight stamp) is not a conflict, nor is
+    /// a head committed at or before the snapshot.
+    fn ensure_no_concurrent_committed_write(&self, txn: TxnId, key: Key) -> Result<()> {
+        let Some(active) = self.active.get(&txn) else {
+            return Err(GraphusError::Transaction(format!(
+                "write in inactive txn {}",
+                txn.0
+            )));
+        };
+        let snapshot_ts = active.snapshot.ts;
+        if let Some(xmin) = self.store.head_xmin(key)
+            && let VersionStamp::Committed(committed_ts) = VersionStamp::from_raw(xmin)
+            && committed_ts > snapshot_ts
+        {
+            return Err(GraphusError::Transaction(format!(
+                "write conflict: key {key} was updated by a concurrent transaction that committed \
+                 after this snapshot (first-committer-wins); retry"
+            )));
+        }
+        Ok(())
+    }
+
     fn acquire_write(&mut self, txn: TxnId, key: Key) -> Result<()> {
         match self.locks.acquire(txn, key) {
             LockOutcome::Granted => Ok(()),

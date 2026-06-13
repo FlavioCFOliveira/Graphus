@@ -119,6 +119,12 @@ pub trait VersionedStore {
 
     /// Total number of physical versions currently stored (across all chains). Test/metric aid.
     fn version_count(&self) -> usize;
+
+    /// The `xmin` (`created_ts`) stamp word of `key`'s current head (newest) version, or `None` if
+    /// the key has no version. Used by the manager to enforce SI **first-committer-wins**: a writer
+    /// whose snapshot predates the head's *committed* creator is overwriting a version it cannot see
+    /// (a lost update) and must abort. A head still in-flight is handled by the write lock, not here.
+    fn head_xmin(&self, key: Key) -> Option<u64>;
 }
 
 /// An in-memory [`VersionedStore`] for tests: each key maps to a `Vec<Version>` ordered
@@ -251,6 +257,13 @@ impl VersionedStore for MemVersionedStore {
 
     fn version_count(&self) -> usize {
         self.chains.values().map(Vec::len).sum()
+    }
+
+    fn head_xmin(&self, key: Key) -> Option<u64> {
+        self.chains
+            .get(&key)
+            .and_then(|c| c.first())
+            .map(|v| v.xmin)
     }
 }
 
