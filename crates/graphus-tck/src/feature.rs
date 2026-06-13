@@ -149,7 +149,8 @@ pub fn load_feature(path: &Path, feature_rel: &str) -> Result<Vec<Scenario>, Str
 ///
 /// Returns the `gherkin` parse error message if `text` is not a well-formed feature file.
 pub fn load_feature_str(text: &str, feature_rel: &str) -> Result<Vec<Scenario>, String> {
-    let feature = gherkin::Feature::parse(text, GherkinEnv::default())
+    let sanitized = sanitize_table_escapes(text);
+    let feature = gherkin::Feature::parse(&sanitized, GherkinEnv::default())
         .map_err(|e| format!("parse {feature_rel}: {e}"))?;
 
     let mut out = Vec::new();
@@ -164,6 +165,111 @@ pub fn load_feature_str(text: &str, feature_rel: &str) -> Result<Vec<Scenario>, 
         }
     }
     Ok(out)
+}
+
+/// Normalises data-table cell backslash escapes so the `gherkin` 0.16 parser accepts the full
+/// openCypher TCK corpus without touching the vendored `.feature` files.
+///
+/// # Why this exists
+///
+/// The official Gherkin data-table grammar treats a backslash inside a cell as an escape lead-in:
+/// `\\` → `\`, `\|` → `|`, `\n` → newline, and — per the reference Cucumber implementations — **any
+/// other** `\x` passes through verbatim as a literal backslash followed by `x`. The `gherkin` 0.16
+/// PEG (`src/parser.rs`, rule `escaped_cell_char`) only implements the first three and has no
+/// fall-through: a `\` that is not part of `\\`/`\|`/`\n` matches no alternative, the cell repetition
+/// stops early, and the row's closing `|` is never found — surfacing as a misleading
+/// `"unknown keyword"` error on the *next* line.
+///
+/// Two cells in `expressions/literals/Literals6.feature` hit this (`| '\'' |` and the escaped-char
+/// cell), which capped TCK conformance by dropping all 13 of that file's scenarios. A corpus-wide
+/// scan confirms these are the only two affected cells today, but this normalisation is written for
+/// the whole corpus so any future vendored cell behaves identically.
+///
+/// # The transformation (and why it is faithful)
+///
+/// On data-table rows only (a line whose first non-whitespace byte is `|`, and which is **not**
+/// inside a `"""`/```` ``` ```` docstring — docstrings are captured verbatim by gherkin and must not
+/// be altered), every backslash that is **not** the lead byte of a `\\`, `\|`, or `\n` escape is
+/// doubled to `\\`. gherkin then unescapes that `\\` back to a single `\`, reproducing exactly the
+/// spec's "unknown escape passes through as a literal backslash" behaviour. Recognised escapes
+/// (`\\`, `\|`, `\n`) are left untouched, so gherkin's own unescaping is preserved bit-for-bit; the
+/// transformation is therefore a no-op for every cell that already parses.
+///
+/// The cell string the harness ultimately compares (`crate::value::parse_expected`, which itself
+/// decodes the TCK mini-language escapes such as `\'`) receives precisely the spec-correct
+/// table-unescaped text — verified by round-tripping both affected cells through `sanitize` followed
+/// by gherkin's unescaping (see the unit tests below).
+fn sanitize_table_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    // Track docstring state so table-shaped lines inside a `"""` / ``` block are left verbatim.
+    let mut in_docstring = false;
+    let mut fence: &str = "";
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if in_docstring {
+            if trimmed.starts_with(fence) {
+                in_docstring = false;
+            }
+            out.push_str(line);
+            continue;
+        }
+        if trimmed.starts_with("\"\"\"") {
+            in_docstring = true;
+            fence = "\"\"\"";
+            out.push_str(line);
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            in_docstring = true;
+            fence = "```";
+            out.push_str(line);
+            continue;
+        }
+        if trimmed.starts_with('|') {
+            sanitize_table_line(line, &mut out);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Appends `line` (a data-table row) to `out`, doubling every backslash that does not lead a
+/// gherkin-recognised `\\`, `\|`, or `\n` escape (see [`sanitize_table_escapes`]).
+fn sanitize_table_line(line: &str, out: &mut String) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            match bytes.get(i + 1) {
+                // A recognised escape: copy both bytes unchanged.
+                Some(b'\\') | Some(b'|') | Some(b'n') => {
+                    out.push('\\');
+                    out.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                // Unknown escape (or trailing backslash): double it so gherkin unescapes it back to
+                // a single literal backslash.
+                _ => {
+                    out.push_str("\\\\");
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        // A run of non-backslash bytes: copy it verbatim. `\` (0x5C) is ASCII and can never appear
+        // as a UTF-8 lead or continuation byte, so a `b'\\'` match only ever lands on a char
+        // boundary — `&line[start..i]` is therefore always a valid slice and multi-byte characters
+        // stay intact.
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'\\' {
+            i += 1;
+        }
+        out.push_str(&line[start..i]);
+    }
 }
 
 /// Expands one `gherkin::Scenario` into one-or-more concrete [`Scenario`]s.
@@ -582,6 +688,95 @@ mod tests {
         assert_eq!(p.signature, "test.my.proc() :: (x :: INTEGER?)");
         assert_eq!(p.header, ["x"]);
         assert_eq!(p.rows, [["1"]]);
+    }
+
+    /// Mirrors gherkin 0.16's data-table cell unescaping (`\\`→`\`, `\|`→`|`, `\n`→newline; every
+    /// other byte verbatim) so a test can assert what the parser hands the harness.
+    fn gherkin_cell_unescape(cell: &str) -> String {
+        let b = cell.as_bytes();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                match b.get(i + 1) {
+                    Some(b'\\') => {
+                        out.push('\\');
+                        i += 2;
+                        continue;
+                    }
+                    Some(b'|') => {
+                        out.push('|');
+                        i += 2;
+                        continue;
+                    }
+                    Some(b'n') => {
+                        out.push('\n');
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // Copy one whole UTF-8 char.
+            let ch = cell[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    #[test]
+    fn sanitizer_is_a_noop_for_cells_without_unknown_escapes() {
+        // A plain table and one using only recognised escapes must be returned byte-for-byte.
+        let plain = "Feature: F\n  Scenario: S\n    Given an empty graph\n    Then the result should be, in any order:\n      | a | b |\n      | 1 | x |\n";
+        assert_eq!(sanitize_table_escapes(plain), plain);
+        let recognised = "      | a\\\\b | c\\|d |\n"; // cell text: a\\b , c\|d
+        assert_eq!(sanitize_table_escapes(recognised), recognised);
+    }
+
+    #[test]
+    fn sanitizer_rescues_unknown_escapes_to_a_literal_backslash() {
+        // `\'` is not a gherkin escape; doubling the backslash makes gherkin unescape it back to a
+        // single literal `\`, matching the spec's pass-through behaviour.
+        let raw = "      | '\\''    |\n";
+        let san = sanitize_table_escapes(raw);
+        assert_eq!(san, "      | '\\\\''    |\n");
+        // After gherkin's own unescaping, the cell content equals the original `'\''` — exactly what
+        // `crate::value::parse_expected` expects to decode.
+        assert_eq!(gherkin_cell_unescape("'\\\\''"), "'\\''");
+    }
+
+    #[test]
+    fn sanitizer_leaves_docstrings_verbatim() {
+        // A `\'` inside a query docstring must NOT be doubled (docstrings are captured verbatim by
+        // gherkin and carry the query's own backslashes).
+        let f = "Feature: F\n  Scenario: S\n    When executing query:\n      \"\"\"\n      RETURN '\\'' AS x\n      \"\"\"\n";
+        let san = sanitize_table_escapes(f);
+        assert!(
+            san.contains("RETURN '\\'' AS x"),
+            "docstring backslash must be preserved, got:\n{san}"
+        );
+        // And it does not accidentally double the docstring's backslash.
+        assert!(!san.contains("RETURN '\\\\'' AS x"));
+    }
+
+    #[test]
+    fn literals6_escaped_quote_cells_parse_and_carry_the_right_expected_value() {
+        // The two cells that broke gherkin 0.16: a single escaped quote, and the escaped-characters
+        // cell. Both must now parse, and the expected value must round-trip to `'`-decoded text.
+        let f = "Feature: F\n  Scenario: S\n    Given any graph\n\
+                 \x20   When executing query:\n      \"\"\"\n      RETURN '\\'' AS literal\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | literal |\n      | '\\''    |\n\
+                 \x20   And no side effects\n";
+        let scs = one(f);
+        assert_eq!(scs.len(), 1, "the escaped-quote scenario must parse");
+        let StepKind::ResultUnordered(t) = &scs[0].steps[2].kind else {
+            panic!("expected a result table, got {:?}", scs[0].steps[2].kind);
+        };
+        // The raw cell handed to the value parser is `'\''` (gherkin unescaped the doubled backslash).
+        assert_eq!(t.rows[0][0], "'\\''");
+        let parsed = crate::value::parse_expected(&t.rows[0][0]).expect("value parses");
+        assert_eq!(parsed, crate::value::ExpectedValue::String("'".to_owned()));
     }
 
     #[test]

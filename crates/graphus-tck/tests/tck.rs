@@ -72,7 +72,7 @@ use graphus_tck::runner::run_scenario;
 /// `EXISTS { ... RETURN ... }` form, structural (node/relationship/path) values inside list
 /// literals (`toBoolean(n)` via `[true, n]` cannot raise its `TypeError`), and ORDER BY keys
 /// that *evaluate* aggregates (`ORDER BY sum(…)` matching a projected aggregate).
-const BASELINE: usize = 3496;
+const BASELINE: usize = 3515;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.
