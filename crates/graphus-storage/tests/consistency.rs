@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use graphus_bufpool::page;
 use graphus_core::capability::Rng;
-use graphus_core::{PageId, TxnId, Value};
+use graphus_core::{PageId, Timestamp, TxnId, Value, VersionStamp};
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_sim::SimRng;
 use graphus_storage::record::{
@@ -36,7 +36,8 @@ use graphus_storage::store::StoreKind;
 use graphus_storage::{
     AgreementFault, ConsistencyReport, IndexAgreement, IndexEntry, Namespace, RecordStore,
     Violation, check::AdjacencyFault, check::FreeListFault, check::HeapChainFault,
-    check::LabelBitmapFault, check::PropertyFault, recovery, verify_on_open,
+    check::LabelBitmapFault, check::MvccHeaderFault, check::PropertyFault, recovery,
+    verify_on_open,
 };
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
@@ -216,6 +217,58 @@ impl DiskImage {
             }
         }
         panic!("no in-use overflow property record found in the image");
+    }
+
+    /// Locates **every** in-use overflow property record `(device_page_id, byte_offset)` in the image,
+    /// in page/slot order. Used by the heap-aliasing test, which needs two distinct overflow chains.
+    fn locate_overflow_props(&self) -> Vec<(u64, usize)> {
+        let size = StoreKind::Prop.record_size();
+        let rpp = (PAGE_SIZE - page::HEADER_SIZE) / size;
+        let mut out = Vec::new();
+        for (pid, bytes) in &self.pages {
+            if page::page_type(bytes) != 1 {
+                continue;
+            }
+            for slot in 0..rpp {
+                let off = page::HEADER_SIZE + slot * size;
+                if off + size > PAGE_SIZE {
+                    break;
+                }
+                let prop = PropRecord::decode(&bytes[off..off + size]);
+                if prop.mvcc.in_use() && prop.type_tag & graphus_storage::PROP_OVERFLOW_BIT != 0 {
+                    out.push((*pid, off));
+                }
+            }
+        }
+        out
+    }
+
+    /// Locates an in-use `strings.store` heap block whose payload is filled with `fill`, returning
+    /// `(device_page_id, byte_offset)`. A multi-block `String` value of a single repeated byte fills
+    /// its blocks' 48-byte payloads with that byte, which disambiguates a real heap block from any
+    /// node/rel record that happens to live on another page (those never carry 48 bytes of `fill`).
+    fn locate_value_block(&self, fill: u8) -> (u64, usize) {
+        let size = StoreKind::Strings.record_size();
+        let rpp = (PAGE_SIZE - page::HEADER_SIZE) / size;
+        for (pid, bytes) in &self.pages {
+            if page::page_type(bytes) != 1 {
+                continue;
+            }
+            for slot in 0..rpp {
+                let off = page::HEADER_SIZE + slot * size;
+                if off + size > PAGE_SIZE {
+                    break;
+                }
+                let block = graphus_storage::HeapBlock::decode(&bytes[off..off + size]);
+                if block.mvcc.in_use()
+                    && block.bytes().iter().all(|&b| b == fill)
+                    && !block.bytes().is_empty()
+                {
+                    return (*pid, off);
+                }
+            }
+        }
+        panic!("no in-use heap block filled with {fill:#x} found in the image");
     }
 }
 
@@ -580,6 +633,202 @@ fn dangling_overflow_chain_is_flagged() {
             }
         )),
         "expected a HeapChain violation for the dangling chain: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+// ============================================================================================
+// MVCC-header integrity (storage audit F8) — the version-visibility metadata graphus-txn reads.
+// ============================================================================================
+
+/// A live record whose MVCC stamps invert (created at a *later* committed timestamp than it expired)
+/// is flagged — a tombstone that "expired before it was created" would feed visibility nonsense.
+#[test]
+fn mvcc_timestamp_inversion_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (_n, eid) = s.create_node(txn).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    {
+        let mut clean = img.open();
+        assert!(report(&mut clean).is_consistent(), "clean store passes");
+    }
+    let (page_id, off) = img.locate(StoreKind::Node, eid.0);
+    let mut node = img.read_node_at(page_id, off);
+    // created (xmin) > expired (xmax), both committed timestamps.
+    node.mvcc.created_ts = VersionStamp::committed(Timestamp(100));
+    node.mvcc.expired_ts = VersionStamp::committed(Timestamp(50));
+    img.write_node_at(page_id, off, &node);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::MvccHeader {
+                detail: MvccHeaderFault::TimestampInversion { .. },
+                ..
+            }
+        )),
+        "expected a timestamp-inversion violation: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A live record whose `undo_ptr` (older-version back-pointer) dangles past its store's high-water
+/// is flagged — a corrupt version-chain pointer (and the future unbounded-loop hazard).
+#[test]
+fn mvcc_dangling_undo_ptr_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (_n, eid) = s.create_node(txn).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    let (page_id, off) = img.locate(StoreKind::Node, eid.0);
+    let mut node = img.read_node_at(page_id, off);
+    node.mvcc.undo_ptr = 9_999; // far past the node store's high-water
+    img.write_node_at(page_id, off, &node);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::MvccHeader {
+                detail: MvccHeaderFault::UndoPtrOutOfRange { undo_ptr: 9_999 },
+                ..
+            }
+        )),
+        "expected a dangling-undo_ptr violation: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A live record with no creator stamp (`created_ts`/`xmin` zeroed) is flagged — every version must
+/// record who created it.
+#[test]
+fn mvcc_missing_creator_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (_n, eid) = s.create_node(txn).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    let (page_id, off) = img.locate(StoreKind::Node, eid.0);
+    let mut node = img.read_node_at(page_id, off);
+    node.mvcc.created_ts = 0; // the "none" sentinel — invalid on a live record
+    img.write_node_at(page_id, off, &node);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::MvccHeader {
+                detail: MvccHeaderFault::NoCreator,
+                ..
+            }
+        )),
+        "expected a missing-creator violation: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+// ============================================================================================
+// Overflow-heap aliasing + block-length (storage audit F13).
+// ============================================================================================
+
+/// A heap block reachable from TWO distinct overflow chains is flagged — its payload would be shared
+/// between two property values (silent data corruption the per-chain walk alone could not see).
+#[test]
+fn heap_block_aliased_by_two_chains_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n1, _) = s.create_node(txn).unwrap();
+    let (n2, _) = s.create_node(txn).unwrap();
+    let key = s.intern_token(Namespace::PropKey, "bio").unwrap();
+    s.set_node_property_value(txn, n1, key, &Value::String("a".repeat(200)))
+        .unwrap();
+    s.set_node_property_value(txn, n2, key, &Value::String("b".repeat(200)))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    {
+        let mut clean = img.open();
+        assert!(
+            report(&mut clean).is_consistent(),
+            "clean two-chain store passes"
+        );
+    }
+    // Point the second overflow chain's head at the first chain's head block (alias).
+    let props = img.locate_overflow_props();
+    assert_eq!(props.len(), 2, "two overflow properties were created");
+    let head1 = img.read_prop_at(props[0].0, props[0].1).value_inline;
+    let mut p2 = img.read_prop_at(props[1].0, props[1].1);
+    p2.value_inline = head1; // both chains now reference the same block
+    img.write_prop_at(props[1].0, props[1].1, &p2);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::HeapChain {
+                detail: HeapChainFault::SharedBlock { .. },
+                ..
+            }
+        )),
+        "expected a shared-block violation: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A heap block whose `len` exceeds [`BLOCK_PAYLOAD`] is flagged — a corrupt length `HeapBlock::bytes`
+/// would otherwise clamp silently.
+#[test]
+fn heap_block_len_too_long_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+    let key = s.intern_token(Namespace::PropKey, "bio").unwrap();
+    s.set_node_property_value(txn, n, key, &Value::String("c".repeat(200)))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+    let (page_id, off) = img.locate_value_block(b'c');
+    // The `len` field sits at byte 33 within a block: MVCC header (25) + next_block (8). Corrupt it
+    // to one past the 48-byte payload, then re-checksum so the *length* (not the CRC) is what fires.
+    let len_off = off + 33;
+    let bad = (graphus_storage::BLOCK_PAYLOAD as u16) + 1;
+    img.page_mut(page_id)[len_off..len_off + 2].copy_from_slice(&bad.to_le_bytes());
+    img.refresh_checksum(page_id);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::HeapChain {
+                detail: HeapChainFault::BlockLenTooLong { .. },
+                ..
+            }
+        )),
+        "expected a block-len-too-long violation: {:?}",
         r.violations
     );
     assert!(verify_on_open(&mut store, &[]).is_err());

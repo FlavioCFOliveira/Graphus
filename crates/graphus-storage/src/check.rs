@@ -56,14 +56,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use graphus_bufpool::page;
-use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
+use graphus_core::{PageId, VersionStamp};
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
-use crate::heap::HeapBlock;
+use crate::heap::{BLOCK_PAYLOAD, HeapBlock};
 use crate::idalloc::NULL_ID;
-use crate::record::{ChainSide, NodeRecord, PropRecord, RelRecord};
+use crate::record::{ChainSide, MvccHeader, NodeRecord, PropRecord, RelRecord};
 use crate::store::{RecordStore, STORE_COUNT, StoreKind};
 use crate::valenc::OVERFLOW_BIT as PROP_OVERFLOW_BIT;
 
@@ -84,6 +84,17 @@ pub enum Violation {
         page: u64,
         /// The `page_id` the header claims.
         stored: u64,
+    },
+    /// A live record's MVCC header (`05 §7`) is internally inconsistent — a timestamp inversion, a
+    /// missing creator, or a dangling `undo_ptr` — which would feed `graphus-txn` visibility
+    /// unpredictable inputs (`rmp` storage audit F8).
+    MvccHeader {
+        /// `StoreKind` of the record whose MVCC header is malformed.
+        kind: StoreKind,
+        /// Physical id of the offending record.
+        id: u64,
+        /// Which MVCC-header rule was broken.
+        detail: MvccHeaderFault,
     },
     /// An adjacency / incidence-chain invariant was violated (`04 §2.3`–§2.4). `node` is the chain
     /// owner; `rel` the offending relationship (`0` if not link-specific); `detail` the precise rule.
@@ -234,6 +245,45 @@ pub enum HeapChainFault {
     DeadBlock,
     /// The chain did not terminate within the cycle guard (a corrupted cycle).
     NonTerminating,
+    /// A heap block is reachable from **two** distinct live overflow chains (an aliased block — its
+    /// payload would be shared/corrupted between two property values). `other_owner` is the first
+    /// property record already found to own the block (`rmp` storage audit F13).
+    SharedBlock {
+        /// The property record that first claimed this block (the current owner is the
+        /// [`Violation::HeapChain::prop`]).
+        other_owner: u64,
+    },
+    /// A block's `len` field exceeds [`BLOCK_PAYLOAD`](crate::heap::BLOCK_PAYLOAD): a corrupt length
+    /// that `HeapBlock::bytes` would otherwise clamp silently (`rmp` storage audit F13).
+    BlockLenTooLong {
+        /// The corrupt `len` value.
+        len: u16,
+    },
+}
+
+/// The precise MVCC-header rule broken by a [`Violation::MvccHeader`] (`05 §7`; `rmp` storage
+/// audit F8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccHeaderFault {
+    /// A live (in-use) record has no creator stamp (`created_ts`/`xmin` is the `0` *none* sentinel):
+    /// every committed-or-in-flight version must record who created it.
+    NoCreator,
+    /// Both `created_ts` (`xmin`) and `expired_ts` (`xmax`) are **committed** timestamps but the
+    /// creation timestamp is strictly greater than the expiry timestamp — a version that expired
+    /// before it was created (`04 §5.2`). (Mixed in-flight/committed stamps live in disjoint number
+    /// spaces and are not compared.)
+    TimestampInversion {
+        /// The creating transaction's commit timestamp.
+        created: u64,
+        /// The expiring transaction's commit timestamp.
+        expired: u64,
+    },
+    /// `undo_ptr` (the older-version back-pointer) is non-zero but outside `1..high_water` of the
+    /// record's own store — a dangling version-chain pointer (`05 §7`).
+    UndoPtrOutOfRange {
+        /// The dangling `undo_ptr` value.
+        undo_ptr: u64,
+    },
 }
 
 /// The precise free-list rule broken by a [`Violation::FreeList`].
@@ -365,6 +415,7 @@ pub fn check_store<D: BlockDevice, S: LogSink>(
     check_property_chains(store, &cat, &scan, &mut report)?;
     check_adjacency(store, &cat, &scan, &mut report)?;
     check_heap_chains(&cat, &scan, &mut report);
+    check_mvcc_headers(&cat, &scan, &mut report);
     check_free_lists(&cat, &scan, &mut report);
     check_label_bitmaps(&cat, &scan, &mut report);
 
@@ -585,6 +636,13 @@ fn check_checksums_and_page_ids<D: BlockDevice, S: LogSink>(
                 if stored != p.0 {
                     report.push(Violation::PageId { page: p.0, stored });
                 }
+                // NOTE: the page-type header byte (`05 §6`) is deliberately NOT validated here. It is
+                // set in memory at allocation but is not part of the WAL redo image, so a crash +
+                // ARIES recovery legitimately reconstructs pages with a zero type byte; it is also
+                // never read to interpret a page (records are located by store-kind arithmetic, not by
+                // page_type), so it is not load-bearing. Enforcing it would require making it
+                // recovery-durable for no correctness benefit (storage audit F8: page-type sub-check
+                // intentionally not implemented).
             }
         }
     }
@@ -996,10 +1054,77 @@ fn check_label_bitmaps(cat: &Catalog, scan: &Scan, report: &mut ConsistencyRepor
 ///
 /// This is the overflow-heap analogue of [`check_property_chains`]: it proves *"no dangling block
 /// ids, chain terminates, freed blocks not referenced"* (`rmp` task #43 acceptance).
+/// Validates the MVCC header (`05 §7`) of every live node, relationship and property record — the
+/// version-visibility metadata `graphus-txn` reads directly. A corrupt header here is silent
+/// isolation corruption: an inverted or dangling stamp feeds the visibility rule unpredictable
+/// inputs. Checks, per live record (`rmp` storage audit F8):
+///
+/// * **A creator is present** ([`MvccHeaderFault::NoCreator`]): an in-use version's `created_ts`
+///   (`xmin`) is never the `0` none-sentinel.
+/// * **No timestamp inversion** ([`MvccHeaderFault::TimestampInversion`]): when both `xmin` and
+///   `xmax` are *committed* timestamps, `xmin <= xmax`. Mixed in-flight/committed stamps occupy
+///   disjoint number spaces (`VersionStamp`'s in-flight bit) and are deliberately not compared, so a
+///   lazily-unfrozen committed version (whose `xmin` is still its writer's `TxnId`) is never a false
+///   positive.
+/// * **`undo_ptr` is in range** ([`MvccHeaderFault::UndoPtrOutOfRange`]): the older-version
+///   back-pointer is `0` (none) or a physical id in `1..high_water` of the record's own store. The
+///   per-value version chain is a documented follow-up, so today `undo_ptr` is always `0`; this guard
+///   catches a dangling pointer now and the future unbounded-loop hazard the moment chains activate.
+fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
+    let mut check = |kind: StoreKind, id: u64, mvcc: MvccHeader| {
+        if VersionStamp::from_raw(mvcc.created_ts) == VersionStamp::None {
+            report.push(Violation::MvccHeader {
+                kind,
+                id,
+                detail: MvccHeaderFault::NoCreator,
+            });
+        }
+        if let (VersionStamp::Committed(c), VersionStamp::Committed(e)) = (
+            VersionStamp::from_raw(mvcc.created_ts),
+            VersionStamp::from_raw(mvcc.expired_ts),
+        ) {
+            if c.0 > e.0 {
+                report.push(Violation::MvccHeader {
+                    kind,
+                    id,
+                    detail: MvccHeaderFault::TimestampInversion {
+                        created: c.0,
+                        expired: e.0,
+                    },
+                });
+            }
+        }
+        if mvcc.undo_ptr != NULL_ID && mvcc.undo_ptr >= cat.high_water(kind) {
+            report.push(Violation::MvccHeader {
+                kind,
+                id,
+                detail: MvccHeaderFault::UndoPtrOutOfRange {
+                    undo_ptr: mvcc.undo_ptr,
+                },
+            });
+        }
+    };
+    for (&id, rec) in &scan.live_nodes {
+        check(StoreKind::Node, id, rec.mvcc);
+    }
+    for (&id, rec) in &scan.live_rels {
+        check(StoreKind::Rel, id, rec.mvcc);
+    }
+    for (&id, rec) in &scan.live_props {
+        check(StoreKind::Prop, id, rec.mvcc);
+    }
+}
+
 fn check_heap_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
     let block_hw = cat.high_water(StoreKind::Strings);
     // A well-formed chain has at most `block_hw` blocks; double it for slack against a corrupt cycle.
     let guard = block_hw.saturating_mul(2).saturating_add(2);
+
+    // Global block -> first-owning property, across ALL live chains: a block reachable from two
+    // distinct chains is an aliased block whose 48-byte payload would be shared between two property
+    // values (`rmp` storage audit F13). `live_props` is a `BTreeMap`, so the "first owner" is
+    // deterministically the smallest property id referencing the block.
+    let mut block_owner: BTreeMap<u64, u64> = BTreeMap::new();
 
     for (&pid, prop) in &scan.live_props {
         if prop.type_tag & PROP_OVERFLOW_BIT == 0 {
@@ -1034,6 +1159,24 @@ fn check_heap_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
                 });
                 break;
             };
+            // Cross-chain aliasing: this block already belongs to an earlier chain.
+            if let Some(&other_owner) = block_owner.get(&cur) {
+                report.push(Violation::HeapChain {
+                    prop: pid,
+                    block: cur,
+                    detail: HeapChainFault::SharedBlock { other_owner },
+                });
+                break;
+            }
+            block_owner.insert(cur, pid);
+            // A corrupt `len` would be clamped silently by `HeapBlock::bytes`; report it here.
+            if block.len as usize > BLOCK_PAYLOAD {
+                report.push(Violation::HeapChain {
+                    prop: pid,
+                    block: cur,
+                    detail: HeapChainFault::BlockLenTooLong { len: block.len },
+                });
+            }
             cur = block.next_block;
         }
     }
