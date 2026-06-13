@@ -415,6 +415,31 @@ pub enum PhysicalOp {
         steps: Vec<Var>,
     },
 
+    /// **Shortest-path search**: find the minimal-relationship-count path(s) between the bound
+    /// `from` and `to` endpoints over a variable-length relationship (carried through from
+    /// [`ShortestPath`](crate::logical::LogicalOp::ShortestPath)). Breadth-first, no repeated nodes
+    /// within a path; `all` selects every minimal-length path vs. one.
+    ShortestPath {
+        /// The upstream relation, binding both endpoints.
+        input: Box<PhysicalOp>,
+        /// The (bound) source endpoint.
+        from: Var,
+        /// The (bound) target endpoint.
+        to: Var,
+        /// The relationship variable bound to the path's relationship list.
+        relationship: Var,
+        /// The named path variable (`p = shortestPath(...)`), if any.
+        path: Option<Var>,
+        /// The traversal direction.
+        direction: crate::ast::RelDirection,
+        /// The relationship-type alternatives; empty means "any type".
+        types: Vec<RelType>,
+        /// The variable-length length bounds.
+        range: crate::ast::VarLengthRange,
+        /// `true` for `allShortestPaths`; `false` for `shortestPath`.
+        all: bool,
+    },
+
     // ---- relational ---------------------------------------------------------------------------
     /// Keep rows whose `predicate` is `TRUE` (residual filter; three-valued logic, `04 §7.6`).
     Filter {
@@ -775,6 +800,29 @@ impl Planner<'_> {
                 steps: steps.clone(),
             },
 
+            // ---- shortest path ---------------------------------------------------------------
+            LogicalOp::ShortestPath {
+                input,
+                from,
+                to,
+                relationship,
+                path,
+                direction,
+                types,
+                range,
+                all,
+            } => PhysicalOp::ShortestPath {
+                input: Box::new(self.lower(input, deps)),
+                from: from.clone(),
+                to: to.clone(),
+                relationship: relationship.clone(),
+                path: path.clone(),
+                direction: *direction,
+                types: types.clone(),
+                range: *range,
+                all: *all,
+            },
+
             // ---- relational ------------------------------------------------------------------
             LogicalOp::Projection {
                 input,
@@ -1088,6 +1136,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. } => contains_write(input),
         PhysicalOp::NestedLoopJoin { left, right }
@@ -1272,6 +1321,27 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             direction,
             types,
             range,
+        },
+        PhysicalOp::ShortestPath {
+            input,
+            from,
+            to,
+            relationship,
+            path,
+            direction,
+            types,
+            range,
+            all,
+        } => PhysicalOp::ShortestPath {
+            input: opt(input),
+            from,
+            to,
+            relationship,
+            path,
+            direction,
+            types,
+            range,
+            all,
         },
         PhysicalOp::NamedPath {
             input,
@@ -1681,6 +1751,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. }
         | PhysicalOp::Create { input, .. }
@@ -1963,6 +2034,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. }
         | PhysicalOp::Create { input, .. }
@@ -2446,6 +2518,20 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             push_unique(out, relationship.clone());
             push_unique(out, to.clone());
         }
+        PhysicalOp::ShortestPath {
+            input,
+            relationship,
+            path,
+            ..
+        } => {
+            // Both endpoints are bound by `input`; this op binds the relationship list and, when
+            // named, the path variable.
+            gather_bound_vars(input, out);
+            push_unique(out, relationship.clone());
+            if let Some(p) = path {
+                push_unique(out, p.clone());
+            }
+        }
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
@@ -2638,6 +2724,33 @@ impl PhysicalOp {
                     h::arrow_left(*direction),
                     h::types(types),
                     h::range(range),
+                    h::arrow_right(*direction),
+                )?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::ShortestPath {
+                input,
+                from,
+                to,
+                relationship,
+                path,
+                direction,
+                types,
+                range,
+                all,
+            } => {
+                let name = if *all {
+                    "AllShortestPaths"
+                } else {
+                    "ShortestPath"
+                };
+                let p = path.as_ref().map(|v| format!("{v} = ")).unwrap_or_default();
+                writeln!(
+                    f,
+                    "{name}({p}({from}){}{relationship}{}{}{}({to}))",
+                    h::arrow_left(*direction),
+                    h::types(types),
+                    h::range(&Some(*range)),
                     h::arrow_right(*direction),
                 )?;
                 input.fmt_indented(f, depth + 1)

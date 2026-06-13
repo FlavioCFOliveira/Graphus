@@ -153,6 +153,39 @@ pub enum LogicalOp {
         steps: Vec<Var>,
     },
 
+    /// Find the shortest path(s) between two nodes over a single variable-length relationship
+    /// (`shortestPath((a)-[*]-(b))` / `allShortestPaths((a)-[*]-(b))`).
+    ///
+    /// Both endpoints (`from`, `to`) are expected to be bound by `input` (the supported
+    /// both-endpoints-bound case). The executor runs a breadth-first search from `from` to `to`
+    /// honouring `direction`, `types` and the `range` length bounds, with no repeated nodes within a
+    /// path (openCypher `shortestPath` semantics). For `all = false` it emits a single minimal-length
+    /// path; for `all = true` it emits every path of that minimal length (one row each). It binds the
+    /// `relationship` variable to the path's relationship list and, when present, the `path` variable
+    /// to the path value. When no path exists within the bounds it emits no row (so a plain `MATCH`
+    /// filters the row out, and an `OPTIONAL MATCH` null-fills it through the usual optional machinery).
+    ShortestPath {
+        /// The upstream relation, which must bind both [`from`](Self::ShortestPath::from) and
+        /// [`to`](Self::ShortestPath::to).
+        input: Box<LogicalOp>,
+        /// The (bound) source endpoint.
+        from: Var,
+        /// The (bound) target endpoint.
+        to: Var,
+        /// The relationship variable bound to the path's relationship list.
+        relationship: Var,
+        /// The named path variable (`p = shortestPath(...)`), if any.
+        path: Option<Var>,
+        /// The traversal direction.
+        direction: RelDirection,
+        /// The relationship-type alternatives (`:A|B`); empty means "any type".
+        types: Vec<RelType>,
+        /// The variable-length length bounds.
+        range: VarLengthRange,
+        /// `true` for `allShortestPaths` (every minimal-length path); `false` for `shortestPath`.
+        all: bool,
+    },
+
     // ---- relational ---------------------------------------------------------------------------
     /// Keep only the input rows for which `predicate` evaluates to `TRUE` (openCypher `WHERE`, and
     /// the implicit filters from inline pattern predicates).
@@ -627,6 +660,36 @@ impl LogicalOp {
                 steps,
             } => {
                 writeln!(f, "NamedPath({variable} = {start}, {})", fmt_vars(steps))?;
+                input.fmt_indented(f, depth + 1)
+            }
+
+            Self::ShortestPath {
+                input,
+                from,
+                to,
+                relationship,
+                path,
+                direction,
+                types,
+                range,
+                all,
+            } => {
+                let func = if *all {
+                    "allShortestPaths"
+                } else {
+                    "shortestPath"
+                };
+                let path_str = path
+                    .as_ref()
+                    .map_or_else(String::new, |p| format!("{p} = "));
+                writeln!(
+                    f,
+                    "ShortestPath({path_str}{func}(({from}){}{relationship}{}{}{}({to})))",
+                    arrow_left(*direction),
+                    fmt_types(types),
+                    fmt_range(&Some(*range)),
+                    arrow_right(*direction),
+                )?;
                 input.fmt_indented(f, depth + 1)
             }
 

@@ -308,6 +308,21 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, inner.cost + rows * COST_EXPAND_EDGE)
         }
 
+        // A shortest-path BFS explores up to ~degree^avg_len edges per source row but yields a single
+        // path (`shortestPath`) or a small number (`allShortestPaths`) — so its cardinality is modelled
+        // as a passthrough of the input while its cost reflects the bounded traversal.
+        PhysicalOp::ShortestPath {
+            input,
+            types,
+            range,
+            ..
+        } => {
+            let inner = estimate_cost(input, stats);
+            let degree = typed_degree(types, stats);
+            let explored = inner.rows * degree.powf(average_path_length(range));
+            CostEstimate::new(inner.rows, inner.cost + explored * COST_EXPAND_EDGE)
+        }
+
         // A named path binds one path value per input row — cardinality unchanged, a cheap per-row
         // projection.
         PhysicalOp::NamedPath { input, .. } => passthrough(input, stats, COST_ROW_PROJECT),

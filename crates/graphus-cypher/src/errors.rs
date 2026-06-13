@@ -198,6 +198,11 @@ pub enum SemanticDetail {
     /// Neo4j extension absent from the openCypher TCK corpus, so this detail has **no** TCK
     /// counterpart; its spelling is internal.
     InvalidLoadCsvUrl,
+    /// `InvalidShortestPath` — a `shortestPath(...)` / `allShortestPaths(...)` wraps a pattern that
+    /// is not a single variable-length relationship between two node patterns. `shortestPath` is a
+    /// Neo4j / openCypher-reference path-search extension absent from the openCypher TCK corpus, so
+    /// this detail has **no** TCK counterpart; its spelling is internal.
+    InvalidShortestPath,
 }
 
 impl SemanticDetail {
@@ -229,6 +234,8 @@ impl SemanticDetail {
             // `LOAD CSV` is a Neo4j extension absent from the openCypher TCK; this is an internal
             // spelling with no TCK `Then ... should be raised` counterpart.
             Self::InvalidLoadCsvUrl => "InvalidLoadCsvUrl",
+            // `shortestPath` is absent from the openCypher TCK; internal spelling, no TCK step.
+            Self::InvalidShortestPath => "InvalidShortestPath",
         }
     }
 }
@@ -443,6 +450,13 @@ pub enum SemanticErrorKind {
     /// A `LOAD CSV ... FROM <expr>` URL is a statically-typed non-string literal. Internal detail
     /// `InvalidLoadCsvUrl` (no TCK counterpart — `LOAD CSV` is a Neo4j extension).
     InvalidLoadCsvUrl,
+    /// A `shortestPath(...)` / `allShortestPaths(...)` wraps an unsupported pattern (not a single
+    /// variable-length relationship between two node patterns). Internal detail
+    /// `InvalidShortestPath` (no TCK counterpart — a Neo4j / openCypher-reference extension).
+    InvalidShortestPath {
+        /// A human-readable explanation of why the wrapped pattern is rejected.
+        reason: String,
+    },
 }
 
 /// How a pattern variable is bound — used to report [`SemanticErrorKind::VariableTypeConflict`].
@@ -494,6 +508,7 @@ impl SemanticErrorKind {
             Self::InvalidClauseComposition { .. } => SemanticDetail::InvalidClauseComposition,
             Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
             Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
+            Self::InvalidShortestPath { .. } => SemanticDetail::InvalidShortestPath,
         }
     }
 
@@ -621,6 +636,9 @@ impl fmt::Display for SemanticErrorKind {
             Self::InvalidLoadCsvUrl => {
                 f.write_str("the LOAD CSV source URL must be a string expression")
             }
+            Self::InvalidShortestPath { reason } => {
+                write!(f, "invalid shortestPath/allShortestPaths pattern: {reason}")
+            }
         }
     }
 }
@@ -678,6 +696,9 @@ mod tests {
             // `LOAD CSV` is a Neo4j extension with no TCK detail; the spelling is internal but pinned
             // here for the same stability guarantee.
             (SemanticDetail::InvalidLoadCsvUrl, "InvalidLoadCsvUrl"),
+            // `shortestPath` is a Neo4j / openCypher-reference extension with no TCK detail; pinned
+            // here for the same stability guarantee.
+            (SemanticDetail::InvalidShortestPath, "InvalidShortestPath"),
         ];
         for (detail, s) in pairs {
             assert_eq!(detail.as_tck_str(), s);
@@ -767,7 +788,8 @@ mod tests {
                 | SemanticErrorKind::InvalidDelete
                 | SemanticErrorKind::InvalidClauseComposition { .. }
                 | SemanticErrorKind::DifferentColumnsInUnion
-                | SemanticErrorKind::InvalidLoadCsvUrl => kind.classification(),
+                | SemanticErrorKind::InvalidLoadCsvUrl
+                | SemanticErrorKind::InvalidShortestPath { .. } => kind.classification(),
             }
         }
 
@@ -821,6 +843,9 @@ mod tests {
             SemanticErrorKind::InvalidClauseComposition { reason: "x" },
             SemanticErrorKind::DifferentColumnsInUnion,
             SemanticErrorKind::InvalidLoadCsvUrl,
+            SemanticErrorKind::InvalidShortestPath {
+                reason: "x".to_owned(),
+            },
         ] {
             assert_eq!(classify(&kind).phase, ErrorPhase::CompileTime, "{kind:?}");
         }

@@ -113,10 +113,10 @@
 
 use crate::ast::{
     Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause, MatchClause,
-    MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, ProjectionBody,
-    ProjectionItem, Query, QueryBody, RelDirection, RelationshipPattern, RemoveClause, RemoveItem,
-    SetClause, SetItem, SingleQuery, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart,
-    UnwindClause, YieldItem,
+    MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind,
+    ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection, RelationshipPattern,
+    RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, SortItem, StandaloneCall,
+    StandaloneYield, UnaryOp, UnionPart, UnwindClause, YieldItem,
 };
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck, FunctionRegistry};
@@ -1001,6 +1001,12 @@ impl Analyzer<'_> {
         scope: &mut Scope,
         role: PatternRole,
     ) -> Result<(), SemanticError> {
+        // A `shortestPath(...)` / `allShortestPaths(...)` wraps a single variable-length pattern and
+        // is read-only by nature: it may never appear in a CREATE/MERGE write pattern, and its
+        // inner pattern must be exactly one variable-length relationship between two node patterns.
+        if part.kind != PatternPartKind::Normal {
+            self.check_shortest_path(part, role)?;
+        }
         if let Some(var) = &part.var {
             // A named path variable can never re-use an existing name (paths do not unify), and
             // its own pattern cannot re-use the path name for a node/relationship either: both are
@@ -1017,6 +1023,57 @@ impl Analyzer<'_> {
             scope.bind(&var.name, VarKind::Value, var.span)?;
         }
         self.bind_pattern_element(&part.element, scope, role)
+    }
+
+    /// Validates the inner pattern of a `shortestPath(...)` / `allShortestPaths(...)` search
+    /// function (openCypher / Neo4j-dialect path search), enforcing the supported shape:
+    ///
+    /// - It may only appear in a read (`MATCH`/`OPTIONAL MATCH`) pattern, never a `CREATE`/`MERGE`.
+    /// - The wrapped pattern is exactly **one** relationship between **two** node patterns
+    ///   (`(a)-[...]-(b)`), with no longer chain.
+    /// - That single relationship is **variable-length** (`-[*]-`, `-[*1..6]-`, …); a fixed-length
+    ///   relationship has a known single length and is not a shortest-path search.
+    ///
+    /// Faults are reported as [`SemanticErrorKind::InvalidShortestPath`] (a compile-time
+    /// `SyntaxError`, mirroring how the reference implementations reject these forms). Node and
+    /// relationship variables inside the pattern are bound by the ordinary element walk afterwards.
+    fn check_shortest_path(
+        &self,
+        part: &PatternPart,
+        role: PatternRole,
+    ) -> Result<(), SemanticError> {
+        if role != PatternRole::Read {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidShortestPath {
+                    reason: "shortestPath/allShortestPaths can only be used in a MATCH pattern"
+                        .to_owned(),
+                },
+                part.span,
+            ));
+        }
+        if part.element.chain.len() != 1 {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidShortestPath {
+                    reason: format!(
+                        "the pattern must be a single relationship between two nodes, \
+                         but it has {} relationship(s)",
+                        part.element.chain.len()
+                    ),
+                },
+                part.element.span,
+            ));
+        }
+        let rel = &part.element.chain[0].relationship;
+        if rel.range.is_none() {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidShortestPath {
+                    reason: "the relationship must be variable-length (e.g. `-[*]-`, `-[*1..6]-`)"
+                        .to_owned(),
+                },
+                rel.span,
+            ));
+        }
+        Ok(())
     }
 
     fn bind_pattern_element(

@@ -96,9 +96,9 @@
 
 use crate::ast::{
     Clause, CreateClause, DeleteClause, Expr, ExprKind, LoadCsvClause, MatchClause, MergeAction,
-    MergeClause, NodePattern, PatternElement, PatternPart, ProjectionBody, ProjectionItem, Query,
-    QueryBody, RelType, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem,
-    SingleQuery, StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
+    MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind, ProjectionBody,
+    ProjectionItem, Query, QueryBody, RelType, RelationshipPattern, RemoveClause, RemoveItem,
+    SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -302,6 +302,9 @@ impl Planner {
     /// hoisted to [`Filter`](LogicalOp::Filter)s immediately above their binding operator
     /// (the [Normalisation](crate::lower#normalisation) rule).
     fn lower_pattern_part(&mut self, part: &PatternPart, current: Option<LogicalOp>) -> LogicalOp {
+        if part.kind != PatternPartKind::Normal {
+            return self.lower_shortest_path_part(part, current);
+        }
         let element = &part.element;
         // The anchor node: scan it unless `current` already binds it, then filter on inline props.
         let anchor_var = self.node_var(&element.start);
@@ -355,6 +358,72 @@ impl Planner {
             };
         }
         plan
+    }
+
+    /// Lowers a `shortestPath(...)` / `allShortestPaths(...)` pattern part (`part.kind != Normal`).
+    ///
+    /// The inner pattern is validated by [`semantics`](crate::semantics) to be exactly one
+    /// variable-length relationship between two node patterns `(a)-[*]-(b)`. Both endpoints are
+    /// bound first (scanned, or reused when an enclosing `MATCH` already bound them — exactly like a
+    /// normal pattern's anchor), their inline property maps hoisted to filters, then a single
+    /// [`ShortestPath`](LogicalOp::ShortestPath) operator searches between them.
+    fn lower_shortest_path_part(
+        &mut self,
+        part: &PatternPart,
+        current: Option<LogicalOp>,
+    ) -> LogicalOp {
+        let element = &part.element;
+        let link = &element.chain[0]; // semantics guarantees exactly one chain link
+        let from_node = &element.start;
+        let to_node = &link.node;
+        let rel = &link.relationship;
+        let from_var = self.node_var(from_node);
+        let to_var = self.node_var(to_node);
+        let rel_var = self.rel_var(rel);
+
+        // Bind the source endpoint (scan-or-reuse + inline filter), mirroring the normal anchor path.
+        let mut plan = match current {
+            Some(plan) if plan_binds(&plan, &from_var) => plan,
+            Some(plan) => {
+                let scan = self.scan_node(from_node, &from_var);
+                let args = collect_bound_vars(&plan);
+                let scan = self.correlate_scan(scan, args);
+                LogicalOp::Apply {
+                    left: Box::new(plan),
+                    right: Box::new(scan),
+                }
+            }
+            None => self.scan_node(from_node, &from_var),
+        };
+        plan = self.filter_inline_props(plan, from_node.properties.as_ref(), &from_var);
+
+        // Bind the target endpoint the same way (reuse if already bound, else scan + correlate).
+        plan = if plan_binds(&plan, &to_var) {
+            plan
+        } else {
+            let scan = self.scan_node(to_node, &to_var);
+            let args = collect_bound_vars(&plan);
+            let scan = self.correlate_scan(scan, args);
+            LogicalOp::Apply {
+                left: Box::new(plan),
+                right: Box::new(scan),
+            }
+        };
+        plan = self.filter_inline_props(plan, to_node.properties.as_ref(), &to_var);
+
+        LogicalOp::ShortestPath {
+            input: Box::new(plan),
+            from: from_var,
+            to: to_var,
+            relationship: rel_var,
+            path: part.var.as_ref().map(|v| Var::named(&v.name)),
+            direction: rel.direction,
+            types: rel.types.clone(),
+            range: rel
+                .range
+                .expect("shortestPath relationship is variable-length"),
+            all: part.kind == PatternPartKind::AllShortestPaths,
+        }
     }
 
     /// Wraps a fresh leaf scan so it reads from an [`Argument`](LogicalOp::Argument) of the carried
@@ -1082,6 +1151,20 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
             gather_bound_vars(input, out);
             push_unique(out, relationship.clone());
             push_unique(out, to.clone());
+        }
+        LogicalOp::ShortestPath {
+            input,
+            to,
+            relationship,
+            path,
+            ..
+        } => {
+            gather_bound_vars(input, out);
+            push_unique(out, to.clone());
+            push_unique(out, relationship.clone());
+            if let Some(p) = path {
+                push_unique(out, p.clone());
+            }
         }
         LogicalOp::Filter { input, .. }
         | LogicalOp::Skip { input, .. }

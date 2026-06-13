@@ -58,11 +58,11 @@ use crate::ast::{
     BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause,
     ExistsSubquery, Expr, ExprKind, Label, ListComprehension, Literal, LoadCsvClause, MapKey,
     MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink, PatternComprehension,
-    PatternElement, PatternPart, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem,
-    QuantifierExpr, QuantifierKind, Query, QueryBody, RelDirection, RelType, RelationshipPattern,
-    RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery, SortDirection,
-    SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, VarLengthRange,
-    Variable, WithClause, YieldItem,
+    PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody,
+    ProjectionItem, QuantifierExpr, QuantifierKind, Query, QueryBody, RelDirection, RelType,
+    RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery,
+    SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause,
+    VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -1017,6 +1017,9 @@ impl<'t, 's> Parser<'t, 's> {
     }
 
     /// Parses `PatternPart = (Variable, '=', AnonymousPatternPart) | AnonymousPatternPart`.
+    ///
+    /// The anonymous part is either an ordinary pattern element or a `shortestPath(...)` /
+    /// `allShortestPaths(...)` search function wrapping a single inner pattern.
     fn parse_pattern_part(&mut self) -> Result<PatternPart, SyntaxError> {
         let start = self.here_span().start;
         // Named path: `var = (...)`. A leading identifier followed by `=` is the named-path form.
@@ -1029,13 +1032,52 @@ impl<'t, 's> Parser<'t, 's> {
         } else {
             None
         };
-        let element = self.parse_pattern_element()?;
+        let (kind, element) = self.parse_pattern_part_body()?;
         let end = element.span.end;
         Ok(PatternPart {
             var,
+            kind,
             element,
             span: Span::new(start, end),
         })
+    }
+
+    /// Parses the body of a pattern part: either an ordinary [`PatternElement`] or a
+    /// `shortestPath(<pattern>)` / `allShortestPaths(<pattern>)` search function.
+    ///
+    /// The two search functions are recognised as a leading identifier (case-insensitively
+    /// `shortestPath` / `allShortestPaths`) immediately followed by `(`; the inner pattern is an
+    /// ordinary [`PatternElement`] parsed between the parentheses. Anything else is parsed as a
+    /// plain pattern element, so an ordinary node named `shortestPath` (`(shortestPath)-[...]`) is
+    /// unaffected — the disambiguator is the function-call `(` with no node-pattern shape inside.
+    fn parse_pattern_part_body(
+        &mut self,
+    ) -> Result<(PatternPartKind, PatternElement), SyntaxError> {
+        if let Some(TokenKind::Identifier(name)) = self.peek_kind() {
+            let kind = if name.eq_ignore_ascii_case("shortestPath") {
+                Some(PatternPartKind::ShortestPath)
+            } else if name.eq_ignore_ascii_case("allShortestPaths") {
+                Some(PatternPartKind::AllShortestPaths)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                if matches!(self.peek_at(1).map(|t| &t.kind), Some(TokenKind::LParen)) {
+                    self.bump(); // the search-function name
+                    self.expect(
+                        &TokenKind::LParen,
+                        "'(' to begin the shortest-path search pattern",
+                    )?;
+                    let element = self.parse_pattern_element()?;
+                    self.expect(
+                        &TokenKind::RParen,
+                        "')' to close the shortest-path search pattern",
+                    )?;
+                    return Ok((kind, element));
+                }
+            }
+        }
+        Ok((PatternPartKind::Normal, self.parse_pattern_element()?))
     }
 
     /// Parses `PatternElement = NodePattern, { PatternElementChain }`.

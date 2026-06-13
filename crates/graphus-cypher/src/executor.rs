@@ -262,6 +262,27 @@ enum Operator {
         pending: VecDeque<Row>,
     },
 
+    /// `ShortestPath`/`allShortestPaths`: for each input row (both endpoints already bound), run a
+    /// breadth-first search from `from` to `to` honouring `direction`, `types` and the `range` length
+    /// bounds, with node-uniqueness within a path (openCypher `shortestPath` semantics). For
+    /// `all = false` it emits a single minimal-length path; for `all = true` it emits every path of
+    /// that minimal length (one row each). Each produced row binds `relationship` to the path's
+    /// relationship list and, when present, `path` to the reconstructed path value. No path within the
+    /// bounds emits no row (a plain `MATCH` filters it out; an `OPTIONAL MATCH` null-fills it through
+    /// the usual optional machinery).
+    ShortestPath {
+        input: Box<Operator>,
+        from: Var,
+        to: Var,
+        relationship: Var,
+        path: Option<Var>,
+        direction: RelDirection,
+        types: Vec<RelType>,
+        range: VarLengthRange,
+        all: bool,
+        pending: VecDeque<Row>,
+    },
+
     /// `NamedPath`: for each input row, reconstruct the path value bound by `MATCH p = …` from the
     /// pattern part's `start` node and `steps` relationship bindings, binding `variable` to it.
     NamedPath {
@@ -529,6 +550,39 @@ impl Operator {
                         pending,
                     )?;
                 }
+            },
+
+            Operator::ShortestPath {
+                input,
+                from,
+                to,
+                relationship,
+                path,
+                direction,
+                types,
+                range,
+                all,
+                pending,
+            } => loop {
+                if let Some(row) = pending.pop_front() {
+                    return Ok(Some(row));
+                }
+                let Some(base) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                shortest_paths_into_pending(
+                    &base,
+                    from,
+                    to,
+                    relationship,
+                    path,
+                    *direction,
+                    types,
+                    *range,
+                    *all,
+                    ctx,
+                    pending,
+                )?;
             },
 
             Operator::Optional {
@@ -867,6 +921,166 @@ fn var_expand_into_pending(
     )
 }
 
+/// Runs a breadth-first search for `shortestPath`/`allShortestPaths` between the already-bound
+/// `from` and `to` endpoints of `base`, pushing one row per shortest path into `pending` (or none
+/// when no path of a length within `range` connects them). `all` selects between a single minimal
+/// path and every minimal-length path.
+///
+/// The forward BFS records, for every node reached at its shortest distance, the set of
+/// `(predecessor, relationship)` pairs lying on a shortest path (the shortest-path predecessor DAG),
+/// then enumerates paths by backtracking from `to` to `from` over that DAG. Because each step
+/// strictly decreases the distance, every enumerated path is node-unique (openCypher `shortestPath`
+/// semantics) and the enumeration always terminates. The multigraph is honoured — parallel
+/// relationships between two consecutive-distance nodes are distinct shortest paths.
+///
+/// Boundary: both endpoints must be bound (the supported form). A lower bound greater than the
+/// actual shortest distance (e.g. `shortestPath((a)-[*3..]-(b))` with `a`, `b` two hops apart) is
+/// not satisfied — no row is produced — since the BFS reports the unconstrained shortest distance.
+#[allow(clippy::too_many_arguments)]
+fn shortest_paths_into_pending(
+    base: &Row,
+    from: &Var,
+    to: &Var,
+    relationship: &Var,
+    path: &Option<Var>,
+    direction: RelDirection,
+    types: &[RelType],
+    range: VarLengthRange,
+    all: bool,
+    ctx: &mut Ctx<'_>,
+    pending: &mut VecDeque<Row>,
+) -> Result<(), ExecError> {
+    let Some(anchor) = base.get(&from.name).and_then(RowValue::as_node) else {
+        return Ok(());
+    };
+    let Some(target) = base.get(&to.name).and_then(RowValue::as_node) else {
+        return Ok(());
+    };
+    let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
+    let dir = ExpandDirection::from_pattern(direction);
+    let min = range.min.unwrap_or(1);
+    let max = range.max;
+
+    // Forward BFS: shortest distance to each node + the shortest-path predecessor DAG.
+    let mut dist: std::collections::HashMap<NodeId, u64> = std::collections::HashMap::new();
+    let mut preds: std::collections::HashMap<NodeId, Vec<(NodeId, crate::graph_access::RelId)>> =
+        std::collections::HashMap::new();
+    dist.insert(anchor, 0);
+    let mut frontier = vec![anchor];
+    let mut depth = 0u64;
+    // The zero-length path (the anchor itself) is a valid shortest path only when the lower bound
+    // admits length 0 and the endpoints coincide.
+    let mut reached: Option<u64> = (anchor == target && min == 0).then_some(0);
+
+    while !frontier.is_empty() {
+        if max.is_some_and(|m| depth >= m) {
+            break;
+        }
+        if reached.is_some_and(|d| depth >= d) {
+            break; // every shortest path is discovered by the level the target is first reached
+        }
+        ctx.check_cancelled()?;
+        let mut next = Vec::new();
+        for &node in &frontier {
+            for inc in ctx.graph.expand(node, dir, &type_names) {
+                let nb = inc.neighbour;
+                match dist.get(&nb).copied() {
+                    None => {
+                        dist.insert(nb, depth + 1);
+                        preds.entry(nb).or_default().push((node, inc.rel));
+                        next.push(nb);
+                        if nb == target && reached.is_none() {
+                            reached = Some(depth + 1);
+                        }
+                    }
+                    // Another shortest-path predecessor reaching `nb` at the same minimal distance.
+                    Some(d) if d == depth + 1 => {
+                        preds.entry(nb).or_default().push((node, inc.rel));
+                    }
+                    _ => {} // already reached via a strictly shorter path
+                }
+            }
+        }
+        depth += 1;
+        frontier = next;
+    }
+
+    let Some(d) = reached else {
+        return Ok(()); // disconnected within the bounds
+    };
+    if d < min {
+        return Ok(()); // the shortest path is below the requested lower bound
+    }
+
+    // Enumerate the relationship trails (anchor -> target order) of the shortest path(s).
+    let mut trails: Vec<Vec<crate::graph_access::RelId>> = Vec::new();
+    if d == 0 {
+        trails.push(Vec::new());
+    } else {
+        let mut rev_trail = Vec::new();
+        collect_shortest(target, anchor, &preds, &mut rev_trail, &mut trails, all);
+    }
+
+    for trail in trails {
+        let mut row = base.clone();
+        row.set(
+            relationship.name.clone(),
+            RowValue::list(
+                trail
+                    .iter()
+                    .map(|&id| RowValue::Rel(RelRef { id }))
+                    .collect(),
+            ),
+        );
+        if let Some(pvar) = path {
+            let mut current = anchor;
+            let mut steps = Vec::with_capacity(trail.len());
+            for &rel in &trail {
+                let hop = hop_step_from(rel, current, &*ctx.graph);
+                current = hop.node;
+                steps.push(hop);
+            }
+            row.set(
+                pvar.name.clone(),
+                RowValue::Path(PathValue {
+                    start: anchor,
+                    steps,
+                }),
+            );
+        }
+        pending.push_back(row);
+    }
+    Ok(())
+}
+
+/// Backtracks the shortest-path predecessor DAG from `node` to `anchor`, collecting each path's
+/// relationship trail (pushed reversed on the way down, emitted in anchor->target order). With
+/// `all = false` it stops after the first complete path (a single shortest path).
+fn collect_shortest(
+    node: NodeId,
+    anchor: NodeId,
+    preds: &std::collections::HashMap<NodeId, Vec<(NodeId, crate::graph_access::RelId)>>,
+    rev_trail: &mut Vec<crate::graph_access::RelId>,
+    out: &mut Vec<Vec<crate::graph_access::RelId>>,
+    all: bool,
+) {
+    if node == anchor {
+        out.push(rev_trail.iter().rev().copied().collect());
+        return;
+    }
+    let Some(parents) = preds.get(&node) else {
+        return;
+    };
+    for &(parent, rel) in parents {
+        rev_trail.push(rel);
+        collect_shortest(parent, anchor, preds, rev_trail, out, all);
+        rev_trail.pop();
+        if !all && !out.is_empty() {
+            return;
+        }
+    }
+}
+
 /// Reconstructs the [`PathValue`] a `NamedPath` operator binds (`MATCH p = …`) from the pattern
 /// part's `start` node binding and its per-link `steps` relationship bindings.
 ///
@@ -1105,6 +1319,28 @@ fn build_operator(
             types: types.clone(),
             into: true,
             range: *range,
+            pending: VecDeque::new(),
+        }),
+        PhysicalOp::ShortestPath {
+            input,
+            from,
+            to,
+            relationship,
+            path,
+            direction,
+            types,
+            range,
+            all,
+        } => Ok(Operator::ShortestPath {
+            input: Box::new(build_operator(input, arg, ctx)?),
+            from: from.clone(),
+            to: to.clone(),
+            relationship: relationship.clone(),
+            path: path.clone(),
+            direction: *direction,
+            types: types.clone(),
+            range: *range,
+            all: *all,
             pending: VecDeque::new(),
         }),
         PhysicalOp::NamedPath {
@@ -2885,6 +3121,25 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             for v in [relationship, to] {
                 if !cols.contains(&v.name) {
                     cols.push(v.name.clone());
+                }
+            }
+            cols
+        }
+        PhysicalOp::ShortestPath {
+            input,
+            relationship,
+            path,
+            ..
+        } => {
+            // Both endpoints are bound by `input`; this operator introduces the relationship list and,
+            // when named (`p = shortestPath(...)`), the path variable.
+            let mut cols = result_columns(input, procedures);
+            if !cols.contains(&relationship.name) {
+                cols.push(relationship.name.clone());
+            }
+            if let Some(p) = path {
+                if !cols.contains(&p.name) {
+                    cols.push(p.name.clone());
                 }
             }
             cols

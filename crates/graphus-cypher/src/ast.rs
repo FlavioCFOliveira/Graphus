@@ -463,16 +463,36 @@ pub struct YieldItem {
 
 /// One pattern part of a `Pattern`, optionally a named path (openCypher `PatternPart`).
 ///
-/// `p = (...)-[...]->(...)` (named path) or a bare anonymous pattern.
+/// `p = (...)-[...]->(...)` (named path) or a bare anonymous pattern. The [`kind`](Self::kind)
+/// distinguishes an ordinary pattern from a `shortestPath(...)` / `allShortestPaths(...)` wrapper.
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct PatternPart {
     /// The path variable if `var = ...` was written (openCypher `Variable '=' AnonymousPatternPart`).
     pub var: Option<Variable>,
-    /// The pattern element (a node, then zero or more `relationship node` chain links).
+    /// Whether the element is wrapped in `shortestPath(...)` / `allShortestPaths(...)`.
+    pub kind: PatternPartKind,
+    /// The pattern element (a node, then zero or more `relationship node` chain links). For a
+    /// shortest-path part this is the single inner pattern of the `shortestPath(...)` call.
     pub element: PatternElement,
     /// Span covering the (optional) variable and the element.
     pub span: Span,
+}
+
+/// Whether a [`PatternPart`] is an ordinary pattern or a shortest-path search function.
+///
+/// `shortestPath` / `allShortestPaths` are openCypher path-search functions (in the openCypher
+/// reference implementation and the Neo4j Cypher dialect). They wrap a single variable-length
+/// pattern `(a)-[*]-(b)` and return the minimal-relationship-count path(s) between the endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum PatternPartKind {
+    /// An ordinary pattern element (no shortest-path wrapper).
+    Normal,
+    /// `shortestPath((a)-[*]-(b))` — one minimal-length path (any one when several are minimal).
+    ShortestPath,
+    /// `allShortestPaths((a)-[*]-(b))` — every path of the minimal length.
+    AllShortestPaths,
 }
 
 /// A pattern element: a node followed by a chain of `(relationship)(node)` links

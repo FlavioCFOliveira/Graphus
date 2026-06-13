@@ -342,6 +342,10 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
         // A named path binds one path value per input row — cardinality is unchanged.
         LogicalOp::NamedPath { input, .. } => estimate(input, stats),
 
+        // `shortestPath` yields at most one path per input row; `allShortestPaths` a small number.
+        // Both endpoints are bound by the input, so the cardinality is modelled as a passthrough.
+        LogicalOp::ShortestPath { input, .. } => estimate(input, stats),
+
         // ---- relational ---------------------------------------------------------------------------
 
         // A filter keeps at most its input (a filter never adds rows). When the predicate is a single
@@ -694,6 +698,7 @@ fn label_for_var(op: &LogicalOp, variable: &str) -> Option<String> {
         | LogicalOp::Unwind { input, .. }
         | LogicalOp::LoadCsv { input, .. }
         | LogicalOp::Expand { input, .. }
+        | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::NamedPath { input, .. }
         | LogicalOp::Optional { input, .. }
         | LogicalOp::Create { input, .. }

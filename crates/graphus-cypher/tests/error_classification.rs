@@ -77,6 +77,9 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
         SemanticErrorKind::InvalidClauseComposition { reason: "test" },
         SemanticErrorKind::DifferentColumnsInUnion,
         SemanticErrorKind::InvalidLoadCsvUrl,
+        SemanticErrorKind::InvalidShortestPath {
+            reason: "test".to_owned(),
+        },
     ]
 }
 
@@ -158,6 +161,9 @@ fn expected_classification(kind: &SemanticErrorKind) -> (ErrorType, SemanticDeta
             SemanticDetail::DifferentColumnsInUnion,
         ),
         K::InvalidLoadCsvUrl => (ErrorType::SyntaxError, SemanticDetail::InvalidLoadCsvUrl),
+        K::InvalidShortestPath { .. } => {
+            (ErrorType::SyntaxError, SemanticDetail::InvalidShortestPath)
+        }
         // `#[non_exhaustive]` requires this arm in a downstream crate. A new, unlisted variant
         // trips it loudly rather than passing silently; the compile-time guard is in-crate.
         other => panic!("unlisted SemanticErrorKind in the classification cross-check: {other:?}"),
@@ -233,11 +239,11 @@ fn renders_the_verbatim_tck_gherkin_triple() {
 #[test]
 fn every_listed_kind_is_distinct() {
     let kinds = all_kinds();
-    // 22 variants as of this writing; the assert documents the count and trips if one is dropped
+    // 23 variants as of this writing; the assert documents the count and trips if one is dropped
     // from `all_kinds` without the match also changing (the match would then fail to compile).
     assert_eq!(
         kinds.len(),
-        22,
+        23,
         "all_kinds() should list every SemanticErrorKind variant once"
     );
     let details: std::collections::HashSet<_> = kinds.iter().map(|k| k.detail()).collect();
