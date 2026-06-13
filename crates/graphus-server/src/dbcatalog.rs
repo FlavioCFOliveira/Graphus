@@ -512,7 +512,20 @@ fn open_or_create_coordinator(
         let wal = WalManager::create(create_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
         // Seed element ids from 1 (`04 §2.2`).
-        RecordStore::create(device, wal, pool_pages, 1)?
+        let store = RecordStore::create(device, wal, pool_pages, 1)?;
+        // Durable-create barrier (`04 §4.9`, storage audit F1). `RecordStore::create` flushes the
+        // device and `WalManager::create` hardens the WAL header, so both files' **content** is now
+        // durable — but their **directory entries** are not. On ext4/XFS/btrfs/APFS an `fdatasync`
+        // of a file's content does NOT harden the parent directory entry that names it, so a power
+        // loss after a later `COMMIT` (which hardens the WAL content and returns success to the
+        // client) could leave `store.blk` and/or `wal.log` unfindable on reboot. `open_or_create`
+        // would then see an empty/absent device and create a FRESH EMPTY store, silently discarding
+        // acknowledged-committed data. Hardening the directory now (both files live in the same dir,
+        // so one `fsync` covers the plaintext and the encrypted paths alike) makes the entries
+        // durable before the engine serves its first commit. Mirrors the create-side barrier in
+        // [`provision_fresh_dir`] and the durable-rename idiom in [`crate::key_rotation`].
+        fsync_parent_dir(device_file)?;
+        store
     };
 
     // The inviolable integrity gate (`04 §4.6`/§4.8): refuse to serve a corrupt store. The
@@ -1328,6 +1341,27 @@ fn remove_dir(dir: &Path) -> Result<(), CatalogError> {
     }
 }
 
+/// `fsync`s the directory that contains `file`, hardening the (just-created) directory entry that
+/// names it — the engine-thread counterpart of [`fsync_dir`] that maps to a [`GraphusError`] and is
+/// keyed off a file path. Used by [`open_or_create_coordinator`]'s durable-create barrier so a fresh
+/// store + WAL are findable after a crash (storage audit F1, `04 §4.9`).
+///
+/// # Errors
+/// Returns a storage error if `file` has no parent directory or the directory `fsync` fails.
+fn fsync_parent_dir(file: &Path) -> Result<(), GraphusError> {
+    let dir = file.parent().ok_or_else(|| {
+        GraphusError::Storage(format!(
+            "file {} has no parent directory to fsync",
+            file.display()
+        ))
+    })?;
+    let f = std::fs::File::open(dir).map_err(|e| {
+        GraphusError::Storage(format!("opening directory {} to fsync: {e}", dir.display()))
+    })?;
+    f.sync_all()
+        .map_err(|e| GraphusError::Storage(format!("syncing directory {}: {e}", dir.display())))
+}
+
 /// Opens `dir` and `fsync`s it, hardening its directory entries (creations and unlinks) — the
 /// standard POSIX way to make directory-level changes durable.
 fn fsync_dir(dir: &Path) -> Result<(), CatalogError> {
@@ -1476,6 +1510,67 @@ mod tests {
         assert!(loaded.is_empty());
         // Loading never creates the file (backward compat: an old store dir stays untouched).
         assert!(!root.path.join(CATALOG_FILE_NAME).exists());
+    }
+
+    // ---- durable-create barrier (storage audit F1) ------------------------------------------------
+
+    /// The directory-`fsync` barrier hardens a real directory and refuses a parentless path. The
+    /// `fsync` itself (directory entries made durable) is, like [`provision_fresh_dir`]'s barrier,
+    /// asserted by code review — proving it would require crash simulation — but the happy and error
+    /// control-flow paths are exercised here so a regression in the call surface is caught.
+    #[test]
+    fn fsync_parent_dir_hardens_a_directory_and_rejects_a_parentless_path() {
+        let root = TempRoot::new("fsync-parent");
+        let file = root.path.join("some.file");
+        std::fs::write(&file, b"x").expect("write file");
+        fsync_parent_dir(&file).expect("fsync the parent of an existing file");
+        // The filesystem root has no parent directory to harden.
+        assert!(matches!(
+            fsync_parent_dir(Path::new("/")),
+            Err(GraphusError::Storage(_))
+        ));
+    }
+
+    /// A freshly-created store + WAL round-trips through a drop and reopen for BOTH the plaintext and
+    /// the encrypted path — proving the durable-create barrier (the `fsync_parent_dir` added to the
+    /// fresh-create branch) does not break create/recover/`verify_on_open`, and that both files are
+    /// created in, and findable from, their directory. This is the functional guard for F1; the
+    /// power-loss durability the barrier provides is covered by code review (see the barrier comment).
+    #[test]
+    fn fresh_create_round_trips_through_reopen_plaintext_and_encrypted() {
+        for tag in ["create-plain", "create-enc"] {
+            let root = TempRoot::new(tag);
+            let dir = root.path.join("db");
+            std::fs::create_dir_all(&dir).expect("create db dir");
+            let device_file = dir.join(STORE_FILE_NAME);
+            let wal_file = dir.join(WAL_FILE_NAME);
+
+            // Only the encrypted variant configures a master key (a valid 32-byte key file).
+            let master_key = if tag == "create-enc" {
+                let key_file = root.path.join("key.bin");
+                std::fs::write(&key_file, [0x42u8; graphus_crypto::KEY_LEN]).expect("write key");
+                Some(MasterKey::load_from_file(&key_file).expect("load master key"))
+            } else {
+                None
+            };
+
+            // Fresh create: exercises the durable-create barrier (fsync of the containing dir).
+            {
+                let coord =
+                    open_or_create_coordinator(&device_file, &wal_file, 64, master_key.as_ref())
+                        .expect("fresh create");
+                drop(coord); // close the files so they can be reopened below
+            }
+            // Both files exist and are findable from the directory.
+            assert!(device_file.exists(), "{tag}: store file should exist");
+            assert!(wal_file.exists(), "{tag}: WAL file should exist");
+
+            // Reopen via the existing-store path (WAL recovery + verify_on_open) — must succeed.
+            let reopened =
+                open_or_create_coordinator(&device_file, &wal_file, 64, master_key.as_ref())
+                    .unwrap_or_else(|e| panic!("{tag}: reopen failed: {e}"));
+            drop(reopened);
+        }
     }
 
     #[test]
