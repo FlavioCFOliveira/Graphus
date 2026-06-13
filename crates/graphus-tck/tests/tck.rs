@@ -158,7 +158,21 @@ use graphus_tck::runner::run_scenario;
 /// which classifies to the TCK `ArgumentError: NumberOutOfRange`. Wins: `expressions/aggregation`
 /// Aggregation6 [1]/[2] (values) and [3]/[4]/[5] (bad-argument errors), +11. Measured, zero
 /// regressions: the net +11 equals the Aggregation6 percentile-scenario count exactly.
-const BASELINE: usize = 3667;
+///
+/// 3667 → 3715 (#132, graph-element accessors + static property access): `labels()`/`type()` now
+/// propagate null (`labels(null) = null`), raise a runtime `TypeError` (`InvalidArgumentValue`) on a
+/// non-null non-matching argument, and are rejected at compile time on a statically-provable wrong
+/// type — a node into `type()`, a path into `labels()` — via a new `SType::Path`/`VarKind::Path`.
+/// List indexing (`list[i]`) and dynamic property access (`n['name']`) now operate at the
+/// `RowValue` level, so a structural list preserves its node/relationship references (the "accept
+/// type Any" path: `labels(list[0])`, `(list[1]).prop`). An aliased projection carries its provable
+/// static type forward, so `WITH 123 AS x RETURN x.num` is a compile-time mismatch. A *leading*
+/// `OPTIONAL MATCH` over the empty unit row now preserves its one all-`NULL` driving row instead of
+/// collapsing to zero. The harness also honours `(ignoring element order for lists)` by matching a
+/// list cell as a bag. Wins: `expressions/graph` 34→60 (Graph3/4/6/7/9), plus the leading-optional
+/// fix unblocking further `clauses`/`expressions` scenarios. Measured, zero regressions (full
+/// failure-set diff: 0 newly-failing scenarios; the net +48 is purely additive).
+const BASELINE: usize = 3715;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

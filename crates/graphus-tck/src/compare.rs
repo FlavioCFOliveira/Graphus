@@ -91,9 +91,18 @@ pub struct ConcretePathStep {
     pub node: ConcreteNode,
 }
 
-/// Returns `true` if the engine's resolved cell `actual` matches the TCK `expected` value.
+/// Returns `true` if the engine's resolved cell `actual` matches the TCK `expected` value, with
+/// **order-significant** list comparison (the default for `… in any order` / `… in order`).
 #[must_use]
 pub fn matches(expected: &ExpectedValue, actual: &Concrete) -> bool {
+    matches_with(expected, actual, false)
+}
+
+/// As [`matches`], but when `ignore_list_order` is set the elements *within* a list cell are matched
+/// as a bag (order-insensitive) — the `… (ignoring element order for lists)` assertion variant. The
+/// flag is propagated into nested lists/maps so it holds at every depth.
+#[must_use]
+pub fn matches_with(expected: &ExpectedValue, actual: &Concrete, ignore_list_order: bool) -> bool {
     match (expected, actual) {
         // ---- structural: node / rel / path ----------------------------------------------------
         (ExpectedValue::Node(en), Concrete::Node { labels, properties }) => {
@@ -110,18 +119,21 @@ pub fn matches(expected: &ExpectedValue, actual: &Concrete) -> bool {
 
         // ---- containers that may straddle the value/structural boundary ------------------------
         (ExpectedValue::List(exs), Concrete::List(acs)) => {
-            exs.len() == acs.len() && exs.iter().zip(acs).all(|(e, a)| matches(e, a))
+            list_matches(exs, acs, ignore_list_order, |e, a| {
+                matches_with(e, a, ignore_list_order)
+            })
         }
         (ExpectedValue::List(exs), Concrete::Value(Value::List(avs))) => {
             // A pure-property list on the actual side: lift each element to a `Concrete::Value`.
-            exs.len() == avs.len()
-                && exs
-                    .iter()
-                    .zip(avs)
-                    .all(|(e, a)| matches(e, &Concrete::Value(a.clone())))
+            let acs: Vec<Concrete> = avs.iter().cloned().map(Concrete::Value).collect();
+            list_matches(exs, &acs, ignore_list_order, |e, a| {
+                matches_with(e, a, ignore_list_order)
+            })
         }
-        (ExpectedValue::Map(exs), Concrete::Map(acs)) => map_matches(exs, acs),
-        (ExpectedValue::Map(exs), Concrete::Value(Value::Map(avs))) => map_matches_values(exs, avs),
+        (ExpectedValue::Map(exs), Concrete::Map(acs)) => map_matches(exs, acs, ignore_list_order),
+        (ExpectedValue::Map(exs), Concrete::Value(Value::Map(avs))) => {
+            map_matches_values(exs, avs, ignore_list_order)
+        }
 
         // ---- pure property values: defer to the engine's equivalence ---------------------------
         (_, Concrete::Value(av)) => match expected_to_value(expected) {
@@ -139,6 +151,34 @@ pub fn matches(expected: &ExpectedValue, actual: &Concrete) -> bool {
         // Any other cross-kind pairing is a non-match.
         _ => false,
     }
+}
+
+/// Matches an expected list against an actual list, either positionally or — when `ignore_order` is
+/// set — as a bag (each expected element matched to a distinct actual element via the same
+/// backtracking bipartite matching used for unordered rows). `cell` compares a single element pair.
+fn list_matches(
+    exs: &[ExpectedValue],
+    acs: &[Concrete],
+    ignore_order: bool,
+    cell: impl Fn(&ExpectedValue, &Concrete) -> bool,
+) -> bool {
+    if exs.len() != acs.len() {
+        return false;
+    }
+    if !ignore_order {
+        return exs.iter().zip(acs).all(|(e, a)| cell(e, a));
+    }
+    let candidates: Vec<Vec<usize>> = exs
+        .iter()
+        .map(|e| {
+            acs.iter()
+                .enumerate()
+                .filter(|(_, a)| cell(e, a))
+                .map(|(j, _)| j)
+                .collect()
+        })
+        .collect();
+    bipartite_perfect_match(&candidates, acs.len())
 }
 
 /// The canonical ISO-8601 rendering of a temporal [`Value`], or `None` for non-temporals.
@@ -220,6 +260,15 @@ fn concrete_node_matches(en: &ExpectedNode, an: &ConcreteNode) -> bool {
 /// Same key set; each value compared via [`matches`] against a `Concrete::Value` so a property whose
 /// value is itself a list/map of scalars still routes through engine equivalence.
 fn props_match(expected: &[(String, ExpectedValue)], actual: &[(String, Value)]) -> bool {
+    props_match_ordered(expected, actual, false)
+}
+
+/// As [`props_match`], threading `ignore_list_order` into each value comparison.
+fn props_match_ordered(
+    expected: &[(String, ExpectedValue)],
+    actual: &[(String, Value)],
+    ignore_list_order: bool,
+) -> bool {
     if expected.len() != actual.len() {
         return false;
     }
@@ -227,12 +276,18 @@ fn props_match(expected: &[(String, ExpectedValue)], actual: &[(String, Value)])
         actual
             .iter()
             .find(|(ak, _)| ak == k)
-            .is_some_and(|(_, av)| matches(ev, &Concrete::Value(av.clone())))
+            .is_some_and(|(_, av)| {
+                matches_with(ev, &Concrete::Value(av.clone()), ignore_list_order)
+            })
     })
 }
 
 /// Map match where the actual side is a [`Concrete::Map`] (values may be structural).
-fn map_matches(expected: &[(String, ExpectedValue)], actual: &[(String, Concrete)]) -> bool {
+fn map_matches(
+    expected: &[(String, ExpectedValue)],
+    actual: &[(String, Concrete)],
+    ignore_list_order: bool,
+) -> bool {
     if expected.len() != actual.len() {
         return false;
     }
@@ -240,13 +295,17 @@ fn map_matches(expected: &[(String, ExpectedValue)], actual: &[(String, Concrete
         actual
             .iter()
             .find(|(ak, _)| ak == k)
-            .is_some_and(|(_, av)| matches(ev, av))
+            .is_some_and(|(_, av)| matches_with(ev, av, ignore_list_order))
     })
 }
 
 /// Map match where the actual side is a pure-`Value` map.
-fn map_matches_values(expected: &[(String, ExpectedValue)], actual: &[(String, Value)]) -> bool {
-    props_match(expected, actual)
+fn map_matches_values(
+    expected: &[(String, ExpectedValue)],
+    actual: &[(String, Value)],
+    ignore_list_order: bool,
+) -> bool {
+    props_match_ordered(expected, actual, ignore_list_order)
 }
 
 /// The outcome of a result-set comparison: success, or a human description of the first mismatch.
@@ -258,7 +317,11 @@ pub type RowSetResult = Result<(), String>;
 /// # Errors
 ///
 /// Returns a description if the row counts differ or any positional row fails to match.
-pub fn assert_ordered(expected: &[Vec<ExpectedValue>], actual: &[Vec<Concrete>]) -> RowSetResult {
+pub fn assert_ordered(
+    expected: &[Vec<ExpectedValue>],
+    actual: &[Vec<Concrete>],
+    ignore_list_order: bool,
+) -> RowSetResult {
     if expected.len() != actual.len() {
         return Err(format!(
             "row count mismatch: expected {}, got {}",
@@ -267,7 +330,7 @@ pub fn assert_ordered(expected: &[Vec<ExpectedValue>], actual: &[Vec<Concrete>])
         ));
     }
     for (i, (erow, arow)) in expected.iter().zip(actual).enumerate() {
-        if !row_matches(erow, arow) {
+        if !row_matches(erow, arow, ignore_list_order) {
             return Err(format!(
                 "ordered row {i} mismatch:\n  expected {erow:?}\n  got      {arow:?}"
             ));
@@ -286,7 +349,11 @@ pub fn assert_ordered(expected: &[Vec<ExpectedValue>], actual: &[Vec<Concrete>])
 /// # Errors
 ///
 /// Returns a description if counts differ or no perfect one-to-one matching exists.
-pub fn assert_unordered(expected: &[Vec<ExpectedValue>], actual: &[Vec<Concrete>]) -> RowSetResult {
+pub fn assert_unordered(
+    expected: &[Vec<ExpectedValue>],
+    actual: &[Vec<Concrete>],
+    ignore_list_order: bool,
+) -> RowSetResult {
     if expected.len() != actual.len() {
         return Err(format!(
             "row count mismatch: expected {}, got {}",
@@ -301,7 +368,7 @@ pub fn assert_unordered(expected: &[Vec<ExpectedValue>], actual: &[Vec<Concrete>
             actual
                 .iter()
                 .enumerate()
-                .filter(|(_, arow)| row_matches(erow, arow))
+                .filter(|(_, arow)| row_matches(erow, arow, ignore_list_order))
                 .map(|(j, _)| j)
                 .collect()
         })
@@ -317,8 +384,12 @@ pub fn assert_unordered(expected: &[Vec<ExpectedValue>], actual: &[Vec<Concrete>
 }
 
 /// Whether the two rows match cell-by-cell, positionally (columns are already aligned by header).
-fn row_matches(expected: &[ExpectedValue], actual: &[Concrete]) -> bool {
-    expected.len() == actual.len() && expected.iter().zip(actual).all(|(e, a)| matches(e, a))
+fn row_matches(expected: &[ExpectedValue], actual: &[Concrete], ignore_list_order: bool) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|(e, a)| matches_with(e, a, ignore_list_order))
 }
 
 /// Hopcroft–Karp-style augmenting-path matching: returns `true` iff every left vertex (expected row)
@@ -461,10 +532,10 @@ mod tests {
     fn ordered_rows_are_positional() {
         let expected = vec![vec![ev_int(1)], vec![ev_int(2)]];
         let actual = vec![vec![v(Value::Integer(1))], vec![v(Value::Integer(2))]];
-        assert!(assert_ordered(&expected, &actual).is_ok());
+        assert!(assert_ordered(&expected, &actual, false).is_ok());
         // Swapped order fails for an ordered assertion.
         let swapped = vec![vec![v(Value::Integer(2))], vec![v(Value::Integer(1))]];
-        assert!(assert_ordered(&expected, &swapped).is_err());
+        assert!(assert_ordered(&expected, &swapped, false).is_err());
     }
 
     #[test]
@@ -472,10 +543,10 @@ mod tests {
         let expected = vec![vec![ev_int(1)], vec![ev_int(2)]];
         // Reversed order is fine for a bag.
         let actual = vec![vec![v(Value::Integer(2))], vec![v(Value::Integer(1))]];
-        assert!(assert_unordered(&expected, &actual).is_ok());
+        assert!(assert_unordered(&expected, &actual, false).is_ok());
         // A duplicate where the expected had distinct values fails.
         let dup = vec![vec![v(Value::Integer(1))], vec![v(Value::Integer(1))]];
-        assert!(assert_unordered(&expected, &dup).is_err());
+        assert!(assert_unordered(&expected, &dup, false).is_err());
     }
 
     #[test]
@@ -489,7 +560,7 @@ mod tests {
         ];
         // Note: row arities differ, so expected[0] (arity 1) only matches actual[1] (arity 1), and
         // expected[1] (arity 2) only matches actual[0]. This is the unambiguous case; assert it.
-        assert!(assert_unordered(&expected, &actual).is_ok());
+        assert!(assert_unordered(&expected, &actual, false).is_ok());
     }
 
     #[test]
@@ -497,8 +568,8 @@ mod tests {
         // Two identical expected rows require two distinct identical actual rows.
         let expected = vec![vec![ev_int(7)], vec![ev_int(7)]];
         let actual = vec![vec![v(Value::Integer(7))], vec![v(Value::Integer(7))]];
-        assert!(assert_unordered(&expected, &actual).is_ok());
+        assert!(assert_unordered(&expected, &actual, false).is_ok());
         let only_one = vec![vec![v(Value::Integer(7))], vec![v(Value::Integer(8))]];
-        assert!(assert_unordered(&expected, &only_one).is_err());
+        assert!(assert_unordered(&expected, &only_one, false).is_err());
     }
 }

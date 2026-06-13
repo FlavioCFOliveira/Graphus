@@ -70,6 +70,8 @@ pub enum SType {
     Node,
     /// A relationship (a variable bound by a relationship pattern).
     Relationship,
+    /// A path (a variable bound by a named-path pattern, `MATCH p = …`).
+    Path,
 }
 
 impl SType {
@@ -102,6 +104,14 @@ impl SType {
 /// the semantic scope (node/relationship bindings); quantifier and list-comprehension iteration
 /// variables are layered on locally as the walk descends.
 pub type TypeEnv = HashMap<String, SType>;
+
+/// Infers the static type of `expr` under `env` (the public entry point used by
+/// [`crate::semantics`] to flow an aliased projection's provable type into the next clause's scope).
+/// See [`infer`] for the inference rules.
+#[must_use]
+pub fn infer_type(expr: &Expr, env: &TypeEnv) -> SType {
+    infer(expr, env)
+}
 
 /// Infers the static type of `expr` under `env`. Returns [`SType::Unknown`] for everything whose
 /// type is not provable (see the module docs) — the result is only ever used to *find* a provable
@@ -300,15 +310,41 @@ fn check_function_args(name: &[String], args: &[Expr], env: &TypeEnv) -> Result<
         return Ok(());
     }
     let bad = match dotted.as_str() {
-        // `type()` reads a relationship's type; a node is a provable mismatch.
-        "type" => matches!(ty, SType::Node),
+        // `labels()` reads a node's labels; a relationship, path or scalar/list is a provable
+        // mismatch (`expressions/graph/Graph3.feature` [8]: `labels()` on a path is a compile-time
+        // `SyntaxError`). A node-typed argument is the only valid concrete type.
+        "labels" => matches!(
+            ty,
+            SType::Relationship
+                | SType::Path
+                | SType::Bool
+                | SType::Int
+                | SType::Float
+                | SType::Str
+                | SType::List(_)
+                | SType::Map
+        ),
+        // `type()` reads a relationship's type; a node or path is a provable mismatch
+        // (`expressions/graph/Graph4.feature` [7]).
+        "type" => matches!(
+            ty,
+            SType::Node
+                | SType::Path
+                | SType::Bool
+                | SType::Int
+                | SType::Float
+                | SType::Str
+                | SType::List(_)
+                | SType::Map
+        ),
         // `length()` measures a path; a node or relationship is a provable mismatch (a path
-        // variable is `Unknown` here, so the valid case is never flagged).
+        // variable is now typed, so a path argument is correctly accepted).
         "length" => matches!(ty, SType::Node | SType::Relationship),
-        // `properties()` accepts a node, relationship or map; a scalar/list is a provable mismatch.
+        // `properties()` accepts a node, relationship or map; a scalar/list/path is a provable
+        // mismatch.
         "properties" => matches!(
             ty,
-            SType::Bool | SType::Int | SType::Float | SType::Str | SType::List(_)
+            SType::Bool | SType::Int | SType::Float | SType::Str | SType::List(_) | SType::Path
         ),
         _ => false,
     };
@@ -429,6 +465,41 @@ mod tests {
         assert_eq!(SType::Null.join(SType::Str), SType::Str);
         assert_eq!(SType::Str.join(SType::Null), SType::Str);
         assert_eq!(SType::Int.join(SType::Str), SType::Unknown);
+    }
+
+    #[test]
+    fn labels_and_type_reject_provable_non_matching_arguments() {
+        let mut env = TypeEnv::new();
+        env.insert("n".to_owned(), SType::Node);
+        env.insert("r".to_owned(), SType::Relationship);
+        env.insert("p".to_owned(), SType::Path);
+        env.insert("v".to_owned(), SType::Unknown);
+
+        // `labels()` accepts a node and an unknown, rejects a relationship/path/scalar.
+        assert!(check_expr(&expr("labels(n)"), &env).is_ok());
+        assert!(check_expr(&expr("labels(v)"), &env).is_ok());
+        assert!(check_expr(&expr("labels(r)"), &env).is_err());
+        assert!(check_expr(&expr("labels(p)"), &env).is_err());
+        assert!(check_expr(&expr("labels(1)"), &env).is_err());
+
+        // `type()` accepts a relationship and an unknown, rejects a node/path/scalar.
+        assert!(check_expr(&expr("type(r)"), &env).is_ok());
+        assert!(check_expr(&expr("type(v)"), &env).is_ok());
+        assert!(check_expr(&expr("type(n)"), &env).is_err());
+        assert!(check_expr(&expr("type(p)"), &env).is_err());
+        assert!(check_expr(&expr("type('s')"), &env).is_err());
+    }
+
+    #[test]
+    fn property_access_rejects_provable_non_graph_base() {
+        let mut env = TypeEnv::new();
+        env.insert("n".to_owned(), SType::Node);
+        env.insert("x".to_owned(), SType::Int);
+        // A node base is fine; a provably-scalar base (e.g. `WITH 123 AS x … x.num`) is a mismatch.
+        assert!(check_expr(&expr("n.prop"), &env).is_ok());
+        assert!(check_expr(&expr("x.num"), &env).is_err());
+        assert!(check_expr(&expr("(123).num"), &env).is_err());
+        assert!(check_expr(&expr("true.bar"), &env).is_err());
     }
 
     #[test]

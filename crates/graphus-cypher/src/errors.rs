@@ -479,7 +479,11 @@ pub enum VarKind {
     Node,
     /// Bound to a relationship by a relationship pattern.
     Relationship,
-    /// Bound to a path by a named path / `UNWIND` / `WITH`/`RETURN` projection / `YIELD`.
+    /// Bound to a path by a named-path pattern (`MATCH p = …`). Distinguished from [`Self::Value`]
+    /// so the static type checker can reject a path where a node/relationship is required
+    /// (`labels(p)`, `type(p)`; `expressions/graph/Graph{3,4}.feature`).
+    Path,
+    /// Bound to a plain value by an `UNWIND` / `WITH`/`RETURN` projection / `YIELD`.
     Value,
 }
 
@@ -488,6 +492,7 @@ impl fmt::Display for VarKind {
         f.write_str(match self {
             Self::Node => "node",
             Self::Relationship => "relationship",
+            Self::Path => "path",
             Self::Value => "value",
         })
     }

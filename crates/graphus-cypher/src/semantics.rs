@@ -373,9 +373,15 @@ struct Scope {
     bindings: HashMap<String, Binding>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Binding {
     kind: VarKind,
+    /// The variable's statically-inferred value type, when known. Node/relationship/path kinds carry
+    /// their corresponding [`SType`]; a plain value binding ([`VarKind::Value`]) carries the static
+    /// type of the projected expression when it is provable (`WITH 123 AS x` → [`SType::Int`]), or
+    /// [`SType::Unknown`] otherwise. Used by [`Analyzer::scope_types`] so a downstream clause can
+    /// statically reject e.g. `x.num` on a non-graph `x` (`expressions/graph/Graph6.feature` [9]).
+    stype: SType,
 }
 
 impl Scope {
@@ -393,6 +399,19 @@ impl Scope {
     ///
     /// [`VariableTypeConflict`]: SemanticErrorKind::VariableTypeConflict
     fn bind(&mut self, name: &str, kind: VarKind, span: Span) -> Result<(), SemanticError> {
+        self.bind_typed(name, kind, kind_default_stype(kind), span)
+    }
+
+    /// As [`Self::bind`], but records an explicit static value type for the binding (used when an
+    /// aliased projection's expression has a provable type, so a downstream property access on a
+    /// non-graph value can be rejected at compile time).
+    fn bind_typed(
+        &mut self,
+        name: &str,
+        kind: VarKind,
+        stype: SType,
+        span: Span,
+    ) -> Result<(), SemanticError> {
         if let Some(existing) = self.bindings.get(name) {
             if existing.kind != kind {
                 return Err(SemanticError::new(
@@ -407,8 +426,19 @@ impl Scope {
             // Same kind: a benign re-reference (e.g. `MATCH (a) MATCH (a)`), not an error.
             return Ok(());
         }
-        self.bindings.insert(name.to_owned(), Binding { kind });
+        self.bindings
+            .insert(name.to_owned(), Binding { kind, stype });
         Ok(())
+    }
+}
+
+/// The default static type for a binding of `kind`, used when no projected-expression type is known.
+fn kind_default_stype(kind: VarKind) -> SType {
+    match kind {
+        VarKind::Node => SType::Node,
+        VarKind::Relationship => SType::Relationship,
+        VarKind::Path => SType::Path,
+        VarKind::Value => SType::Unknown,
     }
 }
 
@@ -823,7 +853,10 @@ impl Analyzer<'_> {
         //    boundary (so `WITH n` still lets `n` be used as a node afterwards); any computed
         //    expression becomes a plain value.
         let aggregating = self.projection_is_aggregating(body);
-        let mut columns: Vec<(String, VarKind, Span)> = Vec::new();
+        let mut columns: Vec<(String, VarKind, SType, Span)> = Vec::new();
+        // The incoming scope's static-type environment, so an aliased projection (`WITH 123 AS x`)
+        // can carry its provable value type forward for the next clause's static checks.
+        let incoming_types = Self::scope_types(scope);
 
         // The grouping-key context for the aggregation rules: the simple grouping keys of this
         // projection, plus (for `*`) every carried binding, which is a bare-variable grouping key.
@@ -838,14 +871,27 @@ impl Analyzer<'_> {
         // `*` carries every incoming binding through unchanged (name + kind preserved).
         if body.star {
             for (name, binding) in &scope.bindings {
-                columns.push((name.clone(), binding.kind, clause_span));
+                columns.push((
+                    name.clone(),
+                    binding.kind,
+                    binding.stype.clone(),
+                    clause_span,
+                ));
             }
         }
 
         for item in &body.items {
             self.check_projection_item(item, scope, aggregating, &keys, is_final_return)?;
             let (col_name, kind) = self.column_name_and_kind(item, scope, is_final_return)?;
-            columns.push((col_name, kind, item.span));
+            // A bare entity variable keeps its concrete type; any other expression carries its
+            // statically-inferred value type (often `Unknown`, but a literal/typed expression is
+            // provable — `WITH 123 AS x` makes `x` an `Int`, so `x.num` later is a static mismatch).
+            let stype = if matches!(kind, VarKind::Value) {
+                static_type::infer_type(&item.expr, &incoming_types)
+            } else {
+                kind_default_stype(kind)
+            };
+            columns.push((col_name, kind, stype, item.span));
         }
 
         // 2) Duplicate result-column names are a ColumnNameConflict (TCK) — checked *before* the new
@@ -857,8 +903,8 @@ impl Analyzer<'_> {
         // 3) Build the post-projection scope from the (now-unique) columns. `bind` cannot raise a
         //    type conflict here because the names are distinct (step 2 guaranteed it).
         let mut new_scope = Scope::default();
-        for (name, kind, span) in &columns {
-            new_scope.bind(name, *kind, *span)?;
+        for (name, kind, stype, span) in &columns {
+            new_scope.bind_typed(name, *kind, stype.clone(), *span)?;
         }
 
         // 4) ORDER BY / SKIP / LIMIT and a trailing WHERE are evaluated against the projection body.
@@ -878,7 +924,7 @@ impl Analyzer<'_> {
         let dual_scope = {
             let mut s = scope.clone();
             for (name, binding) in &new_scope.bindings {
-                s.bindings.insert(name.clone(), *binding);
+                s.bindings.insert(name.clone(), binding.clone());
             }
             s
         };
@@ -979,10 +1025,10 @@ impl Analyzer<'_> {
 
     fn check_duplicate_columns(
         &self,
-        columns: &[(String, VarKind, Span)],
+        columns: &[(String, VarKind, SType, Span)],
     ) -> Result<(), SemanticError> {
         let mut seen: HashMap<&str, ()> = HashMap::with_capacity(columns.len());
-        for (name, _kind, span) in columns {
+        for (name, _kind, _stype, span) in columns {
             if seen.insert(name.as_str(), ()).is_some() {
                 return Err(SemanticError::new(
                     SemanticErrorKind::ColumnNameConflict { name: name.clone() },
@@ -1075,7 +1121,7 @@ impl Analyzer<'_> {
                     var.span,
                 ));
             }
-            scope.bind(&var.name, VarKind::Value, var.span)?;
+            scope.bind(&var.name, VarKind::Path, var.span)?;
         }
         self.bind_pattern_element(&part.element, scope, role)
     }
@@ -1270,14 +1316,7 @@ impl Analyzer<'_> {
         scope
             .bindings
             .iter()
-            .map(|(name, binding)| {
-                let ty = match binding.kind {
-                    VarKind::Node => SType::Node,
-                    VarKind::Relationship => SType::Relationship,
-                    VarKind::Value => SType::Unknown,
-                };
-                (name.clone(), ty)
-            })
+            .map(|(name, binding)| (name.clone(), binding.stype.clone()))
             .collect()
     }
 
@@ -2060,6 +2099,41 @@ mod tests {
             procedures: procedure_registry::builtins(),
         };
         assert!(analyzer.projection_is_aggregating(body));
+    }
+
+    #[test]
+    fn projected_literal_type_flows_into_static_property_check() {
+        // An aliased literal carries its provable type forward, so a property access on the
+        // non-graph value is a compile-time mismatch (`expressions/graph/Graph6.feature` [9]).
+        for exp in ["123", "42.45", "true", "'string'", "[123, true]"] {
+            let q = ast(&format!("WITH {exp} AS x RETURN x.num"));
+            let err = analyze(&q).expect_err("non-graph property base must be rejected");
+            assert!(
+                matches!(err.kind, SemanticErrorKind::InvalidExpressionType { .. }),
+                "{exp}: unexpected kind {:?}",
+                err.kind
+            );
+        }
+        // A node carried through WITH stays a node, so its property access is accepted.
+        assert!(analyze(&ast("MATCH (n) WITH n AS m RETURN m.prop")).is_ok());
+        // An unknown value (`UNWIND`) is never the basis of a static error.
+        assert!(analyze(&ast("UNWIND [1, 2] AS x RETURN x.num")).is_ok());
+    }
+
+    #[test]
+    fn labels_on_a_named_path_is_a_compile_time_error() {
+        // `labels(p)` on a named path is a compile-time SyntaxError
+        // (`expressions/graph/Graph3.feature` [8]); `type()` on a node likewise.
+        let err = analyze(&ast("MATCH p = (a) RETURN labels(p)"))
+            .expect_err("labels() on a path must be rejected");
+        assert!(matches!(
+            err.kind,
+            SemanticErrorKind::InvalidExpressionType { .. }
+        ));
+        assert!(analyze(&ast("MATCH (r) RETURN type(r)")).is_err());
+        // A relationship variable into `type()`, and a path into `length()`, are accepted.
+        assert!(analyze(&ast("MATCH ()-[r]->() RETURN type(r)")).is_ok());
+        assert!(analyze(&ast("MATCH p = ()-[*]-() RETURN length(p)")).is_ok());
     }
 
     #[test]

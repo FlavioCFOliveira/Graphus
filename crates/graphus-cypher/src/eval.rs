@@ -756,6 +756,13 @@ fn eval_property(
 
 /// Evaluates `base[index]`: list element by integer index (negative indexes from the end) or map
 /// value by string key; out-of-range / wrong-type yields null (Cypher).
+///
+/// The base is evaluated at the [`RowValue`] level so that indexing a **structural** list — one that
+/// holds node/relationship/path references (e.g. `[a, 1]` with `a` a node) — returns the structural
+/// element unchanged. This is what lets `labels(list[0])`, `type(list[0])` and `(list[1]).prop`
+/// recover the graph element the TCK's "accept type Any" scenarios feed through a list
+/// (`expressions/graph/Graph{3,4,6}.feature`). A pure-property list keeps its former `Value`-level
+/// behaviour exactly.
 fn eval_index(
     base: &Expr,
     index: &Expr,
@@ -764,26 +771,43 @@ fn eval_index(
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
 ) -> EvalResult {
-    let base = eval_value(base, row, params, graph, functions)?;
+    let base = eval(base, row, params, graph, functions)?;
     let idx = eval_value(index, row, params, graph, functions)?;
     if base.is_null() || idx.is_null() {
         return Ok(RowValue::NULL);
     }
+    // Dynamic property access: a node/relationship indexed by a string key reads that property
+    // (`n['name']`; `expressions/graph/Graph7.feature`), exactly like the static `n.name` form.
     match (&base, &idx) {
-        (Value::List(items), Value::Integer(i)) => {
-            let len = items.len() as i64;
-            let pos = if *i < 0 { len + *i } else { *i };
-            if pos < 0 || pos >= len {
-                Ok(RowValue::NULL)
-            } else {
-                Ok(RowValue::Value(items[pos as usize].clone()))
-            }
+        (RowValue::Node(NodeRef { id }), Value::String(k)) => {
+            return Ok(RowValue::Value(
+                graph.node_property(*id, k).unwrap_or(Value::Null),
+            ));
         }
+        (RowValue::Rel(RelRef { id }), Value::String(k)) => {
+            return Ok(RowValue::Value(
+                graph.rel_property(*id, k).unwrap_or(Value::Null),
+            ));
+        }
+        _ => {}
+    }
+    // A structural list indexed by an integer returns the element as a `RowValue`, preserving any
+    // node/relationship/path reference it carries.
+    if let (Some(items), Value::Integer(i)) = (base.as_list_elems(), &idx) {
+        let len = items.len() as i64;
+        let pos = if *i < 0 { len + *i } else { *i };
+        return if pos < 0 || pos >= len {
+            Ok(RowValue::NULL)
+        } else {
+            Ok(items[pos as usize].clone())
+        };
+    }
+    match (to_value(base), &idx) {
         (Value::Map(entries), Value::String(k)) => Ok(RowValue::Value(
             entries
-                .iter()
+                .into_iter()
                 .find(|(ek, _)| ek == k)
-                .map(|(_, v)| v.clone())
+                .map(|(_, v)| v)
                 .unwrap_or(Value::Null),
         )),
         _ => Err(EvalError::TypeError {
@@ -988,27 +1012,41 @@ fn call_function(
         }
         "labels" => {
             let v = eval(&args[0], row, params, graph, functions)?;
-            return Ok(match v {
-                RowValue::Node(NodeRef { id }) => RowValue::Value(Value::List(
+            return match v {
+                RowValue::Node(NodeRef { id }) => Ok(RowValue::Value(Value::List(
                     graph
                         .node_labels(id)
                         .unwrap_or_default()
                         .into_iter()
                         .map(Value::String)
                         .collect(),
-                )),
-                _ => RowValue::NULL,
-            });
+                ))),
+                // `labels(null)` is null (a missing optional match, `labels(null)` literally).
+                RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                // Any non-null, non-node argument is a runtime `TypeError` the TCK details as
+                // `InvalidArgumentValue` (`expressions/graph/Graph3.feature` [9]). The statically
+                // decidable cases (a node literal / a path) are already rejected at compile time.
+                other => Err(EvalError::TypeError {
+                    context: format!("labels() requires a node, got {}", describe(&other)),
+                }),
+            };
         }
         "type" => {
             let v = eval(&args[0], row, params, graph, functions)?;
-            return Ok(match v {
-                RowValue::Rel(RelRef { id }) => graph
+            return match v {
+                RowValue::Rel(RelRef { id }) => Ok(graph
                     .rel_data(id)
                     .map(|d| RowValue::Value(Value::String(d.rel_type)))
-                    .unwrap_or(RowValue::NULL),
-                _ => RowValue::NULL,
-            });
+                    .unwrap_or(RowValue::NULL)),
+                // `type(null)` is null (an unmatched optional relationship, `type(null)` literally).
+                RowValue::Value(Value::Null) => Ok(RowValue::NULL),
+                // Any non-null, non-relationship argument is a runtime `TypeError`
+                // (`expressions/graph/Graph4.feature` [6]); a node argument is rejected at compile
+                // time (statically decidable).
+                other => Err(EvalError::TypeError {
+                    context: format!("type() requires a relationship, got {}", describe(&other)),
+                }),
+            };
         }
         "properties" => {
             let v = eval(&args[0], row, params, graph, functions)?;
@@ -2160,6 +2198,123 @@ mod tests {
         let g = MemGraph::new();
         let bound = BoundParameters::empty();
         to_value(eval(&expr, &Row::empty(), &bound, &g, no_functions()).unwrap())
+    }
+
+    /// Evaluates `src` against `graph` with `row` in scope, returning the raw [`EvalResult`] so a
+    /// test can assert on the `RowValue` structure or a runtime error.
+    fn eval_in(graph: &dyn GraphAccess, row: &Row, src: &str) -> EvalResult {
+        let expr = parse_expr(src);
+        eval(&expr, row, &BoundParameters::empty(), graph, no_functions())
+    }
+
+    /// A graph with one `:Foo:Bar` node bound to `n` and one `:T {k:7}` relationship bound to `r`,
+    /// plus the row binding both — the fixture for the accessor rules (`rmp` task #132).
+    fn graph_with_node_and_rel() -> (MemGraph, Row) {
+        let mut g = MemGraph::new();
+        let n = g.add_node(
+            ["Foo", "Bar"],
+            [("name", Value::String("Mattias".to_owned()))],
+        );
+        let a = g.add_node(Vec::<String>::new(), Vec::<(String, Value)>::new());
+        let b = g.add_node(Vec::<String>::new(), Vec::<(String, Value)>::new());
+        let r = g.add_rel("T", a, b, [("k", Value::Integer(7))]);
+        let mut row = Row::empty();
+        row.set("n", RowValue::Node(NodeRef { id: n }));
+        row.set("r", RowValue::Rel(RelRef { id: r }));
+        (g, row)
+    }
+
+    #[test]
+    fn labels_on_node_rel_null_and_invalid() {
+        let (g, row) = graph_with_node_and_rel();
+        // A node yields its label list (order is unspecified, so compare as a set).
+        let RowValue::Value(Value::List(labels)) = eval_in(&g, &row, "labels(n)").unwrap() else {
+            panic!("labels(n) should be a list");
+        };
+        let set: std::collections::BTreeSet<_> = labels
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                _ => panic!("label not a string"),
+            })
+            .collect();
+        assert_eq!(
+            set,
+            ["Bar".to_owned(), "Foo".to_owned()].into_iter().collect()
+        );
+        // `labels(null)` is null, not an error.
+        assert_eq!(eval_in(&g, &row, "labels(null)").unwrap(), RowValue::NULL);
+        // A non-null, non-node argument (a relationship reaches the runtime path; a scalar literal is
+        // already rejected at compile time) is a runtime TypeError.
+        assert!(matches!(
+            eval_in(&g, &row, "labels(r)"),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn type_on_rel_node_null_and_invalid() {
+        let (g, row) = graph_with_node_and_rel();
+        assert_eq!(
+            eval_in(&g, &row, "type(r)").unwrap(),
+            RowValue::Value(Value::String("T".to_owned()))
+        );
+        // `type(null)` is null, not an error.
+        assert_eq!(eval_in(&g, &row, "type(null)").unwrap(), RowValue::NULL);
+        // A non-null, non-relationship argument is a runtime TypeError.
+        assert!(matches!(
+            eval_in(&g, &row, "type(n)"),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn dynamic_property_access_reads_entity_property() {
+        let (g, row) = graph_with_node_and_rel();
+        // `n['name']` is dynamic property access, equivalent to `n.name`.
+        assert_eq!(
+            eval_in(&g, &row, "n['nam' + 'e']").unwrap(),
+            RowValue::Value(Value::String("Mattias".to_owned()))
+        );
+        assert_eq!(
+            eval_in(&g, &row, "r['k']").unwrap(),
+            RowValue::Value(Value::Integer(7))
+        );
+        // A missing key is null (the missing-property rule).
+        assert_eq!(eval_in(&g, &row, "n['missing']").unwrap(), RowValue::NULL);
+    }
+
+    #[test]
+    fn indexing_a_structural_list_preserves_the_element_reference() {
+        let (g, row) = graph_with_node_and_rel();
+        // `[n, 1][0]` must recover the *node* (not a collapsed null), so `labels([n,1][0])` works —
+        // the "accept type Any" path (`expressions/graph/Graph3.feature` [6]).
+        let labels = eval_in(&g, &row, "labels([n, 1][0])").unwrap();
+        assert!(
+            matches!(&labels, RowValue::Value(Value::List(l)) if l.len() == 2),
+            "labels([n,1][0]) should be the node's 2-label list, got {labels:?}"
+        );
+        // The same list indexed past the node returns the integer (a pure value).
+        assert_eq!(
+            eval_in(&g, &row, "[n, 1][1]").unwrap(),
+            RowValue::Value(Value::Integer(1))
+        );
+        // `type([r, 1][0])` recovers the relationship.
+        assert_eq!(
+            eval_in(&g, &row, "type([r, 1][0])").unwrap(),
+            RowValue::Value(Value::String("T".to_owned()))
+        );
+    }
+
+    #[test]
+    fn static_property_access_on_null_entity_is_null() {
+        let g = MemGraph::new();
+        let mut row = Row::empty();
+        row.set("n", RowValue::NULL);
+        // `n.prop` where `n IS NULL` is null, not an error (`expressions/graph/Graph6.feature` [3]).
+        assert_eq!(eval_in(&g, &row, "n.prop").unwrap(), RowValue::NULL);
+        // Dynamic access on null is likewise null.
+        assert_eq!(eval_in(&g, &row, "n['prop']").unwrap(), RowValue::NULL);
     }
 
     #[test]

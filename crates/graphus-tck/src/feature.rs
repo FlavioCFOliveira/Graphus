@@ -82,6 +82,10 @@ pub struct ResultTable {
     pub header: Vec<String>,
     /// The data rows (each cell is the raw expected-value text, parsed lazily by [`crate::compare`]).
     pub rows: Vec<Vec<String>>,
+    /// `true` for the `… (ignoring element order for lists)` assertion variants, where the order of
+    /// elements *within* a list cell is not significant (`labels()`/`keys()` return their elements in
+    /// an unspecified order; `expressions/graph/Graph3.feature` [2], [3], [6]).
+    pub ignore_list_order: bool,
 }
 
 /// The classified meaning of a TCK step.
@@ -460,16 +464,20 @@ fn classify(
     // The "(ignoring element order for lists)" variants relax list-element order; we treat them as
     // their base ordered/unordered kind for the row-level comparison (a documented, conservative
     // approximation — see `compare`).
+    // The `(ignoring element order for lists)` variants additionally relax the order of elements
+    // *within* a list cell (threaded through `ResultTable::ignore_list_order`); the row-order kind is
+    // the assertion's base "in order" / "in any order" sense.
+    let ignore_list_order = value.contains("(ignoring element order for lists)");
     if value.starts_with("the result should be, in order") {
         return table.map_or(StepKind::ResultEmpty, |t| {
-            StepKind::ResultOrdered(result_table(t))
+            StepKind::ResultOrdered(result_table(t, ignore_list_order))
         });
     }
     if value.starts_with("the result should be, in any order")
         || value.starts_with("the result should be (ignoring element order for lists)")
     {
         return table.map_or(StepKind::ResultEmpty, |t| {
-            StepKind::ResultUnordered(result_table(t))
+            StepKind::ResultUnordered(result_table(t, ignore_list_order))
         });
     }
 
@@ -561,8 +569,9 @@ fn procedure_step(signature: &str, table: Option<&gherkin::Table>) -> ProcedureS
     }
 }
 
-/// A result table: header row + data rows of raw cell strings.
-fn result_table(table: &gherkin::Table) -> ResultTable {
+/// A result table: header row + data rows of raw cell strings. `ignore_list_order` records whether
+/// the assertion was the `… (ignoring element order for lists)` variant.
+fn result_table(table: &gherkin::Table, ignore_list_order: bool) -> ResultTable {
     let mut iter = table.rows.iter();
     let header = iter
         .next()
@@ -571,7 +580,11 @@ fn result_table(table: &gherkin::Table) -> ResultTable {
     let rows = iter
         .map(|r| r.iter().map(|c| c.trim().to_owned()).collect())
         .collect();
-    ResultTable { header, rows }
+    ResultTable {
+        header,
+        rows,
+        ignore_list_order,
+    }
 }
 
 /// Parses every cell of a [`ResultTable`] row into [`ExpectedValue`]s, in column order.

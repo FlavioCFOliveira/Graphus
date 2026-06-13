@@ -363,16 +363,26 @@ fn optional_match_lowers_to_apply_over_optional() {
 }
 
 #[test]
-fn leading_optional_match_behaves_like_match() {
-    // With no prior plan there is no outer row to preserve, so a leading OPTIONAL MATCH lowers
-    // exactly like MATCH (no Apply/Optional wrapper).
+fn leading_optional_match_preserves_the_unit_driving_row() {
+    // A leading OPTIONAL MATCH still has a driving row to preserve: the single empty unit row
+    // (`LogicalOp::Empty`). Lowering it like a plain MATCH would drop to zero rows when the pattern
+    // matches nothing, but openCypher mandates one all-`NULL` row
+    // (`OPTIONAL MATCH (n:DoesNotExist) RETURN labels(n)` is a single `null`; `rmp` #132,
+    // `expressions/graph/Graph3.feature` [7]). So it lowers to `Apply(Empty, Optional(scan))`.
     let plan = plan("OPTIONAL MATCH (n) RETURN n");
     let LogicalOp::Projection { input, .. } = &plan else {
         panic!("expected Projection");
     };
+    let LogicalOp::Apply { left, right } = &**input else {
+        panic!("expected Apply, got: {input}");
+    };
     assert!(
-        matches!(**input, LogicalOp::AllNodesScan { .. }),
-        "leading OPTIONAL MATCH should not wrap in Apply/Optional, got: {input}"
+        matches!(**left, LogicalOp::Empty),
+        "the driving side must be the single unit row, got: {left}"
+    );
+    assert!(
+        matches!(**right, LogicalOp::Optional { .. }),
+        "the optional pattern must be wrapped in Optional, got: {right}"
     );
 }
 

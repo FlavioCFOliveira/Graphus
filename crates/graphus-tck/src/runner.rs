@@ -923,9 +923,9 @@ fn check_rows_expectation(run: &QueryRun, ordered: bool, table: &ResultTable) ->
     }
 
     let result = if ordered {
-        assert_ordered(&expected_rows, rows)
+        assert_ordered(&expected_rows, rows, table.ignore_list_order)
     } else {
-        assert_unordered(&expected_rows, rows)
+        assert_unordered(&expected_rows, rows, table.ignore_list_order)
     };
     match result {
         Ok(()) => Outcome::Passed,

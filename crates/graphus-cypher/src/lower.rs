@@ -247,10 +247,12 @@ impl Planner {
     /// scans correlated to the carried bindings (an [`Argument`](LogicalOp::Argument) base), wrapped
     /// in [`Optional`](LogicalOp::Optional) over the variables it introduces, and applied.
     fn lower_optional_match(&mut self, m: &MatchClause, current: Option<LogicalOp>) -> LogicalOp {
-        let Some(left) = current else {
-            // Leading OPTIONAL MATCH has no left row to preserve; it behaves like MATCH.
-            return self.lower_required_match(m, None);
-        };
+        // A leading OPTIONAL MATCH still has a driving row to preserve: the single empty
+        // ([`LogicalOp::Empty`]) unit row. Treating it like a plain MATCH would drop to zero rows
+        // when the pattern matches nothing, but openCypher mandates one all-`NULL` row
+        // (`OPTIONAL MATCH (n:DoesNotExist) RETURN labels(n)` is a single `null`;
+        // `expressions/graph/Graph3.feature` [7], `Graph6.feature` [3]/[7], `Graph9.feature` [3]).
+        let left = current.unwrap_or(LogicalOp::Empty);
 
         let arguments = collect_bound_vars(&left);
         let argument = LogicalOp::Argument {
