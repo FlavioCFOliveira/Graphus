@@ -16,11 +16,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use graphus_auth::{AuthProvider, PeerCred as AuthPeerCred, PeerCredSource};
 use graphus_bolt::server::{BoltSession, SessionConfig};
 use graphus_io::{TcpAcceptor, UdsAcceptor};
 use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use super::transport::AsyncToBlockingTransport;
@@ -53,16 +55,21 @@ fn session_config(advertised_bolt_address: Option<String>) -> SessionConfig {
     }
 }
 
-/// Runs the UDS Bolt accept loop until shutdown. Each accepted connection is admitted by peer-cred
-/// then handed to a blocking session task. `context` is the shared database-targeting + admin
-/// surface every per-connection executor routes through (rmp #84). `advertised_bolt_address` is the
-/// address routing drivers are told to reconnect to in a `ROUTE` reply (rmp #95).
+/// Runs the UDS Bolt accept loop until shutdown. Each accepted connection is admitted by the global
+/// connection cap then by peer-cred, and finally handed to a blocking session task. `context` is the
+/// shared database-targeting + admin surface every per-connection executor routes through (rmp #84).
+/// `advertised_bolt_address` is the address routing drivers are told to reconnect to in a `ROUTE`
+/// reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore (rmp #118);
+/// `idle_timeout` reaps idle sessions when set (`None` = disabled).
+#[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_uds_accept_loop(
     acceptor: UdsAcceptor,
     context: AdminContext,
     auth: Arc<dyn AuthProvider>,
     advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
+    conn_limit: Arc<Semaphore>,
+    idle_timeout: Option<Duration>,
     shutdown: ShutdownCoordinator,
 ) {
     let handle = Handle::current();
@@ -78,6 +85,15 @@ pub async fn run_uds_accept_loop(
                         continue;
                     }
                 };
+
+                // Connection-admission gate (rmp #118): take a permit *before* any protocol work. A
+                // saturated cap means the process is at its connection budget; shed by closing the
+                // socket and continue — never block the accept loop waiting for a permit.
+                let Some(permit) = try_admit(&conn_limit, &metrics, "UDS") else {
+                    drop(conn);
+                    continue;
+                };
+
                 metrics.record_bolt_uds_conn();
 
                 // Peer-cred admission gate (`04 §8.4`): resolve the uid to a known RBAC user against
@@ -88,7 +104,8 @@ pub async fn run_uds_accept_loop(
                 if let Err(reason) = admit_peer(context.security(), peer) {
                     metrics.record_auth_failure();
                     tracing::warn!(reason, "UDS connection refused by peer-cred gate");
-                    // Drop the connection: closing the socket is the refusal.
+                    // Drop the connection (and its permit): closing the socket is the refusal.
+                    drop(permit);
                     drop(conn);
                     continue;
                 }
@@ -100,6 +117,8 @@ pub async fn run_uds_accept_loop(
                     AuditSource::BoltUds,
                     Arc::clone(&auth),
                     session_config(advertised_bolt_address.clone()),
+                    idle_timeout,
+                    permit,
                     shutdown.clone(),
                 );
             }
@@ -108,10 +127,33 @@ pub async fn run_uds_accept_loop(
     tracing::info!("UDS accept loop stopped");
 }
 
-/// Runs the TCP Bolt accept loop until shutdown. Each accepted connection is TLS-wrapped, then handed
-/// to a blocking session task (native LOGON auth happens inside the session). `context` is the
-/// shared database-targeting + admin surface (rmp #84). `advertised_bolt_address` is the address
-/// routing drivers are told to reconnect to in a `ROUTE` reply (rmp #95).
+/// Tries to take a connection-admission permit (rmp #118), returning `Some(permit)` to admit or
+/// `None` to **load-shed** (the global `max_connections` cap is saturated). A shed is recorded in
+/// `graphus_connections_shed_total` and logged at `warn`; the caller closes the socket. This never
+/// blocks: `try_acquire_owned` is non-waiting, so a saturated server keeps draining its accept queue
+/// (fast-closing the excess) instead of stalling the loop.
+fn try_admit(
+    conn_limit: &Arc<Semaphore>,
+    metrics: &Metrics,
+    interface: &str,
+) -> Option<OwnedSemaphorePermit> {
+    match Arc::clone(conn_limit).try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            metrics.record_conn_shed();
+            tracing::warn!(interface, "connection load-shed: max_connections reached");
+            None
+        }
+    }
+}
+
+/// Runs the TCP Bolt accept loop until shutdown. Each accepted connection is admitted by the global
+/// connection cap, TLS-wrapped under a handshake deadline, then handed to a blocking session task
+/// (native LOGON auth happens inside the session). `context` is the shared database-targeting + admin
+/// surface (rmp #84). `advertised_bolt_address` is the address routing drivers are told to reconnect
+/// to in a `ROUTE` reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore,
+/// `handshake_timeout` bounds the TLS handshake, and `idle_timeout` reaps idle sessions (rmp #118).
+#[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_tcp_accept_loop(
     acceptor: TcpAcceptor,
     tls: TlsAcceptor,
@@ -119,6 +161,9 @@ pub async fn run_tcp_accept_loop(
     auth: Arc<dyn AuthProvider>,
     advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
+    conn_limit: Arc<Semaphore>,
+    handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
     shutdown: ShutdownCoordinator,
 ) {
     let handle = Handle::current();
@@ -134,9 +179,21 @@ pub async fn run_tcp_accept_loop(
                         continue;
                     }
                 };
+
+                // Connection-admission gate (rmp #118): take a permit *before* the TLS handshake, so a
+                // flood of connections that never complete a handshake cannot exhaust the process's
+                // connection budget. The permit is moved into the handshake task and on into the
+                // session, releasing on drop when the connection ends (success, timeout, or error).
+                let Some(permit) = try_admit(&conn_limit, &metrics, "Bolt-TCP") else {
+                    drop(conn);
+                    continue;
+                };
+
                 metrics.record_bolt_tcp_conn();
 
-                // TLS handshake on a task so a slow/abusive handshake never blocks the accept loop.
+                // TLS handshake on a task so a slow/abusive handshake never blocks the accept loop, and
+                // bounded by `handshake_timeout` so a stalled handshake (slow-loris) is dropped rather
+                // than pinning the task and socket indefinitely (rmp #118).
                 let tls = tls.clone();
                 let handle = handle.clone();
                 let context = context.clone();
@@ -145,8 +202,8 @@ pub async fn run_tcp_accept_loop(
                 let metrics = Arc::clone(&metrics);
                 let advertised = advertised_bolt_address.clone();
                 tokio::spawn(async move {
-                    match tls.accept(conn).await {
-                        Ok(tls_stream) => {
+                    match tokio::time::timeout(handshake_timeout, tls.accept(conn)).await {
+                        Ok(Ok(tls_stream)) => {
                             // Mint the per-connection id only once TLS succeeds, so abandoned
                             // handshakes do not consume ids (rmp #95).
                             spawn_session(
@@ -156,12 +213,23 @@ pub async fn run_tcp_accept_loop(
                                 AuditSource::BoltTcp,
                                 auth,
                                 session_config(advertised),
+                                idle_timeout,
+                                permit,
                                 shutdown,
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             metrics.record_auth_failure();
                             tracing::warn!(error = %e, "Bolt-TCP TLS handshake failed");
+                            // `permit` drops here, freeing the connection budget.
+                        }
+                        Err(_elapsed) => {
+                            metrics.record_handshake_timeout();
+                            tracing::warn!(
+                                timeout_ms = handshake_timeout.as_millis(),
+                                "Bolt-TCP TLS handshake timed out; dropping connection"
+                            );
+                            // `permit` drops here, freeing the connection budget.
                         }
                     }
                 });
@@ -217,10 +285,17 @@ impl PeerCredSource for FixedPeerCred {
 /// carries this connection's minted id and the advertised routing address (rmp #95); `source` is
 /// the connection's audit transport (`BoltUds`/`BoltTcp`) recorded on every audited event (rmp #70).
 ///
+/// `idle_timeout`, when set, is installed as the transport's per-read deadline so a session that goes
+/// silent (no inbound bytes) within the window is reaped: the bridged read returns EOF and the session
+/// loop ends cleanly (rmp #118). `permit` is the connection-admission permit (rmp #118); it is moved
+/// into the task and held for the whole session, releasing the global connection-budget slot on drop
+/// when the connection ends.
+///
 /// The session is **blocking** (its `Transport` and engine submits block), so it runs on
 /// `spawn_blocking`, never a runtime worker (`04 §9.1`). The [`AuthProvider`] seam is shared (`Arc`);
 /// the session borrows it for its lifetime, so we move the `Arc` into the task and borrow from there.
 /// Backed by `LiveAuth` (rmp #94), each `LOGON` resolves against the current security model.
+#[allow(clippy::too_many_arguments)] // The session driver legitimately needs all the shared services.
 fn spawn_session<S>(
     stream: S,
     handle: Handle,
@@ -228,12 +303,17 @@ fn spawn_session<S>(
     source: AuditSource,
     auth: Arc<dyn AuthProvider>,
     session_config: SessionConfig,
+    idle_timeout: Option<Duration>,
+    permit: OwnedSemaphorePermit,
     shutdown: ShutdownCoordinator,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, None);
+        // Hold the connection-admission permit for the session's lifetime; it releases on drop when
+        // this task returns (rmp #118).
+        let _permit = permit;
+        let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, idle_timeout);
         let executor = BoltEngineExecutor::new(context, source);
         let mut session =
             BoltSession::with_config(transport, executor, auth.as_ref(), session_config);

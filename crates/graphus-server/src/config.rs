@@ -128,6 +128,14 @@ pub struct AdmissionConfig {
     pub engine_queue_capacity: usize,
     /// Bounded capacity of a result row stream's channel (egress backpressure). Must be > 0.
     pub result_buffer_capacity: usize,
+    /// Maximum number of **concurrently-open connections** across all listeners (UDS + Bolt-TCP +
+    /// REST), enforced at *accept time* before any protocol bytes are read. This is the first line of
+    /// defence against resource exhaustion under hostile load: it caps file descriptors and per-
+    /// connection tasks *ahead* of [`max_concurrent_queries`](Self::max_concurrent_queries), which only
+    /// engages once a connection is established and submitting work. A connection accepted beyond this
+    /// limit is immediately closed (load-shed) and counted in `graphus_connections_shed_total`. Must
+    /// be > 0. (rmp #118)
+    pub max_connections: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -136,6 +144,7 @@ impl Default for AdmissionConfig {
             max_concurrent_queries: 256,
             engine_queue_capacity: 1024,
             result_buffer_capacity: 256,
+            max_connections: 1024,
         }
     }
 }
@@ -149,6 +158,17 @@ pub struct TimingConfig {
     /// Hard deadline for draining in-flight work on graceful shutdown before stragglers are forcibly
     /// rolled back (`04 §9.4`). In milliseconds.
     pub shutdown_drain_deadline_ms: u64,
+    /// Maximum time a newly-accepted network connection may take to complete its **TLS handshake**
+    /// before the server drops it (`04 §8.4`; rmp #118). A stalled handshake otherwise pins an accept-
+    /// side task and an open socket indefinitely, a classic slow-loris resource-exhaustion vector. In
+    /// milliseconds; must be > 0. UDS is exempt (no TLS — it is admitted by peer-cred at accept time).
+    pub handshake_timeout_ms: u64,
+    /// Maximum time a connection may sit **idle** (no inbound bytes) before the server reaps it, as a
+    /// read deadline applied to the per-connection session (`04 §9`; rmp #118). `0` **disables** idle
+    /// reaping (the default, so existing long-lived idle sessions are unaffected); any value `> 0`
+    /// enables it. Applies to the Bolt sessions (UDS + TCP) via the read bridge; the REST listener's
+    /// hyper stack manages its own connection lifetimes.
+    pub idle_timeout_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -156,6 +176,8 @@ impl Default for TimingConfig {
         Self {
             slow_query_threshold_ms: 500,
             shutdown_drain_deadline_ms: 10_000,
+            handshake_timeout_ms: 10_000,
+            idle_timeout_ms: 0,
         }
     }
 }
@@ -171,6 +193,23 @@ impl TimingConfig {
     #[must_use]
     pub fn shutdown_drain_deadline(&self) -> Duration {
         Duration::from_millis(self.shutdown_drain_deadline_ms)
+    }
+
+    /// The TLS-handshake timeout as a [`Duration`] (rmp #118).
+    #[must_use]
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms)
+    }
+
+    /// The idle/read timeout as a [`Duration`], or `None` when idle reaping is disabled
+    /// (`idle_timeout_ms == 0`) — rmp #118.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        if self.idle_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.idle_timeout_ms))
+        }
     }
 }
 
@@ -421,11 +460,30 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_MAX_CONNECTIONS") {
+            self.admission.max_connections = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_MAX_CONNECTIONS is not a positive integer: {v:?}"
+                ))
+            })?;
+        }
         if let Ok(v) = var("GRAPHUS_SLOW_QUERY_THRESHOLD_MS") {
             self.timing.slow_query_threshold_ms = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
                     "GRAPHUS_SLOW_QUERY_THRESHOLD_MS is not an integer: {v:?}"
                 ))
+            })?;
+        }
+        if let Ok(v) = var("GRAPHUS_HANDSHAKE_TIMEOUT_MS") {
+            self.timing.handshake_timeout_ms = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_HANDSHAKE_TIMEOUT_MS is not an integer: {v:?}"
+                ))
+            })?;
+        }
+        if let Ok(v) = var("GRAPHUS_IDLE_TIMEOUT_MS") {
+            self.timing.idle_timeout_ms = v.parse().map_err(|_| {
+                ConfigError::Parse(format!("GRAPHUS_IDLE_TIMEOUT_MS is not an integer: {v:?}"))
             })?;
         }
         Ok(())
@@ -468,6 +526,18 @@ impl ServerConfig {
         if self.admission.result_buffer_capacity == 0 {
             return Err(ConfigError::Invalid(
                 "admission.result_buffer_capacity must be > 0".to_owned(),
+            ));
+        }
+        if self.admission.max_connections == 0 {
+            return Err(ConfigError::Invalid(
+                "admission.max_connections must be > 0".to_owned(),
+            ));
+        }
+        if self.timing.handshake_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "timing.handshake_timeout_ms must be > 0 (a zero handshake deadline would reject \
+                 every TLS connection)"
+                    .to_owned(),
             ));
         }
 
@@ -624,6 +694,52 @@ mod tests {
     }
 
     #[test]
+    fn connection_admission_defaults_and_validation() {
+        // Sensible defaults (rmp #118).
+        let cfg = AdmissionConfig::default();
+        assert_eq!(cfg.max_connections, 1024);
+        let t = TimingConfig::default();
+        assert_eq!(t.handshake_timeout_ms, 10_000);
+        assert_eq!(t.idle_timeout_ms, 0, "idle reaping is off by default");
+        assert_eq!(t.handshake_timeout(), Duration::from_millis(10_000));
+        assert_eq!(t.idle_timeout(), None, "0 ⇒ disabled");
+        assert_eq!(
+            TimingConfig {
+                idle_timeout_ms: 250,
+                ..TimingConfig::default()
+            }
+            .idle_timeout(),
+            Some(Duration::from_millis(250))
+        );
+
+        // A zero connection cap is rejected.
+        let cfg = ServerConfig {
+            admission: AdmissionConfig {
+                max_connections: 0,
+                ..AdmissionConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+
+        // A zero handshake timeout is rejected (it would refuse every TLS connection).
+        let cfg = ServerConfig {
+            timing: TimingConfig {
+                handshake_timeout_ms: 0,
+                ..TimingConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
     fn parses_a_toml_file() {
         let toml = r#"
             store_path = "/var/lib/graphus"
@@ -638,15 +754,21 @@ mod tests {
 
             [admission]
             max_concurrent_queries = 512
+            max_connections = 4096
 
             [timing]
             slow_query_threshold_ms = 250
+            handshake_timeout_ms = 3000
+            idle_timeout_ms = 30000
         "#;
         let cfg: ServerConfig = toml::from_str(toml).expect("parse");
         assert_eq!(cfg.store_path, PathBuf::from("/var/lib/graphus"));
         assert_eq!(cfg.buffer_pool_pages, 8192);
         assert_eq!(cfg.admission.max_concurrent_queries, 512);
+        assert_eq!(cfg.admission.max_connections, 4096);
         assert_eq!(cfg.timing.slow_query_threshold_ms, 250);
+        assert_eq!(cfg.timing.handshake_timeout_ms, 3000);
+        assert_eq!(cfg.timing.idle_timeout_ms, 30_000);
         assert!(cfg.tls.is_enabled());
         assert!(cfg.validate().is_ok());
     }

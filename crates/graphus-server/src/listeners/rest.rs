@@ -16,6 +16,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -85,11 +86,20 @@ impl Service<Request<Incoming>> for BlockingRouter {
 
 /// Runs the REST accept loop until shutdown, serving `router` over each accepted (optionally
 /// TLS-wrapped) connection.
+///
+/// `conn_limit` is the process-wide connection-admission semaphore (rmp #118): a permit is taken at
+/// accept time *before* the TLS handshake, and held for the connection's lifetime (moved into the
+/// per-connection task), so a flood of REST connections cannot exhaust the process's connection budget
+/// ahead of query admission. `handshake_timeout` bounds the TLS handshake so a stalled one is dropped
+/// rather than pinning the task and socket (the hyper stack manages per-request/idle lifetimes itself).
+#[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_rest_accept_loop(
     acceptor: TcpAcceptor,
     tls: Option<TlsAcceptor>,
     router: Router,
     metrics: Arc<crate::metrics::Metrics>,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    handshake_timeout: Duration,
     shutdown: ShutdownCoordinator,
 ) {
     let handle = Handle::current();
@@ -105,6 +115,22 @@ pub async fn run_rest_accept_loop(
                         continue;
                     }
                 };
+
+                // Connection-admission gate (rmp #118): take a permit before any TLS/HTTP work; shed
+                // (close + count) when the global cap is saturated, never blocking the accept loop.
+                let permit = match Arc::clone(&conn_limit).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        metrics.record_conn_shed();
+                        tracing::warn!(
+                            interface = "REST",
+                            "connection load-shed: max_connections reached"
+                        );
+                        drop(conn);
+                        continue;
+                    }
+                };
+
                 metrics.record_rest_request();
                 let svc = BlockingRouter {
                     router: router.clone(),
@@ -112,8 +138,20 @@ pub async fn run_rest_accept_loop(
                 };
                 let tls = tls.clone();
                 let conn_shutdown = shutdown.clone();
+                let conn_metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
-                    serve_connection(conn, tls, svc, conn_shutdown).await;
+                    // The permit is held for the whole connection, releasing on drop when this task
+                    // returns (rmp #118).
+                    let _permit = permit;
+                    serve_connection(
+                        conn,
+                        tls,
+                        svc,
+                        handshake_timeout,
+                        conn_metrics,
+                        conn_shutdown,
+                    )
+                    .await;
                 });
             }
         }
@@ -124,18 +162,23 @@ pub async fn run_rest_accept_loop(
 /// Serves one HTTP connection: TLS-terminate if configured, then run hyper's auto (HTTP/1+2)
 /// connection over the [`BlockingRouter`] service. A graceful-shutdown trigger stops the connection
 /// after the in-flight request completes.
+///
+/// The TLS handshake is bounded by `handshake_timeout` (rmp #118): a stalled handshake is dropped
+/// (and counted in `graphus_handshake_timeouts_total`) rather than pinning this task and the socket.
 async fn serve_connection(
     conn: graphus_io::TcpConn,
     tls: Option<TlsAcceptor>,
     svc: BlockingRouter,
+    handshake_timeout: Duration,
+    metrics: Arc<crate::metrics::Metrics>,
     shutdown: ShutdownCoordinator,
 ) {
     let builder = ConnBuilder::new(TokioExecutor::new());
     let service = hyper_util::service::TowerToHyperService::new(svc);
 
     match tls {
-        Some(tls) => match tls.accept(conn).await {
-            Ok(tls_stream) => {
+        Some(tls) => match tokio::time::timeout(handshake_timeout, tls.accept(conn)).await {
+            Ok(Ok(tls_stream)) => {
                 let io = TokioIo::new(tls_stream);
                 let conn = builder.serve_connection(io, service);
                 tokio::pin!(conn);
@@ -147,7 +190,14 @@ async fn serve_connection(
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "REST TLS handshake failed"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "REST TLS handshake failed"),
+            Err(_elapsed) => {
+                metrics.record_handshake_timeout();
+                tracing::warn!(
+                    timeout_ms = handshake_timeout.as_millis(),
+                    "REST TLS handshake timed out; dropping connection"
+                );
+            }
         },
         None => {
             // No TLS (e.g. a test harness on loopback): serve plaintext HTTP. Production config

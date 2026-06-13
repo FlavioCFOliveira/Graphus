@@ -66,10 +66,12 @@ fn config(temp: &TempStore) -> ServerConfig {
             max_concurrent_queries: 64,
             engine_queue_capacity: 256,
             result_buffer_capacity: 64,
+            ..AdmissionConfig::default()
         },
         timing: TimingConfig {
             slow_query_threshold_ms: 1_000,
             shutdown_drain_deadline_ms: 5_000,
+            ..TimingConfig::default()
         },
         jwt_secret: "extension-itest-jwt-secret-uds-only!!".to_owned(),
         auth: AuthBootstrap {

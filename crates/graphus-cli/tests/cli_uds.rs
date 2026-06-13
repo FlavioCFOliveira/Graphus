@@ -103,10 +103,12 @@ fn uds_only_config(temp: &TempStore) -> ServerConfig {
             max_concurrent_queries: 64,
             engine_queue_capacity: 256,
             result_buffer_capacity: 64,
+            ..AdmissionConfig::default()
         },
         timing: TimingConfig {
             slow_query_threshold_ms: 1_000,
             shutdown_drain_deadline_ms: 5_000,
+            ..TimingConfig::default()
         },
         // No network listener is enabled, so the insecure default secret is fine (and unused).
         jwt_secret: "cli-itest-jwt-secret-not-used-uds-only!".to_owned(),

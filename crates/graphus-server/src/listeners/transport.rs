@@ -32,7 +32,10 @@ pub struct AsyncToBlockingTransport<S> {
     stream: S,
     handle: Handle,
     shutdown: ShutdownCoordinator,
-    /// Optional hard read deadline for draining stragglers (`04 §9.4`); `None` = no deadline.
+    /// Optional per-read deadline (`None` = no deadline). Serves as the **idle/read timeout** that
+    /// reaps a silent connection (rmp #118): each `read` that receives no bytes within the window
+    /// returns EOF, ending the session loop cleanly. It also doubles as a drain bound during graceful
+    /// shutdown (`04 §9.4`) — in both cases the effect is the same: a stalled read ends the session.
     read_deadline: Option<std::time::Duration>,
 }
 

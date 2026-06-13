@@ -105,6 +105,13 @@ pub struct Metrics {
     rest_requests: AtomicU64,
     /// Connections rejected for failed authentication, summed across interfaces.
     auth_failures: AtomicU64,
+    /// Connections **load-shed** at accept time because the connection-admission semaphore was
+    /// saturated (`max_connections` reached) — the connection was closed before any protocol bytes
+    /// (rmp #118).
+    conn_shed: AtomicU64,
+    /// Network connections dropped because their TLS handshake did not complete within
+    /// `handshake_timeout_ms` (a slow-loris guard — rmp #118).
+    handshake_timeouts: AtomicU64,
 
     // ---- query latency ----
     latency: LatencyHistogram,
@@ -133,6 +140,8 @@ impl Metrics {
             bolt_tcp_conns: AtomicU64::new(0),
             rest_requests: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
+            conn_shed: AtomicU64::new(0),
+            handshake_timeouts: AtomicU64::new(0),
             latency: LatencyHistogram::new(),
             slow_queries: AtomicU64::new(0),
         }
@@ -191,6 +200,18 @@ impl Metrics {
     /// Records a failed authentication on any interface.
     pub fn record_auth_failure(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a connection load-shed at accept time (the `max_connections` cap was reached — rmp
+    /// #118). The connection was closed before any protocol bytes were read.
+    pub fn record_conn_shed(&self) {
+        self.conn_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a network connection dropped because its TLS handshake exceeded the handshake timeout
+    /// (rmp #118).
+    pub fn record_handshake_timeout(&self) {
+        self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Observes a query's execution latency into the histogram.
@@ -276,6 +297,18 @@ impl Metrics {
         );
         counter(
             &mut out,
+            "graphus_connections_shed_total",
+            "Connections load-shed at accept time (max_connections reached).",
+            self.conn_shed.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_handshake_timeouts_total",
+            "Network connections dropped because their TLS handshake timed out.",
+            self.handshake_timeouts.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
             "graphus_slow_queries_total",
             "Queries exceeding the slow-query threshold.",
             self.slow_queries.load(Ordering::Relaxed),
@@ -354,6 +387,18 @@ mod tests {
         m.record_admission_released();
         let text = m.render_prometheus();
         assert!(text.contains("graphus_admission_in_flight 0"));
+    }
+
+    #[test]
+    fn connection_admission_counters_render() {
+        let m = Metrics::new();
+        m.record_conn_shed();
+        m.record_conn_shed();
+        m.record_handshake_timeout();
+        let text = m.render_prometheus();
+        assert!(text.contains("graphus_connections_shed_total 2"));
+        assert!(text.contains("graphus_handshake_timeouts_total 1"));
+        assert!(text.contains("# TYPE graphus_connections_shed_total counter"));
     }
 
     #[test]

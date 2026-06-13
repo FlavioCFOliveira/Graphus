@@ -79,6 +79,21 @@ pub async fn start_all(
 ) -> Result<Listeners, String> {
     let tls_acceptor = tls.map(TlsAcceptor::from);
 
+    // ---- Connection admission (rmp #118) ----
+    // A single, process-wide semaphore caps the number of *concurrently-open* connections across all
+    // three listeners. It is enforced at accept time, *before* any protocol bytes are read, so a flood
+    // of half-open/abusive connections cannot exhaust file descriptors or per-connection tasks ahead
+    // of the query-admission semaphore (which only engages once a connection is established and
+    // submitting work). A global (not per-listener) cap is the correct shape: the resource being
+    // protected — FDs and tasks — is process-wide. Each accepted connection moves its
+    // `OwnedSemaphorePermit` into its session task, releasing it on drop when the connection ends.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(
+        config.admission.max_connections,
+    ));
+    // The TLS-handshake deadline and optional idle/read deadline applied to network sessions.
+    let handshake_timeout = config.timing.handshake_timeout();
+    let idle_timeout = config.timing.idle_timeout();
+
     // The address routing (`neo4j://`) drivers are told to reconnect to in a `ROUTE` reply (rmp
     // #95): the explicit advertised address, else the Bolt-TCP bind address (see
     // `ServerConfig::resolved_advertised_bolt_address`).
@@ -106,6 +121,8 @@ pub async fn start_all(
             Arc::clone(&auth),
             advertised_bolt.clone(),
             Arc::clone(&metrics),
+            Arc::clone(&conn_limit),
+            idle_timeout,
             shutdown.clone(),
         ));
         Some(bound)
@@ -132,6 +149,9 @@ pub async fn start_all(
             Arc::clone(&auth),
             advertised_bolt.clone(),
             Arc::clone(&metrics),
+            Arc::clone(&conn_limit),
+            handshake_timeout,
+            idle_timeout,
             shutdown.clone(),
         ));
         Some(bound)
@@ -164,6 +184,8 @@ pub async fn start_all(
             tls_acceptor.clone(),
             router,
             Arc::clone(&metrics),
+            Arc::clone(&conn_limit),
+            handshake_timeout,
             shutdown.clone(),
         ));
         Some(bound)
