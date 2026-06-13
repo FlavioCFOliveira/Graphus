@@ -1190,6 +1190,18 @@ fn call_function(
                 }),
             };
         }
+        // Scalar type-conversion functions (openCypher `expressions/typeConversion/**`). These are
+        // evaluated at the `RowValue` level so that a structural/entity argument — node,
+        // relationship, path, list, or map — is rejected with the runtime `TypeError` the TCK
+        // details as `InvalidArgumentValue` (`TypeConversion2/3/4` scenario "Fail … on invalid
+        // types"). Were they to fall through to the generic `argv` collapse below, an entity would
+        // silently become `null` (via `to_value`) and the invalid-type scenarios would wrongly
+        // succeed. The accepted property values delegate to the value-level helpers, which encode
+        // each function's exact conversion table.
+        "tointeger" | "tofloat" | "tostring" | "toboolean" | "tobooleanornull" => {
+            let v = eval(&args[0], row, params, graph, functions)?;
+            return convert_scalar(&lower, v).map(RowValue::Value);
+        }
         _ => {}
     }
 
@@ -1240,17 +1252,6 @@ fn call_function(
         | "localdatetime.truncate" => {
             crate::temporal_fns::truncate(&lower, &argv[0], &argv[1], argv.get(2))?
         }
-        "tostring" => match &argv[0] {
-            Value::Null => Value::Null,
-            v => match crate::temporal_fns::to_iso(v) {
-                Some(iso) => Value::String(iso),
-                None => Value::String(stringify_scalar(v)),
-            },
-        },
-        "tointeger" => to_integer(&argv[0]),
-        "tofloat" => to_float(&argv[0]),
-        "toboolean" => to_boolean(&argv[0], false)?,
-        "tobooleanornull" => to_boolean(&argv[0], true)?,
         "range" => range_fn(&argv)?,
         "abs" => match &argv[0] {
             Value::Integer(i) => i
@@ -1339,22 +1340,93 @@ fn num_type_error(fname: &str) -> EvalError {
     }
 }
 
-fn to_integer(v: &Value) -> Value {
-    match v {
-        Value::Integer(i) => Value::Integer(*i),
-        Value::Float(f) => Value::Integer(*f as i64),
-        Value::String(s) => s
-            .trim()
-            .parse::<i64>()
-            .map(Value::Integer)
-            .unwrap_or(Value::Null),
-        Value::Boolean(_) | Value::Null => Value::Null,
-        _ => Value::Null,
+/// Dispatches the scalar type-conversion functions (`toInteger`/`toFloat`/`toString`/`toBoolean`/
+/// `toBooleanOrNull`) on an **un-collapsed** [`RowValue`] argument.
+///
+/// A structural or entity argument — node, relationship, path, structural list, or map — is not a
+/// convertible scalar and raises the runtime `TypeError` the openCypher TCK details as
+/// `InvalidArgumentValue` (`expressions/typeConversion/TypeConversion{2,3,4}.feature`, the
+/// "Fail … on invalid types" outlines). `null` is the identity for every conversion. Property
+/// scalars (`Value`) delegate to the per-function helpers, which encode each conversion table.
+///
+/// `lower` is the already-lowercased function name; it is one of the five conversion spellings (the
+/// caller dispatches only those here).
+fn convert_scalar(lower: &str, rv: RowValue) -> Result<Value, EvalError> {
+    // The `…OrNull` companions never raise: any non-convertible argument (structural or otherwise)
+    // is `null` rather than a `TypeError` (Neo4j's `toBooleanOrNull`/`toIntegerOrNull`/… contract).
+    // For the strict spellings, a structural/entity argument is the runtime `TypeError`.
+    let null_on_invalid = lower.ends_with("ornull");
+
+    // Structural/entity arguments are non-convertible for every conversion function. (A `null`
+    // RowValue is `RowValue::Value(Value::Null)` and so flows through to the value-level helpers,
+    // each of which maps `null` → `null`.)
+    let v = match rv {
+        RowValue::Value(v) => v,
+        RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) | RowValue::List(_) => {
+            if null_on_invalid {
+                return Ok(Value::Null);
+            }
+            return Err(invalid_conversion_argument(lower));
+        }
+    };
+    // A structural value that survived collapse as `Value::List`/`Value::Map` (e.g. a literal `[]`
+    // or `{}`) is equally non-convertible.
+    if matches!(v, Value::List(_) | Value::Map(_)) {
+        if null_on_invalid {
+            return Ok(Value::Null);
+        }
+        return Err(invalid_conversion_argument(lower));
+    }
+    match lower {
+        "tointeger" => to_integer(&v),
+        "tofloat" => to_float(&v),
+        "tostring" => to_string_value(&v),
+        "toboolean" => to_boolean(&v, false),
+        "tobooleanornull" => to_boolean(&v, true),
+        // Unreachable: the caller dispatches only the five conversion spellings.
+        _ => Err(EvalError::TypeError {
+            context: format!("{lower}() is not a scalar conversion"),
+        }),
     }
 }
 
-fn to_float(v: &Value) -> Value {
-    match v {
+/// The runtime `TypeError` raised when a conversion function receives a non-convertible
+/// (structural/entity) argument. The TCK gates the invalid-type scenarios on the error TYPE
+/// (`TypeError`) and PHASE (`runtime`); the `InvalidArgumentValue` detail is a soft match.
+fn invalid_conversion_argument(lower: &str) -> EvalError {
+    EvalError::TypeError {
+        context: format!("{lower}() does not accept a node, relationship, path, list or map"),
+    }
+}
+
+/// `toInteger(v)` over an already-validated scalar (`convert_scalar` has rejected entities/lists/
+/// maps). An integer is itself; a float truncates toward zero; a numeric string parses (integer
+/// first, then float-with-truncation) or yields `null`; a boolean and `null` yield `null`.
+fn to_integer(v: &Value) -> Result<Value, EvalError> {
+    Ok(match v {
+        Value::Integer(i) => Value::Integer(*i),
+        Value::Float(f) => Value::Integer(*f as i64),
+        Value::String(s) => {
+            let t = s.trim();
+            // Try an exact integer first (preserves full `i64` range that an `f64` round-trip would
+            // lose); fall back to a float parse and truncate (`toInteger('1.7') = 1`,
+            // `toInteger('2.9') = 2`). A non-numeric string (`'foo'`, `''`) is `null`.
+            t.parse::<i64>()
+                .map(Value::Integer)
+                .or_else(|_| t.parse::<f64>().map(|f| Value::Integer(f as i64)))
+                .unwrap_or(Value::Null)
+        }
+        Value::Boolean(_) | Value::Null => Value::Null,
+        // `convert_scalar` has already rejected the structural cases; any residual is `null`.
+        _ => Value::Null,
+    })
+}
+
+/// `toFloat(v)` over an already-validated scalar. A float is itself; an integer widens; a numeric
+/// string parses or yields `null`; `null` yields `null`. A boolean is **not** convertible
+/// (`TypeConversion3.feature` [6] lists `true` among the invalid types).
+fn to_float(v: &Value) -> Result<Value, EvalError> {
+    Ok(match v {
         Value::Float(f) => Value::Float(*f),
         Value::Integer(i) => Value::Float(*i as f64),
         Value::String(s) => s
@@ -1362,8 +1434,23 @@ fn to_float(v: &Value) -> Value {
             .parse::<f64>()
             .map(Value::Float)
             .unwrap_or(Value::Null),
+        Value::Null => Value::Null,
+        Value::Boolean(_) => return Err(invalid_conversion_argument("tofloat")),
+        // `convert_scalar` has already rejected the structural cases; any residual is `null`.
         _ => Value::Null,
-    }
+    })
+}
+
+/// `toString(v)` over an already-validated scalar. Integers, floats, booleans, strings, and
+/// temporal/spatial values render to their canonical string; `null` yields `null`.
+fn to_string_value(v: &Value) -> Result<Value, EvalError> {
+    Ok(match v {
+        Value::Null => Value::Null,
+        v => match crate::temporal_fns::to_iso(v) {
+            Some(iso) => Value::String(iso),
+            None => Value::String(stringify_scalar(v)),
+        },
+    })
 }
 
 /// `toBoolean(v)` / `toBooleanOrNull(v)` (openCypher TCK `expressions/typeConversion/
@@ -2487,6 +2574,100 @@ mod tests {
         assert_eq!(evaluate("toBooleanOrNull({})"), Value::Null);
         assert_eq!(evaluate("toBooleanOrNull('true')"), Value::Boolean(true));
         assert_eq!(evaluate("toBooleanOrNull(null)"), Value::Null);
+    }
+
+    /// Asserts that evaluating `src` raises a runtime [`EvalError::TypeError`] (the class the harness
+    /// maps to the TCK `TypeError` at `runtime`, detail `InvalidArgumentValue`).
+    fn assert_type_error(src: &str) {
+        let g = MemGraph::new();
+        let expr = parse_expr(src);
+        let err = eval(
+            &expr,
+            &Row::empty(),
+            &BoundParameters::empty(),
+            &g,
+            no_functions(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EvalError::TypeError { .. }), "{src}: {err:?}");
+    }
+
+    #[test]
+    fn to_integer_conversion_table() {
+        // TCK `TypeConversion2` [1], [3], [4], [6], [7]: integer/float/numeric-string conversions.
+        assert_eq!(evaluate("toInteger(82.9)"), Value::Integer(82));
+        assert_eq!(evaluate("toInteger(7)"), Value::Integer(7));
+        assert_eq!(evaluate("toInteger('42')"), Value::Integer(42));
+        // [4] handling Any type: a float-shaped string truncates (`'1.7'` → 1, `'2.9'` → 2).
+        assert_eq!(evaluate("toInteger('1.7')"), Value::Integer(1));
+        assert_eq!(evaluate("toInteger('2.9')"), Value::Integer(2));
+        // [2]/[5] non-numeric and empty strings are null.
+        assert_eq!(evaluate("toInteger('foo')"), Value::Null);
+        assert_eq!(evaluate("toInteger('')"), Value::Null);
+        // null is the identity; a boolean is non-numeric → null (absent from the invalid table).
+        assert_eq!(evaluate("toInteger(null)"), Value::Null);
+        assert_eq!(evaluate("toInteger(true)"), Value::Null);
+        // A large integer-shaped string keeps full `i64` precision (no `f64` round-trip).
+        assert_eq!(
+            evaluate("toInteger('9007199254740993')"),
+            Value::Integer(9_007_199_254_740_993)
+        );
+    }
+
+    #[test]
+    fn to_integer_rejects_invalid_types() {
+        // TCK `TypeConversion2` [8]: list/map/node/relationship/path are runtime TypeErrors. The
+        // list/map cases are reachable here; node/rel/path are covered by the TCK feature run (they
+        // require a graph binding).
+        assert_type_error("toInteger([])");
+        assert_type_error("toInteger({})");
+        // Inside a list comprehension the element is still rejected (the [8] query shape).
+        assert_type_error("[x IN [1, []] | toInteger(x)]");
+    }
+
+    #[test]
+    fn to_float_conversion_table() {
+        // TCK `TypeConversion3` [1], [3], [4], [5].
+        assert_eq!(evaluate("toFloat(3.4)"), Value::Float(3.4));
+        assert_eq!(evaluate("toFloat(3)"), Value::Float(3.0));
+        assert_eq!(evaluate("toFloat('5')"), Value::Float(5.0));
+        assert_eq!(evaluate("toFloat('2.5')"), Value::Float(2.5));
+        // [2]/[4] non-numeric and empty strings are null; null is the identity.
+        assert_eq!(evaluate("toFloat('foo')"), Value::Null);
+        assert_eq!(evaluate("toFloat('')"), Value::Null);
+        assert_eq!(evaluate("toFloat(null)"), Value::Null);
+    }
+
+    #[test]
+    fn to_float_rejects_invalid_types_including_boolean() {
+        // TCK `TypeConversion3` [6]: boolean/list/map/node/relationship/path are runtime TypeErrors.
+        // Note that — unlike `toInteger`/`toBoolean` — a boolean is invalid for `toFloat`.
+        assert_type_error("toFloat(true)");
+        assert_type_error("toFloat([])");
+        assert_type_error("toFloat({})");
+        assert_type_error("[x IN [1.0, true] | toFloat(x)]");
+    }
+
+    #[test]
+    fn to_string_conversion_table() {
+        // TCK `TypeConversion4` [1], [2], [3], [5], [6].
+        assert_eq!(evaluate("toString(42)"), Value::String("42".to_owned()));
+        assert_eq!(evaluate("toString(2.3)"), Value::String("2.3".to_owned()));
+        assert_eq!(evaluate("toString(true)"), Value::String("true".to_owned()));
+        assert_eq!(
+            evaluate("toString(1 < 0)"),
+            Value::String("false".to_owned())
+        );
+        assert_eq!(evaluate("toString('apa')"), Value::String("apa".to_owned()));
+        assert_eq!(evaluate("toString(null)"), Value::Null);
+    }
+
+    #[test]
+    fn to_string_rejects_invalid_types() {
+        // TCK `TypeConversion4` [10]: list/map/node/relationship/path are runtime TypeErrors.
+        assert_type_error("toString([])");
+        assert_type_error("toString({})");
+        assert_type_error("[x IN [1, '', []] | toString(x)]");
     }
 
     #[test]

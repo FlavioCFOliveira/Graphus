@@ -172,7 +172,19 @@ use graphus_tck::runner::run_scenario;
 /// list cell as a bag. Wins: `expressions/graph` 34→60 (Graph3/4/6/7/9), plus the leading-optional
 /// fix unblocking further `clauses`/`expressions` scenarios. Measured, zero regressions (full
 /// failure-set diff: 0 newly-failing scenarios; the net +48 is purely additive).
-const BASELINE: usize = 3715;
+///
+/// 3715 → 3736 (#133, scalar type-conversion alignment): `toInteger`/`toFloat`/`toString`/
+/// `toBoolean` now evaluate their argument at the `RowValue` level, so a node/relationship/path/
+/// list/map argument raises a runtime `TypeError` (`InvalidArgumentValue`) instead of silently
+/// collapsing to `null` — `expressions/typeConversion` TypeConversion2 [8], TypeConversion3 [6],
+/// TypeConversion4 [10] (the "Fail … on invalid types" outlines). `toInteger` of a numeric string
+/// now truncates the float form (`'1.7'` → 1, `'2.9'` → 2) so the "handling Any type" and
+/// "list of strings" scenarios pass, and integer-shaped strings keep full `i64` precision.
+/// `toFloat(true)` is now correctly invalid (a boolean is convertible for `toInteger`/`toBoolean`
+/// but not `toFloat`). The `…OrNull` companions yield `null` rather than raising. Wins:
+/// `expressions/typeConversion` to 47/47 (100%), +21. Measured, zero regressions (full
+/// failure-set diff: the net +21 is purely additive).
+const BASELINE: usize = 3736;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.
