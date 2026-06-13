@@ -281,6 +281,84 @@ fn torn_tail_record_is_ignored_and_its_txn_rolled_back() {
 }
 
 #[test]
+fn interior_log_corruption_is_detected_not_silently_truncated() {
+    // Three fully-committed transactions. Bit-rot flips a body byte of the FIRST transaction's
+    // record (interior corruption), leaving every later committed record intact and self-consistent.
+    // Recovery must FAIL LOUD rather than silently truncate at the bad spot and drop the committed
+    // T2 + T3 — the cardinal ACID violation the original "any decode error == torn tail" rule caused
+    // (storage audit F4).
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+    for t in 1..=3u64 {
+        wal.begin(TxnId(t));
+        wal.log_update(TxnId(t), PageId(0), d(-1), d(1));
+        wal.log_update(TxnId(t), PageId(1), d(1), d(-1));
+        wal.commit(TxnId(t)).unwrap();
+    }
+    let mut full = wal.sink().durable_bytes().to_vec();
+
+    // Corrupt a body byte (the txn-id field) of the FIRST record: its CRC32C now fails, but its
+    // length/type are intact so the scan decodes it as BadCrc, and every later record is untouched.
+    let bounds = record_boundaries(&full);
+    assert!(
+        bounds.len() > 4,
+        "need several intact records after the first"
+    );
+    let txn_id_byte = bounds[0] as usize + 20; // OFF_TXN_ID inside record 0
+    full[txn_id_byte] ^= 0xFF;
+
+    let mut sink = MemLogSink::new();
+    sink.append(&full);
+    sink.sync().unwrap();
+    let mut wal2 = WalManager::open(sink).unwrap();
+    let mut store = DeltaStore::with_initial(3, 100);
+    let err = recover(&mut wal2, &mut store)
+        .expect_err("interior corruption must fail recovery, not silently truncate");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("interior log corruption"),
+        "must report interior corruption; got: {msg}"
+    );
+}
+
+#[test]
+fn a_torn_tail_after_committed_records_still_truncates_cleanly() {
+    // The complement of the interior-corruption test: a genuine torn tail at the very end (the last
+    // append never completed, with NO valid record after the torn point) must still truncate to
+    // committed-or-nothing across MULTIPLE preceding committed transactions — the fail-loud rule must
+    // not regress the legitimate, common torn-tail case.
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+    wal.begin(TxnId(1));
+    wal.log_update(TxnId(1), PageId(0), d(-10), d(10));
+    wal.log_update(TxnId(1), PageId(1), d(10), d(-10));
+    wal.commit(TxnId(1)).unwrap();
+    wal.begin(TxnId(2));
+    wal.log_update(TxnId(2), PageId(0), d(-10), d(10));
+    wal.log_update(TxnId(2), PageId(1), d(10), d(-10));
+    wal.commit(TxnId(2)).unwrap();
+    // T3 commits (so its records are durable), then the crash tears its COMMIT record — nothing
+    // valid follows the torn point.
+    wal.begin(TxnId(3));
+    wal.log_update(TxnId(3), PageId(0), d(-5), d(5));
+    wal.log_update(TxnId(3), PageId(1), d(5), d(-5));
+    let c3 = wal.commit(TxnId(3)).unwrap();
+    let full = wal.sink().durable_bytes().to_vec();
+    let torn_len = (c3.0 + 3) as usize; // a few bytes into T3's COMMIT: a torn tail
+
+    let mut sink = MemLogSink::new();
+    sink.append(&full[..torn_len]);
+    sink.sync().unwrap();
+    let mut wal2 = WalManager::open(sink).unwrap();
+    let mut store = DeltaStore::with_initial(2, 100);
+    let report = recover(&mut wal2, &mut store).expect("a clean torn tail must still recover");
+    assert!(report.tail_truncated, "the torn tail ends the scan");
+    assert_eq!(report.losers, 1, "T3 is a loser (its COMMIT was torn)");
+    // T1 + T2 committed; T3 fully undone.
+    assert_eq!(store.value(0), 80);
+    assert_eq!(store.value(1), 120);
+    assert_eq!(store.total(), 200);
+}
+
+#[test]
 fn checkpoint_sets_the_redo_start_without_losing_changes() {
     let mut wal = WalManager::create(MemLogSink::new()).unwrap();
     wal.begin(TxnId(1));

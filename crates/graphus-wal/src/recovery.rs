@@ -20,12 +20,12 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use graphus_core::error::Result;
+use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, PageId, TxnId};
 
 use crate::checkpoint::CheckpointSnapshot;
 use crate::manager::{HEADER_LEN, WalManager};
-use crate::record::{DecodeError, LogRecord, RecordType};
+use crate::record::{DecodeError, LogRecord, MIN_RECORD_LEN, RecordType};
 use crate::sink::LogSink;
 
 /// What a redo/undo image means for a page. Implemented by the storage layer (and by recovery
@@ -140,10 +140,31 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
                 }
                 ordered.push(rec);
             }
-            // A decode failure means the durable log ends here: either a clean torn tail
-            // (un-acknowledged records, legitimately lost) or trailing garbage. Either way the
-            // scan stops at the last intact record, which preserves committed-or-nothing.
+            // A record failed to decode. This is EITHER a benign torn tail (the last, still
+            // un-acknowledged append never completed — those records are legitimately lost) OR
+            // INTERIOR corruption of the durable log (bit-rot / a bad block in the middle). The two
+            // must not be conflated: silently truncating on interior corruption (the original
+            // behaviour) would drop EVERY committed transaction logged after the bad spot and report
+            // success — a silent loss of acknowledged committed data, the cardinal ACID violation
+            // (storage audit F4).
+            //
+            // A genuine record stamps its own LSN == its byte offset, and that field is covered by
+            // the record's CRC32C. So if any later offset in the durable range decodes to a
+            // *self-consistent* record (`lsn == offset`), there is real committed data beyond the
+            // failure point: this is interior corruption, and recovery FAILS LOUD (refuses to open)
+            // rather than truncate. If no such record follows, it is a clean torn tail and the scan
+            // stops here, preserving committed-or-nothing. Biasing an ambiguous tail toward
+            // fail-closed (the operator investigates; no bytes are discarded) is the correct ACID
+            // choice versus silently dropping possibly-committed data.
             Err(DecodeError::Incomplete | DecodeError::BadCrc | DecodeError::Corrupt) => {
+                if let Some(off) = next_self_consistent_record(&log, cursor + 1) {
+                    return Err(GraphusError::Storage(format!(
+                        "WAL interior log corruption: an undecodable record at offset {cursor} is \
+                         followed by a valid record at offset {off}; refusing to recover, because \
+                         truncating here would silently drop the committed transactions logged \
+                         after offset {cursor}"
+                    )));
+                }
                 tail_truncated = true;
                 break;
             }
@@ -240,6 +261,29 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
         clrs_written,
         tail_truncated,
     })
+}
+
+/// Scans `log[from..]` for the first offset that decodes to a **self-consistent** record — one whose
+/// stamped LSN equals its own byte offset (`record.lsn == offset`). A record's LSN is its byte offset
+/// (`§4.1`) and is covered by the record's CRC32C, so a self-consistent decode is a record genuinely
+/// written at that position, not a chance CRC match (a stray CRC32C hit would additionally have to
+/// carry exactly the right 8-byte offset — astronomically unlikely).
+///
+/// Used by [`recover_from`] to tell interior log corruption (a valid record follows an undecodable
+/// one ⇒ committed data exists beyond the failure ⇒ fail loud) from a benign torn tail (no genuine
+/// record follows ⇒ truncate). Returns the offset of the first such record, or `None` if none
+/// remains in the durable range.
+fn next_self_consistent_record(log: &[u8], from: usize) -> Option<usize> {
+    let mut off = from;
+    while off + MIN_RECORD_LEN <= log.len() {
+        if let Ok((rec, _)) = LogRecord::decode(&log[off..]) {
+            if rec.lsn.0 == off as u64 {
+                return Some(off);
+            }
+        }
+        off += 1;
+    }
+    None
 }
 
 #[cfg(test)]
