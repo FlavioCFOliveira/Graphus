@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use graphus_bufpool::page;
 use graphus_core::capability::Rng;
 use graphus_core::{ElementId, TxnId};
-use graphus_io::{MemBlockDevice, PAGE_SIZE, Page};
+use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_sim::SimRng;
 use graphus_storage::record::NODE_RECORD_SIZE;
 use graphus_storage::{
@@ -395,8 +395,10 @@ fn tamper_per_page_checksum_then_refake_digest_is_caught_by_page_crc() {
 #[test]
 fn tamper_misplaced_page_id_is_rejected() {
     // Rewrite the *framing* page_id of the first page (the metadata page, device id 0) to a wrong
-    // value, while keeping the page body (with its self-referential page_id header = 0) and re-fake
-    // the digest. The header/framing disagreement is what fires.
+    // but IN-RANGE value (page id 1, which exists in this multi-page backup), while keeping the page
+    // body (with its self-referential page_id header = 0) and re-fake the digest. The header/framing
+    // disagreement is what fires — distinct from the out-of-range page-id check (a separate, earlier
+    // guard exercised by `verify_and_restore_reject_an_out_of_range_page_id`).
     let mut artifact = good_artifact();
     const HEADER_LEN: usize = 8 + 4 + 4 + 16 + 8;
     // First framed page_id is at HEADER_LEN..HEADER_LEN+8; it should be 0 (the metadata page).
@@ -406,7 +408,14 @@ fn tamper_misplaced_page_id_is_rejected() {
         original_framed, 0,
         "first framed page is the metadata page (device 0)"
     );
-    artifact[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&999u64.to_le_bytes());
+    // Confirm page id 1 is in range (a multi-page backup), so the per-page header check — not the
+    // range check — is what catches the tamper.
+    let page_count = u64::from_le_bytes(artifact[32..40].try_into().unwrap());
+    assert!(
+        page_count > 1,
+        "build_graph(3, 100) yields a multi-page backup"
+    );
+    artifact[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&1u64.to_le_bytes());
     let digest_at = artifact.len() - 4;
     let digest = crc32c::crc32c(&artifact[..digest_at]);
     artifact[digest_at..].copy_from_slice(&digest.to_le_bytes());
@@ -465,6 +474,39 @@ fn restore_rejects_an_inconsistent_image_that_passes_both_digests() {
     assert!(
         err.contains("integrity check failed"),
         "restore must reject via the consistency checker (not a structural error); got: {err}"
+    );
+}
+
+#[test]
+fn verify_and_restore_reject_an_out_of_range_page_id() {
+    // A crafted artifact whose first framed page claims page_id = u64::MAX must be rejected cleanly —
+    // no overflow panic, no absurd device extend — by both verification and restore (storage audit
+    // F10). A valid backup's page ids are dense in [0, page_count).
+    let mut original = build_graph(5, 60);
+    let mut artifact = backup_store(&mut original).expect("backup");
+
+    // The first page entry's framed page_id is the 8 bytes immediately after the artifact header.
+    let pid_off = ARTIFACT_HEADER_LEN;
+    artifact[pid_off..pid_off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    refresh_artifact_digest(&mut artifact); // re-fake the digest so the page-id range check is what fires
+
+    let verr = verify_backup(&artifact).expect_err("an out-of-range page id must be rejected");
+    assert!(
+        verr.to_string().contains("out-of-range page id"),
+        "got: {verr}"
+    );
+
+    // restore_onto must reject it too (no panic, no giant extend on the device).
+    let mut device = MemBlockDevice::new(0);
+    let rerr = restore_onto(&artifact, &mut device).expect_err("restore must reject it too");
+    assert!(
+        rerr.to_string().contains("out-of-range page id"),
+        "got: {rerr}"
+    );
+    assert_eq!(
+        device.page_count(),
+        0,
+        "a rejected restore must not grow the device"
     );
 }
 

@@ -212,6 +212,19 @@ fn parse(artifact: &[u8]) -> Result<ParsedBackup<'_>> {
                 .try_into()
                 .expect("8-byte slice (bounds checked by section length)"),
         );
+        // A `page_id` is a device-page position. The store's device-page maps only ever grow and are
+        // never freed (`04 §2.1`), so a backup of `page_count` pages frames exactly the dense set
+        // `{0 .. page_count-1}` — every framed `page_id` is therefore `< page_count`. Rejecting an
+        // out-of-range id here keeps an untrusted/crafted artifact from driving `restore_onto`'s
+        // device-extent arithmetic (`max_id + 1`) to overflow or to an absurd multi-exabyte
+        // `extend`/`set_len` (storage audit F10) — a defence that composes with the per-page
+        // `page_id`-header cross-check in [`verify_backup`].
+        if page_id >= page_count as u64 {
+            return Err(GraphusError::Storage(format!(
+                "backup frames an out-of-range page id {page_id} (page_count is {page_count}); \
+                 a valid backup's page ids are dense in [0, page_count)"
+            )));
+        }
         let start = cur + 8;
         let end = start + PAGE_SIZE;
         pages.push((page_id, &artifact[start..end]));
@@ -296,7 +309,14 @@ pub fn restore_onto<D: BlockDevice>(artifact: &[u8], device: &mut D) -> Result<(
 
     let max_id = parsed.pages.iter().map(|(id, _)| *id).max();
     if let Some(max_id) = max_id {
-        let needed = max_id + 1;
+        // `parse` already bounds every `page_id` to `[0, page_count)`, so this cannot overflow; the
+        // `checked_add` is belt-and-braces against a future caller of this device-agnostic primitive
+        // that bypasses `parse` (storage audit F10).
+        let needed = max_id.checked_add(1).ok_or_else(|| {
+            GraphusError::Storage(format!(
+                "backup page id {max_id} overflows the addressable range"
+            ))
+        })?;
         if device.page_count() < needed {
             device.extend(needed - device.page_count())?;
         }
