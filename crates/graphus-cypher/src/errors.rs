@@ -203,6 +203,11 @@ pub enum SemanticDetail {
     /// Neo4j / openCypher-reference path-search extension absent from the openCypher TCK corpus, so
     /// this detail has **no** TCK counterpart; its spelling is internal.
     InvalidShortestPath,
+    /// `UnexpectedSyntax` — a syntactically-formed construct appears in a position the grammar
+    /// forbids, e.g. a bare pattern predicate (`(n)-[]->()`) used in a `RETURN`/`WITH` projection,
+    /// on the right-hand side of `SET`, or as a function argument (TCK
+    /// `expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]).
+    UnexpectedSyntax,
 }
 
 impl SemanticDetail {
@@ -236,6 +241,7 @@ impl SemanticDetail {
             Self::InvalidLoadCsvUrl => "InvalidLoadCsvUrl",
             // `shortestPath` is absent from the openCypher TCK; internal spelling, no TCK step.
             Self::InvalidShortestPath => "InvalidShortestPath",
+            Self::UnexpectedSyntax => "UnexpectedSyntax",
         }
     }
 }
@@ -457,6 +463,12 @@ pub enum SemanticErrorKind {
         /// A human-readable explanation of why the wrapped pattern is rejected.
         reason: String,
     },
+    /// A bare **pattern predicate** (`(n)-[]->()` written directly as a value) appears in a position
+    /// the grammar reserves for ordinary expressions — a `RETURN`/`WITH` projection, the right-hand
+    /// side of `SET`, or a function argument. A pattern predicate is only valid in a predicate
+    /// position (a `WHERE`, or an operand of the boolean operators / `NOT`). TCK detail
+    /// `UnexpectedSyntax` (`expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]).
+    PatternPredicateInExpression,
 }
 
 /// How a pattern variable is bound — used to report [`SemanticErrorKind::VariableTypeConflict`].
@@ -509,6 +521,7 @@ impl SemanticErrorKind {
             Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
             Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
             Self::InvalidShortestPath { .. } => SemanticDetail::InvalidShortestPath,
+            Self::PatternPredicateInExpression => SemanticDetail::UnexpectedSyntax,
         }
     }
 
@@ -639,6 +652,11 @@ impl fmt::Display for SemanticErrorKind {
             Self::InvalidShortestPath { reason } => {
                 write!(f, "invalid shortestPath/allShortestPaths pattern: {reason}")
             }
+            Self::PatternPredicateInExpression => f.write_str(
+                "a pattern predicate may only appear in a predicate position (a WHERE or a \
+                 boolean operand), not in a projection, on the right-hand side of SET, or as a \
+                 function argument",
+            ),
         }
     }
 }
@@ -699,6 +717,7 @@ mod tests {
             // `shortestPath` is a Neo4j / openCypher-reference extension with no TCK detail; pinned
             // here for the same stability guarantee.
             (SemanticDetail::InvalidShortestPath, "InvalidShortestPath"),
+            (SemanticDetail::UnexpectedSyntax, "UnexpectedSyntax"),
         ];
         for (detail, s) in pairs {
             assert_eq!(detail.as_tck_str(), s);
@@ -789,7 +808,8 @@ mod tests {
                 | SemanticErrorKind::InvalidClauseComposition { .. }
                 | SemanticErrorKind::DifferentColumnsInUnion
                 | SemanticErrorKind::InvalidLoadCsvUrl
-                | SemanticErrorKind::InvalidShortestPath { .. } => kind.classification(),
+                | SemanticErrorKind::InvalidShortestPath { .. }
+                | SemanticErrorKind::PatternPredicateInExpression => kind.classification(),
             }
         }
 
@@ -846,6 +866,7 @@ mod tests {
             SemanticErrorKind::InvalidShortestPath {
                 reason: "x".to_owned(),
             },
+            SemanticErrorKind::PatternPredicateInExpression,
         ] {
             assert_eq!(classify(&kind).phase, ErrorPhase::CompileTime, "{kind:?}");
         }

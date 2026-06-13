@@ -982,3 +982,85 @@ mod static_type_checks {
         ok("MATCH (n) RETURN n LIMIT 10");
     }
 }
+
+// =================================================================================================
+// Pattern predicates (rmp #126): the two openCypher static restrictions — fresh-variable
+// introduction (UndefinedVariable) and placement outside a predicate position (UnexpectedSyntax).
+// =================================================================================================
+
+mod pattern_predicates {
+    use super::*;
+
+    #[test]
+    fn valid_in_where_with_bound_variables() {
+        // The driving variable is bound by the MATCH; the pattern only constrains it.
+        ok("MATCH (n) WHERE (n)-[]->() RETURN n");
+        ok("MATCH (n) WHERE (n)-[:REL1*]-() RETURN n");
+        ok("MATCH (n), (m) WHERE (n)-[:REL1]->(m) RETURN n, m");
+        // Combined with NOT / AND / OR — all predicate positions.
+        ok("MATCH (a) WHERE NOT (a)-[:T]->() RETURN a");
+        ok("MATCH (n) WHERE (n)-[:A]-() AND (n)-[:B]-() RETURN n");
+        ok("MATCH (n) WHERE (n)-[:A]-() OR (n)-[:B]-() RETURN n");
+    }
+
+    #[test]
+    fn fresh_variable_in_pattern_predicate_is_undefined() {
+        // A pattern predicate may not introduce variables: every named one must already be bound.
+        // A fresh relationship variable `r`:
+        assert_detail(
+            "MATCH (n) WHERE (n)-[r]->() RETURN n",
+            SemanticDetail::UndefinedVariable,
+        );
+        // A fresh endpoint node variable `a`:
+        assert_detail(
+            "MATCH (n) WHERE (n)-[]->(a) RETURN n",
+            SemanticDetail::UndefinedVariable,
+        );
+        // An entirely fresh single node `(a)` is not even bound — still UndefinedVariable.
+        assert_detail(
+            "MATCH (n) WHERE (a)-[]->() RETURN n",
+            SemanticDetail::UndefinedVariable,
+        );
+    }
+
+    #[test]
+    fn explicit_exists_subquery_may_introduce_variables() {
+        // The explicit `EXISTS { ... }` form has *no* such restriction — it binds freely.
+        ok("MATCH (n) WHERE EXISTS { (n)-[r]->(a) } RETURN n");
+    }
+
+    #[test]
+    fn pattern_predicate_in_projection_is_unexpected_syntax() {
+        assert_detail(
+            "MATCH (n) RETURN (n)-[]->()",
+            SemanticDetail::UnexpectedSyntax,
+        );
+        assert_detail(
+            "MATCH (n) WITH (n)-[]->() AS x RETURN x",
+            SemanticDetail::UnexpectedSyntax,
+        );
+    }
+
+    #[test]
+    fn pattern_predicate_as_function_argument_is_unexpected_syntax() {
+        // `size((a)-->())` — List6 [6].
+        assert_detail(
+            "MATCH (a), (b), (c) RETURN size((a)-->())",
+            SemanticDetail::UnexpectedSyntax,
+        );
+    }
+
+    #[test]
+    fn pattern_predicate_on_set_rhs_is_unexpected_syntax() {
+        assert_detail(
+            "MATCH (n) SET n.prop = head(nodes(head((n)-[:REL]->()))).foo",
+            SemanticDetail::UnexpectedSyntax,
+        );
+    }
+
+    #[test]
+    fn explicit_exists_subquery_is_allowed_in_projection() {
+        // An explicit `EXISTS { ... }` is a legitimate boolean *value*, allowed in a projection.
+        ok("MATCH (n) RETURN EXISTS { (n)-[]->() } AS hasOut");
+    }
+}

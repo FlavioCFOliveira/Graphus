@@ -1638,3 +1638,97 @@ fn a_point_property_round_trips_through_a_node() {
     );
     assert_eq!(rows[0].value("lat"), Value::Float(41.15));
 }
+
+// =================================================================================================
+// Pattern predicates (rmp #126): `(n)-[]->()` as a boolean, desugaring to an existential. Mirrors
+// `tck/features/expressions/pattern/Pattern1.feature`, executed end to end over a MemGraph.
+// =================================================================================================
+
+/// The Pattern1 fixture: `(a:A)-[:REL1]->(b:B), (b)-[:REL2]->(a), (a)-[:REL3]->(:C),
+/// (a)-[:REL1]->(:D)`. Returns the graph and the A/B node ids.
+fn seed_pattern1() -> (MemGraph, NodeId, NodeId) {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], NO_PROPS);
+    let b = g.add_node(["B"], NO_PROPS);
+    let c = g.add_node(["C"], NO_PROPS);
+    let d = g.add_node(["D"], NO_PROPS);
+    g.add_rel("REL1", a, b, NO_PROPS);
+    g.add_rel("REL2", b, a, NO_PROPS);
+    g.add_rel("REL3", a, c, NO_PROPS);
+    g.add_rel("REL1", a, d, NO_PROPS);
+    (g, a, b)
+}
+
+/// The set of node ids returned in column `n`.
+fn node_id_set(rows: &[Row]) -> std::collections::BTreeSet<NodeId> {
+    rows.iter()
+        .map(|r| r.get("n").unwrap().as_node().expect("column n is a node"))
+        .collect()
+}
+
+#[test]
+fn pattern_predicate_outgoing_existence() {
+    // `WHERE (n)-[]->()` keeps only nodes with at least one outgoing relationship: A and B.
+    let (mut g, a, b) = seed_pattern1();
+    let rows = run("MATCH (n) WHERE (n)-[]->() RETURN n", &mut g);
+    assert_eq!(node_id_set(&rows), [a, b].into_iter().collect());
+}
+
+#[test]
+fn pattern_predicate_typed_outgoing() {
+    // `WHERE (n)-[:REL1]->()` — only A has an outgoing REL1.
+    let (mut g, a, _b) = seed_pattern1();
+    let rows = run("MATCH (n) WHERE (n)-[:REL1]->() RETURN n", &mut g);
+    assert_eq!(node_id_set(&rows), [a].into_iter().collect());
+}
+
+#[test]
+fn pattern_predicate_negated() {
+    // `WHERE NOT (n)-[:REL2]-()` — every node *except* the two REL2 endpoints (A and B).
+    let (mut g, a, b) = seed_pattern1();
+    let rows = run("MATCH (n) WHERE NOT (n)-[:REL2]-() RETURN n", &mut g);
+    let got = node_id_set(&rows);
+    assert!(
+        !got.contains(&a) && !got.contains(&b),
+        "A and B are excluded"
+    );
+    assert_eq!(got.len(), 2, "the two REL2-free nodes (C and D) remain");
+}
+
+#[test]
+fn pattern_predicate_conjunction_and_disjunction() {
+    let (mut g, a, b) = seed_pattern1();
+    // AND: outgoing REL1 *and* (incoming) REL2 — only A satisfies both.
+    let rows = run(
+        "MATCH (n) WHERE (n)-[:REL1]->() AND (n)-[:REL2]-() RETURN n",
+        &mut g,
+    );
+    assert_eq!(node_id_set(&rows), [a].into_iter().collect());
+    // OR: REL1 either direction or REL3 — A, B, and the REL1 targets.
+    let rows = run(
+        "MATCH (n) WHERE (n)-[:REL1]-() OR (n)-[:REL2]-() RETURN n",
+        &mut g,
+    );
+    let got = node_id_set(&rows);
+    assert!(got.contains(&a) && got.contains(&b));
+}
+
+#[test]
+fn pattern_predicate_between_two_bound_nodes() {
+    // `WHERE (n)-[:REL1]->(m)` constrains an existing pair — A→B is the only REL1 forward edge
+    // to a labelled-as-matched node here besides A→D.
+    let (mut g, a, b) = seed_pattern1();
+    let rows = run("MATCH (n), (m) WHERE (n)-[:REL1]->(m) RETURN n, m", &mut g);
+    // Every result row's n is A (the sole REL1 source).
+    assert!(
+        rows.iter()
+            .all(|r| r.get("n").unwrap().as_node() == Some(a)),
+        "n is always A"
+    );
+    // B is among the reachable m's.
+    assert!(
+        rows.iter()
+            .any(|r| r.get("m").unwrap().as_node() == Some(b)),
+        "B is a REL1 target of A"
+    );
+}

@@ -112,11 +112,11 @@
 //! (escalated, `02 Q2`).
 
 use crate::ast::{
-    Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause, MatchClause,
-    MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind,
-    ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection, RelationshipPattern,
-    RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, SortItem, StandaloneCall,
-    StandaloneYield, UnaryOp, UnionPart, UnwindClause, YieldItem,
+    BinaryOp, Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause,
+    MatchClause, MergeAction, MergeClause, NodePattern, PatternElement, PatternPart,
+    PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection,
+    RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, SortItem,
+    StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, Variable, YieldItem,
 };
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck, FunctionRegistry};
@@ -541,6 +541,7 @@ impl Analyzer<'_> {
     fn check_unwind(&self, u: &UnwindClause, scope: &mut Scope) -> Result<(), SemanticError> {
         // The list expression is evaluated in the *current* scope, then the alias is bound.
         self.check_expr(&u.expr, scope)?;
+        Self::check_pattern_predicate_placement(&u.expr, false)?;
         self.reject_aggregation(&u.expr, "UNWIND")?;
         scope.bind(&u.alias.name, VarKind::Value, u.alias.span)
     }
@@ -598,11 +599,13 @@ impl Analyzer<'_> {
             SetItem::Property { target, value } => {
                 self.check_expr_refs(target, scope)?;
                 self.check_expr(value, scope)?;
+                Self::check_pattern_predicate_placement(value, false)?;
                 self.reject_aggregation(value, "SET")?;
             }
             SetItem::Replace { target, value } | SetItem::Merge { target, value } => {
                 self.require_defined(&target.name, target.span, scope)?;
                 self.check_expr(value, scope)?;
+                Self::check_pattern_predicate_placement(value, false)?;
                 self.reject_aggregation(value, "SET")?;
             }
             SetItem::Labels { target, .. } => {
@@ -888,6 +891,8 @@ impl Analyzer<'_> {
         is_final_return: bool,
     ) -> Result<(), SemanticError> {
         self.check_expr(&item.expr, scope)?;
+        // A projection is a value position: a bare pattern predicate is `UnexpectedSyntax` here.
+        Self::check_pattern_predicate_placement(&item.expr, false)?;
         // Aggregations may not be nested anywhere, and may not draw from `rand()`.
         self.reject_nested_aggregation(&item.expr)?;
         self.reject_nondeterministic_in_aggregate(&item.expr)?;
@@ -994,6 +999,31 @@ impl Analyzer<'_> {
     }
 
     // ---- patterns ---------------------------------------------------------------------------
+
+    /// Visits every **named** variable in a pattern part — the optional path variable, every node
+    /// variable, and every relationship variable — calling `f` on each. Used to enforce the
+    /// pattern-predicate rule that all named variables must already be bound (`UndefinedVariable`).
+    fn for_each_pattern_variable(
+        part: &PatternPart,
+        f: &mut impl FnMut(&Variable) -> Result<(), SemanticError>,
+    ) -> Result<(), SemanticError> {
+        if let Some(var) = &part.var {
+            f(var)?;
+        }
+        let element = &part.element;
+        if let Some(var) = &element.start.variable {
+            f(var)?;
+        }
+        for link in &element.chain {
+            if let Some(var) = &link.relationship.variable {
+                f(var)?;
+            }
+            if let Some(var) = &link.node.variable {
+                f(var)?;
+            }
+        }
+        Ok(())
+    }
 
     fn bind_pattern_part(
         &self,
@@ -1325,6 +1355,17 @@ impl Analyzer<'_> {
                 self.check_expr_refs(&q.predicate, &inner)
             }
             ExprKind::ExistsSubquery(ex) => {
+                // A bare *pattern predicate* (`(n)-[]->()`) may not **introduce** variables: every
+                // named node/relationship variable must already be bound in the outer scope, else
+                // openCypher raises `UndefinedVariable` (TCK `expressions/pattern/Pattern1` [10]).
+                // An explicit `EXISTS { ... }` has no such restriction — it binds freely.
+                if ex.from_pattern_predicate {
+                    for part in &ex.pattern {
+                        Self::for_each_pattern_variable(part, &mut |var| {
+                            self.require_defined(&var.name, var.span, scope)
+                        })?;
+                    }
+                }
                 // The pattern binds its variables locally (outer bindings stay visible as
                 // constraints); the WHERE predicate sees both.
                 let mut inner = scope.clone();
@@ -1407,7 +1448,81 @@ impl Analyzer<'_> {
         position: &'static str,
     ) -> Result<(), SemanticError> {
         self.check_expr(expr, scope)?;
+        // A `WHERE` is a predicate position: bare pattern predicates are legal here (and under the
+        // boolean operators nested in it), so start the placement walk in predicate context.
+        Self::check_pattern_predicate_placement(expr, true)?;
         self.reject_aggregation(expr, position)
+    }
+
+    /// Enforces that a bare **pattern predicate** (`(n)-[]->()` written as an
+    /// [`ExprKind::ExistsSubquery`] with `from_pattern_predicate`) appears only in a *predicate
+    /// position* — a `WHERE`, or an operand of `NOT` / `AND` / `OR` / `XOR` reachable from one.
+    /// Anywhere else (a projection, a `SET` right-hand side, a function argument, a comparison /
+    /// arithmetic operand, a collection element) it is the openCypher `UnexpectedSyntax` error (TCK
+    /// `expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]).
+    ///
+    /// `in_predicate` carries whether the *current* expression sits in a predicate position. The
+    /// boolean connectives propagate it to their operands; every other parent puts its children into
+    /// **value** position. Predicate slots nested inside an otherwise value-position expression — a
+    /// list/pattern-comprehension `WHERE`, a quantifier predicate, an `EXISTS { ... }` `WHERE` — are
+    /// re-entered in predicate context, since they are genuine sub-predicates.
+    fn check_pattern_predicate_placement(
+        expr: &Expr,
+        in_predicate: bool,
+    ) -> Result<(), SemanticError> {
+        match &expr.kind {
+            ExprKind::ExistsSubquery(ex) => {
+                if ex.from_pattern_predicate && !in_predicate {
+                    return Err(SemanticError::new(
+                        SemanticErrorKind::PatternPredicateInExpression,
+                        expr.span,
+                    ));
+                }
+                // The optional `WHERE` of an `EXISTS { ... }` is itself a predicate position.
+                if let Some(pred) = &ex.predicate {
+                    Self::check_pattern_predicate_placement(pred, true)?;
+                }
+                Ok(())
+            }
+            // `NOT` propagates the predicate context to its operand.
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                operand,
+            } => Self::check_pattern_predicate_placement(operand, in_predicate),
+            // `AND` / `OR` / `XOR` propagate; every other binary operator is a value context.
+            ExprKind::Binary { op, lhs, rhs } => {
+                let boolean = matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor);
+                let child_ctx = in_predicate && boolean;
+                Self::check_pattern_predicate_placement(lhs, child_ctx)?;
+                Self::check_pattern_predicate_placement(rhs, child_ctx)
+            }
+            // Comprehensions / quantifiers: the iterated list is a value, but their `WHERE` is a
+            // predicate; the projection is a value.
+            ExprKind::ListComprehension(lc) => {
+                Self::check_pattern_predicate_placement(&lc.list, false)?;
+                if let Some(pred) = &lc.predicate {
+                    Self::check_pattern_predicate_placement(pred, true)?;
+                }
+                if let Some(proj) = &lc.projection {
+                    Self::check_pattern_predicate_placement(proj, false)?;
+                }
+                Ok(())
+            }
+            ExprKind::PatternComprehension(pc) => {
+                if let Some(pred) = &pc.predicate {
+                    Self::check_pattern_predicate_placement(pred, true)?;
+                }
+                Self::check_pattern_predicate_placement(&pc.projection, false)
+            }
+            ExprKind::Quantifier(q) => {
+                Self::check_pattern_predicate_placement(&q.list, false)?;
+                Self::check_pattern_predicate_placement(&q.predicate, true)
+            }
+            // Any other expression node: all children are value positions.
+            _ => Self::for_each_child(expr, &mut |child| {
+                Self::check_pattern_predicate_placement(child, false)
+            }),
+        }
     }
 
     /// A `SKIP`/`LIMIT` count must be a non-negative-integer **constant** expression
@@ -1758,7 +1873,6 @@ impl Analyzer<'_> {
                 true
             }
             ExprKind::Binary { op, .. } => {
-                use crate::ast::BinaryOp;
                 matches!(
                     op,
                     BinaryOp::Add

@@ -81,7 +81,19 @@ use graphus_tck::runner::run_scenario;
 /// background steps to every scenario (Gherkin semantics) fixed Match5 3/29 → 28/29 (+25; the lone
 /// remaining failure is the unsupported double-arrow `<-[*]->` pattern, an honest parser gap). The
 /// variable-length expand engine itself was already correct — proven by `tests/var_length.rs`.
-const BASELINE: usize = 3540;
+///
+/// 3540 → 3562 (#126, pattern predicates): a relationship pattern written directly as a boolean
+/// expression (`MATCH (n) WHERE (n)-[]->() RETURN n`) now parses, desugaring to the existing
+/// `EXISTS { pattern }` existential (openCypher `PatternPredicate = RelationshipsPattern`). The
+/// parser disambiguates a node-pattern-shaped `(…)` followed by a relationship connector from an
+/// ordinary parenthesized expression; semantics enforce the two openCypher restrictions — a pattern
+/// predicate may not introduce fresh variables (`UndefinedVariable`) and may only appear in a
+/// predicate position, never a projection / `SET` RHS / function argument (`UnexpectedSyntax`).
+/// Wins: `expressions/pattern/Pattern1` 17/39 → 38/39 (+21; the lone gap is the bare-node
+/// `WHERE (n)` self-pattern type check), `expressions/list/List6` +1 (`size()` on a pattern
+/// predicate now rejected), and `clauses/match-where/MatchWhere4` / `clauses/with-where/WithWhere4`
+/// +1 each (disjunctive multi-part predicates including patterns). Measured: zero regressions.
+const BASELINE: usize = 3562;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

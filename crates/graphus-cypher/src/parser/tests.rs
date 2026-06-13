@@ -1141,3 +1141,187 @@ fn opencypher_example_queries_parse() {
         assert!(parse(q).is_ok(), "openCypher example failed to parse: {q}");
     }
 }
+
+// =================================================================================================
+// Pattern predicates (rmp #126): a relationship pattern used directly as a boolean expression,
+// `(n)-[]->()`, desugars to an `EXISTS { pattern }` existential (openCypher
+// `PatternPredicate = RelationshipsPattern`).
+// =================================================================================================
+
+/// The `WHERE` expression of the first `MATCH` clause of `q` (panics if absent).
+fn match_where(q: &str) -> Expr {
+    let query = ok(q);
+    for c in clauses(&query) {
+        if let Clause::Match(m) = c {
+            return m
+                .where_clause
+                .clone()
+                .unwrap_or_else(|| panic!("query `{q}` has no MATCH ... WHERE"));
+        }
+    }
+    panic!("query `{q}` has no MATCH clause");
+}
+
+/// Unwraps a pattern-predicate [`ExprKind::ExistsSubquery`] (asserting it came from a bare pattern
+/// predicate, not an explicit `EXISTS {{ ... }}`), returning its single pattern element.
+fn pattern_predicate_element(expr: &Expr) -> PatternElement {
+    let ExprKind::ExistsSubquery(ex) = &expr.kind else {
+        panic!(
+            "expected a pattern-predicate ExistsSubquery, got {:?}",
+            expr.kind
+        );
+    };
+    assert!(
+        ex.from_pattern_predicate,
+        "expected from_pattern_predicate = true"
+    );
+    assert!(
+        ex.predicate.is_none(),
+        "a bare pattern predicate has no WHERE"
+    );
+    assert_eq!(
+        ex.pattern.len(),
+        1,
+        "a pattern predicate is one pattern part"
+    );
+    let part = &ex.pattern[0];
+    assert!(
+        part.var.is_none(),
+        "a pattern predicate has no path variable"
+    );
+    part.element.clone()
+}
+
+#[test]
+fn pattern_predicate_simple_outgoing() {
+    let where_e = match_where("MATCH (n) WHERE (n)-[]->() RETURN n");
+    let element = pattern_predicate_element(&where_e);
+    assert_eq!(
+        element.start.variable.as_ref().map(|v| v.name.as_str()),
+        Some("n")
+    );
+    assert_eq!(element.chain.len(), 1);
+    assert_eq!(
+        element.chain[0].relationship.direction,
+        RelDirection::LeftToRight
+    );
+}
+
+#[test]
+fn pattern_predicate_directions() {
+    // Undirected `-[]-`.
+    let e = match_where("MATCH (n) WHERE (n)-[]-() RETURN n");
+    assert_eq!(
+        pattern_predicate_element(&e).chain[0]
+            .relationship
+            .direction,
+        RelDirection::Undirected
+    );
+    // Incoming `<-[]-`.
+    let e = match_where("MATCH (n) WHERE (n)<-[]-() RETURN n");
+    assert_eq!(
+        pattern_predicate_element(&e).chain[0]
+            .relationship
+            .direction,
+        RelDirection::RightToLeft
+    );
+    // Arrow shorthands without a detail bracket: `-->`, `<--`, `--`.
+    for (q, dir) in [
+        (
+            "MATCH (n) WHERE (n)-->() RETURN n",
+            RelDirection::LeftToRight,
+        ),
+        (
+            "MATCH (n) WHERE (n)<--() RETURN n",
+            RelDirection::RightToLeft,
+        ),
+        ("MATCH (n) WHERE (n)--() RETURN n", RelDirection::Undirected),
+    ] {
+        let e = match_where(q);
+        assert_eq!(
+            pattern_predicate_element(&e).chain[0]
+                .relationship
+                .direction,
+            dir,
+            "wrong direction for `{q}`"
+        );
+    }
+}
+
+#[test]
+fn pattern_predicate_with_type_and_var_length() {
+    // Relationship type.
+    let e = match_where("MATCH (n) WHERE (n)-[:REL1]->() RETURN n");
+    let rel = &pattern_predicate_element(&e).chain[0].relationship;
+    assert_eq!(rel.types.len(), 1);
+    assert!(rel.range.is_none());
+    // Type alternatives + variable length.
+    let e = match_where("MATCH (n), (m) WHERE (n)-[:REL1|REL2*]-(m) RETURN n, m");
+    let rel = &pattern_predicate_element(&e).chain[0].relationship;
+    assert_eq!(rel.types.len(), 2);
+    assert!(rel.range.is_some());
+}
+
+#[test]
+fn pattern_predicate_multi_hop() {
+    let e = match_where("MATCH (a) WHERE (a)-[:T]->(:C)<-[:T]-(a {num: 5}) RETURN a");
+    let element = pattern_predicate_element(&e);
+    assert_eq!(element.chain.len(), 2, "two relationship hops");
+}
+
+#[test]
+fn pattern_predicate_combines_with_not_and_or() {
+    // NOT (pattern).
+    let e = match_where("MATCH (a) WHERE NOT (a)-[:T]->() RETURN a");
+    let ExprKind::Unary {
+        op: UnaryOp::Not,
+        operand,
+    } = &e.kind
+    else {
+        panic!("expected NOT, got {:?}", e.kind);
+    };
+    let _ = pattern_predicate_element(operand); // asserts the operand is a pattern predicate.
+
+    // (pattern) AND (pattern): both operands are pattern predicates.
+    let e = match_where("MATCH (n) WHERE (n)-[:A]-() AND (n)-[:B]-() RETURN n");
+    let ExprKind::Binary {
+        op: BinaryOp::And,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        panic!("expected AND, got {:?}", e.kind);
+    };
+    let _ = pattern_predicate_element(lhs);
+    let _ = pattern_predicate_element(rhs);
+}
+
+#[test]
+fn disambiguation_parenthesized_arithmetic_is_not_a_pattern() {
+    // The classic ambiguity: `(1 + 2) * 3` is arithmetic, never a pattern predicate.
+    let k = return_kind("RETURN (1 + 2) * 3");
+    let ExprKind::Binary {
+        op: BinaryOp::Mul, ..
+    } = k
+    else {
+        panic!("expected multiplication, got {k:?}");
+    };
+    // A parenthesized variable followed by subtraction stays arithmetic.
+    let k = return_kind("RETURN (a) - 1");
+    let ExprKind::Binary {
+        op: BinaryOp::Sub, ..
+    } = k
+    else {
+        panic!("expected subtraction, got {k:?}");
+    };
+    // A bare parenthesized expression is unwrapped, not turned into a pattern.
+    assert!(matches!(return_kind("RETURN (n)"), ExprKind::Variable(_)));
+}
+
+#[test]
+fn pattern_predicate_in_general_expression_position_parses() {
+    // The parser accepts a pattern predicate anywhere an expression may appear; the *placement*
+    // restriction (only valid in a predicate position) is a semantic concern, not a syntactic one.
+    assert!(parse("MATCH (n) RETURN (n)-[]->()").is_ok());
+    assert!(parse("MATCH (n) WITH (n)-[]->() AS x RETURN x").is_ok());
+}

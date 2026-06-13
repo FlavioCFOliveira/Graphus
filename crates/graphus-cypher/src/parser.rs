@@ -1792,6 +1792,15 @@ impl<'t, 's> Parser<'t, 's> {
             TokenKind::LBracket => self.parse_list_or_comprehension(),
             TokenKind::LBrace => self.parse_map_literal(),
             TokenKind::LParen => {
+                // Disambiguate a *pattern predicate* `(n)-[]->()` (openCypher
+                // `PatternPredicate = RelationshipsPattern`, used as a boolean expression) from an
+                // ordinary parenthesized expression `(1 + 2)`. A pattern predicate begins with a
+                // node pattern whose closing `)` is immediately followed by a relationship connector
+                // (`-`, `--`, `<-`). `paren_group_is_node_then_rel` performs exactly that lookahead
+                // (it is shared with the pattern-comprehension disambiguation).
+                if self.at_pattern_predicate_start() {
+                    return self.parse_pattern_predicate();
+                }
                 self.bump();
                 let inner = self.parse_expr()?;
                 let rp = self.expect(
@@ -1922,12 +1931,135 @@ impl<'t, 's> Parser<'t, 's> {
             };
             let rb = self.expect(&TokenKind::RBrace, "'}' to close an EXISTS subquery")?;
             return Ok(Expr::new(
-                ExprKind::ExistsSubquery(Box::new(ExistsSubquery { pattern, predicate })),
+                ExprKind::ExistsSubquery(Box::new(ExistsSubquery {
+                    pattern,
+                    predicate,
+                    from_pattern_predicate: false,
+                })),
                 Span::new(start, rb.span.end),
             ));
         }
         // Function form `exists(expr)`.
         self.finish_function_call(vec!["exists".to_owned()], start)
+    }
+
+    /// Whether the current `(` begins a *pattern predicate* (`(n)-[]->()`) rather than a
+    /// parenthesized expression (`(1 + 2)`, `(n) - 1`).
+    ///
+    /// This is a stricter cousin of [`paren_group_is_node_then_rel`](Self::paren_group_is_node_then_rel)
+    /// (which suffices inside `[...]`, where a leading `(` can only be a node pattern). In a general
+    /// expression position the leading `(` is overwhelmingly a parenthesized subexpression, so the
+    /// lookahead must be precise to avoid mis-parsing arithmetic such as `(a)-1` or `(1+2)-[3,4]` as
+    /// a relationship. It requires **both**:
+    ///
+    /// 1. the parenthesized group to have **node-pattern shape** — an optional variable, an optional
+    ///    `:`-label list, and an optional inline property map / parameter, with **no** operators,
+    ///    literals, or other expression tokens at parenthesis depth 1; and
+    /// 2. the closing `)` to be **immediately followed by a relationship connector**: `--`
+    ///    ([`DashDash`](TokenKind::DashDash)), `<-` ([`ArrowLeft`](TokenKind::ArrowLeft)), or a `-`
+    ///    ([`Minus`](TokenKind::Minus)) that itself heads a detail bracket `-[`
+    ///    ([`LBracket`](TokenKind::LBracket)).
+    ///
+    /// A bare `-` followed by anything other than `[` is subtraction, never a relationship, so it is
+    /// rejected here (openCypher spells an undirected relationship `--` / `-[..]-`, never a single
+    /// `-` between two nodes).
+    fn at_pattern_predicate_start(&self) -> bool {
+        debug_assert!(self.at(&TokenKind::LParen));
+        // Scan the node-pattern shape from `(` to its matching `)`; reject anything that is not part
+        // of a `NodePattern` at depth 1. `end` ends up at the index of the closing `)`.
+        let mut i = self.pos + 1; // first token inside the parens
+        // Optional variable.
+        if matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Identifier(_))
+        ) {
+            i += 1;
+        }
+        // Optional `:`-label list: `: Name (: Name)*` (label conjunction is colon-separated here).
+        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Colon)) {
+            i += 1;
+            match self.tokens.get(i).map(|t| &t.kind) {
+                Some(TokenKind::Identifier(_)) => i += 1,
+                Some(k) if keyword_as_name(k).is_some() => i += 1,
+                _ => return false,
+            }
+        }
+        // Optional inline properties: a `{ ... }` map literal or a parameter `$p`.
+        match self.tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::LBrace) => {
+                // Skip a balanced `{ ... }` group.
+                let mut depth = 0usize;
+                loop {
+                    match self.tokens.get(i).map(|t| &t.kind) {
+                        Some(TokenKind::LBrace) => depth += 1,
+                        Some(TokenKind::RBrace) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        None => return false,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            Some(TokenKind::Parameter(_)) => i += 1,
+            _ => {}
+        }
+        // The very next token must be the closing `)` — anything else means the group held an
+        // expression, not a bare node pattern.
+        if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::RParen)) {
+            return false;
+        }
+        i += 1;
+        // The token after `)` must begin a relationship connector.
+        match self.tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::DashDash | TokenKind::ArrowLeft) => true,
+            // A single `-` is a relationship only when it heads a detail bracket `-[`.
+            Some(TokenKind::Minus) => {
+                matches!(
+                    self.tokens.get(i + 1).map(|t| &t.kind),
+                    Some(TokenKind::LBracket)
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// Parses a *pattern predicate* — a relationship pattern used directly as a boolean expression
+    /// (openCypher `PatternPredicate = RelationshipsPattern`), e.g. `(n)-[]->()` in
+    /// `MATCH (n) WHERE (n)-[]->() RETURN n`.
+    ///
+    /// A pattern predicate is semantically an existential over the pattern: it is true iff the
+    /// pattern matches at least once given the outer row's bindings. Rather than introduce a new
+    /// evaluation path, it desugars to the already-supported [`ExprKind::ExistsSubquery`] (the
+    /// `EXISTS { pattern }` form), so the binding/semantic/lowering/eval phases reuse the existential
+    /// machinery unchanged. Variables already bound in the outer scope constrain the pattern; fresh
+    /// variables inside it are existentially quantified and do not escape — exactly the `EXISTS`
+    /// semantics.
+    ///
+    /// The grammar restricts a pattern predicate to a single `RelationshipsPattern` (one
+    /// [`PatternElement`]: a node followed by at least one chain link), with no comma-separated parts
+    /// and no named-path variable — those forms are only valid inside an explicit `EXISTS { ... }`.
+    fn parse_pattern_predicate(&mut self) -> Result<Expr, SyntaxError> {
+        let element = self.parse_pattern_element()?;
+        let span = element.span;
+        let part = PatternPart {
+            var: None,
+            kind: PatternPartKind::Normal,
+            element,
+            span,
+        };
+        Ok(Expr::new(
+            ExprKind::ExistsSubquery(Box::new(ExistsSubquery {
+                pattern: vec![part],
+                predicate: None,
+                from_pattern_predicate: true,
+            })),
+            span,
+        ))
     }
 
     /// Looks ahead from a `.` to decide whether a dotted name is a namespaced function call

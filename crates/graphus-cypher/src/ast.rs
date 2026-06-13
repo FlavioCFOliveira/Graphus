@@ -941,4 +941,15 @@ pub struct ExistsSubquery {
     pub pattern: Vec<PatternPart>,
     /// The optional `WHERE` predicate over the pattern's bindings.
     pub predicate: Option<Box<Expr>>,
+    /// `true` when this node was synthesized from a bare **pattern predicate** (`(n)-[]->()` written
+    /// directly as a boolean expression) rather than an explicit `EXISTS { ... }`.
+    ///
+    /// The two share evaluation semantics (existential over the pattern) but differ in their static
+    /// rules: a pattern predicate (a) may **not** introduce fresh variables — every named variable
+    /// must already be bound in the outer scope (openCypher `UndefinedVariable`; TCK
+    /// `expressions/pattern/Pattern1` [10]) — and (b) is only valid in a **predicate position**, not
+    /// inside a projection / `SET` right-hand side / function argument (openCypher `UnexpectedSyntax`;
+    /// TCK `expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]). An explicit
+    /// `EXISTS { ... }` has neither restriction.
+    pub from_pattern_predicate: bool,
 }
