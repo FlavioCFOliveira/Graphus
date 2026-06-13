@@ -26,16 +26,18 @@
 //!   master key + the *store's* salt (passed in by the caller), so the WAL and store share one
 //!   salt source. The header logically maps physical offset `0` to logical offset `0` (the WAL
 //!   manager's own header sits at logical `0`, inside the first frame).
-//! - **Frame** (one per [`sync`](LogSink::sync) that has pending bytes):
+//! - **Frame** (one per [`sync`](LogSink::sync) that has pending bytes, v3 — `rmp` #116):
 //!   ```text
-//!     phys_len(8) || logical_len(8) || nonce(12) || ciphertext(logical_len) || tag(16)
+//!     magic(4) || phys_len(8) || logical_offset(8) || logical_len(8) || nonce(12) || ciphertext(logical_len) || tag(16)
 //!   ```
-//!   `phys_len` is the whole frame length on disk (so a forward scan steps frame-to-frame and a
-//!   torn tail is caught when the claimed length runs past the durable bytes). `nonce` is a fresh
-//!   random 96-bit value per frame. **AAD = the frame's logical start offset (8-byte LE)**, so a
-//!   frame cannot be reordered, duplicated, or spliced to another logical position without failing
-//!   authentication. GCM ciphertext length equals plaintext length, so `ciphertext` is exactly
-//!   `logical_len` bytes.
+//!   `magic` is a fixed all-non-zero sentinel so the reclaim-gap resync on open lands on a frame
+//!   start, never on a zero `phys_len` byte. `phys_len` is the whole frame length on disk (so a
+//!   forward scan steps frame-to-frame and a torn tail is caught when the claimed length runs past
+//!   the durable bytes). `logical_offset` is the frame's logical start offset, stored on disk so a
+//!   frame is **self-locating** after a reclaimed prefix is freed. `nonce` is a fresh random 96-bit
+//!   value per frame. **AAD = the frame's logical start offset (8-byte LE)**, so a frame cannot be
+//!   reordered, duplicated, or spliced to another logical position without failing authentication.
+//!   GCM ciphertext length equals plaintext length, so `ciphertext` is exactly `logical_len` bytes.
 //!
 //! ## Crash / torn-tail semantics (ACID-preserving)
 //!
@@ -70,7 +72,14 @@ pub const WAL_SINK_MAGIC: [u8; 8] = *b"GRAPHUSW";
 ///   nonce now shares no nonce space with frame encryption). This changes the persisted WAL KCV
 ///   bytes; a v1 sink fails closed at open on the version check. No migration is needed (pre-1.0,
 ///   no persisted production encrypted WALs).
-pub const WAL_SINK_VERSION: u32 = 2;
+/// - **v3** (rmp #116): each frame now stores its **logical start offset** on disk (between
+///   `phys_len` and `logical_len`), authenticated as the AAD. This makes a frame **self-locating**, so
+///   after [`reclaim`](LogSink::reclaim) physically deletes a prefix/run of frames (their backing
+///   segments are unlinked and read back as zeros), [`open`](EncryptedLogSink::open) can skip the
+///   zero gap and resume decoding from the next surviving frame's stored offset — the logical
+///   byte-offset == LSN invariant is preserved across reclamation. Changes the frame layout; a v2
+///   sink fails closed at open on the version check. No migration needed (pre-1.0).
+pub const WAL_SINK_VERSION: u32 = 3;
 
 /// Cipher identifier for AES-256-GCM with a 96-bit nonce and 128-bit tag (matches the store).
 pub const WAL_CIPHER_AES_256_GCM: u32 = 1;
@@ -87,15 +96,29 @@ const HDR_OFF_KCV: usize = 20;
 const HDR_PREFIX_LEN: usize = HDR_OFF_KCV;
 
 // --- frame layout (all multi-byte integers little-endian) ----------------------------------------
-// phys_len(8) || logical_len(8) || nonce(12) || ciphertext(logical_len) || tag(16)
-const FR_OFF_PHYS_LEN: usize = 0;
-const FR_OFF_LOGICAL_LEN: usize = 8;
-const FR_OFF_NONCE: usize = 16;
+// magic(4) || phys_len(8) || logical_offset(8) || logical_len(8) || nonce(12) || ciphertext(logical_len) || tag(16)
+const FR_OFF_MAGIC: usize = 0;
+const FR_OFF_PHYS_LEN: usize = 4;
+const FR_OFF_LOGICAL_OFFSET: usize = 12;
+const FR_OFF_LOGICAL_LEN: usize = 20;
+const FR_OFF_NONCE: usize = 28;
 const FR_OFF_CIPHERTEXT: usize = FR_OFF_NONCE + NONCE_LEN;
 
-/// The fixed frame overhead: the two length fields, the nonce, and the trailing tag. The on-disk
-/// frame length is `FRAME_OVERHEAD + logical_len`.
-const FRAME_OVERHEAD: usize = 8 + 8 + NONCE_LEN + TAG_LEN;
+/// A fixed, **all-non-zero** 4-byte frame magic ("GWFR", little-endian) at the very start of every
+/// frame. Its purpose is to make the reclaim-gap resync in [`EncryptedLogSink::open`] rigorous: a
+/// freed prefix/run of frames reads back as zeros, and the scan finds the next surviving frame by
+/// skipping the zero run to the first non-zero byte. Because every byte of this magic is non-zero,
+/// that first non-zero byte is **always** the magic's first byte — never a frame's `phys_len` low
+/// byte, which can legitimately be `0` (e.g. when `logical_len ≡ 200 mod 256`, so `phys_len` is a
+/// multiple of 256). Without the magic, such a frame after a gap would be mis-framed and silently
+/// dropped as a torn tail, losing committed data (`rmp` #116 audit S2). `decode` validates the magic,
+/// so a misaligned resume is caught rather than mis-decoded.
+const FRAME_MAGIC: [u8; 4] = *b"GWFR";
+
+/// The fixed frame overhead: the magic, the three header fields (`phys_len`, `logical_offset`,
+/// `logical_len`), the nonce, and the trailing tag. The on-disk frame length is
+/// `FRAME_OVERHEAD + logical_len`.
+const FRAME_OVERHEAD: usize = 4 + 8 + 8 + 8 + NONCE_LEN + TAG_LEN;
 
 /// One frame's physical layout: where its plaintext begins logically, and where it sits physically.
 #[derive(Debug, Clone, Copy)]
@@ -121,10 +144,15 @@ struct FrameLoc {
 pub struct EncryptedLogSink<S: LogSink> {
     backing: S,
     cipher: Aes256Gcm,
-    /// The frame index, in logical order, covering `[0, logical_durable_len)`.
+    /// The frame index, in logical order, covering `[0, logical_durable_len)`. A reclaimed prefix/run
+    /// of frames is absent; the logical gap it leaves reads back as zeros (`rmp` #116).
     frames: Vec<FrameLoc>,
-    /// The sum of synced frame plaintext lengths (the logical durable length).
+    /// The logical durable length (the end of the last frame). Unchanged by reclamation — the freed
+    /// frames become a zero gap, never a shift (logical byte-offset == LSN).
     logical_durable_len: u64,
+    /// The physical length of the sink header in the backing (where frame 0 begins). The backing's
+    /// reclaim floor is never set below this, so the header (the backing's anchor) is never freed.
+    header_phys_len: u64,
     /// Buffered plaintext appended but not yet sealed into a frame (mirrors the backing sinks'
     /// `pending`).
     pending: Vec<u8>,
@@ -158,6 +186,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
         }
         let kcv = keyring.compute_wal_kcv()?;
         let header = encode_sink_header(&kcv);
+        let header_phys_len = header.len() as u64;
         backing.append(&header);
         backing.sync()?;
         Ok(Self {
@@ -165,6 +194,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
             cipher: keyring.wal_cipher(),
             frames: Vec::new(),
             logical_durable_len: 0,
+            header_phys_len,
             pending: Vec::new(),
         })
     }
@@ -187,24 +217,43 @@ impl<S: LogSink> EncryptedLogSink<S> {
         let header_len = parse_and_verify_sink_header(&physical, keyring)?;
 
         let cipher = keyring.wal_cipher();
-        let mut frames = Vec::new();
+        let mut frames: Vec<FrameLoc> = Vec::new();
         let mut logical_durable_len: u64 = 0;
         let mut cursor = header_len;
 
-        // Forward scan: step frame-to-frame. The first frame that is short, claims a length running
-        // past the durable bytes, or fails AEAD authentication is a torn/garbage tail — stop there,
-        // dropping it and everything after (there is nothing after a synced frame but a torn tail).
-        while cursor < physical.len() {
+        // Forward scan: step frame-to-frame. Each frame stores its own logical offset (v3) and begins
+        // with an all-non-zero magic, so a **reclaimed gap** — a run of zero bytes left by deleted
+        // backing segments below the recovery floor (`rmp` #116) — is skipped to the next surviving
+        // frame: the first non-zero byte after the gap is always that frame's magic (never a `phys_len`
+        // low byte, which can be `0`), and `decode` validates the magic to catch any misaligned resume.
+        // The frame then resumes from its stored offset. The first frame that is short, fails the
+        // magic, claims an impossible length, fails AEAD, or claims an offset before where we are (a
+        // relocated/corrupt frame) is a torn/garbage tail — stop there, dropping it and everything after.
+        loop {
+            // Skip a reclaimed zero gap (between the header and the first surviving frame, or between
+            // surviving frames after an interior run was freed).
+            while cursor < physical.len() && physical[cursor] == 0 {
+                cursor += 1;
+            }
+            if cursor >= physical.len() {
+                break;
+            }
             let Some((loc, plaintext_ok)) =
-                decode_and_authenticate_frame(&physical, cursor, logical_durable_len, &cipher)
+                decode_and_authenticate_frame(&physical, cursor, &cipher)
             else {
                 break;
             };
             if !plaintext_ok {
                 break;
             }
+            // The stored logical offset must not move backwards (frames are appended in increasing
+            // logical order; a reclaim gap only ever *increases* it). A backwards offset is a relocated
+            // or corrupt frame — treat as a torn tail and stop, never re-ordering the logical stream.
+            if loc.logical_offset < logical_durable_len {
+                break;
+            }
             cursor = (loc.phys_offset + loc.phys_len) as usize;
-            logical_durable_len += loc.logical_len;
+            logical_durable_len = loc.logical_offset + loc.logical_len;
             frames.push(loc);
         }
 
@@ -213,6 +262,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
             cipher,
             frames,
             logical_durable_len,
+            header_phys_len: header_len as u64,
             pending: Vec::new(),
         })
     }
@@ -272,7 +322,9 @@ impl<S: LogSink> EncryptedLogSink<S> {
         let logical_len = plaintext.len() as u64;
         let phys_len = (FRAME_OVERHEAD + plaintext.len()) as u64;
         let mut frame = Vec::with_capacity(phys_len as usize);
+        frame.extend_from_slice(&FRAME_MAGIC); // all-non-zero: rigorous reclaim-gap resync
         frame.extend_from_slice(&phys_len.to_le_bytes());
+        frame.extend_from_slice(&logical_offset.to_le_bytes()); // v3: self-locating frame
         frame.extend_from_slice(&logical_len.to_le_bytes());
         frame.extend_from_slice(&nonce_bytes);
         frame.extend_from_slice(&sealed); // ciphertext || tag
@@ -338,19 +390,66 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
         let mut physical = Vec::new();
         self.backing.read_durable(0, &mut physical)?;
 
+        // Build the logical range zero-filled, then place each surviving frame's plaintext at its
+        // logical position. A **reclaimed gap** (frames dropped from the index, `rmp` #116) has no
+        // frame covering it, so it stays zero — exactly the `MemLogSink::reclaim` contract, which lets
+        // recovery skip the leading zero run. The reclaim floor never frees below `from`, so the WAL
+        // header (frame 0 at logical 0) and offsets `[0, from)` are always real bytes.
+        let total = (self.logical_durable_len - from) as usize;
+        into.resize(total, 0);
         for loc in &self.frames {
             let frame_end = loc.logical_offset + loc.logical_len;
             if frame_end <= from {
                 continue; // entirely before the requested range
             }
-            // This frame overlaps `[from, durable)`; decrypt it.
             let plaintext = self.decrypt_frame_at(&physical, loc)?;
-            // Slice off any prefix before `from` (only ever the first overlapping frame).
-            let start = from.saturating_sub(loc.logical_offset) as usize;
-            if start < plaintext.len() {
-                into.extend_from_slice(&plaintext[start..]);
+            // Skip any prefix before `from` (only ever the first overlapping frame).
+            let skip = from.saturating_sub(loc.logical_offset) as usize;
+            if skip >= plaintext.len() {
+                continue;
             }
+            let out_off = (loc.logical_offset + skip as u64 - from) as usize;
+            let slice = &plaintext[skip..];
+            into[out_off..out_off + slice.len()].copy_from_slice(slice);
         }
+        Ok(())
+    }
+
+    fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
+        // Translate the logical reclaim range `[from, up_to)` to whole **frames**, then to a physical
+        // range on the backing. `from` is the WAL header end (logical `HEADER_LEN`); frame 0 (logical
+        // `[0, HEADER_LEN)`, the WAL header) sits below it and is always protected. Frames whose whole
+        // logical range lies below `up_to` are a reclaimable prefix; the last frame is always kept
+        // (the active region). The freed frames' backing segments are deleted (read back as zeros);
+        // their logical ranges then read as zeros (see `read_durable`).
+        if self.frames.len() <= 1 {
+            return Ok(()); // nothing past frame 0 / nothing to keep-and-free
+        }
+        // Skip the protected prefix below `from` (frame 0 = the WAL header).
+        let mut protect_end = 0;
+        while protect_end < self.frames.len() && self.frames[protect_end].logical_offset < from {
+            protect_end += 1;
+        }
+        // Collect the reclaimable run from there: frames fully below `up_to`, never the last frame.
+        let last = self.frames.len() - 1;
+        let mut cut = protect_end;
+        while cut < last && self.frames[cut].logical_offset + self.frames[cut].logical_len <= up_to
+        {
+            cut += 1;
+        }
+        if cut == protect_end {
+            return Ok(());
+        }
+        // Physical range to free: from the first reclaimable frame's physical start (= the physical
+        // end of the protected prefix, never below the backing's anchor/header) up to the first
+        // surviving frame's physical start. The backing deletes whole segments inside that range.
+        let phys_from = self.frames[protect_end]
+            .phys_offset
+            .max(self.header_phys_len);
+        let phys_to = self.frames[cut].phys_offset;
+        self.backing.reclaim(phys_from, phys_to)?;
+        // Drop the freed frames from the index; offsets/lengths are unchanged (the gap reads as zeros).
+        self.frames.drain(protect_end..cut);
         Ok(())
     }
 }
@@ -470,21 +569,26 @@ fn parse_and_verify_sink_header(physical: &[u8], keyring: &Keyring) -> Result<us
     Ok(kcv_end)
 }
 
-/// Decodes the frame starting at physical offset `cursor` and authenticates it against the running
-/// `logical_offset` (the AAD). Returns `Some((loc, true))` on a fully valid frame, or `None`/`(_,
-/// false)` when the frame is short, claims an impossible length, or fails AEAD — signalling a torn
-/// tail to drop.
+/// Decodes the frame starting at physical offset `cursor` and authenticates it against its **stored**
+/// logical offset (v3: the offset is on disk and is the AAD, so a frame is self-locating after a
+/// reclaimed prefix). Returns `Some((loc, true))` on a fully valid frame, or `None`/`(_, false)` when
+/// the frame is short, claims an impossible length, or fails AEAD — signalling a torn tail to drop.
 fn decode_and_authenticate_frame(
     physical: &[u8],
     cursor: usize,
-    logical_offset: u64,
     cipher: &Aes256Gcm,
 ) -> Option<(FrameLoc, bool)> {
-    // Need at least the two length fields to read the claimed physical length.
+    // Need at least the magic + three header fields to read the claimed lengths and offset.
     if cursor + FR_OFF_NONCE > physical.len() {
         return None;
     }
+    // The all-non-zero frame magic must match: it is the first byte the gap-skip lands on, and it
+    // catches a misaligned resume (which would otherwise be mis-decoded). A mismatch is a torn tail.
+    if physical[cursor + FR_OFF_MAGIC..cursor + FR_OFF_MAGIC + 4] != FRAME_MAGIC {
+        return None;
+    }
     let phys_len = u64::from_le_bytes(read8(physical, cursor + FR_OFF_PHYS_LEN));
+    let logical_offset = u64::from_le_bytes(read8(physical, cursor + FR_OFF_LOGICAL_OFFSET));
     let logical_len = u64::from_le_bytes(read8(physical, cursor + FR_OFF_LOGICAL_LEN));
     // The claimed physical length must be consistent (overhead + logical_len) and within bounds.
     let expected_phys = (FRAME_OVERHEAD as u64).checked_add(logical_len)?;
@@ -801,5 +905,148 @@ mod tests {
     /// Reads the KCV length out of an encoded sink header (test helper for byte-poking).
     fn kcv_len_of(bytes: &[u8]) -> usize {
         u32::from_le_bytes(read4(bytes, HDR_OFF_KCV_LEN)) as usize
+    }
+
+    #[test]
+    fn reclaim_zeros_a_logical_prefix_and_survives_reopen() {
+        // Frame 0 is the "header" (logical [0,8)); reclaim protects it (from = 8). Frames 1..3 are
+        // freed (their physical bytes are zeroed in the backing); frame 4 (the active one) is kept.
+        let kr = keyring(0x5C);
+        let mut enc = fresh(&kr);
+        for chunk in [&b"HEADER01"[..], b"aaaa", b"bbbb", b"cccc", b"dddd"] {
+            enc.append(chunk);
+            enc.sync().expect("sync");
+        }
+        assert_eq!(enc.durable_len(), 24);
+
+        // Reclaim [8, 20): frames 1,2,3 (logical [8,12),[12,16),[16,20)) are fully below the floor.
+        enc.reclaim(8, 20).expect("reclaim");
+        assert_eq!(enc.durable_len(), 24, "reclaim never shifts offsets");
+
+        let mut live = Vec::new();
+        enc.read_durable(0, &mut live).expect("read live");
+        assert_eq!(&live[0..8], b"HEADER01", "the header frame is preserved");
+        assert_eq!(
+            &live[8..20],
+            &[0u8; 12],
+            "the reclaimed prefix reads as zeros"
+        );
+        assert_eq!(&live[20..24], b"dddd", "the active frame survives");
+
+        // Reopen the backing: the scan must skip the physical zero gap and resume from frame 4's
+        // stored logical offset (v3 self-locating frames), reconstructing the identical logical stream.
+        let backing = enc.into_backing();
+        let reopened = EncryptedLogSink::open(backing, &kr).expect("reopen across a reclaim gap");
+        assert_eq!(reopened.durable_len(), 24);
+        let mut after = Vec::new();
+        reopened.read_durable(0, &mut after).expect("read reopened");
+        assert_eq!(
+            after, live,
+            "reopen reconstructs the post-reclaim logical stream"
+        );
+    }
+
+    #[test]
+    fn reclaim_gap_resync_survives_a_zero_low_byte_phys_len() {
+        // Audit S2 regression: a frame whose `phys_len` is a multiple of 256 has a `phys_len` low byte
+        // of 0. With FRAME_OVERHEAD = 56, that happens at `logical_len = 200` (phys_len = 256). After a
+        // reclaim gap, the zero-skip must NOT mistake that low byte for part of the gap — the
+        // all-non-zero frame magic makes the resync land on the magic, rigorously.
+        let kr = keyring(0x70);
+        let mut enc = fresh(&kr);
+        enc.append(b"HEADER01"); // frame 0 (header), logical [0,8)
+        enc.sync().expect("sync header");
+        enc.append(&[0xAB; 100]); // frame 1 — reclaimed below the floor
+        enc.sync().expect("sync f1");
+        // frame 2: logical_len = 200 → phys_len = FRAME_OVERHEAD(56) + 200 = 256 (low byte 0).
+        let surviving = vec![0xCD; 200];
+        enc.append(&surviving);
+        enc.sync().expect("sync f2");
+        let f2_start = 8 + 100; // logical offset of frame 2
+        assert_eq!(enc.durable_len(), (8 + 100 + 200) as u64);
+
+        // Reclaim frame 1 (logical [8,108)), keeping the header (frame 0) and the active frame 2.
+        enc.reclaim(8, f2_start as u64).expect("reclaim");
+
+        // Reopen across the gap: the surviving frame 2 has a zero `phys_len` low byte, but its magic
+        // is found by the zero-skip, so it is decoded — not dropped as a torn tail.
+        let backing = enc.into_backing();
+        let reopened = EncryptedLogSink::open(backing, &kr).expect("reopen across gap");
+        assert_eq!(reopened.durable_len(), (8 + 100 + 200) as u64);
+        let mut out = Vec::new();
+        reopened.read_durable(0, &mut out).expect("read");
+        assert_eq!(&out[0..8], b"HEADER01");
+        assert_eq!(&out[8..108], &[0u8; 100], "frame 1 was reclaimed to zeros");
+        assert_eq!(
+            &out[108..308],
+            &surviving[..],
+            "frame 2 survives the gap resync"
+        );
+    }
+
+    #[test]
+    fn reclaim_keeps_the_active_frame_and_the_header() {
+        // A floor above the whole log must still keep frame 0 (header) and the last (active) frame.
+        let kr = keyring(0x5E);
+        let mut enc = fresh(&kr);
+        enc.append(b"HEADER01");
+        enc.sync().expect("sync header");
+        enc.append(b"live");
+        enc.sync().expect("sync live");
+        enc.reclaim(8, 10_000).expect("reclaim");
+        let mut out = Vec::new();
+        enc.read_durable(0, &mut out).expect("read");
+        assert_eq!(out, b"HEADER01live");
+    }
+
+    // Audit D5: exercise encrypted reclaim against a REAL segmented `FileLogSink` backing (not the
+    // `MemLogSink`, which zeroes exact byte ranges). The file backing only deletes WHOLE segments, so
+    // this covers the segment-granularity physical-deletion path + a reopen across the resulting gap.
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn encrypted_reclaim_over_a_real_file_backing_reopens() {
+        use graphus_wal::FileLogSink;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("graphus-enc-recl-{nanos}-{}", std::process::id()));
+        let kr = keyring(0x71);
+
+        let f2_logical;
+        {
+            // Tiny 64-byte segment target forces the encrypted frames across many segment files.
+            let backing = FileLogSink::open_with_segment_target(&dir, 64).expect("open backing");
+            let mut enc = EncryptedLogSink::create(backing, &kr).expect("create");
+            enc.append(b"HEADER01"); // frame 0 (header)
+            enc.sync().expect("sync header");
+            enc.append(&[0x11; 300]); // frame 1 — reclaimed
+            enc.sync().expect("sync f1");
+            f2_logical = enc.durable_len();
+            enc.append(b"SURVIVOR"); // frame 2 — kept (active)
+            enc.sync().expect("sync f2");
+
+            enc.reclaim(8, f2_logical).expect("reclaim");
+            // The freed frame 1's logical range reads back as zeros on the live sink.
+            let mut live = Vec::new();
+            enc.read_durable(0, &mut live).expect("read live");
+            assert_eq!(&live[0..8], b"HEADER01");
+            assert_eq!(&live[(f2_logical as usize)..], b"SURVIVOR");
+        }
+        // Reopen from disk: the segmented backing physically deleted whole below-floor segments; the
+        // scan skips the zero gap (via the frame magic) and recovers HEADER01 + SURVIVOR.
+        let backing = FileLogSink::open_with_segment_target(&dir, 64).expect("reopen backing");
+        let reopened = EncryptedLogSink::open(backing, &kr).expect("reopen");
+        let mut out = Vec::new();
+        reopened.read_durable(0, &mut out).expect("read");
+        assert_eq!(&out[0..8], b"HEADER01");
+        assert_eq!(&out[(f2_logical as usize)..], b"SURVIVOR");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

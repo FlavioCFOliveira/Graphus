@@ -17,6 +17,29 @@ use graphus_server::config::{
 use graphus_server::engine::{AccessMode, EngineHandle};
 use graphus_server::{Server, ServerHandle};
 
+/// Reads the WAL header bytes — the `anchor` file inside the segmented WAL directory (`rmp` #116),
+/// which holds the log/sink header (the magic recovery validates).
+fn read_wal_anchor(wal_dir: &std::path::Path) -> Vec<u8> {
+    std::fs::read(wal_dir.join("anchor")).expect("read wal anchor")
+}
+
+/// Concatenates every byte of the segmented WAL directory (the `anchor` then the `seg.<base>` files
+/// in offset order), for a cleartext-leak scan over the whole log (`rmp` #116).
+fn read_wal_all_bytes(wal_dir: &std::path::Path) -> Vec<u8> {
+    let mut segs: Vec<(String, PathBuf)> = std::fs::read_dir(wal_dir)
+        .expect("read wal dir")
+        .filter_map(std::result::Result::ok)
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .filter(|(n, _)| n.starts_with("seg."))
+        .collect();
+    segs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = read_wal_anchor(wal_dir);
+    for (_, p) in segs {
+        out.extend_from_slice(&std::fs::read(&p).expect("read wal segment"));
+    }
+    out
+}
+
 /// A unique temp directory for one test's data root + key file (auto-removed on drop).
 struct TempStore {
     path: PathBuf,
@@ -158,17 +181,18 @@ async fn encrypted_store_persists_and_reopens_with_the_correct_key() {
         "the label name must not appear in cleartext in the encrypted store file"
     );
 
-    // The WAL file is encrypted too (rmp #88): the label written through the WAL must not appear in
-    // cleartext, and the file must carry the encrypted-WAL sink magic ("GRAPHUSW") at its start.
-    let wal_file = temp.store_dir().join("graphus.wal");
-    let wal_bytes = std::fs::read(&wal_file).expect("read wal file");
+    // The WAL is encrypted too (rmp #88): the label written through the WAL must not appear in
+    // cleartext across any segment, and the anchor header must carry the encrypted-WAL sink magic
+    // ("GRAPHUSW"). The WAL is a segmented directory (rmp #116).
+    let wal_dir = temp.store_dir().join("graphus.wal");
+    let wal_bytes = read_wal_all_bytes(&wal_dir);
     assert!(
         !wal_bytes.windows(b"Secret".len()).any(|w| w == b"Secret"),
-        "the label name must not appear in cleartext in the encrypted WAL file"
+        "the label name must not appear in cleartext in the encrypted WAL"
     );
     assert!(
-        wal_bytes.starts_with(b"GRAPHUSW"),
-        "the encrypted WAL begins with the encrypted-WAL sink magic"
+        read_wal_anchor(&wal_dir).starts_with(b"GRAPHUSW"),
+        "the encrypted WAL anchor begins with the encrypted-WAL sink magic"
     );
 
     // Boot #2: with the SAME key the data reads back.
@@ -232,17 +256,18 @@ async fn plaintext_path_is_unchanged_without_a_key() {
         "a plaintext store stores label names in the clear (the encrypted store must not)"
     );
 
-    // The plaintext WAL is byte-identical to before WAL encryption existed: no encrypted-WAL magic,
-    // and it carries the plaintext WAL magic ("GWAL", little-endian 0x4757414C) in its header.
-    let wal_file = temp.store_dir().join("graphus.wal");
-    let wal_bytes = std::fs::read(&wal_file).expect("read wal file");
+    // The plaintext WAL header is byte-identical to before WAL encryption existed: no encrypted-WAL
+    // magic, and the anchor carries the plaintext WAL magic ("GWAL", little-endian 0x4757414C). The
+    // WAL is a segmented directory (rmp #116); the header lives in the `anchor` file.
+    let wal_dir = temp.store_dir().join("graphus.wal");
+    let anchor = read_wal_anchor(&wal_dir);
     assert!(
-        !wal_bytes.starts_with(b"GRAPHUSW"),
+        !anchor.starts_with(b"GRAPHUSW"),
         "a plaintext WAL must not carry the encrypted-WAL sink magic"
     );
     assert_eq!(
-        &wal_bytes[0..4],
+        &anchor[0..4],
         &0x4757_414Cu32.to_le_bytes(),
-        "a plaintext WAL begins with the unchanged plaintext WAL magic"
+        "a plaintext WAL anchor begins with the unchanged plaintext WAL magic"
     );
 }

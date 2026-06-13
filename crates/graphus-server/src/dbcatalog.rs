@@ -13,12 +13,12 @@
 //! ```text
 //! <store_path>/                      ← the DEFAULT database (the unchanged single-db layout)
 //! ├── graphus.store
-//! ├── graphus.wal
+//! ├── graphus.wal/                   ← the segmented WAL directory (anchor + seg.<base>, rmp #116)
 //! ├── databases.toml                 ← the durable catalog (ABSENT ⇒ no additional databases)
 //! └── databases/
 //!     └── <name>/                    ← one directory per additional database
 //!         ├── graphus.store
-//!         └── graphus.wal
+//!         └── graphus.wal/
 //! ```
 //!
 //! The default database lives **directly in `store_path`**, exactly where a pre-multi-db deployment

@@ -445,3 +445,79 @@ fn checkpoint_sets_the_redo_start_without_losing_changes() {
     assert_eq!(store.value(7), 107);
     assert_eq!(store.total(), 800);
 }
+
+/// End-to-end over the **production segmented `FileLogSink`** (`rmp` #116): committed transactions
+/// roll the log past several segments; a reclaim physically **deletes** the below-floor segment
+/// files; then — modelling a crash — the sink is dropped and the WAL directory reopened from disk,
+/// and recovery still yields committed-or-nothing. Proves physical segment deletion + reopen +
+/// recovery, not just the in-memory zero-fill the `MemLogSink` tests cover.
+#[cfg_attr(
+    miri,
+    ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+)]
+#[test]
+fn file_sink_reclaim_then_reopen_recovers_committed_or_nothing() {
+    use graphus_wal::FileLogSink;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("graphus-wal-recl-{nanos}-{}", std::process::id()));
+
+    let t3_first;
+    let t3_upd;
+    {
+        // A tiny 16-byte segment target forces the log across many segment files.
+        let sink = FileLogSink::open_with_segment_target(&dir, 16).expect("open wal dir");
+        let mut wal = WalManager::create(sink).expect("create wal");
+        wal.begin(TxnId(1));
+        wal.log_update(TxnId(1), PageId(0), d(-10), d(10));
+        wal.commit(TxnId(1)).unwrap();
+        wal.begin(TxnId(2));
+        wal.log_update(TxnId(2), PageId(1), d(5), d(-5));
+        wal.commit(TxnId(2)).unwrap();
+        t3_first = wal.next_lsn(); // T3 (the loser) begins here
+        wal.begin(TxnId(3));
+        t3_upd = wal.log_update(TxnId(3), PageId(0), d(-7), d(7)); // a stolen, uncommitted write
+        wal.flush();
+
+        // Reclaim: clamped to T3's first record. Segments fully below it are physically deleted.
+        wal.reclaim(Lsn(wal.durable_len())).unwrap();
+
+        // The freed prefix now reads back as zeros; T3's records survive intact.
+        let mut log = Vec::new();
+        wal.read_durable(Lsn(0), &mut log).unwrap();
+        assert!(
+            log[t3_first.0 as usize..].iter().any(|&b| b != 0),
+            "the active transaction's records must survive the reclaim"
+        );
+        // Drop `wal`/`sink` here — modelling a crash after the reclaim (no graceful close).
+    }
+
+    // Reopen the WAL directory from disk and recover.
+    let sink = FileLogSink::open_with_segment_target(&dir, 16).expect("reopen wal dir");
+    let mut wal2 = WalManager::open(sink).expect("open wal");
+    // Steal/no-force disk: T1+T2's committed effects (below the floor) are already on the pages at
+    // their last LSNs, and T3's stolen write is present — so recovery skips the freed prefix and
+    // only has to undo the loser T3.
+    let mut store = DeltaStore::with_initial(2, 100);
+    // Page 0's last writer is T3's stolen update (stamp its LSN so redo treats it as already applied
+    // and skips it; only undo should touch it). Page 1's last writer is T2 (committed, below the
+    // freed floor — its effect is on the page, and no surviving record references it).
+    store.pages.insert(0, (t3_upd, 100 - 10 - 7)); // T1 committed (-10) + T3 stolen (-7)
+    store.pages.insert(1, (t3_first, 100 + 5)); // T2 committed (+5)
+    let report = recover(&mut wal2, &mut store).expect("recovery over a reclaimed file WAL");
+
+    // The loser T3 is rolled back; committed T1+T2 stand. Conservation holds.
+    assert_eq!(store.value(0), 90, "T1 committed; T3's stolen -7 is undone");
+    assert_eq!(store.value(1), 105, "T2 committed");
+    assert_eq!(store.total(), 195);
+    assert_eq!(report.losers, 1, "only T3 is a loser");
+    assert!(
+        !report.tail_truncated,
+        "no torn tail; a clean reclaimed log"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

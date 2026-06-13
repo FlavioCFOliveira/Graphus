@@ -237,4 +237,14 @@ impl LogSink for WalSink {
             Self::Encrypted(s) => s.read_durable(from, into),
         }
     }
+
+    fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
+        // Forward to the concrete sink so production WAL disk is actually bounded (`rmp` #116):
+        // without this, `WalSink` would inherit the trait's NO-OP `reclaim` and the segmented
+        // `FileLogSink` / encrypted sink would never free anything in production.
+        match self {
+            Self::Plain(s) => s.reclaim(from, up_to),
+            Self::Encrypted(s) => s.reclaim(from, up_to),
+        }
+    }
 }

@@ -11,8 +11,9 @@
 //! store in `<dir>` and writes its nodes and relationships to the two output files in the same CSV
 //! format the importer reads (so the pair round-trips).
 //!
-//! A `<dir>` holds two files: `graph.store` (the block device) and `graph.wal` (the write-ahead log),
-//! matching the server's on-disk layout.
+//! A `<dir>` holds `graph.store` (the block device, a file) and `graph.wal` (the write-ahead log, a
+//! segmented directory of an `anchor` + `seg.<base>` files — `rmp` #116), matching the server's
+//! on-disk layout.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};

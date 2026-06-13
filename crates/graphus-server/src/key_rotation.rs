@@ -51,9 +51,19 @@
 //!    (a) write a marker file `.rotation-commit` (naming the targets + their temps), fsync it, fsync
 //!    the directory — **this is the linearization point**: its presence means "the new files are
 //!    complete and authoritative; finish the swap";
-//!    (b) rename `device_file.rot-new` → `device_file`, then `wal_file.rot-new` → `wal_file`; fsync
-//!    the directory (the renames' directory entries are durable);
+//!    (b) swap `device_file.rot-new` → `device_file`, then `wal_file.rot-new` → `wal_file`; fsync
+//!    the directory (the swaps' directory entries are durable);
 //!    (c) remove the marker; fsync the directory.
+//!
+//! The store device is a single **file**, swapped by an atomic POSIX `rename(2)`. The WAL is a
+//! segmented **directory** (`rmp` #116), which `rename(2)` cannot atomically replace when the target
+//! is a non-empty directory — so its swap is `remove_dir_all(target)` then `rename(temp, target)`
+//! ([`replace_path`]). That two-step swap is **not atomic**, but under the marker it is crash-safe by
+//! **idempotent replay**: the temp directory is consumed (removed-then-renamed) only while it still
+//! exists, so a crash between the remove and the rename — or partway through the remove — re-runs as
+//! `remove (finishes/no-op) + rename` and converges; a fully-completed swap has no temp and is a
+//! no-op. The per-window table below therefore holds for the directory swap too; "rename" reads as
+//! "the [`replace_path`] swap" for the WAL.
 //!
 //! ## Per-window crash-safety analysis
 //!
@@ -71,7 +81,9 @@
 //! **idempotent** — a temp is renamed over its target only if the temp still exists, so a half-done
 //! swap is completed and a fully-done swap is a no-op. Before the marker, the originals are
 //! authoritative and any stray temp is discarded (an aborted rotation that never committed leaves no
-//! trace). A POSIX `rename(2)` over an existing path is atomic, so a target is never seen torn.
+//! trace). A POSIX `rename(2)` over an existing path is atomic (the device file), so that target is
+//! never seen torn; the WAL directory swap is the non-atomic `remove_dir_all + rename` made safe by
+//! idempotent replay, as described above.
 //!
 //! No `unsafe`; no key/plaintext is ever logged.
 
@@ -84,7 +96,7 @@ use graphus_crypto::{
 };
 use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 use graphus_storage::recovery::recover_device;
-use graphus_wal::{FileLogSink, LogSink, WalManager};
+use graphus_wal::{FileLogSink, HEADER_LEN, LogSink, WalManager};
 
 /// The filename suffix of a rotation's in-progress temp file (a fully re-encrypted device or WAL,
 /// not yet swapped over its target).
@@ -232,20 +244,35 @@ fn read_old_wal_logical_bytes(wal_file: &Path, old_keyring: &Keyring) -> Result<
     Ok(logical)
 }
 
-/// Writes `logical_bytes` as a fresh encrypted WAL at `dest` under `new_keyring`: a new sink header +
-/// (if there are any logical bytes) one frame carrying them. An empty/header-only old WAL yields a
-/// fresh header only. The destination is created clean and `sync`'d before returning.
+/// Writes `logical_bytes` as a fresh encrypted WAL at `dest` under `new_keyring`. The WAL header
+/// (`[0, HEADER_LEN)`) is sealed as its **own** first frame and the remaining records as a second
+/// frame, exactly mirroring a freshly created WAL (`WalManager::create` syncs the header alone before
+/// any record). This keeps the rotated WAL's reclamation granularity intact (`rmp` #116): the tiny
+/// header frame stays protected while the records frame and everything appended after it can later be
+/// reclaimed — without the split, a single giant header-bearing frame would be pinned forever. An
+/// empty/header-only old WAL yields just the header frame (or a bare header). Created clean and
+/// `sync`'d before returning.
 fn reencrypt_wal(logical_bytes: &[u8], new_keyring: &Keyring, dest: &Path) -> Result<()> {
-    remove_if_exists(dest)?;
+    // The WAL is a segmented directory (`rmp` #116); clear any leftover temp directory wholesale.
+    remove_path_if_exists(dest)?;
     let backing = FileLogSink::open(dest)
         .map_err(|e| GraphusError::Storage(format!("creating new WAL backing: {e}")))?;
     let mut sink = EncryptedFileLogSink::create(backing, new_keyring)?;
-    if !logical_bytes.is_empty() {
+    let header_len = HEADER_LEN as usize;
+    if logical_bytes.is_empty() {
+        // No logical bytes: still harden the fresh sink header (create already synced it, but a
+        // uniform sync keeps the contract explicit and costs nothing for an empty WAL).
+        sink.sync()?;
+    } else if logical_bytes.len() <= header_len {
+        // Header-only WAL: one frame carrying exactly the header bytes.
         sink.append(logical_bytes);
         sink.sync()?;
     } else {
-        // No logical bytes: still harden the fresh header (create already synced it, but a uniform
-        // sync keeps the contract explicit and costs nothing meaningful for an empty WAL).
+        // Header frame, then a records frame — matching a fresh WAL's frame structure so the header
+        // frame (logical `[0, HEADER_LEN)`) is protected and the records frame remains reclaimable.
+        sink.append(&logical_bytes[..header_len]);
+        sink.sync()?;
+        sink.append(&logical_bytes[header_len..]);
         sink.sync()?;
     }
     Ok(())
@@ -267,9 +294,10 @@ fn commit_swap(
     write_marker(&marker, device_file, wal_file)?;
     fsync_dir(db_dir)?;
 
-    // (b) Rename each temp over its target (atomic per file), then harden the directory entries.
-    rename(device_temp, device_file)?;
-    rename(wal_temp, wal_file)?;
+    // (b) Swap each temp over its target (the device file by an atomic rename; the segmented WAL
+    //     directory by a marker-guarded remove+rename), then harden the directory entries.
+    replace_path(device_temp, device_file)?;
+    replace_path(wal_temp, wal_file)?;
     fsync_dir(db_dir)?;
 
     // (c) Remove the marker; harden its unlink. The rotation is now fully complete.
@@ -312,9 +340,53 @@ fn rename(from: &Path, to: &Path) -> Result<()> {
     })
 }
 
+/// Replaces `target` with `temp` (a confirmed-existing temp), handling both kinds of target:
+///
+/// - **File** (the store device): a POSIX `rename(2)` atomically replaces the existing target file.
+/// - **Directory** (the segmented WAL, `rmp` #116): `rename(2)` cannot atomically replace a non-empty
+///   directory, so the (possibly partial) target directory is removed first, then the temp directory
+///   is renamed into place. Under the rotation commit marker this two-step swap stays crash-safe and
+///   **idempotent**: a crash after the remove but before the rename re-runs as `remove (no-op) +
+///   rename`, and a crash mid-remove re-runs as `remove (finishes) + rename` — see the module docs'
+///   per-window analysis (the marker is the linearization point; a temp is consumed only if present).
+fn replace_path(temp: &Path, target: &Path) -> Result<()> {
+    if temp.is_dir() {
+        remove_path_if_exists(target)?;
+    }
+    rename(temp, target)
+}
+
 /// Removes a file if it exists; an already-absent file is fine (idempotent).
 fn remove_if_exists(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(GraphusError::Storage(format!(
+            "removing {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Removes `path` whether it is a file or a directory tree; an already-absent path is fine
+/// (idempotent). Used for the segmented WAL, whose temp/target are directories (`rmp` #116).
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(GraphusError::Storage(format!(
+                "stat {} for removal: {e}",
+                path.display()
+            )));
+        }
+    };
+    let result = if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(GraphusError::Storage(format!(
@@ -350,7 +422,7 @@ pub fn recover_pending_rotation(db_dir: &Path, device_file: &Path, wal_file: &Pa
         let mut swapped_any = false;
         for (target, temp) in [(device_file, &device_temp), (wal_file, &wal_temp)] {
             if temp.exists() {
-                rename(temp, target)?;
+                replace_path(temp, target)?;
                 swapped_any = true;
             }
         }
@@ -369,7 +441,7 @@ pub fn recover_pending_rotation(db_dir: &Path, device_file: &Path, wal_file: &Pa
         let mut removed_any = false;
         for temp in [&device_temp, &wal_temp] {
             if temp.exists() {
-                remove_if_exists(temp)?;
+                remove_path_if_exists(temp)?;
                 removed_any = true;
             }
         }
@@ -664,8 +736,8 @@ mod tests {
             &dir.wal(),
         )
         .expect("write marker");
-        // Rename ONLY the device temp over its target (the WAL temp still pending).
-        std::fs::rename(temp_path(&dir.device()), dir.device()).expect("rename device temp");
+        // Swap ONLY the device temp over its target (the WAL temp still pending).
+        replace_path(&temp_path(&dir.device()), &dir.device()).expect("swap device temp");
         assert!(!temp_path(&dir.device()).exists());
         assert!(temp_path(&dir.wal()).exists());
 
@@ -693,8 +765,8 @@ mod tests {
             &dir.wal(),
         )
         .expect("write marker");
-        std::fs::rename(temp_path(&dir.device()), dir.device()).expect("rename device temp");
-        std::fs::rename(temp_path(&dir.wal()), dir.wal()).expect("rename wal temp");
+        replace_path(&temp_path(&dir.device()), &dir.device()).expect("swap device temp");
+        replace_path(&temp_path(&dir.wal()), &dir.wal()).expect("swap wal temp");
         // Marker still present (the crash window before its removal).
         assert!(dir.path.join(ROTATION_MARKER_NAME).exists());
 
@@ -706,6 +778,65 @@ mod tests {
             open_store(&dir, &MASTER_A).is_err(),
             "old key must not open"
         );
+    }
+
+    /// (c') The directory-swap crash window unique to the segmented WAL (`rmp` #116): after the
+    /// marker and after the WAL **target directory was removed** but before the temp directory was
+    /// renamed into its place. Recovery must complete the swap (remove is a no-op, then rename) and
+    /// open under the NEW key — proving the two-step remove+rename stays crash-safe and idempotent.
+    #[test]
+    fn crash_after_wal_target_removed_before_rename_completes_to_new_key() {
+        let dir = TempDir::new("crash-dir-swap");
+        let (a, b, r, _l, rt) = create_store_with_graph(&dir, &MASTER_A);
+        prepare_temps(&dir, &MASTER_A, &MASTER_B);
+        write_marker(
+            &dir.path.join(ROTATION_MARKER_NAME),
+            &dir.device(),
+            &dir.wal(),
+        )
+        .expect("write marker");
+        // Device fully swapped; WAL target directory removed, but the temp dir not yet renamed.
+        replace_path(&temp_path(&dir.device()), &dir.device()).expect("swap device temp");
+        remove_path_if_exists(&dir.wal()).expect("remove wal target dir");
+        assert!(!dir.wal().exists(), "wal target removed");
+        assert!(temp_path(&dir.wal()).exists(), "wal temp still pending");
+
+        recover_pending_rotation(&dir.path, &dir.device(), &dir.wal()).expect("recover");
+
+        assert!(
+            !temp_path(&dir.wal()).exists(),
+            "wal temp swapped into place"
+        );
+        assert!(!dir.path.join(ROTATION_MARKER_NAME).exists(), "marker gone");
+        assert_graph_intact(&dir, &MASTER_B, a, b, r, rt);
+        assert!(
+            open_store(&dir, &MASTER_A).is_err(),
+            "old key must not open"
+        );
+    }
+
+    /// A rotation round-trip over a WAL that has been **reclaimed** (a zero gap in its logical stream):
+    /// the re-encrypted WAL must preserve the logical bytes (offsets/LSNs), so the graph stays intact
+    /// under the new key. Guards the #116 interaction between reclamation and key rotation.
+    #[test]
+    fn rotation_round_trips_a_reclaimed_wal() {
+        let dir = TempDir::new("rotate-reclaimed");
+        let (a, b, r, _l, rt) = create_store_with_graph(&dir, &MASTER_A);
+        // Reclaim the old WAL's prefix below a safe floor, then rotate. Open the WAL, reclaim, drop.
+        {
+            let header = EncryptedFileDevice::read_file_header(dir.device()).expect("header");
+            let kr = Keyring::from_master_key(MASTER_A, &header.salt);
+            let backing = FileLogSink::open(dir.wal()).expect("wal backing");
+            let sink = EncryptedFileLogSink::open(backing, &kr).expect("wal sink");
+            let mut wal = WalManager::open(sink).expect("wal mgr");
+            // No active transactions after the committed graph, so the floor is the durable length;
+            // reclaim everything reclaimable below it (keeps the header + active frame).
+            let durable = wal.durable_len();
+            wal.reclaim(graphus_core::Lsn(durable)).expect("reclaim");
+        }
+        rotate_master_key(&dir.path, &dir.device(), &dir.wal(), &MASTER_A, &MASTER_B)
+            .expect("rotate a reclaimed wal");
+        assert_graph_intact(&dir, &MASTER_B, a, b, r, rt);
     }
 
     /// Recovery is idempotent: running it twice (a crash mid-recovery) still converges to the new key.
