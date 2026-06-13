@@ -72,7 +72,16 @@ use graphus_tck::runner::run_scenario;
 /// `EXISTS { ... RETURN ... }` form, structural (node/relationship/path) values inside list
 /// literals (`toBoolean(n)` via `[true, n]` cannot raise its `TypeError`), and ORDER BY keys
 /// that *evaluate* aggregates (`ORDER BY sum(…)` matching a projected aggregate).
-const BASELINE: usize = 3515;
+///
+/// 3515 → 3540 (#125, feature-level `Background:` blocks): the corpus's sole `Background:` user,
+/// `clauses/match/Match5.feature`, had its graph-seeding `Given`/`having executed:` steps silently
+/// dropped — gherkin parses a `Background:` into `feature.background`, separate from each scenario's
+/// own steps, and the harness only read `feature.scenarios`. Every Match5 scenario therefore ran
+/// against an empty graph, so all 26 variable-length patterns returned 0 rows. Prepending the
+/// background steps to every scenario (Gherkin semantics) fixed Match5 3/29 → 28/29 (+25; the lone
+/// remaining failure is the unsupported double-arrow `<-[*]->` pattern, an honest parser gap). The
+/// variable-length expand engine itself was already correct — proven by `tests/var_length.rs`.
+const BASELINE: usize = 3540;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

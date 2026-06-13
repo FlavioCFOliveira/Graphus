@@ -154,14 +154,30 @@ pub fn load_feature_str(text: &str, feature_rel: &str) -> Result<Vec<Scenario>, 
         .map_err(|e| format!("parse {feature_rel}: {e}"))?;
 
     let mut out = Vec::new();
+    // A feature-level `Background:` block runs before **every** scenario (Cucumber/Gherkin
+    // semantics); the openCypher TCK uses it to seed the graph (`Given an empty graph` + one or more
+    // `And having executed:` CREATE steps). Its steps are parsed by gherkin into `feature.background`
+    // — *separate* from each scenario's own steps — so they must be prepended to every scenario, or
+    // the setup is silently lost and every query runs against an empty graph.
+    let feature_bg: &[gherkin::Step] = feature
+        .background
+        .as_ref()
+        .map_or(&[], |bg| bg.steps.as_slice());
+
     // Scenarios may live directly on the feature or be grouped under rules; walk both so none are
     // missed (the gherkin model exposes rule-grouped scenarios separately).
     for sc in &feature.scenarios {
-        out.extend(expand_scenario(sc, feature_rel));
+        out.extend(expand_scenario(sc, feature_bg, feature_rel));
     }
     for rule in &feature.rules {
+        // A `Rule:` may carry its own `Background:` that runs *after* the feature background for the
+        // scenarios under that rule (Gherkin semantics). Concatenate feature-then-rule background.
+        let mut rule_bg: Vec<gherkin::Step> = feature_bg.to_vec();
+        if let Some(bg) = rule.background.as_ref() {
+            rule_bg.extend(bg.steps.iter().cloned());
+        }
         for sc in &rule.scenarios {
-            out.extend(expand_scenario(sc, feature_rel));
+            out.extend(expand_scenario(sc, &rule_bg, feature_rel));
         }
     }
     Ok(out)
@@ -277,22 +293,27 @@ fn sanitize_table_line(line: &str, out: &mut String) {
 /// With no `Examples`, the scenario is classified once verbatim. With one or more `Examples` blocks,
 /// each data row produces one concrete scenario whose steps have had every `<column>` placeholder
 /// substituted by that row's value (`tck/README.adoc`: the outline is expanded per Examples row).
-fn expand_scenario(sc: &gherkin::Scenario, feature_rel: &str) -> Vec<Scenario> {
+fn expand_scenario(
+    sc: &gherkin::Scenario,
+    background: &[gherkin::Step],
+    feature_rel: &str,
+) -> Vec<Scenario> {
+    // Background steps run first, then the scenario's own steps (Gherkin semantics).
+    let all_steps = || background.iter().chain(sc.steps.iter());
+
     let substitutions = examples_rows(sc);
     if substitutions.is_empty() {
         return vec![Scenario {
             feature_rel: feature_rel.to_owned(),
             name: sc.name.clone(),
-            steps: sc.steps.iter().map(classify_step).collect(),
+            steps: all_steps().map(classify_step).collect(),
         }];
     }
 
     substitutions
         .into_iter()
         .map(|row| {
-            let steps = sc
-                .steps
-                .iter()
+            let steps = all_steps()
                 .map(|st| classify_step(&substitute_step(st, &row)))
                 .collect();
             Scenario {
@@ -637,6 +658,66 @@ mod tests {
         assert!(
             matches!(&scs[1].steps[2].kind, StepKind::ResultUnordered(t) if t.rows[0][0] == "6")
         );
+    }
+
+    /// A feature-level `Background:` block must be prepended to **every** scenario's steps — its
+    /// `Given`/`And having executed:` seed steps run before the scenario's own steps. Regression for
+    /// `rmp` #125: the background was parsed by gherkin into `feature.background` and silently dropped,
+    /// so every scenario ran against an empty graph (e.g. `clauses/match/Match5.feature` — the corpus's
+    /// sole `Background:` user — returned 0 rows for all 26 variable-length scenarios).
+    #[test]
+    fn background_steps_are_prepended_to_every_scenario() {
+        let f = "Feature: F\n\n  Background:\n\
+                 \x20   Given an empty graph\n\
+                 \x20   And having executed:\n      \"\"\"\n      CREATE (:A)\n      \"\"\"\n\n\
+                 \x20 Scenario: S1\n\
+                 \x20   When executing query:\n      \"\"\"\n      MATCH (n) RETURN n\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | n    |\n      | (:A) |\n\
+                 \x20   And no side effects\n\n\
+                 \x20 Scenario: S2\n\
+                 \x20   When executing query:\n      \"\"\"\n      MATCH (n) RETURN count(*) AS c\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | c |\n      | 1 |\n\
+                 \x20   And no side effects\n";
+        let scs = one(f);
+        assert_eq!(scs.len(), 2, "two scenarios under one background");
+        for sc in &scs {
+            // Each scenario starts with the two background steps, then its own When/Then/AndNoSideEffects.
+            assert!(
+                matches!(sc.steps[0].kind, StepKind::EmptyGraph),
+                "background `Given an empty graph` must lead, got {:?}",
+                sc.steps[0].kind
+            );
+            assert!(
+                matches!(&sc.steps[1].kind, StepKind::InitQuery(q) if q == "CREATE (:A)"),
+                "background `having executed:` must follow, got {:?}",
+                sc.steps[1].kind
+            );
+            assert!(
+                matches!(&sc.steps[2].kind, StepKind::Query(_)),
+                "the scenario's own `When` follows the background, got {:?}",
+                sc.steps[2].kind
+            );
+        }
+    }
+
+    /// A `Scenario Outline` under a `Background:` gets the background prepended to **each** expanded
+    /// row's scenario (the background runs once per concrete scenario).
+    #[test]
+    fn background_is_prepended_to_each_outline_row() {
+        let f = "Feature: F\n\n  Background:\n\
+                 \x20   Given an empty graph\n\n\
+                 \x20 Scenario Outline: S\n\
+                 \x20   When executing query:\n      \"\"\"\n      RETURN <expr> AS r\n      \"\"\"\n\
+                 \x20   Then the result should be, in any order:\n      | r     |\n      | <res> |\n\
+                 \x20   Examples:\n      | expr | res |\n      | 1+1  | 2   |\n      | 2*3  | 6   |\n";
+        let scs = one(f);
+        assert_eq!(scs.len(), 2, "two Examples rows -> two scenarios");
+        for sc in &scs {
+            assert!(
+                matches!(sc.steps[0].kind, StepKind::EmptyGraph),
+                "every outline row must carry the background first"
+            );
+        }
     }
 
     #[test]
