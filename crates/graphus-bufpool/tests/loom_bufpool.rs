@@ -305,7 +305,8 @@ fn loom_wal_rule_before_every_write_back() {
         let p0 = pool.clone();
         let t0 = loom::thread::spawn(move || {
             if let Ok((f, _id)) = p0.new_page() {
-                p0.with_page_mut(f, |pg| pg[10] = 0xAA);
+                // A WAL-logged change stamps the page's redo LSN (write into the body, offset >= 24).
+                p0.with_page_mut_lsn(f, Lsn(0x10), |pg| pg[100] = 0xAA);
                 p0.unpin(f);
             }
         });
@@ -313,7 +314,7 @@ fn loom_wal_rule_before_every_write_back() {
         let p1 = pool.clone();
         let t1 = loom::thread::spawn(move || {
             if let Ok((f, _id)) = p1.new_page() {
-                p1.with_page_mut(f, |pg| pg[20] = 0xBB);
+                p1.with_page_mut_lsn(f, Lsn(0x20), |pg| pg[120] = 0xBB);
                 p1.unpin(f);
             }
         });

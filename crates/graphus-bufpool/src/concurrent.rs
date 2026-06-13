@@ -266,6 +266,27 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         func(&mut meta.data)
     }
 
+    /// Like [`with_page_mut`](Self::with_page_mut) but **stamps `lsn` as the page's `page_lsn`** under
+    /// the write latch before applying `func` — the first-class way to record a WAL-logged change so
+    /// the WAL-before-data rule holds at write-back (storage audit F6).
+    ///
+    /// Any mutation backed by a WAL record MUST use this (or stamp `page_lsn` inside
+    /// `with_page_mut`'s closure): a dirty page written home with `page_lsn == 0` under a real
+    /// [`WalRule`] would make [`write_back`](Self::write_back)'s `ensure_durable(0)` a no-op and
+    /// silently break WAL-before-data. `with_page_mut` is for stamp-free work only (e.g. zero-init of
+    /// a freshly allocated page); `write_back` debug-asserts the invariant.
+    pub fn with_page_mut_lsn<R>(
+        &self,
+        f: PinnedFrame,
+        lsn: Lsn,
+        func: impl FnOnce(&mut Page) -> R,
+    ) -> R {
+        let mut meta = unwrap_lock(self.frames[f.0].meta.write());
+        meta.dirty = true;
+        page::set_page_lsn(&mut meta.data, lsn);
+        func(&mut meta.data)
+    }
+
     /// Decrements the pin count of a frame (`Release`), so the frame can later be evicted once no
     /// pins remain. Saturating at zero, so a stray double-unpin cannot underflow.
     pub fn unpin(&self, f: PinnedFrame) {
@@ -418,7 +439,17 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         self.write_back(&mut meta)
     }
 
-    /// Writes every dirty frame back and syncs the device.
+    /// Writes every dirty frame back (each under its own write latch) and syncs the device.
+    ///
+    /// # Concurrency contract (storage audit F12)
+    /// This is **not** a global barrier under concurrent writers: each frame's latch is released
+    /// after its write-back, so a writer can re-dirty a frame *after* it was written but *before* the
+    /// final `sync_all`. Such a page is left dirty (its dirty flag is re-set) and is captured by a
+    /// later `flush_all` — so **no committed change is ever lost**, but a returned `Ok` does not mean
+    /// "every page dirty at the call instant is now durable". A caller needing that stronger barrier
+    /// (a *sharp* checkpoint) must **quiesce writers** for the duration — which the single-threaded
+    /// storage engine's checkpoint does by construction (it owns the only writer). Do not rely on
+    /// `flush_all` alone as a checkpoint barrier from multiple concurrent writers.
     ///
     /// # Errors
     /// Propagates the first WAL-rule, device-write or sync failure.
@@ -585,6 +616,16 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             .ok_or_else(|| GraphusError::Storage("a dirty frame must hold a page".to_owned()))?;
         page::write_checksum(&mut meta.data);
         let lsn = page::page_lsn(&meta.data);
+        // WAL-before-data invariant (storage audit F6): under a real WAL every dirty page must carry
+        // a non-zero `page_lsn`, else `ensure_durable(0)` is a no-op and the data could reach the
+        // device before its redo record is durable. A `page_lsn` of 0 here means the mutation failed
+        // to stamp it (use `with_page_mut_lsn`). Debug-only: cheap, and the production path stamps.
+        debug_assert!(
+            lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
+            "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did not \
+             stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
+            page_id.0
+        );
         // WAL rule: the log must be durable through this page's LSN before the data is written
         // home (`specification` §3.2 page_lsn, §4.3 steal/no-force).
         self.ensure_durable(lsn)?;
@@ -605,11 +646,13 @@ struct Victim<'a> {
     guard: RwLockWriteGuard<'a, FrameMeta>,
 }
 
-fn unwrap_lock<T>(r: std::result::Result<T, impl std::fmt::Debug>) -> T {
-    match r {
-        Ok(v) => v,
-        Err(e) => panic!("buffer-pool lock poisoned: {e:?}"),
-    }
+/// Acquires a latch/mutex guard, **recovering it even if a prior holder panicked** (storage audit
+/// F14). A poisoned latch must not permanently wedge a frame (every later access would panic, an
+/// availability failure under extreme load): the protected state is just page bytes + a dirty flag,
+/// and the WAL provides durability/recovery for any change a panicking mutation left partial, so the
+/// guard is taken via [`PoisonError::into_inner`] rather than re-panicking.
+fn unwrap_lock<G>(r: std::result::Result<G, std::sync::PoisonError<G>>) -> G {
+    r.unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // The behavioural tests below run under the *normal* `cargo test` gate (no loom). They mirror the
@@ -627,6 +670,82 @@ mod tests {
 
     fn pool(cap: usize) -> ConcurrentBufferPool<MemBlockDevice> {
         ConcurrentBufferPool::new(MemBlockDevice::new(0), cap)
+    }
+
+    /// A [`WalRule`] that records the highest LSN it was asked to harden and reports `tracks_lsn`
+    /// like a real WAL — so a write-back's WAL-rule call can be observed.
+    #[derive(Default)]
+    struct RecordingWal {
+        max_hardened: u64,
+    }
+    impl WalRule for RecordingWal {
+        fn ensure_durable(&mut self, up_to: Lsn) -> Result<()> {
+            self.max_hardened = self.max_hardened.max(up_to.0);
+            Ok(())
+        }
+    }
+
+    /// F6: a write-back hardens the page's **stamped** redo LSN (via `with_page_mut_lsn`), not `0` —
+    /// proving the WAL-before-data rule sees the real LSN once the concurrent pool backs a real WAL.
+    #[test]
+    fn write_back_hardens_the_stamped_lsn() {
+        let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), RecordingWal::default(), 2);
+        let (f, _id) = p.new_page().unwrap();
+        // Write into the page BODY (offset >= HEADER_SIZE); the page_lsn header lives at offset 8.
+        p.with_page_mut_lsn(f, Lsn(4242), |page| page[100] = 0x7);
+        p.unpin(f);
+        p.flush_all().unwrap();
+        assert_eq!(
+            p.wal.lock().unwrap().max_hardened,
+            4242,
+            "write-back must harden the mutation's stamped LSN, not 0"
+        );
+    }
+
+    /// F14: a panic inside a `with_page_mut` closure must not permanently wedge the frame — the
+    /// poisoned latch is recovered and the pool stays usable.
+    #[test]
+    fn a_panicking_mutation_does_not_wedge_the_pool() {
+        let p = pool(2);
+        let (f, _id) = p.new_page().unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.with_page_mut(f, |_page| panic!("boom in mutation"));
+        }));
+        assert!(panicked.is_err(), "the mutation closure panicked");
+        // The frame is still usable (latch recovered from poison, not wedged).
+        p.with_page_mut(f, |page| page[5] = 0x9);
+        assert_eq!(
+            p.with_page(f, |page| page[5]),
+            0x9,
+            "the frame must be usable after a panicked mutation"
+        );
+        p.unpin(f);
+        p.flush_all().unwrap();
+    }
+
+    /// F12: a page re-dirtied after a `flush_all` is tracked as dirty again (not lost) and a later
+    /// `flush_all` clears it — the documented no-loss property of the non-barrier flush.
+    #[test]
+    fn a_redirtied_page_is_preserved_and_flushed_later() {
+        let p = pool(2);
+        let (f, _id) = p.new_page().unwrap();
+        p.with_page_mut(f, |page| page[0] = 1);
+        p.flush_all().unwrap();
+        assert_eq!(p.dirty_frames(), 0, "first flush clears the dirty page");
+        // Re-dirty after the flush: it must be tracked again, so a later flush persists it.
+        p.with_page_mut(f, |page| page[0] = 2);
+        assert_eq!(
+            p.dirty_frames(),
+            1,
+            "a re-dirtied page is dirty again, never silently lost"
+        );
+        p.flush_all().unwrap();
+        assert_eq!(
+            p.dirty_frames(),
+            0,
+            "the later flush captures the re-dirtied page"
+        );
+        p.unpin(f);
     }
 
     #[test]
@@ -693,7 +812,9 @@ mod tests {
         }
         let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), FailWal, 2);
         let (f, _id) = p.new_page().unwrap();
-        p.with_page_mut(f, |page| page[0] = 1);
+        // Stamp a real redo LSN (a WAL-logged change always does), so the write-back exercises the
+        // ensure_durable failure path rather than the unstamped-page debug-assert.
+        p.with_page_mut_lsn(f, Lsn(1), |page| page[100] = 1);
         assert!(p.flush(f).is_err()); // the WAL rule refuses, so the write-back fails
     }
 

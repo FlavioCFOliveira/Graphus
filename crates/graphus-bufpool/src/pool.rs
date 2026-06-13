@@ -18,6 +18,14 @@ use crate::page;
 pub trait WalRule {
     /// Ensures the log is durable up to (and including) `up_to`.
     fn ensure_durable(&mut self, up_to: Lsn) -> Result<()>;
+
+    /// Whether this rule tracks real LSNs (a real WAL) rather than treating everything as already
+    /// durable ([`NoWal`]). When `true`, every dirty page written home must carry a non-zero
+    /// `page_lsn` — otherwise the WAL-before-data rule cannot be honoured (a debug-assert in the
+    /// concurrent pool's write-back enforces this; see `ConcurrentBufferPool`). Defaults to `true`.
+    fn tracks_lsn(&self) -> bool {
+        true
+    }
 }
 
 /// A [`WalRule`] for standalone use (no WAL): every LSN is considered already durable.
@@ -27,6 +35,10 @@ pub struct NoWal;
 impl WalRule for NoWal {
     fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
         Ok(())
+    }
+
+    fn tracks_lsn(&self) -> bool {
+        false
     }
 }
 
