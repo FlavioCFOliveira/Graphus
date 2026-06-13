@@ -148,7 +148,17 @@ use graphus_tck::runner::run_scenario;
 /// zero regressions: clauses 1113→1117, expressions 2486→2515, useCases 24→24; `with-orderBy`
 /// 277/292 and `return-orderby` 24/35 both *unchanged* (the orderability path is preserved). The
 /// net +33 equals the sum of the affected-feature gains exactly.
-const BASELINE: usize = 3656;
+///
+/// 3656 → 3667 (#131, `percentileDisc`/`percentileCont` aggregations): the two percentile aggregates
+/// are now computed in the executor's group accumulator following Neo4j's exact algorithm —
+/// `percentileDisc` is nearest-rank (`floatIdx = p*count`, returning a real set member with its
+/// source numeric subtype), `percentileCont` is linear interpolation (`floatIdx = p*(count-1)`,
+/// always a `Float`). The percentile argument (`args[1]`) is captured and range-validated on the
+/// first contributing row; a value outside `[0,1]` raises the new `EvalError::NumberOutOfRange`,
+/// which classifies to the TCK `ArgumentError: NumberOutOfRange`. Wins: `expressions/aggregation`
+/// Aggregation6 [1]/[2] (values) and [3]/[4]/[5] (bad-argument errors), +11. Measured, zero
+/// regressions: the net +11 equals the Aggregation6 percentile-scenario count exactly.
+const BASELINE: usize = 3667;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

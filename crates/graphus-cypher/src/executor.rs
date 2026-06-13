@@ -2049,6 +2049,12 @@ struct Accumulator {
     extreme: Option<Value>,
     // RowValue-typed so `collect(n)` / `collect(nodes(p))` keep their structural elements.
     collected: Vec<RowValue>,
+    // `percentileCont`/`percentileDisc`: every numeric input value, kept as `(sort_key, original)`
+    // so the result can preserve the source numeric subtype (`percentileDisc` returns a real value
+    // of the set) while sorting on the `f64` key. The percentile (`args[1]`) is captured and
+    // range-validated on the first contributing row, matching Neo4j's `onFirstRow` semantics.
+    numeric: Vec<(f64, Value)>,
+    percentile: Option<f64>,
 }
 
 /// The aggregate function an [`Accumulator`] computes.
@@ -2061,6 +2067,12 @@ enum AggKind {
     Min,
     Max,
     Collect,
+    /// `percentileCont(expr, p)` — continuous percentile via linear interpolation over the sorted
+    /// numeric values; `p ∈ [0.0, 1.0]`.
+    PercentileCont,
+    /// `percentileDisc(expr, p)` — discrete percentile (nearest-rank) returning a real value of the
+    /// set; `p ∈ [0.0, 1.0]`.
+    PercentileDisc,
     /// A non-aggregating expression placed in the aggregate slot (defensive; treated as last value).
     Other,
 }
@@ -2078,6 +2090,8 @@ impl Accumulator {
                     "min" => AggKind::Min,
                     "max" => AggKind::Max,
                     "collect" => AggKind::Collect,
+                    "percentilecont" => AggKind::PercentileCont,
+                    "percentiledisc" => AggKind::PercentileDisc,
                     _ => AggKind::Other,
                 };
                 (kind, *distinct)
@@ -2094,6 +2108,8 @@ impl Accumulator {
             int_sum: 0,
             extreme: None,
             collected: Vec::new(),
+            numeric: Vec::new(),
+            percentile: None,
         }
     }
 
@@ -2127,6 +2143,30 @@ impl Accumulator {
         // `collect` keeps the full RowValue (structural elements survive into the list).
         if self.kind == AggKind::Collect {
             self.collected.push(rv);
+            return Ok(());
+        }
+        // `percentileCont`/`percentileDisc(value, p)`: gather every numeric `value`, keyed by its
+        // `f64` for sorting but keeping the original `Value` so `percentileDisc` returns a real set
+        // member with its source subtype. The percentile is captured and range-validated on the
+        // first contributing (numeric, non-null) row — mirroring Neo4j's `onFirstRow`, which runs
+        // inside the per-number callback, so a leading null `value` contributes no validation.
+        if matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc) {
+            let argv = collapse_rv(&rv);
+            let key = match &argv {
+                Value::Integer(i) => *i as f64,
+                Value::Float(f) => *f,
+                // A non-numeric `value` is a runtime type error (the aggregate operates on numbers).
+                _ => {
+                    return Err(ExecError::Eval(EvalError::TypeError {
+                        context: "percentileCont/percentileDisc require numeric input".to_owned(),
+                    }));
+                }
+            };
+            if self.percentile.is_none() {
+                let p = self.eval_percentile(expr, row, ctx)?;
+                self.percentile = Some(p);
+            }
+            self.numeric.push((key, argv));
             return Ok(());
         }
         // The collapsed property value for the numeric / extreme arms. An entity/path collapses to
@@ -2175,9 +2215,48 @@ impl Accumulator {
             }
             AggKind::Other => self.extreme = Some(argv),
             // Handled by the early returns above.
-            AggKind::Collect | AggKind::CountStar => unreachable!(),
+            AggKind::Collect
+            | AggKind::CountStar
+            | AggKind::PercentileCont
+            | AggKind::PercentileDisc => unreachable!(),
         }
         Ok(())
+    }
+
+    /// Evaluates and range-validates the percentile argument (`args[1]`) of a
+    /// `percentileCont`/`percentileDisc` call. The percentile is a per-group constant; the semantic
+    /// pass guarantees it does not reference the aggregated value, so any contributing row yields
+    /// the same result.
+    ///
+    /// # Errors
+    ///
+    /// - [`EvalError::TypeError`] if the percentile is not a number (or is null);
+    /// - [`EvalError::NumberOutOfRange`] if it lies outside `[0.0, 1.0]`.
+    fn eval_percentile(&self, expr: &Expr, row: &Row, ctx: &mut Ctx<'_>) -> Result<f64, ExecError> {
+        let arg = match &expr.kind {
+            ExprKind::FunctionCall { args, .. } if args.len() >= 2 => &args[1],
+            // Arity is checked at compile time; a malformed call reaching here is a type error.
+            _ => {
+                return Err(ExecError::Eval(EvalError::TypeError {
+                    context: "percentileCont/percentileDisc expect (value, percentile)".to_owned(),
+                }));
+            }
+        };
+        let p = match collapse_rv(&eval(arg, row, ctx.params, ctx.graph, ctx.functions)?) {
+            Value::Integer(i) => i as f64,
+            Value::Float(f) => f,
+            _ => {
+                return Err(ExecError::Eval(EvalError::TypeError {
+                    context: "percentile must be a number".to_owned(),
+                }));
+            }
+        };
+        if !(0.0..=1.0).contains(&p) {
+            return Err(ExecError::Eval(EvalError::NumberOutOfRange {
+                value: p.to_string(),
+            }));
+        }
+        Ok(p)
     }
 
     /// Produces the group's aggregate value.
@@ -2201,8 +2280,59 @@ impl Accumulator {
             AggKind::Min | AggKind::Max | AggKind::Other => self.extreme.unwrap_or(Value::Null),
             // `collect` builds the canonical list (structural iff any element is).
             AggKind::Collect => return RowValue::list(self.collected),
+            AggKind::PercentileCont | AggKind::PercentileDisc => self.finish_percentile(),
         };
         RowValue::Value(value)
+    }
+
+    /// Computes the group's percentile (`percentileCont`/`percentileDisc`) over the gathered numeric
+    /// values, following Neo4j's algorithm exactly. With no contributing values the result is
+    /// `null`. The percentile was already range-validated in [`Accumulator::update`].
+    fn finish_percentile(mut self) -> Value {
+        let count = self.numeric.len();
+        if count == 0 {
+            return Value::Null;
+        }
+        // Sort ascending by the numeric key (NaN cannot occur: inputs are real `Integer`/`Float`).
+        self.numeric
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // `percentile` is `Some` whenever `numeric` is non-empty (both are set together in `update`).
+        let perc = self.percentile.unwrap_or(0.0);
+
+        match self.kind {
+            AggKind::PercentileDisc => {
+                // Nearest-rank: returns a real value of the set (original subtype preserved).
+                let idx = if perc == 1.0 || count == 1 {
+                    count - 1
+                } else {
+                    let float_idx = perc * count as f64;
+                    let to_int = float_idx as usize; // truncation toward zero (perc, count ≥ 0)
+                    if float_idx != to_int as f64 || to_int == 0 {
+                        to_int
+                    } else {
+                        to_int - 1
+                    }
+                };
+                self.numeric[idx].1.clone()
+            }
+            AggKind::PercentileCont => {
+                // Linear interpolation; always yields a `Float`.
+                if perc == 1.0 || count == 1 {
+                    return Value::Float(self.numeric[count - 1].0);
+                }
+                let float_idx = perc * (count - 1) as f64;
+                let floor = float_idx as usize; // truncation toward zero
+                let ceil = float_idx.ceil() as usize;
+                let value = if ceil == floor || floor == count - 1 {
+                    self.numeric[floor].0
+                } else {
+                    self.numeric[floor].0 * (ceil as f64 - float_idx)
+                        + self.numeric[ceil].0 * (float_idx - floor as f64)
+                };
+                Value::Float(value)
+            }
+            _ => unreachable!("finish_percentile is only reached for percentile kinds"),
+        }
     }
 }
 
@@ -3475,5 +3605,149 @@ mod tests {
             plan.to_string().contains("SpatialIndexSeek"),
             "the indexed plan must route through the spatial seek:\n{plan}"
         );
+    }
+
+    // ---- rmp #131: percentileDisc / percentileCont aggregations -------------------------------
+
+    /// Runs `src`, returning the runtime error (panics if the query succeeds). Sibling of [`run`].
+    fn run_err(src: &str, graph: &mut MemGraph) -> ExecError {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let plan = plan_physical(
+            &lower(&analyze(&ast).expect("analyze")),
+            &IndexCatalog::empty(),
+        );
+        let params = crate::binding::bind_parameters(&plan, &crate::binding::Parameters::new())
+            .expect("bind");
+        // The error may surface either while opening the cursor (aggregation is eager) or while
+        // draining it; capture it from whichever stage produces it.
+        match execute(&plan, &params, graph) {
+            Err(e) => e,
+            Ok(mut cursor) => cursor
+                .collect_all()
+                .expect_err("query was expected to fail at runtime"),
+        }
+    }
+
+    /// Builds a graph of one node per element of `prices` (property `price`), so an aggregation over
+    /// `MATCH (n) RETURN agg(n.price, ...)` sees exactly those values.
+    fn prices_graph(prices: &[f64]) -> MemGraph {
+        let mut g = MemGraph::new();
+        for &p in prices {
+            let _ = g.add_node(["P"], [("price", Value::Float(p))]);
+        }
+        g
+    }
+
+    fn percentile(agg: &str, prices: &[f64], p: f64) -> Value {
+        let mut g = prices_graph(prices);
+        let src = format!("MATCH (n) RETURN {agg}(n.price, {p}) AS r");
+        let rows = run(&src, &mut g);
+        assert_eq!(
+            rows.len(),
+            1,
+            "an aggregation over a non-empty match is one row"
+        );
+        rows[0].value("r")
+    }
+
+    #[test]
+    fn percentile_disc_nearest_rank_over_known_set() {
+        // Sorted set [1,2,3,4]; nearest-rank `idx`:
+        //   p=0   -> floatIdx=0,  idx=0 -> 1
+        //   p=0.5 -> floatIdx=2,  idx=1 (exact, non-zero -> idx-1) -> 2
+        //   p=1.0 -> last -> 4
+        let xs = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(percentile("percentileDisc", &xs, 0.0), Value::Float(1.0));
+        assert_eq!(percentile("percentileDisc", &xs, 0.5), Value::Float(2.0));
+        assert_eq!(percentile("percentileDisc", &xs, 1.0), Value::Float(4.0));
+    }
+
+    #[test]
+    fn percentile_cont_linear_interpolation_over_known_set() {
+        // Sorted set [1,2,3,4]; floatIdx = p*(n-1) = p*3:
+        //   p=0   -> idx 0 -> 1.0
+        //   p=0.5 -> floatIdx=1.5, floor=1,ceil=2 -> 2*(0.5)+3*(0.5) = 2.5
+        //   p=1.0 -> last -> 4.0
+        let xs = [1.0, 2.0, 3.0, 4.0];
+        assert_eq!(percentile("percentileCont", &xs, 0.0), Value::Float(1.0));
+        assert_eq!(percentile("percentileCont", &xs, 0.5), Value::Float(2.5));
+        assert_eq!(percentile("percentileCont", &xs, 1.0), Value::Float(4.0));
+    }
+
+    #[test]
+    fn percentile_three_value_set_matches_tck_examples() {
+        // TCK Aggregation6 [1]/[2]: prices 10/20/30, p=0/0.5/1 -> 10/20/30 for both functions.
+        let xs = [10.0, 20.0, 30.0];
+        for agg in ["percentileDisc", "percentileCont"] {
+            assert_eq!(percentile(agg, &xs, 0.0), Value::Float(10.0));
+            assert_eq!(percentile(agg, &xs, 0.5), Value::Float(20.0));
+            assert_eq!(percentile(agg, &xs, 1.0), Value::Float(30.0));
+        }
+    }
+
+    #[test]
+    fn percentile_disc_preserves_integer_subtype() {
+        // `percentileDisc` returns a real member of the set, so an integer property stays an integer.
+        let mut g = MemGraph::new();
+        for v in [1_i64, 2, 3, 4] {
+            let _ = g.add_node(["P"], [("price", Value::Integer(v))]);
+        }
+        let rows = run("MATCH (n) RETURN percentileDisc(n.price, 0.5) AS r", &mut g);
+        assert_eq!(rows[0].value("r"), Value::Integer(2));
+    }
+
+    #[test]
+    fn percentile_ignores_null_values() {
+        // A null `value` contributes nothing (like every other aggregate), so [null,1,2,3,4] behaves
+        // exactly like [1,2,3,4].
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["P"], NO_PROPS); // no `price` -> n.price is null
+        for v in [1.0, 2.0, 3.0, 4.0] {
+            let _ = g.add_node(["P"], [("price", Value::Float(v))]);
+        }
+        let rows = run("MATCH (n) RETURN percentileCont(n.price, 0.5) AS r", &mut g);
+        assert_eq!(rows[0].value("r"), Value::Float(2.5));
+    }
+
+    #[test]
+    fn percentile_over_empty_set_is_null() {
+        let mut g = MemGraph::new();
+        let rows = run(
+            "MATCH (n:Missing) RETURN percentileDisc(n.price, 0.5) AS r",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1, "the empty group still emits one row");
+        assert_eq!(rows[0].value("r"), Value::Null);
+        let rows = run(
+            "MATCH (n:Missing) RETURN percentileCont(n.price, 0.5) AS r",
+            &mut g,
+        );
+        assert_eq!(rows[0].value("r"), Value::Null);
+    }
+
+    #[test]
+    fn percentile_out_of_range_is_number_out_of_range() {
+        // The percentile must lie in [0,1]; outside it raises NumberOutOfRange (TCK ArgumentError).
+        for p in ["1.5", "-0.1", "1000", "-1"] {
+            for agg in ["percentileDisc", "percentileCont"] {
+                let mut g = prices_graph(&[10.0]);
+                let src = format!("MATCH (n) RETURN {agg}(n.price, {p}) AS r");
+                match run_err(&src, &mut g) {
+                    ExecError::Eval(EvalError::NumberOutOfRange { .. }) => {}
+                    other => panic!("expected NumberOutOfRange for {agg}(.., {p}), got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn percentile_non_numeric_argument_is_type_error() {
+        // A non-numeric percentile is a runtime type error, not NumberOutOfRange.
+        let mut g = prices_graph(&[10.0]);
+        match run_err("MATCH (n) RETURN percentileCont(n.price, 'x') AS r", &mut g) {
+            ExecError::Eval(EvalError::TypeError { .. }) => {}
+            other => panic!("expected TypeError for a string percentile, got {other:?}"),
+        }
     }
 }

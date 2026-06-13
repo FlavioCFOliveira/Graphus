@@ -63,6 +63,15 @@ pub enum EvalError {
         /// The dotted function name.
         name: String,
     },
+    /// A numeric argument fell outside the range a built-in accepts — e.g. the `percentile`
+    /// argument of `percentileCont`/`percentileDisc`, which must lie in `[0.0, 1.0]`. Maps to the
+    /// Bolt/TCK `ArgumentError` class with the `NumberOutOfRange` detail (the same class an
+    /// invalid-argument runtime failure takes).
+    NumberOutOfRange {
+        /// The offending value, pre-formatted for the diagnostic message (kept as a `String` so the
+        /// error type stays `Eq`).
+        value: String,
+    },
     /// A **user-defined function** (`rmp` task #75) — registered as an extension — failed at
     /// runtime: its body returned a
     /// [`FunctionFailure`](crate::function_registry::FunctionFailure), typically because an argument
@@ -89,6 +98,9 @@ impl fmt::Display for EvalError {
                     f,
                     "function `{name}` is not implemented in the executor yet"
                 )
+            }
+            Self::NumberOutOfRange { value } => {
+                write!(f, "number out of range: {value} is not in [0.0, 1.0]")
             }
             Self::ExtensionFunction { name, message } => {
                 write!(f, "function `{name}` failed: {message}")

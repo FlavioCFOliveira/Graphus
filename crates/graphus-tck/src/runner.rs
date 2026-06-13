@@ -817,6 +817,9 @@ fn classify_eval_error(e: &graphus_cypher::EvalError, message: String) -> TckErr
         // A built-in that passed compile-time arity but has no runtime implementation: not a real
         // TCK class. Mark it so the scenario fails honestly rather than matching.
         Ev::UnsupportedFunction { .. } => ("UnsupportedFunction", None),
+        // An out-of-range numeric argument (e.g. a `percentileCont`/`percentileDisc` percentile
+        // outside `[0,1]`) is the TCK `ArgumentError: NumberOutOfRange`.
+        Ev::NumberOutOfRange { .. } => ("ArgumentError", Some("NumberOutOfRange")),
         _ => ("TypeError", None),
     };
     TckError {
