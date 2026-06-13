@@ -157,8 +157,42 @@ static TABLE: &[Signature] = &[
         arity: Arity::Range(0, 1),
         aggregate: false,
     },
+    // Clock variants of the constructors (openCypher temporal CIP; `Temporal4.feature` [13]).
+    // Arity 0 is the "current instant" form (transaction-/statement-/realtime-clock granularity —
+    // a named deferral, needs the clock seam); arity 1 covers the optional `timezone` argument and
+    // the null-propagation form. Each returns the same type as its base constructor.
+    Signature {
+        name: "date.transaction",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "date.statement",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "date.realtime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
     Signature {
         name: "datetime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "datetime.transaction",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "datetime.statement",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "datetime.realtime",
         arity: Arity::Range(0, 1),
         aggregate: false,
     },
@@ -218,12 +252,57 @@ static TABLE: &[Signature] = &[
         aggregate: false,
     },
     Signature {
+        name: "localdatetime.transaction",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "localdatetime.statement",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "localdatetime.realtime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
         name: "localtime",
         arity: Arity::Range(0, 1),
         aggregate: false,
     },
     Signature {
+        name: "localtime.transaction",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "localtime.statement",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "localtime.realtime",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
         name: "time",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "time.transaction",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "time.statement",
+        arity: Arity::Range(0, 1),
+        aggregate: false,
+    },
+    Signature {
+        name: "time.realtime",
         arity: Arity::Range(0, 1),
         aggregate: false,
     },

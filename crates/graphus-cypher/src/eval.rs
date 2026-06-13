@@ -1132,10 +1132,31 @@ fn call_function(
         .collect::<Result<_, _>>()?;
 
     let result = match lower.as_str() {
-        // Temporal constructors (rmp #53): string / component-map / projection forms.
-        "date" | "time" | "datetime" | "localtime" | "localdatetime" | "duration" => {
-            crate::temporal_fns::construct(&lower, argv.first())?
-        }
+        // Temporal constructors (rmp #53): string / component-map / projection forms, plus the
+        // clock variants (`date.transaction`, `localtime.realtime`, … — `Temporal4.feature` [13]).
+        // The clock variants route to the same base constructor; their zero-argument "current
+        // instant" form is a named deferral (needs the clock seam), handled in `construct`.
+        "date"
+        | "time"
+        | "datetime"
+        | "localtime"
+        | "localdatetime"
+        | "duration"
+        | "date.transaction"
+        | "date.statement"
+        | "date.realtime"
+        | "datetime.transaction"
+        | "datetime.statement"
+        | "datetime.realtime"
+        | "localdatetime.transaction"
+        | "localdatetime.statement"
+        | "localdatetime.realtime"
+        | "localtime.transaction"
+        | "localtime.statement"
+        | "localtime.realtime"
+        | "time.transaction"
+        | "time.statement"
+        | "time.realtime" => crate::temporal_fns::construct(&lower, argv.first())?,
         // Spatial point constructor and distance (rmp #73). `distance` and `point.distance` are
         // the two openCypher spellings of the same two-point distance.
         "point" => crate::spatial_fns::construct_point(&argv[0])?,

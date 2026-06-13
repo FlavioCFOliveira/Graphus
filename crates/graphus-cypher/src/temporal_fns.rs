@@ -55,7 +55,22 @@ fn type_err(context: impl Into<String>) -> EvalError {
 
 /// Dispatches a temporal constructor by (lower-cased) name. `None` argument is the
 /// "current instant" form (a named deferral — needs the transaction clock).
+///
+/// Accepts both the bare constructors (`date`, `localtime`, `time`, `localdatetime`, `datetime`,
+/// `duration`) and their **clock variants** (`date.transaction`, `localtime.statement`,
+/// `time.realtime`, …; `Temporal4.feature` [13]). A clock variant is the base type captured at a
+/// given clock granularity: it returns the same type as its base constructor, propagates a `null`
+/// argument to `null`, and — in its zero-argument "current instant" form — is the same named
+/// deferral as the bare constructor (it needs the clock seam, which is not yet wired). The optional
+/// argument of a clock variant is a timezone, which the base constructor's map/string forms already
+/// accept; for the null-propagation path tested by the TCK the argument never reaches the base.
 pub(crate) fn construct(name: &str, arg: Option<&Value>) -> Result<Value, EvalError> {
+    // A clock variant (`<base>.transaction` / `.statement` / `.realtime`) constructs the same type
+    // as its base; strip the suffix so both forms share one code path.
+    let base = name
+        .split_once('.')
+        .filter(|(_, suffix)| matches!(*suffix, "transaction" | "statement" | "realtime"))
+        .map_or(name, |(base, _)| base);
     let Some(arg) = arg else {
         return Err(EvalError::UnsupportedFunction {
             name: format!("{name}() without arguments (requires the transaction clock)"),
@@ -64,7 +79,7 @@ pub(crate) fn construct(name: &str, arg: Option<&Value>) -> Result<Value, EvalEr
     if arg.is_null() {
         return Ok(Value::Null);
     }
-    match name {
+    match base {
         "date" => construct_date(arg),
         "localtime" => construct_local_time(arg),
         "time" => construct_time(arg),
@@ -1610,5 +1625,85 @@ mod tests {
             .expect("localtime() constructs");
         let d = duration_between("duration.between", &a, &b).expect("computes");
         assert_eq!(iso(&d), "PT16H30M");
+    }
+
+    /// `Temporal4.feature` [13]: every constructor and clock variant propagates a `null` argument
+    /// to `null` (rather than raising). The base names plus the 15 clock variants.
+    #[test]
+    fn clock_variants_and_bases_propagate_null() {
+        const NAMES: &[&str] = &[
+            "date",
+            "date.transaction",
+            "date.statement",
+            "date.realtime",
+            "localtime",
+            "localtime.transaction",
+            "localtime.statement",
+            "localtime.realtime",
+            "time",
+            "time.transaction",
+            "time.statement",
+            "time.realtime",
+            "localdatetime",
+            "localdatetime.transaction",
+            "localdatetime.statement",
+            "localdatetime.realtime",
+            "datetime",
+            "datetime.transaction",
+            "datetime.statement",
+            "datetime.realtime",
+            "duration",
+        ];
+        for name in NAMES {
+            let out = construct(name, Some(&Value::Null))
+                .unwrap_or_else(|e| panic!("{name}(null) should be null, got error: {e:?}"));
+            assert_eq!(out, Value::Null, "{name}(null) must be null");
+        }
+    }
+
+    /// A clock variant constructs the same value type as its base constructor when given a
+    /// projection argument (the optional value/timezone form), confirming the suffix strip routes
+    /// to the right base.
+    #[test]
+    fn clock_variants_route_to_their_base_type() {
+        let from_str = |name: &str, s: &str| {
+            construct(name, Some(&Value::String(s.to_owned())))
+                .unwrap_or_else(|e| panic!("{name} constructs: {e:?}"))
+        };
+        assert!(matches!(
+            from_str("date.transaction", "1984-10-11"),
+            Value::Date(_)
+        ));
+        assert!(matches!(
+            from_str("localtime.statement", "12:00"),
+            Value::LocalTime(_)
+        ));
+        assert!(matches!(
+            from_str("time.realtime", "12:00"),
+            Value::ZonedTime(_)
+        ));
+        assert!(matches!(
+            from_str("localdatetime.realtime", "1912-01-01T00:00"),
+            Value::LocalDateTime(_)
+        ));
+        assert!(matches!(
+            from_str("datetime.transaction", "1912-01-01T00:00Z"),
+            Value::ZonedDateTime(_)
+        ));
+    }
+
+    /// The zero-argument "current instant" form of a clock variant remains a documented named
+    /// deferral (it needs the clock seam), exactly like the bare constructor.
+    #[test]
+    fn clock_variants_zero_arg_is_deferred() {
+        for name in ["date.realtime", "datetime.statement", "time.transaction"] {
+            assert!(
+                matches!(
+                    construct(name, None),
+                    Err(EvalError::UnsupportedFunction { .. })
+                ),
+                "{name}() with no argument must defer (clock seam not wired)"
+            );
+        }
     }
 }

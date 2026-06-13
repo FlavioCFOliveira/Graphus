@@ -107,12 +107,18 @@ use graphus_tck::runner::run_scenario;
 /// (+4), `clauses/create/Create5` 0/5 → 4/5 (+4), `clauses/merge/Merge6` 2/6 → 3/6 (+1). Measured:
 /// zero regressions (the net +27 equals the sum of the affected-feature gains exactly). The harness
 /// fix proved temporal *storage* already works: Temporal4 [1]–[12] (date/time/datetime/duration
-/// scalars **and arrays** round-tripping through a node property) all pass. The 15 remaining
-/// Temporal4 failures are one *honest engine gap*: scenario [13] uses the transaction-clock
-/// constructors `date.transaction` / `date.statement` / `date.realtime` (and the `localtime` /
-/// `time` / `localdatetime` / `datetime` equivalents), which the function registry does not yet
-/// know (`unknown function …` at compile time) — input for a follow-up engine task, deliberately
-/// left failing rather than masked.
+/// scalars **and arrays** round-tripping through a node property) all pass.
+///
+/// 3608 → 3623 (#129, temporal clock constructors): scenario Temporal4 [13] (`Should propagate
+/// null`, 15 example rows) now passes — Temporal4 is 39/39. The clock variants
+/// `date.transaction` / `date.statement` / `date.realtime` (and the `localtime` / `time` /
+/// `localdatetime` / `datetime` equivalents) are registered and route to their base constructor:
+/// they return the base type, propagate a `null` argument to `null` (the path the TCK exercises),
+/// and accept the optional timezone argument. Their zero-argument "current instant" form remains a
+/// documented named deferral (it needs a clock seam), shared with the bare constructors — that gap
+/// is the *honest* remaining failure in Temporal10 [12] (`date()` / `time()` / … with no argument),
+/// deliberately left failing rather than masked. Measured: zero regressions (the net +15 equals
+/// Temporal4 [13]'s 15 example rows exactly).
 ///
 /// 3589 → 3608 (#128, WITH … WHERE dual scope): the trailing `WHERE` of a `WITH` (and its `ORDER BY`)
 /// is evaluated in the **dual scope** — the projected aliases UNION the pre-projection input
@@ -126,7 +132,7 @@ use graphus_tck::runner::run_scenario;
 /// `useCases/triadicSelection/TriadicSelection1` +14 (the triadic anti-join / friend-of-a-friend
 /// queries), `clauses/with-where/WithWhere1` +3, `WithWhere7` +2. Measured: zero regressions (the
 /// net +19 equals the sum of the affected-feature gains exactly).
-const BASELINE: usize = 3608;
+const BASELINE: usize = 3623;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.
