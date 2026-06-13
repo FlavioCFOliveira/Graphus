@@ -1462,13 +1462,36 @@ impl<'t, 's> Parser<'t, 's> {
     /// the *chained-comparison* semantics are a later concern). Each comparison's right operand is a
     /// full predicate expression (so predicates bind tighter than comparison, per the EBNF nesting).
     fn parse_comparison(&mut self) -> Result<Expr, SyntaxError> {
-        let mut lhs = self.parse_predicate()?;
-        while let Some(op) = self.peek_comparison_op() {
+        let first = self.parse_predicate()?;
+        let Some(op) = self.peek_comparison_op() else {
+            return Ok(first);
+        };
+        self.bump();
+        let second = self.parse_predicate()?;
+
+        // A single comparison `a OP b` is left as-is.
+        if self.peek_comparison_op().is_none() {
+            return Ok(Self::binary(op, first, second));
+        }
+
+        // A *chained* comparison `a OP1 b OP2 c …` desugars to the conjunction of its adjacent
+        // pairwise comparisons sharing the middle operands: `(a OP1 b) AND (b OP2 c) AND …`
+        // (openCypher; pinned by the TCK `expressions/comparison/Comparison3` range scenarios, e.g.
+        // `1 < n < 3` ≡ `1 < n AND n < 3`). Operands in expression position are side-effect-free, so
+        // re-using the shared operand by `clone` is semantically exact.
+        //
+        // `prev` holds the right operand of the comparison just emitted; it becomes the left operand
+        // of the next link. `acc` accumulates the running conjunction.
+        let mut prev = second.clone();
+        let mut acc = Self::binary(op, first, second);
+        while let Some(next_op) = self.peek_comparison_op() {
             self.bump();
             let rhs = self.parse_predicate()?;
-            lhs = Self::binary(op, lhs, rhs);
+            let link = Self::binary(next_op, prev, rhs.clone());
+            prev = rhs;
+            acc = Self::binary(BinaryOp::And, acc, link);
         }
-        Ok(lhs)
+        Ok(acc)
     }
 
     /// Maps the current token to a comparison [`BinaryOp`] if it is one.

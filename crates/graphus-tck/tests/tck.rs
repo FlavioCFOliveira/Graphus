@@ -132,7 +132,23 @@ use graphus_tck::runner::run_scenario;
 /// `useCases/triadicSelection/TriadicSelection1` +14 (the triadic anti-join / friend-of-a-friend
 /// queries), `clauses/with-where/WithWhere1` +3, `WithWhere7` +2. Measured: zero regressions (the
 /// net +19 equals the sum of the affected-feature gains exactly).
-const BASELINE: usize = 3623;
+///
+/// 3623 → 3656 (#130, comparability vs orderability for `<`/`>`/`<=`/`>=`): the inequality operators
+/// now use the openCypher **comparability** *partial* relation (`graphus_cypher::compare_values`,
+/// CIP2016-06-14 §Comparability) instead of the total **orderability** (`cmp_values`, which
+/// `ORDER BY`/`min`/`max`/`DISTINCT`/indexes keep — left untouched). A cross-type comparison
+/// (string vs number, a `map` operand, mismatched temporal classes / point CRS, a `null` reached
+/// inside a list) now yields `NULL`; `NaN`-vs-number yields `FALSE` while `NaN`-vs-non-number yields
+/// `NULL`. Two further pre-existing bugs found and fixed in the same cycle: (a) **chained
+/// comparisons** `a < b < c` were parsed left-associatively as `(a < b) < c` (a boolean compared to
+/// `c`) instead of desugaring to the conjunction `a < b AND b < c`; (b) **large-integer equality**
+/// compared two `INTEGER`s through `f64`, so distinct 19-digit ids collapsed to equal. Wins:
+/// `expressions/comparison` 47→72 (Comparison1 [12]/[13], Comparison2 [1]–[6], Comparison3 [1]–[9]
+/// ranges, Comparison4 chains), plus clause-level cross-type/range queries. Measured per-category,
+/// zero regressions: clauses 1113→1117, expressions 2486→2515, useCases 24→24; `with-orderBy`
+/// 277/292 and `return-orderby` 24/35 both *unchanged* (the orderability path is preserved). The
+/// net +33 equals the sum of the affected-feature gains exactly.
+const BASELINE: usize = 3656;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

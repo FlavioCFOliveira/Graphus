@@ -200,6 +200,103 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// The Cypher **comparability** of two values — the *partial* relation behind the inequality
+/// operators `<`, `>`, `<=`, `>=` (CIP2016-06-14 §Comparability, the TCK-enforced source).
+///
+/// Returns `Some(Ordering)` when the two values are comparable, and `None` when they are
+/// **incomparable** — in which case the operator yields `NULL`. This is deliberately *distinct* from
+/// [`cmp_values`] (the total *orderability* used by `ORDER BY`, `min`/`max`, `DISTINCT` and the
+/// index key codec, which must stay a total order over *all* values, including across classes,
+/// `NaN` and `null`).
+///
+/// The comparability rules (CIP §Comparability), each making the result incomparable (`None`) where
+/// stated:
+///
+/// - **`null`**: a `null` operand (or a `null` *reached as the deciding element of a list*) is
+///   incomparable. (Callers must already have handled a *top-level* `null`; this function still
+///   guards it for nested-list correctness.)
+/// - **Numbers**: `INTEGER` and `FLOAT` compare numerically across the supertype. A `NaN` operand
+///   makes a *number-vs-number* comparison incomparable (`None`); the TCK pins `NaN`-vs-number to a
+///   `false` inequality, which the operator layer derives from `None` together with the cross-type
+///   rule below (NaN-vs-string is `null`, NaN-vs-number is `false`).
+/// - **Strings**: lexicographically by Unicode code units.
+/// - **Booleans**: `false < true`.
+/// - **Bytes**: lexicographically (a Graphus/PackStream extension, internally consistent).
+/// - **Temporals**: comparable only **within the same temporal class**; different temporal classes
+///   are incomparable.
+/// - **Spatial points**: comparable only within the **same CRS**; a different CRS is incomparable.
+/// - **Lists**: compared element-by-element. The first position whose elements are *decisively*
+///   ordered (`Less`/`Greater`) decides the whole comparison; if a position is reached whose
+///   elements are **incomparable** and no earlier position decided, the list comparison is
+///   incomparable (`None`); on a fully-equal common prefix, the shorter list is `Less`.
+/// - **Maps**: incomparable by the order operators (`None`).
+/// - **Any cross-class pair** (e.g. string vs number, number vs boolean): incomparable (`None`).
+pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
+    // A null operand is incomparable (NULL propagation for the inequality operators).
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    match (a, b) {
+        (Value::Boolean(x), Value::Boolean(y)) => Some(x.cmp(y)),
+        (Value::String(x), Value::String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
+        (Value::List(x), Value::List(y)) => compare_lists(x, y),
+        // Maps are incomparable by the inequality operators (CIP §Comparability).
+        (Value::Map(_), Value::Map(_)) => None,
+        // Points are comparable only within the same CRS.
+        (Value::Point(x), Value::Point(y)) => {
+            if x.crs == y.crs {
+                Some(x.total_cmp(y))
+            } else {
+                None
+            }
+        }
+        // Numbers compare numerically across INTEGER/FLOAT; a NaN operand is incomparable for a
+        // number-vs-number pair.
+        (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
+            if matches!(a, Value::Float(f) if f.is_nan())
+                || matches!(b, Value::Float(f) if f.is_nan())
+            {
+                return None;
+            }
+            // Reuse the numeric magnitude order; signed zero compares equal here (`-0.0` and `+0.0`
+            // are the same point for comparability/equality, unlike *ordering*).
+            let (xa, xb) = (as_f64(a), as_f64(b));
+            xa.partial_cmp(&xb)
+        }
+        // Same-class temporals compare chronologically; mismatched temporal classes fall through to
+        // the cross-class `None` arm below.
+        (Value::Date(_), Value::Date(_))
+        | (Value::LocalTime(_), Value::LocalTime(_))
+        | (Value::ZonedTime(_), Value::ZonedTime(_))
+        | (Value::LocalDateTime(_), Value::LocalDateTime(_))
+        | (Value::ZonedDateTime(_), Value::ZonedDateTime(_))
+        | (Value::Duration(_), Value::Duration(_)) => Some(cmp_same_temporal(a, b)),
+        // Any other pair is a different value class (string vs number, number vs boolean, a temporal
+        // vs a different temporal class, …) and is incomparable.
+        _ => None,
+    }
+}
+
+/// Comparability over lists (CIP §Comparability list rule): walk element-by-element; the first
+/// *decisively-ordered* position decides, a *reached* incomparable position makes the whole list
+/// incomparable, and a fully-equal common prefix orders the shorter list first.
+fn compare_lists(x: &[Value], y: &[Value]) -> Option<Ordering> {
+    for (xe, ye) in x.iter().zip(y.iter()) {
+        match compare_values(xe, ye) {
+            // Decisive: this position settles the whole comparison.
+            Some(Ordering::Less) => return Some(Ordering::Less),
+            Some(Ordering::Greater) => return Some(Ordering::Greater),
+            // Equal at this position: keep scanning.
+            Some(Ordering::Equal) => {}
+            // Incomparable at the first position that is not equal: the list is incomparable.
+            None => return None,
+        }
+    }
+    // Common prefix fully equal: the shorter list is the lesser.
+    Some(x.len().cmp(&y.len()))
+}
+
 /// Lexicographic order over lists: compare element-by-element with [`cmp_values`]; on a common
 /// prefix, the shorter list sorts first (`04 §7.6`).
 fn cmp_lists(x: &[Value], y: &[Value]) -> Ordering {
@@ -446,6 +543,213 @@ mod tests {
                 days_since_epoch: i32::MIN,
             }),
         );
+    }
+
+    // ---- comparability (`compare_values`, the partial relation) --------------------------------
+
+    #[test]
+    fn comparability_cross_type_is_incomparable() {
+        // Cross-class pairs yield None (→ NULL at the operator). The orderability `cmp_values` still
+        // produces a total order for the very same pairs (proven below), which is what keeps
+        // ORDER BY total.
+        let pairs = [
+            (Value::String("1".to_owned()), Value::Integer(1)),
+            (Value::Integer(1), Value::Boolean(true)),
+            (Value::String("a".to_owned()), Value::Boolean(false)),
+            (Value::Float(1.0), Value::String("1.0".to_owned())),
+            (Value::Map(vec![]), Value::Map(vec![])),
+            (Value::Map(vec![]), Value::Integer(1)),
+        ];
+        for (a, b) in &pairs {
+            assert_eq!(
+                compare_values(a, b),
+                None,
+                "{a:?} <?> {b:?} must be incomparable"
+            );
+            assert_eq!(compare_values(b, a), None, "symmetry of incomparability");
+            // Orderability stays total (antisymmetric) over the same pair: the two directions are
+            // exact reverses (strictly ordered for different classes, both Equal for two empty maps).
+            assert_eq!(
+                cmp_values(a, b),
+                cmp_values(b, a).reverse(),
+                "orderability must remain a total (antisymmetric) order over {a:?},{b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparability_null_operand_is_incomparable() {
+        assert_eq!(compare_values(&Value::Null, &Value::Integer(1)), None);
+        assert_eq!(compare_values(&Value::Integer(1), &Value::Null), None);
+        assert_eq!(compare_values(&Value::Null, &Value::Null), None);
+    }
+
+    #[test]
+    fn comparability_numbers_int_vs_float() {
+        assert_eq!(
+            compare_values(&Value::Integer(1), &Value::Float(1.5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&Value::Float(2.0), &Value::Integer(1)),
+            Some(Ordering::Greater)
+        );
+        // 1 and 1.0 are numerically equal under comparability (no ordering tie-break here).
+        assert_eq!(
+            compare_values(&Value::Integer(1), &Value::Float(1.0)),
+            Some(Ordering::Equal)
+        );
+        // Signed zeros compare equal under comparability (unlike the *ordering* rule).
+        assert_eq!(
+            compare_values(&Value::Float(-0.0), &Value::Float(0.0)),
+            Some(Ordering::Equal)
+        );
+    }
+
+    #[test]
+    fn comparability_nan_number_pair_is_incomparable() {
+        // NaN vs a number is `None` here; the operator layer maps that to FALSE (TCK Comparison2 [5]).
+        assert_eq!(
+            compare_values(&Value::Float(f64::NAN), &Value::Integer(1)),
+            None
+        );
+        assert_eq!(
+            compare_values(&Value::Integer(1), &Value::Float(f64::NAN)),
+            None
+        );
+        assert_eq!(
+            compare_values(&Value::Float(f64::NAN), &Value::Float(f64::NAN)),
+            None
+        );
+    }
+
+    #[test]
+    fn comparability_strings_lexicographic() {
+        assert_eq!(
+            compare_values(
+                &Value::String("a".to_owned()),
+                &Value::String("ab".to_owned())
+            ),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(
+                &Value::String("b".to_owned()),
+                &Value::String("ab".to_owned())
+            ),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn comparability_booleans() {
+        assert_eq!(
+            compare_values(&Value::Boolean(false), &Value::Boolean(true)),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn comparability_lists_prefix_and_incomparable_propagation() {
+        // Common prefix: shorter is less ([1] < [1, 0]); equivalently [1, 0] > [1].
+        assert_eq!(
+            compare_values(
+                &Value::List(vec![Value::Integer(1), Value::Integer(0)]),
+                &Value::List(vec![Value::Integer(1)])
+            ),
+            Some(Ordering::Greater)
+        );
+        // [1, null] vs [1]: the common prefix is equal, then length decides → Greater (TCK [4]
+        // `[1, null] >= [1]` → true). The null is never *reached as a deciding element*.
+        assert_eq!(
+            compare_values(
+                &Value::List(vec![Value::Integer(1), Value::Null]),
+                &Value::List(vec![Value::Integer(1)])
+            ),
+            Some(Ordering::Greater)
+        );
+        // [1, 2] vs [1, null]: position 1 is 2-vs-null → incomparable, nothing earlier decided → None
+        // (TCK [4] `[1, 2] >= [1, null]` → null).
+        assert_eq!(
+            compare_values(
+                &Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+                &Value::List(vec![Value::Integer(1), Value::Null])
+            ),
+            None
+        );
+        // [1, 'a'] vs [1, null]: 'a'-vs-null at position 1 → incomparable → None (TCK [4]).
+        assert_eq!(
+            compare_values(
+                &Value::List(vec![Value::Integer(1), Value::String("a".to_owned())]),
+                &Value::List(vec![Value::Integer(1), Value::Null])
+            ),
+            None
+        );
+        // [1, 2] vs [3, null]: position 0 decides (1 < 3) before the null is ever reached → Less
+        // (TCK [4] `[1, 2] >= [3, null]` → false).
+        assert_eq!(
+            compare_values(
+                &Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+                &Value::List(vec![Value::Integer(3), Value::Null])
+            ),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn comparability_temporals_only_within_class() {
+        // Same class: chronological.
+        assert_eq!(
+            compare_values(
+                &Value::Date(Date {
+                    days_since_epoch: 0
+                }),
+                &Value::Date(Date {
+                    days_since_epoch: 1
+                })
+            ),
+            Some(Ordering::Less)
+        );
+        // Different temporal classes: incomparable.
+        assert_eq!(
+            compare_values(
+                &Value::Date(Date::default()),
+                &Value::LocalTime(LocalTime { nanos_of_day: 0 })
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn comparability_points_only_within_crs() {
+        assert_eq!(
+            compare_values(
+                &Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 2.0)),
+                &Value::Point(Point::new_2d(Crs::Cartesian, 1.0, 3.0))
+            ),
+            Some(Ordering::Less)
+        );
+        // Different CRS → incomparable.
+        assert_eq!(
+            compare_values(
+                &Value::Point(Point::new_2d(Crs::Wgs84, 0.0, 0.0)),
+                &Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn order_by_keeps_total_order_across_types() {
+        // The very cross-type pairs that comparability reports incomparable are still strictly,
+        // totally ordered by `cmp_values` (what ORDER BY/min/max/DISTINCT/indexes use). This is the
+        // load-bearing separation: comparability is partial, orderability is total.
+        let a = Value::String("1".to_owned());
+        let b = Value::Integer(1);
+        assert_eq!(compare_values(&a, &b), None); // partial: incomparable
+        // total: STRING < NUMBER (CIP global order), strict and antisymmetric.
+        assert_eq!(cmp_values(&a, &b), Ordering::Less);
+        assert_eq!(cmp_values(&b, &a), Ordering::Greater);
     }
 
     #[test]

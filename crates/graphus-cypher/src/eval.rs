@@ -36,7 +36,7 @@ use crate::equality::{equals, is_in};
 use crate::function_registry::FunctionRegistry;
 use crate::graph_access::GraphAccess;
 use crate::lexer::IntLiteral;
-use crate::ordering::cmp_values;
+use crate::ordering::compare_values;
 use crate::runtime::{NodeRef, PathStep, PathValue, RelRef, Row, RowValue};
 use crate::ternary::Ternary;
 
@@ -422,27 +422,45 @@ fn row_values_equal(a: &RowValue, b: &RowValue) -> Ternary {
     }
 }
 
-/// The 3VL result of a `<`/`>`/`<=`/`>=` comparison: `NULL` if either side is null, else the
-/// orderability ([`cmp_values`]) projected onto the operator.
+/// The 3VL result of a `<`/`>`/`<=`/`>=` comparison, driven by the Cypher **comparability** relation
+/// ([`compare_values`], the *partial* order — CIP §Comparability), **not** the total orderability
+/// ([`crate::ordering::cmp_values`], which `ORDER BY`/`min`/`max`/`DISTINCT`/indexes keep).
+///
+/// - A `null` operand makes the result `NULL` (incomparability via null propagation).
+/// - Incomparable operands (cross-type — string vs number, a map operand, a `null` reached inside a
+///   list, mismatched temporal classes / CRS, …) make the result `NULL`.
+/// - A `NaN` operand against a **numeric** operand makes every inequality `FALSE` (the TCK
+///   `Comparison2 [5]` rule); a `NaN` against a **non-numeric** operand is a cross-type comparison
+///   and is therefore `NULL`.
 fn compare(op: BinaryOp, a: &Value, b: &Value) -> Ternary {
     use std::cmp::Ordering;
     if a.is_null() || b.is_null() {
         return Ternary::Null;
     }
-    // A NaN operand makes inequalities NULL (it is incomparable in Cypher's `<`/`>`), matching the
-    // openCypher rule that NaN is unordered for relational comparisons.
-    if is_nan(a) || is_nan(b) {
-        return Ternary::Null;
+    // NaN against a numeric operand: every inequality is FALSE (openCypher; TCK `Comparison2 [5]`,
+    // e.g. `(0.0/0.0) > 1` → false). NaN against a *non-numeric* operand is a cross-type comparison,
+    // which `compare_values` already reports as incomparable → NULL below.
+    if (is_nan(a) && is_numeric(b)) || (is_nan(b) && is_numeric(a)) {
+        return Ternary::False;
     }
-    let ord = cmp_values(a, b);
-    let truth = match op {
-        BinaryOp::Lt => ord == Ordering::Less,
-        BinaryOp::Gt => ord == Ordering::Greater,
-        BinaryOp::Lte => ord != Ordering::Greater,
-        BinaryOp::Gte => ord != Ordering::Less,
-        _ => unreachable!("compare on a non-comparison operator"),
-    };
-    Ternary::from_bool(truth)
+    match compare_values(a, b) {
+        None => Ternary::Null, // incomparable operands → NULL
+        Some(ord) => {
+            let truth = match op {
+                BinaryOp::Lt => ord == Ordering::Less,
+                BinaryOp::Gt => ord == Ordering::Greater,
+                BinaryOp::Lte => ord != Ordering::Greater,
+                BinaryOp::Gte => ord != Ordering::Less,
+                _ => unreachable!("compare on a non-comparison operator"),
+            };
+            Ternary::from_bool(truth)
+        }
+    }
+}
+
+/// Whether a value is a Cypher number (`INTEGER` or `FLOAT`, including `NaN`).
+fn is_numeric(v: &Value) -> bool {
+    matches!(v, Value::Integer(_) | Value::Float(_))
 }
 
 fn is_nan(v: &Value) -> bool {

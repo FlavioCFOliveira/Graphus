@@ -184,7 +184,7 @@ pub use logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
 pub use lower::lower;
-pub use ordering::cmp_values;
+pub use ordering::{cmp_values, compare_values};
 pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
 pub use physical::{PhysicalOp, PhysicalPlan, RangeBound, plan_physical, plan_physical_with_stats};
 pub use plan_cache::{

@@ -64,8 +64,12 @@ fn deep_equals(a: &Value, b: &Value) -> Ternary {
         (Value::Boolean(x), Value::Boolean(y)) => Ternary::from_bool(x == y),
         (Value::String(x), Value::String(y)) => Ternary::from_bool(x == y),
         (Value::Bytes(x), Value::Bytes(y)) => Ternary::from_bool(x == y),
-        // Numbers compare numerically across INTEGER/FLOAT; -0.0 == +0.0 (Rust `==` already does
-        // this for f64), and neither is NaN here (filtered in `equals`).
+        // Two INTEGERs compare as exact `i64` — never via `f64`, whose 53-bit mantissa would make
+        // distinct large integers (e.g. 4611686018427387905 vs 4611686018427387900) spuriously
+        // equal (TCK `Comparison1 [12]/[13]`).
+        (Value::Integer(x), Value::Integer(y)) => Ternary::from_bool(x == y),
+        // Mixed INTEGER/FLOAT (or FLOAT/FLOAT) compare numerically as `f64`; -0.0 == +0.0 (Rust `==`
+        // already does this for f64), and neither is NaN here (filtered in `equals`).
         (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
             Ternary::from_bool(num_f64(a) == num_f64(b))
         }
@@ -221,6 +225,22 @@ mod tests {
         assert_eq!(equals(&i(1), &f(1.0)), Ternary::True); // 1 = 1.0 → TRUE
         assert_eq!(equals(&i(1), &f(1.5)), Ternary::False);
         assert_eq!(equals(&i(2), &i(2)), Ternary::True);
+    }
+
+    #[test]
+    fn large_distinct_integers_are_not_equal() {
+        // Both round to the same f64 (53-bit mantissa), so an f64-based compare would wrongly say
+        // TRUE. Exact i64 comparison keeps them distinct (TCK `Comparison1 [12]/[13]`).
+        assert_eq!(
+            equals(&i(4_611_686_018_427_387_905), &i(4_611_686_018_427_387_900)),
+            Ternary::False
+        );
+        assert_eq!(
+            equals(&i(4_611_686_018_427_387_905), &i(4_611_686_018_427_387_905)),
+            Ternary::True
+        );
+        // A genuine int/float numeric equality still holds across the types.
+        assert_eq!(equals(&i(2), &f(2.0)), Ternary::True);
     }
 
     #[test]
