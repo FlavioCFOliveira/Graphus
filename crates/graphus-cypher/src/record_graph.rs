@@ -2093,13 +2093,32 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
-        match self.store.borrow_mut().incident_rels(node.0) {
-            Ok(rels) => rels.into_iter().map(RelId).collect(),
+        // The store walks the physical incidence chain, which still threads MVCC-tombstoned
+        // relationships (their slot stays in use until vacuum). Filter to those visible to this
+        // transaction so a deleted relationship is not reported as incident — otherwise a node's
+        // DETACH check, the result-egress snapshot, and any degree-style read would observe a
+        // relationship this transaction has already removed (or that another transaction deleted).
+        let ids = match self.store.borrow_mut().incident_rels(node.0) {
+            Ok(rels) => rels,
             Err(e) => {
                 self.capture(e);
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        ids.into_iter()
+            .filter(|&rid| {
+                let mvcc = match self.store.borrow_mut().rel(rid) {
+                    Ok(rec) => rec.mvcc,
+                    Err(e) => {
+                        self.capture(e);
+                        return false;
+                    }
+                };
+                self.note_read(rel_ssi_key(rid));
+                self.visible(mvcc)
+            })
+            .map(RelId)
+            .collect()
     }
 
     fn delete_rel(&mut self, rel: RelId) {

@@ -184,7 +184,23 @@ use graphus_tck::runner::run_scenario;
 /// but not `toFloat`). The `…OrNull` companions yield `null` rather than raising. Wins:
 /// `expressions/typeConversion` to 47/47 (100%), +21. Measured, zero regressions (full
 /// failure-set diff: the net +21 is purely additive).
-const BASELINE: usize = 3736;
+///
+/// 3736 → 3760 (#134, DELETE semantics): `clauses/delete` to 41/41 (100%, +22), with the +24 net
+/// fully additive. Five fixes: (1) `RecordGraph::incident_rels` now filters MVCC-tombstoned
+/// relationships, so a deleted relationship is no longer reported as incident (fixed every
+/// relationship `-relationships` count and the spurious `DeleteConnectedNode` after delete);
+/// (2) a new structural `RowValue::Map` (mirroring `RowValue::List`) preserves graph elements
+/// through map construction and `m.key`/`m['key']` access, so `DELETE` reaches the node/rel/path a
+/// map holds (`Delete5` [3]-[6]); (3) `DELETE` is now two-phase — gather all targets (dedup by id),
+/// delete every relationship, then every node — so two overlapping paths delete cleanly without
+/// `DETACH` (`Delete5` [7]); (4) the openCypher delete-after-read **Eager** barrier wraps a
+/// `DELETE`'s graph-reading input, so `MATCH (a)-[r]-(b) DELETE r,a,b RETURN count(*)` observes the
+/// full pre-delete row set (`Delete4` [1][2]); (5) the compile-time `DELETE`-non-entity split:
+/// arithmetic (`DELETE 1 + 1`) is `InvalidArgumentType` while a label/type predicate
+/// (`DELETE n:Person`/`r:T`) is `InvalidDelete` (`Delete5` [9], `Delete1`/`Delete2`). Measured,
+/// zero regressions (full failure-set diff: 0 newly-failing scenarios; the net +24 is purely
+/// additive).
+const BASELINE: usize = 3760;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

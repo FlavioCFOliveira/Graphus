@@ -269,6 +269,33 @@ pub(crate) fn materialize_value(graph: &mut dyn GraphAccess, rv: &RowValue) -> M
                 .map(|it| materialize_value(graph, it))
                 .collect(),
         ),
+        // A structural map collapses to a property map at egress: its keys are kept and each value
+        // is materialized through the property collapse (an entity/path becomes null). No result is
+        // ever a structural map in practice — they exist only as transient `DELETE`-through-map
+        // intermediates (Delete5.feature) — so this keeps the wire seam (PackStream/Jolt) free of a
+        // structural-map case while staying total.
+        RowValue::Map(entries) => MaterializedValue::Value(Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), collapse_for_egress(v)))
+                .collect(),
+        )),
+    }
+}
+
+/// The property collapse of a [`RowValue`] used when a structural map reaches result egress:
+/// entities/paths become null, nested structural collections collapse recursively.
+fn collapse_for_egress(rv: &RowValue) -> Value {
+    match rv {
+        RowValue::Value(v) => v.clone(),
+        RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) => Value::Null,
+        RowValue::List(items) => Value::List(items.iter().map(collapse_for_egress).collect()),
+        RowValue::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), collapse_for_egress(v)))
+                .collect(),
+        ),
     }
 }
 

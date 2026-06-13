@@ -918,7 +918,15 @@ impl Planner<'_> {
                 detach,
                 exprs,
             } => PhysicalOp::Delete {
-                input: Box::new(self.lower(input, deps)),
+                // Eagerness barrier (openCypher "Eager" rule). A `DELETE` removes graph elements its
+                // own upstream read may still be scanning: in `MATCH (a)-[r]-(b) DELETE r, a, b
+                // RETURN count(*)` the undirected expansion yields two rows for the one relationship,
+                // but if the first row's pipelined `DELETE` runs before the second is produced, the
+                // expansion no longer finds the (now-deleted) relationship and the row count collapses
+                // (`clauses/delete/Delete4.feature` [1][2]). Draining the read into an `Eager` buffer
+                // before any deletion decouples the read from the write, so the full pre-delete row set
+                // is observed.
+                input: Box::new(eager_for_read_write(self.lower(input, deps))),
                 detach: *detach,
                 exprs: exprs.clone(),
             },
@@ -1112,6 +1120,60 @@ fn eager_over_writes(input: PhysicalOp) -> PhysicalOp {
         }
     } else {
         input
+    }
+}
+
+/// Wraps a `DELETE`'s input in an [`Eager`](PhysicalOp::Eager) barrier when that input reads the
+/// graph, so the entire pre-delete row set is materialized before any element is removed (the
+/// openCypher delete-after-read eagerness rule; see the `LogicalOp::Delete` lowering). An input
+/// that performs no graph read (e.g. `CREATE (n) DELETE n`, where the row is freshly created and
+/// cannot be re-scanned) needs no barrier.
+fn eager_for_read_write(input: PhysicalOp) -> PhysicalOp {
+    if contains_read(&input) {
+        PhysicalOp::Eager {
+            input: Box::new(input),
+        }
+    } else {
+        input
+    }
+}
+
+/// Whether the physical (sub)plan reads the graph through a scan, index seek or expansion anywhere —
+/// the reads a same-query write could interfere with.
+fn contains_read(op: &PhysicalOp) -> bool {
+    match op {
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::ExpandAll { .. }
+        | PhysicalOp::ExpandInto { .. }
+        | PhysicalOp::ShortestPath { .. } => true,
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. }
+        | PhysicalOp::Optional { input, .. } => contains_read(input),
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => contains_read(left) || contains_read(right),
+        PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_read),
+        PhysicalOp::Argument { .. } | PhysicalOp::Empty => false,
     }
 }
 

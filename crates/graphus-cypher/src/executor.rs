@@ -2344,6 +2344,12 @@ fn collapse_rv(rv: &RowValue) -> Value {
         RowValue::Value(v) => v.clone(),
         RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) => Value::Null,
         RowValue::List(items) => Value::List(items.iter().map(collapse_rv).collect()),
+        RowValue::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), collapse_rv(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -2734,54 +2740,99 @@ fn entity_node(target: &Var, row: &Row) -> Result<NodeId, ExecError> {
 }
 
 /// Applies a `[DETACH] DELETE` to the entities the expressions resolve to.
+///
+/// A single `DELETE` clause is **two-phase**: it first collects every distinct relationship and
+/// node its expressions resolve to (recursing through lists, maps and paths), then deletes **all
+/// relationships before any node**. This is what lets a plain (non-`DETACH`) `DELETE` of two
+/// overlapping paths succeed — once every targeted relationship is gone, each targeted node is
+/// isolated and the connectedness rule is satisfied (openCypher `DELETE pathColls.key[0],
+/// pathColls.key[1]`; `clauses/delete/Delete5.feature` [7]). Deduplicating by id makes the delete
+/// idempotent across overlapping targets and keeps the side-effect counts exact (each element
+/// counted once).
 fn apply_delete(
     detach: bool,
     exprs: &[Expr],
     row: &Row,
     ctx: &mut Ctx<'_>,
 ) -> Result<(), ExecError> {
+    // Preserve first-seen order while deduping, so deletion order is deterministic.
+    let mut rel_ids: Vec<RelId> = Vec::new();
+    let mut node_ids: Vec<NodeId> = Vec::new();
+    let mut seen_rels = std::collections::BTreeSet::new();
+    let mut seen_nodes = std::collections::BTreeSet::new();
     for expr in exprs {
-        delete_row_value(
-            detach,
-            eval(expr, row, ctx.params, ctx.graph, ctx.functions)?,
-            ctx,
-        )?;
+        let value = eval(expr, row, ctx.params, ctx.graph, ctx.functions)?;
+        collect_delete_targets(
+            value,
+            &mut rel_ids,
+            &mut node_ids,
+            &mut seen_rels,
+            &mut seen_nodes,
+        );
+    }
+
+    // Phase 1: every targeted relationship (idempotent on an already-gone relationship).
+    for rid in rel_ids {
+        ctx.graph.delete_rel(rid);
+    }
+    // Phase 2: every targeted node, now under the connectedness rule against the *remaining*
+    // relationships (those not in this clause's target set).
+    for nid in node_ids {
+        delete_node(detach, nid, ctx)?;
     }
     Ok(())
 }
 
-/// Deletes one resolved `DELETE` target: a relationship, a node (with the connectedness rule), a
-/// **path** (its relationships first, then its nodes — openCypher `DELETE p`), or a list of
-/// targets (elementwise). Null / non-entity values are a no-op (Cypher ignores null `DELETE`).
-fn delete_row_value(detach: bool, target: RowValue, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
+/// Recursively gathers the graph elements a `DELETE` target resolves to into the dedup'd
+/// relationship / node id sets. A relationship contributes its id; a node its id; a path all its
+/// relationship ids then all its node ids; a list/structural-map recurses into its elements/values.
+/// Null and any other non-entity value is a no-op (Cypher ignores null/non-entity `DELETE`).
+fn collect_delete_targets(
+    target: RowValue,
+    rel_ids: &mut Vec<RelId>,
+    node_ids: &mut Vec<NodeId>,
+    seen_rels: &mut std::collections::BTreeSet<RelId>,
+    seen_nodes: &mut std::collections::BTreeSet<NodeId>,
+) {
     match target {
-        RowValue::Rel(r) => ctx.graph.delete_rel(r.id),
-        RowValue::Node(n) => delete_node(detach, n.id, ctx)?,
-        RowValue::Path(p) => {
-            // The path's relationships go first so its interior nodes become deletable without
-            // DETACH; then each distinct node, under the usual connectedness rule.
-            for rel in p.rels() {
-                ctx.graph.delete_rel(rel);
+        RowValue::Rel(r) => {
+            if seen_rels.insert(r.id) {
+                rel_ids.push(r.id);
             }
-            let mut seen = std::collections::BTreeSet::new();
+        }
+        RowValue::Node(n) => {
+            if seen_nodes.insert(n.id) {
+                node_ids.push(n.id);
+            }
+        }
+        RowValue::Path(p) => {
+            for rel in p.rels() {
+                if seen_rels.insert(rel) {
+                    rel_ids.push(rel);
+                }
+            }
             for node in p.nodes() {
-                if seen.insert(node) {
-                    delete_node(detach, node, ctx)?;
+                if seen_nodes.insert(node) {
+                    node_ids.push(node);
                 }
             }
         }
         RowValue::List(items) => {
             for item in items {
-                delete_row_value(detach, item, ctx)?;
+                collect_delete_targets(item, rel_ids, node_ids, seen_rels, seen_nodes);
             }
         }
-        RowValue::Value(_) => {}
+        // A map is not itself a deletable entity; deleting its graph elements is done by accessing
+        // them (`DELETE m.key`), which unwraps to the inner node/rel/path before reaching here. A
+        // bare map (like any non-entity value) is a no-op, matching Cypher's null/non-entity rule.
+        RowValue::Map(_) | RowValue::Value(_) => {}
     }
-    Ok(())
 }
 
-/// Deletes one node under the connectedness rule: incident relationships fail the delete unless
-/// `DETACH` removes them first.
+/// Deletes one node under the connectedness rule: remaining incident relationships fail the delete
+/// unless `DETACH` removes them first. By the time this runs in [`apply_delete`], every
+/// relationship the same clause targets is already gone, so only relationships *outside* the
+/// delete set can trip the rule.
 fn delete_node(detach: bool, id: NodeId, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
     let incident = ctx.graph.incident_rels(id);
     if !incident.is_empty() {
@@ -3489,6 +3540,122 @@ mod tests {
 
         let survivors = run("MATCH (n:Doomed) RETURN n", &mut g);
         assert!(survivors.is_empty(), "both nodes were deleted");
+    }
+
+    #[test]
+    fn delete_node_referenced_through_a_list() {
+        // `DELETE friends[0]` must reach the node the list holds (openCypher
+        // `clauses/delete/Delete5.feature` [1]). DETACH so the incident relationship is removed too.
+        let mut g = MemGraph::new();
+        let u = g.add_node(["User"], NO_PROPS);
+        let f = g.add_node::<[&str; 0], _, _, _>([], NO_PROPS);
+        let _ = g.add_rel("FRIEND", u, f, NO_PROPS);
+        let rows = run(
+            "MATCH (:User)-[:FRIEND]->(n) WITH collect(n) AS friends DETACH DELETE friends[0]",
+            &mut g,
+        );
+        assert!(rows.is_empty());
+        assert_eq!(g.node_count(), 1, "only the friend node was deleted");
+        assert_eq!(g.rel_count(), 0, "DETACH removed the incident relationship");
+    }
+
+    #[test]
+    fn delete_node_referenced_through_a_map() {
+        // `DELETE nodes.key` where `nodes` is `{key: u}` must recover the node from the structural
+        // map (`clauses/delete/Delete5.feature` [3]).
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["User"], NO_PROPS);
+        let _ = g.add_node(["User"], NO_PROPS);
+        let rows = run(
+            "MATCH (u:User) WITH {key: u} AS nodes DELETE nodes.key",
+            &mut g,
+        );
+        assert!(rows.is_empty());
+        assert_eq!(
+            g.node_count(),
+            0,
+            "both User nodes were deleted via the map"
+        );
+    }
+
+    #[test]
+    fn delete_relationship_referenced_through_a_nested_map() {
+        // `DELETE rels.key.key[0]` reaches the relationship a nested map-of-list holds
+        // (`clauses/delete/Delete5.feature` [6]).
+        let mut g = MemGraph::new();
+        let a = g.add_node(["User"], NO_PROPS);
+        let b = g.add_node(["User"], NO_PROPS);
+        let _ = g.add_rel("R", a, b, NO_PROPS);
+        let _ = g.add_rel("R", b, a, NO_PROPS);
+        let rows = run(
+            "MATCH (:User)-[r]->(:User) WITH {key: {key: collect(r)}} AS rels DELETE rels.key.key[0]",
+            &mut g,
+        );
+        assert!(rows.is_empty());
+        assert_eq!(g.node_count(), 2, "no node was deleted");
+        assert_eq!(
+            g.rel_count(),
+            1,
+            "exactly one of the two relationships was deleted"
+        );
+    }
+
+    #[test]
+    fn delete_two_overlapping_paths_without_detach() {
+        // Two paths over a bidirectional pair: `DELETE p0, p1` must delete every relationship before
+        // any node, so the connectedness rule never trips without DETACH
+        // (`clauses/delete/Delete5.feature` [7]).
+        let mut g = MemGraph::new();
+        let a = g.add_node(["User"], NO_PROPS);
+        let b = g.add_node(["User"], NO_PROPS);
+        let _ = g.add_rel("R", a, b, NO_PROPS);
+        let _ = g.add_rel("R", b, a, NO_PROPS);
+        let rows = run(
+            "MATCH p = (:User)-[r]->(:User) WITH collect(p) AS ps DELETE ps[0], ps[1]",
+            &mut g,
+        );
+        assert!(rows.is_empty());
+        assert_eq!(g.node_count(), 0, "both nodes deleted");
+        assert_eq!(g.rel_count(), 0, "both relationships deleted");
+    }
+
+    #[test]
+    fn delete_dedups_repeated_targets() {
+        // The same node named twice in one DELETE is deleted exactly once (idempotent), and a node
+        // listed alongside its relationship deletes cleanly without DETACH (rels go first).
+        let mut g = MemGraph::new();
+        let a = g.add_node::<[&str; 0], _, _, _>([], NO_PROPS);
+        let b = g.add_node::<[&str; 0], _, _, _>([], NO_PROPS);
+        let _ = g.add_rel("R", a, b, NO_PROPS);
+        let rows = run("MATCH (a)-[r]->(b) DELETE r, a, b, a", &mut g);
+        assert!(rows.is_empty());
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.rel_count(), 0);
+    }
+
+    #[test]
+    fn delete_of_an_integer_expression_is_a_compile_time_type_error() {
+        // `DELETE 1 + 1` is `InvalidArgumentType` (arithmetic), not `InvalidDelete`
+        // (`clauses/delete/Delete5.feature` [9]).
+        let src = "MATCH () DELETE 1 + 1";
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let err = analyze(&ast).expect_err("DELETE of arithmetic must fail semantic analysis");
+        assert_eq!(
+            err.classification().detail.as_tck_str(),
+            "InvalidArgumentType"
+        );
+    }
+
+    #[test]
+    fn delete_of_a_label_predicate_is_invalid_delete() {
+        // `DELETE n:Person` is the syntactic `InvalidDelete` family, distinct from the arithmetic
+        // type error above (`clauses/delete/Delete1.feature`).
+        let src = "MATCH (n) DELETE n:Person";
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let err = analyze(&ast).expect_err("DELETE of a label predicate must fail");
+        assert_eq!(err.classification().detail.as_tck_str(), "InvalidDelete");
     }
 
     #[test]

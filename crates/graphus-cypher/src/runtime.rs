@@ -127,6 +127,13 @@ pub enum RowValue {
     /// invariant that a pure-property list always collapses to [`RowValue::Value`]`(Value::List)`,
     /// so each list has exactly one canonical representation.
     List(Vec<RowValue>),
+    /// A **structural** map — one whose values (transitively) contain a node, relationship or path,
+    /// which the property [`Value::Map`] cannot carry. Build through [`RowValue::map`], which keeps
+    /// the invariant that a pure-property map always collapses to [`RowValue::Value`]`(Value::Map)`,
+    /// so each map has exactly one canonical representation. This is what lets `m.key`, `m['key']`
+    /// and `m.key[0]` recover a graph element a map literal holds (openCypher `DELETE`-through-map;
+    /// `clauses/delete/Delete5.feature`).
+    Map(Vec<(String, RowValue)>),
 }
 
 impl RowValue {
@@ -212,6 +219,48 @@ impl RowValue {
             _ => None,
         }
     }
+
+    /// Builds the canonical map value over `entries`: a pure-property map collapses to
+    /// [`RowValue::Value`]`(Value::Map)`, while a map with any structural value (node / relationship
+    /// / path / nested structural list or map) stays a [`RowValue::Map`].
+    ///
+    /// This is the **only** sanctioned way to build a map `RowValue`, mirroring [`RowValue::list`],
+    /// so every map has exactly one representation and equivalence/ordering never have to unify a
+    /// pure map across the two variants.
+    pub fn map(entries: Vec<(String, RowValue)>) -> RowValue {
+        if entries.iter().all(|(_, v)| matches!(v, RowValue::Value(_))) {
+            RowValue::Value(Value::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| match v {
+                        RowValue::Value(v) => (k, v),
+                        // Unreachable by the `all` check above; kept total for safety.
+                        _ => (k, Value::Null),
+                    })
+                    .collect(),
+            ))
+        } else {
+            RowValue::Map(entries)
+        }
+    }
+
+    /// Borrows this value as a sequence of map entries, when it is a map of either representation: a
+    /// structural [`RowValue::Map`] borrows directly; a property [`Value::Map`] lifts each value
+    /// into a [`RowValue::Value`] (cloning the entries).
+    #[must_use]
+    pub fn as_map_entries(&self) -> Option<Vec<(String, RowValue)>> {
+        match self {
+            RowValue::Map(entries) => Some(entries.clone()),
+            RowValue::Value(Value::Map(entries)) => Some(
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|(k, v)| (k, RowValue::Value(v)))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl From<Value> for RowValue {
@@ -230,9 +279,10 @@ fn row_value_rank(v: &RowValue) -> u8 {
         RowValue::Node(_) => 0,
         RowValue::Rel(_) => 1,
         RowValue::Path(_) => 2,
-        // A structural list shares the property-value rank so it interleaves with `Value::List`
-        // (the two list representations must order as one class; see `cmp_row_values`).
-        RowValue::List(_) | RowValue::Value(_) => 3,
+        // A structural list/map shares the property-value rank so it interleaves with the
+        // corresponding `Value::List`/`Value::Map` (the two representations of each must order as one
+        // class; see `cmp_row_values`).
+        RowValue::List(_) | RowValue::Map(_) | RowValue::Value(_) => 3,
     }
 }
 
@@ -256,6 +306,10 @@ pub fn cmp_row_values(a: &RowValue, b: &RowValue) -> Ordering {
         // collapse (structural elements become null) so the class order matches `Value::List`'s.
         (RowValue::List(_), RowValue::Value(y)) => cmp_values(&collapse_for_ordering(a), y),
         (RowValue::Value(x), RowValue::List(_)) => cmp_values(x, &collapse_for_ordering(b)),
+        // A structural map compares through its property collapse against any other value, so the
+        // class order matches `Value::Map`'s (mirrors the structural-list rule above).
+        (RowValue::Map(_), _) => cmp_values(&collapse_for_ordering(a), &collapse_for_ordering(b)),
+        (_, RowValue::Map(_)) => cmp_values(&collapse_for_ordering(a), &collapse_for_ordering(b)),
         _ => row_value_rank(a).cmp(&row_value_rank(b)),
     }
 }
@@ -284,6 +338,12 @@ fn collapse_for_ordering(v: &RowValue) -> Value {
     match v {
         RowValue::Value(x) => x.clone(),
         RowValue::List(items) => Value::List(items.iter().map(collapse_for_ordering).collect()),
+        RowValue::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, val)| (k.clone(), collapse_for_ordering(val)))
+                .collect(),
+        ),
         RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) => Value::Null,
     }
 }
@@ -307,6 +367,16 @@ pub fn row_values_equivalent(a: &RowValue, b: &RowValue) -> bool {
                 && x.iter()
                     .zip(y)
                     .all(|(ex, ey)| row_values_equivalent(ex, ey))
+        }
+        (RowValue::Map(x), RowValue::Map(y)) => {
+            // Map equivalence is key-set + per-key value equivalence, order-independent (mirrors the
+            // property-map equivalence in [`equivalent`]).
+            x.len() == y.len()
+                && x.iter().all(|(kx, vx)| {
+                    y.iter()
+                        .find(|(ky, _)| ky == kx)
+                        .is_some_and(|(_, vy)| row_values_equivalent(vx, vy))
+                })
         }
         _ => false,
     }
@@ -440,6 +510,55 @@ mod tests {
         r.set("a", RowValue::Value(Value::Integer(10)));
         assert_eq!(r.columns(), &["a".to_owned(), "b".to_owned()]);
         assert_eq!(r.get("a"), Some(&RowValue::Value(Value::Integer(10))));
+    }
+
+    #[test]
+    fn map_collapses_to_value_when_pure_property() {
+        // A map of only property values is canonicalised to `Value::Map`, so a pure map has exactly
+        // one representation (mirrors `RowValue::list`).
+        let m = RowValue::map(vec![
+            ("a".to_owned(), RowValue::Value(Value::Integer(1))),
+            (
+                "b".to_owned(),
+                RowValue::Value(Value::String("x".to_owned())),
+            ),
+        ]);
+        match m {
+            RowValue::Value(Value::Map(entries)) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0], ("a".to_owned(), Value::Integer(1)));
+            }
+            other => panic!("expected a collapsed property map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_stays_structural_when_holding_an_entity() {
+        // A map with a node value keeps the structural representation, so `m.key` can recover the
+        // node reference for `DELETE` (Delete5.feature).
+        let node = RowValue::Node(NodeRef { id: NodeId(3) });
+        let m = RowValue::map(vec![("key".to_owned(), node)]);
+        let RowValue::Map(entries) = &m else {
+            panic!("expected a structural map, got {m:?}");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.as_node(), Some(NodeId(3)));
+        // `as_map_entries` borrows the structural entries unchanged.
+        let borrowed = m.as_map_entries().expect("map entries");
+        assert_eq!(borrowed[0].1.as_node(), Some(NodeId(3)));
+    }
+
+    #[test]
+    fn structural_map_equivalence_is_order_independent() {
+        let a = RowValue::Map(vec![
+            ("k".to_owned(), RowValue::Node(NodeRef { id: NodeId(1) })),
+            ("j".to_owned(), RowValue::Value(Value::Integer(2))),
+        ]);
+        let b = RowValue::Map(vec![
+            ("j".to_owned(), RowValue::Value(Value::Integer(2))),
+            ("k".to_owned(), RowValue::Node(NodeRef { id: NodeId(1) })),
+        ]);
+        assert!(row_values_equivalent(&a, &b));
     }
 
     #[test]

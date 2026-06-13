@@ -519,9 +519,18 @@ fn create_reusing_a_matched_node_as_endpoint_is_valid() {
 }
 
 #[test]
-fn delete_of_a_literal_is_an_error() {
+fn delete_of_a_non_entity_is_a_compile_time_error() {
+    // openCypher splits the compile-time `DELETE`-non-entity fault by detail
+    // (`clauses/delete/Delete{1,2,5}.feature`):
+    //   * a literal / list / map / `count(*)` / label-predicate form is `InvalidDelete`;
+    //   * an arithmetic (number-typed) expression is `InvalidArgumentType`.
     assert_detail("DELETE 1", SemanticDetail::InvalidDelete);
-    assert_detail("MATCH (n) DELETE n.age + 1", SemanticDetail::InvalidDelete);
+    assert_detail("MATCH (n) DELETE n:Person", SemanticDetail::InvalidDelete);
+    assert_detail(
+        "MATCH (n) DELETE n.age + 1",
+        SemanticDetail::InvalidArgumentType,
+    );
+    assert_detail("MATCH () DELETE 1 + 1", SemanticDetail::InvalidArgumentType);
 }
 
 #[test]

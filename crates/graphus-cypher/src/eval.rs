@@ -189,12 +189,11 @@ pub fn eval(
         ExprKind::Map(entries) => {
             let mut out = Vec::with_capacity(entries.len());
             for (MapKey { name, .. }, v) in entries {
-                out.push((
-                    name.clone(),
-                    to_value(eval(v, row, params, graph, functions)?),
-                ));
+                out.push((name.clone(), eval(v, row, params, graph, functions)?));
             }
-            Ok(RowValue::Value(Value::Map(out)))
+            // Canonical map construction: stays structural iff any value is (node/rel/path/structural
+            // collection), so `{key: u}.key` recovers the node for `DELETE` (Delete5.feature).
+            Ok(RowValue::map(out))
         }
 
         ExprKind::Case(case) => eval_case(case, row, params, graph, functions),
@@ -237,6 +236,12 @@ fn to_value(rv: RowValue) -> Value {
         // A structural list collapses elementwise, so size/shape-sensitive value consumers (e.g.
         // `size()`, UNWIND fallbacks) still observe the right cardinality.
         RowValue::List(items) => Value::List(items.into_iter().map(to_value).collect()),
+        // A structural map collapses value-wise, keeping its keys (so `keys(m)`, `size(m)` and map
+        // projection still see the right shape; the structural values become null in a pure-value
+        // context, matching the entity collapse above).
+        RowValue::Map(entries) => {
+            Value::Map(entries.into_iter().map(|(k, v)| (k, to_value(v))).collect())
+        }
     }
 }
 
@@ -740,6 +745,14 @@ fn eval_property(
                 .map(|(_, v)| v)
                 .unwrap_or(Value::Null),
         )),
+        // A structural map keeps its values at the `RowValue` level, so `m.key` recovers the
+        // node/relationship/path reference (or nested structural collection) the map holds — the
+        // property-map arm above only handles pure-property maps (Delete5.feature).
+        RowValue::Map(entries) => Ok(entries
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .unwrap_or(RowValue::NULL)),
         // Point component access: `p.x`, `p.longitude`, `p.crs`, `p.srid`, … (rmp #73).
         RowValue::Value(Value::Point(p)) => Ok(RowValue::Value(
             crate::spatial_fns::component(&p, key).unwrap_or(Value::Null),
@@ -801,6 +814,15 @@ fn eval_index(
         } else {
             Ok(items[pos as usize].clone())
         };
+    }
+    // A structural map indexed by a string key returns the value as a `RowValue`, preserving any
+    // node/relationship/path reference it carries (`m['key']`, the dynamic analogue of `m.key`).
+    if let (Some(entries), Value::String(k)) = (base.as_map_entries(), &idx) {
+        return Ok(entries
+            .into_iter()
+            .find(|(ek, _)| ek == k)
+            .map(|(_, v)| v)
+            .unwrap_or(RowValue::NULL));
     }
     match (to_value(base), &idx) {
         (Value::Map(entries), Value::String(k)) => Ok(RowValue::Value(
@@ -941,6 +963,7 @@ fn describe(v: &RowValue) -> String {
         RowValue::Rel(_) => "Relationship".to_owned(),
         RowValue::Path(_) => "Path".to_owned(),
         RowValue::List(_) => "List".to_owned(),
+        RowValue::Map(_) => "Map".to_owned(),
         RowValue::Value(v) => match v {
             Value::Null => "null".to_owned(),
             Value::Boolean(_) => "Boolean".to_owned(),
@@ -1362,7 +1385,11 @@ fn convert_scalar(lower: &str, rv: RowValue) -> Result<Value, EvalError> {
     // each of which maps `null` → `null`.)
     let v = match rv {
         RowValue::Value(v) => v,
-        RowValue::Node(_) | RowValue::Rel(_) | RowValue::Path(_) | RowValue::List(_) => {
+        RowValue::Node(_)
+        | RowValue::Rel(_)
+        | RowValue::Path(_)
+        | RowValue::List(_)
+        | RowValue::Map(_) => {
             if null_on_invalid {
                 return Ok(Value::Null);
             }

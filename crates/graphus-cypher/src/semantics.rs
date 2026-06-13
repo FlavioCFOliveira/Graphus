@@ -663,14 +663,15 @@ impl Analyzer<'_> {
     fn check_delete(&self, d: &DeleteClause, scope: &Scope) -> Result<(), SemanticError> {
         for expr in &d.exprs {
             self.check_expr(expr, scope)?;
-            // DELETE targets must be entity references, not arbitrary literals (TCK `InvalidDelete`).
-            // We statically reject the clearly-non-entity forms (literals, lists, maps, arithmetic);
-            // whether a *variable* names a node/rel/path is a runtime fact, so we accept it here.
-            if Self::is_clearly_non_entity(expr) {
-                return Err(SemanticError::new(
-                    SemanticErrorKind::InvalidDelete,
-                    expr.span,
-                ));
+            // DELETE targets must be entity references, not arbitrary literals. We statically reject
+            // the clearly-non-entity forms; whether a *variable* names a node/rel/path is a runtime
+            // fact, so we accept it here. openCypher distinguishes two compile-time details:
+            //   * an arithmetic / typed-scalar expression (`DELETE 1 + 1`) is `InvalidArgumentType`;
+            //   * any other non-entity form — literals, lists, maps, a label/type predicate such as
+            //     `DELETE n:Person` / `DELETE r:T` — is `InvalidDelete`
+            // (`clauses/delete/Delete{1,2,5}.feature`).
+            if let Some(kind) = Self::non_entity_delete_error(expr) {
+                return Err(SemanticError::new(kind, expr.span));
             }
         }
         Ok(())
@@ -1929,25 +1930,39 @@ impl Analyzer<'_> {
         )
     }
 
-    /// Whether `expr` is clearly *not* a graph entity for `DELETE` (a literal, list, map, or
-    /// arithmetic result). A variable is accepted (its entity-ness is a runtime fact).
-    fn is_clearly_non_entity(expr: &Expr) -> bool {
+    /// Classifies a `DELETE` target that is *clearly* not a graph entity, returning the openCypher
+    /// compile-time error kind, or `None` if the expression could name a node/rel/path at runtime
+    /// (a variable, property, index, function call, …) and so is accepted here.
+    ///
+    /// Two details are distinguished:
+    ///   * an **arithmetic** expression (`DELETE 1 + 1`) is `InvalidExpressionType` →
+    ///     `InvalidArgumentType` (`clauses/delete/Delete5.feature` \[9\]);
+    ///   * any other clearly-non-entity form — a literal, list, map, `count(*)`, or a label/type
+    ///     predicate such as `DELETE n:Person` / `DELETE r:T` — is `InvalidDelete`
+    ///     (`clauses/delete/Delete{1,2}.feature`).
+    fn non_entity_delete_error(expr: &Expr) -> Option<SemanticErrorKind> {
         match &expr.kind {
-            ExprKind::Literal(_) | ExprKind::List(_) | ExprKind::Map(_) | ExprKind::CountStar => {
-                true
-            }
-            ExprKind::Binary { op, .. } => {
-                matches!(
-                    op,
+            // An arithmetic result is a number: a wrong *type* for DELETE → `InvalidArgumentType`.
+            ExprKind::Binary {
+                op:
                     BinaryOp::Add
-                        | BinaryOp::Sub
-                        | BinaryOp::Mul
-                        | BinaryOp::Div
-                        | BinaryOp::Mod
-                        | BinaryOp::Pow
-                )
-            }
-            _ => false,
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::Pow,
+                ..
+            } => Some(SemanticErrorKind::InvalidExpressionType {
+                context: "DELETE requires a node, relationship or path, not a number".to_owned(),
+            }),
+            // A literal/list/map/count(*) and the `expr:Label` label-predicate form are the
+            // syntactic `InvalidDelete` family.
+            ExprKind::Literal(_)
+            | ExprKind::List(_)
+            | ExprKind::Map(_)
+            | ExprKind::CountStar
+            | ExprKind::HasLabels { .. } => Some(SemanticErrorKind::InvalidDelete),
+            _ => None,
         }
     }
 

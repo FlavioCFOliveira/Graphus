@@ -698,6 +698,14 @@ fn resolve_cell(cell: &RowValue, graph: &dyn GraphAccess) -> Concrete {
         RowValue::List(items) => {
             Concrete::List(items.iter().map(|it| resolve_cell(it, graph)).collect())
         }
+        // A structural map (a map literal holding entities, e.g. `{key: u}`) resolves value-wise,
+        // each value carried through as its own structural/property snapshot.
+        RowValue::Map(entries) => Concrete::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), resolve_cell(v, graph)))
+                .collect(),
+        ),
         RowValue::Path(p) => Concrete::Path(resolve_path(p, graph)),
     }
 }
