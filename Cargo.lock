@@ -1200,6 +1200,7 @@ version = "0.0.0"
 dependencies = [
  "graphus-core",
  "graphus-sim",
+ "graphus-txn",
 ]
 
 [[package]]

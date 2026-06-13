@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use graphus_core::TxnId;
 use graphus_core::capability::Rng;
 use graphus_sim::SimRng;
-use graphus_txn::{HistoryChecker, MemVersionedStore, TxnHistory, TxnManager};
+use graphus_txn::{HistoryChecker, MemVersionedStore, NoDurability, TxnHistory, TxnManager};
 
 /// The writer-id payload (8 bytes LE). `0` is the seed writer.
 fn writer_payload(writer: u64) -> Vec<u8> {
@@ -104,7 +104,7 @@ fn run_staggered(seed: u64) -> Option<Vec<TxnId>> {
     let mut next_plan = 0usize;
     let mut guard = 0u64;
 
-    let commit_one = |mgr: &mut TxnManager<MemVersionedStore>,
+    let commit_one = |mgr: &mut TxnManager<MemVersionedStore, NoDurability>,
                       t: InFlight,
                       key_writers: &mut HashMap<u64, Vec<u64>>,
                       committed: &mut Vec<CommittedTxn>| {

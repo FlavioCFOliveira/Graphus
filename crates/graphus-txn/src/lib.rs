@@ -69,10 +69,14 @@ pub mod visibility;
 
 pub use gc::{GcReport, collect};
 pub use lock::{LockOutcome, LockTable};
-pub use manager::{Durability, NoDurability, TxnManager};
+#[cfg(any(test, feature = "test-support"))]
+pub use manager::NoDurability;
+pub use manager::{Durability, TxnManager};
 pub use oracle::{TimestampOracle, VersionStamp};
 pub use serializability::{HistoryChecker, Op, TxnHistory};
 pub use snapshot::{CommitRegistry, IsolationLevel, Snapshot, TxnOutcome};
 pub use ssi::SsiTracker;
-pub use store::{Key, MemVersionedStore, Version, VersionedStore};
+#[cfg(any(test, feature = "test-support"))]
+pub use store::MemVersionedStore;
+pub use store::{Key, Version, VersionedStore};
 pub use visibility::is_visible;

@@ -53,10 +53,16 @@ pub trait Durability {
     fn harden_commit(&mut self, txn: TxnId) -> Result<()>;
 }
 
-/// The no-op durability hook used in tests (and any caller that hardens elsewhere).
+/// The no-op durability hook for **tests only** (storage audit F15). It is gated behind
+/// `cfg(test)` / the `test-support` feature so a production (default-features) build cannot wire a
+/// transaction manager whose commits are not hardened: production must supply a real [`Durability`]
+/// (bound to `graphus_wal::WalManager::commit`) via [`TxnManager::with_durability`]. The WAL-backed
+/// durable `VersionedStore` is the explicit ACID-certification dependency this gate makes visible.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct NoDurability;
 
+#[cfg(any(test, feature = "test-support"))]
 impl Durability for NoDurability {
     fn harden_commit(&mut self, _txn: TxnId) -> Result<()> {
         Ok(())
@@ -71,8 +77,13 @@ struct ActiveTxn {
 }
 
 /// The MVCC + SSI transaction manager (`04 §5`).
+///
+/// `D` (the [`Durability`] hook) has **no default**: production must name a real durability binding
+/// via [`with_durability`](Self::with_durability). The no-op [`NoDurability`] and the convenience
+/// [`new`](Self::new) constructor exist only under `cfg(test)` / the `test-support` feature
+/// (storage audit F15).
 #[derive(Debug)]
-pub struct TxnManager<S: VersionedStore, D: Durability = NoDurability> {
+pub struct TxnManager<S: VersionedStore, D: Durability> {
     oracle: TimestampOracle,
     registry: CommitRegistry,
     ssi: SsiTracker,
@@ -83,8 +94,11 @@ pub struct TxnManager<S: VersionedStore, D: Durability = NoDurability> {
     next_txn_id: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<S: VersionedStore> TxnManager<S, NoDurability> {
-    /// A manager over `store` with no durability hook (tests, or callers that harden elsewhere).
+    /// A manager over `store` with **no durability hook** — tests only. Gated behind `cfg(test)` /
+    /// the `test-support` feature so production cannot construct a non-durable manager by accident
+    /// (storage audit F15); production uses [`with_durability`](Self::with_durability).
     #[must_use]
     pub fn new(store: S) -> Self {
         Self::with_durability(store, NoDurability)
@@ -404,7 +418,7 @@ mod tests {
     use super::*;
     use crate::store::MemVersionedStore;
 
-    fn mgr() -> TxnManager<MemVersionedStore> {
+    fn mgr() -> TxnManager<MemVersionedStore, NoDurability> {
         TxnManager::new(MemVersionedStore::new())
     }
 

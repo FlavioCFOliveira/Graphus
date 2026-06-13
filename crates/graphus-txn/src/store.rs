@@ -30,12 +30,16 @@
 //! and resolving the §12 representation spike) is a follow-up task, intentionally **out of scope**
 //! here. The trait is the seam: any store that upholds its contract drops in unchanged.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
 use graphus_core::{Timestamp, TxnId};
 
-use crate::oracle::VersionStamp;
 use crate::snapshot::{CommitRegistry, Snapshot};
+// Used only by the test-only `MemVersionedStore` reference implementation (gated below).
+#[cfg(any(test, feature = "test-support"))]
+use crate::oracle::VersionStamp;
+#[cfg(any(test, feature = "test-support"))]
 use crate::visibility::is_visible;
 
 /// An opaque key identifying a versioned record (a node/relationship/property physical id in the
@@ -127,13 +131,19 @@ pub trait VersionedStore {
     fn head_xmin(&self, key: Key) -> Option<u64>;
 }
 
-/// An in-memory [`VersionedStore`] for tests: each key maps to a `Vec<Version>` ordered
-/// **newest-first** (index `0` is the chain head), mirroring the in-place-latest + undo-chain layout.
+/// An in-memory [`VersionedStore`] **for tests only** (storage audit F15): each key maps to a
+/// `Vec<Version>` ordered **newest-first** (index `0` is the chain head), mirroring the
+/// in-place-latest + undo-chain layout. Gated behind `cfg(test)` / the `test-support` feature so a
+/// production build cannot run the manager over a non-durable in-memory store — production must
+/// supply a durable `VersionedStore` (the WAL-backed implementation is the open ACID-certification
+/// dependency).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct MemVersionedStore {
     chains: HashMap<Key, Vec<Version>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemVersionedStore {
     /// An empty store.
     #[must_use]
@@ -148,6 +158,7 @@ impl MemVersionedStore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl VersionedStore for MemVersionedStore {
     fn create_version(
         &mut self,

@@ -4,18 +4,18 @@
 //! (`specification/04-technical-design.md` §5).
 
 use graphus_core::GraphusError;
-use graphus_txn::{IsolationLevel, MemVersionedStore, TxnManager, VersionedStore};
+use graphus_txn::{IsolationLevel, MemVersionedStore, NoDurability, TxnManager, VersionedStore};
 
 /// Keys used by the write-skew scenario (think: two on-call doctors `x` and `y`).
 const X: u64 = 100;
 const Y: u64 = 200;
 
-fn manager() -> TxnManager<MemVersionedStore> {
+fn manager() -> TxnManager<MemVersionedStore, NoDurability> {
     TxnManager::new(MemVersionedStore::new())
 }
 
 /// Seeds both keys with an initial committed value, returning the manager ready for the scenario.
-fn seeded() -> TxnManager<MemVersionedStore> {
+fn seeded() -> TxnManager<MemVersionedStore, NoDurability> {
     let mut m = manager();
     let t = m.begin_serializable();
     m.write(t, X, b"on".to_vec()).unwrap();

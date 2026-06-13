@@ -8,8 +8,19 @@ repository.workspace = true
 authors.workspace = true
 description = "MVCC + Serializable Snapshot Isolation transaction manager for Graphus."
 
+[features]
+# Exposes the test-only no-op durability hook (`NoDurability`), the in-memory reference store
+# (`MemVersionedStore`) and the `TxnManager::new` convenience constructor. OFF by default so a
+# production build cannot wire a non-durable transaction manager by accident (storage audit F15);
+# the crate's own tests enable it via the self dev-dependency below.
+test-support = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }
+# Enable the test-only API for this crate's own unit/integration/doc tests (the standard self
+# dev-dependency idiom): the test build links graphus-txn with `test-support` on, so the gated
+# reference types are available to tests without exposing them to production consumers.
+graphus-txn = { path = ".", features = ["test-support"] }
