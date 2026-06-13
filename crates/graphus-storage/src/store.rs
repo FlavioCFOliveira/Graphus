@@ -223,7 +223,21 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// rollback / [`open`](Self::open), so it shares the id high-water marks' durability lifecycle and
     /// is correct after abort and after crash recovery. See [`Statistics`].
     statistics: Statistics,
+    /// Take an automatic checkpoint once this many WAL bytes have been appended since the last one
+    /// (`04 §4.7`, `rmp` storage audit F3). `0` disables the automatic cadence (manual
+    /// [`checkpoint`](Self::checkpoint) only). Bounds crash-recovery **redo** to roughly this much
+    /// log, instead of replaying the whole history. Defaults to
+    /// [`DEFAULT_CHECKPOINT_INTERVAL_BYTES`].
+    checkpoint_interval_bytes: u64,
+    /// The WAL `durable_len` captured at the last checkpoint (or at open); the automatic cadence
+    /// fires when `durable_len - this >= checkpoint_interval_bytes`.
+    wal_len_at_last_checkpoint: u64,
 }
+
+/// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
+/// bound crash-recovery redo work while keeping the checkpoint's flush amortised under steady load;
+/// tunable per store via [`RecordStore::set_checkpoint_interval_bytes`].
+pub const DEFAULT_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Creates a brand-new record store on an empty `device`, with `wal` an already-created WAL,
@@ -265,10 +279,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             commit_registry: CommitRegistry::new(),
             pending_gc_prune: None,
             statistics: Statistics::new(),
+            checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
+            wal_len_at_last_checkpoint: 0,
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
         store.flush()?;
+        store.wal_len_at_last_checkpoint = store.wal.with(|w| w.durable_len());
         Ok(store)
     }
 
@@ -298,6 +315,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             FixedStore::from_meta(StoreKind::Prop, &meta.stores[2]),
             FixedStore::from_meta(StoreKind::Strings, &meta.stores[3]),
         ];
+        let shared_len = shared.with(|w| w.durable_len());
         Ok(Self {
             pool,
             wal: shared,
@@ -310,6 +328,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             commit_registry,
             pending_gc_prune: None,
             statistics: meta.statistics,
+            checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
+            wal_len_at_last_checkpoint: shared_len,
         })
     }
 
@@ -680,6 +700,58 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             for writer in pending.writers {
                 self.commit_registry.forget(writer);
             }
+        }
+        // Bound crash-recovery redo: take a checkpoint once enough WAL has accumulated since the last
+        // one (`rmp` storage audit F3). The commit above is already durable, so a checkpoint here only
+        // adds a flush + marker — never affecting this transaction's durability.
+        self.maybe_checkpoint()?;
+        Ok(())
+    }
+
+    /// Overrides the automatic-checkpoint cadence (WAL bytes between checkpoints). `0` disables it
+    /// (manual [`checkpoint`](Self::checkpoint) only). See [`DEFAULT_CHECKPOINT_INTERVAL_BYTES`].
+    pub fn set_checkpoint_interval_bytes(&mut self, bytes: u64) {
+        self.checkpoint_interval_bytes = bytes;
+    }
+
+    /// Takes a **checkpoint** (`04 §4.7`, `rmp` storage audit F3), bounding crash-recovery redo to
+    /// the work logged since the previous checkpoint instead of replaying the whole history.
+    ///
+    /// This is a **sharp** checkpoint: it first flushes every dirty page home (each write-back
+    /// enforces the WAL rule, so the log is durable through the page's `page_lsn` before the page
+    /// lands) and syncs the device, so **every change logged so far is durable on its data page**.
+    /// It then appends a `CHECKPOINT-END` with an empty Dirty Page Table and hardens it. Because the
+    /// flush made everything prior durable, recovery's redo can begin at this checkpoint's LSN (see
+    /// [`graphus_wal::recover`]) — nothing before it needs replay.
+    ///
+    /// Physical reclamation of the now-redundant WAL prefix (bounding **disk** and the analysis
+    /// scan) is the separate follow-up to this redo-bounding step.
+    ///
+    /// # Errors
+    /// Returns a storage error if flushing the dirty pages or syncing the device fails.
+    ///
+    /// # Panics
+    /// Panics if the checkpoint `fdatasync` fails (`04 §4.9`), inherited from
+    /// [`WalManager::checkpoint`].
+    pub fn checkpoint(&mut self) -> Result<()> {
+        // Sharp checkpoint: make every logged change durable on its data page (WAL-before-data is
+        // enforced per page inside `flush_all`), then mark the clean point in the log.
+        self.pool.flush_all()?;
+        self.wal.with(|w| w.checkpoint(&[]));
+        self.wal_len_at_last_checkpoint = self.wal.with(|w| w.durable_len());
+        Ok(())
+    }
+
+    /// Fires an automatic [`checkpoint`](Self::checkpoint) when `checkpoint_interval_bytes` of WAL
+    /// have been appended since the last one (`0` disables the cadence). Called after each commit.
+    fn maybe_checkpoint(&mut self) -> Result<()> {
+        if self.checkpoint_interval_bytes == 0 {
+            return Ok(());
+        }
+        let durable = self.wal.with(|w| w.durable_len());
+        if durable.saturating_sub(self.wal_len_at_last_checkpoint) >= self.checkpoint_interval_bytes
+        {
+            self.checkpoint()?;
         }
         Ok(())
     }

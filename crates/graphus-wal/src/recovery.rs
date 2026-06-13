@@ -111,6 +111,7 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
     let mut ended: HashSet<u64> = HashSet::new();
     let mut txn_last: HashMap<u64, Lsn> = HashMap::new();
     let mut last_checkpoint: Option<CheckpointSnapshot> = None;
+    let mut last_checkpoint_lsn: Option<Lsn> = None;
     let mut tail_truncated = false;
 
     // The scan begins at `scan_start` for a logical/chain WAL, or at `HEADER_LEN` for a normal log.
@@ -131,6 +132,7 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
                     RecordType::CheckpointEnd => {
                         if let Some(s) = CheckpointSnapshot::decode(&rec.redo) {
                             last_checkpoint = Some(s);
+                            last_checkpoint_lsn = Some(rec.lsn);
                         }
                     }
                     _ => {}
@@ -179,9 +181,17 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
         .collect();
 
     // --- Phase 2: redo (repeating history) ---
+    // Redo starts at the smallest dirty-page `recovery_lsn` the checkpoint captured (a fuzzy
+    // checkpoint). When the checkpoint's DPT is **empty** — i.e. it was taken after a flush that made
+    // every prior change durable on its data page (a sharp checkpoint, as the storage engine and
+    // `backup_store` take) — redo starts at the **checkpoint's own LSN**: nothing before it needs
+    // redo, only the changes logged after it. With no checkpoint at all, redo must scan from the
+    // header. Either way, per-page `page_lsn` gating below still skips any change already on its page,
+    // so this floor only bounds *how much* is scanned, never correctness (`04 §4.8`).
     let redo_start = last_checkpoint
         .as_ref()
         .and_then(CheckpointSnapshot::redo_start)
+        .or(last_checkpoint_lsn)
         .unwrap_or(Lsn(HEADER_LEN));
 
     let mut redo_applied = 0usize;

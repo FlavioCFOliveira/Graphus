@@ -97,7 +97,9 @@ pub use record::{
     ChainSide, MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE,
     PropRecord, REL_RECORD_SIZE, RelRecord,
 };
-pub use store::{GcPassReport, META_PAGE, RecordStore, StoreKind};
+pub use store::{
+    DEFAULT_CHECKPOINT_INTERVAL_BYTES, GcPassReport, META_PAGE, RecordStore, StoreKind,
+};
 pub use tokens::{Namespace, TokenStore};
 pub use valenc::{
     OVERFLOW_BIT as PROP_OVERFLOW_BIT, TAG_DATE, TAG_DURATION, TAG_LIST, TAG_LOCAL_DATE_TIME,

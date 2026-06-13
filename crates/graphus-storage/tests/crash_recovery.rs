@@ -320,3 +320,120 @@ fn free_list_recovers_so_ids_keep_reusing() {
 
     let _ = PAGE_SIZE; // documents the page-size dependency exercised by the recovery path
 }
+
+// ============================================================================================
+// Checkpointing bounds crash-recovery redo (storage audit F3).
+// ============================================================================================
+
+/// A checkpoint advances recovery's redo start past the WAL header and recovery still replays the
+/// **post-checkpoint** committed work that was only in the WAL — proving the checkpoint bounds redo
+/// without losing data. Models a real post-checkpoint no-force crash: the checkpoint flushed the
+/// pre-checkpoint page home, later committed work lives only in the durable WAL.
+#[test]
+fn a_checkpoint_bounds_recovery_redo_and_replays_post_checkpoint_work() {
+    use graphus_io::BlockDevice;
+    use graphus_wal::HEADER_LEN;
+
+    let mut s = fresh(64);
+    s.set_checkpoint_interval_bytes(0); // manual checkpoints, for a precise redo_start assertion
+
+    // Pre-checkpoint committed work.
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let (a, eid_a) = s.create_node(t1).unwrap();
+    s.commit(t1).unwrap();
+
+    // Sharp checkpoint: a's page is now durable on the device; redo can start here.
+    s.checkpoint().unwrap();
+    let ckpt_end = s.with_wal(|w| w.durable_len());
+
+    // Snapshot the post-checkpoint device image (the pool is clean after the checkpoint, so a read
+    // returns the durable device bytes — a's page is present, no later work is).
+    let captured: Vec<(u64, Box<Page>)> = s
+        .mapped_pages()
+        .into_iter()
+        .map(|p| (p.0, s.read_device_page(p).expect("read page")))
+        .collect();
+
+    // Post-checkpoint committed work — durable only in the WAL (NOT flushed to the device).
+    let t2 = TxnId(2);
+    s.begin(t2);
+    let (b, eid_b) = s.create_node(t2).unwrap();
+    s.commit(t2).unwrap();
+
+    // Stage the post-checkpoint device image and replay the full durable WAL onto it.
+    let max = captured.iter().map(|(i, _)| *i).max().unwrap_or(0);
+    let mut device = MemBlockDevice::new(max + 1);
+    for (idx, bytes) in &captured {
+        device
+            .write_page(graphus_core::PageId(*idx), bytes)
+            .expect("stage page");
+    }
+    device.sync_all().expect("persist image");
+
+    let log = durable_log(&s);
+    let mut sink = MemLogSink::new();
+    sink.append(&log);
+    sink.sync().expect("sync log");
+    let mut wal = WalManager::open(sink.clone()).expect("open wal");
+    let report = recover_device(&mut wal, &mut device).expect("recover");
+    let wal = WalManager::open(sink).expect("reopen wal");
+    let mut rec = RecordStore::open(device, wal, 64).expect("open store");
+
+    // Redo started at the checkpoint — well past the WAL header (bounded redo).
+    assert!(
+        report.redo_start.0 > HEADER_LEN,
+        "redo must start past the WAL header, at the checkpoint (got {})",
+        report.redo_start.0
+    );
+    assert!(
+        report.redo_start.0 <= ckpt_end,
+        "redo starts at the checkpoint, not later"
+    );
+    // The pre-checkpoint node survives via its flushed page; the post-checkpoint node is replayed
+    // by redo from the WAL alone.
+    assert_eq!(rec.node(a).unwrap().element_id, eid_a);
+    assert!(rec.node(a).unwrap().mvcc.in_use());
+    assert_eq!(rec.node(b).unwrap().element_id, eid_b);
+    assert!(rec.node(b).unwrap().mvcc.in_use());
+}
+
+/// The automatic checkpoint cadence fires once enough WAL has accumulated: with a small interval, a
+/// run of commits produces a checkpoint, so a later crash recovers with `redo_start` past the header.
+#[test]
+fn automatic_checkpoint_cadence_emits_a_checkpoint() {
+    use graphus_wal::HEADER_LEN;
+
+    let mut s = fresh(64);
+    s.set_checkpoint_interval_bytes(200); // tiny interval ⇒ a checkpoint after a couple of commits
+
+    let mut last = 0u64;
+    for i in 1..=8u64 {
+        let txn = TxnId(i);
+        s.begin(txn);
+        let (n, _) = s.create_node(txn).unwrap();
+        last = n;
+        s.commit(txn).unwrap();
+    }
+
+    // Recover via a steal crash (everything flushed): the report's redo_start must be a checkpoint
+    // the automatic cadence emitted — past the WAL header.
+    let mut rec = recover_steal(&mut s);
+    assert!(
+        rec.node(last).unwrap().mvcc.in_use(),
+        "the last node survives"
+    );
+
+    // Re-derive the redo_start from the durable log to prove a checkpoint was emitted.
+    let log = durable_log(&s);
+    let mut sink = MemLogSink::new();
+    sink.append(&log);
+    sink.sync().expect("sync log");
+    let mut device = MemBlockDevice::new(0);
+    let mut wal = WalManager::open(sink).expect("open wal");
+    let report = recover_device(&mut wal, &mut device).expect("recover");
+    assert!(
+        report.redo_start.0 > HEADER_LEN,
+        "the automatic cadence must have emitted at least one checkpoint (redo_start past header)"
+    );
+}
