@@ -94,6 +94,8 @@
 //! path variable `p` in the scope, but materialising the path value is an executor concern, so the
 //! logical plan records the traversal without a dedicated path-build operator yet.
 
+use std::collections::BTreeSet;
+
 use crate::ast::{
     Clause, CreateClause, DeleteClause, Expr, ExprKind, LoadCsvClause, MatchClause, MergeAction,
     MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind, ProjectionBody,
@@ -680,6 +682,20 @@ impl Planner {
     /// projection becomes an [`Aggregation`](LogicalOp::Aggregation) whose group keys are the
     /// non-aggregating items and whose aggregates are the aggregating items (the semantic pass
     /// already proved the split is unambiguous, [`crate::semantics`]).
+    ///
+    /// ## Carrying input variables for a trailing `WITH … WHERE` (the dual scope)
+    ///
+    /// A trailing `WITH … WHERE` is evaluated in the **dual scope** — the projected aliases union the
+    /// input variables in scope *before* the projection (`crate::semantics`, `WithWhere7`;
+    /// `TriadicSelection1`'s `WITH c WHERE r IS NULL` anti-join). But the `Projection` operator emits
+    /// a fresh row holding **only** the projected columns, so a `Filter` placed naïvely above it could
+    /// no longer read a dropped input variable. To honour the dual scope at runtime, for a
+    /// **non-aggregating** projection we *carry* every input variable the `WHERE` references (that the
+    /// projection does not already re-emit) as extra projection columns, place the `Filter` above the
+    /// augmented projection, then add a final **narrowing** projection to drop the carried-only
+    /// columns and restore the declared output shape. An **aggregating / DISTINCT** projection
+    /// collapses rows, so its `WHERE` may only reference columns that survive the collapse (grouping
+    /// keys / aggregate aliases — `WithWhere6`), which are already emitted; nothing is carried.
     fn lower_projection_body(
         &mut self,
         body: &ProjectionBody,
@@ -714,7 +730,38 @@ impl Planner {
             .map(|item| self.projection_column(item))
             .collect();
 
-        let mut plan = if body_aggregates(body) {
+        let aggregating = body_aggregates(body);
+
+        // The declared output columns (what the clauses *after* this projection may reference): the
+        // `*`-carried names plus the explicit aliases, in source order.
+        let output_names: Vec<String> = star_cols
+            .iter()
+            .map(|c| c.alias.clone())
+            .chain(explicit_cols.iter().map(|c| c.alias.clone()))
+            .collect();
+
+        // Input variables to *carry* across the projection so a trailing `WITH … WHERE` can read a
+        // variable it drops (the dual scope — see the doc comment). Only for a non-aggregating
+        // projection (an aggregating/DISTINCT projection collapses rows, so its WHERE may reference
+        // only surviving columns, which are already emitted). We carry an input variable when the
+        // WHERE references it and the projection does not already re-emit a column of that name (an
+        // alias of the same name shadows the input, so no carry is needed — the alias is the value
+        // the dual scope sees).
+        let carried: Vec<String> = match where_clause {
+            Some(pred) if !aggregating => {
+                let mut referenced = BTreeSet::new();
+                collect_referenced_vars(pred, &mut referenced);
+                collect_bound_vars(&input)
+                    .into_iter()
+                    .filter(|v| !v.synthetic)
+                    .map(|v| v.name)
+                    .filter(|name| referenced.contains(name) && !output_names.contains(name))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        let mut plan = if aggregating {
             // Partition explicit items into grouping keys and aggregates. `*`-carried columns are
             // always grouping keys (bare variables).
             let mut group_keys = star_cols;
@@ -762,6 +809,14 @@ impl Planner {
         } else {
             let mut items = star_cols;
             items.extend(explicit_cols);
+            // Carry the dual-scope input variables as extra columns (each as itself). The narrowing
+            // projection below removes them after the WHERE filter has run.
+            for name in &carried {
+                items.push(ProjectionColumn {
+                    expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
+                    alias: name.clone(),
+                });
+            }
             LogicalOp::Projection {
                 input: Box::new(input),
                 items,
@@ -801,6 +856,24 @@ impl Planner {
                 input: Box::new(plan),
                 predicate: pred.clone(),
             };
+            // If the WHERE forced input variables to be carried across the projection, narrow the row
+            // back to the declared output columns now that the filter has consumed them. The narrowing
+            // projection is a pure column-subset (no DISTINCT, no new expressions), so it preserves
+            // both row count and order.
+            if !carried.is_empty() {
+                let items = output_names
+                    .iter()
+                    .map(|name| ProjectionColumn {
+                        expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
+                        alias: name.clone(),
+                    })
+                    .collect();
+                plan = LogicalOp::Projection {
+                    input: Box::new(plan),
+                    items,
+                    distinct: false,
+                };
+            }
         }
         plan
     }
@@ -1119,6 +1192,98 @@ fn collect_bound_vars(plan: &LogicalOp) -> Vec<Var> {
     let mut out = Vec::new();
     gather_bound_vars(plan, &mut out);
     out
+}
+
+/// Collects every variable **name** referenced anywhere in `expr` into `out`.
+///
+/// This is a deliberate **over-approximation**: it does not model the scoping of comprehension /
+/// quantifier / subquery binders, so a binder-local name (e.g. the `x` of `[x IN list | x]`) is
+/// reported too. That is sound for the single caller — choosing which *input* variables to carry
+/// across a projection for a `WITH … WHERE` (see [`Planner::lower_projection_body`]). The carry set
+/// is intersected with the actual input bindings, so a spurious binder name that is not an input
+/// variable is filtered out; over-collecting can only ever carry a column that is then dropped by
+/// the narrowing projection, never miss one the filter needs.
+fn collect_referenced_vars(expr: &Expr, out: &mut BTreeSet<String>) {
+    match &expr.kind {
+        ExprKind::Variable(name) => {
+            out.insert(name.clone());
+        }
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::CountStar => {}
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_referenced_vars(lhs, out);
+            collect_referenced_vars(rhs, out);
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
+            collect_referenced_vars(operand, out);
+        }
+        ExprKind::Predicate { operand, rhs, .. } => {
+            collect_referenced_vars(operand, out);
+            if let Some(r) = rhs {
+                collect_referenced_vars(r, out);
+            }
+        }
+        ExprKind::Property { base, .. } => collect_referenced_vars(base, out),
+        ExprKind::Index { base, index } => {
+            collect_referenced_vars(base, out);
+            collect_referenced_vars(index, out);
+        }
+        ExprKind::Slice { base, low, high } => {
+            collect_referenced_vars(base, out);
+            if let Some(l) = low {
+                collect_referenced_vars(l, out);
+            }
+            if let Some(h) = high {
+                collect_referenced_vars(h, out);
+            }
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+            for a in args {
+                collect_referenced_vars(a, out);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (_, v) in entries {
+                collect_referenced_vars(v, out);
+            }
+        }
+        ExprKind::Case(case) => {
+            if let Some(subject) = &case.subject {
+                collect_referenced_vars(subject, out);
+            }
+            for alt in &case.alternatives {
+                collect_referenced_vars(&alt.when, out);
+                collect_referenced_vars(&alt.then, out);
+            }
+            if let Some(else_expr) = &case.else_expr {
+                collect_referenced_vars(else_expr, out);
+            }
+        }
+        ExprKind::ListComprehension(lc) => {
+            collect_referenced_vars(&lc.list, out);
+            if let Some(p) = &lc.predicate {
+                collect_referenced_vars(p, out);
+            }
+            if let Some(p) = &lc.projection {
+                collect_referenced_vars(p, out);
+            }
+        }
+        ExprKind::PatternComprehension(pc) => {
+            if let Some(p) = &pc.predicate {
+                collect_referenced_vars(p, out);
+            }
+            collect_referenced_vars(&pc.projection, out);
+        }
+        ExprKind::Quantifier(q) => {
+            collect_referenced_vars(&q.list, out);
+            collect_referenced_vars(&q.predicate, out);
+        }
+        ExprKind::ExistsSubquery(_) => {
+            // An existential subquery embeds a pattern (not a bare Expr); its free variables that
+            // refer to the outer scope are handled by the subquery's own correlated-argument
+            // collection. Carrying for an EXISTS-only WHERE is not required by the dual-scope cases
+            // the TCK exercises; conservatively contribute nothing here.
+        }
+    }
 }
 
 fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {

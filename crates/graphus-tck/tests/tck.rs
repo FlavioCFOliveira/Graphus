@@ -113,7 +113,20 @@ use graphus_tck::runner::run_scenario;
 /// `time` / `localdatetime` / `datetime` equivalents), which the function registry does not yet
 /// know (`unknown function …` at compile time) — input for a follow-up engine task, deliberately
 /// left failing rather than masked.
-const BASELINE: usize = 3589;
+///
+/// 3589 → 3608 (#128, WITH … WHERE dual scope): the trailing `WHERE` of a `WITH` (and its `ORDER BY`)
+/// is evaluated in the **dual scope** — the projected aliases UNION the pre-projection input
+/// variables — per the openCypher grammar (`WITH items [ORDER BY] [SKIP] [LIMIT] [WHERE]`, where the
+/// `WHERE` nests inside the projection body) and the canonical `WithWhere7` before/after/both test.
+/// Graphus had reset the scope to the projected names *before* the `WHERE`, rejecting a `WHERE` that
+/// references a dropped variable (`WITH c WHERE r IS NULL` → `variable r is not defined`). Both the
+/// semantic binder (dual scope) and the planner were fixed: for a non-aggregating projection the
+/// planner now carries the referenced input variables across the projection, filters above the
+/// augmented projection, then narrows the row back to the declared output columns. Wins:
+/// `useCases/triadicSelection/TriadicSelection1` +14 (the triadic anti-join / friend-of-a-friend
+/// queries), `clauses/with-where/WithWhere1` +3, `WithWhere7` +2. Measured: zero regressions (the
+/// net +19 equals the sum of the affected-feature gains exactly).
+const BASELINE: usize = 3608;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

@@ -44,10 +44,25 @@
 //!
 //! A `WITH` or `RETURN` is a **projection boundary**: after it, the scope is **reset** to exactly the
 //! projected names (the alias of each item, or the inferable name of a bare variable / `*`
-//! expansion). A variable not carried through a `WITH` is therefore **undefined** afterwards — the
-//! single most important scoping rule the TCK exercises. `ORDER BY`, `SKIP` and `LIMIT` attached to a
-//! projection, and a `WITH … WHERE`, are evaluated **in the post-projection scope** (they see the
-//! projected names, per the openCypher grammar where they sit inside the `ProjectionBody`).
+//! expansion). A variable not carried through a `WITH` is therefore **undefined** in the clauses
+//! that *follow* the projection — the single most important scoping rule the TCK exercises.
+//!
+//! The projection's own *trailing* sub-clauses are a deliberate exception, because the openCypher
+//! grammar nests them **inside** the `ProjectionBody` (`WITH items [ORDER BY] [SKIP] [LIMIT]
+//! [WHERE]`):
+//!
+//! - A `WITH … WHERE` and the `ORDER BY` expressions are evaluated in a **dual scope** — the
+//!   projected aliases **union** the input variables in scope *before* the projection, with aliases
+//!   shadowing an input variable of the same name. So `WITH c WHERE r IS NULL` legally references
+//!   `r` even though `r` is dropped by the projection (the triadic anti-join, `TriadicSelection1`;
+//!   the canonical `WithWhere7` before/after/both test). The engine carries the referenced input
+//!   variables across the projection at runtime so the filter actually applies (see `crate::lower`).
+//! - The one carve-out: `ORDER BY` over an **aggregating or DISTINCT** projection sees only the
+//!   projected columns — those operators collapse rows, so a pre-projection variable has no
+//!   well-defined per-row value to sort by (`rmp` task #40). A trailing `WHERE` keeps the dual scope
+//!   even there, referencing surviving grouping keys / aggregate aliases (`WithWhere6`).
+//! - `SKIP` and `LIMIT` are pure pagination over the projected stream and see only the projected
+//!   names.
 //!
 //! # Aggregation rules (`04 §7.6` grouping semantics; openCypher)
 //!
@@ -846,24 +861,34 @@ impl Analyzer<'_> {
             new_scope.bind(name, *kind, *span)?;
         }
 
-        // 4) ORDER BY / SKIP / LIMIT and a trailing WHERE are evaluated in the *post*-projection
-        //    scope (they sit inside the ProjectionBody per the grammar). ORDER BY is the one
-        //    exception: for a **non-aggregating, non-DISTINCT** projection, openCypher lets it
-        //    reference both the projected aliases AND the variables in scope *before* the projection
-        //    (`rmp` task #40; Neo4j/openCypher ORDER BY scoping). An aggregating or DISTINCT
-        //    projection drops the pre-projection variables, so its ORDER BY sees only the projected
-        //    columns. Aliases shadow a pre-projection variable of the same name.
-        let order_scope = if aggregating || body.distinct {
-            new_scope.clone()
-        } else {
+        // 4) ORDER BY / SKIP / LIMIT and a trailing WHERE are evaluated against the projection body.
+        //    Per the openCypher grammar a `WITH … [ORDER BY] [SKIP] [LIMIT] [WHERE]` lets the
+        //    `ORDER BY` and the trailing `WHERE` reference **both** the projected aliases AND the
+        //    input variables in scope *before* the projection — the "dual scope" (`WithWhere7`,
+        //    the canonical before/after/both test; `TriadicSelection1`'s `WITH c WHERE r IS NULL`
+        //    anti-join). Aliases shadow a pre-projection variable of the same name.
+        //
+        //    The one carve-out is `ORDER BY` over an **aggregating or DISTINCT** projection: such a
+        //    projection collapses rows, so the pre-projection variables no longer have a well-defined
+        //    per-output-row value and `ORDER BY` sees only the projected columns (`rmp` task #40).
+        //    A trailing `WHERE`, by contrast, *always* sees the dual scope: even over an aggregating
+        //    projection it may reference a surviving grouping key (`WithWhere6`:
+        //    `WITH a, count(*) AS relCount WHERE relCount > 1`), and the engine carries the needed
+        //    input variables across the projection so the filter can be applied (see `crate::lower`).
+        let dual_scope = {
             let mut s = scope.clone();
             for (name, binding) in &new_scope.bindings {
                 s.bindings.insert(name.clone(), *binding);
             }
             s
         };
+        let order_scope = if aggregating || body.distinct {
+            &new_scope
+        } else {
+            &dual_scope
+        };
         for sort in &body.order_by {
-            self.check_order_by_item(sort, &order_scope, aggregating, &keys)?;
+            self.check_order_by_item(sort, order_scope, aggregating, &keys)?;
         }
         if let Some(skip) = &body.skip {
             self.check_expr(skip, &new_scope)?;
@@ -876,7 +901,7 @@ impl Analyzer<'_> {
             Self::check_skip_limit_literal(limit, "LIMIT")?;
         }
         if let Some(w) = where_clause {
-            self.check_predicate(w, &new_scope, "WHERE")?;
+            self.check_predicate(w, &dual_scope, "WHERE")?;
         }
 
         Ok(new_scope)

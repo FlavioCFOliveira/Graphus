@@ -1732,3 +1732,133 @@ fn pattern_predicate_between_two_bound_nodes() {
         "B is a REL1 target of A"
     );
 }
+
+// =================================================================================================
+// WITH ... WHERE dual scope (rmp #128): the trailing WHERE of a WITH sees BOTH the projected
+// aliases AND the input variables dropped by the projection (openCypher `WithWhere7`,
+// `TriadicSelection1`). The engine carries the referenced input variables across the projection so
+// the filter applies, then narrows the row back to the declared output columns.
+// =================================================================================================
+
+/// Seeds the triadic-selection shape: `a -KNOWS-> b -KNOWS-> c`, plus a *direct* `a -KNOWS-> cdir`.
+/// The anti-join `MATCH (a)-[:KNOWS]->(b)-->(c) OPTIONAL MATCH (a)-[r:KNOWS]->(c) WITH c WHERE r IS
+/// NULL` must return the friends-of-friends that `a` does **not** know directly — i.e. `c` but not
+/// `cdir`.
+fn seed_triadic() -> MemGraph {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], [("name", s("a"))]);
+    let b = g.add_node([] as [&str; 0], [("name", s("b"))]);
+    let c = g.add_node([] as [&str; 0], [("name", s("c"))]);
+    let cdir = g.add_node([] as [&str; 0], [("name", s("cdir"))]);
+    // Friend-of-friend chains: a -> b -> c, and a -> b -> cdir (both c and cdir are FoFs).
+    g.add_rel("KNOWS", a, b, [] as [(&str, Value); 0]);
+    g.add_rel("KNOWS", b, c, [] as [(&str, Value); 0]);
+    g.add_rel("KNOWS", b, cdir, [] as [(&str, Value); 0]);
+    // a knows cdir DIRECTLY -> cdir must be excluded by the anti-join.
+    g.add_rel("KNOWS", a, cdir, [] as [(&str, Value); 0]);
+    g
+}
+
+#[test]
+fn with_where_triadic_anti_join_references_dropped_relationship() {
+    let mut g = seed_triadic();
+    let rows = run(
+        "MATCH (a:A)-[:KNOWS]->(b)-->(c) \
+         OPTIONAL MATCH (a)-[r:KNOWS]->(c) \
+         WITH c WHERE r IS NULL \
+         RETURN c.name AS name",
+        &mut g,
+    );
+    let names = col(&rows, "name");
+    // Only `c` survives: `cdir` is known directly by `a`, so its OPTIONAL `r` is non-null.
+    assert_eq!(
+        names,
+        vec![s("c")],
+        "anti-join drops the directly-known FoF"
+    );
+    // The carried `r` must NOT leak into the output columns — the row is narrowed to `name` only.
+    assert_eq!(rows[0].columns(), &["name".to_owned()]);
+}
+
+#[test]
+fn with_where_sees_variable_dropped_by_projection() {
+    // WithWhere7 [1]: `WITH a.name2 AS name WHERE a.name2 = 'B'` — WHERE reads the pre-projection
+    // `a`, the projection emits only `name`.
+    let mut g = MemGraph::new();
+    for n in ["A", "B", "C"] {
+        g.add_node([] as [&str; 0], [("name2", s(n))]);
+    }
+    let rows = run(
+        "MATCH (a) WITH a.name2 AS name WHERE a.name2 = 'B' RETURN name",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "name"), vec![s("B")]);
+    assert_eq!(rows[0].columns(), &["name".to_owned()]);
+}
+
+#[test]
+fn with_where_sees_projected_alias() {
+    // WithWhere7 [2]: `WITH a.name2 AS name WHERE name = 'B'` — WHERE reads the projected alias.
+    let mut g = MemGraph::new();
+    for n in ["A", "B", "C"] {
+        g.add_node([] as [&str; 0], [("name2", s(n))]);
+    }
+    let rows = run(
+        "MATCH (a) WITH a.name2 AS name WHERE name = 'B' RETURN name",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "name"), vec![s("B")]);
+}
+
+#[test]
+fn with_where_sees_both_dropped_and_projected() {
+    // WithWhere7 [3]: `WHERE name = 'B' OR a.name2 = 'C'` — both scopes in one predicate.
+    let mut g = MemGraph::new();
+    for n in ["A", "B", "C"] {
+        g.add_node([] as [&str; 0], [("name2", s(n))]);
+    }
+    let rows = run(
+        "MATCH (a) WITH a.name2 AS name WHERE name = 'B' OR a.name2 = 'C' RETURN name",
+        &mut g,
+    );
+    let mut names = col(&rows, "name");
+    names.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(names, vec![s("B"), s("C")]);
+}
+
+#[test]
+fn with_where_alias_shadows_input_variable_of_same_name() {
+    // An alias that re-binds an input name shadows it: in `WITH a.tag AS a WHERE a = 'keep'`, the
+    // `a` in WHERE is the projected *string* alias, not the input node. So no input carry is needed
+    // and the filter is on the alias value.
+    let mut g = MemGraph::new();
+    g.add_node([] as [&str; 0], [("tag", s("keep"))]);
+    g.add_node([] as [&str; 0], [("tag", s("drop"))]);
+    let rows = run(
+        "MATCH (a) WITH a.tag AS a WHERE a = 'keep' RETURN a",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "a"), vec![s("keep")]);
+    assert_eq!(rows[0].columns(), &["a".to_owned()]);
+}
+
+#[test]
+fn with_where_filters_before_pagination_is_unaffected_by_carry() {
+    // A WHERE that references a dropped variable still narrows correctly when combined with a
+    // computed projected column used elsewhere. Here `keep` is projected and `a.name2` is dropped;
+    // both are referenced in the WHERE.
+    let mut g = MemGraph::new();
+    for (name, k) in [("A", true), ("B", false), ("C", true)] {
+        g.add_node(
+            [] as [&str; 0],
+            [("name2", s(name)), ("k", Value::Boolean(k))],
+        );
+    }
+    let rows = run(
+        "MATCH (a) WITH a.name2 AS label, a.k AS keep WHERE keep AND a.name2 <> 'X' \
+         RETURN label ORDER BY label",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "label"), vec![s("A"), s("C")]);
+    assert_eq!(rows[0].columns(), &["label".to_owned()]);
+}

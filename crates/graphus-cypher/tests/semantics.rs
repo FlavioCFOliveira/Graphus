@@ -119,6 +119,46 @@ fn with_star_carries_everything_through() {
 }
 
 #[test]
+fn with_where_sees_dropped_input_variable_dual_scope() {
+    // rmp #128: the trailing WHERE of a WITH is evaluated in the dual scope (projected aliases UNION
+    // the pre-projection input variables). `r` is dropped by `WITH c`, yet the WHERE may reference
+    // it (the triadic anti-join, `TriadicSelection1`).
+    ok("MATCH (a:A)-[:KNOWS]->(b)-->(c) \
+        OPTIONAL MATCH (a)-[r:KNOWS]->(c) \
+        WITH c WHERE r IS NULL \
+        RETURN c.name");
+    // `WithWhere7`: WHERE sees a variable bound *before* but not after WITH ([1])…
+    ok("MATCH (a) WITH a.name2 AS name WHERE a.name2 = 'B' RETURN name");
+    // …a variable bound *after* but not before ([2])…
+    ok("MATCH (a) WITH a.name2 AS name WHERE name = 'B' RETURN name");
+    // …and both at once ([3]).
+    ok("MATCH (a) WITH a.name2 AS name WHERE name = 'B' OR a.name2 = 'C' RETURN name");
+}
+
+#[test]
+fn with_where_dual_scope_does_not_leak_into_following_clauses() {
+    // The dual scope is confined to the WITH's own trailing WHERE/ORDER BY: a clause *after* the
+    // projection still sees only the projected names. `r` is usable in the WHERE but undefined in
+    // the RETURN that follows.
+    let src = "MATCH (a)-[r]->(b) WITH b WHERE r IS NULL RETURN r";
+    assert_detail(src, SemanticDetail::UndefinedVariable);
+}
+
+#[test]
+fn with_where_can_reference_aggregate_alias() {
+    // `WithWhere6`: an aggregating WITH's WHERE may reference the aggregate alias (post-aggregation).
+    ok("MATCH (a)-->(b) WITH a, count(*) AS relCount WHERE relCount > 1 RETURN a");
+}
+
+#[test]
+fn return_has_no_trailing_where_dropped_variable_stays_undefined() {
+    // RETURN has no WHERE in the grammar; the dual-scope rule is WITH-only. A variable dropped by a
+    // WITH remains undefined in a later WHERE attached to a *subsequent* MATCH.
+    let src = "MATCH (a)-[r]->(b) WITH b MATCH (b)-->(c) WHERE r IS NULL RETURN c";
+    assert_detail(src, SemanticDetail::UndefinedVariable);
+}
+
+#[test]
 fn variable_introduced_after_with_is_in_scope() {
     ok("WITH 1 AS x RETURN x");
     ok("UNWIND [1, 2, 3] AS n RETURN n");
