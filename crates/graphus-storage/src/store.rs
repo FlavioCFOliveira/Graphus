@@ -25,12 +25,12 @@
 //! and traversal dedupes it by relationship id (`04 §2.4`). [`RecordStore::incident_rels`] walks
 //! a node's chain in O(degree) with no index probe.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use graphus_bufpool::BufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{ElementId, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
+use graphus_core::{ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_txn::{CommitRegistry, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
@@ -232,6 +232,13 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// The WAL `durable_len` captured at the last checkpoint (or at open); the automatic cadence
     /// fires when `durable_len - this >= checkpoint_interval_bytes`.
     wal_len_at_last_checkpoint: u64,
+    /// Commit-record LSN of every committed-but-not-yet-GC-frozen transaction (`rmp` #114, the
+    /// lazy-freeze interaction of #49/#59). A committed version may still carry its writer's in-flight
+    /// `TxnId` on disk until GC freezes it; resolving that stamp after a crash needs the writer's
+    /// commit record. WAL reclamation must therefore never drop a commit record below the **oldest**
+    /// entry here. Populated at commit and on reopen (from the durable commit records), pruned when a
+    /// GC freeze settles + forgets a writer — exactly tracking [`commit_registry`](Self::commit_registry).
+    unfrozen_commit_lsn: BTreeMap<TxnId, Lsn>,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -281,6 +288,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: 0,
+            unfrozen_commit_lsn: BTreeMap::new(),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -306,8 +314,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // had already frozen and pruned (`rmp` task #59) reappear here; that is harmless — no header
         // references them, so the entries are never consulted and the next GC pass prunes them again.
         let mut commit_registry = CommitRegistry::new();
-        for (committed_txn, ts) in shared.with(|w| w.committed_transactions())? {
+        let mut unfrozen_commit_lsn = BTreeMap::new();
+        for (committed_txn, ts, lsn) in shared.with(|w| w.committed_transactions())? {
             commit_registry.record_commit(committed_txn, ts);
+            // Conservatively treat every surviving committed txn as possibly-unfrozen (a pre-crash GC
+            // may have frozen some, harmlessly re-included; the next GC pass re-prunes them). This
+            // floors WAL reclamation so no commit record an unfrozen version needs is dropped.
+            unfrozen_commit_lsn.insert(committed_txn, lsn);
         }
         let stores = [
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0]),
@@ -330,6 +343,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: shared_len,
+            unfrozen_commit_lsn,
         })
     }
 
@@ -685,7 +699,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.active.remove(&txn);
         self.commit_registry.record_commit(txn, commit_ts);
         self.checkpoint_meta(txn, false)?;
-        self.wal.with(|w| w.commit_at(txn, commit_ts))?;
+        let commit_lsn = self.wal.with(|w| w.commit_at(txn, commit_ts))?;
+        // Remember this commit record's LSN until a GC freeze settles `txn`'s versions: WAL
+        // reclamation must keep it readable so a crash can still resolve an unfrozen in-flight stamp
+        // (`rmp` #114 / the lazy freeze of #49/#59).
+        self.unfrozen_commit_lsn.insert(txn, commit_lsn);
         // If `txn` was a GC pass, its header freeze is durable from here on (`rmp` task #59): every
         // writer the pass scheduled is no longer referenced by any on-disk in-flight stamp, so the
         // Active/Recent Transaction Table entries can be forgotten — this, after the freeze, is what
@@ -699,6 +717,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let pending = self.pending_gc_prune.take().expect("checked Some above");
             for writer in pending.writers {
                 self.commit_registry.forget(writer);
+                // The writer's versions are now frozen (commit-ts stamps on disk): its commit record
+                // is no longer needed to resolve any stamp, so it stops flooring WAL reclamation.
+                self.unfrozen_commit_lsn.remove(&writer);
             }
         }
         // Bound crash-recovery redo: take a checkpoint once enough WAL has accumulated since the last
@@ -737,7 +758,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Sharp checkpoint: make every logged change durable on its data page (WAL-before-data is
         // enforced per page inside `flush_all`), then mark the clean point in the log.
         self.pool.flush_all()?;
-        self.wal.with(|w| w.checkpoint(&[]));
+        // Reclaim the WAL prefix that recovery no longer needs (`rmp` #114): below the checkpoint
+        // (redo floor — everything before is flushed) AND below the oldest unfrozen committed
+        // transaction's commit record (so an unfrozen in-flight stamp stays resolvable). The WAL
+        // additionally clamps to the oldest active transaction's first record (loser undo).
+        let oldest_unfrozen = self.unfrozen_commit_lsn.values().map(|l| l.0).min();
+        self.wal.with(|w| -> Result<()> {
+            let ckpt_lsn = w.checkpoint(&[]);
+            let floor = oldest_unfrozen.map_or(ckpt_lsn.0, |u| ckpt_lsn.0.min(u));
+            w.reclaim(Lsn(floor))
+        })?;
         self.wal_len_at_last_checkpoint = self.wal.with(|w| w.durable_len());
         Ok(())
     }

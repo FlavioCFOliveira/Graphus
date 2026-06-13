@@ -32,6 +32,25 @@ pub trait LogSink {
 
     /// Reads durable bytes `[from, durable_len)` into `into` (which is cleared first).
     fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()>;
+
+    /// Physically reclaims the storage backing the durable byte range `[from, up_to)` — bytes that
+    /// recovery no longer needs (below the checkpoint / oldest-active-transaction floor, `rmp` #114).
+    ///
+    /// The logical length and every byte offset are **unchanged** (LSN == byte offset is preserved):
+    /// only physical storage is freed, and the reclaimed range subsequently reads back as **zeros**.
+    /// Recovery tolerates this by skipping a leading zero prefix to the first intact record (a real
+    /// record never begins with a zero byte). The **default is a no-op**: a sink that does not (yet)
+    /// implement physical reclamation keeps the bytes — always correct, just not disk-bounded. The
+    /// in-memory [`MemLogSink`] implements it (zeroing the range) so the recovery skip-path and the
+    /// storage reclaim floor are exercised under Deterministic Simulation Testing; wiring it to the
+    /// production [`FileLogSink`] (a segmented log whose reclaimed segments are deleted, which also
+    /// needs the encryption key-rotation swap to handle the segment set) is the remaining step.
+    ///
+    /// # Errors
+    /// Returns a storage error if the underlying reclaim operation fails.
+    fn reclaim(&mut self, _from: u64, _up_to: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// In-memory [`LogSink`] for Deterministic Simulation Testing. Un-synced appends live in
@@ -97,6 +116,18 @@ impl LogSink for MemLogSink {
         let from = from as usize;
         if from <= self.durable.len() {
             into.extend_from_slice(&self.durable[from..]);
+        }
+        Ok(())
+    }
+
+    fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
+        // Models physical reclamation (a deleted segment / punched hole): the range reads back as
+        // zeros — the bytes are freed — while the logical length and all offsets are preserved. Lets
+        // recovery's skip-leading-zeros path and the storage reclaim floor be exercised under DST.
+        let from = (from as usize).min(self.durable.len());
+        let up_to = (up_to as usize).min(self.durable.len());
+        if from < up_to {
+            self.durable[from..up_to].fill(0);
         }
         Ok(())
     }

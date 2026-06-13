@@ -398,6 +398,53 @@ fn a_checkpoint_bounds_recovery_redo_and_replays_post_checkpoint_work() {
     assert!(rec.node(b).unwrap().mvcc.in_use());
 }
 
+/// A checkpoint physically reclaims the WAL prefix that is below both the checkpoint (redo floor) and
+/// the oldest unfrozen committed transaction (so no commit record an unfrozen stamp needs is lost,
+/// `rmp` #114). The freed prefix reads back as zeros (the in-memory sink models a deleted segment),
+/// and recovery still reconstructs the committed graph — bounded disk *and* bounded analysis scan.
+#[test]
+fn a_checkpoint_reclaims_the_frozen_wal_prefix() {
+    use graphus_wal::HEADER_LEN;
+
+    let mut s = fresh(64);
+    s.set_checkpoint_interval_bytes(0); // manual checkpoints
+
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let (a, _) = s.create_node(t1).unwrap();
+    s.commit(t1).unwrap();
+    let t2 = TxnId(2);
+    s.begin(t2);
+    let (b, _) = s.create_node(t2).unwrap();
+    s.commit(t2).unwrap();
+
+    // GC-freeze T1 + T2 so their commit records stop flooring reclamation (their on-disk stamps are
+    // now committed timestamps, not in-flight TxnIds).
+    gc_pass(&mut s, TxnId(50));
+
+    // A checkpoint flushes everything home and reclaims the now-unneeded WAL prefix.
+    s.checkpoint().unwrap();
+
+    // The committed prefix beyond the header was reclaimed to zeros (disk + scan bounded).
+    let log = durable_log(&s);
+    assert!(log.len() as u64 > HEADER_LEN, "the WAL has records");
+    assert!(
+        log[HEADER_LEN as usize..].iter().take(64).any(|&x| x == 0),
+        "the checkpoint must reclaim (zero) part of the committed WAL prefix"
+    );
+
+    // Recovery over the reclaimed log still yields the committed graph.
+    let mut rec = recover_steal(&mut s);
+    assert!(
+        rec.node(a).unwrap().mvcc.in_use(),
+        "node a survives reclaim"
+    );
+    assert!(
+        rec.node(b).unwrap().mvcc.in_use(),
+        "node b survives reclaim"
+    );
+}
+
 /// The automatic checkpoint cadence fires once enough WAL has accumulated: with a small interval, a
 /// run of commits produces a checkpoint, so a later crash recovers with `redo_start` past the header.
 #[test]

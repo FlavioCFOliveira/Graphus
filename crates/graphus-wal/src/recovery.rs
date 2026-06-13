@@ -118,6 +118,15 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
     // Clamp to at least `HEADER_LEN` (offset 0 is the null LSN; the header is never a record) and to
     // within the log so a degenerate input can never index out of bounds.
     let mut cursor = (scan_start.0.max(HEADER_LEN) as usize).min(log.len());
+    // Skip a leading run of zero bytes: a **reclaimed WAL prefix** (deleted segments / punched holes
+    // below the recovery floor, `rmp` #114) reads back as zeros, and a real record never begins with
+    // a zero byte (its leading `total_len` is `>= MIN_RECORD_LEN`). This advances the scan to the
+    // first surviving record. It is confined to the *leading* prefix: once a record is found the loop
+    // governs, so the interior-corruption detection below still fires on any zero/garbage gap that
+    // appears *between* real records (a reclaim only ever frees a contiguous front prefix).
+    while cursor < log.len() && log[cursor] == 0 {
+        cursor += 1;
+    }
     while cursor < log.len() {
         match LogRecord::decode(&log[cursor..]) {
             Ok((rec, n)) => {

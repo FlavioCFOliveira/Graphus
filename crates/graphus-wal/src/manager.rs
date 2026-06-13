@@ -42,6 +42,10 @@ struct UndoEntry {
 
 /// In-memory state of an active transaction (its Active-Transaction-Table entry).
 struct TxnState {
+    /// LSN of this transaction's **first** logged record (its `BEGIN`, or its earliest record if it
+    /// was reconstructed without one). Bounds WAL reclamation: the log below the oldest active
+    /// transaction's `first_lsn` must be retained so a loser's undo back-chain stays readable.
+    first_lsn: Lsn,
     last_lsn: Lsn,
     undo: Vec<UndoEntry>,
 }
@@ -149,18 +153,23 @@ impl<S: LogSink> WalManager<S> {
     ///
     /// # Errors
     /// Propagates a sink read error.
-    pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp)>> {
+    pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp, Lsn)>> {
         let mut log = Vec::new();
         self.read_durable(Lsn(0), &mut log)?;
         let mut out = Vec::new();
         let mut cursor = HEADER_LEN as usize;
+        // Skip a reclaimed (zero) prefix to the first surviving record (`rmp` #114; see
+        // `recover_from`). A real record never begins with a zero byte.
+        while cursor < log.len() && log[cursor] == 0 {
+            cursor += 1;
+        }
         while cursor < log.len() {
             match LogRecord::decode(&log[cursor..]) {
                 Ok((rec, n)) => {
                     cursor += n;
                     if rec.rec_type == RecordType::Commit {
                         if let Some(ts) = rec.commit_ts() {
-                            out.push((rec.txn_id, ts));
+                            out.push((rec.txn_id, ts, rec.lsn));
                         }
                     }
                 }
@@ -177,6 +186,7 @@ impl<S: LogSink> WalManager<S> {
         self.active.insert(
             txn,
             TxnState {
+                first_lsn: lsn,
                 last_lsn: lsn,
                 undo: Vec::new(),
             },
@@ -194,6 +204,7 @@ impl<S: LogSink> WalManager<S> {
         r.undo = undo.clone();
         let lsn = self.append(&mut r);
         let st = self.active.entry(txn).or_insert(TxnState {
+            first_lsn: lsn,
             last_lsn: lsn,
             undo: Vec::new(),
         });
@@ -307,6 +318,28 @@ impl<S: LogSink> WalManager<S> {
         let lsn = self.append(&mut end);
         self.harden();
         lsn
+    }
+
+    /// Physically reclaims the durable log below `up_to` (`§4.7`, `rmp` #114), bounding WAL disk and
+    /// the recovery analysis scan. `up_to` is the caller's recovery floor — typically the last
+    /// checkpoint's `redo_start` (after a sharp checkpoint, the checkpoint LSN). This method further
+    /// clamps it to the **oldest active transaction's first LSN**, so a loser's undo back-chain is
+    /// never reclaimed; with that floor the reclaimed prefix is provably unneeded by recovery.
+    ///
+    /// Byte offsets / LSNs are unchanged (the reclaimed prefix simply reads back as zeros, which
+    /// recovery skips). A sink that cannot reclaim (the default [`LogSink::reclaim`]) makes this a
+    /// no-op — always correct, just not disk-bounded.
+    ///
+    /// # Errors
+    /// Propagates a sink reclaim failure.
+    pub fn reclaim(&mut self, up_to: Lsn) -> Result<()> {
+        let floor = self
+            .active
+            .values()
+            .map(|s| s.first_lsn.0)
+            .min()
+            .map_or(up_to.0, |oldest| up_to.0.min(oldest));
+        self.sink.reclaim(HEADER_LEN, floor)
     }
 
     /// The buffer-pool **WAL rule** (`§4` / `graphus_bufpool::WalRule`): before a dirty page

@@ -281,6 +281,62 @@ fn torn_tail_record_is_ignored_and_its_txn_rolled_back() {
 }
 
 #[test]
+fn reclaim_respects_the_active_transaction_floor_and_recovery_skips_the_freed_prefix() {
+    // T1 and T2 commit; T3 is still in flight (a loser) when a reclaim runs. The reclaim is asked to
+    // free everything up to the end, but must clamp to T3's first record so T3's undo back-chain
+    // stays readable. The freed prefix (T1+T2) reads back as zeros (MemLogSink models a deleted
+    // segment); recovery skips it, redoes nothing below the floor, and rolls T3 back — without a
+    // false interior-corruption alarm.
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+    wal.begin(TxnId(1));
+    wal.log_update(TxnId(1), PageId(0), d(-10), d(10));
+    wal.commit(TxnId(1)).unwrap();
+    wal.begin(TxnId(2));
+    wal.log_update(TxnId(2), PageId(1), d(5), d(-5));
+    wal.commit(TxnId(2)).unwrap();
+    let t3_first = wal.next_lsn(); // T3's BEGIN lands here
+    wal.begin(TxnId(3));
+    wal.log_update(TxnId(3), PageId(0), d(-7), d(7)); // a stolen, uncommitted write
+    wal.flush(); // harden the loser's tail so recovery must undo it
+
+    // Ask to reclaim the whole log; the active-transaction floor clamps it to T3's first record.
+    wal.reclaim(Lsn(wal.durable_len())).unwrap();
+
+    // T3's records survive the reclaim (its bytes at/after t3_first are NOT zeroed).
+    let durable = wal.sink().durable_bytes();
+    assert!(
+        durable[t3_first.0 as usize..].iter().any(|&b| b != 0),
+        "the active transaction's records must not be reclaimed"
+    );
+    // The committed prefix below the floor WAS freed (reads as zeros).
+    assert!(
+        durable[HEADER_LEN as usize..t3_first.0 as usize]
+            .iter()
+            .all(|&b| b == 0),
+        "the committed prefix below the floor must be reclaimed to zeros"
+    );
+
+    // Recovery over the reclaimed log: a steal disk already holds T1+T2's committed effects and T3's
+    // stolen write; recovery skips the zero prefix and undoes the loser T3.
+    let mut store = DeltaStore::with_initial(2, 100);
+    // Pre-apply the durable, committed-or-stolen disk state at the pages' last LSNs so redo is a
+    // no-op and only undo runs. (T1: page0 -10 ; T2: page1 +5 ; T3 stolen: page0 -7.)
+    store
+        .pages
+        .insert(0, (Lsn(wal.durable_len()), 100 - 10 - 7));
+    store.pages.insert(1, (Lsn(wal.durable_len()), 100 + 5));
+    let mut sink = MemLogSink::new();
+    sink.append(wal.sink().durable_bytes());
+    sink.sync().unwrap();
+    let mut wal2 = WalManager::open(sink).unwrap();
+    let report = recover(&mut wal2, &mut store).expect("recovery over a reclaimed log succeeds");
+    assert_eq!(report.losers, 1, "T3 is the loser to undo");
+    // T3's stolen write is rolled back; T1+T2 stand.
+    assert_eq!(store.value(0), 90, "page0 = 100 - 10 (T3's -7 undone)");
+    assert_eq!(store.value(1), 105, "page1 = 100 + 5");
+}
+
+#[test]
 fn interior_log_corruption_is_detected_not_silently_truncated() {
     // Three fully-committed transactions. Bit-rot flips a body byte of the FIRST transaction's
     // record (interior corruption), leaving every later committed record intact and self-consistent.
