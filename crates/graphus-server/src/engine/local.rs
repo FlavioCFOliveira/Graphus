@@ -264,6 +264,53 @@ impl LocalEngine<MemBlockDevice, MemLogSink> {
         let coordinator = TxnCoordinator::new(store);
         Ok(Self::new(coordinator, clock))
     }
+
+    /// The durable (synced) bytes of this engine's write-ahead log — the prefix that would survive a
+    /// power loss. Used to model crash recovery (see [`Self::crash_restart`]).
+    #[must_use]
+    pub fn wal_durable_bytes(&self) -> Vec<u8> {
+        self.coordinator
+            .as_ref()
+            .map(|c| c.with_store_mut(|s| s.with_wal(|w| w.sink().durable_bytes().to_vec())))
+            .unwrap_or_default()
+    }
+
+    /// Models a **crash + restart**: rebuilds a fresh engine purely from this engine's *durable* WAL
+    /// prefix via ARIES recovery (`graphus_storage::recovery::recover_device`), exactly as a real
+    /// reopen does. The in-memory page cache and any un-acknowledged/in-flight state are discarded;
+    /// every acknowledged commit (which is in the durable WAL by the group-commit rule) is replayed.
+    /// The caller drops the old engine (the "crash") and continues against the returned one.
+    ///
+    /// This is the wire-level analogue of the storage harness's `recover_no_force`, so the DST can
+    /// prove end-to-end durability **over the protocols** (rmp #167), atop the same recovery path the
+    /// storage harness already certifies.
+    ///
+    /// # Errors
+    /// [`GraphusError::Storage`] if recovery or the reopen fails (which itself signals a durability
+    /// bug worth surfacing).
+    pub fn crash_restart(
+        &self,
+        clock: Arc<dyn Clock + Send + Sync>,
+        pool_pages: usize,
+    ) -> Result<Self> {
+        use graphus_storage::recovery::recover_device;
+
+        // Reconstruct the durable WAL into a fresh sink (the new "disk"); rebuild the device purely
+        // from it — no page-cache, no device sharing — so only durable state survives.
+        let log = self.wal_durable_bytes();
+        let mut sink = MemLogSink::new();
+        sink.append(&log);
+        sink.sync()?;
+
+        let mut device = MemBlockDevice::new(0);
+        let mut wal = WalManager::open(sink.clone())?;
+        recover_device(&mut wal, &mut device)?;
+
+        let wal = WalManager::open(sink)?;
+        let store = RecordStore::open(device, wal, pool_pages)?;
+        let coordinator = TxnCoordinator::new(store);
+        Ok(Self::new(coordinator, clock))
+    }
 }
 
 /// The error when the engine has been consumed by [`LocalEngine::shutdown`] (mirrors the threaded
