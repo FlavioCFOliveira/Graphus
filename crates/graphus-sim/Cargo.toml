@@ -10,3 +10,7 @@ description = "Deterministic and production capability implementations and fault
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+# The Bolt `Transport` trait, so the simulated network's endpoints (`net::SimEndpoint`) can be handed
+# directly to a real `BoltSession` over an in-memory, deterministic byte pipe (rmp #161). graphus-bolt
+# depends only on graphus-core + graphus-auth, so this introduces no dependency cycle.
+graphus-bolt = { path = "../graphus-bolt" }

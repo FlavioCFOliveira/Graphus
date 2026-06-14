@@ -1197,6 +1197,7 @@ dependencies = [
 name = "graphus-sim"
 version = "0.0.0"
 dependencies = [
+ "graphus-bolt",
  "graphus-core",
 ]
 

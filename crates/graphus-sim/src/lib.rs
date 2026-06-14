@@ -6,6 +6,12 @@
 //! so that injected faults (crashes, I/O errors, reorderings) replay exactly.
 #![forbid(unsafe_code)]
 
+pub mod net;
+pub mod scheduler;
+
+pub use net::{LinkId, NetConfig, Side, SimEndpoint, SimNet};
+pub use scheduler::SimScheduler;
+
 use graphus_core::capability::{Clock, Rng};
 
 /// A deterministic clock that advances only when explicitly ticked.
@@ -66,6 +72,31 @@ impl SimRng {
                 seed
             },
         }
+    }
+
+    /// A uniform value in `0..bound` (`0` when `bound == 0`). Uses modulo reduction — the slight bias
+    /// is irrelevant for fault scheduling and keeps the generator dependency-free.
+    pub fn below(&mut self, bound: u64) -> u64 {
+        if bound == 0 {
+            0
+        } else {
+            self.next_u64() % bound
+        }
+    }
+
+    /// A uniform value in the inclusive range `lo..=hi` (returns `lo` when `hi <= lo`).
+    pub fn range_inclusive(&mut self, lo: u64, hi: u64) -> u64 {
+        if hi <= lo {
+            lo
+        } else {
+            lo + self.below(hi - lo + 1)
+        }
+    }
+
+    /// Returns `true` with probability `permille / 1000` (a seed-driven coin flip for fault
+    /// injection). `permille >= 1000` is always `true`; `0` is always `false`.
+    pub fn chance(&mut self, permille: u32) -> bool {
+        (self.next_u64() % 1000) < u64::from(permille)
     }
 }
 
