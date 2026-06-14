@@ -660,10 +660,18 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
             converted_offset = Some(target);
         } else {
             // The date is owned by the date components; only the time-of-day converts. The
-            // target offset is resolved at the instant the (assembled date, base time, base
-            // offset) denote.
+            // source offset is re-resolved against the base's own zone at the *assembled*
+            // local — a zoned `time:` base reused under a different date can sit on the other
+            // side of a DST transition than where its offset was originally resolved
+            // (`Temporal3.feature` scenario [10]: a Stockholm October time re-anchored to late
+            // March 1984 carries +02:00, not its stored +01:00). The target offset is then
+            // resolved at the instant the (assembled date, base time, source offset) denote.
             let date = date_from_map(map, default_date)?;
             let local = LocalDateTime::from_date_time(date, b.time);
+            let from = match &b.zone {
+                Some(zone) => timezone::resolve_local(zone, &local, Some(from))?.1,
+                None => from,
+            };
             let instant = local.epoch_seconds - i64::from(from);
             let target = spec.offset_at_instant(instant)?;
             default_time = Some(shift_time(b.time, target - from));
@@ -1128,6 +1136,66 @@ pub(crate) fn duration_between(kind: &str, a: &Value, b: &Value) -> Result<Value
         }
     };
     Ok(Value::Duration(result))
+}
+
+// =================================================================================================
+// datetime.fromepoch / datetime.fromepochmillis
+// =================================================================================================
+
+/// `datetime.fromepoch(seconds, nanoseconds)`: the UTC instant `seconds` after
+/// the Unix epoch, with a sub-second `nanoseconds` field added on top
+/// (`Temporal1.feature` scenario \[11\]). Either argument being `null`
+/// propagates to `null`.
+pub(crate) fn from_epoch_seconds(secs: &Value, nanos: &Value) -> Result<Value, EvalError> {
+    if secs.is_null() || nanos.is_null() {
+        return Ok(Value::Null);
+    }
+    let secs = epoch_int(secs, "datetime.fromepoch")?;
+    let nanos = epoch_int(nanos, "datetime.fromepoch")?;
+    utc_from_epoch(secs, nanos)
+}
+
+/// `datetime.fromepochmillis(milliseconds)`: the UTC instant `milliseconds`
+/// after the Unix epoch (`Temporal1.feature` scenario \[11\]). A `null`
+/// argument propagates to `null`.
+pub(crate) fn from_epoch_millis(millis: &Value) -> Result<Value, EvalError> {
+    if millis.is_null() {
+        return Ok(Value::Null);
+    }
+    let millis = epoch_int(millis, "datetime.fromepochmillis")?;
+    // Split into whole seconds and a non-negative sub-second nanosecond field so
+    // instants before the epoch decompose correctly (Euclidean division).
+    let secs = millis.div_euclid(1000);
+    let nanos = millis.rem_euclid(1000) * 1_000_000;
+    utc_from_epoch(secs, nanos)
+}
+
+/// Builds a UTC `DateTime` (offset `Z`, no named zone) from an epoch-second
+/// count and a nanosecond addend, carrying whole seconds out of the nanosecond
+/// field so the stored `nanos` stays in `0 ..= 999_999_999`.
+fn utc_from_epoch(secs: i64, nanos: i64) -> Result<Value, EvalError> {
+    let epoch_seconds = secs
+        .checked_add(nanos.div_euclid(1_000_000_000))
+        .ok_or_else(|| type_err("datetime epoch seconds overflow"))?;
+    let nanos = u32::try_from(nanos.rem_euclid(1_000_000_000)).expect("rem_euclid(1e9) fits u32");
+    let local = LocalDateTime {
+        epoch_seconds,
+        nanos,
+    };
+    Ok(Value::ZonedDateTime(
+        ZonedDateTime::from_local(local, 0, "").map_err(terr)?,
+    ))
+}
+
+/// Extracts an integer epoch component, rejecting non-integers as a typed error.
+fn epoch_int(value: &Value, func: &str) -> Result<i64, EvalError> {
+    match value {
+        Value::Integer(i) => Ok(*i),
+        other => Err(type_err(format!(
+            "{func}() requires integer arguments, got {}",
+            kind_name(other)
+        ))),
+    }
 }
 
 fn instant_nanos(dt: &LocalDateTime) -> i128 {
@@ -1705,5 +1773,129 @@ mod tests {
                 "{name}() with no argument must defer (clock seam not wired)"
             );
         }
+    }
+
+    #[test]
+    fn datetime_from_epoch_builds_a_utc_instant() {
+        // Temporal1 [11]: `datetime.fromepoch(seconds, nanoseconds)` is the UTC instant the
+        // epoch second count denotes, with the nanosecond field added on top.
+        let d = from_epoch_seconds(&Value::Integer(416_779), &Value::Integer(999_999_999))
+            .expect("fromepoch constructs");
+        assert_eq!(iso(&d), "1970-01-05T19:46:19.999999999Z");
+    }
+
+    #[test]
+    fn datetime_from_epoch_millis_builds_a_utc_instant() {
+        // Temporal1 [11]: `datetime.fromepochmillis(milliseconds)` is the UTC instant the
+        // epoch millisecond count denotes.
+        let d = from_epoch_millis(&Value::Integer(237_821_673_987))
+            .expect("fromepochmillis constructs");
+        assert_eq!(iso(&d), "1977-07-15T13:34:33.987Z");
+    }
+
+    #[test]
+    fn datetime_from_epoch_before_the_epoch_keeps_a_non_negative_nanos_field() {
+        // A negative epoch instant decomposes with Euclidean carry: one nanosecond before the
+        // epoch is `1969-12-31T23:59:59.999999999Z`, not a negative nanosecond field.
+        let d = from_epoch_seconds(&Value::Integer(0), &Value::Integer(-1))
+            .expect("fromepoch constructs");
+        assert_eq!(iso(&d), "1969-12-31T23:59:59.999999999Z");
+    }
+
+    #[test]
+    fn datetime_from_epoch_propagates_null_and_rejects_non_integers() {
+        assert_eq!(
+            from_epoch_seconds(&Value::Null, &Value::Integer(0)).expect("null propagates"),
+            Value::Null
+        );
+        assert_eq!(
+            from_epoch_millis(&Value::Null).expect("null propagates"),
+            Value::Null
+        );
+        assert!(matches!(
+            from_epoch_seconds(&Value::Float(1.5), &Value::Integer(0)),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn duration_between_equal_instants_is_zero() {
+        // Temporal10 [12]: `duration.inSeconds(x, x)` for any temporal `x` is the zero duration.
+        for value in [
+            construct("localtime", Some(&Value::String("12:34:54.7".into()))).unwrap(),
+            construct("date", Some(&Value::String("1984-10-11".into()))).unwrap(),
+            construct(
+                "localdatetime",
+                Some(&Value::String("1984-10-11T12:00".into())),
+            )
+            .unwrap(),
+            construct("datetime", Some(&Value::String("1984-10-11T12:00Z".into()))).unwrap(),
+        ] {
+            let d = duration_between("duration.inseconds", &value, &value).expect("computes");
+            assert_eq!(
+                iso(&d),
+                "PT0S",
+                "duration between equal instants must be zero"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_between_splits_a_sub_second_remainder_with_floor_semantics() {
+        // Temporal10 [1]: a backward difference of -23h59m59.9s reports `seconds = -86400` and
+        // `nanosecondsOfSecond = 100000000` (floor decomposition), while the ISO string keeps
+        // the trunc-toward-zero form `PT-23H-59M-59.9S`.
+        let a = construct(
+            "localdatetime",
+            Some(&Value::String("2018-01-02T10:00:00.1".into())),
+        )
+        .unwrap();
+        let b = construct(
+            "localdatetime",
+            Some(&Value::String("2018-01-01T10:00:00.2".into())),
+        )
+        .unwrap();
+        let d = duration_between("duration.between", &a, &b).expect("computes");
+        assert_eq!(iso(&d), "PT-23H-59M-59.9S");
+        let Value::Duration(dur) = d else {
+            panic!("duration.between yields a Duration")
+        };
+        assert_eq!(dur.seconds_total(), -86_400);
+        assert_eq!(dur.nanoseconds_of_second(), 100_000_000);
+    }
+
+    #[test]
+    fn datetime_from_date_and_zoned_time_reresolves_the_source_zone_at_the_final_date() {
+        // Temporal3 [10]: a Stockholm October time reused under a late-March date carries
+        // +02:00 (summer), not its stored +01:00, when converted to another zone.
+        let other_date = construct(
+            "localdatetime",
+            Some(&map(&[
+                ("year", Value::Integer(1984)),
+                ("week", Value::Integer(10)),
+                ("dayOfWeek", Value::Integer(3)),
+                ("hour", Value::Integer(12)),
+            ])),
+        )
+        .unwrap();
+        let other_time = dt(map(&[
+            ("year", Value::Integer(1984)),
+            ("month", Value::Integer(10)),
+            ("day", Value::Integer(11)),
+            ("hour", Value::Integer(12)),
+            ("timezone", Value::String("Europe/Stockholm".into())),
+        ]));
+        let result = construct(
+            "datetime",
+            Some(&map(&[
+                ("date", other_date),
+                ("time", other_time),
+                ("day", Value::Integer(28)),
+                ("second", Value::Integer(42)),
+                ("timezone", Value::String("Pacific/Honolulu".into())),
+            ])),
+        )
+        .expect("datetime() selects");
+        assert_eq!(iso(&result), "1984-03-28T00:00:42-10:00[Pacific/Honolulu]");
     }
 }

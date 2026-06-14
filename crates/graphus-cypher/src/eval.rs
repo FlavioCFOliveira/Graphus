@@ -1303,6 +1303,10 @@ fn call_function(
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
             crate::temporal_fns::duration_between(&lower, &argv[0], &argv[1])?
         }
+        // `datetime.fromepoch(seconds, nanos)` / `datetime.fromepochmillis(ms)`:
+        // a UTC instant from a POSIX-epoch count (`Temporal1.feature` [11]).
+        "datetime.fromepoch" => crate::temporal_fns::from_epoch_seconds(&argv[0], &argv[1])?,
+        "datetime.fromepochmillis" => crate::temporal_fns::from_epoch_millis(&argv[0])?,
         "date.truncate"
         | "time.truncate"
         | "localtime.truncate"

@@ -1365,11 +1365,18 @@ impl Duration {
         self.minutes() % 60
     }
 
-    /// Total whole seconds of the seconds group (including the nanosecond
-    /// carry, truncated toward zero).
+    /// Total whole seconds of the seconds group.
+    ///
+    /// Decomposed with **floor** semantics, so the companion fractional second
+    /// ([`Self::nanoseconds_of_second`]) is always non-negative and shares the
+    /// `(seconds, nanosecondsOfSecond)` split Neo4j reports: a total of
+    /// `-86_399.9 s` is `seconds = -86_400`, `nanosecondsOfSecond = 100_000_000`
+    /// (`Temporal10.feature` scenario \[1\]). This differs from the
+    /// trunc-toward-zero decomposition the ISO string uses
+    /// ([`Self::to_iso_string`] renders `PT-23H-59M-59.9S`).
     #[must_use]
     pub fn seconds_total(&self) -> i64 {
-        clamp_i128_to_i64(seconds_group_total_nanos(self) / 1_000_000_000)
+        clamp_i128_to_i64(seconds_group_total_nanos(self).div_euclid(1_000_000_000))
     }
 
     /// Seconds remaining within the minute.
@@ -1410,9 +1417,14 @@ impl Duration {
     }
 
     /// Nanoseconds remaining within the second.
+    ///
+    /// The fractional second of the **floor** decomposition (see
+    /// [`Self::seconds_total`]): always in `0 ..= 999_999_999`, so a total of
+    /// `-86_399.9 s` reports `100_000_000` alongside `seconds = -86_400`
+    /// (`Temporal10.feature` scenario \[1\]).
     #[must_use]
     pub fn nanoseconds_of_second(&self) -> i64 {
-        clamp_i128_to_i64(seconds_group_total_nanos(self) % 1_000_000_000)
+        clamp_i128_to_i64(seconds_group_total_nanos(self).rem_euclid(1_000_000_000))
     }
 
     // -- Formatting --
@@ -3323,6 +3335,32 @@ mod tests {
             "1912-01-01T00:00"
         );
         assert_eq!(dur(0, 0, 12, 0).to_string(), "PT12S");
+    }
+
+    #[test]
+    fn duration_seconds_and_nanos_of_second_use_floor_decomposition() {
+        // Temporal10 [1]: a total of -86_399.9 s reports `seconds = -86_400` and
+        // `nanosecondsOfSecond = +100_000_000` (floor), even though the ISO string keeps the
+        // trunc-toward-zero form. The companion forward case is plain truncation.
+        let backward = Duration {
+            months: 0,
+            days: 0,
+            seconds: -86_400,
+            nanos: 100_000_000,
+        };
+        assert_eq!(backward.seconds_total(), -86_400);
+        assert_eq!(backward.nanoseconds_of_second(), 100_000_000);
+        assert_eq!(backward.to_iso_string(), "PT-23H-59M-59.9S");
+
+        let forward = Duration {
+            months: 0,
+            days: 0,
+            seconds: 86_399,
+            nanos: 900_000_000,
+        };
+        assert_eq!(forward.seconds_total(), 86_399);
+        assert_eq!(forward.nanoseconds_of_second(), 900_000_000);
+        assert_eq!(forward.to_iso_string(), "PT23H59M59.9S");
     }
 
     #[test]

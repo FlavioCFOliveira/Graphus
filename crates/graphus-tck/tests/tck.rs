@@ -239,7 +239,7 @@ use graphus_tck::runner::run_scenario;
 /// `expressions/string/{String8,String9,String10}` [8] (STARTS WITH/ENDS WITH/CONTAINS non-string
 /// operands). Measured, zero regressions (full failure-set diff: 0 newly-failing scenarios; the net
 /// +19 is purely additive).
-const BASELINE: usize = 3866;
+const BASELINE: usize = 3869;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

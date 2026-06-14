@@ -197,6 +197,21 @@ static TABLE: &[Signature] = &[
         aggregate: false,
     },
     Signature {
+        // `datetime.fromepoch(seconds, nanoseconds)`: a UTC instant from a
+        // POSIX-epoch second count and a sub-second nanosecond field
+        // (`Temporal1.feature` scenario [11]).
+        name: "datetime.fromepoch",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        // `datetime.fromepochmillis(milliseconds)`: a UTC instant from a
+        // POSIX-epoch millisecond count (`Temporal1.feature` scenario [11]).
+        name: "datetime.fromepochmillis",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
         name: "date.truncate",
         arity: Arity::Range(2, 3),
         aggregate: false,
