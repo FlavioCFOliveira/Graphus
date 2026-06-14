@@ -43,6 +43,7 @@ Legend: ★ = recommended option.
 | D-vector-index | Out of scope for v1; deferred to a later phase |
 | D-security-scope | Auth + RBAC + TLS (REST + Bolt) + user/role management in v1; fine-grained access control / encryption-at-rest / auditing in Phase 2 |
 | D-dst-investment | Scaffold a deterministic simulation testing harness from the start with fault injection |
+| **D-vopr** | **External, totally-deterministic VOPR simulator: drive the REAL Bolt/PackStream + REST protocol stacks and the REAL engine over a SIMULATED transport + clock + disk (seed-reproducible), with misbehaved-client / fault / load coverage and four oracles (ref-model, Elle isolation, invariants/liveness, crash-durability)** *(extends D-dst-investment to the connectivity/protocol layer; "external" = real protocols, no backdoor, over an in-memory transport — not real OS sockets. See `07-dst-simulator.md`.)* |
 
 **Four owner overrides of the recommendation** (recorded with a `note` on their KG nodes) reshape the
 scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
