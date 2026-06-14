@@ -20,7 +20,7 @@ use graphus_server::engine::{LocalEngine, RunReply};
 use graphus_sim::{SharedClock, SimScheduler};
 use graphus_wal::MemLogSink;
 
-use crate::mix::{MixProfile, WorkloadGen, WorkloadOp};
+use crate::mix::{LoadProfile, MixProfile, WorkloadGen, WorkloadOp};
 
 /// The simulated engine type: the real engine over the simulated in-memory device + log.
 type SimEngine = LocalEngine<MemBlockDevice, MemLogSink>;
@@ -38,6 +38,8 @@ pub struct VoprConfig {
     pub pool_pages: usize,
     /// The workload mix (op-class weights) the generator draws from.
     pub mix: MixProfile,
+    /// How arrivals are spread over scheduler time (steady / ramp / spike) — the load profile.
+    pub load: LoadProfile,
 }
 
 impl VoprConfig {
@@ -50,6 +52,7 @@ impl VoprConfig {
             ops_per_client: 50,
             pool_pages: 256,
             mix: MixProfile::mixed(),
+            load: LoadProfile::Steady { min: 1, max: 1000 },
         }
     }
 
@@ -57,6 +60,13 @@ impl VoprConfig {
     #[must_use]
     pub fn with_mix(mut self, mix: MixProfile) -> Self {
         self.mix = mix;
+        self
+    }
+
+    /// The same run with a specific `load` profile.
+    #[must_use]
+    pub fn with_load(mut self, load: LoadProfile) -> Self {
+        self.load = load;
         self
     }
 }
@@ -78,6 +88,11 @@ pub struct VoprReport {
     pub state_hash: u64,
     /// Logical time (ns) at the end of the run.
     pub end_time: u64,
+    /// Number of `:Person` nodes the workload asked to create (the generator's id space).
+    pub created_nodes: i64,
+    /// Number of `:Person` nodes actually present at the end (queried back). Must equal
+    /// `created_nodes` — a liveness/consistency check: no acked create is lost or duplicated.
+    pub persisted_nodes: i64,
 }
 
 /// One scheduled unit of work: a client issuing its next operation.
@@ -100,11 +115,15 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
 
     // One scheduler owns the master seed; every random choice is drawn from it.
     let mut sched: SimScheduler<Tick> = SimScheduler::new(cfg.seed);
+    let total = u64::from(cfg.ops_per_client) * u64::from(cfg.clients);
+    let mut step_idx: u64 = 0;
     for _ in 0..cfg.ops_per_client {
         for client in 0..cfg.clients {
-            // A seed-drawn delay interleaves clients; ties at the same tick are RNG-ordered too.
-            let delay = sched.rng().range_inclusive(1, 1000);
-            sched.schedule_after(delay, Tick { client });
+            // The load profile shapes inter-arrival delay over scheduler time (steady/ramp/spike);
+            // ties at the same tick are RNG-ordered too. Arrivals accumulate so a ramp/spike spreads.
+            let delay = cfg.load.arrival_delay(sched.rng(), step_idx, total.max(1));
+            sched.schedule_at(step_idx.saturating_add(delay), Tick { client });
+            step_idx += 1;
         }
     }
 
@@ -136,6 +155,8 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
     }
 
     let state_hash = snapshot_hash(&mut eng);
+    let created_nodes = wgen.node_count();
+    let persisted_nodes = count_persons(&mut eng);
     let end_time = sched.now();
     // Best-effort: harden + consume the engine (it is dropped either way).
     let _ = eng.shutdown();
@@ -148,6 +169,8 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         trace_hash: trace.finish(),
         state_hash,
         end_time,
+        created_nodes,
+        persisted_nodes,
     }
 }
 
@@ -205,6 +228,7 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
             ops_per_client: ops,
             pool_pages: 256,
             mix: MixProfile::mixed(),
+            load: LoadProfile::Steady { min: 1, max: 1000 },
         };
         let first = run(cfg);
         let second = run(cfg);
@@ -301,6 +325,19 @@ fn drain(reply: &mut RunReply) -> Outcome {
         }
     }
     Outcome { ok: true, rows, cells, error: None }
+}
+
+/// Counts the `:Person` nodes currently in the graph by counting the rows of a label scan (avoids
+/// parsing an aggregate cell). A liveness/consistency probe: it must equal the number of acked
+/// `CreateNode` ops.
+fn count_persons(eng: &mut SimEngine) -> i64 {
+    let Ok(ticket) = eng.begin_auto_commit(AccessMode::Read) else {
+        return -1;
+    };
+    match eng.run(ticket, "MATCH (n:Person) RETURN n.id", vec![], true, None) {
+        Ok(mut reply) => drain(&mut reply).rows as i64,
+        Err(_) => -1,
+    }
 }
 
 /// Hashes a canonical, ordered snapshot of the whole graph (nodes then relationships), so two runs
@@ -403,6 +440,55 @@ mod tests {
             .map(|s| run(VoprConfig::for_seed(s)).state_hash)
             .collect();
         assert!(states.len() > 1, "the final state depends on the seed");
+    }
+
+    /// Stress: a large workload under high concurrency completes (no hang/deadlock — reaching the
+    /// asserts proves termination), every scheduled op runs (monotone progress), and every acked
+    /// node create is persisted exactly once (no lost/duplicated work under load).
+    #[test]
+    fn high_load_run_is_live_and_consistent() {
+        // Many interleaved clients at high arrival pressure. Sized to stay fast in a debug build
+        // (the workload's `MATCH (:Person {id})` is an unindexed scan, so cost grows with the graph);
+        // it still exercises deep interleaving + a few hundred concurrent-ish ops.
+        let cfg = VoprConfig {
+            seed: 2024,
+            clients: 16,
+            ops_per_client: 40,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            load: LoadProfile::Steady { min: 1, max: 50 },
+        };
+        let r = run(cfg);
+        assert_eq!(r.steps, 16 * 40, "every scheduled op ran (monotone progress)");
+        assert_eq!(r.err_ops, 0, "a clean high-load workload has no errors");
+        assert_eq!(
+            r.created_nodes, r.persisted_nodes,
+            "every acked node create is persisted exactly once under load: {} != {}",
+            r.created_nodes, r.persisted_nodes
+        );
+        assert!(r.created_nodes > 100, "the stress run did substantial work");
+    }
+
+    /// Each load profile (steady/ramp/spike) drives a complete, deterministic, consistent run.
+    #[test]
+    fn load_profiles_all_complete_consistently() {
+        let profiles = [
+            LoadProfile::Steady { min: 1, max: 20 },
+            LoadProfile::Ramp { start: 100, end: 1 },
+            LoadProfile::Spike { base: 30, period: 16, burst: 4 },
+        ];
+        for load in profiles {
+            let cfg = VoprConfig::for_seed(77).with_mix(MixProfile::mixed()).with_load(load);
+            let a = run(cfg);
+            let b = run(cfg);
+            assert_eq!(a, b, "load profile {load:?} is deterministic");
+            assert_eq!(a.steps, (cfg.clients * cfg.ops_per_client) as usize, "all ops ran under {load:?}");
+            assert_eq!(
+                a.created_nodes, a.persisted_nodes,
+                "consistent under {load:?}: {} != {}",
+                a.created_nodes, a.persisted_nodes
+            );
+        }
     }
 
     #[test]
