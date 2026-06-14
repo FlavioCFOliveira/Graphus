@@ -429,7 +429,21 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// `CONNECTED`: only `HELLO` is valid.
     fn dispatch_connected(&mut self, request: Request) -> BoltResult<Flow> {
         match request {
-            Request::Hello { extra: _ } => {
+            Request::Hello { extra } => {
+                // `user_agent` is a REQUIRED field of the HELLO extra map across all Bolt 5.x
+                // versions (`04 §8.1`); a HELLO that omits it (or carries a non-string / empty
+                // value) is malformed and is rejected with FAILURE rather than silently accepted —
+                // this also closes a trivial DoS where a client drives the handshake with truncated
+                // metadata. The connection enters FAILED and the listener closes it.
+                let user_agent_ok = map_str(&extra, "user_agent").is_some_and(|s| !s.is_empty());
+                if !user_agent_ok {
+                    self.send_failure(Failure::new(
+                        "Neo.ClientError.Request.Invalid",
+                        "HELLO is missing the required `user_agent` field",
+                    ))?;
+                    self.state = State::Failed;
+                    return Ok(Flow::Continue);
+                }
                 // HELLO no longer carries credentials in 5.1+ (LOGON does). Acknowledge with server
                 // metadata and move to AUTHENTICATION. The `server` agent and the per-connection
                 // `connection_id` come from the listener's `SessionConfig` (rmp #95); `hints` is the

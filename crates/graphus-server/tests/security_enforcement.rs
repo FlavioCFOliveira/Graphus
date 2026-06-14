@@ -128,11 +128,11 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: JWT_SECRET.to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: vec![UserBootstrap {
                 name: "bob".to_owned(),
-                password: "pw2".to_owned(),
+                password: "user2-pw8".to_owned(),
             }],
         },
         encryption: graphus_server::config::EncryptionConfig::default(),
@@ -346,7 +346,7 @@ async fn fine_grained_enforcement_admin_restricted_and_live_grant_revoke() {
 
     // ---- 1) Admin seeds data and sees everything (unrestricted pass-through). -------------------
     let mut alice = BoltClient::connect(&uds).await;
-    alice.handshake_and_logon("alice", "pw").await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
 
     alice
         .run_ok("CREATE (:Person {name: 'Ada', secret: 'hush'})")
@@ -375,7 +375,7 @@ async fn fine_grained_enforcement_admin_restricted_and_live_grant_revoke() {
 
     // ---- 2) Narrow bob to Traverse+Read on :Person.name only (revoke his broad readwrite). ------
     let mut admin = BoltClient::connect(&uds).await;
-    admin.handshake_and_logon("alice", "pw").await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
     admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
     admin.run_ok("CREATE ROLE person_reader").await;
     admin
@@ -389,7 +389,7 @@ async fn fine_grained_enforcement_admin_restricted_and_live_grant_revoke() {
 
     // bob now connects and is filtered.
     let mut bob = BoltClient::connect(&uds).await;
-    bob.handshake_and_logon("bob", "pw2").await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
 
     // Person nodes are visible; `name` reads; `secret` is hidden (reads as NULL, node still visible).
     let people = bob.run_ok("MATCH (n:Person) RETURN n.name, n.secret").await;
@@ -443,7 +443,7 @@ async fn fine_grained_enforcement_admin_restricted_and_live_grant_revoke() {
     // ---- 3) A live GRANT takes effect on bob's NEXT statement. ----------------------------------
     // Admin grants bob Read on :Person.secret; bob's next query reads it without reconnecting.
     let mut admin2 = BoltClient::connect(&uds).await;
-    admin2.handshake_and_logon("alice", "pw").await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
     admin2
         .run_ok("GRANT READ ON PROPERTY graphus.Person.secret TO person_reader")
         .await;
@@ -458,7 +458,7 @@ async fn fine_grained_enforcement_admin_restricted_and_live_grant_revoke() {
 
     // ---- 4) A live REVOKE takes effect on bob's NEXT statement. ----------------------------------
     let mut admin3 = BoltClient::connect(&uds).await;
-    admin3.handshake_and_logon("alice", "pw").await;
+    admin3.handshake_and_logon("alice", "admin-pw8").await;
     admin3
         .run_ok("REVOKE READ ON PROPERTY graphus.Person.secret FROM person_reader")
         .await;
@@ -492,7 +492,7 @@ async fn admin_path_is_unrestricted() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut alice = BoltClient::connect(&uds).await;
-    alice.handshake_and_logon("alice", "pw").await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
 
     alice
         .run_ok("CREATE (:A {p: 1})-[:R {w: 2}]->(:B {q: 3})")

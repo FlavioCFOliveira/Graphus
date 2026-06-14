@@ -323,13 +323,54 @@ struct CollectionLen(usize);
 pub struct Unpacker<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Current nesting depth of the in-progress decode (lists/maps/structures). Guarded against
+    /// [`MAX_DECODE_DEPTH`] so a maliciously deep payload cannot overflow the stack (DoS hardening).
+    depth: usize,
 }
+
+/// Maximum nesting depth accepted when decoding a PackStream value (lists, maps, and structures).
+///
+/// Decoding is recursive, so an adversary-supplied, deeply nested payload (e.g. tens of thousands of
+/// nested empty lists) could otherwise exhaust the call stack and abort the process — a trivial
+/// denial-of-service from network bytes.
+///
+/// The bound is chosen from measurement, not folklore: a debug build of [`unpack_value`] consumes
+/// roughly 2 KiB of stack per recursive frame, so ~1000 frames already overflow the default 2 MiB
+/// thread stack a Bolt session runs on. `256` levels therefore cost at most ~0.5 MiB even in the
+/// worst (debug) profile — safe with wide margin on a 1 MiB stack — while remaining orders of
+/// magnitude beyond any legitimate Bolt payload (real-world property/list nesting is single-digit).
+/// A well-formed message is never rejected; only a hostile one is.
+pub const MAX_DECODE_DEPTH: usize = 256;
 
 impl<'a> Unpacker<'a> {
     /// A new unpacker over `buf`, positioned at the start.
     #[must_use]
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Enters one level of recursive decoding, rejecting the input once [`MAX_DECODE_DEPTH`] is
+    /// exceeded. Pair every successful call with [`Unpacker::leave_nested`].
+    ///
+    /// # Errors
+    /// [`BoltError::Decode`] when the nesting depth would exceed [`MAX_DECODE_DEPTH`].
+    fn enter_nested(&mut self) -> BoltResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_DECODE_DEPTH {
+            return Err(BoltError::Decode(format!(
+                "PackStream nesting depth exceeds the maximum of {MAX_DECODE_DEPTH}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Leaves one level of recursive decoding previously entered via [`Unpacker::enter_nested`].
+    fn leave_nested(&mut self) {
+        self.depth -= 1;
     }
 
     /// Bytes not yet consumed.
@@ -759,6 +800,17 @@ pub fn pack_point_3d(packer: &mut Packer, srid: i64, x: f64, y: f64, z: f64) {
     packer.write_float(z);
 }
 
+/// Inserts `(key, value)` into a decoded dictionary with PackStream "last seen value wins"
+/// semantics (`04 §7.1`): if `key` is already present, its value is replaced in place; otherwise the
+/// pair is appended (preserving first-seen ordering for distinct keys).
+fn map_insert_last_wins(entries: &mut Vec<(String, Value)>, key: String, value: Value) {
+    if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
+        slot.1 = value;
+    } else {
+        entries.push((key, value));
+    }
+}
+
 /// Decodes one [`Value`] from `unpacker`.
 ///
 /// # Errors
@@ -797,20 +849,26 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
         _ if is_string_marker(marker) => Ok(Value::String(unpacker.read_string()?)),
         _ if is_list_marker(marker) => {
             let n = unpacker.read_list_header()?;
+            unpacker.enter_nested()?;
             let mut items = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 items.push(unpack_value(unpacker)?);
             }
+            unpacker.leave_nested();
             Ok(Value::List(items))
         }
         _ if is_map_marker(marker) => {
             let n = unpacker.read_map_header()?;
-            let mut entries = Vec::with_capacity(n.min(1024));
+            unpacker.enter_nested()?;
+            let mut entries: Vec<(String, Value)> = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let k = unpacker.read_string()?;
                 let v = unpack_value(unpacker)?;
-                entries.push((k, v));
+                // PackStream dictionaries are "last seen value wins" for duplicate keys (`04 §7.1`):
+                // overwrite an existing entry rather than retaining a duplicate pair.
+                map_insert_last_wins(&mut entries, k, v);
             }
+            unpacker.leave_nested();
             Ok(Value::Map(entries))
         }
         _ if is_struct_marker(marker) => unpack_structured_value(unpacker),
@@ -964,10 +1022,12 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
     // A list may be structural (contain an entity), so decode element-wise as BoltValues.
     if is_list_marker(marker) {
         let n = unpacker.read_list_header()?;
+        unpacker.enter_nested()?;
         let mut items = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
             items.push(unpack_bolt_value(unpacker)?);
         }
+        unpacker.leave_nested();
         return Ok(BoltValue::List(items));
     }
 
@@ -977,12 +1037,15 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
 /// Decodes the property map of a graph structure as `(key, value)` pairs.
 fn unpack_properties(unpacker: &mut Unpacker<'_>) -> BoltResult<Vec<(String, Value)>> {
     let n = unpacker.read_map_header()?;
-    let mut props = Vec::with_capacity(n.min(1024));
+    unpacker.enter_nested()?;
+    let mut props: Vec<(String, Value)> = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
         let k = unpacker.read_string()?;
         let v = unpack_value(unpacker)?;
-        props.push((k, v));
+        // "Last seen value wins" for duplicate keys, exactly as a top-level dictionary (`04 §7.1`).
+        map_insert_last_wins(&mut props, k, v);
     }
+    unpacker.leave_nested();
     Ok(props)
 }
 
@@ -1491,6 +1554,96 @@ mod tests {
         let mut u = Unpacker::new(&bytes);
         let err = unpack_value(&mut u).unwrap_err();
         assert!(matches!(err, BoltError::Decode(_)));
+    }
+
+    #[test]
+    fn deeply_nested_list_is_rejected_not_overflowed() {
+        // Regression (DoS hardening): a payload of deeply nested single-element lists must be
+        // rejected with a Decode error rather than recursing until the stack overflows/aborts.
+        // Build `MAX_DECODE_DEPTH + 1` nested TINY_LISTs of one element, then a Null at the bottom.
+        let mut bytes = vec![TINY_LIST_BASE + 1; MAX_DECODE_DEPTH + 1];
+        bytes.push(NULL);
+        let mut u = Unpacker::new(&bytes);
+        let err = unpack_value(&mut u).expect_err("over-deep nesting must be rejected");
+        assert!(
+            matches!(err, BoltError::Decode(ref m) if m.contains("nesting depth")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_map_is_rejected_not_overflowed() {
+        // The same guard must apply to nested dictionaries: each level is a single-entry TINY_MAP
+        // (`0xA1`) whose key is the empty string (`0x80`).
+        let mut bytes = Vec::new();
+        for _ in 0..=MAX_DECODE_DEPTH {
+            bytes.push(TINY_MAP_BASE + 1); // map of 1 entry
+            bytes.push(TINY_STRING_BASE); // empty-string key
+        }
+        bytes.push(NULL); // innermost value
+        let mut u = Unpacker::new(&bytes);
+        let err = unpack_value(&mut u).expect_err("over-deep map nesting must be rejected");
+        assert!(
+            matches!(err, BoltError::Decode(ref m) if m.contains("nesting depth")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn nesting_at_the_depth_limit_is_accepted() {
+        // A payload nested exactly to the limit must still decode: the bound is the maximum
+        // accepted depth, not one below it.
+        let mut bytes = vec![TINY_LIST_BASE + 1; MAX_DECODE_DEPTH];
+        bytes.push(NULL);
+        let mut u = Unpacker::new(&bytes);
+        assert!(
+            unpack_value(&mut u).is_ok(),
+            "nesting exactly at the limit must be accepted"
+        );
+    }
+
+    #[test]
+    fn duplicate_map_keys_keep_last_value() {
+        // Regression: PackStream dictionaries are "last seen value wins" (`04 §7.1`). A map encoding
+        // the same key twice must decode to a single entry carrying the LAST value.
+        let mut p = Packer::new();
+        p.write_map_header(2);
+        p.write_string("k");
+        p.write_int(1);
+        p.write_string("k");
+        p.write_int(2);
+        let bytes = p.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        let v = unpack_value(&mut u).expect("decode map");
+        assert_eq!(
+            v,
+            Value::Map(vec![("k".to_owned(), Value::Integer(2))]),
+            "duplicate key must collapse to the last-seen value"
+        );
+    }
+
+    #[test]
+    fn duplicate_property_keys_keep_last_value() {
+        // The same "last wins" rule must hold for a graph entity's property map (`unpack_properties`).
+        // Encode a Node whose property map repeats `p`; the surviving value must be the last one.
+        let mut p = Packer::new();
+        p.write_struct_header(tag::NODE, 4).unwrap();
+        p.write_int(7); // id
+        p.write_list_header(0); // labels
+        p.write_map_header(2); // properties: duplicate key `p`
+        p.write_string("p");
+        p.write_int(10);
+        p.write_string("p");
+        p.write_int(20);
+        p.write_string("e7"); // element_id
+        let bytes = p.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        let node = unpack_node(&mut u).expect("decode node");
+        assert_eq!(
+            node.properties,
+            vec![("p".to_owned(), Value::Integer(20))],
+            "duplicate property key must collapse to the last-seen value"
+        );
     }
 
     #[test]

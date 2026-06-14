@@ -654,12 +654,19 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
             (map.int_or("epochseconds", 0)?, 0i64)
         } else {
             let ms = map.int_or("epochmillis", 0)?;
+            // `rem_euclid(1000)` is in `0..=999`, so `* 1_000_000` never overflows.
             (ms.div_euclid(1000), ms.rem_euclid(1000) * 1_000_000)
         };
         let extra_nanos = map.int_or("nanosecond", 0)?;
-        let total_nanos = base_nanos + extra_nanos;
+        // Guard the nanosecond accumulation and the seconds carry against overflow rather than
+        // panicking in release on `datetime({epochSeconds: i64::MAX, nanosecond: i64::MAX})`.
+        let total_nanos = base_nanos
+            .checked_add(extra_nanos)
+            .ok_or_else(|| type_err("datetime epoch nanoseconds overflow"))?;
         let local = LocalDateTime {
-            epoch_seconds: secs + total_nanos.div_euclid(1_000_000_000),
+            epoch_seconds: secs
+                .checked_add(total_nanos.div_euclid(1_000_000_000))
+                .ok_or_else(|| type_err("datetime epoch seconds overflow"))?,
             nanos: u32::try_from(total_nanos.rem_euclid(1_000_000_000))
                 .expect("rem_euclid(1e9) fits u32"),
         };
@@ -673,7 +680,10 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
         };
         // The local fields shift by the resolved offset.
         let shifted = LocalDateTime {
-            epoch_seconds: local.epoch_seconds + i64::from(offset),
+            epoch_seconds: local
+                .epoch_seconds
+                .checked_add(i64::from(offset))
+                .ok_or_else(|| type_err("datetime epoch seconds overflow"))?,
             nanos: local.nanos,
         };
         return Ok(Value::ZonedDateTime(
@@ -2030,5 +2040,29 @@ mod tests {
         )
         .expect("datetime() selects");
         assert_eq!(iso(&result), "1984-03-28T00:00:42-10:00[Pacific/Honolulu]");
+    }
+
+    /// Regression (audit SEV 4): the `datetime({epochSeconds/epochMillis, nanosecond})` form added
+    /// its epoch components with unchecked `i64 +`, panicking on overflow in debug and producing a
+    /// wrapped (wrong) instant in release. Overflow must now surface as a runtime `TypeError`.
+    #[test]
+    fn datetime_epoch_overflow_is_a_runtime_error_not_a_panic() {
+        let err = construct(
+            "datetime",
+            Some(&map(&[
+                ("epochSeconds", Value::Integer(i64::MAX)),
+                ("nanosecond", Value::Integer(i64::MAX)),
+            ])),
+            &test_clock(),
+        )
+        .expect_err("epoch overflow must error");
+        assert!(
+            matches!(err, EvalError::TypeError { .. }),
+            "expected TypeError, got {err:?}"
+        );
+
+        // A non-overflowing epoch form still constructs the expected instant.
+        let ok = dt(map(&[("epochSeconds", Value::Integer(0))]));
+        assert_eq!(iso(&ok), "1970-01-01T00:00Z");
     }
 }

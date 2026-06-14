@@ -577,7 +577,12 @@ fn decode_list(bytes: &[u8]) -> Result<Value, ValueDecodeError> {
         }
         return Ok(Value::List(Vec::new()));
     }
-    let mut items = Vec::with_capacity(count);
+    // Cap the pre-allocation by the input length: `count` is an untrusted on-disk u32, and the
+    // smallest list element is a single byte, so a real list of `count` elements occupies at least
+    // `count` bytes — capacity never legitimately exceeds `bytes.len()`. Without the cap, a corrupt
+    // `count = 0xFFFF_FFFF` forces a multi-GiB allocation (OOM) before the per-element decode (which
+    // fails fast on truncation) ever runs.
+    let mut items = Vec::with_capacity(count.min(bytes.len()));
     for _ in 0..count {
         items.push(decode_list_element(elem_tag, &mut cur)?);
     }
@@ -719,6 +724,25 @@ mod tests {
             ALL_TAGS,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             "class tags are persisted bytes and must never be renumbered"
+        );
+    }
+
+    /// Regression (storage audit, finding 4 / SEV 2): a corrupt list image whose `count` field is a
+    /// huge untrusted value must not drive a multi-gigabyte pre-allocation (OOM). `decode_list` caps
+    /// `Vec::with_capacity` at the input length, then fails fast when the (absent) element bytes are
+    /// read. The decode must return an error — not abort the process on an allocation.
+    #[test]
+    fn decode_list_with_forged_count_does_not_oom() {
+        // Body layout produced by `encode_list`: elem_tag (u8), count (u32 LE), then elements.
+        // Here: TAG_INT elements, count = u32::MAX, but zero element bytes follow.
+        let mut body = Vec::new();
+        body.push(TAG_INT);
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        // No element bytes: the first `decode_list_element` read is truncated.
+        let res = decode(TAG_LIST, &body);
+        assert!(
+            matches!(res, Err(ValueDecodeError::Malformed { .. })),
+            "a forged list count must yield a Malformed error, got {res:?}"
         );
     }
 

@@ -49,7 +49,7 @@
 //! use graphus_auth::{Authenticator, Privilege};
 //!
 //! // One shared service per server; populate users, roles, and grants.
-//! let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret");
+//! let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret").unwrap();
 //! auth.catalog_mut().create_user("alice").unwrap();
 //! auth.catalog_mut().create_role("reader").unwrap();
 //! auth.catalog_mut()

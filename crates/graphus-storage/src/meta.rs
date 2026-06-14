@@ -1128,7 +1128,11 @@ impl Statistics {
                     "full-text index {name:?} declares no properties"
                 )));
             }
-            let mut property_tokens = Vec::with_capacity(n_props);
+            // Cap the pre-allocation by the bytes remaining: `n_props` is an untrusted on-disk u32
+            // and each property is a 4-byte `read_u32`, so the real count cannot exceed `bytes.len()`.
+            // Without the cap, `n_props = 0xFFFF_FFFF` would force a multi-GiB allocation (OOM) before
+            // the per-element bounds checks below ever run. The reads still validate every element.
+            let mut property_tokens = Vec::with_capacity(n_props.min(bytes.len()));
             for _ in 0..n_props {
                 property_tokens.push(read_u32(bytes, cur)?);
             }
@@ -1247,7 +1251,10 @@ impl Statistics {
                     "constraint {name:?} covers no properties"
                 )));
             }
-            let mut property_tokens = Vec::with_capacity(n_props);
+            // Cap by the bytes remaining (see the full-text decoder above): `n_props` is an untrusted
+            // u32 and each property is a 4-byte read, so capacity never legitimately exceeds
+            // `bytes.len()`. Prevents an OOM from a forged count before the per-element reads validate.
+            let mut property_tokens = Vec::with_capacity(n_props.min(bytes.len()));
             for _ in 0..n_props {
                 property_tokens.push(read_u32(bytes, cur)?);
             }
@@ -1403,7 +1410,10 @@ impl Meta {
             let fl_end = take(bytes, &mut cur, fl_len)?;
             s.free_list = FreeList::decode(&bytes[cur - fl_len..fl_end])?;
             let n_pages = read_u32(bytes, &mut cur)? as usize;
-            s.device_pages = Vec::with_capacity(n_pages);
+            // Cap by the bytes remaining: each device-page entry is an 8-byte `read_u64`, so the real
+            // count cannot exceed `bytes.len()`. Without the cap a forged `n_pages = 0xFFFF_FFFF`
+            // forces a multi-GiB allocation (OOM) before the per-element reads validate the input.
+            s.device_pages = Vec::with_capacity(n_pages.min(bytes.len()));
             for _ in 0..n_pages {
                 s.device_pages.push(read_u64(bytes, &mut cur)?);
             }
@@ -1467,6 +1477,57 @@ mod tests {
         let m = Meta::new(1);
         let back = Meta::decode(&m.encode().unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    /// Regression (storage audit, finding 3 / SEV 3): a forged full-text catalog whose `n_props`
+    /// field is a huge untrusted u32 must not drive a multi-gigabyte pre-allocation (OOM). The
+    /// decoder caps `Vec::with_capacity` at the input length and then fails fast when the (absent)
+    /// per-property reads run. It must return an error, not abort on an allocation.
+    #[test]
+    fn decode_fulltext_catalog_with_forged_n_props_does_not_oom() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 index entry
+        let name = b"idx";
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&7u32.to_le_bytes()); // label_token
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // forged n_props = u32::MAX
+        // No property-token bytes follow: the first per-property read is truncated.
+        let mut cur = 0usize;
+        assert!(Statistics::decode_fulltext_catalog(&bytes, &mut cur).is_err());
+    }
+
+    /// Regression (storage audit, finding 3 / SEV 3): same OOM guard for the constraint catalog.
+    #[test]
+    fn decode_constraint_catalog_with_forged_n_props_does_not_oom() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 constraint entry
+        let name = b"c1";
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // label_token
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // forged n_props = u32::MAX
+        let mut cur = 0usize;
+        assert!(Statistics::decode_constraint_catalog(&bytes, &mut cur).is_err());
+    }
+
+    /// Regression (storage audit, finding 3 / SEV 3): a forged `Meta` image whose per-store
+    /// `device_pages` count is a huge untrusted u32 must not OOM on the `Vec::with_capacity`. We
+    /// craft the minimal prefix `Meta::decode` reads up to the first store's `n_pages`, set it to
+    /// `u32::MAX`, and supply no page bytes; the decode must error, not abort.
+    #[test]
+    fn decode_meta_with_forged_device_pages_count_does_not_oom() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u128.to_le_bytes()); // element_id_next
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // commit_ts_hw
+        // First store: high_water(u64), free_list len(u32)+bytes, then n_pages(u32).
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // high_water
+        // A minimal valid free-list image is a 4-byte count word of 0 (an empty free list).
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // free_list byte length = 4
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // free-list count = 0
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // forged n_pages = u32::MAX
+        // No device-page bytes follow.
+        assert!(Meta::decode(&bytes).is_err());
     }
 
     #[test]

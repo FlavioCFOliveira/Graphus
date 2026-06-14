@@ -53,7 +53,7 @@ const TTL: u64 = 1_000_000_000; // 1s, in clock nanos
 /// An authenticator with `alice` (DB Read + Write) and `bob` (DB Read only), so tests can exercise
 /// both authorized and forbidden access modes. No passwords needed (REST uses Bearer).
 fn fixture_auth() -> Authenticator {
-    let mut a = Authenticator::new(JWT_SECRET);
+    let mut a = Authenticator::new(JWT_SECRET).expect("JWT_SECRET is >= 32 bytes");
     a.catalog_mut().create_user("alice").unwrap();
     a.catalog_mut().create_user("bob").unwrap();
     a.catalog_mut().create_role("rw").unwrap();
@@ -1039,4 +1039,122 @@ async fn graph_viz_compile_error_is_problem_json() {
     // The read transaction was rolled back after the error.
     assert!(h.engine.log().iter().any(|l| l.starts_with("rollback")));
     assert_eq!(h.registry.open_count(), 0);
+}
+
+// =============================== DoS hardening (untrusted HTTP input) ============================
+//
+// Two input-driven DoS vectors fixed in graphus-rest, each pinned by a regression test below:
+//   1. A request body over the explicit cap is rejected `413` before any decoding/buffering grows
+//      memory unbounded (`crate::router::MAX_REQUEST_BODY_BYTES`, `DefaultBodyLimit`).
+//   2. A deeply nested CBOR body — small on the wire, but recursive to decode — is refused as a
+//      controlled `400` (problem+json `Malformed`), never a stack-overflow panic
+//      (`crate::value::MAX_CBOR_DEPTH`, both the request-path deserializer and `cbor_to_value`).
+
+/// A body larger than [`crate::router::MAX_REQUEST_BODY_BYTES`] is rejected `413 Payload Too Large`
+/// before it is buffered, so an oversized body cannot exhaust server memory (regression: the router
+/// previously relied on axum's implicit, un-auditable 2 MiB default). The body here is otherwise a
+/// well-formed JSON request — only its size triggers the rejection.
+#[tokio::test]
+async fn oversized_request_body_is_rejected_413() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    // One statement whose Cypher string alone exceeds the cap → the serialized body is over the
+    // limit. The body is valid JSON; the size, not the shape, is what must be rejected.
+    let huge_query = "X".repeat(crate::router::MAX_REQUEST_BODY_BYTES + 1);
+    let body = serde_json::to_vec(&json!({
+        "statements": [{ "statement": huge_query }]
+    }))
+    .unwrap();
+    assert!(body.len() > crate::router::MAX_REQUEST_BODY_BYTES);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/db/neo4j/tx/commit")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = h.send(req).await;
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // The body never reached the engine — nothing ran.
+    assert!(h.engine.log().is_empty());
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+/// A request body just under the cap is accepted (the `413` boundary is exclusive of legitimate
+/// payloads): the limit rejects abuse without clipping a large-but-valid statement batch.
+#[tokio::test]
+async fn body_under_the_cap_is_accepted() {
+    let engine = MockEngine::new().on_query("RETURN 1", Canned::rows(&["n"], vec![]));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/db/neo4j/tx/commit")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "statements": [{ "statement": "RETURN 1" }] })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// A deeply nested CBOR request body — far past [`crate::value::MAX_CBOR_DEPTH`], yet a few KiB on
+/// the wire — is refused as a controlled `400` problem+json, **not** a stack-overflow panic. Before
+/// the fix the request-path deserializer recursed without an audited bound, so a single small body
+/// could crash the worker thread. The body fits comfortably under the size cap, proving the depth
+/// guard (not the size guard) is what catches it.
+#[tokio::test]
+async fn deeply_nested_cbor_body_is_rejected_not_panic() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    // Build `parameters` = [[[ ... ]]] nested well past MAX_CBOR_DEPTH, then CBOR-encode the whole
+    // RunRequest. Each level is one array marker byte, so this stays tiny on the wire.
+    let depth = crate::value::MAX_CBOR_DEPTH + 50;
+    let mut nested = ciborium::Value::Integer(0.into());
+    for _ in 0..depth {
+        nested = ciborium::Value::Array(vec![nested]);
+    }
+    let request = ciborium::Value::Map(vec![(
+        ciborium::Value::Text("statements".to_owned()),
+        ciborium::Value::Array(vec![ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("statement".to_owned()),
+                ciborium::Value::Text("RETURN $x".to_owned()),
+            ),
+            (
+                ciborium::Value::Text("parameters".to_owned()),
+                ciborium::Value::Map(vec![(ciborium::Value::Text("x".to_owned()), nested)]),
+            ),
+        ])]),
+    )]);
+
+    let mut body = Vec::new();
+    ciborium::into_writer(&request, &mut body).unwrap();
+    assert!(
+        body.len() < crate::router::MAX_REQUEST_BODY_BYTES,
+        "the deep body must be small on the wire ({} bytes) so the depth guard, not the size guard, \
+         is what rejects it",
+        body.len()
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/db/neo4j/tx/commit")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .body(Body::from(body))
+        .unwrap();
+    // If this returns at all (rather than aborting the runtime), the recursion was bounded.
+    let resp = h.send(req).await;
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    assert!(h.engine.log().is_empty());
 }

@@ -205,6 +205,20 @@ impl LogRecord {
     /// into the record. Returns the encoded length.
     pub fn encode_to(&mut self, lsn: Lsn, out: &mut Vec<u8>) -> usize {
         self.lsn = lsn;
+        // The redo/undo image lengths are framed as `u32` on the wire (below). A ≥4 GiB image would
+        // truncate silently, producing a corrupt, undecodable record. Such an image is never produced
+        // by this engine (page images are bounded), so guard with a debug assertion that fires in
+        // tests/debug builds rather than emitting silent corruption.
+        debug_assert!(
+            self.redo.len() <= u32::MAX as usize,
+            "WAL redo image {} bytes exceeds the u32 frame limit",
+            self.redo.len()
+        );
+        debug_assert!(
+            self.undo.len() <= u32::MAX as usize,
+            "WAL undo image {} bytes exceeds the u32 frame limit",
+            self.undo.len()
+        );
         let total = self.encoded_len();
         let start = out.len();
         out.reserve(total);

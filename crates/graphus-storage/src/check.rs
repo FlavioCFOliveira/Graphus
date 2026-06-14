@@ -953,7 +953,12 @@ fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) 
         }
     }
 
-    for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
+    for kind in [
+        StoreKind::Node,
+        StoreKind::Rel,
+        StoreKind::Prop,
+        StoreKind::Strings,
+    ] {
         let hw = cat.high_water(kind);
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         for &id in cat.free(kind) {

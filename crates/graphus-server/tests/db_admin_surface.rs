@@ -121,11 +121,11 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: JWT_SECRET.to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: vec![UserBootstrap {
                 name: "bob".to_owned(),
-                password: "pw2".to_owned(),
+                password: "user2-pw8".to_owned(),
             }],
         },
         encryption: graphus_server::config::EncryptionConfig::default(),
@@ -169,7 +169,7 @@ async fn boot(config: ServerConfig) -> ServerHandle {
 /// issuance, exactly like `server_integration.rs`).
 fn mint_token(user: &str) -> String {
     use graphus_auth::Authenticator;
-    let mut auth = Authenticator::new(JWT_SECRET.as_bytes());
+    let mut auth = Authenticator::new(JWT_SECRET.as_bytes()).expect("JWT_SECRET is >= 32 bytes");
     auth.catalog_mut().create_user(user).expect("create user");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -527,7 +527,7 @@ async fn bolt_create_index_is_non_blocking_and_reaches_online() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     // Seed a populated graph (so the build has work to do).
     for age in 20..30 {
@@ -602,7 +602,7 @@ async fn index_ddl_privilege_and_transaction_rules() {
 
     // A non-admin (bob) is denied CREATE INDEX and SHOW INDEXES — the Security classification.
     let mut bob = BoltClient::connect(&uds).await;
-    bob.handshake_and_logon("bob", "pw2").await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
     let f = bob
         .run_on_db("CREATE INDEX FOR (n:Person) ON (n.age)", None)
         .await
@@ -620,7 +620,7 @@ async fn index_ddl_privilege_and_transaction_rules() {
 
     // Admin (alice): index DDL inside an explicit transaction is rejected, with no side effect.
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.begin(None).await.expect("BEGIN");
     let f = c
         .run_on_db("CREATE INDEX FOR (n:Person) ON (n.age)", None)
@@ -671,7 +671,7 @@ async fn bolt_sessions_target_databases_with_full_isolation() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut admin = BoltClient::connect(&uds).await;
-    admin.handshake_and_logon("alice", "pw").await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
 
     // CREATE DATABASE over the wire: empty result.
     let rows = admin.run_ok("CREATE DATABASE sales", None).await;
@@ -697,7 +697,7 @@ async fn bolt_sessions_target_databases_with_full_isolation() {
 
     // A separate session writes into `sales` (RUN extra db) and into the default (no db field).
     let mut session = BoltClient::connect(&uds).await;
-    session.handshake_and_logon("alice", "pw").await;
+    session.handshake_and_logon("alice", "admin-pw8").await;
     session
         .run_ok("CREATE (:SalesOnly {v: 1})", Some("sales"))
         .await;
@@ -762,7 +762,7 @@ async fn bolt_admin_lifecycle_create_show_stop_drop_and_if_variants() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     c.run_ok("CREATE DATABASE scratch", None).await;
 
@@ -840,7 +840,7 @@ async fn created_database_survives_a_restart() {
         let server = boot(config.clone()).await;
         let uds = server.uds_path.clone().expect("UDS enabled");
         let mut c = BoltClient::connect(&uds).await;
-        c.handshake_and_logon("alice", "pw").await;
+        c.handshake_and_logon("alice", "admin-pw8").await;
         c.run_ok("CREATE DATABASE keep", None).await;
         c.run_ok("CREATE (:Kept {v: 7})", Some("keep")).await;
         c.goodbye().await;
@@ -850,7 +850,7 @@ async fn created_database_survives_a_restart() {
     let server = boot(config).await;
     let uds = server.uds_path.clone().expect("UDS enabled");
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     let dbs = show_databases(&mut c).await;
     let keep = dbs.iter().find(|d| d.name == "keep").expect("keep is back");
     assert_eq!(keep.state, "online", "online again after the restart");
@@ -873,7 +873,7 @@ async fn bolt_unknown_database_fails_clearly_and_session_recovers() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     // Auto-commit RUN against a missing database.
     let f = c
@@ -915,7 +915,7 @@ async fn bolt_run_cannot_switch_database_inside_an_explicit_transaction() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.run_ok("CREATE DATABASE other", None).await;
 
     c.begin(None).await.expect("BEGIN on the default");
@@ -943,7 +943,7 @@ async fn bolt_admin_commands_are_rejected_inside_an_explicit_transaction() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     c.begin(None).await.expect("BEGIN");
     let f = c
@@ -974,7 +974,7 @@ async fn non_admin_principal_is_denied_admin_commands_with_no_side_effects() {
 
     // Bolt: bob authenticates fine and can query...
     let mut bob = BoltClient::connect(&uds).await;
-    bob.handshake_and_logon("bob", "pw2").await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
     assert_eq!(bob.count("RETURN 1", None).await, 1);
     // ...but CREATE DATABASE is forbidden (the Security classification, not a generic error).
     let f = bob
@@ -1007,7 +1007,7 @@ async fn non_admin_principal_is_denied_admin_commands_with_no_side_effects() {
 
     // No side effects: the admin sees no `forbidden` database.
     let mut alice = BoltClient::connect(&uds).await;
-    alice.handshake_and_logon("alice", "pw").await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
     let dbs = show_databases(&mut alice).await;
     assert!(
         !dbs.iter().any(|d| d.name == "forbidden"),
@@ -1119,7 +1119,7 @@ async fn admin_grammar_is_strict_on_the_wire() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     // Claimed (CREATE DATABASE …) but malformed → a syntax-class FAILURE.
     let f = c

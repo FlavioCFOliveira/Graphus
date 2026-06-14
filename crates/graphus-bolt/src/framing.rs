@@ -13,10 +13,20 @@
 //! takes an already-serialized message payload and frames it; [`Dechunker`] reassembles a payload
 //! from a byte stream. The framing and the codec compose in [`crate::message`].
 
-use crate::error::BoltResult;
+use crate::error::{BoltError, BoltResult};
 
 /// The maximum number of payload bytes in a single chunk (the largest 16-bit big-endian length).
 pub const MAX_CHUNK_PAYLOAD: usize = u16::MAX as usize;
+
+/// The default cap on the size (in bytes) of a single **reassembled** message payload.
+///
+/// A Bolt message may legitimately span many chunks (`04 §8.1`), but it is reassembled into one
+/// contiguous buffer before decoding. Without a bound, a malicious peer can stream an unbounded run
+/// of non-empty chunks (never sending the `00 00` terminator) and force the server to buffer until
+/// it runs out of memory — a trivial denial-of-service. This default (64 MiB) is far larger than any
+/// legitimate Bolt message yet bounds the worst case. Use [`Dechunker::with_max_message_size`] to
+/// tune it per deployment.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// The two-byte end-of-message / NOOP marker (`00 00`).
 pub const END_MARKER: [u8; 2] = [0x00, 0x00];
@@ -71,7 +81,7 @@ pub enum Frame {
 /// The distinction between an empty message and a NOOP is positional, exactly as on the wire: a
 /// `00 00` that terminates one-or-more non-empty chunks ends a [`Frame::Message`]; a `00 00` seen
 /// with no buffered payload is a [`Frame::Noop`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Dechunker {
     /// Bytes received but not yet parsed into chunks.
     inbox: Vec<u8>,
@@ -82,13 +92,36 @@ pub struct Dechunker {
     /// set by any non-end chunk) has contributed to the current message, distinguishing an
     /// end-of-message from a NOOP.
     in_message: bool,
+    /// Hard cap on the size of a single reassembled message; exceeding it is a fatal framing error
+    /// (DoS hardening — see [`DEFAULT_MAX_MESSAGE_SIZE`]).
+    max_message_size: usize,
+}
+
+impl Default for Dechunker {
+    fn default() -> Self {
+        Self {
+            inbox: Vec::new(),
+            assembling: Vec::new(),
+            in_message: false,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        }
+    }
 }
 
 impl Dechunker {
-    /// A new, empty dechunker.
+    /// A new, empty dechunker with the [`DEFAULT_MAX_MESSAGE_SIZE`] reassembly cap.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A new, empty dechunker with a custom reassembled-message size cap (DoS hardening).
+    #[must_use]
+    pub fn with_max_message_size(max_message_size: usize) -> Self {
+        Self {
+            max_message_size,
+            ..Self::default()
+        }
     }
 
     /// Appends received bytes to the internal buffer.
@@ -103,9 +136,9 @@ impl Dechunker {
     /// [`Frame::Message`] (or a [`Frame::Noop`] if nothing was assembled).
     ///
     /// # Errors
-    /// This never errors today (all 16-bit lengths are valid); it returns [`BoltResult`] so the
-    /// signature is stable if a future framing extension (e.g. oversized-message limits) adds a
-    /// validity check.
+    /// [`BoltError::Decode`] when a reassembled message would exceed the configured
+    /// [`max_message_size`](Dechunker::with_max_message_size): the framing is aborted so the caller
+    /// can close the connection rather than buffer unboundedly (DoS hardening).
     pub fn next_frame(&mut self) -> BoltResult<Option<Frame>> {
         loop {
             // Need at least a 2-byte length header to proceed.
@@ -123,6 +156,17 @@ impl Dechunker {
                     return Ok(Some(Frame::Message(payload)));
                 }
                 return Ok(Some(Frame::Noop));
+            }
+
+            // Reject before buffering: the chunk's payload would push the reassembled message past
+            // the cap. Checked against the already-assembled size (saturating, so it cannot wrap),
+            // so an unbounded run of non-terminated chunks is stopped at the limit rather than
+            // exhausting memory.
+            if self.assembling.len().saturating_add(len) > self.max_message_size {
+                return Err(BoltError::Decode(format!(
+                    "reassembled Bolt message exceeds the maximum size of {} bytes",
+                    self.max_message_size
+                )));
             }
 
             // A data chunk: wait until the full header+payload has arrived.
@@ -240,6 +284,46 @@ mod tests {
                 Frame::Message(b"one".to_vec()),
                 Frame::Message(b"two".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn oversized_reassembled_message_is_rejected() {
+        // Regression (DoS hardening): a peer streams non-empty chunks without ever sending the
+        // `00 00` terminator. The reassembly cap must abort with an error instead of buffering
+        // unboundedly. Use a tiny cap so the test is cheap and deterministic.
+        let mut d = Dechunker::with_max_message_size(8);
+        // First chunk of 5 bytes is fine (5 <= 8).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0x00, 0x05]);
+        wire.extend_from_slice(b"abcde");
+        d.push(&wire);
+        assert_eq!(d.next_frame().unwrap(), None); // consumed, awaiting more
+
+        // A second 5-byte chunk would make 10 bytes (> 8): rejected, and the rejection is decided
+        // from the header alone (no need to deliver the payload first).
+        d.push(&[0x00, 0x05]);
+        let err = d
+            .next_frame()
+            .expect_err("oversized message must be rejected");
+        assert!(
+            matches!(err, BoltError::Decode(ref m) if m.contains("maximum size")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn message_at_the_size_cap_is_accepted() {
+        // A message exactly at the cap must still be accepted (the bound is inclusive).
+        let mut d = Dechunker::with_max_message_size(5);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0x00, 0x05]);
+        wire.extend_from_slice(b"abcde");
+        wire.extend_from_slice(&END_MARKER);
+        d.push(&wire);
+        assert_eq!(
+            d.next_frame().unwrap(),
+            Some(Frame::Message(b"abcde".to_vec()))
         );
     }
 

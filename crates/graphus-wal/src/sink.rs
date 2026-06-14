@@ -345,8 +345,10 @@ impl LogSink for FileLogSink {
                 .map_err(|e| GraphusError::Storage(format!("create wal anchor: {e}")))?;
             f.write_all_at(&self.pending, 0)
                 .map_err(|e| GraphusError::Storage(format!("wal anchor write: {e}")))?;
-            f.sync_data()
-                .map_err(|e| GraphusError::Storage(format!("wal anchor fdatasync: {e}")))?;
+            // True stable-storage barrier (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere): a bare
+            // `fdatasync` on APFS/HFS+ does not flush the drive's volatile write cache, so an
+            // acknowledged commit could be lost on power failure. See `crate::fullsync`.
+            crate::fullsync::full_sync_data(&f, "wal anchor fdatasync")?;
             self.sync_dir()?; // harden the anchor's directory entry
             self.anchor_len = self.pending.len() as u64;
             self.durable_len = self.anchor_len;
@@ -385,10 +387,9 @@ impl LogSink for FileLogSink {
             .file
             .write_all_at(&self.pending, write_at)
             .map_err(|e| GraphusError::Storage(format!("wal segment write: {e}")))?;
-        active
-            .file
-            .sync_data()
-            .map_err(|e| GraphusError::Storage(format!("wal segment fdatasync: {e}")))?;
+        // True stable-storage barrier (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere) — see the
+        // anchor path above and `crate::fullsync`.
+        crate::fullsync::full_sync_data(&active.file, "wal segment fdatasync")?;
         let n = self.pending.len() as u64;
         active.len += n;
         self.durable_len += n;

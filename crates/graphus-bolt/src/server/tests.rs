@@ -13,16 +13,17 @@ use crate::transport::MemoryTransport;
 use graphus_auth::{Authenticator, Privilege};
 use graphus_core::{GraphusError, Value};
 
-/// An authenticator with one `alice`/`pw` user (Bolt native auth, `04 §8.4`).
+/// An authenticator with one `alice`/`alice-pw` user (Bolt native auth, `04 §8.4`).
 fn auth_fixture() -> Authenticator {
-    let mut a = Authenticator::new(b"shared-jwt-secret-at-least-32-bytes!!");
+    let mut a = Authenticator::new(b"shared-jwt-secret-at-least-32-bytes!!")
+        .expect("fixture secret is >= 32 bytes");
     a.catalog_mut().create_user("alice").unwrap();
     a.catalog_mut().create_role("reader").unwrap();
     a.catalog_mut()
         .grant_privilege("reader", Privilege::read_database())
         .unwrap();
     a.catalog_mut().grant_role("alice", "reader").unwrap();
-    a.set_password("alice", "pw").unwrap();
+    a.set_password("alice", "alice-pw").unwrap();
     a
 }
 
@@ -53,13 +54,21 @@ fn manifest_handshake(chosen: Version) -> Vec<u8> {
     out
 }
 
-/// A `LOGON` with the `basic` scheme for `alice`/`pw`.
+/// A spec-valid `HELLO` carrying the required `user_agent` field (`04 §8.1`). Use this in tests that
+/// drive a healthy handshake; the missing-`user_agent` rejection has its own dedicated test.
+fn hello() -> Request {
+    Request::Hello {
+        extra: vec![("user_agent".to_owned(), Value::String("drv/1".to_owned()))],
+    }
+}
+
+/// A `LOGON` with the `basic` scheme for `alice`/`alice-pw`.
 fn logon_alice() -> Request {
     Request::Logon {
         auth: vec![
             ("scheme".to_owned(), Value::String("basic".to_owned())),
             ("principal".to_owned(), Value::String("alice".to_owned())),
-            ("credentials".to_owned(), Value::String("pw".to_owned())),
+            ("credentials".to_owned(), Value::String("alice-pw".to_owned())),
         ],
     }
 }
@@ -181,7 +190,7 @@ fn failure_then_ignore_until_reset_recovery() {
         );
 
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Run {
             query: "BAD CYPHER".to_owned(),
@@ -257,7 +266,7 @@ fn pull_honours_bounded_fetch_size_with_has_more() {
     );
 
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Run {
             query: "RETURN r".to_owned(),
@@ -322,7 +331,7 @@ fn bounded_pull_landing_exactly_on_last_record_does_not_say_has_more() {
         ),
     );
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Run {
             query: "RETURN r".to_owned(),
@@ -363,7 +372,7 @@ fn discard_drops_rows_and_yields_summary_only() {
         ),
     );
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Run {
             query: "RETURN r".to_owned(),
@@ -390,7 +399,7 @@ fn discard_drops_rows_and_yields_summary_only() {
 fn bad_credentials_fail_and_then_ignore() {
     let exec = MockExecutor::new();
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         Request::Logon {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
@@ -432,7 +441,7 @@ fn handshake_rejection_closes_connection() {
         Proposal::exact(0, 0),
         Proposal::exact(0, 0),
     ]);
-    input.extend_from_slice(&encode_request_framed(&Request::Hello { extra: vec![] }).unwrap());
+    input.extend_from_slice(&encode_request_framed(&hello()).unwrap());
     let auth = auth_fixture();
     let mut transport = MemoryTransport::with_input(&input);
     {
@@ -449,7 +458,7 @@ fn handshake_rejection_closes_connection() {
 fn out_of_order_run_before_logon_fails() {
     // RUN in AUTHENTICATION (before LOGON) is illegal → FAILURE.
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         Request::Run {
             query: "RETURN 1".to_owned(),
             parameters: vec![],
@@ -476,7 +485,7 @@ fn out_of_order_run_before_logon_fails() {
 fn rollback_in_transaction_returns_to_ready() {
     let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Begin { extra: vec![] },
         Request::Rollback,
@@ -503,7 +512,7 @@ fn reset_mid_transaction_rolls_back() {
     // RESET while TX_READY must roll back the open transaction and return to READY.
     let exec = MockExecutor::new();
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Begin { extra: vec![] },
         Request::Reset,
@@ -524,7 +533,7 @@ fn reset_mid_transaction_rolls_back() {
 fn noop_keepalive_between_messages_is_ignored() {
     // Insert a bare NOOP (00 00) between LOGON and RUN; the session must skip it.
     let mut input = handshake_54();
-    input.extend_from_slice(&encode_request_framed(&Request::Hello { extra: vec![] }).unwrap());
+    input.extend_from_slice(&encode_request_framed(&hello()).unwrap());
     input.extend_from_slice(&encode_request_framed(&logon_alice()).unwrap());
     input.extend_from_slice(&crate::framing::END_MARKER); // NOOP
     input.extend_from_slice(
@@ -562,7 +571,7 @@ fn commit_serialization_failure_is_transient_failure() {
         "serialization failure".to_owned(),
     ));
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Begin { extra: vec![] },
         Request::Commit,
@@ -585,12 +594,72 @@ fn commit_serialization_failure_is_transient_failure() {
 #[test]
 fn eof_before_goodbye_ends_cleanly() {
     // The peer drops the socket right after LOGON; the session ends without error, state DEFUNCT.
-    let input = session_input(&[Request::Hello { extra: vec![] }, logon_alice()]);
+    let input = session_input(&[hello(), logon_alice()]);
     let auth = auth_fixture();
     let mut transport = MemoryTransport::with_input(&input);
     let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
     session.run().expect("clean EOF");
     assert_eq!(session.state(), State::Defunct);
+}
+
+#[test]
+fn hello_without_user_agent_is_rejected_with_failure() {
+    // Regression: `user_agent` is REQUIRED in HELLO (`04 §8.1`). A HELLO that omits it must be
+    // answered with FAILURE (not SUCCESS), and the connection must enter FAILED — it must never
+    // advance to AUTHENTICATION. A subsequent LOGON is then IGNORED.
+    let input = session_input(&[
+        Request::Hello { extra: vec![] }, // no `user_agent`
+        logon_alice(),
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().expect("session runs");
+        assert_ne!(
+            session.principal(),
+            Some("alice"),
+            "a rejected HELLO must not authenticate"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    match &r[0] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(f.message.contains("user_agent"), "message: {}", f.message);
+        }
+        other => panic!("expected HELLO FAILURE, got {other:?}"),
+    }
+    // The LOGON that followed must have been IGNORED (no second SUCCESS/FAILURE for it).
+    assert!(
+        !matches!(r.get(1), Some(Response::Success { .. })),
+        "LOGON after a failed HELLO must not succeed: {r:?}"
+    );
+}
+
+#[test]
+fn hello_with_empty_user_agent_is_rejected() {
+    // A present-but-empty `user_agent` is as malformed as an absent one.
+    let input = session_input(&[
+        Request::Hello {
+            extra: vec![("user_agent".to_owned(), Value::String(String::new()))],
+        },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().expect("session runs");
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(
+        matches!(&r[0], Response::Failure(f) if f.message.contains("user_agent")),
+        "empty user_agent must be rejected: {r:?}"
+    );
 }
 
 #[test]
@@ -608,7 +677,7 @@ fn summary_carries_query_type_and_stats() {
         },
     );
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Run {
             query: "CREATE (n)".to_owned(),
@@ -646,7 +715,7 @@ fn db_field_from_extras_reaches_the_executor() {
     // empty/absent value is normalised to None (Bolt 5.x database targeting — rmp #84).
     let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         // Auto-commit RUN naming a database.
         Request::Run {
@@ -695,12 +764,7 @@ fn db_field_from_extras_reaches_the_executor() {
 fn logon_announces_the_principal_and_logoff_clears_it() {
     // LOGON → set_principal(Some), LOGOFF → set_principal(None) (rmp #84 identity plumbing).
     let exec = MockExecutor::new();
-    let input = session_input(&[
-        Request::Hello { extra: vec![] },
-        logon_alice(),
-        Request::Logoff,
-        Request::Goodbye,
-    ]);
+    let input = session_input(&[hello(), logon_alice(), Request::Logoff, Request::Goodbye]);
     let auth = auth_fixture();
     let mut transport = MemoryTransport::with_input(&input);
     let mut session = BoltSession::new(&mut transport, exec, &auth);
@@ -730,7 +794,7 @@ fn manifest_handshake_negotiates_and_runs_a_full_session() {
     );
     let mut input = manifest_handshake(Version::new(5, 4));
     for r in [
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Run {
             query: "RETURN 1".to_owned(),
@@ -777,7 +841,7 @@ fn manifest_handshake_negotiates_and_runs_a_full_session() {
 fn both_handshake_forms_reach_the_same_version() {
     // Legacy and manifest handshakes against the same fixture both negotiate 5.4.
     let auth = auth_fixture();
-    let legacy_input = session_input(&[Request::Hello { extra: vec![] }, logon_alice()]);
+    let legacy_input = session_input(&[hello(), logon_alice()]);
     let mut legacy_transport = MemoryTransport::with_input(&legacy_input);
     let legacy_version = {
         let mut s = BoltSession::new(&mut legacy_transport, MockExecutor::new(), &auth);
@@ -786,7 +850,7 @@ fn both_handshake_forms_reach_the_same_version() {
     };
 
     let mut manifest_input = manifest_handshake(Version::new(5, 4));
-    for r in [Request::Hello { extra: vec![] }, logon_alice()] {
+    for r in [hello(), logon_alice()] {
         manifest_input.extend_from_slice(&encode_request_framed(&r).unwrap());
     }
     let mut manifest_transport = MemoryTransport::with_input(&manifest_input);
@@ -817,7 +881,7 @@ fn route_returns_a_well_formed_single_instance_routing_table() {
     let exec = MockExecutor::new();
     let mut input = handshake_54();
     for r in [
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Route {
             routing: vec![],
@@ -902,7 +966,7 @@ fn route_db_defaults_to_null_for_the_home_database() {
     // ROUTE with an empty/absent db field yields a null `db` in the table (the home database).
     let mut input = handshake_54();
     for r in [
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Route {
             routing: vec![],
@@ -953,7 +1017,7 @@ fn telemetry_is_acknowledged_with_success_and_never_fails() {
         CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
     );
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         logon_alice(),
         Request::Telemetry { api: 2 },
         Request::Run {
@@ -989,7 +1053,7 @@ fn telemetry_is_acknowledged_with_success_and_never_fails() {
 fn telemetry_before_logon_is_still_success_not_failure() {
     // Even out of the usual order (sent in AUTHENTICATION), TELEMETRY is acknowledged, never failed.
     let input = session_input(&[
-        Request::Hello { extra: vec![] },
+        hello(),
         Request::Telemetry { api: 1 },
         logon_alice(),
         Request::Goodbye,
@@ -1018,7 +1082,7 @@ fn telemetry_before_logon_is_still_success_not_failure() {
 fn connection_id_is_unique_per_session_and_surfaced_in_hello() {
     // Two sessions configured with distinct connection ids must each report their own in HELLO.
     fn hello_connection_id(conn_id: &str) -> String {
-        let input = session_input(&[Request::Hello { extra: vec![] }, Request::Goodbye]);
+        let input = session_input(&[hello(), Request::Goodbye]);
         let auth = auth_fixture();
         let mut transport = MemoryTransport::with_input(&input);
         {
@@ -1058,7 +1122,7 @@ fn connection_id_is_unique_per_session_and_surfaced_in_hello() {
 #[test]
 fn hello_reports_the_server_agent_and_hints() {
     // HELLO SUCCESS carries a Graphus server agent and a hints map (drivers probe both).
-    let input = session_input(&[Request::Hello { extra: vec![] }, Request::Goodbye]);
+    let input = session_input(&[hello(), Request::Goodbye]);
     let auth = auth_fixture();
     let mut transport = MemoryTransport::with_input(&input);
     {

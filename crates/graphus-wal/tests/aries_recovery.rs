@@ -377,6 +377,65 @@ fn interior_log_corruption_is_detected_not_silently_truncated() {
 }
 
 #[test]
+fn committed_transactions_fails_loud_on_interior_corruption() {
+    // Regression (storage audit, finding 5 / SEV 3): `committed_transactions` rebuilds the recovered
+    // transaction table and must apply the SAME interior-corruption guard as `recover_from`. If an
+    // undecodable record is followed by genuine committed records, stopping silently would drop those
+    // transactions from the table — an ACID violation. It must fail loud instead.
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+    for t in 1..=3u64 {
+        wal.begin(TxnId(t));
+        wal.log_update(TxnId(t), PageId(0), d(-1), d(1));
+        wal.commit(TxnId(t)).unwrap();
+    }
+    let mut full = wal.sink().durable_bytes().to_vec();
+
+    // Corrupt a body byte of the FIRST record (BadCrc), leaving all later records self-consistent.
+    let bounds = record_boundaries(&full);
+    assert!(bounds.len() > 4, "need several intact records after the first");
+    let txn_id_byte = bounds[0] as usize + 20; // OFF_TXN_ID inside record 0
+    full[txn_id_byte] ^= 0xFF;
+
+    let mut sink = MemLogSink::new();
+    sink.append(&full);
+    sink.sync().unwrap();
+    let wal2 = WalManager::open(sink).unwrap();
+    let err = wal2
+        .committed_transactions()
+        .expect_err("interior corruption must fail, not silently truncate the txn table");
+    assert!(
+        err.to_string().contains("interior log corruption"),
+        "must report interior corruption; got: {err}"
+    );
+}
+
+#[test]
+fn committed_transactions_tolerates_a_genuine_torn_tail() {
+    // Complement of the above: a genuine torn tail (no valid record after the torn point) must NOT
+    // trip the fail-loud guard — `committed_transactions` returns the committed prefix cleanly.
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+    for t in 1..=2u64 {
+        wal.begin(TxnId(t));
+        wal.log_update(TxnId(t), PageId(0), d(-1), d(1));
+        wal.commit(TxnId(t)).unwrap();
+    }
+    let mut full = wal.sink().durable_bytes().to_vec();
+    // Append a few stray non-zero bytes that cannot decode and have no valid record after them: a
+    // torn tail. (A leading zero would be skipped as reclaimed space, so use 0xFF.)
+    full.extend_from_slice(&[0xFF; 8]);
+
+    let mut sink = MemLogSink::new();
+    sink.append(&full);
+    sink.sync().unwrap();
+    let wal2 = WalManager::open(sink).unwrap();
+    let committed = wal2
+        .committed_transactions()
+        .expect("a torn tail must not fail the scan");
+    // Both committed transactions are recovered; the torn tail is ignored.
+    assert_eq!(committed.len(), 2, "both committed txns must be in the table");
+}
+
+#[test]
 fn a_torn_tail_after_committed_records_still_truncates_cleanly() {
     // The complement of the interior-corruption test: a genuine torn tail at the very end (the last
     // append never completed, with NO valid record after the torn point) must still truncate to

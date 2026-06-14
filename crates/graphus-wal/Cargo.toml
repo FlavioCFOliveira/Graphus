@@ -12,5 +12,11 @@ description = "ARIES write-ahead log, group commit, checkpoints and recovery for
 graphus-core = { path = "../graphus-core" }
 crc32c = "0.6"
 
+# macOS-only: the `fcntl(fd, F_FULLFSYNC)` durability barrier for WAL segments (a plain `fdatasync`
+# on APFS/HFS+ does not flush the drive's volatile write cache — see `src/fullsync.rs`). Linux and
+# other targets never pull `libc`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

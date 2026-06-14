@@ -58,6 +58,12 @@ pub fn equivalent(a: &Value, b: &Value) -> bool {
 /// Numeric equivalence: `NaN ≡ NaN` (`true`), `-0.0 ≡ +0.0` (`true`), else numeric `==` across
 /// `INTEGER`/`FLOAT` (`1 ≡ 1.0`).
 fn num_equivalent(a: &Value, b: &Value) -> bool {
+    // Two integers compare exactly: the `as f64` round-trip below loses precision above 2^53, so
+    // distinct large `i64`s (e.g. `i64::MAX` and `i64::MAX - 1`) would otherwise be grouped
+    // together, collapsing distinct DISTINCT/grouping keys.
+    if let (Value::Integer(x), Value::Integer(y)) = (a, b) {
+        return x == y;
+    }
     let (x, y) = (num_f64(a), num_f64(b));
     if x.is_nan() || y.is_nan() {
         // Both NaN group together; a NaN and a non-NaN do not.
@@ -137,6 +143,18 @@ mod tests {
     fn signed_zero_is_equivalent() {
         // The resolved tricky case: -0.0 ≡ +0.0 → TRUE (matches `=`; contrast ordering).
         assert!(equivalent(&f(-0.0), &f(0.0)));
+    }
+
+    /// Regression (audit SEV 6): two distinct large `i64`s differ by less than one ULP at `f64`, so
+    /// the old `as f64` path treated them as equivalent — collapsing distinct DISTINCT / grouping
+    /// keys. They must now be distinguished exactly.
+    #[test]
+    fn large_distinct_integers_are_not_equivalent() {
+        assert!(!equivalent(&i(i64::MAX), &i(i64::MAX - 1)));
+        assert!(!equivalent(&i(i64::MIN), &i(i64::MIN + 1)));
+        // Equal integers and the integer/float `1 ≡ 1.0` case still hold.
+        assert!(equivalent(&i(i64::MAX), &i(i64::MAX)));
+        assert!(equivalent(&i(1), &f(1.0)));
     }
 
     #[test]

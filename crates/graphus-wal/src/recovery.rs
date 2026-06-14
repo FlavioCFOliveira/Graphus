@@ -292,7 +292,7 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
 /// one ⇒ committed data exists beyond the failure ⇒ fail loud) from a benign torn tail (no genuine
 /// record follows ⇒ truncate). Returns the offset of the first such record, or `None` if none
 /// remains in the durable range.
-fn next_self_consistent_record(log: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn next_self_consistent_record(log: &[u8], from: usize) -> Option<usize> {
     let mut off = from;
     while off + MIN_RECORD_LEN <= log.len() {
         if let Ok((rec, _)) = LogRecord::decode(&log[off..]) {

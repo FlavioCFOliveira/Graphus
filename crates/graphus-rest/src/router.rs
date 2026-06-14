@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use graphus_auth::{AuthError, AuthProvider, Privilege};
@@ -243,12 +243,24 @@ impl<E: RestEngine> AppState<E> {
     }
 }
 
+/// Maximum size, in bytes, of a request body the REST API will buffer before rejecting it `413`.
+///
+/// Every handler reads the whole body into memory (the [`Bytes`] extractor) to decode it as a single
+/// JSON/CBOR request, so an unbounded body is a memory-exhaustion DoS reachable from one request.
+/// axum applies an implicit 2 MiB cap, but it is neither tunable nor auditable; this constant makes
+/// the limit **explicit and documented** and is wired with [`DefaultBodyLimit::max`] below. 4 MiB
+/// comfortably accommodates a large statement batch with inline parameters while staying small enough
+/// that a flood of max-size bodies cannot exhaust server memory. A body past this limit is refused
+/// with `413 Payload Too Large` before any decoding runs.
+pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 /// Builds the REST [`Router`] with all routes and the HTTP-niceties layers wired (`04 §8.2`).
 ///
 /// The returned router is ready to be served by a listener (rmp #20) or driven in-process by
 /// `tower::ServiceExt::oneshot` (the tests). HTTP/2 is supported by the underlying hyper server when
 /// the listener enables it (axum's `http2` feature is on); **CORS** and **response compression** are
-/// wired here as `tower-http` layers.
+/// wired here as `tower-http` layers. The request body is capped at [`MAX_REQUEST_BODY_BYTES`]
+/// (`413` past the cap) so untrusted input cannot exhaust memory.
 pub fn router<E: RestEngine + 'static>(state: AppState<E>) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi_doc))
@@ -260,6 +272,9 @@ pub fn router<E: RestEngine + 'static>(state: AppState<E>) -> Router {
             post(run_in_tx::<E>).delete(rollback_tx::<E>),
         )
         .route("/db/{db}/tx/{id}/commit", post(commit_tx::<E>))
+        // Bound the buffered request body explicitly (`413` past the cap) so untrusted input cannot
+        // exhaust server memory. Replaces axum's implicit, un-auditable 2 MiB default.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         // HTTP niceties (`04 §8.2`): permissive CORS + gzip response compression, wired for
         // production use. Their exhaustive behaviour is tower-http's, not re-tested here.
         .layer(CompressionLayer::new())
@@ -921,7 +936,15 @@ fn decode_request(headers: &HeaderMap, body: &Bytes) -> Result<RunRequest, Probl
                 detail: e.to_string(),
             })
         }),
-        Decode::Cbor => ciborium::from_reader::<RunRequest, _>(body.as_ref()).map_err(|e| {
+        // Bound deserialization recursion explicitly (defence-in-depth): a body within the size cap
+        // can still nest CBOR arrays/maps deeply enough to overflow the stack, and ciborium's own
+        // default limit is implicit. Cap at the same audited depth the typed-value codec enforces
+        // (`value::MAX_CBOR_DEPTH`); over-deep input becomes a controlled `Malformed`, never a panic.
+        Decode::Cbor => ciborium::de::from_reader_with_recursion_limit::<RunRequest, _>(
+            body.as_ref(),
+            value::MAX_CBOR_DEPTH,
+        )
+        .map_err(|e| {
             Problem::from_codec_error(&ValueCodecError::Malformed {
                 detail: e.to_string(),
             })

@@ -191,6 +191,21 @@ impl DiskImage {
         self.refresh_checksum(page_id);
     }
 
+    /// Reads a `strings.store` heap block at `(page_id, off)`.
+    fn read_value_block_at(&self, page_id: u64, off: usize) -> graphus_storage::HeapBlock {
+        let bytes = &self.pages.iter().find(|(i, _)| *i == page_id).unwrap().1;
+        graphus_storage::HeapBlock::decode(&bytes[off..off + StoreKind::Strings.record_size()])
+    }
+
+    /// Overwrites a heap block at `(page_id, off)` and refreshes the checksum.
+    fn write_value_block_at(&mut self, page_id: u64, off: usize, block: &graphus_storage::HeapBlock) {
+        let size = StoreKind::Strings.record_size();
+        let mut buf = vec![0u8; size];
+        block.encode(&mut buf);
+        self.page_mut(page_id)[off..off + size].copy_from_slice(&buf);
+        self.refresh_checksum(page_id);
+    }
+
     /// Locates the **single** in-use property record in the image (the corruption tests build exactly
     /// one), returning its `(device_page_id, byte_offset)`. Property records have no element id, so
     /// they are found by scanning record pages for an in-use property slot.
@@ -1128,6 +1143,72 @@ fn corrupt_free_list_still_in_use_is_flagged() {
         r.violations
     );
     let _ = a;
+}
+
+/// (g2) Regression (storage audit, finding 7 / SEV 1): the **strings.store** (heap) free list must be
+/// validated too. Before the fix, the free-list loop iterated only [Node, Rel, Prop], so a corrupt
+/// heap free list went entirely unchecked (the `StoreKind::Strings` match arm was dead code). Here a
+/// freed heap block is resurrected to "in use" on disk while it stays on the strings free list — a
+/// `StillInUse` contradiction that must now be flagged.
+#[test]
+fn corrupt_strings_free_list_still_in_use_is_flagged() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (n, _) = s.create_node(txn).unwrap();
+    let key = s.intern_token(Namespace::PropKey, "bio").unwrap();
+    // A multi-block String overflow value allocates heap blocks in strings.store.
+    s.set_node_property_value(txn, n, key, &Value::String("c".repeat(200)))
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    // Locate one live heap block's physical slot *before* deletion (its payload is still `c`; after
+    // GC the slot is cleared, so we must record the location now). The slot is physically stable
+    // across GC (it clears in place), so the same (page, off) addresses the freed block afterward.
+    let pre = DiskImage::capture(&mut s);
+    let (page_id, off) = pre.locate_value_block(b'c');
+
+    // Delete the node and GC: the property chain's heap blocks are freed onto the strings free list
+    // and their records are cleared.
+    let txn2 = TxnId(2);
+    s.begin(txn2);
+    s.delete_node(txn2, n).unwrap();
+    s.commit(txn2).unwrap();
+    gc_pass(&mut s, TxnId(3));
+
+    let mut img = DiskImage::capture(&mut s);
+    {
+        // Uncorrupted: the block is freed and its record is not in use -> consistent (the strings
+        // free list is now actually validated, and it is clean here -> no false positive).
+        let mut clean = img.open();
+        assert!(
+            report(&mut clean).is_consistent(),
+            "a clean strings free list must pass: {:?}",
+            report(&mut img.open()).violations
+        );
+    }
+
+    // Corrupt: resurrect the freed block's record to "in use" on disk while it remains on the strings
+    // free list.
+    let mut block = img.read_value_block_at(page_id, off);
+    block.mvcc = graphus_storage::MvccHeader::live(99);
+    img.write_value_block_at(page_id, off, &block);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::FreeList {
+                kind: StoreKind::Strings,
+                detail: FreeListFault::StillInUse,
+                ..
+            }
+        )),
+        "expected a StillInUse violation on the strings free list: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
 }
 
 /// (h) Termination on corruption: a deliberately cyclic incidence-chain pointer must be reported as

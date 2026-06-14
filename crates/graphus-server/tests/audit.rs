@@ -124,11 +124,11 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: JWT_SECRET.to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: vec![UserBootstrap {
                 name: "bob".to_owned(),
-                password: "pw2".to_owned(),
+                password: "user2-pw8".to_owned(),
             }],
         },
         encryption: graphus_server::config::EncryptionConfig::default(),
@@ -387,7 +387,7 @@ async fn auth_success_is_audited() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
 
@@ -428,7 +428,7 @@ async fn authz_denial_is_audited() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut bob = BoltClient::connect(&uds).await;
-    bob.handshake_and_logon("bob", "pw2").await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
     // bob has read+write but NOT admin: SHOW USERS is denied.
     let f = bob.run("SHOW USERS").await.expect_err("non-admin denied");
     assert!(f.code.contains("Security.Forbidden"), "{f:?}");
@@ -452,8 +452,8 @@ async fn security_change_is_audited() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
-    c.run_ok("CREATE USER carol SET PASSWORD 'cpw'").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+    c.run_ok("CREATE USER carol SET PASSWORD 'carol-pw8'").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
 
@@ -466,7 +466,7 @@ async fn security_change_is_audited() {
         "detail names the command: {detail}"
     );
     assert!(
-        !detail.contains("cpw"),
+        !detail.contains("carol-pw8"),
         "the password is never in detail: {detail}"
     );
 }
@@ -479,7 +479,7 @@ async fn admin_change_is_audited() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.run_ok("CREATE DATABASE salesaudit").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
@@ -503,7 +503,7 @@ async fn schema_change_is_audited() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     // A node so the index has something to populate, then the openCypher CREATE INDEX form.
     c.run_ok("CREATE (n:Person {name:'p'})").await;
     c.run_ok("CREATE INDEX FOR (n:Person) ON (n.name)").await;
@@ -529,7 +529,7 @@ async fn data_change_is_audited_when_enabled() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.run_ok("CREATE (n:Person {name:'x'})").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
@@ -563,7 +563,7 @@ async fn no_secrets_in_audit_log() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.run_ok("CREATE USER dan SET PASSWORD 'topsecretpw'").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
@@ -592,8 +592,8 @@ async fn audit_survives_restart_and_ordering() {
         let server = boot(config.clone()).await;
         let uds = server.uds_path.clone().expect("UDS enabled");
         let mut c = BoltClient::connect(&uds).await;
-        c.handshake_and_logon("alice", "pw").await;
-        c.run_ok("CREATE USER erin SET PASSWORD 'epw'").await;
+        c.handshake_and_logon("alice", "admin-pw8").await;
+        c.run_ok("CREATE USER erin SET PASSWORD 'erin-pw8'").await;
         c.goodbye().await;
         server.shutdown().await.expect("clean shutdown");
     }
@@ -609,7 +609,7 @@ async fn audit_survives_restart_and_ordering() {
     let server = boot(config).await;
     let uds = server.uds_path.clone().expect("UDS enabled");
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.run_ok("CREATE ROLE auditrole").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
@@ -672,7 +672,7 @@ async fn disabled_audit_writes_no_file() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
     c.run_ok("CREATE (n:Person {name:'y'})").await;
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");

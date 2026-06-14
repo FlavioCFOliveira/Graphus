@@ -105,11 +105,11 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: JWT_SECRET.to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: vec![UserBootstrap {
                 name: "bob".to_owned(),
-                password: "pw2".to_owned(),
+                password: "user2-pw8".to_owned(),
             }],
         },
         encryption: graphus_server::config::EncryptionConfig::default(),
@@ -322,7 +322,7 @@ async fn rest_auth_status(addr: std::net::SocketAddr, user: &str) -> u16 {
 /// the **current** catalog — which is exactly the live property under test.
 fn mint_token(user: &str) -> String {
     use graphus_auth::JwtAuthenticator;
-    let jwt = JwtAuthenticator::new(JWT_SECRET.as_bytes());
+    let jwt = JwtAuthenticator::new(JWT_SECRET.as_bytes()).expect("JWT_SECRET is >= 32 bytes");
     jwt.issue_token(user, now_unix_secs(), 3_600)
         .expect("mint token")
 }
@@ -354,7 +354,7 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
     // CREATE without a reboot, asserted next.
     let mut dave_pre = BoltClient::connect(&uds).await;
     let code = dave_pre
-        .handshake_and_try_logon("dave", "davepw")
+        .handshake_and_try_logon("dave", "dave-pw8")
         .await
         .expect_err("unknown user cannot LOGON");
     assert!(
@@ -370,8 +370,8 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
 
     // Admin creates `dave` at runtime over the live server (Bolt admin surface).
     let mut admin = BoltClient::connect(&uds).await;
-    admin.handshake_and_logon("alice", "pw").await;
-    admin.run_ok("CREATE USER dave SET PASSWORD 'davepw'").await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("CREATE USER dave SET PASSWORD 'dave-pw8'").await;
     // `dave` needs READ for the REST auto-commit read used by `rest_auth_status`; grant it the
     // bootstrap `readwrite` role (server-wide read+write) so the Bearer success is observable as 200.
     admin.run_ok("GRANT ROLE readwrite TO dave").await;
@@ -380,7 +380,7 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
     // PROPERTY 1 (Bolt): `dave` can now LOGON immediately — previously impossible until reboot.
     let mut dave_bolt = BoltClient::connect(&uds).await;
     dave_bolt
-        .handshake_and_try_logon("dave", "davepw")
+        .handshake_and_try_logon("dave", "dave-pw8")
         .await
         .expect("runtime-created user LOGS ON over Bolt without a reboot");
     dave_bolt.goodbye().await;
@@ -394,13 +394,13 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
 
     // PROPERTY 3: admin drops `dave` at runtime; both transports refuse him immediately.
     let mut admin2 = BoltClient::connect(&uds).await;
-    admin2.handshake_and_logon("alice", "pw").await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
     admin2.run_ok("DROP USER dave").await;
     admin2.goodbye().await;
 
     let mut dave_after = BoltClient::connect(&uds).await;
     let code = dave_after
-        .handshake_and_try_logon("dave", "davepw")
+        .handshake_and_try_logon("dave", "dave-pw8")
         .await
         .expect_err("dropped user cannot LOGON");
     assert!(
@@ -416,10 +416,10 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
 
     // The admin and the unmodified bootstrap user still authenticate throughout.
     let mut alice = BoltClient::connect(&uds).await;
-    alice.handshake_and_logon("alice", "pw").await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
     alice.goodbye().await;
     let mut bob = BoltClient::connect(&uds).await;
-    bob.handshake_and_logon("bob", "pw2").await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
     bob.goodbye().await;
 
     server.shutdown().await.expect("clean shutdown");
@@ -438,7 +438,7 @@ async fn runtime_password_change_takes_effect_live() {
 
     // Admin creates `erin` with an initial password.
     let mut admin = BoltClient::connect(&uds).await;
-    admin.handshake_and_logon("alice", "pw").await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
     admin
         .run_ok("CREATE USER erin SET PASSWORD 'old-secret'")
         .await;
@@ -454,7 +454,7 @@ async fn runtime_password_change_takes_effect_live() {
 
     // Admin changes the credential at runtime (drop + recreate with a new password).
     let mut admin2 = BoltClient::connect(&uds).await;
-    admin2.handshake_and_logon("alice", "pw").await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
     admin2.run_ok("DROP USER erin").await;
     admin2
         .run_ok("CREATE USER erin SET PASSWORD 'new-secret'")

@@ -1641,3 +1641,67 @@ fn parse_exists_full_query_with_aggregation_and_where() {
     assert!(matches!(head.clauses[1], Clause::With(_)));
     assert!(matches!(head.clauses[2], Clause::Return(_)));
 }
+
+// =================================================================================================
+// Recursion-depth guard (audit SEV 9: unbounded recursive descent → native stack overflow)
+// =================================================================================================
+
+/// Runs `body` on a 64 MiB stack, mirroring how the engine isolates query execution on a large
+/// dedicated stack. The default test-harness stack (~2 MiB) is far too small for the depth the guard
+/// is meant to allow before tripping — descending the precedence ladder ~[`MAX_EXPR_DEPTH`] times
+/// would itself overflow it — so these tests must reproduce the production stack to prove the guard
+/// (rather than a native overflow) is what stops the recursion.
+fn on_large_stack(body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(body)
+        .expect("spawn worker thread")
+        .join()
+        .expect("parsing must not overflow the stack — the depth guard must trip first");
+}
+
+/// A query whose expression nests far deeper than [`MAX_EXPR_DEPTH`] must be rejected as a
+/// `SyntaxError` rather than overflowing the native stack (which would SIGABRT the server). The
+/// guard is exercised through the three shapes the auditor flagged: nested parentheses, nested
+/// bracket (list) literals, and stacked `NOT`. The `join()` succeeding is itself the assertion that
+/// no stack overflow occurred (an overflow aborts the whole process, failing the test).
+#[test]
+fn deeply_nested_parentheses_are_rejected_not_a_stack_overflow() {
+    on_large_stack(|| {
+        let depth = MAX_EXPR_DEPTH + 50;
+        let q = format!("RETURN {}1{}", "(".repeat(depth), ")".repeat(depth));
+        assert_eq!(err(&q).kind, SyntaxErrorKind::NestingTooDeep);
+    });
+}
+
+#[test]
+fn deeply_nested_brackets_are_rejected_not_a_stack_overflow() {
+    on_large_stack(|| {
+        let depth = MAX_EXPR_DEPTH + 50;
+        let q = format!("RETURN {}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert_eq!(err(&q).kind, SyntaxErrorKind::NestingTooDeep);
+    });
+}
+
+#[test]
+fn deeply_stacked_not_is_rejected_not_a_stack_overflow() {
+    on_large_stack(|| {
+        let depth = MAX_EXPR_DEPTH + 50;
+        let q = format!("RETURN {}true", "NOT ".repeat(depth));
+        assert_eq!(err(&q).kind, SyntaxErrorKind::NestingTooDeep);
+    });
+}
+
+/// The guard must not reject ordinary, modestly nested queries: depth well under the limit still
+/// parses cleanly (and the depth counter resets between sibling expressions, so a wide query of
+/// many shallow expressions is fine).
+#[test]
+fn moderately_nested_expression_still_parses() {
+    on_large_stack(|| {
+        let q = format!("RETURN {}1 + 2{}", "(".repeat(64), ")".repeat(64));
+        let _ = ok(&q);
+        // A counter that did not reset per-sibling would accumulate across these and falsely trip.
+        let items: Vec<String> = (0..200).map(|i| format!("((({i}))) AS c{i}")).collect();
+        let _ = ok(&format!("RETURN {}", items.join(", ")));
+    });
+}

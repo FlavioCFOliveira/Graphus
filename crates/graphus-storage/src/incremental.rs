@@ -104,6 +104,18 @@ use crate::store::RecordStore;
 /// and WAL ranges, so the two version axes are independent.
 pub const CHAIN_FORMAT_VERSION: u32 = 1;
 
+/// Upper bound on `base_lsn` (and therefore on the synthetic zero-prefix gap a restore allocates in
+/// [`build_logical_wal`]) accepted from an untrusted [`ChainManifest`].
+///
+/// A `ChainManifest` is protected only by a CRC32C, which is **not** a cryptographic authenticator:
+/// a forged or bit-flipped manifest can carry `base_lsn = u64::MAX`. `restore_to` allocates a
+/// `base_lsn`-length zero buffer for the logical WAL's pre-`base_lsn` gap, so an unbounded `base_lsn`
+/// is a remote OOM / denial-of-service vector (a multi-terabyte allocation from a few bytes of
+/// attacker-controlled input). `base_lsn` is a WAL byte offset (`durable_len` at base time); 1 TiB
+/// is already far beyond any realistic WAL prefix, so any larger value is necessarily corrupt or
+/// hostile and is rejected by [`verify_chain`] before a restore can act on it.
+pub const MAX_BASE_LSN: u64 = 1 << 40; // 1 TiB
+
 /// One increment's bookkeeping in a [`ChainManifest`]: the half-open WAL byte range it captured and
 /// the integrity facts needed to re-prove it without the bytes in hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +457,18 @@ pub fn verify_chain<C: LinkCodec>(
         )));
     }
 
+    // Reject an absurd `base_lsn` before anything acts on it. The manifest is CRC-protected, not
+    // authenticated, so a forged/bit-flipped `base_lsn` (e.g. `u64::MAX`) would otherwise drive
+    // `build_logical_wal` into a multi-terabyte zero-allocation (remote OOM). `base_lsn` is a WAL
+    // byte offset; anything past `MAX_BASE_LSN` is necessarily corrupt or hostile.
+    if manifest.base_lsn.0 > MAX_BASE_LSN {
+        return Err(GraphusError::Storage(format!(
+            "chain base_lsn {} exceeds the sane maximum {MAX_BASE_LSN} (corrupt or hostile \
+             manifest); refusing to restore",
+            manifest.base_lsn.0
+        )));
+    }
+
     // 2 + 3: open and verify the base.
     let base_plain = codec.open(&links.base)?;
     verify_backup(&base_plain)?;
@@ -646,6 +670,16 @@ fn build_logical_wal<C: LinkCodec>(
     links: &ChainLinks,
     codec: &C,
 ) -> Result<Vec<u8>> {
+    // Defense in depth: `verify_chain` already rejects an out-of-range `base_lsn`, but never trust an
+    // untrusted length to size an allocation. Cap here too so a direct or unverified caller cannot
+    // OOM.
+    if manifest.base_lsn.0 > MAX_BASE_LSN {
+        return Err(GraphusError::Storage(format!(
+            "chain base_lsn {} exceeds the sane maximum {MAX_BASE_LSN}; refusing to allocate the \
+             logical WAL prefix",
+            manifest.base_lsn.0
+        )));
+    }
     let base = manifest.base_lsn.0 as usize;
     let mut total = base;
     for inc in &manifest.increments {
@@ -939,6 +973,55 @@ mod tests {
         // Fix the CRC -> now it verifies.
         m.increments[0].crc = crc32c::crc32c(&[1, 2, 3]);
         verify_chain(&m, &links, &Plain).expect("now valid");
+    }
+
+    /// Regression (storage audit, finding 2 / SEV 6): a `ChainManifest` is CRC-protected, not
+    /// authenticated, so a forged/bit-flipped `base_lsn` can be `u64::MAX`. `restore_to` allocates a
+    /// `base_lsn`-length zero buffer for the logical WAL prefix, so an unbounded `base_lsn` is a
+    /// remote OOM vector. `verify_chain` must reject it before any restore acts on it.
+    #[test]
+    fn verify_chain_rejects_an_absurd_base_lsn() {
+        let m = ChainManifest {
+            chain_id: 42,
+            base_creation_mark: 42,
+            base_lsn: Lsn(u64::MAX), // forged: would drive a multi-exabyte allocation
+            increments: Vec::new(),
+        };
+        let links = ChainLinks {
+            base: minimal_base_artifact(),
+            increments: Vec::new(),
+        };
+        let err = verify_chain(&m, &links, &Plain).unwrap_err().to_string();
+        assert!(
+            err.contains("base_lsn") && err.contains("sane maximum"),
+            "got: {err}"
+        );
+
+        // A `base_lsn` exactly at the cap passes the bound check (boundary is inclusive). With an
+        // empty, well-formed chain over a valid base, verification then succeeds outright.
+        let at_cap = ChainManifest {
+            base_lsn: Lsn(MAX_BASE_LSN),
+            ..m.clone()
+        };
+        verify_chain(&at_cap, &links, &Plain).expect("base_lsn at the cap is accepted");
+    }
+
+    /// Regression (storage audit, finding 2 / SEV 6): `build_logical_wal` independently caps the
+    /// allocation (defense in depth) for a direct/unverified caller.
+    #[test]
+    fn build_logical_wal_rejects_an_absurd_base_lsn() {
+        let m = ChainManifest {
+            chain_id: 1,
+            base_creation_mark: 1,
+            base_lsn: Lsn(u64::MAX),
+            increments: Vec::new(),
+        };
+        let links = ChainLinks {
+            base: minimal_base_artifact(),
+            increments: Vec::new(),
+        };
+        let err = build_logical_wal(&m, &links, &Plain).unwrap_err().to_string();
+        assert!(err.contains("base_lsn") && err.contains("sane maximum"), "got: {err}");
     }
 
     #[test]

@@ -17,6 +17,14 @@ use argon2::{Argon2, password_hash::Error as PhcError};
 
 use crate::error::{AuthError, Result};
 
+/// The minimum accepted password length, in characters (Unicode scalar values).
+///
+/// Empty or trivially short passwords defeat the purpose of hashing — they are brute-forceable
+/// regardless of the KDF. OWASP recommends a minimum of 8 characters as a baseline; [`hash_password`]
+/// (and therefore `Authenticator::set_password`) rejects anything shorter so a weak credential never
+/// reaches the store.
+pub const MIN_PASSWORD_LEN: usize = 8;
+
 /// Hashes `plaintext` with Argon2id and a fresh random salt, returning the PHC-format string to
 /// store (e.g. on [`User::password_hash`](crate::User::password_hash)).
 ///
@@ -25,9 +33,19 @@ use crate::error::{AuthError, Result};
 /// passwords indistinguishable on disk).
 ///
 /// # Errors
-/// [`AuthError::PasswordHash`] if the underlying Argon2 hashing fails (e.g. a parameter/memory
-/// configuration error). It does **not** fail on ordinary inputs.
+/// - [`AuthError::WeakPassword`] if `plaintext` is shorter than [`MIN_PASSWORD_LEN`] characters
+///   (including the empty string).
+/// - [`AuthError::PasswordHash`] if the underlying Argon2 hashing fails (e.g. a parameter/memory
+///   configuration error). It does **not** fail on ordinary inputs.
 pub fn hash_password(plaintext: &str) -> Result<String> {
+    // Count Unicode scalar values, not bytes, so the policy is about visible length rather than
+    // UTF-8 encoding width.
+    let len = plaintext.chars().count();
+    if len < MIN_PASSWORD_LEN {
+        return Err(AuthError::WeakPassword {
+            detail: format!("password must be at least {MIN_PASSWORD_LEN} characters"),
+        });
+    }
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     argon2
@@ -73,7 +91,7 @@ mod tests {
 
     #[test]
     fn rejects_a_wrong_password() {
-        let hash = hash_password("s3cr3t").unwrap();
+        let hash = hash_password("s3cr3t-strong").unwrap();
         assert!(!verify_password("not-the-password", &hash).unwrap());
     }
 
@@ -88,11 +106,34 @@ mod tests {
     #[test]
     fn same_password_hashes_differently_each_time() {
         // Distinct random salts ⇒ distinct PHC strings, yet both verify.
-        let a = hash_password("same").unwrap();
-        let b = hash_password("same").unwrap();
+        let a = hash_password("same-strong-pw").unwrap();
+        let b = hash_password("same-strong-pw").unwrap();
         assert_ne!(a, b);
-        assert!(verify_password("same", &a).unwrap());
-        assert!(verify_password("same", &b).unwrap());
+        assert!(verify_password("same-strong-pw", &a).unwrap());
+        assert!(verify_password("same-strong-pw", &b).unwrap());
+    }
+
+    #[test]
+    fn empty_or_short_password_is_rejected() {
+        // Empty and below-minimum passwords are refused before any hashing happens.
+        assert!(matches!(
+            hash_password(""),
+            Err(AuthError::WeakPassword { .. })
+        ));
+        // 7 characters: one below the 8-character minimum.
+        assert!(matches!(
+            hash_password("short77"),
+            Err(AuthError::WeakPassword { .. })
+        ));
+    }
+
+    #[test]
+    fn password_at_minimum_length_is_accepted() {
+        // Exactly 8 characters is the boundary and must hash successfully.
+        let pw = "8charsok";
+        assert_eq!(pw.chars().count(), MIN_PASSWORD_LEN);
+        let hash = hash_password(pw).unwrap();
+        assert!(verify_password(pw, &hash).unwrap());
     }
 
     #[test]

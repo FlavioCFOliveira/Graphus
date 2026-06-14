@@ -58,6 +58,25 @@ pub const DEFAULT_CELL_SIZE: f64 = 1.0;
 /// A grid cell coordinate: the integer `(col, row)` a point's `(x, y)` falls into.
 type Cell = (i64, i64);
 
+/// The number of cells in the inclusive rectangle `[cx0, cx1] × [cy0, cy1]`, or [`None`] when it is
+/// inverted or its area does not fit in [`usize`].
+///
+/// `query_bbox` uses this to choose between probing every possible cell (cheap only for a small box)
+/// and walking the occupied cells (cost-bounded for any box). A `None` result means "unbounded" and
+/// forces the occupied-cell walk, which is what prevents a whole-coordinate-range box from probing
+/// ~2^128 cells.
+fn cell_rect_area(cx0: i64, cx1: i64, cy0: i64, cy1: i64) -> Option<usize> {
+    if cx0 > cx1 || cy0 > cy1 {
+        return None;
+    }
+    // Inclusive span widths, computed in i128 so even `i64::MIN..=i64::MAX` cannot overflow before
+    // we narrow to usize.
+    let w = (cx1 as i128 - cx0 as i128) + 1;
+    let h = (cy1 as i128 - cy0 as i128) + 1;
+    let area = w.checked_mul(h)?;
+    usize::try_from(area).ok()
+}
+
 /// A uniform **grid index** over 2D-projected points: `cell -> sorted node ids`, plus a forward map
 /// (`node -> its (cell, point)`) so an update/delete is O(1) in the number of cells (`rmp` task #73).
 ///
@@ -208,24 +227,45 @@ impl SpatialIndex {
         let (cx0, cx1) = (self.axis_cell(min_x), self.axis_cell(max_x));
         let (cy0, cy1) = (self.axis_cell(min_y), self.axis_cell(max_y));
         let mut out: BTreeSet<u64> = BTreeSet::new();
-        // Enumerate the overlapping cell rectangle. The cell *counts* are bounded by the query
-        // region size / cell_size, so a localized query visits few cells.
-        let mut cx = cx0;
-        while cx <= cx1 {
-            let mut cy = cy0;
-            while cy <= cy1 {
-                if let Some(list) = self.cells.get(&(cx, cy)) {
-                    out.extend(list.iter().copied());
+        // Two ways to enumerate the candidates exist, and we pick the cheaper one. Probing the
+        // *possible* cell rectangle `(cx1-cx0+1) * (cy1-cy0+1)` is O(box area); a query box spanning
+        // the whole coordinate range covers ~2^128 cells, which is an unbounded-CPU DoS. Walking the
+        // *occupied* cells instead — `self.cells.range(..)` over the row span, filtering each by the
+        // column span — is O(self.cells.len()) regardless of how large the box is. We probe only when
+        // the box's cell rectangle is genuinely small (fits in `usize` and is no larger than the
+        // number of occupied cells); otherwise we walk the occupied cells. Both visit a superset of
+        // the overlapping cells, so the candidate contract holds either way.
+        let probe_area = cell_rect_area(cx0, cx1, cy0, cy1);
+        let probe_cheaper = probe_area.is_some_and(|area| area <= self.cells.len());
+        if probe_cheaper {
+            // Box is small: probe each possible cell directly. `cx0..=cx1`/`cy0..=cy1` are finite and
+            // their product fits in `usize` (checked above), so neither inner loop can overflow.
+            let mut cx = cx0;
+            while cx <= cx1 {
+                let mut cy = cy0;
+                while cy <= cy1 {
+                    if let Some(list) = self.cells.get(&(cx, cy)) {
+                        out.extend(list.iter().copied());
+                    }
+                    cy = match cy.checked_add(1) {
+                        Some(n) => n,
+                        None => break,
+                    };
                 }
-                cy = match cy.checked_add(1) {
+                cx = match cx.checked_add(1) {
                     Some(n) => n,
                     None => break,
                 };
             }
-            cx = match cx.checked_add(1) {
-                Some(n) => n,
-                None => break,
-            };
+        } else {
+            // Box is huge (or unbounded): walk only the occupied cells in `[(cx0, *), (cx1, *)]`,
+            // keeping those whose column is within `[cy0, cy1]`. Cost is bounded by
+            // `self.cells.len()`, not by the box area.
+            for (&(_, cy), list) in self.cells.range((cx0, cy0)..=(cx1, i64::MAX)) {
+                if cy >= cy0 && cy <= cy1 {
+                    out.extend(list.iter().copied());
+                }
+            }
         }
         out.into_iter().collect()
     }
@@ -246,12 +286,19 @@ impl SpatialIndex {
         if !radius.is_finite() || radius < 0.0 {
             return Vec::new();
         }
-        self.query_bbox(
-            center_x - radius,
-            center_x + radius,
-            center_y - radius,
-            center_y + radius,
-        )
+        let (min_x, max_x) = (center_x - radius, center_x + radius);
+        let (min_y, max_y) = (center_y - radius, center_y + radius);
+        // With a large finite center/radius the sum can overflow to ±inf. `axis_cell` maps ±inf to
+        // cell 0, which would collapse the bounding box to a single cell and return a NON-superset
+        // (wrong result) instead of the true candidates. When any bound is non-finite — or `center`
+        // itself is non-finite, in which case `query_bbox`'s NaN guard would reject everything — the
+        // safe, contract-preserving answer is the full candidate set (a superset the caller
+        // re-checks), exactly the "query the grid cannot bound" fallback. A finite box still goes the
+        // fast path.
+        if !(min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite()) {
+            return self.all_candidates();
+        }
+        self.query_bbox(min_x, max_x, min_y, max_y)
     }
 
     /// All indexed node ids, ascending. The correct (if unselective) candidate set for a query the
@@ -381,6 +428,86 @@ mod tests {
         idx.index_point(10, Point::new_3d(Crs::Cartesian3D, 0.5, 0.5, 100.0));
         // The z coordinate does not affect the (x,y) bucketing; the caller's exact predicate handles z.
         assert_eq!(idx.query_bbox(0.0, 1.0, 0.0, 1.0), vec![10]);
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Security regressions (auditor findings #1 and #2)
+    // ----------------------------------------------------------------------------------------
+
+    #[test]
+    fn query_bbox_over_the_whole_coordinate_range_is_bounded_and_correct() {
+        // Regression for the DoS: a bbox spanning ~the whole f64/cell range used to probe the
+        // *possible* cell rectangle (~2^128 cells) → unbounded CPU. It must instead walk only the
+        // few OCCUPIED cells and return the correct superset (here: all indexed points). A small,
+        // fixed cell size makes the would-be probe rectangle astronomically large.
+        let mut idx = SpatialIndex::new(1e-6);
+        idx.index_point(10, cart(-1.0e12, -1.0e12));
+        idx.index_point(20, cart(0.0, 0.0));
+        idx.index_point(30, cart(1.0e12, 1.0e12));
+
+        let start = std::time::Instant::now();
+        let mut got = idx.query_bbox(f64::MIN, f64::MAX, f64::MIN, f64::MAX);
+        let elapsed = start.elapsed();
+        got.sort_unstable();
+
+        assert_eq!(got, vec![10, 20, 30], "must return every indexed candidate");
+        // The occupied-cell walk is O(cells); the old probe would never finish. A generous bound
+        // catches the regression without being flaky on a loaded CI box.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "query_bbox over the full range took {elapsed:?} — it must walk occupied cells, not probe ~2^128",
+        );
+    }
+
+    #[test]
+    fn query_bbox_huge_box_still_excludes_out_of_range_rows() {
+        // The occupied-cell walk must still respect the box on BOTH axes: a box wide in x but narrow
+        // in y must drop points outside the y span. Tiny cells force the occupied-cell path.
+        let mut idx = SpatialIndex::new(1e-6);
+        idx.index_point(10, cart(-1.0e12, 0.0)); // y in range
+        idx.index_point(20, cart(1.0e12, 0.0)); // y in range
+        idx.index_point(30, cart(0.0, 1.0e12)); // y far out of range
+        let mut got = idx.query_bbox(f64::MIN, f64::MAX, -1.0, 1.0);
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 20], "y-out-of-range point must be excluded");
+    }
+
+    #[test]
+    fn query_within_with_overflowing_center_plus_radius_returns_correct_superset() {
+        // Regression for the wrong-result bug: `center ± radius` with large finite values overflows
+        // to ±inf, which `axis_cell` mapped to cell 0 — collapsing the query to one cell and
+        // returning a NON-superset. It must instead fall back to all candidates (a valid superset
+        // the caller re-checks), so every truly-in-range point is still present.
+        let mut idx = SpatialIndex::new(1.0);
+        idx.index_point(10, cart(0.0, 0.0)); // genuinely within the (enormous) radius
+        idx.index_point(20, cart(1.0e300, 1.0e300));
+        idx.index_point(30, cart(-1.0e300, -1.0e300));
+
+        // center finite, radius finite, but center + radius == +inf and center - radius == -inf.
+        let got = idx.query_within(0.0, 0.0, f64::MAX);
+        let mut got_sorted = got.clone();
+        got_sorted.sort_unstable();
+        assert_eq!(
+            got_sorted,
+            vec![10, 20, 30],
+            "overflowing box must fall back to all candidates (a correct superset), not collapse to cell 0",
+        );
+
+        // The true in-range point (the origin) is present — the property the bug violated.
+        assert!(got.contains(&10), "the in-range candidate must never be dropped");
+    }
+
+    #[test]
+    fn query_within_overflow_superset_holds_against_an_offset_origin() {
+        // A second overflow shape: a non-zero finite center whose +radius still overflows. The
+        // fallback must include a point the collapsed (cell-0) query would have missed.
+        let mut idx = SpatialIndex::new(2.5);
+        idx.index_point(99, cart(7.0, -3.0)); // not in cell (0,0)
+        let got = idx.query_within(7.0, -3.0, f64::MAX);
+        assert!(
+            got.contains(&99),
+            "fallback superset must include the offset point the collapsed query would miss",
+        );
     }
 
     #[test]

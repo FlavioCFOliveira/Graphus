@@ -17,9 +17,15 @@
 //! The WAL is parameterised over its sink and its [`ApplyTarget`] precisely so the whole
 //! durability path can be driven deterministically and crash-tested exhaustively (decision
 //! `D-dst-investment`); see `tests/aries_recovery.rs`.
-#![forbid(unsafe_code)]
+// `forbid(unsafe_code)` everywhere except macOS, which needs one scoped `unsafe` block
+// (`fcntl(fd, F_FULLFSYNC)` in `fullsync.rs`) to issue a true stable-storage barrier for the WAL
+// segments — a bare `fdatasync` on APFS/HFS+ does not flush the drive's volatile write cache. macOS
+// relaxes the lint to `deny` (any other stray `unsafe` still fails the build).
+#![cfg_attr(not(target_os = "macos"), forbid(unsafe_code))]
+#![cfg_attr(target_os = "macos", deny(unsafe_code))]
 
 pub mod checkpoint;
+mod fullsync;
 pub mod manager;
 pub mod record;
 pub mod recovery;

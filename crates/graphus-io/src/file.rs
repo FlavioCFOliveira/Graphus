@@ -75,11 +75,14 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn sync_data(&mut self) -> Result<()> {
-        self.file.sync_data().map_err(|e| io_err("sync_data", &e))
+        // `full_sync_data` issues a true stable-storage barrier on every platform: `F_FULLFSYNC` on
+        // macOS (a bare `fdatasync` there does NOT flush the drive's volatile write cache), an
+        // ordinary `fdatasync` elsewhere. See `crate::fullsync`.
+        crate::full_sync_data(&self.file).map_err(|e| io_err("sync_data", &e))
     }
 
     fn sync_all(&mut self) -> Result<()> {
-        self.file.sync_all().map_err(|e| io_err("sync_all", &e))
+        crate::full_sync_all(&self.file).map_err(|e| io_err("sync_all", &e))
     }
 
     fn page_count(&self) -> u64 {

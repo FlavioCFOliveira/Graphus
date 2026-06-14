@@ -85,7 +85,7 @@ fn config(temp: &TempStore) -> ServerConfig {
         jwt_secret: "spatial-itest-jwt-secret-uds-only!!!".to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: None,
             users: Vec::new(),
         },

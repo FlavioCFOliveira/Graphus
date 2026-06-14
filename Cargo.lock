@@ -1210,6 +1210,7 @@ dependencies = [
  "crc32c",
  "graphus-core",
  "graphus-sim",
+ "libc",
 ]
 
 [[package]]

@@ -100,6 +100,22 @@ pub enum EvalError {
     /// (`clauses/return/Return2.feature`). `id`/`type` remain accessible after delete; only
     /// property/label reads fail.
     DeletedEntityAccess,
+    /// A built-in tried to materialise a collection larger than the server will allow (e.g.
+    /// `range(1, 9_000_000_000_000_000_000)`), which would exhaust memory. Surfaced as a runtime
+    /// failure rather than letting the allocation OOM the process.
+    ResourceLimit {
+        /// A pre-formatted description of the limit that was exceeded (kept as a `String` so the
+        /// error type stays `Eq`).
+        detail: String,
+    },
+    /// A built-in was dispatched with fewer arguments than it indexes. The semantic analyzer's
+    /// arity check normally guarantees this never happens, but the dispatcher stays defensive so a
+    /// gap in that check can never turn into an out-of-bounds panic on user input. Maps to the
+    /// `ArgumentError` class at the Bolt boundary.
+    ArgumentCount {
+        /// The dotted function name.
+        name: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -123,6 +139,12 @@ impl fmt::Display for EvalError {
             Self::Subquery { message } => write!(f, "EXISTS subquery failed: {message}"),
             Self::DeletedEntityAccess => {
                 write!(f, "cannot access properties or labels of a deleted entity")
+            }
+            Self::ResourceLimit { detail } => {
+                write!(f, "resource limit exceeded: {detail}")
+            }
+            Self::ArgumentCount { name } => {
+                write!(f, "function `{name}` was called with too few arguments")
             }
         }
     }
@@ -658,7 +680,13 @@ fn eval_div(
         if *y == 0 {
             return Err(EvalError::DivisionByZero);
         }
-        return Ok(RowValue::Value(Value::Integer(x / y)));
+        // `checked_div` also rejects `i64::MIN / -1`, which overflows the magnitude of `i64`
+        // (a hard panic even in release otherwise); surface it as the integer-overflow class.
+        return x
+            .checked_div(*y)
+            .map(Value::Integer)
+            .map(RowValue::Value)
+            .ok_or(EvalError::IntegerOverflow);
     }
     match (numeric_f64(&a), numeric_f64(&b)) {
         (Some(x), Some(y)) => Ok(RowValue::Value(Value::Float(x / y))),
@@ -686,7 +714,13 @@ fn eval_mod(
         if *y == 0 {
             return Err(EvalError::DivisionByZero);
         }
-        return Ok(RowValue::Value(Value::Integer(x % y)));
+        // `checked_rem` also rejects `i64::MIN % -1` (which panics on overflow even in release);
+        // surface it as the integer-overflow class, mirroring `eval_div`.
+        return x
+            .checked_rem(*y)
+            .map(Value::Integer)
+            .map(RowValue::Value)
+            .ok_or(EvalError::IntegerOverflow);
     }
     match (numeric_f64(&a), numeric_f64(&b)) {
         (Some(x), Some(y)) => Ok(RowValue::Value(Value::Float(x % y))),
@@ -1390,25 +1424,38 @@ fn call_function(
         | "time.realtime" => crate::temporal_fns::construct(&lower, argv.first(), clock)?,
         // Spatial point constructor and distance (rmp #73). `distance` and `point.distance` are
         // the two openCypher spellings of the same two-point distance.
-        "point" => crate::spatial_fns::construct_point(&argv[0])?,
-        "distance" | "point.distance" => crate::spatial_fns::distance(&argv[0], &argv[1])?,
+        "point" => crate::spatial_fns::construct_point(arg(&argv, 0, &lower)?)?,
+        "distance" | "point.distance" => {
+            crate::spatial_fns::distance(arg(&argv, 0, &lower)?, arg(&argv, 1, &lower)?)?
+        }
         // Temporal difference and truncation functions (rmp #53).
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
-            crate::temporal_fns::duration_between(&lower, &argv[0], &argv[1])?
+            crate::temporal_fns::duration_between(
+                &lower,
+                arg(&argv, 0, &lower)?,
+                arg(&argv, 1, &lower)?,
+            )?
         }
         // `datetime.fromepoch(seconds, nanos)` / `datetime.fromepochmillis(ms)`:
         // a UTC instant from a POSIX-epoch count (`Temporal1.feature` [11]).
-        "datetime.fromepoch" => crate::temporal_fns::from_epoch_seconds(&argv[0], &argv[1])?,
-        "datetime.fromepochmillis" => crate::temporal_fns::from_epoch_millis(&argv[0])?,
+        "datetime.fromepoch" => {
+            crate::temporal_fns::from_epoch_seconds(arg(&argv, 0, &lower)?, arg(&argv, 1, &lower)?)?
+        }
+        "datetime.fromepochmillis" => {
+            crate::temporal_fns::from_epoch_millis(arg(&argv, 0, &lower)?)?
+        }
         "date.truncate"
         | "time.truncate"
         | "localtime.truncate"
         | "datetime.truncate"
-        | "localdatetime.truncate" => {
-            crate::temporal_fns::truncate(&lower, &argv[0], &argv[1], argv.get(2))?
-        }
+        | "localdatetime.truncate" => crate::temporal_fns::truncate(
+            &lower,
+            arg(&argv, 0, &lower)?,
+            arg(&argv, 1, &lower)?,
+            argv.get(2),
+        )?,
         "range" => range_fn(&argv)?,
-        "abs" => match &argv[0] {
+        "abs" => match arg(&argv, 0, "abs")? {
             Value::Integer(i) => i
                 .checked_abs()
                 .map(Value::Integer)
@@ -1417,13 +1464,13 @@ fn call_function(
             Value::Null => Value::Null,
             _ => return Err(num_type_error("abs")),
         },
-        "ceil" => float_unary(&argv[0], f64::ceil, "ceil")?,
-        "floor" => float_unary(&argv[0], f64::floor, "floor")?,
-        "round" => float_unary(&argv[0], f64::round, "round")?,
+        "ceil" => float_unary(arg(&argv, 0, "ceil")?, f64::ceil, "ceil")?,
+        "floor" => float_unary(arg(&argv, 0, "floor")?, f64::floor, "floor")?,
+        "round" => float_unary(arg(&argv, 0, "round")?, f64::round, "round")?,
         // `sqrt()` of a negative number is NaN (IEEE 754, which the openCypher Float is).
-        "sqrt" => float_unary(&argv[0], f64::sqrt, "sqrt")?,
+        "sqrt" => float_unary(arg(&argv, 0, "sqrt")?, f64::sqrt, "sqrt")?,
         "rand" => Value::Float(next_rand_f64()),
-        "sign" => match &argv[0] {
+        "sign" => match arg(&argv, 0, "sign")? {
             Value::Integer(i) => Value::Integer(i.signum()),
             Value::Float(f) => Value::Integer(if *f > 0.0 {
                 1
@@ -1435,11 +1482,19 @@ fn call_function(
             Value::Null => Value::Null,
             _ => return Err(num_type_error("sign")),
         },
-        "toupper" => string_unary(&argv[0], |s| s.to_uppercase(), "toUpper")?,
-        "tolower" => string_unary(&argv[0], |s| s.to_lowercase(), "toLower")?,
-        "trim" => string_unary(&argv[0], |s| s.trim().to_owned(), "trim")?,
-        "ltrim" => string_unary(&argv[0], |s| s.trim_start().to_owned(), "ltrim")?,
-        "rtrim" => string_unary(&argv[0], |s| s.trim_end().to_owned(), "rtrim")?,
+        "toupper" => string_unary(arg(&argv, 0, "toUpper")?, |s| s.to_uppercase(), "toUpper")?,
+        "tolower" => string_unary(arg(&argv, 0, "toLower")?, |s| s.to_lowercase(), "toLower")?,
+        "trim" => string_unary(arg(&argv, 0, "trim")?, |s| s.trim().to_owned(), "trim")?,
+        "ltrim" => string_unary(
+            arg(&argv, 0, "ltrim")?,
+            |s| s.trim_start().to_owned(),
+            "ltrim",
+        )?,
+        "rtrim" => string_unary(
+            arg(&argv, 0, "rtrim")?,
+            |s| s.trim_end().to_owned(),
+            "rtrim",
+        )?,
         "substring" => substring_fn(&argv)?,
         "replace" => replace_fn(&argv)?,
         "split" => split_fn(&argv)?,
@@ -1493,6 +1548,15 @@ fn num_type_error(fname: &str) -> EvalError {
     EvalError::TypeError {
         context: format!("{fname}() requires a number"),
     }
+}
+
+/// Borrows the `n`-th positional argument of a built-in defensively. The semantic analyzer's arity
+/// check should make this infallible, but if it ever misses a case we return an
+/// [`EvalError::ArgumentCount`] instead of panicking on out-of-bounds user input.
+fn arg<'a>(argv: &'a [Value], n: usize, fname: &str) -> Result<&'a Value, EvalError> {
+    argv.get(n).ok_or_else(|| EvalError::ArgumentCount {
+        name: fname.to_owned(),
+    })
 }
 
 /// Dispatches the scalar type-conversion functions (`toInteger`/`toFloat`/`toString`/`toBoolean`/
@@ -1564,7 +1628,7 @@ fn invalid_conversion_argument(lower: &str) -> EvalError {
 fn to_integer(v: &Value) -> Result<Value, EvalError> {
     Ok(match v {
         Value::Integer(i) => Value::Integer(*i),
-        Value::Float(f) => Value::Integer(*f as i64),
+        Value::Float(f) => float_to_integer(*f),
         Value::String(s) => {
             let t = s.trim();
             // Try an exact integer first (preserves full `i64` range that an `f64` round-trip would
@@ -1572,13 +1636,27 @@ fn to_integer(v: &Value) -> Result<Value, EvalError> {
             // `toInteger('2.9') = 2`). A non-numeric string (`'foo'`, `''`) is `null`.
             t.parse::<i64>()
                 .map(Value::Integer)
-                .or_else(|_| t.parse::<f64>().map(|f| Value::Integer(f as i64)))
-                .unwrap_or(Value::Null)
+                .unwrap_or_else(|_| t.parse::<f64>().map_or(Value::Null, float_to_integer))
         }
         Value::Boolean(_) | Value::Null => Value::Null,
         // `convert_scalar` has already rejected the structural cases; any residual is `null`.
         _ => Value::Null,
     })
+}
+
+/// Truncates a float toward zero into an `i64`, yielding `null` for values openCypher cannot
+/// represent as an integer: NaN, ±infinity, and magnitudes outside the `i64` range. A plain
+/// `f as i64` cast would instead *saturate* (`1e30 as i64 == i64::MAX`), silently fabricating a
+/// value openCypher requires to be `null`.
+fn float_to_integer(f: f64) -> Value {
+    // The exact boundary: `i64::MAX` is not representable as `f64`, so compare against the next
+    // representable power of two (`2^63`) and the inclusive lower bound `i64::MIN` (which *is*
+    // representable exactly). Truncation toward zero happens via the `as` cast once in range.
+    if f.is_finite() && f >= -(2.0_f64.powi(63)) && f < 2.0_f64.powi(63) {
+        Value::Integer(f.trunc() as i64)
+    } else {
+        Value::Null
+    }
 }
 
 /// `toFloat(v)` over an already-validated scalar. A float is itself; an integer widens; a numeric
@@ -1706,6 +1784,11 @@ fn string_unary(v: &Value, f: impl Fn(&str) -> String, fname: &str) -> Result<Va
 }
 
 /// `range(start, end[, step])` — an inclusive integer range (openCypher).
+/// The largest number of elements `range()` is allowed to materialise. A list this size already
+/// occupies tens of gigabytes; anything larger is treated as a resource-limit failure rather than
+/// being allowed to exhaust memory.
+const MAX_RANGE_ELEMENTS: i128 = 1 << 30;
+
 fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
     let int = |v: &Value| match v {
         Value::Integer(i) => Ok(*i),
@@ -1713,8 +1796,8 @@ fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
             context: "range() requires integer arguments".to_owned(),
         }),
     };
-    let start = int(&argv[0])?;
-    let end = int(&argv[1])?;
+    let start = int(arg(argv, 0, "range")?)?;
+    let end = int(arg(argv, 1, "range")?)?;
     let step = if argv.len() > 2 { int(&argv[2])? } else { 1 };
     if step == 0 {
         // A zero step is a runtime `ArgumentError`/`NumberOutOfRange` (the step is out of its valid
@@ -1724,7 +1807,21 @@ fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
             value: "range() step 0".to_owned(),
         });
     }
-    let mut out = Vec::new();
+    // Reject ranges that would materialise more elements than the server will hold, before
+    // allocating anything: `range(1, 9_000_000_000_000_000_000)` would otherwise OOM the process.
+    // The count is computed with `i128` so the span itself never overflows.
+    let count: i128 = if (step > 0 && start <= end) || (step < 0 && start >= end) {
+        let span = (i128::from(end) - i128::from(start)).abs();
+        span / i128::from(step).abs() + 1
+    } else {
+        0
+    };
+    if count > MAX_RANGE_ELEMENTS {
+        return Err(EvalError::ResourceLimit {
+            detail: format!("range() would produce {count} elements (limit {MAX_RANGE_ELEMENTS})"),
+        });
+    }
+    let mut out = Vec::with_capacity(count as usize);
     let mut cur = start;
     if step > 0 {
         while cur <= end {
@@ -1748,8 +1845,9 @@ fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
 
 /// `substring(s, start[, length])` over Unicode scalar values (chars), clamped (openCypher).
 fn substring_fn(argv: &[Value]) -> Result<Value, EvalError> {
-    let Value::String(s) = &argv[0] else {
-        return match &argv[0] {
+    let a0 = arg(argv, 0, "substring")?;
+    let Value::String(s) = a0 else {
+        return match a0 {
             Value::Null => Ok(Value::Null),
             _ => Err(EvalError::TypeError {
                 context: "substring() requires a string".to_owned(),
@@ -1757,7 +1855,7 @@ fn substring_fn(argv: &[Value]) -> Result<Value, EvalError> {
         };
     };
     let chars: Vec<char> = s.chars().collect();
-    let start = match &argv[1] {
+    let start = match arg(argv, 1, "substring")? {
         Value::Integer(i) => (*i).max(0) as usize,
         _ => {
             return Err(EvalError::TypeError {
@@ -1785,7 +1883,11 @@ fn substring_fn(argv: &[Value]) -> Result<Value, EvalError> {
 
 /// `replace(s, search, replacement)` (openCypher).
 fn replace_fn(argv: &[Value]) -> Result<Value, EvalError> {
-    match (&argv[0], &argv[1], &argv[2]) {
+    match (
+        arg(argv, 0, "replace")?,
+        arg(argv, 1, "replace")?,
+        arg(argv, 2, "replace")?,
+    ) {
         (Value::String(s), Value::String(search), Value::String(rep)) => {
             Ok(Value::String(s.replace(search.as_str(), rep)))
         }
@@ -1798,7 +1900,7 @@ fn replace_fn(argv: &[Value]) -> Result<Value, EvalError> {
 
 /// `split(s, delimiter)` (openCypher).
 fn split_fn(argv: &[Value]) -> Result<Value, EvalError> {
-    match (&argv[0], &argv[1]) {
+    match (arg(argv, 0, "split")?, arg(argv, 1, "split")?) {
         (Value::String(s), Value::String(delim)) => {
             let parts: Vec<Value> = if delim.is_empty() {
                 s.chars().map(|c| Value::String(c.to_string())).collect()
@@ -1818,7 +1920,8 @@ fn split_fn(argv: &[Value]) -> Result<Value, EvalError> {
 
 /// `left(s, n)` / `right(s, n)` (openCypher).
 fn left_right_fn(argv: &[Value], left: bool) -> Result<Value, EvalError> {
-    match (&argv[0], &argv[1]) {
+    let fname = if left { "left" } else { "right" };
+    match (arg(argv, 0, fname)?, arg(argv, 1, fname)?) {
         (Value::String(s), Value::Integer(n)) => {
             let chars: Vec<char> = s.chars().collect();
             let n = (*n).max(0) as usize;
@@ -3568,6 +3671,78 @@ mod tests {
         assert_eq!(
             to_value(eval_with_udfs("abs(-7)", &set).unwrap()),
             Value::Integer(7)
+        );
+    }
+
+    // --- regression tests for the audited reachable panics / wrong results ------------------------
+
+    /// Regression (audit SEV 9): `i64::MIN / -1` overflows the magnitude of `i64` and panics even in
+    /// release. It must surface as the integer-overflow error class, not abort the process.
+    #[test]
+    fn integer_division_min_by_neg_one_is_overflow_not_panic() {
+        let g = MemGraph::new();
+        let err = eval_in(&g, &Row::empty(), "-9223372036854775808 / -1").unwrap_err();
+        assert_eq!(err, EvalError::IntegerOverflow);
+    }
+
+    /// Regression (audit SEV 9): `i64::MIN % -1` panics on overflow the same way; it must surface as
+    /// the integer-overflow class.
+    #[test]
+    fn integer_modulo_min_by_neg_one_is_overflow_not_panic() {
+        let g = MemGraph::new();
+        let err = eval_in(&g, &Row::empty(), "-9223372036854775808 % -1").unwrap_err();
+        assert_eq!(err, EvalError::IntegerOverflow);
+        // A normal modulo still works.
+        assert_eq!(evaluate("7 % 3"), Value::Integer(1));
+    }
+
+    /// Regression (audit SEV 7): an enormous `range()` must be rejected as a resource limit rather
+    /// than being allowed to allocate a multi-exabyte `Vec` and OOM the process. A reasonable range
+    /// still materialises.
+    #[test]
+    fn range_rejects_oversized_materialisation() {
+        let g = MemGraph::new();
+        let err = eval_in(&g, &Row::empty(), "range(1, 9000000000000000000)").unwrap_err();
+        assert!(
+            matches!(err, EvalError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+        assert_eq!(
+            to_value(eval_in(&g, &Row::empty(), "range(1, 5)").unwrap()),
+            Value::List((1..=5).map(Value::Integer).collect())
+        );
+    }
+
+    /// Regression (audit SEV 8): `toInteger` of a value outside the `i64` range must yield `null`
+    /// (openCypher), not saturate to `i64::MAX`. NaN and ±infinity are likewise `null`.
+    #[test]
+    fn to_integer_returns_null_for_non_representable() {
+        assert_eq!(evaluate("toInteger(1e30)"), Value::Null);
+        assert_eq!(evaluate("toInteger(-1e30)"), Value::Null);
+        assert_eq!(evaluate("toInteger('1e30')"), Value::Null);
+        assert_eq!(evaluate("toInteger(1.0/0.0)"), Value::Null);
+        // In-range conversions still truncate toward zero as before.
+        assert_eq!(evaluate("toInteger(2.9)"), Value::Integer(2));
+        assert_eq!(evaluate("toInteger('1.7')"), Value::Integer(1));
+        assert_eq!(evaluate("toInteger(42)"), Value::Integer(42));
+    }
+
+    /// Regression (audit SEV 3): the built-in dispatcher must not index its argument vector blindly.
+    /// `range_fn` is reachable from dispatch; calling it with too few arguments returns an
+    /// `ArgumentCount` error instead of panicking on an out-of-bounds index.
+    #[test]
+    fn builtin_with_missing_argument_does_not_panic() {
+        assert_eq!(
+            range_fn(&[]).unwrap_err(),
+            EvalError::ArgumentCount {
+                name: "range".to_owned()
+            }
+        );
+        assert_eq!(
+            split_fn(&[Value::String("a,b".to_owned())]).unwrap_err(),
+            EvalError::ArgumentCount {
+                name: "split".to_owned()
+            }
         );
     }
 }

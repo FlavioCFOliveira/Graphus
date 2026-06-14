@@ -35,6 +35,18 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+/// The maximum length, in **bytes**, of a single analyzed term (`rmp` task #72).
+///
+/// Matches Lucene's `StandardAnalyzer` default `maxTokenLength` (255, rounded to a clean 256). It
+/// bounds the memory a single untrusted token can amplify into: without a cap, a multi-megabyte run
+/// of alphanumeric characters in a node property — or in a search string — would become one giant
+/// term occupying a posting-list key and the forward set, an amplification path from untrusted text.
+/// A run reaching the cap is **truncated** at the last whole character that fits (never split mid
+/// UTF-8 sequence) and the remainder of the run is discarded, so the term stays a bounded, valid
+/// `String`. Because the identical analyzer runs at index and query time, truncation is symmetric and
+/// does not change which (in-bound) documents match.
+pub const MAX_TERM_LEN: usize = 256;
+
 /// The set of supported full-text analyzers (`rmp` task #72).
 ///
 /// The analyzer is a **property of the index**, fixed at `CREATE FULLTEXT INDEX … OPTIONS {analyzer}`
@@ -142,7 +154,13 @@ impl Analyzer {
         // Tokenize on Unicode non-alphanumeric boundaries.
         for ch in text.chars() {
             if ch.is_alphanumeric() {
-                current.push(ch);
+                // Cap the in-progress token so an untrusted multi-megabyte alphanumeric run does not
+                // amplify into one giant `String` (see `MAX_TERM_LEN`). Once the cap is reached we
+                // stop accumulating; the rest of this run is discarded but still acts as no boundary,
+                // so the following separator flushes the (capped) token.
+                if current.len() + ch.len_utf8() <= MAX_TERM_LEN {
+                    current.push(ch);
+                }
             } else if !current.is_empty() {
                 Self::push_standard_term(&mut terms, &current);
                 current.clear();
@@ -157,21 +175,39 @@ impl Analyzer {
     /// Lowercases `raw` and pushes it onto `terms` unless it is a stop-word.
     fn push_standard_term(terms: &mut Vec<String>, raw: &str) {
         // Lowercasing may expand a char (e.g. `İ` → `i̇`); `to_lowercase` handles the full mapping.
-        let lower = raw.to_lowercase();
+        // It can push the result back over `MAX_TERM_LEN` even though `raw` was capped, so truncate
+        // the lowercased form too (defense-in-depth against case-folding expansion).
+        let lower = truncate_term(&raw.to_lowercase());
         if !is_standard_stop_word(&lower) {
             terms.push(lower);
         }
     }
 
-    /// The keyword analysis: the whole trimmed input is one lowercased term (none if empty).
+    /// The keyword analysis: the whole trimmed input is one lowercased term (none if empty),
+    /// truncated to [`MAX_TERM_LEN`] so an untrusted multi-megabyte field cannot become one giant
+    /// term.
     fn analyze_keyword(text: &str) -> Vec<String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             Vec::new()
         } else {
-            vec![trimmed.to_lowercase()]
+            vec![truncate_term(&trimmed.to_lowercase())]
         }
     }
+}
+
+/// Truncates `term` to at most [`MAX_TERM_LEN`] bytes on a UTF-8 character boundary, returning it
+/// unchanged when already within the cap (the common case, no allocation).
+fn truncate_term(term: &str) -> String {
+    if term.len() <= MAX_TERM_LEN {
+        return term.to_owned();
+    }
+    // Find the largest char boundary `<= MAX_TERM_LEN` so we never split a multi-byte char.
+    let mut end = MAX_TERM_LEN;
+    while end > 0 && !term.is_char_boundary(end) {
+        end -= 1;
+    }
+    term[..end].to_owned()
 }
 
 /// The documented English stop-word set for the [`Analyzer::Standard`] analyzer (`rmp` task #72).
@@ -463,6 +499,52 @@ mod tests {
         assert!(Analyzer::Standard.analyze("").is_empty());
         assert!(Analyzer::Standard.analyze("   ,. ; ").is_empty());
         assert!(Analyzer::Standard.analyze("the and of to").is_empty());
+    }
+
+    #[test]
+    fn oversized_tokens_are_capped_to_max_term_len() {
+        // Regression for auditor finding #4: an untrusted multi-megabyte alphanumeric run must not
+        // amplify into one giant term. Both analyzers cap a term at MAX_TERM_LEN bytes.
+        let giant = "a".repeat(4 * 1024 * 1024); // 4 MiB single run
+
+        // Standard: the run is one (capped) token; it stays within the byte cap.
+        let standard = Analyzer::Standard.analyze(&giant);
+        assert_eq!(standard.len(), 1, "the run is a single token");
+        assert!(
+            standard[0].len() <= MAX_TERM_LEN,
+            "standard term must be capped to MAX_TERM_LEN, got {}",
+            standard[0].len(),
+        );
+
+        // Keyword: the whole field is one (capped) term.
+        let keyword = Analyzer::Keyword.analyze(&giant);
+        assert_eq!(keyword.len(), 1);
+        assert!(
+            keyword[0].len() <= MAX_TERM_LEN,
+            "keyword term must be capped to MAX_TERM_LEN, got {}",
+            keyword[0].len(),
+        );
+
+        // A run mixed with separators still caps each token and keeps the surrounding tokens.
+        let mixed = format!("head {giant} tail");
+        let terms = Analyzer::Standard.analyze(&mixed);
+        assert_eq!(terms.len(), 3, "head + capped giant + tail");
+        assert_eq!(terms[0], "head");
+        assert!(terms[1].len() <= MAX_TERM_LEN);
+        assert_eq!(terms[2], "tail");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        // A run of multi-byte chars must truncate on a char boundary, yielding a valid String no
+        // longer than MAX_TERM_LEN. 'é' is 2 bytes; MAX_TERM_LEN is even, but the guard must hold
+        // regardless — assert the result is valid UTF-8 within the cap.
+        let run = "é".repeat(4096); // 8 KiB of 2-byte chars
+        let terms = Analyzer::Standard.analyze(&run);
+        assert_eq!(terms.len(), 1);
+        assert!(terms[0].len() <= MAX_TERM_LEN);
+        // Must be a clean prefix of 'é' chars (no replacement char / no panic when constructed).
+        assert!(terms[0].chars().all(|c| c == 'é'));
     }
 
     #[test]

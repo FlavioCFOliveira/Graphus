@@ -57,25 +57,45 @@ impl std::fmt::Debug for JwtAuthenticator {
     }
 }
 
+/// The minimum HMAC secret length, in bytes, accepted by [`JwtAuthenticator::new`].
+///
+/// HS256 keys shorter than the 256-bit (32-byte) output of SHA-256 reduce the effective security of
+/// the MAC and make brute-forcing the signing key tractable — a forged-token risk. RFC 2104 §3 and
+/// RFC 7518 §3.2 both require an HMAC key at least as long as the hash output, so we reject anything
+/// shorter than 32 bytes at construction (fail-closed startup) rather than mint forgeable tokens.
+pub const MIN_JWT_SECRET_LEN: usize = 32;
+
 impl JwtAuthenticator {
     /// Creates an authenticator from a raw HMAC `secret`.
     ///
     /// The `validation` is fixed to HS256 with the library's *internal* expiry check disabled (we
     /// enforce `exp` deterministically against an injected clock instead); the subject claim is
     /// still required to be present.
-    #[must_use]
-    pub fn new(secret: &[u8]) -> Self {
+    ///
+    /// # Errors
+    /// [`AuthError::WeakSecret`] if `secret` is shorter than [`MIN_JWT_SECRET_LEN`] bytes — a short
+    /// HS256 key would make signatures brute-forceable and tokens forgeable, so it is rejected here
+    /// at startup instead of producing an insecure authenticator.
+    pub fn new(secret: &[u8]) -> Result<Self> {
+        if secret.len() < MIN_JWT_SECRET_LEN {
+            return Err(AuthError::WeakSecret {
+                detail: format!(
+                    "JWT signing secret is {} bytes; HS256 requires at least {MIN_JWT_SECRET_LEN}",
+                    secret.len()
+                ),
+            });
+        }
         let mut validation = Validation::new(Algorithm::HS256);
         // We validate `exp` ourselves against the injected clock (see module docs), so turn off the
         // library's wall-clock check. Require `sub` so a token without a subject is rejected.
         validation.validate_exp = false;
         validation.required_spec_claims =
             std::collections::HashSet::from(["sub".to_owned(), "exp".to_owned()]);
-        Self {
+        Ok(Self {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
             validation,
-        }
+        })
     }
 
     /// Issues a signed HS256 token for `subject`, expiring `ttl_secs` after `now_unix_secs`.
@@ -133,9 +153,14 @@ mod tests {
     const SECRET: &[u8] = b"a-test-secret-at-least-32-bytes-long!!";
     const NOW: u64 = 1_700_000_000;
 
+    /// Constructs from the fixture secret, asserting it is accepted.
+    fn authenticator() -> JwtAuthenticator {
+        JwtAuthenticator::new(SECRET).expect("fixture secret is >= 32 bytes")
+    }
+
     #[test]
     fn round_trips_subject_and_expiry() {
-        let auth = JwtAuthenticator::new(SECRET);
+        let auth = authenticator();
         let token = auth.issue_token("alice", NOW, 3600).unwrap();
         let claims = auth.verify_bearer(&token, NOW + 10).unwrap();
         assert_eq!(claims.sub, "alice");
@@ -145,7 +170,7 @@ mod tests {
 
     #[test]
     fn expired_token_is_rejected() {
-        let auth = JwtAuthenticator::new(SECRET);
+        let auth = authenticator();
         let token = auth.issue_token("alice", NOW, 60).unwrap();
         // Exactly at expiry counts as expired (exp <= now).
         assert_eq!(
@@ -161,7 +186,7 @@ mod tests {
 
     #[test]
     fn tampered_token_is_rejected() {
-        let auth = JwtAuthenticator::new(SECRET);
+        let auth = authenticator();
         let mut token = auth.issue_token("alice", NOW, 3600).unwrap();
         // Flip a character in the signature segment.
         let last = token.pop().unwrap();
@@ -174,8 +199,9 @@ mod tests {
 
     #[test]
     fn token_signed_with_another_secret_is_rejected() {
-        let issuer = JwtAuthenticator::new(SECRET);
-        let verifier = JwtAuthenticator::new(b"a-completely-different-secret-key-32b!");
+        let issuer = authenticator();
+        let verifier = JwtAuthenticator::new(b"a-completely-different-secret-key-32b!")
+            .expect("alternate secret is >= 32 bytes");
         let token = issuer.issue_token("alice", NOW, 3600).unwrap();
         assert!(matches!(
             verifier.verify_bearer(&token, NOW + 10),
@@ -185,7 +211,7 @@ mod tests {
 
     #[test]
     fn garbage_token_is_rejected() {
-        let auth = JwtAuthenticator::new(SECRET);
+        let auth = authenticator();
         assert!(matches!(
             auth.verify_bearer("not.a.jwt", NOW),
             Err(AuthError::BadToken { .. })
@@ -194,9 +220,32 @@ mod tests {
 
     #[test]
     fn debug_does_not_leak_secret() {
-        let auth = JwtAuthenticator::new(SECRET);
+        let auth = authenticator();
         let dbg = format!("{auth:?}");
         assert!(!dbg.contains("secret"));
         assert!(dbg.contains("HS256"));
+    }
+
+    #[test]
+    fn short_secret_is_rejected_as_weak() {
+        // A 31-byte secret is one byte below the HS256 minimum and must be refused, so a
+        // mis-configured server fails closed at startup rather than minting forgeable tokens.
+        let short = vec![b'x'; MIN_JWT_SECRET_LEN - 1];
+        assert!(matches!(
+            JwtAuthenticator::new(&short),
+            Err(AuthError::WeakSecret { .. })
+        ));
+        // An empty secret is the degenerate worst case.
+        assert!(matches!(
+            JwtAuthenticator::new(b""),
+            Err(AuthError::WeakSecret { .. })
+        ));
+    }
+
+    #[test]
+    fn secret_at_minimum_length_is_accepted() {
+        // Exactly 32 bytes is the boundary and must be accepted.
+        let exact = vec![b'k'; MIN_JWT_SECRET_LEN];
+        assert!(JwtAuthenticator::new(&exact).is_ok());
     }
 }

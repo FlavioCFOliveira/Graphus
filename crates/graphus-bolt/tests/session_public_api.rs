@@ -74,14 +74,15 @@ impl BoltExecutor for DemoExecutor {
 }
 
 fn auth() -> Authenticator {
-    let mut a = Authenticator::new(b"shared-jwt-secret-at-least-32-bytes!!");
+    let mut a = Authenticator::new(b"shared-jwt-secret-at-least-32-bytes!!")
+        .expect("fixture secret is >= 32 bytes");
     a.catalog_mut().create_user("bob").unwrap();
     a.catalog_mut().create_role("r").unwrap();
     a.catalog_mut()
         .grant_privilege("r", Privilege::read_database())
         .unwrap();
     a.catalog_mut().grant_role("bob", "r").unwrap();
-    a.set_password("bob", "secret").unwrap();
+    a.set_password("bob", "bob-secret").unwrap();
     a
 }
 
@@ -112,7 +113,7 @@ fn full_session_over_public_api() {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("bob".to_owned())),
-                ("credentials".to_owned(), Value::String("secret".to_owned())),
+                ("credentials".to_owned(), Value::String("bob-secret".to_owned())),
             ],
         },
         Request::Run {

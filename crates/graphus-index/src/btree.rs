@@ -280,9 +280,12 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         let leaf = self.descend_to_leaf(root, key)?;
         let f = self.pool.fetch(leaf)?;
         let v = NodeView::new(self.pool.page(f));
-        let out = v.find_exact(key).map(|i| v.value(i).to_vec());
+        let out = match v.validate() {
+            Ok(()) => Ok(v.find_exact(key).map(|i| v.value(i).to_vec())),
+            Err(e) => Err(e),
+        };
         self.pool.unpin(f);
-        Ok(out)
+        out
     }
 
     /// Collects all `(key, value)` entries with `lo <= key < hi` in ascending key order
@@ -324,6 +327,10 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         loop {
             let f = self.pool.fetch(leaf)?;
             let v = NodeView::new(self.pool.page(f));
+            if let Err(e) = v.validate() {
+                self.pool.unpin(f);
+                return Err(e);
+            }
             let start = v.lower_bound(lo);
             let mut passed_hi = false;
             for i in start..v.slot_count() {
@@ -352,6 +359,10 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         loop {
             let f = self.pool.fetch(cur)?;
             let v = NodeView::new(self.pool.page(f));
+            if let Err(e) = v.validate() {
+                self.pool.unpin(f);
+                return Err(e);
+            }
             if v.is_leaf() {
                 self.pool.unpin(f);
                 return Ok(cur);

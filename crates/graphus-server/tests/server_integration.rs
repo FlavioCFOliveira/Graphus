@@ -98,7 +98,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: "integration-test-jwt-secret-32-bytes!".to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: Vec::new(),
         },
@@ -358,14 +358,14 @@ async fn bolt_uds_full_session_returns_records() {
     // First, write a node via an auto-commit RUN so the read below has something to return.
     {
         let mut client = BoltUdsClient::connect(&uds).await;
-        client.handshake_and_logon("alice", "pw").await;
+        client.handshake_and_logon("alice", "admin-pw8").await;
         client.run_pull("CREATE (:Greeting {text: 'hello'})").await;
         client.goodbye().await;
     }
 
     // Now a fresh session reads it back.
     let mut client = BoltUdsClient::connect(&uds).await;
-    client.handshake_and_logon("alice", "pw").await;
+    client.handshake_and_logon("alice", "admin-pw8").await;
     let records = client.run_pull("MATCH (g:Greeting) RETURN g.text").await;
     client.goodbye().await;
 
@@ -391,7 +391,7 @@ async fn bolt_write_without_return_advertises_no_fields_and_streams_no_records()
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut client = BoltUdsClient::connect(&uds).await;
-    client.handshake_and_logon("alice", "pw").await;
+    client.handshake_and_logon("alice", "admin-pw8").await;
 
     // A bare `CREATE` with no `RETURN`: RUN must advertise no fields and PULL must stream no records.
     let (fields, records) = client.run_fields_then_pull("CREATE (:N {x: 1})").await;
@@ -433,7 +433,7 @@ async fn bolt_structural_results_node_rel_path_on_the_wire() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut client = BoltUdsClient::connect(&uds).await;
-    client.handshake_and_logon("alice", "pw").await;
+    client.handshake_and_logon("alice", "admin-pw8").await;
 
     // WRITE txn (auto-commit): build a small graph a:Person -[:KNOWS]-> b:Person:Employee. We drain
     // the RUN/PULL but deliberately do NOT assert on any rows it streams: a write without `RETURN`
@@ -587,7 +587,7 @@ async fn bolt_uds_route_and_telemetry_round_trip() {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("pw".to_owned())),
+                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
             ],
         })
         .await;
@@ -1097,7 +1097,8 @@ async fn tls_config_path_boots_network_listeners() {
 /// server does not expose a token-mint endpoint in v1; a real deployment issues tokens out of band.)
 async fn mint_token(_server: &ServerHandle, user: &str) -> String {
     use graphus_auth::Authenticator;
-    let mut auth = Authenticator::new(b"integration-test-jwt-secret-32-bytes!");
+    let mut auth = Authenticator::new(b"integration-test-jwt-secret-32-bytes!")
+        .expect("fixture secret is >= 32 bytes");
     auth.catalog_mut().create_user(user).unwrap();
     auth.issue_token(user, now_unix_secs(), 3_600).unwrap()
 }

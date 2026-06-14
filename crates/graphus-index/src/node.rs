@@ -158,6 +158,65 @@ impl<'a> NodeView<'a> {
         SLOT_DIR_START + i * SLOT_SIZE
     }
 
+    /// Validates that the slot directory is internally consistent before the hot read paths iterate
+    /// over it, so a page that is *corrupt yet survives the page checksum* (e.g. bit-rot that happens
+    /// to keep a valid CRC, or a malformed image) cannot drive an [`assert!`] panic or an
+    /// out-of-bounds slice in [`key`](Self::key) / [`value`](Self::value) / [`child`](Self::child)
+    /// during a client query. This is **defense-in-depth**: a well-formed page always passes, and the
+    /// accessors keep their existing fast (unchecked) bodies — callers on the hot read paths gate on
+    /// this once per fetched page instead of paying a bounds check per slot access.
+    ///
+    /// A node is well-formed when every slot's cell `[off, off + klen + vlen)` lies wholly within the
+    /// cell-heap region `[dir_end, CELL_LIMIT]` (so it neither overlaps the slot directory nor runs
+    /// into the special area), and — for an internal node — the trailing `u64` child pointer at
+    /// `off + klen` also fits.
+    ///
+    /// # Errors
+    /// Returns [`graphus_core::GraphusError::Storage`] describing the first inconsistency found.
+    pub fn validate(&self) -> graphus_core::error::Result<()> {
+        let n = self.slot_count();
+        let dir_end = SLOT_DIR_START + n * SLOT_SIZE;
+        // The directory itself must fit ahead of the special area; an absurd slot_count would make
+        // `slot_off` read past the page.
+        if dir_end > CELL_LIMIT {
+            return Err(graphus_core::GraphusError::Storage(format!(
+                "corrupt index page: slot_count {n} overflows the page directory",
+            )));
+        }
+        let is_leaf = self.level() == 0;
+        for i in 0..n {
+            let slot = Self::slot_off(i);
+            let off = rd_u16(self.bytes, slot) as usize;
+            let klen = rd_u16(self.bytes, slot + 2) as usize;
+            let vlen = rd_u16(self.bytes, slot + 4) as usize;
+            // The cell body must sit inside the heap region, never inside the directory or past the
+            // special area. `checked_add` guards the (already u16-bounded) arithmetic defensively.
+            let cell_end = off
+                .checked_add(klen)
+                .and_then(|e| e.checked_add(vlen))
+                .ok_or_else(|| {
+                    graphus_core::GraphusError::Storage(format!(
+                        "corrupt index page: slot {i} cell length overflows",
+                    ))
+                })?;
+            if off < dir_end || cell_end > CELL_LIMIT {
+                return Err(graphus_core::GraphusError::Storage(format!(
+                    "corrupt index page: slot {i} cell [{off}, {cell_end}) outside heap [{dir_end}, {CELL_LIMIT}]",
+                )));
+            }
+            // An internal cell also carries a trailing `u64` child at `off + klen`; ensure it fits.
+            if !is_leaf {
+                let child_end = off.checked_add(klen).and_then(|e| e.checked_add(8)).filter(|e| *e <= CELL_LIMIT);
+                if child_end.is_none() {
+                    return Err(graphus_core::GraphusError::Storage(format!(
+                        "corrupt index page: slot {i} internal child pointer outside the page",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The encoded key bytes of slot `i`.
     ///
     /// # Panics
@@ -600,6 +659,65 @@ mod tests {
         assert!(n.leaf_insert(b"key", b"a-much-larger-value-than-before"));
         n.compact();
         assert_eq!(n.view().value(0), b"a-much-larger-value-than-before");
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_node() {
+        let mut page = blank_page();
+        let mut n = NodeMut::new(&mut page);
+        n.init(0);
+        assert!(n.leaf_insert(b"a", b"1"));
+        assert!(n.leaf_insert(b"b", b"22"));
+        n.view().validate().expect("a well-formed leaf must validate");
+
+        let mut ipage = blank_page();
+        let mut ni = NodeMut::new(&mut ipage);
+        ni.init(1);
+        ni.set_leftmost_child(100);
+        assert!(ni.internal_insert(b"m", 200));
+        ni.view().validate().expect("a well-formed internal node must validate");
+    }
+
+    #[test]
+    fn validate_rejects_a_corrupt_slot_directory_instead_of_panicking() {
+        // Regression for auditor finding #3: a page that survives the checksum but has an internally
+        // inconsistent slot directory must be reported as a Storage error on the read path, never
+        // panic or slice out of bounds. We forge such corruption directly in the bytes.
+        let mut page = blank_page();
+        let mut n = NodeMut::new(&mut page);
+        n.init(0);
+        assert!(n.leaf_insert(b"a", b"1"));
+
+        // (a) An absurd slot_count makes the directory run past the page.
+        wr_u16(&mut page, OFF_SLOT_COUNT, u16::MAX);
+        assert!(
+            NodeView::new(&page).validate().is_err(),
+            "an out-of-range slot_count must be rejected",
+        );
+
+        // (b) A single slot whose cell offset points past the special area.
+        let mut page2 = blank_page();
+        let mut n2 = NodeMut::new(&mut page2);
+        n2.init(0);
+        assert!(n2.leaf_insert(b"a", b"1"));
+        let slot = SLOT_DIR_START; // first (and only) slot
+        wr_u16(&mut page2, slot, (CELL_LIMIT - 1) as u16); // off near the very end
+        wr_u16(&mut page2, slot + 2, 64); // klen that now runs past CELL_LIMIT
+        assert!(
+            NodeView::new(&page2).validate().is_err(),
+            "a cell running past the heap region must be rejected",
+        );
+
+        // (c) A cell offset that points *into* the slot directory.
+        let mut page3 = blank_page();
+        let mut n3 = NodeMut::new(&mut page3);
+        n3.init(0);
+        assert!(n3.leaf_insert(b"a", b"1"));
+        wr_u16(&mut page3, SLOT_DIR_START, (SLOT_DIR_START) as u16); // off inside the directory
+        assert!(
+            NodeView::new(&page3).validate().is_err(),
+            "a cell overlapping the slot directory must be rejected",
+        );
     }
 
     #[test]

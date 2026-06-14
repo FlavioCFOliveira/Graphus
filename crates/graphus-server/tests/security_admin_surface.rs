@@ -124,11 +124,11 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: JWT_SECRET.to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: vec![UserBootstrap {
                 name: "bob".to_owned(),
-                password: "pw2".to_owned(),
+                password: "user2-pw8".to_owned(),
             }],
         },
         encryption: graphus_server::config::EncryptionConfig::default(),
@@ -384,11 +384,11 @@ async fn security_commands_full_lifecycle_over_the_wire() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     // CREATE USER / ROLE.
     assert!(
-        c.run_ok("CREATE USER carol SET PASSWORD 'cpw'")
+        c.run_ok("CREATE USER carol SET PASSWORD 'carol-pw8'")
             .await
             .is_empty()
     );
@@ -464,19 +464,19 @@ async fn if_exists_variants_and_clear_errors() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
-    c.run_ok("CREATE USER dave SET PASSWORD 'd'").await;
+    c.run_ok("CREATE USER dave SET PASSWORD 'dave-pw8'").await;
     // Duplicate without IF NOT EXISTS: a client error.
     let f = c
-        .run("CREATE USER dave SET PASSWORD 'd'")
+        .run("CREATE USER dave SET PASSWORD 'dave-pw8'")
         .await
         .expect_err("duplicate user fails");
     assert!(f.message.contains("already exists"), "{f:?}");
     assert!(f.code.contains("ClientError"), "{f:?}");
     c.reset().await;
     // IF NOT EXISTS: the duplicate is a no-op success.
-    c.run_ok("CREATE USER dave SET PASSWORD 'd' IF NOT EXISTS")
+    c.run_ok("CREATE USER dave SET PASSWORD 'dave-pw8' IF NOT EXISTS")
         .await;
 
     // DROP of a missing user fails; IF EXISTS no-ops.
@@ -507,9 +507,9 @@ async fn non_admin_is_denied_security_commands_with_no_side_effects() {
 
     // bob (read+write, no admin) is denied every security statement.
     let mut bob = BoltClient::connect(&uds).await;
-    bob.handshake_and_logon("bob", "pw2").await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
     for stmt in [
-        "CREATE USER mallory SET PASSWORD 'x'",
+        "CREATE USER mallory SET PASSWORD 'mallory8'",
         "CREATE ROLE evil",
         "GRANT ADMIN ON DATABASE TO readwrite",
         "GRANT ROLE readwrite TO bob",
@@ -527,7 +527,7 @@ async fn non_admin_is_denied_security_commands_with_no_side_effects() {
 
     // No side effects: alice sees no `mallory`, no `evil`, and bob did not self-escalate.
     let mut alice = BoltClient::connect(&uds).await;
-    alice.handshake_and_logon("alice", "pw").await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
     let names = column(&alice.run_ok("SHOW USERS").await, 0);
     assert!(
         !names.contains(&"mallory".to_owned()),
@@ -541,7 +541,7 @@ async fn non_admin_is_denied_security_commands_with_no_side_effects() {
     // bob still cannot run SHOW USERS (he gained no admin).
     alice.goodbye().await;
     let mut bob2 = BoltClient::connect(&uds).await;
-    bob2.handshake_and_logon("bob", "pw2").await;
+    bob2.handshake_and_logon("bob", "user2-pw8").await;
     assert!(bob2.run("SHOW USERS").await.is_err(), "bob still not admin");
     bob2.reset().await;
     bob2.goodbye().await;
@@ -558,11 +558,11 @@ async fn security_commands_rejected_inside_explicit_transaction() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     c.begin().await;
     let f = c
-        .run("CREATE USER nope SET PASSWORD 'x'")
+        .run("CREATE USER nope SET PASSWORD 'mallory8'")
         .await
         .expect_err("security command inside an explicit transaction");
     assert!(f.message.contains("explicit transaction"), "{f:?}");
@@ -587,7 +587,7 @@ async fn bootstrap_admin_cannot_be_locked_out_over_the_wire() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     for stmt in [
         "DROP USER alice",
@@ -622,7 +622,7 @@ async fn security_model_survives_restart_and_never_persists_plaintext() {
         let server = boot(config.clone()).await;
         let uds = server.uds_path.clone().expect("UDS enabled");
         let mut c = BoltClient::connect(&uds).await;
-        c.handshake_and_logon("alice", "pw").await;
+        c.handshake_and_logon("alice", "admin-pw8").await;
         c.run_ok("CREATE USER erin SET PASSWORD 'sup3r-s3cret'")
             .await;
         c.run_ok("CREATE ROLE auditor").await;
@@ -654,7 +654,7 @@ async fn security_model_survives_restart_and_never_persists_plaintext() {
 
     // alice (admin) sees erin + auditor in the reloaded model.
     let mut alice = BoltClient::connect(&uds).await;
-    alice.handshake_and_logon("alice", "pw").await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
     let names = column(&alice.run_ok("SHOW USERS").await, 0);
     assert!(
         names.contains(&"erin".to_owned()),
@@ -673,7 +673,7 @@ async fn security_model_survives_restart_and_never_persists_plaintext() {
 
     // bob (dropped) can no longer authenticate after the restart (his removal is durable).
     let mut bob = BoltClient::connect(&uds).await;
-    let logon = bob.handshake_then_try_logon("bob", "pw2").await;
+    let logon = bob.handshake_then_try_logon("bob", "user2-pw8").await;
     assert!(
         logon.is_err(),
         "a dropped user must not authenticate after restart"
@@ -691,7 +691,7 @@ async fn security_grammar_is_strict_on_the_wire() {
     let uds = server.uds_path.clone().expect("UDS enabled");
 
     let mut c = BoltClient::connect(&uds).await;
-    c.handshake_and_logon("alice", "pw").await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
 
     // Claimed but malformed → a syntax-class FAILURE.
     for bad in [

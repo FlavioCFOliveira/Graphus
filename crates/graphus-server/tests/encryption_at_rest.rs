@@ -105,7 +105,7 @@ fn config_with_key(temp: &TempStore, key_path: Option<PathBuf>) -> ServerConfig 
         jwt_secret: "enc-itest-jwt-secret-uds-only-here!!".to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: None,
             users: Vec::new(),
         },

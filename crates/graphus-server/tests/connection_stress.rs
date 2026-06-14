@@ -95,7 +95,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: "integration-test-jwt-secret-32-bytes!".to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "admin-pw8".to_owned(),
             admin_uid: Some(current_uid()),
             users: Vec::new(),
         },
@@ -215,7 +215,7 @@ async fn run_client(path: &std::path::Path) -> std::io::Result<ClientOutcome> {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("pw".to_owned())),
+                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
             ],
         },
     )
@@ -536,7 +536,7 @@ async fn open_logged_in_uds(path: &std::path::Path) -> UnixStream {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("pw".to_owned())),
+                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
             ],
         },
     )

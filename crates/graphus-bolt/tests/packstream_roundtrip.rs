@@ -138,7 +138,21 @@ fn any_value() -> impl Strategy<Value = Value> {
         |inner| {
             prop_oneof![
                 proptest::collection::vec(inner.clone(), 0..10).prop_map(Value::List),
-                proptest::collection::vec(("[a-z]{0,8}", inner), 0..10).prop_map(Value::Map),
+                // De-duplicate keys (keeping the LAST value, matching PackStream's "last seen value
+                // wins" decode rule) so the generated map has no duplicate keys. A map *with*
+                // duplicate keys cannot round-trip byte-for-byte — by design, the decoder collapses
+                // duplicates — and that collapse is asserted by dedicated unit tests, not here.
+                proptest::collection::vec(("[a-z]{0,8}", inner), 0..10).prop_map(|pairs| {
+                    let mut entries: Vec<(String, Value)> = Vec::with_capacity(pairs.len());
+                    for (k, v) in pairs {
+                        if let Some(slot) = entries.iter_mut().find(|(ek, _)| *ek == k) {
+                            slot.1 = v;
+                        } else {
+                            entries.push((k, v));
+                        }
+                    }
+                    Value::Map(entries)
+                }),
             ]
         },
     )

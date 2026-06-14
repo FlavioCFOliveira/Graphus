@@ -394,12 +394,35 @@ pub fn value_to_cbor(value: &Value) -> ciborium::Value {
     }
 }
 
+/// Maximum nesting depth `cbor_to_value` will descend before refusing the input.
+///
+/// CBOR (RFC 8949) is a **trusted boundary**: a request body that fits under the HTTP body cap can
+/// still nest arrays/maps thousands of levels deep, and an unbounded recursive walk would exhaust the
+/// thread stack and panic (a DoS reachable from a single request). Unlike `serde_json`, `ciborium`'s
+/// own [`ciborium::Value`] tree imposes no depth limit once built, so the limit must live here. The
+/// value is generous for every legitimate Graphus payload (parameters are flat maps of scalars/lists;
+/// the deepest real shape is a point map at depth 2) while sitting far below any plausible stack
+/// budget. Inputs deeper than this surface as [`ValueCodecError::Malformed`] — never a panic
+/// (`04 §11.4`, the fuzz-hardening rule for every decoder).
+pub const MAX_CBOR_DEPTH: usize = 128;
+
 /// Decodes a CBOR data item into a [`Value`].
+///
+/// Nesting is bounded to [`MAX_CBOR_DEPTH`]: a body fitting under the HTTP body cap can still nest
+/// deeply enough to overflow the stack, so an over-deep item is rejected rather than recursed into.
 ///
 /// # Errors
 /// [`ValueCodecError::UnsupportedCbor`] for a CBOR construct Graphus does not model as a `Value`
-/// (a tag, or a non-text map key).
+/// (a tag, or a non-text map key); [`ValueCodecError::Malformed`] if the item nests deeper than
+/// [`MAX_CBOR_DEPTH`].
 pub fn cbor_to_value(cbor: &ciborium::Value) -> Result<Value, ValueCodecError> {
+    cbor_to_value_depth(cbor, MAX_CBOR_DEPTH)
+}
+
+/// Depth-bounded core of [`cbor_to_value`]. `budget` is the number of further nesting levels still
+/// permitted; each descent into an array/map consumes one. At zero the input is refused as
+/// [`ValueCodecError::Malformed`] before any further recursion, capping stack growth.
+fn cbor_to_value_depth(cbor: &ciborium::Value, budget: usize) -> Result<Value, ValueCodecError> {
     use ciborium::Value as Cbor;
     match cbor {
         Cbor::Null => Ok(Value::Null),
@@ -413,13 +436,19 @@ pub fn cbor_to_value(cbor: &ciborium::Value) -> Result<Value, ValueCodecError> {
         Cbor::Text(s) => Ok(Value::String(s.clone())),
         Cbor::Bytes(b) => Ok(Value::Bytes(b.clone())),
         Cbor::Array(xs) => {
+            let Some(inner) = budget.checked_sub(1) else {
+                return Err(too_deep());
+            };
             let mut out = Vec::with_capacity(xs.len());
             for x in xs {
-                out.push(cbor_to_value(x)?);
+                out.push(cbor_to_value_depth(x, inner)?);
             }
             Ok(Value::List(out))
         }
         Cbor::Map(kv) => {
+            let Some(inner) = budget.checked_sub(1) else {
+                return Err(too_deep());
+            };
             let mut out = Vec::with_capacity(kv.len());
             for (k, v) in kv {
                 let Cbor::Text(key) = k else {
@@ -427,7 +456,7 @@ pub fn cbor_to_value(cbor: &ciborium::Value) -> Result<Value, ValueCodecError> {
                         detail: "map keys must be text".to_owned(),
                     });
                 };
-                out.push((key.clone(), cbor_to_value(v)?));
+                out.push((key.clone(), cbor_to_value_depth(v, inner)?));
             }
             // A self-describing point map (the `crs`/`srid`/`coordinates` shape `value_to_cbor`
             // emits) re-decodes as a `Value::Point` (`rmp` task #73); any other map stays a map.
@@ -439,6 +468,13 @@ pub fn cbor_to_value(cbor: &ciborium::Value) -> Result<Value, ValueCodecError> {
         other => Err(ValueCodecError::UnsupportedCbor {
             detail: format!("{other:?}"),
         }),
+    }
+}
+
+/// The controlled error for a CBOR item nested past [`MAX_CBOR_DEPTH`].
+fn too_deep() -> ValueCodecError {
+    ValueCodecError::Malformed {
+        detail: format!("CBOR nesting exceeds the maximum depth of {MAX_CBOR_DEPTH}"),
     }
 }
 
@@ -1029,5 +1065,59 @@ mod tests {
             ("note".to_owned(), Value::String("hi".to_owned())),
         ]);
         assert_eq!(cbor_round_trip(&m), m);
+    }
+
+    // ---- DoS hardening: CBOR depth guard ------------------------------------------------------
+
+    /// Builds a `ciborium::Value` nested `depth` arrays deep around an integer leaf.
+    fn nested_cbor_array(depth: usize) -> ciborium::Value {
+        let mut v = ciborium::Value::Integer(0.into());
+        for _ in 0..depth {
+            v = ciborium::Value::Array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn cbor_just_inside_the_depth_limit_decodes() {
+        // A list nested exactly to the limit (each level consumes one unit of budget) still decodes:
+        // the guard rejects only what is *past* the bound, never legitimate nesting at it.
+        let cbor = nested_cbor_array(MAX_CBOR_DEPTH);
+        let decoded = cbor_to_value(&cbor).expect("nesting at the limit must decode");
+        // Walk back down to confirm the structure survived intact.
+        let mut cur = &decoded;
+        for _ in 0..MAX_CBOR_DEPTH {
+            match cur {
+                Value::List(xs) if xs.len() == 1 => cur = &xs[0],
+                other => panic!("expected a singleton list at each level, got {other:?}"),
+            }
+        }
+        assert_eq!(*cur, Value::Integer(0));
+    }
+
+    #[test]
+    fn cbor_past_the_depth_limit_is_malformed_not_panic() {
+        // Regression: `cbor_to_value` recursed without a bound, so a deeply nested (but tiny-on-the-
+        // wire) CBOR item from an untrusted request could overflow the stack and panic. It must now
+        // return a controlled `Malformed` instead — a fuzz-hardening guarantee (`04 §11.4`).
+        let cbor = nested_cbor_array(MAX_CBOR_DEPTH + 1);
+        let err = cbor_to_value(&cbor).expect_err("over-deep nesting must be refused");
+        assert!(
+            matches!(err, ValueCodecError::Malformed { .. }),
+            "expected Malformed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cbor_well_past_the_depth_limit_short_circuits() {
+        // Several times the limit: the guard must short-circuit early (it descends at most
+        // MAX_CBOR_DEPTH frames regardless of input depth), returning an error rather than walking
+        // the whole tree. Depth is kept modest so *constructing and dropping* the input tree — both
+        // recursive on `ciborium::Value` — stay within the test thread's own stack.
+        let cbor = nested_cbor_array(MAX_CBOR_DEPTH * 8);
+        assert!(matches!(
+            cbor_to_value(&cbor),
+            Err(ValueCodecError::Malformed { .. })
+        ));
     }
 }

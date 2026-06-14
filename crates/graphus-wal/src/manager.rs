@@ -148,11 +148,18 @@ impl<S: LogSink> WalManager<S> {
     /// the writer's in-flight `TxnId` on disk, so visibility must resolve that id to a commit
     /// timestamp, and the durable commit records are the source of truth. Non-MVCC commits (index /
     /// system transactions written via [`commit`](Self::commit)) carry the `0` sentinel timestamp;
-    /// they are harmless to include (no version header references their `TxnId`). The scan stops at
-    /// the first torn/short tail record, exactly like recovery, preserving committed-or-nothing.
+    /// they are harmless to include (no version header references their `TxnId`).
+    ///
+    /// Corruption handling matches [`recover_from`](crate::recover_from) exactly: an undecodable
+    /// record that is **followed** by a genuine, self-consistent record is *interior corruption* —
+    /// there is committed data beyond the failure point, so stopping here would silently drop it (and
+    /// thus drop those transactions from the rebuilt transaction table). That is the cardinal ACID
+    /// violation, so this FAILS LOUD. An undecodable record with no genuine record after it is a
+    /// benign torn tail (the last, un-acknowledged append never completed) and the scan stops there,
+    /// preserving committed-or-nothing.
     ///
     /// # Errors
-    /// Propagates a sink read error.
+    /// Propagates a sink read error, or returns a storage error on interior WAL corruption.
     pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp, Lsn)>> {
         let mut log = Vec::new();
         self.read_durable(Lsn(0), &mut log)?;
@@ -173,7 +180,20 @@ impl<S: LogSink> WalManager<S> {
                         }
                     }
                 }
-                Err(_) => break,
+                // Same interior-corruption guard as `recover_from`: only truncate on a genuine torn
+                // tail; fail loud if real committed data follows the undecodable spot.
+                Err(_) => {
+                    if let Some(off) = crate::recovery::next_self_consistent_record(&log, cursor + 1)
+                    {
+                        return Err(GraphusError::Storage(format!(
+                            "WAL interior log corruption: an undecodable record at offset {cursor} \
+                             is followed by a valid record at offset {off}; refusing to rebuild the \
+                             transaction table, because stopping here would silently drop the \
+                             committed transactions logged after offset {cursor}"
+                        )));
+                    }
+                    break;
+                }
             }
         }
         Ok(out)

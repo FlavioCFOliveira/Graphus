@@ -42,8 +42,15 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 
 # io_uring capability probe only (`io_uring_setup(2)` + `close(2)`); pulled in solely by the
-# optional `io-uring` feature, Linux-only. Not in the default build.
+# optional `io-uring` feature, Linux-only. Not in the default build on non-macOS targets.
 libc = { version = "0.2", optional = true }
+
+# macOS needs `libc` unconditionally for the `fcntl(fd, F_FULLFSYNC)` durability barrier (APFS/HFS+
+# do not flush the drive's volatile write cache on a plain `fsync`; only `F_FULLFSYNC` does — see
+# `src/fullsync.rs`). On macOS the dependency is always present (not optional); Linux/other targets
+# never pull it unless the `io-uring` feature is enabled.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # `macros` + `time` enable `#[tokio::test]` and timeouts in the loopback round-trip tests; `net` is

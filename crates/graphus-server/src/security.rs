@@ -537,7 +537,9 @@ impl SecurityCatalog {
     pub fn load(config: &ServerConfig) -> Result<Self> {
         let root = config.store_path.clone();
         let bootstrap_admin = config.auth.admin_user.clone();
-        let mut auth = Authenticator::new(config.jwt_secret.as_bytes());
+        // A short JWT secret is rejected here (fail-closed startup): a weak HS256 key would make
+        // Bearer tokens forgeable. `AuthError` converts into `SecurityError::Rbac` via `?`.
+        let mut auth = Authenticator::new(config.jwt_secret.as_bytes())?;
 
         if security_file_exists(&root) {
             // Authoritative file: load it; config bootstrap is ignored for the RBAC model.
@@ -1093,14 +1095,14 @@ mod tests {
 
     /// An authenticator seeded with a `root` admin (global Admin) and the JWT secret.
     fn admin_auth() -> Authenticator {
-        let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!");
+        let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
         auth.catalog_mut().create_user("root").unwrap();
         auth.catalog_mut().create_role("admin").unwrap();
         auth.catalog_mut()
             .grant_privilege("admin", Privilege::admin_database())
             .unwrap();
         auth.catalog_mut().grant_role("root", "admin").unwrap();
-        auth.set_password("root", "secret").unwrap();
+        auth.set_password("root", "root-secret").unwrap();
         auth
     }
 
@@ -1112,18 +1114,18 @@ mod tests {
     async fn create_user_persists_and_is_visible() {
         let root = TempRoot::new("create");
         let sec = catalog(&root);
-        sec.create_user("alice", Some("pw")).await.expect("create");
+        sec.create_user("alice", Some("valid-pw")).await.expect("create");
 
         // Visible in memory.
         assert!(sec.list_users().iter().any(|u| u.name == "alice"));
         // The password verifies (the hash, not plaintext, is what was stored).
-        assert!(sec.with_auth(|a| a.verify_password("alice", "pw").unwrap()));
+        assert!(sec.with_auth(|a| a.verify_password("alice", "valid-pw").unwrap()));
 
         // Persisted: the security file exists and names alice but NOT her plaintext.
         let text = std::fs::read_to_string(root.path.join(SECURITY_FILE_NAME)).expect("file");
         assert!(text.contains("alice"));
         assert!(
-            !text.contains("\"pw\""),
+            !text.contains("valid-pw"),
             "plaintext must never be persisted"
         );
         assert!(text.contains("$argon2id$"), "the argon2 hash is persisted");
@@ -1138,14 +1140,14 @@ mod tests {
             sec.grant_privilege("reader", Privilege::on_label(Action::Read, "db", "Person"))
                 .await
                 .expect("grant");
-            sec.create_user("alice", Some("pw")).await.expect("user");
+            sec.create_user("alice", Some("valid-pw")).await.expect("user");
             sec.grant_role("alice", "reader").await.expect("grant role");
         }
         // "Restart": reload from the file via load_into and assert the model is intact.
-        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!");
+        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
         load_into(&root.path, &mut reloaded).expect("reload");
         assert!(reloaded.catalog().has_user("alice"));
-        assert!(reloaded.verify_password("alice", "pw").unwrap());
+        assert!(reloaded.verify_password("alice", "valid-pw").unwrap());
         // The fine-grained grant survived exactly.
         assert!(reloaded.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
         assert!(reloaded.authorize(
@@ -1182,7 +1184,7 @@ mod tests {
         for (tag, text) in cases {
             let root = TempRoot::new(&format!("malformed-{tag}"));
             std::fs::write(root.path.join(SECURITY_FILE_NAME), text).expect("write file");
-            let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!");
+            let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
             let result = load_into(&root.path, &mut auth);
             assert!(
                 matches!(result, Err(SecurityError::Corrupt { .. })),
@@ -1204,7 +1206,7 @@ mod tests {
         // Simulate a crash mid-write of a later mutation: garbage temp next to the valid file.
         std::fs::write(root.path.join(SECURITY_TMP_NAME), b"%% garbage %%").expect("plant tmp");
 
-        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!");
+        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
         load_into(&root.path, &mut reloaded).expect("load");
         assert!(
             reloaded.catalog().has_user("root"),
@@ -1326,14 +1328,14 @@ mod tests {
         );
     }
 
-    /// A `ServerConfig` rooted at `root` with admin `root`/`pw` and a fixed JWT secret.
+    /// A `ServerConfig` rooted at `root` with admin `root`/`valid-pw` and a fixed JWT secret.
     fn fresh_config(root: &TempRoot) -> ServerConfig {
         ServerConfig {
             store_path: root.path.clone(),
             jwt_secret: "a-32-byte-or-longer-jwt-signing-secret!!".to_owned(),
             auth: crate::config::AuthBootstrap {
                 admin_user: "root".to_owned(),
-                admin_password: "pw".to_owned(),
+                admin_password: "valid-pw".to_owned(),
                 ..crate::config::AuthBootstrap::default()
             },
             ..ServerConfig::default()
@@ -1358,7 +1360,7 @@ mod tests {
         config.auth.admin_password = "different".to_owned();
         let sec2 = SecurityCatalog::load(&config).expect("reload");
         assert!(
-            sec2.with_auth(|a| a.verify_password("root", "pw").unwrap()),
+            sec2.with_auth(|a| a.verify_password("root", "valid-pw").unwrap()),
             "file is authoritative"
         );
         assert!(!sec2.with_auth(|a| a.verify_password("root", "different").unwrap()));

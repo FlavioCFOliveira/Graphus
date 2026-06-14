@@ -26,11 +26,20 @@
 //! the optional, Linux-gated `io-uring` Cargo feature; in that build the crate lint is relaxed to
 //! `deny` and the `uring` module scopes an `allow`, with every `unsafe` block documented by a
 //! `// SAFETY:` comment. The portable default never compiles any `unsafe`.
-#![cfg_attr(not(feature = "io-uring"), forbid(unsafe_code))]
-#![cfg_attr(feature = "io-uring", deny(unsafe_code))]
+// `forbid(unsafe_code)` is kept for the portable, non-macOS default build. macOS needs one scoped
+// `unsafe` block (`fcntl(fd, F_FULLFSYNC)` in `fullsync.rs`) to issue a true stable-storage barrier,
+// and the optional `io-uring` feature needs the probe's `unsafe`; both relax the crate lint to
+// `deny` (so a stray `unsafe` anywhere else still fails the build) while letting those two
+// `// SAFETY:`-documented blocks compile.
+#![cfg_attr(
+    all(not(feature = "io-uring"), not(target_os = "macos")),
+    forbid(unsafe_code)
+)]
+#![cfg_attr(any(feature = "io-uring", target_os = "macos"), deny(unsafe_code))]
 
 mod block;
 mod file;
+mod fullsync;
 mod mem;
 mod replace;
 
@@ -55,6 +64,7 @@ mod uring;
 
 pub use block::{BlockDevice, PAGE_SIZE, Page};
 pub use file::FileBlockDevice;
+pub use fullsync::{full_sync_all, full_sync_data};
 pub use mem::MemBlockDevice;
 pub use replace::atomic_replace_file;
 

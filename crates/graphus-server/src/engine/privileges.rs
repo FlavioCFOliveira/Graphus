@@ -243,7 +243,8 @@ mod tests {
     /// Builds an [`Authenticator`] with an admin `root` and an `alice` whose `custom` role is granted
     /// exactly `grants`.
     fn auth_with(grants: &[Privilege]) -> Authenticator {
-        let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!");
+        let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!")
+            .expect("fixture secret is >= 32 bytes");
         auth.catalog_mut().create_user("root").unwrap();
         auth.catalog_mut().create_role("admin").unwrap();
         auth.catalog_mut()

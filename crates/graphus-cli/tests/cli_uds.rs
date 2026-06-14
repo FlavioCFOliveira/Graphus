@@ -113,7 +113,7 @@ fn uds_only_config(temp: &TempStore) -> ServerConfig {
         jwt_secret: "cli-itest-jwt-secret-not-used-uds-only!".to_owned(),
         auth: AuthBootstrap {
             admin_user: "alice".to_owned(),
-            admin_password: "pw".to_owned(),
+            admin_password: "pw-secret-1".to_owned(),
             admin_uid: Some(current_uid()),
             users: Vec::new(),
         },
@@ -143,7 +143,7 @@ where
     let uds = uds.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut client = BoltClient::connect_uds(&uds).expect("connect over UDS");
-        client.login("alice", "pw").expect("login as alice");
+        client.login("alice", "pw-secret-1").expect("login as alice");
         f(client)
     })
     .await
@@ -358,7 +358,7 @@ async fn cli_binary_one_shot_command_over_live_uds() {
                 "-c",
                 "RETURN 'pong' AS reply, 42 AS answer",
             ])
-            .env("GRAPHUS_PASSWORD", "pw")
+            .env("GRAPHUS_PASSWORD", "pw-secret-1")
             .output()
             .expect("spawn graphus-cli")
     })

@@ -193,6 +193,10 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
         | (Value::LocalDateTime(_), _)
         | (Value::ZonedDateTime(_), _)
         | (Value::Duration(_), _) => cmp_same_temporal(a, b),
+        // Two integers compare exactly: an `as f64` round-trip loses precision above 2^53, so
+        // distinct large `i64`s (e.g. `i64::MAX` and `i64::MAX - 1`) would otherwise collapse to
+        // `Equal`, breaking the total order ORDER BY / min / max rely on.
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
         // Otherwise both are numbers (same class rank 14): compare numerically, then INTEGER before
         // FLOAT on a magnitude tie, so `1` and `1.0` (equal numerically) still order deterministically.
         _ => {
@@ -260,6 +264,9 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
         }
         // Numbers compare numerically across INTEGER/FLOAT; a NaN operand is incomparable for a
         // number-vs-number pair.
+        // Two integers compare exactly (an `as f64` round-trip loses precision above 2^53, which
+        // would make distinct large `i64`s compare `Equal` and break `<`/`>` ordering).
+        (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
         (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
             if matches!(a, Value::Float(f) if f.is_nan())
                 || matches!(b, Value::Float(f) if f.is_nan())
@@ -414,6 +421,26 @@ mod tests {
             cmp_values(&Value::Float(0.0), &Value::Float(0.0)),
             Ordering::Equal
         );
+    }
+
+    /// Regression (audit SEV 7): two distinct large `i64`s differ by less than one ULP at `f64`, so
+    /// the old `as f64` comparison collapsed them to `Equal`, breaking the total order ORDER BY /
+    /// min / max rely on and making `<`/`>` wrong. They must now compare exactly.
+    #[test]
+    fn large_distinct_integers_keep_a_total_order() {
+        let a = Value::Integer(i64::MAX);
+        let b = Value::Integer(i64::MAX - 1);
+        // Orderability (cmp_values): strictly ordered, not Equal.
+        lt(b.clone(), a.clone());
+        assert_ne!(cmp_values(&a, &b), Ordering::Equal);
+        // Comparability (compare_values): the `<`/`>` operators must also distinguish them.
+        assert_eq!(compare_values(&b, &a), Some(Ordering::Less));
+        assert_eq!(compare_values(&a, &b), Some(Ordering::Greater));
+        // A neighbouring pair near the negative bound, too.
+        let c = Value::Integer(i64::MIN);
+        let d = Value::Integer(i64::MIN + 1);
+        assert_eq!(compare_values(&c, &d), Some(Ordering::Less));
+        assert_ne!(cmp_values(&c, &d), Ordering::Equal);
     }
 
     #[test]

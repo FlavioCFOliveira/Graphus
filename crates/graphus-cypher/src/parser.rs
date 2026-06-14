@@ -129,6 +129,12 @@ pub enum SyntaxErrorKind {
     },
     /// Trailing tokens remained after a complete statement (and optional `;`).
     TrailingInput,
+    /// The expression grammar nested deeper than [`MAX_EXPR_DEPTH`] (e.g. thousands of nested
+    /// parentheses, brackets, or stacked `NOT`s). Bounding the recursion converts what would be a
+    /// native stack overflow (SIGABRT) into a recoverable compile-time `SyntaxError`. This also
+    /// protects every later pass that recurses over the same AST (semantic analysis, type checking,
+    /// evaluation), since the AST can no longer be arbitrarily deep.
+    NestingTooDeep,
     /// A construct was structurally well-formed at the token level but is not a legal start of any
     /// expression / clause here (e.g. an operator where an operand was required).
     UnexpectedToken {
@@ -155,6 +161,7 @@ impl fmt::Display for SyntaxErrorKind {
             Self::IntegerOverflow => {
                 f.write_str("integer literal out of range (does not fit a 64-bit signed integer)")
             }
+            Self::NestingTooDeep => f.write_str("expression nests too deeply"),
         }
     }
 }
@@ -234,6 +241,19 @@ impl Query {
 }
 
 /// The recursive-descent + Pratt parser state: a cursor over a token slice.
+/// The maximum expression-nesting depth the parser will accept before raising
+/// [`SyntaxErrorKind::NestingTooDeep`]. Each level of parentheses, brackets, or stacked `NOT`
+/// consumes one unit.
+///
+/// The limit is comfortably above any hand-written query yet bounds the recursive descent — and
+/// every later pass that recurses over the same AST (semantic analysis, type checking, evaluation)
+/// — so an adversarially deep query is rejected as a `SyntaxError` instead of overflowing the
+/// stack. Each nesting level descends the whole precedence ladder, so the engine runs queries on a
+/// large dedicated stack (the server's worker / the TCK harness's 128 MiB threads); 1 000 levels is
+/// safe there with a wide margin, while still aligning with the low-thousands guard Neo4j's Cypher
+/// parser applies. (Callers on a small default stack should likewise isolate parsing on a worker.)
+const MAX_EXPR_DEPTH: usize = 1_000;
+
 struct Parser<'t, 's> {
     /// The tokens to parse.
     tokens: &'t [Token],
@@ -241,6 +261,35 @@ struct Parser<'t, 's> {
     source: &'s str,
     /// The current token index.
     pos: usize,
+    /// The current expression-recursion depth, bounded by [`MAX_EXPR_DEPTH`]. Incremented on entry
+    /// to each recursive expression rule and decremented on exit by [`DepthGuard`], so an
+    /// adversarially deep query is rejected as a `SyntaxError` instead of overflowing the stack.
+    depth: usize,
+}
+
+/// An RAII guard that decrements [`Parser::depth`] when it is dropped, so the depth is restored on
+/// every exit path (including the `?` error propagation that unwinds the recursive descent).
+struct DepthGuard<'p, 't, 's> {
+    parser: &'p mut Parser<'t, 's>,
+}
+
+impl Drop for DepthGuard<'_, '_, '_> {
+    fn drop(&mut self) {
+        self.parser.depth -= 1;
+    }
+}
+
+impl<'p, 't, 's> std::ops::Deref for DepthGuard<'p, 't, 's> {
+    type Target = Parser<'t, 's>;
+    fn deref(&self) -> &Self::Target {
+        self.parser
+    }
+}
+
+impl std::ops::DerefMut for DepthGuard<'_, '_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.parser
+    }
 }
 
 impl<'t, 's> Parser<'t, 's> {
@@ -250,7 +299,24 @@ impl<'t, 's> Parser<'t, 's> {
             tokens,
             source,
             pos: 0,
+            depth: 0,
         }
+    }
+
+    /// Enters one level of expression recursion, returning a [`DepthGuard`] that restores the depth
+    /// on drop. Errors with [`SyntaxErrorKind::NestingTooDeep`] once [`MAX_EXPR_DEPTH`] is exceeded,
+    /// turning a would-be stack overflow into a recoverable `SyntaxError`.
+    fn enter_recursion(&mut self) -> Result<DepthGuard<'_, 't, 's>, SyntaxError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            // Restore the depth before erroring so a caller that recovers sees a consistent state.
+            self.depth -= 1;
+            return Err(SyntaxError::new(
+                SyntaxErrorKind::NestingTooDeep,
+                self.here_span(),
+            ));
+        }
+        Ok(DepthGuard { parser: self })
     }
 
     // --- cursor primitives -----------------------------------------------------------------------
@@ -1453,8 +1519,13 @@ impl<'t, 's> Parser<'t, 's> {
     // --- expressions (Pratt over the EBNF precedence ladder) -------------------------------------
 
     /// Parses a full `Expression` (the precedence ladder starts at `OrExpression`).
+    ///
+    /// Every nested expression — a parenthesised group, a list/map literal element, a function
+    /// argument, a comprehension body — re-enters here, so a single depth guard at this choke point
+    /// bounds the overall recursion (stacked `NOT`, which recurses directly, is guarded separately).
     fn parse_expr(&mut self) -> Result<Expr, SyntaxError> {
-        self.parse_or()
+        let mut guard = self.enter_recursion()?;
+        guard.parse_or()
     }
 
     /// `OrExpression = XorExpression, { 'OR', XorExpression }` (left-assoc).
@@ -1493,9 +1564,12 @@ impl<'t, 's> Parser<'t, 's> {
     /// `NotExpression = { 'NOT' }, ComparisonExpression` (prefix, stacks).
     fn parse_not(&mut self) -> Result<Expr, SyntaxError> {
         if self.at(&TokenKind::Not) {
-            let start = self.here_span().start;
-            self.bump();
-            let operand = self.parse_not()?;
+            // Stacked `NOT NOT … x` recurses directly here (bypassing `parse_expr`), so it needs its
+            // own depth guard to stay bounded.
+            let mut guard = self.enter_recursion()?;
+            let start = guard.here_span().start;
+            guard.bump();
+            let operand = guard.parse_not()?;
             let span = Span::new(start, operand.span.end);
             Ok(Expr::new(
                 ExprKind::Unary {

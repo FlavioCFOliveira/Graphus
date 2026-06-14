@@ -67,6 +67,21 @@ pub enum AuthError {
         /// A short, non-sensitive description of the failure.
         detail: String,
     },
+    /// The JWT signing secret supplied at construction was too short to be cryptographically sound
+    /// for HS256 (shorter than [`MIN_JWT_SECRET_LEN`](crate::token::MIN_JWT_SECRET_LEN) bytes). This
+    /// is a configuration/startup fault: a weak secret makes Bearer tokens forgeable, so the
+    /// authenticator refuses to build rather than operate insecurely.
+    WeakSecret {
+        /// A short, non-sensitive description of why the secret was rejected.
+        detail: String,
+    },
+    /// A password supplied to `set_password`/`hash_password` did not meet the minimum strength
+    /// policy (it was empty or shorter than the required minimum length). This is a configuration
+    /// or input fault, not a failed login.
+    WeakPassword {
+        /// A short, non-sensitive description of why the password was rejected.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for AuthError {
@@ -81,6 +96,8 @@ impl std::fmt::Display for AuthError {
             Self::TlsConfig { detail } => write!(f, "tls configuration error: {detail}"),
             Self::InvalidLimits { detail } => write!(f, "invalid limit configuration: {detail}"),
             Self::PasswordHash { detail } => write!(f, "password hashing error: {detail}"),
+            Self::WeakSecret { detail } => write!(f, "weak jwt signing secret: {detail}"),
+            Self::WeakPassword { detail } => write!(f, "weak password: {detail}"),
         }
     }
 }

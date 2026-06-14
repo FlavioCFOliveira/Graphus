@@ -85,13 +85,18 @@ pub struct Authenticator {
 impl Authenticator {
     /// Creates an authenticator with an empty catalog and uid map, using `jwt_secret` for HS256
     /// Bearer tokens.
-    #[must_use]
-    pub fn new(jwt_secret: &[u8]) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// [`AuthError::WeakSecret`] if `jwt_secret` is shorter than
+    /// [`MIN_JWT_SECRET_LEN`](crate::token::MIN_JWT_SECRET_LEN) bytes — a short HS256 key would make
+    /// Bearer tokens forgeable, so construction fails closed rather than yielding an insecure
+    /// authenticator.
+    pub fn new(jwt_secret: &[u8]) -> Result<Self> {
+        Ok(Self {
             catalog: Catalog::new(),
-            jwt: JwtAuthenticator::new(jwt_secret),
+            jwt: JwtAuthenticator::new(jwt_secret)?,
             peers: PeerCredMap::new(),
-        }
+        })
     }
 
     /// Shared access to the RBAC catalog (for user/role/privilege CRUD via its inherent methods).
@@ -114,10 +119,25 @@ impl Authenticator {
 
     /// Sets (or replaces) `user`'s password, storing only its Argon2 hash.
     ///
+    /// The password must meet the minimum strength policy
+    /// ([`MIN_PASSWORD_LEN`](crate::password::MIN_PASSWORD_LEN) characters); a weak password is
+    /// rejected before any hashing or store mutation. User existence is checked first so an unknown
+    /// user yields the more specific [`AuthError::NotFound`].
+    ///
     /// # Errors
     /// - [`AuthError::NotFound`] if the user does not exist.
+    /// - [`AuthError::WeakPassword`] if `plaintext` is empty or below the minimum length.
     /// - [`AuthError::PasswordHash`] if hashing fails.
     pub fn set_password(&mut self, user: &str, plaintext: &str) -> Result<()> {
+        // Resolve the user first so an unknown user yields the specific `NotFound` (rather than a
+        // `WeakPassword`/`PasswordHash` masking the real cause), and to avoid the costly Argon2 work
+        // for a user that does not exist. The strength policy is then enforced inside `hash_password`
+        // before the store is mutated.
+        if !self.catalog.has_user(user) {
+            return Err(AuthError::NotFound {
+                what: format!("user {user}"),
+            });
+        }
         let hash = password::hash_password(plaintext)?;
         let u = self
             .catalog
@@ -324,14 +344,15 @@ mod tests {
     /// An authenticator with one `alice` user (password `pw`, role `reader` → DB Read), uid 1000
     /// mapped to `alice`.
     fn fixture() -> Authenticator {
-        let mut a = Authenticator::new(b"shared-jwt-secret-at-least-32-bytes!!");
+        let mut a = Authenticator::new(b"shared-jwt-secret-at-least-32-bytes!!")
+            .expect("fixture secret is >= 32 bytes");
         a.catalog_mut().create_user("alice").unwrap();
         a.catalog_mut().create_role("reader").unwrap();
         a.catalog_mut()
             .grant_privilege("reader", Privilege::read_database())
             .unwrap();
         a.catalog_mut().grant_role("alice", "reader").unwrap();
-        a.set_password("alice", "pw").unwrap();
+        a.set_password("alice", "alice-pw").unwrap();
         a.peers_mut().map_uid(1000, "alice");
         a
     }
@@ -339,13 +360,13 @@ mod tests {
     #[test]
     fn password_auth_round_trips() {
         let a = fixture();
-        assert_eq!(a.authenticate_password("alice", "pw").unwrap(), "alice");
+        assert_eq!(a.authenticate_password("alice", "alice-pw").unwrap(), "alice");
         assert_eq!(
-            a.authenticate_password("alice", "wrong"),
+            a.authenticate_password("alice", "wrong-password"),
             Err(AuthError::Unauthenticated)
         );
         assert_eq!(
-            a.authenticate_password("ghost", "pw"),
+            a.authenticate_password("ghost", "alice-pw"),
             Err(AuthError::Unauthenticated)
         );
     }
@@ -353,10 +374,46 @@ mod tests {
     #[test]
     fn set_password_requires_existing_user() {
         let mut a = fixture();
+        // The unknown-user check precedes the strength check, so a short password for a missing
+        // user still surfaces `NotFound` (the more specific cause).
         assert!(matches!(
             a.set_password("ghost", "pw"),
             Err(AuthError::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn weak_jwt_secret_is_rejected() {
+        // A short HS256 secret must refuse construction so the server fails closed at startup.
+        assert!(matches!(
+            Authenticator::new(b"too-short"),
+            Err(AuthError::WeakSecret { .. })
+        ));
+        // Exactly 32 bytes is accepted.
+        assert!(Authenticator::new(&[b'k'; 32]).is_ok());
+    }
+
+    #[test]
+    fn set_password_rejects_weak_password() {
+        let mut a = fixture();
+        // An empty or below-minimum password for an existing user is refused without mutating the
+        // stored hash, so the prior credential keeps working.
+        assert!(matches!(
+            a.set_password("alice", ""),
+            Err(AuthError::WeakPassword { .. })
+        ));
+        assert!(matches!(
+            a.set_password("alice", "short77"),
+            Err(AuthError::WeakPassword { .. })
+        ));
+        // The original password is untouched after the rejected updates.
+        assert_eq!(a.authenticate_password("alice", "alice-pw").unwrap(), "alice");
+        // A sufficiently long password is accepted.
+        a.set_password("alice", "new-strong-password").unwrap();
+        assert_eq!(
+            a.authenticate_password("alice", "new-strong-password").unwrap(),
+            "alice"
+        );
     }
 
     #[test]
