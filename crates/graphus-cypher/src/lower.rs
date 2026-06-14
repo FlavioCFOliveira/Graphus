@@ -349,6 +349,11 @@ impl Planner {
             };
             plan = self.filter_inline_props(plan, link.relationship.properties.as_ref(), &rel_var);
             plan = self.filter_inline_props(plan, link.node.properties.as_ref(), &to_var);
+            // The target node's inline labels (`(a)-[r]->(b:X)`) constrain `b` to entities carrying
+            // all listed labels. The anchor's labels are handled by its scan (`scan_node`), but an
+            // expand target is reached through the relationship, never scanned, so its labels must be
+            // applied here as a `HasLabels` filter (`WithOrderBy4` [15] regression guard).
+            plan = self.filter_inline_labels(plan, &link.node.labels, &to_var, link.node.span);
             step_rels.push(rel_var);
             from = to_var;
         }
@@ -553,6 +558,32 @@ impl Planner {
         }
     }
 
+    /// If `labels` is non-empty, places a [`HasLabels`](ExprKind::HasLabels) [`Filter`] over `entity`
+    /// immediately above `plan`. Used for an expand **target** node's inline labels (`->(b:X)`),
+    /// which — unlike an anchor — is reached through the relationship and so is never label-scanned.
+    fn filter_inline_labels(
+        &mut self,
+        plan: LogicalOp,
+        labels: &[crate::ast::Label],
+        entity: &Var,
+        span: Span,
+    ) -> LogicalOp {
+        if labels.is_empty() {
+            return plan;
+        }
+        let predicate = Expr::new(
+            ExprKind::HasLabels {
+                operand: Box::new(Expr::new(ExprKind::Variable(entity.name.clone()), span)),
+                labels: labels.to_vec(),
+            },
+            span,
+        );
+        LogicalOp::Filter {
+            input: Box::new(plan),
+            predicate,
+        }
+    }
+
     // ---- UNWIND -----------------------------------------------------------------------------
 
     fn lower_unwind(&mut self, u: &UnwindClause, current: Option<LogicalOp>) -> LogicalOp {
@@ -742,17 +773,26 @@ impl Planner {
             .chain(explicit_cols.iter().map(|c| c.alias.clone()))
             .collect();
 
-        // Input variables to *carry* across the projection so a trailing `WITH … WHERE` can read a
-        // variable it drops (the dual scope — see the doc comment). Only for a non-aggregating
-        // projection (an aggregating/DISTINCT projection collapses rows, so its WHERE may reference
-        // only surviving columns, which are already emitted). We carry an input variable when the
-        // WHERE references it and the projection does not already re-emit a column of that name (an
-        // alias of the same name shadows the input, so no carry is needed — the alias is the value
-        // the dual scope sees).
-        let carried: Vec<String> = match where_clause {
-            Some(pred) if !aggregating => {
-                let mut referenced = BTreeSet::new();
+        // Input variables to *carry* across the projection so a trailing `WITH … WHERE` **or an
+        // `ORDER BY`** can read a variable the projection drops (the dual scope — see the doc
+        // comment). Only for a **non-aggregating** projection (an aggregating/DISTINCT projection
+        // collapses rows, so its `ORDER BY`/`WHERE` is desugared differently — see below). We carry
+        // an input variable when the `WHERE` or an `ORDER BY` item references it and the projection
+        // does not already re-emit a column of that name (an alias of the same name shadows the
+        // input, so no carry is needed — the alias is the value the dual scope sees).
+        let carried: Vec<String> = if aggregating {
+            Vec::new()
+        } else {
+            let mut referenced = BTreeSet::new();
+            if let Some(pred) = where_clause {
                 collect_referenced_vars(pred, &mut referenced);
+            }
+            for sort in &body.order_by {
+                collect_referenced_vars(&sort.expr, &mut referenced);
+            }
+            if referenced.is_empty() {
+                Vec::new()
+            } else {
                 collect_bound_vars(&input)
                     .into_iter()
                     .filter(|v| !v.synthetic)
@@ -760,65 +800,88 @@ impl Planner {
                     .filter(|name| referenced.contains(name) && !output_names.contains(name))
                     .collect()
             }
-            _ => Vec::new(),
         };
 
+        // For an **aggregating** projection the `Sort` runs *above* the `Aggregation`, where the
+        // pre-projection variables no longer exist. An `ORDER BY` over such a projection may still
+        // (a) reference projected aliases (grouping keys / aggregate aliases), and (b) *restate* a
+        // projected grouping-key expression or aggregation expression over the pre-projection input
+        // (`ORDER BY max(n.age)`, `ORDER BY $age + avg(p.age) - 1000`, `ORDER BY a.name + 'C'` —
+        // `ReturnOrderBy2` [3]/[6]/[7], `WithOrderBy4` [11]/[16]/[17]/[18], `WithOrderBy2`
+        // [22]/[23]). To evaluate each such item above the `Aggregation`, we **rewrite** every
+        // maximal sub-expression that equals a projected column's source expression into a reference
+        // to that column's alias (`max(n.age)` → the `max(n.age)` column, `avg(p.age)` → `avgAge`).
+        // The semantic pass has already proven the rewrite leaves only projected columns and
+        // constants/parameters behind (any surviving pre-projection variable is an `UndefinedVariable`
+        // at compile time — `WithOrderBy4` [13]/[14]/[19]), so the rewritten key resolves entirely
+        // against the post-aggregation row.
+        //
+        // The substitution targets, longest source-expression first so a larger restated expression
+        // wins over a nested one (e.g. a whole `a.num + a.num2` column over its bare `a.num`).
+        let order_keys: Vec<SortKey> = if aggregating {
+            let mut targets: Vec<(&Expr, &str)> = star_cols
+                .iter()
+                .chain(&explicit_cols)
+                .map(|c| (&c.expr, c.alias.as_str()))
+                .collect();
+            targets.sort_by_key(|t| std::cmp::Reverse(expr_size(t.0)));
+            body.order_by
+                .iter()
+                .map(|s| SortKey {
+                    expr: rewrite_order_expr(&s.expr, &targets),
+                    direction: s.direction,
+                })
+                .collect()
+        } else {
+            body.order_by
+                .iter()
+                .map(|s| SortKey {
+                    expr: s.expr.clone(),
+                    direction: s.direction,
+                })
+                .collect()
+        };
+
+        // The shape the `Projection`/`Aggregation` operator emits (in operator order), before any
+        // narrowing/re-ordering. For an aggregation this is keys-then-aggregates; for a plain
+        // projection it is the declared columns plus carried dual-scope columns. The declared output
+        // (`output_names`) is restored by a narrowing projection at the top when this differs (which
+        // also drops the carried dual-scope columns).
+        let emitted: Vec<String>;
         let mut plan = if aggregating {
             // Partition explicit items into grouping keys and aggregates. `*`-carried columns are
             // always grouping keys (bare variables).
             let mut group_keys = star_cols;
             let mut aggregates = Vec::new();
-            // The result shape must keep the source column order (`RETURN n.a AS a, count(*) AS c,
-            // n.b AS b` yields columns a, c, b), but the Aggregation operator emits its keys first,
-            // then the aggregates. Track the source order and restore it with a re-ordering
-            // projection when the two differ.
-            let mut source_order: Vec<String> =
-                group_keys.iter().map(|c| c.alias.clone()).collect();
             for (item, col) in body.items.iter().zip(explicit_cols) {
-                source_order.push(col.alias.clone());
                 if expr_contains_aggregate(&item.expr) {
                     aggregates.push(col);
                 } else {
                     group_keys.push(col);
                 }
             }
-            let emitted: Vec<String> = group_keys
+            emitted = group_keys
                 .iter()
                 .chain(&aggregates)
                 .map(|c| c.alias.clone())
                 .collect();
-            let agg = LogicalOp::Aggregation {
+            LogicalOp::Aggregation {
                 input: Box::new(input),
                 group_keys,
                 aggregates,
-            };
-            if emitted == source_order {
-                agg
-            } else {
-                let items = source_order
-                    .into_iter()
-                    .map(|name| ProjectionColumn {
-                        expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
-                        alias: name,
-                    })
-                    .collect();
-                LogicalOp::Projection {
-                    input: Box::new(agg),
-                    items,
-                    distinct: false,
-                }
             }
         } else {
             let mut items = star_cols;
             items.extend(explicit_cols);
             // Carry the dual-scope input variables as extra columns (each as itself). The narrowing
-            // projection below removes them after the WHERE filter has run.
+            // projection below removes them after the ORDER BY/WHERE have run.
             for name in &carried {
                 items.push(ProjectionColumn {
                     expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
                     alias: name.clone(),
                 });
             }
+            emitted = items.iter().map(|c| c.alias.clone()).collect();
             LogicalOp::Projection {
                 input: Box::new(input),
                 items,
@@ -826,19 +889,11 @@ impl Planner {
             }
         };
 
-        // ORDER BY ▸ SKIP ▸ LIMIT, then WHERE (post-projection scope).
-        if !body.order_by.is_empty() {
-            let keys = body
-                .order_by
-                .iter()
-                .map(|s| SortKey {
-                    expr: s.expr.clone(),
-                    direction: s.direction,
-                })
-                .collect();
+        // ORDER BY ▸ SKIP ▸ LIMIT, then a narrowing projection, then WHERE (post-projection scope).
+        if !order_keys.is_empty() {
             plan = LogicalOp::Sort {
                 input: Box::new(plan),
-                keys,
+                keys: order_keys,
             };
         }
         if let Some(skip) = &body.skip {
@@ -853,28 +908,50 @@ impl Planner {
                 count: limit.clone(),
             };
         }
-        if let Some(pred) = where_clause {
-            plan = LogicalOp::Filter {
-                input: Box::new(plan),
-                predicate: pred.clone(),
-            };
-            // If the WHERE forced input variables to be carried across the projection, narrow the row
-            // back to the declared output columns now that the filter has consumed them. The narrowing
-            // projection is a pure column-subset (no DISTINCT, no new expressions), so it preserves
-            // both row count and order.
-            if !carried.is_empty() {
-                let items = output_names
-                    .iter()
-                    .map(|name| ProjectionColumn {
-                        expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
-                        alias: name.clone(),
-                    })
-                    .collect();
-                plan = LogicalOp::Projection {
+        // Narrow/re-order the row back to the declared output columns now that ORDER BY (and SKIP /
+        // LIMIT) have consumed any carried dual-scope columns or ORDER BY synthetics, and the
+        // aggregation's keys-then-aggregates order has served its purpose. This is a pure
+        // column-subset/permutation (no DISTINCT, no new expressions): it preserves both row count
+        // and order. The trailing WHERE (dual scope) is applied *before* the narrowing only for a
+        // non-aggregating projection, where it may read carried columns; for an aggregating
+        // projection WHERE references only surviving columns, so the narrowing may precede it.
+        let needs_narrowing = emitted != output_names;
+        let narrowing = |input: LogicalOp| -> LogicalOp {
+            let items = output_names
+                .iter()
+                .map(|name| ProjectionColumn {
+                    expr: Expr::new(ExprKind::Variable(name.clone()), clause_span),
+                    alias: name.clone(),
+                })
+                .collect();
+            LogicalOp::Projection {
+                input: Box::new(input),
+                items,
+                distinct: false,
+            }
+        };
+        match where_clause {
+            Some(pred) if !aggregating && !carried.is_empty() => {
+                // The WHERE may read a carried column, so filter first, then narrow.
+                plan = LogicalOp::Filter {
                     input: Box::new(plan),
-                    items,
-                    distinct: false,
+                    predicate: pred.clone(),
                 };
+                plan = narrowing(plan);
+            }
+            Some(pred) => {
+                if needs_narrowing {
+                    plan = narrowing(plan);
+                }
+                plan = LogicalOp::Filter {
+                    input: Box::new(plan),
+                    predicate: pred.clone(),
+                };
+            }
+            None => {
+                if needs_narrowing {
+                    plan = narrowing(plan);
+                }
             }
         }
         plan
@@ -1107,6 +1184,143 @@ fn body_aggregates(body: &ProjectionBody) -> bool {
     body.items
         .iter()
         .any(|it| expr_contains_aggregate(&it.expr))
+}
+
+/// Rewrites an aggregating projection's `ORDER BY` expression so it can be evaluated **above** the
+/// `Aggregation` (where the pre-projection variables no longer exist): every maximal sub-expression
+/// equal (ignoring spans) to a projected column's source expression is replaced by a reference to
+/// that column's alias. `targets` is `(source expr, alias)`, **longest source first**, so a larger
+/// restated expression is matched before any nested one. See [`Planner::lower_projection_body`].
+fn rewrite_order_expr(expr: &Expr, targets: &[(&Expr, &str)]) -> Expr {
+    // A whole-expression match wins (and stops the descent): the restated column is the value.
+    for (src, alias) in targets {
+        if expr.eq_ignoring_span(src) {
+            return Expr::new(ExprKind::Variable((*alias).to_owned()), expr.span);
+        }
+    }
+    // Otherwise recurse into the children, rebuilding the same node shape.
+    let kind = match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Parameter(_)
+        | ExprKind::Variable(_)
+        | ExprKind::CountStar => return expr.clone(),
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: Box::new(rewrite_order_expr(lhs, targets)),
+            rhs: Box::new(rewrite_order_expr(rhs, targets)),
+        },
+        ExprKind::Unary { op, operand } => ExprKind::Unary {
+            op: *op,
+            operand: Box::new(rewrite_order_expr(operand, targets)),
+        },
+        ExprKind::Predicate { op, operand, rhs } => ExprKind::Predicate {
+            op: *op,
+            operand: Box::new(rewrite_order_expr(operand, targets)),
+            rhs: rhs
+                .as_deref()
+                .map(|r| Box::new(rewrite_order_expr(r, targets))),
+        },
+        ExprKind::Property { base, key } => ExprKind::Property {
+            base: Box::new(rewrite_order_expr(base, targets)),
+            key: key.clone(),
+        },
+        ExprKind::Index { base, index } => ExprKind::Index {
+            base: Box::new(rewrite_order_expr(base, targets)),
+            index: Box::new(rewrite_order_expr(index, targets)),
+        },
+        ExprKind::Slice { base, low, high } => ExprKind::Slice {
+            base: Box::new(rewrite_order_expr(base, targets)),
+            low: low
+                .as_deref()
+                .map(|e| Box::new(rewrite_order_expr(e, targets))),
+            high: high
+                .as_deref()
+                .map(|e| Box::new(rewrite_order_expr(e, targets))),
+        },
+        ExprKind::HasLabels { operand, labels } => ExprKind::HasLabels {
+            operand: Box::new(rewrite_order_expr(operand, targets)),
+            labels: labels.clone(),
+        },
+        ExprKind::FunctionCall {
+            name,
+            distinct,
+            args,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: args
+                .iter()
+                .map(|a| rewrite_order_expr(a, targets))
+                .collect(),
+        },
+        ExprKind::List(items) => ExprKind::List(
+            items
+                .iter()
+                .map(|e| rewrite_order_expr(e, targets))
+                .collect(),
+        ),
+        ExprKind::Map(entries) => ExprKind::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), rewrite_order_expr(v, targets)))
+                .collect(),
+        ),
+        // Complex/binder-scoped forms (CASE, comprehensions, quantifiers, subqueries) are never the
+        // *inner* of a restated aggregate ORDER BY item in the TCK; the semantic pass has proven any
+        // surviving pre-projection variable is a compile-time error, so a whole-expression match
+        // above is the only rewrite these need. Leave them untouched.
+        _ => return expr.clone(),
+    };
+    Expr::new(kind, expr.span)
+}
+
+/// The node count of `expr` (itself plus all descendants), used to order rewrite targets so a larger
+/// restated expression is matched before a nested smaller one.
+fn expr_size(expr: &Expr) -> usize {
+    let mut n = 1;
+    let mut count = |e: &Expr| {
+        n += expr_size(e);
+    };
+    match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Parameter(_)
+        | ExprKind::Variable(_)
+        | ExprKind::CountStar => {}
+        ExprKind::Binary { lhs, rhs, .. } => {
+            count(lhs);
+            count(rhs);
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => count(operand),
+        ExprKind::Predicate { operand, rhs, .. } => {
+            count(operand);
+            if let Some(r) = rhs {
+                count(r);
+            }
+        }
+        ExprKind::Property { base, .. } => count(base),
+        ExprKind::Index { base, index } => {
+            count(base);
+            count(index);
+        }
+        ExprKind::Slice { base, low, high } => {
+            count(base);
+            if let Some(l) = low {
+                count(l);
+            }
+            if let Some(h) = high {
+                count(h);
+            }
+        }
+        ExprKind::FunctionCall { args, .. } => args.iter().for_each(&mut count),
+        ExprKind::List(items) => items.iter().for_each(&mut count),
+        ExprKind::Map(entries) => entries.iter().for_each(|(_, v)| count(v)),
+        ExprKind::Case(_)
+        | ExprKind::ListComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::ExistsSubquery(_) => {}
+    }
+    n
 }
 
 /// Whether `expr` contains an aggregating function call (or the `count(*)` atom) anywhere.
@@ -1475,5 +1689,110 @@ mod tests {
         } else {
             unreachable!()
         }
+    }
+
+    /// Collects the [`SortKey`]s of the first [`Sort`](LogicalOp::Sort) found in the plan tree.
+    fn first_sort_keys(plan: &LogicalOp) -> Option<Vec<SortKey>> {
+        match plan {
+            LogicalOp::Sort { keys, .. } => Some(keys.clone()),
+            LogicalOp::Projection { input, .. }
+            | LogicalOp::Aggregation { input, .. }
+            | LogicalOp::Filter { input, .. }
+            | LogicalOp::Skip { input, .. }
+            | LogicalOp::Limit { input, .. } => first_sort_keys(input),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn aggregating_order_by_restated_aggregate_rewrites_to_projected_alias() {
+        // `ORDER BY max(n.age)` over an aggregating projection that projects `max(n.age)` must sort
+        // on the *projected* column (its inferred alias), not re-evaluate the aggregate above the
+        // Aggregation where `n` no longer exists (`ReturnOrderBy2` [3]).
+        let plan = plan_of("MATCH (n) RETURN n.division, max(n.age) ORDER BY max(n.age)");
+        let keys = first_sort_keys(&plan).expect("a Sort node");
+        assert_eq!(keys.len(), 1);
+        // The rewritten key is a bare variable reference to the `max(n.age)` column — no aggregate.
+        assert!(
+            matches!(&keys[0].expr.kind, ExprKind::Variable(name) if name == "max(n.age)"),
+            "expected sort key to reference the projected column, got {:?}",
+            keys[0].expr.kind
+        );
+    }
+
+    #[test]
+    fn aggregating_order_by_composite_aggregate_rewrites_inner_aggregate() {
+        // `ORDER BY $p + avg(a.age) - 1000` over `WITH avg(a.age) AS avgAge`: the `avg(a.age)`
+        // sub-expression is rewritten to the `avgAge` column; the constants/param remain
+        // (`WithOrderBy4` [16]).
+        let plan = plan_of(
+            "MATCH (a) WITH avg(a.age) AS avgAge ORDER BY $p + avg(a.age) - 1000 RETURN avgAge",
+        );
+        let keys = first_sort_keys(&plan).expect("a Sort node");
+        // The rewritten key must not reference `a` anymore (it has been replaced by `avgAge`).
+        let mut refs = BTreeSet::new();
+        collect_referenced_vars(&keys[0].expr, &mut refs);
+        assert!(
+            !refs.contains("a"),
+            "pre-projection `a` must be rewritten away: {refs:?}"
+        );
+        assert!(
+            refs.contains("avgAge"),
+            "the projected aggregate alias must appear: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn non_aggregating_order_by_carries_dropped_input_variable() {
+        // `RETURN n.num AS prop ORDER BY n.num`: the projection drops `n`, but ORDER BY references
+        // it, so `n` must be carried across the projection (`ReturnOrderBy2` [1]). The plan must
+        // therefore still bind `n` at the Sort's input.
+        let plan = plan_of("MATCH (n) RETURN n.num AS prop ORDER BY n.num");
+        // Walk to the Sort and confirm its input still exposes `n`.
+        fn sort_input_binds_n(plan: &LogicalOp) -> bool {
+            match plan {
+                LogicalOp::Sort { input, .. } => {
+                    collect_bound_vars(input).iter().any(|v| v.name == "n")
+                }
+                LogicalOp::Projection { input, .. }
+                | LogicalOp::Filter { input, .. }
+                | LogicalOp::Skip { input, .. }
+                | LogicalOp::Limit { input, .. } => sort_input_binds_n(input),
+                _ => false,
+            }
+        }
+        assert!(
+            sort_input_binds_n(&plan),
+            "ORDER BY must carry `n` across the projection"
+        );
+    }
+
+    #[test]
+    fn expand_target_inline_labels_become_a_filter() {
+        // `(a)-[r]->(b:X)`: the target label `:X` must produce a HasLabels filter (an expand target
+        // is never label-scanned). Regression guard for `WithOrderBy4` [15].
+        let plan = plan_of("MATCH (a)-[r]->(b:X) RETURN r");
+        fn has_x_label_filter(plan: &LogicalOp) -> bool {
+            match plan {
+                LogicalOp::Filter { input, predicate } => {
+                    let hit = matches!(
+                        &predicate.kind,
+                        ExprKind::HasLabels { labels, .. }
+                            if labels.iter().any(|l| l.name == "X")
+                    );
+                    hit || has_x_label_filter(input)
+                }
+                LogicalOp::Projection { input, .. }
+                | LogicalOp::Expand { input, .. }
+                | LogicalOp::Skip { input, .. }
+                | LogicalOp::Limit { input, .. }
+                | LogicalOp::Sort { input, .. } => has_x_label_filter(input),
+                _ => false,
+            }
+        }
+        assert!(
+            has_x_label_filter(&plan),
+            "expand target label `:X` must become a HasLabels filter"
+        );
     }
 }

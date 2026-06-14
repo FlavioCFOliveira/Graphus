@@ -633,6 +633,116 @@ impl Expr {
     pub fn new(kind: ExprKind, span: Span) -> Self {
         Self { kind, span }
     }
+
+    /// Structural equality that ignores byte [`Span`]s.
+    ///
+    /// Two expressions parsed from different source positions (e.g. the same `n.age` written once in
+    /// a projection and again in an `ORDER BY`) compare equal here even though their spans differ.
+    /// Used by the projection-boundary lowering to recognise an `ORDER BY` sub-expression that
+    /// re-states a projected grouping key or aggregate (`crate::lower`, `crate::semantics`).
+    #[must_use]
+    pub fn eq_ignoring_span(&self, other: &Expr) -> bool {
+        self.clone().zeroed_spans() == other.clone().zeroed_spans()
+    }
+
+    /// Returns a clone of this expression with every span (its own and all descendants') reset to
+    /// `0..0`, so the derived [`PartialEq`] becomes span-insensitive.
+    fn zeroed_spans(mut self) -> Expr {
+        self.zero_spans_in_place();
+        self
+    }
+
+    fn zero_spans_in_place(&mut self) {
+        self.span = Span::new(0, 0);
+        match &mut self.kind {
+            ExprKind::Literal(_)
+            | ExprKind::Parameter(_)
+            | ExprKind::Variable(_)
+            | ExprKind::CountStar => {}
+            ExprKind::Binary { lhs, rhs, .. } => {
+                lhs.zero_spans_in_place();
+                rhs.zero_spans_in_place();
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
+                operand.zero_spans_in_place();
+            }
+            ExprKind::Predicate { operand, rhs, .. } => {
+                operand.zero_spans_in_place();
+                if let Some(rhs) = rhs {
+                    rhs.zero_spans_in_place();
+                }
+            }
+            ExprKind::Property { base, .. } => base.zero_spans_in_place(),
+            ExprKind::Index { base, index } => {
+                base.zero_spans_in_place();
+                index.zero_spans_in_place();
+            }
+            ExprKind::Slice { base, low, high } => {
+                base.zero_spans_in_place();
+                if let Some(low) = low {
+                    low.zero_spans_in_place();
+                }
+                if let Some(high) = high {
+                    high.zero_spans_in_place();
+                }
+            }
+            ExprKind::FunctionCall { args, .. } => {
+                for a in args {
+                    a.zero_spans_in_place();
+                }
+            }
+            ExprKind::List(items) => {
+                for it in items {
+                    it.zero_spans_in_place();
+                }
+            }
+            ExprKind::Map(entries) => {
+                for (_k, v) in entries {
+                    v.zero_spans_in_place();
+                }
+            }
+            ExprKind::Case(case) => {
+                if let Some(subj) = &mut case.subject {
+                    subj.zero_spans_in_place();
+                }
+                for alt in &mut case.alternatives {
+                    alt.when.zero_spans_in_place();
+                    alt.then.zero_spans_in_place();
+                }
+                if let Some(else_e) = &mut case.else_expr {
+                    else_e.zero_spans_in_place();
+                }
+            }
+            ExprKind::ListComprehension(lc) => {
+                lc.list.zero_spans_in_place();
+                if let Some(pred) = &mut lc.predicate {
+                    pred.zero_spans_in_place();
+                }
+                if let Some(proj) = &mut lc.projection {
+                    proj.zero_spans_in_place();
+                }
+            }
+            ExprKind::Quantifier(q) => {
+                q.list.zero_spans_in_place();
+                q.predicate.zero_spans_in_place();
+            }
+            // Pattern-scoped forms embed patterns that themselves embed expressions; an `ORDER BY`
+            // restatement never targets these, so a shallow zeroing of the boxed node's own
+            // expression children is sufficient for the equality use-case (the embedded patterns'
+            // spans are left as-is, which only ever makes two such forms compare *unequal* — the
+            // conservative, safe direction: no spurious substitution).
+            ExprKind::PatternComprehension(pc) => {
+                if let Some(pred) = &mut pc.predicate {
+                    pred.zero_spans_in_place();
+                }
+            }
+            ExprKind::ExistsSubquery(ex) => {
+                if let Some(pred) = &mut ex.predicate {
+                    pred.zero_spans_in_place();
+                }
+            }
+        }
+    }
 }
 
 /// The variants of an [`Expr`].

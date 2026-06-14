@@ -442,6 +442,101 @@ fn kind_default_stype(kind: VarKind) -> SType {
     }
 }
 
+/// Replaces every maximal sub-expression of `expr` equal (ignoring spans) to one of the `targets`
+/// (a collapsing projection's projected source expressions, longest first) by the neutral `null`
+/// literal. Used to validate a collapsing projection's `ORDER BY`: a restated projected expression
+/// resolves to its post-projection column, so only the *remaining* (non-restated) references need to
+/// be checked against the post-projection scope. See [`Analyzer::check_collapsing_order_by_item`].
+fn substitute_restated(expr: &Expr, targets: &[&Expr]) -> Expr {
+    for t in targets {
+        if expr.eq_ignoring_span(t) {
+            return Expr::new(ExprKind::Literal(Literal::Null), expr.span);
+        }
+    }
+    let kind = match &expr.kind {
+        ExprKind::Literal(_)
+        | ExprKind::Parameter(_)
+        | ExprKind::Variable(_)
+        | ExprKind::CountStar => return expr.clone(),
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: Box::new(substitute_restated(lhs, targets)),
+            rhs: Box::new(substitute_restated(rhs, targets)),
+        },
+        ExprKind::Unary { op, operand } => ExprKind::Unary {
+            op: *op,
+            operand: Box::new(substitute_restated(operand, targets)),
+        },
+        ExprKind::Predicate { op, operand, rhs } => ExprKind::Predicate {
+            op: *op,
+            operand: Box::new(substitute_restated(operand, targets)),
+            rhs: rhs
+                .as_deref()
+                .map(|r| Box::new(substitute_restated(r, targets))),
+        },
+        ExprKind::Property { base, key } => ExprKind::Property {
+            base: Box::new(substitute_restated(base, targets)),
+            key: key.clone(),
+        },
+        ExprKind::Index { base, index } => ExprKind::Index {
+            base: Box::new(substitute_restated(base, targets)),
+            index: Box::new(substitute_restated(index, targets)),
+        },
+        ExprKind::Slice { base, low, high } => ExprKind::Slice {
+            base: Box::new(substitute_restated(base, targets)),
+            low: low
+                .as_deref()
+                .map(|e| Box::new(substitute_restated(e, targets))),
+            high: high
+                .as_deref()
+                .map(|e| Box::new(substitute_restated(e, targets))),
+        },
+        ExprKind::HasLabels { operand, labels } => ExprKind::HasLabels {
+            operand: Box::new(substitute_restated(operand, targets)),
+            labels: labels.clone(),
+        },
+        ExprKind::FunctionCall {
+            name,
+            distinct,
+            args,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            distinct: *distinct,
+            args: args
+                .iter()
+                .map(|a| substitute_restated(a, targets))
+                .collect(),
+        },
+        ExprKind::List(items) => ExprKind::List(
+            items
+                .iter()
+                .map(|e| substitute_restated(e, targets))
+                .collect(),
+        ),
+        ExprKind::Map(entries) => ExprKind::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), substitute_restated(v, targets)))
+                .collect(),
+        ),
+        // Complex/binder-scoped forms are never the inner of a restated aggregate ORDER BY item in
+        // the TCK; a whole-expression match above is the only substitution they need.
+        _ => return expr.clone(),
+    };
+    Expr::new(kind, expr.span)
+}
+
+/// The node count of `expr` (itself plus all descendants), used to order restatement targets so a
+/// larger restated expression is matched before a nested smaller one.
+fn expr_node_count(expr: &Expr) -> usize {
+    let mut n = 1;
+    let _ = Analyzer::for_each_child(expr, &mut |child| {
+        n += expr_node_count(child);
+        Ok(())
+    });
+    n
+}
+
 /// The grouping-key context of one (potentially aggregating) projection body, computed once per
 /// projection and consumed by the aggregation rules (module docs *Aggregation rules*).
 struct GroupingKeys<'a> {
@@ -929,13 +1024,32 @@ impl Analyzer<'_> {
             }
             s
         };
-        let order_scope = if aggregating || body.distinct {
-            &new_scope
-        } else {
-            &dual_scope
-        };
+        // A **collapsing** projection (aggregating or `DISTINCT`) merges input rows, so its `ORDER BY`
+        // cannot see a per-row pre-projection variable directly — it may only reference the projected
+        // columns, or *restate* a projected source expression (a grouping key or an aggregation
+        // expression: `ORDER BY max(n.age)`, `ORDER BY $age + avg(p.age) - 1000`, `ORDER BY a.name`
+        // over `WITH DISTINCT a.name AS name`). For the scope check we therefore substitute every
+        // maximal sub-expression equal to a projected item's source expression by a neutral constant
+        // (the column exists post-projection) and resolve the *remainder* against the post-projection
+        // scope: any surviving pre-projection variable is an `UndefinedVariable` (`WithOrderBy4`
+        // [13]/[14]/[19]). A non-collapsing projection keeps the full dual scope (`WithOrderBy4` [8]).
+        let collapsing = aggregating || body.distinct;
+        // Restatement targets: the explicit items' source expressions, longest first (a larger
+        // restated expression must match before any nested one).
+        let mut restate_targets: Vec<&Expr> = body.items.iter().map(|it| &it.expr).collect();
+        restate_targets.sort_by_key(|e| std::cmp::Reverse(expr_node_count(e)));
         for sort in &body.order_by {
-            self.check_order_by_item(sort, order_scope, aggregating, &keys)?;
+            if collapsing {
+                self.check_collapsing_order_by_item(
+                    sort,
+                    &new_scope,
+                    aggregating,
+                    &keys,
+                    &restate_targets,
+                )?;
+            } else {
+                self.check_order_by_item(sort, &dual_scope, aggregating, &keys)?;
+            }
         }
         if let Some(skip) = &body.skip {
             self.check_expr(skip, &new_scope)?;
@@ -987,6 +1101,44 @@ impl Analyzer<'_> {
         if aggregating && self.contains_aggregate(&item.expr) {
             self.check_aggregate_item_references(&item.expr, &keys.simple, &mut Vec::new())?;
         }
+        Ok(())
+    }
+
+    /// Validates an `ORDER BY` item of a **collapsing** projection (aggregating or `DISTINCT`).
+    ///
+    /// Such a projection merges rows, so the item is resolved against the *post-projection* scope
+    /// after substituting every restated projected source expression (a grouping key or aggregation
+    /// expression) by a neutral constant — the column exists post-projection, so only the *remainder*
+    /// must resolve. A surviving pre-projection variable is an `UndefinedVariable`
+    /// (`WithOrderBy4` [13]/[14]/[19]). The aggregate in-item grouping rule (ambiguity check) runs
+    /// first on the *original* expression, exactly as for [`Self::check_order_by_item`].
+    fn check_collapsing_order_by_item(
+        &self,
+        sort: &SortItem,
+        new_scope: &Scope,
+        aggregating: bool,
+        keys: &GroupingKeys<'_>,
+        restate_targets: &[&Expr],
+    ) -> Result<(), SemanticError> {
+        // Same ambiguity rule as a projection item / non-collapsing ORDER BY (`WithOrderBy4` [20]).
+        if aggregating && self.contains_aggregate(&sort.expr) && keys.has_complex {
+            self.check_aggregate_item_references(&sort.expr, &keys.with_aliases, &mut Vec::new())?;
+        }
+        // A `DISTINCT`-only (non-aggregating) projection's ORDER BY may not contain an aggregate at
+        // all — the projection does not aggregate (`WithOrderBy2` [25] shape over `DISTINCT`).
+        if !aggregating && self.contains_aggregate(&sort.expr) {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidAggregation {
+                    position: "ORDER BY of a non-aggregating projection",
+                },
+                sort.span,
+            ));
+        }
+        // Substitute restated projected expressions, then resolve the remainder post-projection.
+        let rewritten = substitute_restated(&sort.expr, restate_targets);
+        self.check_expr(&rewritten, new_scope)?;
+        self.reject_nested_aggregation(&sort.expr)?;
+        self.reject_nondeterministic_in_aggregate(&sort.expr)?;
         Ok(())
     }
 
@@ -2114,6 +2266,52 @@ mod tests {
             procedures: procedure_registry::builtins(),
         };
         assert!(analyzer.projection_is_aggregating(body));
+    }
+
+    #[test]
+    fn aggregating_order_by_restating_a_projected_aggregate_is_accepted() {
+        // `ORDER BY` may restate a projected grouping key / aggregation over the pre-projection
+        // input (`ReturnOrderBy2` [3]/[6]/[7], `WithOrderBy4` [11]/[16]/[17]/[18]).
+        for q in [
+            "MATCH (n) RETURN n.division, max(n.age) ORDER BY max(n.age)",
+            "MATCH (a) RETURN a, count(*) ORDER BY count(*)",
+            "MATCH (n) RETURN n.name, count(*) AS foo ORDER BY n.name",
+            "MATCH (a) WITH a.x % 3 AS mod, sum(a.x + a.y) AS sum ORDER BY sum(a.x + a.y) RETURN mod, sum",
+            "MATCH (a) WITH avg(a.age) AS avgAge ORDER BY $age + avg(a.age) - 1000 RETURN avgAge",
+        ] {
+            assert!(analyze(&ast(q)).is_ok(), "should accept: {q}");
+        }
+    }
+
+    #[test]
+    fn aggregating_order_by_with_unprojected_aggregate_is_undefined_variable() {
+        // An ORDER BY aggregate that is **not** a restatement of a projected one leaves a
+        // pre-projection variable behind → UndefinedVariable (`WithOrderBy4` [13]/[14]/[19]).
+        for q in [
+            "MATCH (a:A) WITH a, a.x + a.y AS sum WITH a.z % 3 AS mod, min(sum) AS min ORDER BY sum(sum) RETURN mod, min",
+            "MATCH (a:A) WITH a.z % 3 AS mod, min(a.x + a.y) AS min ORDER BY sum(a.x + a.y) RETURN mod, min",
+            "MATCH (me)--(you) WITH count(you.age) AS agg ORDER BY me.age + count(you.age) RETURN *",
+        ] {
+            let err = analyze(&ast(q)).expect_err("should reject");
+            assert!(
+                matches!(err.kind, SemanticErrorKind::UndefinedVariable { .. }),
+                "{q}: expected UndefinedVariable, got {:?}",
+                err.kind
+            );
+        }
+    }
+
+    #[test]
+    fn aggregating_order_by_with_complex_grouping_key_in_aggregate_is_ambiguous() {
+        // A *complex* projected grouping key reused outside the aggregate in an ORDER BY item is
+        // AmbiguousAggregationExpression (`WithOrderBy4` [20]).
+        let q = "MATCH (me)--(you) WITH me.age + you.age AS ages, count(*) AS cnt ORDER BY me.age + you.age + count(*) RETURN ages";
+        let err = analyze(&ast(q)).expect_err("should reject");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::AmbiguousAggregationExpression),
+            "expected AmbiguousAggregationExpression, got {:?}",
+            err.kind
+        );
     }
 
     #[test]
