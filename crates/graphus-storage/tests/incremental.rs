@@ -632,3 +632,79 @@ fn a_flipped_byte_in_a_sealed_link_fails_closed() {
         "a tampered sealed link must fail closed"
     );
 }
+
+// =================================================================================================
+// 6. The single-file ChainArtifact container (rmp #149 operator backup surface) end-to-end.
+// =================================================================================================
+
+/// Mirrors the server's operator backup path: seed several committed transactions, `begin_chain` +
+/// one (empty) `capture_increment`, pack into a single `ChainArtifact`, encode → decode, then
+/// `restore_chain_file_atomic` at `Latest` and confirm every seeded node survives. Catches any
+/// data-loss in the begin_chain → capture_increment → ChainArtifact → restore pipeline.
+#[test]
+fn chain_artifact_file_round_trip_preserves_all_committed_nodes() {
+    use graphus_io::FileBlockDevice;
+    use graphus_storage::ChainArtifact;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "graphus-chainartifact-{}-{n}.blk",
+        std::process::id()
+    ));
+
+    // Three separate committed transactions (two nodes each => six live nodes).
+    let mut store = fresh(64);
+    let mut seeded = Vec::new();
+    for (i, rt) in ["T1", "T2", "T3"].iter().enumerate() {
+        let (a, b, _) = commit_edge(&mut store, TxnId(1 + i as u64), rt);
+        seeded.push(a);
+        seeded.push(b);
+    }
+    let live_before = store.scan_node_ids().expect("scan").len();
+    assert_eq!(live_before, 6, "six live nodes seeded");
+
+    // The server's capture: begin_chain (base + checkpoint) then one capture_increment.
+    let (mut manifest, base) = begin_chain(&mut store, &Plain).expect("begin chain");
+    let inc = capture_increment(&mut store, &mut manifest, &Plain).expect("capture");
+    let artifact = ChainArtifact {
+        manifest,
+        links: ChainLinks {
+            base,
+            increments: vec![inc],
+        },
+    };
+
+    // Encode → decode (the single-file container) — then restore at Latest to a file.
+    let encoded = artifact.encode();
+    let decoded = ChainArtifact::decode(&encoded).expect("decode chain artifact");
+    restore_chain_file_atomic(
+        &decoded.manifest,
+        &decoded.links,
+        RestoreTarget::Latest,
+        &Plain,
+        &path,
+        |p| FileBlockDevice::open(p),
+        64,
+    )
+    .expect("atomic chain restore");
+
+    // Reopen and confirm every seeded node survived.
+    let dev = FileBlockDevice::open(&path).expect("reopen file");
+    let mut restored = RecordStore::open(dev, WalManager::create(MemLogSink::new()).unwrap(), 64)
+        .expect("open restored store");
+    let live_after = restored.scan_node_ids().expect("scan restored").len();
+    assert_eq!(
+        live_after, 6,
+        "all six committed nodes survive the ChainArtifact round-trip"
+    );
+    for id in seeded {
+        assert!(
+            restored.node(id).expect("node").mvcc.in_use(),
+            "seeded node {id} must be live after restore"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

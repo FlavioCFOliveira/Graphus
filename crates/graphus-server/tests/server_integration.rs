@@ -107,6 +107,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         // The REST test client speaks plaintext HTTP on loopback; opt into the non-TLS network path
         // (production keeps this off — `ServerConfig::validate`).
         allow_insecure_network: true,
+        metrics_scrape_token: None,
     }
 }
 
@@ -587,7 +588,10 @@ async fn bolt_uds_route_and_telemetry_round_trip() {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("admin-pw8".to_owned()),
+                ),
             ],
         })
         .await;
@@ -987,8 +991,12 @@ async fn metrics_and_health_endpoints_respond() {
     assert_eq!(status, 200, "ready once booted");
     assert!(body.contains("ready"));
 
-    let (status, body) = http_request(rest, "GET", "/metrics", None, None).await;
-    assert_eq!(status, 200, "metrics");
+    // `/metrics` is fail-closed (rmp #149): unauthenticated is refused, an admin Bearer is admitted.
+    let (status, _) = http_request(rest, "GET", "/metrics", None, None).await;
+    assert_eq!(status, 401, "unauthenticated /metrics is refused");
+    let admin = mint_token(&server, "alice").await;
+    let (status, body) = http_request(rest, "GET", "/metrics", Some(&admin), None).await;
+    assert_eq!(status, 200, "admin Bearer grants /metrics");
     assert!(
         body.contains("graphus_query_duration_seconds")
             && body.contains("# TYPE graphus_active_transactions gauge"),

@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use graphus_cli::client::{BoltClient, ClientError};
 use graphus_cli::render::render_table;
@@ -51,6 +51,77 @@ struct Args {
     /// Run a single statement non-interactively, print its result, and exit.
     #[arg(short = 'c', long = "command", value_name = "CYPHER")]
     command: Option<String>,
+
+    /// An operator subcommand (backup / restore). When omitted, the CLI runs `-c` once or starts
+    /// the interactive REPL (the default behaviour).
+    #[command(subcommand)]
+    subcommand: Option<Command>,
+}
+
+/// Operator subcommands (`rmp` task #149). Each builds the corresponding administrative statement
+/// (`BACKUP DATABASE …` / `RESTORE DATABASE …`) and runs it over the authenticated Bolt session —
+/// the server gates both behind the global `Admin` privilege, so an unauthorized user is refused.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Take an online, PITR-capable backup of a database and write it to a file.
+    Backup {
+        /// The database to back up.
+        #[arg(long, value_name = "NAME", default_value = "graphus")]
+        database: String,
+        /// The destination file path for the backup artifact (on the **server's** filesystem).
+        #[arg(long, value_name = "PATH")]
+        to: String,
+    },
+    /// Restore a database from a backup file, optionally to a point in time. The database must be
+    /// stopped first (`STOP DATABASE <name>`); the default database cannot be restored in place.
+    Restore {
+        /// The database to restore.
+        #[arg(long, value_name = "NAME")]
+        database: String,
+        /// The source backup-artifact file path (on the **server's** filesystem).
+        #[arg(long, value_name = "PATH")]
+        from: String,
+        /// Restore to a specific WAL LSN (point-in-time). Mutually exclusive with `--at-timestamp`.
+        #[arg(long, value_name = "LSN", conflicts_with = "at_timestamp")]
+        at_lsn: Option<u64>,
+        /// Restore to a specific commit timestamp (point-in-time). Mutually exclusive with `--at-lsn`.
+        #[arg(long, value_name = "TIMESTAMP")]
+        at_timestamp: Option<u64>,
+    },
+}
+
+impl Command {
+    /// Renders the subcommand as the administrative statement the server recognises. Names/paths are
+    /// backtick/quote-wrapped so unusual (but valid) names and paths are passed through verbatim.
+    fn to_statement(&self) -> String {
+        match self {
+            Self::Backup { database, to } => {
+                format!("BACKUP DATABASE `{database}` TO '{}'", escape_single(to))
+            }
+            Self::Restore {
+                database,
+                from,
+                at_lsn,
+                at_timestamp,
+            } => {
+                let at = match (at_lsn, at_timestamp) {
+                    (Some(lsn), _) => format!(" AT LSN {lsn}"),
+                    (None, Some(ts)) => format!(" AT TIMESTAMP {ts}"),
+                    (None, None) => String::new(),
+                };
+                format!(
+                    "RESTORE DATABASE `{database}` FROM '{}'{at}",
+                    escape_single(from)
+                )
+            }
+        }
+    }
+}
+
+/// Escapes a single-quoted string literal for the admin grammar: `\` and `'` are backslash-escaped
+/// (the admin lexer unescapes `\\` and `\'`), so a path containing a quote is passed through safely.
+fn escape_single(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 fn main() -> ExitCode {
@@ -79,6 +150,12 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("login failed: {e}"))?;
     // The password is dropped here; it lives only as long as the single LOGON send needed it.
     drop(password);
+
+    // An operator subcommand (backup/restore) takes precedence: build its admin statement and run it
+    // once. Otherwise fall back to `-c` (one-shot) or the interactive REPL.
+    if let Some(subcommand) = args.subcommand {
+        return run_once(client, &subcommand.to_statement());
+    }
 
     match args.command {
         // One-shot: run the statement, render it, send GOODBYE, exit with a status reflecting success.
@@ -168,6 +245,98 @@ mod tests {
             resolve_password(Some("flagpw".to_owned())).unwrap(),
             "flagpw"
         );
+    }
+
+    #[test]
+    fn backup_subcommand_builds_statement() {
+        let args = Args::try_parse_from([
+            "graphus-cli",
+            "backup",
+            "--database",
+            "sales",
+            "--to",
+            "/backups/sales.gbk",
+        ])
+        .expect("backup args parse");
+        let sub = args.subcommand.expect("subcommand present");
+        assert_eq!(
+            sub.to_statement(),
+            "BACKUP DATABASE `sales` TO '/backups/sales.gbk'"
+        );
+    }
+
+    #[test]
+    fn restore_subcommand_builds_statement_with_pitr() {
+        // Plain restore (whole chain).
+        let args = Args::try_parse_from([
+            "graphus-cli",
+            "restore",
+            "--database",
+            "sales",
+            "--from",
+            "/b",
+        ])
+        .expect("restore args parse");
+        assert_eq!(
+            args.subcommand.unwrap().to_statement(),
+            "RESTORE DATABASE `sales` FROM '/b'"
+        );
+        // PITR by LSN.
+        let args = Args::try_parse_from([
+            "graphus-cli",
+            "restore",
+            "--database",
+            "sales",
+            "--from",
+            "/b",
+            "--at-lsn",
+            "4096",
+        ])
+        .expect("restore-lsn args parse");
+        assert_eq!(
+            args.subcommand.unwrap().to_statement(),
+            "RESTORE DATABASE `sales` FROM '/b' AT LSN 4096"
+        );
+        // PITR by timestamp.
+        let args = Args::try_parse_from([
+            "graphus-cli",
+            "restore",
+            "--database",
+            "sales",
+            "--from",
+            "/b",
+            "--at-timestamp",
+            "1700000000",
+        ])
+        .expect("restore-ts args parse");
+        assert_eq!(
+            args.subcommand.unwrap().to_statement(),
+            "RESTORE DATABASE `sales` FROM '/b' AT TIMESTAMP 1700000000"
+        );
+    }
+
+    #[test]
+    fn restore_lsn_and_timestamp_are_mutually_exclusive() {
+        let err = Args::try_parse_from([
+            "graphus-cli",
+            "restore",
+            "--database",
+            "sales",
+            "--from",
+            "/b",
+            "--at-lsn",
+            "1",
+            "--at-timestamp",
+            "2",
+        ]);
+        assert!(err.is_err(), "--at-lsn and --at-timestamp must conflict");
+    }
+
+    #[test]
+    fn escape_single_quotes_and_backslashes() {
+        assert_eq!(escape_single("a'b"), "a\\'b");
+        assert_eq!(escape_single("a\\b"), "a\\\\b");
+        assert_eq!(escape_single("/plain/path"), "/plain/path");
     }
 
     #[test]

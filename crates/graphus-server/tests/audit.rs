@@ -141,6 +141,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
             retain_files: 5,
         },
         allow_insecure_network: true,
+        metrics_scrape_token: None,
     }
 }
 

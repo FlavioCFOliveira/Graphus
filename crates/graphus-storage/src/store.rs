@@ -996,6 +996,40 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
+    /// Freezes **every** committed-but-unfrozen MVCC header in all three record stores under `txn`,
+    /// settling each in-flight `TxnId` stamp to its durable `Committed(ts)` form (the freeze sweep of
+    /// [`gc`](Self::gc), without any reclamation). After this commits, every committed version on disk
+    /// carries a self-describing commit timestamp, so the image is **MVCC-resolvable without the WAL's
+    /// commit records** — which is exactly what a backup needs: a restored store opens with a *fresh*
+    /// WAL (the backup carries the data image, not the log), so any header still keyed by an in-flight
+    /// `TxnId` would be unresolvable and read as invisible. Freezing before capture makes the backup
+    /// base self-sufficient (`rmp` task #149; this also closes the same latent gap for the full-backup
+    /// path of `rmp` task #23 — a backup taken before any GC pass had frozen recent commits).
+    ///
+    /// `txn` must be a fresh, not-yet-begun id; the caller drives `begin(txn)` → this →
+    /// `commit(txn)`. Returns the number of header words frozen.
+    ///
+    /// # Errors
+    /// Returns a storage error if a header read or a freeze patch write fails.
+    pub fn freeze_committed_headers(&mut self, txn: TxnId) -> Result<usize> {
+        let mut frozen = 0usize;
+        frozen += self.freeze_store_headers(txn, StoreKind::Rel)?;
+        frozen += self.freeze_store_headers(txn, StoreKind::Node)?;
+        frozen += self.freeze_store_headers(txn, StoreKind::Prop)?;
+        // Schedule the same Active/Recent Transaction Table prune `gc` does: the sweep rewrote every
+        // committed writer's on-disk in-flight stamps, so each becomes forgettable once this freeze is
+        // durable (when `txn` commits). Mirrors `gc`'s prune scheduling so the table stays bounded.
+        let writers = self.commit_registry.committed_writers();
+        let prune_scheduled = writers.len();
+        if prune_scheduled > 0 {
+            self.pending_gc_prune = Some(PendingGcPrune {
+                gc_txn: txn,
+                writers,
+            });
+        }
+        Ok(frozen)
+    }
+
     /// Freezes the MVCC headers of every in-use record in `kind`'s store (`rmp` task #59): each
     /// `xmin`/`xmax` word carrying a committed writer's in-flight `TxnId` is rewritten to its
     /// `Committed(ts)` form via the same WAL-logged 8-byte header patch as a tombstone or the old

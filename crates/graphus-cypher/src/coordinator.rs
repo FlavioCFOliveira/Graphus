@@ -1941,6 +1941,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
+    /// Runs `f` with **mutable** access to the underlying store, without consuming the coordinator.
+    ///
+    /// This is the lending counterpart to [`into_store`](Self::into_store): it gives storage-level
+    /// maintenance that needs `&mut RecordStore` (a backup capture, an explicit checkpoint) a way to
+    /// run *between* commands on the single engine thread and leave the coordinator usable afterwards.
+    /// The store is borrowed for exactly the duration of `f`; do not call back into the coordinator
+    /// from within `f` (it would re-borrow the same `RefCell`).
+    ///
+    /// # Panics
+    /// Panics if the store is already borrowed (a live statement seam from
+    /// [`statement`](Self::statement) is held, or `f` re-enters the coordinator) — the same misuse
+    /// [`into_store`](Self::into_store) rejects.
+    pub fn with_store_mut<R>(&self, f: impl FnOnce(&mut RecordStore<D, S>) -> R) -> R {
+        let mut store = self.store.borrow_mut();
+        f(&mut store)
+    }
+
     /// Aborts `txn`: store undo, SSI forget, lock release, and removal from the open set.
     fn abort(&mut self, txn: TxnId) -> Result<()> {
         self.store.borrow_mut().rollback(txn)?;

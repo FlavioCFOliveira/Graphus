@@ -178,6 +178,7 @@ pub async fn start_all(
             Arc::clone(&metrics),
             shutdown.clone(),
             readiness.clone(),
+            config.metrics_scrape_token.as_deref().map(Arc::from),
         );
         tokio::spawn(rest::run_rest_accept_loop(
             acceptor,
@@ -219,6 +220,7 @@ fn build_rest_router(
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
+    metrics_scrape_token: Option<Arc<str>>,
 ) -> axum::Router {
     use graphus_rest::registry::TxRegistry;
     use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, router};
@@ -233,7 +235,15 @@ fn build_rest_router(
         AppState::new(rest_engine, auth, registry, Arc::clone(&clock)).with_auth_observer(observer),
     );
 
-    let extra = extra_routes::routes(metrics, engine, security, clock, shutdown, readiness);
+    let extra = extra_routes::routes(
+        metrics,
+        engine,
+        security,
+        clock,
+        shutdown,
+        readiness,
+        metrics_scrape_token,
+    );
     api.merge(extra)
 }
 

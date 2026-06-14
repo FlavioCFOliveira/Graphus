@@ -31,6 +31,10 @@ use graphus_server::{Server, ServerHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 
+/// The `/metrics` scrape token this test configures, so its raw HTTP reads authenticate against the
+/// now fail-closed `/metrics` endpoint (rmp #149).
+const METRICS_TOKEN: &str = "conn-admission-itest-scrape-token";
+
 /// A unique temp directory for one test's store (auto-removed on drop).
 struct TempStore {
     path: PathBuf,
@@ -90,6 +94,9 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         encryption: graphus_server::config::EncryptionConfig::default(),
         audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: true,
+        // A scrape token so the `/metrics` reads below authenticate (rmp #149: /metrics is
+        // fail-closed — an unauthenticated scrape is now 401).
+        metrics_scrape_token: Some(METRICS_TOKEN.to_owned()),
     }
 }
 
@@ -175,7 +182,10 @@ async fn open_logged_in_uds(path: &std::path::Path) -> UnixStream {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("admin-pw8".to_owned()),
+                ),
             ],
         },
     )
@@ -472,7 +482,8 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
         return (0, String::new());
     };
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: text/plain\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: text/plain\r\n\
+         Authorization: Bearer {METRICS_TOKEN}\r\n\r\n"
     );
     if stream.write_all(req.as_bytes()).await.is_err() || stream.flush().await.is_err() {
         return (0, String::new());

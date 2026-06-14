@@ -91,6 +91,7 @@ fn config(temp: &TempStore) -> ServerConfig {
         encryption: graphus_server::config::EncryptionConfig::default(),
         audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: false,
+        metrics_scrape_token: None,
     }
 }
 

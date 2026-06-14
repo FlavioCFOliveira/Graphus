@@ -915,7 +915,9 @@ pub fn classify_admin(cmd: &crate::admin::AdminCommand) -> AuditClass {
         | A::StartDatabase { .. }
         | A::StopDatabase { .. }
         | A::ShowDatabases
-        | A::ShowDatabase { .. } => AuditClass::AdminChange,
+        | A::ShowDatabase { .. }
+        | A::BackupDatabase { .. }
+        | A::RestoreDatabase { .. } => AuditClass::AdminChange,
     }
 }
 
@@ -939,6 +941,8 @@ pub fn is_mutating_admin(cmd: &crate::admin::AdminCommand) -> bool {
             | A::RevokeRole { .. }
             | A::GrantPrivilege { .. }
             | A::RevokePrivilege { .. }
+            | A::BackupDatabase { .. }
+            | A::RestoreDatabase { .. }
     )
 }
 
@@ -953,7 +957,9 @@ pub fn admin_target_database(cmd: &crate::admin::AdminCommand) -> Option<String>
         | A::DropDatabase { name, .. }
         | A::StartDatabase { name }
         | A::StopDatabase { name }
-        | A::ShowDatabase { name } => Some(name.clone()),
+        | A::ShowDatabase { name }
+        | A::BackupDatabase { name, .. }
+        | A::RestoreDatabase { name, .. } => Some(name.clone()),
         _ => None,
     }
 }
@@ -1008,6 +1014,16 @@ pub fn redact_admin_detail(cmd: &crate::admin::AdminCommand) -> String {
         A::ShowUsers => "SHOW USERS".to_owned(),
         A::ShowRoles => "SHOW ROLES".to_owned(),
         A::ShowPrivileges => "SHOW PRIVILEGES".to_owned(),
+        A::BackupDatabase { name, path } => format!("BACKUP DATABASE {name} TO {path}"),
+        A::RestoreDatabase { name, path, point } => {
+            use crate::admin::RestorePoint as R;
+            let at = match point {
+                R::Latest => String::new(),
+                R::Lsn(n) => format!(" AT LSN {n}"),
+                R::Timestamp(t) => format!(" AT TIMESTAMP {t}"),
+            };
+            format!("RESTORE DATABASE {name} FROM {path}{at}")
+        }
     }
 }
 

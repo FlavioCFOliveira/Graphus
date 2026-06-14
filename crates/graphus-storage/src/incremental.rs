@@ -307,6 +307,144 @@ pub struct ChainLinks {
     pub increments: Vec<Vec<u8>>,
 }
 
+/// Magic identifying a single-file backup-chain artifact (`"GRPHCAR\0"` — Graphus Chain ARtifact).
+const CHAIN_FILE_MAGIC: [u8; 8] = *b"GRPHCAR\0";
+
+/// One self-describing on-disk **backup-chain artifact**: a [`ChainManifest`] paired with its
+/// [`ChainLinks`] in a single, framed, CRC-protected byte container (`rmp` task #149 operator
+/// backup surface). This is the unit an operator's `BACKUP DATABASE … TO '<path>'` writes and
+/// `RESTORE DATABASE … FROM '<path>'` reads back: the manifest indexes the chain and the links carry
+/// its (codec-transformed) bytes, so a restore has everything [`restore_to`] / [`verify_chain`] need
+/// in one file.
+///
+/// The container is pure framing — integrity of the *chain* itself (base verifies, increment CRCs,
+/// contiguous LSN ranges, AEAD tags for a sealed chain) is re-proved by [`verify_chain`] /
+/// [`restore_to`]; the trailing CRC here only catches a torn or bit-rotted *file*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainArtifact {
+    /// The chain index.
+    pub manifest: ChainManifest,
+    /// The chain's (codec-transformed) link bytes.
+    pub links: ChainLinks,
+}
+
+impl ChainArtifact {
+    /// Serialises the artifact to a self-describing, CRC-protected byte container (little-endian):
+    /// `magic(8) || version(4) || manifest_len(8) || manifest || base_len(8) || base ||
+    /// inc_count(8) || (inc_len(8) || inc)* || crc32c(4)`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let manifest = self.manifest.encode();
+        let mut out = Vec::new();
+        out.extend_from_slice(&CHAIN_FILE_MAGIC);
+        out.extend_from_slice(&CHAIN_FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(manifest.len() as u64).to_le_bytes());
+        out.extend_from_slice(&manifest);
+        out.extend_from_slice(&(self.links.base.len() as u64).to_le_bytes());
+        out.extend_from_slice(&self.links.base);
+        out.extend_from_slice(&(self.links.increments.len() as u64).to_le_bytes());
+        for inc in &self.links.increments {
+            out.extend_from_slice(&(inc.len() as u64).to_le_bytes());
+            out.extend_from_slice(inc);
+        }
+        let digest = crc32c::crc32c(&out);
+        out.extend_from_slice(&digest.to_le_bytes());
+        out
+    }
+
+    /// Parses an artifact from its [`encode`](Self::encode)d form, validating the magic, version,
+    /// every length field against the remaining bytes, and the trailing whole-file CRC.
+    ///
+    /// This validates only the **file framing**; the chain's own integrity is re-proved by
+    /// [`verify_chain`] / [`restore_to`] (which the restore path always runs first).
+    ///
+    /// # Errors
+    /// Returns [`GraphusError::Storage`] for a too-short buffer, a bad magic, an unsupported version,
+    /// a length field that runs past the buffer, or a CRC mismatch (a tampered or truncated file).
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        // A small cursor reader that fails closed on any out-of-bounds length field.
+        let total = bytes.len();
+        if total < 8 + 4 + 4 {
+            return Err(GraphusError::Storage(format!(
+                "backup chain artifact too short: {total} bytes"
+            )));
+        }
+        if bytes[0..8] != CHAIN_FILE_MAGIC {
+            return Err(GraphusError::Storage(
+                "backup chain artifact has a bad magic (not a Graphus backup chain artifact)"
+                    .to_owned(),
+            ));
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4-byte slice"));
+        if version != CHAIN_FORMAT_VERSION {
+            return Err(GraphusError::Storage(format!(
+                "unsupported backup chain artifact version {version} (this build supports \
+                 {CHAIN_FORMAT_VERSION})"
+            )));
+        }
+
+        // Verify the trailing whole-file CRC before trusting any interior length field.
+        let digest_off = total - 4;
+        let stored = u32::from_le_bytes(bytes[digest_off..].try_into().expect("4-byte trailer"));
+        let computed = crc32c::crc32c(&bytes[..digest_off]);
+        if stored != computed {
+            return Err(GraphusError::Storage(format!(
+                "backup chain artifact CRC mismatch: stored {stored:#010x}, computed \
+                 {computed:#010x} (file tampered or truncated)"
+            )));
+        }
+
+        // Body is everything between the header and the digest trailer.
+        let body = &bytes[12..digest_off];
+        let mut cur = 0usize;
+        let read_len = |cur: &mut usize| -> Result<usize> {
+            let end = cur
+                .checked_add(8)
+                .filter(|e| *e <= body.len())
+                .ok_or_else(|| {
+                    GraphusError::Storage(
+                        "backup chain artifact truncated (length field)".to_owned(),
+                    )
+                })?;
+            let n = u64::from_le_bytes(body[*cur..end].try_into().expect("8-byte slice")) as usize;
+            *cur = end;
+            Ok(n)
+        };
+        let read_slice = |cur: &mut usize, n: usize| -> Result<Vec<u8>> {
+            let end = cur
+                .checked_add(n)
+                .filter(|e| *e <= body.len())
+                .ok_or_else(|| {
+                    GraphusError::Storage("backup chain artifact truncated (payload)".to_owned())
+                })?;
+            let v = body[*cur..end].to_vec();
+            *cur = end;
+            Ok(v)
+        };
+
+        let manifest_len = read_len(&mut cur)?;
+        let manifest_bytes = read_slice(&mut cur, manifest_len)?;
+        let manifest = ChainManifest::decode(&manifest_bytes)?;
+        let base_len = read_len(&mut cur)?;
+        let base = read_slice(&mut cur, base_len)?;
+        let inc_count = read_len(&mut cur)?;
+        let mut increments = Vec::with_capacity(inc_count.min(body.len()));
+        for _ in 0..inc_count {
+            let inc_len = read_len(&mut cur)?;
+            increments.push(read_slice(&mut cur, inc_len)?);
+        }
+        if cur != body.len() {
+            return Err(GraphusError::Storage(
+                "backup chain artifact has trailing bytes after the declared links".to_owned(),
+            ));
+        }
+        Ok(Self {
+            manifest,
+            links: ChainLinks { base, increments },
+        })
+    }
+}
+
 /// The encode/decode seam for a chain link, so encryption is injectable **without** a
 /// `graphus-storage -> graphus-crypto` dependency (which would be a cycle — crypto depends on
 /// storage). `seal` is applied when a link is *written*; `open` recovers its plaintext when a link
@@ -870,6 +1008,63 @@ mod tests {
     }
 
     #[test]
+    fn chain_artifact_round_trips() {
+        let artifact = ChainArtifact {
+            manifest: sample_manifest(),
+            links: ChainLinks {
+                base: vec![1, 2, 3, 4, 5],
+                increments: vec![vec![6, 7, 8], vec![9, 10, 11, 12]],
+            },
+        };
+        let bytes = artifact.encode();
+        let got = ChainArtifact::decode(&bytes).expect("decode");
+        assert_eq!(got, artifact);
+    }
+
+    #[test]
+    fn chain_artifact_base_only_round_trips() {
+        let artifact = ChainArtifact {
+            manifest: ChainManifest {
+                chain_id: 7,
+                base_creation_mark: 7,
+                base_lsn: Lsn(8),
+                increments: Vec::new(),
+            },
+            links: ChainLinks {
+                base: vec![0xAA; 9],
+                increments: Vec::new(),
+            },
+        };
+        let got = ChainArtifact::decode(&artifact.encode()).expect("decode");
+        assert_eq!(got, artifact);
+    }
+
+    #[test]
+    fn chain_artifact_rejects_tamper_and_truncation() {
+        let artifact = ChainArtifact {
+            manifest: sample_manifest(),
+            links: ChainLinks {
+                base: vec![1, 2, 3],
+                increments: vec![vec![4, 5]],
+            },
+        };
+        let good = artifact.encode();
+        // Bad magic.
+        let mut bad = good.clone();
+        bad[0] ^= 0xFF;
+        assert!(ChainArtifact::decode(&bad).is_err());
+        // Bit-flip in the body trips the trailing CRC.
+        let mut flipped = good.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xFF;
+        assert!(ChainArtifact::decode(&flipped).is_err());
+        // Truncation.
+        assert!(ChainArtifact::decode(&good[..good.len() - 8]).is_err());
+        // Empty / far-too-short.
+        assert!(ChainArtifact::decode(&[]).is_err());
+    }
+
+    #[test]
     fn manifest_too_short_is_rejected() {
         assert!(ChainManifest::decode(&[0u8; 4]).is_err());
     }
@@ -1020,8 +1215,13 @@ mod tests {
             base: minimal_base_artifact(),
             increments: Vec::new(),
         };
-        let err = build_logical_wal(&m, &links, &Plain).unwrap_err().to_string();
-        assert!(err.contains("base_lsn") && err.contains("sane maximum"), "got: {err}");
+        let err = build_logical_wal(&m, &links, &Plain)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("base_lsn") && err.contains("sane maximum"),
+            "got: {err}"
+        );
     }
 
     #[test]

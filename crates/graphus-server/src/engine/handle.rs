@@ -248,6 +248,21 @@ impl EngineHandle {
         recv_async(rx).await?
     }
 
+    /// Captures an **online backup chain artifact** of the live store (`rmp` task #149), returning its
+    /// encoded **plaintext** bytes (a [`graphus_storage::ChainArtifact`]). Online: the engine quiesces
+    /// the store and frames it between commands, never stopping the database. Like the DDL commands it
+    /// takes **no admission permit** and the caller must apply the admin-privilege gate beforehand;
+    /// the catalog seals + writes the returned bytes to the operator's path.
+    ///
+    /// # Errors
+    /// [`GraphusError::Storage`] if the capture fails (which also indicates a corrupt source store —
+    /// the backup refuses to propagate corruption), or if the engine is shut down.
+    pub async fn backup(&self) -> Result<Vec<u8>, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::Backup { reply }).await?;
+        recv_async(rx).await?
+    }
+
     // ---- Blocking submit (the Bolt session, on a blocking task, uses these) ----------------------
 
     /// Blocking variant of [`begin`](Self::begin) for the synchronous Bolt seam (called on a

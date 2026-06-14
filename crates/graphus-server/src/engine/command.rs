@@ -327,6 +327,18 @@ pub enum EngineCommand {
         /// Reply channel: the buffered fields + rows (reusing [`IndexDdlReply`]), or an engine error.
         reply: Reply<Result<IndexDdlReply, GraphusError>>,
     },
+    /// Capture an **online backup chain artifact** of the live store (`rmp` task #149): on the engine
+    /// thread the store is borrowed mutably, quiesced (flush + checkpoint) and framed as a base full
+    /// artifact plus the WAL tail — a [`graphus_storage::ChainArtifact`] encoded to bytes with the
+    /// identity codec. The reply carries the **plaintext** encoded artifact; the catalog seals it
+    /// (when the database is encrypted) and writes it to the operator's path. Like the DDL commands
+    /// this takes no admission permit (it is a control operation the engine serialises itself), and
+    /// the caller is responsible for the admin-privilege gate beforehand.
+    Backup {
+        /// Reply channel: the encoded plaintext `ChainArtifact` bytes, or a storage error (which also
+        /// signals a corrupt source store — `backup_store` refuses to back up corruption).
+        reply: Reply<Result<Vec<u8>, GraphusError>>,
+    },
 }
 
 /// The summary metadata for a finished result / committed transaction, unified across both seams.

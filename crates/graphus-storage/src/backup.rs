@@ -113,6 +113,31 @@ const DIGEST_LEN: usize = 4;
 /// Panics if the checkpoint's `fdatasync` fails (`04 §4.9`), inherited from
 /// [`WalManager::checkpoint`].
 pub fn backup_store<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -> Result<Vec<u8>> {
+    // 0. Freeze every committed-but-unfrozen MVCC header so the captured image is **MVCC-resolvable
+    //    without the WAL** (`rmp` task #149). A restored store opens with a fresh, empty WAL (the
+    //    backup carries the data image, not the log), so a version still keyed by its writer's
+    //    in-flight `TxnId` would be unresolvable and read as invisible. Settling them to their durable
+    //    `Committed(ts)` form first makes the base self-sufficient. This runs as a tiny self-contained
+    //    transaction (`begin → freeze → commit`) under a reserved id; it only rewrites header words to
+    //    the commit timestamps the records already committed at, so it changes no query-visible state.
+    //    The freeze txn is committed **only when it actually froze a header** — so a backup of an
+    //    already-frozen store (e.g. re-backing-up a freshly-restored store) burns no commit timestamp
+    //    and is byte-for-byte idempotent.
+    let freeze_txn = graphus_core::TxnId(u64::MAX);
+    store.begin(freeze_txn);
+    match store.freeze_committed_headers(freeze_txn) {
+        Ok(0) => {
+            // Nothing to freeze: roll the empty txn back so the meta page (and `commit_ts_hw`) is
+            // untouched, keeping the backup idempotent.
+            store.rollback(freeze_txn)?;
+        }
+        Ok(_) => store.commit(freeze_txn)?,
+        Err(e) => {
+            let _ = store.rollback(freeze_txn);
+            return Err(e);
+        }
+    }
+
     // 1. Quiesce: flush every dirty page home (WAL rule enforced on each write-back) and sync.
     store.flush()?;
     // 2. Mark a clean, recoverable point. The snapshot is taken after a full flush, so no page is

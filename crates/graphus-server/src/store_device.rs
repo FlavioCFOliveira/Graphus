@@ -69,6 +69,26 @@ impl MasterKey {
         let master: [u8; graphus_crypto::KEY_LEN] = **self.bytes;
         Keyring::from_master_key(master, salt)
     }
+
+    /// Seals an operator backup artifact under this master key (AES-256-GCM, rmp #89), so a backup
+    /// file of an **encrypted** database never contains plaintext page images at rest. The salt is
+    /// generated per call and embedded in the envelope, so the artifact is openable with the master
+    /// key alone via [`open_artifact`](Self::open_artifact).
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] if the AEAD seal fails.
+    pub fn seal_artifact(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        graphus_crypto::seal_backup(plaintext, &self.bytes)
+    }
+
+    /// Opens a sealed operator backup artifact, returning its plaintext (the inverse of
+    /// [`seal_artifact`](Self::seal_artifact)). Fail-closed: a wrong key or any tamper is rejected.
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] if the envelope is malformed or fails authentication.
+    pub fn open_artifact(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+        graphus_crypto::open_backup(sealed, &self.bytes)
+    }
 }
 
 /// Parses key-file bytes into a 32-byte master key (raw 32 bytes, or 64 hex chars), trimming

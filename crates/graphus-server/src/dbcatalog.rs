@@ -187,6 +187,10 @@ pub enum CatalogError {
     },
     /// `drop` of a database that is not stopped (drop requires desired + actual state offline).
     NotOffline(String),
+    /// A backup capture or a restore failed (`rmp` task #149): a storage/crypto fault, a malformed
+    /// or wrong-key backup file, or a target-state precondition (e.g. restore requires the database
+    /// stopped). The message is the operator-facing reason.
+    Backup(String),
     /// Starting or stopping the database's engine failed (e.g. an integrity-check failure).
     Engine(GraphusError),
 }
@@ -218,6 +222,7 @@ impl std::fmt::Display for CatalogError {
                 f,
                 "database {name:?} must be stopped (offline) before it can be dropped"
             ),
+            Self::Backup(m) => write!(f, "backup/restore failed: {m}"),
             Self::Engine(e) => write!(f, "database engine error: {e}"),
         }
     }
@@ -667,6 +672,131 @@ fn spawn_db_engine(
     )
 }
 
+/// Writes `bytes` to `dest` **atomically and durably** (`rmp` task #149 operator backup write): a
+/// fresh sibling temp is filled + `fsync`ed, then `rename(2)`d over `dest` and the directory
+/// `fsync`ed — so a crash leaves `dest` as the old whole file or the new whole file, never a torn
+/// mixture. Maps the storage error to a [`CatalogError::Backup`].
+fn write_file_atomic(dest: &Path, bytes: &[u8]) -> Result<(), CatalogError> {
+    use std::io::Write as _;
+    graphus_io::atomic_replace_file(dest, |tmp| {
+        let mut f = std::fs::File::create(tmp)
+            .map_err(|e| GraphusError::Storage(format!("creating backup temp: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| GraphusError::Storage(format!("writing backup: {e}")))?;
+        f.sync_all()
+            .map_err(|e| GraphusError::Storage(format!("syncing backup: {e}")))
+    })
+    .map_err(|e| CatalogError::Backup(e.to_string()))
+}
+
+/// Restores `device_file` from the backup chain artifact at `src` to `target` (`rmp` task #149).
+/// Reads + (optionally) unseals + decodes the artifact, then lays it down atomically with the
+/// catalog's device-opening scheme so an encrypted database is restored as a valid encrypted store
+/// (a fresh per-store salt). Pure blocking filesystem/crypto work — run off the runtime.
+fn restore_db_file(
+    src: &Path,
+    device_file: &Path,
+    target: graphus_storage::RestoreTarget,
+    master_key: Option<&MasterKey>,
+    pool_pages: usize,
+) -> Result<(), CatalogError> {
+    use graphus_storage::{ChainArtifact, Plain, restore_chain_file_atomic};
+
+    let to_backup_err = |e: GraphusError| CatalogError::Backup(e.to_string());
+
+    // 1. Read the backup file.
+    let raw = std::fs::read(src)
+        .map_err(|e| CatalogError::Backup(format!("reading backup file {}: {e}", src.display())))?;
+    // 2. Unseal under the master key when the database is encrypted (fail-closed on wrong key/tamper).
+    let plaintext = match master_key {
+        Some(key) => key.open_artifact(&raw).map_err(to_backup_err)?,
+        None => raw,
+    };
+    // 3. Decode the chain artifact (file framing) — the chain's own integrity is re-proved next.
+    let artifact = ChainArtifact::decode(&plaintext).map_err(to_backup_err)?;
+    let codec = Plain;
+
+    // 4. Lay it down atomically with the right device type. The page images are plaintext above the
+    //    device seam, so re-encrypting under a fresh salt is correct for an encrypted database.
+    //
+    //    The chain restore leaves the device at a consistent committed state needing **no** WAL
+    //    replay, but the next `START DATABASE` opens the *existing* WAL file and would replay its
+    //    (now stale) records onto the restored device — and for an encrypted store the old WAL's
+    //    subkey no longer matches the restored device's fresh salt. So after the device is restored
+    //    we reset the WAL to a fresh empty log consistent with the restored device (step 5).
+    let wal_file = device_file.with_file_name(WAL_FILE_NAME);
+    match master_key {
+        None => {
+            restore_chain_file_atomic(
+                &artifact.manifest,
+                &artifact.links,
+                target,
+                &codec,
+                device_file,
+                |tmp| FileBlockDevice::open(tmp),
+                pool_pages,
+            )
+            .map_err(to_backup_err)?;
+            // 5. Fresh empty plaintext WAL (recovery replays nothing on the next open).
+            reset_wal(&wal_file, None).map_err(to_backup_err)?;
+        }
+        Some(key) => {
+            let salt = graphus_crypto::random_salt();
+            let keyring = key.keyring_for(&salt);
+            restore_chain_file_atomic(
+                &artifact.manifest,
+                &artifact.links,
+                target,
+                &codec,
+                device_file,
+                |tmp| {
+                    Ok(StoreDevice::Encrypted(Box::new(
+                        EncryptedFileDevice::create_file(tmp, &keyring, salt)?,
+                    )))
+                },
+                pool_pages,
+            )
+            .map_err(to_backup_err)?;
+            // 5. Fresh empty WAL whose subkey is derived from the restored device's new salt
+            //    (`wal_keyring_for_existing` reads that salt back from the device header on open).
+            let wal_keyring =
+                wal_keyring_for_existing(device_file, master_key).map_err(to_backup_err)?;
+            reset_wal(&wal_file, wal_keyring.as_ref()).map_err(to_backup_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resets the WAL at `wal_dir` to a **fresh empty WAL** consistent with a just-restored device
+/// (`rmp` task #149): a plaintext WAL when `keyring` is `None`, or an encrypted WAL whose subkey is
+/// derived from the restored device's salt otherwise. The next open then recovers nothing (the chain
+/// restore already left the device at a consistent committed state), and an encrypted store's WAL
+/// subkey matches its device again.
+///
+/// The Graphus WAL is a **directory** of segment files ([`FileLogSink`]), so it is reset by removing
+/// the directory and recreating a fresh empty WAL in its place — not by an atomic file rename. The
+/// device was restored atomically *before* this runs; should the process crash between the device
+/// rename and this reset, the next open would see the restored device beside a stale WAL — the
+/// operator simply re-runs the (idempotent) restore, which re-lays the device and resets the WAL
+/// again. (Restore is an offline operator action, not a hot path, so this is the right trade-off.)
+fn reset_wal(wal_dir: &Path, keyring: Option<&Keyring>) -> Result<(), GraphusError> {
+    // Remove any existing WAL directory (segments + anchor). A missing directory is fine.
+    match std::fs::remove_dir_all(wal_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(GraphusError::Storage(format!(
+                "removing the WAL directory {} on restore: {e}",
+                wal_dir.display()
+            )));
+        }
+    }
+    // Create + harden a fresh empty WAL (writes the header durably into a fresh segment).
+    let _wal = WalManager::create(create_wal_sink(wal_dir, keyring)?)
+        .map_err(|e| GraphusError::Storage(format!("creating fresh WAL on restore: {e}")))?;
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------------
 // The catalog
 // ------------------------------------------------------------------------------------------------
@@ -1104,6 +1234,106 @@ impl DatabaseCatalog {
 
         let dir = self.db_dir(&name);
         run_blocking(move || remove_dir(&dir)).await
+    }
+
+    /// The store directory of database `name`: the data root for the default database, or
+    /// `<root>/databases/<name>` for an additional one (mirrors [`spawn_in`](Self::spawn_in)'s
+    /// targets). `name` must already be normalized.
+    fn dir_of(&self, name: &str) -> PathBuf {
+        if name == self.default_name {
+            self.root.clone()
+        } else {
+            self.db_dir(name)
+        }
+    }
+
+    /// Captures an **online backup chain artifact** of database `name` and writes it atomically to
+    /// `dest` (`rmp` task #149). The database must be **online**: the capture goes through its running
+    /// engine ([`EngineHandle::backup`]), which quiesces and frames the store between commands without
+    /// stopping it. The artifact supports point-in-time restore (`Latest` / a chosen LSN / a chosen
+    /// commit timestamp) via [`restore`](Self::restore).
+    ///
+    /// When the database is **encrypted**, the artifact is sealed under the master key before it
+    /// touches disk (rmp #89), so a backup file never leaks plaintext page images at rest. An
+    /// unencrypted database writes the plaintext artifact (protect the file with filesystem
+    /// permissions). The write is atomic (temp + `rename` + directory `fsync`).
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownDatabase`] if the database is offline/unknown, [`CatalogError::Backup`]
+    /// if the capture, the seal, or the file write fails.
+    pub async fn backup(&self, name: &str, dest: &Path) -> Result<(), CatalogError> {
+        let name = normalize_db_name(name)?;
+        let handle = self
+            .handle(&name)
+            .ok_or_else(|| CatalogError::UnknownDatabase(name.clone()))?;
+        // 1. Capture the plaintext chain artifact through the engine (online).
+        let plaintext = handle
+            .backup()
+            .await
+            .map_err(|e| CatalogError::Backup(e.to_string()))?;
+        // 2. Seal under the master key when the database is encrypted.
+        let bytes = match &self.params.master_key {
+            Some(key) => key
+                .seal_artifact(&plaintext)
+                .map_err(|e| CatalogError::Backup(e.to_string()))?,
+            None => plaintext,
+        };
+        // 3. Write atomically off the runtime (the directory `fsync` must not run on a worker).
+        let dest = dest.to_path_buf();
+        run_blocking(move || write_file_atomic(&dest, &bytes)).await
+    }
+
+    /// **Restores** database `name` from the backup chain artifact at `src`, to `target`
+    /// (`rmp` task #149): the whole committed chain (`RestoreTarget::Latest`), a chosen WAL
+    /// `RestoreTarget::Lsn`, or a chosen `RestoreTarget::Timestamp` (PITR).
+    ///
+    /// The database **must be stopped** (offline) first — the restore atomically replaces the store
+    /// file under it, which is only sound when no engine holds the device. The default database can
+    /// never be stopped, so it cannot be restored in place while the server runs; stop the server and
+    /// restore offline, or restore into a fresh named database. On success the database stays stopped;
+    /// the operator restarts it (`START DATABASE`) to bring the restored data online.
+    ///
+    /// The artifact is unsealed under the master key when the database is encrypted, decoded, its
+    /// chain re-proved (`verify_chain`, inside the file-atomic restore), and laid down with the
+    /// catalog's own device-opening scheme so an encrypted database is restored as a valid encrypted
+    /// store.
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownDatabase`], [`CatalogError::DefaultDatabase`] (default cannot be
+    /// restored in place), [`CatalogError::NotOffline`] (stop it first), or [`CatalogError::Backup`]
+    /// if the file is missing/malformed/wrong-key or the restore fails (the target is left untouched
+    /// on any error — the restore is atomic).
+    pub async fn restore(
+        &self,
+        name: &str,
+        src: &Path,
+        target: graphus_storage::RestoreTarget,
+    ) -> Result<(), CatalogError> {
+        let name = normalize_db_name(name)?;
+        if name == self.default_name {
+            return Err(CatalogError::DefaultDatabase {
+                name,
+                operation: "restore",
+            });
+        }
+        // The database must exist and be stopped (no running engine holding the device).
+        {
+            let state = self.admin.lock().await;
+            if !state.entries.contains_key(&name) {
+                return Err(CatalogError::UnknownDatabase(name));
+            }
+            if state.running.contains_key(&name) {
+                return Err(CatalogError::NotOffline(name));
+            }
+        }
+        let device_file = self.dir_of(&name).join(STORE_FILE_NAME);
+        let src = src.to_path_buf();
+        let master_key = self.params.master_key.clone();
+        let pool_pages = self.params.buffer_pool_pages;
+        run_blocking(move || {
+            restore_db_file(&src, &device_file, target, master_key.as_ref(), pool_pages)
+        })
+        .await
     }
 
     /// Stops **every** running engine for process shutdown (`04 §9.4`): additional databases

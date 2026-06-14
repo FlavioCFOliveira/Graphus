@@ -268,6 +268,10 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
             let out = handle_constraint_ddl(coord, &command);
             let _ = reply.send(out);
         }
+        Cmd::Backup { reply } => {
+            let out = handle_backup(coord);
+            let _ = reply.send(out);
+        }
         Cmd::Shutdown { reply } => {
             // Drain stragglers through `&mut`, then consume the coordinator for the final flush. An
             // in-flight index build is left durably `Populating`: it resumes and completes on the
@@ -418,6 +422,44 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             Ok(IndexDdlReply { fields, rows })
         }
     }
+}
+
+/// Captures an **online backup chain artifact** of the live store (`rmp` task #149) on the engine
+/// thread, returning its encoded plaintext bytes.
+///
+/// The store is borrowed mutably (without consuming the coordinator — see
+/// [`TxnCoordinator::with_store_mut`]) and a backup *chain* is captured rather than a bare full
+/// artifact: `begin_chain` quiesces (flush + checkpoint) and frames the base full image at the WAL
+/// watermark, then `capture_increment` appends the WAL tail accumulated since. The resulting
+/// `(manifest, links)` pair restores to **any committed point** in `[base_lsn, tip]` via
+/// `restore_to`/`restore_chain_file_atomic` — i.e. it supports PITR (`RestoreTarget::Latest`/`Lsn`/
+/// `Timestamp`), not just a whole-snapshot restore.
+///
+/// The identity [`Plain`](graphus_storage::Plain) codec is used here: the chain bytes are plaintext.
+/// Confidentiality at rest of the *operator backup file* is the catalog's responsibility (it seals
+/// the encoded artifact under the master key when the database is encrypted, rmp #89), keeping the
+/// `!Send` engine thread free of key material.
+fn handle_backup<D: BlockDevice, S: LogSink>(
+    coordinator: &mut TxnCoordinator<D, S>,
+) -> Result<Vec<u8>> {
+    use graphus_storage::{ChainArtifact, ChainLinks, Plain, begin_chain, capture_increment};
+
+    coordinator.with_store_mut(|store| {
+        let codec = Plain;
+        // Base full artifact + the WAL watermark at base time.
+        let (mut manifest, base) = begin_chain(store, &codec)?;
+        // The WAL tail since the base watermark: an empty increment (no commits since the
+        // checkpoint) is a benign zero-length marker that `restore_to` handles transparently.
+        let increment = capture_increment(store, &mut manifest, &codec)?;
+        let artifact = ChainArtifact {
+            manifest,
+            links: ChainLinks {
+                base,
+                increments: vec![increment],
+            },
+        };
+        Ok(artifact.encode())
+    })
 }
 
 /// Executes one constraint-DDL command against the coordinator's constraint catalog (`rmp` task

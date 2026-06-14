@@ -47,8 +47,8 @@
 //! Recovery treats that as an empty DWB — the safe, committed-or-nothing outcome.
 
 use graphus_bufpool::page;
-use graphus_core::error::{GraphusError, Result};
 use graphus_core::PageId;
+use graphus_core::error::{GraphusError, Result};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 
 /// Magic identifying a valid DWB header slot (`"GDWB"` + version `1`, little-endian).
@@ -325,7 +325,10 @@ mod tests {
 
         let mut got: Page = [0u8; PAGE_SIZE];
         home.read_page(PageId(2), &mut got).expect("read repaired");
-        assert!(page::verify_checksum(&got), "home page must be intact after repair");
+        assert!(
+            page::verify_checksum(&got),
+            "home page must be intact after repair"
+        );
         assert_eq!(&got[..], &good[..], "home page must equal the DWB copy");
     }
 
@@ -344,7 +347,11 @@ mod tests {
         assert_eq!(dwb.recover_home(&mut home).expect("recover"), 0);
         let mut got: Page = [0u8; PAGE_SIZE];
         home.read_page(PageId(2), &mut got).expect("read");
-        assert_eq!(&got[..], &old[..], "intact home page must be left for redo to reconcile");
+        assert_eq!(
+            &got[..],
+            &old[..],
+            "intact home page must be left for redo to reconcile"
+        );
     }
 
     #[test]
@@ -354,9 +361,13 @@ mod tests {
         dwb.stage_batch(&[(PageId(1), &good)]).expect("stage");
         // Corrupt the header slot (a crash mid-DWB-write): its checksum no longer verifies.
         let mut hdr: Page = [0u8; PAGE_SIZE];
-        dwb.device.read_page(PageId(DWB_HEADER_SLOT), &mut hdr).unwrap();
+        dwb.device
+            .read_page(PageId(DWB_HEADER_SLOT), &mut hdr)
+            .unwrap();
         hdr[8] ^= 0xFF; // flip the count field; checksum now fails
-        dwb.device.write_page(PageId(DWB_HEADER_SLOT), &hdr).unwrap();
+        dwb.device
+            .write_page(PageId(DWB_HEADER_SLOT), &hdr)
+            .unwrap();
         dwb.device.sync_data().unwrap();
 
         // Even with a torn home page, a header that does not decode means "no committed batch".
@@ -375,9 +386,13 @@ mod tests {
         dwb.stage_batch(&[(PageId(3), &good)]).expect("stage");
         // Corrupt the DWB data slot too (a double fault): both home and copy are torn.
         let mut slot: Page = [0u8; PAGE_SIZE];
-        dwb.device.read_page(PageId(DWB_FIRST_DATA_SLOT), &mut slot).unwrap();
+        dwb.device
+            .read_page(PageId(DWB_FIRST_DATA_SLOT), &mut slot)
+            .unwrap();
         slot[200] ^= 0xFF; // body byte; slot checksum now fails
-        dwb.device.write_page(PageId(DWB_FIRST_DATA_SLOT), &slot).unwrap();
+        dwb.device
+            .write_page(PageId(DWB_FIRST_DATA_SLOT), &slot)
+            .unwrap();
         dwb.device.sync_data().unwrap();
 
         let mut home = MemBlockDevice::new(4);
@@ -385,7 +400,10 @@ mod tests {
         torn[100..].iter_mut().for_each(|b| *b = 0);
         home.write_page(PageId(3), &torn).unwrap();
         home.sync_data().unwrap();
-        assert!(dwb.recover_home(&mut home).is_err(), "double fault must surface as an error");
+        assert!(
+            dwb.recover_home(&mut home).is_err(),
+            "double fault must surface as an error"
+        );
     }
 
     #[test]
@@ -407,7 +425,9 @@ mod tests {
     fn batch_over_the_cap_is_rejected() {
         let mut dwb = fresh_dwb();
         let p = make_page(1, 1, 0);
-        let big: Vec<(PageId, &Page)> = (0..=DWB_MAX_BATCH).map(|i| (PageId(i as u64), &p)).collect();
+        let big: Vec<(PageId, &Page)> = (0..=DWB_MAX_BATCH)
+            .map(|i| (PageId(i as u64), &p))
+            .collect();
         assert!(dwb.stage_batch(&big).is_err());
     }
 }

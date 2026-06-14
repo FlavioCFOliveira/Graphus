@@ -212,6 +212,55 @@ pub enum AdminCommand {
     ShowRoles,
     /// `SHOW PRIVILEGES`.
     ShowPrivileges,
+
+    // ---- Operator backup / restore surface (rmp #149) ----
+    /// `BACKUP DATABASE <name> TO '<path>'` — capture an online backup chain artifact of `name`
+    /// (PITR-capable) and write it to `path`.
+    BackupDatabase {
+        /// The database to back up (the catalog normalizes + validates it).
+        name: String,
+        /// The destination file path for the artifact.
+        path: String,
+    },
+    /// `RESTORE DATABASE <name> FROM '<path>' [AT LSN <n> | AT TIMESTAMP <n>]` — restore `name` from
+    /// the backup chain artifact at `path`, to `point` (whole chain / a WAL LSN / a commit
+    /// timestamp). The database must be **stopped** first; the default database cannot be restored
+    /// in place.
+    RestoreDatabase {
+        /// The database to restore.
+        name: String,
+        /// The source backup-artifact file path.
+        path: String,
+        /// The point to restore to (PITR).
+        point: RestorePoint,
+    },
+}
+
+/// The point a [`AdminCommand::RestoreDatabase`] should recover to (`rmp` task #149). Maps 1:1 onto
+/// [`graphus_storage::RestoreTarget`]; kept separate so the admin grammar is decoupled from the
+/// storage crate's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestorePoint {
+    /// The whole committed chain (every captured transaction). The default with no `AT` clause.
+    Latest,
+    /// A specific WAL LSN (byte offset): replay up to and including the record ending there.
+    Lsn(u64),
+    /// A commit timestamp: replay up to and including the last transaction committed at or before it.
+    Timestamp(u64),
+}
+
+impl RestorePoint {
+    /// Maps onto the storage crate's [`graphus_storage::RestoreTarget`].
+    #[must_use]
+    pub fn to_target(self) -> graphus_storage::RestoreTarget {
+        match self {
+            Self::Latest => graphus_storage::RestoreTarget::Latest,
+            Self::Lsn(n) => graphus_storage::RestoreTarget::Lsn(graphus_core::Lsn(n)),
+            Self::Timestamp(t) => {
+                graphus_storage::RestoreTarget::Timestamp(graphus_core::Timestamp(t))
+            }
+        }
+    }
 }
 
 /// A grantable action in the `GRANT`/`REVOKE` grammar (mirrors [`graphus_auth::Action`] but kept
@@ -479,6 +528,15 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
     // alone (the security surface, rmp #92). Their remainder must then parse exactly.
     if verb == "GRANT" || verb == "REVOKE" {
         return match parse_grant_revoke(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // BACKUP / RESTORE are never valid Cypher statement starts either, so they are CLAIMED on the
+    // first token alone (the operator backup surface, rmp #149).
+    if verb == "BACKUP" || verb == "RESTORE" {
+        return match parse_backup_restore(&verb, &mut lex) {
             Ok(cmd) => AdminParse::Command(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
@@ -1367,6 +1425,104 @@ fn parse_grant_revoke(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, S
     })
 }
 
+/// Parses `BACKUP`/`RESTORE` (the verb already read, the statement already CLAIMED — neither is
+/// valid Cypher). Two shapes (`rmp` task #149):
+///
+/// ```text
+/// BACKUP  DATABASE <name> TO   '<path>'
+/// RESTORE DATABASE <name> FROM '<path>' [AT LSN <n> | AT TIMESTAMP <n>]
+/// ```
+///
+/// `<name>` is a bare word or a `` `backtick-quoted` `` name (the database-surface rule); `<path>` is
+/// a `'single'`- or `"double"`-quoted string literal. The optional `AT LSN`/`AT TIMESTAMP` clause
+/// (RESTORE only) selects the point-in-time recovery target; absent, it restores the whole chain.
+fn parse_backup_restore(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
+    let backing_up = verb == "BACKUP";
+    // DATABASE
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected DATABASE after {verb}"))?;
+    if !is_keyword(&kw, "DATABASE") {
+        return Err(unexpected_generic(&kw, &format!("DATABASE after {verb}")));
+    }
+    // <name>
+    let name = expect_security_name(lex, &format!("a database name after {verb} DATABASE"))?;
+    // TO (backup) / FROM (restore)
+    let connective = if backing_up { "TO" } else { "FROM" };
+    expect_security_keyword(lex, connective, verb)?;
+    // '<path>'
+    let path = match lex.next_tok()? {
+        Some(Tok::Str(p)) => p,
+        Some(other) => {
+            return Err(unexpected_generic(
+                &other,
+                &format!("a quoted file path after {connective}"),
+            ));
+        }
+        None => return Err(format!("expected a quoted file path after {connective}")),
+    };
+    if path.trim().is_empty() {
+        return Err(format!("the {connective} file path must not be empty"));
+    }
+
+    if backing_up {
+        expect_end(lex, "BACKUP DATABASE")?;
+        return Ok(AdminCommand::BackupDatabase { name, path });
+    }
+
+    // RESTORE: optional `AT LSN <n>` / `AT TIMESTAMP <n>`.
+    let point = parse_optional_restore_point(lex)?;
+    expect_end(lex, "RESTORE DATABASE")?;
+    Ok(AdminCommand::RestoreDatabase { name, path, point })
+}
+
+/// Parses an optional `AT (LSN | TIMESTAMP) <n>` clause for `RESTORE DATABASE` (`rmp` task #149).
+/// Absent ⇒ [`RestorePoint::Latest`]. `<n>` is a non-negative decimal integer.
+fn parse_optional_restore_point(lex: &mut Lexer<'_>) -> Result<RestorePoint, String> {
+    // Peek: only consume if the next token is AT.
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    match peek.next_tok()? {
+        Some(t) if is_keyword(&t, "AT") => {
+            lex.rest = peek.rest.clone();
+        }
+        _ => return Ok(RestorePoint::Latest),
+    }
+    let kind = lex
+        .next_tok()?
+        .ok_or_else(|| "expected LSN or TIMESTAMP after AT".to_owned())?;
+    let is_lsn = is_keyword(&kind, "LSN");
+    if !is_lsn && !is_keyword(&kind, "TIMESTAMP") {
+        return Err(unexpected_generic(&kind, "LSN or TIMESTAMP after AT"));
+    }
+    let n = match lex.next_tok()? {
+        Some(Tok::Word(w)) => w.parse::<u64>().map_err(|_| {
+            format!(
+                "expected a non-negative integer after AT {}, got `{w}`",
+                keyword_text(&kind)
+            )
+        })?,
+        Some(other) => {
+            return Err(unexpected_generic(
+                &other,
+                &format!("a non-negative integer after AT {}", keyword_text(&kind)),
+            ));
+        }
+        None => {
+            return Err(format!(
+                "expected a non-negative integer after AT {}",
+                keyword_text(&kind)
+            ));
+        }
+    };
+    Ok(if is_lsn {
+        RestorePoint::Lsn(n)
+    } else {
+        RestorePoint::Timestamp(n)
+    })
+}
+
 /// Parses a privilege `<scope>` in `GRANT`/`REVOKE`. The accepted forms map 1:1 onto the
 /// [`graphus_auth::Resource`] containment tree:
 ///
@@ -1994,6 +2150,29 @@ impl AdminContext {
             AdminCommand::ShowUsers => Ok(show_users(&self.security.list_users())),
             AdminCommand::ShowRoles => Ok(show_roles(&self.security.list_roles())),
             AdminCommand::ShowPrivileges => Ok(show_privileges(&self.security.list_privileges())),
+
+            // ---- Operator backup / restore surface (rmp #149) ----
+            AdminCommand::BackupDatabase { name, path } => {
+                let outcome = {
+                    let catalog = Arc::clone(&self.catalog);
+                    let (name, path) = (name.clone(), std::path::PathBuf::from(path));
+                    self.run_on_runtime(async move { catalog.backup(&name, &path).await })?
+                };
+                outcome
+                    .map(|()| AdminResult::empty())
+                    .map_err(|e| graphus_error_from_catalog(&e))
+            }
+            AdminCommand::RestoreDatabase { name, path, point } => {
+                let outcome = {
+                    let catalog = Arc::clone(&self.catalog);
+                    let (name, path) = (name.clone(), std::path::PathBuf::from(path));
+                    let target = point.to_target();
+                    self.run_on_runtime(async move { catalog.restore(&name, &path, target).await })?
+                };
+                outcome
+                    .map(|()| AdminResult::empty())
+                    .map_err(|e| graphus_error_from_catalog(&e))
+            }
         }
     }
 
@@ -2187,6 +2366,7 @@ fn graphus_error_from_catalog(e: &CatalogError) -> GraphusError {
         | CatalogError::AlreadyExists(_)
         | CatalogError::UnknownDatabase(_)
         | CatalogError::NotOffline(_)
+        | CatalogError::Backup(_)
         | CatalogError::DefaultDatabase { .. } => GraphusError::Runtime(e.to_string()),
         CatalogError::Io { .. }
         | CatalogError::Corrupt { .. }

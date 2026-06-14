@@ -51,10 +51,14 @@ struct ExtraState {
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
+    /// Optional Prometheus scrape token (rmp #149). `None` ⇒ `/metrics` requires an **admin Bearer**;
+    /// `Some(token)` ⇒ `/metrics` also accepts `Authorization: Bearer <token>` (constant-time match).
+    metrics_scrape_token: Option<Arc<str>>,
 }
 
 /// Builds the observability + admin routes as a standalone `Router` to be merged onto the REST API
 /// router.
+#[allow(clippy::too_many_arguments)] // The server routes legitimately aggregate the shared services.
 pub fn routes(
     metrics: Arc<Metrics>,
     engine: EngineHandle,
@@ -62,6 +66,7 @@ pub fn routes(
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
+    metrics_scrape_token: Option<Arc<str>>,
 ) -> Router {
     let state = ExtraState {
         metrics,
@@ -70,6 +75,7 @@ pub fn routes(
         clock,
         shutdown,
         readiness,
+        metrics_scrape_token,
     };
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -81,10 +87,16 @@ pub fn routes(
         .with_state(state)
 }
 
-/// `GET /metrics` — Prometheus text exposition (`04 §9` / NFR-10). Unauthenticated by design: it is a
-/// scrape endpoint, conventionally bound on a trusted network; it exposes only aggregate counters,
-/// no data.
-async fn metrics_handler(State(state): State<ExtraState>) -> Response {
+/// `GET /metrics` — Prometheus text exposition (`04 §9` / NFR-10). **Fail-closed** (rmp #149): a
+/// scrape must authenticate, either with the configured scrape token (`Authorization: Bearer
+/// <token>`, constant-time compared) or — when no token is configured — with a valid **admin Bearer**
+/// (the same gate as `/admin/*`). It exposes only aggregate counters (no data), but an unauthenticated
+/// metrics endpoint leaks operational signal (query volumes, error rates, tenant activity) and is a
+/// production hazard, so it is closed by default. The `/health/*` probes stay open.
+async fn metrics_handler(State(state): State<ExtraState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize_metrics(&state, &headers) {
+        return *resp;
+    }
     let body = state.metrics.render_prometheus();
     (
         StatusCode::OK,
@@ -95,6 +107,37 @@ async fn metrics_handler(State(state): State<ExtraState>) -> Response {
         body,
     )
         .into_response()
+}
+
+/// Authorizes a `/metrics` scrape (rmp #149): accept a configured scrape token (constant-time
+/// compared) when present, otherwise fall back to requiring an admin Bearer (the `/admin/*` gate).
+/// Returns the boxed error response on failure (a `Response` is large — see [`require_admin`]).
+fn authorize_metrics(state: &ExtraState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if let (Some(expected), Some(presented)) =
+        (state.metrics_scrape_token.as_deref(), bearer_token(headers))
+    {
+        if constant_time_eq(expected.as_bytes(), presented.as_bytes()) {
+            return Ok(());
+        }
+    }
+    // No (matching) scrape token: require an admin Bearer. `require_admin` records an auth failure
+    // metric on a bad/missing token and returns the boxed 401/403, so a probe with neither a valid
+    // scrape token nor an admin Bearer is fail-closed.
+    require_admin(state, headers).map(|_who| ())
+}
+
+/// Constant-time byte-slice equality, so a scrape-token comparison does not leak the secret's length
+/// or a matching prefix through timing. Returns `false` immediately on a length mismatch (the length
+/// of a *rejected* guess is not the secret's length), then folds every byte of equal-length inputs.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// `GET /health/live` — liveness: always `200 OK` while the process runs (`04 §9`).

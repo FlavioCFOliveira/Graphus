@@ -322,6 +322,19 @@ pub struct ServerConfig {
     /// loopback test harnesses and trusted-network/dev setups. The name is deliberately alarming so
     /// it is never set in production by accident.
     pub allow_insecure_network: bool,
+
+    /// Optional **bearer token** that authenticates Prometheus scrapes of `/metrics` (rmp #149).
+    ///
+    /// `/metrics` is **fail-closed** by default: when this is `None`, a scrape must present a valid
+    /// **admin Bearer token** (the same gate as `/admin/*`). When set to `Some(token)`, a scraper may
+    /// alternatively present `Authorization: Bearer <token>` (compared in constant time) — the
+    /// conventional shared-secret a Prometheus server holds, so it need not be a full admin. The
+    /// liveness/readiness probes (`/health/live`, `/health/ready`) stay open regardless.
+    ///
+    /// Overridable via `GRAPHUS_METRICS_SCRAPE_TOKEN`. An **explicitly empty** value is a
+    /// misconfiguration (a blank shared secret authenticates nobody safely) and is rejected by
+    /// [`validate`](Self::validate); leave it unset to require an admin Bearer instead.
+    pub metrics_scrape_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -342,6 +355,7 @@ impl Default for ServerConfig {
             encryption: EncryptionConfig::default(),
             audit: AuditConfig::default(),
             allow_insecure_network: false,
+            metrics_scrape_token: None,
         }
     }
 }
@@ -449,6 +463,11 @@ impl ServerConfig {
         }
         if let Ok(v) = var("GRAPHUS_ENCRYPTION_KEY_PATH") {
             self.encryption.key_path = empty_to_none(v).map(PathBuf::from);
+        }
+        if let Ok(v) = var("GRAPHUS_METRICS_SCRAPE_TOKEN") {
+            // Unlike a listener address, an empty value here is NOT "disable": it is an explicit blank
+            // secret, which `validate` rejects. Carry it verbatim so the validator can catch it.
+            self.metrics_scrape_token = Some(v);
         }
         if let Ok(v) = var("GRAPHUS_MAX_CONCURRENT_QUERIES") {
             self.admission.max_concurrent_queries = v.parse().map_err(|_| {
@@ -569,6 +588,18 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "rest_addr is enabled but jwt_secret is the insecure default: set a real secret via \
                  the config file or GRAPHUS_JWT_SECRET"
+                    .to_owned(),
+            ));
+        }
+        if self
+            .metrics_scrape_token
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "metrics_scrape_token is set but empty: a blank scrape secret authenticates nobody \
+                 safely. Leave it unset to require an admin Bearer for /metrics, or set a real \
+                 token."
                     .to_owned(),
             ));
         }

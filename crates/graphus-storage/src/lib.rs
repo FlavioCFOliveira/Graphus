@@ -75,16 +75,16 @@ pub use backup::{
     BACKUP_FORMAT_VERSION, BACKUP_MAGIC, backup_creation_marker, backup_store, restore,
     restore_file_atomic, restore_onto, verify_backup,
 };
-pub use dwb::{DWB_MAX_BATCH, Dwb, dwb_device_pages};
 pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, HeapChainFault,
     IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, Violation, verify_on_open,
 };
+pub use dwb::{DWB_MAX_BATCH, Dwb, dwb_device_pages};
 pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use incremental::{
-    CHAIN_FORMAT_VERSION, ChainLinks, ChainManifest, IncrementMeta, LinkCodec, Plain,
-    RestoreTarget, begin_chain, capture_increment, restore_chain_file_atomic, restore_to,
+    CHAIN_FORMAT_VERSION, ChainArtifact, ChainLinks, ChainManifest, IncrementMeta, LinkCodec,
+    Plain, RestoreTarget, begin_chain, capture_increment, restore_chain_file_atomic, restore_to,
     verify_chain,
 };
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
