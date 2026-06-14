@@ -434,7 +434,9 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
         | LogicalOp::Merge { input, .. }
         | LogicalOp::SetClause { input, .. }
         | LogicalOp::Delete { input, .. }
-        | LogicalOp::Remove { input, .. } => estimate(input, stats),
+        | LogicalOp::Remove { input, .. }
+        // FOREACH passes each input row through unchanged (a per-row side effect): same cardinality.
+        | LogicalOp::Foreach { input, .. } => estimate(input, stats),
 
         // ---- procedure ----------------------------------------------------------------------------
 
@@ -703,7 +705,8 @@ fn label_for_var(op: &LogicalOp, variable: &str) -> Option<String> {
         | LogicalOp::Merge { input, .. }
         | LogicalOp::SetClause { input, .. }
         | LogicalOp::Delete { input, .. }
-        | LogicalOp::Remove { input, .. } => label_for_var(input, variable),
+        | LogicalOp::Remove { input, .. }
+        | LogicalOp::Foreach { input, .. } => label_for_var(input, variable),
         // Binary operators: the binding may be on either side.
         LogicalOp::Apply { left, right } | LogicalOp::Union { left, right, .. } => {
             label_for_var(left, variable).or_else(|| label_for_var(right, variable))

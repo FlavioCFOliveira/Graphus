@@ -494,6 +494,14 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             }
             walk_physical(input, record);
         }
+        PhysicalOp::Foreach {
+            input, list, body, ..
+        } => {
+            params_in_expr(list, ParamType::Any, record);
+            walk_physical(input, record);
+            // The body sub-plan may reference `$param`s in its inner update clauses.
+            walk_physical(body, record);
+        }
         PhysicalOp::ProcedureCall { input, args, .. } => {
             if let Some(args) = args {
                 for a in args {
@@ -714,6 +722,10 @@ fn params_in_single_query(sq: &SingleQuery, record: &mut impl FnMut(&str, ParamT
                     }
                 }
             }
+            Clause::Foreach(f) => {
+                params_in_expr(&f.list, ParamType::Any, record);
+                params_in_clauses(&f.body, record);
+            }
             Clause::With(w) => {
                 params_in_projection_body(&w.body, record);
                 if let Some(p) = &w.where_clause {
@@ -723,6 +735,19 @@ fn params_in_single_query(sq: &SingleQuery, record: &mut impl FnMut(&str, ParamT
             Clause::Return(r) => params_in_projection_body(&r.body, record),
         }
     }
+}
+
+/// Walks a list of clauses (e.g. a `FOREACH` body), reporting each `$param` reference through
+/// `record`. Shares the per-clause logic with [`params_in_single_query`] by iterating directly.
+fn params_in_clauses(clauses: &[Clause], record: &mut impl FnMut(&str, ParamType)) {
+    // A `FOREACH` body is a `Vec<Clause>` (not a `SingleQuery`); reuse the single-query walker by
+    // wrapping it in an ad-hoc single query is unnecessary — recurse over the inner clauses through a
+    // synthetic `SingleQuery` view so the same per-clause arms apply.
+    let view = SingleQuery {
+        clauses: clauses.to_vec(),
+        span: crate::lexer::Span::new(0, 0),
+    };
+    params_in_single_query(&view, record);
 }
 
 fn params_in_set_item(item: &SetItem, record: &mut impl FnMut(&str, ParamType)) {

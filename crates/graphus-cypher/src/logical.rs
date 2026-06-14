@@ -412,6 +412,27 @@ pub enum LogicalOp {
         ops: Vec<RemoveOp>,
     },
 
+    /// Run the inner update sub-plan once per `(input row, list element)` for its side effects,
+    /// passing each input row through unchanged (openCypher `FOREACH ( var IN list | …+ )`).
+    ///
+    /// For every `input` row, `list` is evaluated once; for each element the loop `variable` is bound
+    /// onto the row and the correlated `body` sub-plan — rooted at an [`Argument`](Self::Argument)
+    /// leaf carrying the outer row's variables plus `variable` — is driven and **fully drained** for
+    /// its side effects, then discarded. The loop variable is local: it does not escape into the
+    /// emitted row, so `Foreach`'s output columns equal its `input`'s. `FOREACH` does not change row
+    /// cardinality.
+    Foreach {
+        /// The upstream relation driving the iteration (one pass per row).
+        input: Box<LogicalOp>,
+        /// The loop variable bound to each list element (local to the body).
+        variable: Var,
+        /// The list expression, evaluated once per input row (unevaluated AST).
+        list: Expr,
+        /// The inner update sub-plan, rooted at an [`Argument`](Self::Argument) leaf and driven once
+        /// per `(input row, list element)` for its side effects.
+        body: Box<LogicalOp>,
+    },
+
     // ---- procedure ----------------------------------------------------------------------------
     /// Invoke a procedure and stream its result rows, binding the `yields` columns (openCypher
     /// `CALL proc(args) [YIELD ...]`).
@@ -834,6 +855,16 @@ impl LogicalOp {
             }
             Self::Remove { input, ops } => {
                 writeln!(f, "Remove({})", fmt_remove_ops(ops))?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::Foreach {
+                input,
+                variable,
+                body,
+                ..
+            } => {
+                writeln!(f, "Foreach({})", variable.name)?;
+                body.fmt_indented(f, depth + 1)?;
                 input.fmt_indented(f, depth + 1)
             }
 

@@ -483,6 +483,16 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(inner.rows, inner.cost + inner.rows * COST_ROW_SCAN)
         }
 
+        // FOREACH passes each input row through unchanged (cardinality = input's), but runs the body
+        // sub-plan once per (input row, list element). Model the body's per-element cost over an
+        // assumed list length, so a body of heavy writes is costed proportionally to the iterations.
+        PhysicalOp::Foreach { input, body, .. } => {
+            let inner = estimate_cost(input, stats);
+            let body_cost = estimate_cost(body, stats).cost;
+            let iterations = inner.rows * DEFAULT_LIST_LENGTH;
+            CostEstimate::new(inner.rows, inner.cost + iterations * body_cost)
+        }
+
         // ---- procedure ----------------------------------------------------------------------------
 
         // A correlated call yields a default per driving row; a leading call yields the default once.

@@ -179,6 +179,8 @@ pub enum TokenKind {
     Remove,
     /// `UNWIND`
     Unwind,
+    /// `FOREACH`
+    Foreach,
     /// `CALL`
     Call,
     /// `YIELD`
@@ -1195,6 +1197,7 @@ fn keyword_or_identifier(text: &str) -> TokenKind {
         "detach" => TokenKind::Detach,
         "remove" => TokenKind::Remove,
         "unwind" => TokenKind::Unwind,
+        "foreach" => TokenKind::Foreach,
         "call" => TokenKind::Call,
         "yield" => TokenKind::Yield,
         "order" => TokenKind::Order,
@@ -1565,6 +1568,16 @@ mod tests {
         assert_eq!(kinds("wherever"), vec![ident("wherever")]);
         // ...but the exact word (any case) is the keyword.
         assert_eq!(kinds("MaTcH"), vec![TokenKind::Match]);
+    }
+
+    #[test]
+    fn foreach_is_a_reserved_keyword() {
+        // `FOREACH` lexes as the reserved keyword (case-insensitive), and `|` as `Pipe`.
+        assert_eq!(kinds("FOREACH"), vec![TokenKind::Foreach]);
+        assert_eq!(kinds("foreach"), vec![TokenKind::Foreach]);
+        assert_eq!(kinds("ForEach"), vec![TokenKind::Foreach]);
+        // A lookalike is a plain identifier, not the keyword.
+        assert_eq!(kinds("foreaches"), vec![ident("foreaches")]);
     }
 
     #[test]

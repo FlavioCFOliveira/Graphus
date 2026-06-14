@@ -331,6 +331,12 @@ fn collect_clause_literals(clause: &Clause, out: &mut Vec<LiteralSite>) {
                 }
             }
         }
+        Clause::Foreach(f) => {
+            collect_expr_literals(&f.list, out);
+            for inner in &f.body {
+                collect_clause_literals(inner, out);
+            }
+        }
         Clause::With(w) => {
             collect_projection_body_literals(&w.body, out);
             if let Some(p) = &w.where_clause {

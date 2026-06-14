@@ -2035,3 +2035,174 @@ fn list_concatenation_preserves_structural_elements() {
         "concatenation kept the node references"
     );
 }
+
+// =================================================================================================
+// FOREACH (rmp #122): a per-row side-effect that runs its update body once per list element. It does
+// not change row cardinality and the loop variable does not escape.
+// =================================================================================================
+
+#[test]
+fn foreach_creates_one_node_per_list_element() {
+    let mut g = MemGraph::new();
+    let rows = run("FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))", &mut g);
+    assert_eq!(
+        rows.len(),
+        0,
+        "a bare FOREACH is a write root: zero result rows"
+    );
+    assert_eq!(g.node_count(), 3, "one node created per list element");
+    let mut vs: Vec<Value> = g
+        .scan_nodes_by_label("N")
+        .into_iter()
+        .map(|id| g.node_property(id, "v").unwrap())
+        .collect();
+    vs.sort_by_key(|v| match v {
+        Value::Integer(n) => *n,
+        _ => panic!("expected integer property"),
+    });
+    assert_eq!(vs, vec![i(1), i(2), i(3)]);
+}
+
+#[test]
+fn foreach_set_mutates_an_outer_bound_node_per_element() {
+    let mut g = MemGraph::new();
+    let n = g.add_node(["Acc"], [("total", i(0))]);
+    // For each element, overwrite `total` with that element; the last element wins.
+    run(
+        "MATCH (n:Acc) FOREACH (x IN [10, 20, 30] | SET n.total = x)",
+        &mut g,
+    );
+    assert_eq!(
+        g.node_property(n, "total"),
+        Some(i(30)),
+        "SET inside FOREACH mutated the outer node, last element wins"
+    );
+}
+
+#[test]
+fn foreach_delete_removes_collected_nodes() {
+    let mut g = MemGraph::new();
+    g.add_node(["Doomed"], NO_PROPS);
+    g.add_node(["Doomed"], NO_PROPS);
+    g.add_node(["Keep"], NO_PROPS);
+    // Collect the doomed nodes into a list, then delete each one inside FOREACH.
+    run(
+        "MATCH (n:Doomed) WITH collect(n) AS ns FOREACH (n IN ns | DELETE n)",
+        &mut g,
+    );
+    assert_eq!(
+        g.scan_nodes_by_label("Doomed").len(),
+        0,
+        "all doomed deleted"
+    );
+    assert_eq!(
+        g.scan_nodes_by_label("Keep").len(),
+        1,
+        "the keeper survives"
+    );
+    assert_eq!(g.node_count(), 1);
+}
+
+#[test]
+fn nested_foreach_flattens_and_creates() {
+    let mut g = MemGraph::new();
+    run(
+        "FOREACH (x IN [[1, 2], [3]] | FOREACH (y IN x | CREATE (:N {v: y})))",
+        &mut g,
+    );
+    assert_eq!(
+        g.node_count(),
+        3,
+        "nested FOREACH creates one node per leaf element"
+    );
+    let mut vs: Vec<i64> = g
+        .scan_nodes_by_label("N")
+        .into_iter()
+        .map(|id| match g.node_property(id, "v").unwrap() {
+            Value::Integer(n) => n,
+            _ => panic!("expected integer"),
+        })
+        .collect();
+    vs.sort_unstable();
+    assert_eq!(vs, vec![1, 2, 3]);
+}
+
+#[test]
+fn foreach_over_empty_list_is_a_no_op() {
+    let mut g = MemGraph::new();
+    let rows = run("FOREACH (x IN [] | CREATE (:N {v: x}))", &mut g);
+    assert_eq!(rows.len(), 0);
+    assert_eq!(g.node_count(), 0, "an empty list yields zero iterations");
+}
+
+#[test]
+fn foreach_over_null_is_a_no_op() {
+    let mut g = MemGraph::new();
+    let n = g.add_node(["Host"], NO_PROPS); // no `items` property → n.items is null
+    // FOREACH over a null list performs zero iterations and leaves the graph untouched.
+    run(
+        "MATCH (n:Host) FOREACH (x IN n.items | CREATE (:N {v: x}))",
+        &mut g,
+    );
+    assert_eq!(g.node_count(), 1, "only the pre-existing host node remains");
+    assert_eq!(g.scan_nodes_by_label("N").len(), 0);
+    let _ = n;
+}
+
+#[test]
+fn foreach_preserves_input_cardinality() {
+    let mut g = MemGraph::new();
+    g.add_node(["Driver"], [("name", s("a"))]);
+    g.add_node(["Driver"], [("name", s("b"))]);
+    // Two driving rows; FOREACH runs its body per row and passes BOTH rows through to RETURN.
+    let rows = run(
+        "MATCH (d:Driver) FOREACH (x IN [1] | CREATE (:Made)) RETURN d.name AS name",
+        &mut g,
+    );
+    let mut names: Vec<Value> = rows.iter().map(|r| r.value("name")).collect();
+    names.sort_by_key(|v| match v {
+        Value::String(s) => s.clone(),
+        _ => panic!("expected string"),
+    });
+    assert_eq!(
+        names,
+        vec![s("a"), s("b")],
+        "both driving rows pass through"
+    );
+    assert_eq!(
+        g.scan_nodes_by_label("Made").len(),
+        2,
+        "the body ran once per driving row (cardinality preserved)"
+    );
+}
+
+#[test]
+fn foreach_loop_variable_does_not_escape_into_returned_row() {
+    let mut g = MemGraph::new();
+    // The loop variable `x` is local; the body's SET captures it, but it never appears on the row.
+    let n = g.add_node(["Acc"], NO_PROPS);
+    let rows = run(
+        "MATCH (n:Acc) FOREACH (x IN [7] | SET n.v = x) RETURN n.v AS v",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("v"), i(7));
+    assert_eq!(g.node_property(n, "v"), Some(i(7)));
+}
+
+#[test]
+fn foreach_over_non_list_is_a_runtime_type_error() {
+    let mut g = MemGraph::new();
+    let src = "FOREACH (x IN 5 | CREATE (:N {v: x}))";
+    let toks = tokenize(src).unwrap();
+    let ast = parse_tokens(&toks, src).unwrap();
+    let plan = plan_physical(&lower(&analyze(&ast).unwrap()), &IndexCatalog::empty());
+    let bound = bind_parameters(&plan, &Parameters::new()).unwrap();
+    let mut cursor = execute(&plan, &bound, &mut g).unwrap();
+    let err = cursor.collect_all().unwrap_err();
+    assert!(
+        matches!(err, ExecError::Eval(_)),
+        "FOREACH over a non-list value is a runtime TypeError, got {err:?}"
+    );
+    assert_eq!(g.node_count(), 0, "no side effect ran for the bad list");
+}

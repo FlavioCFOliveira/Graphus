@@ -97,10 +97,11 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    Clause, CreateClause, DeleteClause, Expr, ExprKind, LoadCsvClause, MatchClause, MergeAction,
-    MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind, ProjectionBody,
-    ProjectionItem, Query, QueryBody, RelType, RelationshipPattern, RemoveClause, RemoveItem,
-    SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
+    Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause, LoadCsvClause, MatchClause,
+    MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind,
+    ProjectionBody, ProjectionItem, Query, QueryBody, RelType, RelationshipPattern, RemoveClause,
+    RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield, UnionPart,
+    UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -258,6 +259,7 @@ impl Planner {
             Clause::Set(s) => self.lower_set(s, current),
             Clause::Delete(d) => self.lower_delete(d, current),
             Clause::Remove(r) => self.lower_remove(r, current),
+            Clause::Foreach(f) => self.lower_foreach(f, current),
             Clause::With(w) => {
                 self.lower_projection_body(&w.body, w.where_clause.as_ref(), w.span, current)
             }
@@ -1172,6 +1174,38 @@ impl Planner {
         }
     }
 
+    /// Lowers `FOREACH ( var IN list | <update-clause>+ )`.
+    ///
+    /// The inner body is a **correlated** sub-plan: it is rooted at an [`Argument`](LogicalOp::Argument)
+    /// leaf that carries the variables visible to the body — every variable bound by the driving
+    /// `input` plus the loop `variable`. The body's update clauses are folded left-to-right over that
+    /// leaf with the same per-clause lowering the main loop uses, so a `CREATE`/`MERGE` binding is
+    /// visible to a later body clause (and stays local to the body). The executor drives this sub-plan
+    /// once per `(input row, list element)` for its side effects (see
+    /// [`LogicalOp::Foreach`](LogicalOp::Foreach)).
+    fn lower_foreach(&mut self, f: &ForeachClause, current: Option<LogicalOp>) -> LogicalOp {
+        let input = current.unwrap_or(LogicalOp::Empty);
+
+        // The body reads the driving row's variables plus the loop variable through the Argument leaf.
+        let mut arguments = collect_bound_vars(&input);
+        let loop_var = Var::named(&f.variable.name);
+        push_unique(&mut arguments, loop_var.clone());
+
+        let mut body: Option<LogicalOp> = Some(LogicalOp::Argument { arguments });
+        for clause in &f.body {
+            body = Some(self.lower_clause(clause, body));
+        }
+        // Semantic analysis guarantees a non-empty FOREACH body, so `body` is always `Some`.
+        let body = body.unwrap_or(LogicalOp::Empty);
+
+        LogicalOp::Foreach {
+            input: Box::new(input),
+            variable: loop_var,
+            list: f.list.clone(),
+            body: Box::new(body),
+        }
+    }
+
     /// Lowers create/merge pattern parts into the flat [`CreatePart`] list.
     ///
     /// Each pattern element becomes one [`CreatePart::Node`] per node and one
@@ -1762,6 +1796,9 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
         LogicalOp::SetClause { input, .. }
         | LogicalOp::Delete { input, .. }
         | LogicalOp::Remove { input, .. } => gather_bound_vars(input, out),
+        // FOREACH passes its input row through unchanged; the loop variable is local to the body and
+        // does not escape, so only the input's bindings are visible downstream.
+        LogicalOp::Foreach { input, .. } => gather_bound_vars(input, out),
         LogicalOp::ProcedureCall { input, yields, .. } => {
             if let Some(input) = input {
                 gather_bound_vars(input, out);

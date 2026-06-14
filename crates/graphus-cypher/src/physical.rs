@@ -623,6 +623,19 @@ pub enum PhysicalOp {
         /// The removals, in source order.
         ops: Vec<RemoveOp>,
     },
+    /// Run the inner update sub-plan once per `(input row, list element)` for its side effects,
+    /// passing each input row through unchanged (`FOREACH`). The `body` is correlated (rooted at an
+    /// [`Argument`](PhysicalOp::Argument) leaf); the executor rebuilds it per `(row, element)`.
+    Foreach {
+        /// The upstream relation driving the iteration.
+        input: Box<PhysicalOp>,
+        /// The loop variable bound to each list element (local to the body).
+        variable: Var,
+        /// The list expression, evaluated once per input row.
+        list: Expr,
+        /// The correlated inner update sub-plan (Argument-rooted).
+        body: Box<PhysicalOp>,
+    },
 
     // ---- procedure ----------------------------------------------------------------------------
     /// Invoke a procedure, binding the `yields` columns (`CALL … YIELD`).
@@ -986,6 +999,20 @@ impl Planner<'_> {
                 input: Box::new(self.lower(input, deps)),
                 ops: ops.clone(),
             },
+            LogicalOp::Foreach {
+                input,
+                variable,
+                list,
+                body,
+            } => PhysicalOp::Foreach {
+                // Eagerness barrier (openCypher "Eager" rule): FOREACH is a write, so a read feeding
+                // it is fully drained before any iteration runs (same rationale as CREATE/DELETE).
+                input: Box::new(eager_for_read_write(self.lower(input, deps))),
+                variable: variable.clone(),
+                list: list.clone(),
+                // The body is the correlated update sub-plan (Argument-rooted); lower it directly.
+                body: Box::new(self.lower(body, deps)),
+            },
 
             // ---- procedure -------------------------------------------------------------------
             LogicalOp::ProcedureCall {
@@ -1220,6 +1247,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::SetClause { input, .. }
         | PhysicalOp::Delete { input, .. }
         | PhysicalOp::Remove { input, .. }
+        | PhysicalOp::Foreach { input, .. }
         | PhysicalOp::Optional { input, .. } => contains_read(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
@@ -1237,7 +1265,8 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::Merge { .. }
         | PhysicalOp::SetClause { .. }
         | PhysicalOp::Delete { .. }
-        | PhysicalOp::Remove { .. } => true,
+        | PhysicalOp::Remove { .. }
+        | PhysicalOp::Foreach { .. } => true,
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
@@ -1605,6 +1634,18 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             input: opt(input),
             ops,
         },
+        PhysicalOp::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => PhysicalOp::Foreach {
+            input: opt(input),
+            variable,
+            list,
+            // The body is a self-contained correlated sub-plan; optimise it like any other child.
+            body: opt(body),
+        },
 
         // Procedure call (optional input).
         PhysicalOp::ProcedureCall {
@@ -1886,7 +1927,11 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::Merge { input, .. }
         | PhysicalOp::SetClause { input, .. }
         | PhysicalOp::Delete { input, .. }
-        | PhysicalOp::Remove { input, .. } => contains_argument(input),
+        | PhysicalOp::Remove { input, .. }
+        // FOREACH's `body` is intentionally Argument-rooted, but that Argument is internal — it is
+        // resolved by FOREACH itself, exactly like a NestedLoopJoin's right branch. So the whole
+        // FOREACH op is correlated iff its `input` is; the body's Argument must not leak out.
+        | PhysicalOp::Foreach { input, .. } => contains_argument(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
@@ -2170,6 +2215,12 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::SetClause { input, .. }
         | PhysicalOp::Delete { input, .. }
         | PhysicalOp::Remove { input, .. } => gather_index_dependencies(input, deps),
+        // FOREACH's body sub-plan may itself touch indexed entities (its writes), so collect from
+        // both the driving input and the body.
+        PhysicalOp::Foreach { input, body, .. } => {
+            gather_index_dependencies(input, deps);
+            gather_index_dependencies(body, deps);
+        }
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
@@ -2718,7 +2769,9 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         }
         PhysicalOp::SetClause { input, .. }
         | PhysicalOp::Delete { input, .. }
-        | PhysicalOp::Remove { input, .. } => gather_bound_vars(input, out),
+        | PhysicalOp::Remove { input, .. }
+        // FOREACH's loop variable is local; only the input's bindings survive downstream.
+        | PhysicalOp::Foreach { input, .. } => gather_bound_vars(input, out),
         PhysicalOp::ProcedureCall { input, yields, .. } => {
             if let Some(input) = input {
                 gather_bound_vars(input, out);
@@ -3038,6 +3091,16 @@ impl PhysicalOp {
             }
             Self::Remove { input, ops } => {
                 writeln!(f, "Remove({})", h::remove_ops(ops))?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::Foreach {
+                input,
+                variable,
+                body,
+                ..
+            } => {
+                writeln!(f, "Foreach({})", variable.name)?;
+                body.fmt_indented(f, depth + 1)?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::ProcedureCall {

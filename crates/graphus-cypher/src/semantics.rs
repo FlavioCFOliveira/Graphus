@@ -123,12 +123,12 @@
 //! **`SET`-on-non-entity** static rejection — the parser already constrains `SET` targets to
 //! variables / property chains, and whether the target *is* an entity is generally a runtime fact,
 //! so only the structural part is enforced here; (3) the exotic productions the parser
-//! itself defers (`FOREACH`, `CALL { subquery }`, DDL); (4) the two-letter Neo4j **status codes**
+//! itself defers (`CALL { subquery }`, DDL); (4) the two-letter Neo4j **status codes**
 //! (escalated, `02 Q2`).
 
 use crate::ast::{
-    BinaryOp, Clause, CreateClause, DeleteClause, Expr, ExprKind, Literal, LoadCsvClause,
-    MatchClause, MergeAction, MergeClause, NodePattern, PatternElement, PatternPart,
+    BinaryOp, Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause, Literal,
+    LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern, PatternElement, PatternPart,
     PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection,
     RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, SortItem,
     StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, Variable, YieldItem,
@@ -702,6 +702,7 @@ impl Analyzer<'_> {
                 Clause::Set(s) => self.check_set(s, &scope)?,
                 Clause::Delete(d) => self.check_delete(d, &scope)?,
                 Clause::Remove(r) => self.check_remove(r, &scope)?,
+                Clause::Foreach(f) => self.check_foreach(f, &scope)?,
                 Clause::With(w) => {
                     // Projection boundary: WHERE/ORDER BY see the *post*-projection scope.
                     scope = self.check_projection(
@@ -766,6 +767,7 @@ impl Analyzer<'_> {
                     | Clause::Set(_)
                     | Clause::Delete(_)
                     | Clause::Remove(_)
+                    | Clause::Foreach(_)
             ) {
                 return Err(SemanticError::new(
                     SemanticErrorKind::InvalidClauseComposition {
@@ -853,6 +855,44 @@ impl Analyzer<'_> {
         Self::check_pattern_predicate_placement(&u.expr, false)?;
         self.reject_aggregation(&u.expr, "UNWIND")?;
         scope.bind(&u.alias.name, VarKind::Value, u.alias.span)
+    }
+
+    /// Validates a `FOREACH ( var IN list | <update-clause>+ )` clause.
+    ///
+    /// The `list` expression is resolved in the **current** scope (aggregation forbidden, like
+    /// `UNWIND`). The loop `variable` is then bound into a **local** scope clone for the body; it does
+    /// not escape (`FOREACH` is a per-row side-effect that passes the input row through unchanged), so
+    /// the outer `scope` is left untouched. Each body clause is validated with the same per-clause
+    /// checker the top level uses; the parser already guarantees only updating clauses appear, but a
+    /// defensive fallback rejects any other clause as `InvalidClauseComposition` rather than panicking.
+    /// Inner `CREATE`/`MERGE` bindings flow into the local scope (visible to later body clauses) and
+    /// are discarded with it — matching the manual's "variable context within FOREACH is separate".
+    fn check_foreach(&self, f: &ForeachClause, scope: &Scope) -> Result<(), SemanticError> {
+        self.check_expr(&f.list, scope)?;
+        Self::check_pattern_predicate_placement(&f.list, false)?;
+        self.reject_aggregation(&f.list, "FOREACH")?;
+
+        let mut inner = scope.clone();
+        inner.bind(&f.variable.name, VarKind::Value, f.variable.span)?;
+        for clause in &f.body {
+            match clause {
+                Clause::Create(c) => self.check_create(c, &mut inner)?,
+                Clause::Merge(m) => self.check_merge(m, &mut inner)?,
+                Clause::Set(s) => self.check_set(s, &inner)?,
+                Clause::Delete(d) => self.check_delete(d, &inner)?,
+                Clause::Remove(r) => self.check_remove(r, &inner)?,
+                Clause::Foreach(nested) => self.check_foreach(nested, &inner)?,
+                other => {
+                    return Err(SemanticError::new(
+                        SemanticErrorKind::InvalidClauseComposition {
+                            reason: "only updating clauses are allowed inside FOREACH",
+                        },
+                        other.span(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validates a `LOAD CSV` clause: the source-URL expression is resolved in the *current* scope

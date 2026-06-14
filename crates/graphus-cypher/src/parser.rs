@@ -56,13 +56,13 @@
 
 use crate::ast::{
     BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause,
-    ExistsSubquery, Expr, ExprKind, Label, ListComprehension, Literal, LoadCsvClause, MapKey,
-    MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink, PatternComprehension,
-    PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody,
-    ProjectionItem, QuantifierExpr, QuantifierKind, Query, QueryBody, RelDirection, RelType,
-    RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery,
-    SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause,
-    VarLengthRange, Variable, WithClause, YieldItem,
+    ExistsSubquery, Expr, ExprKind, ForeachClause, Label, ListComprehension, Literal,
+    LoadCsvClause, MapKey, MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink,
+    PatternComprehension, PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall,
+    ProjectionBody, ProjectionItem, QuantifierExpr, QuantifierKind, Query, QueryBody, RelDirection,
+    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
+    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart,
+    UnwindClause, VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -476,6 +476,7 @@ impl<'t, 's> Parser<'t, 's> {
             TokenKind::Set => Clause::Set(self.parse_set()?),
             TokenKind::Detach | TokenKind::Delete => Clause::Delete(self.parse_delete()?),
             TokenKind::Remove => Clause::Remove(self.parse_remove()?),
+            TokenKind::Foreach => Clause::Foreach(self.parse_foreach()?),
             TokenKind::With => Clause::With(self.parse_with()?),
             TokenKind::Return => Clause::Return(self.parse_return()?),
             // Not a clause start: `UNION`, `;`, or trailing garbage. Stop the clause loop.
@@ -517,6 +518,54 @@ impl<'t, 's> Parser<'t, 's> {
         Ok(UnwindClause {
             expr,
             alias,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parses
+    /// `Foreach = 'FOREACH', '(', Variable, 'IN', Expression, '|', { UpdatingClause }, ')'`.
+    ///
+    /// The body is restricted to **updating** clauses only — `CREATE`, `SET`, `[DETACH] DELETE`,
+    /// `REMOVE`, `MERGE`, and a nested `FOREACH`. Any reading / projection clause (`MATCH`,
+    /// `OPTIONAL MATCH`, `WITH`, `RETURN`, `UNWIND`, `CALL`, `LOAD CSV`) at the inner-clause position
+    /// is a [`SyntaxError`] (`SyntaxErrorKind::Expected`). At least one update clause is required —
+    /// an empty body is a syntax error.
+    fn parse_foreach(&mut self) -> Result<ForeachClause, SyntaxError> {
+        let start = self.here_span().start;
+        self.expect(&TokenKind::Foreach, "FOREACH")?;
+        self.expect(&TokenKind::LParen, "'(' to begin a FOREACH")?;
+        let variable = self.parse_variable()?;
+        self.expect(&TokenKind::In, "IN in a FOREACH")?;
+        let list = self.parse_expr()?;
+        self.expect(&TokenKind::Pipe, "'|' before the FOREACH update clauses")?;
+
+        let mut body = Vec::new();
+        while !self.at(&TokenKind::RParen) {
+            let kind = self
+                .peek_kind()
+                .ok_or_else(|| self.expected_here("an update clause inside FOREACH"))?;
+            let clause = match kind {
+                TokenKind::Create => Clause::Create(self.parse_create()?),
+                TokenKind::Merge => Clause::Merge(self.parse_merge()?),
+                TokenKind::Set => Clause::Set(self.parse_set()?),
+                TokenKind::Detach | TokenKind::Delete => Clause::Delete(self.parse_delete()?),
+                TokenKind::Remove => Clause::Remove(self.parse_remove()?),
+                TokenKind::Foreach => Clause::Foreach(self.parse_foreach()?),
+                // Only updating clauses are legal inside FOREACH; anything else (MATCH, WITH,
+                // RETURN, UNWIND, CALL, …) is a syntax error.
+                _ => return Err(self.expected_here("an update clause inside FOREACH")),
+            };
+            body.push(clause);
+        }
+        if body.is_empty() {
+            return Err(self.expected_here("an update clause inside FOREACH"));
+        }
+        let rparen = self.expect(&TokenKind::RParen, "')' to close the FOREACH")?;
+        let end = rparen.span.end;
+        Ok(ForeachClause {
+            variable,
+            list,
+            body,
             span: Span::new(start, end),
         })
     }
@@ -2692,6 +2741,7 @@ fn token_text(kind: &TokenKind) -> &'static str {
         TokenKind::Detach => "DETACH",
         TokenKind::Remove => "REMOVE",
         TokenKind::Unwind => "UNWIND",
+        TokenKind::Foreach => "FOREACH",
         TokenKind::Call => "CALL",
         TokenKind::Yield => "YIELD",
         TokenKind::Order => "ORDER",

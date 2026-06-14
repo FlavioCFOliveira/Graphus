@@ -1206,3 +1206,67 @@ mod pattern_predicates {
         );
     }
 }
+
+// =================================================================================================
+// FOREACH (rmp #122)
+// =================================================================================================
+
+mod foreach_clause {
+    use super::*;
+
+    #[test]
+    fn foreach_over_a_literal_list_is_valid() {
+        ok("FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))");
+    }
+
+    #[test]
+    fn foreach_loop_variable_is_visible_to_body_clauses() {
+        // The loop variable `x` resolves inside the body's CREATE/SET.
+        ok("FOREACH (x IN [1, 2] | CREATE (m:M {v: x}) SET m.also = x)");
+    }
+
+    #[test]
+    fn foreach_list_may_reference_outer_bound_variables() {
+        ok("MATCH (n) FOREACH (x IN n.items | SET n.last = x)");
+    }
+
+    #[test]
+    fn foreach_inner_create_binding_is_visible_to_later_body_clauses() {
+        ok("FOREACH (x IN [1] | CREATE (m:M {v: x}) SET m.v = x + 1)");
+    }
+
+    #[test]
+    fn foreach_loop_variable_does_not_escape() {
+        // `x` is local to the FOREACH; referencing it afterwards is an UndefinedVariable.
+        assert_detail(
+            "FOREACH (x IN [1] | CREATE (:N)) RETURN x",
+            SemanticDetail::UndefinedVariable,
+        );
+    }
+
+    #[test]
+    fn foreach_list_undefined_variable_is_rejected() {
+        assert_detail(
+            "FOREACH (x IN missing | CREATE (:N {v: x}))",
+            SemanticDetail::UndefinedVariable,
+        );
+    }
+
+    #[test]
+    fn nested_foreach_is_valid() {
+        ok("FOREACH (x IN [[1, 2], [3]] | FOREACH (y IN x | CREATE (:N {v: y})))");
+    }
+
+    #[test]
+    fn foreach_inside_an_exists_subquery_is_rejected() {
+        // A FOREACH writes, so it is forbidden inside an EXISTS predicate subquery. The subquery's
+        // full-query form (a leading MATCH followed by the FOREACH) parses, so the writing-clause
+        // rejection is the semantic phase's job.
+        let e =
+            err("MATCH (n) WHERE EXISTS { MATCH (m) FOREACH (x IN [1] | SET m.v = x) } RETURN n");
+        assert_eq!(
+            e.classification().detail,
+            SemanticDetail::InvalidClauseComposition,
+        );
+    }
+}

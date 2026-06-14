@@ -26,8 +26,8 @@
 //!
 //! The covered surface and the explicitly-deferred productions are documented on
 //! [`parser`](crate::parser); in short, the common read/write surface is covered and a few exotic
-//! productions (`FOREACH`, `CALL { subquery }`, existential subqueries, quantifier predicates,
-//! `LOAD CSV`, DDL) are deferred as named follow-ups rather than silently omitted.
+//! productions (`CALL { subquery }`, existential subqueries, quantifier predicates, DDL) are
+//! deferred as named follow-ups rather than silently omitted.
 
 use crate::lexer::Span;
 
@@ -117,6 +117,8 @@ pub enum Clause {
     Delete(DeleteClause),
     /// `REMOVE <remove-item>, ...` (openCypher `Remove`).
     Remove(RemoveClause),
+    /// `FOREACH ( <var> IN <expr> | <update-clause>+ )` (openCypher `Foreach`).
+    Foreach(ForeachClause),
     /// `WITH <projection> [WHERE <expr>]` (openCypher `With`).
     With(WithClause),
     /// `RETURN <projection>` (openCypher `Return`).
@@ -136,6 +138,7 @@ impl Clause {
             Self::Set(c) => c.span,
             Self::Delete(c) => c.span,
             Self::Remove(c) => c.span,
+            Self::Foreach(c) => c.span,
             Self::With(c) => c.span,
             Self::Return(c) => c.span,
         }
@@ -165,6 +168,29 @@ pub struct UnwindClause {
     /// The variable each element is bound to.
     pub alias: Variable,
     /// Span from `UNWIND` to the alias.
+    pub span: Span,
+}
+
+/// `FOREACH ( <var> IN <list-expr> | <update-clause>+ )` (openCypher
+/// `Foreach = FOREACH '(' Variable IN Expression '|' { UpdatingClause } ')'`).
+///
+/// A per-row side-effect clause: for each input row, the `list` expression is evaluated **once**, and
+/// for every element the loop [`variable`](Self::variable) is bound and the [`body`](Self::body)
+/// update clauses run in order. `FOREACH` does **not** change row cardinality — the driving row is
+/// passed through unchanged — and the loop variable is **local** to the clause (it does not escape to
+/// later clauses). The grammar restricts `body` to *updating* clauses only
+/// (`CREATE`/`SET`/`REMOVE`/`DELETE`/`MERGE` and nested `FOREACH`); the parser enforces that
+/// (a reading/projection clause inside `FOREACH` is a [`SyntaxError`](crate::parser::SyntaxError)).
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct ForeachClause {
+    /// The loop variable, bound to each element of [`list`](Self::list) in turn (local to the clause).
+    pub variable: Variable,
+    /// The list expression, evaluated once per input row.
+    pub list: Expr,
+    /// The update clauses run per element (guaranteed by the parser to be updating clauses only).
+    pub body: Vec<Clause>,
+    /// Span from `FOREACH` to the closing `)`.
     pub span: Span,
 }
 
@@ -838,6 +864,12 @@ impl Clause {
                     if let RemoveItem::Property(e) = item {
                         e.zero_spans_in_place();
                     }
+                }
+            }
+            Self::Foreach(c) => {
+                c.list.zero_spans_in_place();
+                for clause in &mut c.body {
+                    clause.zero_expr_spans_in_place();
                 }
             }
             Self::With(c) => {

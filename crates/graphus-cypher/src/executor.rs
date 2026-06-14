@@ -343,6 +343,19 @@ enum Operator {
         pending: VecDeque<Row>,
     },
 
+    /// `FOREACH ( var IN list | …+ )`: a per-row side-effect. For each input row, `list` is evaluated
+    /// once; for each element the loop `variable` is bound on a correlation row and the inner update
+    /// sub-plan (`body_template`, rebuilt per element via [`build_operator_with_arg`]) is driven to
+    /// completion for its side effects. The input row is passed through **unchanged** (the loop
+    /// variable is local and never escapes), so cardinality is preserved.
+    Foreach {
+        input: Box<Operator>,
+        variable: Var,
+        list: Expr,
+        /// The correlated body sub-plan, rebuilt per `(row, element)` over its Argument leaf.
+        body_template: Box<PhysicalOp>,
+    },
+
     /// `CALL proc(args) [YIELD …]` (rmp #57): for each driving row, evaluate the arguments, invoke
     /// the procedure through the registry, and stream one output row per procedure result row —
     /// the driving row extended with the `bindings` columns. A **void** procedure (no declared
@@ -726,6 +739,44 @@ impl Operator {
                     pending.extend(out);
                     return Ok(Some(first));
                 }
+            }
+
+            Operator::Foreach {
+                input,
+                variable,
+                list,
+                body_template,
+            } => {
+                // FOREACH is a per-row side-effect; it passes each input row through UNCHANGED.
+                let Some(row) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                // Evaluate the list **structurally** (`eval`, not `eval_value`) so a list of
+                // nodes / relationships / paths is preserved — the same rationale as UNWIND.
+                let listv = eval(list, &row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
+                let elems = match listv.as_list_elems() {
+                    Some(items) => items,
+                    // FOREACH over null is a no-op for that row (zero iterations).
+                    None if matches!(listv, RowValue::Value(Value::Null)) => Vec::new(),
+                    // A non-list, non-null value is a runtime TypeError: unlike UNWIND, FOREACH does
+                    // NOT treat a scalar as a one-element list — openCypher requires a list here.
+                    None => {
+                        return Err(ExecError::Eval(EvalError::TypeError {
+                            context: "FOREACH expects a list".to_owned(),
+                        }));
+                    }
+                };
+                for elem in elems {
+                    ctx.check_cancelled()?;
+                    // Bind the loop variable for this element onto a correlation row and run the inner
+                    // update sub-plan to completion, draining every row for its side effects. The
+                    // loop variable lives only on this correlation row, so it never escapes into the
+                    // emitted `row`.
+                    let arg_row = row.with(variable.name.clone(), elem);
+                    let mut sub = build_operator_with_arg(body_template, &arg_row, ctx)?;
+                    while sub.next(ctx)?.is_some() {}
+                }
+                Ok(Some(row))
             }
 
             Operator::ProcedureCall {
@@ -1861,6 +1912,17 @@ fn build_operator(
             input: Box::new(build_operator(input, arg, ctx)?),
             kind: WriteKind::Remove { ops: ops.clone() },
             pending: VecDeque::new(),
+        }),
+        PhysicalOp::Foreach {
+            input,
+            variable,
+            list,
+            body,
+        } => Ok(Operator::Foreach {
+            input: Box::new(build_operator(input, arg, ctx)?),
+            variable: variable.clone(),
+            list: list.clone(),
+            body_template: body.clone(),
         }),
 
         // ---- procedure ------------------------------------------------------------------------
@@ -3793,6 +3855,7 @@ fn root_is_write(op: &PhysicalOp) -> bool {
             | PhysicalOp::SetClause { .. }
             | PhysicalOp::Delete { .. }
             | PhysicalOp::Remove { .. }
+            | PhysicalOp::Foreach { .. }
     )
 }
 
@@ -3828,7 +3891,9 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::Merge { .. }
         | PhysicalOp::SetClause { .. }
         | PhysicalOp::Delete { .. }
-        | PhysicalOp::Remove { .. } => Vec::new(),
+        | PhysicalOp::Remove { .. }
+        // FOREACH is a write root: no `RETURN` sits above it, so it declares no result columns.
+        | PhysicalOp::Foreach { .. } => Vec::new(),
         PhysicalOp::TopN { input, .. } => result_columns(input, procedures),
         PhysicalOp::Unwind {
             input, variable, ..

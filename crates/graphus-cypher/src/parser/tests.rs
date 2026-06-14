@@ -171,6 +171,56 @@ fn unwind_binds_alias() {
 }
 
 #[test]
+fn foreach_parses_variable_list_and_update_body() {
+    let query = ok("FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))");
+    let Clause::Foreach(f) = &clauses(&query)[0] else {
+        panic!("expected FOREACH")
+    };
+    assert_eq!(f.variable.name, "x");
+    assert!(matches!(f.list.kind, ExprKind::List(_)));
+    assert_eq!(f.body.len(), 1);
+    assert!(matches!(f.body[0], Clause::Create(_)));
+}
+
+#[test]
+fn foreach_accepts_multiple_and_nested_update_clauses() {
+    let query = ok("MATCH (n) FOREACH (x IN n.items | \
+         CREATE (m:M {v: x}) SET n.touched = true \
+         FOREACH (y IN [x] | CREATE (:Inner {w: y})))");
+    let Clause::Foreach(f) = &clauses(&query)[1] else {
+        panic!("expected FOREACH as the second clause")
+    };
+    assert_eq!(f.body.len(), 3);
+    assert!(matches!(f.body[0], Clause::Create(_)));
+    assert!(matches!(f.body[1], Clause::Set(_)));
+    assert!(matches!(f.body[2], Clause::Foreach(_)));
+}
+
+#[test]
+fn foreach_rejects_reading_and_projection_clauses_in_body() {
+    // Only updating clauses are legal inside FOREACH; a MATCH/WITH/RETURN/UNWIND is a syntax error.
+    for bad in [
+        "FOREACH (x IN [1] | MATCH (n) SET n.v = x)",
+        "FOREACH (x IN [1] | WITH x CREATE (:N))",
+        "FOREACH (x IN [1] | RETURN x)",
+        "FOREACH (x IN [1] | UNWIND [x] AS y CREATE (:N))",
+    ] {
+        let e = err(bad);
+        assert!(
+            matches!(e.kind, SyntaxErrorKind::Expected { .. }),
+            "expected a syntax error for `{bad}`, got {:?}",
+            e.kind
+        );
+    }
+}
+
+#[test]
+fn foreach_rejects_empty_body() {
+    let e = err("FOREACH (x IN [1] | )");
+    assert!(matches!(e.kind, SyntaxErrorKind::Expected { .. }));
+}
+
+#[test]
 fn create_pattern() {
     let query = ok("CREATE (a:A)-[:R]->(b:B)");
     let Clause::Create(c) = &clauses(&query)[0] else {
