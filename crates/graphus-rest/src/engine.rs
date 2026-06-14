@@ -153,12 +153,17 @@ pub struct TxHandle(pub u64);
 ///
 /// ## Thread-safety
 ///
-/// axum shares one piece of state across all worker tasks, so the engine is held as
-/// `Arc<dyn RestEngine>` and must be `Send + Sync`. The methods take `&self` (not `&mut self`,
-/// unlike the per-connection `graphus_bolt` `BoltExecutor`) precisely because many in-flight HTTP
-/// requests share the one engine; the engine manages its own interior synchronisation (the real
-/// coordinator funnels writes through the sharded ACID path — `04 §9.1`).
-pub trait RestEngine: Send + Sync {
+/// The production [`router`](crate::router) shares one engine across all axum worker tasks, so it
+/// bounds `E: RestEngine + Send + Sync + 'static` **at the router** (not on the trait). The methods
+/// take `&self` (not `&mut self`, unlike the per-connection `graphus_bolt` `BoltExecutor`) precisely
+/// because many in-flight HTTP requests share the one engine; the engine manages its own interior
+/// synchronisation (the real coordinator funnels writes through the sharded ACID path — `04 §9.1`).
+///
+/// The trait itself is **not** `Send + Sync` so the deterministic single-threaded VOPR simulator
+/// (rmp #164) can implement it over an `Rc<RefCell<…>>` engine and reuse the router's *synchronous*
+/// request core (`AppState` + `run_statements_buffered`) verbatim, without ever touching the async
+/// axum surface. The `Send + Sync` requirement lives where it is actually needed — the router.
+pub trait RestEngine {
     /// The concrete result stream this engine yields. (An associated type keeps the seam free of
     /// per-row boxing; the engine picks its cursor type.)
     type Stream: ResultStream;

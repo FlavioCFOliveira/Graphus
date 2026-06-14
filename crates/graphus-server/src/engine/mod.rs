@@ -25,6 +25,7 @@
 
 pub mod bolt_values;
 pub mod command;
+pub mod rest_values;
 mod exec;
 mod handle;
 mod local;

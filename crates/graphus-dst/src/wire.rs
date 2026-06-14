@@ -15,8 +15,10 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use graphus_auth::{AuthProvider, Authenticator, Privilege};
+use graphus_core::capability::Clock;
 use graphus_bolt::executor::{
     AccessMode as BoltAccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
 };
@@ -24,10 +26,19 @@ use graphus_bolt::server::{BoltSession, encode_client_handshake, encode_request_
 use graphus_bolt::{BoltResult, Dechunker, Frame, Proposal, Request, Response, Transport};
 use graphus_core::{GraphusError, Value};
 use graphus_io::MemBlockDevice;
+use graphus_rest::engine::{
+    AccessMode as RestAccessMode, RestEngine, ResultStream, Row, RunSummary as RestRunSummary,
+    TxHandle, TxOrigin,
+};
+use graphus_rest::registry::TxRegistry;
+use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, execute_autocommit};
+use graphus_rest::protocol::Statement;
+use graphus_rest::{CachedResponse, Wire};
 use graphus_server::engine::bolt_values::materialized_to_bolt;
 use graphus_server::engine::command::AccessMode as EngineAccessMode;
+use graphus_server::engine::rest_values::materialized_to_rest;
 use graphus_server::engine::{LocalEngine, RunReply, TxTicket};
-use graphus_sim::{Side, SimNet};
+use graphus_sim::{SharedClock, Side, SimNet};
 use graphus_wal::MemLogSink;
 
 /// The simulated engine, shared (single-threaded `Rc<RefCell<…>>`) so successive client sessions hit
@@ -251,12 +262,138 @@ pub fn login_prologue() -> Vec<Request> {
     ]
 }
 
+// =================================== REST wire client (rmp #164) ================================
+
+/// A [`RestEngine`] over the deterministic [`LocalEngine`] — the REST analogue of
+/// [`LocalBoltExecutor`]. It is **not** `Send` (the engine is single-threaded), which is exactly why
+/// the REST router relaxed its `Send + Sync` bound onto the router function (rmp #164): the simulator
+/// reuses the router's synchronous request core (`graphus_rest::router::execute_autocommit`) without
+/// the async axum surface.
+pub struct SimRestEngine {
+    engine: SharedEngine,
+}
+
+impl SimRestEngine {
+    /// Builds a REST engine over the shared deterministic engine.
+    #[must_use]
+    pub fn new(engine: SharedEngine) -> Self {
+        Self { engine }
+    }
+}
+
+/// The REST result stream: owns the engine's self-contained [`RunReply`] and maps cells to
+/// [`graphus_rest`]'s `RestValue` via the SAME mapping the real server seam uses.
+pub struct SimRestStream {
+    reply: RunReply,
+    summary: RestRunSummary,
+}
+
+impl ResultStream for SimRestStream {
+    fn fields(&self) -> &[String] {
+        &self.reply.fields
+    }
+
+    fn next_row(&mut self) -> Result<Option<Row>, GraphusError> {
+        match self.reply.rows.next()? {
+            Some(row) => Ok(Some(row.iter().map(materialized_to_rest).collect())),
+            None => Ok(None),
+        }
+    }
+
+    fn summary(&self) -> RestRunSummary {
+        self.summary.clone()
+    }
+}
+
+/// Maps the REST access mode onto the engine's neutral access mode.
+fn map_rest_mode(mode: RestAccessMode) -> EngineAccessMode {
+    match mode {
+        RestAccessMode::Read => EngineAccessMode::Read,
+        RestAccessMode::Write => EngineAccessMode::Write,
+    }
+}
+
+impl RestEngine for SimRestEngine {
+    type Stream = SimRestStream;
+
+    fn begin(
+        &self,
+        _db: &str,
+        mode: RestAccessMode,
+        _origin: TxOrigin<'_>,
+    ) -> Result<TxHandle, GraphusError> {
+        // An explicit transaction (the auto-commit core does begin → run → commit itself).
+        let ticket = self.engine.borrow_mut().begin(map_rest_mode(mode))?;
+        Ok(TxHandle(ticket.0))
+    }
+
+    fn run(
+        &self,
+        tx: TxHandle,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError> {
+        let reply = self
+            .engine
+            .borrow_mut()
+            .run(TxTicket(tx.0), query, parameters, false, None)?;
+        Ok(SimRestStream {
+            reply,
+            summary: RestRunSummary::default(),
+        })
+    }
+
+    fn commit(&self, tx: TxHandle) -> Result<RestRunSummary, GraphusError> {
+        self.engine.borrow_mut().commit(TxTicket(tx.0))?;
+        Ok(RestRunSummary::default())
+    }
+
+    fn rollback(&self, tx: TxHandle) -> Result<(), GraphusError> {
+        self.engine.borrow_mut().rollback(TxTicket(tx.0))
+    }
+}
+
+/// Drives one **auto-commit REST request** (a statement batch) through the REAL REST request core
+/// against `engine`, returning the serialized response (status + content-type + JSON body bytes).
+///
+/// This is the third connection method in the deterministic harness: it exercises the genuine REST
+/// statement binding, transaction lifecycle and result serialization (`execute_autocommit`), without
+/// the axum/hyper socket layer. `write` selects the transaction access mode.
+#[must_use]
+pub fn run_rest_autocommit(
+    engine: SharedEngine,
+    statements: &[Statement],
+    write: bool,
+) -> CachedResponse {
+    // `AppState::new` stores the engine as `Arc<E>`, so an `Arc` is required even though our engine is
+    // intentionally `!Send` (single-threaded determinism); it never crosses a thread.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let sim_engine = Arc::new(SimRestEngine::new(engine));
+    let auth: Arc<dyn AuthProvider> = Arc::new(sim_auth());
+    let registry = Arc::new(TxRegistry::new(DEFAULT_TX_TTL_NANOS));
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SharedClock::new(0));
+    let state = AppState::new(sim_engine, auth, registry, clock);
+    let mode = if write {
+        RestAccessMode::Write
+    } else {
+        RestAccessMode::Read
+    };
+    execute_autocommit(&state, "neo4j", "sim", mode, Wire::Json, statements)
+}
+
+/// Builds a single-statement REST batch with no inline parameters (parameters can be embedded as
+/// literals in `cypher`).
+#[must_use]
+pub fn rest_statement(cypher: &str) -> Statement {
+    Statement {
+        statement: cypher.to_owned(),
+        parameters: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    use graphus_sim::SharedClock;
 
     fn engine() -> SharedEngine {
         let clock = Arc::new(SharedClock::new(0));
@@ -359,5 +496,61 @@ mod tests {
             .filter(|r| matches!(r, Response::Record { .. }))
             .count();
         assert_eq!(temp_records, 0, "rolled-back node is invisible: {responses:?}");
+    }
+
+    /// A REST auto-commit request over the real request core: create a node, then read it back, and
+    /// confirm the JSON response (status 200) carries the data — the third connection method, fully
+    /// deterministic.
+    #[test]
+    fn rest_autocommit_round_trips_engine_data() {
+        let eng = engine();
+
+        let create = run_rest_autocommit(
+            eng.clone(),
+            &[rest_statement("CREATE (:City {name: 'Lisbon'})")],
+            true,
+        );
+        assert_eq!(create.status, 200, "create succeeds: {create:?}");
+
+        let read = run_rest_autocommit(
+            eng.clone(),
+            &[rest_statement("MATCH (c:City) RETURN c.name AS name")],
+            false,
+        );
+        assert_eq!(read.status, 200, "read succeeds: {read:?}");
+        let body = String::from_utf8_lossy(&read.body);
+        assert!(body.contains("Lisbon"), "REST JSON carries the created node: {body}");
+    }
+
+    /// The same REST request replays byte-identically from the same engine state (determinism).
+    #[test]
+    fn rest_autocommit_is_deterministic() {
+        let run = || {
+            let eng = engine();
+            let resp = run_rest_autocommit(
+                eng,
+                &[rest_statement("CREATE (:N {v: 1}) RETURN 1 AS one")],
+                true,
+            );
+            (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
+        };
+        assert_eq!(run(), run(), "same script ⇒ identical REST response");
+    }
+
+    /// A compile error comes back as an RFC 9457 problem+json with a 4xx status (no panic).
+    #[test]
+    fn rest_compile_error_is_problem_json() {
+        let eng = engine();
+        let resp = run_rest_autocommit(eng, &[rest_statement("THIS IS NOT CYPHER")], true);
+        assert!(
+            (400..500).contains(&resp.status),
+            "a bad statement is a client error, got {}",
+            resp.status
+        );
+        assert!(
+            resp.content_type.contains("problem+json") || resp.content_type.contains("json"),
+            "error is JSON problem: {}",
+            resp.content_type
+        );
     }
 }

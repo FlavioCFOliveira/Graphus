@@ -1105,6 +1105,7 @@ dependencies = [
  "graphus-bufpool",
  "graphus-core",
  "graphus-io",
+ "graphus-rest",
  "graphus-server",
  "graphus-sim",
  "graphus-storage",

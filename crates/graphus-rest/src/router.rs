@@ -61,7 +61,7 @@ use graphus_auth::{AuthError, AuthProvider, Privilege};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{Value as Json, json};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -261,7 +261,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// the listener enables it (axum's `http2` feature is on); **CORS** and **response compression** are
 /// wired here as `tower-http` layers. The request body is capped at [`MAX_REQUEST_BODY_BYTES`]
 /// (`413` past the cap) so untrusted input cannot exhaust memory.
-pub fn router<E: RestEngine + 'static>(state: AppState<E>) -> Router {
+pub fn router<E: RestEngine + Send + Sync + 'static>(state: AppState<E>) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi_doc))
         .route("/db/{db}/tx", post(begin::<E>))
@@ -764,6 +764,48 @@ fn run_statements_buffered<E: RestEngine>(
             expires_at_nanos,
         },
     ))
+}
+
+/// **Deterministic synchronous entry** for the VOPR simulator (rmp #164): runs an auto-commit
+/// statement batch through the **same** request core the axum `auto_commit` handler uses
+/// (`run_statements_buffered`), returning the serialized response as a [`CachedResponse`]
+/// (status + content-type + body bytes).
+///
+/// This bypasses only the axum/tower/hyper HTTP transport (generic plumbing, covered by the
+/// integration tests) and the auth/idempotency layers — everything Graphus-specific about a REST
+/// request (statement binding, the engine tx lifecycle, result serialization in `accept`'s wire
+/// format, and RFC 9457 problem mapping on error) runs verbatim. It needs no `Send`/async, so the
+/// single-threaded deterministic engine (rmp #160) drives it reproducibly.
+///
+/// `mode` is the transaction access mode; on a begin error a problem+json response is returned.
+pub fn execute_autocommit<E: RestEngine>(
+    state: &AppState<E>,
+    db: &str,
+    principal: &str,
+    mode: AccessMode,
+    accept: Wire,
+    statements: &[Statement],
+) -> CachedResponse {
+    let handle = match state.engine.begin(
+        db,
+        mode,
+        TxOrigin {
+            principal,
+            explicit: false,
+        },
+    ) {
+        Ok(h) => h,
+        Err(e) => return Built::problem(Problem::from_graphus_error(&e)).cached(),
+    };
+    // `serializable_built` re-derives the wire format from the `Accept` header, so synthesise one
+    // carrying the requested format.
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(accept.content_type()) {
+        headers.insert(ACCEPT, v);
+    }
+    run_statements_buffered(state, &headers, handle, statements, Finalise::Commit, accept)
+        .unwrap_or_else(Built::problem)
+        .cached()
 }
 
 /// Runs one statement and returns its typed-encoded [`StatementResult`] (the buffered path).

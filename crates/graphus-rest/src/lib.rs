@@ -43,7 +43,7 @@
 //! // The listener owns the real `RestEngine` (graphus-cypher's coordinator), the shared
 //! // authentication seam (`AuthProvider` — the server backs it with a LIVE security-catalog view,
 //! // rmp #94), and the production `Clock`, builds the router, and serves it over TLS:
-//! fn build<E: RestEngine + 'static>(
+//! fn build<E: RestEngine + Send + Sync + 'static>(
 //!     engine: Arc<E>,
 //!     auth: Arc<dyn AuthProvider>,
 //!     clock: Arc<dyn Clock + Send + Sync>,

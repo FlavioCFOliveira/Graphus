@@ -32,3 +32,6 @@ graphus-server = { path = "../graphus-server" }
 graphus-bolt = { path = "../graphus-bolt" }
 # The Bolt session's `AuthProvider` (a real `Authenticator`) for the LOGON exchange.
 graphus-auth = { path = "../graphus-auth" }
+# The REAL REST request core (rmp #164): `execute_autocommit` + `RestEngine`/`AppState`, driven over
+# the deterministic engine without the axum/socket layer.
+graphus-rest = { path = "../graphus-rest" }
