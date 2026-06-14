@@ -53,6 +53,13 @@ path = "src/bin/bench_gate.rs"
 name = "commit_path"
 harness = false
 
+# Real-disk fsync commit-path benchmark (rmp #120): the same commit path as `commit_path`, but over a
+# file-backed device + file log sink so every commit pays a genuine `fdatasync` — quantifying the
+# physical-durability cost the in-memory DST run elides. Uses a tempdir, cleaned up on drop.
+[[bench]]
+name = "commit_path_fsync"
+harness = false
+
 [[bench]]
 name = "read_path"
 harness = false

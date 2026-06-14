@@ -405,3 +405,80 @@ query lacks an `id` anchor: the slowest are the new tag/country correlations (`B
 (`BI-isolated`); the shortest-path shapes (`IC13`/`IC14`) run a real BFS over the KNOWS graph. The
 harness is the instrument that will show all of these drop as more index seeks and join strategies are
 wired into planning.
+
+---
+
+## 10. Real-disk fsync commit path — the physical-durability cost (`rmp` #120)
+
+All numbers in §3 are from the **in-memory DST substrate** (`MemBlockDevice` + `MemLogSink`), where
+`LogSink::sync` is a buffer append with **no syscall**. That isolates the commit *logic* with no disk
+noise, but it does **not** reflect physical durability: nowhere did it pay a real `fdatasync`. The
+production-readiness audit flagged this as an empirical gap — the §3 throughput is the *logic*
+ceiling, not the durable commit rate. `benches/commit_path_fsync.rs` (`rmp` #120) closes it: the
+**identical** `CommitDriver` op-mix and op-counts, but the store sits on a **file-backed device**
+(`graphus_io::FileBlockDevice`) + **file-backed log sink** (`graphus_wal::FileLogSink`) in a tempdir
+(removed on drop), so every `RecordStore::commit` drives the group-commit path all the way to
+`FileLogSink::sync → fdatasync` (data **and** the directory entry) on a real filesystem.
+
+> **One fsync per commit (worst case).** The harness is single-threaded (`04 §11.1`), identical to
+> §3, so each commit pays its **own** `fdatasync` with no multi-thread group-commit *batching*. This
+> is therefore the **un-amortized floor** of durable commit latency: one transaction, one fsync. A
+> runtime-layer commit queue that batches N committers behind a single fsync would amortize this
+> (the follow-up in §7); §10 establishes the per-commit syscall cost that batching must amortize.
+
+### 10.1 Test environment (this run)
+
+Same machine class as §1 (AMD Ryzen 9 5900HX, Linux 6.8.0-124-generic `x86_64`, `rustc` edition
+2024), Criterion `bench` profile. The tempdir lives under `$TMPDIR` (`/tmp`) — on this host an
+**ext4 filesystem on an NVMe SSD**. `fdatasync` latency is dominated by the storage device's durable
+write acknowledgement, so these absolute numbers are **storage-media-specific** (a slower HDD or a
+network filesystem would be far worse; a device with a battery-backed write cache, far better) —
+re-run on the target deployment media. Captured with
+`cargo bench -p graphus-bench --bench commit_path_fsync -- --warm-up-time 1 --measurement-time 3`.
+
+### 10.2 Real-disk fsync vs in-memory DST — the headline delta
+
+Per-commit latency from the bench's own histogram (the last `[FSYNC#120]` line per op-count), beside
+the in-memory DST sweep from §3.2 (same op-counts):
+
+| ops / commit | **real-disk** p50 | **real-disk** p99 | **real-disk** commits/s | in-mem DST p50 (§3.2) | in-mem DST commits/s (§3.2) | **fsync tax (p50)** |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (baseline) | **1.044 ms** | 1.502 ms | **~939** | 2.79 µs | ~276 K | **~374×** |
+| 4 | **1.106 ms** | 1.596 ms | **~874** | 3.28 µs | ~304 K | **~337×** |
+| 16 | **1.134 ms** | 1.956 ms | **~862** | 10.8 µs | ~84 K | **~105×** |
+| 64 | **1.200 ms** | 4.733 ms | **~799** | 18.5 µs | ~32 K | **~65×** |
+
+Criterion's own per-iteration medians corroborate the histogram: 1-op `1.0944–1.1301 ms`, 4-op
+`1.1405–1.1815 ms`, 16-op `1.1558–1.1823 ms`, 64-op `1.1712–1.2168 ms`.
+
+**Reading the delta.**
+
+1. **The physical fsync dominates the durable commit by ~2–3 orders of magnitude.** A 1-op commit
+   that costs **2.79 µs** of pure logic on the DST sink costs **~1.04 ms** when it must actually reach
+   stable storage — a **~374×** tax. The honest durable single-thread commit ceiling on this host is
+   **~900–940 commits/s** per fsync, **not** the ~276 K the in-memory run reports. Any capacity
+   planning must use the §10 number for durability-bound workloads, not §3.
+2. **The per-commit cost is almost flat in op-count** (1.04 ms → 1.20 ms from 1 → 64 ops, ~1.15×),
+   because the latency is **fsync-bound, not WAL-volume-bound**: the syscall waits on the device's
+   durable-write acknowledgement, which dwarfs the marginal cost of the extra WAL bytes. The mirror of
+   this is that **batching pays off enormously here**: at 64 ops/commit the real-disk path already
+   does **~51 K ops/s** (vs ~939 ops/s at 1 op/commit) — amortizing one fsync over more work is the
+   single biggest durable-throughput lever, which is exactly the runtime-layer group-commit case (§7).
+3. **The p99.9/max outliers (~4.7–5.2 ms) are real fsync tail latency**, not a substrate artifact —
+   they are the filesystem/device occasionally taking far longer to acknowledge a durable write (e.g.
+   a journal commit or a flush coinciding). Unlike the §3 `MemLogSink` realloc spikes (§5), these are
+   a genuine production tail the deployment must budget for.
+
+### 10.3 Reproducing
+
+```sh
+# The real-disk fsync commit path (quick params; the per-commit latencies print to stderr as
+# `[FSYNC#120] …` lines — take the last line per op-count):
+cargo bench -p graphus-bench --bench commit_path_fsync -- --warm-up-time 1 --measurement-time 3
+
+# Side by side with the in-memory DST commit path (§3):
+cargo bench -p graphus-bench --bench commit_path
+```
+
+The bench creates a unique tempdir per driver (device file + `wal/` directory) and removes it on
+drop, so it leaves no scratch files behind. The numbers are storage-media-specific (§10.1).
