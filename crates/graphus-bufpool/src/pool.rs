@@ -4,7 +4,9 @@
 //! A concurrent, latched version (validated with loom) is a separate Phase 1 task; this is
 //! the correct single-threaded core the storage and WAL layers build on.
 
-use std::collections::HashMap;
+// FxHashMap: the page table is keyed by internal PageIds (never attacker-controlled), so the
+// faster non-cryptographic hash is safe and avoids SipHash overhead on this hot lookup path.
+use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, PageId};
@@ -94,7 +96,7 @@ impl<D: BlockDevice, W: WalRule> BufferPool<D, W> {
             device,
             wal,
             frames,
-            table: HashMap::new(),
+            table: HashMap::default(),
             clock: 0,
         }
     }

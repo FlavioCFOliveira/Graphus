@@ -23,7 +23,7 @@
 //! memory; the only in-memory structure is the id map (one entry per node), which a relationship pass
 //! fundamentally requires.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use graphus_core::{Result, TxnId};
@@ -194,16 +194,16 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         let external_id = record.get(header.id_index).unwrap_or("").to_owned();
 
         // Collect labels first (a single `set_node_labels` write), then properties.
-        let mut label_tokens: Vec<u32> = Vec::new();
+        // PERF (C18): dedup via a `HashSet` (O(1) membership) instead of `Vec::contains` (O(n) per
+        // probe, O(n^2) per row). `set_node_labels` treats labels as a set, so order is irrelevant.
+        let mut label_set: HashSet<u32> = HashSet::new();
         for (i, role) in header.columns.iter().enumerate() {
             let cell = record.get(i).unwrap_or("");
             match role {
                 ColumnRole::Label => {
                     for label in cell.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                         let token = self.store.intern_token(Namespace::Label, label)?;
-                        if !label_tokens.contains(&token) {
-                            label_tokens.push(token);
-                        }
+                        label_set.insert(token);
                     }
                 }
                 ColumnRole::Property { key, ty } => {
@@ -225,7 +225,8 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
                 | ColumnRole::Ignore => {}
             }
         }
-        if !label_tokens.is_empty() {
+        if !label_set.is_empty() {
+            let label_tokens: Vec<u32> = label_set.into_iter().collect();
             self.store.set_node_labels(txn, node_id, &label_tokens)?;
         }
 

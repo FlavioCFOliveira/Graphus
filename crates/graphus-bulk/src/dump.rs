@@ -80,6 +80,29 @@ fn newest_per_key(props: Vec<(u64, u32, Value)>) -> BTreeMap<u32, Value> {
     out
 }
 
+/// PERF (C17): collapses a property chain to the newest value per key **and** resolves token ids to
+/// key names in a single pass, returning a name-keyed map ready for column lookup. This replaces the
+/// previous "build a token-keyed `BTreeMap`, then re-key into a name-keyed `BTreeMap`" double build.
+///
+/// Newest-wins is preserved: token interning is 1:1 (a name has exactly one token), so deduping by
+/// token before resolving and deduping by name while resolving yield identical results.
+fn newest_by_name<D: BlockDevice, S: LogSink>(
+    store: &RecordStore<D, S>,
+    props: Vec<(u64, u32, Value)>,
+) -> Result<BTreeMap<String, Value>> {
+    // First-occurrence-per-token wins (chain is newest-to-oldest); resolve each surviving token to
+    // its name once.
+    let mut seen: BTreeMap<u32, ()> = BTreeMap::new();
+    let mut out: BTreeMap<String, Value> = BTreeMap::new();
+    for (_pid, key_token, value) in props {
+        if seen.insert(key_token, ()).is_none() {
+            let name = key_name(store, Namespace::PropKey, key_token)?;
+            out.insert(name, value);
+        }
+    }
+    Ok(out)
+}
+
 /// Dumps every node of `store` to `writer` in the importer's node-CSV format.
 ///
 /// Returns the stable ordering of property-key names used for the columns (so the relationship dump
@@ -124,14 +147,14 @@ pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
         for t in label_tokens {
             labels.push(key_name(store, Namespace::Label, t)?);
         }
-        let props = newest_per_key(store.node_property_values(id)?);
-        // Re-key the per-token map to key *names* for column lookup.
-        let mut by_name: BTreeMap<String, Value> = BTreeMap::new();
-        for (key_token, value) in props {
-            by_name.insert(key_name(store, Namespace::PropKey, key_token)?, value);
-        }
+        // PERF (C17): build the name-keyed newest-value map in one pass (no token-map → name-map
+        // double build).
+        let node_props = store.node_property_values(id)?;
+        let by_name = newest_by_name(store, node_props)?;
 
-        let mut row = vec![id.to_string(), labels.join(";")];
+        // PERF (C19): render the u64 id via `itoa` (no digit-by-digit `Display` machinery).
+        let mut id_buf = itoa::Buffer::new();
+        let mut row = vec![id_buf.format(id).to_owned(), labels.join(";")];
         for key in &keys {
             row.push(by_name.get(key).map(render_value).unwrap_or_default());
         }
@@ -182,15 +205,16 @@ pub fn dump_relationships<D: BlockDevice, S: LogSink, W: Write>(
     for &id in &rel_ids {
         let rec = store.rel(id)?;
         let type_name = key_name(store, Namespace::RelType, rec.type_id)?;
-        let props = newest_per_key(store.rel_property_values(id)?);
-        let mut by_name: BTreeMap<String, Value> = BTreeMap::new();
-        for (key_token, value) in props {
-            by_name.insert(key_name(store, Namespace::PropKey, key_token)?, value);
-        }
+        // PERF (C17): single-pass name-keyed newest-value map (see `dump_nodes`).
+        let rel_props = store.rel_property_values(id)?;
+        let by_name = newest_by_name(store, rel_props)?;
 
+        // PERF (C19): render the endpoint u64 ids via `itoa`.
+        let mut start_buf = itoa::Buffer::new();
+        let mut end_buf = itoa::Buffer::new();
         let mut row = vec![
-            rec.start_node.to_string(),
-            rec.end_node.to_string(),
+            start_buf.format(rec.start_node).to_owned(),
+            end_buf.format(rec.end_node).to_owned(),
             type_name,
         ];
         for key in &keys {

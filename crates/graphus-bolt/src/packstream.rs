@@ -188,6 +188,12 @@ impl Packer {
         self.buf
     }
 
+    /// PERF (C4/C5): clears the buffer while retaining its allocated capacity, so a single `Packer`
+    /// can encode many messages back-to-back without re-allocating between them.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+    }
+
     /// Borrows the encoded bytes so far.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {

@@ -24,6 +24,9 @@ graphus-wal = { path = "../graphus-wal" }
 # `std::io::Read`-based so a large file streams record-by-record, never slurped. Kept out of the
 # storage core deliberately (the storage crate must not depend on `csv`).
 csv = "1.4"
+# PERF (C19): allocation-free integer-to-decimal rendering for the per-row physical ids in the
+# dumper. Already present transitively in the lock; pinned here as a direct dependency.
+itoa = "1.0"
 
 [[bin]]
 name = "graphus-bulk"

@@ -14,7 +14,7 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, PageId, Timestamp, TxnId};
 
 use crate::checkpoint::CheckpointSnapshot;
-use crate::record::{LogRecord, RecordType};
+use crate::record::{LogRecord, LogRecordRef, RecordType};
 use crate::recovery::ApplyTarget;
 use crate::sink::LogSink;
 
@@ -171,7 +171,9 @@ impl<S: LogSink> WalManager<S> {
             cursor += 1;
         }
         while cursor < log.len() {
-            match LogRecord::decode(&log[cursor..]) {
+            // This scan reads only header fields and the commit timestamp prefix of `redo`, never the
+            // owned redo/undo images, so decode in place (no per-record heap allocation).
+            match LogRecordRef::decode(&log[cursor..]) {
                 Ok((rec, n)) => {
                     cursor += n;
                     if rec.rec_type == RecordType::Commit {
@@ -221,8 +223,12 @@ impl<S: LogSink> WalManager<S> {
         let mut r = LogRecord::new(RecordType::Update, txn, page_id);
         r.prev_lsn = prev;
         r.redo = redo;
-        r.undo = undo.clone();
+        r.undo = undo;
         let lsn = self.append(&mut r);
+        // `append` has already encoded `r.undo` into the durable record, so move (rather than clone)
+        // those bytes into the in-memory UndoEntry: the encoded bytes and the stored UndoEntry.undo
+        // stay byte-identical with one fewer allocation.
+        let undo = std::mem::take(&mut r.undo);
         let st = self.active.entry(txn).or_insert(TxnState {
             first_lsn: lsn,
             last_lsn: lsn,

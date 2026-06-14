@@ -25,7 +25,7 @@ use graphus_core::{Lsn, PageId, TxnId};
 
 use crate::checkpoint::CheckpointSnapshot;
 use crate::manager::{HEADER_LEN, WalManager};
-use crate::record::{DecodeError, LogRecord, MIN_RECORD_LEN, RecordType};
+use crate::record::{DecodeError, LogRecord, LogRecordRef, MIN_RECORD_LEN, RecordType};
 use crate::sink::LogSink;
 
 /// What a redo/undo image means for a page. Implemented by the storage layer (and by recovery
@@ -295,7 +295,9 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
 pub(crate) fn next_self_consistent_record(log: &[u8], from: usize) -> Option<usize> {
     let mut off = from;
     while off + MIN_RECORD_LEN <= log.len() {
-        if let Ok((rec, _)) = LogRecord::decode(&log[off..]) {
+        // Probes only the self-consistency of the header (`lsn == off`), never redo/undo, so decode
+        // in place without allocating — this runs once per byte across the corrupt region.
+        if let Ok((rec, _)) = LogRecordRef::decode(&log[off..]) {
             if rec.lsn.0 == off as u64 {
                 return Some(off);
             }

@@ -550,9 +550,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let end = offset + bytes.len();
         assert!(end <= PAGE_SIZE, "region runs past the page");
         let f = self.pool.fetch(page)?;
-        let pre = self.pool.page(f)[offset..end].to_vec();
+        // Build the undo patch from the still-unmodified page slice before the in-place overwrite
+        // below, avoiding an intermediate `pre` Vec copy.
+        let undo = paging::encode_patch(offset, &self.pool.page(f)[offset..end]);
         let redo = paging::encode_patch(offset, bytes);
-        let undo = paging::encode_patch(offset, &pre);
         let lsn = self.wal.with(|w| w.log_update(txn, page, redo, undo));
         let p = self.pool.page_mut(f);
         p[offset..end].copy_from_slice(bytes);
@@ -920,7 +921,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for id in 1..node_hw {
             let mvcc = self.read_node(id)?.mvcc;
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
-                && self.incident_rels(id)?.is_empty()
+                && !self.has_incident_rels(id)?
             {
                 self.reclaim_node(txn, id)?;
                 reclaimed += 1;
@@ -1087,20 +1088,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         {
             self.pending_gc_prune = None;
         }
-        let device_pages: [Vec<PageId>; STORE_COUNT] = [
-            self.stores[0].device_pages.clone(),
-            self.stores[1].device_pages.clone(),
-            self.stores[2].device_pages.clone(),
-            self.stores[3].device_pages.clone(),
-        ];
+        // Move out the pre-rollback page maps (no clone): `reload_catalog` reassigns each
+        // `self.stores[i]` wholesale below, so the taken Vecs are otherwise discarded. We re-extend
+        // the reloaded (shrunk) maps with only the tail entries the catalog reload dropped.
+        let device_pages: [Vec<PageId>; STORE_COUNT] = std::array::from_fn(|i| {
+            std::mem::take(&mut self.stores[i].device_pages)
+        });
         let mut target = pool_target::PoolTarget::new(&mut self.pool);
         self.wal.with(|w| w.rollback(txn, &mut target))?;
         self.reload_catalog()?;
         // Page growth is not undone; restore the in-memory page maps that the catalog reload (from
-        // the pre-growth metadata) shrank, so already-allocated device pages stay addressable.
+        // the pre-growth metadata) shrank, so already-allocated device pages stay addressable. Only
+        // the tail entries `[reloaded_len..]` were lost, so re-extend with just those.
         for (i, pages) in device_pages.into_iter().enumerate() {
-            if pages.len() > self.stores[i].device_pages.len() {
-                self.stores[i].device_pages = pages;
+            let reloaded_len = self.stores[i].device_pages.len();
+            if pages.len() > reloaded_len {
+                self.stores[i]
+                    .device_pages
+                    .extend_from_slice(&pages[reloaded_len..]);
             }
         }
         Ok(())
@@ -1967,7 +1972,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Build the chain from the tail back to the head so each block knows its successor's id.
         let mut next = NULL_ID;
         let mut head = NULL_ID;
-        for chunk in payload_chunks(payload).into_iter().rev() {
+        // An empty payload still allocates a single empty block (`04 §2.2`); a non-empty payload is
+        // split into `BLOCK_PAYLOAD`-sized chunks. Iterate the chunks directly in reverse (tail to
+        // head) without collecting them into a temporary `Vec`. The empty-payload branch yields one
+        // empty chunk, matching the previous `payload_chunks` invariant exactly.
+        let mut empty_iter = std::iter::once::<&[u8]>(&[]);
+        let mut chunk_iter = payload.chunks(BLOCK_PAYLOAD).rev();
+        let chunks: &mut dyn Iterator<Item = &[u8]> = if payload.is_empty() {
+            &mut empty_iter
+        } else {
+            &mut chunk_iter
+        };
+        for chunk in chunks {
             let id = self.alloc_id(StoreKind::Strings);
             let block = HeapBlock::new(txn.0, chunk, next);
             self.write_block(id, &block, txn)?;
@@ -2398,6 +2414,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain is malformed (a cycle
     /// guard caps the walk).
+    /// Whether `node_id` has any incident relationships, without materialising the chain.
+    ///
+    /// The incidence walk in [`incident_rels`](Self::incident_rels) starts at the node's `first_rel`
+    /// head pointer and stops at `NULL_ID`; an empty chain is therefore exactly `first_rel ==
+    /// NULL_ID`. This avoids the full `Vec` allocation when the caller only needs emptiness (e.g. the
+    /// GC reclaimability check).
+    pub fn has_incident_rels(&mut self, node_id: u64) -> Result<bool> {
+        Ok(self.read_node(node_id)?.first_rel != NULL_ID)
+    }
+
     pub fn incident_rels(&mut self, node_id: u64) -> Result<Vec<u64>> {
         let node = self.read_node(node_id)?;
         let mut out = Vec::new();
@@ -2807,17 +2833,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 enum NeighbourPtr {
     Prev,
     Next,
-}
-
-/// Splits `payload` into [`BLOCK_PAYLOAD`]-sized chunks for the overflow heap (`rmp` task #43). An
-/// **empty** payload yields a single empty chunk, so a chain always has at least one block and its
-/// head id is a valid, non-null pointer (`04 §2.2`).
-fn payload_chunks(payload: &[u8]) -> Vec<&[u8]> {
-    if payload.is_empty() {
-        vec![&[]]
-    } else {
-        payload.chunks(BLOCK_PAYLOAD).collect()
-    }
 }
 
 /// A buffer-pool-backed [`ApplyTarget`](graphus_wal::ApplyTarget) used for **live rollback** only

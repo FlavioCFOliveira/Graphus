@@ -26,7 +26,9 @@
 //! - **Write-write is the only blocking**, resolved first-updater-wins with deadlock detection
 //!   (`04 §5.7`).
 
-use std::collections::HashMap;
+// FxHashMap: the active-transaction table is keyed by internal TxnId (never attacker-controlled)
+// and never iterated in an order-observable way, so the faster non-cryptographic hash is safe.
+use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::{GraphusError, Result, Timestamp, TxnId, VersionStamp};
 
@@ -116,7 +118,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             locks: LockTable::new(),
             store,
             durability,
-            active: HashMap::new(),
+            active: HashMap::default(),
             next_txn_id: 0,
         }
     }

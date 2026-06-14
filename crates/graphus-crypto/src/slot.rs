@@ -74,7 +74,12 @@ pub fn view(slot: &Slot) -> SlotView<'_> {
 }
 
 /// Assembles a slot from its `(nonce, tag, ciphertext)` regions for writing.
+///
+/// Retained as the symmetric counterpart to [`view`] and the canonical reference for the slot
+/// layout; the hot write path now seals the ciphertext in place (see `device::write_page`) rather
+/// than concatenating, so this is exercised only by the layout round-trip test.
 #[must_use]
+#[allow(dead_code)]
 pub fn assemble(
     nonce: &[u8; NONCE_LEN],
     tag: &[u8; TAG_LEN],

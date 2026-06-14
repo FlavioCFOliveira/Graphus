@@ -9,7 +9,9 @@
 //! only the writer's `TxnId` while it is in flight; the mapping `TxnId → outcome` lives in the
 //! [`CommitRegistry`], which is the manager's Active/Recent Transaction Table.
 
-use std::collections::HashMap;
+// FxHashMap: keyed by internal TxnId (never attacker-controlled) and never iterated in an
+// order-observable way, so the faster non-cryptographic hash is safe on this visibility hot path.
+use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::{Timestamp, TxnId};
 

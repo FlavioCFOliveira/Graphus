@@ -71,7 +71,9 @@
 //! Latches are short-lived and the spec forbids holding them across `.await`; this pool is fully
 //! synchronous, so that rule is upheld by construction (there is no `.await` anywhere).
 
-use std::collections::HashMap;
+// FxHashMap: each shard is keyed by internal PageIds (never attacker-controlled), so the faster
+// non-cryptographic hash is safe and cuts SipHash overhead on every sharded lookup.
+use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, PageId};
@@ -202,7 +204,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         assert!(capacity > 0, "buffer pool capacity must be > 0");
         let frames = (0..capacity).map(|_| FrameSlot::empty()).collect();
         let table = (0..SHARD_COUNT)
-            .map(|_| Mutex::new(HashMap::new()))
+            .map(|_| Mutex::new(HashMap::default()))
             .collect();
         Self {
             device: Mutex::new(device),

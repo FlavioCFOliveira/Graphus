@@ -18,8 +18,11 @@
 //! key so the manager can decide deterministically. In a multi-threaded promotion the same graph is
 //! protected by a latch; the abort-the-youngest rule and the wait-for edges are unchanged.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+// FxHashMap/FxHashSet: all maps and sets here are keyed by internal Key/TxnId (u64, never
+// attacker-controlled) and never iterated in an order-observable way (the deadlock victim is chosen
+// by `max_by_key`, not iteration order), so the faster non-cryptographic hash is safe.
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 
 use graphus_core::TxnId;
 
@@ -99,9 +102,9 @@ impl LockTable {
     pub fn find_deadlock_victim(&self) -> Option<TxnId> {
         // Depth-first cycle detection over the wait-for graph; collect every transaction on any
         // cycle, then pick the youngest.
-        let mut on_cycle: HashSet<TxnId> = HashSet::new();
-        let mut visiting: HashSet<TxnId> = HashSet::new();
-        let mut visited: HashSet<TxnId> = HashSet::new();
+        let mut on_cycle: HashSet<TxnId> = HashSet::default();
+        let mut visiting: HashSet<TxnId> = HashSet::default();
+        let mut visited: HashSet<TxnId> = HashSet::default();
 
         let nodes: Vec<TxnId> = self.waits_for.keys().copied().collect();
         for start in nodes {

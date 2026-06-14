@@ -12,6 +12,9 @@ description = "Self-managed buffer pool, page header and CRC32C checksums for Gr
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
 crc32c = "0.6"
+# Fast, non-cryptographic hash (FxHashMap) for internal, integer-keyed hot maps only — the page
+# table keys are internal PageIds, never attacker-controlled, so SipHash's DoS resistance is moot.
+rustc-hash = "2"
 
 # `loom` model-checks the concurrent buffer pool's latching logic. It is needed by the *library*
 # (via `src/sync.rs`) only when compiled with `--cfg loom`, so it is gated on that cfg rather than

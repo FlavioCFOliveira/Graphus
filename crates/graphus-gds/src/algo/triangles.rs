@@ -8,7 +8,6 @@
 use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId};
 use crate::error::Result;
-use std::collections::BTreeSet;
 
 /// Triangle/clustering output.
 #[derive(Debug, Clone)]
@@ -33,19 +32,8 @@ pub struct TriangleResult {
 pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleResult> {
     let n = graph.node_count();
 
-    // Build deduplicated, self-loop-free undirected neighbour sets.
-    let mut adj: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n];
-    for (u, neis) in graph.iter_adjacency() {
-        for &v in neis {
-            if u == v {
-                continue; // drop self-loops
-            }
-            adj[u as usize].insert(v);
-            if let Some(set) = adj.get_mut(v as usize) {
-                set.insert(u);
-            }
-        }
-    }
+    // Build deduplicated, self-loop-free undirected neighbour lists, each sorted ascending.
+    let adj = simple_undirected_adjacency(graph);
 
     let mut triangles = vec![0u64; n];
     let mut total = 0u64;
@@ -60,14 +48,16 @@ pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleR
                 continue;
             }
             let nv = &adj[v as usize];
-            // Intersect nu and nv, only counting w > v to avoid triple-counting.
+            // Intersect nu and nv, only counting w > v to avoid triple-counting. Both lists are
+            // sorted ascending, so binary-search the smaller into the larger (the `w > v` filter
+            // matches the original set-based version exactly).
             let (small, large) = if nu.len() <= nv.len() {
                 (nu, nv)
             } else {
                 (nv, nu)
             };
             for &w in small {
-                if w > v && large.contains(&w) {
+                if w > v && large.binary_search(&w).is_ok() {
                     total = total.saturating_add(1);
                     triangles[u] = triangles[u].saturating_add(1);
                     triangles[v as usize] = triangles[v as usize].saturating_add(1);
@@ -94,21 +84,33 @@ pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleR
     })
 }
 
-/// Helper used by other modules: the deduplicated, self-loop-free undirected neighbour sets.
+/// Helper used by other modules: the deduplicated, self-loop-free undirected neighbour lists, each
+/// sorted in ascending [`InternalId`] order.
+///
+/// Returns contiguous `Vec<u32>` per node (rather than `BTreeSet`) for cache-friendly intersection
+/// (binary search / two-pointer merge) while preserving the same set semantics: each list is
+/// self-loop-free, has no duplicates, and is ascending — exactly the iteration order a `BTreeSet`
+/// would yield.
 #[must_use]
-pub(crate) fn simple_undirected_adjacency(graph: &CsrGraph) -> Vec<BTreeSet<u32>> {
+pub(crate) fn simple_undirected_adjacency(graph: &CsrGraph) -> Vec<Vec<InternalId>> {
     let n = graph.node_count();
-    let mut adj: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n];
+    let mut adj: Vec<Vec<InternalId>> = vec![Vec::new(); n];
     for (u, neis) in graph.iter_adjacency() {
         for &v in neis {
             if u == v {
-                continue;
+                continue; // drop self-loops
             }
-            adj[u as usize].insert(v);
-            if let Some(set) = adj.get_mut(v as usize) {
-                set.insert(u as InternalId);
+            adj[u as usize].push(v);
+            if let Some(list) = adj.get_mut(v as usize) {
+                list.push(u);
             }
         }
+    }
+    // Sort + dedup each list: ascending order with parallel edges collapsed, matching the prior
+    // BTreeSet semantics exactly.
+    for list in &mut adj {
+        list.sort_unstable();
+        list.dedup();
     }
     adj
 }

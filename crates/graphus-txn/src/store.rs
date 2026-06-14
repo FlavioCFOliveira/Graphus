@@ -31,7 +31,9 @@
 //! here. The trait is the seam: any store that upholds its contract drops in unchanged.
 
 #[cfg(any(test, feature = "test-support"))]
-use std::collections::HashMap;
+// FxHashMap: the in-memory reference store is keyed by internal Key (u64) and never iterated in an
+// order-observable way, so the faster non-cryptographic hash is safe.
+use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::{Timestamp, TxnId};
 

@@ -326,15 +326,26 @@ impl Response {
     /// [`BoltError::Encode`] only if a structure would exceed 15 fields (never for these messages).
     pub fn encode(&self) -> BoltResult<Vec<u8>> {
         let mut p = Packer::new();
+        self.encode_into(&mut p)?;
+        Ok(p.into_inner())
+    }
+
+    /// PERF (C4/C5): encodes this response into a caller-provided [`Packer`], producing byte-identical
+    /// output to [`Response::encode`]. Lets the server reuse a single retained `Packer` (cleared via
+    /// [`Packer::reset`]) across messages instead of allocating a fresh zero-capacity buffer per send.
+    ///
+    /// # Errors
+    /// [`BoltError::Encode`] only if a structure would exceed 15 fields (never for these messages).
+    pub fn encode_into(&self, p: &mut Packer) -> BoltResult<()> {
         match self {
             Response::Success { metadata } => {
-                write_struct_with_map(&mut p, opcode::SUCCESS, metadata)?;
+                write_struct_with_map(p, opcode::SUCCESS, metadata)?;
             }
             Response::Record { values } => {
                 p.write_struct_header(opcode::RECORD, 1)?;
                 p.write_list_header(values.len());
                 for v in values {
-                    pack_bolt_value(&mut p, v);
+                    pack_bolt_value(p, v);
                 }
             }
             Response::Ignored => p.write_struct_header(opcode::IGNORED, 0)?,
@@ -343,10 +354,10 @@ impl Response {
                     ("code".to_owned(), Value::String(f.code.clone())),
                     ("message".to_owned(), Value::String(f.message.clone())),
                 ];
-                write_struct_with_map(&mut p, opcode::FAILURE, &meta)?;
+                write_struct_with_map(p, opcode::FAILURE, &meta)?;
             }
         }
-        Ok(p.into_inner())
+        Ok(())
     }
 
     /// Decodes a response from a message payload (the inverse of [`Response::encode`]; used by tests

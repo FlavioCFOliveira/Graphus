@@ -662,7 +662,7 @@ fn collect_into_projection<E: RestEngine>(
     let params = bind_parameters(stmt).map_err(|e| GraphusError::Runtime(e.to_string()))?;
     let mut stream = state.engine.run(handle, &stmt.statement, params)?;
     while let Some(row) = stream.next_row()? {
-        projection.add_row(&row);
+        projection.add_row(row);
     }
     Ok(())
 }

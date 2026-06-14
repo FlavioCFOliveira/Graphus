@@ -17,6 +17,9 @@ test-support = []
 
 [dependencies]
 graphus-core = { path = "../graphus-core" }
+# Fast, non-cryptographic hash (FxHashMap/FxHashSet) for internal, integer-keyed hot maps only —
+# keys are internal TxnId/Key (u64), never attacker-controlled, so SipHash's DoS resistance is moot.
+rustc-hash = "2"
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

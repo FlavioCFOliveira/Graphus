@@ -288,6 +288,93 @@ impl LogRecord {
     }
 }
 
+/// A WAL record decoded **in place**: the `redo`/`undo` images borrow the source buffer instead of
+/// being copied into owned `Vec`s. Used by read-only scans (the recovery transaction-table rebuild
+/// and the torn-tail probe) that inspect only header fields and at most a prefix of `redo`, avoiding
+/// the two heap allocations [`LogRecord::decode`] performs per record. The validation, field layout
+/// and accept/reject behaviour are byte-for-byte identical to [`LogRecord::decode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogRecordRef<'a> {
+    /// See [`LogRecord::lsn`].
+    pub lsn: Lsn,
+    /// See [`LogRecord::prev_lsn`].
+    pub prev_lsn: Lsn,
+    /// See [`LogRecord::txn_id`].
+    pub txn_id: TxnId,
+    /// See [`LogRecord::rec_type`].
+    pub rec_type: RecordType,
+    /// See [`LogRecord::page_id`].
+    pub page_id: PageId,
+    /// See [`LogRecord::undo_next_lsn`].
+    pub undo_next_lsn: Lsn,
+    /// Redo image, borrowed from the source buffer.
+    pub redo: &'a [u8],
+    /// Undo image, borrowed from the source buffer.
+    pub undo: &'a [u8],
+}
+
+impl<'a> LogRecordRef<'a> {
+    /// Decodes the record at the start of `bytes` without allocating, borrowing `redo`/`undo` from
+    /// the input. Same validation and error taxonomy as [`LogRecord::decode`].
+    pub fn decode(bytes: &'a [u8]) -> Result<(Self, usize), DecodeError> {
+        if bytes.len() < REC_FIXED_PREFIX + 8 {
+            return Err(DecodeError::Incomplete);
+        }
+        let total = read_u32(bytes, OFF_TOTAL_LEN) as usize;
+        if total < MIN_RECORD_LEN {
+            return Err(DecodeError::Corrupt);
+        }
+        if bytes.len() < total {
+            return Err(DecodeError::Incomplete);
+        }
+        let rec = &bytes[..total];
+        let stored_crc = read_u32(rec, total - 4);
+        if crc32c::crc32c(&rec[..total - 4]) != stored_crc {
+            return Err(DecodeError::BadCrc);
+        }
+        let rec_type = RecordType::from_u8(rec[OFF_TYPE]).ok_or(DecodeError::Corrupt)?;
+        let redo_len = read_u32(rec, OFF_REDO_LEN) as usize;
+        let redo_start = OFF_REDO_LEN + 4;
+        let undo_len_off = redo_start
+            .checked_add(redo_len)
+            .ok_or(DecodeError::Corrupt)?;
+        if undo_len_off + 4 + 4 > total {
+            return Err(DecodeError::Corrupt);
+        }
+        let undo_len = read_u32(rec, undo_len_off) as usize;
+        let undo_start = undo_len_off + 4;
+        if undo_start + undo_len + 4 != total {
+            return Err(DecodeError::Corrupt);
+        }
+        Ok((
+            Self {
+                lsn: Lsn(read_u64(rec, OFF_LSN)),
+                prev_lsn: Lsn(read_u64(rec, OFF_PREV_LSN)),
+                txn_id: TxnId(read_u64(rec, OFF_TXN_ID)),
+                rec_type,
+                page_id: PageId(read_u64(rec, OFF_PAGE_ID)),
+                undo_next_lsn: Lsn(read_u64(rec, OFF_UNDO_NEXT)),
+                redo: &rec[redo_start..redo_start + redo_len],
+                undo: &rec[undo_start..undo_start + undo_len],
+            },
+            total,
+        ))
+    }
+
+    /// The MVCC commit timestamp carried by a [`Commit`](RecordType::Commit) record; see
+    /// [`LogRecord::commit_ts`]. Returns `None` for a non-commit record.
+    #[must_use]
+    pub fn commit_ts(&self) -> Option<Timestamp> {
+        if self.rec_type != RecordType::Commit {
+            return None;
+        }
+        let ts = self.redo.get(..8).map_or(0, |b| {
+            u64::from_le_bytes(b.try_into().expect("8-byte slice"))
+        });
+        Some(Timestamp(ts))
+    }
+}
+
 fn read_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().expect("4-byte slice"))
 }

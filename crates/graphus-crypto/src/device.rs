@@ -57,11 +57,11 @@
 //! the storage layer verifies each page's CRC32C header on read, which an all-zero page fails. See the
 //! KNOWN LIMITATION block in [`read_page`] for the full bound and the regression tests that pin it.
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::AeadInPlace;
+use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
-use graphus_io::{BlockDevice, PAGE_SIZE, Page};
+use graphus_io::{BlockDevice, Page};
 
 use crate::header::{HEADER_SLOTS, Header};
 use crate::keyring::Keyring;
@@ -267,20 +267,15 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
 
         let v = slot::view(&s);
         let nonce = Nonce::from(*v.nonce);
-        // GCM's `decrypt` takes ciphertext || tag; the RustCrypto API expects them concatenated.
-        let mut combined = Vec::with_capacity(PAGE_SIZE + TAG_LEN);
-        combined.extend_from_slice(v.ciphertext);
-        combined.extend_from_slice(v.tag);
+        let tag = Tag::from(*v.tag);
         let aad = Self::aad(page);
-        let plaintext = self
-            .cipher
-            .decrypt(
-                &nonce,
-                aes_gcm::aead::Payload {
-                    msg: &combined,
-                    aad: &aad,
-                },
-            )
+        // Decrypt in place: copy the ciphertext region into the caller's buffer (GCM ciphertext
+        // length equals plaintext length, both exactly `PAGE_SIZE`) and authenticate-decrypt it
+        // against the detached tag. This is byte-identical to the attached `decrypt` of
+        // `ciphertext || tag` but avoids the `combined` concatenation Vec and the result Vec.
+        buf.copy_from_slice(v.ciphertext);
+        self.cipher
+            .decrypt_in_place_detached(&nonce, &aad, buf.as_mut_slice(), &tag)
             .map_err(|_| {
                 // A tag failure is the unified signal for: wrong key, tamper, torn/partial write, or
                 // a relocated page (AAD mismatch). Fail closed exactly like a CRC failure.
@@ -290,14 +285,6 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
                     page.0
                 ))
             })?;
-        if plaintext.len() != PAGE_SIZE {
-            return Err(GraphusError::Storage(format!(
-                "decrypted page {} has length {} (expected {PAGE_SIZE})",
-                page.0,
-                plaintext.len()
-            )));
-        }
-        buf.copy_from_slice(&plaintext);
         Ok(())
     }
 
@@ -312,38 +299,26 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         let nonce_bytes = random_nonce();
         let nonce = Nonce::from(nonce_bytes);
         let aad = Self::aad(page);
-        let sealed = self
+        // Encrypt in place: build the slot, copy the plaintext into its ciphertext region, then
+        // seal that region in place to obtain the detached tag. The detached API produces a
+        // byte-identical ciphertext and tag to the attached `encrypt` of `plaintext`, but writes
+        // the ciphertext directly into the slot — no result Vec, no split.
+        let mut s: Slot = [0u8; SLOT_SIZE];
+        s[slot::CIPHERTEXT_OFFSET..].copy_from_slice(buf.as_slice());
+        let tag = self
             .cipher
-            .encrypt(
-                &nonce,
-                aes_gcm::aead::Payload {
-                    msg: buf.as_slice(),
-                    aad: &aad,
-                },
-            )
+            .encrypt_in_place_detached(&nonce, &aad, &mut s[slot::CIPHERTEXT_OFFSET..])
             .map_err(|_| {
                 GraphusError::Storage(format!(
                     "authenticated encryption failed for page {}",
                     page.0
                 ))
             })?;
-        // `encrypt` returns ciphertext || tag; split them back out for the slot layout.
-        if sealed.len() != PAGE_SIZE + TAG_LEN {
-            return Err(GraphusError::Storage(format!(
-                "sealed page {} has length {} (expected {})",
-                page.0,
-                sealed.len(),
-                PAGE_SIZE + TAG_LEN
-            )));
-        }
-        let (ciphertext, tag) = sealed.split_at(PAGE_SIZE);
-        let ciphertext: &[u8; PAGE_SIZE] = ciphertext
-            .try_into()
-            .expect("INVARIANT: split at PAGE_SIZE yields a PAGE_SIZE prefix");
-        let tag: &[u8; TAG_LEN] = tag
-            .try_into()
-            .expect("INVARIANT: the GCM tail is exactly TAG_LEN bytes");
-        let s = slot::assemble(&nonce_bytes, tag, ciphertext);
+        // `tag` is the 16-byte GCM authentication tag (`TAG_LEN`); place nonce and tag in their
+        // header regions to complete the `nonce || tag || ciphertext` slot layout.
+        debug_assert_eq!(tag.len(), TAG_LEN);
+        s[slot::NONCE_OFFSET..slot::NONCE_OFFSET + NONCE_LEN].copy_from_slice(&nonce_bytes);
+        s[slot::TAG_OFFSET..slot::TAG_OFFSET + TAG_LEN].copy_from_slice(tag.as_ref());
         self.backing.write_slot(page.0 + HEADER_SLOTS, &s)
     }
 
@@ -440,6 +415,7 @@ mod tests {
     use super::*;
     use crate::keyring::{KEY_LEN, SALT_LEN};
     use crate::raw::MemRawSlots;
+    use graphus_io::PAGE_SIZE;
 
     fn keyring(salt: &[u8; SALT_LEN]) -> Keyring {
         Keyring::from_key_file_bytes(&[0x5Cu8; KEY_LEN], salt).expect("keyring")

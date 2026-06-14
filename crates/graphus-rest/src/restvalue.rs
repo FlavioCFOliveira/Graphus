@@ -220,15 +220,17 @@ impl GraphProjection {
     /// - [`RestValue::Path`] adds every node and relationship along the path.
     /// - [`RestValue::List`] recurses into each element (so nested structural lists are walked).
     /// - [`RestValue::Value`] (a scalar/temporal/map property value) contributes nothing.
-    pub fn add_value(&mut self, value: &RestValue) {
+    pub fn add_value(&mut self, value: RestValue) {
+        // PERF (C14): consumes the value so structural entities move into the projection rather than
+        // being cloned (the caller drops the row immediately after). Behaviour is unchanged.
         match value {
             RestValue::Node(node) => self.add_node(node),
             RestValue::Relationship(rel) => self.add_relationship(rel),
             RestValue::Path(path) => {
-                for node in &path.nodes {
+                for node in path.nodes {
                     self.add_node(node);
                 }
-                for rel in &path.relationships {
+                for rel in path.relationships {
                     self.add_relationship(rel);
                 }
             }
@@ -242,24 +244,26 @@ impl GraphProjection {
         }
     }
 
-    /// Folds one whole result row (each cell) into the projection.
-    pub fn add_row(&mut self, row: &[RestValue]) {
+    /// Folds one whole result row (each cell) into the projection, consuming the row.
+    pub fn add_row(&mut self, row: Vec<RestValue>) {
         for cell in row {
             self.add_value(cell);
         }
     }
 
     /// Adds a node unless its id was already collected (keeping the first sighting).
-    fn add_node(&mut self, node: &RestNode) {
+    fn add_node(&mut self, node: RestNode) {
+        // PERF (C14): move the owned node in instead of cloning a borrowed one.
         if self.seen_nodes.insert(node.id) {
-            self.nodes.push(node.clone());
+            self.nodes.push(node);
         }
     }
 
     /// Adds a relationship unless its id was already collected (keeping the first sighting).
-    fn add_relationship(&mut self, rel: &RestRelationship) {
+    fn add_relationship(&mut self, rel: RestRelationship) {
+        // PERF (C14): move the owned relationship in instead of cloning a borrowed one.
         if self.seen_relationships.insert(rel.id) {
-            self.relationships.push(rel.clone());
+            self.relationships.push(rel);
         }
     }
 
@@ -439,7 +443,7 @@ mod tests {
     fn projection_collects_nodes_and_relationships() {
         // A row `(a)-[r]->(b)` projects to two nodes + one relationship with correct endpoints.
         let mut proj = GraphProjection::new();
-        proj.add_row(&[
+        proj.add_row(vec![
             RestValue::Node(node(1, "Person")),
             RestValue::Relationship(rel(100, 1, 2)),
             RestValue::Node(node(2, "Person")),
@@ -462,8 +466,8 @@ mod tests {
     fn projection_dedups_shared_node_across_rows() {
         // The same node id appears in two rows; it must collapse to one entry.
         let mut proj = GraphProjection::new();
-        proj.add_row(&[RestValue::Node(node(7, "A")), RestValue::Node(node(8, "B"))]);
-        proj.add_row(&[RestValue::Node(node(7, "A")), RestValue::Node(node(9, "C"))]);
+        proj.add_row(vec![RestValue::Node(node(7, "A")), RestValue::Node(node(8, "B"))]);
+        proj.add_row(vec![RestValue::Node(node(7, "A")), RestValue::Node(node(9, "C"))]);
         assert_eq!(proj.node_count(), 3, "node 7 collapses to one entry");
         let ids: Vec<i64> = proj
             .to_json()
@@ -481,8 +485,8 @@ mod tests {
     #[test]
     fn projection_dedups_shared_relationship() {
         let mut proj = GraphProjection::new();
-        proj.add_value(&RestValue::Relationship(rel(100, 1, 2)));
-        proj.add_value(&RestValue::Relationship(rel(100, 1, 2)));
+        proj.add_value(RestValue::Relationship(rel(100, 1, 2)));
+        proj.add_value(RestValue::Relationship(rel(100, 1, 2)));
         assert_eq!(proj.relationship_count(), 1);
     }
 
@@ -494,7 +498,7 @@ mod tests {
             relationships: vec![rel(10, 1, 2), rel(11, 2, 3)],
         };
         let mut proj = GraphProjection::new();
-        proj.add_row(&[
+        proj.add_row(vec![
             RestValue::Path(path),
             // A list re-mentioning node 2 (dedup) and adding node 4.
             RestValue::List(vec![
@@ -509,7 +513,7 @@ mod tests {
     #[test]
     fn projection_of_scalar_only_result_is_empty() {
         let mut proj = GraphProjection::new();
-        proj.add_row(&[
+        proj.add_row(vec![
             RestValue::Value(Value::Integer(1)),
             RestValue::Value(Value::String("hello".to_owned())),
             // A non-structural list of scalars contributes nothing either.

@@ -50,6 +50,7 @@ use crate::handshake::{
     parse_manifest_choice, server_reply,
 };
 use crate::message::{ALL, Request, Response};
+use crate::packstream::Packer;
 use crate::transport::Transport;
 
 /// The server-side connection state (`04 §8.1`).
@@ -155,6 +156,10 @@ pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     dechunker: Dechunker,
     /// A scratch read buffer.
     read_buf: Vec<u8>,
+    /// PERF (C4/C5): retained encode buffer (PackStream payload), reused across responses.
+    packer: Packer,
+    /// PERF (C4/C5): retained framing buffer (chunked wire bytes), reused across responses.
+    framed: Vec<u8>,
 }
 
 /// An open `RUN` result plus a **one-record lookahead** buffer.
@@ -235,6 +240,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             open_stream: None,
             dechunker: Dechunker::new(),
             read_buf: vec![0u8; 8 * 1024],
+            packer: Packer::new(),
+            framed: Vec::new(),
         }
     }
 
@@ -848,8 +855,9 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             if n == 0 {
                 return Ok(None); // EOF
             }
-            let chunk = self.read_buf[..n].to_vec();
-            self.dechunker.push(&chunk);
+            // PERF (C1): push the read slice directly; `push` already copies into the inbox,
+            // so the intermediate `to_vec()` was a redundant per-read heap allocation.
+            self.dechunker.push(&self.read_buf[..n]);
         }
     }
 
@@ -873,10 +881,14 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
 
     /// Encodes a response, frames it into chunks, and writes it.
     fn send(&mut self, response: &Response) -> BoltResult<()> {
-        let payload = response.encode()?;
-        let mut framed = Vec::with_capacity(payload.len() + 4);
-        chunk_message_into(&mut framed, &payload);
-        self.transport.write_all(&framed)
+        // PERF (C4/C5): encode into the retained packer and frame into the retained buffer, both
+        // cleared (capacity preserved) between messages, so the steady-state send path allocates
+        // nothing. Wire bytes are byte-identical to the prior fresh-Vec path.
+        self.packer.reset();
+        response.encode_into(&mut self.packer)?;
+        self.framed.clear();
+        chunk_message_into(&mut self.framed, self.packer.as_bytes());
+        self.transport.write_all(&self.framed)
     }
 
     /// Convenience: send a `FAILURE`.

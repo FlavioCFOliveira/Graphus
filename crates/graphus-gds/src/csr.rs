@@ -210,8 +210,14 @@ impl CsrBuilder {
         }
 
         let m = expanded.len();
+        // CSR offsets hold values in `0..=m` (cumulative edge counts). We keep them as `u32` for
+        // cache density (4 bytes/node instead of 8), so the edge count must fit in `u32` — mirror
+        // the node-count guard above.
+        if m > u32::MAX as usize {
+            return Err(GdsError::Overflow("edge count exceeds u32 offset space"));
+        }
         // Counting sort by source into CSR offsets.
-        let mut offsets = vec![0usize; n + 1];
+        let mut offsets = vec![0u32; n + 1];
         for e in &expanded {
             // `src` is guaranteed interned (add_edge/intern), so the lookup is infallible; we still
             // avoid `unwrap` and skip defensively rather than panic.
@@ -235,7 +241,7 @@ impl CsrBuilder {
             else {
                 continue;
             };
-            let pos = cursor[s as usize];
+            let pos = cursor[s as usize] as usize;
             targets[pos] = d;
             if self.weighted {
                 weights[pos] = e.weight;
@@ -267,7 +273,9 @@ pub struct CsrGraph {
     orientation: Orientation,
     external: Vec<ExternalId>,
     index_of: HashMap<ExternalId, InternalId>,
-    offsets: Vec<usize>,
+    /// CSR row offsets, length `node_count + 1`, values in `0..=edge_count`. Stored as `u32` (not
+    /// `usize`) for cache density; the edge-count fit is guaranteed by the build-time guard.
+    offsets: Vec<u32>,
     targets: Vec<InternalId>,
     weights: Vec<f64>,
 }
@@ -319,8 +327,8 @@ impl CsrGraph {
     #[must_use]
     pub fn neighbors(&self, node: InternalId) -> Option<&[InternalId]> {
         let i = node as usize;
-        let start = *self.offsets.get(i)?;
-        let end = *self.offsets.get(i + 1)?;
+        let start = *self.offsets.get(i)? as usize;
+        let end = *self.offsets.get(i + 1)? as usize;
         self.targets.get(start..end)
     }
 
@@ -332,8 +340,8 @@ impl CsrGraph {
             return None;
         }
         let i = node as usize;
-        let start = *self.offsets.get(i)?;
-        let end = *self.offsets.get(i + 1)?;
+        let start = *self.offsets.get(i)? as usize;
+        let end = *self.offsets.get(i + 1)? as usize;
         self.weights.get(start..end)
     }
 
@@ -341,16 +349,16 @@ impl CsrGraph {
     #[must_use]
     pub fn out_degree(&self, node: InternalId) -> Option<usize> {
         let i = node as usize;
-        let start = *self.offsets.get(i)?;
-        let end = *self.offsets.get(i + 1)?;
+        let start = *self.offsets.get(i)? as usize;
+        let end = *self.offsets.get(i + 1)? as usize;
         end.checked_sub(start)
     }
 
     /// An iterator over `(internal_id, neighbors_slice)` for every node, in id order.
     pub fn iter_adjacency(&self) -> impl Iterator<Item = (InternalId, &[InternalId])> {
         (0..self.node_count()).map(move |i| {
-            let start = self.offsets[i];
-            let end = self.offsets[i + 1];
+            let start = self.offsets[i] as usize;
+            let end = self.offsets[i + 1] as usize;
             (i as InternalId, &self.targets[start..end])
         })
     }
@@ -362,11 +370,11 @@ impl CsrGraph {
     pub fn memory_bytes(&self) -> usize {
         let id = core::mem::size_of::<ExternalId>();
         let idx = core::mem::size_of::<InternalId>();
-        let usz = core::mem::size_of::<usize>();
+        let off = core::mem::size_of::<u32>();
         let f = core::mem::size_of::<f64>();
 
         let external = self.external.capacity().saturating_mul(id);
-        let offsets = self.offsets.capacity().saturating_mul(usz);
+        let offsets = self.offsets.capacity().saturating_mul(off);
         let targets = self.targets.capacity().saturating_mul(idx);
         let weights = self.weights.capacity().saturating_mul(f);
         // HashMap stores (ExternalId, InternalId) pairs; approximate at capacity.

@@ -85,6 +85,11 @@ pub enum Frame {
 pub struct Dechunker {
     /// Bytes received but not yet parsed into chunks.
     inbox: Vec<u8>,
+    /// PERF (C2): read offset into `inbox`. Consumed chunks advance this cursor instead of being
+    /// drained from the front (an O(remaining) memmove per chunk). The buffer is compacted lazily —
+    /// only once everything is consumed or the cursor crosses a threshold — so steady-state framing
+    /// is amortised O(1) per chunk. The *logical* buffer is always `inbox[read_cursor..]`.
+    read_cursor: usize,
     /// Payload assembled for the in-progress message (non-empty chunks seen since the last
     /// end-marker).
     assembling: Vec<u8>,
@@ -101,6 +106,7 @@ impl Default for Dechunker {
     fn default() -> Self {
         Self {
             inbox: Vec::new(),
+            read_cursor: 0,
             assembling: Vec::new(),
             in_message: false,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
@@ -126,7 +132,24 @@ impl Dechunker {
 
     /// Appends received bytes to the internal buffer.
     pub fn push(&mut self, bytes: &[u8]) {
+        // PERF (C2): reclaim already-consumed front bytes before growing, so the backing `Vec` does
+        // not accumulate dead prefix across many `push` calls.
+        self.compact();
         self.inbox.extend_from_slice(bytes);
+    }
+
+    /// Drops consumed front bytes (`inbox[..read_cursor]`) and resets the cursor. Called when the
+    /// buffer is fully drained, when the cursor grows large, or before appending more input.
+    fn compact(&mut self) {
+        if self.read_cursor == 0 {
+            return;
+        }
+        if self.read_cursor >= self.inbox.len() {
+            self.inbox.clear();
+        } else {
+            self.inbox.drain(..self.read_cursor);
+        }
+        self.read_cursor = 0;
     }
 
     /// Returns the next complete [`Frame`], or `Ok(None)` if more bytes are needed.
@@ -141,20 +164,31 @@ impl Dechunker {
     /// can close the connection rather than buffer unboundedly (DoS hardening).
     pub fn next_frame(&mut self) -> BoltResult<Option<Frame>> {
         loop {
+            // PERF (C2): the logical buffer is `inbox[read_cursor..]`; consumed chunks advance the
+            // cursor rather than draining the front. Compact lazily once it grows large so the dead
+            // prefix never accumulates unboundedly between `push` calls (e.g. a stream of many small
+            // messages without intervening pushes).
+            if self.read_cursor > 8 * 1024 && self.read_cursor > self.inbox.len() / 2 {
+                self.compact();
+            }
+            let avail = self.inbox.len() - self.read_cursor;
             // Need at least a 2-byte length header to proceed.
-            if self.inbox.len() < 2 {
+            if avail < 2 {
                 return Ok(None);
             }
-            let len = usize::from(u16::from_be_bytes([self.inbox[0], self.inbox[1]]));
+            let base = self.read_cursor;
+            let len = usize::from(u16::from_be_bytes([self.inbox[base], self.inbox[base + 1]]));
 
             if len == 0 {
                 // End-of-message / NOOP marker.
-                self.inbox.drain(..2);
+                self.read_cursor += 2;
                 if self.in_message {
                     let payload = std::mem::take(&mut self.assembling);
                     self.in_message = false;
+                    self.compact_if_drained();
                     return Ok(Some(Frame::Message(payload)));
                 }
+                self.compact_if_drained();
                 return Ok(Some(Frame::Noop));
             }
 
@@ -171,20 +205,31 @@ impl Dechunker {
 
             // A data chunk: wait until the full header+payload has arrived.
             let total = 2 + len;
-            if self.inbox.len() < total {
+            if avail < total {
                 return Ok(None);
             }
-            self.assembling.extend_from_slice(&self.inbox[2..total]);
+            self.assembling
+                .extend_from_slice(&self.inbox[base + 2..base + total]);
             self.in_message = true;
-            self.inbox.drain(..total);
+            self.read_cursor += total;
             // Loop: there may be more chunks (or the terminating marker) already buffered.
+        }
+    }
+
+    /// Compacts the inbox when the cursor has consumed everything buffered. This keeps the common
+    /// "buffer fully drained between reads" case allocation-stable (cursor reset to 0, no memmove).
+    fn compact_if_drained(&mut self) {
+        if self.read_cursor >= self.inbox.len() {
+            self.inbox.clear();
+            self.read_cursor = 0;
         }
     }
 
     /// Whether any buffered bytes remain unparsed (a partial chunk awaiting more input).
     #[must_use]
     pub fn has_buffered(&self) -> bool {
-        !self.inbox.is_empty() || !self.assembling.is_empty()
+        // PERF (C2): unparsed bytes are `inbox[read_cursor..]`, not the whole `inbox`.
+        self.read_cursor < self.inbox.len() || !self.assembling.is_empty()
     }
 }
 
@@ -325,6 +370,50 @@ mod tests {
             d.next_frame().unwrap(),
             Some(Frame::Message(b"abcde".to_vec()))
         );
+    }
+
+    #[test]
+    fn many_messages_one_push_drive_cursor_then_compact() {
+        // PERF (C2) regression: a single large push of many small messages must reassemble each one
+        // byte-identically while the read cursor advances (and lazily compacts) instead of draining
+        // the front. Build enough payload that the cursor crosses the 8 KiB compaction threshold.
+        let mut wire = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..2000u32 {
+            let payload = format!("msg-{i}").into_bytes();
+            chunk_message_into(&mut wire, &payload);
+            expected.push(Frame::Message(payload));
+        }
+        let mut d = Dechunker::new();
+        d.push(&wire);
+        let mut got = Vec::new();
+        while let Some(f) = d.next_frame().expect("framing") {
+            got.push(f);
+        }
+        assert_eq!(got, expected);
+        assert!(!d.has_buffered(), "buffer must be fully drained");
+    }
+
+    #[test]
+    fn cursor_survives_interleaved_push_and_consume() {
+        // A frame is consumed (advancing the cursor), then more bytes are pushed: `push` must compact
+        // the consumed prefix so the second frame still reassembles correctly.
+        let mut d = Dechunker::new();
+        let mut first = Vec::new();
+        chunk_message_into(&mut first, b"first");
+        d.push(&first);
+        assert_eq!(
+            d.next_frame().unwrap(),
+            Some(Frame::Message(b"first".to_vec()))
+        );
+        let mut second = Vec::new();
+        chunk_message_into(&mut second, b"second");
+        d.push(&second);
+        assert_eq!(
+            d.next_frame().unwrap(),
+            Some(Frame::Message(b"second".to_vec()))
+        );
+        assert!(!d.has_buffered());
     }
 
     #[test]

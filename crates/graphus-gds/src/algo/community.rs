@@ -76,6 +76,11 @@ pub fn label_propagation(
     let mut iterations = 0u32;
     let mut converged = false;
 
+    // Reusable label tally, hoisted out of the hot loops and `.clear()`ed per node so its
+    // allocation (and capacity) is retained across the O(k·n) inner iterations instead of being
+    // freshly allocated for every node on every sweep.
+    let mut counts: HashMap<InternalId, u32> = HashMap::new();
+
     // Deterministic node visitation order (ascending) with in-place updates (semi-synchronous).
     while iterations < config.max_iter {
         cancel.check()?;
@@ -87,8 +92,8 @@ pub fn label_propagation(
             if neighbors.is_empty() {
                 continue; // isolated node keeps its own label
             }
-            // Tally neighbour labels.
-            let mut counts: HashMap<InternalId, u32> = HashMap::new();
+            // Tally neighbour labels (reuse the hoisted map; clearing keeps its capacity).
+            counts.clear();
             for &u in neighbors {
                 *counts.entry(label[u as usize]).or_insert(0) += 1;
             }
