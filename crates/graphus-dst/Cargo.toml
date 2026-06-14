@@ -35,3 +35,7 @@ graphus-auth = { path = "../graphus-auth" }
 # The REAL REST request core (rmp #164): `execute_autocommit` + `RestEngine`/`AppState`, driven over
 # the deterministic engine without the axum/socket layer.
 graphus-rest = { path = "../graphus-rest" }
+# The Elle/Adya isolation checker (rmp #170) + the engine's MaterializedValue result cells, so the
+# harness can record real transaction histories and certify serializability end-to-end.
+graphus-elle = { path = "../graphus-elle" }
+graphus-cypher = { path = "../graphus-cypher" }

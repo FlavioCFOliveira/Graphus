@@ -40,6 +40,7 @@ pub mod checker;
 pub mod cli;
 pub mod fault;
 pub mod faults;
+pub mod isolation;
 pub mod harness;
 pub mod misbehave;
 pub mod mix;
