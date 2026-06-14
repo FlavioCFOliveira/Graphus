@@ -51,7 +51,14 @@ const AVG_NANOS_PER_MONTH: i128 = 30_436_875 * 1_000_000;
 /// (`NODE` = 1, `RELATIONSHIP` = 2, `PATH` = 4) keep reserved slots so adding them later does not
 /// renumber the rest. `null` is the largest, above even `NaN` (which is handled inside the number
 /// class by [`total_f64`], so `null` simply sits above all numbers).
-fn class_rank(v: &Value) -> u8 {
+///
+/// Exposed `pub(crate)` so the `RowValue`-level comparator ([`crate::runtime::cmp_row_values`]) can
+/// interleave the structural classes (`Node`/`Relationship`/`Path`, which live only at the
+/// [`RowValue`](crate::runtime::RowValue) level) into the *same* global order, rather than ranking
+/// every property `Value` as one opaque class. The reserved structural slots (1, 2, 4) are exactly
+/// what lets it do so without renumbering: `Map(0) < Node(1) < Relationship(2) < List(3) <
+/// Path(4) < Point(5) < {temporals} < String < Bytes < Boolean < Number < null`.
+pub(crate) fn class_rank(v: &Value) -> u8 {
     match v {
         Value::Map(_) => 0,
         // 1 = NODE, 2 = RELATIONSHIP (deferred to the executor sub-task).

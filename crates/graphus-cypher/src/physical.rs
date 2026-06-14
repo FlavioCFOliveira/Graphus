@@ -896,6 +896,23 @@ impl Planner<'_> {
             LogicalOp::Apply { left, right } => {
                 let phys_left = self.lower(left, deps);
                 let phys_right = self.lower(right, deps);
+                // Eagerness barrier (openCypher "Eager" rule) across a write→read clause boundary. A
+                // fresh `MATCH` after a write becomes `Apply(left = <… writes …>, right = scan)`, and
+                // the join drives the right scan **once per left row**. If the left's writes are
+                // pipelined (one create per left row pulled), the right scan for an early row sees only
+                // the writes produced so far, so a later `MATCH () CREATE ()` re-scans the graph
+                // mid-mutation and the create count drifts (observed +9/+12, expected +10;
+                // `clauses/create/Create3.feature` [3]). When the left contains a write **and** the
+                // right reads the graph, drain the left into an `Eager` buffer first, so every
+                // left-side write settles before the right scan runs for any row. A left with no write,
+                // or a right that performs no graph read, needs no barrier (the common, hot path).
+                let phys_left = if contains_write(&phys_left) && contains_read(&phys_right) {
+                    PhysicalOp::Eager {
+                        input: Box::new(phys_left),
+                    }
+                } else {
+                    phys_left
+                };
                 choose_join(phys_left, phys_right, right)
             }
             LogicalOp::Optional {
@@ -913,7 +930,17 @@ impl Planner<'_> {
 
             // ---- write -----------------------------------------------------------------------
             LogicalOp::Create { input, pattern } => PhysicalOp::Create {
-                input: Box::new(self.lower(input, deps)),
+                // Eagerness barrier (openCypher "Eager" rule). A `CREATE` adds nodes its own upstream
+                // `MATCH` could match: in `MATCH () CREATE () WITH * MATCH () CREATE ()` the second
+                // `MATCH ()` feeds the second `CREATE ()`, a read→write cycle. If the read is pipelined
+                // into the create, an early row's fresh node is re-scanned and the create count
+                // snowballs (`clauses/create/Create3.feature` [3]). Draining the read into an `Eager`
+                // buffer first makes the `MATCH` observe exactly the pre-`CREATE` graph (this barrier
+                // pairs with the one on a write-bearing `Apply` *left*, which settles an *earlier*
+                // clause's writes before this `MATCH` scans — both are needed for the two-stage case
+                // above). A create whose input performs no graph read (a bare `CREATE ()` from `Empty`,
+                // `CREATE (a) CREATE (b)`) needs no barrier — the common, hot path.
+                input: Box::new(eager_for_read_write(self.lower(input, deps))),
                 pattern: pattern.clone(),
             },
             LogicalOp::Merge {

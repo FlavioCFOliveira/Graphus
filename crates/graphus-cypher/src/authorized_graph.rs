@@ -66,7 +66,9 @@
 use graphus_core::Value;
 use graphus_core::error::GraphusError;
 
-use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
+use crate::graph_access::{
+    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+};
 
 /// The narrow privilege interface the [`AuthorizedGraph`] enforces against, resolved **once per
 /// statement** for one principal + session database (rmp #93).
@@ -331,6 +333,21 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         } else {
             None
         }
+    }
+
+    fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
+        // A relationship the current transaction deleted earlier in this query still yields its type
+        // (`type(r)` after `DELETE r`, `clauses/return/Return2.feature` [14]). The transaction
+        // necessarily had traverse access to match-and-delete it, so this forwards straight to the
+        // inner record graph (the self-delete is an MVCC fact, not an RBAC question). On the
+        // unrestricted/non-record paths this is just the default `rel_data` delegate.
+        self.inner.rel_data_including_deleted(rel)
+    }
+
+    fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
+        // Self-delete is a property of this transaction's own MVCC write, independent of RBAC, so it
+        // forwards to the inner graph unconditionally.
+        self.inner.entity_deleted_by_txn(entity)
     }
 
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {

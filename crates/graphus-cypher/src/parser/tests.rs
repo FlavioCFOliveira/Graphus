@@ -799,6 +799,36 @@ fn empty_map_literal() {
 }
 
 #[test]
+fn map_literal_accepts_null_and_boolean_keyword_keys() {
+    // openCypher allows `null`/`true`/`false` as (non-reserved) property/map key names; the original
+    // source spelling is preserved so `null` and `NULL` stay DISTINCT keys
+    // (`expressions/map/Map1.feature` [5], `Map2.feature` [5]).
+    let ExprKind::Map(entries) = return_kind("RETURN {null: 'Mats', NULL: 'Pontus'}") else {
+        panic!("expected a map literal")
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].0.name, "null");
+    assert_eq!(entries[1].0.name, "NULL");
+
+    // `true`/`false` are likewise valid key names.
+    let ExprKind::Map(entries) = return_kind("RETURN {true: 1, false: 2}") else {
+        panic!("expected a map literal")
+    };
+    assert_eq!(entries[0].0.name, "true");
+    assert_eq!(entries[1].0.name, "false");
+}
+
+#[test]
+fn property_access_accepts_keyword_keys() {
+    // The same non-reserved-key rule applies to static `.prop` access spelled with a keyword.
+    let exprs = return_exprs("RETURN m.null");
+    let ExprKind::Property { key, .. } = &exprs[0].kind else {
+        panic!("expected a property access, got {:?}", exprs[0].kind)
+    };
+    assert_eq!(key, "null");
+}
+
+#[test]
 fn searched_case_expression() {
     let ExprKind::Case(case) = return_kind("RETURN CASE WHEN x > 1 THEN 'big' ELSE 'small' END")
     else {

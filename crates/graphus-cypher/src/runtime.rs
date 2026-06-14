@@ -269,32 +269,54 @@ impl From<Value> for RowValue {
     }
 }
 
-/// The integer rank used to order **across** the `RowValue` cases for `ORDER BY` and tie-breaking.
+/// The **unified global class rank** of a [`RowValue`] for `ORDER BY`, interleaving the structural
+/// classes (`Node`/`Relationship`/`Path` — which exist only at the `RowValue` level) into the very
+/// same CIP2016-06-14 §Orderability order the property classes use (`04 §7.6`).
 ///
-/// Entities slot above property scalars but below `null`, consistent with the openCypher class order
-/// (`Node`/`Relationship` rank above the property classes, `04 §7.6` / [`crate::ordering`]). Within
-/// each entity case the id orders deterministically so the result is total.
+/// The ascending order is `Map < Node < Relationship < List < Path < Point < {temporals} < String <
+/// Bytes < Boolean < Number < null` (the structural entities slot **between** `Map` and `List`, not
+/// above every property scalar — `ReturnOrderBy1.feature` [11]/[12], whose expected total order is
+/// `{map} < (:Node) < [:Rel] < [list] < <path> < 'string' < boolean < number < NaN < null`). `NaN`
+/// is folded into the number class by [`cmp_values`]/[`total_f64`] (just below `null`), so it needs
+/// no rank of its own.
+///
+/// A structural list/map (`RowValue::List`/`RowValue::Map`) shares the rank of the corresponding
+/// `Value::List`/`Value::Map`, so the two representations of each collection class order as one
+/// (their *within-class* comparison is the elementwise / collapsed path below).
 fn row_value_rank(v: &RowValue) -> u8 {
     match v {
-        RowValue::Node(_) => 0,
-        RowValue::Rel(_) => 1,
-        RowValue::Path(_) => 2,
-        // A structural list/map shares the property-value rank so it interleaves with the
-        // corresponding `Value::List`/`Value::Map` (the two representations of each must order as one
-        // class; see `cmp_row_values`).
-        RowValue::List(_) | RowValue::Map(_) | RowValue::Value(_) => 3,
+        // Structural entities take the reserved CIP slots 1/2/4 (see `ordering::class_rank`), which sit
+        // between `Map` (0) and the rest of the property classes.
+        RowValue::Node(_) => 1,
+        RowValue::Rel(_) => 2,
+        RowValue::Path(_) => 4,
+        // A structural list/map ranks as its property-`Value` class (`List` = 3, `Map` = 0), so it
+        // interleaves with the matching `Value::List`/`Value::Map`.
+        RowValue::List(_) => crate::ordering::class_rank(&Value::List(vec![])),
+        RowValue::Map(_) => crate::ordering::class_rank(&Value::Map(vec![])),
+        // A property value uses the shared CIP class rank directly.
+        RowValue::Value(x) => crate::ordering::class_rank(x),
     }
 }
 
 /// Total ordering over [`RowValue`]s for `ORDER BY` (`04 §7.6`).
 ///
-/// Property values use the Cypher orderability [`cmp_values`]; entity references order by id with a
-/// stable cross-case rank, so the relation is total even when a column mixes entities and scalars.
-/// Lists of either representation compare elementwise (shorter is less on a common prefix); paths
-/// compare by (start, steps). A structural list against a non-list property value compares through
-/// its property collapse (structural elements become null), keeping the relation total.
+/// Cross-class comparisons are decided by the unified [`row_value_rank`] (which interleaves the
+/// structural `Node`/`Relationship`/`Path` classes into the CIP property-class order), so a column
+/// mixing entities, lists, scalars and `null` is totally ordered exactly as openCypher requires
+/// (`ReturnOrderBy1.feature` [11]/[12]). Within one class: property values use the Cypher
+/// orderability [`cmp_values`]; entity references order by id; lists of either representation compare
+/// elementwise (shorter is less on a common prefix); paths compare by (start, steps); maps compare
+/// through their property collapse.
 #[must_use]
 pub fn cmp_row_values(a: &RowValue, b: &RowValue) -> Ordering {
+    // Decide across classes by the unified global rank first; an unequal rank settles the order
+    // (this is what places `Map < Node < Rel < List < Path < … < Number < null`).
+    let (ra, rb) = (row_value_rank(a), row_value_rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    // Same class: compare within it.
     match (a, b) {
         // List-kind values (either representation) compare elementwise as one class.
         _ if is_list_kind(a) && is_list_kind(b) => cmp_row_lists(a, b),
@@ -302,15 +324,14 @@ pub fn cmp_row_values(a: &RowValue, b: &RowValue) -> Ordering {
         (RowValue::Node(x), RowValue::Node(y)) => x.id.cmp(&y.id),
         (RowValue::Rel(x), RowValue::Rel(y)) => x.id.cmp(&y.id),
         (RowValue::Path(x), RowValue::Path(y)) => x.cmp(y),
-        // A structural list against a non-list property value: compare through the property
-        // collapse (structural elements become null) so the class order matches `Value::List`'s.
-        (RowValue::List(_), RowValue::Value(y)) => cmp_values(&collapse_for_ordering(a), y),
-        (RowValue::Value(x), RowValue::List(_)) => cmp_values(x, &collapse_for_ordering(b)),
-        // A structural map compares through its property collapse against any other value, so the
-        // class order matches `Value::Map`'s (mirrors the structural-list rule above).
-        (RowValue::Map(_), _) => cmp_values(&collapse_for_ordering(a), &collapse_for_ordering(b)),
-        (_, RowValue::Map(_)) => cmp_values(&collapse_for_ordering(a), &collapse_for_ordering(b)),
-        _ => row_value_rank(a).cmp(&row_value_rank(b)),
+        // A structural map (or a structural map vs `Value::Map`) compares through its property
+        // collapse, so the within-`Map`-class order matches `Value::Map`'s.
+        (RowValue::Map(_), _) | (_, RowValue::Map(_)) => {
+            cmp_values(&collapse_for_ordering(a), &collapse_for_ordering(b))
+        }
+        // Same rank but distinct representations not covered above (defensive): fall back to the
+        // collapsed property order, which is total.
+        _ => cmp_values(&collapse_for_ordering(a), &collapse_for_ordering(b)),
     }
 }
 
@@ -572,6 +593,62 @@ mod tests {
         assert_eq!(cmp_row_values(&n, &r), Ordering::Less);
         assert_eq!(cmp_row_values(&r, &v), Ordering::Less);
         assert_eq!(cmp_row_values(&v, &v), Ordering::Equal);
+    }
+
+    #[test]
+    fn order_by_across_distinct_types_follows_cip_total_order() {
+        // The CIP/TCK ascending total order across classes (ReturnOrderBy1.feature [11]):
+        //   {map} < (:Node) < [:Rel] < [list] < <path> < 'string' < boolean < number < NaN < null
+        let map = RowValue::Value(Value::Map(vec![(
+            "a".to_owned(),
+            Value::String("map".to_owned()),
+        )]));
+        let node = RowValue::Node(NodeRef { id: NodeId(1) });
+        let rel = RowValue::Rel(RelRef {
+            id: crate::graph_access::RelId(1),
+        });
+        let list = RowValue::Value(Value::List(vec![Value::String("list".to_owned())]));
+        let path = RowValue::Path(PathValue {
+            start: NodeId(1),
+            steps: Vec::new(),
+        });
+        let string = RowValue::Value(Value::String("text".to_owned()));
+        let boolean = RowValue::Value(Value::Boolean(false));
+        let number = RowValue::Value(Value::Float(1.5));
+        let nan = RowValue::Value(Value::Float(f64::NAN));
+        let null = RowValue::NULL;
+
+        let ascending = [
+            &map, &node, &rel, &list, &path, &string, &boolean, &number, &nan, &null,
+        ];
+        // Every adjacent pair is strictly increasing, and antisymmetric.
+        for w in ascending.windows(2) {
+            assert_eq!(
+                cmp_row_values(w[0], w[1]),
+                Ordering::Less,
+                "{:?} should be < {:?}",
+                w[0],
+                w[1]
+            );
+            assert_eq!(
+                cmp_row_values(w[1], w[0]),
+                Ordering::Greater,
+                "antisymmetry for {:?},{:?}",
+                w[0],
+                w[1]
+            );
+        }
+        // Within the number class, an integer interleaves with floats by value (no #130 regression).
+        assert_eq!(
+            cmp_row_values(
+                &RowValue::Value(Value::Integer(1)),
+                &RowValue::Value(Value::Float(1.5))
+            ),
+            Ordering::Less
+        );
+        // NaN sits just below null (the largest number-ish value).
+        assert_eq!(cmp_row_values(&nan, &null), Ordering::Less);
+        assert_eq!(cmp_row_values(&number, &nan), Ordering::Less);
     }
 
     #[test]

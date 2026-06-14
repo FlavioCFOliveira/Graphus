@@ -266,7 +266,21 @@ use graphus_tck::runner::run_scenario;
 /// regressions (failure-set identity diff: 0 newly-failing scenarios). `create/Create3` [3] remains a
 /// residual failure — a pre-existing `WITH *` over-empty-scope cardinality bug, now surfaced honestly
 /// instead of masked by the former erroneous rejection.
-const BASELINE: usize = 3895;
+///
+/// rmp #145 (five graphus-cypher fixes), lifting 3895 → 3907. First, access to an entity deleted
+/// earlier in the same query: `id`/`type` survive, but a property/label read raises `EntityNotFound`/
+/// `DeletedEntityAccess` (`return/Return2` [14]/[15]/[16]/[17]) — a new `entity_deleted_by_txn` seam
+/// plus `rel_data_including_deleted`. Second, `ORDER BY` across distinct value types now follows the
+/// full CIP total order at the `RowValue` level (structural Node/Rel/Path interleaved with the property
+/// classes; `return/ReturnOrderBy1` [11]/[12]). Third, a label predicate on a relationship checks its
+/// type (`expressions/graph/Graph5` [2]). Fourth, `null`/`true`/`false` accepted as map/property key
+/// names, preserving source spelling so `null` and `NULL` stay distinct (`expressions/map/Map1` [5],
+/// `Map2` [5]). Fifth, the two-stage `MATCH () CREATE () WITH * MATCH () CREATE ()` now gives the
+/// correct +10 via paired `Eager` barriers (a write-bearing `Apply` left plus a graph-reading `CREATE`
+/// input), fixing the `create/Create3` [3] residual above. Measured, zero regressions (failure-set
+/// identity diff: 0 newly-failing scenarios). Residual failures: 3 `expressions/temporal/Temporal10`
+/// duration scenarios (pre-existing, out of scope).
+const BASELINE: usize = 3907;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

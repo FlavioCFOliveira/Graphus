@@ -94,6 +94,21 @@ pub struct Incident {
     pub neighbour: NodeId,
 }
 
+/// A node or relationship identity, used to ask the seam whether it was deleted by the current
+/// transaction ([`GraphAccess::entity_deleted_by_txn`]).
+///
+/// openCypher keeps a deleted entity's **identity** (`id`, `type`) accessible after a same-query
+/// `DELETE`, but a property/label read on it must raise a runtime error
+/// (`clauses/return/Return2.feature`). This enum lets the executor name the entity it is about to
+/// read so the seam can report a self-delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedEntity {
+    /// A node identity.
+    Node(NodeId),
+    /// A relationship identity.
+    Rel(RelId),
+}
+
 /// A read-only snapshot of a relationship's structural fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
@@ -160,6 +175,31 @@ pub trait GraphAccess {
 
     /// The structural fields of `rel`, or `None` if it does not exist.
     fn rel_data(&self, rel: RelId) -> Option<RelData>;
+
+    /// The structural fields of `rel`, **including** when `rel` was deleted by the *current*
+    /// transaction (an MVCC tombstone this very query wrote).
+    ///
+    /// openCypher keeps `type(r)` (and `id(r)`) accessible after a same-query `DELETE r`
+    /// (`clauses/return/Return2.feature` [14]). Since [`rel_data`](Self::rel_data) hides a
+    /// self-deleted relationship (it is no longer visible to the snapshot), `type()` reads the type
+    /// through this method instead, which bypasses the self-delete hide. The default delegates to
+    /// [`rel_data`](Self::rel_data) — a backend with no MVCC tombstones (e.g. [`MemGraph`]) has
+    /// nothing extra to surface.
+    fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
+        self.rel_data(rel)
+    }
+
+    /// Whether `entity` (a node or relationship id) was **deleted by the current transaction** — an
+    /// MVCC tombstone written by this very query's own `DELETE`.
+    ///
+    /// Such an entity keeps its identity (`id`, `type`) accessible, but a property or label read on
+    /// it must raise `DeletedEntityAccess` (openCypher; `clauses/return/Return2.feature` [15]/[16]/
+    /// [17]). The default is `false`: a backend with no MVCC tombstones (e.g. [`MemGraph`]) never
+    /// reports a self-delete — there, a deleted entity is simply gone.
+    fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
+        let _ = entity;
+        false
+    }
 
     /// The value of `node`'s property `key`, or `None` if the node or property is absent.
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value>;

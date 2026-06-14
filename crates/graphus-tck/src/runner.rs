@@ -831,6 +831,9 @@ fn classify_eval_error(e: &graphus_cypher::EvalError, message: String) -> TckErr
         // An out-of-range numeric argument (e.g. a `percentileCont`/`percentileDisc` percentile
         // outside `[0,1]`) is the TCK `ArgumentError: NumberOutOfRange`.
         Ev::NumberOutOfRange { .. } => ("ArgumentError", Some("NumberOutOfRange")),
+        // Reading a property/label of an entity deleted earlier in the same query
+        // (`clauses/return/Return2.feature`).
+        Ev::DeletedEntityAccess => ("EntityNotFound", Some("DeletedEntityAccess")),
         _ => ("TypeError", None),
     };
     TckError {

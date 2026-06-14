@@ -74,7 +74,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphus_core::error::GraphusError;
-use graphus_core::{Timestamp, TxnId, Value};
+use graphus_core::{Timestamp, TxnId, Value, VersionStamp};
 use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::encode_single;
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
@@ -129,7 +129,9 @@ fn tuples_match(a: &[Value], b: &[Value]) -> bool {
 }
 
 use crate::constraint::ConstraintViolation;
-use crate::graph_access::{ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId};
+use crate::graph_access::{
+    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+};
 use crate::index_set::{ConstraintRule, IndexSet};
 
 /// A [`GraphAccess`] implementation over a real [`RecordStore`], scoped to one transaction
@@ -321,6 +323,23 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             mvcc.expired_ts,
             &self.registry,
         )
+    }
+
+    /// Whether the version carrying `mvcc` was **deleted by this very transaction** — its creator is
+    /// visible to the snapshot (it existed before our `DELETE`) and its expirer is *our own*
+    /// in-flight stamp (`04 §5.3`). This is the discriminator openCypher needs for a same-query
+    /// `DELETE`: such an entity keeps its identity (`id`/`type`) but a property/label read on it
+    /// raises `DeletedEntityAccess` (`clauses/return/Return2.feature`).
+    ///
+    /// `is_visible(snapshot, created_ts, 0, registry)` tests creator-visibility alone (passing `0` as
+    /// the expirer = "live", so the result is true iff the creator committed at/before our snapshot or
+    /// is our own write). The deliberate side-effect-free read (no `note_read`/SSI marker) keeps the
+    /// own-write self-delete check from perturbing serializability: a transaction inspecting its *own*
+    /// tombstone has no rw-dependency to record.
+    fn deleted_by_self(&self, mvcc: MvccHeader) -> bool {
+        let creator_visible = is_visible(self.snapshot, mvcc.created_ts, 0, &self.registry);
+        creator_visible
+            && VersionStamp::from_raw(mvcc.expired_ts) == VersionStamp::InFlight(self.txn)
     }
 
     /// The transaction id this query runs in.
@@ -1554,6 +1573,51 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             start: NodeId(rec.start_node),
             end: NodeId(rec.end_node),
         })
+    }
+
+    fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
+        // Read the raw record. Unlike `rel_data` this does **not** apply the snapshot's expirer-hide,
+        // so a relationship this transaction deleted earlier in the same query still yields its type
+        // (openCypher keeps `type(r)`/`id(r)` accessible after `DELETE r`,
+        // `clauses/return/Return2.feature` [14]). We still require the *creator* to be visible (a
+        // relationship never created for us, or created by a concurrent uncommitted writer, is not
+        // ours to read). No `note_read`/SSI marker: reading our own tombstone has no rw-dependency.
+        let mut store = self.store.borrow_mut();
+        let rec = match store.rel(rel.0) {
+            Ok(rec) => rec,
+            Err(_) => return None,
+        };
+        // Visible normally, or a tombstone we wrote ourselves: both keep the type readable.
+        if !self.visible(rec.mvcc) && !self.deleted_by_self(rec.mvcc) {
+            return None;
+        }
+        let rel_type = store
+            .token_name(Namespace::RelType, rec.type_id)
+            .unwrap_or("")
+            .to_owned();
+        Some(RelData {
+            rel_type,
+            start: NodeId(rec.start_node),
+            end: NodeId(rec.end_node),
+        })
+    }
+
+    fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
+        // The raw MVCC header of the physical record (a missing page = the id was never allocated, so
+        // it cannot be our self-delete). No `note_read`/SSI marker: a self-delete check on our own
+        // write records no rw-dependency, so it must not perturb serializability (the surrounding read
+        // methods all mark, but this is a side-effect-free identity check).
+        let mvcc = match entity {
+            DeletedEntity::Node(id) => match self.store.borrow_mut().node(id.0) {
+                Ok(rec) => rec.mvcc,
+                Err(_) => return false,
+            },
+            DeletedEntity::Rel(id) => match self.store.borrow_mut().rel(id.0) {
+                Ok(rec) => rec.mvcc,
+                Err(_) => return false,
+            },
+        };
+        self.deleted_by_self(mvcc)
     }
 
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {

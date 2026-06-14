@@ -34,7 +34,7 @@ use crate::ast::{BinaryOp, CaseExpr, Expr, ExprKind, Literal, MapKey, PredicateO
 use crate::binding::BoundParameters;
 use crate::equality::{equals, is_in};
 use crate::function_registry::FunctionRegistry;
-use crate::graph_access::GraphAccess;
+use crate::graph_access::{DeletedEntity, GraphAccess};
 use crate::ordering::compare_values;
 use crate::runtime::{NodeRef, PathStep, PathValue, RelRef, Row, RowValue};
 use crate::ternary::Ternary;
@@ -94,6 +94,11 @@ pub enum EvalError {
         /// The inner failure's message.
         message: String,
     },
+    /// A property or label of an entity DELETED earlier in the same transaction was accessed.
+    /// openCypher raises this at runtime: TCK type `EntityNotFound`, detail `DeletedEntityAccess`
+    /// (`clauses/return/Return2.feature`). `id`/`type` remain accessible after delete; only
+    /// property/label reads fail.
+    DeletedEntityAccess,
 }
 
 impl fmt::Display for EvalError {
@@ -115,6 +120,9 @@ impl fmt::Display for EvalError {
                 write!(f, "function `{name}` failed: {message}")
             }
             Self::Subquery { message } => write!(f, "EXISTS subquery failed: {message}"),
+            Self::DeletedEntityAccess => {
+                write!(f, "cannot access properties or labels of a deleted entity")
+            }
         }
     }
 }
@@ -778,12 +786,25 @@ fn eval_property(
     functions: &dyn FunctionRegistry,
 ) -> EvalResult {
     match eval(base, row, params, graph, functions)? {
-        RowValue::Node(NodeRef { id }) => Ok(RowValue::Value(
-            graph.node_property(id, key).unwrap_or(Value::Null),
-        )),
-        RowValue::Rel(RelRef { id }) => Ok(RowValue::Value(
-            graph.rel_property(id, key).unwrap_or(Value::Null),
-        )),
+        RowValue::Node(NodeRef { id }) => {
+            // Reading a property of an entity deleted earlier in this same query raises at runtime
+            // (`clauses/return/Return2.feature` [15]); `id`/`type` stay accessible, only properties
+            // and labels fail.
+            if graph.entity_deleted_by_txn(DeletedEntity::Node(id)) {
+                return Err(EvalError::DeletedEntityAccess);
+            }
+            Ok(RowValue::Value(
+                graph.node_property(id, key).unwrap_or(Value::Null),
+            ))
+        }
+        RowValue::Rel(RelRef { id }) => {
+            if graph.entity_deleted_by_txn(DeletedEntity::Rel(id)) {
+                return Err(EvalError::DeletedEntityAccess); // Return2.feature [17]
+            }
+            Ok(RowValue::Value(
+                graph.rel_property(id, key).unwrap_or(Value::Null),
+            ))
+        }
         RowValue::Value(Value::Map(entries)) => Ok(RowValue::Value(
             entries
                 .into_iter()
@@ -839,11 +860,19 @@ fn eval_index(
     // (`n['name']`; `expressions/graph/Graph7.feature`), exactly like the static `n.name` form.
     match (&base, &idx) {
         (RowValue::Node(NodeRef { id }), Value::String(k)) => {
+            // `n['key']` on an entity self-deleted earlier in the query fails exactly like `n.key`
+            // (`clauses/return/Return2.feature`).
+            if graph.entity_deleted_by_txn(DeletedEntity::Node(*id)) {
+                return Err(EvalError::DeletedEntityAccess);
+            }
             return Ok(RowValue::Value(
                 graph.node_property(*id, k).unwrap_or(Value::Null),
             ));
         }
         (RowValue::Rel(RelRef { id }), Value::String(k)) => {
+            if graph.entity_deleted_by_txn(DeletedEntity::Rel(*id)) {
+                return Err(EvalError::DeletedEntityAccess);
+            }
             return Ok(RowValue::Value(
                 graph.rel_property(*id, k).unwrap_or(Value::Null),
             ));
@@ -971,8 +1000,16 @@ fn has_labels(base: &RowValue, labels: &[&str], graph: &dyn GraphAccess) -> Tern
             }
             None => Ternary::False,
         },
+        // A label predicate on a RELATIONSHIP checks its TYPE: `r:T` is true iff the rel's type equals
+        // the single label name (case-sensitive), else false — never null for a non-null rel
+        // (`expressions/graph/Graph5.feature` [2]). `all` over the (single-element, in the TCK) label
+        // list generalises the type-equality check faithfully.
+        RowValue::Rel(RelRef { id }) => match graph.rel_data(*id) {
+            Some(data) => Ternary::from_bool(labels.iter().all(|l| data.rel_type == *l)),
+            None => Ternary::False,
+        },
         RowValue::Value(Value::Null) => Ternary::Null,
-        // Label predicate on a non-node is FALSE (it has no labels).
+        // Label predicate on any other non-null, non-entity value is FALSE (it has no labels/type).
         _ => Ternary::False,
     }
 }
@@ -1082,14 +1119,21 @@ fn call_function(
         "labels" => {
             let v = eval(&args[0], row, params, graph, functions)?;
             return match v {
-                RowValue::Node(NodeRef { id }) => Ok(RowValue::Value(Value::List(
-                    graph
-                        .node_labels(id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(Value::String)
-                        .collect(),
-                ))),
+                RowValue::Node(NodeRef { id }) => {
+                    // `labels(n)` on a node self-deleted earlier in this query raises at runtime
+                    // (`clauses/return/Return2.feature` [16]); only `id`/`type` survive a delete.
+                    if graph.entity_deleted_by_txn(DeletedEntity::Node(id)) {
+                        return Err(EvalError::DeletedEntityAccess);
+                    }
+                    Ok(RowValue::Value(Value::List(
+                        graph
+                            .node_labels(id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    )))
+                }
                 // `labels(null)` is null (a missing optional match, `labels(null)` literally).
                 RowValue::Value(Value::Null) => Ok(RowValue::NULL),
                 // Any non-null, non-node argument is a runtime `TypeError` the TCK details as
@@ -1103,8 +1147,12 @@ fn call_function(
         "type" => {
             let v = eval(&args[0], row, params, graph, functions)?;
             return match v {
+                // `type(r)` STILL works after a same-query `DELETE r` (the relationship keeps its
+                // identity; only property/label reads fail — `clauses/return/Return2.feature` [14]).
+                // `rel_data_including_deleted` reads the type through a self-delete tombstone that the
+                // visibility-filtered `rel_data` would otherwise hide.
                 RowValue::Rel(RelRef { id }) => Ok(graph
-                    .rel_data(id)
+                    .rel_data_including_deleted(id)
                     .map(|d| RowValue::Value(Value::String(d.rel_type)))
                     .unwrap_or(RowValue::NULL)),
                 // `type(null)` is null (an unmatched optional relationship, `type(null)` literally).
@@ -2708,6 +2756,195 @@ mod tests {
             eval_in(&g, &row, "type(n)"),
             Err(EvalError::TypeError { .. })
         ));
+    }
+
+    // ---- Theme 3: label predicate on a relationship (`Graph5.feature` [2]) ---------------------
+
+    #[test]
+    fn label_predicate_on_relationship_checks_type() {
+        let (g, row) = graph_with_node_and_rel(); // `r` is a `:T` relationship
+        // `r:T` is true (type matches), case-sensitively; `r:t` is false; never null for a non-null rel.
+        assert_eq!(
+            eval_in(&g, &row, "r:T").unwrap(),
+            RowValue::Value(Value::Boolean(true))
+        );
+        assert_eq!(
+            eval_in(&g, &row, "r:t").unwrap(),
+            RowValue::Value(Value::Boolean(false))
+        );
+        assert_eq!(
+            eval_in(&g, &row, "r:Other").unwrap(),
+            RowValue::Value(Value::Boolean(false))
+        );
+    }
+
+    // ---- Theme 1: access to an entity deleted by the current transaction -----------------------
+
+    /// A `GraphAccess` decorator that reports **every** entity as self-deleted, to exercise the
+    /// executor's `DeletedEntityAccess` paths over the in-memory reference graph (which itself never
+    /// tombstones). The authoritative coverage is the TCK through the record-backed graph; this proves
+    /// the eval wiring (property/label/index raise, `id`/`type` survive).
+    struct AllDeleted<'a>(&'a dyn GraphAccess);
+
+    impl GraphAccess for AllDeleted<'_> {
+        fn scan_nodes(&self) -> Vec<crate::graph_access::NodeId> {
+            self.0.scan_nodes()
+        }
+        fn scan_nodes_by_label(&self, label: &str) -> Vec<crate::graph_access::NodeId> {
+            self.0.scan_nodes_by_label(label)
+        }
+        fn expand(
+            &self,
+            node: crate::graph_access::NodeId,
+            direction: crate::graph_access::ExpandDirection,
+            types: &[String],
+        ) -> Vec<crate::graph_access::Incident> {
+            self.0.expand(node, direction, types)
+        }
+        fn node_exists(&self, node: crate::graph_access::NodeId) -> bool {
+            self.0.node_exists(node)
+        }
+        fn rel_exists(&self, rel: crate::graph_access::RelId) -> bool {
+            self.0.rel_exists(rel)
+        }
+        fn node_labels(&self, node: crate::graph_access::NodeId) -> Option<Vec<String>> {
+            self.0.node_labels(node)
+        }
+        fn rel_data(
+            &self,
+            rel: crate::graph_access::RelId,
+        ) -> Option<crate::graph_access::RelData> {
+            self.0.rel_data(rel)
+        }
+        fn node_property(&self, node: crate::graph_access::NodeId, key: &str) -> Option<Value> {
+            self.0.node_property(node, key)
+        }
+        fn rel_property(&self, rel: crate::graph_access::RelId, key: &str) -> Option<Value> {
+            self.0.rel_property(rel, key)
+        }
+        fn node_properties(
+            &self,
+            node: crate::graph_access::NodeId,
+        ) -> Option<Vec<(String, Value)>> {
+            self.0.node_properties(node)
+        }
+        fn rel_properties(&self, rel: crate::graph_access::RelId) -> Option<Vec<(String, Value)>> {
+            self.0.rel_properties(rel)
+        }
+        // The whole point of the decorator: report every entity as self-deleted.
+        fn entity_deleted_by_txn(&self, _entity: DeletedEntity) -> bool {
+            true
+        }
+        // Writes are never exercised here; forward them so the impl is complete.
+        fn create_node(
+            &mut self,
+            _labels: &[String],
+            _properties: &[(String, Value)],
+        ) -> crate::graph_access::NodeId {
+            unreachable!("AllDeleted is read-only in tests")
+        }
+        fn create_rel(
+            &mut self,
+            _rel_type: &str,
+            _start: crate::graph_access::NodeId,
+            _end: crate::graph_access::NodeId,
+            _properties: &[(String, Value)],
+        ) -> crate::graph_access::RelId {
+            unreachable!("AllDeleted is read-only in tests")
+        }
+        fn set_node_property(
+            &mut self,
+            _node: crate::graph_access::NodeId,
+            _key: &str,
+            _value: Value,
+        ) {
+        }
+        fn set_rel_property(
+            &mut self,
+            _rel: crate::graph_access::RelId,
+            _key: &str,
+            _value: Value,
+        ) {
+        }
+        fn add_labels(&mut self, _node: crate::graph_access::NodeId, _labels: &[String]) {}
+        fn remove_labels(&mut self, _node: crate::graph_access::NodeId, _labels: &[String]) {}
+        fn remove_node_property(&mut self, _node: crate::graph_access::NodeId, _key: &str) {}
+        fn remove_rel_property(&mut self, _rel: crate::graph_access::RelId, _key: &str) {}
+        fn replace_node_properties(
+            &mut self,
+            _node: crate::graph_access::NodeId,
+            _properties: &[(String, Value)],
+        ) {
+        }
+        fn merge_node_properties(
+            &mut self,
+            _node: crate::graph_access::NodeId,
+            _properties: &[(String, Value)],
+        ) {
+        }
+        fn replace_rel_properties(
+            &mut self,
+            _rel: crate::graph_access::RelId,
+            _properties: &[(String, Value)],
+        ) {
+        }
+        fn merge_rel_properties(
+            &mut self,
+            _rel: crate::graph_access::RelId,
+            _properties: &[(String, Value)],
+        ) {
+        }
+        fn incident_rels(
+            &self,
+            _node: crate::graph_access::NodeId,
+        ) -> Vec<crate::graph_access::RelId> {
+            Vec::new()
+        }
+        fn delete_rel(&mut self, _rel: crate::graph_access::RelId) {}
+        fn delete_node(&mut self, _node: crate::graph_access::NodeId) {}
+    }
+
+    #[test]
+    fn deleted_entity_property_and_label_access_raises_but_id_type_survive() {
+        let (g, row) = graph_with_node_and_rel();
+        let del = AllDeleted(&g);
+
+        // Property reads (static and dynamic) of a self-deleted node/rel raise DeletedEntityAccess.
+        assert_eq!(
+            eval_in(&del, &row, "n.name"),
+            Err(EvalError::DeletedEntityAccess)
+        );
+        assert_eq!(
+            eval_in(&del, &row, "r.k"),
+            Err(EvalError::DeletedEntityAccess)
+        );
+        assert_eq!(
+            eval_in(&del, &row, "n['name']"),
+            Err(EvalError::DeletedEntityAccess)
+        );
+        assert_eq!(
+            eval_in(&del, &row, "r['k']"),
+            Err(EvalError::DeletedEntityAccess)
+        );
+        // labels(n) of a self-deleted node raises.
+        assert_eq!(
+            eval_in(&del, &row, "labels(n)"),
+            Err(EvalError::DeletedEntityAccess)
+        );
+
+        // id() and type() STILL work after delete (identity survives).
+        assert!(matches!(
+            eval_in(&del, &row, "id(n)").unwrap(),
+            RowValue::Value(Value::Integer(_))
+        ));
+        assert!(matches!(
+            eval_in(&del, &row, "id(r)").unwrap(),
+            RowValue::Value(Value::Integer(_))
+        ));
+        assert_eq!(
+            eval_in(&del, &row, "type(r)").unwrap(),
+            RowValue::Value(Value::String("T".to_owned()))
+        );
     }
 
     #[test]

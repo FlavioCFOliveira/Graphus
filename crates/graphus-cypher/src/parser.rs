@@ -2598,8 +2598,23 @@ impl<'t, 's> Parser<'t, 's> {
         }
     }
 
-    /// Parses a property key (`PropertyKeyName = SchemaName`) — identical to [`Self::parse_schema_name`].
+    /// Parses a property key (`PropertyKeyName = SchemaName`).
+    ///
+    /// In addition to a `SymbolicName` or `ReservedWord` (via [`Self::parse_schema_name`]), this
+    /// accepts the literal keywords `null`, `true` and `false` **as a key name** — openCypher allows
+    /// them as (non-reserved) property/schema key names, so a map literal like
+    /// `{null: 'Mats', NULL: 'Pontus'}` is valid (`expressions/map/Map1.feature` [5],
+    /// `Map2.feature` [5]). The *original source spelling* is preserved, so `null` and `NULL` stay
+    /// **distinct keys** (the lexer recognises these keywords case-insensitively, which would
+    /// otherwise collapse the two).
     fn parse_property_key(&mut self, what: &str) -> Result<String, SyntaxError> {
+        if let Some(tok) = self.peek()
+            && matches!(tok.kind, TokenKind::Null | TokenKind::Boolean(_))
+        {
+            let text = self.source[tok.span.start..tok.span.end].to_owned();
+            self.bump();
+            return Ok(text);
+        }
         self.parse_schema_name(what)
     }
 
