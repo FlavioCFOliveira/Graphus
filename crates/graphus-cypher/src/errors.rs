@@ -208,6 +208,11 @@ pub enum SemanticDetail {
     /// on the right-hand side of `SET`, or as a function argument (TCK
     /// `expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]).
     UnexpectedSyntax,
+    /// `RelationshipUniquenessViolation` — the **same** relationship variable is used more than once
+    /// inside a single `MATCH` pattern (`MATCH (a)-[r]->()-[r]->(a)`). Cypher relationship
+    /// isomorphism forbids traversing one relationship twice in a pattern, so reusing its variable is
+    /// a compile-time error (TCK `clauses/match/Match3` [29]).
+    RelationshipUniquenessViolation,
 }
 
 impl SemanticDetail {
@@ -242,6 +247,7 @@ impl SemanticDetail {
             // `shortestPath` is absent from the openCypher TCK; internal spelling, no TCK step.
             Self::InvalidShortestPath => "InvalidShortestPath",
             Self::UnexpectedSyntax => "UnexpectedSyntax",
+            Self::RelationshipUniquenessViolation => "RelationshipUniquenessViolation",
         }
     }
 }
@@ -469,6 +475,14 @@ pub enum SemanticErrorKind {
     /// position (a `WHERE`, or an operand of the boolean operators / `NOT`). TCK detail
     /// `UnexpectedSyntax` (`expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]).
     PatternPredicateInExpression,
+    /// The **same** relationship variable is used twice within one `MATCH` pattern
+    /// (`MATCH (a)-[r]->()-[r]->(a)`). Cypher relationship isomorphism forbids a relationship being
+    /// traversed twice in a pattern, so reusing its variable is rejected at compile time. TCK detail
+    /// `RelationshipUniquenessViolation` (`clauses/match/Match3` [29]).
+    RelationshipUniquenessViolation {
+        /// The reused relationship variable name.
+        name: String,
+    },
 }
 
 /// How a pattern variable is bound — used to report [`SemanticErrorKind::VariableTypeConflict`].
@@ -527,6 +541,9 @@ impl SemanticErrorKind {
             Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
             Self::InvalidShortestPath { .. } => SemanticDetail::InvalidShortestPath,
             Self::PatternPredicateInExpression => SemanticDetail::UnexpectedSyntax,
+            Self::RelationshipUniquenessViolation { .. } => {
+                SemanticDetail::RelationshipUniquenessViolation
+            }
         }
     }
 
@@ -661,6 +678,11 @@ impl fmt::Display for SemanticErrorKind {
                 "a pattern predicate may only appear in a predicate position (a WHERE or a \
                  boolean operand), not in a projection, on the right-hand side of SET, or as a \
                  function argument",
+            ),
+            Self::RelationshipUniquenessViolation { name } => write!(
+                f,
+                "relationship variable `{name}` is used more than once in the same pattern; a \
+                 relationship may not be traversed twice in one MATCH (relationship uniqueness)"
             ),
         }
     }
@@ -814,7 +836,10 @@ mod tests {
                 | SemanticErrorKind::DifferentColumnsInUnion
                 | SemanticErrorKind::InvalidLoadCsvUrl
                 | SemanticErrorKind::InvalidShortestPath { .. }
-                | SemanticErrorKind::PatternPredicateInExpression => kind.classification(),
+                | SemanticErrorKind::PatternPredicateInExpression
+                | SemanticErrorKind::RelationshipUniquenessViolation { .. } => {
+                    kind.classification()
+                }
             }
         }
 
@@ -872,6 +897,9 @@ mod tests {
                 reason: "x".to_owned(),
             },
             SemanticErrorKind::PatternPredicateInExpression,
+            SemanticErrorKind::RelationshipUniquenessViolation {
+                name: "r".to_owned(),
+            },
         ] {
             assert_eq!(classify(&kind).phase, ErrorPhase::CompileTime, "{kind:?}");
         }

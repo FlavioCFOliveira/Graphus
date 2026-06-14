@@ -141,6 +141,7 @@ fn relationship_match_lowers_to_expand_over_scan() {
                 direction,
                 types,
                 range,
+                ..
             } => {
                 assert_eq!(from.name, "a");
                 assert_eq!(relationship.name, "r");

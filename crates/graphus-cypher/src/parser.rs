@@ -1234,19 +1234,16 @@ impl<'t, 's> Parser<'t, 's> {
         );
 
         // --- direction from the (incoming, outgoing) head pair -----------------------------------
+        // Per the openCypher grammar, a relationship may carry *both* a left and a right arrow head
+        // (`<-->`, `<-[r]->`). The first `RelationshipPattern` grammar alternative
+        // (`LeftArrowHead Dash [Detail] Dash RightArrowHead`) is well-formed and, like the
+        // no-arrow-head form, denotes an **undirected** ("both ways") relationship — it matches an
+        // edge in either direction (TCK `Match3` [19], `Match6` [12]/[13]).
         let direction = match (incoming_head, outgoing_head) {
             (true, false) => RelDirection::RightToLeft,
             (false, true) => RelDirection::LeftToRight,
-            (false, false) => RelDirection::Undirected,
-            // `<-...->` is not a well-formed Cypher relationship.
-            (true, true) => {
-                return Err(SyntaxError::new(
-                    SyntaxErrorKind::UnexpectedToken {
-                        found: "a relationship with arrow heads on both ends".to_owned(),
-                    },
-                    Span::new(start, end),
-                ));
-            }
+            // Both no arrow heads and both arrow heads mean undirected.
+            (false, false) | (true, true) => RelDirection::Undirected,
         };
 
         Ok(RelationshipPattern {

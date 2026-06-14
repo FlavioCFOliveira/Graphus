@@ -278,3 +278,42 @@ fn varlength_chained_with_fixed_hop() {
         "the four grandchildren via 1 var hop + 1 fixed hop"
     );
 }
+
+// =================================================================================================
+// rmp #136: var-length property predicate + bound relationship list driving a var-length hop.
+// =================================================================================================
+
+#[test]
+fn var_length_property_predicate_applies_per_relationship() {
+    // (a)-[:WORKED_WITH {year:1987}]->(b)-[:WORKED_WITH {year:1988}]->(c); the `{year:1988}`
+    // predicate selects only the single matching relationship's path (TCK Match4 [5]).
+    use graphus_core::Value;
+    let mut g = MemGraph::new();
+    let a = g.add_node(["Artist", "A"], NO_PROPS);
+    let b = g.add_node(["Artist", "B"], NO_PROPS);
+    let c = g.add_node(["Artist", "C"], NO_PROPS);
+    g.add_rel("WORKED_WITH", a, b, [("year", Value::Integer(1987))]);
+    g.add_rel("WORKED_WITH", b, c, [("year", Value::Integer(1988))]);
+    let rows = run(
+        "MATCH (a:Artist)-[:WORKED_WITH* {year: 1988}]->(b:Artist) RETURN a, b",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1, "only the 1988 edge yields a path (B -> C)");
+}
+
+#[test]
+fn bound_relationship_list_drives_a_variable_length_hop() {
+    // `WITH [r1, r2] AS rs MATCH (first)-[rs*]->(second)` walks exactly the bound list (TCK Match4 [8]).
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], NO_PROPS);
+    let b = g.add_node(["B"], NO_PROPS);
+    let c = g.add_node(["C"], NO_PROPS);
+    g.add_rel("Y", a, b, NO_PROPS);
+    g.add_rel("Y", b, c, NO_PROPS);
+    let rows = run(
+        "MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 \
+         MATCH (first)-[rs*]->(second) RETURN first, second",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1, "exactly the A -> C walk via the bound list");
+}

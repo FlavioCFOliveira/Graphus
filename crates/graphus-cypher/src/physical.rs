@@ -382,6 +382,12 @@ pub enum PhysicalOp {
         types: Vec<RelType>,
         /// The variable-length range, if any.
         range: Option<crate::ast::VarLengthRange>,
+        /// Relationship variables bound by earlier links of the same MATCH pattern, whose bound
+        /// relationships this traversal must not re-use (relationship isomorphism).
+        prior_rels: Vec<Var>,
+        /// A var-length hop's inline relationship-property map, applied per relationship during
+        /// expansion (`None` for a fixed-length hop).
+        rel_props: Option<crate::ast::Expr>,
     },
     /// **Expand-into**: both endpoints are already bound; enumerate only the relationships
     /// **between** them (a connection / cycle check, `04 §7.1`).
@@ -400,6 +406,12 @@ pub enum PhysicalOp {
         types: Vec<RelType>,
         /// The variable-length range, if any.
         range: Option<crate::ast::VarLengthRange>,
+        /// Relationship variables bound by earlier links of the same MATCH pattern, whose bound
+        /// relationships this traversal must not re-use (relationship isomorphism).
+        prior_rels: Vec<Var>,
+        /// A var-length hop's inline relationship-property map, applied per relationship during
+        /// expansion (`None` for a fixed-length hop).
+        rel_props: Option<crate::ast::Expr>,
     },
     /// Bind a **named path** variable from the pattern part's bound traversal variables (carried
     /// through from [`NamedPath`](crate::logical::LogicalOp::NamedPath); `04 §7.2`).
@@ -757,6 +769,8 @@ impl Planner<'_> {
                 direction,
                 types,
                 range,
+                prior_rels,
+                rel_props,
             } => {
                 let phys_input = self.lower(input, deps);
                 // Expand-into iff BOTH endpoints are already bound by the input.
@@ -773,6 +787,8 @@ impl Planner<'_> {
                         direction: *direction,
                         types: types.clone(),
                         range: *range,
+                        prior_rels: prior_rels.clone(),
+                        rel_props: rel_props.clone(),
                     }
                 } else {
                     PhysicalOp::ExpandAll {
@@ -783,6 +799,8 @@ impl Planner<'_> {
                         direction: *direction,
                         types: types.clone(),
                         range: *range,
+                        prior_rels: prior_rels.clone(),
+                        rel_props: rel_props.clone(),
                     }
                 }
             }
@@ -1364,6 +1382,8 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             direction,
             types,
             range,
+            prior_rels,
+            rel_props,
         } => PhysicalOp::ExpandAll {
             input: opt(input),
             from,
@@ -1372,6 +1392,8 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             direction,
             types,
             range,
+            prior_rels,
+            rel_props,
         },
         PhysicalOp::ExpandInto {
             input,
@@ -1381,6 +1403,8 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             direction,
             types,
             range,
+            prior_rels,
+            rel_props,
         } => PhysicalOp::ExpandInto {
             input: opt(input),
             from,
@@ -1389,6 +1413,8 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             direction,
             types,
             range,
+            prior_rels,
+            rel_props,
         },
         PhysicalOp::ShortestPath {
             input,
@@ -2766,6 +2792,8 @@ impl PhysicalOp {
                 direction,
                 types,
                 range,
+                prior_rels: _,
+                rel_props: _,
             } => {
                 writeln!(
                     f,
@@ -2785,6 +2813,8 @@ impl PhysicalOp {
                 direction,
                 types,
                 range,
+                prior_rels: _,
+                rel_props: _,
             } => {
                 writeln!(
                     f,

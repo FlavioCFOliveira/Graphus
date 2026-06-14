@@ -139,7 +139,7 @@ use crate::lexer::Span;
 use crate::procedure_registry::{self, FieldType, ProcedureRegistry, ProcedureSignature};
 use crate::static_type::{self, SType, TypeEnv};
 use graphus_core::GraphusError;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// A [`Query`] that has passed semantic analysis (`04 §7.3`) and is ready for logical planning.
 ///
@@ -412,8 +412,39 @@ impl Scope {
         stype: SType,
         span: Span,
     ) -> Result<(), SemanticError> {
+        self.bind_entity(name, kind, stype, span, false)
+    }
+
+    /// As [`Self::bind_typed`], but the caller states whether the new binding is a **variable-length**
+    /// relationship pattern element (`-[r*]-`). This matters only when rebinding a prior
+    /// [`VarKind::Value`] as a relationship: a fixed-length pattern element (`-[r]-`) needs a single
+    /// relationship, so a value of provable **list** type is a conflict (TCK `Match2` [13]); a
+    /// variable-length element instead consumes a **list** of relationships, so a list value is
+    /// compatible (TCK `Match4` [8]).
+    fn bind_entity(
+        &mut self,
+        name: &str,
+        kind: VarKind,
+        stype: SType,
+        span: Span,
+        var_length: bool,
+    ) -> Result<(), SemanticError> {
         if let Some(existing) = self.bindings.get(name) {
             if existing.kind != kind {
+                // A value binding may flow into a pattern as a node/relationship/path provided its
+                // static type does not *prove* it is a non-entity (a value of unknown type is
+                // assumed to carry the entity at runtime — e.g. `WITH nodeList[i] AS n CREATE (n)…`,
+                // TCK `Match4` [4]; `WITH [r1, r2] AS rs MATCH ()-[rs*]-()`, TCK `Match4` [8]). A
+                // provably non-entity value (`WITH 123 AS r MATCH ()-[r]-()`) stays a conflict
+                // (TCK `Match2` [13]).
+                if existing.kind == VarKind::Value
+                    && value_admits_entity(&existing.stype, kind, var_length)
+                {
+                    // Refine the binding to the entity kind for downstream use.
+                    self.bindings
+                        .insert(name.to_owned(), Binding { kind, stype });
+                    return Ok(());
+                }
                 return Err(SemanticError::new(
                     SemanticErrorKind::VariableTypeConflict {
                         name: name.to_owned(),
@@ -429,6 +460,31 @@ impl Scope {
         self.bindings
             .insert(name.to_owned(), Binding { kind, stype });
         Ok(())
+    }
+}
+
+/// Decides whether a prior [`VarKind::Value`] binding of static type `value_ty` may legally be used
+/// as a pattern entity of `target` kind. A value is *admitted* unless its type provably contradicts
+/// the entity role:
+///
+/// - **Node / Path**: any non-list, non-map scalar literal (`Bool`/`Int`/`Float`/`Str`) is rejected;
+///   `Unknown`, `Null` and graph types pass (a value computed at runtime may be a node/path).
+/// - **Relationship, fixed-length** (`-[r]-`): a single relationship is required, so a provable
+///   `List` is rejected alongside the scalar literals.
+/// - **Relationship, variable-length** (`-[r*]-`): a *list of relationships* is required, so a
+///   provable `List` is **admitted**; scalar literals are still rejected.
+fn value_admits_entity(value_ty: &SType, target: VarKind, var_length: bool) -> bool {
+    match value_ty {
+        // Unknown / Null never *prove* a non-entity: defer to runtime.
+        SType::Unknown | SType::Null => true,
+        // Already a graph type: trivially compatible.
+        SType::Node | SType::Relationship | SType::Path => true,
+        // A list is admitted only when the target is a variable-length relationship (it then binds
+        // the relationship *list*). For a node, a fixed-length relationship, or a path, a provable
+        // list contradicts the single-entity role.
+        SType::List(_) => target == VarKind::Relationship && var_length,
+        // Scalars (`Bool`/`Int`/`Float`/`Str`) and `Map` can never be an entity.
+        SType::Bool | SType::Int | SType::Float | SType::Str | SType::Map => false,
     }
 }
 
@@ -669,11 +725,41 @@ impl Analyzer<'_> {
     // ---- reading / writing clauses ----------------------------------------------------------
 
     fn check_match(&self, m: &MatchClause, scope: &mut Scope) -> Result<(), SemanticError> {
+        // Relationship uniqueness (relationship isomorphism): a relationship may not be traversed
+        // twice within a *single* MATCH pattern, so the same relationship variable must not appear
+        // more than once across this clause's pattern parts — `MATCH (a)-[r]->()-[r]->(a)` is a
+        // compile-time `RelationshipUniquenessViolation` (TCK `Match3` [29]). The check is scoped to
+        // one MATCH clause: reusing a relationship variable in a *later* MATCH clause is legal (it
+        // re-binds the same relationship, TCK `Match3` [25]), so we do not consult `scope` here.
+        Self::check_relationship_uniqueness(&m.pattern)?;
         for part in &m.pattern {
             self.bind_pattern_part(part, scope, PatternRole::Read)?;
         }
         if let Some(w) = &m.where_clause {
             self.check_predicate(w, scope, "WHERE")?;
+        }
+        Ok(())
+    }
+
+    /// Enforces relationship uniqueness across the pattern parts of a single MATCH clause: a
+    /// relationship variable appearing more than once is a [`RelationshipUniquenessViolation`].
+    ///
+    /// [`RelationshipUniquenessViolation`]: SemanticErrorKind::RelationshipUniquenessViolation
+    fn check_relationship_uniqueness(pattern: &[PatternPart]) -> Result<(), SemanticError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for part in pattern {
+            for link in &part.element.chain {
+                if let Some(var) = &link.relationship.variable {
+                    if !seen.insert(var.name.as_str()) {
+                        return Err(SemanticError::new(
+                            SemanticErrorKind::RelationshipUniquenessViolation {
+                                name: var.name.clone(),
+                            },
+                            var.span,
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1437,7 +1523,13 @@ impl Analyzer<'_> {
             }
         }
         if let Some(var) = &rel.variable {
-            scope.bind(&var.name, VarKind::Relationship, var.span)?;
+            scope.bind_entity(
+                &var.name,
+                VarKind::Relationship,
+                kind_default_stype(VarKind::Relationship),
+                var.span,
+                rel.range.is_some(),
+            )?;
         }
         if let Some(props) = &rel.properties {
             self.check_expr(props, scope)?;

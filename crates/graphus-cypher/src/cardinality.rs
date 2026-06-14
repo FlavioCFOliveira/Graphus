@@ -941,6 +941,8 @@ mod tests {
             direction: crate::ast::RelDirection::LeftToRight,
             types: Vec::new(),
             range: None,
+            prior_rels: Vec::new(),
+            rel_props: None,
         };
         // total_nodes (13) * average_degree (9 rels / 13 nodes).
         let expected = 13.0 * (9.0 / 13.0);
@@ -1137,6 +1139,8 @@ mod tests {
                 max: None,
                 exact: false,
             }),
+            prior_rels: Vec::new(),
+            rel_props: None,
         };
         let rows = estimate_rows(&expand, Some(&stub));
         assert!(rows.is_finite(), "variable-length estimate must be finite");
@@ -1159,6 +1163,8 @@ mod tests {
                 max: None,
                 exact: false,
             }),
+            prior_rels: Vec::new(),
+            rel_props: None,
         };
         let rows = estimate_rows(&expand, Some(&stub));
         assert!(rows.is_finite() && !rows.is_nan() && rows >= 0.0);

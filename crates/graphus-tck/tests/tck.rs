@@ -200,7 +200,7 @@ use graphus_tck::runner::run_scenario;
 /// (`DELETE n:Person`/`r:T`) is `InvalidDelete` (`Delete5` [9], `Delete1`/`Delete2`). Measured,
 /// zero regressions (full failure-set diff: 0 newly-failing scenarios; the net +24 is purely
 /// additive).
-const BASELINE: usize = 3796;
+const BASELINE: usize = 3830;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

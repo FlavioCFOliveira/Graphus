@@ -346,8 +346,17 @@ fn eval_binary(
 
         // ---- arithmetic ----------------------------------------------------------------------
         BinaryOp::Add => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
-            arithmetic_add(&a, &b)
+            // Evaluate **structurally** first: `+` is also list concatenation, and a list of nodes /
+            // relationships / paths must keep its structural elements (collapsing through a property
+            // `Value` would turn each entity into `Null` — `[a] + collect(n) + [b]`). When either
+            // operand is a structural list we concatenate at the `RowValue` level; otherwise we defer
+            // to the scalar/property `+` (numeric add, string concat, property-list concat).
+            let a = eval(lhs, row, params, graph, functions)?;
+            let b = eval(rhs, row, params, graph, functions)?;
+            if let Some(out) = structural_list_add(&a, &b) {
+                return Ok(out);
+            }
+            arithmetic_add(&to_value(a), &to_value(b))
         }
         BinaryOp::Sub => {
             let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
@@ -482,6 +491,30 @@ fn is_numeric(v: &Value) -> bool {
 
 fn is_nan(v: &Value) -> bool {
     matches!(v, Value::Float(f) if f.is_nan())
+}
+
+/// Structural list concatenation for `+` when a **structural** list (one holding a node /
+/// relationship / path) is involved. Returns `Some(result)` when at least one operand is a
+/// structural [`RowValue::List`], handling `list + list`, `list + element` and `element + list` while
+/// preserving entity references; returns `None` to defer to the scalar/property `+` (numeric add,
+/// string concat, pure-property list concat) when no structural list participates.
+///
+/// `null + x` / `x + null` is **not** handled here (it is value-level null propagation), so a null
+/// operand makes this return `None` and the property path produces null.
+fn structural_list_add(a: &RowValue, b: &RowValue) -> Option<RowValue> {
+    let a_struct_list = matches!(a, RowValue::List(_));
+    let b_struct_list = matches!(b, RowValue::List(_));
+    if !a_struct_list && !b_struct_list {
+        return None;
+    }
+    // Borrow each operand as list elements when it is list-shaped (structural or property), else
+    // treat it as a single element to append/prepend (Cypher's `list + element`).
+    fn elems_or_single(v: &RowValue) -> Vec<RowValue> {
+        v.as_list_elems().unwrap_or_else(|| vec![v.clone()])
+    }
+    let mut out = elems_or_single(a);
+    out.extend(elems_or_single(b));
+    Some(RowValue::list(out))
 }
 
 /// Cypher `+`: numeric addition, **or** string concatenation, **or** list concatenation, with null

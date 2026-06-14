@@ -293,8 +293,13 @@ impl Planner {
         current: Option<LogicalOp>,
     ) -> LogicalOp {
         let mut plan = current;
+        // Relationship variables bound so far by **this** MATCH pattern, threaded across the
+        // comma-separated parts so each Expand can enforce relationship isomorphism against every
+        // earlier relationship of the same pattern (and only this pattern — a fresh accumulator per
+        // MATCH keeps cross-clause reuse legal).
+        let mut pattern_rels: Vec<Var> = Vec::new();
         for part in parts {
-            plan = Some(self.lower_pattern_part(part, plan));
+            plan = Some(self.lower_pattern_part(part, plan, &mut pattern_rels));
         }
         plan.unwrap_or(LogicalOp::Empty)
     }
@@ -305,19 +310,31 @@ impl Planner {
     /// binding); each chain link becomes an [`Expand`](LogicalOp::Expand). Inline property maps are
     /// hoisted to [`Filter`](LogicalOp::Filter)s immediately above their binding operator
     /// (the [Normalisation](crate::lower#normalisation) rule).
-    fn lower_pattern_part(&mut self, part: &PatternPart, current: Option<LogicalOp>) -> LogicalOp {
+    fn lower_pattern_part(
+        &mut self,
+        part: &PatternPart,
+        current: Option<LogicalOp>,
+        pattern_rels: &mut Vec<Var>,
+    ) -> LogicalOp {
         if part.kind != PatternPartKind::Normal {
             return self.lower_shortest_path_part(part, current);
         }
         let element = &part.element;
         // The anchor node: scan it unless `current` already binds it, then filter on inline props.
         let anchor_var = self.node_var(&element.start);
+        // Whether the anchor is **reused** from a prior plan (already bound). A reused anchor is not
+        // re-scanned, so its inline labels are *not* applied by `scan_node` and must be enforced by a
+        // `HasLabels` filter below (`MATCH (a)-[r]->() WITH a MATCH (a:X)-[r]->()`, TCK `Match3` [25]).
+        let mut anchor_reused = false;
         let mut plan = match current {
             // Already have a plan: if it binds the anchor, the node is shared (correlated); we do
             // not re-scan. Otherwise a comma-pattern introduces a fresh disconnected component,
             // which the physical planner turns into a (cartesian) join; logically we expand from a
             // fresh scan correlated with the existing plan via Apply over an Argument.
-            Some(plan) if plan_binds(&plan, &anchor_var) => plan,
+            Some(plan) if plan_binds(&plan, &anchor_var) => {
+                anchor_reused = true;
+                plan
+            }
             Some(plan) => {
                 let scan = self.scan_node(&element.start, &anchor_var);
                 let args = collect_bound_vars(&plan);
@@ -330,6 +347,16 @@ impl Planner {
             }
             None => self.scan_node(&element.start, &anchor_var),
         };
+        // A reused anchor's inline labels were not applied by a scan; enforce them here so an added
+        // label predicate on an already-bound node actually filters (`Match3` [25]).
+        if anchor_reused {
+            plan = self.filter_inline_labels(
+                plan,
+                &element.start.labels,
+                &anchor_var,
+                element.start.span,
+            );
+        }
         plan = self.filter_inline_props(plan, element.start.properties.as_ref(), &anchor_var);
 
         // Each chain link: expand to the next node, then filter the link's inline props.
@@ -338,6 +365,7 @@ impl Planner {
         for link in &element.chain {
             let rel_var = self.rel_var(&link.relationship);
             let to_var = self.node_var(&link.node);
+            let is_var_length = link.relationship.range.is_some();
             plan = LogicalOp::Expand {
                 input: Box::new(plan),
                 from: from.clone(),
@@ -346,8 +374,25 @@ impl Planner {
                 direction: link.relationship.direction,
                 types: link.relationship.types.clone(),
                 range: link.relationship.range,
+                // Every relationship already bound by this pattern must not be re-traversed.
+                prior_rels: pattern_rels.clone(),
+                // A var-length hop's inline property map is applied **per relationship** inside the
+                // expansion (the variable binds a list, not one relationship). A fixed-length hop's
+                // inline props stay an ordinary post-`Filter` (below).
+                rel_props: if is_var_length {
+                    link.relationship.properties.clone()
+                } else {
+                    None
+                },
             };
-            plan = self.filter_inline_props(plan, link.relationship.properties.as_ref(), &rel_var);
+            // This relationship now participates in the pattern's uniqueness set for later links.
+            pattern_rels.push(rel_var.clone());
+            // Only a fixed-length hop post-filters its inline props on the single relationship
+            // binding; a var-length hop already enforced them per relationship in the Expand.
+            if !is_var_length {
+                plan =
+                    self.filter_inline_props(plan, link.relationship.properties.as_ref(), &rel_var);
+            }
             plan = self.filter_inline_props(plan, link.node.properties.as_ref(), &to_var);
             // The target node's inline labels (`(a)-[r]->(b:X)`) constrain `b` to entities carrying
             // all listed labels. The anchor's labels are handled by its scan (`scan_node`), but an

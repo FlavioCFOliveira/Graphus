@@ -1112,4 +1112,67 @@ mod pattern_predicates {
         // An explicit `EXISTS { ... }` is a legitimate boolean *value*, allowed in a projection.
         ok("MATCH (n) RETURN EXISTS { (n)-[]->() } AS hasOut");
     }
+
+    // ---- relationship uniqueness (rmp #136) ------------------------------------------------------
+
+    #[test]
+    fn reusing_a_relationship_variable_in_one_pattern_is_a_uniqueness_violation() {
+        // `MATCH (a)-[r]->()-[r]->(a)` — the same relationship variable twice in one pattern is a
+        // compile-time `RelationshipUniquenessViolation` (TCK `Match3` [29]).
+        assert_detail(
+            "MATCH (a)-[r]->()-[r]->(a) RETURN r",
+            SemanticDetail::RelationshipUniquenessViolation,
+        );
+    }
+
+    #[test]
+    fn reusing_a_relationship_variable_across_comma_parts_is_a_uniqueness_violation() {
+        assert_detail(
+            "MATCH (a)-[r]->(b), (c)-[r]->(d) RETURN r",
+            SemanticDetail::RelationshipUniquenessViolation,
+        );
+    }
+
+    #[test]
+    fn reusing_a_relationship_variable_across_separate_match_clauses_is_allowed() {
+        // Relationship uniqueness is scoped to a single MATCH pattern; a later MATCH may re-bind the
+        // same relationship variable (TCK `Match3` [25]).
+        ok("MATCH (a1)-[r]->() WITH r, a1 MATCH (a1:X)-[r]->(b2) RETURN a1, r, b2");
+    }
+
+    // ---- value flowing into a pattern as an entity (rmp #136) ------------------------------------
+
+    #[test]
+    fn a_value_of_unknown_type_may_be_used_as_a_node() {
+        // `WITH nodeList[i] AS n CREATE (n)-[:T]->(m)` — an indexed value (unknown static type) is
+        // assumed to carry a node at runtime, not a compile-time type conflict (TCK `Match4` [4]).
+        ok("WITH [1] AS nodeList UNWIND [0] AS i WITH nodeList[i] AS n1 CREATE (n1)-[:T]->(m)");
+    }
+
+    #[test]
+    fn a_list_value_may_drive_a_variable_length_relationship() {
+        // `WITH [r1, r2] AS rs MATCH (a)-[rs*]->(b)` — a list value is a valid var-length
+        // relationship binding (TCK `Match4` [8]).
+        ok("MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 \
+            MATCH (first)-[rs*]->(second) RETURN first, second");
+    }
+
+    #[test]
+    fn a_scalar_value_may_not_be_used_as_a_relationship() {
+        // `WITH 123 AS r MATCH ()-[r]-()` — a provably non-entity value stays a conflict
+        // (TCK `Match2` [13]).
+        assert_detail(
+            "WITH 123 AS r MATCH ()-[r]-() RETURN r",
+            SemanticDetail::VariableTypeConflict,
+        );
+    }
+
+    #[test]
+    fn a_list_value_may_not_be_used_as_a_fixed_length_relationship() {
+        // A fixed-length hop needs a single relationship, so a provable list is a conflict.
+        assert_detail(
+            "WITH [10] AS r MATCH ()-[r]-() RETURN r",
+            SemanticDetail::VariableTypeConflict,
+        );
+    }
 }

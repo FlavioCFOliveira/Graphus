@@ -132,6 +132,20 @@ pub enum LogicalOp {
         /// The variable-length range (`*`, `*1..3`), if the pattern was variable-length; `None` for
         /// a single hop.
         range: Option<VarLengthRange>,
+        /// The relationship variables bound by **earlier** links of the **same MATCH pattern** (this
+        /// part's earlier links and the earlier comma-separated parts). Cypher relationship
+        /// isomorphism forbids traversing one relationship twice in a single pattern, so this
+        /// traversal must skip any candidate relationship already bound to one of these variables on
+        /// the current row. The list is empty for the first relationship of a pattern, and never
+        /// crosses MATCH-clause boundaries (each MATCH starts fresh — `Match3` [25] reuse stays legal).
+        prior_rels: Vec<Var>,
+        /// The relationship's inline property map (`-[:T {k: v}]->`), present only for a
+        /// **variable-length** traversal. For a var-length hop the relationship variable binds a
+        /// *list*, so the predicate cannot be a post-filter on it — it must hold for **every**
+        /// relationship of the path. The executor applies it per relationship during expansion
+        /// (`Match4` [5]). `None` for a fixed-length hop (its inline props are an ordinary
+        /// post-`Filter` on the single relationship binding).
+        rel_props: Option<Expr>,
     },
 
     /// Bind a **named path** variable (`MATCH p = (a)-[r]->(b)`) from the pattern part's already
@@ -641,6 +655,8 @@ impl LogicalOp {
                 direction,
                 types,
                 range,
+                prior_rels: _,
+                rel_props: _,
             } => {
                 writeln!(
                     f,

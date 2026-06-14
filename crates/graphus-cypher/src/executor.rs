@@ -231,7 +231,7 @@ enum Operator {
         input: Box<Operator>,
         list: Expr,
         variable: Var,
-        current: Option<(Row, VecDeque<Value>)>,
+        current: Option<(Row, VecDeque<RowValue>)>,
     },
 
     /// `LoadCsv`: for each input row, resolve the URL to a local file and stream it, emitting one
@@ -259,6 +259,13 @@ enum Operator {
         types: Vec<RelType>,
         into: bool,
         range: Option<VarLengthRange>,
+        /// Relationship variables bound by earlier links of the same MATCH pattern. A candidate
+        /// relationship already bound to one of these on the driving row is skipped (relationship
+        /// isomorphism — a relationship may be traversed at most once per pattern).
+        prior_rels: Vec<Var>,
+        /// A var-length hop's inline relationship-property map, applied to **each** relationship of
+        /// the path during expansion (`None` for a fixed-length hop).
+        rel_props: Option<Expr>,
         pending: VecDeque<Row>,
     },
 
@@ -461,20 +468,23 @@ impl Operator {
             } => loop {
                 if let Some((base, queue)) = current {
                     if let Some(v) = queue.pop_front() {
-                        return Ok(Some(base.with(variable.name.clone(), RowValue::Value(v))));
+                        return Ok(Some(base.with(variable.name.clone(), v)));
                     }
                     *current = None;
                 }
                 let Some(base) = input.next(ctx)? else {
                     return Ok(None);
                 };
-                let listv = eval_value(list, &base, ctx.params, ctx.graph, ctx.functions)?;
-                let elems = match listv {
-                    Value::List(items) => VecDeque::from(items),
+                // Evaluate the list **structurally** (`eval`, not `eval_value`) so a list of nodes /
+                // relationships / paths is preserved — collapsing through a property `Value` would
+                // turn each entity into `Null` (regression guard: `UNWIND collect(node) AS x`).
+                let listv = eval(list, &base, ctx.params, ctx.graph, ctx.functions)?;
+                let elems = match listv.as_list_elems() {
+                    Some(items) => VecDeque::from(items),
                     // UNWIND null produces no rows for that input row (Cypher).
-                    Value::Null => VecDeque::new(),
+                    None if matches!(listv, RowValue::Value(Value::Null)) => VecDeque::new(),
                     // UNWIND of a scalar yields a single row (Cypher treats it as a one-element list).
-                    other => VecDeque::from(vec![other]),
+                    None => VecDeque::from(vec![listv]),
                 };
                 if !elems.is_empty() {
                     *current = Some((base, elems));
@@ -516,6 +526,8 @@ impl Operator {
                 types,
                 into,
                 range,
+                prior_rels,
+                rel_props,
                 pending,
             } => loop {
                 if let Some(row) = pending.pop_front() {
@@ -524,7 +536,25 @@ impl Operator {
                 let Some(base) = input.next(ctx)? else {
                     return Ok(None);
                 };
-                if let Some(range) = range {
+                // A relationship variable **already bound on the input** (reused from a prior clause,
+                // e.g. `MATCH ()-[r]-() MATCH (a)-[r]-(b)`, or a list `MATCH (a)-[rs*]->(b)` with
+                // `rs` bound to a relationship list) constrains the traversal to exactly that
+                // relationship / list rather than enumerating fresh ones (TCK `Match4` [7]/[8]).
+                if base.get(&relationship.name).is_some() {
+                    bound_rel_expand(
+                        &base,
+                        from,
+                        relationship,
+                        to,
+                        *direction,
+                        types,
+                        *into,
+                        range.is_some(),
+                        prior_rels,
+                        ctx,
+                        pending,
+                    )?;
+                } else if let Some(range) = range {
                     var_expand_into_pending(
                         &base,
                         from,
@@ -534,6 +564,8 @@ impl Operator {
                         types,
                         *into,
                         *range,
+                        prior_rels,
+                        rel_props.as_ref(),
                         ctx,
                         pending,
                     )?;
@@ -546,6 +578,7 @@ impl Operator {
                         *direction,
                         types,
                         *into,
+                        prior_rels,
                         ctx,
                         pending,
                     )?;
@@ -752,6 +785,29 @@ fn merge_rows(left: &Row, right: &Row) -> Row {
 
 /// Expands one base row's incident relationships into `pending`. For `ExpandInto`, only edges whose
 /// far endpoint equals the already-bound `to` are kept (a connection check).
+/// Collects the relationship ids already bound to `prior_rels` on `base` — the relationships earlier
+/// links of the same MATCH pattern have traversed. A variable bound to a single relationship
+/// contributes its id; one bound to a variable-length relationship list contributes every id in the
+/// list. Used to enforce relationship isomorphism: a hop must not re-traverse any of these.
+fn used_relationships(base: &Row, prior_rels: &[Var]) -> std::collections::BTreeSet<RelId> {
+    fn collect(v: &RowValue, out: &mut std::collections::BTreeSet<RelId>) {
+        match v {
+            RowValue::Rel(r) => {
+                out.insert(r.id);
+            }
+            RowValue::List(items) => items.iter().for_each(|item| collect(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for var in prior_rels {
+        if let Some(v) = base.get(&var.name) {
+            collect(v, &mut out);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_into_pending(
     base: &Row,
@@ -761,6 +817,7 @@ fn expand_into_pending(
     direction: RelDirection,
     types: &[RelType],
     into: bool,
+    prior_rels: &[Var],
     ctx: &mut Ctx<'_>,
     pending: &mut VecDeque<Row>,
 ) -> Result<(), ExecError> {
@@ -773,6 +830,9 @@ fn expand_into_pending(
     } else {
         None
     };
+    // Relationships already traversed by earlier links of the same pattern — none of which this hop
+    // may re-use (relationship isomorphism, `04 §2.4`).
+    let used = used_relationships(base, prior_rels);
     let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
     let dir = ExpandDirection::from_pattern(direction);
     let incidents = ctx.graph.expand(anchor, dir, &type_names);
@@ -781,6 +841,9 @@ fn expand_into_pending(
     let mut seen_rel = std::collections::BTreeSet::new();
     for inc in incidents {
         if !seen_rel.insert(inc.rel) {
+            continue;
+        }
+        if used.contains(&inc.rel) {
             continue;
         }
         if into && Some(inc.neighbour) != target {
@@ -821,6 +884,8 @@ fn var_expand_into_pending(
     types: &[RelType],
     into: bool,
     range: VarLengthRange,
+    prior_rels: &[Var],
+    rel_props: Option<&Expr>,
     ctx: &mut Ctx<'_>,
     pending: &mut VecDeque<Row>,
 ) -> Result<(), ExecError> {
@@ -833,11 +898,15 @@ fn var_expand_into_pending(
     } else {
         None
     };
+    // Relationships earlier links of the same pattern already traversed — forbidden in this walk
+    // (relationship isomorphism spans the whole pattern, not just this variable-length segment).
+    let forbidden = used_relationships(base, prior_rels);
     let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
     let dir = ExpandDirection::from_pattern(direction);
     let min = range.min.unwrap_or(1);
 
     // The DFS worker: `trail` is the relationship stack (ids, traversal order).
+    #[allow(clippy::too_many_arguments)]
     fn dfs(
         depth: u64,
         current: NodeId,
@@ -847,6 +916,8 @@ fn var_expand_into_pending(
         target: Option<NodeId>,
         dir: ExpandDirection,
         type_names: &[String],
+        forbidden: &std::collections::BTreeSet<RelId>,
+        rel_props: Option<&Expr>,
         base: &Row,
         relationship: &Var,
         to: &Var,
@@ -877,9 +948,18 @@ fn var_expand_into_pending(
         // Deduplicate self-loops reported once per side (`04 §2.4`); the trail check enforces
         // relationship uniqueness across the whole walk.
         let mut seen_rel = std::collections::BTreeSet::new();
-        for inc in ctx.graph.expand(current, dir, type_names) {
-            if !seen_rel.insert(inc.rel) || trail.contains(&inc.rel) {
+        let incidents = ctx.graph.expand(current, dir, type_names);
+        for inc in incidents {
+            if !seen_rel.insert(inc.rel) || trail.contains(&inc.rel) || forbidden.contains(&inc.rel)
+            {
                 continue;
+            }
+            // A var-length hop's inline property map must hold for **every** relationship of the
+            // path: skip a relationship that does not satisfy it (`Match4` [5]).
+            if let Some(props) = rel_props {
+                if !rel_satisfies_props(inc.rel, props, base, relationship, ctx)? {
+                    continue;
+                }
             }
             trail.push(inc.rel);
             dfs(
@@ -891,6 +971,8 @@ fn var_expand_into_pending(
                 target,
                 dir,
                 type_names,
+                forbidden,
+                rel_props,
                 base,
                 relationship,
                 to,
@@ -912,6 +994,8 @@ fn var_expand_into_pending(
         target,
         dir,
         &type_names,
+        &forbidden,
+        rel_props,
         base,
         relationship,
         to,
@@ -919,6 +1003,155 @@ fn var_expand_into_pending(
         ctx,
         pending,
     )
+}
+
+/// Expands a hop whose relationship variable is **already bound on the input row** — a relationship
+/// reused from a prior clause (`MATCH ()-[r]-() MATCH (a)-[r]-(b)`) or a bound relationship **list**
+/// driving a variable-length hop (`WITH [r1, r2] AS rs MATCH (a)-[rs*]->(b)`). Rather than
+/// enumerating fresh relationships, the traversal walks exactly the bound relationship(s) in order
+/// from `from`, honouring the pattern `direction` and `types`, and emits one row binding `to` to the
+/// final endpoint (and, for `into`, only when that endpoint equals the already-bound `to`). Any
+/// mismatch (a relationship not incident in the required direction, a type filter failure, an
+/// already-used relationship, or — for the list form — a list element that is not a relationship)
+/// yields no row.
+#[allow(clippy::too_many_arguments)]
+fn bound_rel_expand(
+    base: &Row,
+    from: &Var,
+    relationship: &Var,
+    to: &Var,
+    direction: RelDirection,
+    types: &[RelType],
+    into: bool,
+    var_length: bool,
+    prior_rels: &[Var],
+    ctx: &mut Ctx<'_>,
+    pending: &mut VecDeque<Row>,
+) -> Result<(), ExecError> {
+    let Some(mut current) = base.get(&from.name).and_then(RowValue::as_node) else {
+        return Ok(());
+    };
+    // The bound relationship(s), in traversal order.
+    let bound = base.get(&relationship.name);
+    let rel_ids: Vec<RelId> = match bound {
+        Some(RowValue::Rel(r)) => vec![r.id],
+        Some(other) => match other.as_list_elems() {
+            Some(elems) => {
+                let mut ids = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    let Some(id) = e.as_rel() else {
+                        return Ok(()); // a non-relationship element cannot drive a relationship hop
+                    };
+                    ids.push(id);
+                }
+                ids
+            }
+            None => return Ok(()),
+        },
+        None => return Ok(()),
+    };
+    // Relationship isomorphism still applies against earlier links of the same pattern.
+    let used = used_relationships(base, prior_rels);
+    let type_ok = |t: &str| types.is_empty() || types.iter().any(|rt| rt.name == t);
+
+    // Walk each bound relationship, advancing `current` through its endpoints.
+    for rel in &rel_ids {
+        if used.contains(rel) {
+            return Ok(());
+        }
+        let Some(data) = ctx.graph.rel_data(*rel) else {
+            return Ok(());
+        };
+        if !type_ok(&data.rel_type) {
+            return Ok(());
+        }
+        let next = match direction {
+            RelDirection::LeftToRight if data.start == current => data.end,
+            RelDirection::RightToLeft if data.end == current => data.start,
+            RelDirection::Undirected if data.start == current => data.end,
+            RelDirection::Undirected if data.end == current => data.start,
+            _ => return Ok(()), // not incident from `current` in the required direction
+        };
+        current = next;
+    }
+
+    // For a zero-length bound list the endpoint is the anchor itself; var-length keeps a list
+    // binding, a single bound relationship keeps its scalar binding (already present on the row).
+    if into {
+        let target = base.get(&to.name).and_then(RowValue::as_node);
+        if Some(current) != target {
+            return Ok(());
+        }
+    }
+    let mut row = base.clone();
+    if !into {
+        row.set(to.name.clone(), RowValue::Node(NodeRef { id: current }));
+    }
+    // Normalise the relationship binding: a var-length hop binds the **list** (even of length one),
+    // a fixed hop keeps the scalar. The bound value is already on the row, so only the var-length
+    // case needs a (re)materialised list to guarantee the structural list representation.
+    if var_length {
+        row.set(
+            relationship.name.clone(),
+            RowValue::list(
+                rel_ids
+                    .iter()
+                    .map(|&id| RowValue::Rel(RelRef { id }))
+                    .collect(),
+            ),
+        );
+    }
+    pending.push_back(row);
+    Ok(())
+}
+
+/// Whether the single relationship `rel` satisfies a var-length hop's inline property map `props`
+/// (`-[:T* {k: v}]->`). Evaluates the property-map predicate against a row binding `rel_var` to this
+/// one relationship, reusing the ordinary inline-property semantics: each `k: v` becomes
+/// `rel_var.k = v`, and a non-matching or null comparison drops the relationship (Cypher 3VL —
+/// `Match4` [5]). `props` is the AST map literal (or `$param`) the lowering carried through.
+fn rel_satisfies_props(
+    rel: RelId,
+    props: &Expr,
+    base: &Row,
+    rel_var: &Var,
+    ctx: &mut Ctx<'_>,
+) -> Result<bool, ExecError> {
+    // Bind the relationship variable to this one relationship, then test each property equality.
+    let mut probe = base.clone();
+    probe.set(rel_var.name.clone(), RowValue::Rel(RelRef { id: rel }));
+    let entries = match &props.kind {
+        ExprKind::Map(entries) => entries,
+        // Only inline map literals reach a var-length hop's `rel_props` (the parser/semantics
+        // restrict pattern properties to map literals or parameters); a parameter map is rare here
+        // and unmeasured, so treat a non-map form as "no constraint" rather than failing.
+        _ => return Ok(true),
+    };
+    let span = crate::lexer::Span::new(0, 0);
+    for (key, value_expr) in entries {
+        // Build and evaluate `rel_var.key = value`, matching the fixed-length inline-property
+        // semantics (`filter_inline_props`): a false or null (3VL) result rejects the relationship.
+        let lhs = Expr::new(
+            ExprKind::Property {
+                base: Box::new(Expr::new(ExprKind::Variable(rel_var.name.clone()), span)),
+                key: key.name.clone(),
+            },
+            span,
+        );
+        let predicate = Expr::new(
+            ExprKind::Binary {
+                op: crate::ast::BinaryOp::Eq,
+                lhs: Box::new(lhs),
+                rhs: Box::new(value_expr.clone()),
+            },
+            span,
+        );
+        let result = eval(&predicate, &probe, ctx.params, ctx.graph, ctx.functions)?;
+        if !matches!(result, RowValue::Value(Value::Boolean(true))) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Runs a breadth-first search for `shortestPath`/`allShortestPaths` between the already-bound
@@ -1291,6 +1524,8 @@ fn build_operator(
             direction,
             types,
             range,
+            prior_rels,
+            rel_props,
         } => Ok(Operator::Expand {
             input: Box::new(build_operator(input, arg, ctx)?),
             from: from.clone(),
@@ -1300,6 +1535,8 @@ fn build_operator(
             types: types.clone(),
             into: false,
             range: *range,
+            prior_rels: prior_rels.clone(),
+            rel_props: rel_props.clone(),
             pending: VecDeque::new(),
         }),
         PhysicalOp::ExpandInto {
@@ -1310,6 +1547,8 @@ fn build_operator(
             direction,
             types,
             range,
+            prior_rels,
+            rel_props,
         } => Ok(Operator::Expand {
             input: Box::new(build_operator(input, arg, ctx)?),
             from: from.clone(),
@@ -1319,6 +1558,8 @@ fn build_operator(
             types: types.clone(),
             into: true,
             range: *range,
+            prior_rels: prior_rels.clone(),
+            rel_props: rel_props.clone(),
             pending: VecDeque::new(),
         }),
         PhysicalOp::ShortestPath {

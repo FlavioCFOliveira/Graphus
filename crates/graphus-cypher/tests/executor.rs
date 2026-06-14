@@ -1862,3 +1862,100 @@ fn with_where_filters_before_pagination_is_unaffected_by_carry() {
     assert_eq!(col(&rows, "label"), vec![s("A"), s("C")]);
     assert_eq!(rows[0].columns(), &["label".to_owned()]);
 }
+
+// =================================================================================================
+// Pattern-matching semantics (rmp #136): undirected, self-loops, named-path directions, UNWIND of
+// structural lists, structural list concatenation.
+// =================================================================================================
+
+#[test]
+fn undirected_relationship_matches_both_directions() {
+    // (:A)-[:T1]->(:Looper)-[:LOOP]->(:Looper)(self), (:Looper)-[:T2]->(:B).
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], NO_PROPS);
+    let l = g.add_node(["Looper"], NO_PROPS);
+    let b = g.add_node(["B"], NO_PROPS);
+    g.add_rel("T1", a, l, NO_PROPS);
+    g.add_rel("LOOP", l, l, NO_PROPS);
+    g.add_rel("T2", l, b, NO_PROPS);
+    // Fully undirected two-hop walk from every node (TCK Match3 [16] = 6 rows).
+    let rows = run("MATCH (x)-[r1]-(y)-[r2]-(z) RETURN x, r1, y, r2, z", &mut g);
+    assert_eq!(
+        rows.len(),
+        6,
+        "every undirected two-hop walk, relationship-unique"
+    );
+}
+
+#[test]
+fn self_loop_is_matched_once_per_relationship() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], NO_PROPS);
+    let l = g.add_node(["Looper"], NO_PROPS);
+    let b = g.add_node(["B"], NO_PROPS);
+    g.add_rel("T1", a, l, NO_PROPS);
+    g.add_rel("LOOP", l, l, NO_PROPS);
+    g.add_rel("T2", l, b, NO_PROPS);
+    // Directed first hop, undirected second (TCK Match3 [15] = 2 rows): the LOOP and the T2.
+    let rows = run(
+        "MATCH (x:A)-[r1]->(y)-[r2]-(z) RETURN x, r1, y, r2, z",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 2, "the self-loop and the onward T2");
+}
+
+#[test]
+fn bidirectional_arrowheads_parse_as_undirected() {
+    // `<-->` / `<-[r]->` denote undirected (TCK Match6 [12]).
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], NO_PROPS);
+    let b = g.add_node(["B"], NO_PROPS);
+    g.add_rel("T1", a, b, NO_PROPS);
+    g.add_rel("T2", b, a, NO_PROPS);
+    let rows = run("MATCH p = (n)<-->(k)<-->(n) RETURN p", &mut g);
+    assert_eq!(rows.len(), 4, "four bidirectional two-hop cycles");
+}
+
+#[test]
+fn named_path_preserves_alternating_directions() {
+    // (b)-[:T]->(a), (c)-[:T]->(b); `(n)-->(m)--(o)` is one path written C..B..A (TCK Match6 [10]).
+    let mut g = MemGraph::new();
+    let a = g.add_node(["A"], NO_PROPS);
+    let b = g.add_node(["B"], NO_PROPS);
+    let c = g.add_node(["C"], NO_PROPS);
+    g.add_rel("T", b, a, NO_PROPS);
+    g.add_rel("T", c, b, NO_PROPS);
+    let rows = run("MATCH p = (n)-->(m)--(o) RETURN p", &mut g);
+    assert_eq!(rows.len(), 1, "exactly the C->B->A path");
+}
+
+#[test]
+fn unwind_preserves_structural_list_elements() {
+    // `UNWIND collect(n) AS x` must keep nodes, not collapse them to null (regression guard).
+    let (mut g, ..) = seed_social();
+    let rows = run(
+        "MATCH (n:Person) WITH collect(n) AS ns UNWIND ns AS x RETURN x",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 3, "one row per collected Person");
+    assert!(
+        rows.iter().all(|r| r.get("x").unwrap().as_node().is_some()),
+        "each unwound element is still a node"
+    );
+}
+
+#[test]
+fn list_concatenation_preserves_structural_elements() {
+    // `[a] + collect(n) + [b]` must keep the nodes (regression guard for `+` on structural lists).
+    let mut g = MemGraph::new();
+    g.add_node(["A"], NO_PROPS);
+    let rows = run(
+        "MATCH (a:A) MATCH (n) WITH a, [a] + collect(n) AS xs UNWIND xs AS x RETURN x",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 2, "the anchor plus the one collected node");
+    assert!(
+        rows.iter().all(|r| r.get("x").unwrap().as_node().is_some()),
+        "concatenation kept the node references"
+    );
+}
