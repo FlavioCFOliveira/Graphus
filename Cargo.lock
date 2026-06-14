@@ -1166,6 +1166,7 @@ dependencies = [
  "axum",
  "graphus-auth",
  "graphus-bolt",
+ "graphus-cli",
  "graphus-core",
  "graphus-crypto",
  "graphus-cypher",

@@ -91,3 +91,8 @@ rcgen = "0.14"
 # The Bolt codec (handshake, framing, PackStream, messages) to drive a real Bolt session end-to-end
 # over a loopback socket from the integration test.
 graphus-bolt = { path = "../graphus-bolt" }
+# The synchronous Bolt/UDS client (the same one the `graphus-cli` binary uses) so the MVP
+# end-to-end test can drive a real, separately-spawned `graphus-server` process over a UDS exactly
+# as an external client would. graphus-cli's normal deps are only graphus-core + graphus-bolt, so
+# this introduces no dependency cycle.
+graphus-cli = { path = "../graphus-cli" }
