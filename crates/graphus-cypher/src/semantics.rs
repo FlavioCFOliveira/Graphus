@@ -631,6 +631,20 @@ impl Analyzer<'_> {
     fn check_query(&self, query: &Query) -> Result<(), SemanticError> {
         match &query.body {
             QueryBody::Regular { head, unions } => {
+                // A single query may not mix `UNION` and `UNION ALL`: every UNION connective must be
+                // the same kind. Chaining one kind (only UNION, or only UNION ALL) is valid. TCK
+                // `InvalidClauseComposition` (`clauses/union/Union3.feature` [1]/[2]).
+                if unions.len() >= 2 {
+                    let first_all = unions[0].all;
+                    if let Some(mixed) = unions.iter().find(|u| u.all != first_all) {
+                        return Err(SemanticError::new(
+                            SemanticErrorKind::InvalidClauseComposition {
+                                reason: "UNION and UNION ALL may not be mixed in the same query",
+                            },
+                            mixed.span,
+                        ));
+                    }
+                }
                 let head_cols = self.check_single_query(head)?;
                 for UnionPart { query: sq, .. } in unions {
                     let cols = self.check_single_query(sq)?;
@@ -1087,14 +1101,15 @@ impl Analyzer<'_> {
         where_clause: Option<&Expr>,
         is_final_return: bool,
     ) -> Result<Scope, SemanticError> {
-        // `RETURN *` / `WITH *` with nothing in scope is an error (no columns to expand). The TCK
-        // raises this as `UndefinedVariable` (the `*` resolves against an empty scope); we point at
-        // the whole projection clause since `*` carries no narrower span of its own.
-        if body.star && scope.bindings.is_empty() && body.items.is_empty() {
+        // `RETURN *` with nothing in scope is an error (no columns to expand). The TCK raises this as
+        // `NoVariablesInScope` (`tck/features/clauses/return/Return7.feature` [2]); we point at the
+        // whole projection clause since `*` carries no narrower span of its own. A `WITH *` over an
+        // empty scope is *not* an error — it simply carries nothing forward (a write-only pipeline
+        // such as `MATCH () CREATE () WITH * CREATE ()` is valid;
+        // `tck/features/clauses/create/Create3.feature` [2]/[3]).
+        if is_final_return && body.star && scope.bindings.is_empty() && body.items.is_empty() {
             return Err(SemanticError::new(
-                SemanticErrorKind::UndefinedVariable {
-                    name: "*".to_owned(),
-                },
+                SemanticErrorKind::NoVariablesInScope,
                 clause_span,
             ));
         }
@@ -1242,6 +1257,18 @@ impl Analyzer<'_> {
         // bare `count(*)`-style aggregate atom is allowed unaliased in a final RETURN where a name
         // can be inferred, but WITH always needs `AS` for a computed expression.
         if item.alias.is_none() && !Self::has_inferable_name(&item.expr) && !is_final_return {
+            return Err(SemanticError::new(
+                SemanticErrorKind::NoExpressionAlias,
+                item.span,
+            ));
+        }
+        // A bare aggregate (`count(*)`, `sum(x)`, …) may go unaliased only in a *final* `RETURN`,
+        // where the result column name is inferred from the call text. In a `WITH` it must be
+        // aliased: a downstream clause can only reference an aggregated value by an explicit name
+        // (`tck/features/clauses/with/With4.feature` [5]: `WITH a, count(*)`). `has_inferable_name`
+        // is shared with the final-RETURN naming path, so it intentionally treats `count(*)` as
+        // nameable; the `WITH`-only restriction is enforced here.
+        if item.alias.is_none() && !is_final_return && self.contains_aggregate(&item.expr) {
             return Err(SemanticError::new(
                 SemanticErrorKind::NoExpressionAlias,
                 item.span,
@@ -1540,10 +1567,13 @@ impl Analyzer<'_> {
             scope.bind(&var.name, VarKind::Node, var.span)?;
         }
         if let Some(props) = &node.properties {
-            // A parameter as the inline predicate of a MERGE node (`MERGE (n $param)`) is rejected at
-            // compile time (`clauses/merge/Merge1` [16]). Checked before the generic expression walk
-            // so the MERGE-specific detail wins.
-            if role == PatternRole::Merge {
+            // A parameter as the inline predicate of a MATCH or MERGE node (`MATCH (n $param)`,
+            // `MERGE (n $param)`) is rejected at compile time: both clauses need a statically-known
+            // property predicate, so a parameter map there is `InvalidParameterUse`
+            // (`clauses/match/Match1` [6], `clauses/merge/Merge1` [16]). A `CREATE` *constructs* a
+            // node, so a parameter map there is legal and not rejected. Checked before the generic
+            // expression walk so this detail wins over the runtime parameter-missing path.
+            if matches!(role, PatternRole::Read | PatternRole::Merge) {
                 Self::reject_parameter_predicate(props)?;
             }
             self.check_expr(props, scope)?;
@@ -1623,9 +1653,11 @@ impl Analyzer<'_> {
             )?;
         }
         if let Some(props) = &rel.properties {
-            // A parameter as the inline predicate of a MERGE relationship (`MERGE (a)-[r:T $param]->(b)`)
-            // is rejected at compile time (`clauses/merge/Merge5` [27]).
-            if role == PatternRole::Merge {
+            // A parameter as the inline predicate of a MATCH or MERGE relationship
+            // (`MATCH ()-[r:FOO $param]->()`, `MERGE (a)-[r:T $param]->(b)`) is rejected at compile
+            // time: `InvalidParameterUse` (`clauses/match/Match2` [8], `clauses/merge/Merge5` [27]).
+            // A `CREATE` relationship may take a parameter map and is not rejected.
+            if matches!(role, PatternRole::Read | PatternRole::Merge) {
                 Self::reject_parameter_predicate(props)?;
             }
             self.check_expr(props, scope)?;
@@ -1730,6 +1762,16 @@ impl Analyzer<'_> {
             ExprKind::ListComprehension(lc) => {
                 // The list is in the outer scope; the iteration variable is local to the body.
                 self.check_expr_refs(&lc.list, scope)?;
+                // An aggregating function may not appear inside a list comprehension's filter or
+                // projection — a comprehension produces one value per element, so aggregation has no
+                // meaning there. TCK `InvalidAggregation`
+                // (`expressions/list/List12.feature` [7]: `[x IN [1,2,3,4,5] | count(*)]`).
+                if let Some(pred) = &lc.predicate {
+                    self.reject_aggregation(pred, "a list comprehension")?;
+                }
+                if let Some(proj) = &lc.projection {
+                    self.reject_aggregation(proj, "a list comprehension")?;
+                }
                 let mut inner = scope.clone();
                 inner.bind(&lc.variable.name, VarKind::Value, lc.variable.span)?;
                 if let Some(pred) = &lc.predicate {
@@ -1861,6 +1903,23 @@ impl Analyzer<'_> {
         // A `WHERE` is a predicate position: bare pattern predicates are legal here (and under the
         // boolean operators nested in it), so start the placement walk in predicate context.
         Self::check_pattern_predicate_placement(expr, true)?;
+        // A `WHERE` whose entire expression is provably a single node (a bare node variable such as
+        // `MATCH (n) WHERE (n)`) is not a boolean predicate: a node is not a boolean. This is the
+        // "self pattern" case, distinct from a real existential pattern predicate `(n)-[]->()` (which
+        // infers `Bool`). TCK `InvalidArgumentType`
+        // (`expressions/pattern/Pattern1.feature` [11]). Only a *provably* node-typed whole predicate
+        // is rejected; an unknown-typed operand is left to the runtime.
+        if matches!(
+            static_type::infer_type(expr, &Self::scope_types(scope)),
+            SType::Node
+        ) {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidExpressionType {
+                    context: "a single node pattern is not a boolean predicate".to_owned(),
+                },
+                expr.span,
+            ));
+        }
         self.reject_aggregation(expr, position)
     }
 
@@ -2649,5 +2708,175 @@ mod tests {
                 err.kind
             );
         }
+    }
+
+    // --- rmp #143: error type/phase/detail fixes -------------------------------------------------
+
+    /// FIX 1 (`union/Union3` [1][2]): mixing `UNION` and `UNION ALL` in one query is rejected; a
+    /// query chaining only one kind (even many times) is valid.
+    #[test]
+    fn mixing_union_and_union_all_is_rejected_but_single_kind_is_valid() {
+        for q in [
+            "RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a",
+            "RETURN 1 AS a UNION ALL RETURN 2 AS a UNION RETURN 3 AS a",
+        ] {
+            let err = analyze(&ast(q)).expect_err("mixed UNION/UNION ALL must be rejected");
+            assert!(
+                matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+                "{q}: expected InvalidClauseComposition, got {:?}",
+                err.kind
+            );
+        }
+        // No-regression: a single kind, chained, stays valid.
+        for q in [
+            "RETURN 1 AS a UNION RETURN 2 AS a",
+            "RETURN 1 AS a UNION ALL RETURN 2 AS a",
+            "RETURN 1 AS a UNION RETURN 2 AS a UNION RETURN 3 AS a",
+            "RETURN 1 AS a UNION ALL RETURN 2 AS a UNION ALL RETURN 3 AS a",
+        ] {
+            assert!(
+                analyze(&ast(q)).is_ok(),
+                "single-kind UNION must be valid: {q}"
+            );
+        }
+    }
+
+    /// FIX 2 (`return/Return7` [2]): `RETURN *` over an empty scope is `NoVariablesInScope`; a
+    /// `RETURN *` with a variable in scope is valid, and `WITH *` over an empty scope is valid.
+    #[test]
+    fn return_star_without_variables_in_scope_is_no_variables_in_scope() {
+        let err = analyze(&ast("MATCH () RETURN *")).expect_err("RETURN * with empty scope");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::NoVariablesInScope),
+            "expected NoVariablesInScope, got {:?}",
+            err.kind
+        );
+        // No-regression: a variable in scope makes `RETURN *` valid.
+        assert!(analyze(&ast("MATCH (n) RETURN *")).is_ok());
+        // No-regression: `WITH *` over an empty scope is a valid no-op pipeline.
+        assert!(analyze(&ast("MATCH () CREATE () WITH * CREATE ()")).is_ok());
+    }
+
+    /// FIX 3 (`with/With4` [5]): an unaliased aggregate in `WITH` is `NoExpressionAlias`; the same
+    /// aggregate aliased is valid, and an unaliased `count(*)` in a final `RETURN` is valid.
+    #[test]
+    fn unaliased_aggregate_in_with_requires_alias() {
+        let err = analyze(&ast("MATCH (a) WITH a, count(*) RETURN a"))
+            .expect_err("count(*) in WITH must be aliased");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::NoExpressionAlias),
+            "expected NoExpressionAlias, got {:?}",
+            err.kind
+        );
+        // No-regression: aliased aggregate in WITH is fine.
+        assert!(analyze(&ast("MATCH (a) WITH a, count(*) AS c RETURN a, c")).is_ok());
+        // No-regression: a bare `count(*)` may be unaliased in a final RETURN (name inferred).
+        assert!(analyze(&ast("MATCH (a) RETURN count(*)")).is_ok());
+        // No-regression: a bare property may still be unaliased in WITH (pre-existing behaviour);
+        // its result column takes the verbatim name `a.num`, referenced via a backtick-quoted name
+        // in the final RETURN. The point is that a bare property does *not* trip NoExpressionAlias.
+        assert!(analyze(&ast("MATCH (a) WITH a.num RETURN `a.num`")).is_ok());
+    }
+
+    /// FIX 4 (`list/List12` [7]): an aggregation inside a list comprehension is `InvalidAggregation`;
+    /// the same aggregation outside any comprehension is valid.
+    #[test]
+    fn aggregation_inside_list_comprehension_is_rejected() {
+        let err = analyze(&ast("MATCH (n) RETURN [x IN [1,2,3,4,5] | count(*)]"))
+            .expect_err("aggregation in list comprehension projection");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidAggregation { .. }),
+            "expected InvalidAggregation, got {:?}",
+            err.kind
+        );
+        // Also in the comprehension's WHERE.
+        let err = analyze(&ast(
+            "MATCH (n) RETURN [x IN [1,2,3] WHERE count(*) > 0 | x]",
+        ))
+        .expect_err("aggregation in list comprehension filter");
+        assert!(matches!(
+            err.kind,
+            SemanticErrorKind::InvalidAggregation { .. }
+        ));
+        // No-regression: aggregation outside a comprehension is valid; a non-aggregating
+        // comprehension is valid.
+        assert!(analyze(&ast("MATCH (n) RETURN count(*)")).is_ok());
+        assert!(analyze(&ast("MATCH (n) RETURN [x IN [1,2,3] | x + 1]")).is_ok());
+    }
+
+    /// FIX 5 (`list/List6` [5]): `size()` on a path is `InvalidArgumentType`; `size()` on a list or a
+    /// pattern predicate (`UnexpectedSyntax`, not the type error) behaves correctly.
+    #[test]
+    fn size_on_a_path_is_invalid_argument_type() {
+        let err =
+            analyze(&ast("MATCH p = (a)-[*]->(b) RETURN size(p)")).expect_err("size() on a path");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidExpressionType { .. }),
+            "expected InvalidExpressionType (→ InvalidArgumentType), got {:?}",
+            err.kind
+        );
+        assert_eq!(
+            err.kind.detail(),
+            crate::errors::SemanticDetail::InvalidArgumentType
+        );
+        // No-regression: size() on a list literal is valid.
+        assert!(analyze(&ast("RETURN size([1, 2, 3])")).is_ok());
+        // No-regression: a pattern predicate as size()'s argument is UnexpectedSyntax, not the type
+        // error (the pattern-placement check must win).
+        let err = analyze(&ast("MATCH (a), (b) RETURN size((a)-->(b))"))
+            .expect_err("size() on a pattern predicate");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::PatternPredicateInExpression),
+            "expected PatternPredicateInExpression (→ UnexpectedSyntax), got {:?}",
+            err.kind
+        );
+    }
+
+    /// FIX 6 (`pattern/Pattern1` [11]): a bare node pattern used as a `WHERE` predicate is
+    /// `InvalidArgumentType`; a real existential pattern predicate in `WHERE` stays valid.
+    #[test]
+    fn bare_node_as_where_predicate_is_invalid_argument_type() {
+        let err = analyze(&ast("MATCH (n) WHERE (n) RETURN n"))
+            .expect_err("bare node as WHERE predicate");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidExpressionType { .. }),
+            "expected InvalidExpressionType (→ InvalidArgumentType), got {:?}",
+            err.kind
+        );
+        assert_eq!(
+            err.kind.detail(),
+            crate::errors::SemanticDetail::InvalidArgumentType
+        );
+        // No-regression: real existential pattern predicates in WHERE are valid.
+        assert!(analyze(&ast("MATCH (n) WHERE (n)-[]->() RETURN n")).is_ok());
+        assert!(analyze(&ast("MATCH (n) WHERE NOT (n)-[]->() RETURN n")).is_ok());
+        assert!(analyze(&ast("MATCH (n) WHERE (n)-[:R]-() AND (n)-[:S]-() RETURN n")).is_ok());
+    }
+
+    /// FIX 7 (`match/Match1` [6], `match/Match2` [8]): a parameter used as a `MATCH` inline property
+    /// predicate is `InvalidParameterUse`; a literal map in `MATCH` and a parameter elsewhere stay
+    /// valid; a parameter map in `CREATE` stays valid.
+    #[test]
+    fn parameter_as_match_inline_predicate_is_invalid_parameter_use() {
+        for q in [
+            "MATCH (n $param) RETURN n",
+            "MATCH ()-[r:FOO $param]->() RETURN r",
+        ] {
+            let err = analyze(&ast(q)).expect_err("parameter as MATCH inline predicate");
+            assert!(
+                matches!(err.kind, SemanticErrorKind::InvalidParameterUse),
+                "{q}: expected InvalidParameterUse, got {:?}",
+                err.kind
+            );
+        }
+        // No-regression: a literal map inline predicate in MATCH is valid.
+        assert!(analyze(&ast("MATCH (n {a: 1}) RETURN n")).is_ok());
+        // No-regression: a parameter used in WHERE (not as an inline predicate) is valid.
+        assert!(analyze(&ast("MATCH (n) WHERE n.x = $param RETURN n")).is_ok());
+        // No-regression: a parameter map in CREATE (which constructs) is valid.
+        assert!(analyze(&ast("CREATE (n $param) RETURN n")).is_ok());
+        // No-regression: a parameter as a MERGE inline predicate still errors (the original case).
+        let err = analyze(&ast("MERGE (n $param) RETURN n")).expect_err("MERGE $param");
+        assert!(matches!(err.kind, SemanticErrorKind::InvalidParameterUse));
     }
 }

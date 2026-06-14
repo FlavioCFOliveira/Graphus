@@ -252,7 +252,21 @@ use graphus_tck::runner::run_scenario;
 /// 7 "Ignore null" scenarios `clauses/set/{Set1[8],Set3[8],Set4[5],Set5[1]}` and
 /// `clauses/remove/{Remove1[5][6],Remove2[5]}`. Measured, zero regressions (failure-set diff: exactly
 /// those 7 scenarios removed, nothing added).
-const BASELINE: usize = 3881;
+///
+/// rmp #143 (8 error type/phase/detail fixes), lifting 3881 → 3895. New compile-time validations:
+/// mixing `UNION`/`UNION ALL` (`union/Union3` [1][2] → `InvalidClauseComposition`); `RETURN *` over
+/// an empty scope (`return/Return7` [2] → new `NoVariablesInScope` detail), which also legalised
+/// `WITH *` over an empty scope and fixed `create/Create3` [2] as a bonus; an unaliased aggregate in
+/// `WITH` (`with/With4` [5] → `NoExpressionAlias`); aggregation inside a list comprehension
+/// (`list/List12` [7] → `InvalidAggregation`); `size()` on a path (`list/List6` [5] →
+/// `InvalidArgumentType`); a bare node pattern as a `WHERE` predicate (`pattern/Pattern1` [11] →
+/// `InvalidArgumentType`); a parameter as a `MATCH` inline predicate (`match/Match1` [6],
+/// `match/Match2` [8] → `InvalidParameterUse`). One runtime fix: `range()` step `0`
+/// (`list/List11` [4], 4 outline rows → `ArgumentError`/`NumberOutOfRange`). Measured, zero
+/// regressions (failure-set identity diff: 0 newly-failing scenarios). `create/Create3` [3] remains a
+/// residual failure — a pre-existing `WITH *` over-empty-scope cardinality bug, now surfaced honestly
+/// instead of masked by the former erroneous rejection.
+const BASELINE: usize = 3895;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

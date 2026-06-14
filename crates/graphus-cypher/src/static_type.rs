@@ -340,6 +340,13 @@ fn check_function_args(name: &[String], args: &[Expr], env: &TypeEnv) -> Result<
         // `length()` measures a path; a node or relationship is a provable mismatch (a path
         // variable is now typed, so a path argument is correctly accepted).
         "length" => matches!(ty, SType::Node | SType::Relationship),
+        // `size()` accepts a list or a string; a **path** is a provable mismatch
+        // (`expressions/list/List6.feature` [5]: `size(p)` on a path is a compile-time
+        // `SyntaxError`/`InvalidArgumentType`). Only `Path` is rejected here: a pattern predicate
+        // used as `size()`'s argument infers `Bool` but must surface as `UnexpectedSyntax` from the
+        // pattern-placement check (`List6` [6]), and other concrete types are left to the runtime —
+        // so the path rejection is the single statically-decidable case for `size()`.
+        "size" => matches!(ty, SType::Path),
         // `properties()` accepts a node, relationship or map; a scalar/list/path is a provable
         // mismatch.
         "properties" => matches!(

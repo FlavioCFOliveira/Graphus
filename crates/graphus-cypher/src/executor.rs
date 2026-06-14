@@ -2532,7 +2532,7 @@ impl Accumulator {
         };
         if !(0.0..=1.0).contains(&p) {
             return Err(ExecError::Eval(EvalError::NumberOutOfRange {
-                value: p.to_string(),
+                value: format!("{p} is not in [0.0, 1.0]"),
             }));
         }
         Ok(p)

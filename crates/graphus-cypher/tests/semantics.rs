@@ -308,8 +308,13 @@ fn aggregation_in_order_by_of_aggregating_projection_is_valid() {
 
 #[test]
 fn return_star_with_empty_scope_is_an_error() {
+    // `RETURN *` over an empty scope is `NoVariablesInScope` (TCK
+    // `clauses/return/Return7.feature` [2]); a `WITH *` over an empty scope, by contrast, is valid.
     let e = err("RETURN *");
-    assert_eq!(e.classification().detail, SemanticDetail::UndefinedVariable);
+    assert_eq!(
+        e.classification().detail,
+        SemanticDetail::NoVariablesInScope
+    );
     // The whole RETURN clause is the offending span (the `*` has no narrower span).
     assert_eq!(e.span, Span::new(0, "RETURN *".len()));
 }

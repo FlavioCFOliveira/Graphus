@@ -34,6 +34,7 @@ fn all_kinds() -> Vec<SemanticErrorKind> {
         SemanticErrorKind::UndefinedVariable {
             name: "x".to_owned(),
         },
+        SemanticErrorKind::NoVariablesInScope,
         SemanticErrorKind::VariableAlreadyBound {
             name: "x".to_owned(),
         },
@@ -101,6 +102,7 @@ fn expected_classification(kind: &SemanticErrorKind) -> (ErrorType, SemanticDeta
     // expects SyntaxError everywhere else; the cross-check value is the per-variant **detail**.
     match kind {
         K::UndefinedVariable { .. } => (ErrorType::SyntaxError, SemanticDetail::UndefinedVariable),
+        K::NoVariablesInScope => (ErrorType::SyntaxError, SemanticDetail::NoVariablesInScope),
         K::VariableAlreadyBound { .. } => {
             (ErrorType::SyntaxError, SemanticDetail::VariableAlreadyBound)
         }
@@ -245,17 +247,18 @@ fn renders_the_verbatim_tck_gherkin_triple() {
 #[test]
 fn every_listed_kind_is_distinct() {
     let kinds = all_kinds();
-    // 25 variants as of this writing; the assert documents the count and trips if one is dropped
+    // 26 variants as of this writing; the assert documents the count and trips if one is dropped
     // from `all_kinds` without the match also changing (the match would then fail to compile).
     assert_eq!(
         kinds.len(),
-        25,
+        26,
         "all_kinds() should list every SemanticErrorKind variant once"
     );
     let details: std::collections::HashSet<_> = kinds.iter().map(|k| k.detail()).collect();
-    // Two variants (`UndefinedVariable` and `RETURN *`'s empty-scope reuse) share the
-    // `UndefinedVariable` detail at the *call site*, but as enum *variants* each detail here is
-    // distinct, so the set size equals the list length.
+    // `all_kinds` lists at most one variant per `SemanticDetail` value (e.g. it carries
+    // `InvalidProcedureArgumentType` but not `InvalidExpressionType`, which share the
+    // `InvalidArgumentType` detail), so each listed variant maps to a distinct detail and the set
+    // size equals the list length.
     assert_eq!(
         details.len(),
         kinds.len(),

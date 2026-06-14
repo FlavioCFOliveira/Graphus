@@ -63,12 +63,13 @@ pub enum EvalError {
         name: String,
     },
     /// A numeric argument fell outside the range a built-in accepts — e.g. the `percentile`
-    /// argument of `percentileCont`/`percentileDisc`, which must lie in `[0.0, 1.0]`. Maps to the
-    /// Bolt/TCK `ArgumentError` class with the `NumberOutOfRange` detail (the same class an
-    /// invalid-argument runtime failure takes).
+    /// argument of `percentileCont`/`percentileDisc`, which must lie in `[0.0, 1.0]`, or a zero
+    /// `step` for `range()` (the step must be a non-zero integer). Maps to the Bolt/TCK
+    /// `ArgumentError` class with the `NumberOutOfRange` detail (the same class an invalid-argument
+    /// runtime failure takes).
     NumberOutOfRange {
-        /// The offending value, pre-formatted for the diagnostic message (kept as a `String` so the
-        /// error type stays `Eq`).
+        /// A pre-formatted description of the offending value / range violation (kept as a `String`
+        /// so the error type stays `Eq`).
         value: String,
     },
     /// A **user-defined function** (`rmp` task #75) — registered as an extension — failed at
@@ -108,7 +109,7 @@ impl fmt::Display for EvalError {
                 )
             }
             Self::NumberOutOfRange { value } => {
-                write!(f, "number out of range: {value} is not in [0.0, 1.0]")
+                write!(f, "number out of range: {value}")
             }
             Self::ExtensionFunction { name, message } => {
                 write!(f, "function `{name}` failed: {message}")
@@ -1634,8 +1635,11 @@ fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
     let end = int(&argv[1])?;
     let step = if argv.len() > 2 { int(&argv[2])? } else { 1 };
     if step == 0 {
-        return Err(EvalError::TypeError {
-            context: "range() step must be non-zero".to_owned(),
+        // A zero step is a runtime `ArgumentError`/`NumberOutOfRange` (the step is out of its valid
+        // range of non-zero integers), not a `TypeError`
+        // (`expressions/list/List11.feature` [4]: `range(<start>, <end>, 0)`).
+        return Err(EvalError::NumberOutOfRange {
+            value: "range() step 0".to_owned(),
         });
     }
     let mut out = Vec::new();
@@ -2878,6 +2882,36 @@ mod tests {
                 Value::Integer(1),
                 Value::Integer(2),
                 Value::Integer(3)
+            ])
+        );
+    }
+
+    /// FIX 8 (`list/List11` [4]): `range()` with a zero step is a runtime
+    /// `ArgumentError`/`NumberOutOfRange`, not a `TypeError`; a non-zero step evaluates normally.
+    #[test]
+    fn range_with_zero_step_is_number_out_of_range() {
+        let g = MemGraph::new();
+        let err = eval_in(&g, &Row::empty(), "range(1, 10, 0)").expect_err("zero step");
+        assert!(
+            matches!(err, EvalError::NumberOutOfRange { .. }),
+            "expected NumberOutOfRange, got {err:?}"
+        );
+        // No-regression: a non-zero step evaluates to the expected list.
+        assert_eq!(
+            evaluate("range(1, 5, 2)"),
+            Value::List(vec![
+                Value::Integer(1),
+                Value::Integer(3),
+                Value::Integer(5)
+            ])
+        );
+        // No-regression: a negative step evaluates correctly.
+        assert_eq!(
+            evaluate("range(3, 1, -1)"),
+            Value::List(vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Integer(1)
             ])
         );
     }

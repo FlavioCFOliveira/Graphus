@@ -135,6 +135,9 @@ impl fmt::Display for ErrorType {
 pub enum SemanticDetail {
     /// `UndefinedVariable` — a variable is referenced where it is not in scope.
     UndefinedVariable,
+    /// `NoVariablesInScope` — a `RETURN *` / `WITH *` is written where there are no variables to
+    /// expand (`tck/features/clauses/return/Return7.feature` \[2\]: `MATCH () RETURN *`).
+    NoVariablesInScope,
     /// `VariableAlreadyBound` — a pattern re-introduces a name already bound to an entity where
     /// Cypher forbids rebinding.
     VariableAlreadyBound,
@@ -214,10 +217,12 @@ pub enum SemanticDetail {
     /// a compile-time error (TCK `clauses/match/Match3` [29]).
     RelationshipUniquenessViolation,
     /// `InvalidParameterUse` — a parameter (`$param`) appears where the grammar forbids it: as the
-    /// inline property predicate of a `MERGE` node or relationship (`MERGE (n $param)`,
-    /// `MERGE (a)-[r:T $param]->(b)`). openCypher rejects this at compile time because `MERGE`'s
-    /// match-or-create needs a *statically-known* property predicate; a parameter map is not one
-    /// (TCK `clauses/merge/Merge1` [16], `clauses/merge/Merge5` [27]).
+    /// inline property predicate of a `MATCH` or `MERGE` node or relationship (`MATCH (n $param)`,
+    /// `MATCH ()-[r:FOO $param]->()`, `MERGE (n $param)`, `MERGE (a)-[r:T $param]->(b)`). openCypher
+    /// rejects this at compile time because a *match* needs a statically-known property predicate; a
+    /// parameter map is not one (TCK `clauses/match/Match1` [6], `clauses/match/Match2` [8],
+    /// `clauses/merge/Merge1` [16], `clauses/merge/Merge5` [27]). A `CREATE` pattern, which
+    /// constructs rather than matches, accepts a parameter map.
     InvalidParameterUse,
 }
 
@@ -227,6 +232,7 @@ impl SemanticDetail {
     pub const fn as_tck_str(self) -> &'static str {
         match self {
             Self::UndefinedVariable => "UndefinedVariable",
+            Self::NoVariablesInScope => "NoVariablesInScope",
             Self::VariableAlreadyBound => "VariableAlreadyBound",
             Self::VariableTypeConflict => "VariableTypeConflict",
             Self::AmbiguousAggregationExpression => "AmbiguousAggregationExpression",
@@ -345,6 +351,10 @@ pub enum SemanticErrorKind {
         /// The referenced name.
         name: String,
     },
+    /// A `RETURN *` is written where there are no variables in scope to expand. TCK detail
+    /// `NoVariablesInScope`, raised as a `SyntaxError`
+    /// (`tck/features/clauses/return/Return7.feature` \[2\]: `MATCH () RETURN *`).
+    NoVariablesInScope,
     /// A pattern re-introduces a name already bound to an entity, which Cypher forbids in that
     /// position. TCK detail `VariableAlreadyBound` (e.g. `tck/features/clauses/merge/Merge*`).
     VariableAlreadyBound {
@@ -490,11 +500,12 @@ pub enum SemanticErrorKind {
         /// The reused relationship variable name.
         name: String,
     },
-    /// A parameter (`$param`) is used as the inline property predicate of a `MERGE` node or
-    /// relationship (`MERGE (n $param)`, `MERGE (a)-[r:T $param]->(b)`). `MERGE`'s match-or-create
-    /// requires a statically-known property predicate, so a parameter map there is rejected at
-    /// compile time. TCK detail `InvalidParameterUse` (`clauses/merge/Merge1` [16],
-    /// `clauses/merge/Merge5` [27]).
+    /// A parameter (`$param`) is used as the inline property predicate of a `MATCH` or `MERGE` node
+    /// or relationship (`MATCH (n $param)`, `MATCH ()-[r:FOO $param]->()`, `MERGE (n $param)`,
+    /// `MERGE (a)-[r:T $param]->(b)`). A match requires a statically-known property predicate, so a
+    /// parameter map there is rejected at compile time. TCK detail `InvalidParameterUse`
+    /// (`clauses/match/Match1` [6], `clauses/match/Match2` [8], `clauses/merge/Merge1` [16],
+    /// `clauses/merge/Merge5` [27]). A `CREATE` accepts a parameter map.
     InvalidParameterUse,
 }
 
@@ -530,6 +541,7 @@ impl SemanticErrorKind {
     pub const fn detail(&self) -> SemanticDetail {
         match self {
             Self::UndefinedVariable { .. } => SemanticDetail::UndefinedVariable,
+            Self::NoVariablesInScope => SemanticDetail::NoVariablesInScope,
             Self::VariableAlreadyBound { .. } => SemanticDetail::VariableAlreadyBound,
             Self::VariableTypeConflict { .. } => SemanticDetail::VariableTypeConflict,
             Self::AmbiguousAggregationExpression => SemanticDetail::AmbiguousAggregationExpression,
@@ -598,6 +610,9 @@ impl fmt::Display for SemanticErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UndefinedVariable { name } => write!(f, "variable `{name}` is not defined"),
+            Self::NoVariablesInScope => {
+                f.write_str("RETURN * is not allowed when there are no variables in scope")
+            }
             Self::VariableAlreadyBound { name } => {
                 write!(
                     f,
@@ -715,6 +730,7 @@ mod tests {
     fn detail_strings_are_the_verbatim_tck_spellings() {
         let pairs = [
             (SemanticDetail::UndefinedVariable, "UndefinedVariable"),
+            (SemanticDetail::NoVariablesInScope, "NoVariablesInScope"),
             (SemanticDetail::VariableAlreadyBound, "VariableAlreadyBound"),
             (SemanticDetail::VariableTypeConflict, "VariableTypeConflict"),
             (
@@ -835,6 +851,7 @@ mod tests {
         fn classify(kind: &SemanticErrorKind) -> Classification {
             match kind {
                 SemanticErrorKind::UndefinedVariable { .. }
+                | SemanticErrorKind::NoVariablesInScope
                 | SemanticErrorKind::VariableAlreadyBound { .. }
                 | SemanticErrorKind::VariableTypeConflict { .. }
                 | SemanticErrorKind::AmbiguousAggregationExpression
@@ -868,6 +885,7 @@ mod tests {
             SemanticErrorKind::UndefinedVariable {
                 name: "x".to_owned(),
             },
+            SemanticErrorKind::NoVariablesInScope,
             SemanticErrorKind::VariableAlreadyBound {
                 name: "x".to_owned(),
             },
