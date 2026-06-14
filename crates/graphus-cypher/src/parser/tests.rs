@@ -1454,3 +1454,110 @@ fn pattern_predicate_in_general_expression_position_parses() {
     assert!(parse("MATCH (n) RETURN (n)-[]->()").is_ok());
     assert!(parse("MATCH (n) WITH (n)-[]->() AS x RETURN x").is_ok());
 }
+
+// =================================================================================================
+// EXISTS subquery: pattern-form vs full-query-form disambiguation (rmp #123)
+// =================================================================================================
+
+/// Unwraps the sole `WHERE`-position [`ExprKind::ExistsSubquery`] of a `MATCH ... WHERE exists{...}`
+/// query.
+fn exists_subquery(q: &str) -> ExistsSubquery {
+    let where_e = match_where(q);
+    let ExprKind::ExistsSubquery(ex) = where_e.kind else {
+        panic!(
+            "expected an ExistsSubquery in `{q}`, got {:?}",
+            where_e.kind
+        );
+    };
+    *ex
+}
+
+#[test]
+fn parse_exists_disambiguation_pattern_only() {
+    // A bare pattern, an explicit MATCH, and a MATCH + WHERE — all the pattern form: `full_query`
+    // is None and `pattern` is populated. The closing `}` immediately follows the pattern/WHERE.
+    for q in [
+        "MATCH (a) WHERE exists { (a)-->(b) } RETURN a",
+        "MATCH (a) WHERE exists { MATCH (a)-->(b) } RETURN a",
+        "MATCH (a) WHERE exists { MATCH (a)-->(b) WHERE a.x = 1 } RETURN a",
+    ] {
+        let ex = exists_subquery(q);
+        assert!(
+            ex.full_query.is_none(),
+            "`{q}` must be the pattern form (full_query None)"
+        );
+        assert_eq!(ex.pattern.len(), 1, "`{q}` must carry its pattern part");
+        assert!(
+            !ex.from_pattern_predicate,
+            "an explicit EXISTS is not a pattern predicate"
+        );
+    }
+}
+
+#[test]
+fn parse_exists_disambiguation_full_query() {
+    // Clauses following the leading pattern (RETURN / WITH) flip it to the full-query form:
+    // `full_query` is Some, `pattern` is empty, and the synthesized first clause is a MATCH over the
+    // leading pattern.
+    for q in [
+        "MATCH (a) WHERE exists { MATCH (a)-->(b) RETURN true } RETURN a",
+        "MATCH (a) WHERE exists { MATCH (a)-->(b) WITH a RETURN a } RETURN a",
+        // The leading MATCH keyword is optional even in the full-query form.
+        "MATCH (a) WHERE exists { (a)-->(b) RETURN true } RETURN a",
+    ] {
+        let ex = exists_subquery(q);
+        let inner = ex
+            .full_query
+            .as_ref()
+            .unwrap_or_else(|| panic!("`{q}` must be the full-query form (full_query Some)"));
+        assert!(ex.pattern.is_empty(), "full-query form has empty pattern");
+        assert!(ex.predicate.is_none(), "full-query form has no predicate");
+
+        let QueryBody::Regular { head, .. } = &inner.body else {
+            panic!("`{q}` inner query should be a regular query");
+        };
+        let Clause::Match(first) = &head.clauses[0] else {
+            panic!(
+                "`{q}` synthesized first clause should be a MATCH, got {:?}",
+                head.clauses[0]
+            );
+        };
+        assert!(!first.optional, "synthesized MATCH is not OPTIONAL");
+        assert_eq!(
+            first.pattern.len(),
+            1,
+            "`{q}` synthesized MATCH carries the leading pattern (a)-->(b)"
+        );
+        // The leading pattern is (a)-->(b): a node `a` with one outgoing hop to `b`.
+        let element = &first.pattern[0].element;
+        assert_eq!(
+            element.start.variable.as_ref().map(|v| v.name.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            element.chain.len(),
+            1,
+            "one relationship hop in the lead pattern"
+        );
+        // A RETURN closes the inner query.
+        assert!(
+            matches!(head.clauses.last(), Some(Clause::Return(_))),
+            "`{q}` inner query ends in RETURN"
+        );
+    }
+}
+
+#[test]
+fn parse_exists_full_query_with_aggregation_and_where() {
+    // The aggregation scenario (TCK ExistentialSubquery2 [2]) parses into MATCH / WITH / RETURN.
+    let ex = exists_subquery(
+        "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS c WHERE c = 3 RETURN true } RETURN n",
+    );
+    let inner = ex.full_query.expect("full-query form");
+    let QueryBody::Regular { head, .. } = &inner.body else {
+        panic!("regular query expected");
+    };
+    assert!(matches!(head.clauses[0], Clause::Match(_)));
+    assert!(matches!(head.clauses[1], Clause::With(_)));
+    assert!(matches!(head.clauses[2], Clause::Return(_)));
+}

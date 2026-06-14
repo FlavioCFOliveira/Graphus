@@ -239,7 +239,14 @@ use graphus_tck::runner::run_scenario;
 /// `expressions/string/{String8,String9,String10}` [8] (STARTS WITH/ENDS WITH/CONTAINS non-string
 /// operands). Measured, zero regressions (full failure-set diff: 0 newly-failing scenarios; the net
 /// +19 is purely additive).
-const BASELINE: usize = 3869;
+///
+/// `rmp` #123: **+5 EXISTS full-query scenarios** — `expressions/existentialSubqueries/`
+/// `ExistentialSubquery2` [1][2] and `ExistentialSubquery3` [1][2][3] now pass (the full-query form
+/// `EXISTS { MATCH ... RETURN ... }`, correlated and read-only, with aggregation and nesting);
+/// `ExistentialSubquery2` [3] remains a compile-time `InvalidClauseComposition` rejection (a writing
+/// clause inside `EXISTS`). Measured, zero regressions (failure-set diff: exactly the 5 scenarios
+/// removed from the FAIL list, nothing added).
+const BASELINE: usize = 3874;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

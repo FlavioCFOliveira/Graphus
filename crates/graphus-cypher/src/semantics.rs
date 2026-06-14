@@ -658,9 +658,24 @@ impl Analyzer<'_> {
         &self,
         sq: &SingleQuery,
     ) -> Result<Option<BTreeSet<String>>, SemanticError> {
+        self.check_single_query_with_scope(sq, Scope::default())
+    }
+
+    /// [`check_single_query`](Self::check_single_query) with a caller-supplied **seeded** scope.
+    ///
+    /// A fresh `Scope::default()` reproduces the standalone semantics. Seeding the scope with the
+    /// outer bindings is how a **correlated** subquery — the full-query form of an `EXISTS { ... }`
+    /// subquery — is analysed: the outer variables are visible (and constrain) the inner query, so a
+    /// correlated reference like `MATCH (n)-->()` (where `n` is an outer variable) resolves instead
+    /// of raising `UndefinedVariable`, while variables the inner query introduces bind locally.
+    fn check_single_query_with_scope(
+        &self,
+        sq: &SingleQuery,
+        seed: Scope,
+    ) -> Result<Option<BTreeSet<String>>, SemanticError> {
         self.check_clause_composition(sq)?;
 
-        let mut scope = Scope::default();
+        let mut scope = seed;
         let mut final_columns = None;
         for (idx, clause) in sq.clauses.iter().enumerate() {
             match clause {
@@ -693,6 +708,60 @@ impl Analyzer<'_> {
             }
         }
         Ok(final_columns)
+    }
+
+    /// Analyses the inner query of an `EXISTS { <full query> }` subquery, **correlated** with the
+    /// outer `scope`.
+    ///
+    /// Two rules beyond a free-standing query:
+    ///
+    /// 1. **Read-only**: an `EXISTS` subquery is a predicate, so it may not mutate the graph. Any
+    ///    writing clause (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`) anywhere in the inner query (its
+    ///    head or any `UNION` branch) is a compile-time `InvalidClauseComposition` (openCypher; TCK
+    ///    `expressions/existentialSubqueries/ExistentialSubquery2` [3]).
+    /// 2. **Correlation**: each single query is analysed with the outer bindings seeded into its
+    ///    scope (see [`check_single_query_with_scope`](Self::check_single_query_with_scope)), so an
+    ///    outer variable referenced inside resolves (and constrains) rather than raising
+    ///    `UndefinedVariable`, while inner-introduced variables stay local and do not escape.
+    fn check_exists_full_query(&self, query: &Query, scope: &Scope) -> Result<(), SemanticError> {
+        match &query.body {
+            QueryBody::Regular { head, unions } => {
+                Self::reject_writing_clauses(head)?;
+                self.check_single_query_with_scope(head, scope.clone())?;
+                for UnionPart { query: sq, .. } in unions {
+                    Self::reject_writing_clauses(sq)?;
+                    self.check_single_query_with_scope(sq, scope.clone())?;
+                }
+                Ok(())
+            }
+            // A bare `EXISTS { CALL ... }` standalone call is not produced by the parser (the
+            // full-query form always synthesizes a leading MATCH), but handle it conservatively as a
+            // correlated read.
+            QueryBody::StandaloneCall(call) => self.check_standalone_call(call),
+        }
+    }
+
+    /// Rejects any **writing** clause inside an `EXISTS` subquery's single query — they would mutate
+    /// the graph from a predicate position, which openCypher forbids as `InvalidClauseComposition`.
+    fn reject_writing_clauses(sq: &SingleQuery) -> Result<(), SemanticError> {
+        for clause in &sq.clauses {
+            if matches!(
+                clause,
+                Clause::Create(_)
+                    | Clause::Merge(_)
+                    | Clause::Set(_)
+                    | Clause::Delete(_)
+                    | Clause::Remove(_)
+            ) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidClauseComposition {
+                        reason: "a writing clause is not allowed inside an EXISTS subquery",
+                    },
+                    clause.span(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Validates clause ordering / composition that the parser deliberately left to this phase
@@ -1691,6 +1760,11 @@ impl Analyzer<'_> {
                 self.check_expr_refs(&q.predicate, &inner)
             }
             ExprKind::ExistsSubquery(ex) => {
+                // Full-query form (`EXISTS { MATCH ... RETURN ... }`): the braces hold a complete
+                // read-only Cypher query, analysed **correlated** with the outer scope.
+                if let Some(inner_query) = &ex.full_query {
+                    return self.check_exists_full_query(inner_query, scope);
+                }
                 // A bare *pattern predicate* (`(n)-[]->()`) may not **introduce** variables: every
                 // named node/relationship variable must already be bound in the outer scope, else
                 // openCypher raises `UndefinedVariable` (TCK `expressions/pattern/Pattern1` [10]).
@@ -2525,5 +2599,55 @@ mod tests {
         // The *root* of a property key is not determined by it, nor is a sibling property.
         assert!(!Analyzer::signature_is_grouped(&["me"], &keys));
         assert!(!Analyzer::signature_is_grouped(&["me", "other"], &keys));
+    }
+
+    // ---- full-query EXISTS subquery (rmp #123) ----------------------------------------------
+
+    #[test]
+    fn exists_full_query_correlated_analysis_accepts() {
+        // The full-query form analyses correlated with the outer scope: an outer `n` referenced in
+        // the inner `MATCH (n)-->()` resolves (no UndefinedVariable). Aggregation and nesting also
+        // analyse cleanly.
+        for q in [
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS c WHERE c = 3 RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) WHERE n.prop = m.prop } RETURN true } RETURN n",
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+        ] {
+            assert!(analyze(&ast(q)).is_ok(), "should analyse: {q}");
+        }
+    }
+
+    #[test]
+    fn exists_writing_clause_rejected() {
+        // TCK ExistentialSubquery2 [3]: a writing clause inside EXISTS is a compile-time
+        // InvalidClauseComposition.
+        let q = "MATCH (n) WHERE exists { MATCH (n)-->(m) SET m.prop='fail' } RETURN n";
+        let err = analyze(&ast(q)).expect_err("a writing clause inside EXISTS must be rejected");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+            "expected InvalidClauseComposition, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn exists_writing_clauses_each_rejected() {
+        // Every writing clause kind directly inside EXISTS is rejected.
+        for inner in [
+            "CREATE (x)",
+            "MERGE (x)",
+            "SET m.prop = 1",
+            "DELETE m",
+            "REMOVE m.prop",
+        ] {
+            let q = format!("MATCH (n) WHERE exists {{ MATCH (n)-->(m) {inner} }} RETURN n");
+            let err = analyze(&ast(&q)).expect_err("writing clause must be rejected");
+            assert!(
+                matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+                "{q}: expected InvalidClauseComposition, got {:?}",
+                err.kind
+            );
+        }
     }
 }

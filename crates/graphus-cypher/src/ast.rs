@@ -740,7 +740,169 @@ impl Expr {
                 if let Some(pred) = &mut ex.predicate {
                     pred.zero_spans_in_place();
                 }
+                // Full-query form: recurse into the inner query, zeroing every contained
+                // expression's span. Mirrors the conservative pattern-form behaviour above — the
+                // inner clauses' *structural* spans are left as-is (which can only ever make two
+                // such forms compare *unequal*, the safe direction for the plan-cache equality
+                // use-case), while the embedded *expression* spans are zeroed so two inner queries
+                // that differ only in source offsets of their expressions compare equal.
+                if let Some(q) = &mut ex.full_query {
+                    q.zero_expr_spans_in_place();
+                }
             }
+        }
+    }
+}
+
+impl Query {
+    /// Zeroes the [`Span`] of every **expression** contained anywhere in this query (recursively,
+    /// through every clause and any nested subqueries).
+    ///
+    /// This is the query-level counterpart of [`Expr::zero_spans_in_place`], used to normalise the
+    /// inner query of an [`ExprKind::ExistsSubquery`] full-query form for plan-cache key equality.
+    /// Structural clause/pattern spans are intentionally **not** touched (see the
+    /// [`ExprKind::ExistsSubquery`] arm of [`Expr::zero_spans_in_place`]).
+    pub fn zero_expr_spans_in_place(&mut self) {
+        match &mut self.body {
+            QueryBody::Regular { head, unions } => {
+                head.zero_expr_spans_in_place();
+                for u in unions {
+                    u.query.zero_expr_spans_in_place();
+                }
+            }
+            QueryBody::StandaloneCall(_) => {}
+        }
+    }
+}
+
+impl SingleQuery {
+    fn zero_expr_spans_in_place(&mut self) {
+        for clause in &mut self.clauses {
+            clause.zero_expr_spans_in_place();
+        }
+    }
+}
+
+impl Clause {
+    /// Zeroes the span of every expression reachable from this clause (recursively).
+    fn zero_expr_spans_in_place(&mut self) {
+        match self {
+            Self::Match(c) => {
+                for part in &mut c.pattern {
+                    part.zero_expr_spans_in_place();
+                }
+                if let Some(w) = &mut c.where_clause {
+                    w.zero_spans_in_place();
+                }
+            }
+            Self::Unwind(c) => c.expr.zero_spans_in_place(),
+            Self::LoadCsv(c) => c.url.zero_spans_in_place(),
+            Self::Call(c) => {
+                if let Some(args) = &mut c.call.args {
+                    for arg in args {
+                        arg.zero_spans_in_place();
+                    }
+                }
+                if let Some(w) = &mut c.where_clause {
+                    w.zero_spans_in_place();
+                }
+            }
+            Self::Create(c) => {
+                for part in &mut c.pattern {
+                    part.zero_expr_spans_in_place();
+                }
+            }
+            Self::Merge(c) => {
+                c.pattern.zero_expr_spans_in_place();
+                for action in &mut c.actions {
+                    let items = match action {
+                        MergeAction::OnCreate(items) | MergeAction::OnMatch(items) => items,
+                    };
+                    for item in items {
+                        item.zero_expr_spans_in_place();
+                    }
+                }
+            }
+            Self::Set(c) => {
+                for item in &mut c.items {
+                    item.zero_expr_spans_in_place();
+                }
+            }
+            Self::Delete(c) => {
+                for e in &mut c.exprs {
+                    e.zero_spans_in_place();
+                }
+            }
+            Self::Remove(c) => {
+                for item in &mut c.items {
+                    if let RemoveItem::Property(e) = item {
+                        e.zero_spans_in_place();
+                    }
+                }
+            }
+            Self::With(c) => {
+                c.body.zero_expr_spans_in_place();
+                if let Some(w) = &mut c.where_clause {
+                    w.zero_spans_in_place();
+                }
+            }
+            Self::Return(c) => c.body.zero_expr_spans_in_place(),
+        }
+    }
+}
+
+impl SetItem {
+    fn zero_expr_spans_in_place(&mut self) {
+        match self {
+            Self::Property { target, value } => {
+                target.zero_spans_in_place();
+                value.zero_spans_in_place();
+            }
+            Self::Replace { value, .. } | Self::Merge { value, .. } => value.zero_spans_in_place(),
+            Self::Labels { .. } => {}
+        }
+    }
+}
+
+impl ProjectionBody {
+    fn zero_expr_spans_in_place(&mut self) {
+        for item in &mut self.items {
+            item.expr.zero_spans_in_place();
+        }
+        for sort in &mut self.order_by {
+            sort.expr.zero_spans_in_place();
+        }
+        if let Some(skip) = &mut self.skip {
+            skip.zero_spans_in_place();
+        }
+        if let Some(limit) = &mut self.limit {
+            limit.zero_spans_in_place();
+        }
+    }
+}
+
+impl PatternPart {
+    fn zero_expr_spans_in_place(&mut self) {
+        self.element.zero_expr_spans_in_place();
+    }
+}
+
+impl PatternElement {
+    fn zero_expr_spans_in_place(&mut self) {
+        self.start.zero_expr_spans_in_place();
+        for link in &mut self.chain {
+            if let Some(props) = &mut link.relationship.properties {
+                props.zero_spans_in_place();
+            }
+            link.node.zero_expr_spans_in_place();
+        }
+    }
+}
+
+impl NodePattern {
+    fn zero_expr_spans_in_place(&mut self) {
+        if let Some(props) = &mut self.properties {
+            props.zero_spans_in_place();
         }
     }
 }
@@ -1040,18 +1202,31 @@ pub enum QuantifierKind {
     Single,
 }
 
-/// An existential subquery `EXISTS { [MATCH] pattern [WHERE pred] }` (openCypher
-/// `ExistentialSubquery`, pattern form).
+/// An existential subquery (openCypher `ExistentialSubquery`).
 ///
-/// True iff the pattern (constrained by the outer row's bindings and the optional `WHERE`)
-/// matches at least once. The full-query form (`EXISTS { MATCH ... RETURN ... }`) is a named
-/// deferral.
+/// Two arms, distinguished by [`full_query`](Self::full_query) / [`is_full_query`](Self::is_full_query):
+///
+/// - **Pattern form** (`full_query` is `None`): `EXISTS { [MATCH] pattern [WHERE pred] }` — true iff
+///   the pattern (constrained by the outer row's bindings and the optional `WHERE`) matches at least
+///   once. The [`pattern`](Self::pattern) / [`predicate`](Self::predicate) fields carry the parts.
+///   This is also how a bare **pattern predicate** (`(n)-[]->()`) desugars
+///   ([`from_pattern_predicate`](Self::from_pattern_predicate)).
+/// - **Full-query form** (`full_query` is `Some`): `EXISTS { MATCH ... [WITH ...] RETURN ... }` — the
+///   braces hold a complete, **read-only** Cypher query (openCypher `RegularQuery`); the subquery is
+///   true iff that query yields at least one row. The interior is **correlated**: outer-scope
+///   variables are visible and constrain it, while variables it introduces do not escape. A writing
+///   clause (`CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`) inside it is a compile-time
+///   `InvalidClauseComposition`. In this arm [`pattern`](Self::pattern) is empty,
+///   [`predicate`](Self::predicate) is `None`, and [`from_pattern_predicate`](Self::from_pattern_predicate)
+///   is `false`; the query lives in [`full_query`](Self::full_query).
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct ExistsSubquery {
-    /// The pattern parts (comma-separated), at least one.
+    /// The pattern parts (comma-separated), at least one — **pattern form only** (empty in the
+    /// full-query form).
     pub pattern: Vec<PatternPart>,
-    /// The optional `WHERE` predicate over the pattern's bindings.
+    /// The optional `WHERE` predicate over the pattern's bindings — **pattern form only** (`None` in
+    /// the full-query form).
     pub predicate: Option<Box<Expr>>,
     /// `true` when this node was synthesized from a bare **pattern predicate** (`(n)-[]->()` written
     /// directly as a boolean expression) rather than an explicit `EXISTS { ... }`.
@@ -1064,4 +1239,17 @@ pub struct ExistsSubquery {
     /// TCK `expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]). An explicit
     /// `EXISTS { ... }` has neither restriction.
     pub from_pattern_predicate: bool,
+    /// The **full-query form**: when `Some`, the braces held a complete read-only Cypher query
+    /// (`EXISTS { MATCH ... RETURN ... }`) rather than a bare pattern. The other three fields are
+    /// then inert (`pattern` empty, `predicate` `None`, `from_pattern_predicate` `false`).
+    pub full_query: Option<Box<Query>>,
+}
+
+impl ExistsSubquery {
+    /// Whether this is the **full-query** arm (`EXISTS { MATCH ... RETURN ... }`) rather than the
+    /// pattern arm (`EXISTS { (a)-->(b) }` / a bare pattern predicate).
+    #[must_use]
+    pub fn is_full_query(&self) -> bool {
+        self.full_query.is_some()
+    }
 }

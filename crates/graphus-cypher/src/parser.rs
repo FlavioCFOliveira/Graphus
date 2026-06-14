@@ -1988,7 +1988,15 @@ impl<'t, 's> Parser<'t, 's> {
         let start = tok.span.start;
         if self.at(&TokenKind::LBrace) {
             self.bump();
-            // The pattern form optionally writes a leading MATCH (Neo4j accepts both).
+            // The pattern form optionally writes a leading MATCH (Neo4j accepts both). We parse the
+            // (optional-MATCH) pattern and optional WHERE exactly as the pattern form always has,
+            // then disambiguate on the *following* token:
+            //   - a closing `}`        => the **pattern form** (`EXISTS { (a)-->(b) [WHERE p] }`),
+            //                             byte-identical to before this task; or
+            //   - anything else (a     => the **full-query form**: more clauses follow (`RETURN` /
+            //     trailing clause)        `WITH` / …), so the parsed pattern was actually the leading
+            //                             MATCH of a full read-only query (`EXISTS { MATCH ... RETURN ... }`).
+            let pattern_start = self.here_span().start;
             self.eat(&TokenKind::Match);
             let pattern = self.parse_pattern()?;
             let predicate = if self.eat(&TokenKind::Where) {
@@ -1996,18 +2004,92 @@ impl<'t, 's> Parser<'t, 's> {
             } else {
                 None
             };
+            if self.at(&TokenKind::RBrace) {
+                // Pattern form.
+                let rb = self.expect(&TokenKind::RBrace, "'}' to close an EXISTS subquery")?;
+                return Ok(Expr::new(
+                    ExprKind::ExistsSubquery(Box::new(ExistsSubquery {
+                        pattern,
+                        predicate,
+                        from_pattern_predicate: false,
+                        full_query: None,
+                    })),
+                    Span::new(start, rb.span.end),
+                ));
+            }
+            // Full-query form. The pattern + optional WHERE we just parsed are the leading
+            // `MATCH <pattern> [WHERE <pred>]` clause of an inner read-only query; synthesize that
+            // MATCH, then drive the normal clause loop to parse the remaining clauses up to `}`.
+            let query = self.parse_exists_full_query(pattern, predicate, pattern_start, start)?;
             let rb = self.expect(&TokenKind::RBrace, "'}' to close an EXISTS subquery")?;
             return Ok(Expr::new(
                 ExprKind::ExistsSubquery(Box::new(ExistsSubquery {
-                    pattern,
-                    predicate,
+                    pattern: vec![],
+                    predicate: None,
                     from_pattern_predicate: false,
+                    full_query: Some(Box::new(query)),
                 })),
                 Span::new(start, rb.span.end),
             ));
         }
         // Function form `exists(expr)`.
         self.finish_function_call(vec!["exists".to_owned()], start)
+    }
+
+    /// Completes the **full-query form** of an `EXISTS { ... }` subquery once disambiguation in
+    /// [`parse_exists`](Self::parse_exists) has decided that clauses follow the leading pattern.
+    ///
+    /// The already-parsed `pattern` (+ optional `predicate`) become the synthesized leading
+    /// `MATCH <pattern> [WHERE <pred>]` clause; the remaining clauses are parsed with the **same**
+    /// clause-loop subroutine the top-level parser uses ([`try_parse_clause`](Self::try_parse_clause)),
+    /// so every clause kind, ordering rule and `UNION` chain is handled identically to a free-standing
+    /// query (the closing `}` ends the loop, since `}` cannot start a clause). The composed inner
+    /// [`Query`] is returned **without** consuming the `}` — the caller expects and consumes it.
+    ///
+    /// `pattern_start` is the byte offset of the leading pattern/MATCH (for the synthesized MATCH
+    /// span); `exists_start` is the offset of the `EXISTS` keyword (for the inner query span).
+    fn parse_exists_full_query(
+        &mut self,
+        pattern: Vec<PatternPart>,
+        predicate: Option<Box<Expr>>,
+        pattern_start: usize,
+        exists_start: usize,
+    ) -> Result<Query, SyntaxError> {
+        // Synthesize the leading `MATCH <pattern> [WHERE <pred>]`. The EXISTS predicate is
+        // `Option<Box<Expr>>` while a `MATCH` `where_clause` is `Option<Expr>`, so unbox it.
+        let match_end = predicate
+            .as_ref()
+            .map(|p| p.span.end)
+            .or_else(|| pattern.last().map(|p| p.span.end))
+            .unwrap_or(pattern_start);
+        let leading = Clause::Match(MatchClause {
+            optional: false,
+            pattern,
+            where_clause: predicate.map(|b| *b),
+            span: Span::new(pattern_start, match_end),
+        });
+
+        // Drive the normal clause loop for the remaining clauses (RETURN / WITH / …) until `}`.
+        let mut clauses = vec![leading];
+        while let Some(clause) = self.try_parse_clause()? {
+            clauses.push(clause);
+        }
+        let head_end = clauses.last().map_or(match_end, |c| c.span().end);
+        let head = SingleQuery {
+            clauses,
+            span: Span::new(pattern_start, head_end),
+        };
+
+        // A `UNION` chain inside the subquery is parsed with the same subroutine the top level uses.
+        let mut unions = Vec::new();
+        while self.at(&TokenKind::Union) {
+            unions.push(self.parse_union_part()?);
+        }
+        let query_end = unions.last().map_or(head_end, |u| u.span.end);
+        Ok(Query {
+            body: QueryBody::Regular { head, unions },
+            span: Span::new(exists_start, query_end),
+        })
     }
 
     /// Whether the current `(` begins a *pattern predicate* (`(n)-[]->()`) rather than a
@@ -2124,6 +2206,7 @@ impl<'t, 's> Parser<'t, 's> {
                 pattern: vec![part],
                 predicate: None,
                 from_pattern_predicate: true,
+                full_query: None,
             })),
             span,
         ))

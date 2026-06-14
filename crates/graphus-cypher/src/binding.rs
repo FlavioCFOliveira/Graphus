@@ -46,7 +46,10 @@ use std::fmt;
 
 use graphus_core::Value;
 
-use crate::ast::{CaseExpr, Expr, ExprKind, PatternPart};
+use crate::ast::{
+    CaseExpr, Clause, Expr, ExprKind, MergeAction, PatternPart, ProjectionBody, Query, QueryBody,
+    RemoveItem, SetItem, SingleQuery,
+};
 use crate::physical::{PhysicalOp, PhysicalPlan};
 use crate::plan_cache::NormalizedQuery;
 
@@ -261,6 +264,20 @@ impl BoundParameters {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+
+    /// Re-materialises these bound values as a raw [`Parameters`] set.
+    ///
+    /// Used to bind a **correlated subplan** (the full-query form of an `EXISTS { ... }` subquery,
+    /// `rmp` #123): the inner plan's parameter set is a subset of the same `$param` namespace, so the
+    /// outer query's already-bound values supply it. Every `$param` the inner query references is
+    /// also collected from the outer query (see [`params_in_query`]), so it is present here.
+    pub fn as_parameters(&self) -> Parameters {
+        let mut params = Parameters::new();
+        for (name, value) in &self.values {
+            params.insert(name.clone(), value.clone());
+        }
+        params
     }
 }
 
@@ -611,7 +628,128 @@ fn params_in_expr(expr: &Expr, ty: ParamType, record: &mut impl FnMut(&str, Para
             if let Some(p) = &ex.predicate {
                 params_in_expr(p, ParamType::Any, record);
             }
+            // Full-query form: collect the parameters of the inner read-only query so they are bound
+            // into the outer `BoundParameters` and thus available when the subquery is executed.
+            if let Some(q) = &ex.full_query {
+                params_in_query(q, record);
+            }
         }
+    }
+}
+
+/// Reports the parameters referenced anywhere in a (sub)query — every clause's expressions, pattern
+/// inline properties, projections, and any further nested subqueries. Used for the full-query form
+/// of an `EXISTS { ... }` subquery so its `$params` are bound alongside the outer query's.
+fn params_in_query(query: &Query, record: &mut impl FnMut(&str, ParamType)) {
+    match &query.body {
+        QueryBody::Regular { head, unions } => {
+            params_in_single_query(head, record);
+            for u in unions {
+                params_in_single_query(&u.query, record);
+            }
+        }
+        QueryBody::StandaloneCall(call) => {
+            if let Some(args) = &call.call.args {
+                for a in args {
+                    params_in_expr(a, ParamType::Any, record);
+                }
+            }
+        }
+    }
+}
+
+fn params_in_single_query(sq: &SingleQuery, record: &mut impl FnMut(&str, ParamType)) {
+    for clause in &sq.clauses {
+        match clause {
+            Clause::Match(m) => {
+                for part in &m.pattern {
+                    params_in_pattern_part(part, record);
+                }
+                if let Some(w) = &m.where_clause {
+                    params_in_expr(w, ParamType::Any, record);
+                }
+            }
+            Clause::Unwind(u) => params_in_expr(&u.expr, ParamType::Any, record),
+            Clause::LoadCsv(l) => params_in_expr(&l.url, ParamType::Any, record),
+            Clause::Call(c) => {
+                if let Some(args) = &c.call.args {
+                    for a in args {
+                        params_in_expr(a, ParamType::Any, record);
+                    }
+                }
+                if let Some(w) = &c.where_clause {
+                    params_in_expr(w, ParamType::Any, record);
+                }
+            }
+            Clause::Create(c) => {
+                for part in &c.pattern {
+                    params_in_pattern_part(part, record);
+                }
+            }
+            Clause::Merge(m) => {
+                params_in_pattern_part(&m.pattern, record);
+                for action in &m.actions {
+                    let items = match action {
+                        MergeAction::OnCreate(items) | MergeAction::OnMatch(items) => items,
+                    };
+                    for item in items {
+                        params_in_set_item(item, record);
+                    }
+                }
+            }
+            Clause::Set(s) => {
+                for item in &s.items {
+                    params_in_set_item(item, record);
+                }
+            }
+            Clause::Delete(d) => {
+                for e in &d.exprs {
+                    params_in_expr(e, ParamType::Any, record);
+                }
+            }
+            Clause::Remove(r) => {
+                for item in &r.items {
+                    if let RemoveItem::Property(e) = item {
+                        params_in_expr(e, ParamType::Any, record);
+                    }
+                }
+            }
+            Clause::With(w) => {
+                params_in_projection_body(&w.body, record);
+                if let Some(p) = &w.where_clause {
+                    params_in_expr(p, ParamType::Any, record);
+                }
+            }
+            Clause::Return(r) => params_in_projection_body(&r.body, record),
+        }
+    }
+}
+
+fn params_in_set_item(item: &SetItem, record: &mut impl FnMut(&str, ParamType)) {
+    match item {
+        SetItem::Property { target, value } => {
+            params_in_expr(target, ParamType::Any, record);
+            params_in_expr(value, ParamType::Any, record);
+        }
+        SetItem::Replace { value, .. } | SetItem::Merge { value, .. } => {
+            params_in_expr(value, ParamType::Any, record);
+        }
+        SetItem::Labels { .. } => {}
+    }
+}
+
+fn params_in_projection_body(body: &ProjectionBody, record: &mut impl FnMut(&str, ParamType)) {
+    for item in &body.items {
+        params_in_expr(&item.expr, ParamType::Any, record);
+    }
+    for sort in &body.order_by {
+        params_in_expr(&sort.expr, ParamType::Any, record);
+    }
+    if let Some(skip) = &body.skip {
+        params_in_expr(skip, ParamType::Integer, record);
+    }
+    if let Some(limit) = &body.limit {
+        params_in_expr(limit, ParamType::Integer, record);
     }
 }
 

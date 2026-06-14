@@ -140,6 +140,23 @@ pub fn lower(query: &ValidatedQuery) -> LogicalOp {
     Planner::default().lower_query(query.query())
 }
 
+/// Lowers a query as a **correlated subplan**: the `outer_vars` are treated as already-bound, so a
+/// leading `MATCH (n)` whose `n` is an outer variable reuses that binding (a shared/correlated
+/// anchor — an `ExpandInto`) instead of re-scanning the whole graph.
+///
+/// This is the lowering half of the full-query form of an `EXISTS { ... }` subquery (`rmp` #123):
+/// the inner read-only query is correlated with the outer row. It mirrors [`lower`] but seeds the
+/// clause-threading `current` with an [`Argument`](LogicalOp::Argument) over `outer_vars` (the same
+/// mechanism `OPTIONAL MATCH` and pattern subqueries use to carry bindings into a sub-pipeline). The
+/// inner plan correlates only on the outer variables it actually references; passing every outer
+/// column is harmless (an unused argument is just projected away by the leaf scans).
+///
+/// The inner query is lowered as if standalone for everything *except* the seeded base, so it
+/// validates and plans through the normal pipeline; the only difference is the runtime correlation.
+pub fn lower_correlated(query: &Query, outer_vars: &[Var]) -> LogicalOp {
+    Planner::default().lower_correlated_query(query, outer_vars)
+}
+
 /// The lowering driver. Carries only the synthetic-variable counter, so anonymous pattern elements
 /// across the whole query get distinct generated names.
 #[derive(Default)]
@@ -155,6 +172,44 @@ impl Planner {
             QueryBody::Regular { head, unions } => self.lower_union_chain(head, unions),
             QueryBody::StandaloneCall(call) => self.lower_standalone_call(call),
         }
+    }
+
+    /// Lowers a whole [`Query`] **correlated** with `outer_vars` (see [`lower_correlated`]). Each
+    /// single query of a `UNION` chain is seeded independently with the same outer arguments.
+    fn lower_correlated_query(&mut self, query: &Query, outer_vars: &[Var]) -> LogicalOp {
+        match &query.body {
+            QueryBody::Regular { head, unions } => {
+                let mut acc = self.lower_single_query_seeded(head, outer_vars);
+                for part in unions {
+                    let right = self.lower_single_query_seeded(&part.query, outer_vars);
+                    acc = LogicalOp::Union {
+                        left: Box::new(acc),
+                        right: Box::new(right),
+                        all: part.all,
+                    };
+                }
+                acc
+            }
+            QueryBody::StandaloneCall(call) => self.lower_standalone_call(call),
+        }
+    }
+
+    /// [`lower_single_query`](Self::lower_single_query) seeded with an
+    /// [`Argument`](LogicalOp::Argument) over `outer_vars`, so the first clause sees the outer
+    /// variables as already-bound (a correlated anchor). With no outer variables this is identical
+    /// to the standalone lowering.
+    fn lower_single_query_seeded(&mut self, sq: &SingleQuery, outer_vars: &[Var]) -> LogicalOp {
+        let mut current: Option<LogicalOp> = if outer_vars.is_empty() {
+            None
+        } else {
+            Some(LogicalOp::Argument {
+                arguments: outer_vars.to_vec(),
+            })
+        };
+        for clause in &sq.clauses {
+            current = Some(self.lower_clause(clause, current));
+        }
+        current.unwrap_or(LogicalOp::Empty)
     }
 
     /// Folds a `UNION` chain left-associatively into [`Union`](LogicalOp::Union) operators.

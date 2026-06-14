@@ -3503,6 +3503,49 @@ impl Executor {
             emits_rows: !root_is_write(&self.plan.root),
         })
     }
+
+    /// [`open_with_extensions`](Self::open_with_extensions) **seeded** with a correlation row.
+    ///
+    /// The plan's [`Argument`](crate::physical::PhysicalOp::Argument) leaf reads its declared columns
+    /// from `seed`; every other leaf ignores it. This drives a **correlated subplan** — the inner
+    /// plan of the full-query form of an `EXISTS { ... }` subquery (`rmp` #123), whose root chain
+    /// bottoms out at an `Argument` seeded with the outer row, so a correlated `MATCH (n)` reuses the
+    /// outer `n` rather than re-scanning the graph.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_with_extensions`](Self::open_with_extensions).
+    pub fn open_seeded<'a>(
+        &self,
+        graph: &'a mut dyn GraphAccess,
+        token: CancellationToken,
+        functions: &'a dyn FunctionRegistry,
+        procedures: &'a dyn ProcedureRegistry,
+        seed: &Row,
+    ) -> Result<Cursor<'a>, ExecError> {
+        let columns = result_columns(&self.plan.root, procedures);
+        let root = {
+            let mut ctx = Ctx {
+                params: &self.params,
+                token: &token,
+                graph,
+                functions,
+                procedures,
+            };
+            build_operator(&self.plan.root, Some(seed), &mut ctx)?
+        };
+        Ok(Cursor {
+            root,
+            params: self.params.clone(),
+            token,
+            graph,
+            functions,
+            procedures,
+            columns,
+            finished: false,
+            emits_rows: !root_is_write(&self.plan.root),
+        })
+    }
 }
 
 /// Executes `plan` (bound with `params`) over `graph`, returning a [`Cursor`] (`04 §7.4`, §7.7).
@@ -4437,5 +4480,154 @@ mod tests {
             ExecError::Eval(EvalError::TypeError { .. }) => {}
             other => panic!("expected TypeError for a string percentile, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Full-query EXISTS subquery (rmp #123)
+    // ---------------------------------------------------------------------------------------------
+
+    /// The TCK `ExistentialSubquery2`/`3` graph: `(:A{prop:1})` with three outgoing `:R` to
+    /// `(:B{prop:1})`, `(:C{prop:2})`, `(:D{prop:3})`. Only `A` has any outgoing relationship.
+    fn exists_tck_graph() -> MemGraph {
+        let mut g = MemGraph::new();
+        let a = g.add_node(["A"], [("prop", Value::Integer(1))]);
+        let b = g.add_node(["B"], [("prop", Value::Integer(1))]);
+        let c = g.add_node(["C"], [("prop", Value::Integer(2))]);
+        let d = g.add_node(["D"], [("prop", Value::Integer(3))]);
+        let _ = g.add_rel("R", a, b, NO_PROPS);
+        let _ = g.add_rel("R", a, c, NO_PROPS);
+        let _ = g.add_rel("R", a, d, NO_PROPS);
+        g
+    }
+
+    /// The `prop` values of the returned `n` nodes (sorted), via a wrapping projection so we read a
+    /// scalar rather than inspecting node identity.
+    fn qualifying_props(src: &str, g: &mut MemGraph) -> Vec<i64> {
+        // Wrap the query so it returns n.prop. The supplied `src` ends in `RETURN n`.
+        let wrapped = src.replace("RETURN n", "RETURN n.prop AS p");
+        let mut props: Vec<i64> = run(&wrapped, g)
+            .iter()
+            .filter_map(|r| match r.value("p") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        props.sort_unstable();
+        props
+    }
+
+    #[test]
+    fn exists_full_query_simple() {
+        // TCK ExistentialSubquery2 [1]: only the node with an outgoing relationship (A, prop 1).
+        let mut g = exists_tck_graph();
+        let props = qualifying_props(
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n",
+            &mut g,
+        );
+        assert_eq!(
+            props,
+            vec![1],
+            "only A (prop 1) has an outgoing relationship"
+        );
+    }
+
+    #[test]
+    fn exists_full_query_aggregation() {
+        // TCK ExistentialSubquery2 [2]: A has exactly 3 outgoing rels; with the extra (b)-[:R]->(d)
+        // edge, B has 1. Only A satisfies `count(*) = 3`.
+        let mut g = MemGraph::new();
+        let a = g.add_node(["A"], [("prop", Value::Integer(1))]);
+        let b = g.add_node(["B"], [("prop", Value::Integer(1))]);
+        let c = g.add_node(["C"], [("prop", Value::Integer(2))]);
+        let d = g.add_node(["D"], [("prop", Value::Integer(3))]);
+        let _ = g.add_rel("R", a, b, NO_PROPS);
+        let _ = g.add_rel("R", a, c, NO_PROPS);
+        let _ = g.add_rel("R", a, d, NO_PROPS);
+        let _ = g.add_rel("R", b, d, NO_PROPS);
+        let props = qualifying_props(
+            "MATCH (n) WHERE exists { MATCH (n)-->(m) WITH n, count(*) AS numConnections WHERE numConnections = 3 RETURN true } RETURN n",
+            &mut g,
+        );
+        assert_eq!(
+            props,
+            vec![1],
+            "only A has exactly 3 outgoing relationships"
+        );
+    }
+
+    #[test]
+    fn exists_correlated_outer_var_constrains() {
+        // The crux: the subquery is correlated by the outer `n`. A node with no outgoing rel must be
+        // EXCLUDED, one with an outgoing rel INCLUDED. (If correlation were broken — the inner MATCH
+        // re-scanning every node — every outer node would pass and all four props would appear.)
+        let mut g = exists_tck_graph();
+        let props = qualifying_props(
+            "MATCH (n) WHERE exists { MATCH (n)-->() RETURN true } RETURN n",
+            &mut g,
+        );
+        assert_eq!(
+            props,
+            vec![1],
+            "correlation must restrict to A; a broken seed would yield [1, 1, 2, 3]"
+        );
+    }
+
+    #[test]
+    fn exists_nested_simple() {
+        // TCK ExistentialSubquery3 [1]: nested EXISTS with a pattern predicate `n.prop = m.prop`.
+        // A(prop 1) -> B(prop 1): the prop match holds only for A.
+        let mut g = exists_tck_graph();
+        let props = qualifying_props(
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { (n)-[]->(m) WHERE n.prop = m.prop } RETURN true } RETURN n",
+            &mut g,
+        );
+        assert_eq!(
+            props,
+            vec![1],
+            "only A matches a prop-equal outgoing neighbour"
+        );
+    }
+
+    #[test]
+    fn exists_nested_full_query() {
+        // TCK ExistentialSubquery3 [2]: nested full-query EXISTS with `(l)<-[:R]-(n)-[:R]->(m)` —
+        // n needs at least two outgoing :R relationships. A has three; nobody else has any.
+        let mut g = exists_tck_graph();
+        let props = qualifying_props(
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+            &mut g,
+        );
+        assert_eq!(props, vec![1], "only A has two+ outgoing :R relationships");
+    }
+
+    #[test]
+    fn exists_nested_full_query_with_pattern_predicate() {
+        // TCK ExistentialSubquery3 [3]: the innermost predicate is a pattern predicate inside WHERE.
+        let mut g = exists_tck_graph();
+        let props = qualifying_props(
+            "MATCH (n) WHERE exists { MATCH (m) WHERE exists { MATCH (l) WHERE (l)<-[:R]-(n)-[:R]->(m) RETURN true } RETURN true } RETURN n",
+            &mut g,
+        );
+        assert_eq!(
+            props,
+            vec![1],
+            "only A satisfies the nested pattern predicate"
+        );
+    }
+
+    #[test]
+    fn exists_pattern_only_unbroken() {
+        // The pre-existing pattern-only form must still work unchanged.
+        let mut g = exists_tck_graph();
+        let props = qualifying_props("MATCH (n) WHERE exists { (n)-->() } RETURN n", &mut g);
+        assert_eq!(props, vec![1], "pattern-only EXISTS still selects A");
+    }
+
+    #[test]
+    fn exists_pattern_predicate_unbroken() {
+        // The pre-existing bare pattern-predicate form must still work unchanged.
+        let mut g = exists_tck_graph();
+        let props = qualifying_props("MATCH (n) WHERE (n)-->() RETURN n", &mut g);
+        assert_eq!(props, vec![1], "bare pattern predicate still selects A");
     }
 }

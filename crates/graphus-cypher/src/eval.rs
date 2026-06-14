@@ -84,6 +84,15 @@ pub enum EvalError {
         /// The handler's failure message.
         message: String,
     },
+    /// The inner read-only query of an `EXISTS { <full query> }` subquery failed at runtime
+    /// (`rmp` #123) with a non-[`Eval`](Self::TypeError)-class executor error (e.g. a `LOAD CSV` I/O
+    /// failure, or a procedure failure inside the subquery). An inner *expression* error surfaces
+    /// directly as its own [`EvalError`] variant; this wraps the residual executor classes so the
+    /// subquery never panics on them.
+    Subquery {
+        /// The inner failure's message.
+        message: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -104,6 +113,7 @@ impl fmt::Display for EvalError {
             Self::ExtensionFunction { name, message } => {
                 write!(f, "function `{name}` failed: {message}")
             }
+            Self::Subquery { message } => write!(f, "EXISTS subquery failed: {message}"),
         }
     }
 }
@@ -1911,6 +1921,11 @@ fn eval_exists_subquery(
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
 ) -> EvalResult {
+    // Full-query form (`EXISTS { MATCH ... RETURN ... }`): execute the inner read-only query as a
+    // correlated subquery seeded by the outer row.
+    if let Some(inner_query) = &ex.full_query {
+        return eval_exists_full_query(inner_query, row, params, graph, functions);
+    }
     // Comma-separated parts join through their shared variables: each part's matches seed the next.
     let mut rows = vec![row.clone()];
     for part in &ex.pattern {
@@ -1943,6 +1958,276 @@ fn eval_exists_subquery(
             }
             Ok(RowValue::Value(Value::Boolean(false)))
         }
+    }
+}
+
+// =================================================================================================
+// Full-query EXISTS subquery execution (rmp #123)
+// =================================================================================================
+
+/// A **read-only** view of a [`GraphAccess`] seam.
+///
+/// The full-query form of an `EXISTS { ... }` subquery runs a real sub-pipeline, but
+/// [`Executor::open_seeded`](crate::executor::Executor::open_seeded) needs `&mut dyn GraphAccess`
+/// while the evaluator only holds `&dyn GraphAccess`. The subquery is guaranteed read-only — any
+/// writing clause inside it is rejected at compile time (`InvalidClauseComposition`, see
+/// `semantics::reject_writing_clauses`) — so this adapter forwards every **read** to the underlying
+/// seam and makes every **write** `unreachable!`: the read-only inner plan never calls a write.
+struct ReadOnlyGraph<'g>(&'g dyn GraphAccess);
+
+impl GraphAccess for ReadOnlyGraph<'_> {
+    // ---- reads: forwarded verbatim to the underlying seam -------------------------------------
+    fn scan_nodes(&self) -> Vec<crate::graph_access::NodeId> {
+        self.0.scan_nodes()
+    }
+    fn scan_nodes_by_label(&self, label: &str) -> Vec<crate::graph_access::NodeId> {
+        self.0.scan_nodes_by_label(label)
+    }
+    fn expand(
+        &self,
+        node: crate::graph_access::NodeId,
+        direction: crate::graph_access::ExpandDirection,
+        types: &[String],
+    ) -> Vec<crate::graph_access::Incident> {
+        self.0.expand(node, direction, types)
+    }
+    fn node_exists(&self, node: crate::graph_access::NodeId) -> bool {
+        self.0.node_exists(node)
+    }
+    fn rel_exists(&self, rel: crate::graph_access::RelId) -> bool {
+        self.0.rel_exists(rel)
+    }
+    fn node_labels(&self, node: crate::graph_access::NodeId) -> Option<Vec<String>> {
+        self.0.node_labels(node)
+    }
+    fn rel_data(&self, rel: crate::graph_access::RelId) -> Option<crate::graph_access::RelData> {
+        self.0.rel_data(rel)
+    }
+    fn node_property(&self, node: crate::graph_access::NodeId, key: &str) -> Option<Value> {
+        self.0.node_property(node, key)
+    }
+    fn rel_property(&self, rel: crate::graph_access::RelId, key: &str) -> Option<Value> {
+        self.0.rel_property(rel, key)
+    }
+    fn node_properties(&self, node: crate::graph_access::NodeId) -> Option<Vec<(String, Value)>> {
+        self.0.node_properties(node)
+    }
+    fn rel_properties(&self, rel: crate::graph_access::RelId) -> Option<Vec<(String, Value)>> {
+        self.0.rel_properties(rel)
+    }
+    fn incident_rels(&self, node: crate::graph_access::NodeId) -> Vec<crate::graph_access::RelId> {
+        self.0.incident_rels(node)
+    }
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<Vec<crate::graph_access::NodeId>> {
+        self.0.index_seek_eq(label, property, value)
+    }
+    fn index_seek_range(
+        &self,
+        label: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<crate::graph_access::NodeId>> {
+        self.0.index_seek_range(label, property, lower, upper)
+    }
+    fn index_seek_spatial(
+        &self,
+        label: &str,
+        property: &str,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<crate::graph_access::NodeId>> {
+        self.0
+            .index_seek_spatial(label, property, center_x, center_y, radius)
+    }
+    fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<crate::graph_access::NodeId>> {
+        self.0.fulltext_query(name, search)
+    }
+    fn fulltext_score(
+        &self,
+        name: &str,
+        node: crate::graph_access::NodeId,
+        search: &str,
+    ) -> Option<u64> {
+        self.0.fulltext_score(name, node, search)
+    }
+    fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+        self.0.statistics()
+    }
+
+    // ---- writes: never reached (the read-only inner plan emits no write operator) -------------
+    fn create_node(
+        &mut self,
+        _labels: &[String],
+        _properties: &[(String, Value)],
+    ) -> crate::graph_access::NodeId {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn create_rel(
+        &mut self,
+        _rel_type: &str,
+        _start: crate::graph_access::NodeId,
+        _end: crate::graph_access::NodeId,
+        _properties: &[(String, Value)],
+    ) -> crate::graph_access::RelId {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn set_node_property(&mut self, _node: crate::graph_access::NodeId, _key: &str, _value: Value) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn set_rel_property(&mut self, _rel: crate::graph_access::RelId, _key: &str, _value: Value) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn add_labels(&mut self, _node: crate::graph_access::NodeId, _labels: &[String]) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn remove_labels(&mut self, _node: crate::graph_access::NodeId, _labels: &[String]) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn remove_node_property(&mut self, _node: crate::graph_access::NodeId, _key: &str) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn remove_rel_property(&mut self, _rel: crate::graph_access::RelId, _key: &str) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn replace_node_properties(
+        &mut self,
+        _node: crate::graph_access::NodeId,
+        _properties: &[(String, Value)],
+    ) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn merge_node_properties(
+        &mut self,
+        _node: crate::graph_access::NodeId,
+        _properties: &[(String, Value)],
+    ) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn replace_rel_properties(
+        &mut self,
+        _rel: crate::graph_access::RelId,
+        _properties: &[(String, Value)],
+    ) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn merge_rel_properties(
+        &mut self,
+        _rel: crate::graph_access::RelId,
+        _properties: &[(String, Value)],
+    ) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn delete_rel(&mut self, _rel: crate::graph_access::RelId) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+    fn delete_node(&mut self, _node: crate::graph_access::NodeId) {
+        unreachable!("EXISTS subquery is read-only; writing clauses are rejected at compile time")
+    }
+}
+
+thread_local! {
+    /// Per-thread memo of compiled inner [`EXISTS`] subplans, keyed by a normalised fingerprint of
+    /// `(inner query AST, outer variable names)`.
+    ///
+    /// The inner physical plan is parameter-independent and does **not** depend on the outer *row*
+    /// (correlation is by the [`Argument`](crate::physical::PhysicalOp::Argument) seed), only on the
+    /// inner query AST and the set of outer variables. `eval_exists_subquery` is re-entered once per
+    /// outer row with the same subquery node, so compiling per row would be quadratic; this memo
+    /// compiles once and reuses. Thread-local because the evaluator is a free function with no
+    /// per-execution handle to hang a cache on, and because [`std::cell::RefCell`] keeps it `!Sync`-
+    /// safe without locking (each executor thread owns its own).
+    static EXISTS_PLAN_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<ExistsPlan>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A compiled inner subplan: the physical plan plus the auto-parameters lifted while lowering it.
+struct ExistsPlan {
+    executor: crate::executor::Executor,
+}
+
+/// Executes the full-query form of an `EXISTS { ... }` subquery: run the inner read-only query
+/// correlated by the outer `row`, returning `Boolean(true)` iff it yields at least one row (never
+/// `Null`).
+fn eval_exists_full_query(
+    inner_query: &crate::ast::Query,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+) -> EvalResult {
+    use crate::catalog::IndexCatalog;
+    use crate::logical::Var;
+
+    // The outer variables visible to the subquery are exactly the columns of the driving row; the
+    // inner plan correlates only on the ones it references (others are harmless unused arguments).
+    let outer_vars: Vec<Var> = row.columns().iter().map(Var::named).collect();
+
+    // Fingerprint = the span-normalised inner query AST + the outer variable names. Two outer rows
+    // with the same column set (the steady state) hit the same compiled plan.
+    let mut normalized = inner_query.clone();
+    normalized.zero_expr_spans_in_place();
+    let fingerprint = format!("{:?}|{:?}", normalized, row.columns());
+
+    let plan =
+        EXISTS_PLAN_CACHE.with(|cache| {
+            if let Some(existing) = cache.borrow().get(&fingerprint) {
+                return Ok::<_, EvalError>(std::rc::Rc::clone(existing));
+            }
+            // Compile once: lower the inner query correlated with the outer variables, plan it
+            // physically (an empty index catalogue is correct — the ReadOnlyGraph still serves any real
+            // index seek through the seam; with no catalogue the planner simply prefers scans), and bind
+            // the inner parameters from the outer (already-bound) parameter set.
+            let logical = crate::lower::lower_correlated(inner_query, &outer_vars);
+            let physical = crate::physical::plan_physical(&logical, &IndexCatalog::empty());
+            let bound = crate::binding::bind_parameters(&physical, &params.as_parameters())
+                .map_err(|e| EvalError::Subquery {
+                    message: e.to_string(),
+                })?;
+            let compiled = std::rc::Rc::new(ExistsPlan {
+                executor: crate::executor::Executor::new(physical, bound),
+            });
+            cache
+                .borrow_mut()
+                .insert(fingerprint.clone(), std::rc::Rc::clone(&compiled));
+            Ok(compiled)
+        })?;
+
+    // Run the inner plan over a read-only view, seeded with the outer row, and pull a single row.
+    let mut ro = ReadOnlyGraph(graph);
+    let token = crate::executor::CancellationToken::new();
+    let mut cursor = plan
+        .executor
+        .open_seeded(
+            &mut ro,
+            token,
+            functions,
+            crate::procedure_registry::builtins(),
+            row,
+        )
+        .map_err(|e| EvalError::Subquery {
+            message: e.to_string(),
+        })?;
+    let any = cursor.next().map_err(exec_error_to_eval)?.is_some();
+    Ok(RowValue::Value(Value::Boolean(any)))
+}
+
+/// Maps an inner-subquery [`ExecError`](crate::executor::ExecError) to an [`EvalError`]: an inner
+/// expression error surfaces as its own class; every other class is wrapped in
+/// [`EvalError::Subquery`].
+fn exec_error_to_eval(e: crate::executor::ExecError) -> EvalError {
+    match e {
+        crate::executor::ExecError::Eval(inner) => inner,
+        other => EvalError::Subquery {
+            message: other.to_string(),
+        },
     }
 }
 

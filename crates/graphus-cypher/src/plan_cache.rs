@@ -478,6 +478,14 @@ fn collect_expr_literals(expr: &Expr, out: &mut Vec<LiteralSite>) {
             if let Some(p) = &ex.predicate {
                 collect_expr_literals(p, out);
             }
+            // Full-query form: lift the literals of the inner read-only query too, so two EXISTS
+            // subqueries differing only in scalar literals normalise to the same cache key. The
+            // inner query was parsed from the same source, so its literal spans are absolute source
+            // offsets and rewrite correctly. Two *structurally different* inner queries can never
+            // collide: their surviving (non-literal) text still differs in the normalised key.
+            if let Some(q) = &ex.full_query {
+                collect_query_literals(q, out);
+            }
         }
     }
 }
