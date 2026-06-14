@@ -22,10 +22,15 @@
 //! re-derives the local fields, and an id absent from the database is a typed
 //! [`EvalError::TypeError`].
 //!
-//! # Named deferrals
+//! # Current-instant forms (the statement clock seam, `rmp` task #140)
 //!
-//! - The zero-argument "current instant" constructor forms need the transaction clock; they raise
-//!   a typed [`EvalError::UnsupportedFunction`].
+//! The zero-argument "current instant" constructor forms (`date()`, `time()`, `datetime()`,
+//! `localtime()`, `localdatetime()`, and their `.transaction` / `.statement` / `.realtime`
+//! variants) read from the [`StatementClock`](crate::statement_clock::StatementClock) threaded in
+//! by the evaluator. The `statement` (and bare, default) granularity is the instant captured once
+//! when the cursor opened, so every current-instant call within one statement observes the **same**
+//! instant (the TCK `PT0S` property). `duration()` has no current-instant form and still raises a
+//! typed [`EvalError::UnsupportedFunction`] when called with no argument.
 
 use graphus_core::Value;
 use graphus_core::temporal_calc::{self as tc, TemporalError};
@@ -34,6 +39,7 @@ use graphus_core::value::temporal::{
 };
 
 use crate::eval::EvalError;
+use crate::statement_clock::StatementClock;
 use crate::timezone;
 
 /// Adapts a calendar-engine error to the evaluator's runtime error class.
@@ -54,27 +60,33 @@ fn type_err(context: impl Into<String>) -> EvalError {
 // =================================================================================================
 
 /// Dispatches a temporal constructor by (lower-cased) name. `None` argument is the
-/// "current instant" form (a named deferral — needs the transaction clock).
+/// "current instant" form, read from the statement clock.
 ///
 /// Accepts both the bare constructors (`date`, `localtime`, `time`, `localdatetime`, `datetime`,
 /// `duration`) and their **clock variants** (`date.transaction`, `localtime.statement`,
 /// `time.realtime`, …; `Temporal4.feature` [13]). A clock variant is the base type captured at a
-/// given clock granularity: it returns the same type as its base constructor, propagates a `null`
-/// argument to `null`, and — in its zero-argument "current instant" form — is the same named
-/// deferral as the bare constructor (it needs the clock seam, which is not yet wired). The optional
-/// argument of a clock variant is a timezone, which the base constructor's map/string forms already
-/// accept; for the null-propagation path tested by the TCK the argument never reaches the base.
-pub(crate) fn construct(name: &str, arg: Option<&Value>) -> Result<Value, EvalError> {
+/// given clock granularity: it returns the same type as its base constructor and propagates a
+/// `null` argument to `null`. The optional argument of a clock variant is a timezone, which the
+/// base constructor's map/string forms already accept; for the null-propagation path tested by the
+/// TCK the argument never reaches the base.
+///
+/// In the zero-argument "current instant" form the clock granularity is chosen from the suffix:
+/// `statement` (and the bare default) reads the fixed per-statement instant from `clock`;
+/// `realtime` reads the live wall clock afresh. `duration()` has no current-instant form.
+pub(crate) fn construct(
+    name: &str,
+    arg: Option<&Value>,
+    clock: &StatementClock,
+) -> Result<Value, EvalError> {
     // A clock variant (`<base>.transaction` / `.statement` / `.realtime`) constructs the same type
-    // as its base; strip the suffix so both forms share one code path.
-    let base = name
+    // as its base; strip the suffix so both forms share one code path, but keep the suffix so the
+    // zero-argument form can pick the clock granularity.
+    let (base, suffix) = name
         .split_once('.')
         .filter(|(_, suffix)| matches!(*suffix, "transaction" | "statement" | "realtime"))
-        .map_or(name, |(base, _)| base);
+        .map_or((name, ""), |(base, suffix)| (base, suffix));
     let Some(arg) = arg else {
-        return Err(EvalError::UnsupportedFunction {
-            name: format!("{name}() without arguments (requires the transaction clock)"),
-        });
+        return construct_current(base, suffix, clock);
     };
     if arg.is_null() {
         return Ok(Value::Null);
@@ -90,6 +102,43 @@ pub(crate) fn construct(name: &str, arg: Option<&Value>) -> Result<Value, EvalEr
             name: other.to_owned(),
         }),
     }
+}
+
+/// Builds a zero-argument "current instant" temporal value from the clock.
+///
+/// The `suffix` selects the clock granularity:
+///
+/// - `""` (bare, the default) or `"statement"` → the fixed per-statement instant in `clock`.
+/// - `"transaction"` → also the per-statement instant. NOTE: a true per-transaction clock would
+///   require coordinator wiring; sharing the statement instant is spec-conformant for
+///   single-statement transactions (the bare `date()` defaults to the statement clock anyway) and
+///   is what the TCK exercises. This is intentionally not over-engineered.
+/// - `"realtime"` → a freshly read live wall clock.
+///
+/// `duration` has no current-instant form and is rejected.
+fn construct_current(base: &str, suffix: &str, clock: &StatementClock) -> Result<Value, EvalError> {
+    let realtime = suffix == "realtime";
+    let value = match base {
+        "date" if realtime => Value::Date(StatementClock::realtime_date()),
+        "date" => Value::Date(clock.date()),
+        "localtime" if realtime => Value::LocalTime(StatementClock::realtime_localtime()),
+        "localtime" => Value::LocalTime(clock.localtime()),
+        "time" if realtime => Value::ZonedTime(StatementClock::realtime_time()),
+        "time" => Value::ZonedTime(clock.time()),
+        "localdatetime" if realtime => {
+            Value::LocalDateTime(StatementClock::realtime_localdatetime())
+        }
+        "localdatetime" => Value::LocalDateTime(clock.localdatetime()),
+        "datetime" if realtime => Value::ZonedDateTime(StatementClock::realtime_datetime()),
+        "datetime" => Value::ZonedDateTime(clock.datetime()),
+        // `duration()` (and any non-temporal base) has no current-instant form.
+        other => {
+            return Err(EvalError::UnsupportedFunction {
+                name: format!("{other}() without arguments"),
+            });
+        }
+    };
+    Ok(value)
 }
 
 fn construct_date(arg: &Value) -> Result<Value, EvalError> {
@@ -1468,6 +1517,12 @@ mod tests {
 
     use super::*;
 
+    /// A captured statement clock for the constructor tests. The argument-bearing constructors
+    /// never read it; the zero-argument current-instant tests only need a single shared capture.
+    fn test_clock() -> StatementClock {
+        StatementClock::capture()
+    }
+
     /// Builds a `Value::Map` from `(key, value)` pairs.
     fn map(entries: &[(&str, Value)]) -> Value {
         Value::Map(
@@ -1483,7 +1538,7 @@ mod tests {
     }
 
     fn dt(arg: Value) -> Value {
-        construct("datetime", Some(&arg)).expect("datetime() constructs")
+        construct("datetime", Some(&arg), &test_clock()).expect("datetime() constructs")
     }
 
     #[test]
@@ -1580,12 +1635,14 @@ mod tests {
                 ("year", Value::Integer(2017)),
                 ("timezone", Value::String("Mars/Olympus_Mons".into())),
             ])),
+            &test_clock(),
         )
         .expect_err("unknown zone must not resolve");
         assert!(matches!(err, EvalError::TypeError { .. }), "{err:?}");
         let err = construct(
             "datetime",
             Some(&Value::String("2017-01-01T12:00[Mars/Olympus_Mons]".into())),
+            &test_clock(),
         )
         .expect_err("unknown zone must not parse");
         assert!(matches!(err, EvalError::TypeError { .. }), "{err:?}");
@@ -1610,6 +1667,7 @@ mod tests {
                 ("day", Value::Integer(29)),
                 ("hour", Value::Integer(4)),
             ])),
+            &test_clock(),
         )
         .expect("localdatetime() constructs");
         let d = duration_between("duration.inseconds", &a, &b).expect("computes");
@@ -1669,8 +1727,12 @@ mod tests {
     fn week_overrides_apply_over_a_base_date() {
         // Temporal1 [1] / Temporal3 [1] (pre-existing bug fixed in this cycle): week-calendar
         // components over a `date:` base default to the base's week-year/week/week-day.
-        let base = construct("date", Some(&Value::String("1816-12-30".into())))
-            .expect("date() constructs");
+        let base = construct(
+            "date",
+            Some(&Value::String("1816-12-30".into())),
+            &test_clock(),
+        )
+        .expect("date() constructs");
         let picked = construct(
             "date",
             Some(&map(&[
@@ -1678,6 +1740,7 @@ mod tests {
                 ("week", Value::Integer(2)),
                 ("dayOfWeek", Value::Integer(3)),
             ])),
+            &test_clock(),
         )
         .expect("date() selects");
         assert_eq!(iso(&picked), "1817-01-08");
@@ -1687,10 +1750,18 @@ mod tests {
     fn duration_between_with_a_time_only_operand_uses_the_time_axis() {
         // Temporal10 [2] (pre-existing bug fixed in this cycle): `date × localtime` measures
         // time-of-day only — the date contributes nothing.
-        let a = construct("date", Some(&Value::String("1984-10-11".into())))
-            .expect("date() constructs");
-        let b = construct("localtime", Some(&Value::String("16:30".into())))
-            .expect("localtime() constructs");
+        let a = construct(
+            "date",
+            Some(&Value::String("1984-10-11".into())),
+            &test_clock(),
+        )
+        .expect("date() constructs");
+        let b = construct(
+            "localtime",
+            Some(&Value::String("16:30".into())),
+            &test_clock(),
+        )
+        .expect("localtime() constructs");
         let d = duration_between("duration.between", &a, &b).expect("computes");
         assert_eq!(iso(&d), "PT16H30M");
     }
@@ -1723,7 +1794,7 @@ mod tests {
             "duration",
         ];
         for name in NAMES {
-            let out = construct(name, Some(&Value::Null))
+            let out = construct(name, Some(&Value::Null), &test_clock())
                 .unwrap_or_else(|e| panic!("{name}(null) should be null, got error: {e:?}"));
             assert_eq!(out, Value::Null, "{name}(null) must be null");
         }
@@ -1735,7 +1806,7 @@ mod tests {
     #[test]
     fn clock_variants_route_to_their_base_type() {
         let from_str = |name: &str, s: &str| {
-            construct(name, Some(&Value::String(s.to_owned())))
+            construct(name, Some(&Value::String(s.to_owned())), &test_clock())
                 .unwrap_or_else(|e| panic!("{name} constructs: {e:?}"))
         };
         assert!(matches!(
@@ -1760,19 +1831,61 @@ mod tests {
         ));
     }
 
-    /// The zero-argument "current instant" form of a clock variant remains a documented named
-    /// deferral (it needs the clock seam), exactly like the bare constructor.
+    /// The zero-argument "current instant" form now constructs the base type from the statement
+    /// clock seam (`rmp` task #140) — for the bare constructor and every clock variant. Each base
+    /// is checked across all granularities (bare / `.statement` / `.transaction` / `.realtime`).
     #[test]
-    fn clock_variants_zero_arg_is_deferred() {
-        for name in ["date.realtime", "datetime.statement", "time.transaction"] {
-            assert!(
-                matches!(
-                    construct(name, None),
-                    Err(EvalError::UnsupportedFunction { .. })
-                ),
-                "{name}() with no argument must defer (clock seam not wired)"
-            );
+    fn clock_variants_zero_arg_constructs_current_instant() {
+        let clock = test_clock();
+        // The expected variant kind is asserted by matching the base name against the built value.
+        let expected_kind_ok = |base: &str, v: &Value| match base {
+            "date" => matches!(v, Value::Date(_)),
+            "localtime" => matches!(v, Value::LocalTime(_)),
+            "time" => matches!(v, Value::ZonedTime(_)),
+            "localdatetime" => matches!(v, Value::LocalDateTime(_)),
+            "datetime" => matches!(v, Value::ZonedDateTime(_)),
+            other => panic!("unexpected base {other}"),
+        };
+        for base in ["date", "localtime", "time", "localdatetime", "datetime"] {
+            for suffix in ["", ".statement", ".transaction", ".realtime"] {
+                let name = format!("{base}{suffix}");
+                let v = construct(&name, None, &clock)
+                    .unwrap_or_else(|e| panic!("{name}() should construct, got error: {e:?}"));
+                assert!(
+                    expected_kind_ok(base, &v),
+                    "{name}() built the wrong value kind: {v:?}"
+                );
+            }
         }
+    }
+
+    /// The statement clock is fixed: two `date()` reads from the *same* clock are equal — the
+    /// unit-level form of the TCK `duration.inSeconds(date(), date()) == 'PT0S'` property
+    /// (`Temporal10.feature` [12]).
+    #[test]
+    fn same_clock_yields_equal_current_instants() {
+        let clock = test_clock();
+        for base in ["date", "localtime", "time", "localdatetime", "datetime"] {
+            let a = construct(base, None, &clock).expect("constructs");
+            let b = construct(base, None, &clock).expect("constructs");
+            assert_eq!(a, b, "{base}() twice from one clock must be equal");
+        }
+        // And across the `.statement` spelling, which shares the same instant.
+        assert_eq!(
+            construct("date", None, &clock).expect("constructs"),
+            construct("date.statement", None, &clock).expect("constructs"),
+            "date() and date.statement() must share the statement instant"
+        );
+    }
+
+    /// `duration()` has no zero-argument current-instant form and is still rejected.
+    #[test]
+    fn duration_zero_arg_is_unsupported() {
+        let clock = test_clock();
+        assert!(matches!(
+            construct("duration", None, &clock),
+            Err(EvalError::UnsupportedFunction { .. })
+        ));
     }
 
     #[test]
@@ -1822,14 +1935,30 @@ mod tests {
     fn duration_between_equal_instants_is_zero() {
         // Temporal10 [12]: `duration.inSeconds(x, x)` for any temporal `x` is the zero duration.
         for value in [
-            construct("localtime", Some(&Value::String("12:34:54.7".into()))).unwrap(),
-            construct("date", Some(&Value::String("1984-10-11".into()))).unwrap(),
+            construct(
+                "localtime",
+                Some(&Value::String("12:34:54.7".into())),
+                &test_clock(),
+            )
+            .unwrap(),
+            construct(
+                "date",
+                Some(&Value::String("1984-10-11".into())),
+                &test_clock(),
+            )
+            .unwrap(),
             construct(
                 "localdatetime",
                 Some(&Value::String("1984-10-11T12:00".into())),
+                &test_clock(),
             )
             .unwrap(),
-            construct("datetime", Some(&Value::String("1984-10-11T12:00Z".into()))).unwrap(),
+            construct(
+                "datetime",
+                Some(&Value::String("1984-10-11T12:00Z".into())),
+                &test_clock(),
+            )
+            .unwrap(),
         ] {
             let d = duration_between("duration.inseconds", &value, &value).expect("computes");
             assert_eq!(
@@ -1848,11 +1977,13 @@ mod tests {
         let a = construct(
             "localdatetime",
             Some(&Value::String("2018-01-02T10:00:00.1".into())),
+            &test_clock(),
         )
         .unwrap();
         let b = construct(
             "localdatetime",
             Some(&Value::String("2018-01-01T10:00:00.2".into())),
+            &test_clock(),
         )
         .unwrap();
         let d = duration_between("duration.between", &a, &b).expect("computes");
@@ -1876,6 +2007,7 @@ mod tests {
                 ("dayOfWeek", Value::Integer(3)),
                 ("hour", Value::Integer(12)),
             ])),
+            &test_clock(),
         )
         .unwrap();
         let other_time = dt(map(&[
@@ -1894,6 +2026,7 @@ mod tests {
                 ("second", Value::Integer(42)),
                 ("timezone", Value::String("Pacific/Honolulu".into())),
             ])),
+            &test_clock(),
         )
         .expect("datetime() selects");
         assert_eq!(iso(&result), "1984-03-28T00:00:42-10:00[Pacific/Honolulu]");

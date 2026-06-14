@@ -278,9 +278,11 @@ use graphus_tck::runner::run_scenario;
 /// `Map2` [5]). Fifth, the two-stage `MATCH () CREATE () WITH * MATCH () CREATE ()` now gives the
 /// correct +10 via paired `Eager` barriers (a write-bearing `Apply` left plus a graph-reading `CREATE`
 /// input), fixing the `create/Create3` [3] residual above. Measured, zero regressions (failure-set
-/// identity diff: 0 newly-failing scenarios). Residual failures: 3 `expressions/temporal/Temporal10`
-/// duration scenarios (pre-existing, out of scope).
-const BASELINE: usize = 3907;
+/// identity diff: 0 newly-failing scenarios). Sixth, the statement clock seam (`rmp` task #140)
+/// wired the zero-argument current-instant temporal constructors (`date()`, `time()`, `datetime()`,
+/// `localtime()`, `localdatetime()`), flipping `expressions/temporal/Temporal10` [12] "Should
+/// compute durations with no difference" to pass (+5 scenarios, zero regressions).
+const BASELINE: usize = 3912;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

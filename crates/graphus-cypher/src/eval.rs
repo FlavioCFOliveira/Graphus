@@ -37,6 +37,7 @@ use crate::function_registry::FunctionRegistry;
 use crate::graph_access::{DeletedEntity, GraphAccess};
 use crate::ordering::compare_values;
 use crate::runtime::{NodeRef, PathStep, PathValue, RelRef, Row, RowValue};
+use crate::statement_clock::StatementClock;
 use crate::ternary::Ternary;
 
 /// A **runtime** Cypher evaluation error (`04 §7.3`).
@@ -152,6 +153,7 @@ pub fn eval(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     match &expr.kind {
         ExprKind::Literal(lit) => literal_value(lit).map(RowValue::Value),
@@ -161,15 +163,28 @@ pub fn eval(
         ExprKind::Variable(name) => Ok(row.get(name).cloned().unwrap_or(RowValue::NULL)),
 
         ExprKind::Binary { op, lhs, rhs } => {
-            eval_binary(*op, lhs, rhs, row, params, graph, functions)
+            eval_binary(*op, lhs, rhs, row, params, graph, functions, clock)
         }
-        ExprKind::Unary { op, operand } => eval_unary(*op, operand, row, params, graph, functions),
-        ExprKind::Predicate { op, operand, rhs } => {
-            eval_predicate(*op, operand, rhs.as_deref(), row, params, graph, functions)
+        ExprKind::Unary { op, operand } => {
+            eval_unary(*op, operand, row, params, graph, functions, clock)
         }
+        ExprKind::Predicate { op, operand, rhs } => eval_predicate(
+            *op,
+            operand,
+            rhs.as_deref(),
+            row,
+            params,
+            graph,
+            functions,
+            clock,
+        ),
 
-        ExprKind::Property { base, key } => eval_property(base, key, row, params, graph, functions),
-        ExprKind::Index { base, index } => eval_index(base, index, row, params, graph, functions),
+        ExprKind::Property { base, key } => {
+            eval_property(base, key, row, params, graph, functions, clock)
+        }
+        ExprKind::Index { base, index } => {
+            eval_index(base, index, row, params, graph, functions, clock)
+        }
         ExprKind::Slice { base, low, high } => eval_slice(
             base,
             low.as_deref(),
@@ -178,9 +193,10 @@ pub fn eval(
             params,
             graph,
             functions,
+            clock,
         ),
         ExprKind::HasLabels { operand, labels } => {
-            let base = eval(operand, row, params, graph, functions)?;
+            let base = eval(operand, row, params, graph, functions, clock)?;
             let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
             Ok(ternary_value(has_labels(&base, &names, graph)))
         }
@@ -189,7 +205,7 @@ pub fn eval(
             name,
             distinct: _,
             args,
-        } => call_function(&name.join("."), args, row, params, graph, functions),
+        } => call_function(&name.join("."), args, row, params, graph, functions, clock),
         // `count(*)` only appears as an aggregate (handled by the Aggregation operator); reaching
         // here as a scalar would be a planner bug, so produce a typed runtime error rather than panic.
         ExprKind::CountStar => Err(EvalError::TypeError {
@@ -199,7 +215,7 @@ pub fn eval(
         ExprKind::List(items) => {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
-                out.push(eval(it, row, params, graph, functions)?);
+                out.push(eval(it, row, params, graph, functions, clock)?);
             }
             // Canonical list construction: stays structural iff any element is (node/rel/path).
             Ok(RowValue::list(out))
@@ -207,23 +223,25 @@ pub fn eval(
         ExprKind::Map(entries) => {
             let mut out = Vec::with_capacity(entries.len());
             for (MapKey { name, .. }, v) in entries {
-                out.push((name.clone(), eval(v, row, params, graph, functions)?));
+                out.push((name.clone(), eval(v, row, params, graph, functions, clock)?));
             }
             // Canonical map construction: stays structural iff any value is (node/rel/path/structural
             // collection), so `{key: u}.key` recovers the node for `DELETE` (Delete5.feature).
             Ok(RowValue::map(out))
         }
 
-        ExprKind::Case(case) => eval_case(case, row, params, graph, functions),
+        ExprKind::Case(case) => eval_case(case, row, params, graph, functions, clock),
 
         ExprKind::ListComprehension(lc) => {
-            eval_list_comprehension(lc, row, params, graph, functions)
+            eval_list_comprehension(lc, row, params, graph, functions, clock)
         }
         ExprKind::PatternComprehension(pc) => {
-            eval_pattern_comprehension(pc, row, params, graph, functions)
+            eval_pattern_comprehension(pc, row, params, graph, functions, clock)
         }
-        ExprKind::Quantifier(q) => eval_quantifier(q, row, params, graph, functions),
-        ExprKind::ExistsSubquery(ex) => eval_exists_subquery(ex, row, params, graph, functions),
+        ExprKind::Quantifier(q) => eval_quantifier(q, row, params, graph, functions, clock),
+        ExprKind::ExistsSubquery(ex) => {
+            eval_exists_subquery(ex, row, params, graph, functions, clock)
+        }
     }
 }
 
@@ -238,8 +256,9 @@ pub fn eval_value(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<Value, EvalError> {
-    Ok(to_value(eval(expr, row, params, graph, functions)?))
+    Ok(to_value(eval(expr, row, params, graph, functions, clock)?))
 }
 
 /// Collapses a [`RowValue`] to a property [`Value`]. An entity reference has **no** property value,
@@ -294,8 +313,9 @@ fn eval_to_ternary(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<Ternary, EvalError> {
-    match eval(expr, row, params, graph, functions)? {
+    match eval(expr, row, params, graph, functions, clock)? {
         RowValue::Value(Value::Boolean(b)) => Ok(Ternary::from_bool(b)),
         RowValue::Value(Value::Null) => Ok(Ternary::Null),
         other => Err(EvalError::TypeError {
@@ -305,6 +325,7 @@ fn eval_to_ternary(
 }
 
 /// Evaluates a binary operator (`04 §7.6` for comparisons/logic; arithmetic by Cypher numeric rules).
+#[allow(clippy::too_many_arguments)] // an internal evaluator worker; the seams are positional
 fn eval_binary(
     op: BinaryOp,
     lhs: &Expr,
@@ -313,46 +334,47 @@ fn eval_binary(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     match op {
         // ---- boolean connectives (Kleene 3VL via Ternary) ------------------------------------
         BinaryOp::And => {
-            let a = eval_to_ternary(lhs, row, params, graph, functions)?;
+            let a = eval_to_ternary(lhs, row, params, graph, functions, clock)?;
             // Short-circuit FALSE without evaluating rhs is sound; but to surface a rhs type error
             // consistently we evaluate rhs too unless `a` already settles it to FALSE.
             if a == Ternary::False {
                 return Ok(ternary_value(Ternary::False));
             }
-            let b = eval_to_ternary(rhs, row, params, graph, functions)?;
+            let b = eval_to_ternary(rhs, row, params, graph, functions, clock)?;
             Ok(ternary_value(a.and(b)))
         }
         BinaryOp::Or => {
-            let a = eval_to_ternary(lhs, row, params, graph, functions)?;
+            let a = eval_to_ternary(lhs, row, params, graph, functions, clock)?;
             if a == Ternary::True {
                 return Ok(ternary_value(Ternary::True));
             }
-            let b = eval_to_ternary(rhs, row, params, graph, functions)?;
+            let b = eval_to_ternary(rhs, row, params, graph, functions, clock)?;
             Ok(ternary_value(a.or(b)))
         }
         BinaryOp::Xor => {
-            let a = eval_to_ternary(lhs, row, params, graph, functions)?;
-            let b = eval_to_ternary(rhs, row, params, graph, functions)?;
+            let a = eval_to_ternary(lhs, row, params, graph, functions, clock)?;
+            let b = eval_to_ternary(rhs, row, params, graph, functions, clock)?;
             Ok(ternary_value(a.xor(b)))
         }
 
         // ---- equality / comparison (reuse the value-model semantics) -------------------------
         BinaryOp::Eq => {
-            let a = eval(lhs, row, params, graph, functions)?;
-            let b = eval(rhs, row, params, graph, functions)?;
+            let a = eval(lhs, row, params, graph, functions, clock)?;
+            let b = eval(rhs, row, params, graph, functions, clock)?;
             Ok(ternary_value(row_values_equal(&a, &b)))
         }
         BinaryOp::Neq => {
-            let a = eval(lhs, row, params, graph, functions)?;
-            let b = eval(rhs, row, params, graph, functions)?;
+            let a = eval(lhs, row, params, graph, functions, clock)?;
+            let b = eval(rhs, row, params, graph, functions, clock)?;
             Ok(ternary_value(!row_values_equal(&a, &b)))
         }
         BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Lte | BinaryOp::Gte => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
             Ok(ternary_value(compare(op, &a, &b)))
         }
         BinaryOp::RegexMatch => {
@@ -369,15 +391,15 @@ fn eval_binary(
             // `Value` would turn each entity into `Null` — `[a] + collect(n) + [b]`). When either
             // operand is a structural list we concatenate at the `RowValue` level; otherwise we defer
             // to the scalar/property `+` (numeric add, string concat, property-list concat).
-            let a = eval(lhs, row, params, graph, functions)?;
-            let b = eval(rhs, row, params, graph, functions)?;
+            let a = eval(lhs, row, params, graph, functions, clock)?;
+            let b = eval(rhs, row, params, graph, functions, clock)?;
             if let Some(out) = structural_list_add(&a, &b) {
                 return Ok(out);
             }
             arithmetic_add(&to_value(a), &to_value(b))
         }
         BinaryOp::Sub => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
             if a.is_null() || b.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -388,7 +410,7 @@ fn eval_binary(
             numeric_binop_values(&a, &b, |x, y| x - y, i64::checked_sub)
         }
         BinaryOp::Mul => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
             if a.is_null() || b.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -398,10 +420,10 @@ fn eval_binary(
             }
             numeric_binop_values(&a, &b, |x, y| x * y, i64::checked_mul)
         }
-        BinaryOp::Div => eval_div(lhs, rhs, row, params, graph, functions),
-        BinaryOp::Mod => eval_mod(lhs, rhs, row, params, graph, functions),
+        BinaryOp::Div => eval_div(lhs, rhs, row, params, graph, functions, clock),
+        BinaryOp::Mod => eval_mod(lhs, rhs, row, params, graph, functions, clock),
         BinaryOp::Pow => {
-            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
             match (numeric_f64(&a), numeric_f64(&b)) {
                 (Some(x), Some(y)) => Ok(RowValue::Value(Value::Float(x.powf(y)))),
                 _ if a.is_null() || b.is_null() => Ok(RowValue::NULL),
@@ -421,10 +443,11 @@ fn eval_pair(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<(Value, Value), EvalError> {
     Ok((
-        eval_value(lhs, row, params, graph, functions)?,
-        eval_value(rhs, row, params, graph, functions)?,
+        eval_value(lhs, row, params, graph, functions, clock)?,
+        eval_value(rhs, row, params, graph, functions, clock)?,
     ))
 }
 
@@ -621,8 +644,9 @@ fn eval_div(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
-    let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
+    let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
     if a.is_null() || b.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -652,8 +676,9 @@ fn eval_mod(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
-    let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions)?;
+    let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
     if a.is_null() || b.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -679,14 +704,15 @@ fn eval_unary(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     match op {
         UnaryOp::Not => {
-            let t = eval_to_ternary(operand, row, params, graph, functions)?;
+            let t = eval_to_ternary(operand, row, params, graph, functions, clock)?;
             Ok(ternary_value(!t))
         }
         UnaryOp::Plus => {
-            let v = eval_value(operand, row, params, graph, functions)?;
+            let v = eval_value(operand, row, params, graph, functions, clock)?;
             if v.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -698,7 +724,7 @@ fn eval_unary(
             }
         }
         UnaryOp::Minus => {
-            let v = eval_value(operand, row, params, graph, functions)?;
+            let v = eval_value(operand, row, params, graph, functions, clock)?;
             if v.is_null() {
                 return Ok(RowValue::NULL);
             }
@@ -719,6 +745,7 @@ fn eval_unary(
 
 /// Evaluates a string/list/null postfix predicate (`STARTS WITH`/`ENDS WITH`/`CONTAINS`/`IN`/`IS
 /// [NOT] NULL`), 3VL.
+#[allow(clippy::too_many_arguments)] // an internal evaluator worker; the seams are positional
 fn eval_predicate(
     op: PredicateOp,
     operand: &Expr,
@@ -727,28 +754,29 @@ fn eval_predicate(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     match op {
         PredicateOp::IsNull => {
-            let v = eval(operand, row, params, graph, functions)?;
+            let v = eval(operand, row, params, graph, functions, clock)?;
             Ok(RowValue::Value(Value::Boolean(v.is_null())))
         }
         PredicateOp::IsNotNull => {
-            let v = eval(operand, row, params, graph, functions)?;
+            let v = eval(operand, row, params, graph, functions, clock)?;
             Ok(RowValue::Value(Value::Boolean(!v.is_null())))
         }
         PredicateOp::In => {
-            let value = eval_value(operand, row, params, graph, functions)?;
+            let value = eval_value(operand, row, params, graph, functions, clock)?;
             let list = match rhs {
-                Some(r) => eval_value(r, row, params, graph, functions)?,
+                Some(r) => eval_value(r, row, params, graph, functions, clock)?,
                 None => Value::Null,
             };
             Ok(ternary_value(is_in(&value, &list)))
         }
         PredicateOp::StartsWith | PredicateOp::EndsWith | PredicateOp::Contains => {
-            let a = eval_value(operand, row, params, graph, functions)?;
+            let a = eval_value(operand, row, params, graph, functions, clock)?;
             let b = match rhs {
-                Some(r) => eval_value(r, row, params, graph, functions)?,
+                Some(r) => eval_value(r, row, params, graph, functions, clock)?,
                 None => Value::Null,
             };
             if a.is_null() || b.is_null() {
@@ -784,8 +812,9 @@ fn eval_property(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
-    match eval(base, row, params, graph, functions)? {
+    match eval(base, row, params, graph, functions, clock)? {
         RowValue::Node(NodeRef { id }) => {
             // Reading a property of an entity deleted earlier in this same query raises at runtime
             // (`clauses/return/Return2.feature` [15]); `id`/`type` stay accessible, only properties
@@ -850,9 +879,10 @@ fn eval_index(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
-    let base = eval(base, row, params, graph, functions)?;
-    let idx = eval_value(index, row, params, graph, functions)?;
+    let base = eval(base, row, params, graph, functions, clock)?;
+    let idx = eval_value(index, row, params, graph, functions, clock)?;
     if base.is_null() || idx.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -914,6 +944,7 @@ fn eval_index(
 }
 
 /// Evaluates `base[low..high]` list slicing with optional, clamped bounds (Cypher semantics).
+#[allow(clippy::too_many_arguments)] // an internal evaluator worker; the seams are positional
 fn eval_slice(
     base: &Expr,
     low: Option<&Expr>,
@@ -922,8 +953,9 @@ fn eval_slice(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
-    let base = eval_value(base, row, params, graph, functions)?;
+    let base = eval_value(base, row, params, graph, functions, clock)?;
     if base.is_null() {
         return Ok(RowValue::NULL);
     }
@@ -936,7 +968,7 @@ fn eval_slice(
     let resolve = |bound: Option<&Expr>, default: i64| -> Result<Option<i64>, EvalError> {
         match bound {
             None => Ok(Some(default)),
-            Some(e) => match eval_value(e, row, params, graph, functions)? {
+            Some(e) => match eval_value(e, row, params, graph, functions, clock)? {
                 Value::Null => Ok(None),
                 Value::Integer(i) => Ok(Some(if i < 0 { len + i } else { i })),
                 _ => Err(EvalError::TypeError {
@@ -964,29 +996,30 @@ fn eval_case(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     match &case.subject {
         // Simple CASE: compare the subject against each WHEN value with Cypher `=`.
         Some(subject) => {
-            let subj = eval_value(subject, row, params, graph, functions)?;
+            let subj = eval_value(subject, row, params, graph, functions, clock)?;
             for alt in &case.alternatives {
-                let when = eval_value(&alt.when, row, params, graph, functions)?;
+                let when = eval_value(&alt.when, row, params, graph, functions, clock)?;
                 if equals(&subj, &when).is_true() {
-                    return eval(&alt.then, row, params, graph, functions);
+                    return eval(&alt.then, row, params, graph, functions, clock);
                 }
             }
         }
         // Searched CASE: each WHEN is a predicate; the first TRUE wins.
         None => {
             for alt in &case.alternatives {
-                if eval_to_ternary(&alt.when, row, params, graph, functions)?.is_true() {
-                    return eval(&alt.then, row, params, graph, functions);
+                if eval_to_ternary(&alt.when, row, params, graph, functions, clock)?.is_true() {
+                    return eval(&alt.then, row, params, graph, functions, clock);
                 }
             }
         }
     }
     match &case.else_expr {
-        Some(e) => eval(e, row, params, graph, functions),
+        Some(e) => eval(e, row, params, graph, functions, clock),
         None => Ok(RowValue::NULL),
     }
 }
@@ -1092,13 +1125,14 @@ fn call_function(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     let lower = name.to_ascii_lowercase();
 
     // `coalesce` is special: it returns its first non-null argument, evaluated left to right.
     if lower == "coalesce" {
         for a in args {
-            let v = eval(a, row, params, graph, functions)?;
+            let v = eval(a, row, params, graph, functions, clock)?;
             if !v.is_null() {
                 return Ok(v);
             }
@@ -1109,7 +1143,7 @@ fn call_function(
     // Entity functions take the un-collapsed RowValue (they need the reference).
     match lower.as_str() {
         "id" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => RowValue::Value(Value::Integer(id.0 as i64)),
                 RowValue::Rel(RelRef { id }) => RowValue::Value(Value::Integer(id.0 as i64)),
@@ -1117,7 +1151,7 @@ fn call_function(
             });
         }
         "labels" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 RowValue::Node(NodeRef { id }) => {
                     // `labels(n)` on a node self-deleted earlier in this query raises at runtime
@@ -1145,7 +1179,7 @@ fn call_function(
             };
         }
         "type" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 // `type(r)` STILL works after a same-query `DELETE r` (the relationship keeps its
                 // identity; only property/label reads fail — `clauses/return/Return2.feature` [14]).
@@ -1166,7 +1200,7 @@ fn call_function(
             };
         }
         "properties" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => map_from_props(graph.node_properties(id)),
                 RowValue::Rel(RelRef { id }) => map_from_props(graph.rel_properties(id)),
@@ -1175,7 +1209,7 @@ fn call_function(
             });
         }
         "keys" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return Ok(match v {
                 RowValue::Node(NodeRef { id }) => keys_list(graph.node_properties(id)),
                 RowValue::Rel(RelRef { id }) => keys_list(graph.rel_properties(id)),
@@ -1186,7 +1220,7 @@ fn call_function(
             });
         }
         "startnode" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return Ok(match v {
                 RowValue::Rel(RelRef { id }) => graph
                     .rel_data(id)
@@ -1196,7 +1230,7 @@ fn call_function(
             });
         }
         "endnode" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return Ok(match v {
                 RowValue::Rel(RelRef { id }) => graph
                     .rel_data(id)
@@ -1207,7 +1241,7 @@ fn call_function(
         }
         // Path accessors (openCypher `expressions/path/**`): ordered projections of a path value.
         "nodes" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 RowValue::Path(p) => Ok(RowValue::list(
                     p.nodes()
@@ -1222,7 +1256,7 @@ fn call_function(
             };
         }
         "relationships" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 RowValue::Path(p) => Ok(RowValue::list(
                     p.rels()
@@ -1240,7 +1274,7 @@ fn call_function(
         // (`nodes(p)`, `collect(n)`, …) and paths keep their elements; the pure-property cases
         // behave exactly as the former `Value`-level implementations.
         "size" | "length" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 // `length(p)` is the path's relationship count (openCypher).
                 RowValue::Path(p) if lower == "length" => {
@@ -1260,7 +1294,7 @@ fn call_function(
             };
         }
         "head" | "last" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             let Some(mut items) = v.as_list_elems() else {
                 return match v {
                     RowValue::Value(Value::Null) => Ok(RowValue::NULL),
@@ -1281,7 +1315,7 @@ fn call_function(
             });
         }
         "tail" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             let items = match v {
                 // `tail(null)` is the empty list (the pre-existing `list_arg` behaviour).
                 RowValue::Value(Value::Null) => Vec::new(),
@@ -1292,7 +1326,7 @@ fn call_function(
             return Ok(RowValue::list(items.into_iter().skip(1).collect()));
         }
         "reverse" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 RowValue::List(items) => Ok(RowValue::list(items.into_iter().rev().collect())),
                 RowValue::Value(Value::List(items)) => Ok(RowValue::Value(Value::List(
@@ -1316,7 +1350,7 @@ fn call_function(
         // succeed. The accepted property values delegate to the value-level helpers, which encode
         // each function's exact conversion table.
         "tointeger" | "tofloat" | "tostring" | "toboolean" | "tobooleanornull" => {
-            let v = eval(&args[0], row, params, graph, functions)?;
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
             return convert_scalar(&lower, v).map(RowValue::Value);
         }
         _ => {}
@@ -1325,7 +1359,7 @@ fn call_function(
     // The remaining functions operate on collapsed property values.
     let argv: Vec<Value> = args
         .iter()
-        .map(|a| eval_value(a, row, params, graph, functions))
+        .map(|a| eval_value(a, row, params, graph, functions, clock))
         .collect::<Result<_, _>>()?;
 
     let result = match lower.as_str() {
@@ -1353,7 +1387,7 @@ fn call_function(
         | "localtime.realtime"
         | "time.transaction"
         | "time.statement"
-        | "time.realtime" => crate::temporal_fns::construct(&lower, argv.first())?,
+        | "time.realtime" => crate::temporal_fns::construct(&lower, argv.first(), clock)?,
         // Spatial point constructor and distance (rmp #73). `distance` and `point.distance` are
         // the two openCypher spellings of the same two-point distance.
         "point" => crate::spatial_fns::construct_point(&argv[0])?,
@@ -1816,6 +1850,7 @@ fn eval_list_comprehension(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     let items = eval_to_list_items(
         &lc.list,
@@ -1824,6 +1859,7 @@ fn eval_list_comprehension(
         params,
         graph,
         functions,
+        clock,
     )?;
     let Some(items) = items else {
         return Ok(RowValue::NULL);
@@ -1832,12 +1868,12 @@ fn eval_list_comprehension(
     for item in items {
         let inner = row.with(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
-            if !eval_to_ternary(pred, &inner, params, graph, functions)?.is_true() {
+            if !eval_to_ternary(pred, &inner, params, graph, functions, clock)?.is_true() {
                 continue;
             }
         }
         match &lc.projection {
-            Some(proj) => out.push(eval(proj, &inner, params, graph, functions)?),
+            Some(proj) => out.push(eval(proj, &inner, params, graph, functions, clock)?),
             None => out.push(item),
         }
     }
@@ -1854,8 +1890,9 @@ fn eval_to_list_items(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<Option<Vec<RowValue>>, EvalError> {
-    let v = eval(list, row, params, graph, functions)?;
+    let v = eval(list, row, params, graph, functions, clock)?;
     if v.is_null() {
         return Ok(None);
     }
@@ -1876,9 +1913,10 @@ fn eval_quantifier(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     use crate::ast::QuantifierKind;
-    let items = eval_to_list_items(&q.list, "quantifier", row, params, graph, functions)?;
+    let items = eval_to_list_items(&q.list, "quantifier", row, params, graph, functions, clock)?;
     let Some(items) = items else {
         return Ok(RowValue::NULL);
     };
@@ -1888,7 +1926,7 @@ fn eval_quantifier(
     let mut nulls = 0usize;
     for item in items {
         let inner = row.with(q.variable.name.clone(), item);
-        match eval_to_ternary(&q.predicate, &inner, params, graph, functions)? {
+        match eval_to_ternary(&q.predicate, &inner, params, graph, functions, clock)? {
             Ternary::True => match q.kind {
                 // One satisfied element decides ANY (true) and NONE (false) outright.
                 QuantifierKind::Any => return yes(),
@@ -1946,19 +1984,28 @@ fn eval_pattern_comprehension(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     // A named path (`[p = (a)-->(b) | p]`) binds the path variable for the predicate/projection.
     let path_var = pc.var.as_ref().map(|v| v.name.as_str());
-    let matches =
-        pattern_element_rows(&pc.element, row, params, graph, functions, false, path_var)?;
+    let matches = pattern_element_rows(
+        &pc.element,
+        row,
+        params,
+        graph,
+        functions,
+        clock,
+        false,
+        path_var,
+    )?;
     let mut out = Vec::new();
     for m in matches {
         if let Some(pred) = &pc.predicate {
-            if !eval_to_ternary(pred, &m, params, graph, functions)?.is_true() {
+            if !eval_to_ternary(pred, &m, params, graph, functions, clock)?.is_true() {
                 continue;
             }
         }
-        out.push(eval(&pc.projection, &m, params, graph, functions)?);
+        out.push(eval(&pc.projection, &m, params, graph, functions, clock)?);
     }
     Ok(RowValue::list(out))
 }
@@ -1972,11 +2019,12 @@ fn eval_exists_subquery(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> EvalResult {
     // Full-query form (`EXISTS { MATCH ... RETURN ... }`): execute the inner read-only query as a
     // correlated subquery seeded by the outer row.
     if let Some(inner_query) = &ex.full_query {
-        return eval_exists_full_query(inner_query, row, params, graph, functions);
+        return eval_exists_full_query(inner_query, row, params, graph, functions, clock);
     }
     // Comma-separated parts join through their shared variables: each part's matches seed the next.
     let mut rows = vec![row.clone()];
@@ -1991,6 +2039,7 @@ fn eval_exists_subquery(
                 params,
                 graph,
                 functions,
+                clock,
                 false,
                 path_var,
             )?);
@@ -2004,7 +2053,7 @@ fn eval_exists_subquery(
         None => Ok(RowValue::Value(Value::Boolean(true))),
         Some(pred) => {
             for r in &rows {
-                if eval_to_ternary(pred, r, params, graph, functions)?.is_true() {
+                if eval_to_ternary(pred, r, params, graph, functions, clock)?.is_true() {
                     return Ok(RowValue::Value(Value::Boolean(true)));
                 }
             }
@@ -2214,6 +2263,12 @@ fn eval_exists_full_query(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    // NOTE (`rmp` task #140): an `EXISTS { ... }` full-query subplan opens its own cursor via
+    // `open_seeded`, which captures a fresh statement clock. The outer `clock` is therefore not
+    // forwarded here; the two captures are microseconds apart, and the bare/`.statement` instant
+    // is still fixed *within* the inner subplan. Threading the outer clock into the subplan would
+    // require widening the public `open_*` signatures, which is out of scope for this seam.
+    _clock: &StatementClock,
 ) -> EvalResult {
     use crate::catalog::IndexCatalog;
     use crate::logical::Var;
@@ -2294,17 +2349,19 @@ fn exec_error_to_eval(e: crate::executor::ExecError) -> EvalError {
 ///
 /// `first_only` stops at the first complete match (the `EXISTS` fast path when no joint
 /// constraints follow).
+#[allow(clippy::too_many_arguments)] // an internal evaluator worker; the seams are positional
 fn pattern_element_rows(
     element: &crate::ast::PatternElement,
     row: &Row,
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
     first_only: bool,
     path_var: Option<&str>,
 ) -> Result<Vec<Row>, EvalError> {
     let mut results = Vec::new();
-    for start in node_candidates(&element.start, row, params, graph, functions)? {
+    for start in node_candidates(&element.start, row, params, graph, functions, clock)? {
         let mut seeded = row.clone();
         if let Some(v) = &element.start.variable {
             seeded.set(v.name.clone(), RowValue::Node(NodeRef { id: start }));
@@ -2313,6 +2370,7 @@ fn pattern_element_rows(
             params,
             graph,
             functions,
+            clock,
             first_only,
             path_var,
             start,
@@ -2340,6 +2398,7 @@ struct ChainCtx<'a> {
     params: &'a BoundParameters,
     graph: &'a dyn GraphAccess,
     functions: &'a dyn FunctionRegistry,
+    clock: &'a StatementClock,
     first_only: bool,
     path_var: Option<&'a str>,
     start: crate::graph_access::NodeId,
@@ -2359,7 +2418,7 @@ fn match_chain(
     out: &mut Vec<Row>,
     cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
-    let (params, graph, functions) = (cctx.params, cctx.graph, cctx.functions);
+    let (params, graph, functions, clock) = (cctx.params, cctx.graph, cctx.functions, cctx.clock);
     let Some(link) = chain.get(idx) else {
         let mut row = row;
         if let Some(pv) = cctx.path_var {
@@ -2400,12 +2459,20 @@ fn match_chain(
             }
         }
         if let Some(props) = &link.relationship.properties {
-            if !rel_props_match(inc.rel, props, &row, params, graph, functions)? {
+            if !rel_props_match(inc.rel, props, &row, params, graph, functions, clock)? {
                 continue;
             }
         }
         // Target node: label/property filters plus the identity constraint when already bound.
-        if !node_matches(inc.neighbour, &link.node, &row, params, graph, functions)? {
+        if !node_matches(
+            inc.neighbour,
+            &link.node,
+            &row,
+            params,
+            graph,
+            functions,
+            clock,
+        )? {
             continue;
         }
         if let Some(v) = &link.node.variable {
@@ -2474,11 +2541,11 @@ fn match_var_length_link(
     out: &mut Vec<Row>,
     cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
-    let (params, graph, functions) = (cctx.params, cctx.graph, cctx.functions);
+    let (params, graph, functions, clock) = (cctx.params, cctx.graph, cctx.functions, cctx.clock);
     let link = &chain[idx];
     let min = range.min.unwrap_or(1);
     // Complete the link at this depth if allowed and the far node satisfies the target pattern.
-    if depth >= min && node_matches(current, &link.node, &row, params, graph, functions)? {
+    if depth >= min && node_matches(current, &link.node, &row, params, graph, functions, clock)? {
         let mut next_row = row.clone();
         let mut ok = true;
         if let Some(v) = &link.relationship.variable {
@@ -2529,7 +2596,7 @@ fn match_var_length_link(
             continue;
         }
         if let Some(props) = &link.relationship.properties {
-            if !rel_props_match(inc.rel, props, &row, params, graph, functions)? {
+            if !rel_props_match(inc.rel, props, &row, params, graph, functions, clock)? {
                 continue;
             }
         }
@@ -2565,11 +2632,14 @@ fn node_candidates(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<Vec<crate::graph_access::NodeId>, EvalError> {
     if let Some(v) = &np.variable {
         if let Some(rv) = row.get(&v.name) {
             return match rv {
-                RowValue::Node(n) if node_matches(n.id, np, row, params, graph, functions)? => {
+                RowValue::Node(n)
+                    if node_matches(n.id, np, row, params, graph, functions, clock)? =>
+                {
                     Ok(vec![n.id])
                 }
                 _ => Ok(Vec::new()),
@@ -2582,7 +2652,7 @@ fn node_candidates(
     };
     let mut out = Vec::new();
     for id in ids {
-        if node_matches(id, np, row, params, graph, functions)? {
+        if node_matches(id, np, row, params, graph, functions, clock)? {
             out.push(id);
         }
     }
@@ -2598,6 +2668,7 @@ fn node_matches(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<bool, EvalError> {
     if !np.labels.is_empty() {
         let Some(labels) = graph.node_labels(id) else {
@@ -2612,7 +2683,7 @@ fn node_matches(
         }
     }
     if let Some(props) = &np.properties {
-        let entries = eval_props_map(props, row, params, graph, functions)?;
+        let entries = eval_props_map(props, row, params, graph, functions, clock)?;
         for (k, want) in entries {
             let actual = graph.node_property(id, &k).unwrap_or(Value::Null);
             if !equals(&actual, &want).is_true() {
@@ -2631,8 +2702,9 @@ fn rel_props_match(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<bool, EvalError> {
-    let entries = eval_props_map(props, row, params, graph, functions)?;
+    let entries = eval_props_map(props, row, params, graph, functions, clock)?;
     for (k, want) in entries {
         let actual = graph.rel_property(id, &k).unwrap_or(Value::Null);
         if !equals(&actual, &want).is_true() {
@@ -2650,8 +2722,9 @@ fn eval_props_map(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
 ) -> Result<Vec<(String, Value)>, EvalError> {
-    match eval_value(props, row, params, graph, functions)? {
+    match eval_value(props, row, params, graph, functions, clock)? {
         Value::Map(entries) => Ok(entries),
         other => Err(EvalError::TypeError {
             context: format!("pattern properties must be a map, got {other:?}"),
@@ -2667,6 +2740,13 @@ mod tests {
     use crate::graph_access::MemGraph;
     use crate::lexer::tokenize;
     use crate::parser::parse_tokens;
+
+    /// A captured statement clock for the evaluation tests. Most tests evaluate expressions that
+    /// never read the clock; the few that exercise current-instant constructors only require that
+    /// the same clock be observed across the expression, which a single capture guarantees.
+    fn test_clock() -> StatementClock {
+        StatementClock::capture()
+    }
 
     /// Parses a single expression by wrapping it in `RETURN <expr>` and extracting the projected
     /// item's expression from the AST.
@@ -2687,14 +2767,31 @@ mod tests {
         let expr = parse_expr(src);
         let g = MemGraph::new();
         let bound = BoundParameters::empty();
-        to_value(eval(&expr, &Row::empty(), &bound, &g, no_functions()).unwrap())
+        to_value(
+            eval(
+                &expr,
+                &Row::empty(),
+                &bound,
+                &g,
+                no_functions(),
+                &test_clock(),
+            )
+            .unwrap(),
+        )
     }
 
     /// Evaluates `src` against `graph` with `row` in scope, returning the raw [`EvalResult`] so a
     /// test can assert on the `RowValue` structure or a runtime error.
     fn eval_in(graph: &dyn GraphAccess, row: &Row, src: &str) -> EvalResult {
         let expr = parse_expr(src);
-        eval(&expr, row, &BoundParameters::empty(), graph, no_functions())
+        eval(
+            &expr,
+            row,
+            &BoundParameters::empty(),
+            graph,
+            no_functions(),
+            &test_clock(),
+        )
     }
 
     /// A graph with one `:Foo:Bar` node bound to `n` and one `:T {k:7}` relationship bound to `r`,
@@ -3016,6 +3113,7 @@ mod tests {
             &BoundParameters::empty(),
             &g,
             no_functions(),
+            &test_clock(),
         )
         .unwrap_err();
         assert_eq!(err, EvalError::DivisionByZero);
@@ -3159,7 +3257,17 @@ mod tests {
         let g = MemGraph::new();
         let bound = bind(&Parameters::new().with("p", Value::Integer(10)), &expr);
         assert_eq!(
-            to_value(eval(&expr, &Row::empty(), &bound, &g, no_functions()).unwrap()),
+            to_value(
+                eval(
+                    &expr,
+                    &Row::empty(),
+                    &bound,
+                    &g,
+                    no_functions(),
+                    &test_clock()
+                )
+                .unwrap()
+            ),
             Value::Integer(11)
         );
     }
@@ -3226,6 +3334,7 @@ mod tests {
                 &BoundParameters::empty(),
                 &g,
                 no_functions(),
+                &test_clock(),
             )
             .unwrap_err();
             assert!(matches!(err, EvalError::TypeError { .. }), "{src}: {err:?}");
@@ -3248,6 +3357,7 @@ mod tests {
             &BoundParameters::empty(),
             &g,
             no_functions(),
+            &test_clock(),
         )
         .unwrap_err();
         assert!(matches!(err, EvalError::TypeError { .. }), "{src}: {err:?}");
@@ -3356,6 +3466,7 @@ mod tests {
             &BoundParameters::empty(),
             &g,
             no_functions(),
+            &test_clock(),
         )
         .unwrap_err();
         assert!(matches!(err, EvalError::UnsupportedFunction { .. }));
@@ -3396,7 +3507,14 @@ mod tests {
     fn eval_with_udfs(src: &str, set: &FunctionSet) -> EvalResult {
         let expr = parse_expr(src);
         let g = MemGraph::new();
-        eval(&expr, &Row::empty(), &BoundParameters::empty(), &g, set)
+        eval(
+            &expr,
+            &Row::empty(),
+            &BoundParameters::empty(),
+            &g,
+            set,
+            &test_clock(),
+        )
     }
 
     #[test]

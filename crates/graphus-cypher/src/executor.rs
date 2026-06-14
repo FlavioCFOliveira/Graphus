@@ -56,6 +56,7 @@ use crate::procedure_registry::{self, ProcedureFailure, ProcedureRegistry};
 use crate::runtime::{
     NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent,
 };
+use crate::statement_clock::StatementClock;
 use crate::ternary::Ternary;
 
 /// A cooperative **cancellation token** shared between a caller and a running query (`04 §7.7`).
@@ -180,6 +181,10 @@ struct Ctx<'a> {
     /// user-defined scalar function call (after the built-ins, which take precedence).
     functions: &'a dyn FunctionRegistry,
     procedures: &'a dyn ProcedureRegistry,
+    /// The fixed per-statement "current instant" (`rmp` task #140): captured once when the cursor
+    /// opened and threaded into [`crate::eval`] so that every zero-argument temporal constructor
+    /// (`date()`, `datetime()`, …) in one statement observes the same instant.
+    clock: StatementClock,
 }
 
 impl Ctx<'_> {
@@ -495,7 +500,14 @@ impl Operator {
                 // Evaluate the list **structurally** (`eval`, not `eval_value`) so a list of nodes /
                 // relationships / paths is preserved — collapsing through a property `Value` would
                 // turn each entity into `Null` (regression guard: `UNWIND collect(node) AS x`).
-                let listv = eval(list, &base, ctx.params, ctx.graph, ctx.functions)?;
+                let listv = eval(
+                    list,
+                    &base,
+                    ctx.params,
+                    ctx.graph,
+                    ctx.functions,
+                    &ctx.clock,
+                )?;
                 let elems = match listv.as_list_elems() {
                     Some(items) => VecDeque::from(items),
                     // UNWIND null produces no rows for that input row (Cypher).
@@ -529,7 +541,8 @@ impl Operator {
                 };
                 // The URL is evaluated per driving row (it may reference the row's bindings), then the
                 // file is resolved and opened — transactionally, inside the statement's graph seam.
-                let url_value = eval_value(url, &base, ctx.params, ctx.graph, ctx.functions)?;
+                let url_value =
+                    eval_value(url, &base, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
                 let state = LoadCsvState::open(base, &url_value, *field_terminator, *with_headers)?;
                 *current = Some(state);
             },
@@ -755,7 +768,14 @@ impl Operator {
                 // collapsed to property values — the v1 procedure argument domain.
                 let mut arg_values = Vec::with_capacity(args.len());
                 for a in args.iter() {
-                    arg_values.push(eval_value(a, &base, ctx.params, ctx.graph, ctx.functions)?);
+                    arg_values.push(eval_value(
+                        a,
+                        &base,
+                        ctx.params,
+                        ctx.graph,
+                        ctx.functions,
+                        &ctx.clock,
+                    )?);
                 }
                 let rows = ctx
                     .procedures
@@ -776,7 +796,14 @@ impl Operator {
 
 /// Evaluates a `SKIP`/`LIMIT`/`TopN` count expression to a non-negative `i64` (binding validated it).
 fn eval_count(expr: &Expr, ctx: &mut Ctx<'_>) -> Result<i64, ExecError> {
-    match eval_value(expr, &Row::empty(), ctx.params, ctx.graph, ctx.functions)? {
+    match eval_value(
+        expr,
+        &Row::empty(),
+        ctx.params,
+        ctx.graph,
+        ctx.functions,
+        &ctx.clock,
+    )? {
         Value::Integer(n) if n >= 0 => Ok(n),
         // A negative or non-integer count is a runtime type error (binding catches the param case;
         // a literal/expression case is caught here).
@@ -788,7 +815,7 @@ fn eval_count(expr: &Expr, ctx: &mut Ctx<'_>) -> Result<i64, ExecError> {
 
 /// Evaluates a predicate to a [`Ternary`] (3VL): non-boolean non-null is a runtime type error.
 fn predicate_truth(expr: &Expr, row: &Row, ctx: &mut Ctx<'_>) -> Result<Ternary, ExecError> {
-    match eval(expr, row, ctx.params, ctx.graph, ctx.functions)? {
+    match eval(expr, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)? {
         RowValue::Value(Value::Boolean(b)) => Ok(Ternary::from_bool(b)),
         RowValue::Value(Value::Null) => Ok(Ternary::Null),
         _ => Err(ExecError::Eval(EvalError::TypeError {
@@ -801,7 +828,14 @@ fn predicate_truth(expr: &Expr, row: &Row, ctx: &mut Ctx<'_>) -> Result<Ternary,
 fn project_row(row: &Row, items: &[ProjectionColumn], ctx: &mut Ctx<'_>) -> Result<Row, ExecError> {
     let mut out = Row::empty();
     for col in items {
-        let v = eval(&col.expr, row, ctx.params, ctx.graph, ctx.functions)?;
+        let v = eval(
+            &col.expr,
+            row,
+            ctx.params,
+            ctx.graph,
+            ctx.functions,
+            &ctx.clock,
+        )?;
         out.set(col.alias.clone(), v);
     }
     Ok(out)
@@ -1179,7 +1213,14 @@ fn rel_satisfies_props(
             },
             span,
         );
-        let result = eval(&predicate, &probe, ctx.params, ctx.graph, ctx.functions)?;
+        let result = eval(
+            &predicate,
+            &probe,
+            ctx.params,
+            ctx.graph,
+            ctx.functions,
+            &ctx.clock,
+        )?;
         if !matches!(result, RowValue::Value(Value::Boolean(true))) {
             return Ok(false);
         }
@@ -1466,7 +1507,14 @@ fn build_operator(
             value,
             ..
         } => {
-            let seek = eval_value(value, &Row::empty(), ctx.params, ctx.graph, ctx.functions)?;
+            let seek = eval_value(
+                value,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
             let ids = match ctx.graph.index_seek_eq(&label.name, property, &seek) {
                 Some(ids) => ids,
                 // No index in the seam: fall back to a label scan + equality residual.
@@ -1484,7 +1532,14 @@ fn build_operator(
             value,
             ..
         } => {
-            let bound_val = eval_value(value, &Row::empty(), ctx.params, ctx.graph, ctx.functions)?;
+            let bound_val = eval_value(
+                value,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
             let (lower, upper) = range_bounds(*bound, &bound_val);
             let ids = match ctx
                 .graph
@@ -2049,7 +2104,14 @@ fn sort_rows(
     for row in rows {
         let mut kvs = Vec::with_capacity(keys.len());
         for k in keys {
-            kvs.push(eval(&k.expr, &row, ctx.params, ctx.graph, ctx.functions)?);
+            kvs.push(eval(
+                &k.expr,
+                &row,
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?);
         }
         keyed.push((kvs, row));
     }
@@ -2121,7 +2183,14 @@ fn aggregate_rows(
         // Compute the group key.
         let mut key_vals = Vec::with_capacity(group_keys.len());
         for col in group_keys {
-            key_vals.push(eval(&col.expr, &row, ctx.params, ctx.graph, ctx.functions)?);
+            key_vals.push(eval(
+                &col.expr,
+                &row,
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?);
         }
         let idx = match groups.iter().position(|g| {
             g.keys.len() == key_vals.len()
@@ -2174,7 +2243,14 @@ fn aggregate_rows(
             }
         }
         for (col, plan) in aggregates.iter().zip(&plans) {
-            let value = eval(&plan.outer, &eval_row, ctx.params, ctx.graph, ctx.functions)?;
+            let value = eval(
+                &plan.outer,
+                &eval_row,
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
             row.set(col.alias.clone(), value);
         }
         out.push_back(row);
@@ -2403,9 +2479,14 @@ impl Accumulator {
         // over node bindings must count them. (`eval_value` would collapse an entity to `Value::Null`
         // — the value-context rule — which made `count(<entity>)` wrongly return 0.)
         let rv = match &expr.kind {
-            ExprKind::FunctionCall { args, .. } if !args.is_empty() => {
-                eval(&args[0], row, ctx.params, ctx.graph, ctx.functions)?
-            }
+            ExprKind::FunctionCall { args, .. } if !args.is_empty() => eval(
+                &args[0],
+                row,
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?,
             _ => RowValue::NULL,
         };
         // count(x), sum, avg, min, max ignore nulls (Cypher); collect drops nulls too. An entity
@@ -2521,7 +2602,14 @@ impl Accumulator {
                 }));
             }
         };
-        let p = match collapse_rv(&eval(arg, row, ctx.params, ctx.graph, ctx.functions)?) {
+        let p = match collapse_rv(&eval(
+            arg,
+            row,
+            ctx.params,
+            ctx.graph,
+            ctx.functions,
+            &ctx.clock,
+        )?) {
             Value::Integer(i) => i as f64,
             Value::Float(f) => f,
             _ => {
@@ -2965,7 +3053,7 @@ fn eval_properties(
     let Some(expr) = props else {
         return Ok(Vec::new());
     };
-    match eval_value(expr, row, ctx.params, ctx.graph, ctx.functions)? {
+    match eval_value(expr, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)? {
         Value::Map(entries) => Ok(entries),
         Value::Null => Ok(Vec::new()),
         _ => Err(ExecError::PropertiesNotAMap),
@@ -3002,7 +3090,7 @@ fn eval_property_source(
     row: &Row,
     ctx: &mut Ctx<'_>,
 ) -> Result<Vec<(String, Value)>, ExecError> {
-    match eval(value, row, ctx.params, ctx.graph, ctx.functions)? {
+    match eval(value, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)? {
         // A graph entity contributes its own property set (the `SET x = entity` copy form).
         RowValue::Node(n) => Ok(ctx.graph.node_properties(n.id).unwrap_or_default()),
         RowValue::Rel(r) => Ok(ctx.graph.rel_properties(r.id).unwrap_or_default()),
@@ -3030,7 +3118,7 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
                 let Some((entity, key)) = resolve_property_target(target, row)? else {
                     continue;
                 };
-                let v = eval_value(value, row, ctx.params, ctx.graph, ctx.functions)?;
+                let v = eval_value(value, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
                 set_entity_property(entity, &key, v, ctx);
             }
             SetOp::ReplaceProperties { target, value } => {
@@ -3168,7 +3256,7 @@ fn apply_delete(
     let mut seen_rels = std::collections::BTreeSet::new();
     let mut seen_nodes = std::collections::BTreeSet::new();
     for expr in exprs {
-        let value = eval(expr, row, ctx.params, ctx.graph, ctx.functions)?;
+        let value = eval(expr, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
         collect_delete_targets(
             value,
             &mut rel_ids,
@@ -3302,6 +3390,9 @@ pub struct Cursor<'a> {
     graph: &'a mut dyn GraphAccess,
     functions: &'a dyn FunctionRegistry,
     procedures: &'a dyn ProcedureRegistry,
+    /// The fixed per-statement "current instant" (`rmp` task #140), captured once at `open()` and
+    /// reused for every `next()`/`pull` so the whole statement observes one instant.
+    clock: StatementClock,
     columns: Vec<String>,
     finished: bool,
     /// `false` for a write statement with no `RETURN`: the cursor drains its operator tree to apply
@@ -3338,6 +3429,7 @@ impl<'a> Cursor<'a> {
             graph: self.graph,
             functions: self.functions,
             procedures: self.procedures,
+            clock: self.clock,
         };
         // A write statement with no `RETURN` yields zero rows (openCypher write cardinality), but
         // its side effects must still happen: drain the operator tree once so every write `next()`
@@ -3523,6 +3615,9 @@ impl Executor {
         procedures: &'a dyn ProcedureRegistry,
     ) -> Result<Cursor<'a>, ExecError> {
         let columns = result_columns(&self.plan.root, procedures);
+        // Capture the statement clock once per open() — this is the fixed per-statement instant
+        // every zero-argument temporal constructor in the statement reads (`rmp` task #140).
+        let clock = StatementClock::capture();
         let root = {
             let mut ctx = Ctx {
                 params: &self.params,
@@ -3530,6 +3625,7 @@ impl Executor {
                 graph,
                 functions,
                 procedures,
+                clock,
             };
             build_operator(&self.plan.root, None, &mut ctx)?
         };
@@ -3540,6 +3636,7 @@ impl Executor {
             graph,
             functions,
             procedures,
+            clock,
             columns,
             finished: false,
             emits_rows: !root_is_write(&self.plan.root),
@@ -3566,6 +3663,8 @@ impl Executor {
         seed: &Row,
     ) -> Result<Cursor<'a>, ExecError> {
         let columns = result_columns(&self.plan.root, procedures);
+        // Capture the statement clock once per open() — see `open_with_extensions` (`rmp` task #140).
+        let clock = StatementClock::capture();
         let root = {
             let mut ctx = Ctx {
                 params: &self.params,
@@ -3573,6 +3672,7 @@ impl Executor {
                 graph,
                 functions,
                 procedures,
+                clock,
             };
             build_operator(&self.plan.root, Some(seed), &mut ctx)?
         };
@@ -3583,6 +3683,7 @@ impl Executor {
             graph,
             functions,
             procedures,
+            clock,
             columns,
             finished: false,
             emits_rows: !root_is_write(&self.plan.root),
