@@ -39,6 +39,36 @@ impl Clock for SimClock {
     }
 }
 
+/// A deterministic clock whose time is **set externally** by the simulator's scheduler, shared by
+/// handle (cheap `Arc` clone) between the simulator and the engine it drives.
+///
+/// Unlike [`SimClock`] (which a single owner advances), `SharedClock` is read by the engine through an
+/// `Arc<dyn Clock>` while the simulator core sets it to the [`SimScheduler`](crate::SimScheduler)'s
+/// current time on every step — so the engine's notion of "now" tracks logical simulation time in
+/// lockstep, with no wall clock anywhere. `Send + Sync` (an atomic), as the engine's clock slot
+/// requires.
+#[derive(Debug, Default, Clone)]
+pub struct SharedClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl SharedClock {
+    /// Creates a shared clock starting at `start` nanoseconds.
+    #[must_use]
+    pub fn new(start: u64) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start)))
+    }
+
+    /// Sets the current time (the simulator calls this with the scheduler's logical time each step).
+    pub fn set(&self, nanos: u64) {
+        self.0.store(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clock for SharedClock {
+    fn now_nanos(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// The production clock backed by the operating-system wall clock.
 ///
 /// A future revision will switch to a monotonic source; this skeleton uses the

@@ -42,6 +42,7 @@ pub mod fault;
 pub mod harness;
 pub mod model;
 pub mod rng;
+pub mod vopr;
 pub mod workload;
 
 pub use checker::{CheckFailure, CheckResult, verify};
@@ -50,4 +51,7 @@ pub use fault::{DeferredFault, FaultKind};
 pub use harness::{ScenarioReport, run_crash_scenario, run_scenario, run_with_fault};
 pub use model::{AckLedger, Model};
 pub use rng::DetRng;
+// The wire-level VOPR core (rmp #162). Its `run`/`summarize` are kept module-qualified (`vopr::run`)
+// so they do not clash with the storage harness's crate-root `run`/`summarize`.
+pub use vopr::{VoprConfig, VoprReport};
 pub use workload::{Op, PlannedTxn, TxnOutcome, WorkloadConfig};

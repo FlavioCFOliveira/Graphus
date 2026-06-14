@@ -23,3 +23,7 @@ graphus-io = { path = "../graphus-io" }
 graphus-wal = { path = "../graphus-wal" }
 graphus-bufpool = { path = "../graphus-bufpool" }
 graphus-storage = { path = "../graphus-storage" }
+# The real engine, driven inline + single-threaded for the wire-level VOPR simulator
+# (`vopr` module, rmp #162): `graphus_server::engine::LocalEngine`. graphus-server does not depend on
+# graphus-dst, so this is acyclic.
+graphus-server = { path = "../graphus-server" }

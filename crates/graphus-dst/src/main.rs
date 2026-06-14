@@ -8,9 +8,22 @@
 
 use std::process::ExitCode;
 
-use graphus_dst::cli;
+use graphus_dst::{cli, vopr};
 
 fn main() -> ExitCode {
+    // The `vopr` subcommand drives the wire-level VOPR simulator core (rmp #162); everything else is
+    // the storage/WAL/txn crash-fault harness. Detect it before the harness arg parser.
+    let mut raw = std::env::args().skip(1).peekable();
+    if raw.peek().map(String::as_str) == Some("vopr") {
+        let (summary, failures) = vopr::run_cli(raw.skip(1));
+        print!("{summary}");
+        return if failures == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     // Skip the program name; parse the rest.
     let cfg = match cli::parse_args(std::env::args().skip(1)) {
         Ok(cfg) => cfg,
