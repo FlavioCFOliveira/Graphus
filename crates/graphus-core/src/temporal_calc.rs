@@ -76,10 +76,13 @@ pub const MAX_OFFSET_SECONDS: i32 = 18 * 3600;
 
 /// Largest absolute proleptic-Gregorian year constructible as a [`Date`].
 ///
-/// `Date` stores `i32` days since 1970-01-01, which spans roughly
-/// +/- 5.88 million years; this bound is checked *before* any day arithmetic so
-/// that the civil conversions below never overflow.
-const MAX_ABS_YEAR: i64 = 5_880_000;
+/// `Date` stores `i64` days since 1970-01-01 (~±25 billion years), so this
+/// bound is set by the **openCypher** specification rather than the storage
+/// type: the language admits years `-999_999_999 ..= +999_999_999`, asserted by
+/// the TCK `Temporal10.feature` "large durations" scenarios. The check runs
+/// *before* any day arithmetic so the civil conversions below never overflow
+/// (they are exact for `|days| <= ~9.1e18 / 400`, far beyond `±3.66e11` days).
+const MAX_ABS_YEAR: i64 = 999_999_999;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -290,16 +293,22 @@ pub fn format_offset(offset_seconds: i32) -> String {
 // ---------------------------------------------------------------------------
 
 impl Date {
-    /// Builds a `Date` from a days-since-epoch count, checking the `i32` range.
+    /// Builds a `Date` from a days-since-epoch count.
+    ///
+    /// `Date` stores `i64` days, so any value the calendar constructors and
+    /// arithmetic produce within the openCypher year range ([`MAX_ABS_YEAR`])
+    /// is representable; the year-range check at each call site is what bounds
+    /// the magnitude.
     fn from_epoch_days(days: i64) -> TemporalResult<Self> {
-        let days_since_epoch = i32::try_from(days).map_err(|_| TemporalError::Overflow)?;
-        Ok(Self { days_since_epoch })
+        Ok(Self {
+            days_since_epoch: days,
+        })
     }
 
-    /// The days-since-epoch count widened to `i64` for arithmetic.
+    /// The days-since-epoch count as `i64` for arithmetic.
     #[must_use]
     fn epoch_days(&self) -> i64 {
-        i64::from(self.days_since_epoch)
+        self.days_since_epoch
     }
 
     /// Constructs a date from calendar components.
@@ -788,8 +797,8 @@ impl LocalDateTime {
     /// always fits in `i64` epoch seconds.
     #[must_use]
     pub fn from_date_time(date: Date, time: LocalTime) -> Self {
-        let epoch_seconds = i64::from(date.days_since_epoch) * SECONDS_PER_DAY
-            + (time.nanos_of_day / NANOS_PER_SECOND) as i64;
+        let epoch_seconds =
+            date.days_since_epoch * SECONDS_PER_DAY + (time.nanos_of_day / NANOS_PER_SECOND) as i64;
         Self {
             epoch_seconds,
             // nanos_of_day % 10^9 is < 10^9, so the cast is lossless.
@@ -802,15 +811,13 @@ impl LocalDateTime {
     /// Uses Euclidean division so instants before 1970 decompose correctly
     /// (e.g. one second before the epoch is `1969-12-31T23:59:59`). For values
     /// produced by this module the round trip with [`Self::from_date_time`] is
-    /// exact; hand-crafted `epoch_seconds` beyond the `i32`-day range of
-    /// [`Date`] saturate to the nearest representable date, and a hand-crafted
+    /// exact. `Date` now stores `i64` days (#141), so the day count of any
+    /// `epoch_seconds` is representable without saturation; a hand-crafted
     /// `nanos` field above `999_999_999` is treated as `999_999_999`.
     #[must_use]
     pub fn to_date_time(&self) -> (Date, LocalTime) {
-        let days = self.epoch_seconds.div_euclid(SECONDS_PER_DAY);
+        let days_since_epoch = self.epoch_seconds.div_euclid(SECONDS_PER_DAY);
         let second_of_day = self.epoch_seconds.rem_euclid(SECONDS_PER_DAY) as u64;
-        let days_since_epoch =
-            i32::try_from(days).unwrap_or(if days < 0 { i32::MIN } else { i32::MAX });
         let nanos = u64::from(self.nanos.min(999_999_999));
         (
             Date { days_since_epoch },
@@ -1948,13 +1955,22 @@ pub fn parse_zoned_time(s: &str) -> TemporalResult<ZonedTime> {
 /// [`TemporalError::Parse`] / [`TemporalError::InvalidComponent`] as for the
 /// underlying date and time parsers.
 pub fn parse_local_date_time(s: &str) -> TemporalResult<LocalDateTime> {
-    let t = s.find('T').ok_or_else(|| TemporalError::Parse {
-        input: s.to_owned(),
-        reason: "expected 'T' between date and time",
-    })?;
-    let date = parse_date(&s[..t])?;
-    let time = parse_local_time(&s[t + 1..])?;
-    Ok(LocalDateTime::from_date_time(date, time))
+    // A `'T'` separates the date and time parts; when it is absent the string is a **date-only**
+    // value and the time defaults to midnight, per the openCypher temporal CIP (a `LocalDateTime`
+    // constructed from a date string has its time component default to `00:00:00.000000000`). This
+    // is the behaviour the TCK `Temporal10.feature` "large durations in seconds" scenario relies on
+    // (`localdatetime('-999999999-01-01')`).
+    match s.find('T') {
+        Some(t) => {
+            let date = parse_date(&s[..t])?;
+            let time = parse_local_time(&s[t + 1..])?;
+            Ok(LocalDateTime::from_date_time(date, time))
+        }
+        None => {
+            let date = parse_date(s)?;
+            Ok(LocalDateTime::from_date_time(date, LocalTime::default()))
+        }
+    }
 }
 
 /// Parses a zoned date-time into its unresolved parts: the local wall-clock
@@ -2370,8 +2386,9 @@ mod tests {
             Date::from_ymd(2023, 1, 0),
             Err(TemporalError::InvalidComponent("day"))
         );
+        // Years beyond the openCypher range `±999_999_999` (#141) are rejected.
         assert_eq!(
-            Date::from_ymd(99_000_000, 1, 1),
+            Date::from_ymd(1_000_000_000, 1, 1),
             Err(TemporalError::Overflow)
         );
     }
@@ -2843,6 +2860,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_local_date_time_defaults_date_only_to_midnight() {
+        // openCypher: a date-only string constructs a LocalDateTime at midnight (#141). This is
+        // what the TCK `Temporal10.feature` "large durations in seconds" scenario relies on, with a
+        // year far outside the former `i32`-days range.
+        let rows: &[(&str, &str)] = &[
+            ("2015-07-21", "2015-07-21T00:00"),
+            ("2015-W30-2", "2015-07-21T00:00"),
+            ("-999999999-01-01", "-999999999-01-01T00:00"),
+            ("+999999999-12-31", "+999999999-12-31T00:00"),
+        ];
+        for (input, expected) in rows {
+            let ldt = parse_local_date_time(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(ldt.to_iso_string(), *expected, "input {input:?}");
+        }
+    }
+
+    #[test]
     fn parse_zoned_date_time_matches_temporal2_scenario_5() {
         let rows: &[(&str, &str)] = &[
             (
@@ -2960,8 +2994,15 @@ mod tests {
         assert!(parse_zoned_time("12:00+19:00").is_err());
         assert!(parse_zoned_time("12:00+01:60").is_err());
         assert!(parse_zoned_time("12:00").is_err());
-        // Date-times.
-        assert!(parse_local_date_time("2015-07-21").is_err());
+        // Date-times. A date-only string is now **valid** and defaults the time to midnight per the
+        // openCypher CIP (#141); the malformed-time case is still rejected.
+        assert_eq!(
+            parse_local_date_time("2015-07-21").unwrap(),
+            LocalDateTime::from_date_time(
+                Date::from_ymd(2015, 7, 21).unwrap(),
+                LocalTime::default()
+            )
+        );
         assert!(parse_local_date_time("2015-07-21T25:00").is_err());
         assert!(parse_zoned_date_time("2015-07-21T12:00+02:00[]").is_err());
         // Durations.
@@ -3305,19 +3346,46 @@ mod tests {
     }
 
     #[test]
-    fn date_arithmetic_overflow_is_reported() {
-        let max_date = Date {
-            days_since_epoch: i32::MAX,
-        };
+    fn date_supports_full_opencypher_year_range() {
+        // openCypher (TCK `Temporal10.feature` "large durations") admits years
+        // `-999_999_999 ..= +999_999_999`. The former `i32`-days `Date` rejected these as Overflow;
+        // with `i64` days (#141) they construct, format, and re-decompose exactly.
+        for (y, m, d, iso) in [
+            (MAX_ABS_YEAR, 12, 31, "+999999999-12-31"),
+            (-MAX_ABS_YEAR, 1, 1, "-999999999-01-01"),
+        ] {
+            let date =
+                Date::from_ymd(y, m, d).expect("openCypher year range must be representable");
+            assert_eq!(date.to_ymd(), (y, m, d));
+            assert_eq!(date.to_iso_string(), iso);
+            // The days count is well within i64 (`±3.66e11` days, < 2^40).
+            assert!(date.days_since_epoch.unsigned_abs() < (1u64 << 40));
+        }
+        // One year beyond the bound is rejected.
         assert_eq!(
-            max_date.add_duration(&dur(0, 1, 0, 0)),
+            Date::from_ymd(MAX_ABS_YEAR + 1, 1, 1),
             Err(TemporalError::Overflow)
         );
-        let min_date = Date {
-            days_since_epoch: i32::MIN,
-        };
         assert_eq!(
-            min_date.sub_duration(&dur(0, 1, 0, 0)),
+            Date::from_ymd(-MAX_ABS_YEAR - 1, 12, 31),
+            Err(TemporalError::Overflow)
+        );
+    }
+
+    #[test]
+    fn date_arithmetic_overflow_is_reported() {
+        // `Date` now stores `i64` days (#141), so the overflow boundary is the openCypher year
+        // range (`±MAX_ABS_YEAR`), not the storage width. Adding a *month* at the upper edge pushes
+        // the year past `+999_999_999` (the month path re-validates the year); subtracting one at
+        // the lower edge past `-999_999_999`.
+        let max_date = Date::from_ymd(MAX_ABS_YEAR, 12, 31).unwrap();
+        assert_eq!(
+            max_date.add_duration(&dur(1, 0, 0, 0)),
+            Err(TemporalError::Overflow)
+        );
+        let min_date = Date::from_ymd(-MAX_ABS_YEAR, 1, 1).unwrap();
+        assert_eq!(
+            min_date.sub_duration(&dur(1, 0, 0, 0)),
             Err(TemporalError::Overflow)
         );
     }

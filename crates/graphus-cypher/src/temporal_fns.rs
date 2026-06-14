@@ -1424,7 +1424,7 @@ fn truncate_parts(unit: &str, date: Date, time: LocalTime) -> Option<(Date, Loca
             // Back to Monday of this ISO week.
             let dow = date.week_day(); // Monday = 1
             let monday = Date {
-                days_since_epoch: date.days_since_epoch - (dow as i32 - 1),
+                days_since_epoch: date.days_since_epoch - (dow - 1),
             };
             (monday, midnight)
         }

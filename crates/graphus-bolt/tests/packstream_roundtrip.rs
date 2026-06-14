@@ -65,7 +65,7 @@ fn leaf_value() -> impl Strategy<Value = Value> {
 /// Every temporal `Value` class.
 fn temporal_value() -> impl Strategy<Value = Value> {
     prop_oneof![
-        any::<i32>().prop_map(|d| Value::Date(Date {
+        any::<i64>().prop_map(|d| Value::Date(Date {
             days_since_epoch: d
         })),
         // nanos-of-day stays within a day.

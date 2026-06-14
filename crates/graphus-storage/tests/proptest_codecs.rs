@@ -54,7 +54,7 @@ fn small_string() -> impl Strategy<Value = String> {
 /// owned by graphus-core's constructors, not the codec).
 fn temporal_value() -> impl Strategy<Value = Value> {
     prop_oneof![
-        any::<i32>().prop_map(|days_since_epoch| Value::Date(Date { days_since_epoch })),
+        any::<i64>().prop_map(|days_since_epoch| Value::Date(Date { days_since_epoch })),
         any::<u64>().prop_map(|nanos_of_day| Value::LocalTime(LocalTime { nanos_of_day })),
         (any::<u64>(), any::<i32>()).prop_map(|(nanos_of_day, offset_seconds)| {
             Value::ZonedTime(ZonedTime {

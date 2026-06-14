@@ -152,15 +152,10 @@ impl StatementClock {
     /// Days since the Unix epoch for an epoch-seconds instant (floored, so negative
     /// instants map to the correct earlier date).
     fn date_from(epoch_seconds: i64) -> Date {
-        let days = epoch_seconds.div_euclid(SECONDS_PER_DAY);
         Date {
-            // The realistic span of a system clock is far inside `i32` days
-            // (±5.8 million years); a pathological clamp keeps this total and panic-free.
-            days_since_epoch: i32::try_from(days).unwrap_or(if days < 0 {
-                i32::MIN
-            } else {
-                i32::MAX
-            }),
+            // `Date` stores `i64` days (#141), so a system-clock instant's day count is always
+            // representable without clamping.
+            days_since_epoch: epoch_seconds.div_euclid(SECONDS_PER_DAY),
         }
     }
 

@@ -547,7 +547,7 @@ mod tests {
         lt(
             Value::Point(Point::new_2d(Crs::Cartesian, f64::MAX, f64::MAX)),
             Value::Date(Date {
-                days_since_epoch: i32::MIN,
+                days_since_epoch: i64::MIN,
             }),
         );
     }

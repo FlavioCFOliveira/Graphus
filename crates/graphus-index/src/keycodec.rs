@@ -279,7 +279,11 @@ fn encode_i128_bits(v: i128) -> [u8; 16] {
 /// Returns [`KeyEncodeError::Unindexable`] if `v` is not a temporal value.
 pub fn encode_temporal(into: &mut Vec<u8>, v: &Value) -> Result<(), KeyEncodeError> {
     match v {
-        Value::Date(d) => into.extend_from_slice(&encode_i32_bits(d.days_since_epoch)),
+        // `Date` is `i64` days (#141): a fixed 8-byte order-preserving offset-binary field, like its
+        // `LocalDateTime` sibling. Widening from the former 4-byte `i32` encoding is safe because
+        // secondary indexes are **in-memory and rebuilt from the base store at every open** (they
+        // are not durable on disk), so no on-disk key ever mixes the two widths.
+        Value::Date(d) => into.extend_from_slice(&encode_i64_bits(d.days_since_epoch)),
         Value::LocalTime(t) => into.extend_from_slice(&encode_u64_bits(t.nanos_of_day)),
         Value::ZonedTime(zt) => {
             // Order by the UTC instant the time denotes (local nanos minus the offset), then by
@@ -525,7 +529,7 @@ mod tests {
         // scalars). A previous revision encoded BOOLEAN < NUMBER < STRING, which this test pins
         // against so the bug cannot recur.
         let temporal = Value::Date(graphus_core::Date {
-            days_since_epoch: i32::MAX,
+            days_since_epoch: i64::MAX,
         });
         let string = Value::String("zzzzzzzzzz".to_owned());
         let boolean = Value::Boolean(false); // the *smallest* boolean
@@ -565,7 +569,7 @@ mod tests {
             nanos: 0,
         });
         let date = Value::Date(graphus_core::Date {
-            days_since_epoch: i32::MIN,
+            days_since_epoch: i64::MIN,
         });
         let zt = Value::ZonedTime(graphus_core::ZonedTime {
             time: graphus_core::LocalTime { nanos_of_day: 0 },

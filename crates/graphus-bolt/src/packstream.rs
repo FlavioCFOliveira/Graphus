@@ -827,9 +827,9 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
     match t {
         tag::DATE => {
             expect_fields(t, field_count, 1)?;
+            // PackStream INTEGER carries the full i64; `Date` is i64 days-since-epoch (#141), so the
+            // value is taken as-is with no narrowing.
             let days = unpacker.read_int()?;
-            let days = i32::try_from(days)
-                .map_err(|_| BoltError::Decode("Date.days out of i32 range".to_owned()))?;
             Ok(Value::Date(Date {
                 days_since_epoch: days,
             }))
@@ -1111,7 +1111,7 @@ fn pack_date(packer: &mut Packer, d: Date) {
     packer
         .write_struct_header(tag::DATE, 1)
         .expect("INVARIANT: Date has 1 field");
-    packer.write_int(i64::from(d.days_since_epoch));
+    packer.write_int(d.days_since_epoch);
 }
 
 fn pack_local_time(packer: &mut Packer, t: LocalTime) {

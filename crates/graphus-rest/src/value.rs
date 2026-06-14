@@ -607,12 +607,12 @@ fn iso_to_temporal(s: &str) -> Result<Value, ValueCodecError> {
 
 /// Days-since-epoch → `YYYY-MM-DD` (proleptic Gregorian), via the civil_from_days algorithm
 /// (Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms"; public domain).
-fn fmt_date(days_since_epoch: i32) -> String {
-    let (y, m, d) = civil_from_days(i64::from(days_since_epoch));
+fn fmt_date(days_since_epoch: i64) -> String {
+    let (y, m, d) = civil_from_days(days_since_epoch);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn parse_date_only(s: &str) -> Option<i32> {
+fn parse_date_only(s: &str) -> Option<i64> {
     // Strict `YYYY-MM-DD` with no time/zone suffix.
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 {
@@ -624,7 +624,7 @@ fn parse_date_only(s: &str) -> Option<i32> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    i32::try_from(days_from_civil(y, m, d)).ok()
+    Some(days_from_civil(y, m, d))
 }
 
 fn fmt_time_of_day(nanos_of_day: u64) -> String {
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn temporal_date_round_trips_through_jolt() {
         // 2024-02-29 (a leap day) exercises the civil-date conversion both ways.
-        let days = days_from_civil(2024, 2, 29) as i32;
+        let days = days_from_civil(2024, 2, 29);
         let v = Value::Date(Date {
             days_since_epoch: days,
         });

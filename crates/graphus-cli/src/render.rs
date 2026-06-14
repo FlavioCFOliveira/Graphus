@@ -251,8 +251,8 @@ fn write_float(out: &mut String, x: f64) {
 }
 
 /// Writes a calendar date as `YYYY-MM-DD` from days since the Unix epoch (proleptic Gregorian).
-fn write_date(out: &mut String, days_since_epoch: i32) {
-    let (y, m, d) = civil_from_days(i64::from(days_since_epoch));
+fn write_date(out: &mut String, days_since_epoch: i64) {
+    let (y, m, d) = civil_from_days(days_since_epoch);
     let _ = write!(out, "{y:04}-{m:02}-{d:02}");
 }
 

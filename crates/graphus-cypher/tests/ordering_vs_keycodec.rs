@@ -120,7 +120,7 @@ fn gen_encodable(rng: &mut SimRng) -> Value {
             Value::Bytes((0..n).map(|_| (rng.next_u64() & 0xFF) as u8).collect())
         }
         7 => Value::Date(Date {
-            days_since_epoch: gen_i64(rng) as i32,
+            days_since_epoch: gen_i64(rng),
         }),
         8 => Value::LocalTime(LocalTime {
             nanos_of_day: gen_nanos_of_day(rng),

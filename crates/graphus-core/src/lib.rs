@@ -235,12 +235,15 @@ pub mod value {
 
         /// A calendar date, as **days since the Unix epoch** (1970-01-01).
         ///
-        /// `i32` days spans roughly ±5.8 million years, far beyond any practical
-        /// range, while keeping a compact fixed-width key component.
+        /// `i64` days spans roughly ±25 billion years, which comfortably covers
+        /// the full openCypher proleptic-Gregorian range of years
+        /// `-999_999_999 ..= +999_999_999` (~±3.66e11 days) required by the TCK
+        /// (`Temporal10.feature` "large durations"), while keeping a compact
+        /// fixed-width key component.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
         pub struct Date {
             /// Days since 1970-01-01 (negative for earlier dates).
-            pub days_since_epoch: i32,
+            pub days_since_epoch: i64,
         }
 
         /// A wall-clock time of day with no date and no zone, as **nanoseconds since

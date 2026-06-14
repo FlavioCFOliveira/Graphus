@@ -23,7 +23,26 @@
 //!
 //! The class tags continue [`crate::propenc`]'s space (`1`=bool, `2`=int, `3`=float) with
 //! [`TAG_STRING`] = `4`, [`TAG_LIST`] = `5`, and the temporal classes [`TAG_DATE`] = `6` through
-//! [`TAG_DURATION`] = `11`, so the inline and overflow tag spaces never collide.
+//! [`TAG_DURATION`] = `11`, then [`TAG_POINT`] = `12` and [`TAG_DATE_WIDE`] = `13`, so the inline
+//! and overflow tag spaces never collide.
+//!
+//! # Backward compatibility — the `Date` widening (`rmp` task #141)
+//!
+//! `Date` was widened from `i32` to `i64` days-since-epoch (openCypher years
+//! `-999_999_999 ..= +999_999_999`). Because the property heap is **durable on disk** and part of
+//! the ACID-certified core, the widening is done with a **new self-describing tag** rather than an
+//! in-place page migration:
+//!
+//! * the encoder *always* emits [`TAG_DATE_WIDE`] (13) with an 8-byte `i64 LE` body;
+//! * the decoder reads [`TAG_DATE_WIDE`] as 8 bytes **and** still reads the legacy [`TAG_DATE`]
+//!   (6) as its original 4-byte `i32 LE` body, sign-extending into the `i64` field.
+//!
+//! The tag carries the width, so legacy 4-byte images written before #141 remain readable
+//! **byte-for-byte** with no rewrite — there is no migration step that could leave a page torn or a
+//! value half-converted, and no on-disk byte already in the wild changes meaning. New writes simply
+//! use the wider tag. The same rule applies to a `Date` **inside a persisted list**: the list's
+//! shared element tag is [`TAG_DATE_WIDE`] for new lists and [`TAG_DATE`] for legacy ones, decoded
+//! by the same per-element dispatch.
 //!
 //! # String format
 //!
@@ -40,7 +59,8 @@
 //! elements):
 //!
 //! ```text
-//!   TAG_DATE            (6)  days_since_epoch: i32 LE                              (4 bytes)
+//!   TAG_DATE_WIDE       (13) days_since_epoch: i64 LE                              (8 bytes)
+//!   TAG_DATE            (6)  days_since_epoch: i32 LE  [legacy, decode-only]       (4 bytes)
 //!   TAG_LOCAL_TIME      (7)  nanos_of_day: u64 LE                                  (8 bytes)
 //!   TAG_ZONED_TIME      (8)  nanos_of_day: u64 LE ++ offset_seconds: i32 LE        (12 bytes)
 //!   TAG_LOCAL_DATE_TIME (9)  epoch_seconds: i64 LE ++ nanos: u32 LE                (12 bytes)
@@ -106,7 +126,10 @@ pub const OVERFLOW_BIT: u8 = 0b1000_0000;
 pub const TAG_STRING: u8 = 4;
 /// `type_tag` low-bits class for a `List`.
 pub const TAG_LIST: u8 = 5;
-/// `type_tag` low-bits class for a `Date` (body: `days_since_epoch: i32 LE`).
+/// `type_tag` low-bits class for a **legacy** narrow `Date` (body:
+/// `days_since_epoch: i32 LE`, 4 bytes). **Decode-only**: kept so values written before the
+/// `i64` widening (`rmp` task #141) remain byte-for-byte readable; the encoder never emits it.
+/// New `Date` values use [`TAG_DATE_WIDE`].
 pub const TAG_DATE: u8 = 6;
 /// `type_tag` low-bits class for a `LocalTime` (body: `nanos_of_day: u64 LE`).
 pub const TAG_LOCAL_TIME: u8 = 7;
@@ -125,6 +148,12 @@ pub const TAG_DURATION: u8 = 11;
 /// discriminant) ++ coord: f64 LE × CRS-dimensionality`). The CRS byte fixes the coordinate count
 /// (2 or 3), so the body is self-delimiting.
 pub const TAG_POINT: u8 = 12;
+/// `type_tag` low-bits class for a **wide** `Date` (body: `days_since_epoch: i64 LE`, 8 bytes;
+/// `rmp` task #141). This is the tag the encoder *always* emits for a `Date`; it carries the full
+/// `i64` range (openCypher years `-999_999_999 ..= +999_999_999`). The legacy [`TAG_DATE`] (4-byte
+/// `i32`) remains decode-only for backward compatibility — the tag is self-describing of its width,
+/// so old and new images coexist with no in-place page migration.
+pub const TAG_DATE_WIDE: u8 = 13;
 
 /// `elem_tag` sentinel inside a serialized **empty** list (it has no element class to record).
 const TAG_LIST_EMPTY: u8 = 0;
@@ -277,7 +306,8 @@ pub fn encode(value: &Value) -> Result<(u8, Vec<u8>), ValueEncodeError> {
 /// The overflow class tag of a temporal [`Value`], or `None` for any other class.
 fn temporal_tag(v: &Value) -> Option<u8> {
     match v {
-        Value::Date(_) => Some(TAG_DATE),
+        // Always emit the wide tag for new writes; the legacy `TAG_DATE` is decode-only (#141).
+        Value::Date(_) => Some(TAG_DATE_WIDE),
         Value::LocalTime(_) => Some(TAG_LOCAL_TIME),
         Value::ZonedTime(_) => Some(TAG_ZONED_TIME),
         Value::LocalDateTime(_) => Some(TAG_LOCAL_DATE_TIME),
@@ -429,7 +459,7 @@ pub fn decode(class_tag: u8, bytes: &[u8]) -> Result<Value, ValueDecodeError> {
             }
             Ok(v)
         }
-        tag @ (TAG_DATE | TAG_LOCAL_TIME | TAG_ZONED_TIME | TAG_LOCAL_DATE_TIME
+        tag @ (TAG_DATE | TAG_DATE_WIDE | TAG_LOCAL_TIME | TAG_ZONED_TIME | TAG_LOCAL_DATE_TIME
         | TAG_ZONED_DATE_TIME | TAG_DURATION) => {
             let mut cur = Cursor::new(bytes);
             let v = decode_temporal_body(tag, &mut cur)?;
@@ -449,8 +479,13 @@ pub fn decode(class_tag: u8, bytes: &[u8]) -> Result<Value, ValueDecodeError> {
 /// the *top-level* caller additionally asserts the cursor is exhausted.
 fn decode_temporal_body(class_tag: u8, cur: &mut Cursor<'_>) -> Result<Value, ValueDecodeError> {
     match class_tag {
+        // Wide (current) form: 8-byte i64 body.
+        TAG_DATE_WIDE => Ok(Value::Date(Date {
+            days_since_epoch: cur.i64()?,
+        })),
+        // Legacy (decode-only) form: 4-byte i32 body, sign-extended into the i64 field (#141).
         TAG_DATE => Ok(Value::Date(Date {
-            days_since_epoch: cur.i32()?,
+            days_since_epoch: i64::from(cur.i32()?),
         })),
         TAG_LOCAL_TIME => Ok(Value::LocalTime(LocalTime {
             nanos_of_day: cur.u64()?,
@@ -572,8 +607,8 @@ fn decode_list_element(elem_tag: u8, cur: &mut Cursor<'_>) -> Result<Value, Valu
             })?;
             Ok(Value::String(s))
         }
-        TAG_DATE | TAG_LOCAL_TIME | TAG_ZONED_TIME | TAG_LOCAL_DATE_TIME | TAG_ZONED_DATE_TIME
-        | TAG_DURATION => decode_temporal_body(elem_tag, cur),
+        TAG_DATE | TAG_DATE_WIDE | TAG_LOCAL_TIME | TAG_ZONED_TIME | TAG_LOCAL_DATE_TIME
+        | TAG_ZONED_DATE_TIME | TAG_DURATION => decode_temporal_body(elem_tag, cur),
         _ => Err(ValueDecodeError::Malformed {
             what: "unknown list element tag",
         }),
@@ -809,14 +844,70 @@ mod tests {
 
     #[test]
     fn dates_round_trip_including_negative_and_extreme_days() {
-        for days in [0, 1, -1, 20_000, -20_000, i32::MIN, i32::MAX] {
+        // Include the openCypher year bounds (`±999_999_999` years ≈ `±3.66e11` days), which
+        // exceed the former `i32` range, plus the `i64` extremes (#141).
+        const MAX_OC_DAYS: i64 = 365_241_780_471; // days(+999_999_999-12-31)
+        for days in [
+            0,
+            1,
+            -1,
+            20_000,
+            -20_000,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+            MAX_OC_DAYS,
+            -MAX_OC_DAYS,
+            i64::MIN,
+            i64::MAX,
+        ] {
             let v = Value::Date(Date {
                 days_since_epoch: days,
             });
             assert_eq!(round_trip(&v), v);
         }
+        // New writes always use the wide tag (#141).
         let (class, _) = encode(&Value::Date(Date::default())).unwrap();
-        assert_eq!(class, TAG_DATE);
+        assert_eq!(class, TAG_DATE_WIDE);
+    }
+
+    /// BACKWARD COMPATIBILITY (#141): a `Date` written *before* the `i64` widening was stored as a
+    /// legacy [`TAG_DATE`] (6) image with a **4-byte i32 LE** body. The decoder must still read
+    /// those bytes byte-for-byte and reconstruct the identical `Date` (with sign-extension), proving
+    /// no in-place page migration is needed and old data stays readable.
+    #[test]
+    fn legacy_narrow_date_image_still_decodes() {
+        // These are the *exact* bytes the pre-#141 encoder produced for these `i32` days values:
+        // `TAG_DATE` (6) class + `i32::to_le_bytes()`.
+        for days in [0_i32, 1, -1, 20_000, -20_000, i32::MIN, i32::MAX] {
+            let legacy_body = days.to_le_bytes();
+            let decoded = decode(TAG_DATE, &legacy_body).unwrap();
+            assert_eq!(
+                decoded,
+                Value::Date(Date {
+                    days_since_epoch: i64::from(days),
+                }),
+                "legacy 4-byte Date image for days={days} must round-trip"
+            );
+        }
+        // A legacy Date *inside a persisted list* (shared element tag = TAG_DATE, 4-byte bodies).
+        // Hand-build the legacy list image: elem_tag(6) ++ count(2) ++ two 4-byte i32 bodies.
+        let mut legacy_list = Vec::new();
+        legacy_list.push(TAG_DATE);
+        legacy_list.extend_from_slice(&2u32.to_le_bytes());
+        legacy_list.extend_from_slice(&(-719_528_i32).to_le_bytes()); // 0001-01-01
+        legacy_list.extend_from_slice(&20_000_i32.to_le_bytes());
+        let decoded = decode(TAG_LIST, &legacy_list).unwrap();
+        assert_eq!(
+            decoded,
+            Value::List(vec![
+                Value::Date(Date {
+                    days_since_epoch: -719_528,
+                }),
+                Value::Date(Date {
+                    days_since_epoch: 20_000,
+                }),
+            ])
+        );
     }
 
     #[test]
@@ -997,13 +1088,17 @@ mod tests {
     /// freeze them byte-for-byte so a refactor can never silently change the encoding.
     #[test]
     fn temporal_byte_layouts_are_frozen() {
+        // `Date` now encodes as the wide tag (#141): an 8-byte i64 LE body. `-2` is `0xFFFF…FFFE`.
         let (tag, bytes) = encode(&Value::Date(Date {
             days_since_epoch: -2,
         }))
         .unwrap();
         assert_eq!(
             (tag, bytes.as_slice()),
-            (TAG_DATE, &[0xFE, 0xFF, 0xFF, 0xFF][..])
+            (
+                TAG_DATE_WIDE,
+                &[0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF][..]
+            )
         );
 
         let (tag, bytes) = encode(&Value::LocalTime(LocalTime {

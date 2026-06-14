@@ -243,7 +243,7 @@ fn gen_value(rng: &mut SimRng) -> Value {
             Value::Bytes(b)
         }
         8 => Value::Date(Date {
-            days_since_epoch: gen_i64(rng) as i32,
+            days_since_epoch: gen_i64(rng),
         }),
         9 => Value::LocalTime(LocalTime {
             nanos_of_day: gen_nanos_of_day(rng),

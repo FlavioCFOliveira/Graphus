@@ -281,8 +281,12 @@ use graphus_tck::runner::run_scenario;
 /// identity diff: 0 newly-failing scenarios). Sixth, the statement clock seam (`rmp` task #140)
 /// wired the zero-argument current-instant temporal constructors (`date()`, `time()`, `datetime()`,
 /// `localtime()`, `localdatetime()`), flipping `expressions/temporal/Temporal10` [12] "Should
-/// compute durations with no difference" to pass (+5 scenarios, zero regressions).
-const BASELINE: usize = 3912;
+/// compute durations with no difference" to pass (+5 scenarios, zero regressions). Seventh, the
+/// `Date` `i32`→`i64` widening (`rmp` task #141) lets dates span the full openCypher year range
+/// `±999_999_999`, and `parse_local_date_time` now defaults a date-only string to midnight; this
+/// flips `expressions/temporal/Temporal10` [9] "Should handle large durations" and [10] "...in
+/// seconds" to pass (+2 scenarios, zero regressions) — reaching **100%** of the harnessed suite.
+const BASELINE: usize = 3914;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.
