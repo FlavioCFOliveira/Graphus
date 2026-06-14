@@ -1082,6 +1082,7 @@ dependencies = [
  "csv",
  "graphus-bufpool",
  "graphus-core",
+ "graphus-gds",
  "graphus-index",
  "graphus-io",
  "graphus-sim",

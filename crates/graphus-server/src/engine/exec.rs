@@ -50,7 +50,24 @@ use crate::metrics::Metrics;
 pub(super) fn install_extensions() -> ExtensionRegistry {
     let mut reg = ExtensionRegistry::new();
     register_builtin_extensions(&mut reg);
+    register_gds(&mut reg);
     reg
+}
+
+/// Registers the Graph Data Science (`gds.*`) procedure surface into `reg` (`rmp` task #133).
+///
+/// The `gds.*` procedures (graph projection lifecycle + the streaming algorithms) share **one**
+/// named-graph catalog, built here and captured by every procedure closure. The catalog lives for the
+/// engine's lifetime (the registry is built once per engine), so a `gds.graph.project(...)` in one
+/// statement is visible to a `gds.pageRank.stream(...)` in the next, exactly as Neo4j's GDS catalog
+/// behaves. Each projection is taken under the calling statement's MVCC-consistent, RBAC-filtered
+/// `GraphAccess` seam, so it is a consistent committed snapshot of the live store.
+fn register_gds(reg: &mut ExtensionRegistry) {
+    let catalog = graphus_cypher::new_gds_catalog();
+    // `register_gds_procedures` registers into a `ProcedureSet`; the `ExtensionRegistry` exposes its
+    // procedure registration through `register_procedure`, so we route through the registry's own set
+    // by registering each procedure there. The shared catalog handle is cloned into every closure.
+    reg.register_gds_procedures(catalog);
 }
 
 /// Registers the engine's compiled-in sample extensions into `reg` (`rmp` task #75). Split from

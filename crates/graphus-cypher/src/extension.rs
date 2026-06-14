@@ -130,6 +130,18 @@ impl ExtensionRegistry {
         self.procedures.register(signature, handler);
     }
 
+    /// Registers the **Graph Data Science (`gds.*`) procedure surface** (`rmp` task #133) into this
+    /// registry's procedure set, all sharing the one `catalog` handle.
+    ///
+    /// This is the one wiring point a deployment calls to make `CALL gds.graph.project(...)`,
+    /// `CALL gds.pageRank.stream(...)` and the rest of the GDS algorithms available. The shared
+    /// [`GdsCatalogHandle`](crate::gds_procedures::GdsCatalogHandle) makes named projections outlive a
+    /// single statement (project once, stream many times). Delegates to
+    /// [`register_gds_procedures`](crate::gds_procedures::register_gds_procedures).
+    pub fn register_gds_procedures(&mut self, catalog: crate::gds_procedures::GdsCatalogHandle) {
+        crate::gds_procedures::register_gds_procedures(&mut self.procedures, catalog);
+    }
+
     /// Registers a **fixture-table** procedure (the openCypher TCK's `there exists a procedure …`
     /// form), delegating to [`ProcedureSet::register_table`].
     ///

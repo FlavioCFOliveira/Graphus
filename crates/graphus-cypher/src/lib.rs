@@ -122,6 +122,7 @@ pub mod eval;
 pub mod executor;
 pub mod extension;
 pub mod function_registry;
+pub mod gds_procedures;
 pub mod graph_access;
 pub mod index_set;
 pub mod lexer;
@@ -170,6 +171,7 @@ pub use executor::{
     execute_with_procedures,
 };
 pub use extension::{ExtensionRegistry, function_handler};
+pub use gds_procedures::{GdsCatalogHandle, new_catalog as new_gds_catalog, register_gds_procedures};
 pub use function_registry::{
     Arity, FunctionFailure, FunctionHandler, FunctionRegistry, FunctionSet, FunctionSignature,
     no_functions,

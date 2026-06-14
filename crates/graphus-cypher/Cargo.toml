@@ -46,6 +46,11 @@ graphus-bufpool = { path = "../graphus-bufpool" }
 # Graphus has its own temporal type system in graphus-core and must not pull in `chrono`.
 jiff-tzdb = "0.1.6"
 tz-rs = "0.7.3"
+# The Graph Data Science engine (`gds.*` procedures, `rmp` task #133): the in-memory CSR projection
+# + named-graph catalog + algorithm library. `graphus-gds` has ZERO runtime dependencies, so this
+# edge is trivially acyclic (gds depends on nothing in the workspace; cypher adapts it to the
+# `GraphAccess` seam in `src/gds_procedures.rs`).
+graphus-gds = { path = "../graphus-gds" }
 # `LOAD CSV` (the in-query source clause, FR-BK) streams a local CSV file with the `csv` crate,
 # honoring `WITH HEADERS` and a custom `FIELDTERMINATOR`. The reader is `std::io::Read`-based so a
 # large file is streamed record-by-record, never slurped (the executor source pulls one row per
