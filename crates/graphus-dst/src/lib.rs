@@ -40,6 +40,7 @@ pub mod checker;
 pub mod cli;
 pub mod fault;
 pub mod harness;
+pub mod mix;
 pub mod model;
 pub mod rng;
 pub mod vopr;

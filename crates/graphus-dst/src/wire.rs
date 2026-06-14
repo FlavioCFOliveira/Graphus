@@ -245,6 +245,33 @@ pub fn sim_auth() -> Authenticator {
     a
 }
 
+/// Runs a generated [`WorkloadOp`](crate::mix::WorkloadOp) stream over a single scripted Bolt session
+/// — proving the shared workload generator (rmp #165) drives the Bolt path, not just the direct
+/// engine path. Each op becomes a `RUN` + `PULL`; the session is framed by the login prologue and a
+/// `GOODBYE`.
+///
+/// # Errors
+/// [`graphus_bolt::BoltError`] as [`run_scripted_bolt_session`].
+pub fn run_bolt_workload(
+    engine: SharedEngine,
+    seed: u64,
+    auth: &dyn AuthProvider,
+    ops: &[crate::mix::WorkloadOp],
+) -> BoltResult<Vec<Response>> {
+    let mut reqs = login_prologue();
+    for op in ops {
+        let (stmt, params) = op.to_cypher();
+        reqs.push(Request::Run {
+            query: stmt.to_owned(),
+            parameters: params,
+            extra: vec![],
+        });
+        reqs.push(Request::Pull { n: -1, qid: None });
+    }
+    reqs.push(Request::Goodbye);
+    run_scripted_bolt_session(engine, seed, auth, &reqs)
+}
+
 /// The standard `HELLO` + `LOGON` prologue for the `sim` user (Bolt 5.x basic auth).
 #[must_use]
 pub fn login_prologue() -> Vec<Request> {
@@ -535,6 +562,26 @@ mod tests {
             (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
         };
         assert_eq!(run(), run(), "same script ⇒ identical REST response");
+    }
+
+    /// The shared workload generator drives the Bolt path: generate a write-heavy op stream and run
+    /// it over a real Bolt session, asserting it completes with no FAILURE (rmp #165).
+    #[test]
+    fn generated_workload_drives_bolt_path() {
+        use crate::mix::{MixProfile, WorkloadGen};
+
+        let mut rng = graphus_sim::SimRng::new(11);
+        let mut wgen = WorkloadGen::new(MixProfile::write_heavy());
+        let ops: Vec<_> = (0..20).map(|_| wgen.next(&mut rng)).collect();
+
+        let eng = engine();
+        let auth = sim_auth();
+        let responses = run_bolt_workload(eng, 11, &auth, &ops).expect("session runs");
+        assert!(
+            !responses.iter().any(|r| matches!(r, Response::Failure { .. })),
+            "generated workload runs clean over Bolt: {responses:?}"
+        );
+        assert!(responses.len() > ops.len(), "each op produced responses");
     }
 
     /// A compile error comes back as an RFC 9457 problem+json with a 4xx status (no panic).

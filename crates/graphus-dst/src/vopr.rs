@@ -20,6 +20,8 @@ use graphus_server::engine::{LocalEngine, RunReply};
 use graphus_sim::{SharedClock, SimScheduler};
 use graphus_wal::MemLogSink;
 
+use crate::mix::{MixProfile, WorkloadGen, WorkloadOp};
+
 /// The simulated engine type: the real engine over the simulated in-memory device + log.
 type SimEngine = LocalEngine<MemBlockDevice, MemLogSink>;
 
@@ -34,10 +36,12 @@ pub struct VoprConfig {
     pub ops_per_client: u32,
     /// Buffer-pool pages for the simulated store.
     pub pool_pages: usize,
+    /// The workload mix (op-class weights) the generator draws from.
+    pub mix: MixProfile,
 }
 
 impl VoprConfig {
-    /// A standard run for `seed` (4 clients × 50 ops over a 256-page pool).
+    /// A standard run for `seed` (4 clients × 50 ops over a 256-page pool, balanced mix).
     #[must_use]
     pub fn for_seed(seed: u64) -> Self {
         Self {
@@ -45,7 +49,15 @@ impl VoprConfig {
             clients: 4,
             ops_per_client: 50,
             pool_pages: 256,
+            mix: MixProfile::mixed(),
         }
+    }
+
+    /// The same run with a specific workload `mix`.
+    #[must_use]
+    pub fn with_mix(mut self, mix: MixProfile) -> Self {
+        self.mix = mix;
+        self
     }
 }
 
@@ -97,7 +109,7 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
     }
 
     let mut trace = Fnv::new();
-    let mut next_person_id: i64 = 0;
+    let mut wgen = WorkloadGen::new(cfg.mix);
     let mut steps = 0usize;
     let mut ok_ops = 0usize;
     let mut err_ops = 0usize;
@@ -106,8 +118,8 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         // Keep the engine's clock in lockstep with logical simulation time.
         clock.set(now);
 
-        let op = gen_op(sched.rng(), &mut next_person_id);
-        let outcome = exec_op(&mut eng, &op);
+        let op = wgen.next(sched.rng());
+        let outcome = exec_op(&mut eng, op);
 
         // Fold this step into the canonical trace (dispatch order, client, op, outcome).
         trace.u64(steps as u64);
@@ -192,6 +204,7 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
             clients,
             ops_per_client: ops,
             pool_pages: 256,
+            mix: MixProfile::mixed(),
         };
         let first = run(cfg);
         let second = run(cfg);
@@ -211,62 +224,6 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
         ));
     }
     (out, failures)
-}
-
-/// A workload operation (a small but LPG-realistic mix: node creates, edge creates, point reads,
-/// neighbourhood traversals). Sprints 2+ broaden this and route it over the wire protocols.
-#[derive(Debug, Clone, Copy)]
-enum Op {
-    CreatePerson { id: i64 },
-    CreateKnows { a: i64, b: i64 },
-    CountPersons,
-    Neighbors { a: i64 },
-}
-
-impl Op {
-    /// A stable label for the trace (independent of the random parameters, which are folded
-    /// separately via the outcome so the trace still distinguishes them through their results).
-    fn label(self) -> &'static str {
-        match self {
-            Op::CreatePerson { .. } => "create_person",
-            Op::CreateKnows { .. } => "create_knows",
-            Op::CountPersons => "count_persons",
-            Op::Neighbors { .. } => "neighbors",
-        }
-    }
-}
-
-/// Generates the next operation from the seeded RNG. The `next_person_id` counter makes node-id
-/// allocation deterministic and monotonic, so a run's id space is a pure function of its op stream.
-fn gen_op(rng: &mut graphus_sim::SimRng, next_person_id: &mut i64) -> Op {
-    // Bootstrap: nothing exists yet ⇒ create the first person.
-    if *next_person_id == 0 {
-        let id = *next_person_id;
-        *next_person_id += 1;
-        return Op::CreatePerson { id };
-    }
-    let count = *next_person_id as u64;
-    match rng.below(100) {
-        // 40%: create a new person (write-heavy bias keeps the graph growing).
-        0..=39 => {
-            let id = *next_person_id;
-            *next_person_id += 1;
-            Op::CreatePerson { id }
-        }
-        // 30%: relate two existing persons (parallel edges + self-loops allowed — multigraph).
-        40..=69 => {
-            let a = rng.below(count) as i64;
-            let b = rng.below(count) as i64;
-            Op::CreateKnows { a, b }
-        }
-        // 15%: a light aggregate read.
-        70..=84 => Op::CountPersons,
-        // 15%: a one-hop traversal read.
-        _ => {
-            let a = rng.below(count) as i64;
-            Op::Neighbors { a }
-        }
-    }
 }
 
 /// The deterministic result of executing one operation (no wall-clock, no identity — only what the
@@ -295,37 +252,16 @@ impl Outcome {
     }
 }
 
-/// Executes one operation through the real engine in its own auto-commit transaction.
-fn exec_op(eng: &mut SimEngine, op: &Op) -> Outcome {
-    match *op {
-        Op::CreatePerson { id } => run_stmt(
-            eng,
-            AccessMode::Write,
-            "CREATE (:Person {id: $id})",
-            vec![("id".to_owned(), Value::Integer(id))],
-        ),
-        Op::CreateKnows { a, b } => run_stmt(
-            eng,
-            AccessMode::Write,
-            "MATCH (a:Person {id: $a}), (b:Person {id: $b}) CREATE (a)-[:KNOWS]->(b)",
-            vec![
-                ("a".to_owned(), Value::Integer(a)),
-                ("b".to_owned(), Value::Integer(b)),
-            ],
-        ),
-        Op::CountPersons => run_stmt(
-            eng,
-            AccessMode::Read,
-            "MATCH (n:Person) RETURN count(n) AS c",
-            vec![],
-        ),
-        Op::Neighbors { a } => run_stmt(
-            eng,
-            AccessMode::Read,
-            "MATCH (:Person {id: $a})-[:KNOWS]->(b) RETURN b.id AS id ORDER BY b.id",
-            vec![("a".to_owned(), Value::Integer(a))],
-        ),
-    }
+/// Executes one workload operation through the real engine in its own auto-commit transaction. The
+/// statement + parameters come from [`WorkloadOp::to_cypher`], shared with the Bolt/REST drivers.
+fn exec_op(eng: &mut SimEngine, op: WorkloadOp) -> Outcome {
+    let mode = if op.is_write() {
+        AccessMode::Write
+    } else {
+        AccessMode::Read
+    };
+    let (stmt, params) = op.to_cypher();
+    run_stmt(eng, mode, stmt, params)
 }
 
 /// Runs one statement to completion in a fresh auto-commit transaction, draining its rows.
