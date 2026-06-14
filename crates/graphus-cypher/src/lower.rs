@@ -1049,11 +1049,32 @@ impl Planner {
                 }
             }
         }
-        LogicalOp::Merge {
+        // A named MERGE path (`MERGE p = (a)-[:R]->(b)`) binds the path value over the pattern's
+        // traversal variables, exactly like a `MATCH p = …` (`clauses/merge/Merge1` [13],
+        // `Merge5` [10]). The MERGE has already bound the anchor node and every step relationship into
+        // the row (whether matched or created), so a `NamedPath` over those variables reconstructs the
+        // path identically to the read path — reusing the same operator rather than a bespoke one. The
+        // traversal variables are read back from the create-parts list (including synthetic names for
+        // anonymous nodes/relationships), guaranteeing the `NamedPath` references the same bindings the
+        // MERGE produced: the anchor is the first node, the steps are the relationships, in order.
+        let path = m.pattern.var.as_ref().map(|v| {
+            let (anchor, steps) = merge_path_traversal_vars(&pattern);
+            (Var::named(&v.name), anchor, steps)
+        });
+        let merge = LogicalOp::Merge {
             input: Box::new(input),
             pattern,
             on_create,
             on_match,
+        };
+        match path {
+            Some((variable, start, steps)) => LogicalOp::NamedPath {
+                input: Box::new(merge),
+                variable,
+                start,
+                steps,
+            },
+            None => merge,
         }
     }
 
@@ -1202,6 +1223,32 @@ impl Planner {
 // =================================================================================================
 
 /// Lowers an AST [`SetItem`] to a logical [`SetOp`].
+/// Extracts the path-traversal variables from a single MERGE pattern's lowered create-parts: the
+/// anchor node variable (the first [`CreatePart::Node`]) and the step relationship variables (every
+/// [`CreatePart::Relationship`], in order). These are exactly what a
+/// [`NamedPath`](LogicalOp::NamedPath) operator needs to reconstruct `MERGE p = …`
+/// (`clauses/merge/Merge1` [13], `Merge5` [10]).
+fn merge_path_traversal_vars(pattern: &[CreatePart]) -> (Var, Vec<Var>) {
+    let mut anchor = None;
+    let mut steps = Vec::new();
+    for part in pattern {
+        match part {
+            CreatePart::Node { variable, .. } => {
+                if anchor.is_none() {
+                    anchor = Some(variable.clone());
+                }
+            }
+            CreatePart::Relationship { variable, .. } => steps.push(variable.clone()),
+        }
+    }
+    // A MERGE pattern always has at least one node, so the anchor is present; default to a fresh
+    // synthetic name only as an unreachable fallback (keeps the function total without a panic).
+    (
+        anchor.unwrap_or_else(|| Var::named("  merge_path_anchor")),
+        steps,
+    )
+}
+
 fn lower_set_item(item: &SetItem) -> SetOp {
     match item {
         SetItem::Property { target, value } => SetOp::Property {

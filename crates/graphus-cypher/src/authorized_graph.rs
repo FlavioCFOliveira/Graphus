@@ -654,6 +654,36 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.merge_node_properties(node, properties);
     }
 
+    fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        if self.oracle.is_unrestricted() {
+            self.inner.replace_rel_properties(rel, properties);
+            return;
+        }
+        // `SET r = map` replaces the whole property set; require write on every key under the rel's
+        // type (clearing a property the user could not write would be a covert delete).
+        for (key, _) in properties {
+            if !self.rel_write_property_allowed(rel, key) {
+                self.deny(Self::forbidden("write", "property", key));
+                return;
+            }
+        }
+        self.inner.replace_rel_properties(rel, properties);
+    }
+
+    fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        if self.oracle.is_unrestricted() {
+            self.inner.merge_rel_properties(rel, properties);
+            return;
+        }
+        for (key, _) in properties {
+            if !self.rel_write_property_allowed(rel, key) {
+                self.deny(Self::forbidden("write", "property", key));
+                return;
+            }
+        }
+        self.inner.merge_rel_properties(rel, properties);
+    }
+
     fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
         let rels = self.inner.incident_rels(node);
         if self.oracle.is_unrestricted() {

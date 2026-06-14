@@ -801,7 +801,7 @@ impl Analyzer<'_> {
     }
 
     fn check_merge(&self, m: &MergeClause, scope: &mut Scope) -> Result<(), SemanticError> {
-        self.bind_pattern_part(&m.pattern, scope, PatternRole::Create)?;
+        self.bind_pattern_part(&m.pattern, scope, PatternRole::Merge)?;
         for action in &m.actions {
             let items = match action {
                 MergeAction::OnCreate(items) | MergeAction::OnMatch(items) => items,
@@ -1426,7 +1426,7 @@ impl Analyzer<'_> {
         // endpoint* of a relationship chain (`MATCH (a), (b) CREATE (a)-[:R]->(b)`). A standalone
         // node part re-using a bound name always creates a new node and so conflicts: TCK
         // `VariableAlreadyBound` (`Fail when creating a node that is already bound`).
-        if role == PatternRole::Create && element.chain.is_empty() {
+        if role.is_write() && element.chain.is_empty() {
             if let Some(var) = &element.start.variable {
                 if scope.contains(&var.name) {
                     return Err(SemanticError::new(
@@ -1457,7 +1457,7 @@ impl Analyzer<'_> {
             // labels or properties to it would redefine the existing node — TCK
             // `VariableAlreadyBound` (`Fail when adding a new label predicate on a node that is
             // already bound`).
-            if role == PatternRole::Create
+            if role.is_write()
                 && scope.contains(&var.name)
                 && (!node.labels.is_empty() || node.properties.is_some())
             {
@@ -1471,8 +1471,28 @@ impl Analyzer<'_> {
             scope.bind(&var.name, VarKind::Node, var.span)?;
         }
         if let Some(props) = &node.properties {
+            // A parameter as the inline predicate of a MERGE node (`MERGE (n $param)`) is rejected at
+            // compile time (`clauses/merge/Merge1` [16]). Checked before the generic expression walk
+            // so the MERGE-specific detail wins.
+            if role == PatternRole::Merge {
+                Self::reject_parameter_predicate(props)?;
+            }
             self.check_expr(props, scope)?;
             self.reject_aggregation(props, "a pattern")?;
+        }
+        Ok(())
+    }
+
+    /// Rejects a parameter used directly as an inline property predicate of a `MERGE` pattern element
+    /// (`MERGE (n $param)`, `MERGE (a)-[r:T $param]->(b)`). openCypher's `Properties` grammar admits
+    /// `MapLiteral | Parameter`, but `MERGE` requires a statically-known predicate, so a bare
+    /// parameter there is `InvalidParameterUse` (`clauses/merge/Merge1` [16], `Merge5` [27]).
+    fn reject_parameter_predicate(props: &Expr) -> Result<(), SemanticError> {
+        if matches!(props.kind, ExprKind::Parameter(_)) {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidParameterUse,
+                props.span,
+            ));
         }
         Ok(())
     }
@@ -1488,7 +1508,7 @@ impl Analyzer<'_> {
         // `MATCH ()-[r]->() CREATE ()-[r]->()`). Checked BEFORE the well-formedness rules below —
         // the TCK expects the variable fault to win when both apply (Create2 [23]). For MATCH,
         // repeating a relationship variable is handled by `Scope::bind`'s same-kind/conflict rules.
-        if role == PatternRole::Create {
+        if role.is_write() {
             if let Some(var) = &rel.variable {
                 if scope.contains(&var.name) {
                     return Err(SemanticError::new(
@@ -1500,14 +1520,16 @@ impl Analyzer<'_> {
                 }
             }
             // CREATE/MERGE relationship well-formedness (TCK):
-            // exactly one type, a direction, and no variable-length range.
+            // exactly one type and no variable-length range. A direction is *also* required for
+            // CREATE, but `MERGE` permits an **undirected** relationship: it matches both directions
+            // and, when none exists, creates one left-to-right (`clauses/merge/Merge5` [11]-[13]).
             if rel.range.is_some() {
                 return Err(SemanticError::new(
                     SemanticErrorKind::CreatingVarLength,
                     rel.span,
                 ));
             }
-            if rel.direction == RelDirection::Undirected {
+            if role == PatternRole::Create && rel.direction == RelDirection::Undirected {
                 return Err(SemanticError::new(
                     SemanticErrorKind::RequiresDirectedRelationship,
                     rel.span,
@@ -1532,6 +1554,11 @@ impl Analyzer<'_> {
             )?;
         }
         if let Some(props) = &rel.properties {
+            // A parameter as the inline predicate of a MERGE relationship (`MERGE (a)-[r:T $param]->(b)`)
+            // is rejected at compile time (`clauses/merge/Merge5` [27]).
+            if role == PatternRole::Merge {
+                Self::reject_parameter_predicate(props)?;
+            }
             self.check_expr(props, scope)?;
             self.reject_aggregation(props, "a pattern")?;
         }
@@ -2315,6 +2342,21 @@ impl Analyzer<'_> {
 enum PatternRole {
     Read,
     Create,
+    /// A `MERGE` pattern. Shares `CREATE`'s write-pattern well-formedness rules (single relationship
+    /// type, no variable-length range, no rebinding of a bound entity variable), with two
+    /// differences: an **undirected** relationship is permitted (`MERGE` matches both directions and
+    /// creates left-to-right — `clauses/merge/Merge5` [11]-[13]), and a **parameter** used as an
+    /// inline property predicate is rejected as `InvalidParameterUse` (`clauses/merge/Merge1` [16],
+    /// `clauses/merge/Merge5` [27]).
+    Merge,
+}
+
+impl PatternRole {
+    /// Whether this role is a write pattern (`CREATE`/`MERGE`) subject to the extra relationship
+    /// well-formedness rules and the bound-variable-rebinding checks.
+    const fn is_write(self) -> bool {
+        matches!(self, Self::Create | Self::Merge)
+    }
 }
 
 /// Whether any node or relationship variable inside `element` is named `name` (the same-pattern

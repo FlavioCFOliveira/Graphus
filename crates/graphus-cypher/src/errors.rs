@@ -213,6 +213,12 @@ pub enum SemanticDetail {
     /// isomorphism forbids traversing one relationship twice in a pattern, so reusing its variable is
     /// a compile-time error (TCK `clauses/match/Match3` [29]).
     RelationshipUniquenessViolation,
+    /// `InvalidParameterUse` — a parameter (`$param`) appears where the grammar forbids it: as the
+    /// inline property predicate of a `MERGE` node or relationship (`MERGE (n $param)`,
+    /// `MERGE (a)-[r:T $param]->(b)`). openCypher rejects this at compile time because `MERGE`'s
+    /// match-or-create needs a *statically-known* property predicate; a parameter map is not one
+    /// (TCK `clauses/merge/Merge1` [16], `clauses/merge/Merge5` [27]).
+    InvalidParameterUse,
 }
 
 impl SemanticDetail {
@@ -248,6 +254,7 @@ impl SemanticDetail {
             Self::InvalidShortestPath => "InvalidShortestPath",
             Self::UnexpectedSyntax => "UnexpectedSyntax",
             Self::RelationshipUniquenessViolation => "RelationshipUniquenessViolation",
+            Self::InvalidParameterUse => "InvalidParameterUse",
         }
     }
 }
@@ -483,6 +490,12 @@ pub enum SemanticErrorKind {
         /// The reused relationship variable name.
         name: String,
     },
+    /// A parameter (`$param`) is used as the inline property predicate of a `MERGE` node or
+    /// relationship (`MERGE (n $param)`, `MERGE (a)-[r:T $param]->(b)`). `MERGE`'s match-or-create
+    /// requires a statically-known property predicate, so a parameter map there is rejected at
+    /// compile time. TCK detail `InvalidParameterUse` (`clauses/merge/Merge1` [16],
+    /// `clauses/merge/Merge5` [27]).
+    InvalidParameterUse,
 }
 
 /// How a pattern variable is bound — used to report [`SemanticErrorKind::VariableTypeConflict`].
@@ -544,6 +557,7 @@ impl SemanticErrorKind {
             Self::RelationshipUniquenessViolation { .. } => {
                 SemanticDetail::RelationshipUniquenessViolation
             }
+            Self::InvalidParameterUse => SemanticDetail::InvalidParameterUse,
         }
     }
 
@@ -684,6 +698,9 @@ impl fmt::Display for SemanticErrorKind {
                 "relationship variable `{name}` is used more than once in the same pattern; a \
                  relationship may not be traversed twice in one MATCH (relationship uniqueness)"
             ),
+            Self::InvalidParameterUse => f.write_str(
+                "a parameter cannot be used as the inline property predicate of a MERGE pattern",
+            ),
         }
     }
 }
@@ -745,6 +762,11 @@ mod tests {
             // here for the same stability guarantee.
             (SemanticDetail::InvalidShortestPath, "InvalidShortestPath"),
             (SemanticDetail::UnexpectedSyntax, "UnexpectedSyntax"),
+            (
+                SemanticDetail::RelationshipUniquenessViolation,
+                "RelationshipUniquenessViolation",
+            ),
+            (SemanticDetail::InvalidParameterUse, "InvalidParameterUse"),
         ];
         for (detail, s) in pairs {
             assert_eq!(detail.as_tck_str(), s);
@@ -837,9 +859,8 @@ mod tests {
                 | SemanticErrorKind::InvalidLoadCsvUrl
                 | SemanticErrorKind::InvalidShortestPath { .. }
                 | SemanticErrorKind::PatternPredicateInExpression
-                | SemanticErrorKind::RelationshipUniquenessViolation { .. } => {
-                    kind.classification()
-                }
+                | SemanticErrorKind::RelationshipUniquenessViolation { .. }
+                | SemanticErrorKind::InvalidParameterUse => kind.classification(),
             }
         }
 

@@ -284,6 +284,13 @@ pub trait GraphAccess {
     /// [`Value::Null`] value removes that key. No-op if absent.
     fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]);
 
+    /// Replaces `rel`'s properties entirely with `properties` (`SET r = map`). No-op if absent.
+    fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]);
+
+    /// Merges `properties` into `rel`'s properties, keeping unmentioned ones (`SET r += map`); a
+    /// [`Value::Null`] value removes that key. No-op if absent.
+    fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]);
+
     /// The relationship ids incident to `node` in **either** direction (used by `DETACH DELETE`).
     fn incident_rels(&self, node: NodeId) -> Vec<RelId>;
 
@@ -768,6 +775,29 @@ impl GraphAccess for MemGraph {
                     n.props.remove(k);
                 } else {
                     n.props.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        if let Some(r) = self.rels.get_mut(&rel) {
+            r.props.clear();
+            for (k, v) in properties {
+                if !v.is_null() {
+                    r.props.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        if let Some(r) = self.rels.get_mut(&rel) {
+            for (k, v) in properties {
+                if v.is_null() {
+                    r.props.remove(k);
+                } else {
+                    r.props.insert(k.clone(), v.clone());
                 }
             }
         }

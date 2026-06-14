@@ -489,8 +489,33 @@ fn merge_relationship_well_formedness_is_enforced() {
         "MERGE (a)-[r]->(b)",
         SemanticDetail::NoSingleRelationshipType,
     );
+    // Unlike CREATE, MERGE *permits* an undirected relationship: it matches both directions and, with
+    // no match, creates one left-to-right (openCypher `clauses/merge/Merge5` [11]-[13]).
+    ok("MERGE (a)-[:KNOWS]-(b)");
+    // The CREATE/MERGE-shared faults still apply to MERGE: a variable-length range is `CreatingVarLength`,
+    // and more than one type is `NoSingleRelationshipType`.
     assert_detail(
-        "MERGE (a)-[:KNOWS]-(b)",
+        "MERGE (a)-[:A|:B]->(b)",
+        SemanticDetail::NoSingleRelationshipType,
+    );
+    assert_detail("MERGE (a)-[:FOO*2]->(b)", SemanticDetail::CreatingVarLength);
+}
+
+#[test]
+fn merge_parameter_predicate_is_invalid_parameter_use() {
+    // A parameter as the inline property predicate of a MERGE node or relationship is the
+    // compile-time SyntaxError `InvalidParameterUse` (`clauses/merge/Merge1` [16], `Merge5` [27]).
+    assert_detail(
+        "MERGE (n $param) RETURN n",
+        SemanticDetail::InvalidParameterUse,
+    );
+    assert_detail(
+        "MERGE (a) MERGE (b) MERGE (a)-[r:FOO $param]->(b) RETURN r",
+        SemanticDetail::InvalidParameterUse,
+    );
+    // A directed CREATE relationship is still undirected-rejected (the rule is unchanged for CREATE).
+    assert_detail(
+        "CREATE (a)-[:KNOWS]-(b)",
         SemanticDetail::RequiresDirectedRelationship,
     );
 }

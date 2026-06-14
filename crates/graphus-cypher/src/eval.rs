@@ -226,7 +226,7 @@ pub fn eval_value(
 
 /// Collapses a [`RowValue`] to a property [`Value`]. An entity reference has **no** property value,
 /// so it becomes `Null` in a value context (it is only meaningful as a structural row binding).
-fn to_value(rv: RowValue) -> Value {
+pub(crate) fn to_value(rv: RowValue) -> Value {
     match rv {
         RowValue::Value(v) => v,
         // An entity/path in a pure value context is not a property value; collapse to null.

@@ -200,7 +200,28 @@ use graphus_tck::runner::run_scenario;
 /// (`DELETE n:Person`/`r:T`) is `InvalidDelete` (`Delete5` [9], `Delete1`/`Delete2`). Measured,
 /// zero regressions (full failure-set diff: 0 newly-failing scenarios; the net +24 is purely
 /// additive).
-const BASELINE: usize = 3830;
+///
+/// 3830 → 3847 (#137, MERGE semantics): `clauses/merge/{Merge1,Merge5,Merge6,Merge7}` all to 100%,
+/// closing 16 scenarios, plus one additive knock-on (`clauses/match/Match8` [2], which combines
+/// MATCH/MERGE/OPTIONAL MATCH). Six fixes: (1) **path binding** — `MERGE p = …` now wraps the merge
+/// in the same `NamedPath` operator a `MATCH p = …` uses, over the create-parts' anchor/step
+/// variables (`Merge1` [13], `Merge5` [10]); (2) **deleted-entity visibility** — a `MERGE` whose
+/// input reads the graph gets the same delete-after-read `Eager` barrier `DELETE` has, so a prior
+/// same-query delete is fully settled before the match scan, never matching a tombstoned entity
+/// (`Merge1` [14], `Merge5` [20]); (3) **unspecified direction** — an undirected `MERGE` relationship
+/// is now accepted (the `RequiresDirectedRelationship` check is `CREATE`-only), matches both
+/// orientations, and creates left-to-right when absent (`Merge5` [11]-[13]); (4) **null property** —
+/// a `MERGE` inline map with a null value raises the runtime `SemanticError: MergeReadOwnWrites` via
+/// the new `ExecError::MergeNullProperty` (`Merge1` [17], `Merge5` [29]); (5) **parameter predicate**
+/// — a parameter used as a `MERGE` node/relationship predicate is the compile-time
+/// `SyntaxError: InvalidParameterUse`, raised by semantic analysis before parameter binding
+/// (`Merge1` [16], `Merge5` [27]); (6) **multi-match fan-out** — `MERGE` now binds **all** matches
+/// (one row each) when several exist and creates only on zero matches, deduping a self-loop reported
+/// twice by the undirected expansion (`Merge5` [3][18][19]); plus `SET r = a` / `SET r += map` now
+/// copy onto a **relationship** (new rel-property seam methods + entity-source eval), fixing
+/// `Merge6` [6][7] and `Merge7` [4][5]. Measured, zero regressions (full failure-set diff: 0
+/// newly-failing scenarios; the net +17 is purely additive).
+const BASELINE: usize = 3847;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

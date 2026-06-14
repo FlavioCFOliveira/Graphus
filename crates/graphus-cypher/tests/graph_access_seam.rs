@@ -165,6 +165,12 @@ impl GraphAccess for IndexedGraph {
     fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
         self.inner.merge_node_properties(node, properties);
     }
+    fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        self.inner.replace_rel_properties(rel, properties);
+    }
+    fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        self.inner.merge_rel_properties(rel, properties);
+    }
     fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
         self.inner.incident_rels(node)
     }

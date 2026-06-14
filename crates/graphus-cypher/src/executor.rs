@@ -109,6 +109,12 @@ pub enum ExecError {
     },
     /// A `CREATE`/`MERGE` inline property map was not a map value at runtime.
     PropertiesNotAMap,
+    /// A `MERGE` pattern's inline property map evaluated to a **null** value for some key
+    /// (`MERGE ({num: null})`, `MERGE (a)-[r:X {num: null}]->(b)`). `MERGE` cannot match-or-create on
+    /// a null property predicate, so this is the runtime TCK `SemanticError: MergeReadOwnWrites`
+    /// (`clauses/merge/Merge1` [17], `clauses/merge/Merge5` [29]). The value is only known once the
+    /// map is evaluated, so the fault is necessarily runtime, not compile-time.
+    MergeNullProperty,
     /// A `LOAD CSV` source could not be read: the URL was not a string, named a non-`file` scheme
     /// (rejected by the Neo4j `LOAD CSV` security model), the file was missing/unreadable, or a
     /// record failed to parse.
@@ -135,6 +141,10 @@ impl fmt::Display for ExecError {
                 write!(f, "expected a node or relationship: {context}")
             }
             Self::PropertiesNotAMap => write!(f, "inline properties must be a map"),
+            Self::MergeNullProperty => write!(
+                f,
+                "MERGE cannot use a null property value as a match predicate (MergeReadOwnWrites)"
+            ),
             Self::LoadCsv { reason } => write!(f, "LOAD CSV failed: {reason}"),
             Self::Procedure(failure) => write!(f, "{failure}"),
         }
@@ -316,9 +326,16 @@ enum Operator {
     },
 
     /// A write operator (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`), applied once per input row.
+    ///
+    /// A `MERGE` can emit **more than one** row for a single input row: when its pattern matches
+    /// several existing entities (e.g. two relationships satisfy `MERGE (a)-[r:T]->(b)`), it binds
+    /// **all** matches, one output row each (`clauses/merge/Merge5` [3]). The `pending` queue holds the
+    /// not-yet-emitted rows of the current input row; every other write kind produces exactly one row
+    /// and leaves the queue empty.
     Write {
         input: Box<Operator>,
         kind: WriteKind,
+        pending: VecDeque<Row>,
     },
 
     /// `CALL proc(args) [YIELD …]` (rmp #57): for each driving row, evaluate the arguments, invoke
@@ -673,12 +690,28 @@ impl Operator {
                 *current_right = Some(Box::new(right_op));
             },
 
-            Operator::Write { input, kind } => {
-                if let Some(row) = input.next(ctx)? {
-                    let out = apply_write(kind, row, ctx)?;
-                    Ok(Some(out))
-                } else {
-                    Ok(None)
+            Operator::Write {
+                input,
+                kind,
+                pending,
+            } => {
+                loop {
+                    // Drain any rows the previous input row fanned out (a multi-match MERGE) first.
+                    if let Some(row) = pending.pop_front() {
+                        return Ok(Some(row));
+                    }
+                    let Some(row) = input.next(ctx)? else {
+                        return Ok(None);
+                    };
+                    let mut out = apply_write(kind, row, ctx)?;
+                    // The common case is a single output row; fan-out (multi-match MERGE) queues the
+                    // rest. An empty `out` (no row produced) loops to the next input row.
+                    if out.is_empty() {
+                        continue;
+                    }
+                    let first = out.remove(0);
+                    pending.extend(out);
+                    return Ok(Some(first));
                 }
             }
 
@@ -1736,6 +1769,7 @@ fn build_operator(
             kind: WriteKind::Create {
                 pattern: pattern.clone(),
             },
+            pending: VecDeque::new(),
         }),
         PhysicalOp::Merge {
             input,
@@ -1749,10 +1783,12 @@ fn build_operator(
                 on_create: on_create.clone(),
                 on_match: on_match.clone(),
             },
+            pending: VecDeque::new(),
         }),
         PhysicalOp::SetClause { input, ops } => Ok(Operator::Write {
             input: Box::new(build_operator(input, arg, ctx)?),
             kind: WriteKind::Set { ops: ops.clone() },
+            pending: VecDeque::new(),
         }),
         PhysicalOp::Delete {
             input,
@@ -1764,10 +1800,12 @@ fn build_operator(
                 detach: *detach,
                 exprs: exprs.clone(),
             },
+            pending: VecDeque::new(),
         }),
         PhysicalOp::Remove { input, ops } => Ok(Operator::Write {
             input: Box::new(build_operator(input, arg, ctx)?),
             kind: WriteKind::Remove { ops: ops.clone() },
+            pending: VecDeque::new(),
         }),
 
         // ---- procedure ------------------------------------------------------------------------
@@ -2663,11 +2701,14 @@ fn union_rows(
 // Write application
 // =================================================================================================
 
-/// Applies a write to the graph for one driving row, returning the row extended with any new
-/// bindings (created entities).
-fn apply_write(kind: &WriteKind, row: Row, ctx: &mut Ctx<'_>) -> Result<Row, ExecError> {
+/// Applies a write to the graph for one driving row, returning the output rows.
+///
+/// Every write kind produces exactly one row — the input row extended with any new bindings —
+/// **except** `MERGE`, which fans out **one row per match** when its pattern matches several existing
+/// entities (`clauses/merge/Merge5` [3]).
+fn apply_write(kind: &WriteKind, row: Row, ctx: &mut Ctx<'_>) -> Result<Vec<Row>, ExecError> {
     match kind {
-        WriteKind::Create { pattern } => create_pattern(pattern, row, ctx),
+        WriteKind::Create { pattern } => Ok(vec![create_pattern(pattern, row, ctx)?]),
         WriteKind::Merge {
             pattern,
             on_create,
@@ -2675,15 +2716,15 @@ fn apply_write(kind: &WriteKind, row: Row, ctx: &mut Ctx<'_>) -> Result<Row, Exe
         } => merge_pattern(pattern, on_create, on_match, row, ctx),
         WriteKind::Set { ops } => {
             apply_set_ops(ops, &row, ctx)?;
-            Ok(row)
+            Ok(vec![row])
         }
         WriteKind::Delete { detach, exprs } => {
             apply_delete(*detach, exprs, &row, ctx)?;
-            Ok(row)
+            Ok(vec![row])
         }
         WriteKind::Remove { ops } => {
             apply_remove_ops(ops, &row, ctx)?;
-            Ok(row)
+            Ok(vec![row])
         }
     }
 }
@@ -2762,95 +2803,131 @@ fn rel_endpoints(
     }
 }
 
-/// `MERGE`: try to match the pattern against the current row; create it if absent. Runs the
+/// `MERGE`: try to match the pattern against the current row; create it if no match exists. Runs the
 /// `ON MATCH` / `ON CREATE` side-effects accordingly.
+///
+/// openCypher `MERGE` semantics: if the pattern matches **at least one** existing binding, bind
+/// **all** matches (one output row each) and run `ON MATCH`; otherwise create **exactly one**
+/// instance and run `ON CREATE` (`clauses/merge/Merge5` [3] requires the multi-match fan-out).
 fn merge_pattern(
     pattern: &[CreatePart],
     on_create: &[SetOp],
     on_match: &[SetOp],
     row: Row,
     ctx: &mut Ctx<'_>,
-) -> Result<Row, ExecError> {
-    if let Some(matched) = try_match_pattern(pattern, &row, ctx)? {
-        apply_set_ops(on_match, &matched, ctx)?;
+) -> Result<Vec<Row>, ExecError> {
+    let matched = try_match_pattern(pattern, &row, ctx)?;
+    if !matched.is_empty() {
+        for m in &matched {
+            apply_set_ops(on_match, m, ctx)?;
+        }
         Ok(matched)
     } else {
         let created = create_pattern(pattern, row, ctx)?;
         apply_set_ops(on_create, &created, ctx)?;
-        Ok(created)
+        Ok(vec![created])
     }
 }
 
-/// Attempts to find an existing binding satisfying the MERGE pattern, given the already-bound row.
+/// Finds **every** existing binding satisfying the MERGE pattern, given the already-bound row.
 ///
-/// v1 supports the common shapes: a single node `MERGE (n:Label {props})`, and a relationship
-/// `MERGE (a)-[r:T {props}]->(b)` whose endpoints are already bound. Returns the row extended with
-/// the matched bindings, or `None` if no match exists.
+/// Supports the shapes MERGE admits: a single node `MERGE (n:Label {props})`, and a relationship
+/// `MERGE (a)-[r:T {props}]->(b)` (directed or undirected) whose endpoints are already bound or
+/// matched earlier in the pattern. Returns one row per match (extended with the matched bindings),
+/// or an empty vector when no match exists. Each part fans the working rows out over its candidates,
+/// so several matches multiply (`clauses/merge/Merge5` [3]).
 fn try_match_pattern(
     pattern: &[CreatePart],
     row: &Row,
     ctx: &mut Ctx<'_>,
-) -> Result<Option<Row>, ExecError> {
-    // We only handle a single-part pattern's primary entity for matching (the planner enforces
-    // MERGE's single pattern). A node part matches by label set + the inline property map; a
-    // relationship part matches by type + endpoints + inline properties.
-    let mut working = row.clone();
+) -> Result<Vec<Row>, ExecError> {
+    // Start from the single driving row; each part either keeps a working row (a reused/bound entity),
+    // matches it against zero or more candidates (fanning out), or eliminates it (no match). An empty
+    // working set at any point means "no match" — `MERGE` then creates.
+    let mut working = vec![row.clone()];
     for part in pattern {
-        match part {
-            CreatePart::Node {
-                variable,
-                labels,
-                properties,
-            } => {
-                // If the variable is already bound to a node (from prior MATCH), reuse it.
-                if working
-                    .get(&variable.name)
-                    .and_then(RowValue::as_node)
-                    .is_some()
-                {
-                    continue;
-                }
-                let props = eval_properties(properties.as_ref(), &working, ctx)?;
-                let label_names: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
-                let candidates = match label_names.first() {
-                    Some(first) => ctx.graph.scan_nodes_by_label(first),
-                    None => ctx.graph.scan_nodes(),
-                };
-                let found = candidates.into_iter().find(|id| {
-                    node_has_labels(*id, &label_names, ctx) && node_has_props(*id, &props, ctx)
-                });
-                match found {
-                    Some(id) => working.set(variable.name.clone(), RowValue::Node(NodeRef { id })),
-                    None => return Ok(None),
-                }
-            }
-            CreatePart::Relationship {
-                variable,
-                from,
-                to,
-                rel_type,
-                direction,
-                properties,
-            } => {
-                let props = eval_properties(properties.as_ref(), &working, ctx)?;
-                let (start, end) = rel_endpoints(from, to, *direction, &working)?;
-                let type_names = [rel_type.name.clone()];
-                let found = ctx
-                    .graph
-                    .expand(start, ExpandDirection::Outgoing, &type_names)
-                    .into_iter()
-                    .filter(|inc| inc.neighbour == end)
-                    .find(|inc| rel_has_props(inc.rel, &props, ctx));
-                match found {
-                    Some(inc) => {
-                        working.set(variable.name.clone(), RowValue::Rel(RelRef { id: inc.rel }))
+        let mut next = Vec::new();
+        for w in working {
+            match part {
+                CreatePart::Node {
+                    variable,
+                    labels,
+                    properties,
+                } => {
+                    // A variable already bound to a node (prior MATCH/MERGE) is reused as-is.
+                    if w.get(&variable.name).and_then(RowValue::as_node).is_some() {
+                        next.push(w);
+                        continue;
                     }
-                    None => return Ok(None),
+                    let props = eval_merge_properties(properties.as_ref(), &w, ctx)?;
+                    let label_names: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
+                    let candidates = match label_names.first() {
+                        Some(first) => ctx.graph.scan_nodes_by_label(first),
+                        None => ctx.graph.scan_nodes(),
+                    };
+                    for id in candidates {
+                        if node_has_labels(id, &label_names, ctx) && node_has_props(id, &props, ctx)
+                        {
+                            let mut row = w.clone();
+                            row.set(variable.name.clone(), RowValue::Node(NodeRef { id }));
+                            next.push(row);
+                        }
+                    }
+                }
+                CreatePart::Relationship {
+                    variable,
+                    from,
+                    to,
+                    rel_type,
+                    direction,
+                    properties,
+                } => {
+                    let props = eval_merge_properties(properties.as_ref(), &w, ctx)?;
+                    // Endpoints are resolved in pattern order (left node, right node). A directed
+                    // pattern fixes the orientation; an undirected one matches a relationship in either
+                    // orientation between the two endpoints.
+                    let (left, right) = rel_endpoints(from, to, RelDirection::LeftToRight, &w)?;
+                    let type_names = [rel_type.name.clone()];
+                    // `expand(..Both..)` reports each incident relationship once per side it touches, so
+                    // a self-loop (or an `a`/`b` alias of the same node) appears twice; dedup by
+                    // relationship id so one relationship yields at most one match per working row
+                    // (`clauses/merge/Merge5` [18][19]).
+                    let mut seen = std::collections::HashSet::new();
+                    for inc in ctx.graph.expand(left, ExpandDirection::Both, &type_names) {
+                        // Keep only the side whose neighbour is the other endpoint.
+                        if inc.neighbour != right {
+                            continue;
+                        }
+                        // Orientation gate: a left-to-right pattern accepts only `left -> right`; a
+                        // right-to-left pattern accepts only `right -> left`; an undirected pattern
+                        // accepts either.
+                        let is_outgoing = rel_starts_at(inc.rel, left, ctx);
+                        let accept = match direction {
+                            RelDirection::LeftToRight => is_outgoing,
+                            RelDirection::RightToLeft => !is_outgoing,
+                            RelDirection::Undirected => true,
+                        };
+                        if accept && seen.insert(inc.rel) && rel_has_props(inc.rel, &props, ctx) {
+                            let mut row = w.clone();
+                            row.set(variable.name.clone(), RowValue::Rel(RelRef { id: inc.rel }));
+                            next.push(row);
+                        }
+                    }
                 }
             }
         }
+        working = next;
+        if working.is_empty() {
+            return Ok(Vec::new());
+        }
     }
-    Ok(Some(working))
+    Ok(working)
+}
+
+/// Whether relationship `rel` has `node` as its start node (used to orient an undirected MERGE match
+/// reported through a `Both` expansion).
+fn rel_starts_at(rel: crate::graph_access::RelId, node: NodeId, ctx: &Ctx<'_>) -> bool {
+    ctx.graph.rel_data(rel).is_some_and(|d| d.start == node)
 }
 
 /// Whether a node carries all of `labels`.
@@ -2895,6 +2972,51 @@ fn eval_properties(
     }
 }
 
+/// Evaluates a `MERGE` pattern element's inline property map, rejecting any **null** value.
+///
+/// `MERGE` cannot match-or-create on a null property predicate, so a map carrying a null value
+/// (`MERGE ({num: null})`) is the runtime TCK `SemanticError: MergeReadOwnWrites`
+/// (`clauses/merge/Merge1` [17], `Merge5` [29]). The null is only observable once the map is
+/// evaluated, hence this is necessarily a runtime check.
+fn eval_merge_properties(
+    props: Option<&Expr>,
+    row: &Row,
+    ctx: &mut Ctx<'_>,
+) -> Result<Vec<(String, Value)>, ExecError> {
+    let entries = eval_properties(props, row, ctx)?;
+    if entries.iter().any(|(_, v)| v.is_null()) {
+        return Err(ExecError::MergeNullProperty);
+    }
+    Ok(entries)
+}
+
+/// Evaluates the right-hand side of `SET x = src` / `SET x += src` into the property `(key, value)`
+/// pairs to apply.
+///
+/// The source may be a **map literal** (`SET r += {a: 1}`) **or another graph entity** (`SET r = a`,
+/// `SET r += b`): copying an entity's properties is openCypher `SET … = node`/`= relationship`
+/// (`clauses/merge/Merge6` [6], `Merge7` [4]). A `null` source clears (replace) or is a no-op overlay
+/// (merge); anything else is a runtime type error.
+fn eval_property_source(
+    value: &Expr,
+    row: &Row,
+    ctx: &mut Ctx<'_>,
+) -> Result<Vec<(String, Value)>, ExecError> {
+    match eval(value, row, ctx.params, ctx.graph, ctx.functions)? {
+        // A graph entity contributes its own property set (the `SET x = entity` copy form).
+        RowValue::Node(n) => Ok(ctx.graph.node_properties(n.id).unwrap_or_default()),
+        RowValue::Rel(r) => Ok(ctx.graph.rel_properties(r.id).unwrap_or_default()),
+        // A map literal/value contributes its entries directly.
+        RowValue::Value(Value::Map(entries)) => Ok(entries),
+        RowValue::Map(entries) => Ok(entries
+            .into_iter()
+            .map(|(k, v)| (k, crate::eval::to_value(v)))
+            .collect()),
+        RowValue::Value(Value::Null) => Ok(Vec::new()),
+        _ => Err(ExecError::PropertiesNotAMap),
+    }
+}
+
 /// Applies a list of `SET` ops to the current row's bound entities.
 fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
     for op in ops {
@@ -2905,22 +3027,20 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
                 set_entity_property(entity, &key, v, ctx);
             }
             SetOp::ReplaceProperties { target, value } => {
-                let id = entity_node(target, row)?;
-                let props = match eval_value(value, row, ctx.params, ctx.graph, ctx.functions)? {
-                    Value::Map(entries) => entries,
-                    Value::Null => Vec::new(),
-                    _ => return Err(ExecError::PropertiesNotAMap),
-                };
-                ctx.graph.replace_node_properties(id, &props);
+                let entity = entity_ref(target, row)?;
+                let props = eval_property_source(value, row, ctx)?;
+                match entity {
+                    EntityRef::Node(id) => ctx.graph.replace_node_properties(id, &props),
+                    EntityRef::Rel(id) => ctx.graph.replace_rel_properties(id, &props),
+                }
             }
             SetOp::MergeProperties { target, value } => {
-                let id = entity_node(target, row)?;
-                let props = match eval_value(value, row, ctx.params, ctx.graph, ctx.functions)? {
-                    Value::Map(entries) => entries,
-                    Value::Null => Vec::new(),
-                    _ => return Err(ExecError::PropertiesNotAMap),
-                };
-                ctx.graph.merge_node_properties(id, &props);
+                let entity = entity_ref(target, row)?;
+                let props = eval_property_source(value, row, ctx)?;
+                match entity {
+                    EntityRef::Node(id) => ctx.graph.merge_node_properties(id, &props),
+                    EntityRef::Rel(id) => ctx.graph.merge_rel_properties(id, &props),
+                }
             }
             SetOp::AddLabels { target, labels } => {
                 let id = entity_node(target, row)?;
@@ -2971,13 +3091,25 @@ fn set_entity_property(entity: EntityRef, key: &str, value: Value, ctx: &mut Ctx
     }
 }
 
-/// Resolves a variable expression to a bound node id (for label/replace ops, which apply to nodes).
+/// Resolves a variable expression to a bound node id (for label ops, which apply only to nodes).
 fn entity_node(target: &Var, row: &Row) -> Result<NodeId, ExecError> {
     row.get(&target.name)
         .and_then(RowValue::as_node)
         .ok_or_else(|| ExecError::NotAnEntity {
             context: format!("`{}` is not a bound node", target.name),
         })
+}
+
+/// Resolves a variable to the node **or relationship** it is bound to (for `SET x = map` / `SET x +=
+/// map`, which apply to either; `clauses/merge/Merge6` [6][7], `Merge7` [4][5]).
+fn entity_ref(target: &Var, row: &Row) -> Result<EntityRef, ExecError> {
+    match row.get(&target.name) {
+        Some(RowValue::Node(n)) => Ok(EntityRef::Node(n.id)),
+        Some(RowValue::Rel(r)) => Ok(EntityRef::Rel(r.id)),
+        _ => Err(ExecError::NotAnEntity {
+            context: format!("`{}` is not a bound node or relationship", target.name),
+        }),
+    }
 }
 
 /// Applies a `[DETACH] DELETE` to the entities the expressions resolve to.
@@ -3908,6 +4040,154 @@ mod tests {
         let accts = run("MATCH (n:Account) RETURN n.id AS id", &mut g);
         assert_eq!(accts.len(), 1, "MERGE created the missing node");
         assert_eq!(accts[0].value("id"), Value::Integer(7));
+    }
+
+    #[test]
+    fn merge_binds_a_node_path() {
+        // `clauses/merge/Merge1` [13]: `MERGE p = (a {num: 1}) RETURN p` binds a zero-length path
+        // over the merged node.
+        let mut g = MemGraph::new();
+        let rows = run("MERGE p = (a {num: 1}) RETURN p", &mut g);
+        assert_eq!(rows.len(), 1);
+        let path = rows[0].get("p").and_then(RowValue::as_path).expect("path");
+        assert!(path.is_empty(), "a single-node path has no steps");
+        assert_eq!(path.nodes().len(), 1);
+    }
+
+    #[test]
+    fn merge_binds_a_relationship_path() {
+        // `clauses/merge/Merge5` [10]: `MERGE p = (a)-[:R]->(b)` binds a one-hop path over the merged
+        // relationship and its endpoints.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "MERGE (a {num: 1}) MERGE (b {num: 2}) MERGE p = (a)-[:R]->(b) RETURN p",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1);
+        let path = rows[0].get("p").and_then(RowValue::as_path).expect("path");
+        assert_eq!(path.len(), 1, "one relationship hop");
+        assert!(
+            path.steps[0].forward,
+            "created left-to-right, traversed forward"
+        );
+    }
+
+    #[test]
+    fn merge_does_not_match_a_deleted_node_and_creates_fresh() {
+        // `clauses/merge/Merge1` [14]: after `MATCH (a:A) DELETE a`, the MERGE scan must not see the
+        // just-deleted nodes, so every row creates a fresh, property-less node (`a2.num` is null).
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["A"], [("num", Value::Integer(1))]);
+        let _ = g.add_node(["A"], [("num", Value::Integer(2))]);
+        let rows = run(
+            "MATCH (a:A) DELETE a MERGE (a2:A) RETURN a2.num AS num",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 2, "one row per pre-delete A node");
+        assert!(
+            rows.iter().all(|r| r.value("num") == Value::Null),
+            "each MERGE created a fresh property-less node, never matched a deleted one"
+        );
+        // Net: the two originals are gone, one fresh node remains.
+        let live = run("MATCH (n:A) RETURN count(*) AS c", &mut g);
+        assert_eq!(live[0].value("c"), Value::Integer(1));
+    }
+
+    #[test]
+    fn undirected_merge_creates_left_to_right() {
+        // `clauses/merge/Merge5` [11]: an undirected MERGE with no match creates the relationship in
+        // the canonical left-to-right direction (start = left endpoint).
+        let mut g = MemGraph::new();
+        let rows = run(
+            "CREATE (a {id: 2}), (b {id: 1}) \
+             MERGE (a)-[r:KNOWS]-(b) \
+             RETURN startNode(r).id AS s, endNode(r).id AS e",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("s"), Value::Integer(2), "start = left node");
+        assert_eq!(rows[0].value("e"), Value::Integer(1), "end = right node");
+    }
+
+    #[test]
+    fn undirected_merge_matches_existing_reversed_relationship() {
+        // `clauses/merge/Merge5` [12]: an undirected MERGE matches an existing relationship even when
+        // it was stored in the opposite orientation — no new relationship is created.
+        let mut g = MemGraph::new();
+        let a = g.add_node([] as [&str; 0], [("id", Value::Integer(1))]);
+        let b = g.add_node([] as [&str; 0], [("id", Value::Integer(2))]);
+        let _ = g.add_rel("KNOWS", a, b, NO_PROPS);
+        // Query matches with the endpoints swapped relative to the stored direction.
+        let rows = run(
+            "MATCH (x {id: 2}), (y {id: 1}) MERGE (x)-[r:KNOWS]-(y) RETURN r",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1);
+        let rels = run("MATCH ()-[r:KNOWS]->() RETURN count(*) AS c", &mut g);
+        assert_eq!(rels[0].value("c"), Value::Integer(1), "no new relationship");
+    }
+
+    #[test]
+    fn merge_matching_two_relationships_yields_two_rows() {
+        // `clauses/merge/Merge5` [3]: when the pattern matches two relationships, MERGE binds BOTH
+        // (one row each) and creates nothing.
+        let mut g = MemGraph::new();
+        let a = g.add_node(["A"], NO_PROPS);
+        let b = g.add_node(["B"], NO_PROPS);
+        let _ = g.add_rel("TYPE", a, b, NO_PROPS);
+        let _ = g.add_rel("TYPE", a, b, NO_PROPS);
+        let rows = run(
+            "MATCH (a:A), (b:B) MERGE (a)-[r:TYPE]->(b) RETURN r",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 2, "both matching relationships are bound");
+        let total = run("MATCH ()-[r:TYPE]->() RETURN count(*) AS c", &mut g);
+        assert_eq!(total[0].value("c"), Value::Integer(2), "nothing created");
+    }
+
+    #[test]
+    fn merge_with_null_property_raises_runtime_semantic_error() {
+        // `clauses/merge/Merge1` [17]: a null inline property value is a runtime
+        // `SemanticError: MergeReadOwnWrites`.
+        let mut g = MemGraph::new();
+        let err = run_err("MERGE ({num: null})", &mut g);
+        assert!(
+            matches!(err, ExecError::MergeNullProperty),
+            "expected MergeNullProperty, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_copies_relationship_properties_from_a_node() {
+        // `clauses/merge/Merge6` [6]: `ON CREATE SET r = a` copies the node `a`'s properties onto the
+        // freshly-created relationship.
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["A"], [("name", Value::String("A".to_owned()))]);
+        let _ = g.add_node(["B"], [("name", Value::String("B".to_owned()))]);
+        let _ = run(
+            "MATCH (a {name: 'A'}), (b {name: 'B'}) \
+             MERGE (a)-[r:TYPE]->(b) ON CREATE SET r = a",
+            &mut g,
+        );
+        let rows = run("MATCH ()-[r:TYPE]->() RETURN r.name AS name", &mut g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("name"), Value::String("A".to_owned()));
+    }
+
+    #[test]
+    fn merge_parameter_predicate_is_rejected_at_compile_time() {
+        // `clauses/merge/Merge1` [16]: a parameter as a MERGE node predicate is the compile-time
+        // SyntaxError `InvalidParameterUse` — raised by semantic analysis, before execution.
+        use crate::errors::SemanticErrorKind;
+        let src = "MERGE (n $param) RETURN n";
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let err = analyze(&ast).expect_err("must be rejected");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidParameterUse),
+            "expected InvalidParameterUse, got {:?}",
+            err.kind
+        );
     }
 
     #[test]

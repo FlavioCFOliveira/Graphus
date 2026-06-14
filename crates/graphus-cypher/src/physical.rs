@@ -922,7 +922,14 @@ impl Planner<'_> {
                 on_create,
                 on_match,
             } => PhysicalOp::Merge {
-                input: Box::new(self.lower(input, deps)),
+                // Eagerness barrier (openCypher "Eager" rule), the same one a read-then-write `DELETE`
+                // gets. `MATCH (a:A) DELETE a MERGE (a2:A)` deletes one node per driving row; if the
+                // pipelined MERGE for the first row runs before the second row's DELETE, its match scan
+                // still sees the not-yet-deleted node and matches it instead of creating fresh — the
+                // wrong result (`clauses/merge/Merge1` [14], `Merge5` [20]). Draining the read into an
+                // `Eager` buffer before any MERGE decouples the upstream deletes from the MERGE scan, so
+                // every delete is settled before the first match attempt.
+                input: Box::new(eager_for_read_write(self.lower(input, deps))),
                 pattern: pattern.clone(),
                 on_create: on_create.clone(),
                 on_match: on_match.clone(),

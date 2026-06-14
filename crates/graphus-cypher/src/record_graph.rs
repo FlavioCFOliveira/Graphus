@@ -2092,6 +2092,39 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
     }
 
+    fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        // `SET r = map` replaces the whole property set: clear the existing relationship properties
+        // (freeing any overflow chains), then set each non-null entry of the map. Mirrors
+        // `replace_node_properties`; relationships carry no constraints, so no deferred check.
+        if !self.rel_exists(rel) {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .borrow_mut()
+            .clear_rel_properties(self.txn, rel.0)
+        {
+            self.capture(e);
+            return;
+        }
+        for (k, v) in properties {
+            if !v.is_null() {
+                self.set_rel_property(rel, k, v.clone());
+            }
+        }
+    }
+
+    fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+        // `SET r += map` keeps unmentioned keys and overlays the map; a null value removes that key.
+        // `set_rel_property` already implements both (null = removal).
+        if !self.rel_exists(rel) {
+            return;
+        }
+        for (k, v) in properties {
+            self.set_rel_property(rel, k, v.clone());
+        }
+    }
+
     fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
         // The store walks the physical incidence chain, which still threads MVCC-tombstoned
         // relationships (their slot stays in use until vacuum). Filter to those visible to this

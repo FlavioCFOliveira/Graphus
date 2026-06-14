@@ -798,6 +798,9 @@ fn classify_exec_error(e: graphus_cypher::ExecError) -> TckError {
         // A write that found a non-entity where an entity was required is a TypeError at runtime.
         X::NotAnEntity { .. } => ("TypeError", None),
         X::PropertiesNotAMap => ("TypeError", None),
+        // A MERGE whose inline property map yielded a null value is the TCK runtime
+        // `SemanticError: MergeReadOwnWrites` (`clauses/merge/Merge1` [17], `Merge5` [29]).
+        X::MergeNullProperty => ("SemanticError", Some("MergeReadOwnWrites")),
         // The pipeline was cancelled — not a TCK error class; surface as a generic runtime error so
         // the scenario fails loudly rather than masquerading as a matched error.
         X::Cancelled => ("Cancelled", None),
