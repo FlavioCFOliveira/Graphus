@@ -84,24 +84,14 @@ pub(crate) fn class_rank(v: &Value) -> u8 {
 /// The Cypher orderability `Ordering` of two `f64`s: `-inf < … < -0.0 < +0.0 < … < +inf < NaN`.
 ///
 /// `-0.0` sorts strictly below `+0.0` (the *ordering* rule). All `NaN`s are the single largest
-/// value and compare equal to each other. This is bit-identical to the index keycodec's
+/// value and compare equal to each other. This is consistent with the index keycodec's
 /// `encode_f64_bits` monotonic key, which is what makes the cross-check pass.
-pub fn total_f64(a: f64, b: f64) -> Ordering {
-    fn mono(x: f64) -> u64 {
-        if x.is_nan() {
-            // Canonical largest key, matching the keycodec's NaN canonicalisation.
-            !0u64
-        } else {
-            let bits = x.to_bits();
-            if bits & 0x8000_0000_0000_0000 != 0 {
-                !bits
-            } else {
-                bits ^ 0x8000_0000_0000_0000
-            }
-        }
-    }
-    mono(a).cmp(&mono(b))
-}
+///
+/// PERF/B4: this is the single canonical implementation in `graphus-core`, re-exported here so the
+/// query layer's historical `ordering::total_f64` call sites keep working. Previously a verbatim
+/// copy of the core implementation lived here; deduplicating cannot change any result because the
+/// bodies were identical by construction (a cross-check test guards this).
+pub use graphus_core::total_f64;
 
 /// The numeric value of an `INTEGER`/`FLOAT` as `f64` (the domain Cypher mixes them in for ordering;
 /// `1` and `1.0` compare equal numerically, then a stable type tie-break keeps the order total).
@@ -370,7 +360,7 @@ mod tests {
             Value::Map(vec![]),
             Value::List(vec![]),
             Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0)),
-            Value::ZonedDateTime(ZonedDateTime::default()),
+            Value::zoned_date_time(ZonedDateTime::default()),
             Value::LocalDateTime(LocalDateTime::default()),
             Value::Date(Date::default()),
             Value::ZonedTime(ZonedTime::default()),
@@ -517,7 +507,7 @@ mod tests {
         );
         // ZonedDateTime by UTC instant: 12:00+01:00 (== 11:00 UTC) < 12:00+00:00 (== 12:00 UTC).
         lt(
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 43_200,
                     nanos: 0,
@@ -525,7 +515,7 @@ mod tests {
                 offset_seconds: 3600,
                 zone_id: String::new(),
             }),
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 43_200,
                     nanos: 0,
@@ -851,7 +841,7 @@ mod tests {
             Value::LocalTime(LocalTime { nanos_of_day: 0 }),
             Value::ZonedTime(ZonedTime::default()),
             Value::LocalDateTime(LocalDateTime::default()),
-            Value::ZonedDateTime(ZonedDateTime::default()),
+            Value::zoned_date_time(ZonedDateTime::default()),
             Value::Duration(Duration::default()),
             Value::Duration(Duration {
                 months: 1,

@@ -1102,28 +1102,31 @@ fn stringify_scalar(v: &Value) -> String {
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::String(s) => s.clone(),
-        other => describe(&RowValue::Value(other.clone())),
+        other => describe(&RowValue::Value(other.clone())).to_owned(),
     }
 }
 
 /// A short type description for diagnostics.
-fn describe(v: &RowValue) -> String {
+///
+/// PERF/B7: returns `&'static str` — every arm is a constant type name, so there is no need to
+/// heap-allocate a `String` per diagnostic. Callers embed it in `format!`/`stringify_scalar`.
+fn describe(v: &RowValue) -> &'static str {
     match v {
-        RowValue::Node(_) => "Node".to_owned(),
-        RowValue::Rel(_) => "Relationship".to_owned(),
-        RowValue::Path(_) => "Path".to_owned(),
-        RowValue::List(_) => "List".to_owned(),
-        RowValue::Map(_) => "Map".to_owned(),
+        RowValue::Node(_) => "Node",
+        RowValue::Rel(_) => "Relationship",
+        RowValue::Path(_) => "Path",
+        RowValue::List(_) => "List",
+        RowValue::Map(_) => "Map",
         RowValue::Value(v) => match v {
-            Value::Null => "null".to_owned(),
-            Value::Boolean(_) => "Boolean".to_owned(),
-            Value::Integer(_) => "Integer".to_owned(),
-            Value::Float(_) => "Float".to_owned(),
-            Value::String(_) => "String".to_owned(),
-            Value::Bytes(_) => "Bytes".to_owned(),
-            Value::List(_) => "List".to_owned(),
-            Value::Map(_) => "Map".to_owned(),
-            _ => "Temporal".to_owned(),
+            Value::Null => "null",
+            Value::Boolean(_) => "Boolean",
+            Value::Integer(_) => "Integer",
+            Value::Float(_) => "Float",
+            Value::String(_) => "String",
+            Value::Bytes(_) => "Bytes",
+            Value::List(_) => "List",
+            Value::Map(_) => "Map",
+            _ => "Temporal",
         },
     }
 }
@@ -1161,7 +1164,27 @@ fn call_function(
     functions: &dyn FunctionRegistry,
     clock: &StatementClock,
 ) -> EvalResult {
-    let lower = name.to_ascii_lowercase();
+    // PERF/B5: function dispatch runs once per call per row. Avoid heap-allocating a lowercased
+    // copy of `name` for the common case (Cypher function names are short ASCII) by lowercasing
+    // into a stack buffer; only an unusually long name falls back to a heap `String`. The selected
+    // function is identical to the previous `to_ascii_lowercase()` path (pure ASCII fold).
+    let mut lower_buf = [0u8; 64];
+    // Lowercase into a stack buffer for the common short-name case; `from_utf8` re-validates the
+    // ASCII-lowercased bytes cheaply (it cannot fail — ASCII folding preserves UTF-8 validity and
+    // length) and keeps this crate `#![forbid(unsafe_code)]`-clean. An over-long name (or the
+    // impossible validation error) falls back to an owned heap lowercase.
+    let lower_cow: std::borrow::Cow<'_, str> = if name.len() <= lower_buf.len() {
+        let buf = &mut lower_buf[..name.len()];
+        buf.copy_from_slice(name.as_bytes());
+        buf.make_ascii_lowercase();
+        match std::str::from_utf8(buf) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => std::borrow::Cow::Owned(name.to_ascii_lowercase()),
+        }
+    } else {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    };
+    let lower: &str = &lower_cow;
 
     // `coalesce` is special: it returns its first non-null argument, evaluated left to right.
     if lower == "coalesce" {
@@ -1175,7 +1198,7 @@ fn call_function(
     }
 
     // Entity functions take the un-collapsed RowValue (they need the reference).
-    match lower.as_str() {
+    match lower {
         "id" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
             return Ok(match v {
@@ -1337,7 +1360,7 @@ fn call_function(
                     }),
                 };
             };
-            return Ok(match lower.as_str() {
+            return Ok(match lower {
                 "head" => {
                     if items.is_empty() {
                         RowValue::NULL
@@ -1385,7 +1408,7 @@ fn call_function(
         // each function's exact conversion table.
         "tointeger" | "tofloat" | "tostring" | "toboolean" | "tobooleanornull" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
-            return convert_scalar(&lower, v).map(RowValue::Value);
+            return convert_scalar(lower, v).map(RowValue::Value);
         }
         _ => {}
     }
@@ -1396,7 +1419,7 @@ fn call_function(
         .map(|a| eval_value(a, row, params, graph, functions, clock))
         .collect::<Result<_, _>>()?;
 
-    let result = match lower.as_str() {
+    let result = match lower {
         // Temporal constructors (rmp #53): string / component-map / projection forms, plus the
         // clock variants (`date.transaction`, `localtime.realtime`, … — `Temporal4.feature` [13]).
         // The clock variants route to the same base constructor; their zero-argument "current
@@ -1421,37 +1444,37 @@ fn call_function(
         | "localtime.realtime"
         | "time.transaction"
         | "time.statement"
-        | "time.realtime" => crate::temporal_fns::construct(&lower, argv.first(), clock)?,
+        | "time.realtime" => crate::temporal_fns::construct(lower, argv.first(), clock)?,
         // Spatial point constructor and distance (rmp #73). `distance` and `point.distance` are
         // the two openCypher spellings of the same two-point distance.
-        "point" => crate::spatial_fns::construct_point(arg(&argv, 0, &lower)?)?,
+        "point" => crate::spatial_fns::construct_point(arg(&argv, 0, lower)?)?,
         "distance" | "point.distance" => {
-            crate::spatial_fns::distance(arg(&argv, 0, &lower)?, arg(&argv, 1, &lower)?)?
+            crate::spatial_fns::distance(arg(&argv, 0, lower)?, arg(&argv, 1, lower)?)?
         }
         // Temporal difference and truncation functions (rmp #53).
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
             crate::temporal_fns::duration_between(
-                &lower,
-                arg(&argv, 0, &lower)?,
-                arg(&argv, 1, &lower)?,
+                lower,
+                arg(&argv, 0, lower)?,
+                arg(&argv, 1, lower)?,
             )?
         }
         // `datetime.fromepoch(seconds, nanos)` / `datetime.fromepochmillis(ms)`:
         // a UTC instant from a POSIX-epoch count (`Temporal1.feature` [11]).
         "datetime.fromepoch" => {
-            crate::temporal_fns::from_epoch_seconds(arg(&argv, 0, &lower)?, arg(&argv, 1, &lower)?)?
+            crate::temporal_fns::from_epoch_seconds(arg(&argv, 0, lower)?, arg(&argv, 1, lower)?)?
         }
         "datetime.fromepochmillis" => {
-            crate::temporal_fns::from_epoch_millis(arg(&argv, 0, &lower)?)?
+            crate::temporal_fns::from_epoch_millis(arg(&argv, 0, lower)?)?
         }
         "date.truncate"
         | "time.truncate"
         | "localtime.truncate"
         | "datetime.truncate"
         | "localdatetime.truncate" => crate::temporal_fns::truncate(
-            &lower,
-            arg(&argv, 0, &lower)?,
-            arg(&argv, 1, &lower)?,
+            lower,
+            arg(&argv, 0, lower)?,
+            arg(&argv, 1, lower)?,
             argv.get(2),
         )?,
         "range" => range_fn(&argv)?,

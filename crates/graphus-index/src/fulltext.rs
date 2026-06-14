@@ -299,15 +299,22 @@ impl InvertedIndex {
         if terms.is_empty() {
             return;
         }
+        // PERF/I2: the previous code allocated a clone for `distinct.insert(term.clone())` on every
+        // input term — including repeated terms, where the clone was immediately dropped on the
+        // failed insert. Gate on `contains` first so a repeated term costs no allocation; a
+        // genuinely new term is still owned independently by `forward` and `postings` (two owners,
+        // two copies is the minimum). Index contents are identical.
         let mut distinct: BTreeSet<String> = BTreeSet::new();
         for term in terms {
-            if distinct.insert(term.clone()) {
-                let list = self.postings.entry(term.clone()).or_default();
-                // Keep each posting list sorted + de-duplicated. `node` is absent (we just removed
-                // the document), so a binary-search insert keeps the invariant in O(log n).
-                if let Err(pos) = list.binary_search(&node) {
-                    list.insert(pos, node);
-                }
+            if distinct.contains(term) {
+                continue;
+            }
+            distinct.insert(term.clone());
+            let list = self.postings.entry(term.clone()).or_default();
+            // Keep each posting list sorted + de-duplicated. `node` is absent (we just removed
+            // the document), so a binary-search insert keeps the invariant in O(log n).
+            if let Err(pos) = list.binary_search(&node) {
+                list.insert(pos, node);
             }
         }
         self.forward.insert(node, distinct);
@@ -388,14 +395,27 @@ impl InvertedIndex {
                 None => return Vec::new(),
             }
         }
-        // Intersect the shortest list against the rest (each list is sorted).
+        // Intersect the shortest list against the rest (each posting list is sorted ascending and
+        // de-duplicated — see `index_document`). PERF/I1: instead of cloning the shortest list and
+        // `retain`-ing it (a full allocation + N×(K-1) binary searches even for ids that drop out
+        // early), gallop each candidate id through the *remaining* lists, keeping it only if every
+        // list contains it. Galloping search amortises to the classic sorted-set intersection cost
+        // and never materialises the discarded ids. Output is the same ascending, de-duplicated set.
         lists.sort_by_key(|l| l.len());
-        let mut acc: Vec<u64> = lists[0].clone();
-        for list in &lists[1..] {
-            acc.retain(|id| list.binary_search(id).is_ok());
-            if acc.is_empty() {
-                break;
+        let (shortest, rest) = lists.split_first().expect("query_and: lists is non-empty");
+        let mut acc: Vec<u64> = Vec::new();
+        // A per-list cursor: because `shortest` is ascending, the search position in every other
+        // (also ascending) list only moves forward, so galloping starts from where the last id left
+        // off — giving the two-pointer behaviour across the whole scan.
+        let mut cursors = vec![0usize; rest.len()];
+        'candidate: for &id in shortest.iter() {
+            for (list, cursor) in rest.iter().zip(cursors.iter_mut()) {
+                *cursor = gallop_to(list, *cursor, id);
+                if list.get(*cursor) != Some(&id) {
+                    continue 'candidate;
+                }
             }
+            acc.push(id);
         }
         acc
     }
@@ -420,6 +440,35 @@ impl InvertedIndex {
         }
         score
     }
+}
+
+/// Galloping (exponential) search: returns the smallest index `>= from` in the ascending,
+/// de-duplicated slice `list` whose element is `>= target`, or `list.len()` if none.
+///
+/// Probes `from`, `from+1`, `from+3`, `from+7`, … (doubling the step) until it overshoots `target`,
+/// then binary-searches the bracketed window. Starting from a moving `from` cursor gives the
+/// two-pointer behaviour [`InvertedIndex::query_and`] relies on: across a scan of ascending targets,
+/// the total work is the standard sorted-set intersection cost, not O(n log n) independent searches.
+fn gallop_to(list: &[u64], from: usize, target: u64) -> usize {
+    let n = list.len();
+    if from >= n {
+        return n;
+    }
+    if list[from] >= target {
+        return from;
+    }
+    // Exponentially expand a window [lo, hi] that brackets the first element >= target.
+    let mut step = 1usize;
+    let mut lo = from;
+    let mut hi = from + step;
+    while hi < n && list[hi] < target {
+        lo = hi;
+        step *= 2;
+        hi = from + step;
+    }
+    let hi = hi.min(n);
+    // Binary search the bracket [lo+1, hi): everything <= lo is < target by construction.
+    lo + 1 + list[lo + 1..hi].partition_point(|&x| x < target)
 }
 
 /// The boolean combination of query terms for a full-text [`InvertedIndex::query`] (`rmp` task #72).

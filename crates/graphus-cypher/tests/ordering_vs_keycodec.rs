@@ -135,7 +135,7 @@ fn gen_encodable(rng: &mut SimRng) -> Value {
             epoch_seconds: gen_i64(rng),
             nanos: (rng.next_u64() % 1_000_000_000) as u32,
         }),
-        11 | 12 => Value::ZonedDateTime(ZonedDateTime {
+        11 | 12 => Value::zoned_date_time(ZonedDateTime {
             local: LocalDateTime {
                 epoch_seconds: gen_i64(rng),
                 nanos: (rng.next_u64() % 1_000_000_000) as u32,
@@ -182,7 +182,7 @@ fn cross_class_pairs_agree_at_the_class_boundary() {
     let chain = [
         // POINT is the lowest encodable class (`… < PATH < POINT < {temporals} < STRING < …`).
         Value::Point(Point::new_3d(Crs::Wgs84_3D, f64::MAX, f64::MAX, f64::MAX)),
-        Value::ZonedDateTime(ZonedDateTime::default()),
+        Value::zoned_date_time(ZonedDateTime::default()),
         Value::LocalDateTime(LocalDateTime::default()),
         Value::Date(Date::default()),
         Value::ZonedTime(ZonedTime::default()),

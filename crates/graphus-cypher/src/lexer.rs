@@ -770,7 +770,9 @@ impl<'a> Lexer<'a> {
     fn scan_escaped_name(&mut self) -> Result<Token, LexError> {
         let start = self.pos;
         self.pos += 1; // consume opening '`'
-        let mut name = String::new();
+        // PERF/P10: the unescaped name is at most the remaining input span; preallocate to avoid
+        // repeated regrowth (doubled backticks only shrink it, so this is a safe upper bound).
+        let mut name = String::with_capacity(self.bytes.len() - self.pos);
         loop {
             match self.peek() {
                 None => {
@@ -824,7 +826,9 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let quote = self.peek().unwrap_or(b'"');
         self.pos += 1; // consume opening quote
-        let mut value = String::new();
+        // PERF/P10: the decoded literal is at most the remaining span length (escapes only shrink
+        // it); preallocating avoids reallocation while scanning long string literals.
+        let mut value = String::with_capacity(self.bytes.len() - self.pos);
         loop {
             match self.peek() {
                 None => {

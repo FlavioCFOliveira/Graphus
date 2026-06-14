@@ -332,6 +332,10 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
                 return Err(e);
             }
             let start = v.lower_bound(lo);
+            // PERF/I3: this leaf contributes at most `slot_count - start` entries; reserve them up
+            // front so a multi-leaf scan grows `out` in leaf-sized steps instead of doubling
+            // per-item. Identical results — only the allocation schedule changes.
+            out.reserve(v.slot_count().saturating_sub(start));
             let mut passed_hi = false;
             for i in start..v.slot_count() {
                 let k = v.key(i);

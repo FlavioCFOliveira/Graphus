@@ -516,7 +516,7 @@ fn decode_temporal_body(class_tag: u8, cur: &mut Cursor<'_>) -> Result<Value, Va
                 String::from_utf8(raw.to_vec()).map_err(|_| ValueDecodeError::Malformed {
                     what: "invalid UTF-8 zone id",
                 })?;
-            Ok(Value::ZonedDateTime(ZonedDateTime {
+            Ok(Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds,
                     nanos,
@@ -998,7 +998,7 @@ mod tests {
             (i64::MIN, 0, i32::MIN, "Etc/GMT+12"),
             (i64::MAX, 999_999_999, i32::MAX, "Antarctica/DumontDUrville"),
         ] {
-            let v = Value::ZonedDateTime(ZonedDateTime {
+            let v = Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: secs,
                     nanos,
@@ -1008,7 +1008,7 @@ mod tests {
             });
             assert_eq!(round_trip(&v), v);
         }
-        let (class, _) = encode(&Value::ZonedDateTime(ZonedDateTime::default())).unwrap();
+        let (class, _) = encode(&Value::zoned_date_time(ZonedDateTime::default())).unwrap();
         assert_eq!(class, TAG_ZONED_DATE_TIME);
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
             )
         );
 
-        let (tag, bytes) = encode(&Value::ZonedDateTime(ZonedDateTime {
+        let (tag, bytes) = encode(&Value::zoned_date_time(ZonedDateTime {
             local: LocalDateTime {
                 epoch_seconds: 2,
                 nanos: 3,
@@ -1241,7 +1241,7 @@ mod tests {
             Value::List(vec![
                 // Mixed zone-id lengths inside one list (empty and non-empty) exercise the
                 // per-element variable-width framing.
-                Value::ZonedDateTime(ZonedDateTime {
+                Value::zoned_date_time(ZonedDateTime {
                     local: LocalDateTime {
                         epoch_seconds: 7,
                         nanos: 8,
@@ -1249,7 +1249,7 @@ mod tests {
                     offset_seconds: 3600,
                     zone_id: "Europe/Lisbon".to_owned(),
                 }),
-                Value::ZonedDateTime(ZonedDateTime {
+                Value::zoned_date_time(ZonedDateTime {
                     local: LocalDateTime::default(),
                     offset_seconds: 0,
                     zone_id: String::new(),
@@ -1308,7 +1308,7 @@ mod tests {
             Value::LocalTime(LocalTime { nanos_of_day: 1 }),
             Value::ZonedTime(ZonedTime::default()),
             Value::LocalDateTime(LocalDateTime::default()),
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime::default(),
                 offset_seconds: 0,
                 zone_id: "UTC".to_owned(),
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_an_invalid_utf8_zone_id() {
-        let (class, mut bytes) = encode(&Value::ZonedDateTime(ZonedDateTime {
+        let (class, mut bytes) = encode(&Value::zoned_date_time(ZonedDateTime {
             local: LocalDateTime::default(),
             offset_seconds: 0,
             zone_id: "ab".to_owned(),

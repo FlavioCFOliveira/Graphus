@@ -342,7 +342,7 @@ fn temporal_values_round_trip_through_the_property_api() {
         ),
         (
             "zdt",
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 1_700_000_000,
                     nanos: 123_456_789,
@@ -353,7 +353,7 @@ fn temporal_values_round_trip_through_the_property_api() {
         ),
         (
             "zdt_offset_only",
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime::default(),
                 offset_seconds: -64_800,
                 zone_id: String::new(), // offset-only (empty zone id)
@@ -410,7 +410,7 @@ fn committed_temporal_property_survives_a_crash_and_recovers() {
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
     let k = s.intern_token(Namespace::PropKey, "when").unwrap();
-    let zdt = Value::ZonedDateTime(ZonedDateTime {
+    let zdt = Value::zoned_date_time(ZonedDateTime {
         local: LocalDateTime {
             epoch_seconds: 1_700_000_000,
             nanos: 42,

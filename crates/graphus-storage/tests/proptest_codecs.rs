@@ -70,7 +70,7 @@ fn temporal_value() -> impl Strategy<Value = Value> {
         }),
         (any::<i64>(), any::<u32>(), any::<i32>(), small_string()).prop_map(
             |(epoch_seconds, nanos, offset_seconds, zone_id)| {
-                Value::ZonedDateTime(ZonedDateTime {
+                Value::zoned_date_time(ZonedDateTime {
                     local: LocalDateTime {
                         epoch_seconds,
                         nanos,
@@ -228,7 +228,7 @@ proptest! {
         let v = Value::List(
             zs.into_iter()
                 .map(|(epoch_seconds, nanos, offset_seconds, zone_id)| {
-                    Value::ZonedDateTime(ZonedDateTime {
+                    Value::zoned_date_time(ZonedDateTime {
                         local: LocalDateTime {
                             epoch_seconds,
                             nanos,

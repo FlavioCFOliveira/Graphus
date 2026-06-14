@@ -556,7 +556,7 @@ mod tests {
         // CIP temporal block (ascending):
         //   ZonedDateTime < LocalDateTime < Date < ZonedTime < LocalTime < Duration
         // Use values whose payloads are *largest* so only the tag can be deciding the order.
-        let zdt = Value::ZonedDateTime(graphus_core::ZonedDateTime {
+        let zdt = Value::zoned_date_time(graphus_core::ZonedDateTime {
             local: graphus_core::LocalDateTime {
                 epoch_seconds: i64::MAX,
                 nanos: 999_999_999,
@@ -628,7 +628,7 @@ mod tests {
             f64::MAX,
             f64::MAX,
         ));
-        let lowest_temporal = Value::ZonedDateTime(graphus_core::ZonedDateTime {
+        let lowest_temporal = Value::zoned_date_time(graphus_core::ZonedDateTime {
             local: graphus_core::LocalDateTime {
                 epoch_seconds: i64::MIN,
                 nanos: 0,
@@ -694,7 +694,7 @@ mod tests {
         assert!(enc(&earlier) < enc(&later));
         // ZonedDateTime: ordered by UTC instant (local - offset). 12:00+01:00 is the same instant
         // as 11:00+00:00, and an earlier instant sorts first.
-        let zdt_earlier = Value::ZonedDateTime(graphus_core::ZonedDateTime {
+        let zdt_earlier = Value::zoned_date_time(graphus_core::ZonedDateTime {
             local: graphus_core::LocalDateTime {
                 epoch_seconds: 0,
                 nanos: 0,
@@ -702,7 +702,7 @@ mod tests {
             offset_seconds: 0,
             zone_id: String::new(),
         });
-        let zdt_later = Value::ZonedDateTime(graphus_core::ZonedDateTime {
+        let zdt_later = Value::zoned_date_time(graphus_core::ZonedDateTime {
             local: graphus_core::LocalDateTime {
                 epoch_seconds: 10,
                 nanos: 0,

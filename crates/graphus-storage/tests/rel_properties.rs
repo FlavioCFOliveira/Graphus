@@ -142,7 +142,7 @@ fn temporal_rel_values_round_trip_through_the_heap() {
     let date = Value::Date(Date {
         days_since_epoch: -3650, // a pre-epoch date
     });
-    let zdt = Value::ZonedDateTime(ZonedDateTime {
+    let zdt = Value::zoned_date_time(ZonedDateTime {
         local: LocalDateTime {
             epoch_seconds: 1_700_000_000,
             nanos: 999_999_999,

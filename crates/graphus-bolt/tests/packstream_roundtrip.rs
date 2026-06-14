@@ -90,7 +90,7 @@ fn temporal_value() -> impl Strategy<Value = Value> {
             -64_800i32..=64_800
         )
             .prop_map(|(s, ns, off)| {
-                Value::ZonedDateTime(ZonedDateTime {
+                Value::zoned_date_time(ZonedDateTime {
                     local: LocalDateTime {
                         epoch_seconds: s,
                         nanos: ns,
@@ -108,7 +108,7 @@ fn temporal_value() -> impl Strategy<Value = Value> {
             "[A-Za-z/_]{1,20}"
         )
             .prop_map(|(s, ns, zone)| {
-                Value::ZonedDateTime(ZonedDateTime {
+                Value::zoned_date_time(ZonedDateTime {
                     local: LocalDateTime {
                         epoch_seconds: s,
                         nanos: ns,

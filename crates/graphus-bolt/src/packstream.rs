@@ -932,7 +932,7 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             let utc_secs = unpacker.read_int()?;
             let nanos = read_u32_field(unpacker, "DateTime.nanoseconds")?;
             let offset = read_i32_field(unpacker, "DateTime.tz_offset_seconds")?;
-            Ok(Value::ZonedDateTime(zoned_from_utc(
+            Ok(Value::zoned_date_time(zoned_from_utc(
                 utc_secs,
                 nanos,
                 offset,
@@ -947,7 +947,7 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             // A zone-id DateTime carries no numeric offset on the wire; the offset is whatever the
             // zone resolves to. We preserve the UTC instant and the zone id, leaving the resolved
             // offset at 0 (offset resolution from an IANA id is the engine's job, not the codec's).
-            Ok(Value::ZonedDateTime(zoned_from_utc(
+            Ok(Value::zoned_date_time(zoned_from_utc(
                 utc_secs, nanos, 0, zone_id,
             )))
         }
@@ -1498,7 +1498,7 @@ mod tests {
                 epoch_seconds: -1,
                 nanos: 0,
             }),
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 1_700_000_000,
                     nanos: 500,
@@ -1506,7 +1506,7 @@ mod tests {
                 offset_seconds: 7200,
                 zone_id: String::new(),
             }),
-            Value::ZonedDateTime(ZonedDateTime {
+            Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 1_700_000_000,
                     nanos: 500,
@@ -1544,7 +1544,7 @@ mod tests {
         assert_eq!(bytes[1], tag::DATE_TIME);
         // Round-trip restores the local instant.
         let mut u = Unpacker::new(&bytes);
-        assert_eq!(unpack_value(&mut u).unwrap(), Value::ZonedDateTime(v));
+        assert_eq!(unpack_value(&mut u).unwrap(), Value::zoned_date_time(v));
     }
 
     #[test]

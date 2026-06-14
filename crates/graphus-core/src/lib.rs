@@ -13,7 +13,7 @@ pub use error::{CONSTRAINT_VIOLATION_PREFIX, GraphusError, Result};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
-pub use value::spatial::{Crs, Point};
+pub use value::spatial::{Crs, Point, total_f64};
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 pub use version::{MAX_TIMESTAMP, VersionStamp};
 
@@ -344,13 +344,18 @@ pub mod value {
         /// A date-and-time with no zone (openCypher `LocalDateTime`).
         LocalDateTime(LocalDateTime),
         /// A date-and-time with a resolved offset and IANA zone (openCypher `DateTime`).
-        ZonedDateTime(ZonedDateTime),
+        ///
+        /// Boxed: `ZonedDateTime` embeds an inline `String` zone id, making it the largest variant
+        /// (48 B). Boxing this rare variant shrinks the whole `Value` enum (`rmp` finding B3). The
+        /// box is transparent to `Clone`/`PartialEq`/ordering/serialization, which deref through it.
+        ZonedDateTime(Box<ZonedDateTime>),
         /// A Cypher duration (months / days / seconds / nanoseconds).
         Duration(Duration),
         /// A spatial point (Cartesian / WGS-84, 2D or 3D; openCypher `Point`, `rmp` task #73). Its
         /// derived [`PartialEq`] is [`Point`]'s Cypher value equality (same CRS *and* equal
         /// coordinates); ordering lives in `graphus-cypher`'s `ordering` module and the index key
         /// codec, both consistent with [`Point::total_cmp`](spatial::Point::total_cmp).
+        ///
         Point(Point),
         // Node, Relationship, and Path variants are added with their owning
         // subsystems (see specification/04-technical-design.md §7.2).
@@ -362,7 +367,24 @@ pub mod value {
         pub fn is_null(&self) -> bool {
             matches!(self, Value::Null)
         }
+
+        /// Builds a [`Value::ZonedDateTime`] from an unboxed [`ZonedDateTime`].
+        ///
+        /// PERF/B3: the variant boxes its payload (the largest variant) to shrink `Value`. This
+        /// constructor centralises the boxing so call sites stay readable and `.map(...)`-able.
+        #[must_use]
+        pub fn zoned_date_time(z: ZonedDateTime) -> Self {
+            Value::ZonedDateTime(Box::new(z))
+        }
     }
+
+    // PERF (B3): `Value` is cloned/moved on every row and list element on the hot path, so its
+    // stack footprint matters. Boxing the largest, rare variant (`ZonedDateTime`, 48 B — it embeds
+    // an inline `String` zone id) shrank `Value` from 48 B to 40 B. The new floor is `Duration`
+    // (32 B, a `Copy` POD of three `i64`s + an `i32`); boxing it was rejected because it is common
+    // in temporal queries and boxing would cost an allocation per value and forfeit `Copy`. This
+    // pins the win so a future fat variant that regresses it fails the build.
+    const _: () = assert!(std::mem::size_of::<Value>() <= 40);
 
     #[cfg(test)]
     mod tests {
@@ -393,7 +415,7 @@ pub mod value {
                 epoch_seconds: 0,
                 nanos: 0,
             });
-            let _ = Value::ZonedDateTime(ZonedDateTime {
+            let _ = Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 0,
                     nanos: 0,

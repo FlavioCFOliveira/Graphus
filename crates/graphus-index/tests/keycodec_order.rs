@@ -258,7 +258,7 @@ fn gen_value(rng: &mut SimRng) -> Value {
             epoch_seconds: gen_i64(rng),
             nanos: (rng.next_u64() % 1_000_000_000) as u32,
         }),
-        12 | 13 => Value::ZonedDateTime(ZonedDateTime {
+        12 | 13 => Value::zoned_date_time(ZonedDateTime {
             local: LocalDateTime {
                 epoch_seconds: gen_i64(rng),
                 nanos: (rng.next_u64() % 1_000_000_000) as u32,

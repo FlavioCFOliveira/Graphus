@@ -2055,11 +2055,16 @@ impl<'t, 's> Parser<'t, 's> {
             )
             && matches!(self.peek_at(2).map(|t| &t.kind), Some(TokenKind::In))
         {
-            let kind = match first.to_ascii_lowercase().as_str() {
-                "any" => Some(QuantifierKind::Any),
-                "none" => Some(QuantifierKind::None),
-                "single" => Some(QuantifierKind::Single),
-                _ => None,
+            // PERF/P6: compare case-insensitively without heap-allocating a lowercased copy of the
+            // identifier on every quantifier-lookahead. Selection is unchanged (same ASCII fold).
+            let kind = if first.eq_ignore_ascii_case("any") {
+                Some(QuantifierKind::Any)
+            } else if first.eq_ignore_ascii_case("none") {
+                Some(QuantifierKind::None)
+            } else if first.eq_ignore_ascii_case("single") {
+                Some(QuantifierKind::Single)
+            } else {
+                None
             };
             if let Some(kind) = kind {
                 return self.finish_quantifier(kind, start_span.start);
