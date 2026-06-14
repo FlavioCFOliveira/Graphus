@@ -3018,16 +3018,25 @@ fn eval_property_source(
 }
 
 /// Applies a list of `SET` ops to the current row's bound entities.
+///
+/// A `SET` whose target is `null` (e.g. a variable left unbound by `OPTIONAL MATCH`) is a silent
+/// no-op with **no side effects**: openCypher `SET a.num = 42` / `SET a = {…}` / `SET a += {…}` over a
+/// null `a` (`clauses/set/Set1` [8], `Set4` [5], `Set5` [1]). The resolver helpers return `None` for a
+/// null target, which short-circuits the op without evaluating its right-hand side.
 fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
     for op in ops {
         match op {
             SetOp::Property { target, value } => {
-                let (entity, key) = resolve_property_target(target, row)?;
+                let Some((entity, key)) = resolve_property_target(target, row)? else {
+                    continue;
+                };
                 let v = eval_value(value, row, ctx.params, ctx.graph, ctx.functions)?;
                 set_entity_property(entity, &key, v, ctx);
             }
             SetOp::ReplaceProperties { target, value } => {
-                let entity = entity_ref(target, row)?;
+                let Some(entity) = entity_ref(target, row)? else {
+                    continue;
+                };
                 let props = eval_property_source(value, row, ctx)?;
                 match entity {
                     EntityRef::Node(id) => ctx.graph.replace_node_properties(id, &props),
@@ -3035,7 +3044,9 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
                 }
             }
             SetOp::MergeProperties { target, value } => {
-                let entity = entity_ref(target, row)?;
+                let Some(entity) = entity_ref(target, row)? else {
+                    continue;
+                };
                 let props = eval_property_source(value, row, ctx)?;
                 match entity {
                     EntityRef::Node(id) => ctx.graph.merge_node_properties(id, &props),
@@ -3043,7 +3054,9 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
                 }
             }
             SetOp::AddLabels { target, labels } => {
-                let id = entity_node(target, row)?;
+                let Some(id) = entity_node(target, row)? else {
+                    continue;
+                };
                 let names: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
                 ctx.graph.add_labels(id, &names);
             }
@@ -3052,8 +3065,16 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
     Ok(())
 }
 
-/// The entity + property key referenced by a `SET a.b = …` target (`a.b`).
-fn resolve_property_target(target: &Expr, row: &Row) -> Result<(EntityRef, String), ExecError> {
+/// The entity + property key referenced by a `SET a.b = …` / `REMOVE a.b` target (`a.b`).
+///
+/// Returns `Ok(None)` when the base variable is bound to `null` (or left unbound), so the caller
+/// treats the whole op as a no-op with no side effects — openCypher ignores `SET`/`REMOVE` of a
+/// property on a null entity (`clauses/set/Set1` [8], `clauses/remove/Remove1` [5][6]). A base bound
+/// to a non-null, non-entity value is still a `NotAnEntity` error.
+fn resolve_property_target(
+    target: &Expr,
+    row: &Row,
+) -> Result<Option<(EntityRef, String)>, ExecError> {
     let ExprKind::Property { base, key } = &target.kind else {
         return Err(ExecError::NotAnEntity {
             context: "SET target must be a property access".to_owned(),
@@ -3067,13 +3088,15 @@ fn resolve_property_target(target: &Expr, row: &Row) -> Result<(EntityRef, Strin
     let entity = match row.get(name) {
         Some(RowValue::Node(n)) => EntityRef::Node(n.id),
         Some(RowValue::Rel(r)) => EntityRef::Rel(r.id),
+        // A null / unbound target is a silent no-op (Cypher's null-target rule).
+        None | Some(RowValue::Value(Value::Null)) => return Ok(None),
         _ => {
             return Err(ExecError::NotAnEntity {
                 context: format!("`{name}` is not a bound node or relationship"),
             });
         }
     };
-    Ok((entity, key.clone()))
+    Ok(Some((entity, key.clone())))
 }
 
 /// A node-or-relationship reference resolved from a row binding.
@@ -3092,20 +3115,31 @@ fn set_entity_property(entity: EntityRef, key: &str, value: Value, ctx: &mut Ctx
 }
 
 /// Resolves a variable expression to a bound node id (for label ops, which apply only to nodes).
-fn entity_node(target: &Var, row: &Row) -> Result<NodeId, ExecError> {
-    row.get(&target.name)
-        .and_then(RowValue::as_node)
-        .ok_or_else(|| ExecError::NotAnEntity {
+///
+/// Returns `Ok(None)` when the target is bound to `null` (or left unbound), so label `SET`/`REMOVE`
+/// over a null node is a silent no-op (`clauses/remove/Remove2` [5]). A non-null, non-node value is
+/// still a `NotAnEntity` error.
+fn entity_node(target: &Var, row: &Row) -> Result<Option<NodeId>, ExecError> {
+    match row.get(&target.name) {
+        Some(RowValue::Node(n)) => Ok(Some(n.id)),
+        None | Some(RowValue::Value(Value::Null)) => Ok(None),
+        _ => Err(ExecError::NotAnEntity {
             context: format!("`{}` is not a bound node", target.name),
-        })
+        }),
+    }
 }
 
 /// Resolves a variable to the node **or relationship** it is bound to (for `SET x = map` / `SET x +=
 /// map`, which apply to either; `clauses/merge/Merge6` [6][7], `Merge7` [4][5]).
-fn entity_ref(target: &Var, row: &Row) -> Result<EntityRef, ExecError> {
+///
+/// Returns `Ok(None)` when the target is bound to `null` (or left unbound), so `SET a = {…}` /
+/// `SET a += {…}` over a null `a` is a silent no-op (`clauses/set/Set4` [5], `Set5` [1]). A non-null,
+/// non-entity value is still a `NotAnEntity` error.
+fn entity_ref(target: &Var, row: &Row) -> Result<Option<EntityRef>, ExecError> {
     match row.get(&target.name) {
-        Some(RowValue::Node(n)) => Ok(EntityRef::Node(n.id)),
-        Some(RowValue::Rel(r)) => Ok(EntityRef::Rel(r.id)),
+        Some(RowValue::Node(n)) => Ok(Some(EntityRef::Node(n.id))),
+        Some(RowValue::Rel(r)) => Ok(Some(EntityRef::Rel(r.id))),
+        None | Some(RowValue::Value(Value::Null)) => Ok(None),
         _ => Err(ExecError::NotAnEntity {
             context: format!("`{}` is not a bound node or relationship", target.name),
         }),
@@ -3222,16 +3256,24 @@ fn delete_node(detach: bool, id: NodeId, ctx: &mut Ctx<'_>) -> Result<(), ExecEr
 }
 
 /// Applies a list of `REMOVE` ops.
+///
+/// A `REMOVE` whose target is `null` (e.g. a variable left unbound by `OPTIONAL MATCH`) is a silent
+/// no-op with no side effects (`clauses/remove/Remove1` [5][6], `Remove2` [5]); the resolver helpers
+/// return `None` for a null target.
 fn apply_remove_ops(ops: &[RemoveOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), ExecError> {
     for op in ops {
         match op {
             RemoveOp::Labels { target, labels } => {
-                let id = entity_node(target, row)?;
+                let Some(id) = entity_node(target, row)? else {
+                    continue;
+                };
                 let names: Vec<String> = labels.iter().map(|l| l.name.clone()).collect();
                 ctx.graph.remove_labels(id, &names);
             }
             RemoveOp::Property { target } => {
-                let (entity, key) = resolve_property_target(target, row)?;
+                let Some((entity, key)) = resolve_property_target(target, row)? else {
+                    continue;
+                };
                 match entity {
                     EntityRef::Node(id) => ctx.graph.remove_node_property(id, &key),
                     EntityRef::Rel(id) => ctx.graph.remove_rel_property(id, &key),

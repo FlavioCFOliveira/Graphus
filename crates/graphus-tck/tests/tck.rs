@@ -246,7 +246,13 @@ use graphus_tck::runner::run_scenario;
 /// `ExistentialSubquery2` [3] remains a compile-time `InvalidClauseComposition` rejection (a writing
 /// clause inside `EXISTS`). Measured, zero regressions (failure-set diff: exactly the 5 scenarios
 /// removed from the FAIL list, nothing added).
-const BASELINE: usize = 3874;
+///
+/// rmp #142 (null in SET/REMOVE): a `SET`/`REMOVE` whose target is a null entity (an `OPTIONAL MATCH`
+/// that bound nothing) is now a silent no-op instead of a `TypeError`, lifting 3874 → 3881. Fixes the
+/// 7 "Ignore null" scenarios `clauses/set/{Set1[8],Set3[8],Set4[5],Set5[1]}` and
+/// `clauses/remove/{Remove1[5][6],Remove2[5]}`. Measured, zero regressions (failure-set diff: exactly
+/// those 7 scenarios removed, nothing added).
+const BASELINE: usize = 3881;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

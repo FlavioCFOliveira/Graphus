@@ -635,6 +635,82 @@ fn remove_property() {
     assert_eq!(g.node_property(a, "temp"), None);
 }
 
+/// `SET n.p = null` removes the property (openCypher `Set1` semantics, via `set_node_property`'s
+/// null-removes contract). The property must be gone afterwards.
+#[test]
+fn set_property_to_null_removes_it() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["P"], [("age", i(20))]);
+    run("MATCH (n:P) SET n.age = null RETURN n", &mut g);
+    assert_eq!(g.node_property(a, "age"), None);
+}
+
+/// `SET n = {map}` with a null value in the map drops that key while applying the rest
+/// (`clauses/set/Set4` [3] — null values in a property map are removed).
+#[test]
+fn set_overriding_map_drops_null_valued_keys() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["X"], [("name", s("A")), ("name2", s("B"))]);
+    run(
+        "MATCH (n:X) SET n = {name: 'B', name2: null, baz: 'C'} RETURN n",
+        &mut g,
+    );
+    assert_eq!(g.node_property(a, "name"), Some(s("B")));
+    assert_eq!(g.node_property(a, "name2"), None);
+    assert_eq!(g.node_property(a, "baz"), Some(s("C")));
+}
+
+/// `SET n += {map}` with an explicit null value removes that key while retaining the rest
+/// (`clauses/set/Set5` [4] — explicit null values in a map remove old values).
+#[test]
+fn set_appending_map_null_value_removes_key() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["X"], [("name", s("A")), ("name2", s("B"))]);
+    run("MATCH (n:X) SET n += {name: null} RETURN n", &mut g);
+    assert_eq!(g.node_property(a, "name"), None);
+    assert_eq!(g.node_property(a, "name2"), Some(s("B")));
+}
+
+/// `REMOVE n.p` on a node that lacks `p` is a silent no-op, not an error
+/// (`clauses/remove/Remove1` [7] — remove a missing node property).
+#[test]
+fn remove_missing_property_is_noop() {
+    let mut g = MemGraph::new();
+    let a = g.add_node(["P"], [("keep", i(1))]);
+    let rows = run("MATCH (n:P) REMOVE n.absent RETURN n", &mut g);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(g.node_property(a, "keep"), Some(i(1)));
+}
+
+/// `SET`/`REMOVE` whose target is a null entity (an `OPTIONAL MATCH` that found nothing) is a silent
+/// no-op: the driving row survives with the target still null, and no entity error is raised
+/// (`clauses/set/Set1` [8], `Set4` [5], `Set5` [1]; `clauses/remove/Remove1` [5], `Remove2` [5]).
+#[test]
+fn set_remove_on_null_target_is_noop() {
+    for query in [
+        "OPTIONAL MATCH (a:DoesNotExist) SET a.num = 42 RETURN a",
+        "OPTIONAL MATCH (a:DoesNotExist) SET a = {num: 42} RETURN a",
+        "OPTIONAL MATCH (a:DoesNotExist) SET a += {num: 42} RETURN a",
+        "OPTIONAL MATCH (a:DoesNotExist) SET a:L RETURN a",
+        "OPTIONAL MATCH (a:DoesNotExist) REMOVE a.num RETURN a",
+        "OPTIONAL MATCH (a:DoesNotExist) REMOVE a:L RETURN a",
+    ] {
+        let mut g = MemGraph::new();
+        let rows = run(query, &mut g);
+        assert_eq!(
+            rows.len(),
+            1,
+            "query should keep the null-filled row: {query}"
+        );
+        assert_eq!(
+            rows[0].value("a"),
+            Value::Null,
+            "target must stay null: {query}"
+        );
+        assert_eq!(g.node_count(), 0, "no entity may be created: {query}");
+    }
+}
+
 #[test]
 fn delete_node_without_relationships() {
     let mut g = MemGraph::new();
