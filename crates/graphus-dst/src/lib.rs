@@ -46,6 +46,7 @@ pub mod misbehave;
 pub mod mix;
 pub mod model;
 pub mod rng;
+pub mod scenarios;
 pub mod vopr;
 pub mod wire;
 pub mod workload;
