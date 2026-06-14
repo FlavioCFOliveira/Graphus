@@ -56,6 +56,7 @@
 
 pub mod backup;
 pub mod check;
+pub mod dwb;
 pub mod heap;
 pub mod idalloc;
 pub mod incremental;
@@ -74,6 +75,7 @@ pub use backup::{
     BACKUP_FORMAT_VERSION, BACKUP_MAGIC, backup_creation_marker, backup_store, restore,
     restore_file_atomic, restore_onto, verify_backup,
 };
+pub use dwb::{DWB_MAX_BATCH, Dwb, dwb_device_pages};
 pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, HeapChainFault,
     IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, Violation, verify_on_open,

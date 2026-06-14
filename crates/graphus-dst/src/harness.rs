@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use graphus_core::TxnId;
-use graphus_io::{BlockDevice, MemBlockDevice, Page};
+use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_storage::recovery::recover_device;
 use graphus_storage::{Namespace, RecordStore};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
@@ -85,9 +85,10 @@ impl ScenarioReport {
 /// Picks the fault kind for a scenario deterministically from `rng`. Crashes dominate (the central
 /// DST fault), with the torn-WAL-tail fault mixed in.
 fn pick_fault(rng: &mut DetRng) -> FaultKind {
-    match rng.below(4) {
+    match rng.below(5) {
         0 => FaultKind::Crash { steal: false },
         1 => FaultKind::TornWalTail,
+        2 => FaultKind::TornDataPage,
         // Weighted toward the steal crash, the richest path (undo of stolen, uncommitted pages).
         _ => FaultKind::Crash { steal: true },
     }
@@ -495,6 +496,123 @@ impl Driver {
                 let keep = self.torn_truncation_point(rng);
                 self.recover_no_force(Some(keep))
             }
+            FaultKind::TornDataPage => self.recover_torn_data_page(rng),
+        }
+    }
+
+    /// Torn-data-page recovery: flush dirty pages home **under doublewrite protection**, snapshot
+    /// that on-disk image while **tearing one home data page** (a power loss mid-write), then recover
+    /// with the doublewrite buffer so the torn page is repaired from its intact doublewrite copy
+    /// *before* ARIES redo reads its `page_lsn` (`05 §3`, `04 §4.5`).
+    ///
+    /// This is the full-engine analogue of [`recover_steal`](Self::recover_steal): same flush + disk
+    /// snapshot + recover spine, but the home image carries a torn page and recovery is the
+    /// DWB-aware [`graphus_storage::recovery::recover_device_with_dwb`]. The post-recovery checker's
+    /// page-checksum invariant (`crate::checker`) fails loudly if the tear is *not* repaired, so a
+    /// pass is real evidence the DWB closed the hole.
+    fn recover_torn_data_page(&mut self, rng: &mut DetRng) -> RecoverySummary {
+        use graphus_storage::Dwb;
+        use graphus_storage::recovery::recover_device_with_dwb;
+
+        // 1. Flush dirty pages home under doublewrite protection: the DWB holds a durable copy of
+        //    every flushed image before the home write.
+        let mut dwb = Dwb::new(MemBlockDevice::new(0)).expect("dwb device");
+        self.store
+            .flush_protected(&mut dwb)
+            .expect("flush_protected");
+
+        // 2. Snapshot the on-disk home image into a fresh device, tearing one data page.
+        let pages = self.store.mapped_pages();
+        let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
+        let mut device = MemBlockDevice::new(max + 1);
+
+        let staged: Vec<(u64, Box<Page>)> = pages
+            .iter()
+            .map(|p| (p.0, self.store.read_device_page(*p).expect("read device page")))
+            .collect();
+
+        // Choose a (page, prefix) tear that **provably lands**: a torn write keeps the first `prefix`
+        // bytes of the new image and leaves the rest as the device's old bytes (all-zero on this
+        // fresh device). For the tear to corrupt the page its body `prefix..PAGE_SIZE` must differ
+        // from zero (a sparse page whose tail is already zero would tear into an identical, still-valid
+        // image — a vacuous fault). We therefore simulate the tear on the staged image and pick the
+        // first candidate whose torn form fails its checksum, deterministically from the seed. The
+        // metadata head (page 0) is excluded so the tear lands on a record page.
+        let prefix = 512 + rng.index(2048);
+        let mut torn_page = None;
+        // A seed-rotated scan order so different seeds tear different pages while staying deterministic.
+        let start = rng.index(staged.len().max(1));
+        for k in 0..staged.len() {
+            let (idx, bytes) = &staged[(start + k) % staged.len()];
+            if *idx == 0 {
+                continue; // never the metadata head
+            }
+            // Simulate the torn image: new prefix over a zero page.
+            let mut sim = [0u8; PAGE_SIZE];
+            sim[..prefix].copy_from_slice(&bytes[..prefix]);
+            if !graphus_bufpool::page::verify_checksum(&sim) {
+                torn_page = Some(*idx);
+                break;
+            }
+        }
+        // `torn_page` is `None` only for a degenerate near-empty store where every non-head page is
+        // sparse enough that a prefix tear stays byte-identical (no record content past `prefix`).
+        // That run still exercises the DWB-protected flush + DWB-aware recovery spine end to end; it
+        // simply has no torn page to repair, which is itself a valid (committed-or-nothing) outcome.
+        for (idx, bytes) in &staged {
+            if Some(*idx) == torn_page {
+                device.arm_torn_write(graphus_core::PageId(*idx), prefix);
+            }
+            device
+                .write_page(graphus_core::PageId(*idx), bytes)
+                .expect("stage page");
+        }
+        device.sync_all().expect("persist disk image");
+
+        // When a tear was injected, it must actually have landed (the home page now fails its
+        // checksum), or the repair side would be vacuous. This is the load-bearing precondition: a
+        // pass after a *real* tear is what proves the DWB repaired it.
+        if let Some(tp) = torn_page {
+            let mut buf = [0u8; PAGE_SIZE];
+            device
+                .read_page(graphus_core::PageId(tp), &mut buf)
+                .expect("read torn");
+            assert!(
+                !graphus_bufpool::page::verify_checksum(&buf),
+                "seed {}: torn home page {tp} unexpectedly passes its checksum \
+                 (the simulated tear and the real tear disagree)",
+                self.seed
+            );
+        }
+
+        // 3. Snapshot the DWB device into a fresh device and recover with doublewrite repair.
+        let dwb_pages = dwb.device().page_count();
+        let mut dwb_dev = MemBlockDevice::new(dwb_pages);
+        for i in 0..dwb_pages {
+            let mut buf = [0u8; PAGE_SIZE];
+            dwb.device()
+                .read_page(graphus_core::PageId(i), &mut buf)
+                .expect("read dwb page");
+            dwb_dev
+                .write_page(graphus_core::PageId(i), &buf)
+                .expect("stage dwb page");
+        }
+        dwb_dev.sync_all().expect("persist dwb image");
+        let mut dwb_restore = Dwb::new(dwb_dev).expect("dwb restore");
+
+        let log = self.store.with_wal(|w| w.sink().durable_bytes().to_vec());
+        let mut sink = MemLogSink::new();
+        sink.append(&log);
+        sink.sync().expect("sync log prefix");
+
+        let mut wal = WalManager::open(sink.clone()).expect("open wal");
+        let report = recover_device_with_dwb(&mut wal, &mut device, &mut dwb_restore)
+            .expect("recover with dwb");
+        let wal = WalManager::open(sink).expect("reopen wal");
+        self.store = RecordStore::open(device, wal, 64).expect("open store");
+        RecoverySummary {
+            losers: report.losers,
+            tail_truncated: report.tail_truncated,
         }
     }
 

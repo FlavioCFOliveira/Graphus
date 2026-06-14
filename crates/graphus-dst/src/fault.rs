@@ -42,11 +42,11 @@
 //!   reach its device after construction, and the task forbids modifying other crates, so the error
 //!   cannot be armed mid-workload on the live store. Deferred until `graphus-storage` exposes a
 //!   device-fault hook; covered at the buffer-pool layer in the meantime (above).
-//! * **Torn DATA page** — the [`graphus_io::MemBlockDevice::arm_torn_write`] device *exists*, but
-//!   repairing a torn home page needs the **doublewrite buffer** (`04 §4.5`), which the design marks
-//!   NOT YET implemented. The page checksum *detects* the tear, but recovery cannot *repair* it
-//!   today, so injecting it would surface a corruption the engine is not yet built to fix. Deferred
-//!   until the DWB task lands, rather than faked.
+//! * **Torn DATA page (DWB-repaired)** — now exercised through the full engine, *not* deferred. The
+//!   [`graphus_io::MemBlockDevice::arm_torn_write`] device tears a home page mid-write; recovery
+//!   repairs it from the **doublewrite buffer** (`05 §3`, `04 §4.5`,
+//!   [`graphus_storage::recovery::recover_device_with_dwb`]) **before** ARIES redo reads its
+//!   `page_lsn`, and the consistency checker then passes. Verified by `tests/torn_data_page.rs`.
 //! * **fsync EIO (the controlled PANIC path, `04 §4.9`)** — a failed `fdatasync` aborts the process
 //!   by design (fsyncgate). The engine already proves this with a `#[should_panic]` unit test
 //!   (`graphus-wal` `manager::tests::fsync_failure_panics`). Exercising it here would mean catching
@@ -72,6 +72,10 @@ pub enum FaultKind {
     /// A crash whose durable WAL prefix is truncated mid-record (a torn tail); recovery must stop at
     /// the last intact record.
     TornWalTail,
+    /// A power loss that tears a **home data page** mid-write (some sectors new, some old). Recovery
+    /// must repair it from the doublewrite buffer (`05 §3`, `04 §4.5`) before ARIES redo reads its
+    /// `page_lsn`, so the checksum-detected tear is repaired rather than served.
+    TornDataPage,
 }
 
 impl FaultKind {
@@ -82,16 +86,18 @@ impl FaultKind {
             FaultKind::Crash { steal: false } => "crash(no-force)",
             FaultKind::Crash { steal: true } => "crash(steal)",
             FaultKind::TornWalTail => "torn-wal-tail",
+            FaultKind::TornDataPage => "torn-data-page",
         }
     }
 
     /// Every fault label the harness can emit, for initialising per-kind tallies in the report.
     #[must_use]
-    pub fn all_labels() -> [&'static str; 3] {
+    pub fn all_labels() -> [&'static str; 4] {
         [
             FaultKind::Crash { steal: false }.label(),
             FaultKind::Crash { steal: true }.label(),
             FaultKind::TornWalTail.label(),
+            FaultKind::TornDataPage.label(),
         ]
     }
 }
@@ -104,8 +110,6 @@ pub enum DeferredFault {
     /// Write I/O error against the full `RecordStore` write path — no public device seam; covered at
     /// the buffer-pool layer instead (`tests/write_io_error.rs`).
     WriteIoErrorFullEngine,
-    /// Torn DATA (home) page — needs the doublewrite buffer (`04 §4.5`), not yet implemented.
-    TornDataPage,
     /// `fdatasync` EIO — the controlled-PANIC path (`04 §4.9`); covered by a WAL unit test, out of
     /// scope here to avoid coupling to panic unwinding (adds no coverage over the crash path).
     FsyncEio,
@@ -119,7 +123,6 @@ impl DeferredFault {
     pub fn label(self) -> &'static str {
         match self {
             DeferredFault::WriteIoErrorFullEngine => "write-io-error(full-engine)",
-            DeferredFault::TornDataPage => "torn-data-page",
             DeferredFault::FsyncEio => "fsync-eio",
             DeferredFault::WriteReordering => "write-reordering",
         }
@@ -134,10 +137,6 @@ impl DeferredFault {
                  task forbids modifying other crates; the surface-not-corrupt contract is verified \
                  at the buffer-pool write path instead (tests/write_io_error.rs)"
             }
-            DeferredFault::TornDataPage => {
-                "needs the doublewrite buffer (04 §4.5), which is not yet implemented; \
-                 the checksum detects the tear but recovery cannot repair it yet"
-            }
             DeferredFault::FsyncEio => {
                 "controlled-PANIC path (04 §4.9); covered by graphus-wal \
                  manager::tests::fsync_failure_panics; out of scope here (no new coverage over crash)"
@@ -151,10 +150,9 @@ impl DeferredFault {
 
     /// Every deferred fault, for listing in the report.
     #[must_use]
-    pub fn all() -> [DeferredFault; 4] {
+    pub fn all() -> [DeferredFault; 3] {
         [
             DeferredFault::WriteIoErrorFullEngine,
-            DeferredFault::TornDataPage,
             DeferredFault::FsyncEio,
             DeferredFault::WriteReordering,
         ]
@@ -173,6 +171,7 @@ mod tests {
         assert!(labels.contains(&FaultKind::Crash { steal: false }.label()));
         assert!(labels.contains(&FaultKind::Crash { steal: true }.label()));
         assert!(labels.contains(&FaultKind::TornWalTail.label()));
+        assert!(labels.contains(&FaultKind::TornDataPage.label()));
     }
 
     #[test]

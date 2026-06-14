@@ -98,6 +98,37 @@ pub fn recover_device<S: LogSink, D: BlockDevice>(
     Ok(report)
 }
 
+/// Like [`recover_device`], but first repairs any **torn home page** from the doublewrite buffer
+/// (`05 §3`, `04 §4.5`) **before** ARIES redo runs.
+///
+/// This closes the torn-data-page durability hole: a power loss mid-write can leave a home page
+/// half-old/half-new, whose header — and therefore its `page_lsn` — is garbage. ARIES redo gates each
+/// change on that `page_lsn` ([`recover`]: `record.lsn > page_lsn`), so a torn page reading a
+/// junk-but-large `page_lsn` would have its redo **skipped** and the corrupt page served. Running the
+/// DWB repair first restores every torn home page from its intact doublewrite copy, so redo reads a
+/// trustworthy `page_lsn` from every page.
+///
+/// Ordering is the crux: the DWB copy was made durable *before* the home write began
+/// ([`crate::dwb::Dwb::stage_batch`]), so at the crash point one intact copy of each in-flight page
+/// always exists, and a page that fails its home checksum is repaired from the DWB before any redo
+/// decision depends on its header.
+///
+/// # Errors
+/// Propagates a DWB read/repair failure (including an unrepairable double fault, surfaced never
+/// hidden, `04 §4.6`), or an [`ApplyTarget::apply`]/sink/sync failure from the subsequent recovery.
+///
+/// # Panics
+/// Panics if hardening the CLRs written during undo fails (`04 §4.9`).
+pub fn recover_device_with_dwb<S: LogSink, D: BlockDevice, W: BlockDevice>(
+    wal: &mut WalManager<S>,
+    device: &mut D,
+    dwb: &mut crate::dwb::Dwb<W>,
+) -> Result<RecoveryReport> {
+    // Phase 0: torn-write repair from the doublewrite buffer, before any redo reads a `page_lsn`.
+    dwb.recover_home(device)?;
+    recover_device(wal, device)
+}
+
 /// Like [`recover_device`], but begins the WAL analysis scan at `scan_start` instead of right after
 /// the header ([`graphus_wal::recover_from`]). Used by the backup-chain point-in-time restore
 /// (`rmp` task #71), whose reconstructed logical WAL has its first record at the chain's `base_lsn`,

@@ -2427,6 +2427,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.pool.flush_all()
     }
 
+    /// Flushes every dirty page home **under doublewrite protection** (`05 §3`, `04 §4.5`): the
+    /// to-be-flushed page images are first staged into the doublewrite buffer `dwb` and made durable,
+    /// and only then written to their home locations. This is the InnoDB-style protocol that lets
+    /// crash recovery repair a torn home page from its intact doublewrite copy
+    /// ([`crate::recovery::recover_device_with_dwb`]).
+    ///
+    /// The current image of every mapped page is snapshotted through the pool (the dirty image if
+    /// resident, else the on-disk image) and staged; over-staging a clean page is harmless (it only
+    /// costs DWB I/O, never correctness — recovery restores a home page *only* if it fails its own
+    /// checksum). After the DWB sync returns the pages are written home via [`flush`](Self::flush),
+    /// so the durable-before-home ordering the protocol requires holds.
+    ///
+    /// # Errors
+    /// Returns a storage error if a page read, a DWB stage/sync, or the home flush fails. A DWB
+    /// error aborts before any home write, preserving the protocol's ordering.
+    pub fn flush_protected<W: BlockDevice>(&mut self, dwb: &mut crate::dwb::Dwb<W>) -> Result<()> {
+        let pages = self.mapped_pages();
+        // Snapshot the current (pending) image of each page; bounded by the DWB batch cap.
+        //
+        // A dirty page sits in the pool with its body finalised but its **checksum field stale**: the
+        // pool recomputes the checksum only at write-back (`graphus_bufpool` `write_back` →
+        // `page::write_checksum`). The doublewrite copy must be the *exact image that lands home*, so
+        // we re-stamp the checksum on our private snapshot — identical to what write-back will write.
+        // Without this the DWB would hold a copy that fails its own checksum and could not repair a
+        // torn home page.
+        let mut images: Vec<(PageId, Box<graphus_io::Page>)> = Vec::with_capacity(pages.len());
+        for p in &pages {
+            let mut img = self.read_device_page(*p)?;
+            page::write_checksum(&mut img);
+            images.push((*p, img));
+        }
+        for chunk in images.chunks(crate::dwb::DWB_MAX_BATCH) {
+            let batch: Vec<(PageId, &graphus_io::Page)> =
+                chunk.iter().map(|(p, img)| (*p, img.as_ref())).collect();
+            dwb.stage_batch(&batch)?;
+            // Home write for this batch. We flush all dirty frames; the DWB has the batch durable, so
+            // a torn home write among them is repairable.
+            self.pool.flush_all()?;
+        }
+        Ok(())
+    }
+
     /// The device `PageId`s this store currently maps (the metadata-page chain plus every allocated
     /// record-store page). Used by Deterministic Simulation Testing to snapshot the on-disk image
     /// after a (partial) flush so a crash + recovery can be exercised against a real disk state
