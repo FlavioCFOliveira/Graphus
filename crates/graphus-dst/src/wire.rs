@@ -209,6 +209,77 @@ pub fn run_scripted_bolt_session(
     Ok(decode_responses(&written))
 }
 
+/// Drives a Bolt session over the simulated network from a **raw, possibly malformed** client byte
+/// stream (rmp #166), capturing both the session's run result and the decoded responses **without
+/// panicking or propagating**. This is the entry point for misbehaved-client testing: feed crafted
+/// garbage / protocol violations and assert the server handles them gracefully.
+///
+/// `raw_input` is the entire client stream (handshake bytes + whatever follows). The first 4 bytes of
+/// the server's output (the handshake reply) are returned separately so a test can inspect a version
+/// rejection.
+#[must_use]
+pub fn drive_raw_bolt(
+    engine: SharedEngine,
+    seed: u64,
+    auth: &dyn AuthProvider,
+    raw_input: &[u8],
+) -> RawBoltOutcome {
+    let net = SimNet::with_seed(seed);
+    let link = net.connect();
+    // A write may legitimately fail if the link is already broken; ignore — we want the server's view.
+    let _ = net.endpoint(link, Side::Client).write_all(raw_input);
+    net.advance_to(FLUSH);
+
+    let server_ep = net.endpoint(link, Side::Server);
+    let executor = LocalBoltExecutor::new(engine);
+    let mut session = BoltSession::new(server_ep, executor, auth);
+    let run_result = session.run();
+
+    net.advance_to(FLUSH * 2);
+    let mut client = net.endpoint(link, Side::Client);
+    let mut written = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = client.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        written.extend_from_slice(&buf[..n]);
+    }
+
+    let handshake_reply = if written.len() >= 4 {
+        Some([written[0], written[1], written[2], written[3]])
+    } else {
+        None
+    };
+    RawBoltOutcome {
+        run_ok: run_result.is_ok(),
+        handshake_reply,
+        responses: decode_responses(&written),
+    }
+}
+
+/// The captured result of a raw/misbehaved Bolt session (see [`drive_raw_bolt`]).
+#[derive(Debug)]
+pub struct RawBoltOutcome {
+    /// Whether `BoltSession::run` returned `Ok` (a clean run) vs `Err` (a transport/protocol error).
+    /// Either is acceptable for a misbehaved client — what matters is that it did not **panic**.
+    pub run_ok: bool,
+    /// The 4-byte handshake reply the server wrote, if any (e.g. `[0,0,0,0]` = version rejected).
+    pub handshake_reply: Option<[u8; 4]>,
+    /// Any Bolt messages the server managed to write before closing.
+    pub responses: Vec<Response>,
+}
+
+impl RawBoltOutcome {
+    /// Whether the server emitted at least one `FAILURE` message.
+    #[must_use]
+    pub fn has_failure(&self) -> bool {
+        self.responses
+            .iter()
+            .any(|r| matches!(r, Response::Failure { .. }))
+    }
+}
+
 /// Decodes the server's written byte stream into [`Response`]s: skips the 4-byte handshake reply, then
 /// dechunks and decodes each message. Returns an empty vec if the stream is too short to contain a
 /// handshake reply (e.g. the session failed before responding).
