@@ -29,7 +29,7 @@
 //! productions (`FOREACH`, `CALL { subquery }`, existential subqueries, quantifier predicates,
 //! `LOAD CSV`, DDL) are deferred as named follow-ups rather than silently omitted.
 
-use crate::lexer::{IntLiteral, Span};
+use crate::lexer::Span;
 
 /// A complete parsed Cypher statement: the top-level [`Cypher = Statement`] production.
 ///
@@ -860,9 +860,11 @@ pub enum ExprKind {
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub enum Literal {
-    /// An integer literal: the decoded magnitude + base from the lexer (sign is a separate unary
-    /// minus). Range-checking against `i64` is a semantic concern (`04 §7.3`).
-    Integer(IntLiteral),
+    /// An integer literal, already resolved to its signed 64-bit value. The parser decodes the
+    /// lexer's magnitude + base, folds a directly-adjacent unary minus, and range-checks against
+    /// `i64::MIN..=i64::MAX` at compile time (an out-of-range literal is a compile-time `SyntaxError`,
+    /// openCypher `IntegerOverflow`; `04 §7.3`, `tck/.../literals/Literals2-4`).
+    Integer(i64),
     /// A floating-point literal.
     Float(f64),
     /// A string literal (escapes already resolved by the lexer).

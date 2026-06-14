@@ -579,9 +579,7 @@ fn literal_value(expr: &Expr) -> Option<graphus_core::Value> {
     use crate::ast::{ExprKind, Literal};
     use graphus_core::Value;
     match &expr.kind {
-        ExprKind::Literal(Literal::Integer(int_lit)) => {
-            i64::try_from(int_lit.value).ok().map(Value::Integer)
-        }
+        ExprKind::Literal(Literal::Integer(i)) => Some(Value::Integer(*i)),
         ExprKind::Literal(Literal::Float(f)) => Some(Value::Float(*f)),
         ExprKind::Literal(Literal::String(s)) => Some(Value::String(s.clone())),
         ExprKind::Literal(Literal::Boolean(b)) => Some(Value::Boolean(*b)),
@@ -662,7 +660,7 @@ mod tests {
     use crate::ast::{Expr, ExprKind, Label, Literal};
     use crate::catalog::IndexId;
     use crate::graph_access::{GraphAccess, MemGraph};
-    use crate::lexer::{IntBase, IntLiteral, Span};
+    use crate::lexer::Span;
     use crate::logical::Var;
     use graphus_core::Value;
 
@@ -677,14 +675,8 @@ mod tests {
         }
     }
 
-    fn int_expr(n: u128) -> Expr {
-        Expr::new(
-            ExprKind::Literal(Literal::Integer(IntLiteral {
-                value: n,
-                base: IntBase::Decimal,
-            })),
-            span(),
-        )
+    fn int_expr(n: i64) -> Expr {
+        Expr::new(ExprKind::Literal(Literal::Integer(n)), span())
     }
 
     /// 1000 `:Person` (every `age` distinct over 0..1000) and 5 `:Company`. A deliberately skewed

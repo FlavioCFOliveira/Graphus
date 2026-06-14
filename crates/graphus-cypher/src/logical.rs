@@ -1038,7 +1038,7 @@ fn fmt_expr(expr: &Expr) -> String {
     use crate::ast::{BinaryOp, ExprKind, Literal, PredicateOp, UnaryOp};
     match &expr.kind {
         ExprKind::Literal(lit) => match lit {
-            Literal::Integer(i) => i.value.to_string(),
+            Literal::Integer(i) => i.to_string(),
             Literal::Float(x) => x.to_string(),
             Literal::String(s) => format!("'{s}'"),
             Literal::Boolean(b) => b.to_string(),

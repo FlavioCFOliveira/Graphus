@@ -249,12 +249,8 @@ struct LiteralSite {
 /// range error rather than the cache silently lifting a bad value).
 fn scalar_literal_value(lit: &Literal) -> Option<Value> {
     match lit {
-        Literal::Integer(int) => {
-            // The magnitude is already decoded (held as a `u128`, base-independent). Only lift it if
-            // it fits `i64` (the Cypher integer range); an out-of-range literal is left inline so its
-            // handling (the parser/executor range check) is unchanged.
-            i64::try_from(int.value).ok().map(Value::Integer)
-        }
+        // The parser already resolved and range-checked the literal into `i64` at compile time.
+        Literal::Integer(i) => Some(Value::Integer(*i)),
         Literal::Float(x) => Some(Value::Float(*x)),
         Literal::String(s) => Some(Value::String(s.clone())),
         Literal::Boolean(b) => Some(Value::Boolean(*b)),

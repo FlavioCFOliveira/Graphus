@@ -371,6 +371,11 @@ pub enum LexErrorKind {
     InvalidUnicodeEscape,
     /// A numeric literal prefix (`0x` / `0o`) with no following digits, or a malformed numeral.
     MalformedNumber,
+    /// A floating-point literal whose magnitude exceeds the `f64` range (e.g. `1.34E999`), which
+    /// `f64::from_str` parses to infinity rather than rejecting. openCypher classifies this as a
+    /// compile-time `SyntaxError` (TCK detail `FloatingPointOverflow`,
+    /// `tck/features/expressions/literals/Literals5` [27]).
+    FloatOverflow,
     /// A `$` not followed by a valid parameter name or decimal index.
     MalformedParameter,
 }
@@ -386,6 +391,7 @@ impl fmt::Display for LexErrorKind {
             Self::InvalidEscape => f.write_str("invalid string escape sequence"),
             Self::InvalidUnicodeEscape => f.write_str("invalid unicode escape sequence"),
             Self::MalformedNumber => f.write_str("malformed numeric literal"),
+            Self::FloatOverflow => f.write_str("floating-point literal out of range"),
             Self::MalformedParameter => f.write_str("malformed parameter"),
         }
     }
@@ -1042,6 +1048,16 @@ impl<'a> Lexer<'a> {
             let value = text.parse::<f64>().map_err(|_| {
                 LexError::new(LexErrorKind::MalformedNumber, Span::new(start, self.pos))
             })?;
+            // `f64::from_str` maps an out-of-range magnitude (e.g. `1.34E999`) to infinity rather
+            // than erroring. The grammar above never admits literal `inf`/`nan` text, so an infinite
+            // result can only mean the written value overflowed `f64` — a compile-time `SyntaxError`
+            // (openCypher; `tck/.../Literals5` [27], detail `FloatingPointOverflow`).
+            if value.is_infinite() {
+                return Err(LexError::new(
+                    LexErrorKind::FloatOverflow,
+                    Span::new(start, self.pos),
+                ));
+            }
             Ok(Token::new(
                 TokenKind::Float(value),
                 Span::new(start, self.pos),

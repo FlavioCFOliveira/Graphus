@@ -1872,6 +1872,16 @@ impl Analyzer<'_> {
     /// A *constant* dynamic count (a parameter, `SKIP toInteger(rand()*9)`) is a runtime concern
     /// and is **not** flagged — the statement plan stays parameter-independent (`04 §7.5`).
     fn check_skip_limit_literal(expr: &Expr, position: &'static str) -> Result<(), SemanticError> {
+        // A negated integer literal (`SKIP -1`) is `NegativeIntegerArgument`. The parser folds a
+        // directly-adjacent unary minus into a signed `Literal::Integer`, so the negative case is now
+        // a negative-valued literal; we also keep the `Unary(Minus, Integer)` arm for any path that
+        // does not fold (defensive — e.g. `-(1)`, which keeps the runtime unary form).
+        if matches!(&expr.kind, ExprKind::Literal(Literal::Integer(n)) if *n < 0) {
+            return Err(SemanticError::new(
+                SemanticErrorKind::NegativeIntegerArgument,
+                expr.span,
+            ));
+        }
         if let ExprKind::Unary {
             op: UnaryOp::Minus,
             operand,

@@ -33,7 +33,7 @@
 //! | 6 | `STARTS WITH` `ENDS WITH` `CONTAINS` `IN` `=~`* `IS [NOT] NULL` | left (postfix) | `StringListNullPredicateExpression` |
 //! | 7 | `+` `-` | left | `AddOrSubtractExpression` |
 //! | 8 | `*` `/` `%` | left | `MultiplyDivideModuloExpression` |
-//! | 9 | `^` | **right** | `PowerOfExpression` |
+//! | 9 | `^` | **left** | `PowerOfExpression` |
 //! | 10 | unary `+` `-` (prefix) | — | `UnaryAddOrSubtractExpression` |
 //! | 11 | `.` `[]` `[..]` `:Label` (postfix) | left | `NonArithmeticOperatorExpression` |
 //! | 12 (tightest) | atoms: literals, `$p`, vars, `f(...)`, `count(*)`, `[...]`, `{...}`, `CASE`, comprehensions, `(...)` | — | `Atom` |
@@ -135,6 +135,10 @@ pub enum SyntaxErrorKind {
         /// A description of the offending token.
         found: String,
     },
+    /// An integer literal (decimal/hex/octal) whose value does not fit Cypher's signed 64-bit integer
+    /// range (`i64::MIN..=i64::MAX`). openCypher classifies this as a compile-time `SyntaxError`
+    /// (TCK detail `IntegerOverflow`; `tck/.../literals/Literals2`/`Literals3`/`Literals4`).
+    IntegerOverflow,
 }
 
 impl fmt::Display for SyntaxErrorKind {
@@ -148,6 +152,9 @@ impl fmt::Display for SyntaxErrorKind {
             }
             Self::TrailingInput => f.write_str("unexpected trailing input after statement"),
             Self::UnexpectedToken { found } => write!(f, "unexpected {found}"),
+            Self::IntegerOverflow => {
+                f.write_str("integer literal out of range (does not fit a 64-bit signed integer)")
+            }
         }
     }
 }
@@ -1624,19 +1631,20 @@ impl<'t, 's> Parser<'t, 's> {
 
     /// `PowerOfExpression = UnaryAddOrSubtractExpression, { '^', UnaryAddOrSubtract }`.
     ///
-    /// Exponentiation is **right-associative** (`2 ^ 3 ^ 2 = 2 ^ (3 ^ 2)`); we recurse on the right
-    /// operand to build the right-leaning tree. The EBNF writes it left-iterative, but the standard
-    /// Cypher semantics (and the TCK) treat `^` as right-associative — resolved here, see the module
-    /// precedence note.
+    /// Exponentiation is **left-associative** in openCypher, per the M23 EBNF's left-iterative form
+    /// `{ '^', … }` and pinned empirically by the TCK: `tck/.../precedence/Precedence2` [2]/[3] assert
+    /// `4 ^ (3 * 2) ^ 3 = (4 ^ 6) ^ 3 = 4 ^ 18 = 68719476736` (the left-associative grouping), not the
+    /// mathematical right-associative `4 ^ (6 ^ 3)`. We therefore iterate left, folding each `^` into
+    /// the accumulated left operand. (This differs from Python/maths convention, which is
+    /// right-associative; the TCK is authoritative here — see the module precedence note.)
     fn parse_power(&mut self) -> Result<Expr, SyntaxError> {
-        let lhs = self.parse_unary()?;
-        if self.at(&TokenKind::Caret) {
+        let mut lhs = self.parse_unary()?;
+        while self.at(&TokenKind::Caret) {
             self.bump();
-            let rhs = self.parse_power()?; // right-assoc: recurse
-            Ok(Self::binary(BinaryOp::Pow, lhs, rhs))
-        } else {
-            Ok(lhs)
+            let rhs = self.parse_unary()?; // left-assoc: iterate
+            lhs = Self::binary(BinaryOp::Pow, lhs, rhs);
         }
+        Ok(lhs)
     }
 
     /// `UnaryAddOrSubtractExpression = [('+'|'-')], NonArithmeticOperatorExpression` (prefix).
@@ -1649,6 +1657,21 @@ impl<'t, 's> Parser<'t, 's> {
         if let Some(op) = op {
             let start = self.here_span().start;
             self.bump();
+            // Fold a `-` directly in front of an integer literal into a single signed literal, so
+            // `-9223372036854775808` (i64::MIN) is admitted as one in-range value. Without folding,
+            // the magnitude `2^63` would fail the positive `i64::MAX` check before negation, and the
+            // smallest integer would be unrepresentable. Only a *bare* integer token folds (a `-(…)`
+            // or `-x` keeps the runtime unary-minus path).
+            if op == UnaryOp::Minus {
+                if let Some(TokenKind::Integer(lit)) = self.peek_kind() {
+                    let value = lit.value;
+                    let lit_span = self.here_span();
+                    self.bump();
+                    let span = Span::new(start, lit_span.end);
+                    let n = Self::resolve_int_magnitude(value, true, span)?;
+                    return Ok(Expr::new(ExprKind::Literal(Literal::Integer(n)), span));
+                }
+            }
             let operand = self.parse_unary()?; // stacked unary `- -x` is fine
             let span = Span::new(start, operand.span.end);
             Ok(Expr::new(
@@ -1661,6 +1684,27 @@ impl<'t, 's> Parser<'t, 's> {
         } else {
             self.parse_postfix_expr()
         }
+    }
+
+    /// Resolves a decoded integer literal magnitude into a signed `i64`, applying `negative` and
+    /// range-checking at compile time.
+    ///
+    /// The Cypher integer range is `i64::MIN..=i64::MAX`. A positive literal admits magnitudes up to
+    /// `i64::MAX` (`2^63 - 1`); a negative literal admits magnitudes up to `2^63` (so `i64::MIN` is
+    /// representable). Anything larger is a compile-time `SyntaxError`
+    /// ([`SyntaxErrorKind::IntegerOverflow`], openCypher detail `IntegerOverflow`).
+    fn resolve_int_magnitude(value: u128, negative: bool, span: Span) -> Result<i64, SyntaxError> {
+        const MIN_MAGNITUDE: u128 = (i64::MAX as u128) + 1; // 2^63 == -i64::MIN
+        let resolved = if negative {
+            if value == MIN_MAGNITUDE {
+                Some(i64::MIN)
+            } else {
+                i64::try_from(value).ok().map(|n| -n)
+            }
+        } else {
+            i64::try_from(value).ok()
+        };
+        resolved.ok_or_else(|| SyntaxError::new(SyntaxErrorKind::IntegerOverflow, span))
     }
 
     /// `NonArithmeticOperatorExpression = Atom, { ListOperator | PropertyLookup }, [NodeLabels]`.
@@ -1771,9 +1815,12 @@ impl<'t, 's> Parser<'t, 's> {
         let span = tok.span;
         match &tok.kind {
             TokenKind::Integer(lit) => {
-                let lit = *lit;
+                let value = lit.value;
                 self.bump();
-                Ok(Expr::new(ExprKind::Literal(Literal::Integer(lit)), span))
+                // A bare (unsigned) integer literal must fit `i64::MAX`; a negative literal is folded
+                // by `parse_unary` before reaching here, so this arm only ever sees the positive case.
+                let n = Self::resolve_int_magnitude(value, false, span)?;
+                Ok(Expr::new(ExprKind::Literal(Literal::Integer(n)), span))
             }
             TokenKind::Float(f) => {
                 let f = *f;

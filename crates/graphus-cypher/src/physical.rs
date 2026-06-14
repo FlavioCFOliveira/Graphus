@@ -2541,11 +2541,8 @@ fn const_value(expr: &Expr) -> Option<Value> {
 /// built from `null` cannot drive a seek), keeping the planner on the scan path.
 fn const_literal(lit: &crate::ast::Literal) -> Option<Value> {
     use crate::ast::Literal;
-    use crate::lexer::IntLiteral;
     match lit {
-        Literal::Integer(IntLiteral { value, .. }) => {
-            i64::try_from(*value).ok().map(Value::Integer)
-        }
+        Literal::Integer(i) => Some(Value::Integer(*i)),
         Literal::Float(x) => Some(Value::Float(*x)),
         Literal::String(s) => Some(Value::String(s.clone())),
         Literal::Boolean(b) => Some(Value::Boolean(*b)),

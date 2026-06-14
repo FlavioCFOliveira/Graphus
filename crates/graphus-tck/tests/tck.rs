@@ -221,7 +221,25 @@ use graphus_tck::runner::run_scenario;
 /// copy onto a **relationship** (new rel-property seam methods + entity-source eval), fixing
 /// `Merge6` [6][7] and `Merge7` [4][5]. Measured, zero regressions (full failure-set diff: 0
 /// newly-failing scenarios; the net +17 is purely additive).
-const BASELINE: usize = 3847;
+///
+/// 3847 → 3866 (#138, numeric-literal limits + operator precedence): three independent fixes across
+/// the lexer/parser/evaluator, closing 19 scenarios. (1) **Integer literal range check at compile
+/// time** — integer literals are now resolved to `i64` *in the parser*, range-checked against
+/// `i64::MIN..=i64::MAX`; an out-of-range literal is a compile-time `SyntaxError` (`IntegerOverflow`)
+/// instead of a runtime `ArithmeticError`, and a `-` directly in front of an integer literal is
+/// folded so `i64::MIN` (`-9223372036854775808`) is representable. Closes
+/// `expressions/literals/Literals2` [8][9][10] (decimal), `Literals3` [8][16][17] (hex), `Literals4`
+/// [8][9][10] (octal). The AST `Literal::Integer` now carries an `i64`, not the lexer magnitude.
+/// (2) **Float overflow** — a float literal whose magnitude exceeds `f64` (e.g. `1.34E999`, which
+/// `f64::from_str` maps to infinity) is now a compile-time `SyntaxError` (`Literals5` [27]).
+/// (3) **Exponentiation is left-associative** — `^` now folds left (`4 ^ (3*2) ^ 3 == (4 ^ 6) ^ 3`),
+/// per the openCypher M23 EBNF and `expressions/precedence/Precedence2` [2][3]; unary minus still
+/// binds tighter than `^`, preserving [4]. (4) **String predicate on a non-string operand yields
+/// `null`** (openCypher/Neo4j), not a `TypeError` — closing `Precedence4` [4] and additively
+/// `expressions/string/{String8,String9,String10}` [8] (STARTS WITH/ENDS WITH/CONTAINS non-string
+/// operands). Measured, zero regressions (full failure-set diff: 0 newly-failing scenarios; the net
+/// +19 is purely additive).
+const BASELINE: usize = 3866;
 
 /// Recursively collects every `*.feature` file under `root`, returning `(absolute_path,
 /// path_relative_to_root)` pairs sorted for a stable run order.

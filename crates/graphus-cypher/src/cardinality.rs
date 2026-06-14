@@ -233,7 +233,7 @@ pub(crate) fn clamp_estimate(x: f64) -> f64 {
 /// `u128`; it is saturated into `f64` (an exact conversion for any realistic count).
 pub(crate) fn literal_row_count(expr: &crate::ast::Expr) -> Option<f64> {
     match &expr.kind {
-        ExprKind::Literal(Literal::Integer(int_lit)) => Some(int_lit.value as f64),
+        ExprKind::Literal(Literal::Integer(i)) => Some(*i as f64),
         _ => None,
     }
 }
@@ -660,9 +660,7 @@ fn property_access(expr: &Expr) -> Option<(String, String)> {
 /// non-negative magnitude is convertible, which is the overwhelmingly common literal shape.
 fn literal_value(expr: &Expr) -> Option<Value> {
     match &expr.kind {
-        ExprKind::Literal(Literal::Integer(int_lit)) => {
-            i64::try_from(int_lit.value).ok().map(Value::Integer)
-        }
+        ExprKind::Literal(Literal::Integer(i)) => Some(Value::Integer(*i)),
         ExprKind::Literal(Literal::Float(f)) => Some(Value::Float(*f)),
         ExprKind::Literal(Literal::String(s)) => Some(Value::String(s.clone())),
         ExprKind::Literal(Literal::Boolean(b)) => Some(Value::Boolean(*b)),
@@ -727,7 +725,7 @@ mod tests {
     use super::*;
     use crate::ast::{Expr, Label, RelType};
     use crate::graph_access::{GraphAccess, MemGraph};
-    use crate::lexer::{IntBase, IntLiteral, Span};
+    use crate::lexer::Span;
     use crate::logical::{LogicalOp, ProjectionColumn, Var};
     use graphus_core::Value;
 
@@ -737,14 +735,8 @@ mod tests {
     }
 
     /// An integer-literal expression `n` for SKIP/LIMIT count tests.
-    fn int_expr(n: u128) -> Expr {
-        Expr::new(
-            ExprKind::Literal(Literal::Integer(IntLiteral {
-                value: n,
-                base: IntBase::Decimal,
-            })),
-            span(),
-        )
+    fn int_expr(n: i64) -> Expr {
+        Expr::new(ExprKind::Literal(Literal::Integer(n)), span())
     }
 
     /// A `true` boolean-literal expression, used wherever an operator needs an arbitrary

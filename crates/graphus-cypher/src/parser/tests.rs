@@ -389,11 +389,13 @@ fn sub_is_left_associative() {
 }
 
 #[test]
-fn power_is_right_associative() {
-    // 2 ^ 3 ^ 2  ==  2 ^ (3 ^ 2)
+fn power_is_left_associative() {
+    // openCypher: `^` is left-associative — `2 ^ 3 ^ 2 == (2 ^ 3) ^ 2`. Pinned by
+    // `tck/.../precedence/Precedence2` [2]/[3] (`4 ^ (3*2) ^ 3 == (4 ^ 6) ^ 3 == 4 ^ 18`). The
+    // *left* operand of the root `^` is therefore the nested `^`.
     let kind = return_kind("RETURN 2 ^ 3 ^ 2");
-    let (_, rhs) = assert_binary_root(&kind, BinaryOp::Pow);
-    assert_binary_root(&rhs.kind, BinaryOp::Pow);
+    let (lhs, _) = assert_binary_root(&kind, BinaryOp::Pow);
+    assert_binary_root(&lhs.kind, BinaryOp::Pow);
 }
 
 #[test]
@@ -402,6 +404,27 @@ fn power_binds_tighter_than_mul() {
     let kind = return_kind("RETURN 2 * 3 ^ 2");
     let (_, rhs) = assert_binary_root(&kind, BinaryOp::Mul);
     assert_binary_root(&rhs.kind, BinaryOp::Pow);
+}
+
+#[test]
+fn power_binds_tighter_than_add() {
+    // 2 + 3 ^ 2  ==  2 + (3 ^ 2)
+    let kind = return_kind("RETURN 2 + 3 ^ 2");
+    let (_, rhs) = assert_binary_root(&kind, BinaryOp::Add);
+    assert_binary_root(&rhs.kind, BinaryOp::Pow);
+}
+
+#[test]
+fn unary_minus_folds_into_power_base() {
+    // `-3 ^ 2` parses as `(-3) ^ 2` (unary minus binds tighter than `^` in openCypher;
+    // `tck/.../precedence/Precedence2` [4] expects `9.0`). The folded literal is the *base*.
+    let kind = return_kind("RETURN -3 ^ 2");
+    let (lhs, _) = assert_binary_root(&kind, BinaryOp::Pow);
+    assert!(
+        matches!(&lhs.kind, ExprKind::Literal(Literal::Integer(-3))),
+        "expected folded -3 as the power base, got {:?}",
+        lhs.kind
+    );
 }
 
 #[test]
@@ -591,6 +614,112 @@ fn literal_atoms() {
         return_kind("RETURN null"),
         ExprKind::Literal(Literal::Null)
     ));
+}
+
+#[test]
+fn integer_literal_resolves_to_i64() {
+    assert!(matches!(
+        return_kind("RETURN 42"),
+        ExprKind::Literal(Literal::Integer(42))
+    ));
+    // The largest positive integer (`i64::MAX`) parses, decimal and hex.
+    assert!(matches!(
+        return_kind("RETURN 9223372036854775807"),
+        ExprKind::Literal(Literal::Integer(i64::MAX))
+    ));
+    assert!(matches!(
+        return_kind("RETURN 0x7FFFFFFFFFFFFFFF"),
+        ExprKind::Literal(Literal::Integer(i64::MAX))
+    ));
+}
+
+#[test]
+fn smallest_integer_folds_to_i64_min() {
+    // `-9223372036854775808` (i64::MIN) is admitted as one folded negative literal
+    // (`tck/.../literals/Literals2` [8]); the magnitude `2^63` is otherwise out of the positive range.
+    assert!(matches!(
+        return_kind("RETURN -9223372036854775808"),
+        ExprKind::Literal(Literal::Integer(i64::MIN))
+    ));
+    // Hex and octal smallest, likewise.
+    assert!(matches!(
+        return_kind("RETURN -0x8000000000000000"),
+        ExprKind::Literal(Literal::Integer(i64::MIN))
+    ));
+    assert!(matches!(
+        return_kind("RETURN -0o1000000000000000000000"),
+        ExprKind::Literal(Literal::Integer(i64::MIN))
+    ));
+}
+
+#[test]
+fn integer_overflow_is_a_compile_time_syntax_error() {
+    // A too-large / too-small literal is a compile-time `SyntaxError` (`IntegerOverflow`), not a
+    // runtime arithmetic error: decimal (`Literals2` [9]/[10]), hex (`Literals3` [16]/[17]), octal
+    // (`Literals4` [9]/[10]).
+    for q in [
+        "RETURN 9223372036854775808",       // i64::MAX + 1
+        "RETURN -9223372036854775809",      // i64::MIN - 1
+        "RETURN 0x8000000000000000",        // hex i64::MAX + 1
+        "RETURN -0x8000000000000001",       // hex i64::MIN - 1
+        "RETURN 0o1000000000000000000000",  // octal i64::MAX + 1
+        "RETURN -0o1000000000000000000001", // octal i64::MIN - 1
+    ] {
+        let e = err(q);
+        assert_eq!(
+            e.kind,
+            SyntaxErrorKind::IntegerOverflow,
+            "query {q:?} should be a compile-time IntegerOverflow"
+        );
+    }
+}
+
+#[test]
+fn float_overflow_is_a_compile_time_syntax_error() {
+    // `1.34E999` overflows `f64`; openCypher rejects it at compile time (`Literals5` [27]). The lexer
+    // raises the error, surfaced through `parse`.
+    let e = crate::parser::parse("RETURN 1.34E999").expect_err("float overflow must fail");
+    assert!(
+        matches!(e, graphus_core::GraphusError::Compile { .. }),
+        "expected a compile-time error, got {e:?}"
+    );
+}
+
+#[test]
+fn string_predicate_binds_tighter_than_or() {
+    // `'x' STARTS WITH a OR b` == `('x' STARTS WITH a) OR b` — the string predicate is the *left*
+    // operand of `OR` (`tck/.../precedence/Precedence4` [4]).
+    let kind = return_kind("RETURN 'x' STARTS WITH a OR b");
+    let (lhs, _) = assert_binary_root(&kind, BinaryOp::Or);
+    assert!(
+        matches!(
+            &lhs.kind,
+            ExprKind::Predicate {
+                op: PredicateOp::StartsWith,
+                ..
+            }
+        ),
+        "LHS of OR should be a STARTS WITH predicate, got {:?}",
+        lhs.kind
+    );
+}
+
+#[test]
+fn string_predicate_binds_tighter_than_and() {
+    // `a AND 'x' CONTAINS b` == `a AND ('x' CONTAINS b)` — the predicate is the *right* operand.
+    let kind = return_kind("RETURN a AND 'x' CONTAINS b");
+    let (_, rhs) = assert_binary_root(&kind, BinaryOp::And);
+    assert!(
+        matches!(
+            &rhs.kind,
+            ExprKind::Predicate {
+                op: PredicateOp::Contains,
+                ..
+            }
+        ),
+        "RHS of AND should be a CONTAINS predicate, got {:?}",
+        rhs.kind
+    );
 }
 
 #[test]

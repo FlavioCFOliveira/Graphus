@@ -35,7 +35,6 @@ use crate::binding::BoundParameters;
 use crate::equality::{equals, is_in};
 use crate::function_registry::FunctionRegistry;
 use crate::graph_access::GraphAccess;
-use crate::lexer::IntLiteral;
 use crate::ordering::compare_values;
 use crate::runtime::{NodeRef, PathStep, PathValue, RelRef, Row, RowValue};
 use crate::ternary::Ternary;
@@ -249,9 +248,9 @@ pub(crate) fn to_value(rv: RowValue) -> Value {
 /// (`04 §7.3` defers the range check to here, the runtime phase).
 fn literal_value(lit: &Literal) -> Result<Value, EvalError> {
     match lit {
-        Literal::Integer(IntLiteral { value, .. }) => i64::try_from(*value)
-            .map(Value::Integer)
-            .map_err(|_| EvalError::IntegerOverflow),
+        // The parser already range-checked the literal into `i64` at compile time (`04 §7.3`,
+        // openCypher `IntegerOverflow`), so decoding here is total.
+        Literal::Integer(i) => Ok(Value::Integer(*i)),
         Literal::Float(x) => Ok(Value::Float(*x)),
         Literal::String(s) => Ok(Value::String(s.clone())),
         Literal::Boolean(b) => Ok(Value::Boolean(*b)),
@@ -746,9 +745,12 @@ fn eval_predicate(
                     };
                     Ok(RowValue::Value(Value::Boolean(truth)))
                 }
-                _ => Err(EvalError::TypeError {
-                    context: "string predicate requires string operands".to_owned(),
-                }),
+                // A non-null, non-string operand yields `null`, not an error: openCypher / Neo4j
+                // specify that `STARTS WITH`/`ENDS WITH`/`CONTAINS` applied to non-`STRING` values
+                // return `null` (pinned by `tck/.../precedence/Precedence4` [4], where
+                // `'abc' STARTS WITH true` must be `null` so the enclosing `<>` is `null`, not a
+                // runtime `TypeError`).
+                _ => Ok(RowValue::NULL),
             }
         }
     }
@@ -2519,6 +2521,45 @@ mod tests {
         );
         assert_eq!(evaluate("toString(42)"), Value::String("42".to_owned()));
         assert_eq!(evaluate("coalesce(null, null, 5)"), Value::Integer(5));
+    }
+
+    #[test]
+    fn exponentiation_precedence_and_left_associativity() {
+        // `^` yields a float and is left-associative: `2 ^ 3 ^ 2 == (2 ^ 3) ^ 2 == 8 ^ 2 == 64`.
+        assert_eq!(evaluate("2 ^ 3 ^ 2"), Value::Float(64.0));
+        // `^` binds tighter than `*`/`+`: `2 * 3 ^ 2 == 2 * 9 == 18`; `2 + 3 ^ 2 == 2 + 9 == 11`.
+        assert_eq!(evaluate("2 * 3 ^ 2"), Value::Float(18.0));
+        assert_eq!(evaluate("2 + 3 ^ 2"), Value::Float(11.0));
+        // Unary minus binds tighter than `^` (`tck/.../Precedence2` [4]): `-2 ^ 2 == (-2) ^ 2 == 4`,
+        // and `-3 ^ 2 == (-3) ^ 2 == 9`, while `-(3 ^ 2) == -9`.
+        assert_eq!(evaluate("-2 ^ 2"), Value::Float(4.0));
+        assert_eq!(evaluate("-3 ^ 2"), Value::Float(9.0));
+        assert_eq!(evaluate("-(3 ^ 2)"), Value::Float(-9.0));
+        // The full Precedence2 [2] `c` column: `4 ^ (3 * 2) ^ 3 == (4 ^ 6) ^ 3 == 4 ^ 18`.
+        assert_eq!(evaluate("4 ^ (3 * 2) ^ 3"), Value::Float(68_719_476_736.0));
+    }
+
+    #[test]
+    fn smallest_integer_literal_evaluates_to_i64_min() {
+        // `-9223372036854775808` (i64::MIN) is a folded, in-range literal — no runtime overflow.
+        assert_eq!(evaluate("-9223372036854775808"), Value::Integer(i64::MIN));
+        assert_eq!(evaluate("9223372036854775807"), Value::Integer(i64::MAX));
+    }
+
+    #[test]
+    fn string_predicate_on_non_string_returns_null() {
+        // openCypher / Neo4j: a string predicate over a non-`STRING` operand yields `null`, not a
+        // type error (`tck/.../precedence/Precedence4` [4]).
+        assert_eq!(evaluate("'abc' STARTS WITH true"), Value::Null);
+        assert_eq!(evaluate("'abc' CONTAINS 1"), Value::Null);
+        assert_eq!(evaluate("'abc' ENDS WITH [1]"), Value::Null);
+        // A null operand likewise yields null (existing 3VL behaviour, kept).
+        assert_eq!(evaluate("'abc' STARTS WITH null"), Value::Null);
+        // And the precedence interaction: `'abc' STARTS WITH null OR true == null OR true == true`.
+        assert_eq!(
+            evaluate("'abc' STARTS WITH null OR true"),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
