@@ -26,6 +26,7 @@
 pub mod command;
 mod exec;
 mod handle;
+mod local;
 pub mod privileges;
 mod seam_bolt;
 mod seam_rest;
@@ -45,6 +46,7 @@ pub use command::{
     AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
+pub use local::LocalEngine;
 pub use privileges::EffectivePrivileges;
 pub use seam_bolt::BoltEngineExecutor;
 pub use seam_rest::{RestAuthObserver, RestEngineAdapter};
@@ -120,6 +122,7 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
     rx: std::sync::mpsc::Receiver<EngineCommand>,
     result_buffer_capacity: usize,
     metrics: Arc<Metrics>,
+    clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) {
     let mut open: HashMap<u64, OpenTx> = HashMap::new();
     let mut next_ticket: u64 = 0;
@@ -152,6 +155,7 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
                         &extensions,
                         result_buffer_capacity,
                         &metrics,
+                        &clock,
                     ) {
                         break; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
@@ -179,6 +183,7 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
                 &extensions,
                 result_buffer_capacity,
                 &metrics,
+                &clock,
             ) {
                 break;
             }
@@ -209,6 +214,7 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
     extensions: &graphus_cypher::extension::ExtensionRegistry,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
+    clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) -> bool {
     let coord = coordinator
         .as_mut()
@@ -243,6 +249,7 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
                 extensions,
                 result_buffer_capacity,
                 metrics,
+                clock,
                 reply,
             );
             metrics.set_active_txns(coord.active_count() as u64);
@@ -692,6 +699,7 @@ pub fn spawn_engine<D, S, B>(
     engine_queue_capacity: usize,
     result_buffer_capacity: usize,
     metrics: Arc<Metrics>,
+    clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) -> Result<Engine>
 where
     D: BlockDevice + 'static,
@@ -709,7 +717,7 @@ where
             Ok(coordinator) => {
                 // Startup succeeded: signal readiness, then run the loop until Shutdown.
                 let _ = init_tx.send(Ok(()));
-                run_engine_loop(coordinator, rx, result_buffer_capacity, loop_metrics);
+                run_engine_loop(coordinator, rx, result_buffer_capacity, loop_metrics, clock);
             }
             Err(e) => {
                 // Startup failed (e.g. corrupt store): report it and exit without serving.

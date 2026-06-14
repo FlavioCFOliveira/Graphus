@@ -1174,6 +1174,7 @@ dependencies = [
  "graphus-cypher",
  "graphus-io",
  "graphus-rest",
+ "graphus-sim",
  "graphus-storage",
  "graphus-txn",
  "graphus-wal",

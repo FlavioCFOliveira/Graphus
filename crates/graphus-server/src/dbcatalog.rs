@@ -435,7 +435,7 @@ fn load_entries(
 
 /// The engine-spawn knobs the catalog captures from [`ServerConfig`] at construction, so runtime
 /// `create`/`start` spawn engines with exactly the same sizing as the default database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineParams {
     /// Buffer-pool capacity in pages, per database (`04 §3`).
     pub buffer_pool_pages: usize,
@@ -450,6 +450,27 @@ pub struct EngineParams {
     /// set, every database's store is an encrypted device (a per-store salted subkey is derived at
     /// create/open). When `None`, the store path is byte-identical to before encryption existed.
     pub master_key: Option<MasterKey>,
+    /// The wall-clock source threaded into the engine for query-latency observation (`04 §11`).
+    /// Production defaults to a [`crate::server::SystemClock`]-backed clock in [`Self::from_config`];
+    /// the deterministic [`crate::engine::LocalEngine`] does not go through this path (it builds its
+    /// engine inline with a `SimClock`), so this field exists solely so the threaded (production)
+    /// engine is itself clock-injectable and never reaches for `Instant::now()` directly.
+    pub clock: std::sync::Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+}
+
+impl std::fmt::Debug for EngineParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `clock` is a `dyn Clock` trait object (not `Debug`); render it as an opaque marker so
+        // `EngineParams` keeps a useful `Debug` for diagnostics without constraining the trait.
+        f.debug_struct("EngineParams")
+            .field("buffer_pool_pages", &self.buffer_pool_pages)
+            .field("engine_queue_capacity", &self.engine_queue_capacity)
+            .field("result_buffer_capacity", &self.result_buffer_capacity)
+            .field("max_concurrent_queries", &self.max_concurrent_queries)
+            .field("master_key", &self.master_key.as_ref().map(|_| "<redacted>"))
+            .field("clock", &"<dyn Clock>")
+            .finish()
+    }
 }
 
 impl EngineParams {
@@ -470,6 +491,7 @@ impl EngineParams {
             result_buffer_capacity: config.admission.result_buffer_capacity,
             max_concurrent_queries: config.admission.max_concurrent_queries,
             master_key,
+            clock: std::sync::Arc::new(crate::server::SystemClock),
         })
     }
 }
@@ -669,6 +691,7 @@ fn spawn_db_engine(
         params.engine_queue_capacity,
         params.result_buffer_capacity,
         metrics,
+        std::sync::Arc::clone(&params.clock),
     )
 }
 
@@ -1653,6 +1676,7 @@ mod tests {
             result_buffer_capacity: 32,
             max_concurrent_queries: 16,
             master_key: None,
+            clock: std::sync::Arc::new(crate::server::SystemClock),
         }
     }
 

@@ -13,7 +13,7 @@
 //! pull runs on a blocking task too (see [`crate::listeners`]), so a blocking `recv` here never
 //! parks a Tokio runtime worker (`04 §9.1`).
 
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 
 use graphus_core::GraphusError;
 use graphus_cypher::MaterializedValue;
@@ -28,8 +28,53 @@ use graphus_cypher::MaterializedValue;
 /// structural type (`BoltValue` / `RestValue`).
 pub type RowItem = Result<Vec<MaterializedValue>, GraphusError>;
 
-/// The engine's end of a result stream: a bounded sender it pushes rows into.
-pub type RowSender = SyncSender<RowItem>;
+/// The sentinel `result_buffer_capacity` that selects an **unbounded** egress channel instead of a
+/// bounded one (see [`egress`]). The production server always passes a small, finite admission-derived
+/// capacity (`04 §9.3`), so `usize::MAX` is a safe, never-collides marker; the inline single-threaded
+/// [`super::LocalEngine`] passes it because, with no concurrent consumer, a bounded channel would
+/// dead-lock once full (its producer and consumer are the *same* thread).
+pub const UNBOUNDED: usize = usize::MAX;
+
+/// The engine's end of a result stream. Bounded for backpressure on the production path (`04 §9.3`),
+/// or unbounded for the inline [`super::LocalEngine`] (which buffers a whole result on one thread).
+///
+/// A single enum keeps the streaming code (`exec::run_cursor`) identical for both: it just calls
+/// [`RowSender::send`]. The receiving end is the same [`Receiver<RowItem>`] in both cases, so
+/// [`RowReceiver`] is unaffected.
+pub enum RowSender {
+    /// A bounded `SyncSender`: a full channel blocks the producer (the §9.3 egress backpressure).
+    Bounded(SyncSender<RowItem>),
+    /// An unbounded `Sender`: never blocks, so a single-threaded producer/consumer cannot dead-lock.
+    Unbounded(Sender<RowItem>),
+}
+
+impl RowSender {
+    /// Pushes one row item, returning `Err` (with the item) only if the receiver was dropped — the
+    /// same contract `SyncSender::send` has, so callers (`exec::run_cursor`) need no change.
+    ///
+    /// # Errors
+    /// [`std::sync::mpsc::SendError`] if the consumer dropped its receiver (early disconnect).
+    pub fn send(&self, item: RowItem) -> Result<(), std::sync::mpsc::SendError<RowItem>> {
+        match self {
+            RowSender::Bounded(s) => s.send(item),
+            RowSender::Unbounded(s) => s.send(item),
+        }
+    }
+}
+
+/// Builds an egress channel of `capacity`: bounded (backpressure) for any finite value, or unbounded
+/// when `capacity == `[`UNBOUNDED`]. Returns the sender half and the raw receiver
+/// (wrap it in [`RowReceiver::new`]).
+#[must_use]
+pub fn egress(capacity: usize) -> (RowSender, Receiver<RowItem>) {
+    if capacity == UNBOUNDED {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (RowSender::Unbounded(tx), rx)
+    } else {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        (RowSender::Bounded(tx), rx)
+    }
+}
 
 /// The consumer's end of a result stream: a receiver pulled by the connection's cursor.
 #[derive(Debug)]

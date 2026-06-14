@@ -96,3 +96,6 @@ graphus-bolt = { path = "../graphus-bolt" }
 # as an external client would. graphus-cli's normal deps are only graphus-core + graphus-bolt, so
 # this introduces no dependency cycle.
 graphus-cli = { path = "../graphus-cli" }
+# The deterministic capability substrate (SimClock/SimRng) so the inline `LocalEngine` tests
+# (`engine::local`) can drive the real engine over a simulated clock — the DST foundation (rmp #160).
+graphus-sim = { path = "../graphus-sim" }

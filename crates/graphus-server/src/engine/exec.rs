@@ -8,9 +8,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use graphus_core::Value;
+use graphus_core::capability::Clock;
 use graphus_core::error::GraphusError;
 use graphus_cypher::extension::ExtensionRegistry;
 use graphus_cypher::function_registry::{Arity, FunctionFailure};
@@ -153,6 +154,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     extensions: &ExtensionRegistry,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
+    clock: &Arc<dyn Clock + Send + Sync>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) {
     // Resolve the open transaction.
@@ -205,14 +207,20 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         return;
     }
 
-    // The egress channel: bounded for backpressure (`04 §9.3`).
-    let (row_tx, row_rx) = std::sync::mpsc::sync_channel(result_buffer_capacity);
+    // The egress channel: bounded for backpressure (`04 §9.3`), or unbounded for the inline
+    // single-threaded driver (`super::stream::UNBOUNDED`, used by `super::LocalEngine`).
+    let (row_tx, row_rx) = super::stream::egress(result_buffer_capacity);
 
     // Execute and stream. `produced_ok` is true iff streaming completed without a runtime error.
     // `stream_rows` opens the cursor, sends the `RunReply` (fields + receiver) over `reply` *before*
     // the first row (so the consumer can drain concurrently), then streams. A compile/runtime error
     // before the first row is delivered through `reply` instead.
-    let started = Instant::now();
+    // Timing is taken from the **injected [`Clock`]** rather than `Instant::now()` so the whole
+    // execution path is wall-clock-free and deterministically testable (`04 §11`): production passes a
+    // [`crate::server::SystemClock`]-backed clock (latency is wall-nanos, equivalent to the previous
+    // `Instant` source for metrics), while the deterministic [`super::LocalEngine`] passes a
+    // `SimClock` so the measured latency — and therefore every observation — replays identically.
+    let started = clock.now_nanos();
     let produced_ok = stream_rows(
         coordinator,
         txn,
@@ -225,7 +233,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         reply,
     );
 
-    let elapsed = started.elapsed();
+    let elapsed = Duration::from_nanos(clock.now_nanos().saturating_sub(started));
     metrics.observe_query_latency(elapsed);
 
     // Auto-commit: commit on success, roll back on a runtime error (`04 §1.3` step 6).
