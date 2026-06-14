@@ -23,6 +23,7 @@
 //! v1 behaviour; lock-free concurrent reads against committed versions are the documented follow-up
 //! (§9.1).
 
+pub mod bolt_values;
 pub mod command;
 mod exec;
 mod handle;

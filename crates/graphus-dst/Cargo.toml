@@ -27,3 +27,8 @@ graphus-storage = { path = "../graphus-storage" }
 # (`vopr` module, rmp #162): `graphus_server::engine::LocalEngine`. graphus-server does not depend on
 # graphus-dst, so this is acyclic.
 graphus-server = { path = "../graphus-server" }
+# The REAL Bolt protocol stack (handshake/framing/PackStream/BoltSession/BoltExecutor) so the wire
+# simulator (`wire` module, rmp #163) drives a genuine Bolt session over the simulated network.
+graphus-bolt = { path = "../graphus-bolt" }
+# The Bolt session's `AuthProvider` (a real `Authenticator`) for the LOGON exchange.
+graphus-auth = { path = "../graphus-auth" }

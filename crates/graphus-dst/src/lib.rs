@@ -43,6 +43,7 @@ pub mod harness;
 pub mod model;
 pub mod rng;
 pub mod vopr;
+pub mod wire;
 pub mod workload;
 
 pub use checker::{CheckFailure, CheckResult, verify};

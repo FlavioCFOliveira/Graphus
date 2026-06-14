@@ -1100,6 +1100,8 @@ dependencies = [
 name = "graphus-dst"
 version = "0.0.0"
 dependencies = [
+ "graphus-auth",
+ "graphus-bolt",
  "graphus-bufpool",
  "graphus-core",
  "graphus-io",
