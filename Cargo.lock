@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-auth"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "argon2",
  "getrandom 0.2.17",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-bench"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "criterion",
  "graphus-core",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-bolt"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "graphus-auth",
  "graphus-core",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-bufpool"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "crc32c",
  "graphus-core",
@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-bulk"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "csv",
  "graphus-core",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "graphus-bolt",
@@ -1060,11 +1060,11 @@ dependencies = [
 
 [[package]]
 name = "graphus-core"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "graphus-crypto"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "graphus-bufpool",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-cypher"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "csv",
  "graphus-bufpool",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-dst"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "graphus-auth",
  "graphus-bolt",
@@ -1117,21 +1117,21 @@ dependencies = [
 
 [[package]]
 name = "graphus-elle"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "graphus-core",
 ]
 
 [[package]]
 name = "graphus-gds"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "graphus-index"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "graphus-bufpool",
  "graphus-core",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-io"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "criterion",
  "graphus-core",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-rest"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "bytes",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-server"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "graphus-auth",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-sim"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "graphus-bolt",
  "graphus-core",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-storage"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "crc32c",
  "graphus-bufpool",
@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-tck"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "gherkin",
  "graphus-core",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-txn"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "graphus-core",
  "graphus-sim",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "graphus-wal"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "crc32c",
  "graphus-core",
