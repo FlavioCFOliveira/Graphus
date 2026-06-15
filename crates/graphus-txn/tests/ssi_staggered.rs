@@ -287,3 +287,122 @@ fn serializable_staggered_histories_have_no_anomalies() {
         }
     }
 }
+
+// =================================================================================================
+// Canonical multi-hop rw-antidependency cycle harness (rmp #224, residual finding #153).
+//
+// The staggered fuzz above proves the detector admits no anomalous *random* history; this harness
+// adds the missing **direct, deterministic** construction the finding asked for: canonical n-cycles
+// of read-write antidependencies (T0 -rw-> T1 -rw-> ... -rw-> T_{n-1} -rw-> T0) for n = 3 and n = 4,
+// asserting the SSI layer breaks every cycle with at least one abort — the concrete safety property
+// behind the 100%-ACID serializability pillar. Plus negative cases that must NOT abort, chosen to
+// contain no dangerous structure at all (a lone antidependency and fully independent transactions),
+// so they hold even though SSI is intentionally conservative and may abort acyclic *pivots*.
+// =================================================================================================
+
+/// Builds a pure rw-antidependency `n`-cycle over `n` concurrent SERIALIZABLE transactions and
+/// asserts the manager aborts at least one of them. Construction: a committed seed installs v1 on
+/// keys `0..n`; then transaction `i` reads key `i` (observing the seed version) and writes key
+/// `(i+1) % n`. Because `i -> (i+1) % n` is a permutation, there is **no** write-write conflict — the
+/// only conflicts are the rw-antidependencies `T_{(i+1)%n} -rw-> T_i` (the reader of key `(i+1)%n`
+/// is dominated by `T_i`'s overwrite), which close an `n`-cycle in the dependency-serialization
+/// graph. A serializable engine MUST refuse to commit the whole cycle.
+fn canonical_rw_cycle_forces_abort(n: u64) {
+    assert!(n >= 2);
+    let mut mgr = TxnManager::new(MemVersionedStore::new());
+
+    let seed = mgr.begin_serializable().unwrap();
+    for k in 0..n {
+        mgr.write(seed, k, writer_payload(0)).unwrap();
+    }
+    mgr.commit(seed).unwrap();
+
+    // All `n` transactions begin concurrently (overlapping lifetimes — none commits before the
+    // cycle is fully wired).
+    let txns: Vec<TxnId> = (0..n).map(|_| mgr.begin_serializable().unwrap()).collect();
+
+    // Read footprints first: each Ti reads key i, observing the seed's v1.
+    for (i, &t) in txns.iter().enumerate() {
+        mgr.read(t, i as u64).unwrap();
+    }
+    // Then the writes that turn those reads into antidependencies: Ti overwrites key (i+1) % n,
+    // which T_{(i+1)%n} just read. No two transactions target the same key (permutation), so every
+    // write succeeds (no first-committer-wins ww-abort) and the structure is purely rw.
+    for (i, &t) in txns.iter().enumerate() {
+        mgr.write(t, (i as u64 + 1) % n, writer_payload(i as u64 + 1))
+            .unwrap();
+    }
+
+    // Commit in index order. At least one commit must fail to break the cycle.
+    let aborts = txns.iter().filter(|&&t| mgr.commit(t).is_err()).count();
+    assert!(
+        aborts >= 1,
+        "n={n}: a {n}-transaction rw-antidependency cycle must force >=1 abort to stay \
+         serializable, but every transaction committed"
+    );
+}
+
+#[test]
+fn three_transaction_rw_cycle_breaks() {
+    canonical_rw_cycle_forces_abort(3);
+}
+
+#[test]
+fn four_transaction_rw_cycle_breaks() {
+    canonical_rw_cycle_forces_abort(4);
+}
+
+#[test]
+fn independent_transactions_never_abort() {
+    // No conflicts at all: each transaction reads and writes a private key. There is no dangerous
+    // structure, so a correct (non-over-aborting) SSI layer commits all of them. Guards against a
+    // detector that spuriously aborts disjoint work.
+    let mut mgr = TxnManager::new(MemVersionedStore::new());
+    let n: u64 = 6;
+
+    let seed = mgr.begin_serializable().unwrap();
+    for k in 0..n {
+        mgr.write(seed, k, writer_payload(0)).unwrap();
+    }
+    mgr.commit(seed).unwrap();
+
+    let txns: Vec<TxnId> = (0..n).map(|_| mgr.begin_serializable().unwrap()).collect();
+    for (i, &t) in txns.iter().enumerate() {
+        mgr.read(t, i as u64).unwrap();
+        mgr.write(t, i as u64, writer_payload(i as u64 + 1))
+            .unwrap();
+    }
+    for (i, &t) in txns.iter().enumerate() {
+        assert!(
+            mgr.commit(t).is_ok(),
+            "independent transaction {i} must commit (no conflict, no false abort)"
+        );
+    }
+}
+
+#[test]
+fn lone_antidependency_does_not_abort() {
+    // A single rw-antidependency edge (T0 -rw-> T1) with NO second edge: there is no pivot (T0 has
+    // only an out-edge, T1 only an in-edge), hence no dangerous structure. Both must commit — a lone
+    // antidependency is not a serializability violation.
+    let mut mgr = TxnManager::new(MemVersionedStore::new());
+
+    let seed = mgr.begin_serializable().unwrap();
+    mgr.write(seed, 0, writer_payload(0)).unwrap(); // key A
+    mgr.write(seed, 1, writer_payload(0)).unwrap(); // key C (T1's private read)
+    mgr.commit(seed).unwrap();
+
+    let t0 = mgr.begin_serializable().unwrap();
+    let t1 = mgr.begin_serializable().unwrap();
+
+    mgr.read(t0, 0).unwrap(); // T0 reads key A (seed v1)
+    mgr.write(t0, 2, writer_payload(1)).unwrap(); // T0 writes key D (private, unread)
+    mgr.read(t1, 1).unwrap(); // T1 reads key C (private, no in-edge to T1)
+    mgr.write(t1, 0, writer_payload(2)).unwrap(); // T1 overwrites key A ⇒ T0 -rw-> T1 (the only edge)
+
+    assert!(mgr.commit(t0).is_ok(), "the antidependency tail commits");
+    assert!(
+        mgr.commit(t1).is_ok(),
+        "a lone antidependency (no pivot) must not abort the head"
+    );
+}
