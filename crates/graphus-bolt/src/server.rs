@@ -401,15 +401,6 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             return Ok(Flow::Stop);
         }
 
-        // TELEMETRY is advisory: acknowledge it with an empty SUCCESS and never fail the connection
-        // over it (rmp #95). It is accepted in any non-failed state without disturbing the state
-        // machine; while FAILED it falls through to the fail-then-ignore rule below (IGNORED, also
-        // never a FAILURE), exactly like any other message.
-        if matches!(request, Request::Telemetry { .. }) && self.state != State::Failed {
-            self.send(&Response::Success { metadata: vec![] })?;
-            return Ok(Flow::Continue);
-        }
-
         // Fail-then-ignore-until-RESET: in FAILED, only RESET is processed; all else is IGNORED.
         if self.state == State::Failed {
             if matches!(request, Request::Reset) {
@@ -593,6 +584,18 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 self.handle_route(db.as_deref())?;
                 Ok(Flow::Continue)
             }
+            (State::Ready, Request::Telemetry { .. }) => {
+                // TELEMETRY (Bolt 5.4+) is advisory: it reports which driver API the client used. The
+                // spec state machine accepts it ONLY in READY — `READY + TELEMETRY -> SUCCESS{} ->
+                // READY` (no state change). It is rejected as a wrong-state request in every other
+                // state (it falls through to `unexpected` below), per the Bolt server-state spec. The
+                // `telemetry.enabled` HELLO hint is opt-out only and never makes TELEMETRY legal
+                // outside READY; in READY the server must SUCCESS it even if the hint was sent.
+                // (Supersedes the earlier rmp #95 "accept in any state" leniency in favour of the
+                // inviolable 100%-Bolt-compliance mandate.)
+                self.send(&Response::Success { metadata: vec![] })?;
+                Ok(Flow::Continue)
+            }
             (_, Request::Logoff) => {
                 // Drop the identity; back to AUTHENTICATION (5.1+ re-auth without a new connection).
                 self.executor.set_principal(None);
@@ -658,6 +661,15 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// when false (DISCARD), then the trailing `SUCCESS`. Honours the fetch size (`04 §7.7`) and
     /// reports an **accurate** `has_more` via the result's one-record lookahead (`06 §3.1`).
     fn handle_pull(&mut self, n: i64, emit: bool) -> BoltResult<Flow> {
+        // Validate the `n` domain (`04 §7.7`/`06 §3.1`): the only legal values are `-1` (fetch/throw
+        // away all remaining) or a strictly positive integer. The spec is silent on `n == 0` and
+        // `n < -1`; the Neo4j reference server rejects them with FAILURE
+        // (`Neo.ClientError.Request.Invalid`) → FAILED, so we mirror that for driver-ecosystem
+        // compatibility rather than silently treating an out-of-range `n` as a no-op or "all".
+        if n != ALL && n < 1 {
+            self.fail_protocol("PULL/DISCARD n must be -1 (all) or a positive integer")?;
+            return Ok(Flow::Continue);
+        }
         let Some(mut result) = self.open_stream.take() else {
             // Should not happen (only reachable in a streaming state), but be defensive.
             self.fail_protocol("PULL/DISCARD with no open result")?;

@@ -68,7 +68,10 @@ fn logon_alice() -> Request {
         auth: vec![
             ("scheme".to_owned(), Value::String("basic".to_owned())),
             ("principal".to_owned(), Value::String("alice".to_owned())),
-            ("credentials".to_owned(), Value::String("alice-pw".to_owned())),
+            (
+                "credentials".to_owned(),
+                Value::String("alice-pw".to_owned()),
+            ),
         ],
     }
 }
@@ -1050,8 +1053,11 @@ fn telemetry_is_acknowledged_with_success_and_never_fails() {
 }
 
 #[test]
-fn telemetry_before_logon_is_still_success_not_failure() {
-    // Even out of the usual order (sent in AUTHENTICATION), TELEMETRY is acknowledged, never failed.
+fn telemetry_in_authentication_is_rejected_as_wrong_state() {
+    // TELEMETRY is legal ONLY in READY (Bolt 5.4+ state machine). Sent out of order in
+    // AUTHENTICATION (after HELLO, before LOGON) it is a wrong-state request: FAILURE → FAILED, and
+    // the following LOGON is then IGNORED until a RESET (`04 §8.1`). This supersedes the earlier
+    // rmp #95 leniency in favour of the inviolable 100%-Bolt-compliance mandate.
     let input = session_input(&[
         hello(),
         Request::Telemetry { api: 1 },
@@ -1063,19 +1069,105 @@ fn telemetry_before_logon_is_still_success_not_failure() {
     {
         let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
         session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
-    // HELLO SUCCESS, TELEMETRY SUCCESS, LOGON SUCCESS — no FAILURE, and LOGON still works after.
+    // HELLO SUCCESS, TELEMETRY FAILURE (wrong state), LOGON IGNORED (FAILED until RESET).
+    assert!(matches!(r[0], Response::Success { .. }), "HELLO → SUCCESS");
+    match &r[1] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected wrong-state FAILURE, got {other:?}"),
+    }
     assert!(
-        matches!(r[1], Response::Success { .. }),
-        "TELEMETRY → SUCCESS"
+        matches!(r[2], Response::Ignored),
+        "LOGON after the TELEMETRY FAILURE → IGNORED"
     );
+    assert_eq!(r.len(), 3);
+}
+
+#[test]
+fn telemetry_before_hello_is_rejected_as_wrong_state() {
+    // TELEMETRY sent in CONNECTED (before HELLO) is a wrong-state request: FAILURE → FAILED. The
+    // subsequent HELLO is then IGNORED until a RESET arrives.
+    let input = session_input(&[Request::Telemetry { api: 3 }, hello(), Request::Goodbye]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // TELEMETRY FAILURE (pre-HELLO), HELLO IGNORED (FAILED until RESET).
+    match &r[0] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected wrong-state FAILURE, got {other:?}"),
+    }
     assert!(
-        matches!(r[2], Response::Success { .. }),
-        "LOGON still works"
+        matches!(r[1], Response::Ignored),
+        "HELLO after the pre-HELLO TELEMETRY FAILURE → IGNORED"
     );
-    assert!(!r.iter().any(|resp| matches!(resp, Response::Failure(_))));
+    assert_eq!(r.len(), 2);
+}
+
+#[test]
+fn pull_and_discard_reject_out_of_range_n() {
+    // The only legal `n` values are -1 (all) or a strictly positive integer. `n == 0` and `n < -1`
+    // are rejected with FAILURE (`Neo.ClientError.Request.Invalid`) → FAILED, matching the Neo4j
+    // reference server, rather than silently fetching nothing or "all".
+    for bad_n in [0_i64, -2, -100] {
+        for emit in [true, false] {
+            let exec = MockExecutor::new().on_query(
+                "RETURN 1",
+                CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+            );
+            let req = if emit {
+                Request::Pull {
+                    n: bad_n,
+                    qid: None,
+                }
+            } else {
+                Request::Discard {
+                    n: bad_n,
+                    qid: None,
+                }
+            };
+            let input = session_input(&[
+                hello(),
+                logon_alice(),
+                Request::Run {
+                    query: "RETURN 1".to_owned(),
+                    parameters: vec![],
+                    extra: vec![],
+                },
+                req,
+                Request::Goodbye,
+            ]);
+            let auth = auth_fixture();
+            let mut transport = MemoryTransport::with_input(&input);
+            {
+                let mut session = BoltSession::new(&mut transport, exec, &auth);
+                session.run().unwrap();
+            }
+            let (_, stream) = split_handshake(transport.written());
+            let r = decode_responses(stream);
+            // HELLO SUCCESS, LOGON SUCCESS, RUN SUCCESS{fields}, PULL/DISCARD FAILURE.
+            match &r[3] {
+                Response::Failure(f) => assert_eq!(
+                    f.code, "Neo.ClientError.Request.Invalid",
+                    "n={bad_n} emit={emit} must FAIL as out-of-range"
+                ),
+                other => panic!("n={bad_n} emit={emit}: expected FAILURE, got {other:?}"),
+            }
+            // No RECORD was emitted before the rejection.
+            assert!(
+                !r.iter().any(|resp| matches!(resp, Response::Record { .. })),
+                "n={bad_n} emit={emit}: out-of-range PULL/DISCARD must not stream records"
+            );
+        }
+    }
 }
 
 #[test]
