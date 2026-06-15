@@ -49,6 +49,8 @@ The project contains an extensive test suite to guarantee that the server behave
 2. **E2E (end-to-end) tests** — Realistic tests that prove the server's readiness for use in different scenarios.
 3. **Stress and load tests** — Realistic tests that prove the server's readiness for use in environments of **EXTREME CONCURRENCY AND LOAD**.
 
+You MUST use the **DST (Deterministic Simulation Testing) simulator** of the project as a support tool for designing test scenarios and for reproducing (replicating) real-world situations. Whenever you author, exercise, or validate test scenarios — especially those involving concurrency, faults, crashes, and recovery — you MUST leverage the DST simulator to model and replicate those real situations deterministically, so that issues can be reproduced reliably and verified against the project's correctness and durability guarantees.
+
 ## Core rules
 
 1. **You are NOT authorized to make decisions on your own.** Whenever the instructions are insufficient, unclear, non-specific, non-concrete, or whenever there are contradictions or ambiguities, you MUST ALWAYS ASK the user how to proceed. When asking the user:
