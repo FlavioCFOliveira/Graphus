@@ -20,7 +20,7 @@ in the project Knowledge Graph (`rmp` roadmap `graphus`).
 | `04-technical-design.md` | The implementation-design layer (the "HOW"): crate boundaries, on-disk layouts, byte-level formats, algorithms, and control/data flow. Collects the remaining measurement-gated spikes in §12. §6.7 documents the full-text index (advanced; delivered ahead of Phase 2, rmp #72). |
 | `05-storage-format.md` | Phase 1 spike: storage-format and durability micro-decisions. Freezes the page header, the versioned-record header, the record-store and B+-tree page layouts, and the offline backup artifact. |
 | `06-bolt-and-error-shapes.md` | Phase 1 spike: pins the Bolt version (5.4), freezes the TCK error-classification table and the Bolt/REST result and failure shapes, and specifies the REST transactional access-mode field. Closes decision-register open questions 2 and 5. |
-| `07-dst-simulator.md` | The external **deterministic simulator** (VOPR, decision `D-vopr`): determinism model, architecture, the three real wire clients, workloads, misbehaved/fault/load coverage, the four oracles (incl. the Elle isolation checker), the scenario catalogue, and the engine gaps it surfaced (`rmp` #171/#172). |
+| `07-dst-simulator.md` | The external **deterministic simulator** (VOPR, decision `D-vopr`): determinism model, architecture, the three real wire clients, workloads, misbehaved/fault/load coverage, the four oracles (incl. the Elle isolation checker), the scenario catalogue, and the engine gaps it surfaced (`rmp` #171/#172/#220). |
 
 ## How to read this
 
