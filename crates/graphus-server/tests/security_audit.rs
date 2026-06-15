@@ -38,7 +38,10 @@ impl TempStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        path.push(format!("graphus-secaudit-{tag}-{nanos}-{}", std::process::id()));
+        path.push(format!(
+            "graphus-secaudit-{tag}-{nanos}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
@@ -272,7 +275,9 @@ fn sec181_rest_header_read_timeout_is_configured_by_default() {
     let configured = timing.header_read_timeout();
     assert_eq!(
         configured,
-        Some(std::time::Duration::from_millis(timing.header_read_timeout_ms)),
+        Some(std::time::Duration::from_millis(
+            timing.header_read_timeout_ms
+        )),
         "header_read_timeout() must surface the configured deadline when non-zero (SEC-181)"
     );
     // Sanity: an explicit 0 disables it (operator opt-out), and the accessor reflects that.

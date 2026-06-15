@@ -466,8 +466,14 @@ mod tests {
     fn projection_dedups_shared_node_across_rows() {
         // The same node id appears in two rows; it must collapse to one entry.
         let mut proj = GraphProjection::new();
-        proj.add_row(vec![RestValue::Node(node(7, "A")), RestValue::Node(node(8, "B"))]);
-        proj.add_row(vec![RestValue::Node(node(7, "A")), RestValue::Node(node(9, "C"))]);
+        proj.add_row(vec![
+            RestValue::Node(node(7, "A")),
+            RestValue::Node(node(8, "B")),
+        ]);
+        proj.add_row(vec![
+            RestValue::Node(node(7, "A")),
+            RestValue::Node(node(9, "C")),
+        ]);
         assert_eq!(proj.node_count(), 3, "node 7 collapses to one entry");
         let ids: Vec<i64> = proj
             .to_json()

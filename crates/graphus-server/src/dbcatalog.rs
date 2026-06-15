@@ -467,7 +467,10 @@ impl std::fmt::Debug for EngineParams {
             .field("engine_queue_capacity", &self.engine_queue_capacity)
             .field("result_buffer_capacity", &self.result_buffer_capacity)
             .field("max_concurrent_queries", &self.max_concurrent_queries)
-            .field("master_key", &self.master_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "master_key",
+                &self.master_key.as_ref().map(|_| "<redacted>"),
+            )
             .field("clock", &"<dyn Clock>")
             .finish()
     }

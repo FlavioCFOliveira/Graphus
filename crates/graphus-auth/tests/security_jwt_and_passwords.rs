@@ -179,7 +179,10 @@ fn jwt_is_bound_to_issuer_and_audience() {
     let claims = deployment_a.verify_bearer(&token, NOW + 10).unwrap();
     assert_eq!(claims.iss, "graphus");
     assert_eq!(claims.aud, "deployment-a");
-    assert!(!claims.jti.is_empty(), "a jti must be stamped for revocation");
+    assert!(
+        !claims.jti.is_empty(),
+        "a jti must be stamped for revocation"
+    );
 }
 
 /// Regression: SEC-180 (CWE-613). Changing a user's password now invalidates already-issued Bearer
@@ -192,7 +195,10 @@ fn password_change_revokes_outstanding_tokens() {
     a.set_password("alice", "original-strong-pw").unwrap();
     let token = a.issue_token("alice", NOW, 3600).unwrap();
     // Valid before the reset.
-    assert_eq!(a.authenticate_bearer(&token, NOW + 10).unwrap().sub, "alice");
+    assert_eq!(
+        a.authenticate_bearer(&token, NOW + 10).unwrap().sub,
+        "alice"
+    );
 
     // Rotate the password (simulating a compromise response / forced reset). This bumps the epoch.
     a.set_password("alice", "rotated-strong-pw").unwrap();
@@ -204,7 +210,10 @@ fn password_change_revokes_outstanding_tokens() {
     );
     // A token minted after the reset is accepted again.
     let fresh = a.issue_token("alice", NOW + 1, 3600).unwrap();
-    assert_eq!(a.authenticate_bearer(&fresh, NOW + 10).unwrap().sub, "alice");
+    assert_eq!(
+        a.authenticate_bearer(&fresh, NOW + 10).unwrap().sub,
+        "alice"
+    );
 }
 
 /// Regression: SEC-180. A single leaked token can be killed by its `jti` without disturbing the

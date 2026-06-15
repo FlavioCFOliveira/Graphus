@@ -224,7 +224,9 @@ fn sec210_csr_index_map_uses_a_dos_resistant_hasher() {
     // Functional sanity: many client-chosen ids (including ones engineered to be adjacent) index
     // and round-trip correctly under the default hasher.
     let n = 5000u64;
-    let nodes: Vec<u64> = (0..n).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+    let nodes: Vec<u64> = (0..n)
+        .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .collect();
     let g = VecGraphSource {
         nodes: nodes.clone(),
         edges: Vec::new(),

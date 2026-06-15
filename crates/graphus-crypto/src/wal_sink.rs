@@ -330,7 +330,12 @@ impl<S: LogSink> EncryptedLogSink<S> {
 
     /// Seals `plaintext` into a frame at logical offset `logical_offset`, stamped with the cumulative
     /// `write_count`, and returns the framed bytes ready to append to the backing.
-    fn seal_frame(&self, logical_offset: u64, write_count: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+    fn seal_frame(
+        &self,
+        logical_offset: u64,
+        write_count: u64,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
         let nonce_bytes = random_nonce();
         let nonce = Nonce::from(nonce_bytes);
         let aad = Self::aad(logical_offset, write_count);

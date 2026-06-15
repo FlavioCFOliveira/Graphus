@@ -502,7 +502,8 @@ mod tests {
         std::fs::write(&inside, b"a,b\n1,2\n").expect("write inside file");
 
         // A secret file OUTSIDE the root.
-        let outside = std::env::temp_dir().join(format!("graphus_loadcsv_secret_{}.txt", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("graphus_loadcsv_secret_{}.txt", std::process::id()));
         std::fs::write(&outside, b"SECRET").expect("write secret");
 
         let policy = CsvImportPolicy::with_import_root(&root);

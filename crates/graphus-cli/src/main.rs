@@ -360,7 +360,10 @@ mod tests {
         std::fs::write(&path, "s3cr3t\n").unwrap();
 
         let pw = resolve_password(None, Some(path.clone())).unwrap();
-        assert_eq!(pw, "s3cr3t", "the trailing newline must not be part of the secret");
+        assert_eq!(
+            pw, "s3cr3t",
+            "the trailing newline must not be part of the secret"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

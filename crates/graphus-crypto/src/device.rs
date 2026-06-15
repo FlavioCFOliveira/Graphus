@@ -137,7 +137,10 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
         // then make them durable before the device is usable.
         backing.extend(HEADER_SLOTS)?;
         backing.write_slot(HEADER_SLOT_INDEX, &header.encode())?;
-        backing.write_slot(COUNTER_SLOT_INDEX, &encode_counter_slot(0, &counter_cipher)?)?;
+        backing.write_slot(
+            COUNTER_SLOT_INDEX,
+            &encode_counter_slot(0, &counter_cipher)?,
+        )?;
         backing.sync_all()?;
         Ok(Self {
             backing,

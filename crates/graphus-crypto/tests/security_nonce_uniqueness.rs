@@ -229,7 +229,8 @@ fn exhausted_budget_fails_closed_on_write() {
     let kr = keyring(&salt);
     let mut dev = EncryptedBlockDevice::create(InspectableSlots::new(), &kr, salt).expect("create");
     dev.extend(1).expect("extend");
-    dev.write_page(PageId(0), &[0x11; PAGE_SIZE]).expect("write");
+    dev.write_page(PageId(0), &[0x11; PAGE_SIZE])
+        .expect("write");
     dev.sync_all().expect("sync");
     let backing = dev.into_backing();
 
@@ -240,7 +241,8 @@ fn exhausted_budget_fails_closed_on_write() {
     tampered[20] ^= 0xFF; // flip a ciphertext/tag byte → AEAD fails on read
     backing.set_slot(1, tampered);
 
-    let mut dev2 = EncryptedBlockDevice::open(backing, &kr).expect("reopen still succeeds (KCV ok)");
+    let mut dev2 =
+        EncryptedBlockDevice::open(backing, &kr).expect("reopen still succeeds (KCV ok)");
     assert_eq!(
         dev2.nonce_budget_consumed(),
         MAX_WRITES_PER_SUBKEY,

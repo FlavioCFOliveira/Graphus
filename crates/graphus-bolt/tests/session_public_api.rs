@@ -113,7 +113,10 @@ fn full_session_over_public_api() {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("bob".to_owned())),
-                ("credentials".to_owned(), Value::String("bob-secret".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("bob-secret".to_owned()),
+                ),
             ],
         },
         Request::Run {

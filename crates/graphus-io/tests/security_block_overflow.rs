@@ -20,7 +20,10 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("graphus-sec-io-{}-{tag}-{n}.blk", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "graphus-sec-io-{}-{tag}-{n}.blk",
+        std::process::id()
+    ))
 }
 
 /// The exact arithmetic performed by `FileBlockDevice::extend` (`new_count * PAGE_SIZE as u64`) and
@@ -49,8 +52,9 @@ fn extend_with_overflowing_page_count_returns_err_not_wrap() {
     // Attacker-chosen huge growth. Run inside catch_unwind so that, were the fix ever regressed
     // back to an unchecked `*`, a debug-build overflow panic surfaces as a test failure here
     // instead of aborting the process: we assert a clean Err, never a panic, never an Ok wrap.
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dev.extend(OVERFLOW_PAGE_COUNT)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dev.extend(OVERFLOW_PAGE_COUNT)
+    }));
 
     match result {
         Ok(Err(_e)) => { /* SECURE: rejected with a clean error, as required. */ }
@@ -101,7 +105,9 @@ fn positioned_access_at_overflowing_page_id_returns_err_not_wrapped_seek() {
     let evil = graphus_core::PageId(OVERFLOW_PAGE_COUNT);
     let mut buf = [0u8; PAGE_SIZE];
 
-    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dev.read_page(evil, &mut buf)));
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dev.read_page(evil, &mut buf)
+    }));
     assert!(
         matches!(read, Ok(Err(_))),
         "REGRESSION (SEC-211): read_page at an overflowing page id must return Err, not panic or \
@@ -109,7 +115,8 @@ fn positioned_access_at_overflowing_page_id_returns_err_not_wrapped_seek() {
     );
 
     let page = [0u8; PAGE_SIZE];
-    let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dev.write_page(evil, &page)));
+    let write =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dev.write_page(evil, &page)));
     assert!(
         matches!(write, Ok(Err(_))),
         "REGRESSION (SEC-211): write_page at an overflowing page id must return Err, not panic or \

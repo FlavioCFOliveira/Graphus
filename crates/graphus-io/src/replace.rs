@@ -218,7 +218,10 @@ mod tests {
         let fresh = dir.0.join("fresh-temp");
         create_fresh_temp(&fresh).expect("fresh temp must be created");
         let meta = std::fs::symlink_metadata(&fresh).expect("metadata");
-        assert!(meta.file_type().is_file(), "created temp must be a regular file");
+        assert!(
+            meta.file_type().is_file(),
+            "created temp must be a regular file"
+        );
     }
 
     /// Regression: SEC-213 — a full `atomic_replace_file` uses an unpredictable temp name and a

@@ -494,7 +494,10 @@ mod tests {
         );
 
         // The true in-range point (the origin) is present — the property the bug violated.
-        assert!(got.contains(&10), "the in-range candidate must never be dropped");
+        assert!(
+            got.contains(&10),
+            "the in-range candidate must never be dropped"
+        );
     }
 
     #[test]

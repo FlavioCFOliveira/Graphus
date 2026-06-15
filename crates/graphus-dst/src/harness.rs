@@ -528,7 +528,12 @@ impl Driver {
 
         let staged: Vec<(u64, Box<Page>)> = pages
             .iter()
-            .map(|p| (p.0, self.store.read_device_page(*p).expect("read device page")))
+            .map(|p| {
+                (
+                    p.0,
+                    self.store.read_device_page(*p).expect("read device page"),
+                )
+            })
             .collect();
 
         // Choose a (page, prefix) tear that **provably lands**: a torn write keeps the first `prefix`

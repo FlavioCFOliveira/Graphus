@@ -54,7 +54,9 @@ impl SharedClock {
     /// Creates a shared clock starting at `start` nanoseconds.
     #[must_use]
     pub fn new(start: u64) -> Self {
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start)))
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            start,
+        )))
     }
 
     /// Sets the current time (the simulator calls this with the scheduler's logical time each step).

@@ -88,7 +88,14 @@ fn sec194_all_formula_prefixes_neutralised_on_export() {
     // `-2` is inert in a spreadsheet.
     let numeric = "id:ID,:LABEL,bal:int\nn1,L,-2\n";
     let dump = import_node_and_dump(numeric);
-    let data_line = dump.lines().find(|l| l.contains(",L,") || l.contains(",L\t") || l.ends_with(",-2")).unwrap_or_else(|| dump.lines().find(|l| l.contains("-2")).expect("numeric row"));
+    let data_line = dump
+        .lines()
+        .find(|l| l.contains(",L,") || l.contains(",L\t") || l.ends_with(",-2"))
+        .unwrap_or_else(|| {
+            dump.lines()
+                .find(|l| l.contains("-2"))
+                .expect("numeric row")
+        });
     assert!(
         data_line.contains("-2") && !data_line.contains("'-2"),
         "a numeric -2 must not be quoted (it is inert): {data_line:?}"
@@ -170,7 +177,13 @@ fn sec195_single_cell_array_is_capped() {
 
     // Within the cap: a modest array still imports successfully.
     let small: String = (0..1000)
-        .map(|i| if i == 0 { "1".to_owned() } else { ";1".to_owned() })
+        .map(|i| {
+            if i == 0 {
+                "1".to_owned()
+            } else {
+                ";1".to_owned()
+            }
+        })
         .collect();
     let csv_ok = format!("id:ID,:LABEL,nums:int[]\nn2,L,{small}\n");
     let store_ok = fresh_store();
@@ -238,7 +251,10 @@ fn sec196_empty_ids_are_not_treated_as_duplicates() {
         .expect("anonymous nodes (empty :ID) must import cleanly");
     let (_store, stats) = importer.finish();
     assert_eq!(stats.nodes, 2, "both anonymous nodes load");
-    assert_eq!(stats.skipped_duplicate_ids, 0, "no skip: empty ids are exempt");
+    assert_eq!(
+        stats.skipped_duplicate_ids, 0,
+        "no skip: empty ids are exempt"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -185,7 +185,9 @@ impl GdsResourcePolicy {
 ///
 /// When no timeout is configured the supplied `Cancel` never fires (the algorithms still terminate
 /// by their own bounds).
-fn with_deadline<T>(f: impl FnOnce(&Cancel<'_>) -> Result<T, ProcedureFailure>) -> Result<T, ProcedureFailure> {
+fn with_deadline<T>(
+    f: impl FnOnce(&Cancel<'_>) -> Result<T, ProcedureFailure>,
+) -> Result<T, ProcedureFailure> {
     match global_gds_policy().algorithm_timeout {
         Some(timeout) => {
             let deadline = Instant::now() + timeout;
@@ -361,11 +363,14 @@ fn config_f64(args: &[Value], map_idx: usize, key: &str) -> Option<f64> {
     let Some(Value::Map(entries)) = args.get(map_idx) else {
         return None;
     };
-    entries.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-        Value::Integer(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        _ => None,
-    })
+    entries
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Value::Integer(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
 }
 
 /// Reads a node-id configuration value (`sourceNode`) from the optional trailing config map.
@@ -484,7 +489,8 @@ fn register_lifecycle(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
             if cat.contains(name) {
                 let _ = GraphCatalog::drop(&mut cat, name);
             }
-            cat.project(name, projected).map_err(|e| gds_failure(NAME, e))?;
+            cat.project(name, projected)
+                .map_err(|e| gds_failure(NAME, e))?;
             Ok(vec![vec![
                 Value::String(name.to_owned()),
                 Value::Integer(node_count),
@@ -587,10 +593,13 @@ fn config_string(args: &[Value], map_idx: usize, key: &str) -> Option<String> {
     let Some(Value::Map(entries)) = args.get(map_idx) else {
         return None;
     };
-    entries.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        _ => None,
-    })
+    entries
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })
 }
 
 /// Looks up a projected graph by name from the shared catalog, mapping an unknown name to a clear
@@ -647,7 +656,10 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         ProcedureSignature::new(
             "gds.pageRank.stream",
             vec![string_in("graphName"), any_in("config")],
-            vec![out("nodeId", ValueClass::Integer), out("score", ValueClass::Float)],
+            vec![
+                out("nodeId", ValueClass::Integer),
+                out("score", ValueClass::Float),
+            ],
         ),
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.pageRank.stream";
@@ -679,7 +691,10 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         ProcedureSignature::new(
             "gds.degree.stream",
             vec![string_in("graphName"), any_in("config")],
-            vec![out("nodeId", ValueClass::Integer), out("score", ValueClass::Float)],
+            vec![
+                out("nodeId", ValueClass::Integer),
+                out("score", ValueClass::Float),
+            ],
         ),
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.degree.stream";
@@ -696,7 +711,10 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         ProcedureSignature::new(
             "gds.closeness.stream",
             vec![string_in("graphName"), any_in("config")],
-            vec![out("nodeId", ValueClass::Integer), out("score", ValueClass::Float)],
+            vec![
+                out("nodeId", ValueClass::Integer),
+                out("score", ValueClass::Float),
+            ],
         ),
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.closeness.stream";
@@ -720,7 +738,10 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         ProcedureSignature::new(
             "gds.betweenness.stream",
             vec![string_in("graphName"), any_in("config")],
-            vec![out("nodeId", ValueClass::Integer), out("score", ValueClass::Float)],
+            vec![
+                out("nodeId", ValueClass::Integer),
+                out("score", ValueClass::Float),
+            ],
         ),
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.betweenness.stream";
@@ -971,18 +992,12 @@ mod tests {
 
         // exists
         let rows = set
-            .invoke(
-                "gds.graph.exists",
-                &[Value::String("g".into())],
-                &mut graph,
-            )
+            .invoke("gds.graph.exists", &[Value::String("g".into())], &mut graph)
             .expect("exists");
         assert_eq!(rows[0][1], Value::Boolean(true));
 
         // list
-        let rows = set
-            .invoke("gds.graph.list", &[], &mut graph)
-            .expect("list");
+        let rows = set.invoke("gds.graph.list", &[], &mut graph).expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::String("g".into()));
 
@@ -990,11 +1005,7 @@ mod tests {
         set.invoke("gds.graph.drop", &[Value::String("g".into())], &mut graph)
             .expect("drop");
         let rows = set
-            .invoke(
-                "gds.graph.exists",
-                &[Value::String("g".into())],
-                &mut graph,
-            )
+            .invoke("gds.graph.exists", &[Value::String("g".into())], &mut graph)
             .expect("exists");
         assert_eq!(rows[0][1], Value::Boolean(false));
     }
@@ -1141,10 +1152,7 @@ mod tests {
                 "gds.dijkstra.stream",
                 &[
                     Value::String("g".into()),
-                    Value::Map(vec![(
-                        "sourceNode".into(),
-                        Value::Integer(a.0 as i64),
-                    )]),
+                    Value::Map(vec![("sourceNode".into(), Value::Integer(a.0 as i64))]),
                 ],
                 &mut graph,
             )
@@ -1235,8 +1243,8 @@ mod tests {
     fn sec204_projection_quota_is_enforced() {
         // Build a small real projection via the procedure layer.
         let (mut graph, _) = triangle_graph();
-        let g = project_from_graph("test", &graph, Some("N"), Some("R"), None, true)
-            .expect("project");
+        let g =
+            project_from_graph("test", &graph, Some("N"), Some("R"), None, true).expect("project");
         let _ = &mut graph;
 
         // A generous policy admits it.
@@ -1248,7 +1256,9 @@ mod tests {
             max_nodes: 0,
             ..GdsResourcePolicy::default()
         };
-        let err = tight_nodes.check_projection(&g).expect_err("node quota must reject");
+        let err = tight_nodes
+            .check_projection(&g)
+            .expect_err("node quota must reject");
         assert!(matches!(err, GdsError::InvalidArgument(_)));
 
         // A memory quota of 1 byte rejects on the bytes basis.
@@ -1269,8 +1279,8 @@ mod tests {
     #[test]
     fn sec201_deadline_cancel_aborts_a_run() {
         let (mut graph, _) = triangle_graph();
-        let g = project_from_graph("test", &graph, Some("N"), Some("R"), None, true)
-            .expect("project");
+        let g =
+            project_from_graph("test", &graph, Some("N"), Some("R"), None, true).expect("project");
         let _ = &mut graph;
 
         // An already-expired deadline: the cooperative check fires on the first poll.

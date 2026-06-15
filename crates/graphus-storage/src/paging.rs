@@ -250,7 +250,11 @@ mod tests {
         let mut page = page_with_head(off, 77); // head == 77 == expect
         let patch = encode_cas_patch(off, /*expect*/ 77, /*new*/ 42);
         apply_patch(&mut page, &patch).unwrap();
-        assert_eq!(read_head(&page, off), 42, "equal case resets to the old head");
+        assert_eq!(
+            read_head(&page, off),
+            42,
+            "equal case resets to the old head"
+        );
     }
 
     #[test]
@@ -329,10 +333,10 @@ mod tests {
         // sentinel only ever lives in the leading offset slot, never confused with a head value.
         let off = 64usize;
         for &(expect, new) in &[
-            (0xFFFFu64, 0u64),               // head value == 0xFFFF (the sentinel as a number)
-            (0u64, 0xFFFFu64),               // NULL_ID head reset to a 0xFFFF-valued old head
-            (u64::MAX, 123u64),              // all-ones head value
-            (0xFFFFu64, u64::MAX),           // 0xFFFF head reset to all-ones
+            (0xFFFFu64, 0u64),     // head value == 0xFFFF (the sentinel as a number)
+            (0u64, 0xFFFFu64),     // NULL_ID head reset to a 0xFFFF-valued old head
+            (u64::MAX, 123u64),    // all-ones head value
+            (0xFFFFu64, u64::MAX), // 0xFFFF head reset to all-ones
         ] {
             let mut page = page_with_head(off, expect); // head still == expect
             let patch = encode_cas_patch(off, expect, new);

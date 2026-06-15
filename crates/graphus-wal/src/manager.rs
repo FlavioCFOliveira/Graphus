@@ -185,7 +185,8 @@ impl<S: LogSink> WalManager<S> {
                 // Same interior-corruption guard as `recover_from`: only truncate on a genuine torn
                 // tail; fail loud if real committed data follows the undecodable spot.
                 Err(_) => {
-                    if let Some(off) = crate::recovery::next_self_consistent_record(&log, cursor + 1)
+                    if let Some(off) =
+                        crate::recovery::next_self_consistent_record(&log, cursor + 1)
                     {
                         return Err(GraphusError::Storage(format!(
                             "WAL interior log corruption: an undecodable record at offset {cursor} \

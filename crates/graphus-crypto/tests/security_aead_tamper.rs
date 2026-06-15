@@ -19,8 +19,8 @@
 use graphus_core::PageId;
 use graphus_core::error::GraphusError;
 use graphus_crypto::{
-    EncryptedBlockDevice, HEADER_SLOTS, KEY_LEN, Keyring, MemRawSlots, RawSlots, SALT_LEN, SLOT_SIZE,
-    open_backup, seal_backup,
+    EncryptedBlockDevice, HEADER_SLOTS, KEY_LEN, Keyring, MemRawSlots, RawSlots, SALT_LEN,
+    SLOT_SIZE, open_backup, seal_backup,
 };
 use graphus_io::{BlockDevice, PAGE_SIZE};
 
@@ -107,8 +107,8 @@ fn store_keyring() -> Keyring {
 #[test]
 fn only_a_fully_zeroed_real_slot_bypasses_aead_nothing_else() {
     let target = PageId(0);
-    let mut dev =
-        EncryptedBlockDevice::create(MemRawSlots::new(0), &store_keyring(), STORE_SALT).expect("create");
+    let mut dev = EncryptedBlockDevice::create(MemRawSlots::new(0), &store_keyring(), STORE_SALT)
+        .expect("create");
     dev.extend(1).expect("extend");
     dev.write_page(target, &[0xAB; PAGE_SIZE]).expect("write");
     dev.sync_all().expect("sync");

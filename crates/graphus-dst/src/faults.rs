@@ -63,7 +63,9 @@ mod tests {
         let eng = engine();
         let created = session(eng.clone(), 1, &["CREATE (:Person {name: 'Ada'})"]);
         assert!(
-            !created.iter().any(|r| matches!(r, Response::Failure { .. })),
+            !created
+                .iter()
+                .any(|r| matches!(r, Response::Failure { .. })),
             "the create commits cleanly: {created:?}"
         );
 
@@ -129,7 +131,11 @@ mod tests {
             let read = session(eng2, 9, &["MATCH (n:N) RETURN n.v AS v ORDER BY n.v"]);
             format!("{read:?}")
         };
-        assert_eq!(recover_and_read(), recover_and_read(), "recovery replays identically");
+        assert_eq!(
+            recover_and_read(),
+            recover_and_read(),
+            "recovery replays identically"
+        );
     }
 
     /// A partitioned link delivers nothing: the real `BoltSession` reads EOF and ends without
@@ -148,7 +154,9 @@ mod tests {
             graphus_bolt::Proposal::exact(0, 0),
         ]);
         input.extend_from_slice(b"more bytes that will never arrive");
-        net.endpoint(link, Side::Client).write_all(&input).expect("write");
+        net.endpoint(link, Side::Client)
+            .write_all(&input)
+            .expect("write");
         net.partition(link);
         net.advance_to(1_000_000);
 
@@ -175,6 +183,9 @@ mod tests {
         let executor = LocalBoltExecutor::new(eng);
         let mut sess = BoltSession::new(net.endpoint(link, Side::Server), executor, &auth);
         let result = sess.run();
-        assert!(result.is_err(), "a reset link makes the session fail, not panic");
+        assert!(
+            result.is_err(),
+            "a reset link makes the session fail, not panic"
+        );
     }
 }

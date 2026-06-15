@@ -18,21 +18,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use graphus_auth::{AuthProvider, Authenticator, Privilege};
-use graphus_core::capability::Clock;
 use graphus_bolt::executor::{
     AccessMode as BoltAccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
 };
 use graphus_bolt::server::{BoltSession, encode_client_handshake, encode_request_framed};
 use graphus_bolt::{BoltResult, Dechunker, Frame, Proposal, Request, Response, Transport};
+use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use graphus_io::MemBlockDevice;
 use graphus_rest::engine::{
     AccessMode as RestAccessMode, RestEngine, ResultStream, Row, RunSummary as RestRunSummary,
     TxHandle, TxOrigin,
 };
+use graphus_rest::protocol::Statement;
 use graphus_rest::registry::TxRegistry;
 use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, execute_autocommit};
-use graphus_rest::protocol::Statement;
 use graphus_rest::{CachedResponse, Wire};
 use graphus_server::engine::bolt_values::materialized_to_bolt;
 use graphus_server::engine::command::AccessMode as EngineAccessMode;
@@ -113,7 +113,9 @@ impl BoltExecutor for LocalBoltExecutor {
             TxControl::AutoCommit { mode, .. } => (eng.begin_auto_commit(map_mode(mode))?, true),
             TxControl::InExplicit { .. } => {
                 let ticket = self.explicit.ok_or_else(|| {
-                    GraphusError::Transaction("RUN in explicit mode with no open transaction".into())
+                    GraphusError::Transaction(
+                        "RUN in explicit mode with no open transaction".into(),
+                    )
                 })?;
                 (ticket, false)
             }
@@ -311,7 +313,9 @@ pub fn sim_auth() -> Authenticator {
     a.catalog_mut()
         .grant_privilege("simrole", Privilege::read_database())
         .expect("grant");
-    a.catalog_mut().grant_role("sim", "simrole").expect("grant role");
+    a.catalog_mut()
+        .grant_role("sim", "simrole")
+        .expect("grant role");
     a.set_password("sim", "sim-secret").expect("set password");
     a
 }
@@ -348,13 +352,19 @@ pub fn run_bolt_workload(
 pub fn login_prologue() -> Vec<Request> {
     vec![
         Request::Hello {
-            extra: vec![("user_agent".to_owned(), Value::String("graphus-vopr".to_owned()))],
+            extra: vec![(
+                "user_agent".to_owned(),
+                Value::String("graphus-vopr".to_owned()),
+            )],
         },
         Request::Logon {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("sim".to_owned())),
-                ("credentials".to_owned(), Value::String("sim-secret".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("sim-secret".to_owned()),
+                ),
             ],
         },
     ]
@@ -534,10 +544,15 @@ mod tests {
             Response::Record { values } => values.iter().any(|v| format!("{v:?}").contains("Ada")),
             _ => false,
         });
-        assert!(has_ada, "the MATCH returns the created node over Bolt: {responses:?}");
+        assert!(
+            has_ada,
+            "the MATCH returns the created node over Bolt: {responses:?}"
+        );
         // No FAILURE responses in a clean session.
         assert!(
-            !responses.iter().any(|r| matches!(r, Response::Failure { .. })),
+            !responses
+                .iter()
+                .any(|r| matches!(r, Response::Failure { .. })),
             "clean session has no FAILURE: {responses:?}"
         );
     }
@@ -561,7 +576,11 @@ mod tests {
             let responses = run_scripted_bolt_session(eng, 42, &auth, &reqs).expect("runs");
             format!("{responses:?}")
         };
-        assert_eq!(run(), run(), "same seed + script ⇒ identical Bolt responses");
+        assert_eq!(
+            run(),
+            run(),
+            "same seed + script ⇒ identical Bolt responses"
+        );
     }
 
     /// An explicit transaction that rolls back leaves no data visible to a later auto-commit read.
@@ -593,7 +612,10 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, Response::Record { .. }))
             .count();
-        assert_eq!(temp_records, 0, "rolled-back node is invisible: {responses:?}");
+        assert_eq!(
+            temp_records, 0,
+            "rolled-back node is invisible: {responses:?}"
+        );
     }
 
     /// A REST auto-commit request over the real request core: create a node, then read it back, and
@@ -617,7 +639,10 @@ mod tests {
         );
         assert_eq!(read.status, 200, "read succeeds: {read:?}");
         let body = String::from_utf8_lossy(&read.body);
-        assert!(body.contains("Lisbon"), "REST JSON carries the created node: {body}");
+        assert!(
+            body.contains("Lisbon"),
+            "REST JSON carries the created node: {body}"
+        );
     }
 
     /// The same REST request replays byte-identically from the same engine state (determinism).
@@ -630,7 +655,10 @@ mod tests {
                 &[rest_statement("CREATE (:N {v: 1}) RETURN 1 AS one")],
                 true,
             );
-            (resp.status, String::from_utf8_lossy(&resp.body).into_owned())
+            (
+                resp.status,
+                String::from_utf8_lossy(&resp.body).into_owned(),
+            )
         };
         assert_eq!(run(), run(), "same script ⇒ identical REST response");
     }
@@ -649,7 +677,9 @@ mod tests {
         let auth = sim_auth();
         let responses = run_bolt_workload(eng, 11, &auth, &ops).expect("session runs");
         assert!(
-            !responses.iter().any(|r| matches!(r, Response::Failure { .. })),
+            !responses
+                .iter()
+                .any(|r| matches!(r, Response::Failure { .. })),
             "generated workload runs clean over Bolt: {responses:?}"
         );
         assert!(responses.len() > ops.len(), "each op produced responses");

@@ -212,7 +212,10 @@ mod tests {
         // issue is a recoverable error, not a panic.
         let mut o = TimestampOracle::new();
         o.next_counter = MAX_TIMESTAMP; // one below would-be-illegal
-        assert!(o.begin().is_err(), "exhausted oracle must refuse, not panic");
+        assert!(
+            o.begin().is_err(),
+            "exhausted oracle must refuse, not panic"
+        );
         assert!(o.commit().is_err(), "commit at exhaustion must refuse too");
     }
 }

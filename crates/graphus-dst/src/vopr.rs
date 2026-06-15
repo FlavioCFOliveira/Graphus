@@ -209,7 +209,9 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
         let parsed = match arg.as_str() {
             "--seed" => next_u64("--seed").map(|v| base_seed = v),
             "--seeds" => next_u64("--seeds").map(|v| count = v.max(1)),
-            "--clients" => next_u64("--clients").map(|v| clients = v.min(u64::from(u32::MAX)) as u32),
+            "--clients" => {
+                next_u64("--clients").map(|v| clients = v.min(u64::from(u32::MAX)) as u32)
+            }
             "--ops" => next_u64("--ops").map(|v| ops = v.min(u64::from(u32::MAX)) as u32),
             other => Err(format!("unknown flag {other}")),
         };
@@ -297,11 +299,23 @@ fn run_stmt(
 ) -> Outcome {
     let ticket = match eng.begin_auto_commit(mode) {
         Ok(t) => t,
-        Err(e) => return Outcome { ok: false, rows: 0, cells: Vec::new(), error: Some(e.to_string()) },
+        Err(e) => {
+            return Outcome {
+                ok: false,
+                rows: 0,
+                cells: Vec::new(),
+                error: Some(e.to_string()),
+            };
+        }
     };
     match eng.run(ticket, stmt, params, true, None) {
         Ok(mut reply) => drain(&mut reply),
-        Err(e) => Outcome { ok: false, rows: 0, cells: Vec::new(), error: Some(e.to_string()) },
+        Err(e) => Outcome {
+            ok: false,
+            rows: 0,
+            cells: Vec::new(),
+            error: Some(e.to_string()),
+        },
     }
 }
 
@@ -320,11 +334,21 @@ fn drain(reply: &mut RunReply) -> Outcome {
             }
             Ok(None) => break,
             Err(e) => {
-                return Outcome { ok: false, rows, cells, error: Some(e.to_string()) };
+                return Outcome {
+                    ok: false,
+                    rows,
+                    cells,
+                    error: Some(e.to_string()),
+                };
             }
         }
     }
-    Outcome { ok: true, rows, cells, error: None }
+    Outcome {
+        ok: true,
+        rows,
+        cells,
+        error: None,
+    }
 }
 
 /// Counts the `:Person` nodes currently in the graph by counting the rows of a label scan (avoids
@@ -412,7 +436,10 @@ mod tests {
         let cfg = VoprConfig::for_seed(20260614);
         let a = run(cfg);
         let b = run(cfg);
-        assert_eq!(a, b, "same seed ⇒ identical VOPR report (trace + state + counts)");
+        assert_eq!(
+            a, b,
+            "same seed ⇒ identical VOPR report (trace + state + counts)"
+        );
         // The run is non-trivial: it dispatched every scheduled op and actually mutated the graph.
         assert_eq!(a.steps, (cfg.clients * cfg.ops_per_client) as usize);
         assert!(a.ok_ops > 0, "the workload performs real work");
@@ -459,7 +486,11 @@ mod tests {
             load: LoadProfile::Steady { min: 1, max: 50 },
         };
         let r = run(cfg);
-        assert_eq!(r.steps, 16 * 40, "every scheduled op ran (monotone progress)");
+        assert_eq!(
+            r.steps,
+            16 * 40,
+            "every scheduled op ran (monotone progress)"
+        );
         assert_eq!(r.err_ops, 0, "a clean high-load workload has no errors");
         assert_eq!(
             r.created_nodes, r.persisted_nodes,
@@ -475,14 +506,24 @@ mod tests {
         let profiles = [
             LoadProfile::Steady { min: 1, max: 20 },
             LoadProfile::Ramp { start: 100, end: 1 },
-            LoadProfile::Spike { base: 30, period: 16, burst: 4 },
+            LoadProfile::Spike {
+                base: 30,
+                period: 16,
+                burst: 4,
+            },
         ];
         for load in profiles {
-            let cfg = VoprConfig::for_seed(77).with_mix(MixProfile::mixed()).with_load(load);
+            let cfg = VoprConfig::for_seed(77)
+                .with_mix(MixProfile::mixed())
+                .with_load(load);
             let a = run(cfg);
             let b = run(cfg);
             assert_eq!(a, b, "load profile {load:?} is deterministic");
-            assert_eq!(a.steps, (cfg.clients * cfg.ops_per_client) as usize, "all ops ran under {load:?}");
+            assert_eq!(
+                a.steps,
+                (cfg.clients * cfg.ops_per_client) as usize,
+                "all ops ran under {load:?}"
+            );
             assert_eq!(
                 a.created_nodes, a.persisted_nodes,
                 "consistent under {load:?}: {} != {}",

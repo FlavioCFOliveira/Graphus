@@ -38,7 +38,10 @@ fn sec197_minted_ids_are_legal_writer_stamps() {
     let a = m.begin(IsolationLevel::Snapshot).unwrap();
     let b = m.begin(IsolationLevel::Snapshot).unwrap();
     assert!(b.0 > a.0, "ids strictly increase");
-    assert!(a.0 != 0 && a.0 <= MAX_TIMESTAMP, "minted id is a legal writer id");
+    assert!(
+        a.0 != 0 && a.0 <= MAX_TIMESTAMP,
+        "minted id is a legal writer id"
+    );
     // Must not panic for a freshly minted id (the SEC-197 destination states never occur).
     let _ = VersionStamp::in_flight(a);
     let _ = VersionStamp::in_flight(b);
@@ -116,7 +119,10 @@ fn sec198_idle_txn_is_reaped_and_unfreezes_gc() {
         m.commit(t).unwrap();
     }
     let before = m.registry_len();
-    assert!(before > 0, "the idle reader pins settled writers in the registry");
+    assert!(
+        before > 0,
+        "the idle reader pins settled writers in the registry"
+    );
 
     // Reap the idle holder, then GC: the watermark advances and the registry drains.
     let reaped = m.reap_idle();
@@ -167,7 +173,11 @@ fn sec199_detects_real_lock_cycle() {
         victim == Some(t1) || victim == Some(t2),
         "a real deadlock cycle must yield a victim, got {victim:?}"
     );
-    assert_eq!(victim, Some(t2), "the youngest (largest TxnId) is the victim");
+    assert_eq!(
+        victim,
+        Some(t2),
+        "the youngest (largest TxnId) is the victim"
+    );
 }
 
 /// Regression: SEC-199. A **pathologically deep** acyclic wait-for chain is processed without a

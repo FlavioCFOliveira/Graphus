@@ -183,7 +183,10 @@ async fn gds_project_and_pagerank_stream_through_engine() {
     assert_eq!(rows.len(), 4);
     for r in &rows {
         match val(&r[1]) {
-            Value::Float(f) => assert!(f.is_finite() && f > 0.0, "score {f} must be finite positive"),
+            Value::Float(f) => assert!(
+                f.is_finite() && f > 0.0,
+                "score {f} must be finite positive"
+            ),
             other => panic!("expected float score, got {other:?}"),
         }
     }

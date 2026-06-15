@@ -139,7 +139,9 @@ impl<D: BlockDevice, W: WalRule> BufferPool<D, W> {
     }
 
     fn oob_msg(idx: usize, capacity: usize) -> String {
-        format!("frame handle {idx} out of bounds (capacity {capacity}): handles must be pool-minted")
+        format!(
+            "frame handle {idx} out of bounds (capacity {capacity}): handles must be pool-minted"
+        )
     }
 
     fn oob_err(idx: usize, capacity: usize) -> GraphusError {

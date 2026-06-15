@@ -444,10 +444,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("allow_insecure_network", &self.allow_insecure_network)
             .field(
                 "metrics_scrape_token",
-                &self
-                    .metrics_scrape_token
-                    .as_deref()
-                    .map(|t| redacted(t)),
+                &self.metrics_scrape_token.as_deref().map(|t| redacted(t)),
             )
             .finish()
     }

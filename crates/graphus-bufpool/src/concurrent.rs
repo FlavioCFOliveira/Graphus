@@ -344,12 +344,12 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // A saturating decrement keeps the count from wrapping below zero even under a buggy
         // double-unpin; the `Release` ordering publishes the caller's page writes before the
         // frame becomes evictable.
-        let _ =
-            self.slot(f)
-                .pin_count
-                .fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
-                    Some(c.saturating_sub(1))
-                });
+        let _ = self
+            .slot(f)
+            .pin_count
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(1))
+            });
     }
 
     /// The current pin count of a frame (diagnostics / tests).

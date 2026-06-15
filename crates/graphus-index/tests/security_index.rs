@@ -21,7 +21,9 @@ use graphus_bufpool::BufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::{PageId, TxnId};
 use graphus_index::BTree;
-use graphus_index::node::{NodeView, PAGE_TYPE_BTREE_INTERNAL, PAGE_TYPE_BTREE_LEAF, SLOT_DIR_START};
+use graphus_index::node::{
+    NodeView, PAGE_TYPE_BTREE_INTERNAL, PAGE_TYPE_BTREE_LEAF, SLOT_DIR_START,
+};
 use graphus_index::recovery::SharedWal;
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE};
 use graphus_wal::{MemLogSink, WalManager};
@@ -251,7 +253,9 @@ fn sec203_open_over_forged_internal_root_errors_not_panic() {
     put_u16(&mut buf, slot + 6, 0);
     page::set_page_id(&mut buf, root.0);
     page::write_checksum(&mut buf);
-    device.write_page(root, &buf).expect("write forged internal root");
+    device
+        .write_page(root, &buf)
+        .expect("write forged internal root");
 
     let shared = SharedWal::new(wal);
     let pool = BufferPool::with_wal(device, shared.clone(), 32);

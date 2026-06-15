@@ -38,8 +38,14 @@ fn empty_and_tiny_buffers_never_panic() {
     for len in 0..MIN_RECORD_LEN {
         let buf = vec![0u8; len];
         // Must return an error, never panic / index OOB.
-        assert!(LogRecord::decode(&buf).is_err(), "len {len} should be undecodable");
-        assert!(LogRecordRef::decode(&buf).is_err(), "ref len {len} should be undecodable");
+        assert!(
+            LogRecord::decode(&buf).is_err(),
+            "len {len} should be undecodable"
+        );
+        assert!(
+            LogRecordRef::decode(&buf).is_err(),
+            "ref len {len} should be undecodable"
+        );
     }
 }
 
@@ -57,7 +63,10 @@ fn lying_total_len_beyond_buffer_is_incomplete_not_oob() {
     // total_len = u32::MAX: the `bytes.len() < total` guard must fire BEFORE any `rec[total-4]`
     // slice is attempted (which would otherwise be a wild OOB index).
     put_u32(&mut f, OFF_TOTAL_LEN, u32::MAX);
-    assert!(matches!(LogRecord::decode(&f), Err(DecodeError::Incomplete)));
+    assert!(matches!(
+        LogRecord::decode(&f),
+        Err(DecodeError::Incomplete)
+    ));
 }
 
 #[test]
@@ -72,7 +81,10 @@ fn gigantic_redo_len_does_not_overflow_or_oob() {
     let crc = crc32c::crc32c(&f[..total - 4]);
     put_u32(&mut f, total - 4, crc);
     assert!(matches!(LogRecord::decode(&f), Err(DecodeError::Corrupt)));
-    assert!(matches!(LogRecordRef::decode(&f), Err(DecodeError::Corrupt)));
+    assert!(matches!(
+        LogRecordRef::decode(&f),
+        Err(DecodeError::Corrupt)
+    ));
 }
 
 #[test]

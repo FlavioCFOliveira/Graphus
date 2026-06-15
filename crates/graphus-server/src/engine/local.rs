@@ -41,8 +41,8 @@ use graphus_storage::RecordStore;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 use super::command::{
-    AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary,
-    reply_channel,
+    AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply,
+    RunSummary, reply_channel,
 };
 use super::privileges::EffectivePrivileges;
 use super::{OpenTx, TxTicket, dispatch_command};
@@ -363,7 +363,10 @@ mod tests {
             .expect("match runs");
         let rows = drain(&mut reply);
         assert_eq!(rows.len(), 1, "the committed node is visible");
-        assert!(rows[0][0].contains("Ada"), "row carries the created name: {rows:?}");
+        assert!(
+            rows[0][0].contains("Ada"),
+            "row carries the created name: {rows:?}"
+        );
     }
 
     #[test]
@@ -390,8 +393,15 @@ mod tests {
 
         let a = run_once();
         let b = run_once();
-        assert_eq!(a, b, "identical script on identical clock ⇒ identical results");
-        assert_eq!(a.len(), 3, "the final MATCH returns the three created nodes");
+        assert_eq!(
+            a, b,
+            "identical script on identical clock ⇒ identical results"
+        );
+        assert_eq!(
+            a.len(),
+            3,
+            "the final MATCH returns the three created nodes"
+        );
     }
 
     #[test]
@@ -411,7 +421,10 @@ mod tests {
             .run(tx, "MATCH (t:Temp) RETURN t", vec![], true, None)
             .expect("match runs");
         let rows = drain(&mut reply);
-        assert!(rows.is_empty(), "rolled-back writes are not visible: {rows:?}");
+        assert!(
+            rows.is_empty(),
+            "rolled-back writes are not visible: {rows:?}"
+        );
     }
 
     #[test]

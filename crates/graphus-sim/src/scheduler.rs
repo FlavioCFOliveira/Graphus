@@ -215,7 +215,11 @@ mod tests {
         let mut sorted = times.clone();
         sorted.sort_unstable();
         assert_eq!(times, sorted, "events dispatch in non-decreasing due time");
-        assert_eq!(times.first(), Some(&5), "the earliest event (due 5) is first");
+        assert_eq!(
+            times.first(),
+            Some(&5),
+            "the earliest event (due 5) is first"
+        );
         assert_eq!(times.last(), Some(&20), "the latest event (due 20) is last");
     }
 

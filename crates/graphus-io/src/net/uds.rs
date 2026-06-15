@@ -188,7 +188,10 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let mut p = std::env::temp_dir();
-            p.push(format!("graphus-uds-{tag}-{nanos}-{}.sock", std::process::id()));
+            p.push(format!(
+                "graphus-uds-{tag}-{nanos}-{}.sock",
+                std::process::id()
+            ));
             Self(p)
         }
     }

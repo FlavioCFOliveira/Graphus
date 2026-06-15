@@ -10,10 +10,12 @@
 //! pre-allocates a `Vec` sized by an unbounded wire list header — a malicious/compromised server can
 //! force a multi-GiB allocation and abort the client process.
 
-use graphus_bolt::executor::{AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl};
+use graphus_auth::Authenticator;
+use graphus_bolt::executor::{
+    AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
+};
 use graphus_bolt::server::{encode_client_handshake, encode_request_framed};
 use graphus_bolt::{BoltSession, MemoryTransport, Request, Response, State};
-use graphus_auth::Authenticator;
 use graphus_core::{GraphusError, Value};
 
 // ---- minimal public-API test doubles ----------------------------------------------------------
@@ -90,7 +92,10 @@ fn logon() -> Request {
         auth: vec![
             ("scheme".to_owned(), Value::String("basic".to_owned())),
             ("principal".to_owned(), Value::String("alice".to_owned())),
-            ("credentials".to_owned(), Value::String("alice-pw".to_owned())),
+            (
+                "credentials".to_owned(),
+                Value::String("alice-pw".to_owned()),
+            ),
         ],
     }
 }
@@ -126,23 +131,27 @@ fn run_before_hello_does_not_panic_and_fails() {
         parameters: vec![],
         extra: vec![],
     }]);
-    assert_ne!(state, State::Ready, "RUN before HELLO must never reach READY");
+    assert_ne!(
+        state,
+        State::Ready,
+        "RUN before HELLO must never reach READY"
+    );
 }
 
 #[test]
 fn logon_before_hello_is_rejected() {
     let state = run_session(&[logon()]);
-    assert_ne!(state, State::Ready, "LOGON before HELLO must never authenticate");
+    assert_ne!(
+        state,
+        State::Ready,
+        "LOGON before HELLO must never authenticate"
+    );
 }
 
 #[test]
 fn pull_before_run_does_not_panic() {
     // PULL with no open result: must be handled defensively (protocol failure), not panic.
-    let state = run_session(&[
-        hello(),
-        logon(),
-        Request::Pull { n: -1, qid: None },
-    ]);
+    let state = run_session(&[hello(), logon(), Request::Pull { n: -1, qid: None }]);
     // The session survived to process the messages without panicking; reaching here is the assertion.
     let _ = state;
 }
@@ -157,7 +166,11 @@ fn wrong_credentials_never_authenticate() {
         ],
     };
     let state = run_session(&[hello(), bad_logon]);
-    assert_ne!(state, State::Ready, "bad credentials must never reach READY");
+    assert_ne!(
+        state,
+        State::Ready,
+        "bad credentials must never reach READY"
+    );
 }
 
 #[test]
@@ -167,7 +180,11 @@ fn unsupported_auth_scheme_is_rejected() {
         auth: vec![("scheme".to_owned(), Value::String("none".to_owned()))],
     };
     let state = run_session(&[hello(), none_logon]);
-    assert_ne!(state, State::Ready, "the `none` scheme must never authenticate");
+    assert_ne!(
+        state,
+        State::Ready,
+        "the `none` scheme must never authenticate"
+    );
 }
 
 #[test]
@@ -221,7 +238,11 @@ fn malformed_message_bytes_yield_failure_not_panic() {
     let mut session = BoltSession::new(transport, TrivialExecutor, &auth);
     let _ = session.run();
     // Reaching here without a panic is the security property under test.
-    assert_ne!(session.state(), State::Ready, "a garbage message must not leave the session READY");
+    assert_ne!(
+        session.state(),
+        State::Ready,
+        "a garbage message must not leave the session READY"
+    );
 }
 
 #[test]

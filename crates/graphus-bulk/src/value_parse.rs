@@ -114,9 +114,7 @@ const FORMULA_TRIGGERS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
 /// non-trigger) pass through untouched.
 fn unescape_formula_guard(cell: &str) -> &str {
     let mut chars = cell.chars();
-    if chars.next() == Some('\'')
-        && chars.next().is_some_and(|c| FORMULA_TRIGGERS.contains(&c))
-    {
+    if chars.next() == Some('\'') && chars.next().is_some_and(|c| FORMULA_TRIGGERS.contains(&c)) {
         // Drop exactly the leading `'` (one UTF-8 byte).
         &cell[1..]
     } else {

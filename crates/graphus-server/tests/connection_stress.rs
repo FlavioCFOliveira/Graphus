@@ -216,7 +216,10 @@ async fn run_client(path: &std::path::Path) -> std::io::Result<ClientOutcome> {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("admin-pw8".to_owned()),
+                ),
             ],
         },
     )
@@ -537,7 +540,10 @@ async fn open_logged_in_uds(path: &std::path::Path) -> UnixStream {
             auth: vec![
                 ("scheme".to_owned(), Value::String("basic".to_owned())),
                 ("principal".to_owned(), Value::String("alice".to_owned())),
-                ("credentials".to_owned(), Value::String("admin-pw8".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("admin-pw8".to_owned()),
+                ),
             ],
         },
     )

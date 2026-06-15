@@ -39,7 +39,10 @@ impl WorkloadOp {
     /// `true` if the op writes (so a driver can pick the transaction access mode).
     #[must_use]
     pub fn is_write(self) -> bool {
-        matches!(self, WorkloadOp::CreateNode { .. } | WorkloadOp::CreateEdge { .. })
+        matches!(
+            self,
+            WorkloadOp::CreateNode { .. } | WorkloadOp::CreateEdge { .. }
+        )
     }
 
     /// The Cypher statement + bound parameters for this op.
@@ -84,25 +87,45 @@ impl MixProfile {
     /// Write-dominated (bulk ingest / heavy mutation): mostly node + edge creates.
     #[must_use]
     pub fn write_heavy() -> Self {
-        Self { create_node: 50, create_edge: 35, count_nodes: 5, neighbors: 10 }
+        Self {
+            create_node: 50,
+            create_edge: 35,
+            count_nodes: 5,
+            neighbors: 10,
+        }
     }
 
     /// Read-dominated (serving traffic): mostly reads, a trickle of writes.
     #[must_use]
     pub fn read_heavy() -> Self {
-        Self { create_node: 8, create_edge: 7, count_nodes: 35, neighbors: 50 }
+        Self {
+            create_node: 8,
+            create_edge: 7,
+            count_nodes: 35,
+            neighbors: 50,
+        }
     }
 
     /// OLTP-light: small, balanced point operations.
     #[must_use]
     pub fn oltp_light() -> Self {
-        Self { create_node: 25, create_edge: 25, count_nodes: 25, neighbors: 25 }
+        Self {
+            create_node: 25,
+            create_edge: 25,
+            count_nodes: 25,
+            neighbors: 25,
+        }
     }
 
     /// A balanced general mix (the default).
     #[must_use]
     pub fn mixed() -> Self {
-        Self { create_node: 40, create_edge: 30, count_nodes: 15, neighbors: 15 }
+        Self {
+            create_node: 40,
+            create_edge: 30,
+            count_nodes: 15,
+            neighbors: 15,
+        }
     }
 
     /// The sum of all weights.
@@ -208,7 +231,11 @@ impl LoadProfile {
                 let frac = (step.min(total)) * span / total;
                 if ascending { lo + frac } else { hi - frac }
             }
-            LoadProfile::Spike { base, period, burst } => {
+            LoadProfile::Spike {
+                base,
+                period,
+                burst,
+            } => {
                 let period = period.max(1);
                 let phase = step % period;
                 if phase < burst { 0 } else { base }
@@ -243,20 +270,20 @@ mod tests {
     #[test]
     fn write_heavy_mix_creates_more_than_it_reads() {
         let d = distribution(MixProfile::write_heavy(), 3, 2000);
-        let writes = d.get("create_node").copied().unwrap_or(0)
-            + d.get("create_edge").copied().unwrap_or(0);
-        let reads = d.get("count_nodes").copied().unwrap_or(0)
-            + d.get("neighbors").copied().unwrap_or(0);
+        let writes =
+            d.get("create_node").copied().unwrap_or(0) + d.get("create_edge").copied().unwrap_or(0);
+        let reads =
+            d.get("count_nodes").copied().unwrap_or(0) + d.get("neighbors").copied().unwrap_or(0);
         assert!(writes > reads, "write-heavy mix is write-dominated: {d:?}");
     }
 
     #[test]
     fn read_heavy_mix_reads_more_than_it_writes() {
         let d = distribution(MixProfile::read_heavy(), 3, 2000);
-        let writes = d.get("create_node").copied().unwrap_or(0)
-            + d.get("create_edge").copied().unwrap_or(0);
-        let reads = d.get("count_nodes").copied().unwrap_or(0)
-            + d.get("neighbors").copied().unwrap_or(0);
+        let writes =
+            d.get("create_node").copied().unwrap_or(0) + d.get("create_edge").copied().unwrap_or(0);
+        let reads =
+            d.get("count_nodes").copied().unwrap_or(0) + d.get("neighbors").copied().unwrap_or(0);
         assert!(reads > writes, "read-heavy mix is read-dominated: {d:?}");
     }
 
@@ -294,7 +321,11 @@ mod tests {
 
     #[test]
     fn spike_load_bursts_then_settles() {
-        let p = LoadProfile::Spike { base: 50, period: 10, burst: 3 };
+        let p = LoadProfile::Spike {
+            base: 50,
+            period: 10,
+            burst: 3,
+        };
         let mut rng = SimRng::new(1);
         // Within a period: first `burst` arrivals are back-to-back (0), the rest pay `base`.
         assert_eq!(p.arrival_delay(&mut rng, 0, 100), 0);

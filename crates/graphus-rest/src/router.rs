@@ -61,7 +61,7 @@ use graphus_auth::{AuthError, AuthProvider, Privilege};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use serde_json::{Value as Json, json};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -924,9 +924,16 @@ pub fn execute_autocommit<E: RestEngine>(
     if let Ok(v) = HeaderValue::from_str(accept.content_type()) {
         headers.insert(ACCEPT, v);
     }
-    run_statements_buffered(state, &headers, handle, statements, Finalise::Commit, accept)
-        .unwrap_or_else(Built::problem)
-        .cached()
+    run_statements_buffered(
+        state,
+        &headers,
+        handle,
+        statements,
+        Finalise::Commit,
+        accept,
+    )
+    .unwrap_or_else(Built::problem)
+    .cached()
 }
 
 /// Runs one statement and returns its typed-encoded [`StatementResult`] (the buffered path).

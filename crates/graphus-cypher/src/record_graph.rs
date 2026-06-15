@@ -442,7 +442,10 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         if self.ssi.is_none() {
             return; // standalone path: nothing to track.
         }
-        self.note_predicate_write_footprint(&[PredicateRead::AnyRel, PredicateRead::RelType(type_id)]);
+        self.note_predicate_write_footprint(&[
+            PredicateRead::AnyRel,
+            PredicateRead::RelType(type_id),
+        ]);
     }
 
     /// Thin wrapper announcing an explicit `footprint` of [`PredicateRead`] markers to the shared

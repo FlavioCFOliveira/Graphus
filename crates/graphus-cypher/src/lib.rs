@@ -172,10 +172,12 @@ pub use executor::{
     execute_with_procedures,
 };
 pub use extension::{ExtensionRegistry, function_handler};
-pub use gds_procedures::{GdsCatalogHandle, new_catalog as new_gds_catalog, register_gds_procedures};
 pub use function_registry::{
     Arity, FunctionFailure, FunctionHandler, FunctionRegistry, FunctionSet, FunctionSignature,
     no_functions,
+};
+pub use gds_procedures::{
+    GdsCatalogHandle, new_catalog as new_gds_catalog, register_gds_procedures,
 };
 pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId};
 /// The full-text [`Analyzer`](graphus_index::fulltext::Analyzer) (`rmp` task #72), re-exported so the

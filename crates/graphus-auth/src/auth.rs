@@ -433,7 +433,10 @@ mod tests {
     #[test]
     fn password_auth_round_trips() {
         let a = fixture();
-        assert_eq!(a.authenticate_password("alice", "alice-pw").unwrap(), "alice");
+        assert_eq!(
+            a.authenticate_password("alice", "alice-pw").unwrap(),
+            "alice"
+        );
         assert_eq!(
             a.authenticate_password("alice", "wrong-password"),
             Err(AuthError::Unauthenticated)
@@ -480,11 +483,15 @@ mod tests {
             Err(AuthError::WeakPassword { .. })
         ));
         // The original password is untouched after the rejected updates.
-        assert_eq!(a.authenticate_password("alice", "alice-pw").unwrap(), "alice");
+        assert_eq!(
+            a.authenticate_password("alice", "alice-pw").unwrap(),
+            "alice"
+        );
         // A sufficiently long password is accepted.
         a.set_password("alice", "new-strong-password").unwrap();
         assert_eq!(
-            a.authenticate_password("alice", "new-strong-password").unwrap(),
+            a.authenticate_password("alice", "new-strong-password")
+                .unwrap(),
             "alice"
         );
     }

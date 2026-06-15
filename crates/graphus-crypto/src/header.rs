@@ -194,7 +194,9 @@ pub fn encode_counter_slot(counter: u64, counter_cipher: &Aes256Gcm) -> Result<S
                 aad: &COUNTER_MAGIC,
             },
         )
-        .map_err(|_| GraphusError::Security("sealing the nonce-budget counter failed".to_owned()))?;
+        .map_err(|_| {
+            GraphusError::Security("sealing the nonce-budget counter failed".to_owned())
+        })?;
     let mut slot = [0u8; SLOT_SIZE];
     slot[CNT_OFF_MAGIC..CNT_OFF_MAGIC + 8].copy_from_slice(&COUNTER_MAGIC);
     slot[CNT_OFF_NONCE..CNT_OFF_NONCE + NONCE_LEN].copy_from_slice(&nonce_bytes);
@@ -221,11 +223,11 @@ pub fn decode_counter_slot(slot: &Slot, counter_cipher: &Aes256Gcm) -> u64 {
     if slot[CNT_OFF_MAGIC..CNT_OFF_MAGIC + 8] != COUNTER_MAGIC {
         return MAX_WRITES_PER_SUBKEY; // not a counter slot / corrupt → fail closed
     }
-    let nonce_bytes: [u8; NONCE_LEN] = match slot[CNT_OFF_NONCE..CNT_OFF_NONCE + NONCE_LEN].try_into()
-    {
-        Ok(n) => n,
-        Err(_) => return MAX_WRITES_PER_SUBKEY,
-    };
+    let nonce_bytes: [u8; NONCE_LEN] =
+        match slot[CNT_OFF_NONCE..CNT_OFF_NONCE + NONCE_LEN].try_into() {
+            Ok(n) => n,
+            Err(_) => return MAX_WRITES_PER_SUBKEY,
+        };
     let nonce = Nonce::from(nonce_bytes);
     let ct_and_tag = &slot[CNT_OFF_CIPHERTEXT..CNT_OFF_CIPHERTEXT + 8 + TAG_LEN];
     match counter_cipher.decrypt(

@@ -104,7 +104,10 @@ fn run_workload(seed: u64) -> HistoryChecker {
         let batch = &plans[i..end];
 
         // Begin all transactions in the wave (they are now concurrent).
-        let txns: Vec<TxnId> = batch.iter().map(|_| mgr.begin_serializable().unwrap()).collect();
+        let txns: Vec<TxnId> = batch
+            .iter()
+            .map(|_| mgr.begin_serializable().unwrap())
+            .collect();
 
         // Each transaction performs its ops; record what it read/intends.
         // We buffer per-txn recorded ops and the version each write WILL install (decided at commit).

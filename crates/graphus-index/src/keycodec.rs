@@ -605,9 +605,18 @@ mod tests {
         // The blocker-C1 fix: `1` (Integer) and `1.0` (Float) are Cypher-equal, so they MUST map to
         // the same predicate-equality marker (unlike the order-preserving index key, which tags them
         // apart). A reader of `{p: 1}` and a concurrent insert of `{p: 1.0}` now share a marker.
-        assert_eq!(eqk(&Value::Integer(1)).unwrap(), eqk(&Value::Float(1.0)).unwrap());
-        assert_eq!(eqk(&Value::Integer(0)).unwrap(), eqk(&Value::Float(0.0)).unwrap());
-        assert_eq!(eqk(&Value::Integer(-3)).unwrap(), eqk(&Value::Float(-3.0)).unwrap());
+        assert_eq!(
+            eqk(&Value::Integer(1)).unwrap(),
+            eqk(&Value::Float(1.0)).unwrap()
+        );
+        assert_eq!(
+            eqk(&Value::Integer(0)).unwrap(),
+            eqk(&Value::Float(0.0)).unwrap()
+        );
+        assert_eq!(
+            eqk(&Value::Integer(-3)).unwrap(),
+            eqk(&Value::Float(-3.0)).unwrap()
+        );
         assert_eq!(
             eqk(&Value::Integer(42)).unwrap(),
             eqk(&Value::Float(42.0)).unwrap()
@@ -617,16 +626,28 @@ mod tests {
     #[test]
     fn canonical_equality_does_not_merge_unequal_numbers() {
         // Cypher-UNEQUAL numbers must never collide (no false abort).
-        assert_ne!(eqk(&Value::Integer(1)).unwrap(), eqk(&Value::Integer(2)).unwrap());
-        assert_ne!(eqk(&Value::Integer(1)).unwrap(), eqk(&Value::Float(1.5)).unwrap());
-        assert_ne!(eqk(&Value::Float(1.0)).unwrap(), eqk(&Value::Float(1.0001)).unwrap());
+        assert_ne!(
+            eqk(&Value::Integer(1)).unwrap(),
+            eqk(&Value::Integer(2)).unwrap()
+        );
+        assert_ne!(
+            eqk(&Value::Integer(1)).unwrap(),
+            eqk(&Value::Float(1.5)).unwrap()
+        );
+        assert_ne!(
+            eqk(&Value::Float(1.0)).unwrap(),
+            eqk(&Value::Float(1.0001)).unwrap()
+        );
         // -0.0 and +0.0 are Cypher-equal — and IEEE total-order encoding of the magnitude already
         // distinguishes them in *ordering*, but for equality we must collapse them. `encode_f64_bits`
         // keeps them distinct; assert the canonical encoder still treats `0`/`0.0`/`-0.0` consistently
         // with Cypher equality where it matters (integer 0 == float 0.0). -0.0 vs +0.0 differ in bytes
         // here (a known ordering artefact), which only ever causes a missed *merge* (extra abort is the
         // sound direction); a reader and writer both producing the same literal form collide correctly.
-        assert_eq!(eqk(&Value::Integer(0)).unwrap(), eqk(&Value::Float(0.0)).unwrap());
+        assert_eq!(
+            eqk(&Value::Integer(0)).unwrap(),
+            eqk(&Value::Float(0.0)).unwrap()
+        );
     }
 
     #[test]
@@ -636,21 +657,36 @@ mod tests {
         let inexact_a = (1_i64 << 53) + 1; // 9007199254740993, NOT exact
         let inexact_b = (1_i64 << 53) + 3; // 9007199254740995, NOT exact, distinct from a
         // Two distinct large (inexact) integers must NOT merge (would be a false abort).
-        assert_ne!(eqk(&Value::Integer(inexact_a)).unwrap(), eqk(&Value::Integer(inexact_b)).unwrap());
+        assert_ne!(
+            eqk(&Value::Integer(inexact_a)).unwrap(),
+            eqk(&Value::Integer(inexact_b)).unwrap()
+        );
         // An inexact large integer must not collide with the exact-f64 integer just below it.
-        assert_ne!(eqk(&Value::Integer(inexact_a)).unwrap(), eqk(&Value::Integer(exact)).unwrap());
+        assert_ne!(
+            eqk(&Value::Integer(inexact_a)).unwrap(),
+            eqk(&Value::Integer(exact)).unwrap()
+        );
         // The exact integer still merges with its float twin.
         #[allow(clippy::cast_precision_loss)]
         let exact_f = exact as f64;
-        assert_eq!(eqk(&Value::Integer(exact)).unwrap(), eqk(&Value::Float(exact_f)).unwrap());
+        assert_eq!(
+            eqk(&Value::Integer(exact)).unwrap(),
+            eqk(&Value::Float(exact_f)).unwrap()
+        );
         // i64::MAX (inexact) keeps an exact identity distinct from i64::MAX-2.
-        assert_ne!(eqk(&Value::Integer(i64::MAX)).unwrap(), eqk(&Value::Integer(i64::MAX - 2)).unwrap());
+        assert_ne!(
+            eqk(&Value::Integer(i64::MAX)).unwrap(),
+            eqk(&Value::Integer(i64::MAX - 2)).unwrap()
+        );
     }
 
     #[test]
     fn canonical_equality_nan_forms_no_marker() {
         // NaN is never equal to anything (incl. itself): it must produce NO equality key.
-        assert_eq!(eqk(&Value::Float(f64::NAN)), Err(KeyEncodeError::Unindexable("NaN")));
+        assert_eq!(
+            eqk(&Value::Float(f64::NAN)),
+            Err(KeyEncodeError::Unindexable("NaN"))
+        );
         assert_eq!(
             eqk(&Value::Float(f64::from_bits(0xFFF8_0000_0000_0001))),
             Err(KeyEncodeError::Unindexable("NaN"))
@@ -670,7 +706,10 @@ mod tests {
             assert_eq!(eqk(&v).unwrap(), encode_single(&v).unwrap());
         }
         // Distinct strings never collide.
-        assert_ne!(eqk(&Value::String("a".into())).unwrap(), eqk(&Value::String("b".into())).unwrap());
+        assert_ne!(
+            eqk(&Value::String("a".into())).unwrap(),
+            eqk(&Value::String("b".into())).unwrap()
+        );
     }
 
     #[test]

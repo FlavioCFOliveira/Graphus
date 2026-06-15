@@ -503,7 +503,10 @@ fn load_into(root: &Path, auth: &mut Authenticator) -> Result<()> {
         catalog
             .set_credential_version(&user.name, user.credential_version)
             .map_err(|e| {
-                corrupt(format!("restoring credential epoch for {:?}: {e}", user.name))
+                corrupt(format!(
+                    "restoring credential epoch for {:?}: {e}",
+                    user.name
+                ))
             })?;
         for role in &user.roles {
             if !catalog.has_role(role) {
@@ -1138,7 +1141,8 @@ mod tests {
 
     /// An authenticator seeded with a `root` admin (global Admin) and the JWT secret.
     fn admin_auth() -> Authenticator {
-        let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
+        let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!")
+            .expect("secret is >= 32 bytes");
         auth.catalog_mut().create_user("root").unwrap();
         auth.catalog_mut().create_role("admin").unwrap();
         auth.catalog_mut()
@@ -1157,7 +1161,9 @@ mod tests {
     async fn create_user_persists_and_is_visible() {
         let root = TempRoot::new("create");
         let sec = catalog(&root);
-        sec.create_user("alice", Some("valid-pw")).await.expect("create");
+        sec.create_user("alice", Some("valid-pw"))
+            .await
+            .expect("create");
 
         // Visible in memory.
         assert!(sec.list_users().iter().any(|u| u.name == "alice"));
@@ -1183,11 +1189,14 @@ mod tests {
             sec.grant_privilege("reader", Privilege::on_label(Action::Read, "db", "Person"))
                 .await
                 .expect("grant");
-            sec.create_user("alice", Some("valid-pw")).await.expect("user");
+            sec.create_user("alice", Some("valid-pw"))
+                .await
+                .expect("user");
             sec.grant_role("alice", "reader").await.expect("grant role");
         }
         // "Restart": reload from the file via load_into and assert the model is intact.
-        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
+        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!")
+            .expect("secret is >= 32 bytes");
         load_into(&root.path, &mut reloaded).expect("reload");
         assert!(reloaded.catalog().has_user("alice"));
         assert!(reloaded.verify_password("alice", "valid-pw").unwrap());
@@ -1227,7 +1236,8 @@ mod tests {
         for (tag, text) in cases {
             let root = TempRoot::new(&format!("malformed-{tag}"));
             std::fs::write(root.path.join(SECURITY_FILE_NAME), text).expect("write file");
-            let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
+            let mut auth = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!")
+                .expect("secret is >= 32 bytes");
             let result = load_into(&root.path, &mut auth);
             assert!(
                 matches!(result, Err(SecurityError::Corrupt { .. })),
@@ -1249,7 +1259,8 @@ mod tests {
         // Simulate a crash mid-write of a later mutation: garbage temp next to the valid file.
         std::fs::write(root.path.join(SECURITY_TMP_NAME), b"%% garbage %%").expect("plant tmp");
 
-        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!").expect("secret is >= 32 bytes");
+        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!")
+            .expect("secret is >= 32 bytes");
         load_into(&root.path, &mut reloaded).expect("load");
         assert!(
             reloaded.catalog().has_user("root"),

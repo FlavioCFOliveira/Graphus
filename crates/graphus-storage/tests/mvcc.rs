@@ -587,7 +587,11 @@ fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
         vec![r1, r3],
         "survivors remain after the post-recovery corpse splice"
     );
-    assert_eq!(s.degree(hub).unwrap(), 2, "degree is exactly the two survivors");
+    assert_eq!(
+        s.degree(hub).unwrap(),
+        2,
+        "degree is exactly the two survivors"
+    );
     // The corpse slot r2 is now freed: used rel slots drop by one to the two-survivor baseline, and
     // the freed id is r2 itself.
     assert_eq!(
@@ -595,7 +599,11 @@ fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
         used_before - 1,
         "the corpse slot is reclaimed by the post-recovery GC"
     );
-    assert_eq!(s.used_rel_slots(), 2, "only the two committed edges remain allocated");
+    assert_eq!(
+        s.used_rel_slots(),
+        2,
+        "only the two committed edges remain allocated"
+    );
     assert!(
         !s.rel(r2).unwrap().mvcc.in_use(),
         "the reclaimed corpse slot {r2} is no longer in use"
@@ -646,7 +654,11 @@ fn live_rollback_of_middle_prepend_reclaims_the_corpse() {
     // Both committed edges survive; the corpse r2 is threaded through but not collected.
     let mut incident = s.incident_rels(hub).unwrap();
     incident.sort_unstable();
-    assert_eq!(incident, vec![r1, r3], "the two committed edges survive the abort");
+    assert_eq!(
+        incident,
+        vec![r1, r3],
+        "the two committed edges survive the abort"
+    );
     assert_eq!(s.degree(hub).unwrap(), 2);
     let used_with_corpse = s.used_rel_slots();
     assert_eq!(
@@ -666,7 +678,11 @@ fn live_rollback_of_middle_prepend_reclaims_the_corpse() {
 
     let mut incident = s.incident_rels(hub).unwrap();
     incident.sort_unstable();
-    assert_eq!(incident, vec![r1, r3], "survivors remain after the corpse splice");
+    assert_eq!(
+        incident,
+        vec![r1, r3],
+        "survivors remain after the corpse splice"
+    );
     assert_eq!(s.degree(hub).unwrap(), 2, "degree stays 2 after the splice");
     assert_eq!(
         s.used_rel_slots(),
@@ -683,7 +699,11 @@ fn live_rollback_of_middle_prepend_reclaims_the_corpse() {
     s.begin(TxnId(6));
     s.gc(TxnId(6), watermark).unwrap();
     s.commit(TxnId(6)).unwrap();
-    assert_eq!(s.used_rel_slots(), 2, "a second GC pass reclaims nothing further");
+    assert_eq!(
+        s.used_rel_slots(),
+        2,
+        "a second GC pass reclaims nothing further"
+    );
 
     let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
     assert!(
@@ -838,7 +858,11 @@ fn consecutive_corpse_run_is_collapsed_and_both_reclaimed() {
 
     let mut incident = s.incident_rels(hub).unwrap();
     incident.sort_unstable();
-    assert_eq!(incident, vec![r1, r4], "both committed edges survive a 2-corpse run");
+    assert_eq!(
+        incident,
+        vec![r1, r4],
+        "both committed edges survive a 2-corpse run"
+    );
     assert_eq!(s.used_rel_slots(), 4, "2 live + 2 corpses before GC");
 
     let watermark = s.snapshot_ts();
@@ -854,7 +878,11 @@ fn consecutive_corpse_run_is_collapsed_and_both_reclaimed() {
         "both committed edges survive the run collapse — the chain was not severed"
     );
     assert_eq!(s.degree(hub).unwrap(), 2);
-    assert_eq!(s.used_rel_slots(), 2, "both corpse slots in the run are reclaimed");
+    assert_eq!(
+        s.used_rel_slots(),
+        2,
+        "both corpse slots in the run are reclaimed"
+    );
     assert!(!s.rel(r2).unwrap().mvcc.in_use());
     assert!(!s.rel(r3).unwrap().mvcc.in_use());
 
@@ -900,8 +928,16 @@ fn self_loop_corpse_is_spliced_from_both_links() {
         vec![r1, loop_live],
         "the committed edge and committed self-loop survive the aborted self-loop"
     );
-    assert_eq!(s.degree(hub).unwrap(), 2, "self-loop counted once: degree 2");
-    assert_eq!(s.used_rel_slots(), 3, "2 live + 1 self-loop corpse before GC");
+    assert_eq!(
+        s.degree(hub).unwrap(),
+        2,
+        "self-loop counted once: degree 2"
+    );
+    assert_eq!(
+        s.used_rel_slots(),
+        3,
+        "2 live + 1 self-loop corpse before GC"
+    );
 
     let watermark = s.snapshot_ts();
     s.begin(TxnId(5));
@@ -916,7 +952,11 @@ fn self_loop_corpse_is_spliced_from_both_links() {
         "survivors remain after the self-loop corpse is spliced from both links"
     );
     assert_eq!(s.degree(hub).unwrap(), 2);
-    assert_eq!(s.used_rel_slots(), 2, "the self-loop corpse's single slot is reclaimed");
+    assert_eq!(
+        s.used_rel_slots(),
+        2,
+        "the self-loop corpse's single slot is reclaimed"
+    );
     assert!(!s.rel(loop_corpse).unwrap().mvcc.in_use());
 
     let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();

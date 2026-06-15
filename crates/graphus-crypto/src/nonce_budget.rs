@@ -123,7 +123,8 @@ mod tests {
         // Seed one below the ceiling: exactly one more write is allowed, then it fails closed.
         let mut b = NonceBudget::resume_from(MAX_WRITES_PER_SUBKEY - 1);
         assert_eq!(
-            b.reserve().expect("the last write under the ceiling is allowed"),
+            b.reserve()
+                .expect("the last write under the ceiling is allowed"),
             MAX_WRITES_PER_SUBKEY
         );
         let err = b.reserve().expect_err("the ceiling write must fail closed");

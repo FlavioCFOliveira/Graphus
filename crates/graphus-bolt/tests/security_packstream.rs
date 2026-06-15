@@ -95,7 +95,10 @@ fn list_with_real_elements_is_bounded_by_input_length() {
     let mut bytes = vec![0xD6, 0x00, 0x10, 0x00, 0x00]; // count = 0x00100000 (~1M)
     bytes.extend(std::iter::repeat_n(0xC0, 64)); // 64 real NULLs, then it must run out
     let r = dec(&bytes);
-    assert!(r.is_err(), "must error on the first missing element, not hang or OOM");
+    assert!(
+        r.is_err(),
+        "must error on the first missing element, not hang or OOM"
+    );
 }
 
 // ---- deep nesting / stack overflow ------------------------------------------------------------
@@ -108,8 +111,12 @@ fn deeply_nested_lists_are_rejected_not_stack_overflowed() {
     let depth = 5000;
     let mut bytes = vec![0x91u8; depth]; // 0x91 = TINY_LIST size 1
     bytes.push(0xC0); // innermost value: NULL
-    let err = dec(&bytes).expect_err("over-deep nesting must be rejected, never overflow the stack");
-    assert!(format!("{err}").contains("depth"), "expected a depth-limit error, got: {err}");
+    let err =
+        dec(&bytes).expect_err("over-deep nesting must be rejected, never overflow the stack");
+    assert!(
+        format!("{err}").contains("depth"),
+        "expected a depth-limit error, got: {err}"
+    );
 }
 
 #[test]
@@ -130,7 +137,10 @@ fn nesting_at_the_limit_is_accepted() {
     // message is never rejected. 200 levels is comfortably under the limit.
     let mut bytes = vec![0x91u8; 200];
     bytes.push(0xC0);
-    assert!(dec(&bytes).is_ok(), "a payload within the depth limit must decode");
+    assert!(
+        dec(&bytes).is_ok(),
+        "a payload within the depth limit must decode"
+    );
 }
 
 // ---- invalid UTF-8 / type confusion -----------------------------------------------------------
@@ -183,7 +193,10 @@ fn struct_marker_without_tag_errors() {
 #[test]
 fn all_integer_widths_round_within_bounds() {
     // INT_8 of -1 (0xC8 0xFF), INT_16, INT_32, INT_64 minimum — none must overflow or panic.
-    assert_eq!(dec(&[0xC8, 0xFF]).unwrap(), graphus_core::Value::Integer(-1));
+    assert_eq!(
+        dec(&[0xC8, 0xFF]).unwrap(),
+        graphus_core::Value::Integer(-1)
+    );
     assert_eq!(
         dec(&[0xCB, 0x80, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
         graphus_core::Value::Integer(i64::MIN)

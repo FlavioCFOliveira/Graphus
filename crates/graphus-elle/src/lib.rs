@@ -69,13 +69,21 @@ impl Transaction {
     /// A committed transaction from `ops`.
     #[must_use]
     pub fn committed(id: TxId, ops: Vec<Op>) -> Self {
-        Self { id, ops, committed: true }
+        Self {
+            id,
+            ops,
+            committed: true,
+        }
     }
 
     /// An aborted transaction from `ops`.
     #[must_use]
     pub fn aborted(id: TxId, ops: Vec<Op>) -> Self {
-        Self { id, ops, committed: false }
+        Self {
+            id,
+            ops,
+            committed: false,
+        }
     }
 }
 
@@ -95,13 +103,19 @@ impl Verdict {
     /// A clean (serializable) verdict.
     #[must_use]
     pub fn ok() -> Self {
-        Self { serializable: true, anomaly: None }
+        Self {
+            serializable: true,
+            anomaly: None,
+        }
     }
 
     /// A violation verdict carrying `reason`.
     #[must_use]
     pub fn violation(reason: impl Into<String>) -> Self {
-        Self { serializable: false, anomaly: Some(reason.into()) }
+        Self {
+            serializable: false,
+            anomaly: Some(reason.into()),
+        }
     }
 }
 
@@ -173,9 +187,10 @@ pub fn check(history: &History) -> Verdict {
     for (key, vals) in &order {
         for pair in vals.windows(2) {
             let (a, b) = (pair[0], pair[1]);
-            if let (Some(&wa), Some(&wb)) =
-                (writer_of.get(&(key.clone(), a)), writer_of.get(&(key.clone(), b)))
-            {
+            if let (Some(&wa), Some(&wb)) = (
+                writer_of.get(&(key.clone(), a)),
+                writer_of.get(&(key.clone(), b)),
+            ) {
                 add_edge(wa, wb, &mut graph);
             }
         }
@@ -186,13 +201,18 @@ pub fn check(history: &History) -> Verdict {
     // write). Without this, an unread write leaves no trace and the cycle is missed.
     let mut values_of_key: HashMap<Key, Vec<(Val, TxId)>> = HashMap::new();
     for ((key, val), &w) in &writer_of {
-        values_of_key.entry(key.clone()).or_default().push((*val, w));
+        values_of_key
+            .entry(key.clone())
+            .or_default()
+            .push((*val, w));
     }
 
     // wr + rw edges from each committed read.
     for t in &committed {
         for op in &t.ops {
-            let Op::Read { key, observed } = op else { continue };
+            let Op::Read { key, observed } = op else {
+                continue;
+            };
             // wr: this reader depends on the writer of every value it observed.
             for v in observed {
                 if let Some(&w) = writer_of.get(&(key.clone(), *v)) {
@@ -220,14 +240,18 @@ pub fn check(history: &History) -> Verdict {
 
 /// Returns a transaction-id cycle if the dependency graph has one, else `None`. DFS with a recursion
 /// stack; tries each committed transaction as a root.
-fn find_cycle(committed: &[&Transaction], graph: &HashMap<TxId, HashSet<TxId>>) -> Option<Vec<TxId>> {
+fn find_cycle(
+    committed: &[&Transaction],
+    graph: &HashMap<TxId, HashSet<TxId>>,
+) -> Option<Vec<TxId>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Colour {
         White,
         Grey,
         Black,
     }
-    let mut colour: HashMap<TxId, Colour> = committed.iter().map(|t| (t.id, Colour::White)).collect();
+    let mut colour: HashMap<TxId, Colour> =
+        committed.iter().map(|t| (t.id, Colour::White)).collect();
 
     // Iterative DFS preserving the path so a back-edge yields the actual cycle.
     for t in committed {
@@ -238,7 +262,10 @@ fn find_cycle(committed: &[&Transaction], graph: &HashMap<TxId, HashSet<TxId>>) 
         let mut path: Vec<TxId> = Vec::new();
         let mut stack: Vec<(TxId, Vec<TxId>, usize)> = Vec::new();
         let succ = |n: TxId| -> Vec<TxId> {
-            let mut s: Vec<TxId> = graph.get(&n).map(|e| e.iter().copied().collect()).unwrap_or_default();
+            let mut s: Vec<TxId> = graph
+                .get(&n)
+                .map(|e| e.iter().copied().collect())
+                .unwrap_or_default();
             s.sort_unstable(); // deterministic traversal
             s
         };
@@ -282,10 +309,16 @@ mod tests {
     use super::*;
 
     fn append(key: &str, val: Val) -> Op {
-        Op::Append { key: key.to_owned(), val }
+        Op::Append {
+            key: key.to_owned(),
+            val,
+        }
     }
     fn read(key: &str, observed: &[Val]) -> Op {
-        Op::Read { key: key.to_owned(), observed: observed.to_vec() }
+        Op::Read {
+            key: key.to_owned(),
+            observed: observed.to_vec(),
+        }
     }
 
     #[test]
@@ -322,7 +355,10 @@ mod tests {
             Transaction::committed(2, vec![read("a", &[]), append("a", 2)]),
         ];
         let v = check(&h);
-        assert!(!v.serializable, "concurrent blind appends to one key are non-serializable: {v:?}");
+        assert!(
+            !v.serializable,
+            "concurrent blind appends to one key are non-serializable: {v:?}"
+        );
     }
 
     #[test]
@@ -345,7 +381,10 @@ mod tests {
             Transaction::committed(3, vec![read("a", &[2, 1])]),
         ];
         let v = check(&h);
-        assert!(!v.serializable, "contradictory read orders are an anomaly: {v:?}");
+        assert!(
+            !v.serializable,
+            "contradictory read orders are an anomaly: {v:?}"
+        );
     }
 
     #[test]

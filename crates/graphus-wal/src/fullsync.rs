@@ -55,9 +55,7 @@ where
     if rc == -1 {
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(code)
-                if code == libc::ENOTSUP || code == libc::ENOTTY || code == libc::EINVAL =>
-            {
+            Some(code) if code == libc::ENOTSUP || code == libc::ENOTTY || code == libc::EINVAL => {
                 fallback()
             }
             _ => Err(err),

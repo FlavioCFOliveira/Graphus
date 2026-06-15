@@ -275,7 +275,7 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
                 // Offset-only: the offset *is* the zone (`Temporal2.feature` scenario [5]).
                 (Some(offset), None) => Ok(Value::zoned_date_time(
                     ZonedDateTime::from_local(local, offset, "").map_err(terr)?,
-                    )),
+                )),
                 // A named zone resolves via the zone rules; an explicit offset alongside it
                 // disambiguates an overlapping local time (`Temporal2.feature` scenario [6]:
                 // `'...+02:00[Europe/Stockholm]'` keeps +02:00, `'...[Europe/London]'`
@@ -285,7 +285,7 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
                     let (local, offset) = timezone::resolve_local(zone, &local, offset)?;
                     Ok(Value::zoned_date_time(
                         ZonedDateTime::from_local(local, offset, zone).map_err(terr)?,
-                        ))
+                    ))
                 }
                 (None, None) => Err(type_err(format!(
                     "datetime() string `{s}` carries neither a UTC offset nor a time zone"
@@ -295,7 +295,7 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
         Value::ZonedDateTime(z) => Ok(Value::ZonedDateTime(z.clone())),
         Value::LocalDateTime(dt) => Ok(Value::zoned_date_time(
             ZonedDateTime::from_local(*dt, 0, "").map_err(terr)?,
-            )),
+        )),
         Value::Date(d) => Ok(Value::zoned_date_time(
             ZonedDateTime::from_local(
                 LocalDateTime::from_date_time(*d, LocalTime::default()),
@@ -303,7 +303,7 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
                 "",
             )
             .map_err(terr)?,
-            )),
+        )),
         Value::Map(entries) => {
             let map = ComponentMap::new(entries)?;
             date_time_from_map(&map)
@@ -688,7 +688,7 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
         };
         return Ok(Value::zoned_date_time(
             ZonedDateTime::from_local(shifted, offset, zone_id).map_err(terr)?,
-            ));
+        ));
     }
 
     let base = base_time(map)?;
@@ -771,7 +771,7 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
     };
     Ok(Value::zoned_date_time(
         ZonedDateTime::from_local(local, offset, zone_id).map_err(terr)?,
-        ))
+    ))
 }
 
 fn clamp_u32(v: i64) -> Result<u32, EvalError> {
@@ -1243,7 +1243,7 @@ fn utc_from_epoch(secs: i64, nanos: i64) -> Result<Value, EvalError> {
     };
     Ok(Value::zoned_date_time(
         ZonedDateTime::from_local(local, 0, "").map_err(terr)?,
-        ))
+    ))
 }
 
 /// Extracts an integer epoch component, rejecting non-integers as a typed error.

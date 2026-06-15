@@ -82,9 +82,7 @@ where
         // observed codes from filesystems that reject the ioctl-style command; ENOTSUP is the
         // documented "operation not supported" code.
         match err.raw_os_error() {
-            Some(code)
-                if code == libc::ENOTSUP || code == libc::ENOTTY || code == libc::EINVAL =>
-            {
+            Some(code) if code == libc::ENOTSUP || code == libc::ENOTTY || code == libc::EINVAL => {
                 fallback()
             }
             _ => Err(err),

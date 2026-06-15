@@ -48,7 +48,8 @@ type Store = RecordStore<MemBlockDevice, MemLogSink>;
 fn import_root() -> &'static PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!("graphus-loadcsv-import-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("graphus-loadcsv-import-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create import root");
         // Install the confined policy once for this test binary. `set` may already be set by a
         // concurrent test thread — that is fine, the root is identical.
@@ -365,7 +366,10 @@ fn load_csv_rejects_an_absolute_path_outside_the_import_root() {
     std::fs::write(&secret, "TOP-SECRET\n").expect("write secret");
     let src = format!(
         "LOAD CSV FROM '{}' AS row RETURN row",
-        secret.to_string_lossy().replace('\\', "\\\\").replace('\'', "\\'")
+        secret
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
     );
     let err = run_expect_exec_error(&src, store, 1);
     let _ = std::fs::remove_file(&secret);

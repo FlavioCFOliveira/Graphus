@@ -392,7 +392,10 @@ fn committed_transactions_fails_loud_on_interior_corruption() {
 
     // Corrupt a body byte of the FIRST record (BadCrc), leaving all later records self-consistent.
     let bounds = record_boundaries(&full);
-    assert!(bounds.len() > 4, "need several intact records after the first");
+    assert!(
+        bounds.len() > 4,
+        "need several intact records after the first"
+    );
     let txn_id_byte = bounds[0] as usize + 20; // OFF_TXN_ID inside record 0
     full[txn_id_byte] ^= 0xFF;
 
@@ -432,7 +435,11 @@ fn committed_transactions_tolerates_a_genuine_torn_tail() {
         .committed_transactions()
         .expect("a torn tail must not fail the scan");
     // Both committed transactions are recovered; the torn tail is ignored.
-    assert_eq!(committed.len(), 2, "both committed txns must be in the table");
+    assert_eq!(
+        committed.len(),
+        2,
+        "both committed txns must be in the table"
+    );
 }
 
 #[test]

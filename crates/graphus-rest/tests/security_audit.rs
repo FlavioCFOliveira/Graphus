@@ -116,11 +116,18 @@ impl RestEngine for MockEngine {
             ));
         }
         drop(g);
-        self.inner.lock().unwrap().log.push(format!("run(q={query})"));
+        self.inner
+            .lock()
+            .unwrap()
+            .log
+            .push(format!("run(q={query})"));
         // Echo a single row carrying the query text so a replay leak is observable in the body.
         Ok(MockStream {
             fields: vec!["x".to_owned()],
-            rows: vec![vec![RestValue::Value(Value::String(format!("ran:{query}")))]].into_iter(),
+            rows: vec![vec![RestValue::Value(Value::String(format!(
+                "ran:{query}"
+            )))]]
+            .into_iter(),
             summary: RunSummary {
                 query_type: Some("r".to_owned()),
                 stats: Vec::new(),
@@ -229,7 +236,12 @@ impl Harness {
 }
 
 async fn body_bytes(resp: Response<Body>) -> Vec<u8> {
-    resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    resp.into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
 }
 async fn body_json(resp: Response<Body>) -> Json {
     serde_json::from_slice(&body_bytes(resp).await).unwrap()
@@ -396,9 +408,7 @@ async fn sec2_idempotency_cache_is_bounded_by_ttl() {
     };
 
     // First call caches the (empty) result under `ttl-key`.
-    let first = h
-        .send(fire(json!({ "statements": [] })))
-        .await;
+    let first = h.send(fire(json!({ "statements": [] }))).await;
     assert_eq!(first.status(), StatusCode::OK);
 
     // In-window retry with a DIFFERENT body still replays the cached empty result (not re-executed).
@@ -768,7 +778,8 @@ async fn ok_rbac_blocks_write_for_read_only_user() {
 async fn ok_expired_bearer_is_401() {
     let h = Harness::new();
     let token = h.token("alice");
-    h.clock.set(h.clock.0.load(Ordering::Relaxed) + 3601 * 1_000_000_000);
+    h.clock
+        .set(h.clock.0.load(Ordering::Relaxed) + 3601 * 1_000_000_000);
     let resp = h
         .send(post(
             "/db/neo4j/tx",

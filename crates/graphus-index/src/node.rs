@@ -223,7 +223,10 @@ impl<'a> NodeView<'a> {
             }
             // An internal cell also carries a trailing `u64` child at `off + klen`; ensure it fits.
             if !is_leaf {
-                let child_end = off.checked_add(klen).and_then(|e| e.checked_add(8)).filter(|e| *e <= CELL_LIMIT);
+                let child_end = off
+                    .checked_add(klen)
+                    .and_then(|e| e.checked_add(8))
+                    .filter(|e| *e <= CELL_LIMIT);
                 if child_end.is_none() {
                     return Err(graphus_core::GraphusError::Storage(format!(
                         "corrupt index page: slot {i} internal child pointer outside the page",
@@ -311,8 +314,9 @@ impl<'a> NodeView<'a> {
     /// [`key`](Self::key).
     #[must_use]
     pub fn child(&self, i: usize) -> u64 {
-        self.try_child(i)
-            .expect("child() on a leaf, slot out of range, or corrupt index page (validate() first)")
+        self.try_child(i).expect(
+            "child() on a leaf, slot out of range, or corrupt index page (validate() first)",
+        )
     }
 
     /// Reads slot `i` into an owned [`Cell`].
@@ -508,7 +512,8 @@ impl<'a> NodeMut<'a> {
             wr_u16(
                 self.bytes,
                 slot + 4,
-                u16::try_from(value.len()).expect("INVARIANT: replacement value fits the cell (u16)"),
+                u16::try_from(value.len())
+                    .expect("INVARIANT: replacement value fits the cell (u16)"),
             );
             true
         } else {
@@ -609,7 +614,8 @@ impl<'a> NodeMut<'a> {
             wr_u16(
                 self.bytes,
                 slot,
-                u16::try_from(floor).expect("INVARIANT: compacted cell offset is page-bounded (u16)"),
+                u16::try_from(floor)
+                    .expect("INVARIANT: compacted cell offset is page-bounded (u16)"),
             );
             wr_u16(
                 self.bytes,
@@ -763,14 +769,18 @@ mod tests {
         n.init(0);
         assert!(n.leaf_insert(b"a", b"1"));
         assert!(n.leaf_insert(b"b", b"22"));
-        n.view().validate().expect("a well-formed leaf must validate");
+        n.view()
+            .validate()
+            .expect("a well-formed leaf must validate");
 
         let mut ipage = blank_page();
         let mut ni = NodeMut::new(&mut ipage);
         ni.init(1);
         ni.set_leftmost_child(100);
         assert!(ni.internal_insert(b"m", 200));
-        ni.view().validate().expect("a well-formed internal node must validate");
+        ni.view()
+            .validate()
+            .expect("a well-formed internal node must validate");
     }
 
     #[test]

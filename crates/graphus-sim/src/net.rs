@@ -244,7 +244,9 @@ impl SimEndpoint {
     #[must_use]
     pub fn readable_len(&self) -> usize {
         let st = self.net.borrow();
-        st.links[self.link].dirs[self.side.read_dir()].readable.len()
+        st.links[self.link].dirs[self.side.read_dir()]
+            .readable
+            .len()
     }
 
     /// Whether this endpoint is at a genuine end-of-stream: the peer has half-closed (or the link was
@@ -305,9 +307,7 @@ impl Transport for SimEndpoint {
         }
         let dir = &mut link.dirs[self.side.write_dir()];
         if dir.write_closed {
-            return Err(BoltError::Transport(
-                "write after half-close".to_owned(),
-            ));
+            return Err(BoltError::Transport("write after half-close".to_owned()));
         }
         // Keep delivery monotonic per direction (reliable, in-order like TCP): a segment is never due
         // before the previous one on the same direction.
@@ -327,7 +327,13 @@ mod tests {
 
     /// Writes `msg` from `from`, then advances time in unit steps until the peer can read it back;
     /// returns the logical time at which the whole message had arrived.
-    fn send_and_drain(net: &SimNet, link: LinkId, from: Side, to: Side, msg: &[u8]) -> (u64, Vec<u8>) {
+    fn send_and_drain(
+        net: &SimNet,
+        link: LinkId,
+        from: Side,
+        to: Side,
+        msg: &[u8],
+    ) -> (u64, Vec<u8>) {
         net.endpoint(link, from).write_all(msg).expect("write");
         let mut got = Vec::new();
         let mut t = net.now();
@@ -356,10 +362,16 @@ mod tests {
         let net = SimNet::with_seed(1);
         let link = net.connect();
         let (_, got) = send_and_drain(&net, link, Side::Client, Side::Server, b"HELLO bolt");
-        assert_eq!(got, b"HELLO bolt", "client→server bytes arrive intact and in order");
+        assert_eq!(
+            got, b"HELLO bolt",
+            "client→server bytes arrive intact and in order"
+        );
 
         let (_, back) = send_and_drain(&net, link, Side::Server, Side::Client, b"SUCCESS");
-        assert_eq!(back, b"SUCCESS", "server→client bytes arrive intact and in order");
+        assert_eq!(
+            back, b"SUCCESS",
+            "server→client bytes arrive intact and in order"
+        );
     }
 
     #[test]
@@ -367,11 +379,21 @@ mod tests {
         // Two links; write one message on each at t=0; the seed-drawn latencies decide which arrives
         // first. The arrival order must be identical for the same seed.
         let arrival_order = |seed: u64| -> Vec<&'static str> {
-            let net = SimNet::new(seed, NetConfig { min_latency: 1, max_latency: 50 });
+            let net = SimNet::new(
+                seed,
+                NetConfig {
+                    min_latency: 1,
+                    max_latency: 50,
+                },
+            );
             let a = net.connect();
             let b = net.connect();
-            net.endpoint(a, Side::Client).write_all(b"A").expect("write a");
-            net.endpoint(b, Side::Client).write_all(b"B").expect("write b");
+            net.endpoint(a, Side::Client)
+                .write_all(b"A")
+                .expect("write a");
+            net.endpoint(b, Side::Client)
+                .write_all(b"B")
+                .expect("write b");
             let mut ra = net.endpoint(a, Side::Server);
             let mut rb = net.endpoint(b, Side::Server);
             let mut order = Vec::new();
@@ -390,7 +412,10 @@ mod tests {
 
         let first = arrival_order(12_345);
         let again = arrival_order(12_345);
-        assert_eq!(first, again, "same seed ⇒ identical cross-link arrival order");
+        assert_eq!(
+            first, again,
+            "same seed ⇒ identical cross-link arrival order"
+        );
         assert_eq!(first.len(), 2, "both messages arrive (non-vacuous)");
     }
 
@@ -399,15 +424,23 @@ mod tests {
         // Search a handful of seeds; at least one pair must differ, proving the order is seed-driven
         // (not a fixed schedule). Deterministic: the seed list is fixed.
         let order = |seed: u64| -> Vec<u64> {
-            let net = SimNet::new(seed, NetConfig { min_latency: 1, max_latency: 100 });
+            let net = SimNet::new(
+                seed,
+                NetConfig {
+                    min_latency: 1,
+                    max_latency: 100,
+                },
+            );
             let links: Vec<LinkId> = (0..4).map(|_| net.connect()).collect();
             for (i, l) in links.iter().enumerate() {
                 net.endpoint(*l, Side::Client)
                     .write_all(&[i as u8])
                     .expect("write");
             }
-            let mut readers: Vec<SimEndpoint> =
-                links.iter().map(|l| net.endpoint(*l, Side::Server)).collect();
+            let mut readers: Vec<SimEndpoint> = links
+                .iter()
+                .map(|l| net.endpoint(*l, Side::Server))
+                .collect();
             let mut order = Vec::new();
             for t in 1..=200 {
                 net.advance_to(t);
@@ -430,17 +463,27 @@ mod tests {
     fn partition_holds_delivery_until_healed() {
         let net = SimNet::with_seed(5);
         let link = net.connect();
-        net.endpoint(link, Side::Client).write_all(b"X").expect("write");
+        net.endpoint(link, Side::Client)
+            .write_all(b"X")
+            .expect("write");
         net.partition(link);
 
         let mut reader = net.endpoint(link, Side::Server);
         net.advance_to(1000);
         let mut buf = [0u8; 8];
-        assert_eq!(reader.read(&mut buf).expect("read"), 0, "partition holds the byte");
+        assert_eq!(
+            reader.read(&mut buf).expect("read"),
+            0,
+            "partition holds the byte"
+        );
 
         net.heal(link);
         net.advance_to(2000);
-        assert_eq!(reader.read(&mut buf).expect("read"), 1, "healed link delivers");
+        assert_eq!(
+            reader.read(&mut buf).expect("read"),
+            1,
+            "healed link delivers"
+        );
         assert_eq!(&buf[..1], b"X");
     }
 
@@ -448,12 +491,17 @@ mod tests {
     fn reset_breaks_both_ends() {
         let net = SimNet::with_seed(5);
         let link = net.connect();
-        net.endpoint(link, Side::Client).write_all(b"data").expect("write");
+        net.endpoint(link, Side::Client)
+            .write_all(b"data")
+            .expect("write");
         net.reset(link);
 
         let mut reader = net.endpoint(link, Side::Server);
         let mut buf = [0u8; 8];
-        assert!(reader.read(&mut buf).is_err(), "a reset link errors on read");
+        assert!(
+            reader.read(&mut buf).is_err(),
+            "a reset link errors on read"
+        );
         assert!(
             net.endpoint(link, Side::Client).write_all(b"more").is_err(),
             "a reset link errors on write",
@@ -465,14 +513,20 @@ mod tests {
     fn close_yields_eof_after_drain() {
         let net = SimNet::with_seed(5);
         let link = net.connect();
-        net.endpoint(link, Side::Client).write_all(b"bye").expect("write");
+        net.endpoint(link, Side::Client)
+            .write_all(b"bye")
+            .expect("write");
         net.close(link, Side::Client);
         net.advance_to(1000);
 
         let mut reader = net.endpoint(link, Side::Server);
         let mut buf = [0u8; 8];
         let n = reader.read(&mut buf).expect("read");
-        assert_eq!(&buf[..n], b"bye", "delivered bytes are still readable after close");
+        assert_eq!(
+            &buf[..n],
+            b"bye",
+            "delivered bytes are still readable after close"
+        );
         assert!(reader.is_eof(), "drained + half-closed ⇒ EOF");
         assert_eq!(reader.read(&mut buf).expect("read"), 0, "EOF reads as 0");
     }

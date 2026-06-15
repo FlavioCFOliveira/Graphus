@@ -25,11 +25,11 @@
 
 pub mod bolt_values;
 pub mod command;
-pub mod rest_values;
 mod exec;
 mod handle;
 mod local;
 pub mod privileges;
+pub mod rest_values;
 mod seam_bolt;
 mod seam_rest;
 pub mod stream;

@@ -10,12 +10,24 @@ use graphus_elle::{Op, Transaction, check};
 
 fn main() -> ExitCode {
     let serial = vec![
-        Transaction::committed(1, vec![Op::Append { key: "a".into(), val: 1 }]),
+        Transaction::committed(
+            1,
+            vec![Op::Append {
+                key: "a".into(),
+                val: 1,
+            }],
+        ),
         Transaction::committed(
             2,
             vec![
-                Op::Read { key: "a".into(), observed: vec![1] },
-                Op::Append { key: "a".into(), val: 2 },
+                Op::Read {
+                    key: "a".into(),
+                    observed: vec![1],
+                },
+                Op::Append {
+                    key: "a".into(),
+                    val: 2,
+                },
             ],
         ),
     ];
@@ -23,15 +35,27 @@ fn main() -> ExitCode {
         Transaction::committed(
             1,
             vec![
-                Op::Read { key: "y".into(), observed: vec![] },
-                Op::Append { key: "x".into(), val: 1 },
+                Op::Read {
+                    key: "y".into(),
+                    observed: vec![],
+                },
+                Op::Append {
+                    key: "x".into(),
+                    val: 1,
+                },
             ],
         ),
         Transaction::committed(
             2,
             vec![
-                Op::Read { key: "x".into(), observed: vec![] },
-                Op::Append { key: "y".into(), val: 1 },
+                Op::Read {
+                    key: "x".into(),
+                    observed: vec![],
+                },
+                Op::Append {
+                    key: "y".into(),
+                    val: 1,
+                },
             ],
         ),
     ];

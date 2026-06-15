@@ -6,9 +6,7 @@
 //! malformed input with errors, never panic or read out of bounds.
 
 use graphus_bolt::framing::{Dechunker, Frame};
-use graphus_bolt::handshake::{
-    parse_client_handshake, parse_manifest_choice, MANIFEST_V1_REQUEST,
-};
+use graphus_bolt::handshake::{MANIFEST_V1_REQUEST, parse_client_handshake, parse_manifest_choice};
 
 // ---- framing: reassembly size cap (CWE-400 / CWE-770) -----------------------------------------
 

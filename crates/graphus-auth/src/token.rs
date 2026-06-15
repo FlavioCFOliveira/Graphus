@@ -282,8 +282,12 @@ mod tests {
     #[test]
     fn two_tokens_get_distinct_jtis() {
         let auth = authenticator();
-        let a = auth.verify_bearer(&auth.issue_token("u", NOW, 60, 0).unwrap(), NOW + 1).unwrap();
-        let b = auth.verify_bearer(&auth.issue_token("u", NOW, 60, 0).unwrap(), NOW + 1).unwrap();
+        let a = auth
+            .verify_bearer(&auth.issue_token("u", NOW, 60, 0).unwrap(), NOW + 1)
+            .unwrap();
+        let b = auth
+            .verify_bearer(&auth.issue_token("u", NOW, 60, 0).unwrap(), NOW + 1)
+            .unwrap();
         assert_ne!(a.jti, b.jti, "each issued token gets a fresh random jti");
     }
 
@@ -332,13 +336,16 @@ mod tests {
     fn token_for_another_audience_is_rejected() {
         // SEC-180: a token minted for deployment A's audience must be rejected by deployment B even
         // under the SAME secret — the iss/aud binding makes tokens non-transferable.
-        let a = JwtAuthenticator::with_identity(SECRET, "graphus", "deployment-a")
-            .expect("secret ok");
-        let b = JwtAuthenticator::with_identity(SECRET, "graphus", "deployment-b")
-            .expect("secret ok");
+        let a =
+            JwtAuthenticator::with_identity(SECRET, "graphus", "deployment-a").expect("secret ok");
+        let b =
+            JwtAuthenticator::with_identity(SECRET, "graphus", "deployment-b").expect("secret ok");
         let token = a.issue_token("alice", NOW, 3600, 0).unwrap();
         assert!(
-            matches!(b.verify_bearer(&token, NOW + 10), Err(AuthError::BadToken { .. })),
+            matches!(
+                b.verify_bearer(&token, NOW + 10),
+                Err(AuthError::BadToken { .. })
+            ),
             "a token bound to audience A must be rejected by audience B"
         );
         // And A accepts its own token.
@@ -347,10 +354,8 @@ mod tests {
 
     #[test]
     fn token_for_another_issuer_is_rejected() {
-        let a = JwtAuthenticator::with_identity(SECRET, "issuer-a", "graphus")
-            .expect("secret ok");
-        let b = JwtAuthenticator::with_identity(SECRET, "issuer-b", "graphus")
-            .expect("secret ok");
+        let a = JwtAuthenticator::with_identity(SECRET, "issuer-a", "graphus").expect("secret ok");
+        let b = JwtAuthenticator::with_identity(SECRET, "issuer-b", "graphus").expect("secret ok");
         let token = a.issue_token("alice", NOW, 3600, 0).unwrap();
         assert!(matches!(
             b.verify_bearer(&token, NOW + 10),

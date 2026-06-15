@@ -144,7 +144,9 @@ where
     let uds = uds.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut client = BoltClient::connect_uds(&uds).expect("connect over UDS");
-        client.login("alice", "pw-secret-1").expect("login as alice");
+        client
+            .login("alice", "pw-secret-1")
+            .expect("login as alice");
         f(client)
     })
     .await

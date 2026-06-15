@@ -374,7 +374,9 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
     // Admin creates `dave` at runtime over the live server (Bolt admin surface).
     let mut admin = BoltClient::connect(&uds).await;
     admin.handshake_and_logon("alice", "admin-pw8").await;
-    admin.run_ok("CREATE USER dave SET PASSWORD 'dave-pw8'").await;
+    admin
+        .run_ok("CREATE USER dave SET PASSWORD 'dave-pw8'")
+        .await;
     // `dave` needs READ for the REST auto-commit read used by `rest_auth_status`; grant it the
     // bootstrap `readwrite` role (server-wide read+write) so the Bearer success is observable as 200.
     admin.run_ok("GRANT ROLE readwrite TO dave").await;

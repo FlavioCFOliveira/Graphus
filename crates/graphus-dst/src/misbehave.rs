@@ -107,7 +107,9 @@ mod tests {
     use graphus_server::engine::LocalEngine;
     use graphus_sim::SharedClock;
 
-    use crate::wire::{SharedEngine, drive_raw_bolt, login_prologue, run_scripted_bolt_session, sim_auth};
+    use crate::wire::{
+        SharedEngine, drive_raw_bolt, login_prologue, run_scripted_bolt_session, sim_auth,
+    };
 
     fn engine() -> SharedEngine {
         Rc::new(RefCell::new(
@@ -152,7 +154,10 @@ mod tests {
             Some([0, 0, 0, 0]),
             "server rejects the impossible version",
         );
-        assert!(outcome.responses.is_empty(), "no messages after a rejected handshake");
+        assert!(
+            outcome.responses.is_empty(),
+            "no messages after a rejected handshake"
+        );
     }
 
     /// `RUN` before authentication is a protocol-state violation: the server must not execute it; it
@@ -215,6 +220,9 @@ mod tests {
         let once = drive_raw_bolt(engine(), 5, &auth, &garbage_after_handshake());
         let twice = drive_raw_bolt(engine(), 5, &auth, &garbage_after_handshake());
         assert_eq!(once.run_ok, twice.run_ok);
-        assert_eq!(format!("{:?}", once.responses), format!("{:?}", twice.responses));
+        assert_eq!(
+            format!("{:?}", once.responses),
+            format!("{:?}", twice.responses)
+        );
     }
 }
