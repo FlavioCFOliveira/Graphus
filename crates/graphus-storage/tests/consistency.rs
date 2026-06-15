@@ -198,7 +198,12 @@ impl DiskImage {
     }
 
     /// Overwrites a heap block at `(page_id, off)` and refreshes the checksum.
-    fn write_value_block_at(&mut self, page_id: u64, off: usize, block: &graphus_storage::HeapBlock) {
+    fn write_value_block_at(
+        &mut self,
+        page_id: u64,
+        off: usize,
+        block: &graphus_storage::HeapBlock,
+    ) {
         let size = StoreKind::Strings.record_size();
         let mut buf = vec![0u8; size];
         block.encode(&mut buf);

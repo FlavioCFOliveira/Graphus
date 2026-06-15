@@ -111,9 +111,15 @@ mod tests {
         assert!(check(&history).serializable, "serial history is serializable");
     }
 
-    /// Two concurrent write–write txns on the SAME existing node must not BOTH commit — SSI detects
-    /// the conflict and aborts one. (The durability of the survivor's committed value is a separate
-    /// found gap, tracked by rmp #172; this test pins the conflict-detection property.)
+    /// Two concurrent write–write txns on the SAME existing node: SSI detects the conflict and aborts
+    /// exactly one, AND the survivor's committed update is **durable** — the final value reflects
+    /// exactly one increment, never the loser's clobber back to the pre-image (`rmp` #172, FIXED).
+    ///
+    /// The durability arm was previously a found gap (the SSI loser's rollback restored a stale
+    /// `first_prop` chain-head pre-image over the survivor's committed value, reverting it to 0 and
+    /// even severing unrelated properties of the node). The storage-layer fix (chain-head
+    /// compare-and-set logical undo + header-only creation undo) guarantees the loser's abort unlinks
+    /// only its own push and never reverts the survivor's committed value.
     #[test]
     fn write_write_conflict_is_detected() {
         let mut eng = engine();
@@ -129,9 +135,36 @@ mod tests {
         let c1 = eng.commit(t1).is_ok();
         let c2 = eng.commit(t2).is_ok();
 
+        // SSI must abort exactly one of the two write–write conflicting transactions.
         assert!(
-            !(c1 && c2),
-            "two concurrent same-node writers must not both commit (SSI conflict), got {c1},{c2}"
+            c1 ^ c2,
+            "exactly one concurrent same-node writer must commit (SSI conflict), got {c1},{c2}"
+        );
+
+        // The survivor's committed increment must persist: the node is still found by its unchanged
+        // key `k`, and `v` reflects exactly one increment (1), never reverted to the pre-image 0.
+        let reader = eng.begin(AccessMode::Read).expect("begin reader");
+        let mut reply = eng
+            .run(
+                reader,
+                "MATCH (c:Counter {k: 'x'}) RETURN c.v AS v",
+                vec![],
+                false,
+                None,
+            )
+            .expect("read runs");
+        let mut observed = Vec::new();
+        while let Ok(Some(row)) = reply.rows.next() {
+            if let Some(MaterializedValue::Value(Value::Integer(n))) = row.first() {
+                observed.push(*n);
+            }
+        }
+        let _ = eng.commit(reader);
+        assert_eq!(
+            observed,
+            vec![1],
+            "the SSI survivor's committed value must persist as exactly one increment (rmp #172), \
+             not be reverted by the loser's undo; got {observed:?}"
         );
     }
 

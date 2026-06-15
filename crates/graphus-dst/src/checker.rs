@@ -271,26 +271,35 @@ fn verify_page_checksums<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, 
     Ok(())
 }
 
-/// Verifies node `node`'s incidence chain is a well-formed doubly-linked list of `(rel_id, side)`
-/// links, mirroring `graphus-storage`'s adjacency property test: from `first_rel`, each link's
-/// `next` has a successor whose `prev` points back, the head link's `prev` is null, and the walk
-/// terminates within a generous guard.
+/// Verifies node `node`'s incidence chain is a well-formed forward thread that **terminates** and
+/// visits each LIVE relationship at most once. From `first_rel` it follows each link's forward
+/// pointer on the side facing `node` (the same threading [`RecordStore::incident_rels`] performs),
+/// **transparently threading through dead-link corpses** (`rmp` #220): an aborted/crashed creation
+/// whose header-only undo cleared `in_use` while preserving the body's forward chain pointers.
+///
+/// The strict doubly-linked `prev == from` symmetry the original walk enforced is deliberately NOT
+/// asserted here: the dead-link model legitimately relaxes it — a corpse (or a head whose CAS push
+/// was no-op'd off by a later committed writer) can leave a stale back-pointer that reads simply
+/// thread past. The authoritative correctness of the live incidence SET is already verified in
+/// [`verify`] (`store.incident_rels(node) == model.incident(node)`, with every enumerated rel proven
+/// live and genuinely incident); this walk's residual job is to guarantee the forward thread
+/// **terminates** (no cycle) and never revisits a live rel.
 fn check_chain_links<D: BlockDevice, S: LogSink>(
     store: &mut RecordStore<D, S>,
     node: u64,
 ) -> CheckResult {
-    /// The chain link `(prev, next)` of relationship `rid` on the side facing `node`, arriving from
-    /// `from` (the previous link's id, `0` at the head). For a self-loop both sides face `node`;
-    /// pick the side whose `prev` equals `from` (the side we actually arrived through).
-    fn link_of<D: BlockDevice, S: LogSink>(
+    /// The forward pointer of relationship `rid` on the side facing `node`, arriving from link
+    /// `from` (`0` at the head). For a self-loop both sides face `node`; pick the side whose `prev`
+    /// matches `from` (the side we arrived through), exactly as `incident_rels` does.
+    fn next_of<D: BlockDevice, S: LogSink>(
         store: &mut RecordStore<D, S>,
         rid: u64,
         node: u64,
         from: u64,
-    ) -> std::result::Result<(u64, u64), CheckFailure> {
+    ) -> std::result::Result<u64, CheckFailure> {
         let r = store.rel(rid).map_err(|e| store_err("rel()", rid, &e))?;
         let is_loop = r.start_node == node && r.end_node == node;
-        let link = if is_loop {
+        let (_, next) = if is_loop {
             let end = r.chain_pointers(ChainSide::End);
             if from == 0 || end.0 == from {
                 end
@@ -302,36 +311,29 @@ fn check_chain_links<D: BlockDevice, S: LogSink>(
         } else {
             r.chain_pointers(ChainSide::End)
         };
-        Ok(link)
+        Ok(next)
     }
 
     let first = store
         .node(node)
         .map_err(|e| store_err("node()", node, &e))?
         .first_rel;
-    let degree = store
-        .degree(node)
-        .map_err(|e| store_err("degree()", node, &e))?;
-    let guard = 4 * (degree as u64) + 8;
 
+    // Termination is proven by tracking every (link, arrived-from) pair visited: a self-loop is
+    // threaded twice (once per side) so a bare link-id set would false-positive on it, but the
+    // `(link, from)` pair is unique per traversal step of a well-formed thread, so a repeat means a
+    // genuine cycle. This bounds the walk without needing the rel high-water.
+    let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
     let mut from = 0u64;
     let mut cur = first;
-    let mut steps = 0u64;
     while cur != 0 {
-        steps += 1;
-        if steps > guard {
+        if !seen.insert((cur, from)) {
             return Err(CheckFailure::BrokenChain {
                 node,
-                detail: "chain link walk did not terminate".to_owned(),
+                detail: format!("link {cur} (from {from}) revisited — chain does not terminate"),
             });
         }
-        let (prev, next) = link_of(store, cur, node, from)?;
-        if prev != from {
-            return Err(CheckFailure::BrokenChain {
-                node,
-                detail: format!("link {cur} prev={prev} expected {from}"),
-            });
-        }
+        let next = next_of(store, cur, node, from)?;
         from = cur;
         cur = next;
     }

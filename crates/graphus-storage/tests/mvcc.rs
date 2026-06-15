@@ -524,3 +524,405 @@ fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
         "only the GC writer (t3) remains"
     );
 }
+
+/// Crash-recovery variant of the aborted-creation dead-link survivor (`rmp` #220): instead of an
+/// explicit live `rollback`, the creating transaction of the middle relationship NEVER commits and
+/// the system crashes. On recovery, redo repeats history (the middle rel is written, in_use) and the
+/// global descending-LSN undo of the losing (uncommitted) transaction applies the **header-only**
+/// creation undo, leaving the middle rel as the IDENTICAL transparent dead link as live rollback — so
+/// the two surviving committed edges are preserved and the chain is not severed.
+#[test]
+fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
+    let mut s = fresh();
+    let rt = s.intern_token(Namespace::RelType, "R").unwrap();
+
+    // Setup (committed): hub + three leaves.
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (hub, _) = s.create_node(setup).unwrap();
+    let (l1, _) = s.create_node(setup).unwrap();
+    let (l2, _) = s.create_node(setup).unwrap();
+    let (l3, _) = s.create_node(setup).unwrap();
+    s.commit(setup).unwrap();
+
+    // Interleave three prepends onto hub's chain. T2 (the middle, r2) is the loser: it is left
+    // in-flight (never committed) when we crash. T1 and T3 commit, so their work — and r2's
+    // updates, made durable by T1/T3's group commits under no-force — is in the durable WAL prefix.
+    let t1 = TxnId(2);
+    let t2 = TxnId(3);
+    let t3 = TxnId(4);
+    s.begin(t1);
+    s.begin(t2);
+    s.begin(t3);
+    let (r1, _) = s.create_rel(t1, rt, hub, l1).unwrap();
+    let (r2, _) = s.create_rel(t2, rt, hub, l2).unwrap();
+    let (r3, _) = s.create_rel(t3, rt, hub, l3).unwrap();
+    s.commit(t1).unwrap();
+    s.commit(t3).unwrap();
+    // CRASH: t2 never commits. Recover the durable WAL prefix onto a fresh device.
+    let mut s = recover_no_force(&s);
+
+    // Both committed edges survive; the loser r2 was undone to a transparent dead link, threaded
+    // through by the forward walk. Recovery must reconstruct the exact same survivor set as live
+    // rollback did.
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(
+        incident,
+        vec![r1, r3],
+        "after crash recovery the hub keeps both committed edges r1 and r3"
+    );
+    assert_eq!(s.degree(hub).unwrap(), 2);
+
+    // GC after recovery splices and reclaims the dead-link corpse and keeps the survivors reachable.
+    let used_before = s.used_rel_slots();
+    let watermark = s.snapshot_ts();
+    s.begin(TxnId(5));
+    s.gc(TxnId(5), watermark).unwrap();
+    s.commit(TxnId(5)).unwrap();
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(
+        incident,
+        vec![r1, r3],
+        "survivors remain after the post-recovery corpse splice"
+    );
+    assert_eq!(s.degree(hub).unwrap(), 2, "degree is exactly the two survivors");
+    // The corpse slot r2 is now freed: used rel slots drop by one to the two-survivor baseline, and
+    // the freed id is r2 itself.
+    assert_eq!(
+        s.used_rel_slots(),
+        used_before - 1,
+        "the corpse slot is reclaimed by the post-recovery GC"
+    );
+    assert_eq!(s.used_rel_slots(), 2, "only the two committed edges remain allocated");
+    assert!(
+        !s.rel(r2).unwrap().mvcc.in_use(),
+        "the reclaimed corpse slot {r2} is no longer in use"
+    );
+
+    // The store is structurally consistent after the splice (the checker enforces the doubly-linked
+    // incidence invariants: head prev == NULL, back-pointer symmetry, independent re-derivation).
+    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    assert!(
+        report.is_consistent(),
+        "store is consistent after corpse splice: {:?}",
+        report.violations
+    );
+}
+
+/// LIVE rollback (`rmp` #220, not the crash path of the test above) of the **middle** writer among
+/// three concurrent prepends onto one supernode. The two committed edges must survive and — crucially
+/// for the space-leak fix — the aborted middle writer's relationship corpse must be **reclaimed** by a
+/// subsequent GC, returning the used rel-slot count to the no-corpse baseline (degree stays 2).
+#[test]
+fn live_rollback_of_middle_prepend_reclaims_the_corpse() {
+    let mut s = fresh();
+    let rt = s.intern_token(Namespace::RelType, "R").unwrap();
+
+    // Setup (committed): hub + three leaves.
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (hub, _) = s.create_node(setup).unwrap();
+    let (l1, _) = s.create_node(setup).unwrap();
+    let (l2, _) = s.create_node(setup).unwrap();
+    let (l3, _) = s.create_node(setup).unwrap();
+    s.commit(setup).unwrap();
+
+    // Three interleaved prepends onto hub; T2 (the MIDDLE, r2) is rolled back LIVE while T1/T3 commit.
+    let t1 = TxnId(2);
+    let t2 = TxnId(3);
+    let t3 = TxnId(4);
+    s.begin(t1);
+    s.begin(t2);
+    s.begin(t3);
+    let (r1, _) = s.create_rel(t1, rt, hub, l1).unwrap();
+    let (r2, _) = s.create_rel(t2, rt, hub, l2).unwrap();
+    let (r3, _) = s.create_rel(t3, rt, hub, l3).unwrap();
+    s.commit(t1).unwrap();
+    s.rollback(t2).unwrap(); // the middle writer aborts: leaves r2 as a dead-link corpse
+    s.commit(t3).unwrap();
+
+    // Both committed edges survive; the corpse r2 is threaded through but not collected.
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(incident, vec![r1, r3], "the two committed edges survive the abort");
+    assert_eq!(s.degree(hub).unwrap(), 2);
+    let used_with_corpse = s.used_rel_slots();
+    assert_eq!(
+        used_with_corpse, 3,
+        "before GC the corpse r2 still occupies a slot (2 live + 1 corpse)"
+    );
+    assert!(
+        !s.rel(r2).unwrap().mvcc.in_use(),
+        "r2 is a not-in-use corpse before GC"
+    );
+
+    // A GC pass splices and reclaims the corpse: used slots drop to the two-survivor baseline.
+    let watermark = s.snapshot_ts();
+    s.begin(TxnId(5));
+    s.gc(TxnId(5), watermark).unwrap();
+    s.commit(TxnId(5)).unwrap();
+
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(incident, vec![r1, r3], "survivors remain after the corpse splice");
+    assert_eq!(s.degree(hub).unwrap(), 2, "degree stays 2 after the splice");
+    assert_eq!(
+        s.used_rel_slots(),
+        2,
+        "the corpse slot is reclaimed: used rel slots return to the no-corpse baseline"
+    );
+    assert!(
+        !s.rel(r2).unwrap().mvcc.in_use(),
+        "the reclaimed corpse slot {r2} is no longer in use"
+    );
+
+    // Re-running GC is idempotent (the corpse is already gone — nothing more to splice).
+    let watermark = s.snapshot_ts();
+    s.begin(TxnId(6));
+    s.gc(TxnId(6), watermark).unwrap();
+    s.commit(TxnId(6)).unwrap();
+    assert_eq!(s.used_rel_slots(), 2, "a second GC pass reclaims nothing further");
+
+    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    assert!(
+        report.is_consistent(),
+        "store is consistent after corpse splice: {:?}",
+        report.violations
+    );
+}
+
+/// Leak-BOUNDARY regression (`rmp` #220, the empirical proof the leak is fixed): drive the
+/// create/abort churn workload — repeatedly open three concurrent writers prepending an edge onto a
+/// shared hub, commit two and abort the pivot (leaving a corpse), then delete the two committed edges
+/// — for many iterations, running GC each round. The physical rel-slot high-water and the used-slot
+/// count MUST stay BOUNDED (return to a flat baseline after GC), so the corpse leak cannot silently
+/// regress. Before the fix, `used_rel_slots` grew by one per aborted creation, monotonically forever.
+#[test]
+fn churn_create_abort_keeps_rel_slots_bounded() {
+    let mut s = fresh();
+    let rt = s.intern_token(Namespace::RelType, "R").unwrap();
+
+    // Committed hub + three reusable leaves.
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (hub, _) = s.create_node(setup).unwrap();
+    let (a, _) = s.create_node(setup).unwrap();
+    let (b, _) = s.create_node(setup).unwrap();
+    let (c, _) = s.create_node(setup).unwrap();
+    s.commit(setup).unwrap();
+
+    let mut txn = 2u64;
+    let mut next = || {
+        let t = TxnId(txn);
+        txn += 1;
+        t
+    };
+
+    let mut high_water_after_gc = Vec::new();
+    let mut used_after_gc = Vec::new();
+
+    for _round in 0..40 {
+        // Three concurrent prepends onto the shared hub; commit two, abort the middle pivot.
+        let t1 = next();
+        let t2 = next();
+        let t3 = next();
+        s.begin(t1);
+        s.begin(t2);
+        s.begin(t3);
+        let (r1, _) = s.create_rel(t1, rt, hub, a).unwrap();
+        let (_r2, _) = s.create_rel(t2, rt, hub, b).unwrap(); // the pivot -> corpse on abort
+        let (r3, _) = s.create_rel(t3, rt, hub, c).unwrap();
+        s.commit(t1).unwrap();
+        s.rollback(t2).unwrap();
+        s.commit(t3).unwrap();
+        assert_eq!(s.degree(hub).unwrap(), 2, "two committed edges this round");
+
+        // Delete the two committed edges (tombstone), so the LOGICAL rel count returns to zero each
+        // round — the only thing that should accumulate without the fix is the leaked corpse slots.
+        let td = next();
+        s.begin(td);
+        s.delete_rel(td, r1).unwrap();
+        s.delete_rel(td, r3).unwrap();
+        s.commit(td).unwrap();
+        // delete_rel is an MVCC tombstone: the slots stay in_use and in the incidence chain (degree
+        // still 2) until GC reclaims them — so the logical count returns to zero only after GC below.
+
+        // GC at a watermark past everything: reclaims the two tombstones AND splices the corpse.
+        let watermark = s.snapshot_ts();
+        let tg = next();
+        s.begin(tg);
+        s.gc(tg, watermark).unwrap();
+        s.commit(tg).unwrap();
+
+        // After GC the hub has no incident rels and ZERO used rel slots remain — the corpse was
+        // freed, not leaked.
+        assert_eq!(s.degree(hub).unwrap(), 0);
+        assert_eq!(
+            s.used_rel_slots(),
+            0,
+            "after GC no rel slot is used (corpse reclaimed, not leaked)"
+        );
+
+        high_water_after_gc.push(s.rel_high_water());
+        used_after_gc.push(s.used_rel_slots());
+    }
+
+    // BOUNDEDNESS: the used-slot count is a flat zero across all rounds (the corpse never accumulates),
+    // and the physical high-water stops growing — it never exceeds the few slots one round needs,
+    // because freed corpse + tombstone slots are reused from the free list round after round.
+    assert!(
+        used_after_gc.iter().all(|&u| u == 0),
+        "used rel slots stay flat at 0 across all churn rounds: {used_after_gc:?}"
+    );
+    let max_hw = high_water_after_gc.iter().copied().max().unwrap();
+    assert!(
+        max_hw <= 4,
+        "rel high-water stays bounded under churn (freed slots are reused), max was {max_hw}: \
+         {high_water_after_gc:?}"
+    );
+    // The high-water is identical from the second round on — proof the leak does not creep.
+    assert!(
+        high_water_after_gc.windows(2).skip(1).all(|w| w[0] == w[1]),
+        "rel high-water is stable across rounds (no monotonic creep): {high_water_after_gc:?}"
+    );
+
+    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    assert!(
+        report.is_consistent(),
+        "store stays consistent across churn: {:?}",
+        report.violations
+    );
+}
+
+/// A **run of consecutive corpses** (`rmp` #220): two adjacent aborted prepends between two committed
+/// edges on one hub. The splice must collapse the whole run LIVE-to-LIVE in one bridge — never leaving
+/// a live link pointing at a freed corpse slot — so both committed edges survive and BOTH corpse slots
+/// are reclaimed. This pins the exact hazard a per-corpse splice mishandled (it severed the chain).
+#[test]
+fn consecutive_corpse_run_is_collapsed_and_both_reclaimed() {
+    let mut s = fresh();
+    let rt = s.intern_token(Namespace::RelType, "R").unwrap();
+
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (hub, _) = s.create_node(setup).unwrap();
+    let (l1, _) = s.create_node(setup).unwrap();
+    let (l2, _) = s.create_node(setup).unwrap();
+    let (l3, _) = s.create_node(setup).unwrap();
+    let (l4, _) = s.create_node(setup).unwrap();
+    s.commit(setup).unwrap();
+
+    // Four interleaved prepends. The chain head ends up:  r4 -> r3 -> r2 -> r1.
+    // Commit the OUTER two (r1 oldest, r4 newest); abort the INNER two (r2, r3) so they form a run of
+    // two consecutive corpses sandwiched between the two committed edges.
+    let (t1, t2, t3, t4) = (TxnId(2), TxnId(3), TxnId(4), TxnId(5));
+    s.begin(t1);
+    s.begin(t2);
+    s.begin(t3);
+    s.begin(t4);
+    let (r1, _) = s.create_rel(t1, rt, hub, l1).unwrap();
+    let (r2, _) = s.create_rel(t2, rt, hub, l2).unwrap();
+    let (r3, _) = s.create_rel(t3, rt, hub, l3).unwrap();
+    let (r4, _) = s.create_rel(t4, rt, hub, l4).unwrap();
+    // Commit the OUTER two first, so that when the inner two abort a committed writer (r4, the head) is
+    // threaded above them: the header-only creation undo then leaves them as corpses (instead of the
+    // plain-unlink path an abort with nothing committed on top would take), forming the run of two
+    // consecutive corpses r3 -> r2 between live head r4 and live tail r1.
+    s.commit(t1).unwrap();
+    s.commit(t4).unwrap();
+    s.rollback(t3).unwrap(); // corpse (r4 committed above it)
+    s.rollback(t2).unwrap(); // corpse, adjacent to r3 -> a run of length 2
+    let _ = (r2, r3); // r2, r3 are the two corpses in the run
+
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(incident, vec![r1, r4], "both committed edges survive a 2-corpse run");
+    assert_eq!(s.used_rel_slots(), 4, "2 live + 2 corpses before GC");
+
+    let watermark = s.snapshot_ts();
+    s.begin(TxnId(6));
+    s.gc(TxnId(6), watermark).unwrap();
+    s.commit(TxnId(6)).unwrap();
+
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(
+        incident,
+        vec![r1, r4],
+        "both committed edges survive the run collapse — the chain was not severed"
+    );
+    assert_eq!(s.degree(hub).unwrap(), 2);
+    assert_eq!(s.used_rel_slots(), 2, "both corpse slots in the run are reclaimed");
+    assert!(!s.rel(r2).unwrap().mvcc.in_use());
+    assert!(!s.rel(r3).unwrap().mvcc.in_use());
+
+    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    assert!(
+        report.is_consistent(),
+        "store is consistent after the run collapse: {:?}",
+        report.violations
+    );
+}
+
+/// A **self-loop corpse** (`rmp` #220, `04 §2.4`): an aborted self-loop creation threads its corpse
+/// into the node's single chain TWICE (once per side). The splice must remove both links and reclaim
+/// the one slot, leaving a committed neighbouring edge and a committed self-loop intact.
+#[test]
+fn self_loop_corpse_is_spliced_from_both_links() {
+    let mut s = fresh();
+    let rt = s.intern_token(Namespace::RelType, "R").unwrap();
+
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (hub, _) = s.create_node(setup).unwrap();
+    let (leaf, _) = s.create_node(setup).unwrap();
+    s.commit(setup).unwrap();
+
+    // A committed plain edge, then an aborted self-loop (the corpse, threaded twice into hub's chain),
+    // then a committed self-loop on top.
+    let (t1, t2, t3) = (TxnId(2), TxnId(3), TxnId(4));
+    s.begin(t1);
+    s.begin(t2);
+    s.begin(t3);
+    let (r1, _) = s.create_rel(t1, rt, hub, leaf).unwrap(); // plain committed edge
+    let (loop_corpse, _) = s.create_rel(t2, rt, hub, hub).unwrap(); // self-loop, will abort
+    let (loop_live, _) = s.create_rel(t3, rt, hub, hub).unwrap(); // self-loop, committed
+    s.commit(t1).unwrap();
+    s.rollback(t2).unwrap(); // self-loop corpse
+    s.commit(t3).unwrap();
+
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(
+        incident,
+        vec![r1, loop_live],
+        "the committed edge and committed self-loop survive the aborted self-loop"
+    );
+    assert_eq!(s.degree(hub).unwrap(), 2, "self-loop counted once: degree 2");
+    assert_eq!(s.used_rel_slots(), 3, "2 live + 1 self-loop corpse before GC");
+
+    let watermark = s.snapshot_ts();
+    s.begin(TxnId(5));
+    s.gc(TxnId(5), watermark).unwrap();
+    s.commit(TxnId(5)).unwrap();
+
+    let mut incident = s.incident_rels(hub).unwrap();
+    incident.sort_unstable();
+    assert_eq!(
+        incident,
+        vec![r1, loop_live],
+        "survivors remain after the self-loop corpse is spliced from both links"
+    );
+    assert_eq!(s.degree(hub).unwrap(), 2);
+    assert_eq!(s.used_rel_slots(), 2, "the self-loop corpse's single slot is reclaimed");
+    assert!(!s.rel(loop_corpse).unwrap().mvcc.in_use());
+
+    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    assert!(
+        report.is_consistent(),
+        "store is consistent after the self-loop corpse splice: {:?}",
+        report.violations
+    );
+}

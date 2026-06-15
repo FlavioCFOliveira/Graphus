@@ -44,8 +44,8 @@ use crate::meta::{
 use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
-    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
-    REL_RECORD_SIZE, RelRecord,
+    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL, NODE_RECORD_SIZE,
+    NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_FIRST_PROP, REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenStore};
 use crate::valenc;
@@ -820,6 +820,137 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.write_region(dev, off + field_off, &word.to_le_bytes(), txn)
     }
 
+    // ------------- chain-safe writes (logical-undo discipline, `rmp` #220 / #172) -------------
+    //
+    // Three writes participate in a graph chain and must NOT log a plain whole-record pre-image undo,
+    // because under STATEMENT-granularity interleaving a concurrently-committed writer can prepend a
+    // record on top of (or relink into) the very field this txn touched. A plain pre-image abort would
+    // then clobber that committed structure. The fixes below replace the unsafe plain undos with the
+    // logical compensations the surviving `paging`/recovery contract replays identically live and on
+    // crash (`04 §4.1`):
+    //
+    //   * `write_chain_head`  — pushing a record onto a `first_rel`/`first_prop` head: undo is a
+    //     compare-and-set ([`paging::encode_cas_patch`]) that resets the head to its old value ONLY if
+    //     it is still this txn's pushed id (else a later writer owns the head — no-op).
+    //   * `write_*_create`    — first write of a freshly-allocated rel/prop record: undo reverts ONLY
+    //     the MVCC header (marks the slot not-in-use), PRESERVING the record body (its forward chain
+    //     pointers). A surviving writer that prepended onto this record then threads THROUGH the dead
+    //     record to its successor instead of having the chain severed by a body-zeroing undo.
+    //   * `write_record_keep` — a side write whose plain pre-image undo would also be unsafe (e.g.
+    //     `relink_old_head` making the old head look like the chain head): logged with undo == redo,
+    //     a no-op on abort; the GC corpse splice re-establishes the correct neighbour state.
+
+    /// Writes the 8-byte chain-head field at `field_off` of record `id` in `kind`'s store to
+    /// `new_head`, logging a **compare-and-set logical undo** (`rmp` #220 / #172): redo installs
+    /// `new_head`; undo resets the field to `old_head` *only if it still equals `new_head`*. This is
+    /// the correct compensation for "push `new_head` onto the head" — it never clobbers a later
+    /// committed writer that has since pushed on top (its push moved the head off `new_head`, so the
+    /// CAS no-ops). Replays identically in live rollback (`PoolTarget`) and crash recovery
+    /// (`DeviceTarget`) via [`paging::apply_patch`].
+    fn write_chain_head(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        field_off: usize,
+        new_head: u64,
+        old_head: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let abs = off + field_off;
+        let redo = paging::encode_patch(abs, &new_head.to_le_bytes());
+        let undo = paging::encode_cas_patch(abs, new_head, old_head);
+        let f = self.pool.fetch(dev)?;
+        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[abs..abs + 8].copy_from_slice(&new_head.to_le_bytes());
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// Writes the full body of record `id` in `kind`'s store, logging a **header-only undo**: the
+    /// redo is the whole-record post-image; the undo restores ONLY the 25-byte MVCC header captured
+    /// live from the page before the overwrite. On abort/recovery this reverts the slot to not-in-use
+    /// while PRESERVING the record's body — crucially its forward chain pointers — so a surviving
+    /// writer that prepended onto this record threads transparently through the dead record to its
+    /// successor instead of the chain being severed (`rmp` #220 / #172).
+    ///
+    /// Sound because `id` is the creating txn's freshly-allocated, slot-private record: no concurrent
+    /// txn ever mutates a not-yet-committed creator's own new slot, so the header pre-image is never
+    /// stale (unlike the chain-head field, which IS concurrently shared — hence `write_chain_head`).
+    fn write_record_header_undo(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        buf: &[u8],
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.ensure_store_page(kind, rel_page)?;
+        let end = off + buf.len();
+        let f = self.pool.fetch(dev)?;
+        // Capture the live header pre-image (the only bytes the undo restores) before overwriting.
+        let undo = paging::encode_patch(off, &self.pool.page(f)[off..off + MVCC_HEADER_SIZE]);
+        let redo = paging::encode_patch(off, buf);
+        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[off..end].copy_from_slice(buf);
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// First write of a freshly-created relationship record, with the header-only creation undo
+    /// (`rmp` #220). See [`write_record_header_undo`](Self::write_record_header_undo).
+    fn write_rel_create(&mut self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
+        let mut buf = [0u8; REL_RECORD_SIZE];
+        rec.encode(&mut buf);
+        self.write_record_header_undo(StoreKind::Rel, id, &buf, txn)
+    }
+
+    /// First write of a freshly-created property record, with the header-only creation undo
+    /// (`rmp` #172). See [`write_record_header_undo`](Self::write_record_header_undo).
+    fn write_prop_create(&mut self, id: u64, rec: &PropRecord, txn: TxnId) -> Result<()> {
+        let mut buf = [0u8; PROP_RECORD_SIZE];
+        rec.encode(&mut buf);
+        self.write_record_header_undo(StoreKind::Prop, id, &buf, txn)
+    }
+
+    /// Writes the full body of record `id` in `kind`'s store with **undo == redo** (a no-op on
+    /// abort/recovery). Used for a side write whose plain pre-image undo would be unsafe under
+    /// interleaving — e.g. [`relink_old_head`](Self::relink_old_head) setting the old head's `prev`
+    /// and clearing its first-in-chain flag: a plain undo would restore the old head as a chain head
+    /// and let GC reclaim it, clobbering a committed prepend. With undo == redo the write simply
+    /// stays; the GC corpse splice re-establishes the correct `prev`/flags when the corpse is removed.
+    fn write_record_keep(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        buf: &[u8],
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.ensure_store_page(kind, rel_page)?;
+        let end = off + buf.len();
+        let redo = paging::encode_patch(off, buf);
+        let undo = redo.clone();
+        let f = self.pool.fetch(dev)?;
+        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[off..end].copy_from_slice(buf);
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    fn write_rel_keep(&mut self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
+        let mut buf = [0u8; REL_RECORD_SIZE];
+        rec.encode(&mut buf);
+        self.write_record_keep(StoreKind::Rel, id, &buf, txn)
+    }
+
     /// Records that `txn` version-stamped (created) record `id` in `kind`'s store, so `commit` can
     /// settle its `xmin`. A no-op for the reserved system transaction, which never creates records.
     fn note_created(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
@@ -909,6 +1040,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let mut reclaimed = 0usize;
 
         let rel_hw = self.store(StoreKind::Rel).alloc.high_water();
+
+        // Dead-link relationship **corpses** (`rmp` #220) — slots that an aborted/crashed creation
+        // left `!in_use` (header-only creation undo) yet not freed, with their forward chain pointers
+        // intact — are spliced out of their endpoint chains and freed by `gc_splice_corpses` BELOW,
+        // after the tombstone sweep. (Earlier this was deferred, leaving an unbounded space leak: a
+        // corpse is not a live version, so `is_reclaimable` returns false and `reclaim_rel` is never
+        // reached for it, so nothing ever freed its slot — one dead rel slot per aborted shared-node
+        // creation, forever.) The splice re-derives each corpse's TRUE position by walking the live
+        // chain rather than trusting the corpse's own (possibly stale) head/prev pointers, so it never
+        // severs a live chain even when a later committed CAS push moved the real head off the corpse;
+        // see `gc_splice_corpses`. While a corpse is unreclaimed (between its creation and the next GC
+        // pass) it is harmless to correctness and durability: every read ([`incident_rels`], the
+        // consistency checker's adjacency walk) threads transparently THROUGH it and visibility skips
+        // it, so no committed data is ever lost. (Singly-linked PROPERTY corpses are reclaimed by the
+        // owner-driven [`gc_property_chain`] splice — they cannot tangle; relationship corpses are
+        // doubly-linked into two chains, which is why their splice is walk-driven.)
         for id in 1..rel_hw {
             let mvcc = self.read_rel(id)?.mvcc;
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry) {
@@ -917,11 +1064,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
 
+        // Splice out and free every dead-link relationship corpse (`rmp` #220). Runs after the
+        // tombstone rel-sweep (so a corpse whose neighbour was just reclaimed sees the updated chain)
+        // and before the node sweep (so a node whose only remaining incidences were corpses becomes
+        // reclaimable in this same pass). Walk-driven and WAL-logged — crash-safe and live-preserving.
+        reclaimed += self.gc_splice_corpses(txn)?;
+
         let node_hw = self.store(StoreKind::Node).alloc.high_water();
         for id in 1..node_hw {
             let mvcc = self.read_node(id)?.mvcc;
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
-                && !self.has_incident_rels(id)?
+                && !self.has_live_incident_rels(id)?
             {
                 self.reclaim_node(txn, id)?;
                 reclaimed += 1;
@@ -1091,12 +1244,39 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Move out the pre-rollback page maps (no clone): `reload_catalog` reassigns each
         // `self.stores[i]` wholesale below, so the taken Vecs are otherwise discarded. We re-extend
         // the reloaded (shrunk) maps with only the tail entries the catalog reload dropped.
-        let device_pages: [Vec<PageId>; STORE_COUNT] = std::array::from_fn(|i| {
-            std::mem::take(&mut self.stores[i].device_pages)
-        });
+        let device_pages: [Vec<PageId>; STORE_COUNT] =
+            std::array::from_fn(|i| std::mem::take(&mut self.stores[i].device_pages));
+        // Capture the in-memory physical-id high-water marks BEFORE the catalog reload (`rmp` #220 /
+        // #172). `reload_catalog` restores the allocators from the last COMMITTED metadata — but under
+        // STATEMENT-granularity interleaving a CONCURRENT, still-open transaction may have advanced a
+        // high-water by allocating its own fresh records, which are not in that committed checkpoint.
+        // Reloading wholesale would lower the high-water below those ids, so a later commit of the
+        // concurrent txn leaves its records OUTSIDE the scanned `1..high_water` range — invisible to
+        // every label/full scan (the engine-level face of #220/#172: committed leaves/edges vanish).
+        // Like device-page growth below, the physical-id high-water is monotonic and must never be
+        // lowered by an unrelated txn's rollback. (A physical id once allocated to a concurrent writer
+        // must not be re-handed-out either; flooring the high-water preserves that too.)
+        let pre_high_water: [u64; STORE_COUNT] =
+            std::array::from_fn(|i| self.stores[i].alloc.high_water());
+        // Same monotonicity hazard for the **token dictionary** and the **`ElementId` allocator**
+        // (`rmp` #220 / #172). `reload_catalog` resets both to the last committed catalog, but a
+        // concurrent open txn may have interned a relationship-type/label/key token (e.g. `LINK`) and
+        // allocated `ElementId`s for records it will soon commit. Dropping those tokens strands a
+        // committed rel's `type_id` on a now-unknown token (a `[:LINK]` type filter then matches
+        // nothing — the engine-level face of #220 where the typed edges "vanish"); lowering the
+        // `ElementId` high-water could re-hand-out a public identity a committed record already uses.
+        // Both are append-only and never reused, so a SUPERSET is always safe; preserve the richer
+        // in-memory views over the committed reload (a token interned only by the aborting txn is
+        // harmless to keep — an unused id, idempotent on re-intern).
+        let pre_tokens = self.tokens.clone();
+        let pre_element_next = self.element_ids.peek();
         let mut target = pool_target::PoolTarget::new(&mut self.pool);
         self.wal.with(|w| w.rollback(txn, &mut target))?;
         self.reload_catalog()?;
+        self.tokens = pre_tokens;
+        if pre_element_next > self.element_ids.peek() {
+            self.element_ids = ElementIdAllocator::new(pre_element_next);
+        }
         // Page growth is not undone; restore the in-memory page maps that the catalog reload (from
         // the pre-growth metadata) shrank, so already-allocated device pages stay addressable. Only
         // the tail entries `[reloaded_len..]` were lost, so re-extend with just those.
@@ -1106,6 +1286,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.stores[i]
                     .device_pages
                     .extend_from_slice(&pages[reloaded_len..]);
+            }
+        }
+        // Floor each allocator at its pre-rollback high-water so a concurrent open txn's freshly
+        // allocated (and possibly soon-committed) ids stay within the scanned range and are never
+        // re-handed-out. `observe(hw - 1)` lifts the high-water to `hw` without inventing a new id.
+        for (i, hw) in pre_high_water.into_iter().enumerate() {
+            if hw > self.stores[i].alloc.high_water() {
+                self.stores[i].alloc.observe(hw - 1);
             }
         }
         Ok(())
@@ -1442,7 +1630,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         start: u64,
         end: u64,
     ) -> Result<(u64, ElementId)> {
-        let mut start_node = self.read_node(start)?;
+        let start_node = self.read_node(start)?;
         if !Self::is_live_version(start_node.mvcc) {
             return Err(GraphusError::Storage(format!(
                 "start node {start} not in use"
@@ -1464,9 +1652,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if old_head != NULL_ID {
                 self.relink_old_head(old_head, start, id, txn)?;
             }
-            start_node.first_rel = id;
-            self.write_rel(id, &rel, txn)?;
-            self.write_node(start, &start_node, txn)?;
+            // The new rel record is written with the header-only creation undo (`rmp` #220): a loser's
+            // abort reverts only its slot's in-use bit and PRESERVES its body, so a committed prepend
+            // on top threads through it. The chain head is pushed via the compare-and-set logical undo
+            // — NOT carried in a plain `write_node` body — so the abort never clobbers a later
+            // committed head (it CAS-no-ops once a committed writer pushed on top).
+            self.write_rel_create(id, &rel, txn)?;
+            self.write_chain_head(
+                StoreKind::Node,
+                start,
+                NODE_OFF_FIRST_REL,
+                id,
+                old_head,
+                txn,
+            )?;
             // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
             // live-relationship count (`rmp` task #82): the self-loop is now a live version. Both
             // endpoints are the (validated) live start node, so the increment is unconditional here.
@@ -1478,7 +1677,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok((id, eid));
         }
 
-        let mut end_node = self.read_node(end)?;
+        let end_node = self.read_node(end)?;
         if !Self::is_live_version(end_node.mvcc) {
             return Err(GraphusError::Storage(format!("end node {end} not in use")));
         }
@@ -1490,7 +1689,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if start_head != NULL_ID {
             self.relink_old_head(start_head, start, id, txn)?;
         }
-        start_node.first_rel = id;
 
         // Push at the head of the END node's chain.
         let end_head = end_node.first_rel;
@@ -1499,11 +1697,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if end_head != NULL_ID {
             self.relink_old_head(end_head, end, id, txn)?;
         }
-        end_node.first_rel = id;
 
-        self.write_rel(id, &rel, txn)?;
-        self.write_node(start, &start_node, txn)?;
-        self.write_node(end, &end_node, txn)?;
+        // Header-only creation undo for the new rel + compare-and-set logical undo for BOTH endpoint
+        // chain heads (`rmp` #220). The endpoint `first_rel` is pushed through `write_chain_head`, NOT
+        // carried in a plain `write_node` body — otherwise a loser's abort would restore a stale head
+        // over a concurrently-committed prepend, collapsing a shared supernode's fan-out.
+        self.write_rel_create(id, &rel, txn)?;
+        self.write_chain_head(
+            StoreKind::Node,
+            start,
+            NODE_OFF_FIRST_REL,
+            id,
+            start_head,
+            txn,
+        )?;
+        self.write_chain_head(StoreKind::Node, end, NODE_OFF_FIRST_REL, id, end_head, txn)?;
         // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
         // live-relationship count (`rmp` task #82): the relationship is now a written, live version
         // and both endpoints are validated. The self-loop branch above returns early, so the grand
@@ -1530,7 +1738,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             old.end_prev_rel = new_id;
             old.chain_flags &= !CHAIN_FLAG_END_FIRST;
         }
-        self.write_rel(old_head, &old, txn)
+        // undo == redo (`rmp` #220): a plain pre-image undo of this relink is unsafe — it would
+        // restore the old head's `prev == NULL` / first-in-chain flag, making it look like the chain
+        // head and letting GC reclaim it on top of a committed prepend. Keeping the write means the
+        // old head correctly records `prev = new_id`; when the new (loser) record becomes a dead-link
+        // corpse, the GC corpse splice re-points the old head's `prev`/flags back to head form.
+        self.write_rel_keep(old_head, &old, txn)
     }
 
     /// Reads the relationship record at physical id `id`.
@@ -1605,6 +1818,244 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         dead.mvcc = MvccHeader::default();
         self.write_rel(id, &dead, txn)?;
         self.store_mut(StoreKind::Rel).free.push(id);
+        Ok(())
+    }
+
+    /// Whether relationship slot `id` is a **dead-link corpse** (`rmp` #220): a slot below the
+    /// high-water that is `!in_use` (its header-only creation undo cleared the in-use bit on an
+    /// aborted/crashed creation) yet is NOT on the free list (no reclamation ever freed it).
+    ///
+    /// Whether node `node_id` has any **live** (in-use) incident relationship, transparently threading
+    /// through any dead-link corpses (`rmp` #220). The GC node-reclaim guard must not be fooled into
+    /// keeping a node alive by a corpse, nor reclaim a node a committed relationship still references;
+    /// [`incident_rels`](Self::incident_rels) already collects only in-use rels while threading through
+    /// corpses, so "empty" here means "no live incident rel".
+    fn has_live_incident_rels(&mut self, node_id: u64) -> Result<bool> {
+        Ok(!self.incident_rels(node_id)?.is_empty())
+    }
+
+    // --------------------- dead-link corpse reclamation (`rmp` #220) --------------------
+    //
+    // An aborted/crashed shared-node edge creation leaves a relationship **corpse**: a slot that the
+    // header-only creation undo ([`write_record_header_undo`]) flipped to `!in_use` while PRESERVING
+    // its body — its `start_node`/`end_node`, its four incidence-chain pointers, and its
+    // `chain_flags` — so a concurrently-committed prepend that threaded onto it stays reachable: the
+    // forward walk ([`incident_rels`], the consistency checker) passes transparently THROUGH the
+    // corpse to its live successor. The corpse is correct for ACID (no committed data is lost) but it
+    // is never visibility-reclaimed: it is not a live version, so [`is_reclaimable`] returns false and
+    // [`reclaim_rel`] is never reached for it. Left alone it is an UNBOUNDED space leak — one dead rel
+    // slot per aborted creation, forever (`rmp` #220).
+    //
+    // `gc_splice_corpses` reclaims it crash-safely. Two hazards a naive splice must avoid:
+    //
+    //   1. A corpse's OWN stored `prev`/`next`/head-flag can be **stale**. When the corpse was the
+    //      chain head and a later committed writer's compare-and-set push installed a new head on top
+    //      of it ([`write_chain_head`]), the node's `first_rel` no longer points at the corpse, yet the
+    //      corpse still records `prev == NULL` and its first-in-chain marker. Trusting those stored
+    //      pointers to find neighbours would mis-locate the splice and sever the live chain.
+    //   2. Corpses can be **consecutive**: several aborted creations in a row leave a run of corpses
+    //      between two live links. Bridging each corpse to its immediate neighbour would leave a live
+    //      link pointing at a corpse slot that a later step frees and zeroes — a dangling pointer that
+    //      drops the rest of the chain.
+    //
+    // Both are dissolved by re-deriving structure from a **live-chain walk**, never from the corpses'
+    // own pointers, and bridging per **maximal run of consecutive corpses**: a run between live links
+    // `L` (or the node head) and `R` (or the chain tail) is collapsed by repointing `L`'s facing-side
+    // `next` directly at `R` and `R`'s facing-side `prev` directly at `L` (or marking `R` the new head
+    // when `L` is the head). Every bridge connects LIVE-to-LIVE (or head/tail), so it never references
+    // a corpse slot and the order in which corpses are later freed is irrelevant. A live relationship
+    // reached *through* the run is `R` itself, which the bridge preserves, so no live thread is severed.
+    // A corpse is freed once **all** its runs (it is in up to two endpoint chains; a self-loop corpse is
+    // in one chain twice) have been bridged. All bridge and free writes go through the ordinary
+    // WAL-logged record/node patches, so the splice replays identically under ARIES recovery: a crash
+    // mid-GC makes the GC txn a loser whose undo restores the corpses in place (the pre-`#220`
+    // behaviour), and redo on a committed pass completes it — no new WAL record type, the same
+    // redo-repeats-history / pre-image-undo discipline as every other mutation.
+
+    /// Splices out and frees every dead-link relationship corpse reachable from a live node's
+    /// incidence chain (`rmp` #220), returning the number of corpse slots reclaimed. Called by
+    /// [`gc`](Self::gc) before the node reclamation sweep so a freed corpse no longer pins its slot.
+    ///
+    /// Walks each live node's chain to discover maximal runs of consecutive corpses with their live
+    /// endpoints (see the module comment above), bridges each run LIVE-to-LIVE with WAL-logged record
+    /// patches, then frees each corpse once every run it was in has been bridged. Crash-safe and
+    /// live-chain-preserving by construction.
+    fn gc_splice_corpses(&mut self, txn: TxnId) -> Result<usize> {
+        // Phase 1 — discover. Walk every live node's chain and collect (a) the per-chain corpse runs to
+        // bridge and (b) the set of all corpse ids to free. A corpse threaded into two endpoint chains
+        // contributes a run on each; a self-loop corpse contributes to its node's single chain twice.
+        let mut runs: Vec<CorpseRun> = Vec::new();
+        let mut corpses: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let node_hw = self.store(StoreKind::Node).alloc.high_water();
+        for node_id in 1..node_hw {
+            if !Self::is_live_version(self.read_node(node_id)?.mvcc) {
+                continue;
+            }
+            self.collect_corpse_runs(node_id, &mut runs, &mut corpses)?;
+        }
+
+        // Phase 2 — bridge every run LIVE-to-LIVE. Each bridge touches only the pointers facing the
+        // run's node, so runs are independent and order-free; none references a corpse slot.
+        for run in &runs {
+            self.bridge_corpse_run(run, txn)?;
+        }
+
+        // Phase 3 — free the now-unreferenced corpse slots. Clear the slot (the in-use bit is already
+        // off; zero the stale body so a re-allocated slot starts clean) and return the id to the free
+        // list, exactly as `reclaim_rel` does for a tombstoned rel.
+        for &corpse_id in &corpses {
+            let element_id = self.read_rel(corpse_id)?.element_id;
+            let mut dead = RelRecord::new(element_id, 0, 0, 0, 0);
+            dead.mvcc = MvccHeader::default(); // in_use stays clear
+            self.write_rel(corpse_id, &dead, txn)?;
+            self.store_mut(StoreKind::Rel).free.push(corpse_id);
+        }
+        Ok(corpses.len())
+    }
+
+    /// Walks `node_id`'s incidence chain (mirroring [`incident_rels`](Self::incident_rels)) and appends
+    /// one [`CorpseRun`] per maximal run of consecutive corpses, recording the live predecessor (`pred`,
+    /// `NULL_ID` when the run starts at the head) and live successor (`succ`, `NULL_ID` at the chain
+    /// tail) that the run collapses to. Also inserts every corpse id into `corpses` for the free phase.
+    /// Because `pred`/`succ` are LIVE links from the walk (never the corpses' own stale pointers),
+    /// bridging is robust to stale head markers and to runs of any length.
+    fn collect_corpse_runs(
+        &mut self,
+        node_id: u64,
+        runs: &mut Vec<CorpseRun>,
+        corpses: &mut std::collections::BTreeSet<u64>,
+    ) -> Result<()> {
+        let mut cur = self.read_node(node_id)?.first_rel;
+        let guard = 2 * self.store(StoreKind::Rel).alloc.high_water() + 2;
+        let mut steps = 0u64;
+        let mut prev_link = NULL_ID; // the link traversed before `cur` (live or corpse)
+        let mut last_live = NULL_ID; // the last LIVE link seen (an open run's `pred`)
+        let mut open_run = false; // whether we are inside a corpse run awaiting its live `succ`
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "incidence chain of node {node_id} is malformed (cycle?)"
+                )));
+            }
+            let r = self.read_rel(cur)?;
+            let is_loop = r.start_node == node_id && r.end_node == node_id;
+            // Pick the side to follow, exactly as `incident_rels`: for a self-loop, follow END's next
+            // when arriving at the head/via END, else START's next.
+            let next = if is_loop {
+                let (end_prev, end_next) = r.chain_pointers(ChainSide::End);
+                if end_prev == prev_link || prev_link == NULL_ID {
+                    end_next
+                } else {
+                    r.chain_pointers(ChainSide::Start).1
+                }
+            } else if r.start_node == node_id {
+                r.start_next_rel
+            } else {
+                r.end_next_rel
+            };
+            if r.mvcc.in_use() {
+                // A live link closes any open corpse run: bridge `last_live -> this live link`.
+                if open_run {
+                    runs.push(CorpseRun {
+                        node: node_id,
+                        pred: last_live,
+                        succ: cur,
+                    });
+                    open_run = false;
+                }
+                last_live = cur;
+            } else {
+                corpses.insert(cur);
+                open_run = true;
+            }
+            prev_link = cur;
+            cur = next;
+        }
+        // A run that reaches the chain tail closes with `succ == NULL_ID`.
+        if open_run {
+            runs.push(CorpseRun {
+                node: node_id,
+                pred: last_live,
+                succ: NULL_ID,
+            });
+        }
+        Ok(())
+    }
+
+    /// Bridges one [`CorpseRun`] LIVE-to-LIVE: repoints the run's live predecessor (or the node head) at
+    /// the run's live successor, and the successor's facing-side `prev` back at the predecessor (setting
+    /// it to NULL with the first-in-chain marker when the predecessor is the head). The repointing
+    /// matches the side facing `run.node` whose pointer currently leads INTO the run (i.e. points at a
+    /// corpse), so it bridges a run of any length without enumerating the corpse ids. It touches only
+    /// the pointers facing `run.node`, never a neighbour's other-side pointers, so it cannot disturb any
+    /// other chain. WAL-logged.
+    fn bridge_corpse_run(&mut self, run: &CorpseRun, txn: TxnId) -> Result<()> {
+        // Forward link: pred.next_facing_node := succ  (or node.first_rel := succ when pred is head).
+        if run.pred == NULL_ID {
+            let mut n = self.read_node(run.node)?;
+            n.first_rel = run.succ;
+            self.write_node(run.node, &n, txn)?;
+        } else {
+            self.relink_run_endpoint(run.pred, run.node, run.succ, NeighbourPtr::Next, txn)?;
+        }
+        // Back link: succ.prev_facing_node := pred  (NULL + first-in-chain marker when pred is head).
+        if run.succ != NULL_ID {
+            self.relink_run_endpoint(run.succ, run.node, run.pred, NeighbourPtr::Prev, txn)?;
+        }
+        Ok(())
+    }
+
+    /// On the live relationship `endpoint`, repoint the `which` pointer (`prev`/`next`) of every side
+    /// facing `node` whose value currently leads INTO the just-collapsed corpse run — i.e. points at a
+    /// dead-link corpse (`!in_use` rel) — to `replacement`, marking a new head when a `prev` becomes
+    /// `NULL`. Unlike [`repoint_neighbour`](Self::repoint_neighbour) (which matches a specific known id),
+    /// this matches "points at a corpse", so it bridges a run of any length without the corpse ids.
+    fn relink_run_endpoint(
+        &mut self,
+        endpoint: u64,
+        node: u64,
+        replacement: u64,
+        which: NeighbourPtr,
+        txn: TxnId,
+    ) -> Result<()> {
+        let mut ep = self.read_rel(endpoint)?;
+        let mut changed = false;
+        for side in [ChainSide::Start, ChainSide::End] {
+            let faces = match side {
+                ChainSide::Start => ep.start_node == node,
+                ChainSide::End => ep.end_node == node,
+            };
+            if !faces {
+                continue;
+            }
+            let (mut p, mut nx) = ep.chain_pointers(side);
+            let target = match which {
+                NeighbourPtr::Next => nx,
+                NeighbourPtr::Prev => p,
+            };
+            // The endpoint's pointer leads into the run iff it points at a corpse (`!in_use`). At bridge
+            // time that target is exactly the run's first (for `Next`) / last (for `Prev`) corpse.
+            if target != NULL_ID && !self.read_rel(target)?.mvcc.in_use() {
+                match which {
+                    NeighbourPtr::Next => nx = replacement,
+                    NeighbourPtr::Prev => {
+                        p = replacement;
+                        if replacement == NULL_ID {
+                            ep.chain_flags |= match side {
+                                ChainSide::Start => CHAIN_FLAG_START_FIRST,
+                                ChainSide::End => CHAIN_FLAG_END_FIRST,
+                            };
+                        }
+                    }
+                }
+                ep.set_chain_pointers(side, p, nx);
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_rel(endpoint, &ep, txn)?;
+        }
         Ok(())
     }
 
@@ -1690,11 +2141,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             let prop = self.read_prop(cur)?;
             let next = prop.next_prop;
-            if Self::is_reclaimable(prop.mvcc, watermark, &self.commit_registry) {
-                // Free the overflow chain, clear and free the record, splice it out of the chain.
-                self.free_property_overflow(txn, &prop)?;
+            let is_tombstone = Self::is_reclaimable(prop.mvcc, watermark, &self.commit_registry);
+            // A dead-link property **corpse** (`rmp` #172): a `!in_use` record not on the free list,
+            // left by an aborted/crashed property creation whose header-only undo cleared in-use while
+            // PRESERVING its `next_prop` body (so live walks thread through it to the committed
+            // successor below it). GC splices it out and frees its slot here. Its overflow heap is NOT
+            // freed: the aborting txn already released those blocks through its own WAL undo, so the
+            // blocks are no longer in-use and freeing again would double-free.
+            let is_corpse =
+                !prop.mvcc.in_use() && !self.store(StoreKind::Prop).free.ids().contains(&cur);
+            if is_tombstone || is_corpse {
+                if is_tombstone {
+                    // Only a tombstone owns its still-in-use overflow chain; free it before reclaiming.
+                    self.free_property_overflow(txn, &prop)?;
+                }
                 let mut dead = prop;
-                dead.mvcc = MvccHeader::default(); // clears in_use
+                dead.mvcc = MvccHeader::default(); // clears in_use (no-op for a corpse, already clear)
                 dead.next_prop = NULL_ID;
                 self.write_prop(cur, &dead, txn)?;
                 self.store_mut(StoreKind::Prop).free.push(cur);
@@ -1837,7 +2299,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         type_tag: u8,
         value_inline: u64,
     ) -> Result<u64> {
-        let mut node = self.read_node(node_id)?;
+        let node = self.read_node(node_id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
@@ -1847,10 +2309,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // to its own transaction.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
         prop.next_prop = node.first_prop;
-        self.write_prop(pid, &prop, txn)?;
+        let old_head = node.first_prop;
+        // Header-only creation undo for the prop + compare-and-set logical undo for the owner's
+        // `first_prop` head (`rmp` #172). A loser's abort then reverts only the prop's in-use bit (its
+        // `next_prop` body is preserved, so a committed prepend threads through it) and CAS-no-ops the
+        // head if a committed writer has since pushed on top — so an unrelated committed property
+        // version below the loser's record is never severed.
+        self.write_prop_create(pid, &prop, txn)?;
         self.note_created(txn, StoreKind::Prop, pid);
-        node.first_prop = pid;
-        self.write_node(node_id, &node, txn)?;
+        self.write_chain_head(
+            StoreKind::Node,
+            node_id,
+            NODE_OFF_FIRST_PROP,
+            pid,
+            old_head,
+            txn,
+        )?;
         Ok(pid)
     }
 
@@ -2267,7 +2741,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         type_tag: u8,
         value_inline: u64,
     ) -> Result<u64> {
-        let mut rel = self.read_rel(rel_id)?;
+        let rel = self.read_rel(rel_id)?;
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
@@ -2276,10 +2750,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // #50); `commit` settles it to the commit timestamp.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
         prop.next_prop = rel.first_prop;
-        self.write_prop(pid, &prop, txn)?;
+        let old_head = rel.first_prop;
+        // Header-only creation undo + compare-and-set head undo (`rmp` #172), mirroring
+        // `add_node_property`: a loser's abort never severs an unrelated committed property version
+        // below this record, nor clobbers a committed head.
+        self.write_prop_create(pid, &prop, txn)?;
         self.note_created(txn, StoreKind::Prop, pid);
-        rel.first_prop = pid;
-        self.write_rel(rel_id, &rel, txn)?;
+        self.write_chain_head(
+            StoreKind::Rel,
+            rel_id,
+            REL_OFF_FIRST_PROP,
+            pid,
+            old_head,
+            txn,
+        )?;
         Ok(pid)
     }
 
@@ -2442,8 +2926,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             let r = self.read_rel(cur)?;
             let is_loop = r.start_node == node_id && r.end_node == node_id;
-            // Record the rel once (dedupe a self-loop's two consecutive links).
-            if out.last() != Some(&cur) {
+            // Record the rel once (dedupe a self-loop's two consecutive links), but ONLY if the slot
+            // is still in use. A not-in-use record is a **dead-link corpse**: an aborted creation undid
+            // its MVCC header header-only (`rmp` #220), leaving its forward chain pointers intact so we
+            // thread transparently THROUGH it to its committed successor without collecting it. (The
+            // higher visibility layer further filters live rels by snapshot; this gate only drops the
+            // aborted/never-committed corpses the header-only undo leaves behind.)
+            if r.mvcc.in_use() && out.last() != Some(&cur) {
                 out.push(cur);
             }
             // Choose the side to follow. For a self-loop, the two links are reached via the END
@@ -2474,6 +2963,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Propagates a chain-walk failure.
     pub fn degree(&mut self, node_id: u64) -> Result<usize> {
         Ok(self.incident_rels(node_id)?.len())
+    }
+
+    /// The number of **used** relationship slots: physical ids below the high-water that are NOT on
+    /// the free list. This counts every allocated rel record — live versions, MVCC tombstones awaiting
+    /// GC, AND dead-link corpses (`rmp` #220) — so it is the high-water-style measure that exposes a
+    /// slot leak: a corpse that GC never freed would keep this count growing under create/abort churn
+    /// even as the logical relationship count stays flat. After [`gc`](Self::gc) splices and frees the
+    /// corpses, the freed slots return to the free list and this count drops back to the no-corpse
+    /// baseline (`high_water - 1 - free_list_len`). Used by the leak-boundary regression tests.
+    #[must_use]
+    pub fn used_rel_slots(&self) -> u64 {
+        let store = self.store(StoreKind::Rel);
+        // ids run 1..high_water (id 0 is the reserved null), minus those returned to the free list.
+        (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
+    }
+
+    /// The relationship store's physical high-water mark: the exclusive upper bound of the allocated
+    /// id space (`1..high_water`). A monotonically growing high-water under create/abort churn would
+    /// be the signature of an unreclaimed-corpse leak; the leak-boundary regression test asserts it
+    /// stays bounded once freed slots are reused (`rmp` #220).
+    #[must_use]
+    pub fn rel_high_water(&self) -> u64 {
+        self.store(StoreKind::Rel).alloc.high_water()
     }
 
     // --------------------------------- flush --------------------------------
@@ -2833,6 +3345,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 enum NeighbourPtr {
     Prev,
     Next,
+}
+
+/// One maximal run of consecutive dead-link corpses discovered by a live-chain walk (`rmp` #220): the
+/// run sits in `node`'s incidence chain between the live link `pred` (`NULL_ID` when the run starts at
+/// the chain head, reached straight from `first_rel`) and the live link `succ` (`NULL_ID` at the chain
+/// tail). `pred`/`succ` are LIVE positions from the walk, never the corpses' own (possibly stale)
+/// stored pointers — see [`RecordStore::gc_splice_corpses`](RecordStore::gc_splice_corpses). Bridging
+/// collapses the whole run by repointing `pred` and `succ` directly at each other.
+#[derive(Clone, Copy)]
+struct CorpseRun {
+    node: u64,
+    pred: u64,
+    succ: u64,
 }
 
 /// A buffer-pool-backed [`ApplyTarget`](graphus_wal::ApplyTarget) used for **live rollback** only

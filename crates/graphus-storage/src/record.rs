@@ -111,8 +111,12 @@ impl MvccHeader {
 pub const NODE_RECORD_SIZE: usize = 65;
 
 const NODE_OFF_ELEMENT_ID: usize = 25; // u128
-const NODE_OFF_FIRST_REL: usize = 41; // u64
-const NODE_OFF_FIRST_PROP: usize = 49; // u64
+/// Byte offset of the `first_rel` chain-head pointer within a node record (used by the store's
+/// compare-and-set chain-head logical undo).
+pub(crate) const NODE_OFF_FIRST_REL: usize = 41; // u64
+/// Byte offset of the `first_prop` chain-head pointer within a node record (used by the store's
+/// compare-and-set chain-head logical undo).
+pub(crate) const NODE_OFF_FIRST_PROP: usize = 49; // u64
 const NODE_OFF_LABELS: usize = 57; // u64
 
 /// A node record (`04 §2.3`): the head of this node's relationship incidence chain
@@ -185,12 +189,20 @@ const REL_OFF_ELEMENT_ID: usize = 25; // u128
 const REL_OFF_TYPE: usize = 41; // u32
 const REL_OFF_START_NODE: usize = 45; // u64
 const REL_OFF_END_NODE: usize = 53; // u64
-const REL_OFF_START_PREV: usize = 61; // u64
+/// Byte offset of the `start_prev_rel` chain back-pointer within a rel record (used by the store's
+/// no-op-undo relink, `rmp` #220).
+pub(crate) const REL_OFF_START_PREV: usize = 61; // u64
 const REL_OFF_START_NEXT: usize = 69; // u64
-const REL_OFF_END_PREV: usize = 77; // u64
+/// Byte offset of the `end_prev_rel` chain back-pointer within a rel record (used by the store's
+/// no-op-undo relink, `rmp` #220).
+pub(crate) const REL_OFF_END_PREV: usize = 77; // u64
 const REL_OFF_END_NEXT: usize = 85; // u64
-const REL_OFF_FIRST_PROP: usize = 93; // u64
-const REL_OFF_CHAIN_FLAGS: usize = 101; // u8
+/// Byte offset of the `first_prop` chain-head pointer within a relationship record (used by the
+/// store's compare-and-set chain-head logical undo).
+pub(crate) const REL_OFF_FIRST_PROP: usize = 93; // u64
+/// Byte offset of the 1-byte `chain_flags` within a rel record (used by the store's no-op-undo
+/// relink, `rmp` #220).
+pub(crate) const REL_OFF_CHAIN_FLAGS: usize = 101; // u8
 
 /// `chain_flags` bit: this relationship is first in the **start node's** incidence chain
 /// (`04 §2.3`, "first-in-chain markers ... to store degree on the first record").

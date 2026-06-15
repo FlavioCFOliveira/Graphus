@@ -154,23 +154,32 @@ concern it certifies, and its oracle.
 ## 8. Findings (engine gaps surfaced by the simulator)
 
 The simulator did its job and surfaced three real serializability/durability gaps (filed in `rmp`,
-pinned by tests so they cannot silently regress, to be fixed in the engine):
+pinned by tests so they cannot silently regress). Two (**#172** and **#220**) are now **FIXED** in the
+storage engine and their pins were flipped into regression **guards**; **#171** remains open:
 
-- **rmp #171 — phantom write-skew / lost-update.** Two transactions that each read a predicate
+- **rmp #171 (OPEN) — phantom write-skew / lost-update.** Two transactions that each read a predicate
   returning nothing and then insert a row matching the other's predicate **both commit**
   (non-serializable). SSI lacks predicate/index-range SIREAD tracking. *Measured boundary:* a
   write–write conflict on an **existing** node is correctly aborted; only phantoms slip.
-- **rmp #172 — concurrent same-node write–write durability.** The conflict is detected (not both
-  commit), but the surviving committed transaction's update can be **lost** (the value reverts to the
-  pre-image). A single, non-concurrent increment persists correctly.
-- **rmp #220 — supernode high-concurrency lost edges.** With **three or more** concurrently-open write
-  transactions each creating an edge on the **same** node, the engine reports exactly two commits as
-  `Ok`, yet the final fan-out collapses to **0** — committed edges are lost (an Atomicity + Durability
-  violation). At **two** concurrent writers it is correct (fan-out 2). The behaviour is measured,
-  reproducible, and deterministic, and it is a sibling of #172. It is pinned by the regression test
-  `scenarios::tests::supernode_high_concurrency_loses_edges_pins_220` so it cannot silently regress;
-  the `concurrent_supernode` certification scenario therefore asserts only the safe two-writer
-  boundary. To be fixed in the engine.
+- **rmp #172 (FIXED) — concurrent same-node write–write durability.** The conflict is detected (SSI
+  aborts exactly one), and the surviving committed transaction's update now **persists** — the value
+  reflects exactly one increment, never reverting to the pre-image. *Root cause:* the SSI loser's
+  rollback restored a stale `first_prop` chain-head pre-image over the survivor's committed value.
+  *Fix:* the chain-head update logs a **compare-and-set logical undo** (unlink only if still the head)
+  and a record creation logs a **header-only undo** (revert the slot to not-in-use while preserving
+  its forward chain pointers), so an abort never reverts another transaction's committed structure.
+  Guarded by `isolation::tests::write_write_conflict_is_detected`.
+- **rmp #220 (FIXED) — supernode high-concurrency lost edges.** With **three or more** concurrently-open
+  write transactions each creating an edge on the **same** node, every edge that **commits** now
+  survives — `fan-out == committed`, at every concurrency degree (previously it collapsed to **0**, an
+  Atomicity + Durability violation). *Root cause:* an SSI loser's rollback clobbered the shared
+  `first_rel` chain head, severed the freshly-created records below it, and — at the catalog level —
+  lowered the id high-water / token dictionary that concurrently-committed records depended on. *Fix:*
+  the same chain-head compare-and-set + header-only creation undo, plus a **monotonic catalog floor on
+  rollback** (an aborting transaction never lowers the shared physical-id high-water, token dictionary,
+  or `ElementId` allocator below what a concurrent open transaction has already advanced them to).
+  Guarded by `scenarios::tests::supernode_high_concurrency_keeps_committed_edges_guards_220`, swept
+  across K ∈ {2,3,4,6,8,12,16,24}.
 
 ## 9. Features beyond the original brief
 

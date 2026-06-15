@@ -13,8 +13,8 @@ use std::sync::Arc;
 use graphus_core::Value;
 use graphus_cypher::MaterializedValue;
 use graphus_io::MemBlockDevice;
-use graphus_server::engine::command::AccessMode;
 use graphus_server::engine::LocalEngine;
+use graphus_server::engine::command::AccessMode;
 use graphus_sim::SharedClock;
 use graphus_wal::MemLogSink;
 
@@ -36,10 +36,18 @@ pub struct ScenarioOutcome {
 
 impl ScenarioOutcome {
     fn pass(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: true, detail: detail.into() }
+        Self {
+            name,
+            ok: true,
+            detail: detail.into(),
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, ok: false, detail: detail.into() }
+        Self {
+            name,
+            ok: false,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -199,10 +207,16 @@ fn oltp_mixed(seed: u64) -> ScenarioOutcome {
     if a.created_nodes != a.persisted_nodes {
         return ScenarioOutcome::fail(
             "oltp_mixed",
-            format!("created {} != persisted {}", a.created_nodes, a.persisted_nodes),
+            format!(
+                "created {} != persisted {}",
+                a.created_nodes, a.persisted_nodes
+            ),
         );
     }
-    ScenarioOutcome::pass("oltp_mixed", format!("{} ops, {} nodes", a.steps, a.persisted_nodes))
+    ScenarioOutcome::pass(
+        "oltp_mixed",
+        format!("{} ops, {} nodes", a.steps, a.persisted_nodes),
+    )
 }
 
 /// Bulk ingest: a write-heavy workload persists every acked create.
@@ -210,11 +224,17 @@ fn bulk_ingest(seed: u64) -> ScenarioOutcome {
     let cfg = VoprConfig::for_seed(seed).with_mix(MixProfile::write_heavy());
     let r = vopr::run(cfg);
     if r.created_nodes == r.persisted_nodes && r.err_ops == 0 {
-        ScenarioOutcome::pass("bulk_ingest", format!("ingested {} nodes", r.persisted_nodes))
+        ScenarioOutcome::pass(
+            "bulk_ingest",
+            format!("ingested {} nodes", r.persisted_nodes),
+        )
     } else {
         ScenarioOutcome::fail(
             "bulk_ingest",
-            format!("created {} persisted {} errs {}", r.created_nodes, r.persisted_nodes, r.err_ops),
+            format!(
+                "created {} persisted {} errs {}",
+                r.created_nodes, r.persisted_nodes, r.err_ops
+            ),
         )
     }
 }
@@ -241,7 +261,11 @@ fn deep_traversal(seed: u64) -> ScenarioOutcome {
     // Build the chain. (Seed only varies the starting id base, keeping it a pure function of seed.)
     let base = (seed % 1000) as i64;
     for i in 0..=N {
-        if !write(&mut eng, "CREATE (:Node {id: $id})", vec![("id".into(), Value::Integer(base + i))]) {
+        if !write(
+            &mut eng,
+            "CREATE (:Node {id: $id})",
+            vec![("id".into(), Value::Integer(base + i))],
+        ) {
             return ScenarioOutcome::fail("deep_traversal", "create node failed");
         }
     }
@@ -249,7 +273,10 @@ fn deep_traversal(seed: u64) -> ScenarioOutcome {
         let ok = write(
             &mut eng,
             "MATCH (a:Node {id: $a}), (b:Node {id: $b}) CREATE (a)-[:NEXT]->(b)",
-            vec![("a".into(), Value::Integer(base + i)), ("b".into(), Value::Integer(base + i + 1))],
+            vec![
+                ("a".into(), Value::Integer(base + i)),
+                ("b".into(), Value::Integer(base + i + 1)),
+            ],
         );
         if !ok {
             return ScenarioOutcome::fail("deep_traversal", "create edge failed");
@@ -262,7 +289,10 @@ fn deep_traversal(seed: u64) -> ScenarioOutcome {
         vec![("a".into(), Value::Integer(base))],
     );
     if reached >= N as usize {
-        ScenarioOutcome::pass("deep_traversal", format!("reached {reached} via var-length"))
+        ScenarioOutcome::pass(
+            "deep_traversal",
+            format!("reached {reached} via var-length"),
+        )
     } else {
         ScenarioOutcome::fail("deep_traversal", format!("only reached {reached} of {N}"))
     }
@@ -273,14 +303,21 @@ fn supernode_fanout(seed: u64) -> ScenarioOutcome {
     const M: i64 = 60;
     let mut eng = engine();
     let base = (seed % 1000) as i64;
-    if !write(&mut eng, "CREATE (:Hub {id: $id})", vec![("id".into(), Value::Integer(base))]) {
+    if !write(
+        &mut eng,
+        "CREATE (:Hub {id: $id})",
+        vec![("id".into(), Value::Integer(base))],
+    ) {
         return ScenarioOutcome::fail("supernode_fanout", "create hub failed");
     }
     for i in 0..M {
         let ok = write(
             &mut eng,
             "MATCH (h:Hub {id: $h}) CREATE (h)-[:LINK]->(:Leaf {id: $l})",
-            vec![("h".into(), Value::Integer(base)), ("l".into(), Value::Integer(base * 1000 + i))],
+            vec![
+                ("h".into(), Value::Integer(base)),
+                ("l".into(), Value::Integer(base * 1000 + i)),
+            ],
         );
         if !ok {
             return ScenarioOutcome::fail("supernode_fanout", "create leaf failed");
@@ -304,7 +341,11 @@ fn large_result_stream(seed: u64) -> ScenarioOutcome {
     let mut eng = engine();
     let base = (seed % 1000) as i64;
     for i in 0..N as i64 {
-        if !write(&mut eng, "CREATE (:Item {id: $id})", vec![("id".into(), Value::Integer(base + i))]) {
+        if !write(
+            &mut eng,
+            "CREATE (:Item {id: $id})",
+            vec![("id".into(), Value::Integer(base + i))],
+        ) {
             return ScenarioOutcome::fail("large_result_stream", "create failed");
         }
     }
@@ -352,9 +393,15 @@ fn contended_writes(seed: u64) -> ScenarioOutcome {
     let c1 = eng.commit(t1).is_ok();
     let c2 = eng.commit(t2).is_ok();
     if c1 && c2 {
-        ScenarioOutcome::fail("contended_writes", "both concurrent writers committed (lost update)")
+        ScenarioOutcome::fail(
+            "contended_writes",
+            "both concurrent writers committed (lost update)",
+        )
     } else {
-        ScenarioOutcome::pass("contended_writes", format!("conflict detected (c1={c1} c2={c2})"))
+        ScenarioOutcome::pass(
+            "contended_writes",
+            format!("conflict detected (c1={c1} c2={c2})"),
+        )
     }
 }
 
@@ -366,7 +413,11 @@ fn cyclic_traversal(seed: u64) -> ScenarioOutcome {
     let mut eng = engine();
     let base = (seed % 1000) as i64;
     for i in 0..C {
-        if !write(&mut eng, "CREATE (:Ring {id: $id})", vec![("id".into(), Value::Integer(base + i))]) {
+        if !write(
+            &mut eng,
+            "CREATE (:Ring {id: $id})",
+            vec![("id".into(), Value::Integer(base + i))],
+        ) {
             return ScenarioOutcome::fail("cyclic_traversal", "create node failed");
         }
     }
@@ -376,7 +427,10 @@ fn cyclic_traversal(seed: u64) -> ScenarioOutcome {
         let ok = write(
             &mut eng,
             "MATCH (a:Ring {id: $a}), (b:Ring {id: $b}) CREATE (a)-[:NEXT]->(b)",
-            vec![("a".into(), Value::Integer(a)), ("b".into(), Value::Integer(b))],
+            vec![
+                ("a".into(), Value::Integer(a)),
+                ("b".into(), Value::Integer(b)),
+            ],
         );
         if !ok {
             return ScenarioOutcome::fail("cyclic_traversal", "create edge failed");
@@ -389,9 +443,15 @@ fn cyclic_traversal(seed: u64) -> ScenarioOutcome {
         vec![("a".into(), Value::Integer(base))],
     );
     if reached == C as usize {
-        ScenarioOutcome::pass("cyclic_traversal", format!("reached all {C} cycle nodes (terminated)"))
+        ScenarioOutcome::pass(
+            "cyclic_traversal",
+            format!("reached all {C} cycle nodes (terminated)"),
+        )
     } else {
-        ScenarioOutcome::fail("cyclic_traversal", format!("reached {reached} distinct of {C}"))
+        ScenarioOutcome::fail(
+            "cyclic_traversal",
+            format!("reached {reached} distinct of {C}"),
+        )
     }
 }
 
@@ -404,7 +464,11 @@ fn point_lookup(seed: u64) -> ScenarioOutcome {
     let mut eng = engine();
     let base = (seed % 1000) as i64;
     for i in 0..N {
-        if !write(&mut eng, "CREATE (:Item {id: $id})", vec![("id".into(), Value::Integer(base + i))]) {
+        if !write(
+            &mut eng,
+            "CREATE (:Item {id: $id})",
+            vec![("id".into(), Value::Integer(base + i))],
+        ) {
             return ScenarioOutcome::fail("point_lookup", "create item failed");
         }
     }
@@ -441,7 +505,11 @@ fn aggregation_analytics(seed: u64) -> ScenarioOutcome {
     let mut eng = engine();
     let base = (seed % 1000) as i64;
     for i in 0..N {
-        if !write(&mut eng, "CREATE (:Metric {id: $id})", vec![("id".into(), Value::Integer(base + i))]) {
+        if !write(
+            &mut eng,
+            "CREATE (:Metric {id: $id})",
+            vec![("id".into(), Value::Integer(base + i))],
+        ) {
             return ScenarioOutcome::fail("aggregation_analytics", "create failed");
         }
     }
@@ -457,19 +525,28 @@ fn aggregation_analytics(seed: u64) -> ScenarioOutcome {
 /// must commit and **both edges must persist** (`fan-out == committed`) — no committed edge is lost.
 /// Certifies the supported single-node write-concurrency guarantee.
 ///
-/// Boundary note: at **three or more** concurrently-open writers on one node, the engine currently
-/// loses committed edges (fan-out collapses to 0) — the measured, reproducible gap **rmp #220**
-/// (sibling of #172), pinned by [`tests::supernode_high_concurrency_loses_edges_pins_220`]. This
-/// scenario therefore certifies the safe boundary (two writers) and does not assert the broken arm.
+/// Concurrency is a **supported, commutative** workload at every degree (`rmp` #220, FIXED): with
+/// **three or more** concurrently-open writers on one node, SSI may abort some pivots, but every edge
+/// that commits survives — `fan-out == committed`, never 0. The storage-layer fix (chain-head
+/// compare-and-set logical undo + header-only creation undo + monotonic catalog floor on rollback)
+/// guarantees an aborted writer's rollback never clobbers a concurrently-committed writer's edge. The
+/// high-concurrency arm is exercised by [`tests::supernode_high_concurrency_keeps_committed_edges_guards_220`].
 fn concurrent_supernode(seed: u64) -> ScenarioOutcome {
     let mut eng = engine();
     let base = (seed % 1000) as i64;
-    if !write(&mut eng, "CREATE (:Hub {id: $id})", vec![("id".into(), Value::Integer(base))]) {
+    if !write(
+        &mut eng,
+        "CREATE (:Hub {id: $id})",
+        vec![("id".into(), Value::Integer(base))],
+    ) {
         return ScenarioOutcome::fail("concurrent_supernode", "create hub failed");
     }
     let (committed, fanout) = two_concurrent_edge_writers(&mut eng, base);
     if committed == 2 && fanout == Some(2) {
-        ScenarioOutcome::pass("concurrent_supernode", "2 concurrent writers, both edges persisted")
+        ScenarioOutcome::pass(
+            "concurrent_supernode",
+            "2 concurrent writers, both edges persisted",
+        )
     } else {
         ScenarioOutcome::fail(
             "concurrent_supernode",
@@ -489,7 +566,10 @@ fn two_concurrent_edge_writers(eng: &mut Eng, base: i64) -> (i64, Option<i64>) {
         if let Ok(mut r) = eng.run(
             t,
             "MATCH (h:Hub {id: $h}) CREATE (h)-[:LINK]->(:Leaf {id: $l})",
-            vec![("h".into(), Value::Integer(base)), ("l".into(), Value::Integer(l))],
+            vec![
+                ("h".into(), Value::Integer(base)),
+                ("l".into(), Value::Integer(l)),
+            ],
             false,
             None,
         ) {
@@ -513,14 +593,23 @@ fn snapshot_isolation(seed: u64) -> ScenarioOutcome {
     let mut eng = engine();
     let base = (seed % 1000) as i64;
     // Baseline: one Acct.
-    if !write(&mut eng, "CREATE (:Snap {id: $id})", vec![("id".into(), Value::Integer(base))]) {
+    if !write(
+        &mut eng,
+        "CREATE (:Snap {id: $id})",
+        vec![("id".into(), Value::Integer(base))],
+    ) {
         return ScenarioOutcome::fail("snapshot_isolation", "setup failed");
     }
     // Open a long-lived reader and take its first observation.
     let Ok(reader) = eng.begin(AccessMode::Read) else {
         return ScenarioOutcome::fail("snapshot_isolation", "begin reader failed");
     };
-    let first = scalar_in(&mut eng, reader, "MATCH (n:Snap) RETURN count(n) AS c", vec![]);
+    let first = scalar_in(
+        &mut eng,
+        reader,
+        "MATCH (n:Snap) RETURN count(n) AS c",
+        vec![],
+    );
     // A concurrent writer inserts and commits a new node.
     let Ok(writer) = eng.begin(AccessMode::Write) else {
         return ScenarioOutcome::fail("snapshot_isolation", "begin writer failed");
@@ -538,7 +627,12 @@ fn snapshot_isolation(seed: u64) -> ScenarioOutcome {
         return ScenarioOutcome::fail("snapshot_isolation", "writer commit failed");
     }
     // The reader re-observes: its snapshot must be unchanged (repeatable read).
-    let second = scalar_in(&mut eng, reader, "MATCH (n:Snap) RETURN count(n) AS c", vec![]);
+    let second = scalar_in(
+        &mut eng,
+        reader,
+        "MATCH (n:Snap) RETURN count(n) AS c",
+        vec![],
+    );
     let _ = eng.commit(reader); // close the read transaction (read-only, may also rollback)
     if first != second {
         return ScenarioOutcome::fail(
@@ -549,7 +643,10 @@ fn snapshot_isolation(seed: u64) -> ScenarioOutcome {
     // A fresh reader now sees the committed write.
     let after = read_scalar(&mut eng, "MATCH (n:Snap) RETURN count(n) AS c", vec![]);
     if first == Some(1) && after == Some(2) {
-        ScenarioOutcome::pass("snapshot_isolation", "snapshot stable across concurrent commit")
+        ScenarioOutcome::pass(
+            "snapshot_isolation",
+            "snapshot stable across concurrent commit",
+        )
     } else {
         ScenarioOutcome::fail(
             "snapshot_isolation",
@@ -582,7 +679,10 @@ fn transaction_rollback(seed: u64) -> ScenarioOutcome {
     if rows == 0 {
         ScenarioOutcome::pass("transaction_rollback", "rolled-back write left no trace")
     } else {
-        ScenarioOutcome::fail("transaction_rollback", format!("{rows} ghost rows after rollback"))
+        ScenarioOutcome::fail(
+            "transaction_rollback",
+            format!("{rows} ghost rows after rollback"),
+        )
     }
 }
 
@@ -595,7 +695,11 @@ fn churn_create_delete(seed: u64) -> ScenarioOutcome {
     let base = (seed % 1000) as i64;
     let make = |eng: &mut Eng, off: i64| -> bool {
         for i in 0..N {
-            if !write(eng, "CREATE (:Churn {id: $id})", vec![("id".into(), Value::Integer(base + off + i))]) {
+            if !write(
+                eng,
+                "CREATE (:Churn {id: $id})",
+                vec![("id".into(), Value::Integer(base + off + i))],
+            ) {
                 return false;
             }
         }
@@ -618,7 +722,10 @@ fn churn_create_delete(seed: u64) -> ScenarioOutcome {
         return ScenarioOutcome::fail("churn_create_delete", "second ingest failed");
     }
     if count_rows(&mut eng, "MATCH (n:Churn) RETURN n", vec![]) == N as usize {
-        ScenarioOutcome::pass("churn_create_delete", format!("churned {N} twice, baseline restored"))
+        ScenarioOutcome::pass(
+            "churn_create_delete",
+            format!("churned {N} twice, baseline restored"),
+        )
     } else {
         ScenarioOutcome::fail("churn_create_delete", "second count != N")
     }
@@ -662,7 +769,9 @@ fn crash_recovery_durability(seed: u64) -> ScenarioOutcome {
     // Crash + recover purely from the durable WAL.
     let mut recovered = match eng.crash_restart(clock.clone(), 256) {
         Ok(e) => e,
-        Err(_) => return ScenarioOutcome::fail("crash_recovery_durability", "crash_restart failed"),
+        Err(_) => {
+            return ScenarioOutcome::fail("crash_recovery_durability", "crash_restart failed");
+        }
     };
     let survived = count_rows(
         &mut recovered,
@@ -675,7 +784,10 @@ fn crash_recovery_durability(seed: u64) -> ScenarioOutcome {
         vec![("id".into(), Value::Integer(base + 1))],
     );
     if survived == 1 && leaked == 0 {
-        ScenarioOutcome::pass("crash_recovery_durability", "acked survived, uncommitted vanished")
+        ScenarioOutcome::pass(
+            "crash_recovery_durability",
+            "acked survived, uncommitted vanished",
+        )
     } else {
         ScenarioOutcome::fail(
             "crash_recovery_durability",
@@ -700,21 +812,41 @@ fn vopr_live_and_consistent(name: &'static str, cfg: VoprConfig) -> ScenarioOutc
     if a.created_nodes != a.persisted_nodes {
         return ScenarioOutcome::fail(
             name,
-            format!("created {} != persisted {}", a.created_nodes, a.persisted_nodes),
+            format!(
+                "created {} != persisted {}",
+                a.created_nodes, a.persisted_nodes
+            ),
         );
     }
-    ScenarioOutcome::pass(name, format!("{} ops, {} nodes", a.steps, a.persisted_nodes))
+    ScenarioOutcome::pass(
+        name,
+        format!("{} ops, {} nodes", a.steps, a.persisted_nodes),
+    )
 }
 
 /// A light VOPR config (8 clients × 24 ops) for the load-shape scenarios — enough interleaving to
 /// exercise the arrival shape while staying fast in a debug build.
 fn load_shape_cfg(seed: u64, load: LoadProfile) -> VoprConfig {
-    VoprConfig { seed, clients: 8, ops_per_client: 24, pool_pages: 256, mix: MixProfile::mixed(), load }
+    VoprConfig {
+        seed,
+        clients: 8,
+        ops_per_client: 24,
+        pool_pages: 256,
+        mix: MixProfile::mixed(),
+        load,
+    }
 }
 
 /// Spike load: a thundering-herd arrival shape (periodic back-to-back bursts) stays live + consistent.
 fn spike_load(seed: u64) -> ScenarioOutcome {
-    let cfg = load_shape_cfg(seed, LoadProfile::Spike { base: 40, period: 16, burst: 6 });
+    let cfg = load_shape_cfg(
+        seed,
+        LoadProfile::Spike {
+            base: 40,
+            period: 16,
+            burst: 6,
+        },
+    );
     vopr_live_and_consistent("spike_load", cfg)
 }
 
@@ -754,19 +886,28 @@ fn sustained_high_concurrency(seed: u64) -> ScenarioOutcome {
     if a.created_nodes != a.persisted_nodes {
         return ScenarioOutcome::fail(
             "sustained_high_concurrency",
-            format!("created {} != persisted {}", a.created_nodes, a.persisted_nodes),
+            format!(
+                "created {} != persisted {}",
+                a.created_nodes, a.persisted_nodes
+            ),
         );
     }
     // Non-vacuous: every scheduled op ran (monotone progress) and real work happened.
     if a.steps == (cfg.clients * cfg.ops_per_client) as usize && a.created_nodes > 50 {
         ScenarioOutcome::pass(
             "sustained_high_concurrency",
-            format!("{} clients, {} ops, {} nodes", cfg.clients, a.steps, a.created_nodes),
+            format!(
+                "{} clients, {} ops, {} nodes",
+                cfg.clients, a.steps, a.created_nodes
+            ),
         )
     } else {
         ScenarioOutcome::fail(
             "sustained_high_concurrency",
-            format!("under-exercised: steps {} nodes {}", a.steps, a.created_nodes),
+            format!(
+                "under-exercised: steps {} nodes {}",
+                a.steps, a.created_nodes
+            ),
         )
     }
 }
@@ -787,20 +928,29 @@ mod tests {
         assert_eq!(outcomes.len(), catalogue().len() * 3);
     }
 
-    /// Pins the measured **rmp #220** boundary so it cannot silently change: two concurrent edge
-    /// writers on one supernode keep both edges, but **three or more** lose all committed edges
-    /// (fan-out collapses to 0). When #220 is fixed in the engine, the `>=3` arm changes and this test
-    /// must be updated to assert `fan-out == committed` for every K — turning the pin into a guard.
+    /// **Guards rmp #220 (FIXED).** Concurrent edge writers on one supernode must keep **exactly the
+    /// committed edges**, for every concurrency K: fan-out == number of committed writers, never 0.
+    /// This was previously a *pin* of the bug (at K>=3 fan-out collapsed to 0 because an SSI loser's
+    /// rollback clobbered the shared chain head and severed the freshly-created records below it, and
+    /// — at the catalog level — reset the id high-water / token dictionary that committed concurrent
+    /// records depended on). The storage-layer fix (chain-head compare-and-set logical undo +
+    /// header-only creation undo + monotonic catalog floor on rollback) turns the pin into this guard.
     #[test]
-    fn supernode_high_concurrency_loses_edges_pins_220() {
+    fn supernode_high_concurrency_keeps_committed_edges_guards_220() {
         // Safe boundary: two concurrent writers — both edges persist.
         let mut eng = engine();
         let _ = write(&mut eng, "CREATE (:Hub {id: 1})", vec![]);
         let (c2, f2) = two_concurrent_edge_writers(&mut eng, 1);
-        assert_eq!((c2, f2), (2, Some(2)), "two concurrent writers must keep both edges");
+        assert_eq!(
+            (c2, f2),
+            (2, Some(2)),
+            "two concurrent writers must keep both edges"
+        );
 
-        // The gap: with K>=3 concurrently-open writers, committed edges are lost (fan-out 0).
-        for k in [3i64, 4, 8] {
+        // With K>=3 concurrently-open writers, SSI aborts the dangerous pivots; every edge that
+        // COMMITS must survive — fan-out equals the committed count (NOT 0). Swept across a range of
+        // concurrency degrees so the guarantee holds at every K, not just one.
+        for k in [2i64, 3, 4, 6, 8, 12, 16, 24] {
             let mut eng = engine();
             let _ = write(&mut eng, "CREATE (:Hub {id: 1})", vec![]);
             let mut tickets = Vec::new();
@@ -817,7 +967,10 @@ mod tests {
                 }
                 tickets.push(t);
             }
-            let committed: i64 = tickets.into_iter().map(|t| i64::from(eng.commit(t).is_ok())).sum();
+            let committed: i64 = tickets
+                .into_iter()
+                .map(|t| i64::from(eng.commit(t).is_ok()))
+                .sum();
             let fanout = read_scalar(
                 &mut eng,
                 "MATCH (h:Hub {id: 1})-[:LINK]->(x) RETURN count(x) AS c",
@@ -826,9 +979,8 @@ mod tests {
             assert!(committed >= 1, "at least one writer commits at K={k}");
             assert_eq!(
                 fanout,
-                Some(0),
-                "rmp #220: at K={k} committed edges are lost (fan-out 0); if this changed, #220 may be \
-                 fixed — update this pin to assert fan-out == committed"
+                Some(committed),
+                "rmp #220 (fixed): at K={k} every committed edge must survive (fan-out == committed)"
             );
         }
     }
@@ -866,7 +1018,10 @@ mod tests {
             "ramp_load",
             "sustained_high_concurrency",
         ] {
-            assert!(names.contains(&expected), "catalogue must include {expected}");
+            assert!(
+                names.contains(&expected),
+                "catalogue must include {expected}"
+            );
         }
     }
 }

@@ -501,6 +501,12 @@ struct Scan {
     live_nodes: BTreeMap<u64, NodeRecord>,
     /// Live relationship ids -> their record.
     live_rels: BTreeMap<u64, RelRecord>,
+    /// **Dead-link corpse** relationship ids -> their record (`rmp` #220): slots that are `!in_use`
+    /// and NOT on the free list, left by an aborted/crashed relationship creation whose header-only
+    /// creation undo cleared the in-use bit while PRESERVING the body's forward chain pointers. They
+    /// are transparently threaded THROUGH by [`RecordStore::incident_rels`] until GC splices them out;
+    /// the adjacency check must thread through them the same way rather than flag a broken chain.
+    corpse_rels: BTreeMap<u64, RelRecord>,
     /// Live property ids -> their record.
     live_props: BTreeMap<u64, PropRecord>,
     /// Live `strings.store` overflow-heap block ids -> their block (`rmp` task #43).
@@ -558,6 +564,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     }
 
     let mut live_rels = BTreeMap::new();
+    let mut corpse_rels = BTreeMap::new();
     for id in 1..cat.high_water(StoreKind::Rel) {
         let Ok(rec) = store.rel(id) else { continue };
         if freed[StoreKind::Rel as usize].contains(&id) {
@@ -566,6 +573,9 @@ fn scan_records<D: BlockDevice, S: LogSink>(
             }
         } else if rec.mvcc.in_use() {
             live_rels.insert(id, rec);
+        } else {
+            // !in_use and not on the free list: a dead-link corpse the adjacency walk threads through.
+            corpse_rels.insert(id, rec);
         }
     }
 
@@ -600,6 +610,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     }
 
     Ok(Scan {
+        corpse_rels,
         live_nodes,
         live_rels,
         live_props,
@@ -831,6 +842,18 @@ fn walk_incidence(
             });
             break;
         }
+        // A dead-link **corpse** (`rmp` #220) is threaded through transparently: it is not counted as
+        // an incident relationship and its (possibly stale) prev pointer is not held to the chain's
+        // symmetry invariant — we just follow its preserved forward pointer to the next link, exactly
+        // as `incident_rels` does, until GC splices it out.
+        if let Some(corpse) = scan.corpse_rels.get(&cur) {
+            let is_loop = corpse.start_node == nid && corpse.end_node == nid;
+            let (_, next) = link_of(corpse, nid, prev_link, is_loop);
+            prev_link = cur;
+            cur = next;
+            continue;
+        }
+
         let Some(rel) = scan.live_rels.get(&cur) else {
             report.push(Violation::Adjacency {
                 node: nid,
@@ -855,7 +878,10 @@ fn walk_incidence(
         let (prev, next) = link_of(rel, nid, prev_link, is_loop);
 
         // Head link must have prev == NULL; a non-head link's prev must equal the link we came from.
-        if prev != prev_link {
+        // A corpse predecessor breaks the strict `prev == prev_link` symmetry (the live link's `prev`
+        // points at the corpse we threaded past, not at the last LIVE link), so accept a `prev` that
+        // resolves to a corpse as well.
+        if prev != prev_link && !scan.corpse_rels.contains_key(&prev) {
             // Distinguish the two head/back-link faults for a sharper report.
             if prev_link == NULL_ID {
                 report.push(Violation::Adjacency {
