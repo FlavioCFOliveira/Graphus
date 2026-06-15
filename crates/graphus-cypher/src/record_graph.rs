@@ -76,11 +76,13 @@ use std::rc::Rc;
 use graphus_core::error::GraphusError;
 use graphus_core::{Timestamp, TxnId, Value, VersionStamp};
 use graphus_index::histogram::PropertyHistogram;
-use graphus_index::keycodec::encode_single;
+use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_io::BlockDevice;
 use graphus_storage::{ConstraintKind, MvccHeader, Namespace, RecordStore};
-use graphus_txn::{CommitRegistry, LockOutcome, LockTable, Snapshot, SsiTracker, is_visible};
+use graphus_txn::{
+    CommitRegistry, LockOutcome, LockTable, PredicateRead, Snapshot, SsiTracker, is_visible,
+};
 use graphus_wal::LogSink;
 
 /// Tag bit distinguishing a relationship key from a node key in the shared [`SsiTracker`]
@@ -288,6 +290,166 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 "write-write conflict: entity held by transaction {}; retry (serialization failure)",
                 holder.0
             )));
+        }
+    }
+
+    /// Records a **predicate** SIREAD marker for this transaction, if coordinated (`04 §5.4`, `rmp`
+    /// #171); a no-op in the standalone path. This is what closes the **phantom** hole the per-record
+    /// [`note_read`](Self::note_read) cannot: a predicate read sees the *set* of matching nodes
+    /// (possibly empty), so a concurrent insert that makes a node match must abort one of the two.
+    fn note_predicate_read(&self, predicate: PredicateRead) {
+        if let Some(ssi) = &self.ssi {
+            ssi.borrow_mut().record_predicate_read(self.txn, predicate);
+        }
+    }
+
+    /// Announces the **predicate footprint** of node `node` to the SSI tracker (`rmp` #171): the set
+    /// of [`PredicateRead`] markers the node currently satisfies, so a concurrent transaction that
+    /// read any of those predicates (and saw this node's absence) gets an rw-edge into this writer.
+    /// Driven from [`reindex_node`](Self::reindex_node) with the node's already-resolved current
+    /// `label_tokens` + `(prop_key, value)` pairs, so it reuses that single write-time read of the
+    /// node's state. A no-op in the standalone path (no SSI tracker).
+    ///
+    /// The footprint enumerates exactly the markers a reader can register (see [`PredicateRead`]):
+    /// the `AllNodes` marker, one `Label` marker per label, and one `Equality` marker per
+    /// `(label, property, value)` the node holds (the value order-preservingly encoded, matching how
+    /// an equality predicate read encodes its sought value). A non-encodable value (`Null`/`List`/
+    /// `Map`) contributes no `Equality` marker — it can never be an equality predicate's sought value
+    /// either, so nothing is missed; the coarser `Label`/`AllNodes` markers still cover any
+    /// label/all-nodes reader.
+    fn note_predicate_write(&self, label_tokens: &[u32], resolved_props: &[(u32, Value)]) {
+        let Some(ssi) = &self.ssi else {
+            return; // standalone path: nothing to track.
+        };
+        let mut footprint = Vec::with_capacity(1 + label_tokens.len() * (1 + resolved_props.len()));
+        footprint.push(PredicateRead::AllNodes);
+        for &label in label_tokens {
+            footprint.push(PredicateRead::Label(label));
+            for (prop_key, value) in resolved_props {
+                // Use the **Cypher-equality-canonical** encoding (`rmp` #171 blocker C1), NOT the
+                // order-preserving index key: `encode_single` tags `Integer(1)` and `Float(1.0)`
+                // apart (they differ in the numtag tie-break byte), so a reader of `{p: 1}` and this
+                // writer's `{p: 1.0}` would register different markers and the phantom rw-edge would
+                // never close. `encode_equality_canonical` maps Cypher-equal numbers to one key, so
+                // the cross-type numeric phantom is caught. NaN yields no marker (never equal to
+                // anything), exactly as a non-encodable value is skipped.
+                if let Ok(encoded) = encode_equality_canonical(value) {
+                    footprint.push(PredicateRead::Equality {
+                        label,
+                        property: *prop_key,
+                        value: encoded,
+                    });
+                }
+            }
+        }
+        ssi.borrow_mut()
+            .record_predicate_write(self.txn, &footprint);
+    }
+
+    /// Announces a node's **pre-image** predicate footprint before a mutation that makes the node
+    /// **stop** satisfying one or more predicates (`rmp` #171 blocker B1): a `DELETE` / `DETACH DELETE`,
+    /// a `REMOVE n:Label`, or a property clear (`SET n.p = null` / `REMOVE n.p`).
+    ///
+    /// # Why a delete is a predicate write
+    ///
+    /// A reader that evaluated `MATCH (n:Label {p: v})` and **saw** a matching node has read that the
+    /// node *is* present. A concurrent transaction that then **deletes** (or un-matches) that node has
+    /// invalidated the reader's result — a classic *read-then-delete write-skew* — yet the physical-key
+    /// rw-edge alone is insufficient when the reader reached the node via a **predicate** scan whose
+    /// result set the delete changed. Announcing the node's *current* (pre-mutation) labels/properties
+    /// as a predicate write closes the rw-edge into this writer for exactly those predicate readers,
+    /// symmetric to how an **insert** ([`note_predicate_write`](Self::note_predicate_write) from
+    /// [`reindex_node`](Self::reindex_node)) closes the edge for an absence-reader.
+    ///
+    /// Must be called **before** the store mutation, while the pre-image is still readable. A no-op in
+    /// the standalone path (no SSI tracker) and a best-effort read: if the labels cannot be enumerated
+    /// (an overflow-form bitmap) only the coarse `AllNodes`/`Label` markers from any readable state are
+    /// announced — never a wrong row, and the per-record `note_write` already covers the physical key.
+    fn note_predicate_write_preimage(&self, node: NodeId) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        // Read the node's *current* labels (store borrow released before announcing).
+        let label_tokens: Vec<u32> = {
+            let mut store = self.store.borrow_mut();
+            match store.node_labels(node.0) {
+                Ok(ids) => ids,
+                // Cannot enumerate labels (overflow-form / missing): still announce `AllNodes` so an
+                // all-nodes predicate reader closes the edge. `note_predicate_write` with empty labels
+                // pushes exactly the `AllNodes` marker.
+                Err(_) => {
+                    self.note_predicate_write(&[], &[]);
+                    return;
+                }
+            }
+        };
+        // The node's current property values (borrows the store internally and releases it).
+        let props = self.read_node_props(node);
+        let resolved_props: Vec<(u32, Value)> = {
+            let store = self.store.borrow();
+            props
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    store
+                        .token_id(Namespace::PropKey, &name)
+                        .map(|prop_key| (prop_key, value))
+                })
+                .collect()
+        };
+        self.note_predicate_write(&label_tokens, &resolved_props);
+    }
+
+    /// Registers the **relationship-pattern** predicate read footprint for a traversal filtered by
+    /// `types` (`rmp` #171 blocker A1): a `MATCH ()-[r:T]-()` reads which relationships of type `T`
+    /// exist, so a concurrent `create_rel`/`delete_rel` of that type is a relationship phantom that
+    /// must close an rw-edge — even when the traversal returns nothing.
+    ///
+    /// * An empty `types` (an untyped `MATCH ()-[r]-()`) registers the conservative [`PredicateRead::AnyRel`]
+    ///   marker: *any* relationship create/delete matches.
+    /// * Each requested type name resolves to its [`Namespace::RelType`] token; a
+    ///   [`PredicateRead::RelType`] marker is registered per token. A type name that was **never
+    ///   interned** (no edge of that type can exist yet) registers the conservative `AnyRel` marker
+    ///   instead — a concurrent writer could `CREATE` the first edge of that type, interning a token we
+    ///   cannot know here, exactly as [`scan_nodes_by_label`](Self::scan_nodes_by_label) falls back to
+    ///   `AllNodes` for a never-seen label. Reads never intern (no durable side effect on a read path).
+    ///
+    /// A no-op in the standalone path (no SSI tracker).
+    fn note_rel_predicate_read(&self, types: &[String]) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        if types.is_empty() {
+            self.note_predicate_read(PredicateRead::AnyRel);
+            return;
+        }
+        for name in types {
+            match self.store.borrow().token_id(Namespace::RelType, name) {
+                Some(token) => self.note_predicate_read(PredicateRead::RelType(token)),
+                // Never-interned type: a concurrent writer could create the first edge of it (a
+                // phantom) under a token we cannot know, so register the conservative `AnyRel`.
+                None => self.note_predicate_read(PredicateRead::AnyRel),
+            }
+        }
+    }
+
+    /// Announces a relationship's **predicate footprint** to the SSI tracker (`rmp` #171 blocker A1):
+    /// the [`PredicateRead::AnyRel`] marker plus the [`PredicateRead::RelType`] marker for its type
+    /// token, so a concurrent transaction that read a relationship-pattern predicate (`MATCH ()-[r:T]-()`,
+    /// or untyped) this edge satisfies — and saw its absence (on a `create_rel`) or presence (on a
+    /// `delete_rel`) — closes an rw-edge into this writer. The relationship analogue of
+    /// [`note_predicate_write`](Self::note_predicate_write). A no-op in the standalone path.
+    fn note_rel_predicate_write(&self, type_id: u32) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        self.note_predicate_write_footprint(&[PredicateRead::AnyRel, PredicateRead::RelType(type_id)]);
+    }
+
+    /// Thin wrapper announcing an explicit `footprint` of [`PredicateRead`] markers to the shared
+    /// tracker (used for the relationship footprint, whose markers are not derived from node state).
+    fn note_predicate_write_footprint(&self, footprint: &[PredicateRead]) {
+        if let Some(ssi) = &self.ssi {
+            ssi.borrow_mut().record_predicate_write(self.txn, footprint);
         }
     }
 
@@ -692,6 +854,14 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 })
                 .collect()
         };
+
+        // SSI predicate footprint (`rmp` #171): announce the markers this node now satisfies, so a
+        // concurrent transaction that read one of those predicates (and saw this node's absence) gets
+        // an rw-antidependency edge into this writer — closing the phantom hole the per-record write
+        // marker (`note_write`, already recorded at the store mutation) cannot. Done with the same
+        // current `(label_tokens, resolved_props)` this index maintenance already read, so no extra
+        // store read is needed.
+        self.note_predicate_write(&label_tokens, &resolved_props);
 
         // The node's current string property values, by prop-key token, for full-text maintenance
         // (`rmp` task #72): a full-text index covers string text, so only string values participate.
@@ -1363,6 +1533,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     // ---- reads --------------------------------------------------------------------------------
 
     fn scan_nodes(&self) -> Vec<NodeId> {
+        // SSI predicate footprint (`rmp` #171): an all-nodes scan `MATCH (n)` depends on *which nodes
+        // exist*, so a concurrent insert of ANY node invalidates it. Register the `AllNodes` predicate
+        // marker so that phantom closes an rw-edge even when this scan returns nothing (an empty graph)
+        // — the per-node SIREADs below only cover nodes that already exist.
+        self.note_predicate_read(PredicateRead::AllNodes);
         // `scan_node_ids` returns every slot-occupied node (live versions *and* tombstones not yet
         // GC'd); keep only those visible to this snapshot (`04 §5.3`, `rmp` task #45).
         let mut store = self.store.borrow_mut();
@@ -1399,8 +1574,24 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // Resolve the label name -> token id without interning: if the label was never created, no
         // live node can carry it, so the scan is correctly empty (`05 §9`, `rmp` task #42).
         let Some(token_id) = self.label_id_existing(label) else {
+            // The label was never interned, so no node can carry it *now*. But a *concurrent* writer
+            // could `CREATE` the first node of this label (a phantom) — and it would intern a token we
+            // cannot know here. We therefore register the conservative `AllNodes` marker so any such
+            // insert closes an rw-edge, rather than interning the label on a read path (which would be
+            // a durable side effect that changes read semantics). This is the rare "label never seen"
+            // case, so the coarseness costs nothing in practice. `note_predicate_read` no-ops standalone.
+            self.note_predicate_read(PredicateRead::AllNodes);
             return Vec::new();
         };
+
+        // SSI predicate footprint (`rmp` #171): `MATCH (n:Label)` is a predicate over which nodes
+        // carry the label, so a concurrent insert/relabel of a node into this label is a phantom that
+        // must close an rw-edge — even when this scan returns nothing. The per-node SIREADs
+        // (`mark_all_live_nodes` / `filter_label_candidates`) only cover *existing* nodes; the `Label`
+        // predicate marker covers the not-yet-existing matching node. This same coarse `Label` marker
+        // is also the conservative footprint for the scan-fallback equality / range filters that sit
+        // on top of this scan (`scan_filter_eq` / `scan_filter_range`).
+        self.note_predicate_read(PredicateRead::Label(token_id));
 
         // Index-accelerated path (`rmp` task #48): on the coordinated path the derived label
         // [`IndexSet`] yields **candidate** node ids carrying this token. Candidates may be a
@@ -1439,6 +1630,13 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
+        // Relationship-pattern predicate read (`rmp` #171 blocker A1): a `MATCH ()-[r:T]-()` traversal
+        // reads which relationships of the requested type(s) exist incident to the anchor. Register the
+        // rel-type (or, untyped, `AnyRel`) predicate marker so a concurrent `create_rel`/`delete_rel`
+        // of a matching type closes an rw-edge — the relationship phantom (read "no `:T` edges", then a
+        // concurrent `CREATE` of a `:T` edge). This covers the *absent* edge the per-rel SIREADs below
+        // (which only mark edges that already exist) cannot.
+        self.note_rel_predicate_read(types);
         let mut store = self.store.borrow_mut();
         let rels = match store.incident_rels(node.0) {
             Ok(rels) => rels,
@@ -1677,6 +1875,22 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // footprint so an index seek and the scan fallback are indistinguishable to SSI (`04 §5.4`,
         // `rmp` task #46) — see `mark_all_live_nodes`.
         self.mark_all_live_nodes();
+        // Plus the phantom-safe predicate marker (`rmp` #171): the *precise* equality predicate, so a
+        // concurrent insert of a node with this exact `(label, property, value)` closes an rw-edge
+        // even when the seek currently matches nothing. The value is encoded with the
+        // **Cypher-equality-canonical** encoder — the same encoding the writer's
+        // `note_predicate_write` uses — so Cypher-equal values (incl. cross-type `1` vs `1.0`, blocker
+        // C1) register the SAME marker. NOTE this is the SSI marker ONLY; the index lookup below passes
+        // the raw `seek` `Value`, so seek/scan result semantics are entirely unchanged. A non-encodable
+        // seek value (`Null`/`List`/`Map`/`NaN`) registers no `Equality` marker (it can never equal a
+        // stored value either); the `mark_all_live_nodes` footprint still covers existing rows.
+        if let Ok(encoded) = encode_equality_canonical(seek) {
+            self.note_predicate_read(PredicateRead::Equality {
+                label: label_token,
+                property: prop_key,
+                value: encoded,
+            });
+        }
 
         // Candidate ids for `(label_token, prop_key) == seek`. The index is candidate-only, so we
         // re-check the FULL `scan_filter_eq` predicate per candidate: visible + carries the label
@@ -1720,6 +1934,12 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // fallback (which read every node via `scan_nodes_by_label`). Preserve that read footprint so
         // the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
         self.mark_all_live_nodes();
+        // Plus the phantom-safe predicate marker (`rmp` #171): a range / property scan registers the
+        // conservative `Label` marker (any insert of this label matches), the documented coarse
+        // over-approximation for a non-equality predicate — sound, at most a few extra aborts among
+        // concurrent range-reader / label-writer pairs. This is the same coarse marker the
+        // scan-fallback range filter (`scan_filter_range` over `scan_nodes_by_label`) registers.
+        self.note_predicate_read(PredicateRead::Label(label_token));
 
         // Candidate ids for the requested range (a superset; see `IndexSet::seek_node_property_range`).
         // NOTE (v1-index limitation): the index keys by exact encoded value, so the value-match path
@@ -1927,6 +2147,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         };
         let rel = RelId(id);
         self.note_write(rel_ssi_key(id));
+        // Relationship phantom (`rmp` #171 blocker A1): announce this new edge's rel-type predicate
+        // footprint so a concurrent transaction that read `MATCH ()-[r:T]-()` (and saw no such edge)
+        // closes an rw-edge into this create. The per-rel `note_write` above marks only the physical
+        // id, which a predicate reader of the (previously absent) edge never SIREAD-marked.
+        self.note_rel_predicate_write(type_id);
         // Relationship properties are stored over `RelRecord.first_prop` (`rmp` task #44), exactly
         // like node properties on `create_node`. A null entry is not stored (Cypher does not persist
         // nulls); a non-persistable class captures a runtime error rather than dropping it silently.
@@ -1943,6 +2168,14 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             return; // error already captured
         };
         self.note_write(node_ssi_key(node.0));
+        // Read-then-update/clear write-skew (`rmp` #171 blocker B1): a `SET n.p = …` changes which
+        // nodes satisfy `MATCH (n:Label {p: old})` (the old value's equality predicate, and on a
+        // `SET n.p = null` removal the predicate the node previously matched). Announce the node's
+        // PRE-image footprint before the store mutation so a concurrent reader of the *old* equality
+        // predicate (who saw this node) closes an rw-edge. The follow-on `reindex_node` on the non-null
+        // path additionally announces the NEW footprint (the new value's predicate), so both the
+        // vacated and the newly-occupied predicates are covered.
+        self.note_predicate_write_preimage(node);
         if value.is_null() {
             // `SET n.p = null` is a removal in Cypher: drop the key (and free any overflow chain it
             // owned) so a later read sees the property absent.
@@ -2049,6 +2282,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             return;
         }
         self.note_write(node_ssi_key(node.0));
+        // Read-then-unlabel write-skew (`rmp` #171 blocker B1): `REMOVE n:Label` changes which nodes
+        // satisfy a `MATCH (n:Label …)` predicate, so announce the node's PRE-image footprint (its
+        // current labels + properties) before stripping the label. A concurrent reader of any of those
+        // predicates that saw this node closes an rw-edge into this writer.
+        self.note_predicate_write_preimage(node);
         // Remove each label that has ever been interned; a label name that was never created cannot
         // be set on any node, so removing it is a no-op (no token is created just to remove it).
         for name in labels {
@@ -2077,6 +2315,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         let Some(key_id) = self.store.borrow().token_id(Namespace::PropKey, key) else {
             return;
         };
+        // Read-then-clear write-skew (`rmp` #171 blocker B1): removing a property changes which nodes
+        // satisfy `MATCH (n:Label {p: v})`, so announce the node's PRE-image (which still holds the
+        // property `p: v`) before the removal. A concurrent reader of that equality predicate that saw
+        // this node closes an rw-edge into this writer.
+        self.note_predicate_write_preimage(node);
         if let Err(e) = self
             .store
             .borrow_mut()
@@ -2110,6 +2353,12 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if !self.node_exists(node) {
             return;
         }
+        // Read-then-replace write-skew (`rmp` #171 blocker B1): `SET n = map` clears every existing
+        // property before re-setting, so announce the node's PRE-image footprint (its current
+        // labels + properties) BEFORE the clear — once the chain is cleared the per-key
+        // `set_node_property` pre-image reads below would no longer see the vacated values. A
+        // concurrent reader of any predicate the node previously satisfied closes an rw-edge here.
+        self.note_predicate_write_preimage(node);
         // `SET n = map` replaces the whole property set: clear the existing properties (freeing any
         // overflow chains, `rmp` task #43), then set each non-null entry of the map (mirrors
         // `MemGraph::replace_node_properties`).
@@ -2223,14 +2472,18 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // or never created) is a no-op, not an error — matching the `MemGraph` contract. Visibility
         // (not raw `in_use`) is the right guard now that delete is an MVCC tombstone (the slot stays
         // in use): a second delete in the same transaction sees its own tombstone and does nothing.
-        let mvcc = match self.store.borrow_mut().rel(rel.0) {
-            Ok(r) => r.mvcc,
+        let (mvcc, type_id) = match self.store.borrow_mut().rel(rel.0) {
+            Ok(r) => (r.mvcc, r.type_id),
             Err(_) => return,
         };
         if !self.visible(mvcc) {
             return;
         }
         self.note_write(rel_ssi_key(rel.0));
+        // Read-then-delete relationship write-skew (`rmp` #171 blocker A1): a concurrent reader of
+        // `MATCH ()-[r:T]-()` that SAW this edge must close an rw-edge into this delete. Announce the
+        // edge's rel-type predicate footprint (its pre-image type), symmetric to `create_rel`.
+        self.note_rel_predicate_write(type_id);
         if let Err(e) = self.store.borrow_mut().delete_rel(self.txn, rel.0) {
             self.capture(e);
         }
@@ -2245,6 +2498,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             return;
         }
         self.note_write(node_ssi_key(node.0));
+        // Read-then-delete write-skew (`rmp` #171 blocker B1): announce the node's PRE-image predicate
+        // footprint before removing it, so a concurrent transaction that read a predicate this node
+        // satisfied (and saw it present) closes an rw-edge into this delete. Must run before the store
+        // mutation while the pre-image is still readable.
+        self.note_predicate_write_preimage(node);
         if let Err(e) = self.store.borrow_mut().delete_node(self.txn, node.0) {
             self.capture(e);
         }

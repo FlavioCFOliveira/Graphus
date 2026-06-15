@@ -77,7 +77,7 @@ pub use manager::{
 pub use oracle::{TimestampOracle, VersionStamp};
 pub use serializability::{HistoryChecker, Op, TxnHistory};
 pub use snapshot::{CommitRegistry, IsolationLevel, Snapshot, TxnOutcome};
-pub use ssi::SsiTracker;
+pub use ssi::{PredicateRead, SsiTracker};
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemVersionedStore;
 pub use store::{Key, Version, VersionedStore};

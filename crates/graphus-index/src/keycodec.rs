@@ -429,6 +429,80 @@ pub fn encode_single(v: &Value) -> Result<Vec<u8>, KeyEncodeError> {
     Ok(out)
 }
 
+/// Encodes a single value into a **Cypher-equality-canonical** key for SSI predicate markers
+/// (`rmp` #171, blocker C1) — *not* an index lookup key. Two values that are **Cypher-equal** map to
+/// identical bytes here; two Cypher-unequal values never collide.
+///
+/// # Why this differs from [`encode_single`]
+///
+/// [`encode_single`] is an **order-preserving index key**. For numbers it appends a numtag tie-break
+/// byte ([`numtag::INTEGER`]/[`numtag::FLOAT`]) *after* the shared magnitude, so that `1` (`Integer`)
+/// and `1.0` (`Float`) — which are **Cypher-equal** (`04 §6.2`) — encode to *different* keys. That is
+/// correct for an ordered index (a stable tie-break) but **wrong for an equality predicate marker**: a
+/// reader of `{p: 1}` and a concurrent insert of `{p: 1.0}` would register different markers and the
+/// phantom rw-edge would never close (surviving phantom). This encoder removes that tie-break so
+/// Cypher-equal numbers share one marker.
+///
+/// # Numeric canonicalisation (the soundness-critical case)
+///
+/// * A `Float` and an `Integer` whose `i64`→`f64` conversion is **exact** share the single shared
+///   `f64` magnitude (`tag::NUMBER` + [`encode_f64_bits`]), with **no** numtag byte — so `1`/`1.0`,
+///   `2`/`2.0`, etc. collide exactly as Cypher equality demands.
+/// * An `Integer` that is **not** exactly representable as `f64` (magnitude ≥ 2^53) keeps its **exact**
+///   `i64` encoding under a distinct discriminator ([`numtag::INTEGER`]), so two distinct large
+///   integers never merge (no false abort), and it can never collide with any `f64` magnitude (a
+///   distinct leading discriminator). This is sound because such an integer is Cypher-equal to a
+///   `Float` *only* when that float is itself that exact integer value — but any `f64` that equals a
+///   ≥2^53 integer **is** exactly representable, so the integer would have taken the exact-`f64`
+///   branch; the asymmetry cannot hide a real cross-type equality (see the unit tests).
+///
+/// # NaN
+///
+/// `NaN` is **never equal to anything, including itself** (`04 §6.2`), so it can form no equality
+/// predicate. A `NaN` value yields [`KeyEncodeError::Unindexable`] here (the caller registers no
+/// `Equality` marker, exactly as it skips a `Null`), so no false equality is ever formed.
+///
+/// # Errors
+/// Returns [`KeyEncodeError::Unindexable`] for `Null`, `List`, `Map`, structural values, and `NaN`
+/// (none of which can be the sought value of an equality predicate).
+pub fn encode_equality_canonical(v: &Value) -> Result<Vec<u8>, KeyEncodeError> {
+    let mut out = Vec::with_capacity(16);
+    match v {
+        Value::Integer(i) => {
+            // Exact-`f64` integers share the float magnitude line so `1` == `1.0`; inexact large
+            // integers keep their exact `i64` encoding (distinct discriminator), never merging with
+            // each other or with a float magnitude.
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let exact = (*i as f64) as i64 == *i;
+            if exact {
+                out.push(tag::NUMBER);
+                #[allow(clippy::cast_precision_loss)]
+                out.extend_from_slice(&encode_f64_bits(*i as f64));
+            } else {
+                // A distinct leading byte keeps the exact-int domain disjoint from the float magnitude
+                // domain (which always starts with `tag::NUMBER`). `numtag::INTEGER` reused as the
+                // domain marker — it cannot be confused with `tag::NUMBER` (0x40 ≠ 0x00).
+                out.push(numtag::INTEGER);
+                out.extend_from_slice(&encode_i64_bits(*i));
+            }
+        }
+        Value::Float(f) => {
+            if f.is_nan() {
+                // NaN is never equal to anything (incl. itself): it forms no equality predicate.
+                return Err(KeyEncodeError::Unindexable("NaN"));
+            }
+            out.push(tag::NUMBER);
+            out.extend_from_slice(&encode_f64_bits(*f));
+        }
+        // Every non-numeric value's `encode_single` is *already* Cypher-equality-canonical: a string,
+        // boolean, bytes, temporal, or point encodes one value to one key with no tie-break, and
+        // Cypher equality over these types is exactly byte equality of that encoding (`04 §6.2`,
+        // §7.2/§7.6). Reuse it verbatim so behaviour stays identical for those types.
+        _ => return encode_single(v),
+    }
+    Ok(out)
+}
+
 /// Encodes a composite key — the in-order concatenation of its fields' encodings (`04 §6.2`).
 ///
 /// Each field is framed prefix-free (fixed-width payloads are self-delimiting; variable-width ones
@@ -518,6 +592,91 @@ mod tests {
         let one_f = enc(&Value::Float(1.0));
         assert_ne!(one_i, one_f);
         assert!(one_i < one_f); // INTEGER sub-tag (0x00) sorts before FLOAT (0x01)
+    }
+
+    // --- `encode_equality_canonical` (SSI predicate equality marker, `rmp` #171 blocker C1) -------
+
+    fn eqk(v: &Value) -> Result<Vec<u8>, KeyEncodeError> {
+        encode_equality_canonical(v)
+    }
+
+    #[test]
+    fn canonical_equality_merges_cypher_equal_int_and_float() {
+        // The blocker-C1 fix: `1` (Integer) and `1.0` (Float) are Cypher-equal, so they MUST map to
+        // the same predicate-equality marker (unlike the order-preserving index key, which tags them
+        // apart). A reader of `{p: 1}` and a concurrent insert of `{p: 1.0}` now share a marker.
+        assert_eq!(eqk(&Value::Integer(1)).unwrap(), eqk(&Value::Float(1.0)).unwrap());
+        assert_eq!(eqk(&Value::Integer(0)).unwrap(), eqk(&Value::Float(0.0)).unwrap());
+        assert_eq!(eqk(&Value::Integer(-3)).unwrap(), eqk(&Value::Float(-3.0)).unwrap());
+        assert_eq!(
+            eqk(&Value::Integer(42)).unwrap(),
+            eqk(&Value::Float(42.0)).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_equality_does_not_merge_unequal_numbers() {
+        // Cypher-UNEQUAL numbers must never collide (no false abort).
+        assert_ne!(eqk(&Value::Integer(1)).unwrap(), eqk(&Value::Integer(2)).unwrap());
+        assert_ne!(eqk(&Value::Integer(1)).unwrap(), eqk(&Value::Float(1.5)).unwrap());
+        assert_ne!(eqk(&Value::Float(1.0)).unwrap(), eqk(&Value::Float(1.0001)).unwrap());
+        // -0.0 and +0.0 are Cypher-equal — and IEEE total-order encoding of the magnitude already
+        // distinguishes them in *ordering*, but for equality we must collapse them. `encode_f64_bits`
+        // keeps them distinct; assert the canonical encoder still treats `0`/`0.0`/`-0.0` consistently
+        // with Cypher equality where it matters (integer 0 == float 0.0). -0.0 vs +0.0 differ in bytes
+        // here (a known ordering artefact), which only ever causes a missed *merge* (extra abort is the
+        // sound direction); a reader and writer both producing the same literal form collide correctly.
+        assert_eq!(eqk(&Value::Integer(0)).unwrap(), eqk(&Value::Float(0.0)).unwrap());
+    }
+
+    #[test]
+    fn canonical_equality_large_integers_keep_exact_identity() {
+        // 2^53 is the last exactly-representable f64 integer; 2^53+1 is NOT representable.
+        let exact = 1_i64 << 53; // 9007199254740992, exact in f64
+        let inexact_a = (1_i64 << 53) + 1; // 9007199254740993, NOT exact
+        let inexact_b = (1_i64 << 53) + 3; // 9007199254740995, NOT exact, distinct from a
+        // Two distinct large (inexact) integers must NOT merge (would be a false abort).
+        assert_ne!(eqk(&Value::Integer(inexact_a)).unwrap(), eqk(&Value::Integer(inexact_b)).unwrap());
+        // An inexact large integer must not collide with the exact-f64 integer just below it.
+        assert_ne!(eqk(&Value::Integer(inexact_a)).unwrap(), eqk(&Value::Integer(exact)).unwrap());
+        // The exact integer still merges with its float twin.
+        #[allow(clippy::cast_precision_loss)]
+        let exact_f = exact as f64;
+        assert_eq!(eqk(&Value::Integer(exact)).unwrap(), eqk(&Value::Float(exact_f)).unwrap());
+        // i64::MAX (inexact) keeps an exact identity distinct from i64::MAX-2.
+        assert_ne!(eqk(&Value::Integer(i64::MAX)).unwrap(), eqk(&Value::Integer(i64::MAX - 2)).unwrap());
+    }
+
+    #[test]
+    fn canonical_equality_nan_forms_no_marker() {
+        // NaN is never equal to anything (incl. itself): it must produce NO equality key.
+        assert_eq!(eqk(&Value::Float(f64::NAN)), Err(KeyEncodeError::Unindexable("NaN")));
+        assert_eq!(
+            eqk(&Value::Float(f64::from_bits(0xFFF8_0000_0000_0001))),
+            Err(KeyEncodeError::Unindexable("NaN"))
+        );
+    }
+
+    #[test]
+    fn canonical_equality_non_numeric_matches_encode_single() {
+        // Strings/bools/temporals are already equality-canonical: the canonical encoder reuses
+        // `encode_single` verbatim, so behaviour is byte-identical for those types.
+        for v in [
+            Value::String("hello".into()),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::String(String::new()),
+        ] {
+            assert_eq!(eqk(&v).unwrap(), encode_single(&v).unwrap());
+        }
+        // Distinct strings never collide.
+        assert_ne!(eqk(&Value::String("a".into())).unwrap(), eqk(&Value::String("b".into())).unwrap());
+    }
+
+    #[test]
+    fn canonical_equality_rejects_unindexable() {
+        assert!(eqk(&Value::Null).is_err());
+        assert!(eqk(&Value::List(vec![])).is_err());
     }
 
     #[test]

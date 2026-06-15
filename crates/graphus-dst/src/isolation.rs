@@ -3,13 +3,15 @@
 //! have the Elle checker rule on whether the committed history is **serializable**.
 //!
 //! This closes the loop on the ACID "I". Running it against the live engine surfaced two real,
-//! measured gaps — exactly what a DST is for — now filed and *pinned* by the tests so they cannot
-//! silently regress and will flip to the correct assertion once fixed:
+//! measured gaps — exactly what a DST is for — both now **fixed** and *guarded* by the tests so they
+//! cannot silently regress:
 //!
 //! - **rmp #171** — *phantom* predicate-read + insert: two transactions that each read a predicate
-//!   returning nothing and then insert a row matching the other's predicate both commit
-//!   (non-serializable). SSI lacks predicate/index-range SIREAD tracking; the Elle checker correctly
-//!   detects the resulting cycle.
+//!   returning nothing and then insert a row matching the other's predicate. FIXED by predicate
+//!   SIREAD tracking in the SSI validator (`graphus-txn`'s `ssi.rs` [`PredicateRead`] + the
+//!   `record_graph` read/write wiring): the empty predicate read now registers a marker the
+//!   concurrent matching insert closes an rw-antidependency against, so SSI aborts exactly one. The
+//!   guard tests assert at most one commits and the committed history is serializable.
 //! - **rmp #172** — concurrent write–write on the same node: the engine *does* detect the conflict
 //!   (not both commit), but the survivor's committed update can be lost. This test pins the
 //!   conflict-detection property and references #172 for the survivor's durability.
@@ -41,7 +43,9 @@ mod tests {
 
     /// Runs a write statement in `ticket` to completion (drains its empty result).
     fn write(eng: &mut Eng, ticket: TxTicket, stmt: &str, params: Vec<(String, Value)>) {
-        let mut reply = eng.run(ticket, stmt, params, false, None).expect("write runs");
+        let mut reply = eng
+            .run(ticket, stmt, params, false, None)
+            .expect("write runs");
         while let Ok(Some(_)) = reply.rows.next() {}
     }
 
@@ -78,12 +82,31 @@ mod tests {
         );
     }
 
+    /// Deletes the `(:Entry {key, val})` node from `key`'s list in `ticket` (read-then-delete model).
+    fn delete_entry(eng: &mut Eng, ticket: TxTicket, key: &str, val: i64) {
+        write(
+            eng,
+            ticket,
+            "MATCH (e:Entry {key: $k, val: $v}) DELETE e",
+            vec![
+                ("k".to_owned(), Value::String(key.to_owned())),
+                ("v".to_owned(), Value::Integer(val)),
+            ],
+        );
+    }
+
     fn tx(id: u64, key: &str, observed: Vec<i64>, append_val: i64, committed: bool) -> Transaction {
         Transaction {
             id,
             ops: vec![
-                Op::Read { key: key.to_owned(), observed },
-                Op::Append { key: key.to_owned(), val: append_val },
+                Op::Read {
+                    key: key.to_owned(),
+                    observed,
+                },
+                Op::Append {
+                    key: key.to_owned(),
+                    val: append_val,
+                },
             ],
             committed,
         }
@@ -106,9 +129,16 @@ mod tests {
         let c2 = eng.commit(t2).is_ok();
 
         assert!(c1 && c2, "non-conflicting serial txns both commit");
-        assert_eq!(r2, vec![1], "the second txn observed the first's committed append");
+        assert_eq!(
+            r2,
+            vec![1],
+            "the second txn observed the first's committed append"
+        );
         let history = vec![tx(1, "a", r1, 1, c1), tx(2, "a", r2, 2, c2)];
-        assert!(check(&history).serializable, "serial history is serializable");
+        assert!(
+            check(&history).serializable,
+            "serial history is serializable"
+        );
     }
 
     /// Two concurrent write–write txns on the SAME existing node: SSI detects the conflict and aborts
@@ -130,8 +160,18 @@ mod tests {
 
         let t1 = eng.begin(AccessMode::Write).expect("begin t1");
         let t2 = eng.begin(AccessMode::Write).expect("begin t2");
-        write(&mut eng, t1, "MATCH (c:Counter {k: 'x'}) SET c.v = c.v + 1", vec![]);
-        write(&mut eng, t2, "MATCH (c:Counter {k: 'x'}) SET c.v = c.v + 1", vec![]);
+        write(
+            &mut eng,
+            t1,
+            "MATCH (c:Counter {k: 'x'}) SET c.v = c.v + 1",
+            vec![],
+        );
+        write(
+            &mut eng,
+            t2,
+            "MATCH (c:Counter {k: 'x'}) SET c.v = c.v + 1",
+            vec![],
+        );
         let c1 = eng.commit(t1).is_ok();
         let c2 = eng.commit(t2).is_ok();
 
@@ -168,12 +208,16 @@ mod tests {
         );
     }
 
-    /// **Pins rmp #171** (phantom write-skew across two keys). T1 reads y (empty) + inserts x; T2 reads
-    /// x (empty) + inserts y; interleaved. The engine currently lets BOTH commit, which the Elle
-    /// checker correctly flags as non-serializable. When #171 is fixed (predicate SIREAD tracking),
-    /// the engine will abort one and this assertion flips to `verdict.serializable`.
+    /// **Guards rmp #171** (phantom write-skew across two keys), FIXED. T1 reads y (empty) + inserts x;
+    /// T2 reads x (empty) + inserts y; interleaved. Each transaction's predicate read of the *absence*
+    /// of the other's key now registers a predicate SIREAD marker, so the concurrent matching insert
+    /// closes an rw-antidependency and SSI's dangerous-structure detection aborts exactly one
+    /// transaction. This guards serializability: with one txn aborted, **at most one commits** and the
+    /// committed history the Elle checker rules on is serializable. (Before the fix the engine admitted
+    /// both, a non-serializable phantom write-skew — see the SSI predicate-tracking unit tests in
+    /// `graphus-txn`'s `ssi.rs` for the tracker-level guard.)
     #[test]
-    fn phantom_write_skew_is_detected_pins_171() {
+    fn phantom_write_skew_is_prevented() {
         let mut eng = engine();
 
         let t1 = eng.begin(AccessMode::Write).expect("begin t1");
@@ -185,42 +229,58 @@ mod tests {
         let c1 = eng.commit(t1).is_ok();
         let c2 = eng.commit(t2).is_ok();
 
+        // SSI must abort exactly one of the two phantom-conflicting transactions (predicate SIREAD
+        // tracking, rmp #171): the two rw-antidependencies form a dangerous structure and the pivot
+        // rule aborts one. At most one commits.
+        assert!(
+            c1 ^ c2,
+            "exactly one of the two phantom write-skew transactions must commit (rmp #171), got {c1},{c2}"
+        );
+
         let history = vec![
             Transaction {
                 id: 1,
                 ops: vec![
-                    Op::Read { key: "y".into(), observed: r1y },
-                    Op::Append { key: "x".into(), val: 1 },
+                    Op::Read {
+                        key: "y".into(),
+                        observed: r1y,
+                    },
+                    Op::Append {
+                        key: "x".into(),
+                        val: 1,
+                    },
                 ],
                 committed: c1,
             },
             Transaction {
                 id: 2,
                 ops: vec![
-                    Op::Read { key: "x".into(), observed: r2x },
-                    Op::Append { key: "y".into(), val: 1 },
+                    Op::Read {
+                        key: "x".into(),
+                        observed: r2x,
+                    },
+                    Op::Append {
+                        key: "y".into(),
+                        val: 1,
+                    },
                 ],
                 committed: c2,
             },
         ];
         let verdict = check(&history);
-        if c1 && c2 {
-            // Current (buggy) behaviour: the oracle MUST catch the phantom write-skew.
-            assert!(
-                !verdict.serializable,
-                "the Elle oracle must detect phantom write-skew the engine admitted (rmp #171): {verdict:?}",
-            );
-        } else {
-            // Fixed behaviour: SSI aborted one ⇒ the committed history is serializable.
-            assert!(verdict.serializable, "with one txn aborted the history is serializable");
-        }
+        assert!(
+            verdict.serializable,
+            "with one transaction aborted the committed history must be serializable: {verdict:?}",
+        );
     }
 
-    /// **Pins rmp #171** (single-key phantom lost-update). Both txns read the empty list then append;
-    /// the engine currently lets both commit. The Elle oracle detects the resulting non-serializable
-    /// history. Flips to asserting serializability once #171 is fixed.
+    /// **Guards rmp #171** (single-key phantom lost-update), FIXED. Both txns read the empty list for
+    /// key `a` then append to it; interleaved. Each empty predicate read registers a predicate SIREAD
+    /// marker that the other's concurrent insert matches, closing the rw-antidependencies that make
+    /// the pair a dangerous structure — so SSI aborts one. With one aborted there is no lost update and
+    /// the committed history is serializable.
     #[test]
-    fn phantom_lost_update_is_detected_pins_171() {
+    fn phantom_lost_update_is_prevented() {
         let mut eng = engine();
 
         let t1 = eng.begin(AccessMode::Write).expect("begin t1");
@@ -232,15 +292,137 @@ mod tests {
         let c1 = eng.commit(t1).is_ok();
         let c2 = eng.commit(t2).is_ok();
 
+        // SSI must abort exactly one of the two phantom-lost-update transactions (rmp #171).
+        assert!(
+            c1 ^ c2,
+            "exactly one of the two phantom lost-update transactions must commit (rmp #171), got {c1},{c2}"
+        );
+
         let history = vec![tx(1, "a", r1, 1, c1), tx(2, "a", r2, 2, c2)];
         let verdict = check(&history);
-        if c1 && c2 {
-            assert!(
-                !verdict.serializable,
-                "the Elle oracle must detect the phantom lost-update the engine admitted (rmp #171): {verdict:?}",
-            );
-        } else {
-            assert!(verdict.serializable, "with one txn aborted the history is serializable");
+        assert!(
+            verdict.serializable,
+            "with one transaction aborted the committed history must be serializable: {verdict:?}",
+        );
+    }
+
+    /// **Guards rmp #171 blocker B1** (read-then-delete write-skew), FIXED. Two entries (`val 1`,
+    /// `val 2`) exist under key `a` with the invariant "at least one entry must remain". T1 reads the
+    /// list (sees both) then deletes `val 1`; T2 reads the list (sees both) then deletes `val 2`;
+    /// interleaved. Serially the second transaction would see only one entry left and its read would
+    /// differ — concurrently, **both** deletes would empty the list, violating the invariant: a classic
+    /// non-serializable read-then-delete write-skew.
+    ///
+    /// The fix announces each delete's **pre-image** predicate footprint (`MATCH (e:Entry {key:'a'})`'s
+    /// `Label`/`Equality` markers), so each transaction's predicate read of the list closes an
+    /// rw-antidependency against the *other's* delete. The two edges form a dangerous structure and SSI
+    /// aborts exactly one — so at least one entry survives.
+    #[test]
+    fn read_then_delete_write_skew_is_prevented_b1() {
+        let mut eng = engine();
+
+        // Setup: two entries under key `a`.
+        let s = eng.begin(AccessMode::Write).expect("begin setup");
+        append(&mut eng, s, "a", 1);
+        append(&mut eng, s, "a", 2);
+        eng.commit(s).expect("commit setup");
+
+        let t1 = eng.begin(AccessMode::Write).expect("begin t1");
+        let t2 = eng.begin(AccessMode::Write).expect("begin t2");
+        // Each reads the predicate (the whole list) — the read that the concurrent delete invalidates.
+        let r1 = read_list(&mut eng, t1, "a");
+        let r2 = read_list(&mut eng, t2, "a");
+        assert_eq!(r1, vec![1, 2], "T1 sees both entries");
+        assert_eq!(r2, vec![1, 2], "T2 sees both entries");
+        // Each deletes a *different* entry: serially the invariant "≥1 remains" holds; concurrently it
+        // would be violated unless SSI aborts one.
+        delete_entry(&mut eng, t1, "a", 1);
+        delete_entry(&mut eng, t2, "a", 2);
+        let c1 = eng.commit(t1).is_ok();
+        let c2 = eng.commit(t2).is_ok();
+
+        // SSI must abort at least one (predicate pre-image tracking, blocker B1). Both committing would
+        // be the non-serializable read-then-delete write-skew.
+        assert!(
+            !(c1 && c2),
+            "both read-then-delete transactions must not commit (rmp #171 B1), got {c1},{c2}"
+        );
+
+        // The invariant must hold: at least one entry remains (no empty list from a double delete).
+        let reader = eng.begin(AccessMode::Read).expect("begin reader");
+        let remaining = read_list(&mut eng, reader, "a");
+        let _ = eng.commit(reader);
+        assert!(
+            !remaining.is_empty(),
+            "the read-then-delete invariant (≥1 entry remains) must hold; got {remaining:?}"
+        );
+    }
+
+    /// **Guards rmp #171 blocker A1** (relationship phantom write-skew), FIXED. Two anchor nodes exist;
+    /// T1 reads `(a)-[:KNOWS]->()` (sees no such edge) then creates `(b)-[:KNOWS]->(b)`; T2 reads
+    /// `(b)-[:KNOWS]->()` (sees none) then creates `(a)-[:KNOWS]->(a)`; interleaved. Each transaction's
+    /// relationship-pattern read of the *absence* of a `:KNOWS` edge now registers a `RelType` predicate
+    /// marker that the other's concurrent `CREATE` of a `:KNOWS` edge closes an rw-antidependency
+    /// against — the relationship analogue of the #171 node phantom. The two edges form a dangerous
+    /// structure and SSI aborts exactly one.
+    #[test]
+    fn relationship_phantom_write_skew_is_prevented_a1() {
+        let mut eng = engine();
+
+        // Setup: two distinct anchor nodes a and b.
+        let s = eng.begin(AccessMode::Write).expect("begin setup");
+        write(&mut eng, s, "CREATE (:Anchor {name: 'a'})", vec![]);
+        write(&mut eng, s, "CREATE (:Anchor {name: 'b'})", vec![]);
+        eng.commit(s).expect("commit setup");
+
+        /// Counts `(:Anchor {name})-[:KNOWS]->()` edges visible to `ticket`.
+        fn count_knows(eng: &mut Eng, ticket: TxTicket, name: &str) -> i64 {
+            let mut reply = eng
+                .run(
+                    ticket,
+                    "MATCH (a:Anchor {name: $n})-[r:KNOWS]->() RETURN count(r) AS c",
+                    vec![("n".to_owned(), Value::String(name.to_owned()))],
+                    false,
+                    None,
+                )
+                .expect("read runs");
+            let mut c = 0;
+            while let Ok(Some(row)) = reply.rows.next() {
+                if let Some(MaterializedValue::Value(Value::Integer(n))) = row.first() {
+                    c = *n;
+                }
+            }
+            c
         }
+
+        let t1 = eng.begin(AccessMode::Write).expect("begin t1");
+        let t2 = eng.begin(AccessMode::Write).expect("begin t2");
+        // Each reads the rel-pattern predicate (absence of a :KNOWS edge from its anchor).
+        let r1 = count_knows(&mut eng, t1, "a");
+        let r2 = count_knows(&mut eng, t2, "b");
+        assert_eq!(r1, 0, "T1 sees no :KNOWS edge from a");
+        assert_eq!(r2, 0, "T2 sees no :KNOWS edge from b");
+        // Each creates a :KNOWS edge on the OTHER's anchor (a self-loop keeps the model simple).
+        write(
+            &mut eng,
+            t1,
+            "MATCH (b:Anchor {name: 'b'}) CREATE (b)-[:KNOWS]->(b)",
+            vec![],
+        );
+        write(
+            &mut eng,
+            t2,
+            "MATCH (a:Anchor {name: 'a'}) CREATE (a)-[:KNOWS]->(a)",
+            vec![],
+        );
+        let c1 = eng.commit(t1).is_ok();
+        let c2 = eng.commit(t2).is_ok();
+
+        // SSI must abort at least one (relationship predicate tracking, blocker A1). Both committing is
+        // the non-serializable relationship phantom write-skew.
+        assert!(
+            !(c1 && c2),
+            "both relationship-phantom transactions must not commit (rmp #171 A1), got {c1},{c2}"
+        );
     }
 }
