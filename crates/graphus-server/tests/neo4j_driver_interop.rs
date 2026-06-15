@@ -216,6 +216,140 @@ function fail(msg) {
 })();
 "#;
 
+/// A full-CRUD Node.js script driving Graphus with the OFFICIAL `neo4j-driver` over `bolt+ssc://` at
+/// a realistic data volume: it **C**reates 100 `:Person` nodes and 200 `:KNOWS` relationships,
+/// **R**eads them back (counts, ordered neighbour traversal, aggregation), **U**pdates node *and*
+/// relationship properties, then **D**eletes a relationship class and a subset of nodes
+/// (`DETACH DELETE`, asserting the cascade). Every step asserts exact, deterministic counts/values;
+/// it prints `GRAPHUS_CRUD_OK` and exits 0 only on full success, else exits 1 with a clear message.
+/// Connection params (port, user, password) arrive via argv.
+const CRUD_SCRIPT: &str = r#"
+'use strict';
+const neo4j = require('neo4j-driver');
+
+const [, , port, user, password] = process.argv;
+const uri = `bolt+ssc://127.0.0.1:${port}`;
+
+const N = 100;       // nodes
+const E = 2 * N;     // 200 edges: each node points at its +1 and +2 neighbours (modulo N)
+
+function fail(msg) {
+  console.error('CRUD FAILURE: ' + msg);
+  process.exit(1);
+}
+const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
+// Plain JS numbers cross the wire as PackStream Float; range()/% require integers, so integer
+// parameters MUST be wrapped with neo4j.int() (exactly as against a real Neo4j server).
+const int = (n) => neo4j.int(n);
+
+// Run a write query inside a managed write transaction.
+async function writeQ(driver, query, params) {
+  const s = driver.session();
+  try { return await s.executeWrite((tx) => tx.run(query, params || {})); }
+  finally { await s.close(); }
+}
+// Run a read query and return one named scalar from the first record.
+async function scalar(driver, query, key, params) {
+  const s = driver.session();
+  try {
+    const r = await s.run(query, params || {});
+    return toNum(r.records[0].get(key));
+  } finally { await s.close(); }
+}
+
+(async () => {
+  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+  try {
+    // 0. Connect: HELLO/LOGON handshake + a connectivity probe round-trip.
+    await driver.verifyConnectivity();
+
+    // 1. CREATE — 100 :Person nodes in one explicit write transaction (UNWIND range is inclusive).
+    await writeQ(driver,
+      'UNWIND range(0, $max) AS i ' +
+      'CREATE (p:Person {id: i, name: "person-" + toString(i), score: i})',
+      { max: int(N - 1) });
+    {
+      const c = await scalar(driver, 'MATCH (p:Person) RETURN count(p) AS c', 'c');
+      if (c !== N) fail(`after CREATE nodes, count=${c}, expected ${N}`);
+    }
+
+    // 2. CREATE — 200 :KNOWS edges: i -> (i+1)%N (weight 1) and i -> (i+2)%N (weight 2).
+    await writeQ(driver,
+      'UNWIND range(0, $max) AS i ' +
+      'MATCH (a:Person {id: i}) ' +
+      'MATCH (b:Person {id: (i + 1) % $n}) ' +
+      'MATCH (c:Person {id: (i + 2) % $n}) ' +
+      'CREATE (a)-[:KNOWS {weight: 1}]->(b) ' +
+      'CREATE (a)-[:KNOWS {weight: 2}]->(c)',
+      { max: int(N - 1), n: int(N) });
+    {
+      const c = await scalar(driver, 'MATCH ()-[r:KNOWS]->() RETURN count(r) AS c', 'c');
+      if (c !== E) fail(`after CREATE edges, count=${c}, expected ${E}`);
+    }
+
+    // 3. READ — ordered neighbour traversal of node 0 must be exactly [1, 2].
+    {
+      const s = driver.session();
+      try {
+        const r = await s.run('MATCH (a:Person {id: 0})-[:KNOWS]->(b) RETURN b.id AS id ORDER BY b.id');
+        const ids = r.records.map((rec) => toNum(rec.get('id')));
+        if (JSON.stringify(ids) !== JSON.stringify([1, 2]))
+          fail(`neighbours of 0 = ${JSON.stringify(ids)}, expected [1,2]`);
+      } finally { await s.close(); }
+    }
+    // 3b. READ — aggregation: 200 edges, weight sum = 100*1 + 100*2 = 300.
+    {
+      const c = await scalar(driver, 'MATCH ()-[r:KNOWS]->() RETURN count(r) AS c', 'c');
+      const sum = await scalar(driver, 'MATCH ()-[r:KNOWS]->() RETURN sum(r.weight) AS s', 's');
+      if (c !== E) fail(`edge count=${c}, expected ${E}`);
+      if (sum !== N * 1 + N * 2) fail(`weight sum=${sum}, expected ${N * 3}`);
+    }
+
+    // 4. UPDATE — bump every node's score by 1000; verify a sampled node.
+    await writeQ(driver, 'MATCH (p:Person) SET p.score = p.score + 1000');
+    {
+      const s = await scalar(driver, 'MATCH (p:Person {id: 7}) RETURN p.score AS score', 'score');
+      if (s !== 1007) fail(`updated score(id=7)=${s}, expected 1007`);
+    }
+    // 4b. UPDATE — rewrite the weight-2 relationship class to weight 20; verify count + new sum.
+    await writeQ(driver, 'MATCH ()-[r:KNOWS {weight: 2}]->() SET r.weight = 20');
+    {
+      const cnt = await scalar(driver, 'MATCH ()-[r:KNOWS {weight: 20}]->() RETURN count(r) AS c', 'c');
+      const sum = await scalar(driver, 'MATCH ()-[r:KNOWS]->() RETURN sum(r.weight) AS s', 's');
+      if (cnt !== N) fail(`weight=20 edges=${cnt}, expected ${N}`);
+      if (sum !== N * 1 + N * 20) fail(`weight sum after update=${sum}, expected ${N * 21}`);
+    }
+
+    // 5. DELETE — drop the weight-20 relationship class; 100 weight-1 edges must remain.
+    await writeQ(driver, 'MATCH ()-[r:KNOWS {weight: 20}]->() DELETE r');
+    {
+      const c = await scalar(driver, 'MATCH ()-[r:KNOWS]->() RETURN count(r) AS c', 'c');
+      if (c !== N) fail(`after DELETE edges, count=${c}, expected ${N}`);
+    }
+    // 5b. DELETE — DETACH DELETE nodes id>=90 (10 nodes). The cascade removes every weight-1 edge
+    //     touching them; the survivors are exactly the edges with BOTH endpoints id<90 (i in 0..88).
+    await writeQ(driver, 'MATCH (p:Person) WHERE p.id >= 90 DETACH DELETE p');
+    {
+      const nodes = await scalar(driver, 'MATCH (p:Person) RETURN count(p) AS c', 'c');
+      if (nodes !== 90) fail(`after DETACH DELETE, nodes=${nodes}, expected 90`);
+      const edges = await scalar(driver, 'MATCH ()-[r:KNOWS]->() RETURN count(r) AS c', 'c');
+      if (edges !== 89) fail(`after DETACH DELETE, edges=${edges}, expected 89`);
+      // Integrity: every surviving edge still has both endpoints present (no orphaned relationship).
+      const anchored = await scalar(driver,
+        'MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN count(r) AS c', 'c');
+      if (anchored !== 89) fail(`node-anchored edge count=${anchored}, expected 89 (orphaned edges!)`);
+    }
+
+    console.log('GRAPHUS_CRUD_OK');
+    process.exit(0);
+  } catch (err) {
+    fail((err && err.stack) ? err.stack : String(err));
+  } finally {
+    await driver.close();
+  }
+})();
+"#;
+
 /// `package.json` pinning the official driver (v6.x — current major) for a reproducible install.
 const PACKAGE_JSON: &str = r#"{
   "name": "graphus-neo4j-interop",
@@ -306,6 +440,110 @@ async fn official_neo4j_driver_interoperates_over_bolt_tls() {
     assert!(
         stdout.contains("GRAPHUS_INTEROP_OK"),
         "driver exited 0 but the success marker was missing.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// Materialises a Node project (`package.json` + the given script as `interop.js`) in `project`,
+/// installs the official driver, runs the script against `port`, and returns `(stdout, stderr,
+/// success)`. Shared by both interop tests so the npm/node plumbing lives in one place.
+async fn install_and_run_driver(
+    project: PathBuf,
+    script: &str,
+    port: u16,
+) -> (String, String, bool) {
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("package.json"), PACKAGE_JSON).unwrap();
+    std::fs::write(project.join("interop.js"), script).unwrap();
+
+    let install = {
+        let project = project.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new("npm")
+                .arg("install")
+                .arg("--no-audit")
+                .arg("--no-fund")
+                .arg("--loglevel=error")
+                .current_dir(&project)
+                .output()
+        })
+        .await
+        .expect("npm install task")
+        .expect("spawn npm install (is `npm` on PATH?)")
+    };
+    assert!(
+        install.status.success(),
+        "npm install failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let run = {
+        let project = project.clone();
+        let port = port.to_string();
+        tokio::task::spawn_blocking(move || {
+            Command::new("node")
+                .arg("interop.js")
+                .arg(&port)
+                .arg(USER)
+                .arg(PASSWORD)
+                .current_dir(&project)
+                .output()
+        })
+        .await
+        .expect("node task")
+        .expect("spawn node (is `node` on PATH?)")
+    };
+
+    (
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+        run.status.success(),
+    )
+}
+
+/// Full CRUD lifecycle over the OFFICIAL Neo4j driver at a realistic volume (≥100 nodes, ≥200 edges).
+///
+/// Boots a real Graphus server (Bolt-TCP+TLS), then drives it with the official `neo4j-driver` to
+/// create 100 nodes + 200 relationships, read them back (counts, ordered traversal, aggregation),
+/// update node *and* relationship properties, and delete a relationship class plus a subset of nodes
+/// (`DETACH DELETE`). The driver script asserts exact deterministic counts at every step; this test
+/// fails loudly with the full driver output if any operation does not round-trip as expected.
+///
+/// Like [`official_neo4j_driver_interoperates_over_bolt_tls`], this is a **real-ecosystem wire
+/// interop** test, which is why it lives behind the `neo4j-interop` feature and not in the DST
+/// simulator: DST is in-process and deterministic and cannot drive the external official driver over
+/// a TLS socket — exercising that exact wire path is the entire point (the rmp #226 precedent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_neo4j_driver_full_crud_nodes_and_edges() {
+    let dir = TempDir::new();
+
+    // Self-signed cert/key for the TLS listener (`bolt+ssc://` trusts it).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.path.join("cert.pem");
+    let key_path = dir.path.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+    // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
+    let config = config_for(&dir, cert_path, key_path);
+    let server = boot(config).await;
+    let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
+
+    // Run the CRUD script against the live server.
+    let (stdout, stderr, ok) =
+        install_and_run_driver(dir.path.join("node-crud"), CRUD_SCRIPT, bolt.port()).await;
+
+    assert!(
+        ok,
+        "the official Neo4j driver CRUD lifecycle did NOT complete against Graphus.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_CRUD_OK"),
+        "driver exited 0 but the CRUD success marker was missing.\n\
          --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
     );
 
