@@ -39,9 +39,12 @@ A single Cargo workspace (Rust edition 2024). Crates follow the layered architec
 | `graphus-index` | B+-tree, token-lookup, composite and relationship-property indexes; constraints. |
 | `graphus-txn` | MVCC + Serializable Snapshot Isolation transaction manager. |
 | `graphus-cypher` | Cypher parse → plan → execute pipeline (targets 100% TCK). |
+| `graphus-gds` | In-memory CSR graph projection + a library of graph data science algorithms. |
 | `graphus-bolt` | Bolt protocol + PackStream over UDS and TCP. |
 | `graphus-rest` | HTTP transactional API (typed JSON / CBOR, NDJSON streaming). |
 | `graphus-auth` | Peer-credential, JWT/Bearer auth and RBAC, shared across listeners. |
+| `graphus-crypto` | Authenticated encryption at rest (AES-256-GCM page encryption + HKDF keyring). |
+| `graphus-bulk` | Offline high-throughput CSV bulk import and whole-graph export. |
 | `graphus-server` | The server process: wiring, admission control, observability. |
 | `graphus-cli` | Interactive shell and admin client. |
 | `graphus-tck` | openCypher TCK harness. |
