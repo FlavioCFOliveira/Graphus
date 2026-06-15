@@ -12,6 +12,12 @@ description = "The Graphus server process: listener wiring, admission control an
 name = "graphus-server"
 path = "src/main.rs"
 
+[features]
+# Opt-in interoperability test against the OFFICIAL Neo4j JavaScript driver (rmp #226). OFF by
+# default so `cargo test` stays hermetic (no Node/npm/network). The `neo4j_driver_interop` test
+# target is gated on this feature; CI runs it explicitly with `--features neo4j-interop`.
+neo4j-interop = []
+
 [dependencies]
 # The shared value model, error taxonomy and the injected `Clock` capability (used to drive REST
 # transaction expiry and JWT validity deterministically). `04 §7.2`, `§8.4`.
