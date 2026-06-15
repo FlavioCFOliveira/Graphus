@@ -44,6 +44,8 @@ Legend: ★ = recommended option.
 | D-security-scope | Auth + RBAC + TLS (REST + Bolt) + user/role management in v1; fine-grained access control / encryption-at-rest / auditing in Phase 2 |
 | D-dst-investment | Scaffold a deterministic simulation testing harness from the start with fault injection |
 | **D-vopr** | **External, totally-deterministic VOPR simulator: drive the REAL Bolt/PackStream + REST protocol stacks and the REAL engine over a SIMULATED transport + clock + disk (seed-reproducible), with misbehaved-client / fault / load coverage and four oracles (ref-model, Elle isolation, invariants/liveness, crash-durability)** *(extends D-dst-investment to the connectivity/protocol layer; "external" = real protocols, no backdoor, over an in-memory transport — not real OS sockets. See `07-dst-simulator.md`.)* |
+| **D-read-parallelism** | **DEFER read-query parallelism for single-node production; keep the single-writer-thread engine model.** Lock-free snapshot reads are the long-term direction, but parallelizing reads is a large, high-risk change to the inviolable ACID guarantees, gated on a prerequisite migration. *(Post-ratification, sprint 19, 2026-06-15. Accepted-as-is; tracked as rmp #146. See note below.)* |
+| **D-perf-deferrals** | **DEFER three higher-risk efficiency optimizations (per-commit catalog write, per-row slot model, streaming SHOW INDEXES/CONSTRAINTS).** Each is either a durability/identity risk, a TCK-correctness-sensitive executor rewrite, or a negligible-benefit change. *(Post-ratification, sprint 19, 2026-06-15. Accepted-as-is; tracked as rmp #159. See note below.)* |
 
 **Four owner overrides of the recommendation** (recorded with a `note` on their KG nodes) reshape the
 scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
@@ -65,6 +67,52 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > fine-grained RBAC, and incremental backup + PITR). It is specified in `04-technical-design.md` §6.7
 > and tracked as `FR-IX-7` (still `[ADV]`); it adds a capability without altering the four-kind core
 > set that option (a) ratifies.
+
+> **Post-ratification note (2026-06-15) — sprint-19 performance/architecture deferrals.**
+> Two performance/architecture findings were evaluated during the sprint-19
+> production-readiness closure and **deferred** (accepted-as-is for the single-node
+> production sign-off, scheduled as future work). Both dispositions are
+> measurement-/audit-grounded and follow the project's "measure to decide" rule and the
+> inviolable ACID requirement: a certified-green engine is not destabilized for
+> non-correctness gains. Each finding is recorded as a `Decision` node
+> (`status: deferred`) tracked against its `rmp` task.
+>
+> **`D-read-parallelism` (rmp #146) — DEFER read-query parallelism.**
+> An architectural audit found that all queries, reads included, currently funnel through
+> a single engine OS thread via an `mpsc` channel, which serializes them; a stress test
+> measured about 166 connections per second under 400-way concurrency on a trivial read.
+> Parallelizing reads is the documented long-term direction (lock-free snapshot reads):
+> the pure `is_visible` MVCC snapshot algebra in `graphus-txn` already exists, and a
+> loom-verified `ConcurrentBufferPool` already exists. It is nevertheless a large to
+> very-large, high-risk change to the inviolable ACID guarantees, and it is gated on a
+> prerequisite migration. The live `RecordStore` read path is `&mut self` over the
+> single-threaded `BufferPool`, and the store, index, token, and commit-registry views
+> are `Rc<RefCell<…>>` (`!Send` / `!Sync`). The single-writer model currently delivers
+> 100% ACID cleanly. The recommended path is a prerequisite epic:
+> (a) migrate `RecordStore` reads onto `ConcurrentBufferPool`;
+> (b) publish snapshot-consistent read views;
+> (c) add the off-thread read executor and the engine routing — reassessed only after (a).
+> **Status:** accepted-as-is for single-node production; tracked as rmp #146.
+>
+> **`D-perf-deferrals` (rmp #159) — DEFER three higher-risk efficiency optimizations.**
+> Each of the three is deferred for its own reason:
+> 1. **Per-commit catalog write (A1).** `RecordStore::commit` unconditionally rewrites the
+>    whole catalog every commit (it clones the `TokenStore` and `Statistics`, serializes,
+>    and page-writes). A dirty-flag gate is high-risk because the catalog persists
+>    monotonic high-water marks — `commit_ts_hw`, `element_id_next`, the per-store physical
+>    id high-water, and the token dictionary — that are not all WAL-recoverable; a missed
+>    dirty-set is a silent durability or identity-reuse bug. The only genuinely
+>    catalog-clean commit is a read-only one, whose payoff is marginal.
+> 2. **Per-row slot model (B1/B2).** `Row` is a parallel `Vec<String>` with linear-scan
+>    name lookup and a full clone per row. Resolving names to plan-time slot indices is a
+>    large, TCK-correctness-sensitive (column order and rebind semantics), non-incremental
+>    executor rewrite that belongs with the future cost-based-planner / typed-schema work.
+>    A cheap, low-risk interim — an `Arc<[Arc<str>]>` shared column schema to remove the
+>    per-row name-vector deep clone — is noted as a possible separate small task.
+> 3. **Streaming SHOW INDEXES / CONSTRAINTS (C11).** The handler collects rows into a `Vec`
+>    before replying, but the result is bounded by schema cardinality (tens of rows) and
+>    the source is already an in-memory `Vec`; the benefit is negligible. Accept-as-is.
+> **Status:** accepted-as-is for production; tracked as rmp #159.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 
@@ -114,6 +162,8 @@ SPIKE #9 (`06-bolt-and-error-shapes.md` §2–§3; resolves open question 2 and 
 | **D-dst-investment** | DST investment | ★(a) scaffold a deterministic simulation harness from the start; (b) add it in Phase 2 | Testing |
 | **D-element-id** | Element ID scheme | (a) Neo4j-style numeric `id()` reused on delete + string `elementId`; ★ internal compact IDs + a **stable, never-reused** public ID (ULID/UUIDv7) for operational safety. **Tension to rule on:** TCK literal ID-reuse vs ACID-grade stability | Data Model |
 | **D-temporal-spatial** | Temporal/spatial type scope | (a) full temporal set + full spatial in v1; ★ full temporal in v1, spatial deferred unless required at launch; (c) integers/epoch only | Data Model |
+| **D-read-parallelism** | Read-query parallelism (post-ratification, sprint 19) | ★(a) **DEFER** — keep the single-writer-thread engine; accept-as-is for single-node production, schedule the parallel-reads epic as future work (rmp #146); (b) parallelize reads now — rejected for this sign-off (large/very-large, high-risk change to inviolable ACID, with an unfinished prerequisite migration) | Architecture / Transaction Manager |
+| **D-perf-deferrals** | Three higher-risk efficiency optimizations (post-ratification, sprint 19) | ★(a) **DEFER all three** — accept-as-is for production, schedule as future work (rmp #159); (b) apply them now — rejected (per-commit catalog dirty-gating is a durability/identity-reuse risk, the per-row slot model is a TCK-correctness-sensitive executor rewrite, and streaming SHOW INDEXES/CONSTRAINTS has negligible benefit) | Architecture / Storage Engine / Executor |
 
 ## Cross-cutting notes
 
