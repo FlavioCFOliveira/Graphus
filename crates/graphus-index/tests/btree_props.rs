@@ -236,3 +236,135 @@ fn decode_i64(bytes: &[u8]) -> i64 {
     let arr: [u8; 8] = bytes.try_into().expect("8-byte key");
     (u64::from_be_bytes(arr) ^ 0x8000_0000_0000_0000) as i64
 }
+
+// ---------------------------------------------------------------------------------------------
+// Page-reclamation behaviour on delete (rmp #222, residual finding #153).
+//
+// The B+-tree delete policy (`btree.rs::delete`, `04 §6.3`) removes the entry in-place and lets the
+// leaf underflow WITHOUT eager merge/rebalance: an emptied leaf stays linked in the right-sibling
+// chain, and the page allocator (`graphus-bufpool::BufferPool::new_page`) is append-only (no
+// free-list). A storage-engine audit (rmp #222) established that this is a *bounded* space
+// amplification, not an ACID/correctness defect:
+//
+//   * Common case (delete-then-reinsert churn / updates): the emptied-but-still-linked leaf is
+//     REUSED — the parent separators are unchanged, so a later in-range key routes back to the same
+//     physical page and refills it. Net page leak is ZERO. This is the workload the vast majority of
+//     OLTP graphs exhibit.
+//   * Worst case (delete-without-reinsert on a monotonically advancing key space — time-series /
+//     TTL / log-retention): the drained low-range leaves are stranded for the database's lifetime.
+//
+// Whole-page reclamation requires a persistent free-list plus an empty-leaf unlink, which the audit
+// recommends but which is a dedicated, crash-recovery-sensitive feature (tracked separately) rather
+// than a residual hardening fix — its worst-case crash behaviour must be proven never to leave a
+// page both reachable and free-listed. These two tests pin the audit's empirical claims so the
+// common-case guarantee cannot silently regress and the known limitation stays visible.
+
+/// Common-case churn (the OLTP norm): filling, deleting everything, then re-inserting the SAME keys
+/// allocates NO new device pages — the emptied leaves are reused. This is the empirical proof that
+/// the delete-policy leak is zero for delete-then-reinsert workloads.
+#[test]
+fn refilling_emptied_leaves_allocates_no_new_pages() {
+    let mut tree = fresh_tree();
+    let n: i64 = 600; // enough keys to force many leaf splits → a multi-leaf tree
+
+    in_txn(&mut tree, 1, |tree, txn| {
+        for k in 0..n {
+            tree.insert(txn, &key(k), &val(k as u64)).expect("insert");
+        }
+    });
+    let pages_after_fill = tree.mapped_pages().len();
+    assert!(
+        pages_after_fill > 3,
+        "expected a multi-page tree, got {pages_after_fill} pages"
+    );
+
+    // Delete every key: the tree drains to empty, leaves underflow but stay linked.
+    in_txn(&mut tree, 2, |tree, txn| {
+        for k in 0..n {
+            assert!(tree.delete(txn, &key(k)).expect("delete"));
+        }
+    });
+    tree.check_invariants().expect("invariants after drain");
+    assert!(tree.scan_all().expect("scan").is_empty());
+
+    // Re-insert the identical key set: every key routes back to its (now empty) original leaf and
+    // refills it. No split, no allocation.
+    in_txn(&mut tree, 3, |tree, txn| {
+        for k in 0..n {
+            tree.insert(txn, &key(k), &val(k as u64)).expect("insert");
+        }
+    });
+    let pages_after_refill = tree.mapped_pages().len();
+
+    assert_eq!(
+        pages_after_refill, pages_after_fill,
+        "delete-then-reinsert of the same keys must reuse the emptied leaves and allocate no new \
+         pages (fill={pages_after_fill}, refill={pages_after_refill})"
+    );
+    // And the data is fully intact after the churn cycle.
+    let scanned: Vec<i64> = tree
+        .scan_all()
+        .expect("scan")
+        .into_iter()
+        .map(|(k, _)| decode_i64(&k))
+        .collect();
+    assert_eq!(scanned, (0..n).collect::<Vec<_>>());
+}
+
+/// Documents (and pins) the KNOWN, ACCEPTED bounded limitation: deleting a key range and never
+/// re-inserting into it, while inserting into a disjoint higher range (a monotonically advancing
+/// key space), strands the drained low leaves — `mapped_pages` does not shrink and grows for the new
+/// range. This is the time-series/TTL worst case the audit flagged; reclaiming these pages is the
+/// separately-tracked free-list feature. The test exists so the limitation is explicit and any
+/// future free-list work has a concrete before/after target.
+#[test]
+fn monotonic_delete_without_reinsert_strands_pages_documented_limitation() {
+    let mut tree = fresh_tree();
+    let n: i64 = 600;
+
+    // Fill the low range [0, n) → a multi-leaf tree.
+    in_txn(&mut tree, 1, |tree, txn| {
+        for k in 0..n {
+            tree.insert(txn, &key(k), &val(k as u64)).expect("insert");
+        }
+    });
+    let pages_after_low_fill = tree.mapped_pages().len();
+
+    // Delete the entire low range (TTL expiry): low leaves drain but stay linked.
+    in_txn(&mut tree, 2, |tree, txn| {
+        for k in 0..n {
+            assert!(tree.delete(txn, &key(k)).expect("delete"));
+        }
+    });
+    tree.check_invariants().expect("invariants after expiry");
+
+    // Insert a DISJOINT higher range [n, 2n) — every key is greater than all stranded leaves, so it
+    // routes to the rightmost leaf and splits forward into NEW pages rather than reusing the drained
+    // low leaves.
+    in_txn(&mut tree, 3, |tree, txn| {
+        for k in n..(2 * n) {
+            tree.insert(txn, &key(k), &val(k as u64)).expect("insert");
+        }
+    });
+    tree.check_invariants().expect("invariants after high fill");
+    let pages_after_high_fill = tree.mapped_pages().len();
+
+    // The drained low leaves were NOT reclaimed/reused: the page high-water only grew. (When a
+    // free-list + empty-leaf unlink lands, this assertion is what should change — the high range
+    // would reuse the freed low pages and `pages_after_high_fill` would stay near
+    // `pages_after_low_fill`.)
+    assert!(
+        pages_after_high_fill > pages_after_low_fill,
+        "documented limitation: monotonic delete-without-reinsert strands pages \
+         (low_fill={pages_after_low_fill}, high_fill={pages_after_high_fill})"
+    );
+
+    // Correctness is unaffected: only the high range remains, fully intact and ordered.
+    let scanned: Vec<i64> = tree
+        .scan_all()
+        .expect("scan")
+        .into_iter()
+        .map(|(k, _)| decode_i64(&k))
+        .collect();
+    assert_eq!(scanned, (n..(2 * n)).collect::<Vec<_>>());
+}

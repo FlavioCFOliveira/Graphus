@@ -419,10 +419,23 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
     ///
     /// **Delete policy (documented):** the entry is removed in-place from its leaf; the leaf is
     /// allowed to underflow (no eager rebalancing/merge), which keeps deletes O(height) and
-    /// crash-recovery simple. A leaf that becomes empty stays linked in the right-sibling chain (a
-    /// future GC/merge pass reclaims empty leaves, `04 §6.3` GC). Point and range correctness are
-    /// unaffected by an underfull-but-sorted leaf, which the property tests assert against a
-    /// `BTreeMap` model across long delete sequences.
+    /// crash-recovery simple. A leaf that becomes empty stays linked in the right-sibling chain.
+    /// Point and range correctness are unaffected by an underfull-but-sorted leaf, which the
+    /// property tests assert against a `BTreeMap` model across long delete sequences.
+    ///
+    /// **Page reclamation (audited — rmp #222):** because the page allocator is append-only (no
+    /// free-list), an emptied leaf's page is not returned to the device here. A storage-engine audit
+    /// established this is a *bounded* space amplification, never an ACID/correctness defect:
+    /// - **Common case (delete-then-reinsert churn):** the emptied-but-linked leaf is **reused** —
+    ///   parent separators are unchanged, so a later in-range key routes back to the same physical
+    ///   page and refills it. Net page leak is **zero** (see the `btree_props` reclamation tests).
+    /// - **Worst case (delete-without-reinsert on a monotonic key space — time-series/TTL):** the
+    ///   drained leaves are stranded for the database's lifetime.
+    ///
+    /// Whole-page reclamation needs a persistent free-list plus a crash-safe empty-leaf unlink
+    /// (`04 §6.3` GC), tracked as a dedicated feature (rmp #225) rather than landed inline here: its
+    /// worst-case crash behaviour must be proven never to leave a page both reachable and
+    /// free-listed before it can touch the certified recovery path.
     ///
     /// # Errors
     /// Propagates a buffer-pool or WAL failure.
