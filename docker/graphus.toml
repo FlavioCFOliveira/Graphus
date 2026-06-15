@@ -1,0 +1,34 @@
+# Graphus — default container configuration.
+#
+# ============================================================================
+#  ⚠️  LOCAL QUICKSTART DEFAULT — SELF-SIGNED TLS, WELL-KNOWN PASSWORD
+# ============================================================================
+# The image entrypoint provisions a SELF-SIGNED TLS certificate and a random
+# JWT secret on first boot (persisted under /data), so Bolt-TCP and REST run
+# ENCRYPTED out of the box. The certificate is NOT trusted by any CA — clients
+# must opt out of verification (Bolt: `bolt+ssc://…`; REST: `curl -k`). This
+# config also ships a well-known admin password so the image "just works".
+#
+# DO NOT use these defaults beyond a local sandbox. For production, mount your
+# own config + a CA-issued certificate (set GRAPHUS_TLS_CERT_PATH /
+# GRAPHUS_TLS_KEY_PATH), set GRAPHUS_JWT_SECRET, and a strong admin password.
+# ----------------------------------------------------------------------------
+
+# All persistent state lives under /data — mount a host volume there so the
+# databases survive container restarts and recreation.
+store_path = "/data/graphus-data"
+uds_path   = "/data/graphus.sock"
+
+# Listeners bound to every interface (0.0.0.0) so the Docker host can reach them.
+# Both are served over TLS (the entrypoint supplies the certificate via the
+# GRAPHUS_TLS_CERT_PATH / GRAPHUS_TLS_KEY_PATH environment variables).
+#   7687 — Bolt over TCP (Neo4j driver ecosystem) — always requires TLS
+#   7474 — Web REST API
+bolt_tcp_addr = "0.0.0.0:7687"
+rest_addr     = "0.0.0.0:7474"
+
+# Bootstrap admin identity for Bolt LOGON and to mint REST Bearer tokens.
+# CHANGE THIS for anything beyond a local sandbox.
+[auth]
+admin_user     = "graphus"
+admin_password = "graphus-local"

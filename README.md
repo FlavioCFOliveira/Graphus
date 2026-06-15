@@ -58,6 +58,132 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Running with Docker
+
+Graphus ships a production-grade, **multi-architecture** container image of the
+`graphus-server`. A single image runs without problems on **x86 / amd64**,
+**aarch64 / arm64**, **Raspberry Pi 5**, and **Apple Silicon** (M1–M5, via Docker's
+Linux/arm64 runtime). All persistent state lives under **`/data`** — mount a volume
+there and your databases survive container restarts and recreation.
+
+> ⚠️ **Local quickstart defaults.** On first boot the entrypoint provisions a
+> **self-signed** TLS certificate and a random JWT secret (persisted under `/data`),
+> so Bolt + REST run **encrypted** out of the box — but the certificate is *not*
+> CA-trusted, and the image ships a well-known admin password. Clients must opt out
+> of verification (`bolt+ssc://…`, `curl -k`). **Do not use these defaults beyond a
+> local sandbox.** See [Production / TLS](#production--tls) to harden it.
+
+### Quick start
+
+```sh
+# Build the multi-arch-capable image from this repository (native arch):
+docker build -t graphus:latest .
+
+# Run it with a named volume for durable persistence and both listeners published:
+docker run -d --name graphus \
+  -p 7687:7687 \         # Bolt over TCP (Neo4j drivers)
+  -p 7474:7474 \         # Web REST API
+  -v graphus-data:/data \  # databases persist here
+  graphus:latest
+
+# Liveness check (unauthenticated; -k because the cert is self-signed):
+curl -k https://localhost:7474/health/live      # -> live
+```
+
+The default credentials for the local quickstart are user **`graphus`** /
+password **`graphus-local`**.
+
+### Using Docker Compose
+
+```sh
+docker compose up --build      # build + run (foreground)
+docker compose down            # stop; the named volume keeps your data
+docker compose down -v         # stop AND delete the data volume
+```
+
+See [`docker-compose.yml`](docker-compose.yml).
+
+### Connecting
+
+**Bolt** — point any Neo4j-ecosystem driver at `bolt+ssc://localhost:7687`. The
+`+ssc` scheme means *encrypted, self-signed certificate* (no CA verification),
+which matches the quickstart's self-signed cert. Example with the Python driver:
+
+```python
+from neo4j import GraphDatabase
+
+driver = GraphDatabase.driver("bolt+ssc://localhost:7687",
+                              auth=("graphus", "graphus-local"))
+with driver.session() as s:
+    s.run("CREATE (:Person {name: 'Ada'})")
+    print(s.run("MATCH (p:Person) RETURN p.name AS name").single()["name"])  # -> Ada
+driver.close()
+```
+
+(With a CA-trusted certificate, use `bolt+s://` instead.)
+
+**REST** — the API is served over TLS on port `7474`. The OpenAPI document is at
+`https://localhost:7474/openapi.json`, and `GET /health/live` / `GET /health/ready`
+report liveness/readiness. Use `curl -k` while the certificate is self-signed. The
+transactional `/db/<name>/tx*` routes require an `Authorization: Bearer <JWT>` token
+(HS256, signed with the server's `jwt_secret`).
+
+### Persistence
+
+Everything durable lives under `/data` (the record store at `/data/graphus-data`,
+the Unix socket at `/data/graphus.sock`, the audit log, the auto-generated JWT
+secret, and the self-signed certificate under `/data/tls`). Mount any of:
+
+```sh
+-v graphus-data:/data            # a Docker named volume (recommended)
+-v /srv/graphus:/data            # a host bind mount (an absolute host path)
+```
+
+The entrypoint runs the server as the unprivileged `graphus` user (uid 10001) and
+makes the mounted directory writable on startup.
+
+### Configuration
+
+The container reads [`docker/graphus.toml`](docker/graphus.toml) by default. Override
+it by mounting your own file over `/etc/graphus/graphus.toml`, by pointing
+`GRAPHUS_CONFIG` at another path, or by setting individual `GRAPHUS_*` environment
+variables (`GRAPHUS_STORE_PATH`, `GRAPHUS_BOLT_TCP_ADDR`, `GRAPHUS_REST_ADDR`,
+`GRAPHUS_UDS_PATH`, `GRAPHUS_JWT_SECRET`, `GRAPHUS_TLS_CERT_PATH`,
+`GRAPHUS_TLS_KEY_PATH`, …).
+
+### Production / TLS
+
+The quickstart uses a self-signed certificate. For anything beyond a local
+sandbox, supply a **CA-issued** certificate and your own secrets, so clients can
+verify the server (`bolt+s://`, plain `https://`):
+
+* set `GRAPHUS_TLS_CERT_PATH` / `GRAPHUS_TLS_KEY_PATH` (PEM) to your real cert+key
+  — this overrides the auto-generated self-signed pair;
+* set a strong `[auth] admin_password` and a real `GRAPHUS_JWT_SECRET`;
+
+```sh
+docker run -d --name graphus \
+  -p 7687:7687 -p 7474:7474 \
+  -v graphus-data:/data \
+  -v /srv/graphus/tls:/etc/graphus/tls:ro \
+  -e GRAPHUS_TLS_CERT_PATH=/etc/graphus/tls/fullchain.pem \
+  -e GRAPHUS_TLS_KEY_PATH=/etc/graphus/tls/privkey.pem \
+  -e GRAPHUS_JWT_SECRET="$(openssl rand -hex 32)" \
+  graphus:latest
+```
+
+### Multi-architecture builds
+
+To build and publish a manifest covering every supported architecture:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/flaviocfoliveira/graphus:latest --push .
+```
+
+CI builds both architectures on every change and publishes on tags — see
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml).
+
 ## License
 
 See [`LICENSE`](LICENSE).

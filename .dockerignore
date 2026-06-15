@@ -1,0 +1,24 @@
+# Keep the build context small and the image reproducible: ship only the
+# sources cargo needs, never local build output or VCS/editor cruft.
+target/
+**/target/
+.git/
+.github/
+**/*.rs.bk
+**/mutants.out*/
+.idea/
+.vscode/
+
+# Docs and local artefacts that do not affect the build.
+*.md
+!Cargo.toml
+specification/
+examples/
+scripts/
+
+# Local runtime data / secrets that must never leak into an image layer.
+graphus-data/
+*.sock
+*.key
+*.pem
+.env

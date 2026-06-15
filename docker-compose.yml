@@ -1,0 +1,39 @@
+# Graphus — local Docker Compose example.
+#
+#   docker compose up --build      # build from source and run
+#   docker compose down            # stop (the named volume keeps your data)
+#
+# Databases persist in the `graphus-data` named volume mounted at /data, so they
+# survive `docker compose down` and container recreation. Remove them with
+# `docker compose down -v`.
+#
+# ⚠️  This example uses the image's local-quickstart defaults: a SELF-SIGNED TLS
+#     certificate (provisioned on first boot) and a well-known admin password.
+#     Bolt + REST are encrypted but the cert is untrusted — connect with
+#     bolt+ssc:// (Bolt) and curl -k (REST). Do NOT use beyond a local sandbox;
+#     see docker/graphus.toml for how to supply a real (CA-issued) certificate.
+
+services:
+  graphus:
+    # Build the image from this repository...
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ...or pull a published multi-arch image instead (comment out `build:` above):
+    # image: ghcr.io/flaviocfoliveira/graphus:latest
+    container_name: graphus
+    restart: unless-stopped
+    ports:
+      - "7687:7687"   # Bolt over TCP (Neo4j drivers)
+      - "7474:7474"   # Web REST API
+    volumes:
+      - graphus-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsSk", "https://127.0.0.1:7474/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  graphus-data:
