@@ -26,6 +26,8 @@ use crate::rbac::{Catalog, Privilege};
 use crate::token::{Claims, JwtAuthenticator};
 use crate::{password, tls};
 
+use std::collections::HashSet;
+
 use graphus_core::capability::Clock;
 use rustls::ServerConfig;
 
@@ -80,6 +82,14 @@ pub struct Authenticator {
     catalog: Catalog,
     jwt: JwtAuthenticator,
     peers: PeerCredMap,
+    /// Explicit per-token revocation denylist (SEC-180, CWE-613): `jti`s that must be rejected even
+    /// while still signed and unexpired and even if the user's credential epoch has not moved. This
+    /// is the *targeted* revocation path (revoke one leaked token) complementing the credential-epoch
+    /// path (revoke all of a user's tokens on password change). It is an in-memory set: it is not
+    /// persisted, because tokens have bounded TTLs and the credential epoch (which *is* durable)
+    /// already covers the restart-spanning case; a process restart clears it. Callers prune it as
+    /// they see fit (e.g. on a timer past the max TTL).
+    revoked_jtis: HashSet<String>,
 }
 
 impl Authenticator {
@@ -96,6 +106,7 @@ impl Authenticator {
             catalog: Catalog::new(),
             jwt: JwtAuthenticator::new(jwt_secret)?,
             peers: PeerCredMap::new(),
+            revoked_jtis: HashSet::new(),
         })
     }
 
@@ -117,12 +128,16 @@ impl Authenticator {
 
     // ---- Per-user password operations --------------------------------------------------------
 
-    /// Sets (or replaces) `user`'s password, storing only its Argon2 hash.
+    /// Sets (or replaces) `user`'s password, storing only its Argon2 hash, and **bumps the user's
+    /// credential epoch** so every Bearer token issued under the previous epoch is invalidated
+    /// (SEC-180 forced logout).
     ///
     /// The password must meet the minimum strength policy
     /// ([`MIN_PASSWORD_LEN`](crate::password::MIN_PASSWORD_LEN) characters); a weak password is
     /// rejected before any hashing or store mutation. User existence is checked first so an unknown
-    /// user yields the more specific [`AuthError::NotFound`].
+    /// user yields the more specific [`AuthError::NotFound`]. The epoch is bumped only **after** the
+    /// new hash is stored, so a rejected (weak) password leaves both the hash and the epoch untouched
+    /// and outstanding tokens keep working.
     ///
     /// # Errors
     /// - [`AuthError::NotFound`] if the user does not exist.
@@ -145,7 +160,18 @@ impl Authenticator {
             .ok_or_else(|| AuthError::NotFound {
                 what: format!("user {user}"),
             })?;
+        // Distinguish setting the *initial* password (user creation/bootstrap) from *replacing* an
+        // existing one: only a genuine change must revoke outstanding tokens. Setting the first
+        // password has no prior tokens to invalidate, so it leaves the epoch at its baseline (0) —
+        // this keeps tokens minted out-of-band against a freshly-created user (epoch 0) valid.
+        let is_replacement = u.password_hash.is_some();
         u.password_hash = Some(hash);
+        if is_replacement {
+            // Forced logout (SEC-180): advance the credential epoch *after* the hash is in place, so
+            // any outstanding token (stamped with the old epoch) is rejected by
+            // `authenticate_bearer`. The user is known to exist (checked above), so this cannot fail.
+            self.catalog.bump_credential_version(user)?;
+        }
         Ok(())
     }
 
@@ -199,37 +225,84 @@ impl Authenticator {
         }
     }
 
-    /// REST Bearer: verifies a JWT (signature + expiry against `now_unix_secs`) and maps its subject
-    /// back to a catalog user, returning the validated [`Claims`].
+    /// REST Bearer: verifies a JWT (signature + expiry against `now_unix_secs`), then applies the
+    /// catalog-side checks the token module cannot — subject liveness, **credential-epoch revocation**,
+    /// and the explicit **`jti` denylist** — returning the validated [`Claims`] only if all pass
+    /// (SEC-180, CWE-613).
     ///
-    /// Resolving the subject to a *known* user closes the gap between "the token is validly signed"
-    /// and "the principal still exists": a token for a since-dropped user is rejected even though
-    /// its signature checks out.
+    /// The layered checks, in order (all deny-by-default, surfacing the same [`AuthError::Unauthenticated`]
+    /// so a rejected token never reveals *why* it was rejected):
+    /// 1. **Subject liveness** — the `sub` must still name a current catalog user (a token for a
+    ///    since-dropped user is rejected even though its signature checks out).
+    /// 2. **Credential epoch** — the token's `ver` must be **≥** the user's current credential epoch.
+    ///    A password change bumps the epoch, so every token minted before the change carries a lower
+    ///    `ver` and is rejected here: a forced password reset performs a forced logout.
+    /// 3. **`jti` denylist** — the token's `jti` must not be on the explicit revocation list
+    ///    ([`revoke_token`](Self::revoke_token)), so a single leaked token can be killed on demand.
     ///
     /// # Errors
     /// - [`AuthError::BadToken`] / [`AuthError::TokenExpired`] per [`JwtAuthenticator::verify_bearer`].
-    /// - [`AuthError::Unauthenticated`] if the subject names no current catalog user.
+    /// - [`AuthError::Unauthenticated`] if the subject names no current catalog user, the token's
+    ///   credential epoch is stale, or its `jti` is revoked.
     pub fn authenticate_bearer(&self, token: &str, now_unix_secs: u64) -> Result<Claims> {
         let claims = self.jwt.verify_bearer(token, now_unix_secs)?;
-        if self.catalog.has_user(&claims.sub) {
-            Ok(claims)
-        } else {
-            Err(AuthError::Unauthenticated)
+        // (1) Subject liveness AND (2) credential epoch are resolved together: a missing user yields
+        // `None`, which is deny-by-default. The token's `ver` must be at least the user's current
+        // epoch; a stale `ver` means a password change has since revoked it.
+        match self.catalog.credential_version(&claims.sub) {
+            Some(current) if claims.ver >= current => {}
+            _ => return Err(AuthError::Unauthenticated),
         }
+        // (3) Targeted revocation: a denylisted `jti` is rejected even while signed, unexpired, and
+        // at the current epoch.
+        if self.revoked_jtis.contains(&claims.jti) {
+            return Err(AuthError::Unauthenticated);
+        }
+        Ok(claims)
     }
 
-    /// Issues a Bearer token for `user`, valid for `ttl_secs` from `now_unix_secs`.
+    /// Issues a Bearer token for `user`, valid for `ttl_secs` from `now_unix_secs`, stamped with the
+    /// user's **current credential epoch** (SEC-180) so a later password change invalidates it.
     ///
     /// # Errors
     /// - [`AuthError::NotFound`] if the user does not exist (only known users get tokens).
     /// - [`AuthError::BadToken`] if encoding fails.
     pub fn issue_token(&self, user: &str, now_unix_secs: u64, ttl_secs: u64) -> Result<String> {
-        if !self.catalog.has_user(user) {
-            return Err(AuthError::NotFound {
+        // Fail-closed: a user with no resolvable credential epoch gets no token (deny-by-default).
+        let ver = self
+            .catalog
+            .credential_version(user)
+            .ok_or_else(|| AuthError::NotFound {
                 what: format!("user {user}"),
-            });
+            })?;
+        self.jwt.issue_token(user, now_unix_secs, ttl_secs, ver)
+    }
+
+    /// Revokes a single outstanding token by its `jti` (SEC-180 targeted revocation): after this,
+    /// [`authenticate_bearer`](Self::authenticate_bearer) rejects any token carrying that `jti`, even
+    /// while it is still signed, unexpired, and at the current credential epoch.
+    ///
+    /// This is the surgical complement to the credential-epoch path (which revokes *all* of a user's
+    /// tokens on a password change). The denylist is in-memory and process-local; entries can be
+    /// dropped once the token's `exp` has passed (see [`prune_revoked`](Self::prune_revoked)).
+    pub fn revoke_token(&mut self, jti: impl Into<String>) {
+        self.revoked_jtis.insert(jti.into());
+    }
+
+    /// Drops `jti`s from the revocation denylist (SEC-180), for the caller to prune entries whose
+    /// tokens have already expired (a `jti` for an expired token is harmless — `exp` rejects it — so
+    /// keeping it only wastes memory). Returns the number removed.
+    pub fn prune_revoked<I>(&mut self, expired_jtis: I) -> usize
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut removed = 0;
+        for jti in expired_jtis {
+            if self.revoked_jtis.remove(&jti) {
+                removed += 1;
+            }
         }
-        self.jwt.issue_token(user, now_unix_secs, ttl_secs)
+        removed
     }
 
     /// UDS `SO_PEERCRED`: resolves a connection's peer credentials to a catalog user.
@@ -453,6 +526,51 @@ mod tests {
             a.issue_token("ghost", 1000, 3600),
             Err(AuthError::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn password_change_revokes_outstanding_tokens() {
+        // Regression: SEC-180 (CWE-613). A password change must invalidate every Bearer token issued
+        // under the previous credential epoch (forced logout), even though the signature stays valid
+        // and the user still exists.
+        let mut a = fixture();
+        let token = a.issue_token("alice", 1000, 3600).unwrap();
+        // Valid before the reset.
+        assert_eq!(a.authenticate_bearer(&token, 1100).unwrap().sub, "alice");
+        // Reset the password (compromise response). This bumps the credential epoch.
+        a.set_password("alice", "rotated-strong-password").unwrap();
+        // The old token now carries a stale `ver` and is rejected, well before its `exp`.
+        assert_eq!(
+            a.authenticate_bearer(&token, 1100),
+            Err(AuthError::Unauthenticated)
+        );
+        // A freshly issued token (stamped at the new epoch) works again.
+        let fresh = a.issue_token("alice", 1100, 3600).unwrap();
+        assert_eq!(a.authenticate_bearer(&fresh, 1200).unwrap().sub, "alice");
+    }
+
+    #[test]
+    fn explicit_jti_revocation_kills_one_token() {
+        // Regression: SEC-180. A single leaked token can be revoked by its `jti` without touching the
+        // user's other tokens or changing the password.
+        let mut a = fixture();
+        let leaked = a.issue_token("alice", 1000, 3600).unwrap();
+        let other = a.issue_token("alice", 1000, 3600).unwrap();
+        let leaked_jti = a.authenticate_bearer(&leaked, 1100).unwrap().jti;
+        // Revoke only the leaked token.
+        a.revoke_token(leaked_jti.clone());
+        assert_eq!(
+            a.authenticate_bearer(&leaked, 1100),
+            Err(AuthError::Unauthenticated),
+            "the revoked token is rejected"
+        );
+        assert_eq!(
+            a.authenticate_bearer(&other, 1100).unwrap().sub,
+            "alice",
+            "the user's other token is unaffected"
+        );
+        // Pruning the (now expired) jti removes it from the in-memory denylist.
+        assert_eq!(a.prune_revoked([leaked_jti]), 1);
     }
 
     #[test]

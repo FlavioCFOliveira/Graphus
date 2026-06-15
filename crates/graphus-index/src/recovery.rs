@@ -89,15 +89,20 @@ impl<S: LogSink> WalRule for SharedWal<S> {
 /// `graphus-storage::paging::encode_patch`, reused so index and record WAL records share a format).
 ///
 /// # Panics
-/// Panics if `offset + bytes.len()` would run past [`PAGE_SIZE`].
+/// Panics if `offset + bytes.len()` would run past [`PAGE_SIZE`], or if `offset` does not fit a
+/// `u16` (the on-wire patch encodes the offset as a `u16`). Both are internal invariants — offsets
+/// are always produced inside `CELL_LIMIT` — so a panic here signals a caller bug, never adversarial
+/// input. The checked arithmetic and explicit narrowing harden against a future regression that
+/// would otherwise truncate the offset silently (SEC-208, CWE-190).
 #[must_use]
 pub fn encode_patch(offset: usize, bytes: &[u8]) -> Vec<u8> {
-    assert!(
-        offset + bytes.len() <= PAGE_SIZE,
-        "patch runs past the page"
-    );
+    let end = offset
+        .checked_add(bytes.len())
+        .expect("INVARIANT: patch offset + length does not overflow usize");
+    assert!(end <= PAGE_SIZE, "patch runs past the page");
+    let off16 = u16::try_from(offset).expect("INVARIANT: patch offset fits a u16 (page-bounded)");
     let mut out = Vec::with_capacity(2 + bytes.len());
-    out.extend_from_slice(&(offset as u16).to_le_bytes());
+    out.extend_from_slice(&off16.to_le_bytes());
     out.extend_from_slice(bytes);
     out
 }

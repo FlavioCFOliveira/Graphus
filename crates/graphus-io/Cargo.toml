@@ -45,11 +45,13 @@ tokio = { version = "1", default-features = false, features = [
 # optional `io-uring` feature, Linux-only. Not in the default build on non-macOS targets.
 libc = { version = "0.2", optional = true }
 
-# macOS needs `libc` unconditionally for the `fcntl(fd, F_FULLFSYNC)` durability barrier (APFS/HFS+
-# do not flush the drive's volatile write cache on a plain `fsync`; only `F_FULLFSYNC` does — see
-# `src/fullsync.rs`). On macOS the dependency is always present (not optional); Linux/other targets
-# never pull it unless the `io-uring` feature is enabled.
-[target.'cfg(target_os = "macos")'.dependencies]
+# `libc` is needed unconditionally on every Unix target for the platform-correct `O_NOFOLLOW`
+# constant used by the symlink-resistant temp-file creation in `atomic_replace_file`
+# (`src/replace.rs`, CWE-59/CWE-377 fix). It is read as a plain integer constant — no `unsafe` — so
+# the portable build stays `#![forbid(unsafe_code)]`. macOS additionally uses it for the
+# `fcntl(fd, F_FULLFSYNC)` durability barrier (APFS/HFS+ do not flush the drive's volatile write
+# cache on a plain `fsync`; only `F_FULLFSYNC` does — see `src/fullsync.rs`).
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

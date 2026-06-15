@@ -60,11 +60,11 @@ use axum::routing::{get, post};
 use graphus_auth::{AuthError, AuthProvider, Privilege};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Method};
 use serde_json::{Value as Json, json};
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::engine::{AccessMode, RestEngine, ResultStream, RunSummary, TxHandle, TxOrigin};
 use crate::negotiate::{Decode, Wire, request_decode, response_wire};
@@ -84,6 +84,11 @@ pub const DEFAULT_TX_TTL_NANOS: u64 = 30 * NANOS_PER_SEC;
 
 /// The `Idempotency-Key` request header name (`04 §8.2`).
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+/// `X-Content-Type-Options` header name (rmp #188). Not a constant in `http::header`.
+const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+/// `Referrer-Policy` header name (rmp #188). Not a constant in `http::header`.
+const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
 
 // =============================== built response ================================================
 
@@ -121,11 +126,22 @@ impl Built {
         Self::new(problem.status_code(), PROBLEM_JSON, body)
     }
 
-    /// Converts to the final `axum::Response`.
+    /// Converts to the final `axum::Response`, injecting defence-in-depth security headers (rmp #188,
+    /// CWE-693/CWE-525) on **every** REST response — including idempotency replays, since this is the
+    /// single conversion point:
+    ///
+    /// - `X-Content-Type-Options: nosniff` — stop MIME sniffing of typed bodies/problem+json.
+    /// - `Cache-Control: no-store` — keep dynamic/authenticated results out of intermediary and
+    ///   browser caches (a result or cached idempotent body must not be stored downstream).
+    /// - `Referrer-Policy: no-referrer` — never leak the request URL (which carries the `{db}` and
+    ///   transaction id) cross-origin.
     fn into_response(self) -> Response {
         Response::builder()
             .status(self.status)
             .header(CONTENT_TYPE, self.content_type)
+            .header(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"))
+            .header(CACHE_CONTROL, HeaderValue::from_static("no-store"))
+            .header(REFERRER_POLICY, HeaderValue::from_static("no-referrer"))
             .body(Body::from(self.body))
             // The status/header/body are all values we control, so this only fails on an internal
             // invariant violation; fall back to a bare 500 rather than panic.
@@ -169,6 +185,84 @@ pub trait AuthObserver: Send + Sync {
     fn on_auth_failure(&self, attempted: Option<&str>, reason: &str);
 }
 
+// =============================== CORS policy ===================================================
+
+/// The cross-origin resource-sharing policy the router applies (rmp #186, CWE-942).
+///
+/// **Fail-closed by default**: [`CorsConfig::default`] / [`CorsConfig::same_origin_only`] emit **no**
+/// `Access-Control-Allow-Origin`, so a browser refuses any cross-origin read of this authenticated,
+/// state-mutating database API. A wildcard is never produced. Cross-origin access is opt-in via an
+/// explicit allow-list of trusted origins ([`CorsConfig::allow_origins`]); credentials are advertised
+/// only when an allow-list is set (never with a wildcard, which the CORS spec forbids anyway).
+///
+/// The server (rmp #20) constructs this from configuration and passes it to the router via
+/// [`AppState::with_cors`]; the previous unconditional `CorsLayer::permissive()` is gone.
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    /// The exact origins allowed to make cross-origin requests (scheme + host + optional port, e.g.
+    /// `https://app.example`). Empty ⇒ same-origin only (no CORS headers emitted).
+    allowed_origins: Vec<HeaderValue>,
+    /// Whether to advertise `Access-Control-Allow-Credentials: true`. Honoured only when
+    /// `allowed_origins` is non-empty (credentials with a wildcard are invalid CORS).
+    allow_credentials: bool,
+}
+
+impl CorsConfig {
+    /// The secure default: **same-origin only**, no cross-origin sharing (no CORS headers). Identical
+    /// to [`CorsConfig::default`]; named for call-site clarity.
+    #[must_use]
+    pub fn same_origin_only() -> Self {
+        Self::default()
+    }
+
+    /// Allow cross-origin requests **only** from the given exact origins (an allow-list). Each origin
+    /// is a full origin string (`https://app.example`); malformed entries are silently dropped (they
+    /// can never match a real `Origin` header, so they are inert rather than a panic).
+    #[must_use]
+    pub fn allow_origins<I, S>(origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let allowed_origins = origins
+            .into_iter()
+            .filter_map(|o| HeaderValue::from_str(o.as_ref()).ok())
+            .collect();
+        Self {
+            allowed_origins,
+            allow_credentials: false,
+        }
+    }
+
+    /// Advertise `Access-Control-Allow-Credentials: true` (builder). No effect unless an allow-list is
+    /// set — credentials with a wildcard origin are invalid per the Fetch standard and never emitted.
+    #[must_use]
+    pub fn with_credentials(mut self, allow: bool) -> Self {
+        self.allow_credentials = allow;
+        self
+    }
+
+    /// Builds the `tower-http` [`CorsLayer`] for this policy. With no allow-list, the layer carries
+    /// no `allow_origin`, so it never emits `Access-Control-Allow-Origin` (fail-closed).
+    fn into_layer(self) -> CorsLayer {
+        let layer = CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT]);
+        if self.allowed_origins.is_empty() {
+            // Same-origin only: do NOT set allow_origin → no ACAO header at all.
+            layer
+        } else {
+            let layer = layer.allow_origin(AllowOrigin::list(self.allowed_origins));
+            // Credentials only ever paired with an explicit allow-list (never a wildcard).
+            if self.allow_credentials {
+                layer.allow_credentials(true)
+            } else {
+                layer
+            }
+        }
+    }
+}
+
 /// The shared application state every handler reads (cloned per request — all fields are `Arc`).
 ///
 /// Generic over the concrete [`RestEngine`] so the seam stays boxing-free; the server constructs it
@@ -184,6 +278,9 @@ pub struct AppState<E: RestEngine> {
     /// An optional audit observer (rmp #70): when set, [`authenticate`] notifies it of each
     /// Bearer-validation outcome. `None` keeps the router byte-for-byte audit-free (e.g. the tests).
     auth_observer: Option<Arc<dyn AuthObserver>>,
+    /// The CORS policy (rmp #186). Defaults to **fail-closed** same-origin only; the server configures
+    /// an allow-list via [`with_cors`](Self::with_cors).
+    cors: CorsConfig,
 }
 
 // Manual `Clone` (deriving would wrongly require `E: Clone`; the fields are all `Arc`).
@@ -195,6 +292,7 @@ impl<E: RestEngine> Clone for AppState<E> {
             registry: Arc::clone(&self.registry),
             clock: Arc::clone(&self.clock),
             auth_observer: self.auth_observer.clone(),
+            cors: self.cors.clone(),
         }
     }
 }
@@ -215,6 +313,8 @@ impl<E: RestEngine + 'static> AppState<E> {
             registry,
             clock,
             auth_observer: None,
+            // Fail-closed by default (rmp #186): no cross-origin sharing unless the server opts in.
+            cors: CorsConfig::default(),
         }
     }
 
@@ -224,6 +324,14 @@ impl<E: RestEngine + 'static> AppState<E> {
     #[must_use]
     pub fn with_auth_observer(mut self, observer: Arc<dyn AuthObserver>) -> Self {
         self.auth_observer = Some(observer);
+        self
+    }
+
+    /// Sets the CORS policy (rmp #186). The default is fail-closed same-origin only; the server passes
+    /// a configured allow-list here. Returns `self` for chaining at construction.
+    #[must_use]
+    pub fn with_cors(mut self, cors: CorsConfig) -> Self {
+        self.cors = cors;
         self
     }
 }
@@ -262,6 +370,9 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// wired here as `tower-http` layers. The request body is capped at [`MAX_REQUEST_BODY_BYTES`]
 /// (`413` past the cap) so untrusted input cannot exhaust memory.
 pub fn router<E: RestEngine + Send + Sync + 'static>(state: AppState<E>) -> Router {
+    // Take the configured CORS policy out of the state before it is moved into the router; the policy
+    // is a layer-construction input, not per-request state.
+    let cors_layer = state.cors.clone().into_layer();
     Router::new()
         .route("/openapi.json", get(openapi_doc))
         .route("/db/{db}/tx", post(begin::<E>))
@@ -275,10 +386,11 @@ pub fn router<E: RestEngine + Send + Sync + 'static>(state: AppState<E>) -> Rout
         // Bound the buffered request body explicitly (`413` past the cap) so untrusted input cannot
         // exhaust server memory. Replaces axum's implicit, un-auditable 2 MiB default.
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        // HTTP niceties (`04 §8.2`): permissive CORS + gzip response compression, wired for
-        // production use. Their exhaustive behaviour is tower-http's, not re-tested here.
+        // HTTP niceties (`04 §8.2`): a **fail-closed, allow-list** CORS policy (rmp #186 — never
+        // `permissive()`/wildcard) + gzip response compression, wired for production use. The CORS
+        // policy comes from `AppState::with_cors` (default: same-origin only).
         .layer(CompressionLayer::new())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
         .with_state(state)
 }
 
@@ -297,8 +409,7 @@ async fn begin<E: RestEngine + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    with_idempotency(&state, &headers, |state| {
-        let identity = authenticate(state, &headers)?;
+    with_idempotency(&state, &headers, |state, identity| {
         let req = decode_request(&headers, &body)?;
         // `06 §4`: validate access_mode; an invalid value is a 400 and the tx is NOT opened.
         let mode = parse_access_mode(&req.access_mode).map_err(|bad| {
@@ -306,7 +417,7 @@ async fn begin<E: RestEngine + 'static>(
                 "invalid access_mode {bad}: expected \"READ\" or \"WRITE\""
             ))
         })?;
-        authorize_mode(state, &identity, mode)?;
+        authorize_mode(state, identity, mode)?;
 
         let handle = state
             .engine
@@ -314,7 +425,7 @@ async fn begin<E: RestEngine + 'static>(
                 &db,
                 mode,
                 TxOrigin {
-                    principal: &identity,
+                    principal: identity,
                     explicit: true,
                 },
             )
@@ -381,13 +492,18 @@ async fn commit_tx<E: RestEngine + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // If idempotency-cached, replay before any side effect.
-    if let Some(replay) = replay_idempotent(&state, &headers) {
+    // Authenticate BEFORE any idempotency replay (rmp #182): an anonymous caller never reaches the
+    // cache, and the replay below is scoped to this principal so it can only return this user's body.
+    let identity = match authenticate(&state, &headers) {
+        Ok(id) => id,
+        Err(p) => return Built::from(p).into_response(),
+    };
+    // If idempotency-cached for this principal, replay before any side effect.
+    if let Some(replay) = replay_idempotent(&state, &headers, &identity) {
         return replay.into_response();
     }
 
     let outcome: Result<(RunRequest, TxHandle), Problem> = (|| {
-        let identity = authenticate(&state, &headers)?;
         let req = decode_request(&headers, &body)?;
         let now = state.now_nanos();
         // Reap first if expired (so a long-idle commit fails as gone rather than committing stale).
@@ -440,7 +556,7 @@ async fn commit_tx<E: RestEngine + 'static>(
         wire,
     )
     .unwrap_or_else(Built::problem);
-    cache_and_respond(&state, &headers, built)
+    cache_and_respond(&state, &headers, &identity, built)
 }
 
 /// `DELETE /db/{db}/tx/{id}` → roll back the open transaction (`04 §8.2`).
@@ -475,12 +591,17 @@ async fn auto_commit<E: RestEngine + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(replay) = replay_idempotent(&state, &headers) {
+    // Authenticate BEFORE any idempotency replay (rmp #182): anonymous callers never reach the cache,
+    // and the replay below is scoped to this principal.
+    let identity = match authenticate(&state, &headers) {
+        Ok(id) => id,
+        Err(p) => return Built::from(p).into_response(),
+    };
+    if let Some(replay) = replay_idempotent(&state, &headers, &identity) {
         return replay.into_response();
     }
 
     let outcome: Result<(RunRequest, TxHandle), Problem> = (|| {
-        let identity = authenticate(&state, &headers)?;
         let req = decode_request(&headers, &body)?;
         let mode = parse_access_mode(&req.access_mode).map_err(|bad| {
             Problem::bad_request(format!(
@@ -532,7 +653,7 @@ async fn auto_commit<E: RestEngine + 'static>(
         wire,
     )
     .unwrap_or_else(Built::problem);
-    cache_and_respond(&state, &headers, built)
+    cache_and_respond(&state, &headers, &identity, built)
 }
 
 /// `POST /db/{db}/graph` → run a read query and return a **deduplicated graph projection** of its
@@ -1071,39 +1192,62 @@ fn into_response(built: Result<Built, Problem>) -> Response {
 
 // =============================== idempotency ===================================================
 
-/// Runs `f` (a finalising handler body) with `Idempotency-Key` dedup wrapped around it: replays a
-/// cached response if the key was seen, otherwise runs `f`, caches its `Built`, and returns it
-/// (`04 §8.2`). `f` returns `Result<Built, Problem>`; either is cached so a retry replays the exact
-/// first outcome (success *or* the first error).
+/// Runs `f` (a finalising handler body) with `Idempotency-Key` dedup wrapped around it, **after**
+/// authentication (rmp #182).
+///
+/// Security ordering: the request is authenticated **first** — an unauthenticated caller can never
+/// reach the idempotency cache, so a cached (authenticated) response is never replayed to an
+/// anonymous caller (CWE-306). The cache is then consulted scoped by the **resolved principal**, so a
+/// key collision across users misses (CWE-639 IDOR). `f` receives the authenticated `identity` and
+/// returns `Result<Built, Problem>`; either is cached so a retry replays the exact first outcome.
 fn with_idempotency<E, F>(state: &AppState<E>, headers: &HeaderMap, f: F) -> Response
 where
     E: RestEngine,
-    F: FnOnce(&AppState<E>) -> Result<Built, Problem>,
+    F: FnOnce(&AppState<E>, &str) -> Result<Built, Problem>,
 {
-    if let Some(replay) = replay_idempotent(state, headers) {
+    // Authenticate BEFORE any replay (rmp #182): an unauthenticated request fails here with 401 and
+    // never observes another caller's cached body.
+    let identity = match authenticate(state, headers) {
+        Ok(id) => id,
+        Err(p) => return Built::from(p).into_response(),
+    };
+    if let Some(replay) = replay_idempotent(state, headers, &identity) {
         return replay.into_response();
     }
-    let built = f(state).unwrap_or_else(Built::problem);
-    cache_and_respond(state, headers, built)
+    let built = f(state, &identity).unwrap_or_else(Built::problem);
+    cache_and_respond(state, headers, &identity, built)
 }
 
-/// Caches `built` under the request's `Idempotency-Key` (if any) and returns it as a `Response`.
+/// Caches `built` under the request's `(principal, Idempotency-Key)` (if a key is present) and
+/// returns it as a `Response` (rmp #182: principal-scoped; rmp #184: bounded by the registry).
 fn cache_and_respond<E: RestEngine>(
     state: &AppState<E>,
     headers: &HeaderMap,
+    principal: &str,
     built: Built,
 ) -> Response {
     if let Some(key) = headers.get(IDEMPOTENCY_KEY).and_then(|v| v.to_str().ok()) {
-        state.registry.store_response(key, built.cached());
+        state
+            .registry
+            .store_response(principal, key, state.now_nanos(), built.cached());
     }
     built.into_response()
 }
 
-/// If the request carries an `Idempotency-Key` already seen, returns the cached [`Built`] to replay
-/// (`04 §8.2`); otherwise `None`.
-fn replay_idempotent<E: RestEngine>(state: &AppState<E>, headers: &HeaderMap) -> Option<Built> {
+/// If the request carries an `Idempotency-Key` already seen **for this authenticated principal**,
+/// returns the cached [`Built`] to replay (`04 §8.2`, rmp #182); otherwise `None`.
+///
+/// The lookup is namespaced by `principal`, so it can only ever return a response this same principal
+/// produced — never another tenant's body.
+fn replay_idempotent<E: RestEngine>(
+    state: &AppState<E>,
+    headers: &HeaderMap,
+    principal: &str,
+) -> Option<Built> {
     let key = headers.get(IDEMPOTENCY_KEY)?.to_str().ok()?;
-    let cached = state.registry.cached_response(key)?;
+    let cached = state
+        .registry
+        .cached_response(principal, key, state.now_nanos())?;
     Some(Built::new(
         StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK),
         &cached.content_type,

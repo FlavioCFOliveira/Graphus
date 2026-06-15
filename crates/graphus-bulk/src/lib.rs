@@ -60,5 +60,5 @@ pub mod value_parse;
 
 pub use dump::{dump_nodes, dump_relationships};
 pub use header::{ColumnRole, HeaderError, NodeHeader, PropertyType, RelHeader, ScalarType};
-pub use import::{BulkImporter, DEFAULT_BATCH_SIZE, ImportStats};
+pub use import::{BulkImporter, DEFAULT_BATCH_SIZE, DuplicatePolicy, ImportStats};
 pub use value_parse::ValueParseError;

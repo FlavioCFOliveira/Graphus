@@ -8,7 +8,13 @@
 //! graphus-cli --uds /run/graphus.sock --user alice            # interactive (prompts for password)
 //! graphus-cli -c "MATCH (n) RETURN count(n)"                  # one-shot, non-interactive
 //! GRAPHUS_PASSWORD=secret graphus-cli --user alice -c "RETURN 1"
+//! graphus-cli --user alice --password-file /run/secrets/pw -c "RETURN 1"   # secure non-interactive
 //! ```
+//!
+//! Passwords are resolved in order: `--password-file` / `$GRAPHUS_PASSWORD` / interactive no-echo
+//! prompt. The inline `--password` flag is still accepted for compatibility but is **discouraged**
+//! (SEC-185): a process argument is visible to other local users (`ps`, `/proc/<pid>/cmdline`) and is
+//! saved in shell history, so using it prints a warning to stderr.
 //!
 //! The wire format is **not** reimplemented here: the client ([`client::BoltClient`]) drives the
 //! symmetric Bolt 5.4 codec from `graphus-bolt` over the socket. See that module and [`repl`] for the
@@ -44,9 +50,18 @@ struct Args {
     #[arg(long, short = 'u', value_name = "USER", default_value = "neo4j")]
     user: String,
 
-    /// The password. If omitted, read from $GRAPHUS_PASSWORD, else prompted (never echoed).
+    /// **Discouraged:** the password passed inline. A process argument is visible to every local
+    /// user via `ps`/`/proc/<pid>/cmdline` and is saved in shell history (SEC-185, CWE-214/522).
+    /// Prefer `--password-file`, `$GRAPHUS_PASSWORD`, or the interactive no-echo prompt. Using this
+    /// flag prints a warning to stderr.
     #[arg(long, short = 'p', value_name = "PASSWORD")]
     password: Option<String>,
+
+    /// Read the password from the first line of this file (secure non-interactive alternative to
+    /// `--password`: the secret never appears in the process arguments). Mutually exclusive with
+    /// `--password`.
+    #[arg(long, value_name = "PATH", conflicts_with = "password")]
+    password_file: Option<PathBuf>,
 
     /// Run a single statement non-interactively, print its result, and exit.
     #[arg(short = 'c', long = "command", value_name = "CYPHER")]
@@ -139,7 +154,7 @@ fn main() -> ExitCode {
 
 /// Resolves credentials, connects + logs in, then runs `-c` once or starts the REPL.
 fn run(args: Args) -> Result<(), String> {
-    let password = resolve_password(args.password)?;
+    let password = resolve_password(args.password, args.password_file)?;
 
     let mut client = BoltClient::connect_uds(&args.uds).map_err(|e| match e {
         ClientError::Io(io) => format!("cannot connect to {}: {io}", args.uds.display()),
@@ -191,18 +206,76 @@ fn run_once(
     }
 }
 
-/// Resolves the password from `--password`, else `$GRAPHUS_PASSWORD`, else a no-echo prompt.
+/// Where a password should be sourced from, in precedence order. Computed by [`password_source`] (a
+/// pure, unit-testable function) and then materialised by [`resolve_password`].
+#[derive(Debug, PartialEq, Eq)]
+enum PasswordSource {
+    /// The inline `--password` flag. **Discouraged** (SEC-185): visible in `ps`/`/proc`; a warning is
+    /// emitted when this is used.
+    Arg(String),
+    /// The first line of the `--password-file`.
+    File(PathBuf),
+    /// The `$GRAPHUS_PASSWORD` environment variable.
+    Env,
+    /// An interactive no-echo prompt.
+    Prompt,
+}
+
+/// Decides where the password comes from, given the resolved flags. Pure (no I/O), so the precedence
+/// and the SEC-185 argv-discouragement are unit-testable. `--password` and `--password-file` are
+/// mutually exclusive at the clap level, so at most one is `Some`.
+fn password_source(flag: Option<String>, file: Option<PathBuf>) -> PasswordSource {
+    if let Some(pw) = flag {
+        return PasswordSource::Arg(pw);
+    }
+    if let Some(path) = file {
+        return PasswordSource::File(path);
+    }
+    if std::env::var_os(PASSWORD_ENV).is_some() {
+        return PasswordSource::Env;
+    }
+    PasswordSource::Prompt
+}
+
+/// Resolves the password from (in order) `--password`, `--password-file`, `$GRAPHUS_PASSWORD`, else a
+/// no-echo prompt.
 ///
 /// The prompt is written to stderr (so `-c` output piped from stdout stays clean) and the typed
 /// characters are never echoed (`rpassword`).
-fn resolve_password(flag: Option<String>) -> Result<String, String> {
-    if let Some(pw) = flag {
-        return Ok(pw);
+///
+/// # Security (SEC-185, CWE-214/522)
+/// `--password` puts the secret in the process arguments — visible to any local user via `ps` /
+/// `/proc/<pid>/cmdline` and saved in shell history. When it is used, a warning is printed to stderr
+/// pointing at the safer alternatives. `--password-file` keeps the secret off the argument list; the
+/// `$GRAPHUS_PASSWORD` env var is less exposed than argv but still readable via `/proc/<pid>/environ`,
+/// so the interactive prompt remains the most protected path.
+fn resolve_password(flag: Option<String>, file: Option<PathBuf>) -> Result<String, String> {
+    match password_source(flag, file) {
+        PasswordSource::Arg(pw) => {
+            eprintln!(
+                "graphus-cli: warning: passing --password on the command line is insecure (visible \
+                 via `ps` and /proc, and saved in shell history). Prefer --password-file, \
+                 $GRAPHUS_PASSWORD, or the interactive prompt."
+            );
+            Ok(pw)
+        }
+        PasswordSource::File(path) => read_password_file(&path),
+        PasswordSource::Env => {
+            std::env::var(PASSWORD_ENV).map_err(|e| format!("could not read ${PASSWORD_ENV}: {e}"))
+        }
+        PasswordSource::Prompt => rpassword::prompt_password("Password: ")
+            .map_err(|e| format!("could not read password: {e}")),
     }
-    if let Ok(pw) = std::env::var(PASSWORD_ENV) {
-        return Ok(pw);
-    }
-    rpassword::prompt_password("Password: ").map_err(|e| format!("could not read password: {e}"))
+}
+
+/// Reads a password from the first line of `path`, stripping a single trailing `\n`/`\r\n`. The rest
+/// of the file is ignored so a trailing newline (as most editors add) does not become part of the
+/// secret.
+fn read_password_file(path: &std::path::Path) -> Result<String, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read password file {}: {e}", path.display()))?;
+    let first = contents.lines().next().unwrap_or("");
+    Ok(first.to_owned())
 }
 
 // A tiny compile-time smoke test that the binary's pieces are wired (`Action` is part of the public
@@ -239,11 +312,71 @@ mod tests {
     }
 
     #[test]
-    fn password_flag_takes_precedence_over_env() {
-        // The flag wins even if the env var is set; this test sets neither beyond the flag.
+    fn password_flag_takes_precedence() {
+        // The inline flag still wins (compat), but its source is `Arg` so a warning is emitted by
+        // `resolve_password`.
         assert_eq!(
-            resolve_password(Some("flagpw".to_owned())).unwrap(),
+            resolve_password(Some("flagpw".to_owned()), None).unwrap(),
             "flagpw"
+        );
+    }
+
+    // Regression: SEC-185 — the password must not be silently sourced from argv. `--password` is
+    // still accepted for compatibility, but it resolves to the `Arg` source, which is exactly the
+    // branch `resolve_password` warns about; the safer sources (`--password-file`, env, prompt) take
+    // over the moment the flag is absent. This pins the precedence so a future refactor cannot make
+    // argv the default path again.
+    #[test]
+    fn sec185_password_source_precedence_keeps_argv_explicit() {
+        // The inline flag, when present, is the (discouraged, warned-about) `Arg` source — never a
+        // silent default.
+        assert_eq!(
+            password_source(Some("pw".to_owned()), None),
+            PasswordSource::Arg("pw".to_owned())
+        );
+        // With no flag, a `--password-file` is preferred (secret off the argument list).
+        assert_eq!(
+            password_source(None, Some(PathBuf::from("/run/secrets/pw"))),
+            PasswordSource::File(PathBuf::from("/run/secrets/pw"))
+        );
+        // With neither flag nor file and no env var set, the interactive prompt is the fallback — the
+        // password is never taken from argv implicitly.
+        // SAFETY of test: the env var is process-global; ensure it is unset for this assertion.
+        // (No other test in this module sets it.)
+        unsafe {
+            std::env::remove_var(PASSWORD_ENV);
+        }
+        assert_eq!(password_source(None, None), PasswordSource::Prompt);
+    }
+
+    #[test]
+    fn password_file_is_read_and_trailing_newline_stripped() {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("graphus-cli-pwfile-{nanos}-{}", std::process::id()));
+        std::fs::write(&path, "s3cr3t\n").unwrap();
+
+        let pw = resolve_password(None, Some(path.clone())).unwrap();
+        assert_eq!(pw, "s3cr3t", "the trailing newline must not be part of the secret");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn password_and_password_file_are_mutually_exclusive() {
+        let parsed = Args::try_parse_from([
+            "graphus-cli",
+            "--password",
+            "x",
+            "--password-file",
+            "/tmp/pw",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--password and --password-file must conflict at the clap level"
         );
     }
 

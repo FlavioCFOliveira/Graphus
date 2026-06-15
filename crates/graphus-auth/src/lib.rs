@@ -87,4 +87,4 @@ pub use limits::{RateLimiter, RequestLimits};
 pub use peercred::{PeerCred, PeerCredMap, PeerCredSource};
 pub use rbac::{Action, Catalog, Privilege, Resource, Role, User};
 pub use tls::{into_shared, tls_server_config};
-pub use token::{Claims, JwtAuthenticator};
+pub use token::{Claims, DEFAULT_AUDIENCE, DEFAULT_ISSUER, JwtAuthenticator};

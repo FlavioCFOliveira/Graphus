@@ -100,55 +100,92 @@ impl LockTable {
     /// make progress and the same victim is picked deterministically (`04 §5.7`).
     #[must_use]
     pub fn find_deadlock_victim(&self) -> Option<TxnId> {
-        // Depth-first cycle detection over the wait-for graph; collect every transaction on any
-        // cycle, then pick the youngest.
+        // SEC-199 (CWE-674): cycle detection over the wait-for graph is **iterative** — an explicit
+        // work stack rather than recursion — so an adversarially long wait-for chain
+        // (T1 -> T2 -> ... -> Tn) cannot exhaust the call stack and crash the process. It collects
+        // every transaction on any cycle, then picks the youngest (largest `TxnId`) as the victim,
+        // exactly as the previous recursive form did.
         let mut on_cycle: HashSet<TxnId> = HashSet::default();
-        let mut visiting: HashSet<TxnId> = HashSet::default();
         let mut visited: HashSet<TxnId> = HashSet::default();
 
-        let nodes: Vec<TxnId> = self.waits_for.keys().copied().collect();
-        for start in nodes {
-            if !visited.contains(&start) {
-                let mut stack: Vec<TxnId> = Vec::new();
-                self.dfs(
-                    start,
-                    &mut visiting,
-                    &mut visited,
-                    &mut stack,
-                    &mut on_cycle,
-                );
+        let roots: Vec<TxnId> = self.waits_for.keys().copied().collect();
+        for root in roots {
+            if visited.contains(&root) {
+                continue;
             }
+            self.collect_cycles_from(root, &mut visited, &mut on_cycle);
         }
         on_cycle.into_iter().max_by_key(|t| t.0)
     }
 
-    fn dfs(
+    /// Iterative DFS from `root` over the wait-for graph, recording every node found on a cycle.
+    ///
+    /// Maintains an explicit traversal `path` (the current DFS stack of nodes) and a per-node child
+    /// iterator cursor, emulating the recursion without using the call stack. A back-edge to a node
+    /// already on `path` marks that suffix of `path` as a cycle. `visited` is shared across roots so
+    /// the whole graph is explored in `O(V + E)` total.
+    fn collect_cycles_from(
         &self,
-        node: TxnId,
-        visiting: &mut HashSet<TxnId>,
+        root: TxnId,
         visited: &mut HashSet<TxnId>,
-        stack: &mut Vec<TxnId>,
         on_cycle: &mut HashSet<TxnId>,
     ) {
-        visiting.insert(node);
-        stack.push(node);
-        if let Some(targets) = self.waits_for.get(&node) {
-            for &next in targets {
-                if visiting.contains(&next) {
-                    // Found a back-edge: everything from `next` to the top of the stack is a cycle.
-                    if let Some(pos) = stack.iter().position(|t| *t == next) {
-                        for t in &stack[pos..] {
+        // Each frame: the node and its outgoing neighbours captured as a Vec we index into.
+        struct Frame {
+            node: TxnId,
+            targets: Vec<TxnId>,
+            next: usize,
+        }
+        // `on_path` mirrors the frames for O(1) back-edge membership tests.
+        let mut on_path: HashSet<TxnId> = HashSet::default();
+        let mut path: Vec<TxnId> = Vec::new();
+        let mut stack: Vec<Frame> = Vec::new();
+
+        let neighbours = |n: TxnId| -> Vec<TxnId> {
+            self.waits_for
+                .get(&n)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        };
+
+        visited.insert(root);
+        on_path.insert(root);
+        path.push(root);
+        stack.push(Frame {
+            node: root,
+            targets: neighbours(root),
+            next: 0,
+        });
+
+        while let Some(frame) = stack.last_mut() {
+            if frame.next < frame.targets.len() {
+                let next = frame.targets[frame.next];
+                frame.next += 1;
+                if on_path.contains(&next) {
+                    // Back-edge: everything from `next` to the top of `path` is on a cycle.
+                    if let Some(pos) = path.iter().position(|t| *t == next) {
+                        for t in &path[pos..] {
                             on_cycle.insert(*t);
                         }
                     }
                 } else if !visited.contains(&next) {
-                    self.dfs(next, visiting, visited, stack, on_cycle);
+                    visited.insert(next);
+                    on_path.insert(next);
+                    path.push(next);
+                    let targets = neighbours(next);
+                    stack.push(Frame {
+                        node: next,
+                        targets,
+                        next: 0,
+                    });
                 }
+            } else {
+                // Done with this node; pop it off both the path and the work stack.
+                on_path.remove(&frame.node);
+                path.pop();
+                stack.pop();
             }
         }
-        stack.pop();
-        visiting.remove(&node);
-        visited.insert(node);
     }
 
     /// The current holder of `key`, if any. Test/inspection aid.

@@ -16,14 +16,53 @@ fn io_err(context: &str, e: &std::io::Error) -> GraphusError {
     GraphusError::Storage(format!("{context}: {e}"))
 }
 
-/// The sibling temp path for `target` (same directory ⇒ same filesystem ⇒ `rename(2)` is atomic).
+/// A process-and-call-unique, hard-to-predict suffix for the temp sibling name.
+///
+/// Combines the pid, a monotonically increasing per-process counter, and the high-resolution
+/// clock. The goal is **not** cryptographic unpredictability but to defeat the
+/// deterministic-name attack (CWE-377): an attacker can no longer pre-plant a symlink at the
+/// known temp path before the replace runs, because the name is not known in advance. The
+/// real guarantee against link-following is `O_EXCL | O_NOFOLLOW` at creation time (see
+/// [`create_fresh_temp`]); this suffix only removes the predictable, reusable target.
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(".graphus-replace-{}-{n}-{nanos}.tmp", std::process::id())
+}
+
+/// A sibling temp path for `target` with an unpredictable suffix (same directory ⇒ same
+/// filesystem ⇒ `rename(2)` is atomic). The randomized suffix defeats the predictable-temp
+/// attack; the actual symlink/clobber defence is enforced when the file is created.
 fn temp_sibling(target: &Path) -> Result<PathBuf> {
     let name = target.file_name().ok_or_else(|| {
         GraphusError::Storage(format!("target path {} has no file name", target.display()))
     })?;
     let mut tmp = name.to_os_string();
-    tmp.push(".graphus-replace-tmp");
+    tmp.push(unique_suffix());
     Ok(target.with_file_name(tmp))
+}
+
+/// Atomically creates `tmp` as a brand-new regular file, refusing to follow a symlink or clobber
+/// an existing entry (CWE-59 / CWE-377). `O_CREAT | O_EXCL` makes the create fail if anything
+/// already exists at the path (including a symlink), and `O_NOFOLLOW` refuses to traverse a final
+/// symlink — so a local attacker who plants a symlink (or a file) at the temp path cannot redirect
+/// our write onto an attacker-chosen target. Permissions are set explicitly to `0600` rather than
+/// relying on the process umask.
+fn create_fresh_temp(tmp: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_CREAT | O_EXCL: fail if the path already exists (incl. a symlink)
+        .custom_flags(libc::O_NOFOLLOW) // refuse to follow a final symlink
+        .mode(0o600) // owner-only; do not depend on umask
+        .open(tmp)
+        .map(|_| ()) // close immediately; `fill` reopens and writes the content
+        .map_err(|e| io_err(&format!("securely creating temp {}", tmp.display()), &e))
 }
 
 /// `fsync`s the directory containing `file`, hardening the just-renamed directory entry — the POSIX
@@ -60,17 +99,12 @@ where
     F: FnOnce(&Path) -> Result<()>,
 {
     let tmp = temp_sibling(target)?;
-    // Clear any stale temp left by a previously-aborted replace, so `fill` starts from a clean slate.
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(io_err(
-                &format!("removing stale temp {}", tmp.display()),
-                &e,
-            ));
-        }
-    }
+    // Securely create the temp first with `O_CREAT|O_EXCL|O_NOFOLLOW` (CWE-59/CWE-377): this fails
+    // if anything already exists at the (unpredictable) path — defeating a planted symlink or a
+    // pre-created file — and never follows a final symlink. The randomized name makes a stale
+    // collision practically impossible; on the off chance of one, `create_new` rejects it as an Err
+    // rather than reusing a possibly-attacker-controlled file.
+    create_fresh_temp(&tmp)?;
     // Produce + durably persist the new content into the temp. On failure, abort and leave `target`.
     if let Err(e) = fill(&tmp) {
         let _ = std::fs::remove_file(&tmp);
@@ -142,6 +176,72 @@ mod tests {
         assert!(!target.exists());
         atomic_replace_file(&target, |tmp| write_durably(tmp, b"hello")).expect("replace");
         assert_eq!(std::fs::read(&target).expect("read"), b"hello");
+    }
+
+    /// Regression: SEC-213 (temp component) — `create_fresh_temp` refuses to follow a planted
+    /// symlink (CWE-59) and refuses to clobber a pre-existing file (CWE-377). It must create a
+    /// brand-new regular file or return an error; it must never write through an attacker's link.
+    #[test]
+    fn create_fresh_temp_refuses_symlink_and_preexisting_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("symlink");
+
+        // (a) A planted symlink at the temp path pointing at a victim file the server can write.
+        let victim = dir.0.join("victim-secret");
+        write_durably(&victim, b"DO-NOT-CLOBBER").expect("seed victim");
+        let temp_link = dir.0.join("temp-as-symlink");
+        symlink(&victim, &temp_link).expect("plant symlink");
+
+        let r = create_fresh_temp(&temp_link);
+        assert!(
+            r.is_err(),
+            "create_fresh_temp must refuse a path that is a symlink (no link following)"
+        );
+        // The victim is untouched: the create did NOT follow the link and truncate/overwrite it.
+        assert_eq!(
+            std::fs::read(&victim).expect("victim still readable"),
+            b"DO-NOT-CLOBBER",
+            "a planted symlink must not redirect the create onto the victim file"
+        );
+
+        // (b) A pre-existing regular file at the temp path must also be refused (O_EXCL), not reused.
+        let existing = dir.0.join("already-here");
+        write_durably(&existing, b"PRE").expect("seed existing");
+        assert!(
+            create_fresh_temp(&existing).is_err(),
+            "create_fresh_temp must refuse to clobber/reuse a pre-existing file"
+        );
+        assert_eq!(std::fs::read(&existing).expect("read"), b"PRE");
+
+        // (c) A fresh, non-existent path succeeds and yields a regular file (not a symlink).
+        let fresh = dir.0.join("fresh-temp");
+        create_fresh_temp(&fresh).expect("fresh temp must be created");
+        let meta = std::fs::symlink_metadata(&fresh).expect("metadata");
+        assert!(meta.file_type().is_file(), "created temp must be a regular file");
+    }
+
+    /// Regression: SEC-213 — a full `atomic_replace_file` uses an unpredictable temp name and a
+    /// symlink-safe creation, so the end-to-end replace still works and leaves no temp residue.
+    #[test]
+    fn atomic_replace_uses_unpredictable_temp_and_leaves_no_residue() {
+        let dir = TempDir::new("unpredictable");
+        let target = dir.0.join("data");
+        write_durably(&target, b"OLD").expect("seed");
+
+        atomic_replace_file(&target, |tmp| {
+            // The temp name must NOT be the old deterministic, predictable sibling.
+            assert!(
+                !tmp.ends_with("data.graphus-replace-tmp"),
+                "temp name must be unpredictable, not the deterministic sibling"
+            );
+            write_durably(tmp, b"NEWNEW")
+        })
+        .expect("replace");
+
+        assert_eq!(std::fs::read(&target).expect("read"), b"NEWNEW");
+        // No predictable-name temp residue remains.
+        assert!(!target.with_file_name("data.graphus-replace-tmp").exists());
     }
 
     #[test]

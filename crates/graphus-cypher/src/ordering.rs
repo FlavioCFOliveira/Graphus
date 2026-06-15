@@ -162,17 +162,35 @@ fn cmp_same_temporal(a: &Value, b: &Value) -> Ordering {
 /// their sorted key set, then by the corresponding values, so the order is independent of insertion
 /// order (`04 §7.6`).
 pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
+    cmp_values_at(a, b, 0)
+}
+
+/// Depth-tracked [`cmp_values`] (`SEC-190`, CWE-674).
+///
+/// `depth` is the current nesting level. The recursion is hard-capped at
+/// [`MAX_VALUE_DEPTH`](crate::value_depth::MAX_VALUE_DEPTH): past the cap the two deeply-nested
+/// sub-values are treated as [`Ordering::Equal`] (a defined, total result) rather than recursing,
+/// so an attacker-controlled deeply-nested value can never overflow the worker stack. Legitimate
+/// Cypher values nest far below the cap, and over-deep parameter values are rejected at the trust
+/// boundary ([`crate::binding::bind_parameters`]) before they reach here, so this is invisible to
+/// conforming queries and the TCK.
+fn cmp_values_at(a: &Value, b: &Value, depth: usize) -> Ordering {
     let (ra, rb) = (class_rank(a), class_rank(b));
     if ra != rb {
         return ra.cmp(&rb);
+    }
+    if depth >= crate::value_depth::MAX_VALUE_DEPTH {
+        // Stack-safety guard: stop recursing into pathologically nested data. Both operands are the
+        // same class (rank already matched), so reporting Equal keeps the relation a total order.
+        return Ordering::Equal;
     }
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
         (Value::String(x), Value::String(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
-        (Value::List(x), Value::List(y)) => cmp_lists(x, y),
-        (Value::Map(x), Value::Map(y)) => cmp_maps(x, y),
+        (Value::List(x), Value::List(y)) => cmp_lists(x, y, depth),
+        (Value::Map(x), Value::Map(y)) => cmp_maps(x, y, depth),
         // Points order by CRS (SRID) then coordinates — `Point::cmp`, the same total order the index
         // key codec encodes (`rmp` task #73).
         (Value::Point(x), Value::Point(y)) => x.total_cmp(y),
@@ -303,9 +321,9 @@ fn compare_lists(x: &[Value], y: &[Value]) -> Option<Ordering> {
 
 /// Lexicographic order over lists: compare element-by-element with [`cmp_values`]; on a common
 /// prefix, the shorter list sorts first (`04 §7.6`).
-fn cmp_lists(x: &[Value], y: &[Value]) -> Ordering {
+fn cmp_lists(x: &[Value], y: &[Value], depth: usize) -> Ordering {
     for (xe, ye) in x.iter().zip(y.iter()) {
-        match cmp_values(xe, ye) {
+        match cmp_values_at(xe, ye, depth + 1) {
             Ordering::Equal => {}
             other => return other,
         }
@@ -315,7 +333,7 @@ fn cmp_lists(x: &[Value], y: &[Value]) -> Ordering {
 
 /// Order over maps, independent of insertion order: compare by the sorted key sequence first, then
 /// (on equal key sets) by the values in that sorted-key order (`04 §7.6`).
-fn cmp_maps(x: &[(String, Value)], y: &[(String, Value)]) -> Ordering {
+fn cmp_maps(x: &[(String, Value)], y: &[(String, Value)], depth: usize) -> Ordering {
     let mut xs: Vec<&(String, Value)> = x.iter().collect();
     let mut ys: Vec<&(String, Value)> = y.iter().collect();
     xs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
@@ -325,7 +343,7 @@ fn cmp_maps(x: &[(String, Value)], y: &[(String, Value)]) -> Ordering {
             Ordering::Equal => {}
             other => return other,
         }
-        match cmp_values(&xe.1, &ye.1) {
+        match cmp_values_at(&xe.1, &ye.1, depth + 1) {
             Ordering::Equal => {}
             other => return other,
         }

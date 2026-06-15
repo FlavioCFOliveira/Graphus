@@ -95,6 +95,14 @@ pub const STORE_KCV_SUBKEY_INFO: &[u8] = b"graphus/store-kcv/aes-256-gcm/v1";
 /// space with any frame encryption.
 pub const WAL_KCV_SUBKEY_INFO: &[u8] = b"graphus/wal-kcv/aes-256-gcm/v1";
 
+/// The HKDF `info` label for the **nonce-budget counter** subkey (rmp #175). The store device's
+/// durable nonce-budget counter slot is authenticated under this dedicated subkey (a random nonce
+/// per counter rewrite), independent of the page-encryption subkey, so a torn or maliciously
+/// tampered counter slot is detected and treated conservatively as the maximum budget (fail closed)
+/// rather than letting an attacker lower the count to defeat the GCM birthday cap. Counter rewrites
+/// happen once per `sync` (not per page write), so they never approach the budget themselves.
+pub const COUNTER_SUBKEY_INFO: &[u8] = b"graphus/store-nonce-counter/aes-256-gcm/v1";
+
 /// The fixed plaintext sealed under the **store KCV subkey** to form the Key-Check-Value. Any fixed,
 /// non-secret constant works; this string documents its own purpose if ever seen in a hex dump.
 const KCV_PLAINTEXT: &[u8] = b"graphus-store-kcv-v1";
@@ -140,6 +148,9 @@ pub struct Keyring {
     /// The derived **WAL KCV** subkey (rmp #87), the WAL analogue of [`Self::store_kcv_subkey`],
     /// independent of [`Self::wal_subkey`]. Zeroized on drop.
     wal_kcv_subkey: Zeroizing<[u8; KEY_LEN]>,
+    /// The derived **nonce-budget counter** subkey (rmp #175): authenticates the store device's
+    /// durable counter slot, independent of the page-encryption subkey. Zeroized on drop.
+    counter_subkey: Zeroizing<[u8; KEY_LEN]>,
 }
 
 impl std::fmt::Debug for Keyring {
@@ -175,11 +186,13 @@ impl Keyring {
         let wal_subkey = derive(WAL_SUBKEY_INFO);
         let store_kcv_subkey = derive(STORE_KCV_SUBKEY_INFO);
         let wal_kcv_subkey = derive(WAL_KCV_SUBKEY_INFO);
+        let counter_subkey = derive(COUNTER_SUBKEY_INFO);
         Self {
             store_subkey,
             wal_subkey,
             store_kcv_subkey,
             wal_kcv_subkey,
+            counter_subkey,
         }
     }
 
@@ -250,6 +263,17 @@ impl Keyring {
                     .to_owned(),
             ))
         }
+    }
+
+    /// The AES-256-GCM AEAD primitive for the **nonce-budget counter** slot (rmp #175): a dedicated
+    /// subkey, distinct from [`Self::store_cipher`], used to authenticate the store device's durable
+    /// counter so a tampered/torn counter is detected and treated as the maximum budget (fail
+    /// closed). Counter writes use a fresh random nonce each rewrite (once per `sync`), so they never
+    /// approach the random-nonce budget themselves.
+    #[must_use]
+    pub fn counter_cipher(&self) -> Aes256Gcm {
+        Aes256Gcm::new_from_slice(self.counter_subkey.as_slice())
+            .expect("INVARIANT: counter subkey is exactly KEY_LEN (32) bytes — a valid AES-256 key")
     }
 
     /// The AES-256-GCM AEAD primitive for write-ahead-log frames (rmp #88).

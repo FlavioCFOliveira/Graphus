@@ -30,8 +30,10 @@ use graphus_io::MemBlockDevice;
 use graphus_storage::RecordStore;
 use graphus_wal::{MemLogSink, WalManager};
 
+use graphus_cypher::loadcsv::{CsvImportPolicy, set_global_import_policy};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -39,6 +41,22 @@ type Store = RecordStore<MemBlockDevice, MemLogSink>;
 // =================================================================================================
 // Harness
 // =================================================================================================
+
+/// The per-test-binary import root: a dedicated temp subdirectory `LOAD CSV` is confined to
+/// (`SEC-189`). Created and installed as the process-global import policy on first use, so every
+/// `LOAD CSV` in this binary reads only files written under this root by [`write_temp_csv`].
+fn import_root() -> &'static PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("graphus-loadcsv-import-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create import root");
+        // Install the confined policy once for this test binary. `set` may already be set by a
+        // concurrent test thread — that is fine, the root is identical.
+        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let _ = set_global_import_policy(CsvImportPolicy::with_import_root(canonical.clone()));
+        canonical
+    })
+}
 
 /// A fresh, empty record store over an in-memory DST device + log.
 fn fresh_store() -> Store {
@@ -91,17 +109,19 @@ fn run_expect_exec_error(src: &str, store: Store, txn: u64) -> ExecError {
     err
 }
 
-/// Writes `contents` to a uniquely-named temp file (PID + counter, the workspace convention — no
-/// `tempfile` dep) and returns its path. The file is left for the OS temp reaper; the test reads it
-/// back through `LOAD CSV`.
+/// Writes `contents` to a uniquely-named file **inside the import root** (`SEC-189` confinement) and
+/// returns its path *relative to that root* — i.e. the bare filename. Queries reference it relative
+/// to the import directory, exactly as a confined `LOAD CSV` must. The file is left for the OS temp
+/// reaper; the test reads it back through `LOAD CSV`.
 fn write_temp_csv(contents: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("graphus-loadcsv-{}-{n}.csv", std::process::id()));
+    let name = format!("graphus-loadcsv-{}-{n}.csv", std::process::id());
+    let path = import_root().join(&name);
     let mut f = std::fs::File::create(&path).expect("create temp csv");
     f.write_all(contents.as_bytes()).expect("write temp csv");
     f.flush().expect("flush temp csv");
-    path
+    PathBuf::from(name)
 }
 
 /// Cypher single-quoted string literal for a filesystem path, escaping `\` and `'` so a Windows path
@@ -297,21 +317,19 @@ fn load_csv_accepts_a_file_url() {
 #[test]
 fn load_csv_missing_file_is_a_runtime_error_and_rolls_back() {
     let store = fresh_store();
-    let missing =
-        std::env::temp_dir().join(format!("graphus-loadcsv-absent-{}.csv", std::process::id()));
-    // Make sure it really does not exist.
-    let _ = std::fs::remove_file(&missing);
+    // A file that does not exist *inside the import root*. Confinement canonicalises the path, which
+    // requires the file to exist, so a missing file surfaces as an unresolvable path (a runtime
+    // `LoadCsv` error that rolls the statement back).
+    let missing_name = format!("graphus-loadcsv-absent-{}.csv", std::process::id());
+    let _ = std::fs::remove_file(import_root().join(&missing_name));
 
-    let src = format!(
-        "LOAD CSV FROM {} AS row CREATE (:N {{v: row[0]}})",
-        cypher_str(&missing)
-    );
+    let src = format!("LOAD CSV FROM '{missing_name}' AS row CREATE (:N {{v: row[0]}})");
     let err = run_expect_exec_error(&src, store, 1);
     match err {
         ExecError::LoadCsv { reason } => {
             assert!(
-                reason.contains("cannot open"),
-                "missing-file error should mention opening the file, got: {reason}"
+                reason.contains("cannot resolve") || reason.contains("cannot open"),
+                "missing-file error should mention the file could not be resolved/opened, got: {reason}"
             );
         }
         other => panic!("expected ExecError::LoadCsv, got {other:?}"),
@@ -331,6 +349,29 @@ fn load_csv_rejects_a_non_file_scheme() {
             );
         }
         other => panic!("expected ExecError::LoadCsv, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_csv_rejects_an_absolute_path_outside_the_import_root() {
+    // Regression: SEC-189 — even with an import root configured, an absolute path pointing at a
+    // file OUTSIDE the root is rejected (the file is re-anchored under the root, where it does not
+    // exist / does not resolve inside the root).
+    let _ = import_root(); // ensure the confined policy is installed
+    let store = fresh_store();
+    // A real secret file far outside the import root.
+    let secret =
+        std::env::temp_dir().join(format!("graphus-loadcsv-secret-{}.txt", std::process::id()));
+    std::fs::write(&secret, "TOP-SECRET\n").expect("write secret");
+    let src = format!(
+        "LOAD CSV FROM '{}' AS row RETURN row",
+        secret.to_string_lossy().replace('\\', "\\\\").replace('\'', "\\'")
+    );
+    let err = run_expect_exec_error(&src, store, 1);
+    let _ = std::fs::remove_file(&secret);
+    match err {
+        ExecError::LoadCsv { .. } => {} // rejected, as required
+        other => panic!("expected ExecError::LoadCsv rejection, got {other:?}"),
     }
 }
 

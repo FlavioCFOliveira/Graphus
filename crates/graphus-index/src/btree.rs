@@ -196,7 +196,17 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
                 max = max.max(p.0);
                 let f = self.pool.fetch(p)?;
                 let v = NodeView::new(self.pool.page(f));
+                // SEC-203: validate an internal node's slot directory before reading its child
+                // slots. A page that is corrupt yet CRC-valid (an adversarially tampered
+                // index/backup file) would otherwise drive an out-of-bounds panic here during
+                // `BTree::open`, crashing the server at startup/recovery. A malformed internal node
+                // surfaces as a `Storage` error. Leaves are not slot-accessed by this walk, so they
+                // are validated by the read/write paths that do touch their slots (SEC-206).
                 if !v.is_leaf() {
+                    if let Err(e) = v.validate() {
+                        self.pool.unpin(f);
+                        return Err(e);
+                    }
                     let lm = v.leftmost_child();
                     if lm != 0 {
                         stack.push(PageId(lm));
@@ -422,6 +432,17 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         };
         let leaf = self.descend_to_leaf(root, key)?;
         let f = self.pool.fetch(leaf)?;
+        // SEC-206: validate the leaf before probing its slots. `descend_to_leaf` validates every
+        // node it routes *through*, but the destination leaf is read here for the first time; a
+        // forged-but-CRC-valid leaf would otherwise panic OOB inside `find_exact`. Reject it as a
+        // `Storage` error instead of crashing on a `delete`.
+        {
+            let v = NodeView::new(self.pool.page(f));
+            if let Err(e) = v.validate() {
+                self.pool.unpin(f);
+                return Err(e);
+            }
+        }
         let present = NodeView::new(self.pool.page(f)).find_exact(key).is_some();
         if !present {
             self.pool.unpin(f);
@@ -449,6 +470,17 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         value: &[u8],
     ) -> Result<Option<(Vec<u8>, PageId)>> {
         let f = self.pool.fetch(node)?;
+        // SEC-206: validate the node before any slot access (read of cells on the leaf path, or
+        // `child_for` on the internal path). The write descent does not go through the validating
+        // `descend_to_leaf`, so a forged-but-CRC-valid page would otherwise panic OOB on an
+        // `insert`. Reject it as a `Storage` error.
+        {
+            let v = NodeView::new(self.pool.page(f));
+            if let Err(e) = v.validate() {
+                self.pool.unpin(f);
+                return Err(e);
+            }
+        }
         let is_leaf = NodeView::new(self.pool.page(f)).is_leaf();
 
         if is_leaf {

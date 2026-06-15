@@ -45,10 +45,45 @@ fn column_type_token(value: &Value) -> &'static str {
     }
 }
 
+/// The leading characters that make a spreadsheet (Excel / LibreOffice Calc / Google Sheets) treat a
+/// CSV cell as a **formula** rather than literal text. A cell beginning with any of these is a CSV
+/// injection vector (CWE-1236, OWASP WSTG-INPV-21): opened in a spreadsheet it can run DDE / call
+/// external programs / exfiltrate data in the victim's context.
+///
+/// `=` `+` `-` `@` are the formula sigils; TAB (`0x09`) and CR (`0x0D`) are the whitespace leaders
+/// some spreadsheets strip before re-evaluating the remainder as a formula.
+const FORMULA_TRIGGERS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+
+/// Neutralises a **string** cell against spreadsheet formula injection (SEC-194, CWE-1236).
+///
+/// If `s` begins with a [formula trigger](FORMULA_TRIGGERS), the cell is prefixed with a single
+/// quote (`'`) — the spreadsheet convention that forces a cell to be read as literal text, so
+/// `=cmd|'/c calc'!A1` is exported as `'=cmd|'/c calc'!A1` and never evaluated. The `'` is purely a
+/// rendering convention (not part of the stored datum); a dump → import round-trip preserves the
+/// logical value because the importer reads the cell verbatim and only the operator's spreadsheet
+/// (the sole consumer that interprets the leading `'`) strips it on display.
+///
+/// Only `String` values are sanitised: numeric / boolean cells are produced by `to_string()` and
+/// cannot begin with a malicious construct (a numeric `-2` is an inert number, not a formula).
+fn sanitize_string_cell(s: &str) -> String {
+    match s.chars().next() {
+        Some(first) if FORMULA_TRIGGERS.contains(&first) => {
+            let mut out = String::with_capacity(s.len() + 1);
+            out.push('\'');
+            out.push_str(s);
+            out
+        }
+        _ => s.to_owned(),
+    }
+}
+
 /// Renders a scalar [`Value`] to the textual cell the importer parses back.
+///
+/// String cells are neutralised against spreadsheet formula injection via
+/// [`sanitize_string_cell`] (SEC-194).
 fn render_scalar(value: &Value) -> String {
     match value {
-        Value::String(s) => s.clone(),
+        Value::String(s) => sanitize_string_cell(s),
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Boolean(b) => b.to_string(),

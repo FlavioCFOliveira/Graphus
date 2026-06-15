@@ -10,6 +10,12 @@
 //! frozen and shared by `Arc`, so reads never observe a torn snapshot.
 
 use crate::error::{GdsError, Result};
+// SECURITY (SEC-210, CWE-407): `index_of` below is keyed by `ExternalId` — a `u64` drawn from
+// CLIENT-CONTROLLED node ids. It MUST stay on a DoS-resistant, randomly-seeded hasher. `std`'s
+// `HashMap` uses SipHash 1-3 with a per-process random seed, which resists hash-flooding, so it is
+// the correct default here. Do NOT swap this map to a fixed-seed fast hasher (e.g. `FxHashMap`, or
+// `ahash` without random keys): the page-table elsewhere in the workspace uses `FxHashMap` for
+// perf, but that pattern is unsafe over client-derived keys and must not be copied onto this map.
 use std::collections::HashMap;
 
 /// The external (caller-facing) node identifier type.
@@ -77,6 +83,9 @@ pub struct CsrBuilder {
     weighted: bool,
     allow_implicit_nodes: bool,
     /// external id -> internal index, assigned in declaration order.
+    ///
+    /// SEC-210: keyed by client-controlled `ExternalId`; keep the DoS-resistant SipHash default (see
+    /// the security note on the `HashMap` import).
     index_of: HashMap<ExternalId, InternalId>,
     /// internal index -> external id.
     external: Vec<ExternalId>,

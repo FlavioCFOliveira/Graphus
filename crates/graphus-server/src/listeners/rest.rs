@@ -24,7 +24,7 @@ use axum::extract::Request;
 use axum::response::Response;
 use graphus_io::TcpAcceptor;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
@@ -91,7 +91,9 @@ impl Service<Request<Incoming>> for BlockingRouter {
 /// accept time *before* the TLS handshake, and held for the connection's lifetime (moved into the
 /// per-connection task), so a flood of REST connections cannot exhaust the process's connection budget
 /// ahead of query admission. `handshake_timeout` bounds the TLS handshake so a stalled one is dropped
-/// rather than pinning the task and socket (the hyper stack manages per-request/idle lifetimes itself).
+/// rather than pinning the task and socket. `header_read_timeout` (SEC-181) bounds how long a client
+/// may take to send its complete request headers *after* TLS, closing the slow-loris HTTP vector that
+/// the handshake deadline alone does not cover; `None` disables it.
 #[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_rest_accept_loop(
     acceptor: TcpAcceptor,
@@ -100,6 +102,7 @@ pub async fn run_rest_accept_loop(
     metrics: Arc<crate::metrics::Metrics>,
     conn_limit: Arc<tokio::sync::Semaphore>,
     handshake_timeout: Duration,
+    header_read_timeout: Option<Duration>,
     shutdown: ShutdownCoordinator,
 ) {
     let handle = Handle::current();
@@ -148,6 +151,7 @@ pub async fn run_rest_accept_loop(
                         tls,
                         svc,
                         handshake_timeout,
+                        header_read_timeout,
                         conn_metrics,
                         conn_shutdown,
                     )
@@ -165,15 +169,27 @@ pub async fn run_rest_accept_loop(
 ///
 /// The TLS handshake is bounded by `handshake_timeout` (rmp #118): a stalled handshake is dropped
 /// (and counted in `graphus_handshake_timeouts_total`) rather than pinning this task and the socket.
+/// After TLS, `header_read_timeout` (SEC-181) bounds how long the client may take to send its
+/// complete request headers, dropping a slow-loris HTTP drip that the handshake deadline cannot see.
 async fn serve_connection(
     conn: graphus_io::TcpConn,
     tls: Option<TlsAcceptor>,
     svc: BlockingRouter,
     handshake_timeout: Duration,
+    header_read_timeout: Option<Duration>,
     metrics: Arc<crate::metrics::Metrics>,
     shutdown: ShutdownCoordinator,
 ) {
-    let builder = ConnBuilder::new(TokioExecutor::new());
+    let mut builder = ConnBuilder::new(TokioExecutor::new());
+    // SEC-181: bound HTTP/1 request-header reads so a post-TLS slow-loris drip is dropped rather than
+    // pinning a connection-admission permit indefinitely. HTTP/2 has its own framing/flow control and
+    // is covered by the connection idle handling; this targets the HTTP/1 header-read vector.
+    // `header_read_timeout` requires a `Timer` on the builder; without one hyper panics at runtime, so
+    // the timer is always installed alongside the timeout.
+    if let Some(timeout) = header_read_timeout {
+        builder.http1().timer(TokioTimer::new());
+        builder.http1().header_read_timeout(timeout);
+    }
     let service = hyper_util::service::TowerToHyperService::new(svc);
 
     match tls {

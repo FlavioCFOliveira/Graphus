@@ -23,6 +23,7 @@
 use graphus_core::Value;
 
 use crate::ternary::Ternary;
+use crate::value_depth::MAX_VALUE_DEPTH;
 
 /// Cypher equality `a = b`, three-valued (CIP §Equality).
 ///
@@ -31,6 +32,18 @@ use crate::ternary::Ternary;
 /// the deep value equality as [`Ternary::True`] / [`Ternary::False`] (with `null` *inside* nested
 /// lists/maps still able to make the result `NULL`).
 pub fn equals(a: &Value, b: &Value) -> Ternary {
+    equals_at(a, b, 0)
+}
+
+/// Depth-tracked [`equals`] (`SEC-190`, CWE-674).
+///
+/// `depth` is the current nesting level. The recursion is hard-capped at [`MAX_VALUE_DEPTH`] so that
+/// a pathologically nested value (an attacker-controlled parameter) can never overflow the worker
+/// stack — instead the comparison stops and reports the deeply-nested sub-values as **equal-unknown**
+/// (`Ternary::Null`), a defined, total result. Legitimate Cypher values nest far below the cap, so
+/// this is invisible to real queries; over-deep parameter values are additionally rejected at the
+/// trust boundary ([`crate::binding::bind_parameters`]) before they ever reach here.
+fn equals_at(a: &Value, b: &Value, depth: usize) -> Ternary {
     // NULL propagation dominates everything (1 = null → NULL, null = null → NULL).
     if a.is_null() || b.is_null() {
         return Ternary::Null;
@@ -39,7 +52,13 @@ pub fn equals(a: &Value, b: &Value) -> Ternary {
     if is_nan(a) || is_nan(b) {
         return Ternary::False;
     }
-    deep_equals(a, b)
+    if depth >= MAX_VALUE_DEPTH {
+        // Stack-safety guard: refuse to recurse further into pathologically nested data. The result
+        // is left unknown rather than risking a stack overflow. Unreachable for legitimate values
+        // (they are shallow) and for bound parameters (rejected at bind by the same cap).
+        return Ternary::Null;
+    }
+    deep_equals(a, b, depth)
 }
 
 /// Cypher inequality `a <> b`, the logical negation of [`equals`] in three-valued logic.
@@ -59,7 +78,7 @@ fn is_nan(v: &Value) -> bool {
 /// Numbers compare numerically; strings/bytes/booleans/temporals by value; lists and maps element-
 /// by-element with three-valued propagation. Nested `null`/`NaN` are handled by recursing through
 /// [`equals`] for list/map elements (so an inner `null` can still surface as `NULL`).
-fn deep_equals(a: &Value, b: &Value) -> Ternary {
+fn deep_equals(a: &Value, b: &Value, depth: usize) -> Ternary {
     match (a, b) {
         (Value::Boolean(x), Value::Boolean(y)) => Ternary::from_bool(x == y),
         (Value::String(x), Value::String(y)) => Ternary::from_bool(x == y),
@@ -73,8 +92,8 @@ fn deep_equals(a: &Value, b: &Value) -> Ternary {
         (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
             Ternary::from_bool(num_f64(a) == num_f64(b))
         }
-        (Value::List(x), Value::List(y)) => list_equals(x, y),
-        (Value::Map(x), Value::Map(y)) => map_equals(x, y),
+        (Value::List(x), Value::List(y)) => list_equals(x, y, depth),
+        (Value::Map(x), Value::Map(y)) => map_equals(x, y, depth),
         // Same-class temporals use their structural (component) equality, which is exactly Cypher
         // temporal equality at nanosecond resolution.
         (Value::Date(x), Value::Date(y)) => Ternary::from_bool(x == y),
@@ -107,13 +126,13 @@ fn num_f64(v: &Value) -> f64 {
 /// A definite length mismatch is `FALSE`. Otherwise compare element-wise with [`equals`]: any
 /// `FALSE` makes the whole list `FALSE`; otherwise any `NULL` makes it `NULL`; only all-`TRUE` is
 /// `TRUE` (CIP §Equality, list comparison).
-fn list_equals(x: &[Value], y: &[Value]) -> Ternary {
+fn list_equals(x: &[Value], y: &[Value], depth: usize) -> Ternary {
     if x.len() != y.len() {
         return Ternary::False;
     }
     let mut acc = Ternary::True;
     for (xe, ye) in x.iter().zip(y.iter()) {
-        match equals(xe, ye) {
+        match equals_at(xe, ye, depth + 1) {
             Ternary::False => return Ternary::False,
             Ternary::Null => acc = Ternary::Null,
             Ternary::True => {}
@@ -127,7 +146,7 @@ fn list_equals(x: &[Value], y: &[Value]) -> Ternary {
 /// A differing key *set* is a definite `FALSE`. Otherwise compare the values at each shared key
 /// with [`equals`] and combine like [`list_equals`] (any `FALSE` → `FALSE`, else any `NULL` →
 /// `NULL`, else `TRUE`). Key order is irrelevant.
-fn map_equals(x: &[(String, Value)], y: &[(String, Value)]) -> Ternary {
+fn map_equals(x: &[(String, Value)], y: &[(String, Value)], depth: usize) -> Ternary {
     if x.len() != y.len() {
         return Ternary::False;
     }
@@ -135,7 +154,7 @@ fn map_equals(x: &[(String, Value)], y: &[(String, Value)]) -> Ternary {
     for (k, xv) in x {
         match y.iter().find(|(yk, _)| yk == k) {
             None => return Ternary::False, // key absent on the other side
-            Some((_, yv)) => match equals(xv, yv) {
+            Some((_, yv)) => match equals_at(xv, yv, depth + 1) {
                 Ternary::False => return Ternary::False,
                 Ternary::Null => acc = Ternary::Null,
                 Ternary::True => {}

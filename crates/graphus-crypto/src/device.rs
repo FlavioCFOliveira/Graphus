@@ -63,8 +63,12 @@ use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
 use graphus_io::{BlockDevice, Page};
 
-use crate::header::{HEADER_SLOTS, Header};
+use crate::header::{
+    COUNTER_SLOT_INDEX, HEADER_SLOT_INDEX, HEADER_SLOTS, Header, decode_counter_slot,
+    encode_counter_slot,
+};
 use crate::keyring::Keyring;
+use crate::nonce_budget::NonceBudget;
 use crate::raw::RawSlots;
 use crate::slot::{self, NONCE_LEN, SLOT_SIZE, Slot, TAG_LEN};
 
@@ -77,7 +81,18 @@ use crate::slot::{self, NONCE_LEN, SLOT_SIZE, Slot, TAG_LEN};
 pub struct EncryptedBlockDevice<R: RawSlots> {
     backing: R,
     cipher: Aes256Gcm,
-    /// Number of **logical** pages (excludes the header slot). This is an in-memory cache of the
+    /// The AEAD primitive for the durable nonce-budget counter slot (rmp #175), under a dedicated
+    /// subkey so a tampered counter is detected and fails closed.
+    counter_cipher: Aes256Gcm,
+    /// The random-nonce write budget for the store subkey (rmp #175): bounds page encryptions below
+    /// the GCM birthday limit and fails closed when exhausted, resumed conservatively from the
+    /// durable counter slot on open. Advanced once per `write_page`, persisted on each `sync`.
+    budget: NonceBudget,
+    /// The counter value last made durable in the counter slot, so a `sync` with no new writes since
+    /// the last counter persist can skip rewriting it (avoids a redundant counter-slot write +
+    /// budget consumption on a pure-metadata sync).
+    durable_counter: u64,
+    /// Number of **logical** pages (excludes the header slots). This is an in-memory cache of the
     /// authoritative value, which is always `backing.slot_count() - HEADER_SLOTS`; `open` seeds it
     /// from the backing and `extend` advances it in step. The header does **not** store it (see the
     /// crash-consistency note in the module docs).
@@ -117,13 +132,19 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
         }
         let kcv = keyring.compute_store_kcv()?;
         let header = Header { salt, kcv };
-        // Reserve and write the header slot, then make it durable before the device is usable.
+        let counter_cipher = keyring.counter_cipher();
+        // Reserve the header + counter slots, write the header (once) and the initial zero counter,
+        // then make them durable before the device is usable.
         backing.extend(HEADER_SLOTS)?;
-        backing.write_slot(0, &header.encode())?;
+        backing.write_slot(HEADER_SLOT_INDEX, &header.encode())?;
+        backing.write_slot(COUNTER_SLOT_INDEX, &encode_counter_slot(0, &counter_cipher)?)?;
         backing.sync_all()?;
         Ok(Self {
             backing,
             cipher: keyring.store_cipher(),
+            counter_cipher,
+            budget: NonceBudget::resume_from(0),
+            durable_counter: 0,
             page_count: 0,
         })
     }
@@ -154,11 +175,20 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
             ));
         }
         let mut header_slot = [0u8; SLOT_SIZE];
-        backing.read_slot(0, &mut header_slot)?;
+        backing.read_slot(HEADER_SLOT_INDEX, &mut header_slot)?;
         let header = Header::decode(&header_slot)?;
         // Fail closed on a wrong/missing key BEFORE reading any page (defence in depth: a page read
         // would also fail the AEAD tag, but the KCV gives an immediate, unambiguous error).
         keyring.verify_store_kcv(&header.kcv)?;
+
+        // Resume the durable nonce-budget counter (rmp #175): read + authenticate the counter slot.
+        // A pristine zero slot → 0; a torn/tampered counter → the maximum budget (fail closed on the
+        // next write). This is the conservative resume that keeps the GCM birthday cap enforced
+        // across reopens (the budget can only ever be over-counted, never silently reset).
+        let counter_cipher = keyring.counter_cipher();
+        let mut counter_slot = [0u8; SLOT_SIZE];
+        backing.read_slot(COUNTER_SLOT_INDEX, &mut counter_slot)?;
+        let consumed = decode_counter_slot(&counter_slot, &counter_cipher);
 
         // The backing slot count is authoritative for the logical page count. There is intentionally
         // no header/slot-count equality check: a count stored in the header could diverge from a
@@ -166,6 +196,9 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
         Ok(Self {
             backing,
             cipher: keyring.store_cipher(),
+            counter_cipher,
+            budget: NonceBudget::resume_from(consumed),
+            durable_counter: consumed,
             page_count: slot_count - HEADER_SLOTS,
         })
     }
@@ -198,6 +231,32 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
     /// offset.
     fn aad(page: PageId) -> [u8; 8] {
         page.0.to_le_bytes()
+    }
+
+    /// Persists the durable nonce-budget counter (rmp #175) into the counter slot **before** the
+    /// backing sync, so the high-water mark is hardened together with (and never behind) the page
+    /// writes it covers. Skipped when no new writes happened since the last persist, so a pure
+    /// metadata sync neither rewrites the slot nor consumes counter budget.
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] if sealing the counter fails; [`GraphusError::Storage`] on a raw
+    /// write failure.
+    fn persist_counter(&mut self) -> Result<()> {
+        let consumed = self.budget.consumed();
+        if consumed == self.durable_counter {
+            return Ok(()); // nothing new to record
+        }
+        let slot = encode_counter_slot(consumed, &self.counter_cipher)?;
+        self.backing.write_slot(COUNTER_SLOT_INDEX, &slot)?;
+        self.durable_counter = consumed;
+        Ok(())
+    }
+
+    /// The current durable nonce-budget high-water mark (writes consumed under the store subkey),
+    /// for tests/inspection (rmp #175).
+    #[must_use]
+    pub fn nonce_budget_consumed(&self) -> u64 {
+        self.budget.consumed()
     }
 }
 
@@ -295,6 +354,10 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
                 page.0, self.page_count
             )));
         }
+        // Reserve nonce budget BEFORE encrypting (rmp #175): once the GCM birthday ceiling for this
+        // subkey is reached, fail closed here rather than risk a (key, nonce) collision. The reserved
+        // count is persisted on the next `sync` as the durable high-water mark.
+        self.budget.reserve()?;
         // Fresh random nonce per write (no GCM nonce reuse under a key; see module docs).
         let nonce_bytes = random_nonce();
         let nonce = Nonce::from(nonce_bytes);
@@ -323,10 +386,12 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
     }
 
     fn sync_data(&mut self) -> Result<()> {
+        self.persist_counter()?;
         self.backing.sync_data()
     }
 
     fn sync_all(&mut self) -> Result<()> {
+        self.persist_counter()?;
         self.backing.sync_all()
     }
 

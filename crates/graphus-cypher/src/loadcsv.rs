@@ -23,6 +23,25 @@
 //! in-query clause (bulk/offline ingestion is the `graphus-bulk` crate's job, over trusted local
 //! files). This keeps the query engine from being a request-forgery vector.
 //!
+//! ## Import-directory confinement (`SEC-189`, CWE-22)
+//!
+//! Resolving "any local file" is **not** enough: a path such as `file:///etc/passwd`, or a
+//! `..`-laden relative path, would otherwise let any client that can run `LOAD CSV` read — and
+//! exfiltrate to itself as result rows — any file the server process can read. To close that, every
+//! resolved file path is confined to a configurable **import root** (Neo4j's
+//! `dbms.directories.import` model, chroot-style), enforced by [`CsvImportPolicy`]:
+//!
+//! - The path the query names is joined under the import root, fully **canonicalised**, and then
+//!   checked to still live inside the (canonicalised) root. A path that escapes the root via `..`
+//!   segments, an absolute path, or a symlink pointing outside the root is **rejected**
+//!   ([`ExecError::LoadCsv`]) — fail-closed.
+//! - The policy is **fail-closed by default**: until the server explicitly configures an import root
+//!   ([`set_global_import_policy`]), `LOAD CSV` from local files is **denied** outright. A server
+//!   that wants the feature opts in by pointing the policy at a dedicated, trusted directory.
+//!
+//! This mirrors Neo4j, where `LOAD CSV` is confined to the `import/` directory by default and only
+//! the operator can widen it.
+//!
 //! # Streaming
 //!
 //! The reader is a [`csv::Reader`] over a buffered [`File`], pulled one [`csv::StringRecord`] at a
@@ -33,12 +52,139 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use graphus_core::Value;
 
 use crate::executor::ExecError;
 use crate::runtime::RowValue;
+
+/// The process-wide `LOAD CSV` import policy (`SEC-189`).
+///
+/// `None` until the server installs one; an uninstalled policy means **deny** (fail-closed). The
+/// server installs a single policy at startup via [`set_global_import_policy`].
+static GLOBAL_IMPORT_POLICY: OnceLock<CsvImportPolicy> = OnceLock::new();
+
+/// Installs the process-wide `LOAD CSV` import policy. Idempotent in the sense of [`OnceLock`]: the
+/// **first** call wins; later calls are ignored and report `Err` with the policy that is in force.
+///
+/// The server is expected to call this exactly once at startup. If it never calls it, `LOAD CSV`
+/// from local files is denied (the fail-closed default).
+///
+/// # Errors
+///
+/// Returns the already-installed [`CsvImportPolicy`] (by clone) if a policy was already set.
+pub fn set_global_import_policy(policy: CsvImportPolicy) -> Result<(), CsvImportPolicy> {
+    GLOBAL_IMPORT_POLICY.set(policy)
+}
+
+/// The import policy in force, or the fail-closed default ([`CsvImportPolicy::denied`]) when the
+/// server has not installed one.
+#[must_use]
+pub fn global_import_policy() -> &'static CsvImportPolicy {
+    GLOBAL_IMPORT_POLICY.get_or_init(CsvImportPolicy::denied)
+}
+
+/// Where `LOAD CSV` is allowed to read local files (`SEC-189`, CWE-22).
+///
+/// Construct with [`CsvImportPolicy::with_import_root`] to confine reads to a directory, or
+/// [`CsvImportPolicy::denied`] to forbid local-file reads entirely (the default). The policy
+/// canonicalises both the import root and the requested path and rejects anything that escapes the
+/// root — via `..`, an absolute path, or a symlink leading outside the root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CsvImportPolicy {
+    /// The canonical import root. `None` ⇒ local-file `LOAD CSV` is denied (fail-closed).
+    root: Option<PathBuf>,
+}
+
+impl CsvImportPolicy {
+    /// A policy that **denies** every local-file `LOAD CSV`. The fail-closed default.
+    #[must_use]
+    pub fn denied() -> Self {
+        Self { root: None }
+    }
+
+    /// A policy confining `LOAD CSV` to `root` (and its subtree).
+    ///
+    /// `root` is canonicalised eagerly; if it cannot be canonicalised (does not exist, or is
+    /// unreadable) the policy still records the path as given, and resolution will fail-closed when a
+    /// query tries to use it. Prefer passing an existing, canonical directory.
+    #[must_use]
+    pub fn with_import_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+        Self {
+            root: Some(canonical),
+        }
+    }
+
+    /// Whether local-file `LOAD CSV` is allowed at all under this policy.
+    #[must_use]
+    pub fn allows_local_files(&self) -> bool {
+        self.root.is_some()
+    }
+
+    /// Resolves a query-supplied path to a concrete, **confined** filesystem path, or rejects it.
+    ///
+    /// The supplied `requested` path (already stripped of any `file:` scheme by
+    /// [`parse_file_url`]) is interpreted **relative to the import root** — a leading `/` and any
+    /// `..`/`.` components are stripped so the join can never climb above the root by construction —
+    /// then the result is canonicalised and re-checked to live inside the canonical root. Any path
+    /// that still escapes (e.g. through a symlink) is rejected.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::LoadCsv`] when local-file reads are denied, when the path escapes the import
+    /// root, or when the path cannot be canonicalised (it does not resolve to a readable file under
+    /// the root).
+    fn resolve(&self, requested: &str) -> Result<PathBuf, ExecError> {
+        let Some(root) = &self.root else {
+            return Err(ExecError::LoadCsv {
+                reason: "LOAD CSV from local files is disabled: no import directory is configured \
+                         (set one to enable confined CSV import)"
+                    .to_owned(),
+            });
+        };
+
+        // Re-anchor the requested path under the root, dropping every component that could climb
+        // out (`RootDir`, `Prefix`, `ParentDir`, `CurDir`). What remains is a strictly-descending
+        // sequence of normal segments, so the lexical join cannot escape the root.
+        let mut confined = root.clone();
+        for comp in Path::new(requested).components() {
+            match comp {
+                Component::Normal(seg) => confined.push(seg),
+                // Reject explicit traversal rather than silently dropping it, so a `..`-laden path
+                // is a hard error (CWE-22), not a quietly-rewritten read.
+                Component::ParentDir => {
+                    return Err(ExecError::LoadCsv {
+                        reason: format!(
+                            "LOAD CSV path `{requested}` contains a `..` segment, which is not \
+                             allowed (paths are confined to the import directory)"
+                        ),
+                    });
+                }
+                // A leading `/`, a Windows prefix, or a `.` carries no descent — ignore it.
+                Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            }
+        }
+
+        // Canonicalise and verify containment: this is what defeats a symlink inside the root that
+        // points back out. `canonicalize` also requires the file to exist, giving a clean error.
+        let canonical = std::fs::canonicalize(&confined).map_err(|e| ExecError::LoadCsv {
+            reason: format!("cannot resolve `{requested}` under the import directory: {e}"),
+        })?;
+        if !canonical.starts_with(root) {
+            return Err(ExecError::LoadCsv {
+                reason: format!(
+                    "LOAD CSV path `{requested}` resolves outside the import directory and is \
+                     rejected"
+                ),
+            });
+        }
+        Ok(canonical)
+    }
+}
 
 /// The open, streaming state of one `LOAD CSV` evaluation: the reader plus, when `WITH HEADERS` was
 /// requested, the decoded header names.
@@ -72,7 +218,7 @@ impl LoadCsvState {
         field_terminator: u8,
         with_headers: bool,
     ) -> Result<Self, ExecError> {
-        let path = resolve_local_path(url_value)?;
+        let path = resolve_local_path(url_value, global_import_policy())?;
         let file = File::open(&path).map_err(|e| ExecError::LoadCsv {
             reason: format!("cannot open `{}`: {e}", path.display()),
         })?;
@@ -147,15 +293,19 @@ impl LoadCsvState {
     }
 }
 
-/// Resolves a `LOAD CSV` URL [`Value`] to a local filesystem [`PathBuf`].
+/// Resolves a `LOAD CSV` URL [`Value`] to a confined local filesystem [`PathBuf`] under `policy`.
 ///
 /// Accepts a bare/relative path, a `file:` URL, or a `file://[host]/path` URL; rejects any other
-/// scheme (the security model documented at the module level) and a non-string value.
+/// scheme (the security model documented at the module level) and a non-string value. The extracted
+/// path is then confined to the configured import root via [`CsvImportPolicy::resolve`]
+/// (`SEC-189`): an absolute path, a `..` traversal, or a symlink escaping the root is rejected, and
+/// when no import root is configured every local-file read is denied.
 ///
 /// # Errors
 ///
-/// Returns [`ExecError::LoadCsv`] for a non-string value or a non-`file` scheme.
-fn resolve_local_path(url_value: &Value) -> Result<PathBuf, ExecError> {
+/// Returns [`ExecError::LoadCsv`] for a non-string value, a non-`file` scheme, a path that escapes
+/// the import directory, or (fail-closed) when local-file reads are disabled.
+fn resolve_local_path(url_value: &Value, policy: &CsvImportPolicy) -> Result<PathBuf, ExecError> {
     let url = match url_value {
         Value::String(s) => s.as_str(),
         other => {
@@ -167,7 +317,8 @@ fn resolve_local_path(url_value: &Value) -> Result<PathBuf, ExecError> {
             });
         }
     };
-    parse_file_url(url).map(PathBuf::from)
+    let path = parse_file_url(url)?;
+    policy.resolve(&path)
 }
 
 /// Extracts the filesystem path from a `LOAD CSV` URL string, enforcing the file-only scheme policy.
@@ -316,10 +467,73 @@ mod tests {
 
     #[test]
     fn non_string_url_value_errors() {
-        let err = resolve_local_path(&Value::Integer(42)).expect_err("non-string URL must error");
+        let err = resolve_local_path(&Value::Integer(42), &CsvImportPolicy::denied())
+            .expect_err("non-string URL must error");
         let ExecError::LoadCsv { reason } = err else {
             panic!("expected a LoadCsv error");
         };
         assert!(reason.contains("must be a string"), "got: {reason}");
+    }
+
+    #[test]
+    fn denied_policy_rejects_every_local_path() {
+        // Regression: SEC-189 — with no import root configured (the fail-closed default), even an
+        // innocuous-looking relative path is refused.
+        let policy = CsvImportPolicy::denied();
+        let err = resolve_local_path(&Value::String("data/people.csv".to_owned()), &policy)
+            .expect_err("a denied policy must refuse local files");
+        let ExecError::LoadCsv { reason } = err else {
+            panic!("expected a LoadCsv error");
+        };
+        assert!(reason.contains("disabled"), "got: {reason}");
+    }
+
+    #[test]
+    fn confined_policy_allows_a_file_inside_the_root_and_rejects_escapes() {
+        // Regression: SEC-189 — a path inside the import root resolves; absolute paths, `..`
+        // traversal, and `file://<abs>` all escape the root and are rejected.
+        let root = std::env::temp_dir().join(format!(
+            "graphus_loadcsv_unit_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        let inside = root.join("ok.csv");
+        std::fs::write(&inside, b"a,b\n1,2\n").expect("write inside file");
+
+        // A secret file OUTSIDE the root.
+        let outside = std::env::temp_dir().join(format!("graphus_loadcsv_secret_{}.txt", std::process::id()));
+        std::fs::write(&outside, b"SECRET").expect("write secret");
+
+        let policy = CsvImportPolicy::with_import_root(&root);
+
+        // Inside the root: allowed, resolved to the canonical path.
+        let resolved = resolve_local_path(&Value::String("ok.csv".to_owned()), &policy)
+            .expect("a file inside the root resolves");
+        assert!(resolved.ends_with("ok.csv"));
+
+        // Absolute path to the secret: rejected (re-anchored under root, then canonicalize fails or
+        // containment check fails).
+        let abs = outside.to_string_lossy().to_string();
+        assert!(
+            resolve_local_path(&Value::String(abs.clone()), &policy).is_err(),
+            "an absolute path to a file outside the root must be rejected"
+        );
+
+        // file:// URL to the secret: rejected.
+        let url = format!("file://{abs}");
+        assert!(
+            resolve_local_path(&Value::String(url), &policy).is_err(),
+            "a file:// URL to a file outside the root must be rejected"
+        );
+
+        // Explicit `..` traversal: rejected.
+        assert!(
+            resolve_local_path(&Value::String("../escape.csv".to_owned()), &policy).is_err(),
+            "a `..` traversal must be rejected"
+        );
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

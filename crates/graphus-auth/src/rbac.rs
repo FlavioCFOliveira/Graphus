@@ -344,16 +344,24 @@ pub struct User {
     pub roles: BTreeSet<String>,
     /// Argon2 PHC hash of the user's password, or `None` if password auth is not configured.
     pub password_hash: Option<String>,
+    /// The user's **credential epoch** (token version, SEC-180 / CWE-613). Every issued Bearer JWT
+    /// is stamped with the epoch current at issue time; a password change bumps this counter, after
+    /// which any token carrying an older `ver` is rejected — a leaked token is invalidated *before*
+    /// its `exp` by a forced password reset. Monotonic, never decremented; `0` for a user whose
+    /// password has never changed. Persisted durably by the server's security catalog so the epoch
+    /// survives restarts (a token that outlived a restart-spanning reset stays revoked).
+    pub credential_version: u64,
 }
 
 impl User {
-    /// Creates a user with no roles and no password.
+    /// Creates a user with no roles, no password, and credential epoch `0`.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             roles: BTreeSet::new(),
             password_hash: None,
+            credential_version: 0,
         }
     }
 }
@@ -448,6 +456,49 @@ impl Catalog {
                 what: format!("user {name}"),
             })?;
         user.password_hash = hash;
+        Ok(())
+    }
+
+    /// The user's current **credential epoch** (token version, SEC-180), or `None` if the user does
+    /// not exist. A token whose stamped `ver` is below this value has been invalidated by a password
+    /// change and must be rejected.
+    #[must_use]
+    pub fn credential_version(&self, name: &str) -> Option<u64> {
+        self.users.get(name).map(|u| u.credential_version)
+    }
+
+    /// Increments the user's **credential epoch** (token version, SEC-180), invalidating every Bearer
+    /// token issued under the previous epoch. Called on every password change so a credential reset
+    /// performs a forced logout of outstanding tokens. Saturating (never wraps).
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if the user does not exist.
+    pub fn bump_credential_version(&mut self, name: &str) -> Result<u64> {
+        let user = self
+            .users
+            .get_mut(name)
+            .ok_or_else(|| AuthError::NotFound {
+                what: format!("user {name}"),
+            })?;
+        user.credential_version = user.credential_version.saturating_add(1);
+        Ok(user.credential_version)
+    }
+
+    /// Restores a user's **credential epoch** verbatim (SEC-180), the load path of the durable
+    /// security catalog — unlike [`bump_credential_version`](Self::bump_credential_version) it does
+    /// **not** advance the counter, it sets the persisted value exactly so the epoch survives a
+    /// restart (a token revoked by a pre-restart reset stays revoked).
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if the user does not exist.
+    pub fn set_credential_version(&mut self, name: &str, version: u64) -> Result<()> {
+        let user = self
+            .users
+            .get_mut(name)
+            .ok_or_else(|| AuthError::NotFound {
+                what: format!("user {name}"),
+            })?;
+        user.credential_version = version;
         Ok(())
     }
 

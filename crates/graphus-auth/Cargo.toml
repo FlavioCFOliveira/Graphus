@@ -18,6 +18,9 @@ argon2 = "0.5"
 # crate default) is not needed for an HMAC secret, so it is disabled to keep the surface minimal.
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 serde = { version = "1", features = ["derive"] }
+# CSPRNG for the random JWT `jti` (token id, SEC-180). Already in the workspace lockfile (pulled by
+# the RustCrypto stack); declared directly here so the dependency is explicit at the use site.
+getrandom = "0.2"
 # TLS 1.3 server config for the network listeners (`D-auth-scheme`). The default `aws_lc_rs`
 # provider installs a process-default CryptoProvider, so `ServerConfig::builder()` needs no manual
 # provider wiring. The handshake itself is the server's job; this crate only builds the config.

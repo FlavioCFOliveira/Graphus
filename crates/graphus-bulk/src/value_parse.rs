@@ -10,24 +10,73 @@ use graphus_core::Value;
 
 use crate::header::{PropertyType, ScalarType};
 
-/// A value-parse error: a cell did not match its declared scalar type.
+/// The default ceiling on the number of elements a single `type[]` array cell may produce
+/// (SEC-195, CWE-789/400). A single CSV cell with millions of `;` separators would otherwise
+/// materialise a multi-million-element `Value::List` from one line, an out-of-band OOM/DoS vector
+/// for a malicious import (or `LOAD CSV`) file even with row batching. Chosen generous enough for any
+/// legitimate array property yet far below what threatens the host; override via [`ParseLimits`].
+pub const DEFAULT_MAX_ARRAY_ELEMS: usize = 65_536;
+
+/// The default ceiling on the byte length of a single CSV cell (SEC-195). The `csv` crate imposes no
+/// native per-field cap, so a single field of many megabytes can itself be a memory-amplification
+/// vector; reject an over-long cell before parsing. Override via [`ParseLimits`].
+pub const DEFAULT_MAX_CELL_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Resource-safety limits applied while parsing a CSV cell (SEC-195). Both default to safe, generous
+/// values ([`DEFAULT_MAX_ARRAY_ELEMS`], [`DEFAULT_MAX_CELL_BYTES`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ParseLimits {
+    /// Maximum number of elements a single `type[]` cell may yield.
+    pub max_array_elems: usize,
+    /// Maximum byte length of a single cell.
+    pub max_cell_bytes: usize,
+}
+
+impl Default for ParseLimits {
+    fn default() -> Self {
+        Self {
+            max_array_elems: DEFAULT_MAX_ARRAY_ELEMS,
+            max_cell_bytes: DEFAULT_MAX_CELL_BYTES,
+        }
+    }
+}
+
+/// A value-parse error: a cell did not match its declared scalar type, or violated a resource limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueParseError {
     /// The property key whose cell failed.
     pub key: String,
-    /// The offending cell text.
+    /// The offending cell text (truncated in the message for an over-long cell).
     pub cell: String,
-    /// The scalar type that was expected.
+    /// The scalar type that was expected, or a description of the limit violated.
     pub expected: &'static str,
 }
 
 impl std::fmt::Display for ValueParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "property `{}`: cannot parse `{}` as {}",
-            self.key, self.cell, self.expected
-        )
+        // Avoid echoing a multi-megabyte offending cell back into the error string.
+        const MAX_SHOWN: usize = 120;
+        if self.cell.len() > MAX_SHOWN {
+            // Clamp to a UTF-8 char boundary so slicing a multibyte cell never panics.
+            let mut cut = MAX_SHOWN;
+            while cut > 0 && !self.cell.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            write!(
+                f,
+                "property `{}`: cannot parse `{}…` ({} bytes) as {}",
+                self.key,
+                &self.cell[..cut],
+                self.cell.len(),
+                self.expected
+            )
+        } else {
+            write!(
+                f,
+                "property `{}`: cannot parse `{}` as {}",
+                self.key, self.cell, self.expected
+            )
+        }
     }
 }
 
@@ -49,10 +98,36 @@ fn scalar_name(t: ScalarType) -> &'static str {
     }
 }
 
+/// The formula-trigger characters the dumper neutralises with a leading `'` (SEC-194). Mirrors
+/// `dump::FORMULA_TRIGGERS`; kept in sync so a dump → import round-trip is lossless.
+const FORMULA_TRIGGERS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+
+/// Reverses the export-side formula-injection neutralisation (SEC-194) for a **string** cell so a
+/// dump → import round-trip preserves the logical value.
+///
+/// The dumper prefixes a `'` to any string cell that begins with a [formula trigger](FORMULA_TRIGGERS);
+/// this strips exactly that one convention quote when it is immediately followed by a trigger (the
+/// only shape the dumper produces). This mirrors how spreadsheets treat a leading `'` as a
+/// text-format marker rather than data: typing `'=1` stores `=1`. A genuine value that legitimately
+/// begins with `'` followed by a trigger (e.g. a hand-authored `'=x`) is the inherent, documented
+/// ambiguity of the convention; all other strings (including a lone `'`, or `'` followed by a
+/// non-trigger) pass through untouched.
+fn unescape_formula_guard(cell: &str) -> &str {
+    let mut chars = cell.chars();
+    if chars.next() == Some('\'')
+        && chars.next().is_some_and(|c| FORMULA_TRIGGERS.contains(&c))
+    {
+        // Drop exactly the leading `'` (one UTF-8 byte).
+        &cell[1..]
+    } else {
+        cell
+    }
+}
+
 /// Parses one scalar `cell` as `ty`, attributing a failure to property `key`.
 fn parse_scalar(cell: &str, ty: ScalarType, key: &str) -> Result<Value, ValueParseError> {
     match ty {
-        ScalarType::String => Ok(Value::String(cell.to_owned())),
+        ScalarType::String => Ok(Value::String(unescape_formula_guard(cell).to_owned())),
         ScalarType::Integer => {
             cell.trim()
                 .parse::<i64>()
@@ -99,6 +174,31 @@ pub fn parse_cell(
     ty: PropertyType,
     key: &str,
 ) -> Result<Option<Value>, ValueParseError> {
+    parse_cell_with_limits(cell, ty, key, ParseLimits::default())
+}
+
+/// Like [`parse_cell`] but with explicit resource [`ParseLimits`] (SEC-195).
+///
+/// # Errors
+///
+/// Returns [`ValueParseError`] when a non-empty cell (or an array element) does not match the
+/// declared scalar type, when the cell exceeds [`ParseLimits::max_cell_bytes`], or when an array
+/// cell would yield more than [`ParseLimits::max_array_elems`] elements.
+pub fn parse_cell_with_limits(
+    cell: &str,
+    ty: PropertyType,
+    key: &str,
+    limits: ParseLimits,
+) -> Result<Option<Value>, ValueParseError> {
+    // SEC-195: reject an over-long cell up front (the `csv` crate has no native per-field cap), so a
+    // single multi-megabyte field cannot be amplified into a huge in-memory value.
+    if cell.len() > limits.max_cell_bytes {
+        return Err(ValueParseError {
+            key: key.to_owned(),
+            cell: cell.to_owned(),
+            expected: "a cell within the configured size limit",
+        });
+    }
     match ty {
         PropertyType::Scalar(s) => {
             // A string column keeps an empty cell as the empty string (it is a valid string); any
@@ -113,7 +213,24 @@ pub fn parse_cell(
                 // An empty array cell is an empty list (a present-but-empty collection).
                 return Ok(Some(Value::List(Vec::new())));
             }
-            let mut items = Vec::new();
+            // SEC-195: bound the element count *before* materialising the list. `split(';')` yields
+            // `separators + 1` elements; reject when that would exceed the cap, so a cell with
+            // millions of `;` cannot allocate a giant `Vec`. We count separators by bytes (`;` is a
+            // single ASCII byte) without allocating.
+            let sep_count = cell.as_bytes().iter().filter(|&&b| b == b';').count();
+            let elem_count = sep_count + 1;
+            if elem_count > limits.max_array_elems {
+                return Err(ValueParseError {
+                    key: key.to_owned(),
+                    cell: if cell.len() > 120 {
+                        format!("<{} elements>", elem_count)
+                    } else {
+                        cell.to_owned()
+                    },
+                    expected: "an array within the configured element-count limit",
+                });
+            }
+            let mut items = Vec::with_capacity(elem_count);
             for element in cell.split(';') {
                 items.push(parse_scalar(element, s, key)?);
             }
@@ -144,6 +261,33 @@ mod tests {
             parse_cell("TRUE", PropertyType::Scalar(ScalarType::Boolean), "k").unwrap(),
             Some(Value::Boolean(true))
         );
+    }
+
+    #[test]
+    fn unescapes_formula_guard_quote_on_string_import() {
+        // Regression: SEC-194. A `'`-followed-by-trigger (the dumper's neutralisation shape) is
+        // stripped, so a dump → import round-trip is lossless for formula-trigger strings.
+        for (input, want) in [
+            ("'=1+1", "=1+1"),
+            ("'+x", "+x"),
+            ("'-2+3", "-2+3"),
+            ("'@SUM", "@SUM"),
+            ("'\t=1", "\t=1"),
+        ] {
+            assert_eq!(
+                parse_cell(input, PropertyType::Scalar(ScalarType::String), "k").unwrap(),
+                Some(Value::String(want.to_owned())),
+                "convention quote before a trigger must be stripped for {input:?}"
+            );
+        }
+        // A lone `'`, or `'` before a NON-trigger, is genuine data and passes through untouched.
+        for keep in ["'hello", "'", "''", "no quote"] {
+            assert_eq!(
+                parse_cell(keep, PropertyType::Scalar(ScalarType::String), "k").unwrap(),
+                Some(Value::String(keep.to_owned())),
+                "non-neutralisation `'` must be preserved verbatim for {keep:?}"
+            );
+        }
     }
 
     #[test]

@@ -168,6 +168,16 @@ pub enum BindError {
         /// The expectation it violated.
         expected: ParamType,
     },
+    /// A supplied parameter value nests deeper than [`MAX_VALUE_DEPTH`](crate::value_depth::MAX_VALUE_DEPTH)
+    /// (`SEC-190`, CWE-674). Such a value is rejected at the trust boundary because comparing,
+    /// ordering or hashing it would otherwise recurse one stack frame per nesting level and overflow
+    /// the worker stack — an unrecoverable process abort. This is a **runtime** error.
+    ValueTooDeep {
+        /// The over-deep parameter's name.
+        name: String,
+        /// The depth limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl BindError {
@@ -183,7 +193,9 @@ impl BindError {
     #[must_use]
     pub fn parameter_name(&self) -> &str {
         match self {
-            Self::MissingParameter { name } | Self::WrongType { name, .. } => name,
+            Self::MissingParameter { name }
+            | Self::WrongType { name, .. }
+            | Self::ValueTooDeep { name, .. } => name,
         }
     }
 }
@@ -203,6 +215,12 @@ impl fmt::Display for BindError {
                 "parameter `${}` has the wrong type: expected {}",
                 display_name(name),
                 expected.describe(),
+            ),
+            Self::ValueTooDeep { name, limit } => write!(
+                f,
+                "parameter `${}` is nested too deeply (limit {limit}); deeply nested values are \
+                 rejected to keep evaluation stack-safe",
+                display_name(name),
             ),
         }
     }
@@ -328,6 +346,15 @@ pub fn bind_parameters(
         let Some(value) = params.get(name) else {
             return Err(BindError::MissingParameter { name: name.clone() });
         };
+        // SEC-190: reject a pathologically nested parameter value at the trust boundary, before it
+        // can drive the depth-recursive equality/ordering/hash routines into a stack overflow. The
+        // check is iterative and capped, so it is itself stack-safe and `O(limit)`.
+        if crate::value_depth::depth_exceeds(value, crate::value_depth::MAX_VALUE_DEPTH) {
+            return Err(BindError::ValueTooDeep {
+                name: name.clone(),
+                limit: crate::value_depth::MAX_VALUE_DEPTH,
+            });
+        }
         if !expected.accepts(value) {
             return Err(BindError::WrongType {
                 name: name.clone(),

@@ -57,6 +57,7 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_wal::LogSink;
 
 use crate::keyring::Keyring;
+use crate::nonce_budget::NonceBudget;
 use crate::slot::{NONCE_LEN, TAG_LEN};
 
 /// Magic bytes identifying an encrypted Graphus **WAL** sink (`"GRAPHUSW"` — Graphus WAL). Distinct
@@ -79,7 +80,13 @@ pub const WAL_SINK_MAGIC: [u8; 8] = *b"GRAPHUSW";
 ///   zero gap and resume decoding from the next surviving frame's stored offset — the logical
 ///   byte-offset == LSN invariant is preserved across reclamation. Changes the frame layout; a v2
 ///   sink fails closed at open on the version check. No migration needed (pre-1.0).
-pub const WAL_SINK_VERSION: u32 = 3;
+/// - **v4** (rmp #175): each frame now stores the cumulative **nonce-budget write count** (the number
+///   of frames sealed under the WAL subkey through this frame, inclusive) on disk after `logical_len`,
+///   authenticated as part of the AAD. On open the budget resumes from the last surviving frame's
+///   count, so the GCM random-nonce birthday cap
+///   ([`crate::nonce_budget::MAX_WRITES_PER_SUBKEY`]) is enforced across reopens. Changes the frame
+///   layout; a v3 sink fails closed at open on the version check. No migration needed (pre-1.0).
+pub const WAL_SINK_VERSION: u32 = 4;
 
 /// Cipher identifier for AES-256-GCM with a 96-bit nonce and 128-bit tag (matches the store).
 pub const WAL_CIPHER_AES_256_GCM: u32 = 1;
@@ -96,12 +103,14 @@ const HDR_OFF_KCV: usize = 20;
 const HDR_PREFIX_LEN: usize = HDR_OFF_KCV;
 
 // --- frame layout (all multi-byte integers little-endian) ----------------------------------------
-// magic(4) || phys_len(8) || logical_offset(8) || logical_len(8) || nonce(12) || ciphertext(logical_len) || tag(16)
+// magic(4) || phys_len(8) || logical_offset(8) || logical_len(8) || write_count(8) || nonce(12)
+//   || ciphertext(logical_len) || tag(16)
 const FR_OFF_MAGIC: usize = 0;
 const FR_OFF_PHYS_LEN: usize = 4;
 const FR_OFF_LOGICAL_OFFSET: usize = 12;
 const FR_OFF_LOGICAL_LEN: usize = 20;
-const FR_OFF_NONCE: usize = 28;
+const FR_OFF_WRITE_COUNT: usize = 28; // v4 (rmp #175): cumulative nonce-budget high-water mark
+const FR_OFF_NONCE: usize = 36;
 const FR_OFF_CIPHERTEXT: usize = FR_OFF_NONCE + NONCE_LEN;
 
 /// A fixed, **all-non-zero** 4-byte frame magic ("GWFR", little-endian) at the very start of every
@@ -115,10 +124,10 @@ const FR_OFF_CIPHERTEXT: usize = FR_OFF_NONCE + NONCE_LEN;
 /// so a misaligned resume is caught rather than mis-decoded.
 const FRAME_MAGIC: [u8; 4] = *b"GWFR";
 
-/// The fixed frame overhead: the magic, the three header fields (`phys_len`, `logical_offset`,
-/// `logical_len`), the nonce, and the trailing tag. The on-disk frame length is
+/// The fixed frame overhead: the magic, the four header fields (`phys_len`, `logical_offset`,
+/// `logical_len`, `write_count`), the nonce, and the trailing tag. The on-disk frame length is
 /// `FRAME_OVERHEAD + logical_len`.
-const FRAME_OVERHEAD: usize = 4 + 8 + 8 + 8 + NONCE_LEN + TAG_LEN;
+const FRAME_OVERHEAD: usize = 4 + 8 + 8 + 8 + 8 + NONCE_LEN + TAG_LEN;
 
 /// One frame's physical layout: where its plaintext begins logically, and where it sits physically.
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +140,9 @@ struct FrameLoc {
     phys_offset: u64,
     /// The whole physical frame length in the backing sink.
     phys_len: u64,
+    /// The cumulative nonce-budget write count through this frame, inclusive (v4, rmp #175). On open
+    /// the budget resumes from the last surviving frame's value.
+    write_count: u64,
 }
 
 /// A [`LogSink`] that encrypts every synced batch of WAL bytes into one authenticated frame in a
@@ -156,6 +168,10 @@ pub struct EncryptedLogSink<S: LogSink> {
     /// Buffered plaintext appended but not yet sealed into a frame (mirrors the backing sinks'
     /// `pending`).
     pending: Vec<u8>,
+    /// The random-nonce write budget for the WAL subkey (rmp #175): bounds frame encryptions below
+    /// the GCM birthday limit and fails closed when exhausted. Resumed conservatively from the last
+    /// surviving frame's stored `write_count` on open; advanced once per sealed frame.
+    budget: NonceBudget,
 }
 
 impl<S: LogSink> std::fmt::Debug for EncryptedLogSink<S> {
@@ -196,6 +212,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
             logical_durable_len: 0,
             header_phys_len,
             pending: Vec::new(),
+            budget: NonceBudget::resume_from(0),
         })
     }
 
@@ -257,6 +274,11 @@ impl<S: LogSink> EncryptedLogSink<S> {
             frames.push(loc);
         }
 
+        // Resume the nonce-budget conservatively from the last surviving frame's cumulative write
+        // count (rmp #175). A reclaim only ever drops *leading* frames, so the last frame always
+        // carries the true high-water mark; if there are no frames the budget starts at 0.
+        let consumed = frames.last().map_or(0, |f| f.write_count);
+
         Ok(Self {
             backing,
             cipher,
@@ -264,6 +286,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
             logical_durable_len,
             header_phys_len: header_len as u64,
             pending: Vec::new(),
+            budget: NonceBudget::resume_from(consumed),
         })
     }
 
@@ -287,18 +310,30 @@ impl<S: LogSink> EncryptedLogSink<S> {
         &mut self.backing
     }
 
-    /// The AAD for a frame at logical offset `off`: its 8-byte little-endian value, binding the
-    /// ciphertext to its logical position (a frame cannot be relocated/reordered).
-    fn aad(off: u64) -> [u8; 8] {
-        off.to_le_bytes()
+    /// The current nonce-budget high-water mark (frames sealed under the WAL subkey), for
+    /// tests/inspection (rmp #175).
+    #[must_use]
+    pub fn nonce_budget_consumed(&self) -> u64 {
+        self.budget.consumed()
     }
 
-    /// Seals `plaintext` into a frame at logical offset `logical_offset` and returns the framed
-    /// bytes ready to append to the backing.
-    fn seal_frame(&self, logical_offset: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+    /// The AAD for a frame: its logical offset and cumulative write count, both 8-byte little-endian
+    /// (16 bytes total). Binding the offset stops a frame being relocated/reordered (v3); binding the
+    /// write count stops the durable nonce-budget high-water mark being tampered to a lower value to
+    /// defeat the GCM birthday cap (v4, rmp #175).
+    fn aad(logical_offset: u64, write_count: u64) -> [u8; 16] {
+        let mut aad = [0u8; 16];
+        aad[..8].copy_from_slice(&logical_offset.to_le_bytes());
+        aad[8..].copy_from_slice(&write_count.to_le_bytes());
+        aad
+    }
+
+    /// Seals `plaintext` into a frame at logical offset `logical_offset`, stamped with the cumulative
+    /// `write_count`, and returns the framed bytes ready to append to the backing.
+    fn seal_frame(&self, logical_offset: u64, write_count: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce_bytes = random_nonce();
         let nonce = Nonce::from(nonce_bytes);
-        let aad = Self::aad(logical_offset);
+        let aad = Self::aad(logical_offset, write_count);
         let sealed = self
             .cipher
             .encrypt(
@@ -326,6 +361,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
         frame.extend_from_slice(&phys_len.to_le_bytes());
         frame.extend_from_slice(&logical_offset.to_le_bytes()); // v3: self-locating frame
         frame.extend_from_slice(&logical_len.to_le_bytes());
+        frame.extend_from_slice(&write_count.to_le_bytes()); // v4: nonce-budget high-water mark
         frame.extend_from_slice(&nonce_bytes);
         frame.extend_from_slice(&sealed); // ciphertext || tag
         debug_assert_eq!(frame.len() as u64, phys_len);
@@ -344,11 +380,16 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
             // anything the backing buffered, and keeps the group-commit contract uniform).
             return self.backing.sync();
         }
+        // Reserve nonce budget BEFORE sealing (rmp #175): once the GCM birthday ceiling for the WAL
+        // subkey is reached, fail closed here rather than risk a (key, nonce) collision. The reserved
+        // count is stamped into the frame as its durable high-water mark. Pending is untouched, so the
+        // caller can retry after rotating the master key.
+        let write_count = self.budget.reserve()?;
         let logical_offset = self.logical_durable_len;
         // `seal_frame` does not borrow `self.pending` mutably, but we must not hold an immutable
         // borrow of `pending` across the `append`; take the pending bytes out first.
         let pending = std::mem::take(&mut self.pending);
-        let frame = match self.seal_frame(logical_offset, &pending) {
+        let frame = match self.seal_frame(logical_offset, write_count, &pending) {
             Ok(f) => f,
             Err(e) => {
                 // Restore pending so the caller can retry; nothing was appended to the backing.
@@ -366,6 +407,7 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
             logical_len: pending.len() as u64,
             phys_offset,
             phys_len,
+            write_count,
         });
         self.logical_durable_len += pending.len() as u64;
         Ok(())
@@ -480,7 +522,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
         let nonce = Nonce::from(nonce_bytes);
         // ciphertext || tag is everything after the nonce.
         let ct_and_tag = &frame[FR_OFF_CIPHERTEXT..];
-        let aad = Self::aad(loc.logical_offset);
+        let aad = Self::aad(loc.logical_offset, loc.write_count);
         let plaintext = self
             .cipher
             .decrypt(
@@ -590,6 +632,7 @@ fn decode_and_authenticate_frame(
     let phys_len = u64::from_le_bytes(read8(physical, cursor + FR_OFF_PHYS_LEN));
     let logical_offset = u64::from_le_bytes(read8(physical, cursor + FR_OFF_LOGICAL_OFFSET));
     let logical_len = u64::from_le_bytes(read8(physical, cursor + FR_OFF_LOGICAL_LEN));
+    let write_count = u64::from_le_bytes(read8(physical, cursor + FR_OFF_WRITE_COUNT));
     // The claimed physical length must be consistent (overhead + logical_len) and within bounds.
     let expected_phys = (FRAME_OVERHEAD as u64).checked_add(logical_len)?;
     if phys_len != expected_phys {
@@ -605,7 +648,9 @@ fn decode_and_authenticate_frame(
         .ok()?;
     let nonce = Nonce::from(nonce_bytes);
     let ct_and_tag = &frame[FR_OFF_CIPHERTEXT..];
-    let aad = logical_offset.to_le_bytes();
+    let mut aad = [0u8; 16];
+    aad[..8].copy_from_slice(&logical_offset.to_le_bytes());
+    aad[8..].copy_from_slice(&write_count.to_le_bytes());
     match cipher.decrypt(
         &nonce,
         aes_gcm::aead::Payload {
@@ -619,6 +664,7 @@ fn decode_and_authenticate_frame(
                 logical_len,
                 phys_offset: cursor as u64,
                 phys_len,
+                write_count,
             },
             true,
         )),

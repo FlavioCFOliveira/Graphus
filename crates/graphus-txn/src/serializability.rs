@@ -157,6 +157,11 @@ impl HistoryChecker {
 }
 
 /// Finds a directed cycle in an edge set, returning its nodes in traversal order, or `None`.
+///
+/// SEC-199 (CWE-674): the search is **iterative** (an explicit work stack), so a pathologically deep
+/// or long serialization graph — an anomaly history with a very long dependency chain — cannot
+/// overflow the call stack. Behaviour is otherwise identical to the previous recursive form: it
+/// returns the first cycle found, as the nodes from the back-edge target up to the current node.
 fn find_cycle(edges: &BTreeSet<(TxnId, TxnId)>) -> Option<Vec<TxnId>> {
     // Adjacency list.
     let mut adj: BTreeMap<TxnId, Vec<TxnId>> = BTreeMap::new();
@@ -167,46 +172,66 @@ fn find_cycle(edges: &BTreeSet<(TxnId, TxnId)>) -> Option<Vec<TxnId>> {
         nodes.insert(b);
     }
 
-    let mut visiting: BTreeSet<TxnId> = BTreeSet::new();
     let mut visited: BTreeSet<TxnId> = BTreeSet::new();
 
     for &start in &nodes {
-        if !visited.contains(&start) {
-            let mut stack: Vec<TxnId> = Vec::new();
-            if let Some(cycle) = dfs_cycle(start, &adj, &mut visiting, &mut visited, &mut stack) {
-                return Some(cycle);
-            }
+        if visited.contains(&start) {
+            continue;
+        }
+        if let Some(cycle) = iter_find_cycle_from(start, &adj, &mut visited) {
+            return Some(cycle);
         }
     }
     None
 }
 
-fn dfs_cycle(
-    node: TxnId,
+/// Iterative DFS from `start` that returns the first cycle reachable, or `None`.
+fn iter_find_cycle_from(
+    start: TxnId,
     adj: &BTreeMap<TxnId, Vec<TxnId>>,
-    visiting: &mut BTreeSet<TxnId>,
     visited: &mut BTreeSet<TxnId>,
-    stack: &mut Vec<TxnId>,
 ) -> Option<Vec<TxnId>> {
-    visiting.insert(node);
-    stack.push(node);
-    if let Some(targets) = adj.get(&node) {
-        for &next in targets {
-            if visiting.contains(&next) {
-                // Back-edge: the cycle is `next .. top-of-stack`.
-                if let Some(pos) = stack.iter().position(|t| *t == next) {
-                    return Some(stack[pos..].to_vec());
+    struct Frame<'a> {
+        node: TxnId,
+        targets: std::slice::Iter<'a, TxnId>,
+    }
+    let empty: &[TxnId] = &[];
+    let iter_of = |n: TxnId| adj.get(&n).map_or(empty, Vec::as_slice).iter();
+
+    let mut on_path: BTreeSet<TxnId> = BTreeSet::new();
+    let mut path: Vec<TxnId> = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
+
+    visited.insert(start);
+    on_path.insert(start);
+    path.push(start);
+    stack.push(Frame {
+        node: start,
+        targets: iter_of(start),
+    });
+
+    while let Some(frame) = stack.last_mut() {
+        if let Some(&next) = frame.targets.next() {
+            if on_path.contains(&next) {
+                // Back-edge: the cycle is `next .. top-of-path`.
+                if let Some(pos) = path.iter().position(|t| *t == next) {
+                    return Some(path[pos..].to_vec());
                 }
-            } else if !visited.contains(&next)
-                && let Some(cycle) = dfs_cycle(next, adj, visiting, visited, stack)
-            {
-                return Some(cycle);
+            } else if !visited.contains(&next) {
+                visited.insert(next);
+                on_path.insert(next);
+                path.push(next);
+                stack.push(Frame {
+                    node: next,
+                    targets: iter_of(next),
+                });
             }
+        } else {
+            on_path.remove(&frame.node);
+            path.pop();
+            stack.pop();
         }
     }
-    stack.pop();
-    visiting.remove(&node);
-    visited.insert(node);
     None
 }
 

@@ -318,13 +318,15 @@ async fn rest_auth_status(addr: std::net::SocketAddr, user: &str) -> u16 {
 }
 
 /// Mints a Bearer token for `user` (subject = `user`) valid for an hour, signed with the server's
-/// configured JWT secret. The token is *structurally* valid regardless of whether the user exists;
-/// the server's live `authenticate_bearer` then decides acceptance by checking the subject against
-/// the **current** catalog — which is exactly the live property under test.
+/// configured JWT secret, stamped at credential epoch `0` (these fixture users never change their
+/// password, so the live catalog's epoch stays `0` and the `ver >= current` check passes). The token
+/// is *structurally* valid regardless of whether the user exists; the server's live
+/// `authenticate_bearer` then decides acceptance by checking the subject against the **current**
+/// catalog — which is exactly the live property under test.
 fn mint_token(user: &str) -> String {
     use graphus_auth::JwtAuthenticator;
     let jwt = JwtAuthenticator::new(JWT_SECRET.as_bytes()).expect("JWT_SECRET is >= 32 bytes");
-    jwt.issue_token(user, now_unix_secs(), 3_600)
+    jwt.issue_token(user, now_unix_secs(), 3_600, 0)
         .expect("mint token")
 }
 

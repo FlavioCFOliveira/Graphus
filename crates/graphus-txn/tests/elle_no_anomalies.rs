@@ -85,7 +85,7 @@ fn run_workload(seed: u64) -> HistoryChecker {
     let mut mgr = TxnManager::new(MemVersionedStore::new());
 
     // Seed every key with version 1 so reads have something to observe.
-    let seed_txn = mgr.begin_serializable();
+    let seed_txn = mgr.begin_serializable().unwrap();
     for k in 0..n_keys {
         mgr.write(seed_txn, k, encode(0, 1)).unwrap();
     }
@@ -104,7 +104,7 @@ fn run_workload(seed: u64) -> HistoryChecker {
         let batch = &plans[i..end];
 
         // Begin all transactions in the wave (they are now concurrent).
-        let txns: Vec<TxnId> = batch.iter().map(|_| mgr.begin_serializable()).collect();
+        let txns: Vec<TxnId> = batch.iter().map(|_| mgr.begin_serializable().unwrap()).collect();
 
         // Each transaction performs its ops; record what it read/intends.
         // We buffer per-txn recorded ops and the version each write WILL install (decided at commit).
@@ -254,13 +254,13 @@ fn snapshot_isolation_can_produce_anomalies_the_checker_catches() {
     // and the checker flags it. This jointly proves (a) SI is genuinely weaker and (b) the checker
     // detects anomalies the engine actually produces, not just synthetic ones.
     let mut mgr = TxnManager::new(MemVersionedStore::new());
-    let seed = mgr.begin_serializable();
+    let seed = mgr.begin_serializable().unwrap();
     mgr.write(seed, 1, encode(0, 1)).unwrap();
     mgr.write(seed, 2, encode(0, 1)).unwrap();
     mgr.commit(seed).unwrap();
 
-    let t1 = mgr.begin(IsolationLevel::Snapshot);
-    let t2 = mgr.begin(IsolationLevel::Snapshot);
+    let t1 = mgr.begin(IsolationLevel::Snapshot).unwrap();
+    let t2 = mgr.begin(IsolationLevel::Snapshot).unwrap();
 
     let r1_y = decode_version(&mgr.read(t1, 2).unwrap().unwrap());
     let r2_x = decode_version(&mgr.read(t2, 1).unwrap().unwrap());

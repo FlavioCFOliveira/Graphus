@@ -102,21 +102,72 @@ impl<D: BlockDevice, W: WalRule> BufferPool<D, W> {
     }
 
     /// Borrows the cached page held by a pinned frame.
+    ///
+    /// # Panics
+    /// Panics if `f` is out of bounds (an invariant violation: handles are minted only by the
+    /// pool, so a pool-minted handle is always in range). Use [`try_page`](Self::try_page) when the
+    /// handle may not be provably pool-minted.
     #[must_use]
     pub fn page(&self, f: FrameId) -> &Page {
-        &self.frames[f.0].data
+        &self.frame(f.0).data
+    }
+
+    /// The fallible counterpart of [`page`](Self::page): returns a clean storage error for an
+    /// out-of-range handle instead of panicking (CWE-129 defence in depth).
+    ///
+    /// # Errors
+    /// Returns a storage error if `f` is out of bounds for this pool.
+    pub fn try_page(&self, f: FrameId) -> Result<&Page> {
+        self.frames
+            .get(f.0)
+            .map(|fr| &*fr.data)
+            .ok_or_else(|| Self::oob_err(f.0, self.frames.len()))
     }
 
     /// Mutably borrows the page held by a pinned frame and marks it dirty.
+    ///
+    /// # Panics
+    /// Panics if `f` is out of bounds (see [`page`](Self::page)).
     pub fn page_mut(&mut self, f: FrameId) -> &mut Page {
-        self.frames[f.0].dirty = true;
-        &mut self.frames[f.0].data
+        let n = self.frames.len();
+        let fr = self
+            .frames
+            .get_mut(f.0)
+            .unwrap_or_else(|| panic!("{}", Self::oob_msg(f.0, n)));
+        fr.dirty = true;
+        &mut fr.data
+    }
+
+    fn oob_msg(idx: usize, capacity: usize) -> String {
+        format!("frame handle {idx} out of bounds (capacity {capacity}): handles must be pool-minted")
+    }
+
+    fn oob_err(idx: usize, capacity: usize) -> GraphusError {
+        GraphusError::Storage(Self::oob_msg(idx, capacity))
+    }
+
+    /// Resolves a frame index to its slot with an explicit bounds check (CWE-129 defence in depth).
+    #[inline]
+    fn frame(&self, idx: usize) -> &Frame {
+        let n = self.frames.len();
+        debug_assert!(idx < n, "{}", Self::oob_msg(idx, n));
+        self.frames
+            .get(idx)
+            .unwrap_or_else(|| panic!("{}", Self::oob_msg(idx, n)))
     }
 
     /// Decrements the pin count of a frame.
+    ///
+    /// # Panics
+    /// Panics if `f` is out of bounds (an invariant violation; handles are pool-minted).
     pub fn unpin(&mut self, f: FrameId) {
-        debug_assert!(self.frames[f.0].pin_count > 0);
-        self.frames[f.0].pin_count = self.frames[f.0].pin_count.saturating_sub(1);
+        let n = self.frames.len();
+        let fr = self
+            .frames
+            .get_mut(f.0)
+            .unwrap_or_else(|| panic!("{}", Self::oob_msg(f.0, n)));
+        debug_assert!(fr.pin_count > 0);
+        fr.pin_count = fr.pin_count.saturating_sub(1);
     }
 
     /// Fetches `page_id`, loading it from the device on a miss (verifying its checksum), and
@@ -261,6 +312,24 @@ mod tests {
         let mut p = pool(1);
         let (_fa, _a) = p.new_page().unwrap(); // pinned
         assert!(p.new_page().is_err());
+    }
+
+    /// Regression: SEC-212 — an out-of-range `FrameId` must yield a controlled error through the
+    /// checked accessor (`try_page`), never an out-of-bounds slice panic (CWE-129).
+    #[test]
+    fn out_of_range_frame_handle_yields_error_not_oob() {
+        let p = pool(2);
+        let evil = FrameId(2); // one past the last valid frame; never pool-minted
+        assert!(
+            p.try_page(evil).is_err(),
+            "an out-of-range handle must return Err, not index out of bounds"
+        );
+        assert!(p.try_page(FrameId(usize::MAX)).is_err());
+        // A valid, pool-minted handle still resolves through the same checked accessor.
+        let mut p = pool(2);
+        let (f, _id) = p.new_page().unwrap();
+        assert!(p.try_page(f).is_ok());
+        p.unpin(f);
     }
 
     #[test]

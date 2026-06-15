@@ -93,6 +93,8 @@ pub async fn start_all(
     // The TLS-handshake deadline and optional idle/read deadline applied to network sessions.
     let handshake_timeout = config.timing.handshake_timeout();
     let idle_timeout = config.timing.idle_timeout();
+    // The REST request-header read deadline (SEC-181) — bounds a post-TLS slow-loris drip.
+    let header_read_timeout = config.timing.header_read_timeout();
 
     // The address routing (`neo4j://`) drivers are told to reconnect to in a `ROUTE` reply (rmp
     // #95): the explicit advertised address, else the Bolt-TCP bind address (see
@@ -187,6 +189,7 @@ pub async fn start_all(
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
             handshake_timeout,
+            header_read_timeout,
             shutdown.clone(),
         ));
         Some(bound)

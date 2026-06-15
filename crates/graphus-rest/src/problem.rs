@@ -52,6 +52,11 @@ use crate::value::ValueCodecError;
 /// The RFC 9457 media type for a problem-details response.
 pub const PROBLEM_JSON: &str = "application/problem+json";
 
+/// The stable, generic `detail` returned to clients for any **server-fault** (5xx) problem (rmp #187,
+/// CWE-209). The verbose internal cause is logged server-side only; the client learns nothing about
+/// the server's internals (filesystem paths, offsets, storage internals).
+const GENERIC_SERVER_FAULT_DETAIL: &str = "an internal error occurred";
+
 /// An RFC 9457 Problem Details object (`06 §3.3`).
 ///
 /// Serialised with the canonical member names. `type`/`title`/`status` are always present; `detail`
@@ -111,42 +116,53 @@ impl Problem {
     /// matching the Bolt renderer.
     #[must_use]
     pub fn from_graphus_error(error: &GraphusError) -> Self {
-        let (status, kind, title, code) = match error {
+        // `server_fault` marks the 5xx (server-side) classes whose raw `detail` must NOT reach the
+        // untrusted client (rmp #187, CWE-209): an internal/storage fault would otherwise disclose
+        // file paths, offsets, and low-level causes. For those, the wire `detail` is a stable generic
+        // string and the verbose cause is logged server-side only. Client-fault 4xx detail is kept —
+        // it is the client's own request that is at fault and the detail helps them fix it.
+        let (status, kind, title, code, server_fault) = match error {
             GraphusError::Compile(_) => (
                 StatusCode::BAD_REQUEST,
                 "compile",
                 "Cypher compile-time error",
                 CODE_COMPILE_SYNTAX,
+                false,
             ),
             GraphusError::Runtime(_) => (
                 StatusCode::BAD_REQUEST,
                 "runtime",
                 "Cypher runtime error",
                 CODE_RUNTIME_ARGUMENT,
+                false,
             ),
             GraphusError::Transaction(_) => (
                 StatusCode::CONFLICT,
                 "transaction",
                 "transaction error",
                 CODE_TXN_TERMINATED,
+                false,
             ),
             GraphusError::Storage(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage",
                 "storage error",
                 CODE_DB_UNKNOWN,
+                true,
             ),
             GraphusError::Protocol(_) => (
                 StatusCode::BAD_REQUEST,
                 "protocol",
                 "protocol error",
                 CODE_REQUEST_INVALID,
+                false,
             ),
             GraphusError::Security(_) => (
                 StatusCode::FORBIDDEN,
                 "forbidden",
                 "not authorized",
                 CODE_FORBIDDEN,
+                false,
             ),
             // `#[non_exhaustive]`: an unclassified future variant defaults to a server fault.
             _ => (
@@ -154,8 +170,15 @@ impl Problem {
                 "internal",
                 "internal error",
                 CODE_DB_UNKNOWN,
+                true,
             ),
         };
+
+        if server_fault {
+            // Log the verbose internal cause server-side, never on the wire (rmp #187, CWE-209).
+            eprintln!("graphus-rest: internal {kind} fault: {error}");
+            return Problem::new(status, kind, title, GENERIC_SERVER_FAULT_DETAIL).with_code(code);
+        }
         Problem::new(status, kind, title, strip_layer_prefix(&error.to_string())).with_code(code)
     }
 
@@ -306,6 +329,19 @@ mod tests {
     fn storage_error_is_500() {
         let p = Problem::from_graphus_error(&GraphusError::Storage("disk".to_owned()));
         assert_eq!(p.status, 500);
+    }
+
+    #[test]
+    fn server_fault_detail_is_redacted() {
+        // rmp #187 (CWE-209): a 500 must carry a generic detail, never the raw internal cause.
+        let p = Problem::from_graphus_error(&GraphusError::Storage(
+            "page fault at /var/lib/graphus/data/store.0001 offset 0xDEADBEEF".to_owned(),
+        ));
+        assert_eq!(p.status, 500);
+        assert_eq!(p.detail.as_deref(), Some(GENERIC_SERVER_FAULT_DETAIL));
+        let detail = p.detail.unwrap();
+        assert!(!detail.contains("/var/lib/graphus"));
+        assert!(!detail.contains("0xDEADBEEF"));
     }
 
     #[test]

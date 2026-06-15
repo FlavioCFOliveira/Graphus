@@ -44,7 +44,8 @@
 //! indexing or `unwrap` that can panic on user input; a [`GdsError`] is mapped to a `ProcedureFailure`
 //! at the boundary.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use graphus_core::Value;
 use graphus_gds::algo::centrality::{
@@ -73,6 +74,127 @@ pub type GdsCatalogHandle = Arc<Mutex<GraphCatalog>>;
 #[must_use]
 pub fn new_catalog() -> GdsCatalogHandle {
     Arc::new(Mutex::new(GraphCatalog::new()))
+}
+
+// =================================================================================================
+// Resource policy (SEC-201/202/204): timeouts, iteration ceilings, projection quotas
+// =================================================================================================
+
+/// The process-wide GDS resource policy. `None` until the server installs one; the fail-safe default
+/// ([`GdsResourcePolicy::default`]) is used otherwise — it already bounds every algorithm.
+static GLOBAL_GDS_POLICY: OnceLock<GdsResourcePolicy> = OnceLock::new();
+
+/// Installs the process-wide GDS resource policy (`SEC-201/202/204`). The **first** call wins
+/// ([`OnceLock`] semantics); the server installs one at startup.
+///
+/// # Errors
+///
+/// Returns the already-installed [`GdsResourcePolicy`] if one was set.
+pub fn set_global_gds_policy(policy: GdsResourcePolicy) -> Result<(), GdsResourcePolicy> {
+    GLOBAL_GDS_POLICY.set(policy)
+}
+
+/// The GDS resource policy in force, or the bounded default when none was installed.
+#[must_use]
+pub fn global_gds_policy() -> &'static GdsResourcePolicy {
+    GLOBAL_GDS_POLICY.get_or_init(GdsResourcePolicy::default)
+}
+
+/// Resource limits applied to every `gds.*` algorithm invocation (`SEC-201/202/204`).
+///
+/// All limits default to *bounded* values, so even a server that never configures a policy is
+/// protected from a single adversarial query pinning a core forever (CPU DoS) or OOM-ing the host:
+///
+/// - **`algorithm_timeout`** — wall-clock deadline threaded into a real [`Cancel`], so an
+///   `O(n·m)`/`O(n²)` run aborts with [`GdsError::Cancelled`] instead of burning a core indefinitely
+///   (`SEC-201`).
+/// - **`max_iterations`** — a ceiling on client-supplied `maxIterations` (`SEC-202`), so a request
+///   like `{maxIterations: 4000000000}` is clamped to a sane bound.
+/// - **`max_nodes` / `max_edges` / `max_memory_bytes`** — projection quotas enforced at
+///   `gds.graph.project` time (`SEC-204`), so an attacker cannot materialise an unbounded in-memory
+///   projection that downstream `O(n²)` algorithms then blow up into OOM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GdsResourcePolicy {
+    /// Wall-clock deadline for one algorithm run. `None` disables the timeout (not recommended in
+    /// production). Default: 30 s.
+    pub algorithm_timeout: Option<Duration>,
+    /// Hard ceiling on the iteration count of iterative algorithms (PageRank, label propagation).
+    /// Default: 1000.
+    pub max_iterations: u32,
+    /// Maximum node count of a projection. Default: 50 million.
+    pub max_nodes: usize,
+    /// Maximum (post-symmetrisation) edge count of a projection. Default: 200 million.
+    pub max_edges: usize,
+    /// Maximum estimated heap footprint of a projection, in bytes. Default: 4 GiB.
+    pub max_memory_bytes: usize,
+}
+
+impl Default for GdsResourcePolicy {
+    fn default() -> Self {
+        Self {
+            algorithm_timeout: Some(Duration::from_secs(30)),
+            max_iterations: 1_000,
+            max_nodes: 50_000_000,
+            max_edges: 200_000_000,
+            max_memory_bytes: 4 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl GdsResourcePolicy {
+    /// Clamps a client-requested iteration count to [`Self::max_iterations`] (`SEC-202`).
+    #[must_use]
+    pub fn clamp_iterations(&self, requested: u32) -> u32 {
+        requested.min(self.max_iterations)
+    }
+
+    /// Validates a freshly-built projection against the node/edge/memory quotas (`SEC-204`).
+    ///
+    /// # Errors
+    ///
+    /// [`GdsError::InvalidArgument`] when any quota is exceeded.
+    fn check_projection(&self, g: &CsrGraph) -> std::result::Result<(), GdsError> {
+        if g.node_count() > self.max_nodes {
+            return Err(GdsError::InvalidArgument(format!(
+                "projection has {} nodes, exceeding the configured limit of {}",
+                g.node_count(),
+                self.max_nodes
+            )));
+        }
+        if g.edge_count() > self.max_edges {
+            return Err(GdsError::InvalidArgument(format!(
+                "projection has {} edges, exceeding the configured limit of {}",
+                g.edge_count(),
+                self.max_edges
+            )));
+        }
+        let bytes = g.memory_bytes();
+        if bytes > self.max_memory_bytes {
+            return Err(GdsError::InvalidArgument(format!(
+                "projection needs ~{bytes} bytes, exceeding the configured limit of {}",
+                self.max_memory_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Runs `f`, supplying it a real [`Cancel`] that fires when the policy's wall-clock deadline elapses
+/// (`SEC-201`). The algorithms check the `Cancel` cooperatively (per source / per iteration), so a
+/// runaway `O(n·m)`/`O(n²)` run aborts with [`GdsError::Cancelled`] rather than pinning a core.
+///
+/// When no timeout is configured the supplied `Cancel` never fires (the algorithms still terminate
+/// by their own bounds).
+fn with_deadline<T>(f: impl FnOnce(&Cancel<'_>) -> Result<T, ProcedureFailure>) -> Result<T, ProcedureFailure> {
+    match global_gds_policy().algorithm_timeout {
+        Some(timeout) => {
+            let deadline = Instant::now() + timeout;
+            // `from_fn` is cheap: a single `Instant::now()` comparison per cooperative check.
+            let cancel = Cancel::from_fn(move || Instant::now() >= deadline);
+            f(&cancel)
+        }
+        None => f(&Cancel::never()),
+    }
 }
 
 // =================================================================================================
@@ -208,6 +330,31 @@ fn arg_opt_string(args: &[Value], idx: usize) -> Option<String> {
     }
 }
 
+/// Validates and clamps a client-supplied `maxIterations` float to the policy ceiling (`SEC-202`).
+///
+/// Rejects a non-finite or negative value with a clear [`ProcedureFailure`] (rather than letting a
+/// saturating `as u32` turn `f64::INFINITY` into `u32::MAX`), then clamps the rounded value to
+/// [`GdsResourcePolicy::max_iterations`]. A fractional request is floored.
+///
+/// # Errors
+///
+/// [`ProcedureFailure`] when `m` is NaN, infinite, or negative.
+fn clamp_max_iter(name: &str, m: f64) -> Result<u32, ProcedureFailure> {
+    if !m.is_finite() || m < 0.0 {
+        return Err(ProcedureFailure::new(
+            name,
+            "maxIterations must be a finite, non-negative integer",
+        ));
+    }
+    // `m` is finite and >= 0 here; floor then saturate into u32 before clamping to the ceiling.
+    let requested = if m >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        m as u32
+    };
+    Ok(global_gds_policy().clamp_iterations(requested))
+}
+
 /// Reads a numeric configuration value from the optional trailing **config map** argument by key,
 /// returning `None` when the map or key is absent (so the algorithm uses its default).
 fn config_f64(args: &[Value], map_idx: usize, key: &str) -> Option<f64> {
@@ -322,6 +469,12 @@ fn register_lifecycle(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
                 weight_property.as_deref(),
                 undirected,
             )?;
+            // SEC-204: enforce the projection quota (nodes / edges / estimated bytes) before the
+            // projection is registered, so an unbounded in-memory graph (and the O(n^2) algorithms
+            // that would run over it) is refused with a clean error rather than OOM-ing the host.
+            global_gds_policy()
+                .check_projection(&projected)
+                .map_err(|e| gds_failure(NAME, e))?;
             let node_count = projected.node_count() as i64;
             let rel_count = projected.edge_count() as i64;
 
@@ -504,12 +657,18 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
                 config.damping = d;
             }
             if let Some(m) = config_f64(args, 1, "maxIterations") {
-                config.max_iter = m.max(0.0) as u32;
+                // SEC-202: clamp the client-supplied iteration count to the policy ceiling and reject
+                // a non-finite / negative value explicitly (a saturating `as u32` would silently turn
+                // `f64::INFINITY` into u32::MAX — the worst case).
+                config.max_iter = clamp_max_iter(NAME, m)?;
             }
             if let Some(t) = config_f64(args, 1, "tolerance") {
                 config.tolerance = t;
             }
-            let result = pagerank(&g, config, &Cancel::never()).map_err(|e| gds_failure(NAME, e))?;
+            // SEC-201: a real deadline-backed Cancel aborts a runaway run.
+            let result = with_deadline(|cancel| {
+                pagerank(&g, config, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             Ok(id_score_rows(&g, &result.rank))
         }),
     );
@@ -542,8 +701,9 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.closeness.stream";
             let g = get_projected(NAME, &cat, args)?;
-            let scores =
-                closeness_centrality(&g, &Cancel::never()).map_err(|e| gds_failure(NAME, e))?;
+            let scores = with_deadline(|cancel| {
+                closeness_centrality(&g, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             Ok(id_score_rows(&g, &scores))
         }),
     );
@@ -565,8 +725,9 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.betweenness.stream";
             let g = get_projected(NAME, &cat, args)?;
-            let raw =
-                betweenness_centrality(&g, &Cancel::never()).map_err(|e| gds_failure(NAME, e))?;
+            let raw = with_deadline(|cancel| {
+                betweenness_centrality(&g, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             let scores = undirected_scale(&g, raw);
             Ok(id_score_rows(&g, &scores))
         }),
@@ -589,8 +750,9 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.wcc.stream";
             let g = get_projected(NAME, &cat, args)?;
-            let result = weakly_connected_components(&g, &Cancel::never())
-                .map_err(|e| gds_failure(NAME, e))?;
+            let result = with_deadline(|cancel| {
+                weakly_connected_components(&g, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             Ok(id_component_rows(&g, &result.component))
         }),
     );
@@ -609,8 +771,9 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.scc.stream";
             let g = get_projected(NAME, &cat, args)?;
-            let result = strongly_connected_components(&g, &Cancel::never())
-                .map_err(|e| gds_failure(NAME, e))?;
+            let result = with_deadline(|cancel| {
+                strongly_connected_components(&g, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             Ok(id_component_rows(&g, &result.component))
         }),
     );
@@ -631,11 +794,12 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
             let g = get_projected(NAME, &cat, args)?;
             let mut config = LabelPropagationConfig::default();
             if let Some(m) = config_f64(args, 1, "maxIterations") {
-                let m = m.max(1.0) as u32;
-                config.max_iter = m;
+                // SEC-202: validate, clamp to the policy ceiling, and keep >= 1 (LPA requires it).
+                config.max_iter = clamp_max_iter(NAME, m)?.max(1);
             }
-            let result =
-                label_propagation(&g, config, &Cancel::never()).map_err(|e| gds_failure(NAME, e))?;
+            let result = with_deadline(|cancel| {
+                label_propagation(&g, config, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             Ok(id_component_rows(&g, &result.label))
         }),
     );
@@ -654,8 +818,9 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.triangleCount.stream";
             let g = get_projected(NAME, &cat, args)?;
-            let result =
-                triangle_count(&g, &Cancel::never()).map_err(|e| gds_failure(NAME, e))?;
+            let result = with_deadline(|cancel| {
+                triangle_count(&g, cancel).map_err(|e| gds_failure(NAME, e))
+            })?;
             let externals = g.external_ids();
             let mut rows = Vec::with_capacity(result.triangles.len());
             for (i, &count) in result.triangles.iter().enumerate() {
@@ -733,12 +898,14 @@ fn shortest_path_rows(
         ));
     };
 
-    let paths = if bellman {
-        bellman_ford(&g, source_internal, &Cancel::never())
-    } else {
-        dijkstra(&g, source_internal, &Cancel::never())
-    }
-    .map_err(|e| gds_failure(name, e))?;
+    let paths = with_deadline(|cancel| {
+        if bellman {
+            bellman_ford(&g, source_internal, cancel)
+        } else {
+            dijkstra(&g, source_internal, cancel)
+        }
+        .map_err(|e| gds_failure(name, e))
+    })?;
 
     let externals = g.external_ids();
     let mut rows = Vec::new();
@@ -1030,5 +1197,87 @@ mod tests {
         assert_eq!(score(a), Value::Float(0.0));
         assert_eq!(score(b), Value::Float(1.0)); // halved undirected convention
         assert_eq!(score(c), Value::Float(0.0));
+    }
+
+    // =============================================================================================
+    // Security regression tests for the resource policy (SEC-201/202/204).
+    //
+    // These exercise the policy logic directly (not the process-global `OnceLock`, which is shared
+    // across the whole test binary and must not be perturbed) so they are deterministic and isolated.
+    // =============================================================================================
+
+    /// Regression: SEC-202 — a client-supplied `maxIterations` is clamped to the policy ceiling, and
+    /// a non-finite / negative value is rejected rather than saturating to `u32::MAX`.
+    #[test]
+    fn sec202_max_iterations_is_clamped_and_validated() {
+        let policy = GdsResourcePolicy {
+            max_iterations: 50,
+            ..GdsResourcePolicy::default()
+        };
+        // Clamp: a huge request is capped at the ceiling.
+        assert_eq!(policy.clamp_iterations(4_000_000_000), 50);
+        // A modest request passes through unchanged.
+        assert_eq!(policy.clamp_iterations(10), 10);
+
+        // The float coercion rejects non-finite / negative values (the worst case the old
+        // `as u32` cast silently turned into u32::MAX).
+        assert!(clamp_max_iter("test", f64::INFINITY).is_err());
+        assert!(clamp_max_iter("test", f64::NAN).is_err());
+        assert!(clamp_max_iter("test", -1.0).is_err());
+        // A finite value is floored then clamped against the GLOBAL policy ceiling (default 1000).
+        let v = clamp_max_iter("test", 3.9).expect("finite value is accepted");
+        assert_eq!(v, 3);
+    }
+
+    /// Regression: SEC-204 — a projection exceeding the node/edge/memory quota is rejected with a
+    /// clean error rather than being registered (and later blown up by an O(n^2) algorithm).
+    #[test]
+    fn sec204_projection_quota_is_enforced() {
+        // Build a small real projection via the procedure layer.
+        let (mut graph, _) = triangle_graph();
+        let g = project_from_graph("test", &graph, Some("N"), Some("R"), None, true)
+            .expect("project");
+        let _ = &mut graph;
+
+        // A generous policy admits it.
+        let ok = GdsResourcePolicy::default();
+        assert!(ok.check_projection(&g).is_ok());
+
+        // A node quota of zero rejects any non-empty projection.
+        let tight_nodes = GdsResourcePolicy {
+            max_nodes: 0,
+            ..GdsResourcePolicy::default()
+        };
+        let err = tight_nodes.check_projection(&g).expect_err("node quota must reject");
+        assert!(matches!(err, GdsError::InvalidArgument(_)));
+
+        // A memory quota of 1 byte rejects on the bytes basis.
+        let tight_mem = GdsResourcePolicy {
+            max_memory_bytes: 1,
+            ..GdsResourcePolicy::default()
+        };
+        assert!(matches!(
+            tight_mem.check_projection(&g),
+            Err(GdsError::InvalidArgument(_))
+        ));
+    }
+
+    /// Regression: SEC-201 — `with_deadline` builds a real, deadline-backed [`Cancel`]; an algorithm
+    /// run against an already-elapsed deadline aborts with `Cancelled` instead of running to
+    /// completion. We prove the wiring directly (a `from_fn` Cancel that is already past its
+    /// deadline), since the procedure body now threads exactly such a token.
+    #[test]
+    fn sec201_deadline_cancel_aborts_a_run() {
+        let (mut graph, _) = triangle_graph();
+        let g = project_from_graph("test", &graph, Some("N"), Some("R"), None, true)
+            .expect("project");
+        let _ = &mut graph;
+
+        // An already-expired deadline: the cooperative check fires on the first poll.
+        let past = Instant::now() - Duration::from_secs(1);
+        let cancel = Cancel::from_fn(move || Instant::now() >= past);
+        let err = betweenness_centrality(&g, &cancel)
+            .expect_err("an expired deadline must abort the run");
+        assert_eq!(err, GdsError::Cancelled);
     }
 }

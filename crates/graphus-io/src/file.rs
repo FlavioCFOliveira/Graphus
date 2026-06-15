@@ -13,6 +13,17 @@ fn io_err(context: &str, e: &std::io::Error) -> GraphusError {
     GraphusError::Storage(format!("{context}: {e}"))
 }
 
+/// Upper bound on the number of pages a single file-backed device may address.
+///
+/// This is a defence-in-depth cap, independent of (and far below) the `u64 * PAGE_SIZE`
+/// overflow boundary: any page count / page id at or above this limit is rejected outright,
+/// so a tampered WAL/store header cannot drive the device into an absurd `set_len` or an
+/// out-of-position seek even before the multiplication is range-checked. At `PAGE_SIZE`
+/// bytes per page this still allows a multi-exabyte logical device — orders of magnitude
+/// beyond any real filesystem — while leaving headroom so `page_count * PAGE_SIZE` never
+/// approaches `u64::MAX`.
+const MAX_PAGE_COUNT: u64 = u64::MAX / (PAGE_SIZE as u64) / 2;
+
 /// A [`BlockDevice`] backed by a regular file, using positioned reads and writes so that
 /// concurrent readers need no shared cursor.
 #[derive(Debug)]
@@ -38,14 +49,32 @@ impl FileBlockDevice {
                 "file length {len} is not a multiple of the page size {PAGE_SIZE}"
             )));
         }
-        Ok(Self {
-            file,
-            page_count: len / PAGE_SIZE as u64,
-        })
+        let page_count = len / PAGE_SIZE as u64;
+        if page_count > MAX_PAGE_COUNT {
+            return Err(GraphusError::Storage(format!(
+                "file length {len} addresses {page_count} pages, exceeding the maximum of \
+                 {MAX_PAGE_COUNT}"
+            )));
+        }
+        Ok(Self { file, page_count })
     }
 
-    fn offset(page: PageId) -> u64 {
-        page.0 * PAGE_SIZE as u64
+    /// The byte offset of `page` within the file, computed with a checked multiplication so an
+    /// attacker-controlled `page_id` (e.g. decoded from a tampered, unkeyed-CRC WAL frame) can
+    /// never wrap `u64` into an out-of-position, in-bounds-looking offset (CWE-190 → CWE-787/125).
+    fn offset(page: PageId) -> Result<u64> {
+        if page.0 >= MAX_PAGE_COUNT {
+            return Err(GraphusError::Storage(format!(
+                "page id {} exceeds the maximum addressable page {MAX_PAGE_COUNT}",
+                page.0
+            )));
+        }
+        page.0.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+            GraphusError::Storage(format!(
+                "page id {} times page size {PAGE_SIZE} overflows the byte offset",
+                page.0
+            ))
+        })
     }
 }
 
@@ -58,7 +87,7 @@ impl BlockDevice for FileBlockDevice {
             )));
         }
         self.file
-            .read_exact_at(buf, Self::offset(page))
+            .read_exact_at(buf, Self::offset(page)?)
             .map_err(|e| io_err("read", &e))
     }
 
@@ -70,7 +99,7 @@ impl BlockDevice for FileBlockDevice {
             )));
         }
         self.file
-            .write_all_at(buf, Self::offset(page))
+            .write_all_at(buf, Self::offset(page)?)
             .map_err(|e| io_err("write", &e))
     }
 
@@ -94,8 +123,24 @@ impl BlockDevice for FileBlockDevice {
             .page_count
             .checked_add(additional)
             .ok_or_else(|| GraphusError::Storage("page count overflow".to_owned()))?;
+        // Defence-in-depth cap first: a tampered WAL/store header could decode an absurd page
+        // count; reject it before computing a byte length at all.
+        if new_count > MAX_PAGE_COUNT {
+            return Err(GraphusError::Storage(format!(
+                "extend to {new_count} pages exceeds the maximum of {MAX_PAGE_COUNT}"
+            )));
+        }
+        // Checked multiplication: `new_count * PAGE_SIZE` must never wrap `u64` into a tiny byte
+        // length (which `set_len` would use to TRUNCATE the file while `page_count` is bumped huge —
+        // desynchronising metadata from the real file length → out-of-position writes → silent
+        // corruption in release, overflow panic in debug). CWE-190 → CWE-787.
+        let new_len = new_count.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+            GraphusError::Storage(format!(
+                "new page count {new_count} times page size {PAGE_SIZE} overflows the byte length"
+            ))
+        })?;
         self.file
-            .set_len(new_count * PAGE_SIZE as u64)
+            .set_len(new_len)
             .map_err(|e| io_err("set_len", &e))?;
         self.page_count = new_count;
         Ok(())

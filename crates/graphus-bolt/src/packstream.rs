@@ -97,6 +97,33 @@ const MAX_U32_LEN: usize = u32::MAX as usize;
 /// A structure has at most 15 fields (the tiny-struct nibble); Bolt never exceeds this.
 pub(crate) const MAX_STRUCT_FIELDS: usize = 15;
 
+/// Upper bound on the number of elements **pre-allocated** from a wire-supplied collection length,
+/// before a single element has been read.
+///
+/// A PackStream `LIST_32`/`MAP_32`/`BYTES_32` header carries a 32-bit count, and a hostile or
+/// compromised peer (or a MITM on a plaintext `bolt://` link) can set it to `0xFFFF_FFFF` while
+/// sending only a few bytes of body. Sizing a `Vec` directly from that header would request
+/// `count * size_of::<T>()` bytes — hundreds of GiB — and abort the process via
+/// `alloc::handle_alloc_error` (CWE-789 / CWE-770). We therefore **never** trust the wire header to
+/// size an allocation: we pre-reserve at most this many slots and let the `Vec` grow as *real*
+/// elements are decoded. Every decode loop is bounded by the actual input length (each item consumes
+/// ≥1 byte and the unpacker errors at end-of-input), so a genuinely large collection still decodes
+/// correctly — it just reallocates instead of pre-sizing. This is the single source of truth for the
+/// policy; use [`prealloc_cap`] at every wire-driven `Vec::with_capacity` call site.
+pub(crate) const MAX_PREALLOC: usize = 1024;
+
+/// Clamps a wire-supplied collection length to a safe pre-allocation capacity ([`MAX_PREALLOC`]).
+///
+/// This is the **only** sanctioned way to turn an untrusted PackStream length into a
+/// `Vec::with_capacity` argument. Capping the pre-sizing changes no successful-decode behaviour (the
+/// `Vec` grows as elements are read); it only removes the unbounded-allocation footgun. See
+/// [`MAX_PREALLOC`] for the threat model.
+#[inline]
+#[must_use]
+pub(crate) fn prealloc_cap(wire_len: usize) -> usize {
+    wire_len.min(MAX_PREALLOC)
+}
+
 // ---- Structure tag bytes (Bolt 5.x; `04 §8.1`, verified 2026-06) -----------------------------
 
 /// PackStream structure tag bytes for the tagged composite [`Value`] classes and the Bolt graph
@@ -415,6 +442,15 @@ impl<'a> Unpacker<'a> {
     }
 
     /// Reads a fixed-width big-endian unsigned size field of `width` bytes (1/2/4) into a `usize`.
+    ///
+    /// # Allocation-safety contract
+    /// The returned length is taken **verbatim from untrusted wire bytes** and is therefore
+    /// unbounded (up to `u32::MAX` for a 4-byte field). It MUST NOT be used to size an allocation
+    /// directly. Every caller either (a) feeds it to [`Unpacker::read_slice`], which bounds it
+    /// against the remaining input before any allocation, or (b) routes it through
+    /// [`prealloc_cap`] before `Vec::with_capacity`. Decode loops driven by this length are bounded
+    /// by the real input (each element consumes ≥1 byte and the unpacker errors at end-of-input),
+    /// so the value can safely drive a `for` loop even though it must never drive a reservation.
     fn read_be_len(&mut self, width: usize) -> BoltResult<usize> {
         let bytes = self.read_slice(width)?;
         let mut acc: usize = 0;
@@ -534,7 +570,13 @@ impl<'a> Unpacker<'a> {
     pub fn read_struct_header(&mut self) -> BoltResult<(u8, usize)> {
         let m = self.read_u8()?;
         if (TINY_STRUCT_BASE..=TINY_STRUCT_BASE + 0x0F).contains(&m) {
+            // INVARIANT: PackStream has no wide-struct marker — the field count is the low nibble of
+            // the tiny-struct byte, so it is bounded to `0..=15` (== [`MAX_STRUCT_FIELDS`]). Callers
+            // (e.g. `message::read_fields`) rely on this to pre-allocate without a [`prealloc_cap`]
+            // clamp. If a future Bolt revision adds a wide-struct marker, this bound must be
+            // re-derived and those call sites re-audited.
             let field_count = usize::from(m - TINY_STRUCT_BASE);
+            debug_assert!(field_count <= MAX_STRUCT_FIELDS);
             let tag = self.read_u8()?;
             Ok((tag, field_count))
         } else {
@@ -856,7 +898,7 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
         _ if is_list_marker(marker) => {
             let n = unpacker.read_list_header()?;
             unpacker.enter_nested()?;
-            let mut items = Vec::with_capacity(n.min(1024));
+            let mut items = Vec::with_capacity(prealloc_cap(n));
             for _ in 0..n {
                 items.push(unpack_value(unpacker)?);
             }
@@ -866,7 +908,7 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
         _ if is_map_marker(marker) => {
             let n = unpacker.read_map_header()?;
             unpacker.enter_nested()?;
-            let mut entries: Vec<(String, Value)> = Vec::with_capacity(n.min(1024));
+            let mut entries: Vec<(String, Value)> = Vec::with_capacity(prealloc_cap(n));
             for _ in 0..n {
                 let k = unpacker.read_string()?;
                 let v = unpack_value(unpacker)?;
@@ -1029,7 +1071,7 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
     if is_list_marker(marker) {
         let n = unpacker.read_list_header()?;
         unpacker.enter_nested()?;
-        let mut items = Vec::with_capacity(n.min(1024));
+        let mut items = Vec::with_capacity(prealloc_cap(n));
         for _ in 0..n {
             items.push(unpack_bolt_value(unpacker)?);
         }
@@ -1044,7 +1086,7 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
 fn unpack_properties(unpacker: &mut Unpacker<'_>) -> BoltResult<Vec<(String, Value)>> {
     let n = unpacker.read_map_header()?;
     unpacker.enter_nested()?;
-    let mut props: Vec<(String, Value)> = Vec::with_capacity(n.min(1024));
+    let mut props: Vec<(String, Value)> = Vec::with_capacity(prealloc_cap(n));
     for _ in 0..n {
         let k = unpacker.read_string()?;
         let v = unpack_value(unpacker)?;
@@ -1061,6 +1103,9 @@ fn unpack_node(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltNode> {
     expect_fields(t, field_count, 4)?;
     let id = unpacker.read_int()?;
     let label_count = unpacker.read_list_header()?;
+    // Pre-allocation is capped (a node carries very few labels in practice, so 64 is a deliberately
+    // tighter bound than [`MAX_PREALLOC`]); the `Vec` still grows if a node legitimately has more.
+    // The wire `label_count` is NEVER trusted to size the allocation — see [`prealloc_cap`].
     let mut labels = Vec::with_capacity(label_count.min(64));
     for _ in 0..label_count {
         labels.push(unpacker.read_string()?);
@@ -1118,17 +1163,17 @@ fn unpack_path(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltPath> {
     let (t, field_count) = unpacker.read_struct_header()?;
     expect_fields(t, field_count, 3)?;
     let node_count = unpacker.read_list_header()?;
-    let mut nodes = Vec::with_capacity(node_count.min(1024));
+    let mut nodes = Vec::with_capacity(prealloc_cap(node_count));
     for _ in 0..node_count {
         nodes.push(unpack_node(unpacker)?);
     }
     let rel_count = unpacker.read_list_header()?;
-    let mut rels = Vec::with_capacity(rel_count.min(1024));
+    let mut rels = Vec::with_capacity(prealloc_cap(rel_count));
     for _ in 0..rel_count {
         rels.push(unpack_unbound_relationship(unpacker)?);
     }
     let idx_count = unpacker.read_list_header()?;
-    let mut indices = Vec::with_capacity(idx_count.min(1024));
+    let mut indices = Vec::with_capacity(prealloc_cap(idx_count));
     for _ in 0..idx_count {
         indices.push(unpacker.read_int()?);
     }

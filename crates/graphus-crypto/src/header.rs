@@ -24,9 +24,24 @@ use graphus_core::error::{GraphusError, Result};
 use crate::keyring::SALT_LEN;
 use crate::slot::{SLOT_SIZE, Slot};
 
-/// Number of physical slots reserved at the start of the device for the header. Logical page `p`
-/// lives at physical slot `p + HEADER_SLOTS`.
-pub const HEADER_SLOTS: u64 = 1;
+/// Number of physical slots reserved at the start of the device before the logical pages. Logical
+/// page `p` lives at physical slot `p + HEADER_SLOTS`.
+///
+/// Two reserved slots (v3, rmp #175):
+/// - physical slot 0 — the **header** (magic/version/cipher/salt/KCV), written **once at create**,
+///   never rewritten (critical to opening the whole store; see the module docs);
+/// - physical slot 1 — the **nonce-budget counter** ([`crate::nonce_budget`]), a durable high-water
+///   mark of random-nonce encryptions under the store subkey, rewritten on each `sync` so the
+///   2^32-write GCM birthday cap is enforced across reopens. Unlike the header it is *not* critical
+///   to opening the store: a torn/garbage counter slot is read conservatively as the maximum
+///   budget, failing closed rather than risking nonce reuse.
+pub const HEADER_SLOTS: u64 = 2;
+
+/// Physical slot index of the header superblock (written once at create).
+pub const HEADER_SLOT_INDEX: u64 = 0;
+
+/// Physical slot index of the durable nonce-budget counter (rewritten on each sync, rmp #175).
+pub const COUNTER_SLOT_INDEX: u64 = 1;
 
 /// Magic bytes identifying a Graphus **encrypted** store file (ASCII "GRAPHUSE" — Graphus
 /// Encrypted). Distinct from the plaintext store magic so the two formats can never be confused.
@@ -41,7 +56,13 @@ pub const HEADER_MAGIC: [u8; 8] = *b"GRAPHUSE";
 ///   a v1 file's KCV would not validate under v2 anyway; the version check fails it closed first with
 ///   a clear "unsupported version" error. This is a pre-1.0 greenfield database with **no persisted
 ///   production encrypted stores**, so no migration path is needed.
-pub const HEADER_VERSION: u32 = 2;
+/// - **v3** (rmp #175): a dedicated **nonce-budget counter** slot (physical slot 1) is reserved
+///   before the logical pages, so [`HEADER_SLOTS`] grew from 1 to 2 and logical page `p` now lives
+///   at slot `p + 2`. The counter durably bounds random-nonce encryptions under the store subkey to
+///   the GCM birthday-safe ceiling ([`crate::nonce_budget::MAX_WRITES_PER_SUBKEY`]). A v2 file fails
+///   closed at open on the version check. No migration is needed (pre-1.0, no persisted production
+///   encrypted stores).
+pub const HEADER_VERSION: u32 = 3;
 
 /// Cipher identifier for AES-256-GCM with a 96-bit nonce and 128-bit tag.
 pub const CIPHER_AES_256_GCM: u32 = 1;
@@ -132,6 +153,105 @@ fn read4(slot: &Slot, off: usize) -> [u8; 4] {
     let mut b = [0u8; 4];
     b.copy_from_slice(&slot[off..off + 4]);
     b
+}
+
+// --- nonce-budget counter slot (physical slot 1, rmp #175) ----------------------------------------
+//
+// The counter slot durably records the random-nonce write high-water mark for the store subkey (see
+// `crate::nonce_budget`). It is authenticated under the dedicated counter subkey
+// (`Keyring::counter_cipher`) with a fresh random nonce per rewrite, so a torn or maliciously
+// tampered counter slot fails AEAD and is read conservatively as the maximum budget (fail closed) —
+// an attacker cannot lower the count to defeat the GCM birthday cap.
+//
+// Layout: magic(8) || nonce(12) || tag(16) || ciphertext(8 = counter u64 LE). The AAD is the slot
+// magic so the slot cannot be repurposed from another offset.
+
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, Nonce};
+
+use crate::nonce_budget::MAX_WRITES_PER_SUBKEY;
+use crate::slot::{NONCE_LEN, TAG_LEN};
+
+/// Magic bytes identifying the nonce-budget counter slot (`"GRPHCNTR"`).
+const COUNTER_MAGIC: [u8; 8] = *b"GRPHCNTR";
+const CNT_OFF_MAGIC: usize = 0;
+const CNT_OFF_NONCE: usize = 8;
+const CNT_OFF_CIPHERTEXT: usize = CNT_OFF_NONCE + NONCE_LEN; // ciphertext || tag follow
+
+/// Encodes the durable nonce-budget counter into physical slot 1, authenticated under the counter
+/// subkey with a fresh random nonce. Trailing bytes are zero.
+///
+/// # Errors
+/// [`GraphusError::Security`] if the AEAD seal fails (not expected for this fixed-size input).
+pub fn encode_counter_slot(counter: u64, counter_cipher: &Aes256Gcm) -> Result<Slot> {
+    let nonce_bytes = random_counter_nonce();
+    let nonce = Nonce::from(nonce_bytes);
+    let sealed = counter_cipher
+        .encrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: &counter.to_le_bytes(),
+                aad: &COUNTER_MAGIC,
+            },
+        )
+        .map_err(|_| GraphusError::Security("sealing the nonce-budget counter failed".to_owned()))?;
+    let mut slot = [0u8; SLOT_SIZE];
+    slot[CNT_OFF_MAGIC..CNT_OFF_MAGIC + 8].copy_from_slice(&COUNTER_MAGIC);
+    slot[CNT_OFF_NONCE..CNT_OFF_NONCE + NONCE_LEN].copy_from_slice(&nonce_bytes);
+    // sealed = ciphertext(8) || tag(16); both fit comfortably in one slot.
+    debug_assert_eq!(sealed.len(), 8 + TAG_LEN);
+    slot[CNT_OFF_CIPHERTEXT..CNT_OFF_CIPHERTEXT + sealed.len()].copy_from_slice(&sealed);
+    Ok(slot)
+}
+
+/// Decodes and authenticates the durable nonce-budget counter from physical slot 1.
+///
+/// Fails **conservatively**: a fresh all-zero slot (a store created before its first counter sync, or
+/// an interrupted extend) decodes to `0` (no writes yet); any *other* slot that does not authenticate
+/// — a torn write, a tampered/zeroed-out-but-non-empty slot, or corruption — is treated as
+/// [`MAX_WRITES_PER_SUBKEY`] (the budget is considered exhausted), so the device fails closed on the
+/// next write rather than risking nonce reuse. This is the safe direction: an attacker cannot lower
+/// the count, only (harmlessly) force an early rotation.
+#[must_use]
+pub fn decode_counter_slot(slot: &Slot, counter_cipher: &Aes256Gcm) -> u64 {
+    // A genuinely pristine (never-counter-written) slot is all-zero → 0 writes consumed.
+    if slot.iter().all(|&b| b == 0) {
+        return 0;
+    }
+    if slot[CNT_OFF_MAGIC..CNT_OFF_MAGIC + 8] != COUNTER_MAGIC {
+        return MAX_WRITES_PER_SUBKEY; // not a counter slot / corrupt → fail closed
+    }
+    let nonce_bytes: [u8; NONCE_LEN] = match slot[CNT_OFF_NONCE..CNT_OFF_NONCE + NONCE_LEN].try_into()
+    {
+        Ok(n) => n,
+        Err(_) => return MAX_WRITES_PER_SUBKEY,
+    };
+    let nonce = Nonce::from(nonce_bytes);
+    let ct_and_tag = &slot[CNT_OFF_CIPHERTEXT..CNT_OFF_CIPHERTEXT + 8 + TAG_LEN];
+    match counter_cipher.decrypt(
+        &nonce,
+        aes_gcm::aead::Payload {
+            msg: ct_and_tag,
+            aad: &COUNTER_MAGIC,
+        },
+    ) {
+        Ok(pt) if pt.len() == 8 => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&pt);
+            u64::from_le_bytes(b)
+        }
+        // AEAD failure or unexpected length → corrupt/tampered counter → fail closed (max budget).
+        _ => MAX_WRITES_PER_SUBKEY,
+    }
+}
+
+/// Draws a fresh random 96-bit nonce for a counter-slot rewrite from the OS CSPRNG.
+fn random_counter_nonce() -> [u8; NONCE_LEN] {
+    use aes_gcm::aead::OsRng;
+    use aes_gcm::aead::rand_core::RngCore;
+    let mut n = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut n);
+    n
 }
 
 #[cfg(test)]

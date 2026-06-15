@@ -26,6 +26,8 @@
 //! - **Write-write is the only blocking**, resolved first-updater-wins with deadlock detection
 //!   (`04 §5.7`).
 
+use std::time::{Duration, Instant};
+
 // FxHashMap: the active-transaction table is keyed by internal TxnId (never attacker-controlled)
 // and never iterated in an order-observable way, so the faster non-cryptographic hash is safe.
 use rustc_hash::FxHashMap as HashMap;
@@ -71,11 +73,48 @@ impl Durability for NoDurability {
     }
 }
 
+/// The default ceiling on concurrently active transactions (SEC-198). Chosen well above any sane
+/// single-node concurrency yet low enough that a runaway client opening transactions in a loop
+/// cannot exhaust memory. Override via [`TxnConfig`].
+pub const DEFAULT_MAX_ACTIVE_TXNS: usize = 100_000;
+
+/// The default idle-transaction timeout (SEC-198): a transaction that neither commits, rolls back,
+/// nor performs an operation within this wall-clock window is eligible for reaping by
+/// [`TxnManager::reap_idle`], so a single abandoned transaction cannot pin the GC low-water mark
+/// forever (the classic long-running-idle-transaction hazard). Override via [`TxnConfig`].
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Resource-safety limits for the transaction manager (SEC-198, CWE-400). Both default to safe,
+/// generous values ([`DEFAULT_MAX_ACTIVE_TXNS`], [`DEFAULT_IDLE_TIMEOUT`]); a server tunes them to
+/// its environment. Keeping them in one struct makes the admission/eviction policy explicit and
+/// forward-compatible with the planned multi-threaded promotion.
+#[derive(Debug, Clone, Copy)]
+pub struct TxnConfig {
+    /// Maximum number of simultaneously active (uncommitted, un-rolled-back) transactions. A
+    /// [`begin`](TxnManager::begin) above this ceiling is refused with a retriable error.
+    pub max_active_txns: usize,
+    /// How long a transaction may stay idle (no begin/read/write/delete progress) before
+    /// [`reap_idle`](TxnManager::reap_idle) may abort it to free the GC watermark.
+    pub idle_timeout: Duration,
+}
+
+impl Default for TxnConfig {
+    fn default() -> Self {
+        Self {
+            max_active_txns: DEFAULT_MAX_ACTIVE_TXNS,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+}
+
 /// Live state of an in-flight transaction, owned by the manager.
 #[derive(Debug)]
 struct ActiveTxn {
     snapshot: Snapshot,
     isolation: IsolationLevel,
+    /// Wall-clock instant of this transaction's most recent operation (begin/read/write/delete).
+    /// Drives the idle-timeout reaper (SEC-198); refreshed on every operation.
+    last_active: Instant,
 }
 
 /// The MVCC + SSI transaction manager (`04 §5`).
@@ -94,6 +133,7 @@ pub struct TxnManager<S: VersionedStore, D: Durability> {
     durability: D,
     active: HashMap<TxnId, ActiveTxn>,
     next_txn_id: u64,
+    config: TxnConfig,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -111,6 +151,11 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     /// A manager over `store` whose commits are hardened through `durability` (production wires this
     /// to the WAL; see [`Durability`]).
     pub fn with_durability(store: S, durability: D) -> Self {
+        Self::with_durability_and_config(store, durability, TxnConfig::default())
+    }
+
+    /// A manager over `store` with explicit durability and resource-limit [`TxnConfig`] (SEC-198).
+    pub fn with_durability_and_config(store: S, durability: D, config: TxnConfig) -> Self {
         Self {
             oracle: TimestampOracle::new(),
             registry: CommitRegistry::new(),
@@ -120,6 +165,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             durability,
             active: HashMap::default(),
             next_txn_id: 0,
+            config,
         }
     }
 
@@ -127,10 +173,42 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     ///
     /// Assigns a fresh `TxnId` and a begin timestamp (its read snapshot) from the oracle, and
     /// registers it with the SSI tracker and the commit registry.
-    pub fn begin(&mut self, isolation: IsolationLevel) -> TxnId {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
-        let begin_ts = self.oracle.begin();
+    ///
+    /// # Errors
+    /// - [`GraphusError::Transaction`] (retriable) if the active-transaction ceiling
+    ///   ([`TxnConfig::max_active_txns`]) is reached — admission control against resource exhaustion
+    ///   (SEC-198, CWE-400).
+    /// - [`GraphusError::Transaction`] if the transaction-id / timestamp space is exhausted
+    ///   (SEC-197, CWE-190): `next_txn_id` is incremented with [`u64::checked_add`] and bounded by
+    ///   the 63-bit usable range so it can never wrap to the reserved `TxnId(0)` nor collide with the
+    ///   in-flight high-bit discriminator.
+    pub fn begin(&mut self, isolation: IsolationLevel) -> Result<TxnId> {
+        // Admission control: refuse a new transaction above the configured ceiling so a client
+        // opening transactions in a loop cannot grow the in-memory tables without bound (SEC-198).
+        if self.active.len() >= self.config.max_active_txns {
+            return Err(GraphusError::Transaction(format!(
+                "transaction admission limit reached ({} active); retry",
+                self.config.max_active_txns
+            )));
+        }
+        // SEC-197: a checked, range-bounded id. The usable id space is `1..=MAX_TIMESTAMP` (bit 63 is
+        // the in-flight/committed discriminator and `TxnId(0)` is reserved), so cap there and refuse
+        // gracefully at exhaustion rather than wrapping into an illegal stamp that panics later.
+        let next_id = self
+            .next_txn_id
+            .checked_add(1)
+            .filter(|n| *n <= graphus_core::MAX_TIMESTAMP)
+            .ok_or_else(|| {
+                GraphusError::Transaction(
+                    "transaction-id space exhausted (63-bit); no new transactions can begin"
+                        .to_owned(),
+                )
+            })?;
+        // The oracle may itself refuse if the timestamp space is exhausted (SEC-200). Reserve the id
+        // only after a begin timestamp is successfully issued so a refusal leaves no gap/poison.
+        let begin_ts = self.oracle.begin()?;
+        self.next_txn_id = next_id;
+        let txn = TxnId(next_id);
         let snapshot = Snapshot {
             owner: txn,
             ts: begin_ts,
@@ -142,13 +220,17 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             ActiveTxn {
                 snapshot,
                 isolation,
+                last_active: Instant::now(),
             },
         );
-        txn
+        Ok(txn)
     }
 
     /// Begins a SERIALIZABLE transaction (the default level).
-    pub fn begin_serializable(&mut self) -> TxnId {
+    ///
+    /// # Errors
+    /// See [`begin`](Self::begin).
+    pub fn begin_serializable(&mut self) -> Result<TxnId> {
         self.begin(IsolationLevel::Serializable)
     }
 
@@ -159,6 +241,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     /// Returns [`GraphusError::Transaction`] if `txn` is not active.
     pub fn read(&mut self, txn: TxnId, key: Key) -> Result<Option<Vec<u8>>> {
         let snapshot = self.active_snapshot(txn)?;
+        self.touch(txn); // refresh idle-timeout activity (SEC-198)
         // SIREAD marker first (SSI tracking is independent of whether a version is visible — a read
         // of a key still establishes the rw relationship if a concurrent writer overwrites it).
         self.ssi.record_read(txn, key);
@@ -176,6 +259,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     ///   with another in-flight transaction.
     pub fn write(&mut self, txn: TxnId, key: Key, payload: Vec<u8>) -> Result<()> {
         self.ensure_active(txn)?;
+        self.touch(txn); // refresh idle-timeout activity (SEC-198)
         self.acquire_write(txn, key)?;
         self.ensure_no_concurrent_committed_write(txn, key)?;
         self.store.create_version(key, txn, payload)?;
@@ -192,6 +276,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     /// - A retriable serialization failure on a write-write conflict.
     pub fn delete(&mut self, txn: TxnId, key: Key) -> Result<()> {
         self.ensure_active(txn)?;
+        self.touch(txn); // refresh idle-timeout activity (SEC-198)
         self.acquire_write(txn, key)?;
         self.ensure_no_concurrent_committed_write(txn, key)?;
         self.store.expire_version(key, txn)?;
@@ -233,8 +318,15 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             self.abort_internal(victim);
         }
 
-        // 2) Assign the commit timestamp.
-        let commit_ts = self.oracle.commit();
+        // 2) Assign the commit timestamp. A timestamp-space exhaustion is a recoverable refusal
+        //    (SEC-200): roll the transaction back rather than panic.
+        let commit_ts = match self.oracle.commit() {
+            Ok(ts) => ts,
+            Err(e) => {
+                self.abort_internal(txn);
+                return Err(e);
+            }
+        };
 
         // 3) Harden durability (production: WAL group commit + fdatasync) BEFORE publishing.
         if let Err(e) = self.durability.harden_commit(txn) {
@@ -249,7 +341,8 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         self.locks.release_all(txn);
         let snapshot_ts = self.active.remove(&txn).map(|a| a.snapshot.ts);
         if let Some(ts) = snapshot_ts {
-            self.oracle.release_begin(ts);
+            // A defensive no-op if bookkeeping is inconsistent (SEC-200); never panic on commit.
+            let _ = self.oracle.release_begin(ts);
         }
         Ok(commit_ts)
     }
@@ -313,7 +406,50 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         &self.store
     }
 
+    /// Aborts every transaction idle longer than [`TxnConfig::idle_timeout`], returning how many
+    /// were reaped (SEC-198, CWE-400).
+    ///
+    /// A transaction that opens, reads/writes nothing further, and never commits or rolls back pins
+    /// the GC low-water mark indefinitely — the classic long-running-idle-transaction hazard — and
+    /// keeps its read/write set, lock, and SSI bookkeeping resident forever. The server calls this
+    /// periodically (a background tick); an idle holder is aborted with the same effect as an
+    /// explicit rollback, freeing the watermark so [`run_gc`](Self::run_gc) can make progress.
+    ///
+    /// Idleness is measured from each transaction's last operation; an actively progressing
+    /// transaction is never reaped regardless of total lifetime.
+    pub fn reap_idle(&mut self) -> usize {
+        self.reap_idle_as_of(Instant::now())
+    }
+
+    /// [`reap_idle`](Self::reap_idle) relative to an explicit `now` (testable without sleeping).
+    fn reap_idle_as_of(&mut self, now: Instant) -> usize {
+        let timeout = self.config.idle_timeout;
+        let victims: Vec<TxnId> = self
+            .active
+            .iter()
+            .filter(|(_, a)| now.saturating_duration_since(a.last_active) >= timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        for txn in &victims {
+            self.abort_internal(*txn);
+        }
+        victims.len()
+    }
+
+    /// The active-transaction / idle-timeout limits in force (observability/tests).
+    #[must_use]
+    pub fn config(&self) -> TxnConfig {
+        self.config
+    }
+
     // ----------------------------- internals -----------------------------
+
+    /// Refreshes a transaction's idle clock (SEC-198). A no-op if `txn` is not active.
+    fn touch(&mut self, txn: TxnId) {
+        if let Some(a) = self.active.get_mut(&txn) {
+            a.last_active = Instant::now();
+        }
+    }
 
     fn active_snapshot(&self, txn: TxnId) -> Result<Snapshot> {
         self.active
@@ -410,7 +546,8 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         self.ssi.forget(txn);
         self.locks.release_all(txn);
         if let Some(a) = self.active.remove(&txn) {
-            self.oracle.release_begin(a.snapshot.ts);
+            // Defensive no-op on a bookkeeping inconsistency (SEC-200); abort must never panic.
+            let _ = self.oracle.release_begin(a.snapshot.ts);
         }
     }
 }
@@ -427,11 +564,11 @@ mod tests {
     #[test]
     fn basic_commit_makes_writes_visible_to_later_txns() {
         let mut m = mgr();
-        let t1 = m.begin_serializable();
+        let t1 = m.begin_serializable().unwrap();
         m.write(t1, 1, b"hello".to_vec()).unwrap();
         m.commit(t1).unwrap();
 
-        let t2 = m.begin_serializable();
+        let t2 = m.begin_serializable().unwrap();
         assert_eq!(m.read(t2, 1).unwrap(), Some(b"hello".to_vec()));
         m.commit(t2).unwrap();
     }
@@ -440,16 +577,16 @@ mod tests {
     fn snapshot_isolation_for_reads_under_concurrent_commit() {
         let mut m = mgr();
         // Seed.
-        let t0 = m.begin_serializable();
+        let t0 = m.begin_serializable().unwrap();
         m.write(t0, 1, b"v1".to_vec()).unwrap();
         m.commit(t0).unwrap();
 
         // Long reader opens its snapshot.
-        let reader = m.begin_serializable();
+        let reader = m.begin_serializable().unwrap();
         assert_eq!(m.read(reader, 1).unwrap(), Some(b"v1".to_vec()));
 
         // A concurrent writer updates and commits.
-        let writer = m.begin_serializable();
+        let writer = m.begin_serializable().unwrap();
         m.write(writer, 1, b"v2".to_vec()).unwrap();
         m.commit(writer).unwrap();
 
@@ -458,7 +595,7 @@ mod tests {
         m.commit(reader).unwrap();
 
         // A fresh transaction sees v2.
-        let t3 = m.begin_serializable();
+        let t3 = m.begin_serializable().unwrap();
         assert_eq!(m.read(t3, 1).unwrap(), Some(b"v2".to_vec()));
         m.commit(t3).unwrap();
     }
@@ -466,8 +603,8 @@ mod tests {
     #[test]
     fn write_write_conflict_is_first_updater_wins() {
         let mut m = mgr();
-        let t1 = m.begin_serializable();
-        let t2 = m.begin_serializable();
+        let t1 = m.begin_serializable().unwrap();
+        let t2 = m.begin_serializable().unwrap();
         m.write(t1, 1, b"a".to_vec()).unwrap();
         // Second writer of the same key conflicts (retriable).
         let err = m.write(t2, 1, b"b".to_vec()).unwrap_err();
@@ -479,17 +616,17 @@ mod tests {
     #[test]
     fn rollback_discards_writes() {
         let mut m = mgr();
-        let t1 = m.begin_serializable();
+        let t1 = m.begin_serializable().unwrap();
         m.write(t1, 1, b"x".to_vec()).unwrap();
         m.rollback(t1).unwrap();
-        let t2 = m.begin_serializable();
+        let t2 = m.begin_serializable().unwrap();
         assert_eq!(m.read(t2, 1).unwrap(), None);
     }
 
     #[test]
     fn inactive_txn_operations_error() {
         let mut m = mgr();
-        let t1 = m.begin_serializable();
+        let t1 = m.begin_serializable().unwrap();
         m.commit(t1).unwrap();
         assert!(m.read(t1, 1).is_err());
         assert!(m.write(t1, 1, b"x".to_vec()).is_err());
@@ -500,13 +637,13 @@ mod tests {
     #[test]
     fn delete_then_invisible() {
         let mut m = mgr();
-        let t0 = m.begin_serializable();
+        let t0 = m.begin_serializable().unwrap();
         m.write(t0, 1, b"v".to_vec()).unwrap();
         m.commit(t0).unwrap();
-        let t1 = m.begin_serializable();
+        let t1 = m.begin_serializable().unwrap();
         m.delete(t1, 1).unwrap();
         m.commit(t1).unwrap();
-        let t2 = m.begin_serializable();
+        let t2 = m.begin_serializable().unwrap();
         assert_eq!(m.read(t2, 1).unwrap(), None);
     }
 
@@ -515,7 +652,7 @@ mod tests {
         let mut m = mgr();
         // Three committed writers grow the registry.
         for key in 1..=3u64 {
-            let t = m.begin_serializable();
+            let t = m.begin_serializable().unwrap();
             m.write(t, key, b"v".to_vec()).unwrap();
             m.commit(t).unwrap();
         }
@@ -524,8 +661,8 @@ mod tests {
         // A long reader pins the low-water mark at its begin timestamp: a writer that commits
         // *after* the reader began stays in the registry (it is still potentially relevant), while
         // the three writers settled before the reader began are pruned.
-        let reader = m.begin_serializable();
-        let late = m.begin_serializable();
+        let reader = m.begin_serializable().unwrap();
+        let late = m.begin_serializable().unwrap();
         m.write(late, 9, b"late".to_vec()).unwrap();
         m.commit(late).unwrap();
         let report = m.run_gc();
@@ -555,11 +692,11 @@ mod tests {
             }
         }
         let mut m = TxnManager::with_durability(MemVersionedStore::new(), AlwaysFail);
-        let t1 = m.begin_serializable();
+        let t1 = m.begin_serializable().unwrap();
         m.write(t1, 1, b"x".to_vec()).unwrap();
         assert!(m.commit(t1).is_err());
         // The write was rolled back; a fresh txn sees nothing.
-        let t2 = m.begin_serializable();
+        let t2 = m.begin_serializable().unwrap();
         assert_eq!(m.read(t2, 1).unwrap(), None);
     }
 }

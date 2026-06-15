@@ -56,6 +56,35 @@ fn weight_at(graph: &CsrGraph, node: u32, edge_index: usize) -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Verifies Dijkstra's precondition — every stored weight is finite and non-negative — in a single
+/// `O(m)` scan over all edges (`SEC-209`).
+///
+/// Exposed within the crate so a caller that runs **many** single-source Dijkstras over the same
+/// immutable graph (e.g. [`closeness_centrality`](crate::algo::centrality::closeness_centrality), one
+/// per node) can validate the weights **once** up front and then call [`dijkstra_validated`],
+/// avoiding the `O(n·m)` cost of re-scanning every edge on every source.
+///
+/// # Errors
+///
+/// [`GdsError::InvalidArgument`] if any stored weight is negative or non-finite.
+pub fn validate_weights_non_negative(graph: &CsrGraph) -> Result<()> {
+    if graph.is_weighted() {
+        let n = graph.node_count();
+        for node in 0..n {
+            if let Some(ws) = graph.neighbor_weights(node as InternalId) {
+                for &w in ws {
+                    if !w.is_finite() || w < 0.0 {
+                        return Err(GdsError::InvalidArgument(
+                            "Dijkstra requires non-negative finite edge weights".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Dijkstra's single-source shortest paths.
 ///
 /// # Precondition
@@ -74,24 +103,32 @@ pub fn dijkstra(
     source: InternalId,
     cancel: &Cancel<'_>,
 ) -> Result<ShortestPaths> {
+    // Verify the non-negativity precondition once, over all stored weights.
+    validate_weights_non_negative(graph)?;
+    dijkstra_validated(graph, source, cancel)
+}
+
+/// Dijkstra's single-source shortest paths, **assuming the weights were already validated** by
+/// [`validate_weights_non_negative`] (`SEC-209`).
+///
+/// This is the per-source core that [`closeness_centrality`](crate::algo::centrality::closeness_centrality)
+/// drives `n` times after a single up-front validation, instead of paying the `O(m)` weight scan on
+/// every source. Calling it on a graph with a negative/non-finite weight is a logic error on the
+/// caller's part (the heap ordering assumes non-negative edges); it will not panic, but the result is
+/// only meaningful for a validated graph.
+///
+/// # Errors
+///
+/// [`GdsError::InvalidArgument`] if `source` is out of range. [`GdsError::Cancelled`] if `cancel`
+/// fires.
+pub fn dijkstra_validated(
+    graph: &CsrGraph,
+    source: InternalId,
+    cancel: &Cancel<'_>,
+) -> Result<ShortestPaths> {
     let n = graph.node_count();
     if (source as usize) >= n {
         return Err(GdsError::InvalidArgument("source node out of range".into()));
-    }
-
-    // Verify the non-negativity precondition once, over all stored weights.
-    if graph.is_weighted() {
-        for node in 0..n {
-            if let Some(ws) = graph.neighbor_weights(node as InternalId) {
-                for &w in ws {
-                    if !w.is_finite() || w < 0.0 {
-                        return Err(GdsError::InvalidArgument(
-                            "Dijkstra requires non-negative finite edge weights".into(),
-                        ));
-                    }
-                }
-            }
-        }
     }
 
     let mut dist = vec![None; n];

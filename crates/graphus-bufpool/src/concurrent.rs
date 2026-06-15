@@ -234,6 +234,43 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         self.frames.len()
     }
 
+    /// Resolves a frame handle to its slot with an explicit bounds check (CWE-129 defence in
+    /// depth). [`PinnedFrame`] handles are minted only by this pool, so `f.0` is in-bounds by
+    /// construction today; this checked accessor makes that invariant load-bearing in code rather
+    /// than implicit, so a future refactor that derived a frame index from an attacker-controlled
+    /// `page_id` or a persisted slot could never turn `self.frames[f.0]` into an out-of-bounds
+    /// access. The hot path keeps a `debug_assert` (zero release-mode cost) and a `.get(...)` whose
+    /// `None` arm is unreachable for a pool-minted handle.
+    #[inline]
+    fn slot(&self, f: PinnedFrame) -> &FrameSlot {
+        debug_assert!(
+            f.0 < self.frames.len(),
+            "frame handle {} out of bounds (capacity {}): handles must be pool-minted",
+            f.0,
+            self.frames.len()
+        );
+        self.frames.get(f.0).unwrap_or_else(|| {
+            panic!(
+                "frame handle {} out of bounds (capacity {})",
+                f.0,
+                self.frames.len()
+            )
+        })
+    }
+
+    /// The checked counterpart of [`slot`](Self::slot) that returns a clean error instead of
+    /// panicking on an out-of-range handle, for callers that may hold an untrusted handle.
+    #[inline]
+    fn try_slot(&self, f: PinnedFrame) -> Result<&FrameSlot> {
+        self.frames.get(f.0).ok_or_else(|| {
+            GraphusError::Storage(format!(
+                "frame handle {} out of bounds (capacity {})",
+                f.0,
+                self.frames.len()
+            ))
+        })
+    }
+
     fn shard_of(&self, page_id: PageId) -> &Mutex<HashMap<PageId, Slot>> {
         // A cheap, deterministic spread; the exact hash is not load-bearing for correctness.
         let h = page_id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize;
@@ -254,8 +291,20 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// distinct frames concurrently. `func` must not block or call back into the pool with this
     /// frame.
     pub fn with_page<R>(&self, f: PinnedFrame, func: impl FnOnce(&Page) -> R) -> R {
-        let meta = unwrap_lock(self.frames[f.0].meta.read());
+        let meta = unwrap_lock(self.slot(f).meta.read());
         func(&meta.data)
+    }
+
+    /// The fallible counterpart of [`with_page`](Self::with_page): returns a clean storage error
+    /// for an out-of-range frame handle instead of panicking (CWE-129). Use this on any path where
+    /// the handle is not provably pool-minted.
+    ///
+    /// # Errors
+    /// Returns a storage error if `f` is out of bounds for this pool.
+    pub fn try_with_page<R>(&self, f: PinnedFrame, func: impl FnOnce(&Page) -> R) -> Result<R> {
+        let slot = self.try_slot(f)?;
+        let meta = unwrap_lock(slot.meta.read());
+        Ok(func(&meta.data))
     }
 
     /// Mutably borrows the page held by a pinned frame, marks it dirty, and applies `func`.
@@ -263,7 +312,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// Takes the frame's **write latch** for the duration of `func` (exclusive). `func` must not
     /// block or call back into the pool with this frame.
     pub fn with_page_mut<R>(&self, f: PinnedFrame, func: impl FnOnce(&mut Page) -> R) -> R {
-        let mut meta = unwrap_lock(self.frames[f.0].meta.write());
+        let mut meta = unwrap_lock(self.slot(f).meta.write());
         meta.dirty = true;
         func(&mut meta.data)
     }
@@ -283,7 +332,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         lsn: Lsn,
         func: impl FnOnce(&mut Page) -> R,
     ) -> R {
-        let mut meta = unwrap_lock(self.frames[f.0].meta.write());
+        let mut meta = unwrap_lock(self.slot(f).meta.write());
         meta.dirty = true;
         page::set_page_lsn(&mut meta.data, lsn);
         func(&mut meta.data)
@@ -296,7 +345,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // double-unpin; the `Release` ordering publishes the caller's page writes before the
         // frame becomes evictable.
         let _ =
-            self.frames[f.0]
+            self.slot(f)
                 .pin_count
                 .fetch_update(Ordering::Release, Ordering::Relaxed, |c| {
                     Some(c.saturating_sub(1))
@@ -306,7 +355,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// The current pin count of a frame (diagnostics / tests).
     #[must_use]
     pub fn pin_count(&self, f: PinnedFrame) -> usize {
-        self.frames[f.0].pin_count.load(Ordering::Acquire)
+        self.slot(f).pin_count.load(Ordering::Acquire)
     }
 
     /// Fetches `page_id`, loading it from the device on a miss (verifying its checksum) and
@@ -793,6 +842,29 @@ mod tests {
         assert_eq!(p.pin_count(g), 1);
         p.unpin(g);
         assert_eq!(p.pin_count(g), 0);
+    }
+
+    /// Regression: SEC-212 — an out-of-range frame handle must yield a controlled error through the
+    /// checked accessor (`try_with_page`), never an out-of-bounds slice panic (CWE-129). The
+    /// infallible `slot()` keeps a `debug_assert`; this proves the fallible path callers use when a
+    /// handle is not provably pool-minted.
+    #[test]
+    fn out_of_range_frame_handle_yields_error_not_oob() {
+        let p = pool(2);
+        // A handle one past the last valid frame: never minted by the pool, models a future
+        // refactor that derived a frame index from an attacker-controlled page id.
+        let evil = PinnedFrame(p.capacity());
+        let r = p.try_with_page(evil, |_page| 0u8);
+        assert!(
+            r.is_err(),
+            "an out-of-range handle must return Err, not index out of bounds"
+        );
+        // A second handle far out of range — same controlled-error contract.
+        assert!(p.try_with_page(PinnedFrame(usize::MAX), |_p| ()).is_err());
+        // A valid, pool-minted handle still works through the same checked accessor.
+        let (f, _id) = p.new_page().unwrap();
+        assert!(p.try_with_page(f, |_p| ()).is_ok());
+        p.unpin(f);
     }
 
     #[test]

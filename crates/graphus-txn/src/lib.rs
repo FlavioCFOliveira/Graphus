@@ -46,12 +46,12 @@
 //! let mut mgr = TxnManager::new(MemVersionedStore::new());
 //!
 //! // A writer commits a value.
-//! let w = mgr.begin(IsolationLevel::Serializable);
+//! let w = mgr.begin(IsolationLevel::Serializable).unwrap();
 //! mgr.write(w, /* key */ 1, b"hello".to_vec()).unwrap();
 //! mgr.commit(w).unwrap();
 //!
 //! // A later transaction reads it from its snapshot.
-//! let r = mgr.begin_serializable();
+//! let r = mgr.begin_serializable().unwrap();
 //! assert_eq!(mgr.read(r, 1).unwrap(), Some(b"hello".to_vec()));
 //! mgr.commit(r).unwrap();
 //! ```
@@ -71,7 +71,9 @@ pub use gc::{GcReport, collect};
 pub use lock::{LockOutcome, LockTable};
 #[cfg(any(test, feature = "test-support"))]
 pub use manager::NoDurability;
-pub use manager::{Durability, TxnManager};
+pub use manager::{
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_ACTIVE_TXNS, Durability, TxnConfig, TxnManager,
+};
 pub use oracle::{TimestampOracle, VersionStamp};
 pub use serializability::{HistoryChecker, Op, TxnHistory};
 pub use snapshot::{CommitRegistry, IsolationLevel, Snapshot, TxnOutcome};

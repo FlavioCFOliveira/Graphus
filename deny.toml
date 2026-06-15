@@ -1,0 +1,62 @@
+# cargo-deny configuration for Graphus (https://embarkstudios.github.io/cargo-deny/).
+#
+# Run locally and in CI with:
+#     cargo deny check
+#
+# This file is the structural supply-chain gate (SEC-178, CWE-208): RUSTSEC advisories,
+# disallowed licenses, and banned crates fail the build so a known-vulnerable dependency cannot
+# land silently. Keep it green; every `ignore` below carries a written, dated justification.
+
+[advisories]
+# Fail on every RUSTSEC advisory by default; only the explicitly-listed ids below are tolerated,
+# each with a documented reason.
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack": `rsa` <= 0.9.x performs non-constant-time RSA decryption,
+    # leaking the private key through a timing side-channel (CVE-2023-49092).
+    #
+    # WHY IGNORED (not exploitable in Graphus):
+    #   * `rsa` v0.9.x is pulled ONLY transitively, by `jsonwebtoken` (graphus-auth). `jsonwebtoken`
+    #     10 compiles `rsa` unconditionally — there is no feature to drop it when only HS256 is used
+    #     (verified: `cargo tree -e features -p jsonwebtoken` shows `rsa` under a non-optional path).
+    #   * Graphus signs and verifies Bearer JWTs with **HS256 only** (symmetric HMAC). It never
+    #     constructs an RS*/PS*/ES* `Algorithm`, so NO RSA private-key operation is ever performed on
+    #     any Graphus code path — the Marvin timing oracle is unreachable through Graphus.
+    #   * This is pinned by a regression test (`graphus-auth` `token.rs::only_hs256_is_ever_constructed`
+    #     and the integration test `jwt_alg_none_is_rejected`): a future change that introduces an
+    #     asymmetric JWT algorithm — and thus a live RSA path — fails the test suite, at which point
+    #     this ignore must be removed and `rsa` upgraded to a fixed release.
+    #
+    # RE-EVALUATE WHEN: `jsonwebtoken` ships a release that either drops `rsa` for HMAC-only builds or
+    # depends on a fixed `rsa` (>= a release carrying the constant-time fix). Then delete this entry.
+    # Reviewed: 2026-06-15.
+    "RUSTSEC-2023-0071",
+]
+
+[bans]
+# Multiple versions of the same crate are a warning (dependency hygiene), not a hard failure, for
+# this pre-1.0 workspace. Tighten to "deny" once the tree is deduplicated.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses compatible with the project. Reviewed: 2026-06-15.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

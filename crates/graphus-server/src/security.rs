@@ -171,6 +171,18 @@ struct UserRecord {
     /// The names of the roles this user belongs to.
     #[serde(default)]
     roles: Vec<String>,
+    /// The user's credential epoch (token version, SEC-180): persisted so a Bearer token revoked by
+    /// a password change stays revoked across a restart. Absent/`0` for a user whose password has
+    /// never changed (the common case), keeping pre-existing security files forward-compatible.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    credential_version: u64,
+}
+
+/// Helper for `skip_serializing_if`: a `0` credential epoch is the default and is omitted from the
+/// file so existing security files round-trip unchanged.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// One role's durable record: name + granted privileges.
@@ -386,6 +398,7 @@ fn to_file(auth: &Authenticator) -> SecurityFile {
             name: name.to_owned(),
             password_hash: user.password_hash.clone(),
             roles: user.roles.iter().cloned().collect(),
+            credential_version: user.credential_version,
         })
         .collect();
     let roles = catalog
@@ -484,6 +497,14 @@ fn load_into(root: &Path, auth: &mut Authenticator) -> Result<()> {
                     corrupt(format!("restoring password hash for {:?}: {e}", user.name))
                 })?;
         }
+        // Restore the credential epoch verbatim (SEC-180): a token revoked by a pre-restart password
+        // change must stay revoked. `set_credential_version` (unlike `bump_*`) sets the persisted
+        // value exactly rather than advancing it.
+        catalog
+            .set_credential_version(&user.name, user.credential_version)
+            .map_err(|e| {
+                corrupt(format!("restoring credential epoch for {:?}: {e}", user.name))
+            })?;
         for role in &user.roles {
             if !catalog.has_role(role) {
                 return Err(corrupt(format!(
@@ -940,8 +961,30 @@ fn persist_file(root: &Path, file: &SecurityFile) -> Result<()> {
     let tmp = root.join(SECURITY_TMP_NAME);
     let dst = root.join(SECURITY_FILE_NAME);
     {
-        let mut f = std::fs::File::create(&tmp)
+        // SEC-177 (CWE-732/312): `security.toml` holds every user's argon2 hash and the uid->user
+        // map, so it must be owner-only. Create the temp with mode `0o600` *before* any bytes are
+        // written (not after, which would leave a world-readable window), and rely on `rename(2)`
+        // preserving the temp's mode for the published file. On Unix we pre-set the mode via
+        // `OpenOptions::mode`; elsewhere the create flags fall back to the platform default.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
             .map_err(|e| io_error(&tmp, "creating security temp", &e))?;
+        // `OpenOptions::mode` only applies on *creation*; a stale temp from a crashed run is reused
+        // via `O_TRUNC` with its old (possibly loose) mode. Re-assert `0o600` on the open fd so the
+        // restricted mode holds regardless of how the inode came to be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| io_error(&tmp, "restricting security temp mode", &e))?;
+        }
         f.write_all(text.as_bytes())
             .map_err(|e| io_error(&tmp, "writing security temp", &e))?;
         f.sync_all()

@@ -47,6 +47,7 @@ mod backup_envelope;
 mod device;
 mod header;
 mod keyring;
+mod nonce_budget;
 mod raw;
 mod slot;
 mod wal_sink;
@@ -57,9 +58,10 @@ pub use backup_envelope::{
 pub use device::{EncryptedBlockDevice, EncryptedFileDevice};
 pub use header::{CIPHER_AES_256_GCM, HEADER_MAGIC, HEADER_SLOTS, HEADER_VERSION, Header};
 pub use keyring::{
-    KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_KCV_SUBKEY_INFO, STORE_SUBKEY_INFO, WAL_KCV_SUBKEY_INFO,
-    WAL_SUBKEY_INFO, random_salt,
+    COUNTER_SUBKEY_INFO, KEY_LEN, Kcv, Keyring, SALT_LEN, STORE_KCV_SUBKEY_INFO, STORE_SUBKEY_INFO,
+    WAL_KCV_SUBKEY_INFO, WAL_SUBKEY_INFO, random_salt,
 };
+pub use nonce_budget::MAX_WRITES_PER_SUBKEY;
 pub use raw::{FileRawSlots, MemRawSlots, RawSlots};
 pub use slot::{NONCE_LEN, SLOT_SIZE, TAG_LEN};
 pub use wal_sink::{

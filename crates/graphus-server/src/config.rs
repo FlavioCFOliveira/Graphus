@@ -169,6 +169,14 @@ pub struct TimingConfig {
     /// enables it. Applies to the Bolt sessions (UDS + TCP) via the read bridge; the REST listener's
     /// hyper stack manages its own connection lifetimes.
     pub idle_timeout_ms: u64,
+    /// Maximum time the REST listener will wait for a client to send the **complete HTTP request
+    /// headers** before it drops the connection (SEC-181; rmp #181). The TLS-handshake deadline
+    /// ([`handshake_timeout_ms`](Self::handshake_timeout_ms)) only covers the handshake; afterwards a
+    /// client could otherwise dribble request headers byte-by-byte indefinitely (a classic slow-loris
+    /// HTTP vector that, with `max_connections` slow connections, makes REST unavailable). Wired to
+    /// hyper's `http1().header_read_timeout(...)`. In milliseconds; `0` **disables** the guard. Has no
+    /// effect on the Bolt listeners (which have their own handshake/idle deadlines).
+    pub header_read_timeout_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -178,6 +186,9 @@ impl Default for TimingConfig {
             shutdown_drain_deadline_ms: 10_000,
             handshake_timeout_ms: 10_000,
             idle_timeout_ms: 0,
+            // A secure default: a well-behaved client sends its headers within seconds; 15s tolerates
+            // slow networks while bounding a slow-loris drip (SEC-181).
+            header_read_timeout_ms: 15_000,
         }
     }
 }
@@ -211,6 +222,17 @@ impl TimingConfig {
             Some(Duration::from_millis(self.idle_timeout_ms))
         }
     }
+
+    /// The REST request-header read timeout as a [`Duration`], or `None` when disabled
+    /// (`header_read_timeout_ms == 0`) — SEC-181 (rmp #181).
+    #[must_use]
+    pub fn header_read_timeout(&self) -> Option<Duration> {
+        if self.header_read_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.header_read_timeout_ms))
+        }
+    }
 }
 
 /// One additional (non-admin) bootstrap user: a name and a password.
@@ -219,7 +241,7 @@ impl TimingConfig {
 /// ship an application identity that runs queries yet cannot drive the administrative surface
 /// (`CREATE DATABASE …`, `/admin/*` — rmp #84). Deny-by-default RBAC means anything beyond
 /// read/write must be granted explicitly afterwards.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct UserBootstrap {
     /// The username (must be non-empty and distinct from the admin user).
@@ -229,10 +251,32 @@ pub struct UserBootstrap {
     pub password: String,
 }
 
+// SEC-183 (CWE-532/209): `password` is a secret; a derived `Debug` would spill it into any
+// `tracing::debug!(?cfg)` or panic payload. Redact it (preserving whether one is set) while keeping
+// the non-secret `name` visible for diagnostics.
+impl std::fmt::Debug for UserBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserBootstrap")
+            .field("name", &self.name)
+            .field("password", &redacted(&self.password))
+            .finish()
+    }
+}
+
+/// Renders a secret for `Debug`: `"<unset>"` when empty (so an empty/disabled secret is still
+/// distinguishable from a set one) and `"<redacted>"` otherwise. Never reveals the value (SEC-183).
+fn redacted(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<unset>"
+    } else {
+        "<redacted>"
+    }
+}
+
 /// The initial RBAC bootstrap: the admin user every fresh deployment needs so a server is usable
 /// out of the box (`04 §8.4`), plus optional non-admin users. In production an operator manages
 /// users via the admin API afterwards; this just seeds the initial identities.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthBootstrap {
     /// The initial admin username.
@@ -247,6 +291,18 @@ pub struct AuthBootstrap {
     pub users: Vec<UserBootstrap>,
 }
 
+// SEC-183 (CWE-532/209): redact `admin_password`; `users` redact themselves via their own `Debug`.
+impl std::fmt::Debug for AuthBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthBootstrap")
+            .field("admin_user", &self.admin_user)
+            .field("admin_password", &redacted(&self.admin_password))
+            .field("admin_uid", &self.admin_uid)
+            .field("users", &self.users)
+            .finish()
+    }
+}
+
 impl Default for AuthBootstrap {
     fn default() -> Self {
         Self {
@@ -259,7 +315,12 @@ impl Default for AuthBootstrap {
 }
 
 /// The complete server configuration (`04 §9`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually to **redact every secret** (`jwt_secret`, `metrics_scrape_token`,
+/// and — transitively — the bootstrap passwords): a stray `tracing::debug!(?config)` or a panic
+/// carrying the config must never spill credentials into the logs or an error message (SEC-183,
+/// CWE-532/209).
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Directory holding the record-store device file and the WAL file. Created if absent.
@@ -357,6 +418,38 @@ impl Default for ServerConfig {
             allow_insecure_network: false,
             metrics_scrape_token: None,
         }
+    }
+}
+
+// SEC-183 (CWE-532/209): redact `jwt_secret` and `metrics_scrape_token`; `auth` redacts its own
+// passwords via [`AuthBootstrap`]'s `Debug`. Every other field is non-secret and rendered verbatim
+// so the config stays diagnosable.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("store_path", &self.store_path)
+            .field("default_database", &self.default_database)
+            .field("buffer_pool_pages", &self.buffer_pool_pages)
+            .field("bolt_tcp_addr", &self.bolt_tcp_addr)
+            .field("advertised_bolt_address", &self.advertised_bolt_address)
+            .field("rest_addr", &self.rest_addr)
+            .field("uds_path", &self.uds_path)
+            .field("tls", &self.tls)
+            .field("admission", &self.admission)
+            .field("timing", &self.timing)
+            .field("jwt_secret", &redacted(&self.jwt_secret))
+            .field("auth", &self.auth)
+            .field("encryption", &self.encryption)
+            .field("audit", &self.audit)
+            .field("allow_insecure_network", &self.allow_insecure_network)
+            .field(
+                "metrics_scrape_token",
+                &self
+                    .metrics_scrape_token
+                    .as_deref()
+                    .map(|t| redacted(t)),
+            )
+            .finish()
     }
 }
 
@@ -500,6 +593,13 @@ impl ServerConfig {
         if let Ok(v) = var("GRAPHUS_IDLE_TIMEOUT_MS") {
             self.timing.idle_timeout_ms = v.parse().map_err(|_| {
                 ConfigError::Parse(format!("GRAPHUS_IDLE_TIMEOUT_MS is not an integer: {v:?}"))
+            })?;
+        }
+        if let Ok(v) = var("GRAPHUS_HEADER_READ_TIMEOUT_MS") {
+            self.timing.header_read_timeout_ms = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_HEADER_READ_TIMEOUT_MS is not an integer: {v:?}"
+                ))
             })?;
         }
         Ok(())

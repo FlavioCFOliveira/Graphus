@@ -12,10 +12,10 @@
 
 use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId, Orientation};
-use crate::error::Result;
+use crate::error::{GdsError, Result};
 use std::collections::VecDeque;
 
-use super::shortest_path::dijkstra;
+use super::shortest_path::{dijkstra_validated, validate_weights_non_negative};
 
 /// Closeness centrality, indexed by internal id.
 ///
@@ -34,11 +34,19 @@ pub fn closeness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec
     }
     let nf = (n - 1) as f64;
 
+    // SEC-209: validate the non-negativity precondition ONCE, not once per source. Previously the
+    // per-source Dijkstra re-scanned all `m` edges on every call, making the validation alone
+    // `O(n·m)` on a weighted graph. With the single up-front scan the per-source path uses
+    // `dijkstra_validated`, which skips the rescan.
+    if graph.is_weighted() {
+        validate_weights_non_negative(graph)?;
+    }
+
     for (s, slot) in result.iter_mut().enumerate() {
         cancel.check()?;
         // distances from s
         let (sum, reachable) = if graph.is_weighted() {
-            let sp = dijkstra(graph, s as InternalId, cancel)?;
+            let sp = dijkstra_validated(graph, s as InternalId, cancel)?;
             let mut sum = 0.0f64;
             let mut reachable = 0usize;
             for d in sp.dist.into_iter().flatten() {
@@ -152,6 +160,17 @@ pub fn betweenness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<V
         // Back-propagation of dependencies (reverse BFS order).
         while let Some(w) = stack.pop() {
             let wi = w as usize;
+            // SEC-205: on a graph engineered to have a super-exponential number of shortest paths
+            // (e.g. a layered lattice), `sigma` can overflow f64 to +inf; the division below would
+            // then yield NaN/0 and silently corrupt *every* score. Detect the non-finite count and
+            // surface a clean Overflow error instead of emitting corrupted betweenness values.
+            // A node on the stack was reached by the BFS, so `sigma[wi] >= 1.0` unless it overflowed
+            // to +inf; checking finiteness is therefore exactly the overflow test.
+            if !sigma[wi].is_finite() {
+                return Err(GdsError::Overflow(
+                    "betweenness shortest-path count exceeded f64 range",
+                ));
+            }
             let coeff = (1.0 + delta[wi]) / sigma[wi];
             for &v in &predecessors[wi] {
                 delta[v as usize] += sigma[v as usize] * coeff;

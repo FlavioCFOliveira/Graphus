@@ -17,7 +17,7 @@ fn manager() -> TxnManager<MemVersionedStore, NoDurability> {
 /// Seeds both keys with an initial committed value, returning the manager ready for the scenario.
 fn seeded() -> TxnManager<MemVersionedStore, NoDurability> {
     let mut m = manager();
-    let t = m.begin_serializable();
+    let t = m.begin_serializable().unwrap();
     m.write(t, X, b"on".to_vec()).unwrap();
     m.write(t, Y, b"on".to_vec()).unwrap();
     m.commit(t).unwrap();
@@ -31,8 +31,8 @@ fn seeded() -> TxnManager<MemVersionedStore, NoDurability> {
 fn write_skew_aborts_one_under_serializable() {
     let mut m = seeded();
 
-    let t1 = m.begin(IsolationLevel::Serializable);
-    let t2 = m.begin(IsolationLevel::Serializable);
+    let t1 = m.begin(IsolationLevel::Serializable).unwrap();
+    let t2 = m.begin(IsolationLevel::Serializable).unwrap();
 
     // Both read the shared set {x, y}.
     assert_eq!(m.read(t1, X).unwrap(), Some(b"on".to_vec()));
@@ -66,8 +66,8 @@ fn write_skew_aborts_one_under_serializable() {
 fn write_skew_both_commit_under_snapshot_isolation() {
     let mut m = seeded();
 
-    let t1 = m.begin(IsolationLevel::Snapshot);
-    let t2 = m.begin(IsolationLevel::Snapshot);
+    let t1 = m.begin(IsolationLevel::Snapshot).unwrap();
+    let t2 = m.begin(IsolationLevel::Snapshot).unwrap();
 
     assert_eq!(m.read(t1, X).unwrap(), Some(b"on".to_vec()));
     assert_eq!(m.read(t1, Y).unwrap(), Some(b"on".to_vec()));
@@ -82,7 +82,7 @@ fn write_skew_both_commit_under_snapshot_isolation() {
     assert!(m.commit(t2).is_ok(), "SI must allow write-skew");
 
     // Both writes landed.
-    let t3 = m.begin_serializable();
+    let t3 = m.begin_serializable().unwrap();
     assert_eq!(m.read(t3, X).unwrap(), Some(b"off".to_vec()));
     assert_eq!(m.read(t3, Y).unwrap(), Some(b"off".to_vec()));
 }
@@ -92,8 +92,8 @@ fn write_skew_both_commit_under_snapshot_isolation() {
 #[test]
 fn lost_update_is_prevented_by_write_write_conflict() {
     let mut m = seeded();
-    let t1 = m.begin_serializable();
-    let t2 = m.begin_serializable();
+    let t1 = m.begin_serializable().unwrap();
+    let t2 = m.begin_serializable().unwrap();
 
     m.write(t1, X, b"t1".to_vec()).unwrap();
     // T2's write to the same key conflicts (retriable) — it cannot blind-overwrite.
@@ -103,7 +103,7 @@ fn lost_update_is_prevented_by_write_write_conflict() {
     m.commit(t1).unwrap();
     // T2 must retry; here we roll it back. The surviving value is T1's.
     m.rollback(t2).ok();
-    let t3 = m.begin_serializable();
+    let t3 = m.begin_serializable().unwrap();
     assert_eq!(m.read(t3, X).unwrap(), Some(b"t1".to_vec()));
 }
 
@@ -116,11 +116,11 @@ fn lost_update_is_prevented_by_write_write_conflict() {
 fn reads_never_block_writers() {
     let mut m = seeded();
 
-    let reader = m.begin_serializable();
+    let reader = m.begin_serializable().unwrap();
     assert_eq!(m.read(reader, X).unwrap(), Some(b"on".to_vec()));
 
     // While the reader's snapshot is open, a writer writes and commits the same key with no wait.
-    let writer = m.begin_serializable();
+    let writer = m.begin_serializable().unwrap();
     m.write(writer, X, b"new".to_vec()).unwrap(); // not blocked by the open reader
     assert!(m.commit(writer).is_ok());
 
@@ -136,8 +136,8 @@ fn reads_never_block_writers() {
 #[test]
 fn deadlock_aborts_the_youngest() {
     let mut m = seeded();
-    let t1 = m.begin_serializable();
-    let t2 = m.begin_serializable();
+    let t1 = m.begin_serializable().unwrap();
+    let t2 = m.begin_serializable().unwrap();
 
     m.write(t1, X, b"a".to_vec()).unwrap(); // T1 holds X
     m.write(t2, Y, b"b".to_vec()).unwrap(); // T2 holds Y
@@ -165,14 +165,14 @@ fn gc_reclaims_past_low_water_and_holds_for_long_reader() {
     assert_eq!(m.store().version_count(), 2);
 
     // A long reader pins the watermark at its begin timestamp.
-    let reader = m.begin_serializable();
+    let reader = m.begin_serializable().unwrap();
     assert_eq!(m.read(reader, X).unwrap(), Some(b"on".to_vec()));
 
     // Two successive updaters of X create dead versions behind the live head.
-    let u1 = m.begin_serializable();
+    let u1 = m.begin_serializable().unwrap();
     m.write(u1, X, b"v2".to_vec()).unwrap();
     m.commit(u1).unwrap();
-    let u2 = m.begin_serializable();
+    let u2 = m.begin_serializable().unwrap();
     m.write(u2, X, b"v3".to_vec()).unwrap();
     m.commit(u2).unwrap();
     assert_eq!(m.store().version_count(), 4); // X: 3 versions, Y: 1
@@ -205,10 +205,10 @@ fn gc_reclaims_past_low_water_and_holds_for_long_reader() {
 #[test]
 fn read_only_serializable_transaction_commits() {
     let mut m = seeded();
-    let reader = m.begin_serializable();
+    let reader = m.begin_serializable().unwrap();
     assert_eq!(m.read(reader, X).unwrap(), Some(b"on".to_vec()));
 
-    let writer = m.begin_serializable();
+    let writer = m.begin_serializable().unwrap();
     m.write(writer, X, b"changed".to_vec()).unwrap();
     m.commit(writer).unwrap();
 

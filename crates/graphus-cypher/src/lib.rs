@@ -146,6 +146,7 @@ pub(crate) mod store_statistics;
 pub(crate) mod temporal_fns;
 pub mod ternary;
 pub(crate) mod timezone;
+pub mod value_depth;
 
 pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
 pub use authorized_graph::{AuthorizedGraph, PrivilegeOracle};

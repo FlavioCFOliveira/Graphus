@@ -117,6 +117,23 @@ fn rd_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().expect("8-byte slice"))
 }
 
+/// A bounds-checked 2-byte little-endian read: `Some(value)` when `[off, off+2)` lies inside `b`,
+/// `None` otherwise. The defense-in-depth primitive behind the safe accessors (SEC-207): an
+/// adversarially forged page whose checksum was recomputed can name an out-of-range offset, and a
+/// read on a hot path must surface that as a graceful error, never an out-of-bounds slice panic.
+fn try_rd_u16(b: &[u8], off: usize) -> Option<u16> {
+    let end = off.checked_add(2)?;
+    b.get(off..end)
+        .map(|s| u16::from_le_bytes(s.try_into().expect("2-byte slice")))
+}
+
+/// A bounds-checked 8-byte little-endian read (see [`try_rd_u16`]).
+fn try_rd_u64(b: &[u8], off: usize) -> Option<u64> {
+    let end = off.checked_add(8)?;
+    b.get(off..end)
+        .map(|s| u64::from_le_bytes(s.try_into().expect("8-byte slice")))
+}
+
 impl<'a> NodeView<'a> {
     /// Wraps a page's bytes for reading.
     #[must_use]
@@ -217,45 +234,85 @@ impl<'a> NodeView<'a> {
         Ok(())
     }
 
+    /// The encoded key bytes of slot `i`, or `None` if the slot index is out of range **or** the
+    /// page bytes are inconsistent (a slot/cell offset that runs past the page).
+    ///
+    /// This is the bounds-checked primitive (SEC-207, defense-in-depth): it never slices
+    /// out-of-bounds, so a forged-but-CRC-valid page cannot drive a panic through it. The panicking
+    /// [`key`](Self::key) is a thin wrapper for the validated hot paths.
+    #[must_use]
+    pub fn try_key(&self, i: usize) -> Option<&'a [u8]> {
+        if i >= self.slot_count() {
+            return None;
+        }
+        let slot = Self::slot_off(i);
+        let off = try_rd_u16(self.bytes, slot)? as usize;
+        let klen = try_rd_u16(self.bytes, slot + 2)? as usize;
+        let end = off.checked_add(klen)?;
+        self.bytes.get(off..end)
+    }
+
+    /// The leaf payload bytes of slot `i`, or `None` on an out-of-range index or an inconsistent
+    /// page (the bounds-checked counterpart of [`value`](Self::value); SEC-207).
+    #[must_use]
+    pub fn try_value(&self, i: usize) -> Option<&'a [u8]> {
+        if i >= self.slot_count() {
+            return None;
+        }
+        let slot = Self::slot_off(i);
+        let off = try_rd_u16(self.bytes, slot)? as usize;
+        let klen = try_rd_u16(self.bytes, slot + 2)? as usize;
+        let vlen = try_rd_u16(self.bytes, slot + 4)? as usize;
+        let start = off.checked_add(klen)?;
+        let end = start.checked_add(vlen)?;
+        self.bytes.get(start..end)
+    }
+
+    /// The internal child pointer of slot `i`, or `None` on a leaf, an out-of-range index, or an
+    /// inconsistent page (the bounds-checked counterpart of [`child`](Self::child); SEC-207).
+    #[must_use]
+    pub fn try_child(&self, i: usize) -> Option<u64> {
+        if self.is_leaf() || i >= self.slot_count() {
+            return None;
+        }
+        let slot = Self::slot_off(i);
+        let off = try_rd_u16(self.bytes, slot)? as usize;
+        let klen = try_rd_u16(self.bytes, slot + 2)? as usize;
+        let child_off = off.checked_add(klen)?;
+        try_rd_u64(self.bytes, child_off)
+    }
+
     /// The encoded key bytes of slot `i`.
     ///
     /// # Panics
-    /// Panics if `i >= slot_count()`.
+    /// Panics if `i >= slot_count()` or the page is inconsistent (a corrupt cell offset). Callers on
+    /// the hot read paths must first run [`validate`](Self::validate); use [`try_key`](Self::try_key)
+    /// to handle corruption gracefully instead.
     #[must_use]
     pub fn key(&self, i: usize) -> &'a [u8] {
-        assert!(i < self.slot_count(), "slot out of range");
-        let slot = Self::slot_off(i);
-        let off = rd_u16(self.bytes, slot) as usize;
-        let klen = rd_u16(self.bytes, slot + 2) as usize;
-        &self.bytes[off..off + klen]
+        self.try_key(i)
+            .expect("slot out of range or corrupt index page (call validate() first)")
     }
 
     /// The leaf payload bytes of slot `i` (empty for an internal node).
     ///
     /// # Panics
-    /// Panics if `i >= slot_count()`.
+    /// Panics if `i >= slot_count()` or the page is inconsistent; see [`key`](Self::key).
     #[must_use]
     pub fn value(&self, i: usize) -> &'a [u8] {
-        assert!(i < self.slot_count(), "slot out of range");
-        let slot = Self::slot_off(i);
-        let off = rd_u16(self.bytes, slot) as usize;
-        let klen = rd_u16(self.bytes, slot + 2) as usize;
-        let vlen = rd_u16(self.bytes, slot + 4) as usize;
-        &self.bytes[off + klen..off + klen + vlen]
+        self.try_value(i)
+            .expect("slot out of range or corrupt index page (call validate() first)")
     }
 
     /// The internal child pointer of slot `i` (the child for keys `>= key(i)` and `< key(i+1)`).
     ///
     /// # Panics
-    /// Panics if `i >= slot_count()` or the node is a leaf.
+    /// Panics if `i >= slot_count()`, the node is a leaf, or the page is inconsistent; see
+    /// [`key`](Self::key).
     #[must_use]
     pub fn child(&self, i: usize) -> u64 {
-        assert!(!self.is_leaf(), "child() on a leaf");
-        assert!(i < self.slot_count(), "slot out of range");
-        let slot = Self::slot_off(i);
-        let off = rd_u16(self.bytes, slot) as usize;
-        let klen = rd_u16(self.bytes, slot + 2) as usize;
-        rd_u64(self.bytes, off + klen)
+        self.try_child(i)
+            .expect("child() on a leaf, slot out of range, or corrupt index page (validate() first)")
     }
 
     /// Reads slot `i` into an owned [`Cell`].
@@ -375,7 +432,12 @@ impl<'a> NodeMut<'a> {
     }
 
     fn set_slot_count(&mut self, n: usize) {
-        wr_u16(self.bytes, OFF_SLOT_COUNT, n as u16);
+        // A slot count never legitimately exceeds `u16::MAX` (the page holds far fewer slots than
+        // 65 535), but make the narrowing explicit so a future regression that miscomputes `n`
+        // fails loudly instead of silently truncating the directory length (SEC-208, CWE-190).
+        debug_assert!(n <= u16::MAX as usize, "slot_count {n} exceeds u16");
+        let n16 = u16::try_from(n).expect("INVARIANT: slot_count fits a u16 (page-bounded)");
+        wr_u16(self.bytes, OFF_SLOT_COUNT, n16);
     }
 
     /// Sets the right-sibling pointer (B-link).
@@ -441,7 +503,13 @@ impl<'a> NodeMut<'a> {
             let off = rd_u16(self.bytes, slot) as usize;
             let klen = rd_u16(self.bytes, slot + 2) as usize;
             self.bytes[off + klen..off + klen + value.len()].copy_from_slice(value);
-            wr_u16(self.bytes, slot + 4, value.len() as u16);
+            // `value.len() <= old_vlen <= u16::MAX` here (it replaces an existing cell in place), so
+            // the narrowing is lossless; assert it to catch a future regression (SEC-208).
+            wr_u16(
+                self.bytes,
+                slot + 4,
+                u16::try_from(value.len()).expect("INVARIANT: replacement value fits the cell (u16)"),
+            );
             true
         } else {
             // Remove and re-insert with the larger value.
@@ -470,10 +538,24 @@ impl<'a> NodeMut<'a> {
         let dst = src + SLOT_SIZE;
         let bytes_to_move = (n - pos) * SLOT_SIZE;
         self.bytes.copy_within(src..src + bytes_to_move, dst);
-        // Write the new slot.
-        wr_u16(self.bytes, src, new_floor as u16);
-        wr_u16(self.bytes, src + 2, key.len() as u16);
-        wr_u16(self.bytes, src + 4, payload.len() as u16);
+        // Write the new slot. Every quantity here is bounded by `CELL_LIMIT < PAGE_SIZE` (well
+        // under `u16::MAX`), so the narrowings are lossless; `try_from` makes a future layout
+        // regression a loud panic instead of a silent truncation (SEC-208, CWE-190).
+        wr_u16(
+            self.bytes,
+            src,
+            u16::try_from(new_floor).expect("INVARIANT: cell offset is page-bounded (u16)"),
+        );
+        wr_u16(
+            self.bytes,
+            src + 2,
+            u16::try_from(key.len()).expect("INVARIANT: key length is page-bounded (u16)"),
+        );
+        wr_u16(
+            self.bytes,
+            src + 4,
+            u16::try_from(payload.len()).expect("INVARIANT: payload length is page-bounded (u16)"),
+        );
         wr_u16(self.bytes, src + 6, 0);
         self.set_slot_count(n + 1);
         true
@@ -523,9 +605,22 @@ impl<'a> NodeMut<'a> {
             floor -= cell.len();
             self.bytes[floor..floor + cell.len()].copy_from_slice(cell);
             let slot = SLOT_DIR_START + i * SLOT_SIZE;
-            wr_u16(self.bytes, slot, floor as u16);
-            wr_u16(self.bytes, slot + 2, *klen as u16);
-            wr_u16(self.bytes, slot + 4, *vlen as u16);
+            // All page-bounded (< CELL_LIMIT); explicit narrowings catch a future regression (SEC-208).
+            wr_u16(
+                self.bytes,
+                slot,
+                u16::try_from(floor).expect("INVARIANT: compacted cell offset is page-bounded (u16)"),
+            );
+            wr_u16(
+                self.bytes,
+                slot + 2,
+                u16::try_from(*klen).expect("INVARIANT: key length is page-bounded (u16)"),
+            );
+            wr_u16(
+                self.bytes,
+                slot + 4,
+                u16::try_from(*vlen).expect("INVARIANT: value length is page-bounded (u16)"),
+            );
             wr_u16(self.bytes, slot + 6, 0);
         }
     }

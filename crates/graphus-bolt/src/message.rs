@@ -32,7 +32,8 @@ use graphus_core::Value;
 
 use crate::error::{BoltError, BoltResult, Failure};
 use crate::packstream::{
-    BoltValue, Packer, Unpacker, pack_bolt_value, pack_value, unpack_bolt_value, unpack_value,
+    BoltValue, MAX_STRUCT_FIELDS, Packer, Unpacker, pack_bolt_value, pack_value, prealloc_cap,
+    unpack_bolt_value, unpack_value,
 };
 
 /// Message opcode (signature) bytes (`04 §8.1`).
@@ -374,7 +375,13 @@ impl Response {
         if tag == opcode::RECORD {
             expect_arity(tag, field_count, 1)?;
             let count = u.read_list_header()?;
-            let mut values = Vec::with_capacity(count);
+            // SECURITY (SEC-192, CWE-789): `count` is a raw wire `LIST_32` header (up to `u32::MAX`)
+            // and `Response::decode` runs CLIENT-side over bytes an untrusted server sends. NEVER
+            // size the allocation from it — cap the pre-reservation via `prealloc_cap` and let the
+            // `Vec` grow as real cells are decoded. The loop is bounded by the actual input length
+            // (each `unpack_bolt_value` consumes ≥1 byte and errors at end-of-input), so a genuinely
+            // large record still decodes; only the unbounded pre-allocation is removed.
+            let mut values = Vec::with_capacity(prealloc_cap(count));
             for _ in 0..count {
                 values.push(unpack_bolt_value(&mut u)?);
             }
@@ -419,6 +426,12 @@ fn write_struct_with_map(p: &mut Packer, tag: u8, map: &[(String, Value)]) -> Bo
 }
 
 fn read_fields(u: &mut Unpacker<'_>, count: usize) -> BoltResult<Vec<Value>> {
+    // INVARIANT (SEC-193): `count` is the structure field count from `read_struct_header`, which is
+    // the tiny-struct nibble and is therefore bounded to `0..=15` (== `MAX_STRUCT_FIELDS`). Unlike a
+    // `LIST_32`/`MAP_32` length it is NOT attacker-scalable, so `Vec::with_capacity(count)` is safe
+    // here without a `prealloc_cap` clamp. The `debug_assert!` pins the contract: if a future Bolt
+    // revision adds a wide-struct marker, this must be re-audited (see SEC-192 for the uncapped case).
+    debug_assert!(count <= MAX_STRUCT_FIELDS);
     let mut fields = Vec::with_capacity(count);
     for _ in 0..count {
         fields.push(unpack_value(u)?);

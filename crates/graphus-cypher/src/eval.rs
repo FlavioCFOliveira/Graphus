@@ -1807,10 +1807,23 @@ fn string_unary(v: &Value, f: impl Fn(&str) -> String, fname: &str) -> Result<Va
 }
 
 /// `range(start, end[, step])` — an inclusive integer range (openCypher).
-/// The largest number of elements `range()` is allowed to materialise. A list this size already
-/// occupies tens of gigabytes; anything larger is treated as a resource-limit failure rather than
-/// being allowed to exhaust memory.
-const MAX_RANGE_ELEMENTS: i128 = 1 << 30;
+///
+/// The byte budget a single materialised `range()` list may occupy (`SEC-191`, CWE-770/789). The
+/// previous element ceiling (`1 << 30`) capped the element *count* but not the *memory*: at
+/// `size_of::<Value>()` (~40 bytes) per element it admitted a ~40 GiB single allocation, an OOM
+/// vector on any normal host. We instead cap the **memory**: 256 MiB is a generous list yet stays
+/// far below any sane RAM budget, and the element ceiling is derived from it so the count guard and
+/// the memory it implies can never diverge again.
+const MAX_RANGE_BYTES: i128 = 256 * 1024 * 1024;
+
+/// The largest number of elements `range()` may materialise, derived from [`MAX_RANGE_BYTES`] and
+/// the in-memory size of one element. Computed at runtime (not as an associated const) because
+/// `size_of` in a `const` context with `i128` arithmetic is awkward; the division is trivial.
+fn max_range_elements() -> i128 {
+    let elem = core::mem::size_of::<Value>() as i128;
+    // `elem` is always > 0 (a `Value` is never zero-sized); guard anyway so the division is total.
+    MAX_RANGE_BYTES / elem.max(1)
+}
 
 fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
     let int = |v: &Value| match v {
@@ -1839,9 +1852,13 @@ fn range_fn(argv: &[Value]) -> Result<Value, EvalError> {
     } else {
         0
     };
-    if count > MAX_RANGE_ELEMENTS {
+    let limit = max_range_elements();
+    if count > limit {
         return Err(EvalError::ResourceLimit {
-            detail: format!("range() would produce {count} elements (limit {MAX_RANGE_ELEMENTS})"),
+            detail: format!(
+                "range() would produce {count} elements (limit {limit}, a {MAX_RANGE_BYTES}-byte \
+                 materialisation budget)"
+            ),
         });
     }
     let mut out = Vec::with_capacity(count as usize);

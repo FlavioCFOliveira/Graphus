@@ -89,7 +89,7 @@ fn run_staggered(seed: u64) -> Option<Vec<TxnId>> {
     let mut mgr = TxnManager::new(MemVersionedStore::new());
 
     // Seed every key (writer 0 ⇒ version 1).
-    let seed_txn = mgr.begin_serializable();
+    let seed_txn = mgr.begin_serializable().unwrap();
     for k in 0..n_keys {
         mgr.write(seed_txn, k, writer_payload(0)).unwrap();
     }
@@ -123,7 +123,7 @@ fn run_staggered(seed: u64) -> Option<Vec<TxnId>> {
         let action = rng.next_u64() % 3;
 
         if active.is_empty() || (action == 0 && can_begin) {
-            let id = mgr.begin_serializable();
+            let id = mgr.begin_serializable().unwrap();
             active.push(InFlight {
                 id,
                 plan: plans[next_plan].clone(),
@@ -223,12 +223,12 @@ fn run_staggered(seed: u64) -> Option<Vec<TxnId>> {
 #[test]
 fn first_committer_wins_rejects_a_lost_update() {
     let mut mgr = TxnManager::new(MemVersionedStore::new());
-    let s = mgr.begin_serializable();
+    let s = mgr.begin_serializable().unwrap();
     mgr.write(s, 0, vec![1]).unwrap();
     mgr.commit(s).unwrap();
 
-    let t1 = mgr.begin_serializable();
-    let t2 = mgr.begin_serializable(); // concurrent: snapshot precedes t1's commit
+    let t1 = mgr.begin_serializable().unwrap();
+    let t2 = mgr.begin_serializable().unwrap(); // concurrent: snapshot precedes t1's commit
     mgr.read(t2, 0).unwrap(); // t2 reads the seed value
     mgr.write(t1, 0, vec![2]).unwrap();
     mgr.commit(t1).unwrap(); // t1 commits a new version of key 0
@@ -247,14 +247,14 @@ fn first_committer_wins_rejects_a_lost_update() {
 #[test]
 fn committed_pivot_structure_aborts_the_closing_endpoint() {
     let mut mgr = TxnManager::new(MemVersionedStore::new());
-    let s = mgr.begin_serializable();
+    let s = mgr.begin_serializable().unwrap();
     mgr.write(s, 0, vec![1]).unwrap(); // key 0 v1
     mgr.write(s, 2, vec![1]).unwrap(); // key 2 v1
     mgr.commit(s).unwrap();
 
-    let t6 = mgr.begin_serializable();
-    let t9 = mgr.begin_serializable();
-    let t12 = mgr.begin_serializable();
+    let t6 = mgr.begin_serializable().unwrap();
+    let t9 = mgr.begin_serializable().unwrap();
+    let t12 = mgr.begin_serializable().unwrap();
 
     // T9 (the pivot) reads key 0 and writes key 2, then commits — at this point it has NEITHER
     // anti-dependency edge yet, so no commit-time check can flag it.

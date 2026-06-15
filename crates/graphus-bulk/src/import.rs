@@ -55,6 +55,9 @@ pub struct ImportStats {
     pub node_seconds: f64,
     /// Wall-clock seconds spent in the relationship pass.
     pub rel_seconds: f64,
+    /// Node rows whose non-empty external `:ID` duplicated an earlier binding and were skipped under
+    /// [`DuplicatePolicy::SkipDuplicate`] (always `0` under the strict default, which errors instead).
+    pub skipped_duplicate_ids: u64,
 }
 
 impl ImportStats {
@@ -79,6 +82,24 @@ impl ImportStats {
     }
 }
 
+/// How the importer reacts to a node row whose non-empty external `:ID` was already bound by an
+/// earlier row (SEC-196, CWE-694).
+///
+/// A silently-overwritten id map is a data-integrity hazard: two physical nodes share an external
+/// id but the map keeps only the last, so every relationship that references that id joins to the
+/// *second* node, never the first — a corrupted import with no error. `neo4j-admin import` fails on
+/// duplicate ids by default; Graphus mirrors that fail-closed stance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DuplicatePolicy {
+    /// Reject a duplicate non-empty `:ID` with an error (the safe default).
+    #[default]
+    Strict,
+    /// Keep the first binding and skip the duplicate row's id remap, counting it in
+    /// [`ImportStats`]. The duplicate's node is still created (it is a real node), but it stays
+    /// unreferenceable by external id. Use only when duplicate ids are known-benign.
+    SkipDuplicate,
+}
+
 /// A streaming bulk importer over a fresh [`RecordStore`].
 ///
 /// Generic over the block device `D` and WAL sink `S` so the same loader drives an in-memory store
@@ -96,6 +117,8 @@ pub struct BulkImporter<D: BlockDevice, S: LogSink> {
     batch_size: usize,
     /// The byte delimiter for every CSV read (default `,`).
     delimiter: u8,
+    /// How a duplicate non-empty external `:ID` is handled (SEC-196). Default: [`DuplicatePolicy::Strict`].
+    duplicate_policy: DuplicatePolicy,
     stats: ImportStats,
 }
 
@@ -103,6 +126,9 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// Creates an importer over `store` (expected to be freshly [`RecordStore::create`]d / empty),
     /// committing every `batch_size` rows (pass [`DEFAULT_BATCH_SIZE`] for the default) and reading
     /// CSV with the field separator `delimiter` (e.g. `b','`).
+    ///
+    /// Duplicate-`:ID` handling defaults to [`DuplicatePolicy::Strict`] (fail-closed); override with
+    /// [`with_duplicate_policy`](Self::with_duplicate_policy).
     pub fn new(store: RecordStore<D, S>, batch_size: usize, delimiter: u8) -> Self {
         Self {
             store,
@@ -110,8 +136,17 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             next_txn: 1,
             batch_size: batch_size.max(1),
             delimiter,
+            duplicate_policy: DuplicatePolicy::default(),
             stats: ImportStats::default(),
         }
+    }
+
+    /// Sets how the importer reacts to a duplicate non-empty external `:ID` (SEC-196). Returns
+    /// `self` for builder-style chaining.
+    #[must_use]
+    pub fn with_duplicate_policy(mut self, policy: DuplicatePolicy) -> Self {
+        self.duplicate_policy = policy;
+        self
     }
 
     /// A CSV reader builder configured with this importer's delimiter, treating the first record as a
@@ -230,9 +265,33 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             self.store.set_node_labels(txn, node_id, &label_tokens)?;
         }
 
-        // Bind the external id last (after a successful write): a duplicate id keeps the latest, like
-        // a re-`CREATE`; an empty id column still maps (the empty string key) so anonymous nodes load.
-        self.id_map.insert(external_id, node_id);
+        // Bind the external id last (after a successful write). SEC-196 (CWE-694): a duplicate
+        // *non-empty* external id must not silently overwrite an earlier binding — that would
+        // re-point every relationship referencing it onto the wrong node. Detect the collision and,
+        // per the configured policy, either reject the import (strict, default) or keep the first
+        // binding and count the skip. An *empty* id is the anonymous-node convention (no relationship
+        // can reference it), so multiple anonymous nodes are allowed to share the empty key.
+        if external_id.is_empty() {
+            self.id_map.insert(external_id, node_id);
+        } else if let Some(&existing) = self.id_map.get(&external_id) {
+            match self.duplicate_policy {
+                DuplicatePolicy::Strict => {
+                    return Err(graphus_core::GraphusError::Storage(format!(
+                        "bulk-import: duplicate :ID {external_id:?} (first bound to node {existing}, \
+                         row {} would rebind to node {node_id}); relationships would join the wrong \
+                         node. Deduplicate the input or use a skip-duplicate policy.",
+                        self.stats.nodes + 1
+                    )));
+                }
+                DuplicatePolicy::SkipDuplicate => {
+                    // Keep the first binding; the duplicate's node exists but stays unreferenceable
+                    // by external id. Count the skip for the operator.
+                    self.stats.skipped_duplicate_ids += 1;
+                }
+            }
+        } else {
+            self.id_map.insert(external_id, node_id);
+        }
         self.stats.nodes += 1;
         Ok(())
     }
