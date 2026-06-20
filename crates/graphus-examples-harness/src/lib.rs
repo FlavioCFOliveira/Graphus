@@ -50,8 +50,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub mod metrics;
 pub mod resource;
 
+pub use metrics::{DiskFootprint, LatencyCollector, PAGE_SIZE, StorageMeter, ThroughputCounter};
 pub use resource::{CpuMeter, CpuTimes, ResourceMeter, RssSample, RssSampler, Target};
 
 /// Identifying metadata for a single example run.
@@ -139,6 +141,8 @@ pub struct ThroughputSection {
     pub p50_latency_ms: f64,
     /// 99th-percentile per-operation latency, in milliseconds.
     pub p99_latency_ms: f64,
+    /// 99.9th-percentile per-operation latency, in milliseconds.
+    pub p999_latency_ms: f64,
 }
 
 /// A single named phase of the scenario together with its measured wall-clock duration.
@@ -262,6 +266,11 @@ impl EvidenceReport {
         let _ = writeln!(s, "| Storage | WAL (bytes) | {} |", self.storage.wal_bytes);
         let _ = writeln!(
             s,
+            "| Storage | fsynced (bytes) | {} |",
+            self.storage.bytes_fsynced
+        );
+        let _ = writeln!(
+            s,
             "| Throughput | operations | {} |",
             self.throughput.operations
         );
@@ -269,6 +278,21 @@ impl EvidenceReport {
             s,
             "| Throughput | ops/sec | {:.3} |",
             self.throughput.ops_per_sec
+        );
+        let _ = writeln!(
+            s,
+            "| Throughput | p50 latency (ms) | {:.3} |",
+            self.throughput.p50_latency_ms
+        );
+        let _ = writeln!(
+            s,
+            "| Throughput | p99 latency (ms) | {:.3} |",
+            self.throughput.p99_latency_ms
+        );
+        let _ = writeln!(
+            s,
+            "| Throughput | p999 latency (ms) | {:.3} |",
+            self.throughput.p999_latency_ms
         );
         let _ = writeln!(s);
 
@@ -361,6 +385,68 @@ impl EvidenceCollector {
         let (cpu, memory) = sections;
         self.report.cpu = cpu;
         self.report.memory = memory;
+    }
+
+    /// Records the on-disk storage evidence by measuring the example's store and WAL paths.
+    ///
+    /// `bytes_fsynced` honestly reports what the caller observed forced to durable media. When an
+    /// example cannot instrument fsync directly, pass `None`: the measured WAL byte count is used as
+    /// the faithful proxy (every committed WAL byte is fsynced before a commit is acknowledged), and
+    /// a note records that this is a proxy rather than a directly-observed counter.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error from walking the store or WAL path (a missing path is treated as a
+    /// zero footprint, not an error).
+    pub fn record_storage(
+        &mut self,
+        store_path: impl AsRef<Path>,
+        wal_path: impl AsRef<Path>,
+        bytes_fsynced: Option<u64>,
+    ) -> io::Result<()> {
+        let (store, wal) = StorageMeter::measure(store_path, wal_path)?;
+        let fsynced = match bytes_fsynced {
+            Some(b) => b,
+            None => {
+                self.report.notes.push(
+                    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed \
+                     WAL byte is fsynced before commit acknowledgement), not a directly-observed \
+                     fsync counter."
+                        .to_string(),
+                );
+                wal.bytes
+            }
+        };
+        self.report.storage = StorageSection::from_footprints(store, wal, fsynced);
+        Ok(())
+    }
+
+    /// Records the throughput + latency evidence from a finished
+    /// [`ThroughputCounter`](metrics::ThroughputCounter) and
+    /// [`LatencyCollector`](metrics::LatencyCollector).
+    ///
+    /// Latency percentiles (p50/p99/p999) are emitted in milliseconds. The throughput window is the
+    /// one the counter measured (call [`ThroughputCounter::stop`](metrics::ThroughputCounter::stop)
+    /// first); for a deterministic injected window use
+    /// [`record_throughput_over`](Self::record_throughput_over).
+    pub fn record_throughput(
+        &mut self,
+        throughput: &metrics::ThroughputCounter,
+        latency: &metrics::LatencyCollector,
+    ) {
+        self.report.throughput = ThroughputSection::from_collectors(throughput, latency);
+    }
+
+    /// Like [`record_throughput`](Self::record_throughput) but with an **injected** throughput
+    /// `window` — the deterministic / DST-friendly path.
+    pub fn record_throughput_over(
+        &mut self,
+        throughput: &metrics::ThroughputCounter,
+        latency: &metrics::LatencyCollector,
+        window: Duration,
+    ) {
+        self.report.throughput =
+            ThroughputSection::from_collectors_over(throughput, latency, window);
     }
 
     /// Mutable access to the storage section, for `rmp #247` to populate.
