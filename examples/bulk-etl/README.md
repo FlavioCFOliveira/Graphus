@@ -1,10 +1,9 @@
 # bulk-etl — high-throughput bulk ingest & ETL (offline)
 
-> **Status:** core deliverables for `rmp #264` (dataset + generator), `#265` (import / export /
-> round-trip), and `#266` (storage footprint + amplification) are implemented and proven. The
-> standardized evidence report, `run.sh`, the dev-only cargo mirror, and the written evidence
-> narrative are added by `rmp #267`–`#270`. This README documents what exists today; the sibling
-> tasks will extend the "Running it" and "Evidence" sections.
+> **Status:** complete. `rmp #264` (dataset + generator), `#265` (import / export / round-trip),
+> `#266` (storage footprint + amplification), `#267` (evidence instrumentation), `#268` (`run.sh`),
+> `#269` (dev-only cargo mirror), and `#270` (evidence report + committed baseline + this README) are
+> all implemented and proven.
 
 This example demonstrates Graphus's **offline bulk data pipeline**: the `graphus-bulk` CLI that
 **imports** node/relationship CSV into a fresh store and **dumps** a whole graph back to CSV, with
@@ -114,58 +113,108 @@ The dataset generator and the import/round-trip/storage drivers live in
 `graphus-gds-gen` / `graphus-fraud-gen`. **Nothing in the production build depends on it** (in
 particular `graphus-server` does not), so it adds zero overhead to the shipped binary.
 
-It exposes three binaries:
+It exposes five binaries:
 
-| Binary           | Purpose |
-|------------------|---------|
-| `bulk_gen`       | Writes the per-label node CSVs + per-type relationship CSVs + `manifest.json` for a `--profile`. Byte-identical per seed. |
-| `bulk_roundtrip` | Drives the **real `graphus-bulk` binary** through `import → dump → re-import`, asserting counts vs the manifest and proving losslessness by content hash. |
-| `bulk_storage`   | Imports the dataset and measures the on-disk footprint + amplification, emitting `storage.json` for the evidence report. |
+| Binary              | Purpose |
+|---------------------|---------|
+| `bulk_gen`          | Writes the per-label node CSVs + per-type relationship CSVs + `manifest.json` for a `--profile`. Byte-identical per seed. |
+| `bulk_roundtrip`    | Drives the **real `graphus-bulk` binary** through `import → dump → re-import`, asserting counts vs the manifest and proving losslessness by content hash. |
+| `bulk_storage`      | Imports the dataset and measures the on-disk footprint + amplification, emitting `storage.json` for the evidence report. |
+| `bulk_evidence`     | Runs the **real `graphus-bulk import`** as a metered child, captures ingest throughput (elements/sec + MB/sec), peak RAM, CPU time, and end-to-end time, folds in `storage.json`, and writes the standardized `report.json` + `report.md`. |
+| `bulk_baseline_cmp` | Gates a fresh `report.json` against the committed `baseline.json` (structural metrics only); prints `GRAPHUS_BASELINE_OK` and exits `0` on success, else exits `1`. |
 
-The library is covered by unit + integration tests (`tests/determinism.rs`): byte-identical CSVs per
-seed, manifest counts == config, globally-unique ids, and a content-hash round-trip on a small
-fixture.
+The library is covered by unit + integration tests in the DEFAULT `cargo test`:
 
-## Running it (today — pre-`run.sh`)
+- `tests/determinism.rs` — byte-identical CSVs per seed, manifest counts == config, globally-unique
+  ids, seed sensitivity;
+- `tests/hermetic_roundtrip.rs` — the **dev-only cargo mirror** (`rmp #269`): an in-process,
+  no-subprocess, no-disk (`MemBlockDevice`) `generate → import → dump → re-import` through the real
+  `graphus-bulk` **library** API (`BulkImporter`), asserting the re-imported **counts** and the
+  id-independent **content hash** match the original — the same losslessness the core proves, run
+  hermetically on every `cargo test`.
 
-`run.sh` (the standardized, self-asserting entry point) lands with `rmp #268`. Until then the pieces
-run directly:
+## Capabilities exercised
+
+| Capability | How it is exercised | Evidence |
+|------------|---------------------|----------|
+| **Deterministic dataset generation** | `bulk_gen` (seeded SplitMix64; pure function of profile) | regenerate-and-diff in `run.sh`; `tests/determinism.rs` |
+| **Offline bulk import** | the real `graphus-bulk import` binary builds a fresh store | reported counts asserted == `manifest.json` |
+| **Whole-graph export** | `graphus-bulk dump` serialises the store back to CSV | non-empty dump asserted; re-import counts asserted |
+| **Lossless round-trip** | `import → dump → re-import`, compared by id-independent content hash | `GRAPHUS_BULK_ROUNDTRIP_OK` + content hash equality |
+| **Ingest throughput** | metered `graphus-bulk import` child | `report.json` `throughput.ops_per_sec` (elements/sec) + `workload.ingest_mb_per_sec` |
+| **Peak RAM / CPU / time** | poll the import child's PID (`/proc` / `ps`) | `report.json` `memory.peak_rss_bytes`, `cpu.*`, `phases[import]` |
+| **Storage footprint + amplification** | `bulk_storage` walks the on-disk store + WAL | `report.json` `storage.*` + `storage.json` |
+| **Regression gate** | `bulk_baseline_cmp` vs committed `baseline.json` | `GRAPHUS_BASELINE_OK` |
+
+## Running it
+
+The standardized, self-asserting entry point is `run.sh` (fully offline — no server, no driver, no
+network). It builds the binaries if needed, then runs the whole pipeline, prints an `N checks run, M
+failures` summary + the evidence path, and exits non-zero on any failed assertion. A `trap` removes
+the temp workspace on exit (success **or** failure), so it leaves no residue.
 
 ```bash
-# Build the offline importer + the dev-only drivers (release).
+# Fast profile (default): 800 nodes / 4,029 rels — the CI/E2E scale, gated against the baseline.
+examples/bulk-etl/run.sh
+
+# Large profile: 24,400 nodes / 139,989 rels — the evidence/volume scale (not baseline-gated).
+BULK_PROFILE=large examples/bulk-etl/run.sh
+
+# Point at a pre-built bin dir to skip the build step.
+GRAPHUS_BIN_DIR=target/release examples/bulk-etl/run.sh
+```
+
+The pieces can also be run directly (what `run.sh` orchestrates):
+
+```bash
 cargo build --release -p graphus-bulk --bin graphus-bulk -p graphus-bulk-gen --bins
-
-BD=target/release
-WD=$(mktemp -d)
-
-# 1. Generate the dataset (fast | large).
-$BD/bulk_gen --profile fast --out-dir "$WD/data"
-
-# 2. Prove the lossless import -> dump -> re-import round-trip on the REAL graphus-bulk binary.
-$BD/bulk_roundtrip --bulk-bin "$BD/graphus-bulk" --data-dir "$WD/data"
-
-# 3. Measure the storage footprint + amplification (writes storage.json).
-$BD/bulk_storage --bulk-bin "$BD/graphus-bulk" --data-dir "$WD/data" --out "$WD/storage.json"
+BD=target/release; WD=$(mktemp -d)
+$BD/bulk_gen        --profile fast --out-dir "$WD/data"
+$BD/bulk_roundtrip  --bulk-bin "$BD/graphus-bulk" --data-dir "$WD/data"
+$BD/bulk_storage    --bulk-bin "$BD/graphus-bulk" --data-dir "$WD/data" --out "$WD/storage.json"
+$BD/bulk_evidence   --bulk-bin "$BD/graphus-bulk" --data-dir "$WD/data" --storage "$WD/storage.json" \
+                    --evidence-dir examples/bulk-etl/evidence --param profile=fast
+rm -rf "$WD"
 ```
 
 ## Evidence
 
-`bulk_storage` emits `storage.json` (consumed by the forthcoming `run.sh` / evidence report,
-mirroring how `gds-analytics`' `gds_sweep` emits `sweep.json`). Stable fields:
+`run.sh` emits a standardized, schema-versioned `report.json` + `report.md` into the git-ignored
+`evidence/` directory (the shared `graphus-examples-harness` schema — same shape as every other
+example), assembled by `bulk_evidence`. The headline metrics:
 
-| Field | Meaning |
-|-------|---------|
-| `store_bytes` / `store_pages` | The durable `graph.store` image. |
-| `wal_bytes` / `wal_pages` | The retained `graph.wal` redo log (transient — truncated/recycled on checkpoint). |
-| `bytes_per_node` / `bytes_per_edge` | On-disk **store** bytes per element. |
-| `store_space_amplification` | `store_bytes / logical_csv_bytes` — the **steady-state** durable cost. |
-| `space_amplification` | `(store + wal) / logical_csv_bytes` — the **peak** footprint right after load (WAL-dominated). |
-| `write_amplification` | `(store + wal) / logical_csv_bytes` — an honest **lower bound** on bytes written. |
+| Report field | Meaning |
+|--------------|---------|
+| `throughput.operations` / `throughput.ops_per_sec` | elements (nodes + rels) loaded / **elements per second** |
+| `workload.ingest_mb_per_sec` | input-CSV **MB per second** the loader sustained |
+| `memory.peak_rss_bytes` | **peak RAM** of the import process (polled while it ran) |
+| `cpu.user_secs` / `cpu.system_secs` / `cpu.mean_core_utilisation` | **CPU time** of the import process |
+| `phases[import].millis` / `total_millis` | **end-to-end** import wall time |
+| `storage.store_bytes` / `store_pages` | the durable `graph.store` image |
+| `storage.wal_bytes` / `wal_pages` | the retained `graph.wal` redo log |
+| `storage.space_amplification` | on-disk **store bytes-per-node** (the gated per-element cost) |
+| `storage.write_amplification` | on-disk **store bytes-per-edge** (the gated per-element cost) |
+| `workload.store_space_amplification` / `total_space_amplification` / `csv_write_amplification` | the CSV-relative amplifications (human visibility, not gated) |
+| `workload.content_hash` | the round-trip content hash (lossless evidence) |
 
-### Measured envelope (release build, this host)
+`bulk_storage` also writes the lower-level `storage.json` (the footprint source `bulk_evidence`
+folds in); its `store_space_amplification` / `space_amplification` / `write_amplification` are the
+CSV-relative ratios documented above.
 
-These are the numbers produced by a real run; they are the documented envelope the evidence report
-checks against.
+### Reading the evidence honestly
+
+- **The offline import is fully deterministic.** `store_bytes`, `store_pages`, `wal_bytes`, and
+  `wal_pages` are **byte-identical across runs and hosts** (the importer batches commits
+  deterministically; no clock-driven checkpointing), which is why the baseline gate can hold them to
+  a tight band.
+- **Amplification.** The durable graph image is ~6–7× the logical CSV size (fixed-record padding,
+  free-list slack, token catalogs). The much larger *total* figure (`store + WAL`) is dominated by
+  the **retained WAL** the batched bulk-load commits produced; that redo log is transient and is
+  truncated/recycled on checkpoint, so it is the peak load-time footprint, not the steady-state cost.
+- **Throughput / CPU / RAM / time are machine-variant** and are recorded for human visibility but
+  **NOT** gated.
+
+### Measured envelope (release build, this host: linux/x86_64, 16 cores)
 
 | Metric | `fast` (800 nodes / 4,029 rels) | `large` (24,400 nodes / 139,989 rels) |
 |--------|--------------------------------:|--------------------------------------:|
@@ -175,13 +224,30 @@ checks against.
 | Bytes / edge (store) | ~246 B | ~220 B |
 | Store space amplification | ~7.2× | ~6.1× |
 | Total (store+WAL) space amplification | ~46.8× | ~41.8× |
+| Ingest throughput (machine-variant) | ~120k–130k elements/sec, ~3.4 MB/sec | scales with volume |
+| Peak RAM (machine-variant) | ~8 MB | larger with volume |
 
-**Reading the amplification honestly:** the durable graph image is ~6–7× the logical CSV size
-(fixed-record padding, free-list slack, token catalogs). The much larger *total* figure is dominated
-by the **retained WAL** the batched bulk-load commits produced; that redo log is transient and is
-truncated/recycled on checkpoint, so it is the peak load-time footprint, not the steady-state cost.
 Round-trip losslessness is proven by content hash at both scales
 (`fast = f09ef9edcd4584631cc07af0116a0d22`, `large = ef61b4b3a9ebb44de27ff88c2c14433e`).
+
+### The committed baseline + regression gate
+
+`baseline.json` (committed, non-git-ignored) is a **fast-profile reference run**. `run.sh` (fast
+profile only) gates a fresh run against it with `bulk_baseline_cmp`, which holds only the **stable
+structural** metrics:
+
+- **exact equality**: `dataset.nodes` / `dataset.relationships` and `workload.imported_elements`
+  (integer-stable for a fixed seed);
+- **within 15%**: `storage.store_bytes`, `storage.wal_bytes`, `storage.space_amplification`
+  (bytes-per-node), `storage.write_amplification` (bytes-per-edge).
+
+**Why these thresholds.** The footprint is deterministic here, so 15% is comfortably loose enough to
+absorb `f64` re-serialization rounding and any future minor record-layout/free-list slack, yet tight
+enough to catch a real footprint regression. The structural counts are gated at exact equality
+because a change means the generator drifted. Throughput, CPU, peak RAM, and wall-time are
+machine-/host-variant and are deliberately **ungated** (held at `∞`) so the shared baseline is never
+flaky across the developer/CI machines it travels between — the same gating philosophy as the
+`gds-analytics` and `fraud-oltp` examples.
 
 > Note on the round-trip property count: `graphus-bulk dump` unifies every property key across all
 > node labels into one CSV file, so a node is written with empty cells for keys other labels carry.

@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "metadata": {
+    "scenario": "bulk-etl",
+    "description": "Offline high-throughput bulk ingest + ETL: import a deterministic LDBC-SNB-like social network from CSV via the real graphus-bulk binary, characterise ingest throughput + the on-disk store footprint / amplification, and prove a lossless import -> dump -> re-import round-trip.",
+    "dataset": {
+      "nodes": 800,
+      "relationships": 4029
+    },
+    "workload": {
+      "connection": "offline",
+      "content_hash": "f09ef9edcd4584631cc07af0116a0d22",
+      "csv_write_amplification": "46.7736",
+      "import_wall_secs": "0.0380",
+      "imported_elements": "4829",
+      "ingest_elements_per_sec": "127218.9",
+      "ingest_mb_per_sec": "3.4439",
+      "logical_csv_bytes": "137075",
+      "nodes_Comment": "432",
+      "nodes_Forum": "24",
+      "nodes_Person": "200",
+      "nodes_Post": "144",
+      "profile": "fast",
+      "rels_CONTAINER_OF": "144",
+      "rels_HAS_CREATOR": "576",
+      "rels_HAS_MEMBER": "288",
+      "rels_KNOWS": "1589",
+      "rels_LIKES": "1000",
+      "rels_REPLY_OF": "432",
+      "store_space_amplification": "7.2313",
+      "total_properties": "7349",
+      "total_space_amplification": "46.7736"
+    },
+    "started_unix_secs": 1781948579
+  },
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_cores": 16,
+    "hostname": "ROG",
+    "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "timestamp_unix_secs": 1781948579
+  },
+  "total_millis": 0.014447000000000002,
+  "phases": [
+    {
+      "name": "import",
+      "millis": 37.958182
+    }
+  ],
+  "cpu": {
+    "user_secs": 0.01,
+    "system_secs": 0.0,
+    "mean_core_utilisation": 0.26344781212124435
+  },
+  "memory": {
+    "peak_rss_bytes": 7913472,
+    "final_rss_bytes": 0
+  },
+  "storage": {
+    "store_bytes": 991232,
+    "wal_bytes": 5420265,
+    "store_pages": 121,
+    "wal_pages": 662,
+    "bytes_fsynced": 5420265,
+    "write_amplification": 246.0243,
+    "space_amplification": 1239.04
+  },
+  "throughput": {
+    "operations": 4829,
+    "ops_per_sec": 127218.94847334891,
+    "p50_latency_ms": 0.0,
+    "p99_latency_ms": 0.0,
+    "p999_latency_ms": 0.0,
+    "abort_rate": 0.0
+  },
+  "notes": [
+    "Ingest throughput + CPU/RAM/time are the REAL `graphus-bulk import` child process (pid metered by polling its /proc or ps) over a 0.0380s offline load of 4829 elements (127218.9 elements/sec, 3.444 MB/sec of input CSV). These are machine-variant and are NOT gated.",
+    "storage.store_bytes / store_pages / wal_bytes / wal_pages are the durable graph.store image + retained graph.wal redo log measured for the SAME dataset (from bulk_storage's storage.json). storage.space_amplification = on-disk STORE bytes-per-node and storage.write_amplification = on-disk STORE bytes-per-edge — the DETERMINISTIC per-element costs the baseline gate holds to a tight band. The CSV-relative amplifications (store/total/write vs logical_csv_bytes) are in the workload params for human visibility.",
+    "Round-trip is LOSSLESS: import -> dump -> re-import preserves the id-independent content hash f09ef9edcd4584631cc07af0116a0d22 (proven by bulk_roundtrip).",
+    "COMMITTED BASELINE (rmp #270): the fast-profile reference run for the regression gate. The offline import is fully DETERMINISTIC (store_bytes/store_pages/wal_bytes/wal_pages are byte-identical across runs and hosts). Only STABLE STRUCTURAL metrics are gated by bulk_baseline_cmp — the dataset size (dataset.nodes/relationships), the imported_elements count, and the durable store footprint (storage.store_bytes/wal_bytes within 15%, storage.space_amplification = store bytes-per-node and storage.write_amplification = store bytes-per-edge within 15%). Ingest throughput/CPU/RAM/wall-time are machine-variant and are NOT gated. Recorded on linux/x86_64."
+  ]
+}
