@@ -1,0 +1,46 @@
+[package]
+name = "graphus-gds-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded influence/citation-network generator + analytically-known reference subgraph for the gds-analytics example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-fraud-gen`,
+# `graphus-examples-harness` and `graphus-bench`: it exists only to support the
+# `examples/gds-analytics` E2E demonstration and is depended upon by NOTHING in the production build.
+# In particular, `graphus-server` MUST NOT depend on it, so it adds ZERO overhead to the shipped
+# binary.
+publish = false
+
+[lib]
+name = "graphus_gds_gen"
+path = "src/lib.rs"
+
+[dependencies]
+# The generator emits the reference ground-truth as JSON and the Cypher load script as text; serde
+# pins match the rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The dependency-free GDS engine, used ONLY by the `gds_sweep` binary to project in-memory CSR graphs
+# of increasing size and measure per-algorithm time + CSR footprint (bytes/node, bytes/edge). It is a
+# zero-runtime-dependency leaf crate; depending on it here keeps the sweep hermetic and CI-runnable
+# WITHOUT a server, and `graphus-server` does NOT depend on this generator crate, so the production
+# build is untouched.
+graphus-gds = { path = "../graphus-gds" }
+
+# The deterministic generator binary: writes `graph.cypher` + `reference.json` for a profile.
+# Usage: `cargo run -p graphus-gds-gen --bin gds_gen -- --profile fast --out-dir <dir>`
+[[bin]]
+name = "gds_gen"
+path = "src/bin/gds_gen.rs"
+
+# The hermetic scalability + CSR-footprint sweep: projects CSR graphs of increasing size in-process
+# and reports per-algorithm wall time + CSR bytes-per-node / bytes-per-edge as machine-readable JSON.
+# GDS is single-threaded (no rayon / thread pool / core knob), so the sweep honestly varies GRAPH
+# SIZE, not core count. Usage: `cargo run -p graphus-gds-gen --bin gds_sweep -- --out <file.json>`
+[[bin]]
+name = "gds_sweep"
+path = "src/bin/gds_sweep.rs"

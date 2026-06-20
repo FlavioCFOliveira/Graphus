@@ -1156,6 +1156,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-gds-gen"
+version = "0.0.1"
+dependencies = [
+ "graphus-gds",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-index"
 version = "0.0.1"
 dependencies = [
