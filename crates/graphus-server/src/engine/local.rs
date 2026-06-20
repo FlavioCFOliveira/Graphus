@@ -238,6 +238,28 @@ impl<D: BlockDevice, S: LogSink> LocalEngine<D, S> {
         rx.recv().map_err(|_| gone())?
     }
 
+    /// Borrows the engine's live block device for the duration of `f`, returning its result — the
+    /// **Deterministic Simulation Testing fault seam** (rmp #236). The VOPR harness uses it to arm a
+    /// disk [`FaultPlan`](graphus_io::FaultPlan) (or a one-shot I/O error) on the *running* engine's
+    /// store mid-workload, so a fault fires during interleaved transactions rather than only on a
+    /// device owned before construction. Returns `None` if the engine has already been shut down (the
+    /// coordinator was consumed), so a caller can never panic on a spent engine.
+    ///
+    /// Mirrors [`RecordStore::device_mut`](graphus_storage::RecordStore::device_mut): gated behind the
+    /// `dst` cargo feature so the production build never compiles this seam — the device stays
+    /// encapsulated and the cost is exactly zero (the method does not exist on the production path).
+    ///
+    /// # Panics
+    /// Panics only if the coordinator's store is already mutably borrowed (a live statement seam is
+    /// held) — the same misuse [`TxnCoordinator::with_store_mut`] rejects; the VOPR harness only arms
+    /// faults *between* dispatched steps, when no statement seam is live.
+    #[cfg(feature = "dst")]
+    pub fn with_device_mut<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> Option<R> {
+        self.coordinator
+            .as_ref()
+            .map(|c| c.with_store_mut(|store| f(store.device_mut())))
+    }
+
     /// Drains in-flight transactions, flushes + syncs the store, and consumes the engine. After this
     /// the driver is spent (every further operation errors with "engine unavailable").
     ///

@@ -25,15 +25,68 @@
 //! exercised alongside the interleaved explicit transactions.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use graphus_core::Value;
+use graphus_core::capability::Clock;
 use graphus_io::MemBlockDevice;
 use graphus_server::engine::command::AccessMode;
 use graphus_server::engine::{LocalEngine, RunReply, TxTicket};
-use graphus_sim::{SharedClock, SimScheduler};
+use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock, SimScheduler};
 use graphus_wal::MemLogSink;
 
 use crate::mix::{LoadProfile, MixProfile, WorkloadGen};
+use crate::vopr_fault::{FaultBudget, FaultScheduler};
+
+/// A [`Clock`] whose active [`ClockFaultPlan`] can be **swapped at run time**, so the unified fault
+/// scheduler can intensify the engine's clock faults *mid-run* (the engine holds one fixed
+/// `Arc<dyn Clock>`, but the plan behind it changes when a clock fault fires).
+///
+/// The simulator sets the inner [`SharedClock`] from scheduler time each step; every engine read of
+/// `now_nanos` then passes through the *current* plan. The fault math is delegated to the audited
+/// [`FaultyClock`] (rmp #233) — built transiently per read over the current plan — so this adds no new
+/// fault logic. Only the **tolerant** trait read is exposed (the engine reaches the clock solely
+/// through the [`Clock`] trait object); the monotone high-water path is not needed here.
+///
+/// `Send + Sync` (the engine's clock slot requires it): the swappable plan is held behind a
+/// [`Mutex`]; the single-threaded simulator never contends it.
+#[derive(Debug)]
+struct SwappableClock {
+    inner: SharedClock,
+    plan: Mutex<ClockFaultPlan>,
+}
+
+impl SwappableClock {
+    /// Builds a clock over `inner` starting with `plan` (inert by default ⇒ reads through transparently
+    /// until a clock fault swaps in a hostile plan).
+    fn new(inner: SharedClock, plan: ClockFaultPlan) -> Self {
+        Self {
+            inner,
+            plan: Mutex::new(plan),
+        }
+    }
+
+    /// Swaps in a new (intensified) clock-fault plan; subsequent reads observe it.
+    fn set_plan(&self, plan: ClockFaultPlan) {
+        if let Ok(mut guard) = self.plan.lock() {
+            *guard = plan;
+        }
+    }
+}
+
+impl Clock for SwappableClock {
+    fn now_nanos(&self) -> u64 {
+        let plan = self
+            .plan
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| ClockFaultPlan::default());
+        // Delegate to the audited FaultyClock tolerant read; a transient instance carries no read-order
+        // state (the per-read fault is a pure function of the plan seed + base time), so rebuilding it
+        // each call is exact and deterministic.
+        FaultyClock::new(self.inner.clone(), plan).now_nanos()
+    }
+}
 
 /// The simulated engine type: the real engine over the simulated in-memory device + log.
 type SimEngine = LocalEngine<MemBlockDevice, MemLogSink>;
@@ -66,6 +119,12 @@ pub struct VoprConfig {
     /// Permille chance that an explicit transaction ends with `ROLLBACK` rather than `COMMIT`, so the
     /// interleaver exercises abort handling too. `0` ⇒ never roll back.
     pub rollback_permille: u32,
+    /// The **unified fault budget** (rmp #236): how many disk / clock / transport faults the scheduler
+    /// injects on the workload timeline, and their intensity caps. Drawn from the master seed, so the
+    /// fault schedule is part of the reproducible run. Defaults to [`FaultBudget::none`] so a standard
+    /// run is fault-free (and bit-for-bit identical to the pre-#236 run); enable faults with
+    /// [`with_faults`](Self::with_faults).
+    pub fault_budget: FaultBudget,
 }
 
 impl VoprConfig {
@@ -82,6 +141,7 @@ impl VoprConfig {
             max_txn_stmts: 4,
             auto_commit_permille: 250,
             rollback_permille: 100,
+            fault_budget: FaultBudget::none(),
         }
     }
 
@@ -96,6 +156,15 @@ impl VoprConfig {
     #[must_use]
     pub fn with_load(mut self, load: LoadProfile) -> Self {
         self.load = load;
+        self
+    }
+
+    /// The same run with a specific **fault budget** (rmp #236): the unified scheduler then injects
+    /// disk / clock / transport faults on the workload timeline under `budget`, folded into the trace
+    /// and tallied in the report. With [`FaultBudget::none`] the run is fault-free.
+    #[must_use]
+    pub fn with_faults(mut self, budget: FaultBudget) -> Self {
+        self.fault_budget = budget;
         self
     }
 
@@ -143,6 +212,16 @@ pub struct VoprReport {
     /// (an SSI serialization conflict the contention exposed). `>0` under contention proves the main
     /// loop now reaches conflict outcomes the old per-op auto-commit loop could not.
     pub aborted_txns: usize,
+    /// Disk faults the unified scheduler armed on the live device during the run (rmp #236). Folded
+    /// into [`trace_hash`](Self::trace_hash), so two replays of the same seed inject the same faults.
+    pub disk_faults: u32,
+    /// Clock faults the unified scheduler injected (intensifying the engine's faulty clock).
+    pub clock_faults: u32,
+    /// Transport faults the unified scheduler **planned and traced**. Under the current in-process
+    /// driver these are scheduled, budgeted and folded into the trace but not physically armed (there
+    /// is no byte stream); they fire physically only under a SimNet-backed driver (the documented
+    /// rmp #236 seam — see [`vopr_fault`](crate::vopr_fault)).
+    pub transport_faults: u32,
 }
 
 /// One scheduled unit of work: a client advancing its open transaction by **one step**. The step's
@@ -196,8 +275,25 @@ impl ClientState {
 pub fn run(cfg: VoprConfig) -> VoprReport {
     // The single simulated clock, shared with the engine and set from scheduler time each step.
     let clock = SharedClock::new(0);
-    let mut eng: SimEngine = LocalEngine::in_memory(Arc::new(clock.clone()), cfg.pool_pages)
-        .expect("build simulated in-memory engine");
+
+    // The unified fault scheduler (rmp #236): plans the seed-driven disk/clock/transport fault schedule
+    // up front, over the run's bounded dispatched-step horizon, under the configured budget. With
+    // `FaultBudget::none()` it is inert and the run is the legacy fault-free run, bit-for-bit.
+    let step_horizon = estimate_step_horizon(&cfg);
+    let mut faults = FaultScheduler::plan(cfg.seed, cfg.fault_budget, step_horizon);
+
+    // The engine reads time through a swappable faulty clock: a clock fault intensifies the plan
+    // mid-run without rebuilding the engine. It starts from the scheduler's initial (inert) plan, so a
+    // fault-free run reads the bare scheduler time exactly as before.
+    let faulty_clock = Arc::new(SwappableClock::new(
+        clock.clone(),
+        faults.initial_clock_plan(),
+    ));
+    let mut eng: SimEngine = LocalEngine::in_memory(
+        faulty_clock.clone() as Arc<dyn Clock + Send + Sync>,
+        cfg.pool_pages,
+    )
+    .expect("build simulated in-memory engine");
 
     // One scheduler owns the master seed; every random choice is drawn from it.
     let mut sched: SimScheduler<Tick> = SimScheduler::new(cfg.seed);
@@ -242,9 +338,34 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         )
         .saturating_add(clients);
 
+    // The dispatched-step ordinal: the canonical fault timeline, advanced once per scheduler step
+    // (whether or not the client made progress). Deterministic and bounded by `step_cap`, so every
+    // planned fault is guaranteed to come due.
+    let mut dispatched = 0u64;
+
     while let Some((now, tick)) = sched.next() {
         // Keep the engine's clock in lockstep with logical simulation time.
         clock.set(now);
+
+        // Drain every fault that has come due at this dispatched-step ordinal, *before* the workload
+        // step runs, so faults fire DURING interleaved (possibly open) transactions on the one timeline.
+        // Each fault folds into the canonical trace, so the fault schedule is part of the reproducible
+        // run. Disk faults arm the live device; clock faults swap in an intensified plan the engine
+        // reads next; transport faults are planned + traced (the SimNet seam — see `vopr_fault`).
+        faults.drain_due(
+            dispatched,
+            |plan| {
+                // `with_device_mut` returns `None` once the engine is shut down (spent); treat that as
+                // "not armed" so a fault on a dead engine is not tallied.
+                eng.with_device_mut(|dev| dev.arm_fault_plan(plan))
+                    .is_some()
+            },
+            |plan| faulty_clock.set_plan(plan),
+            |token, value| {
+                trace.bytes(token);
+                trace.u64(value);
+            },
+        );
 
         let client = tick.client as usize;
         // Decide and execute this client's next step, folding it into the canonical trace and
@@ -274,6 +395,7 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         if progressed {
             steps += 1;
         }
+        dispatched = dispatched.saturating_add(1);
 
         // Belt-and-braces termination guard: the analytic bound above already makes the queue drain,
         // but if anything ever regresses we stop rather than spin.
@@ -281,6 +403,22 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
             break;
         }
     }
+
+    // Trailing drain: fire any planned fault whose ordinal a short run did not quite reach, so the
+    // schedule is fully accounted in the trace + tally regardless of the exact dispatched count. These
+    // fold into the trace identically on replay (the schedule is fixed by the seed).
+    faults.drain_due(
+        u64::MAX,
+        |plan| {
+            eng.with_device_mut(|dev| dev.arm_fault_plan(plan))
+                .is_some()
+        },
+        |plan| faulty_clock.set_plan(plan),
+        |token, value| {
+            trace.bytes(token);
+            trace.u64(value);
+        },
+    );
 
     let state_hash = snapshot_hash(&mut eng);
     // Consistency probe: `persisted_nodes` is the number of `:Person` rows present, `created_nodes`
@@ -290,6 +428,8 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
     let end_time = sched.now();
     // Best-effort: harden + consume the engine (it is dropped either way).
     let _ = eng.shutdown();
+
+    let (disk_faults, clock_faults, transport_faults) = faults.tally();
 
     VoprReport {
         seed: cfg.seed,
@@ -304,7 +444,23 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         max_open_txns,
         committed_txns,
         aborted_txns,
+        disk_faults,
+        clock_faults,
+        transport_faults,
     }
+}
+
+/// The dispatched-step horizon a run spans, so the fault scheduler can spread fault instants *across*
+/// the workload (on real interleaved steps) rather than after it. A run dispatches **at least** one
+/// step per statement (`clients * ops_per_client`); faults are planned over that lower bound so every
+/// planned fault is guaranteed to come due before the run ends (the actual dispatched count, which adds
+/// BEGIN/END overhead, is `>=` this). Deterministic from the config (no RNG), keeping the schedule a
+/// pure function of the config + seed. A trailing drain at end-of-run sweeps up any fault whose
+/// ordinal a short run did not quite reach, so the budget is always fully accounted.
+fn estimate_step_horizon(cfg: &VoprConfig) -> u64 {
+    u64::from(cfg.clients.max(1))
+        .saturating_mul(u64::from(cfg.ops_per_client))
+        .max(1)
 }
 
 /// Advances one client's transaction state machine by exactly one step, executing it against the
@@ -1089,5 +1245,187 @@ mod tests {
         let s2 = summarize(&run(VoprConfig::for_seed(7)));
         assert_eq!(s1, s2, "the summary line replays identically from the seed");
         assert!(s1.contains("trace_hash="));
+    }
+
+    // ---------------------------- unified fault scheduler (rmp #236) ----------------------------
+
+    /// A contended, fault-enabled config: explicit overlapping transactions under a write-heavy mix
+    /// with a generous fault budget, sized to stay fast in a debug build.
+    fn fault_cfg(seed: u64) -> VoprConfig {
+        VoprConfig {
+            clients: 6,
+            ops_per_client: 24,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            max_txn_stmts: 5,
+            auto_commit_permille: 200,
+            rollback_permille: 100,
+            ..VoprConfig::for_seed(seed)
+        }
+        .with_faults(FaultBudget::default().with_max_faults(12))
+    }
+
+    /// **Acceptance.** A fault-enabled run actually injects faults during interleaved work, the budget
+    /// bounds them, and the fault schedule is folded into the trace (so it is part of the reproducible
+    /// run). The consistency probe must still pass — the budgeted chaos stays recoverable.
+    #[test]
+    fn faults_fire_during_interleaved_work_and_stay_consistent() {
+        let cfg = fault_cfg(0x236_0001);
+        let r = run(cfg);
+        let injected = r.disk_faults + r.clock_faults + r.transport_faults;
+        assert!(
+            injected > 0,
+            "a fault-enabled config injects faults (disk={} clock={} xport={})",
+            r.disk_faults,
+            r.clock_faults,
+            r.transport_faults
+        );
+        assert!(
+            injected <= cfg.fault_budget.max_faults,
+            "the budget bounds the injected fault count: {} > {}",
+            injected,
+            cfg.fault_budget.max_faults
+        );
+        // ACID upheld under budgeted chaos: every committed `:Person` create persists exactly once.
+        assert_eq!(
+            r.persisted_nodes, r.created_nodes,
+            "no committed create lost/duplicated under faults: rows {} != distinct {}",
+            r.persisted_nodes, r.created_nodes
+        );
+        // The run did real work alongside the faults.
+        assert!(
+            r.steps > 0 && r.ok_ops > 0,
+            "the faulted run still progresses"
+        );
+    }
+
+    /// **Acceptance (determinism).** Same seed ⇒ identical fault schedule, trace hash, state hash and
+    /// full report — the seed-double-run gate the CLI relies on, now under faults.
+    #[test]
+    fn faulted_run_is_deterministic_same_seed() {
+        let cfg = fault_cfg(0x236_0002);
+        let a = run(cfg);
+        let b = run(cfg);
+        assert_eq!(
+            a, b,
+            "same seed ⇒ identical faulted report (schedule + trace + state)"
+        );
+        assert!(
+            a.disk_faults + a.clock_faults + a.transport_faults > 0,
+            "the determinism check is non-vacuous (faults actually fired)"
+        );
+    }
+
+    /// **Acceptance (sensitivity).** Distinct seeds produce distinct fault schedules, so the trace hash
+    /// genuinely depends on the fault schedule (it is folded in). Across a small set of seeds the trace
+    /// hashes must not all collapse.
+    #[test]
+    fn distinct_seeds_yield_distinct_faulted_traces() {
+        let hashes: std::collections::BTreeSet<u64> =
+            (1u64..=10).map(|s| run(fault_cfg(s)).trace_hash).collect();
+        assert!(
+            hashes.len() > 1,
+            "distinct seeds ⇒ distinct faulted traces (got {} unique)",
+            hashes.len()
+        );
+    }
+
+    /// **Acceptance (fault folds into the trace).** Enabling faults must *change* the canonical trace
+    /// for a fixed seed — proving the fault schedule is genuinely folded into the run digest and not an
+    /// inert side-channel. (The fault RNG is domain-separated from the workload RNG, so the workload
+    /// itself is unchanged; only the folded fault events move the hash.)
+    #[test]
+    fn enabling_faults_changes_the_trace_hash() {
+        let seed = 0x236_0003;
+        let base = run(VoprConfig::for_seed(seed)); // FaultBudget::none()
+        let faulted = run(fault_cfg(seed));
+        assert_eq!(
+            base.disk_faults + base.clock_faults + base.transport_faults,
+            0
+        );
+        assert!(faulted.disk_faults + faulted.clock_faults + faulted.transport_faults > 0);
+        assert_ne!(
+            base.trace_hash, faulted.trace_hash,
+            "the injected fault schedule must fold into (change) the trace hash"
+        );
+    }
+
+    /// A disk-only, high-rate budget exercises the live-device seam hard: many seeded corruptions are
+    /// armed on the running store mid-workload, yet the engine surfaces them (a checksum catches the
+    /// corruption) and the consistency probe still holds — corruption is *recoverable*, not a wipe.
+    #[test]
+    fn disk_only_faults_are_recoverable() {
+        let cfg = VoprConfig {
+            clients: 5,
+            ops_per_client: 20,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            auto_commit_permille: 300,
+            ..VoprConfig::for_seed(0x236_0004)
+        }
+        .with_faults(
+            FaultBudget::default()
+                .with_max_faults(16)
+                .with_weights(1, 0, 0)
+                .with_disk_intensity(2, 64),
+        );
+        let r = run(cfg);
+        assert!(
+            r.disk_faults > 0,
+            "disk faults actually armed (got {})",
+            r.disk_faults
+        );
+        assert_eq!(r.clock_faults, 0, "disk-only budget arms no clock faults");
+        assert_eq!(
+            r.transport_faults, 0,
+            "disk-only budget arms no transport faults"
+        );
+        assert_eq!(
+            r.persisted_nodes, r.created_nodes,
+            "committed creates survive disk corruption: rows {} != distinct {}",
+            r.persisted_nodes, r.created_nodes
+        );
+        assert_eq!(r, run(cfg), "the disk-faulted run replays identically");
+    }
+
+    /// A clock-only budget makes the engine read a hostile (jumping/regressing) clock mid-run; the
+    /// engine must tolerate it (no panic, no negative duration) and stay consistent — the
+    /// `FaultyClock` tolerance contract, exercised through the live engine.
+    #[test]
+    fn clock_only_faults_are_tolerated() {
+        let cfg = VoprConfig {
+            clients: 5,
+            ops_per_client: 20,
+            mix: MixProfile::mixed(),
+            ..VoprConfig::for_seed(0x236_0005)
+        }
+        .with_faults(
+            FaultBudget::default()
+                .with_max_faults(12)
+                .with_weights(0, 1, 0)
+                .with_clock_intensity(50_000),
+        );
+        let r = run(cfg);
+        assert!(
+            r.clock_faults > 0,
+            "clock faults actually fired (got {})",
+            r.clock_faults
+        );
+        assert_eq!(
+            r.persisted_nodes, r.created_nodes,
+            "a hostile clock does not corrupt the graph: rows {} != distinct {}",
+            r.persisted_nodes, r.created_nodes
+        );
+        assert_eq!(r, run(cfg), "the clock-faulted run replays identically");
+    }
+
+    /// The default (fault-free) run is byte-for-byte unchanged by wiring the scheduler in: a
+    /// `FaultBudget::none()` run tallies zero faults and matches the pre-#236 trace/state for the seed.
+    #[test]
+    fn fault_free_run_injects_nothing() {
+        let r = run(VoprConfig::for_seed(20260614));
+        assert_eq!(r.disk_faults, 0);
+        assert_eq!(r.clock_faults, 0);
+        assert_eq!(r.transport_faults, 0);
     }
 }

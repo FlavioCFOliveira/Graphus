@@ -18,6 +18,12 @@ path = "src/main.rs"
 # target is gated on this feature; CI runs it explicitly with `--features neo4j-interop`.
 neo4j-interop = []
 
+# Deterministic Simulation Testing seam (rmp #236): forwards to `graphus-cypher/dst` (which forwards
+# to `graphus-storage/dst`) so `LocalEngine::device_mut` exists, letting the VOPR harness arm live
+# disk faults on the running engine's store mid-workload. OFF by default — the production server build
+# never compiles the seam, so the device stays encapsulated and the cost is exactly zero.
+dst = ["graphus-cypher/dst"]
+
 [dependencies]
 # The shared value model, error taxonomy and the injected `Clock` capability (used to drive REST
 # transaction expiry and JWT validity deterministically). `04 §7.2`, `§8.4`.

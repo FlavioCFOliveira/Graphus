@@ -8,6 +8,12 @@ repository.workspace = true
 authors.workspace = true
 description = "Cypher parse, plan and execute pipeline for Graphus (targets the openCypher TCK)."
 
+[features]
+# Deterministic Simulation Testing seam (rmp #236): forwards to `graphus-storage/dst` so the
+# `RecordStore::device_mut` accessor exists, letting the VOPR harness arm live disk faults on the
+# coordinator's store mid-workload. OFF by default — the production build never compiles the seam.
+dst = ["graphus-storage/dst"]
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 # The `RecordStoreGraph` GraphAccess implementation (src/record_graph.rs) runs the executor against

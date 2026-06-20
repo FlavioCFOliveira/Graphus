@@ -48,6 +48,7 @@ pub mod model;
 pub mod rng;
 pub mod scenarios;
 pub mod vopr;
+pub mod vopr_fault;
 pub mod wire;
 pub mod workload;
 
@@ -60,4 +61,5 @@ pub use rng::DetRng;
 // The wire-level VOPR core (rmp #162). Its `run`/`summarize` are kept module-qualified (`vopr::run`)
 // so they do not clash with the storage harness's crate-root `run`/`summarize`.
 pub use vopr::{VoprConfig, VoprReport};
+pub use vopr_fault::{FaultBudget, FaultScheduler, VoprFaultKind};
 pub use workload::{Op, PlannedTxn, TxnOutcome, WorkloadConfig};
