@@ -1,0 +1,41 @@
+[package]
+name = "graphus-bulk-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded LDBC-SNB-like social-network CSV generator + bulk import/dump round-trip and storage-footprint drivers for the bulk-etl example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-gds-gen`,
+# `graphus-fraud-gen`, `graphus-examples-harness` and `graphus-bench`: it exists only to support the
+# `examples/bulk-etl` E2E demonstration and is depended upon by NOTHING in the production build.
+# In particular, `graphus-server` MUST NOT depend on it, so it adds ZERO overhead to the shipped
+# binary.
+publish = false
+
+[lib]
+name = "graphus_bulk_gen"
+path = "src/lib.rs"
+
+[dependencies]
+# The generator emits the dataset manifest (expected counts + a content figure) as JSON; serde pins
+# match the rest of the workspace. The generator itself emits CSV by hand (the exact
+# `neo4j-admin import`-flavoured format `graphus-bulk` consumes), so it needs no CSV crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The offline bulk importer/dumper, used by the `bulk_roundtrip` + `bulk_storage` binaries to drive
+# the real import -> dump -> re-import round-trip and to measure the on-disk footprint of a loaded
+# store WITHOUT a server. `graphus-bulk` is itself an offline leaf (it does not pull in
+# `graphus-server`), so the round-trip stays hermetic + CI-runnable, and `graphus-server` does NOT
+# depend on this generator crate — the production build is untouched.
+graphus-bulk = { path = "../graphus-bulk" }
+graphus-core = { path = "../graphus-core" }
+graphus-io = { path = "../graphus-io" }
+graphus-storage = { path = "../graphus-storage" }
+graphus-wal = { path = "../graphus-wal" }
+
+# The shared evidence harness, for the storage footprint + amplification measurement (StorageMeter).
+# A dev-only leaf crate (never in `graphus-server`), so this keeps the production build untouched.
+graphus-examples-harness = { path = "../graphus-examples-harness" }

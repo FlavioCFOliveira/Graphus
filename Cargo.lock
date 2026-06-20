@@ -1046,6 +1046,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-bulk-gen"
+version = "0.0.1"
+dependencies = [
+ "graphus-bulk",
+ "graphus-core",
+ "graphus-examples-harness",
+ "graphus-io",
+ "graphus-storage",
+ "graphus-wal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-cli"
 version = "0.0.1"
 dependencies = [
