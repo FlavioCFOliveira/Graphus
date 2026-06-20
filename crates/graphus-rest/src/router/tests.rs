@@ -52,12 +52,20 @@ const TTL: u64 = 1_000_000_000; // 1s, in clock nanos
 
 /// An authenticator with `alice` (DB Read + Write) and `bob` (DB Read only), so tests can exercise
 /// both authorized and forbidden access modes. No passwords needed (REST uses Bearer).
+///
+/// It also seeds `carol`, a **per-tenant** (graph-scoped) principal granted `READ`/`WRITE` on
+/// `GRAPH neo4j` **only** (not server-wide `Resource::Database`). She is the regression fixture for
+/// the per-tenant REST authorization bug: the coarse transaction-mode gate must check the privilege
+/// scoped to the *target* database, so a graph-scoped grant authorizes its own database and nothing
+/// else — see [`graph_scoped_grant_authorizes_its_own_database_over_rest`].
 fn fixture_auth() -> Authenticator {
     let mut a = Authenticator::new(JWT_SECRET).expect("JWT_SECRET is >= 32 bytes");
     a.catalog_mut().create_user("alice").unwrap();
     a.catalog_mut().create_user("bob").unwrap();
+    a.catalog_mut().create_user("carol").unwrap();
     a.catalog_mut().create_role("rw").unwrap();
     a.catalog_mut().create_role("ro").unwrap();
+    a.catalog_mut().create_role("tenant_neo4j").unwrap();
     a.catalog_mut()
         .grant_privilege("rw", Privilege::read_database())
         .unwrap();
@@ -67,8 +75,22 @@ fn fixture_auth() -> Authenticator {
     a.catalog_mut()
         .grant_privilege("ro", Privilege::read_database())
         .unwrap();
+    // carol's role is scoped to ONE database (the graph `neo4j`), never server-wide.
+    a.catalog_mut()
+        .grant_privilege(
+            "tenant_neo4j",
+            Privilege::on_graph(graphus_auth::Action::Read, "neo4j"),
+        )
+        .unwrap();
+    a.catalog_mut()
+        .grant_privilege(
+            "tenant_neo4j",
+            Privilege::on_graph(graphus_auth::Action::Write, "neo4j"),
+        )
+        .unwrap();
     a.catalog_mut().grant_role("alice", "rw").unwrap();
     a.catalog_mut().grant_role("bob", "ro").unwrap();
+    a.catalog_mut().grant_role("carol", "tenant_neo4j").unwrap();
     a
 }
 
@@ -493,6 +515,64 @@ async fn write_mode_forbidden_for_read_only_user() {
         ))
         .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// Regression: the coarse transaction-mode gate must authorize against the **target database's**
+/// graph scope, not the server-wide `Resource::Database` scope. A per-tenant principal granted only
+/// `READ`/`WRITE ON GRAPH neo4j` must be able to open transactions on `/db/neo4j/...` and be
+/// **forbidden** on any other database.
+///
+/// Before the fix, `authorize_mode` required the server-wide `read_database()`/`write_database()`
+/// privilege, so a graph-scoped grant was rejected with `403` even on its own database — making
+/// per-tenant RBAC entirely non-functional over REST (a false-denial security bug). The RBAC
+/// containment rule (`Database ⊇ Graph(db)`) means a broader server-wide grant still satisfies this
+/// gate, so [`alice`]/[`bob`] (server-wide) are unaffected (the tests above still pass).
+#[tokio::test]
+async fn graph_scoped_grant_authorizes_its_own_database_over_rest() {
+    let h = Harness::new();
+    let token = h.token("carol"); // granted READ+WRITE on GRAPH neo4j only.
+
+    // A WRITE tx on her own database (`neo4j`) is authorized (graph-scoped Write satisfies the gate).
+    let resp = h.send(post_json("/db/neo4j/tx", &token, json!({}))).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a graph-scoped WRITE grant must authorize a WRITE tx on its own database"
+    );
+
+    // A READ tx on her own database is likewise authorized (Write ⊇ Read; either grant suffices).
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx",
+            &token,
+            json!({ "access_mode": "READ" }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // But she holds NO grant on a different database (`other`): both READ and WRITE are forbidden —
+    // a graph-scoped grant never crosses a database boundary (no privilege escalation).
+    let resp = h.send(post_json("/db/other/tx", &token, json!({}))).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a graph-scoped grant must NOT authorize a different database (cross-tenant)"
+    );
+    let resp = h
+        .send(post_json(
+            "/db/other/tx",
+            &token,
+            json!({ "access_mode": "READ" }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // No transaction on `other` was ever opened (the gate is fail-fast, before `engine.begin`).
+    assert!(
+        !h.engine.log().iter().any(|e| e.contains("other")),
+        "engine.begin must never run for a forbidden database: {:?}",
+        h.engine.log()
+    );
 }
 
 // =============================== serialization =================================================

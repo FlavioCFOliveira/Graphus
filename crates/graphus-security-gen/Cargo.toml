@@ -1,0 +1,84 @@
+[package]
+name = "graphus-security-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded multi-tenant sensitive-data generator + RBAC provisioning/matrix emitter + hermetic encryption/rotation/backup verifier for the security-multitenant example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-fraud-gen`, `graphus-kg-gen`,
+# `graphus-examples-harness` and `graphus-bench`: it exists only to support the
+# `examples/security-multitenant` E2E demonstration and is depended upon by NOTHING in the production
+# build. In particular, `graphus-server` MUST NOT depend on it, so it adds ZERO overhead to the
+# shipped binary.
+publish = false
+
+[lib]
+name = "graphus_security_gen"
+path = "src/lib.rs"
+
+[features]
+# The pure generator (`security_gen` binary + the library) is hermetic: serde only, no engine, no
+# crypto, no Node, no network. It is always available and CI-runnable. The `dst-repro` feature pulls
+# in the REAL storage + crypto stack for the in-process encryption/rotation/backup verifier
+# (`security_verify`). Kept behind a feature so the pure generator + its determinism test stay light
+# and so the heavy engine/crypto build is opt-in.
+default = []
+dst-repro = [
+    "dep:graphus-server",
+    "dep:graphus-storage",
+    "dep:graphus-crypto",
+    "dep:graphus-core",
+    "dep:graphus-io",
+    "dep:graphus-wal",
+]
+
+[dependencies]
+# The generator emits the provisioning DDL + per-tenant Cypher as text and the manifest (tenants,
+# users, roles, grants, allow/deny matrix) as JSON; serde pins match the rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The shared evidence harness, for the `sec_baseline_cmp` binary: it loads a committed baseline report
+# + a fresh run's report and runs `compare_to_baseline` (the regression gate the example invokes). A
+# dev-only leaf crate (never in `graphus-server`), so this keeps the production build untouched.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
+# --- `dst-repro` feature only: the REAL encryption-at-rest stack, driven in-process for the hermetic
+# ciphertext-on-disk / offline key-rotation / encrypted-backup verifier. graphus-server does not
+# depend on this crate, so this is acyclic. No `dst` feature is needed: rotation drives the raw
+# `RecordStore` + `rotate_master_key` directly (no live engine). ---
+graphus-server = { path = "../graphus-server", optional = true }
+graphus-storage = { path = "../graphus-storage", optional = true }
+graphus-crypto = { path = "../graphus-crypto", optional = true }
+graphus-core = { path = "../graphus-core", optional = true }
+graphus-io = { path = "../graphus-io", optional = true }
+graphus-wal = { path = "../graphus-wal", optional = true }
+
+# The deterministic generator binary: writes `tenant_<name>.cypher` per tenant, `provision.cypher`
+# (admin DDL) and `manifest.json` (tenants, users, roles, grants, matrix) for a profile.
+# Usage: `cargo run -p graphus-security-gen --bin security_gen -- --profile fast --out-dir <dir>`
+[[bin]]
+name = "security_gen"
+path = "src/bin/security_gen.rs"
+
+# The baseline regression gate: compares a fresh evidence report against the committed baseline using
+# only stable STRUCTURAL metrics (storage bytes/pages, dataset size, backup artifact size). Hermetic —
+# needs only the harness, no engine, so it is always available (no `dst-repro`).
+# Named `sec_baseline_cmp` (NOT `baseline_cmp`) to avoid a target/<profile>/baseline_cmp binary-name
+# collision with `graphus-fraud-gen`'s own `baseline_cmp` — every leaf crate ships a comparator.
+# Usage: `cargo run -p graphus-security-gen --bin sec_baseline_cmp -- <baseline.json> <candidate.json>`
+[[bin]]
+name = "sec_baseline_cmp"
+path = "src/bin/sec_baseline_cmp.rs"
+
+# The hermetic in-process encryption/rotation/backup verifier (opt-in: needs the `dst-repro` feature).
+# Proves: ciphertext-on-disk (encrypted absent / cleartext present), offline key rotation (data intact
+# across, old key fails closed), and the encrypted backup roundtrip (no plaintext in the sealed
+# artifact, lossless restore, size/time). Deterministic; no network.
+# Usage: `cargo run -p graphus-security-gen --features dst-repro --bin security_verify -- --out-dir <dir>`
+[[bin]]
+name = "security_verify"
+path = "src/bin/security_verify.rs"
+required-features = ["dst-repro"]

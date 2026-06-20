@@ -57,7 +57,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use graphus_auth::{AuthError, AuthProvider, Privilege};
+use graphus_auth::{Action, AuthError, AuthProvider, Privilege};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
@@ -417,7 +417,7 @@ async fn begin<E: RestEngine + 'static>(
                 "invalid access_mode {bad}: expected \"READ\" or \"WRITE\""
             ))
         })?;
-        authorize_mode(state, identity, mode)?;
+        authorize_mode(state, identity, &db, mode)?;
 
         let handle = state
             .engine
@@ -450,7 +450,7 @@ async fn begin<E: RestEngine + 'static>(
 /// (`04 §8.2`).
 async fn run_in_tx<E: RestEngine + 'static>(
     State(state): State<AppState<E>>,
-    Path((_db, id)): Path<(String, String)>,
+    Path((db, id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -464,7 +464,7 @@ async fn run_in_tx<E: RestEngine + 'static>(
         let Some(info) = state.registry.touch(&id, now, state.engine.as_ref()) else {
             return Err(Problem::unknown_transaction(&id));
         };
-        authorize_mode(&state, &identity, info.mode)?;
+        authorize_mode(&state, &identity, &db, info.mode)?;
         Ok((req, info))
     })();
 
@@ -514,10 +514,10 @@ async fn commit_tx<E: RestEngine + 'static>(
         {
             return Err(Problem::unknown_transaction(&id));
         }
-        let Some((handle, _db, mode)) = state.registry.take(&id) else {
+        let Some((handle, db, mode)) = state.registry.take(&id) else {
             return Err(Problem::unknown_transaction(&id));
         };
-        if let Err(p) = authorize_mode(&state, &identity, mode) {
+        if let Err(p) = authorize_mode(&state, &identity, &db, mode) {
             // Unauthorized: roll the taken handle back (idempotent) and surface the authz failure.
             let _ = state.engine.rollback(handle);
             return Err(p);
@@ -567,10 +567,10 @@ async fn rollback_tx<E: RestEngine + 'static>(
 ) -> Response {
     let built = (|| {
         let identity = authenticate(&state, &headers)?;
-        let Some((handle, _db, mode)) = state.registry.take(&id) else {
+        let Some((handle, db, mode)) = state.registry.take(&id) else {
             return Err(Problem::unknown_transaction(&id));
         };
-        if let Err(p) = authorize_mode(&state, &identity, mode) {
+        if let Err(p) = authorize_mode(&state, &identity, &db, mode) {
             // Still discard the transaction (the caller asked to), but report the authz failure.
             let _ = state.engine.rollback(handle);
             return Err(p);
@@ -608,7 +608,7 @@ async fn auto_commit<E: RestEngine + 'static>(
                 "invalid access_mode {bad}: expected \"READ\" or \"WRITE\""
             ))
         })?;
-        authorize_mode(&state, &identity, mode)?;
+        authorize_mode(&state, &identity, &db, mode)?;
         let handle = state
             .engine
             .begin(
@@ -721,7 +721,7 @@ async fn graph_viz<E: RestEngine + 'static>(
         let req = decode_request(&headers, &body)?;
         // A visualisation query is always a READ (the safe, spec-consistent default — Neo4j's viz
         // surfaces run read). Any `access_mode` in the body is ignored.
-        authorize_mode(&state, &identity, AccessMode::Read)?;
+        authorize_mode(&state, &identity, &db, AccessMode::Read)?;
         let handle = state
             .engine
             .begin(
@@ -1076,18 +1076,35 @@ fn notify_auth_failure<E: RestEngine>(state: &AppState<E>, reason: &str) {
 
 /// Authorizes `identity` for the privilege implied by `mode` (`04 §8.4`): a `WRITE` transaction
 /// needs database `Write`, a `READ` transaction needs database `Read`.
+/// The coarse, **fail-fast** transaction-mode gate: before a transaction is opened on `db`, the
+/// principal must hold at least `Read` (for a `READ` transaction) or `Write` (for a `WRITE`
+/// transaction) **scoped to that database**.
+///
+/// The privilege is checked against [`Privilege::on_graph`] — the *target database's* graph scope —
+/// **not** the server-wide [`graphus_auth::Resource::Database`] scope. This is what makes per-tenant
+/// (graph-scoped) grants usable over REST: a principal granted `WRITE ON GRAPH tenant_a` can open a
+/// `WRITE` transaction on `/db/tenant_a/...` but not on `/db/tenant_b/...`. A broader server-wide
+/// `Database` grant (e.g. the bootstrap `readwrite` role) still satisfies this through the RBAC
+/// containment rule (`Database ⊇ Graph(db)`), so existing deployments are unaffected.
+///
+/// This is only the coarse "may you open *any* transaction here" gate; the engine's fine-grained,
+/// per-element RBAC (label/relationship/property filtering) still applies to every statement run
+/// inside the transaction. The two compose: this rejects a principal with no access to the database
+/// up front (a fast, cheap deny), and the fine-grained layer filters what a principal *with* access
+/// may actually see and change.
 fn authorize_mode<E: RestEngine>(
     state: &AppState<E>,
     identity: &str,
+    db: &str,
     mode: AccessMode,
 ) -> Result<(), Problem> {
-    let privilege = match mode {
-        AccessMode::Read => Privilege::read_database(),
-        AccessMode::Write => Privilege::write_database(),
+    let action = match mode {
+        AccessMode::Read => Action::Read,
+        AccessMode::Write => Action::Write,
     };
     state
         .auth
-        .require(identity, &privilege)
+        .require(identity, &Privilege::on_graph(action, db))
         .map_err(|e| Problem::from_auth_error(&e))
 }
 

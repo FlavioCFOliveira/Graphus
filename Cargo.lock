@@ -1238,6 +1238,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-security-gen"
+version = "0.0.1"
+dependencies = [
+ "graphus-core",
+ "graphus-crypto",
+ "graphus-examples-harness",
+ "graphus-io",
+ "graphus-server",
+ "graphus-storage",
+ "graphus-wal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-server"
 version = "0.0.1"
 dependencies = [
