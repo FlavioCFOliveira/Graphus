@@ -125,6 +125,28 @@ impl CpuMeter {
     }
 }
 
+/// Reads the **cumulative** CPU time consumed by `target` since it started, or `None` if it cannot
+/// be read on this platform / for this PID.
+///
+/// Unlike [`CpuMeter`], which reports CPU consumed *within a bracketed window*, this is the raw
+/// absolute counter. It is the right primitive when the monitored process is **dedicated to the
+/// workload for its whole lifetime** (e.g. an example's purpose-booted server): its since-boot CPU
+/// *is* the workload's CPU, so a single absolute read — paired with the process's wall-clock uptime —
+/// yields the run's CPU evidence without bracketing.
+#[must_use]
+pub fn cumulative_cpu_times(target: Target) -> Option<CpuTimes> {
+    read_cpu_times(target)
+}
+
+/// Reads the current resident-set size of `target` in bytes, or `None` if unavailable.
+///
+/// A single instantaneous read (no bracketing), suitable for sampling a monitored server PID's RSS
+/// at a chosen instant (e.g. at the end of a workload phase).
+#[must_use]
+pub fn current_rss_bytes(target: Target) -> Option<u64> {
+    read_rss_bytes(target)
+}
+
 /// Builds a [`CpuSection`] from CPU times and the wall-clock window they were consumed over.
 #[must_use]
 pub fn cpu_section(times: CpuTimes, wall: Duration) -> CpuSection {

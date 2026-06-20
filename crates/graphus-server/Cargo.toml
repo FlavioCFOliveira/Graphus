@@ -111,3 +111,9 @@ graphus-cli = { path = "../graphus-cli" }
 # The deterministic capability substrate (SimClock/SimRng) so the inline `LocalEngine` tests
 # (`engine::local`) can drive the real engine over a simulated clock — the DST foundation (rmp #160).
 graphus-sim = { path = "../graphus-sim" }
+# The dev-only evidence-collection harness, so the MVP end-to-end test (the cargo mirror of
+# `examples/social-network-uds`) ALSO demonstrates standardized evidence collection: it meters the
+# real server process it spawns (CPU/RSS) and the on-disk store/WAL footprint, then emits a
+# report.json + report.md (rmp #249). This is a TEST-TARGET dev-dependency only — it never enters the
+# `graphus-server` production build (verified via `cargo tree`).
+graphus-examples-harness = { path = "../graphus-examples-harness" }

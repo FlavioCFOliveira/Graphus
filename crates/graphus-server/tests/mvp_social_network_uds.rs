@@ -27,6 +27,11 @@ use std::time::{Duration, Instant};
 
 use graphus_cli::client::BoltClient;
 use graphus_core::Value;
+use graphus_examples_harness::resource::cpu_section;
+use graphus_examples_harness::{
+    DatasetScale, EvidenceCollector, EvidenceReport, RunMetadata, Target, cumulative_cpu_times,
+    current_rss_bytes,
+};
 
 const ADMIN_USER: &str = "alice";
 const ADMIN_PW: &str = "social-demo-pw-1";
@@ -56,6 +61,18 @@ impl Workspace {
     }
     fn log_path(&self) -> PathBuf {
         self.root.join("server.log")
+    }
+    /// The default database's record-store device file (under `store_path`).
+    fn store_file(&self) -> PathBuf {
+        self.root.join("data").join("graphus.store")
+    }
+    /// The default database's WAL file (under `store_path`).
+    fn wal_file(&self) -> PathBuf {
+        self.root.join("data").join("graphus.wal")
+    }
+    /// Where this run's evidence report is emitted (inside the temp workspace, removed on drop).
+    fn evidence_dir(&self) -> PathBuf {
+        self.root.join("evidence")
     }
 
     /// Writes a UDS-only server config bound to this process's uid (so the `SO_PEERCRED` gate admits
@@ -138,6 +155,11 @@ impl ServerProcess {
         let mut proc = Self { child };
         proc.wait_until_ready(&ws.socket_path(), &ws.log_path());
         proc
+    }
+
+    /// The OS process id of the running server (for evidence metering of the real process).
+    fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     fn wait_until_ready(&mut self, socket: &Path, log: &Path) {
@@ -439,6 +461,62 @@ fn mvp_social_network_over_uds_survives_restart_and_crash() {
         scalar_int(&socket, "MATCH (:Post) RETURN count(*) AS c"),
         1,
         "the post deletion survives the crash",
+    );
+
+    // ---- Phase 7: collect standardized performance evidence (rmp #249) ---------------------------
+    // The recovered server is still alive, so we can meter the REAL server process (CPU + RSS) and
+    // the on-disk store/WAL footprint that survived the crash, then emit the standardized
+    // report.json + report.md — the same evidence the `examples/social-network-uds` shell demo
+    // produces, exercised here through the Rust harness. This is purely ADDITIVE: it asserts the
+    // evidence is produced with POPULATED (not specific) fields, so it cannot make the test flaky.
+    let target = Target::Pid(server.pid());
+    let cpu = cumulative_cpu_times(target)
+        .map(|t| cpu_section(t, Duration::from_secs(1)))
+        .unwrap_or_default();
+    let final_rss = current_rss_bytes(target).unwrap_or(0);
+
+    let metadata = RunMetadata::new(
+        "social-network-uds",
+        "Cargo mirror of the social-network-uds example: insert, traverse, mutate, survive a \
+         graceful restart + a hard crash, then collect evidence.",
+    )
+    .with_dataset(DatasetScale::new(nodes_after as u64, rels_after as u64))
+    .workload_param("connection", "uds-bolt")
+    .workload_param("driver", "graphus-cli BoltClient");
+
+    let mut collector = EvidenceCollector::new(metadata);
+    collector.start();
+    *collector.cpu_mut() = cpu;
+    collector.memory_mut().final_rss_bytes = final_rss;
+    collector.memory_mut().peak_rss_bytes = final_rss;
+    collector
+        .record_storage(ws.store_file(), ws.wal_file(), None)
+        .expect("measure store + WAL footprint");
+    collector.note("Evidence collected by the cargo integration test (mvp_social_network_uds).");
+    let report = collector.finish();
+
+    let (json_path, md_path) = report
+        .write_to(ws.evidence_dir())
+        .expect("write evidence report");
+    assert!(json_path.exists(), "report.json must be produced");
+    assert!(md_path.exists(), "report.md must be produced");
+
+    // The emitted report is well-formed and carries the run's identity + real measurements. We
+    // assert POPULATED, not specific, values: the store device is non-empty after the workload, and
+    // the RSS read for a live process is positive on the supported platforms.
+    let loaded = EvidenceReport::load(&json_path).expect("reload report.json");
+    assert_eq!(loaded.metadata.scenario, "social-network-uds");
+    assert_eq!(loaded.metadata.dataset.nodes, nodes_after as u64);
+    assert_eq!(loaded.metadata.dataset.relationships, rels_after as u64);
+    assert!(
+        loaded.storage.store_bytes > 0,
+        "the on-disk store must have a non-zero footprint after the workload, got {}",
+        loaded.storage.store_bytes
+    );
+    assert!(
+        loaded.memory.final_rss_bytes > 0,
+        "a live server process must report a positive RSS, got {}",
+        loaded.memory.final_rss_bytes
     );
 
     // Clean teardown.

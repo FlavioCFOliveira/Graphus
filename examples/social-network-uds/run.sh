@@ -76,6 +76,15 @@ SERVER_LOG="$WORKDIR/server.log"
 ADMIN_USER="alice"
 ADMIN_PW="social-demo-pw-1"
 
+# Evidence collection (rmp #249): the standardized report.json + report.md land in this example's
+# git-ignored evidence/ dir. The on-disk store device + WAL live under $WORKDIR/data (default DB).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVIDENCE_DIR="$SCRIPT_DIR/evidence"
+STORE_FILE="$WORKDIR/data/graphus.store"
+WAL_FILE="$WORKDIR/data/graphus.wal"
+PEAK_RSS_BYTES=0          # high-watermark of the server's RSS, sampled at the heavy phases
+SERVER_START_EPOCH=0      # wall-clock epoch (s) of the most recent server boot, for uptime
+
 SERVER_PID=""
 cleanup() {
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -109,6 +118,7 @@ EOF
 start_server() {
   "$SERVER" "$CONFIG" >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
+  SERVER_START_EPOCH="$(date +%s)"
   # Wait for the UDS to be bound (readiness), or fail fast if the process died.
   for _ in $(seq 1 100); do
     if [ -S "$SOCKET" ]; then return 0; fi
@@ -143,6 +153,48 @@ crash_server() {
   SERVER_PID=""
 }
 
+# --------------------------------------------------------------------------------------------------
+# Evidence helpers (rmp #249) — portable RSS sampling of the LIVE server process
+# --------------------------------------------------------------------------------------------------
+# _now_ms — current time in milliseconds (GNU date), or seconds*1000 fallback (macOS BSD date).
+_now_ms() {
+  local ns
+  ns="$(date +%s%N 2>/dev/null)"
+  case "$ns" in
+    *N|'') echo "$(( $(date +%s) * 1000 ))" ;; # %N unsupported → second resolution
+    *)     echo "$(( ns / 1000000 ))" ;;
+  esac
+}
+
+# server_rss_bytes <pid> — current resident set size of the server in bytes (Linux /proc, macOS ps).
+server_rss_bytes() {
+  local pid="$1" bytes=0
+  if [ -r "/proc/$pid/statm" ]; then
+    # /proc/<pid>/statm: "size resident ..." in pages; resident is field 2.
+    local pages page_sz
+    pages="$(awk '{print $2}' "/proc/$pid/statm" 2>/dev/null || echo 0)"
+    page_sz="$(getconf PAGE_SIZE 2>/dev/null || echo 4096)"
+    bytes=$(( ${pages:-0} * ${page_sz:-4096} ))
+  elif command -v ps >/dev/null 2>&1; then
+    # macOS / other Unix: ps reports RSS in KiB (headerless via "=").
+    local kib
+    kib="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)"
+    bytes=$(( ${kib:-0} * 1024 ))
+  fi
+  echo "${bytes:-0}"
+}
+
+# sample_peak_rss — read the live server's RSS once and keep the running high-watermark.
+sample_peak_rss() {
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    local rss
+    rss="$(server_rss_bytes "$SERVER_PID")"
+    if [ "${rss:-0}" -gt "$PEAK_RSS_BYTES" ]; then
+      PEAK_RSS_BYTES="$rss"
+    fi
+  fi
+}
+
 # Run a Cypher statement and print the raw rendered table.
 cypher() {
   GRAPHUS_PASSWORD="$ADMIN_PW" "$CLI" --uds "$SOCKET" --user "$ADMIN_USER" -c "$1"
@@ -172,6 +224,8 @@ section "Phase 2 — Insert the social graph (people, friendships, follows, post
 
 # People. FRIEND is modelled as a mutual relationship: we create it once per pair and query it
 # undirected. FOLLOWS is directional (a one-way subscription). POSTED links a person to a Post.
+# Time the bulk-insert phase so the evidence report can derive its throughput (ops/sec).
+INSERT_START_MS="$(_now_ms)"
 cypher "
 CREATE (alice:Person {name:'Alice', age:30, city:'Lisbon'}),
        (bob:Person   {name:'Bob',   age:34, city:'Porto'}),
@@ -191,6 +245,9 @@ CREATE (alice:Person {name:'Alice', age:30, city:'Lisbon'}),
        (alice)-[:POSTED]->(:Post {text:'Hello graph world', likes:12}),
        (bob)-[:POSTED]->(:Post {text:'Bolt over UDS is fast', likes:7})
 RETURN count(*) AS created" > /dev/null
+INSERT_MS=$(( $(_now_ms) - INSERT_START_MS ))
+info "bulk insert took ${INSERT_MS} ms"
+sample_peak_rss   # the insert is the write-heavy phase; capture the server's RSS here
 
 assert "six people created"        "6" "$(scalar "MATCH (p:Person) RETURN count(p) AS c")"
 assert "five friendships created"  "5" "$(scalar "MATCH ()-[r:FRIEND]->() RETURN count(r) AS c")"
@@ -281,6 +338,7 @@ assert "one post remains" "1" "$(scalar "MATCH (:Post) RETURN count(*) AS c")"
 NODES_AFTER_EDIT="$(scalar "MATCH (n) RETURN count(n) AS c")"
 RELS_AFTER_EDIT="$(scalar "MATCH ()-[r]->() RETURN count(r) AS c")"
 info "totals after manipulation: $NODES_AFTER_EDIT nodes, $RELS_AFTER_EDIT relationships"
+sample_peak_rss   # capture the server's RSS after the mutation phase
 
 # ==================================================================================================
 # PHASE 6 — Crash recovery: the manipulations survive a SIGKILL (power-failure simulation)
@@ -301,6 +359,64 @@ assert "the MERGE survived the crash (Alice–Eve are friends)" "1" \
 assert "the DELETE survived the crash (Alice–Bob still unfriended)" "0" \
   "$(scalar "MATCH (:Person {name:'Alice'})-[:FRIEND]-(:Person {name:'Bob'}) RETURN count(*) AS c")"
 assert "the post deletion survived the crash" "1" "$(scalar "MATCH (:Post) RETURN count(*) AS c")"
+
+# ==================================================================================================
+# PHASE 7 — Collect standardized performance evidence (rmp #249)
+# ==================================================================================================
+# The server is still alive (the recovered pid), so we can read its real CPU + RSS, and the on-disk
+# store/WAL footprint reflects the full workload that survived the crash. We delegate the heavy
+# /proc + getrusage metering and the report emission to the dev-only `measure_server` harness binary,
+# which writes report.json + report.md into the git-ignored evidence/ dir. This is purely ADDITIVE —
+# it changes none of the assertions above, and a metering failure must not fail the demonstration.
+section "Phase 7 — Collect performance evidence (CPU / RAM / storage)"
+sample_peak_rss
+SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))
+[ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1   # avoid a zero-length CPU window
+
+# Logical sizing for the amplification ratios. The durable graph is the post-crash state
+# (NODES_AFTER_EDIT nodes + RELS_AFTER_EDIT rels). We document a coarse logical-bytes estimate
+# (~256 B/node + ~128 B/rel covers the fixed-record node/rel payloads and their small property
+# values) so the ratios are meaningful-but-honest proxies rather than precise accounting.
+LOGICAL_GRAPH_BYTES=$(( NODES_AFTER_EDIT * 256 + RELS_AFTER_EDIT * 128 ))
+# The bulk insert created 8 nodes + 11 relationships = 19 write operations.
+INSERT_OPS=19
+
+MEASURE_BIN="$BIN_DIR/measure_server"
+if [ ! -x "$MEASURE_BIN" ]; then
+  info "building the dev-only measure_server harness binary (debug)…"
+  ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
+  MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
+fi
+
+if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+  "$MEASURE_BIN" \
+    --evidence-dir "$EVIDENCE_DIR" \
+    --scenario "social-network-uds" \
+    --description "Social network over a Bolt/UDS connection: insert, traverse, mutate, and survive a graceful restart + a hard crash." \
+    --pid "$SERVER_PID" \
+    --uptime-secs "$SERVER_UPTIME_SECS" \
+    --store "$STORE_FILE" \
+    --wal "$WAL_FILE" \
+    --nodes "$NODES_AFTER_EDIT" \
+    --rels "$RELS_AFTER_EDIT" \
+    --peak-rss-bytes "$PEAK_RSS_BYTES" \
+    --workload-ops "$INSERT_OPS" \
+    --workload-secs "$(LC_ALL=C awk "BEGIN{printf \"%.6f\", ${INSERT_MS:-0}/1000}")" \
+    --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
+    --param "connection=uds-bolt" \
+    --param "buffer_pool_pages=2048" \
+    --param "restarts=graceful+crash" \
+    --phase "bulk-insert=${INSERT_MS:-0}" \
+    --note "Dataset is the durable post-crash graph; storage footprint is measured after WAL replay." \
+    && info "evidence written to $EVIDENCE_DIR" \
+    || info "evidence collection failed (non-fatal); see output above"
+  assert "evidence report.json was produced" "yes" \
+    "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+  assert "evidence report.md was produced" "yes" \
+    "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+else
+  info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
+fi
 
 # ==================================================================================================
 # Summary

@@ -33,3 +33,11 @@ libc = "0.2"
 [[bin]]
 name = "emit_evidence"
 path = "src/bin/emit_evidence.rs"
+
+# A driver that meters a RUNNING `graphus-server` (by PID + store/WAL paths) and emits a standardized
+# evidence report. The live `examples/*` (`rmp #249+`) invoke it to collect real CPU/RSS/storage
+# evidence against the server they boot, instead of injecting figures like `emit_evidence` does.
+# Usage: `cargo run -p graphus-examples-harness --bin measure_server -- --evidence-dir <dir> ...`.
+[[bin]]
+name = "measure_server"
+path = "src/bin/measure_server.rs"
