@@ -1,0 +1,3 @@
+# Evidence directories are written at run time by examples and must never be committed.
+# (See examples/README.md — the `evidence/` convention.)
+**/evidence/

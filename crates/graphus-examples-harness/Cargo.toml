@@ -1,0 +1,27 @@
+[package]
+name = "graphus-examples-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared evidence-collection harness for Graphus's demonstrative `examples/*` (dev-only leaf crate)."
+# This is an UNPUBLISHED dev/measurement leaf crate, in the same spirit as `graphus-bench`: it exists
+# only to support the `examples/*` E2E demonstrations and is depended upon by NOTHING in the
+# production build. In particular, `graphus-server` MUST NOT depend on it, so the harness adds ZERO
+# overhead to the server binary. Keep its dependency surface lean.
+publish = false
+
+[dependencies]
+# JSON evidence reports use the same serde pins as the rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# A tiny CLI that drives the harness end to end and writes an evidence directory. The smoke example
+# (`examples/smoke-evidence/run.sh`) invokes it to prove the scaffold produces real output, and it
+# doubles as a copy-from template for the future examples (`rmp #27-#33`).
+# Usage: `cargo run -p graphus-examples-harness --bin emit_evidence -- <evidence-dir>`.
+[[bin]]
+name = "emit_evidence"
+path = "src/bin/emit_evidence.rs"

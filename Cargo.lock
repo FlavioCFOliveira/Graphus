@@ -1125,6 +1125,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-examples-harness"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-gds"
 version = "0.0.1"
 dependencies = [
