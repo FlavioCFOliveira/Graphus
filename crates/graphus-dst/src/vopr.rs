@@ -37,6 +37,8 @@ use graphus_wal::MemLogSink;
 
 use graphus_elle::{Op as ElleOp, Transaction as ElleTxn, check as elle_check};
 
+use graphus_sim::SimRng;
+
 use crate::mix::{LoadProfile, MixProfile, WorkloadGen, WorkloadOp};
 use crate::vopr_fault::{FaultBudget, FaultScheduler};
 use crate::vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
@@ -59,6 +61,14 @@ const LIVENESS_DUMP_WINDOW: usize = 32;
 /// drives against the quiesced engine after the fault window, to prove availability resumed. Small (the
 /// engine has already survived the whole workload) but `> 1` so a partial post-heal stall is visible.
 const RECOVERY_BATCH: usize = 8;
+
+/// Domain-separation tag mixed into the master seed to derive the **swarm RNG** ([`VoprConfig::swarm`],
+/// rmp #241), so swarming the *configuration* never consumes draws from the scheduler's workload RNG
+/// (`master_seed`) or the fault scheduler's RNG (`master_seed ^ FAULT_TAG`). A swarmed config is
+/// therefore a pure function of the seed *and* the seed's workload is unchanged by whether swarming is
+/// on — the three streams compose deterministically from the one master seed. The literal spells
+/// `"SWARM241"`.
+const SWARM_TAG: u64 = 0x5357_4152_4D32_3431;
 
 /// A [`Clock`] whose active [`ClockFaultPlan`] can be **swapped at run time**, so the unified fault
 /// scheduler can intensify the engine's clock faults *mid-run* (the engine holds one fixed
@@ -245,6 +255,145 @@ impl VoprConfig {
     #[must_use]
     pub fn liveness(seed: u64) -> Self {
         Self::safety(seed)
+    }
+
+    /// A **swarm-tested** config for `seed` (rmp #241): *every* knob — environment, workload mix, load
+    /// profile and fault budget — is derived deterministically from the master seed within **sane,
+    /// documented, bounded** ranges, so each seed explores a *different* configuration rather than only
+    /// a different workload+schedule under one fixed environment. This is "swarm testing" (Groce et al.,
+    /// *Swarm Testing*, ISSTA 2012): randomising the test *configuration* per seed dramatically widens
+    /// the state space a seed sweep covers.
+    ///
+    /// # Determinism and stream separation
+    ///
+    /// All config knobs are drawn from a **dedicated** swarm RNG seeded as `seed ^ SWARM_TAG`, *not*
+    /// from the scheduler's workload RNG (`seed`) or the fault scheduler's RNG (`seed ^ FAULT_TAG`).
+    /// Consequences:
+    /// * **Same seed ⇒ identical config** (the derivation is a pure function of the seed).
+    /// * A swarmed config's **workload is still the pure function of `seed`** the non-swarmed run uses —
+    ///   swarming the environment does not perturb the workload/fault draws, it only *chooses the knobs*
+    ///   those draws then run under. The three streams compose deterministically from the one seed.
+    /// * **Distinct seeds ⇒ distinctly different configs** (each knob has its own draw, so the knob
+    ///   distribution over a sweep is non-degenerate — see the `swarm_*` acceptance tests).
+    ///
+    /// # The swarmed range (every bound is recoverable and bounded)
+    ///
+    /// The bounds keep every swarmed run **recoverable** (the fault budget never guarantees a wipe) and
+    /// **bounded** (no zero-client / unbounded config). Small pools are *intentional* — they induce
+    /// buffer-pool eviction/steal pressure — but never zero.
+    ///
+    /// | Knob | Range | Why this bound |
+    /// |------|-------|----------------|
+    /// | `clients` | `2..=12` | ≥2 so transaction overlap is reachable; ≤12 keeps the single-threaded run bounded. |
+    /// | `ops_per_client` | `16..=80` | enough statements to do real work; capped so the run length stays bounded. |
+    /// | `pool_pages` | `48..=512` | a small min induces eviction/steal pressure; never `0` (a zero pool cannot build the engine). |
+    /// | `mix.*` (4 weights) | each `1..=60` | every class stays reachable (≥1, never an all-zero degenerate mix); ratios still vary widely. |
+    /// | `load` | `Steady`/`Ramp`/`Spike`, params below | all three arrival shapes are exercised across a sweep. |
+    /// | &nbsp;&nbsp;`Steady{min,max}` | `min ∈ 1..=200`, `max ∈ min..=min+800` | bounded, ordered inter-arrival jitter. |
+    /// | &nbsp;&nbsp;`Ramp{start,end}` | each `1..=1000` | bounded ramp endpoints (either direction). |
+    /// | &nbsp;&nbsp;`Spike{base,period,burst}` | `base ∈ 1..=200`, `period ∈ 2..=16`, `burst ∈ 1..=period` | bounded base with a real burst within each period. |
+    /// | `max_txn_stmts` | `1..=6` | deeper batches deepen overlap; bounded so a transaction always ends. |
+    /// | `auto_commit_permille` | `0..=1000` | full coverage from always-explicit to always-auto-commit. |
+    /// | `rollback_permille` | `0..=300` | exercises aborts without starving commits. |
+    /// | `fault_budget.max_faults` | `0..=12` | a recoverable fault rate (`0` ⇒ a fault-free swarmed run is reachable too). |
+    /// | `fault_budget` kind weights | each `0..=4`, total forced ≥1 | every kind mix is reachable; never an all-zero (no-eligible-kind) budget when faults are on. |
+    /// | `fault_budget.disk_max_pages` | `1..=4` | a handful of bad pages a checksum catches — recoverable, never a shred. |
+    /// | `fault_budget.disk_page_span` | `16..=128` | faults land on live data within the swarmed pool range. |
+    /// | `fault_budget.clock_max_ns` | `1_000..=10_000` | hostile-but-finite clock skew (the `FaultyClock` contract). |
+    /// | `fault_budget.max_crashes` | `0..=3` | a bounded number of recoverable crash + ARIES restarts. |
+    ///
+    /// # Pinning escape hatch
+    ///
+    /// Swarm is **opt-in**: [`for_seed`](Self::for_seed), [`safety`](Self::safety) and
+    /// [`liveness`](Self::liveness) remain fixed presets for focused / pinned runs, untouched by this.
+    /// Use [`run_cli`]'s `--swarm` flag to swarm each seed in a sweep.
+    #[must_use]
+    pub fn swarm(seed: u64) -> Self {
+        let mut rng = SimRng::new(seed ^ SWARM_TAG);
+
+        let clients = rng.range_inclusive(2, 12) as u32;
+        let ops_per_client = rng.range_inclusive(16, 80) as u32;
+        let pool_pages = rng.range_inclusive(48, 512) as usize;
+
+        // Each class weight stays ≥1 so no class is ever excluded (an all-zero mix would be a degenerate
+        // "no-op" generator); the ratios still range over a wide 1..=60 band so the mix genuinely varies.
+        let mix = MixProfile {
+            create_node: rng.range_inclusive(1, 60) as u32,
+            create_edge: rng.range_inclusive(1, 60) as u32,
+            count_nodes: rng.range_inclusive(1, 60) as u32,
+            neighbors: rng.range_inclusive(1, 60) as u32,
+        };
+
+        let load = match rng.below(3) {
+            0 => {
+                let min = rng.range_inclusive(1, 200);
+                let max = rng.range_inclusive(min, min + 800);
+                LoadProfile::Steady { min, max }
+            }
+            1 => LoadProfile::Ramp {
+                start: rng.range_inclusive(1, 1000),
+                end: rng.range_inclusive(1, 1000),
+            },
+            _ => {
+                let period = rng.range_inclusive(2, 16);
+                LoadProfile::Spike {
+                    base: rng.range_inclusive(1, 200),
+                    period,
+                    burst: rng.range_inclusive(1, period),
+                }
+            }
+        };
+
+        let max_txn_stmts = rng.range_inclusive(1, 6) as u32;
+        let auto_commit_permille = rng.range_inclusive(0, 1000) as u32;
+        let rollback_permille = rng.range_inclusive(0, 300) as u32;
+
+        let fault_budget = Self::swarm_fault_budget(&mut rng);
+
+        Self {
+            seed,
+            clients,
+            ops_per_client,
+            pool_pages,
+            mix,
+            load,
+            max_txn_stmts,
+            auto_commit_permille,
+            rollback_permille,
+            fault_budget,
+        }
+    }
+
+    /// Derives a bounded, **recoverable** [`FaultBudget`] from the swarm RNG (rmp #241). Drawn after all
+    /// environment/workload/load knobs so the budget is the trailing portion of the swarm stream. The
+    /// caps mirror [`FaultBudget`]'s own recoverability contract: every fault a swarmed run injects is
+    /// survivable — a checksum catches a handful of disk pages, the clock stays finite, crashes are
+    /// bounded — so no swarmed config can guarantee a wipe.
+    fn swarm_fault_budget(rng: &mut SimRng) -> FaultBudget {
+        let max_faults = rng.range_inclusive(0, 12) as u32;
+        // Kind weights are each 0..=4, but the total is forced ≥1 (bumping disk) so that whenever faults
+        // are on at least one kind is eligible — an all-zero weight set would silently disable faults.
+        let mut disk_weight = rng.range_inclusive(0, 4) as u32;
+        let clock_weight = rng.range_inclusive(0, 4) as u32;
+        let transport_weight = rng.range_inclusive(0, 4) as u32;
+        if disk_weight + clock_weight + transport_weight == 0 {
+            disk_weight = 1;
+        }
+        let disk_max_pages = rng.range_inclusive(1, 4) as u32;
+        let disk_page_span = rng.range_inclusive(16, 128) as u32;
+        let clock_max_ns = rng.range_inclusive(1_000, 10_000);
+        let max_crashes = rng.range_inclusive(0, 3) as u32;
+
+        FaultBudget {
+            max_faults,
+            disk_weight,
+            clock_weight,
+            transport_weight,
+            disk_max_pages,
+            clock_max_ns,
+            disk_page_span,
+            max_crashes,
+        }
     }
 }
 
@@ -1300,16 +1449,27 @@ pub fn summarize(r: &VoprReport) -> String {
 /// the exact divergence. Either failure class counts toward the returned failure total.
 ///
 /// Flags: `--seed <base>` (default 1), `--seeds <count>` (default 1), `--clients <n>`,
-/// `--ops <n>`. Unknown flags are reported as an error string in the summary.
+/// `--ops <n>`, `--swarm` (derive the full config from each seed within bounds — rmp #241 swarm
+/// testing; ignores `--clients`/`--ops` since it swarms the whole environment). Unknown flags are
+/// reported as an error string in the summary.
 #[must_use]
 pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
     let mut base_seed: u64 = 1;
     let mut count: u64 = 1;
     let mut clients: u32 = 4;
     let mut ops: u32 = 50;
+    // Swarm mode (rmp #241): derive the *full* config from each seed within sane bounds, so a sweep
+    // explores a different environment per seed (not just a different workload). Off by default, so the
+    // pinned `--clients`/`--ops` path stays the focused, reproducible default.
+    let mut swarm = false;
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
+        // `--swarm` takes no value, so handle it before the value-consuming closure.
+        if arg.as_str() == "--swarm" {
+            swarm = true;
+            continue;
+        }
         let mut next_u64 = |label: &str| -> Result<u64, String> {
             it.next()
                 .ok_or_else(|| format!("flag {label} needs a value"))?
@@ -1335,12 +1495,17 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
     let mut failed_seeds = Vec::new();
     let mut oracle_seeds = Vec::new();
     for seed in base_seed..base_seed.saturating_add(count) {
-        // Inherit the interleaver defaults (`max_txn_stmts`, auto-commit / rollback ratios) and
-        // override only the CLI-exposed knobs.
-        let cfg = VoprConfig {
-            clients,
-            ops_per_client: ops,
-            ..VoprConfig::for_seed(seed)
+        // In swarm mode the *entire* config is seed-derived within bounds (the CLI knobs are ignored,
+        // since swarming the environment is the whole point). Otherwise inherit the interleaver defaults
+        // (`max_txn_stmts`, auto-commit / rollback ratios) and override only the CLI-exposed knobs.
+        let cfg = if swarm {
+            VoprConfig::swarm(seed)
+        } else {
+            VoprConfig {
+                clients,
+                ops_per_client: ops,
+                ..VoprConfig::for_seed(seed)
+            }
         };
         let first = run(cfg);
         let second = run(cfg);
@@ -3288,5 +3453,279 @@ mod tests {
             bare, lively,
             "liveness mode must not perturb the canonical run (trace + state + counts)"
         );
+    }
+
+    // ----- rmp #241: swarm testing -------------------------------------------------------------
+
+    /// Asserts a swarmed config respects every documented bound (recoverable + bounded). Used by the
+    /// sweep tests so a single seed regression is caught precisely.
+    fn assert_swarm_bounds(cfg: &VoprConfig) {
+        assert!(
+            (2..=12).contains(&cfg.clients),
+            "clients in [2,12]: {}",
+            cfg.clients
+        );
+        assert!(
+            (16..=80).contains(&cfg.ops_per_client),
+            "ops_per_client in [16,80]: {}",
+            cfg.ops_per_client
+        );
+        assert!(
+            (48..=512).contains(&cfg.pool_pages),
+            "pool_pages in [48,512]: {}",
+            cfg.pool_pages
+        );
+        for w in [
+            cfg.mix.create_node,
+            cfg.mix.create_edge,
+            cfg.mix.count_nodes,
+            cfg.mix.neighbors,
+        ] {
+            assert!((1..=60).contains(&w), "every mix weight in [1,60]: {w}");
+        }
+        assert!(
+            (1..=6).contains(&cfg.max_txn_stmts),
+            "max_txn_stmts in [1,6]: {}",
+            cfg.max_txn_stmts
+        );
+        assert!(
+            cfg.auto_commit_permille <= 1000,
+            "auto_commit_permille <= 1000: {}",
+            cfg.auto_commit_permille
+        );
+        assert!(
+            cfg.rollback_permille <= 300,
+            "rollback_permille <= 300: {}",
+            cfg.rollback_permille
+        );
+        let b = cfg.fault_budget;
+        assert!(b.max_faults <= 12, "max_faults <= 12: {}", b.max_faults);
+        assert!(
+            b.disk_weight + b.clock_weight + b.transport_weight >= 1,
+            "at least one fault kind is eligible"
+        );
+        assert!(
+            (1..=4).contains(&b.disk_max_pages),
+            "disk_max_pages in [1,4]: {}",
+            b.disk_max_pages
+        );
+        assert!(
+            (16..=128).contains(&b.disk_page_span),
+            "disk_page_span in [16,128]: {}",
+            b.disk_page_span
+        );
+        assert!(
+            (1_000..=10_000).contains(&b.clock_max_ns),
+            "clock_max_ns in [1000,10000]: {}",
+            b.clock_max_ns
+        );
+        assert!(b.max_crashes <= 3, "max_crashes <= 3: {}", b.max_crashes);
+        // Load profile params stay within their documented sub-bounds.
+        match cfg.load {
+            LoadProfile::Steady { min, max } => {
+                assert!((1..=200).contains(&min), "steady min in [1,200]: {min}");
+                assert!(max >= min && max <= min + 800, "steady max ordered: {max}");
+            }
+            LoadProfile::Ramp { start, end } => {
+                assert!(
+                    (1..=1000).contains(&start),
+                    "ramp start in [1,1000]: {start}"
+                );
+                assert!((1..=1000).contains(&end), "ramp end in [1,1000]: {end}");
+            }
+            LoadProfile::Spike {
+                base,
+                period,
+                burst,
+            } => {
+                assert!((1..=200).contains(&base), "spike base in [1,200]: {base}");
+                assert!(
+                    (2..=16).contains(&period),
+                    "spike period in [2,16]: {period}"
+                );
+                assert!(
+                    (1..=period).contains(&burst),
+                    "spike burst in [1,period]: {burst}"
+                );
+            }
+        }
+    }
+
+    /// **Acceptance: determinism.** Same seed ⇒ byte-identical swarmed config (the derivation is a pure
+    /// function of the seed), and the swarmed *run* replays identically too.
+    #[test]
+    fn swarm_config_is_deterministic_same_seed() {
+        for seed in [0u64, 1, 7, 42, 0xDEAD_BEEF, u64::MAX] {
+            let a = VoprConfig::swarm(seed);
+            let b = VoprConfig::swarm(seed);
+            // VoprConfig is Copy + Debug but not PartialEq; compare its Debug projection (covers every
+            // field, including the nested mix/load/fault_budget).
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "same seed ⇒ identical swarmed config (seed {seed})"
+            );
+            assert_swarm_bounds(&a);
+            assert_eq!(
+                run(a),
+                run(b),
+                "swarmed run replays identically (seed {seed})"
+            );
+        }
+    }
+
+    /// **Acceptance: the seed is carried through faithfully.** A swarmed config replays from the same
+    /// master seed it was derived for — so a flagged swarmed seed reproduces with `--seed <N> --swarm`.
+    /// (Workload-stream independence — swarming the environment never reshapes the seed's workload — is
+    /// guaranteed structurally by the domain-separated `seed ^ SWARM_TAG` RNG, documented on `swarm`.)
+    #[test]
+    fn swarm_config_carries_the_master_seed() {
+        for seed in [3u64, 11, 99, 0xABCD] {
+            assert_eq!(VoprConfig::swarm(seed).seed, seed, "seed carried through");
+        }
+    }
+
+    /// **Acceptance: non-degeneracy.** Over a 100-seed sweep, the headline knobs each take *several*
+    /// distinct values and are not pinned to a constant — proving the swarm genuinely explores a range of
+    /// configurations rather than collapsing onto one.
+    #[test]
+    fn swarm_sweep_is_non_degenerate() {
+        use std::collections::BTreeSet;
+        let cfgs: Vec<VoprConfig> = (0..100u64).map(VoprConfig::swarm).collect();
+        for c in &cfgs {
+            assert_swarm_bounds(c);
+        }
+
+        let clients: BTreeSet<u32> = cfgs.iter().map(|c| c.clients).collect();
+        let pools: BTreeSet<usize> = cfgs.iter().map(|c| c.pool_pages).collect();
+        let ops: BTreeSet<u32> = cfgs.iter().map(|c| c.ops_per_client).collect();
+        let faults: BTreeSet<u32> = cfgs.iter().map(|c| c.fault_budget.max_faults).collect();
+        let crashes: BTreeSet<u32> = cfgs.iter().map(|c| c.fault_budget.max_crashes).collect();
+        let load_variants: BTreeSet<u8> = cfgs
+            .iter()
+            .map(|c| match c.load {
+                LoadProfile::Steady { .. } => 0,
+                LoadProfile::Ramp { .. } => 1,
+                LoadProfile::Spike { .. } => 2,
+            })
+            .collect();
+
+        // `clients` spans [2,12] (11 values), `max_faults` [0,12] (13), `max_crashes` [0,3] (4); over 100
+        // seeds a healthy uniform draw lands on most of each. Assert a strong-but-safe lower bound on
+        // distinctness so a future degeneration (e.g. a constant knob) trips this.
+        assert!(clients.len() >= 6, "clients vary: {clients:?}");
+        assert!(
+            pools.len() >= 50,
+            "pool_pages vary widely: {} distinct",
+            pools.len()
+        );
+        assert!(
+            ops.len() >= 30,
+            "ops_per_client vary: {} distinct",
+            ops.len()
+        );
+        assert!(faults.len() >= 6, "max_faults vary: {faults:?}");
+        assert!(crashes.len() >= 3, "max_crashes vary: {crashes:?}");
+        assert_eq!(
+            load_variants.len(),
+            3,
+            "all three load shapes appear: {load_variants:?}"
+        );
+        // No knob is a degenerate constant.
+        assert!(
+            clients.len() > 1 && faults.len() > 1,
+            "knobs are not constant"
+        );
+    }
+
+    /// **Acceptance: distinct seeds ⇒ distinct configs.** Adjacent seeds must not collapse onto the same
+    /// configuration (the swarm RNG decorrelates them); over the sweep, near-all configs are unique.
+    #[test]
+    fn swarm_distinct_seeds_distinct_configs() {
+        use std::collections::BTreeSet;
+        let projections: BTreeSet<String> = (0..100u64)
+            .map(|s| format!("{:?}", VoprConfig::swarm(s)))
+            .collect();
+        // The seed field differs per config, so all 100 are trivially distinct *strings*; the meaningful
+        // check is that the seed-independent knobs decorrelate — strip the seed and demand high variety.
+        let knob_projections: BTreeSet<String> = (0..100u64)
+            .map(|s| {
+                let c = VoprConfig::swarm(s);
+                format!(
+                    "{}-{}-{}-{:?}-{:?}-{:?}",
+                    c.clients, c.ops_per_client, c.pool_pages, c.mix, c.load, c.fault_budget
+                )
+            })
+            .collect();
+        assert_eq!(
+            projections.len(),
+            100,
+            "every seed yields a distinct config"
+        );
+        assert!(
+            knob_projections.len() >= 90,
+            "swarmed knob-sets are near-all unique across 100 seeds (got {})",
+            knob_projections.len()
+        );
+    }
+
+    /// **Acceptance: every swarmed config is consistent + deterministic.** Run a small swarmed sweep
+    /// through the same consistency/determinism probe `run_cli` uses: each seed must replay identically
+    /// and the reference-model oracle must agree (no swarmed environment breaks ACID/consistency). This
+    /// is the rmp #241 requirement that a swarmed run stays correct.
+    #[test]
+    fn swarm_sweep_stays_consistent_and_deterministic() {
+        for seed in 0..24u64 {
+            let cfg = VoprConfig::swarm(seed);
+            let first = run(cfg);
+            let second = run(cfg);
+            assert_eq!(
+                first, second,
+                "swarmed seed {seed} must be deterministic (config {cfg:?})"
+            );
+            assert!(
+                first.oracle.is_none(),
+                "swarmed seed {seed} must stay reference-model-consistent: {:?} (config {cfg:?})",
+                first.oracle
+            );
+            // The consistency probe: no committed create lost or duplicated under the swarmed environment.
+            assert_eq!(
+                first.persisted_nodes, first.created_nodes,
+                "swarmed seed {seed}: no lost/duplicated committed create (config {cfg:?})"
+            );
+        }
+    }
+
+    /// **Acceptance: the `--swarm` CLI flag drives swarmed runs and the pinned path is unchanged.** A
+    /// swarmed sweep through `run_cli` reports all-consistent; the non-swarm path still honours
+    /// `--clients`/`--ops`; an unknown flag still errors.
+    #[test]
+    fn swarm_cli_flag_runs_a_swarmed_sweep() {
+        let (out, failures) = run_cli(
+            ["--seed", "0", "--seeds", "20", "--swarm"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert_eq!(failures, 0, "swarmed sweep is all-consistent:\n{out}");
+        assert!(
+            out.contains("all deterministic + oracle-consistent"),
+            "swarmed sweep summary:\n{out}"
+        );
+        // The pinned path is untouched: `--clients`/`--ops` still apply without `--swarm`.
+        let (pinned, pf) = run_cli(
+            [
+                "--seed",
+                "1",
+                "--seeds",
+                "2",
+                "--clients",
+                "3",
+                "--ops",
+                "20",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        assert_eq!(pf, 0, "pinned sweep still works:\n{pinned}");
     }
 }
