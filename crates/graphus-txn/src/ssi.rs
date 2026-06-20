@@ -42,7 +42,14 @@
 //! exempts a committing transaction that performed no writes, which matters under read-heavy graph
 //! workloads.
 
-use std::collections::{HashMap, HashSet};
+// Deterministic hashing (no per-process `RandomState` seed), matching every sibling module in this
+// crate (`store`, `manager`, `snapshot`, `lock`). This is load-bearing for determinism: the SSI
+// validator iterates `txns` to choose a pivot-abort victim, and `std::HashMap`'s randomized iteration
+// order would make that choice — and hence which concurrent transaction reports a serialization error
+// — vary run-to-run for the *same* seed, breaking the DST's "same seed ⇒ identical trace" invariant
+// (surfaced by the rmp #235 cooperative interleaver, which is the first path to hold ≥2 conflicting
+// transactions open at once).
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use graphus_core::{Timestamp, TxnId};
 
@@ -378,20 +385,22 @@ impl SsiTracker {
         // `Tin --rw--> Tpivot --rw--> Tout(=txn)`. We commit `Tout`; the pivot is the still-running
         // (or to-be-checked) middle transaction, which is the safe victim because aborting the
         // pivot — not the now-committing endpoint — guarantees forward progress.
-        for (&pid, p) in &self.txns {
-            if pid == txn {
-                continue;
-            }
-            if p.in_conflict
-                && p.out_conflict
-                && p.out_edges.contains(&txn)
-                && p.commit_ts.is_none()
-            {
-                return Some(pid);
-            }
-        }
-
-        None
+        //
+        // Pick the **lowest-id** qualifying pivot rather than the first one iteration yields: when more
+        // than one pivot qualifies, a deterministic tie-break keeps the abort choice a pure function of
+        // the transaction set (independent of map iteration order), which the DST relies on for
+        // reproducibility.
+        self.txns
+            .iter()
+            .filter(|&(&pid, p)| {
+                pid != txn
+                    && p.in_conflict
+                    && p.out_conflict
+                    && p.out_edges.contains(&txn)
+                    && p.commit_ts.is_none()
+            })
+            .map(|(&pid, _)| pid)
+            .min()
     }
 
     /// Marks `txn` committed at `commit_ts` (kept for conflict resolution until GC).

@@ -215,9 +215,13 @@ fn scalar_in(
 /// Balanced OLTP traffic: a mixed read/write workload runs cleanly, is internally consistent
 /// (`created == persisted`), and replays identically.
 fn oltp_mixed(seed: u64) -> ScenarioOutcome {
+    // These workload-shape scenarios certify clean per-op liveness, so they run on the legacy
+    // auto-commit path; the explicit-transaction interleaver's contention is certified by the `vopr`
+    // unit tests, not here.
     let cfg = VoprConfig::for_seed(seed)
         .with_mix(MixProfile::mixed())
-        .with_load(LoadProfile::Steady { min: 1, max: 30 });
+        .with_load(LoadProfile::Steady { min: 1, max: 30 })
+        .auto_commit_only();
     let a = vopr::run(cfg);
     let b = vopr::run(cfg);
     if a != b {
@@ -243,7 +247,9 @@ fn oltp_mixed(seed: u64) -> ScenarioOutcome {
 
 /// Bulk ingest: a write-heavy workload persists every acked create.
 fn bulk_ingest(seed: u64) -> ScenarioOutcome {
-    let cfg = VoprConfig::for_seed(seed).with_mix(MixProfile::write_heavy());
+    let cfg = VoprConfig::for_seed(seed)
+        .with_mix(MixProfile::write_heavy())
+        .auto_commit_only();
     let r = vopr::run(cfg);
     if r.created_nodes == r.persisted_nodes && r.err_ops == 0 {
         ScenarioOutcome::pass(
@@ -263,7 +269,9 @@ fn bulk_ingest(seed: u64) -> ScenarioOutcome {
 
 /// Read-serving: a read-heavy workload runs without spurious errors and is deterministic.
 fn read_serving(seed: u64) -> ScenarioOutcome {
-    let cfg = VoprConfig::for_seed(seed).with_mix(MixProfile::read_heavy());
+    let cfg = VoprConfig::for_seed(seed)
+        .with_mix(MixProfile::read_heavy())
+        .auto_commit_only();
     let a = vopr::run(cfg);
     let b = vopr::run(cfg);
     if a == b && a.err_ops == 0 {
@@ -902,13 +910,16 @@ fn vopr_live_and_consistent(name: &'static str, cfg: VoprConfig) -> ScenarioOutc
 /// A light VOPR config (8 clients × 24 ops) for the load-shape scenarios — enough interleaving to
 /// exercise the arrival shape while staying fast in a debug build.
 fn load_shape_cfg(seed: u64, load: LoadProfile) -> VoprConfig {
+    // These scenarios certify the *arrival-shape* liveness of the legacy per-op path, so they run in
+    // pure auto-commit mode (`auto_commit_permille = 1000`): every op is its own one-statement
+    // transaction, exactly the pre-#235 behaviour. The cooperative-interleaver overlap and contention
+    // are certified separately by the `vopr` unit tests.
     VoprConfig {
-        seed,
         clients: 8,
         ops_per_client: 24,
-        pool_pages: 256,
-        mix: MixProfile::mixed(),
         load,
+        auto_commit_permille: 1000,
+        ..VoprConfig::for_seed(seed)
     }
 }
 
@@ -938,13 +949,17 @@ fn ramp_load(seed: u64) -> ScenarioOutcome {
 /// cost grows with the graph) while still driving deep interleaving across many clients. Raw scale is
 /// the job of the `vopr` CLI seed-sweep, not this in-crate quick battery.
 fn sustained_high_concurrency(seed: u64) -> ScenarioOutcome {
+    // Pure auto-commit (legacy per-op) mode: this scenario certifies sustained-concurrency liveness of
+    // the auto-commit path with no spurious errors; the explicit-transaction interleaver's contention
+    // outcomes are certified by the `vopr` unit tests.
     let cfg = VoprConfig {
-        seed,
         clients: 16,
         ops_per_client: 12,
         pool_pages: 512,
         mix: MixProfile::write_heavy(),
         load: LoadProfile::Steady { min: 1, max: 30 },
+        auto_commit_permille: 1000,
+        ..VoprConfig::for_seed(seed)
     };
     // Determinism + consistency (two runs).
     let a = vopr::run(cfg);
