@@ -1,6 +1,6 @@
 //! CPU and memory metering for example runs (`rmp #246`).
 //!
-//! This module fills the [`CpuSection`](crate::CpuSection) and [`MemorySection`](crate::MemorySection)
+//! This module fills the [`crate::CpuSection`] and [`crate::MemorySection`]
 //! seams that the `rmp #245` scaffold stubbed. It provides two cooperating pieces:
 //!
 //! - [`CpuMeter`] — brackets a workload and reports the **user** and **system** CPU seconds consumed

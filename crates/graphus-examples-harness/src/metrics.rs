@@ -1,7 +1,7 @@
 //! Storage metering + throughput/latency collectors for example runs (`rmp #247`).
 //!
-//! This module fills the [`StorageSection`](crate::StorageSection) and
-//! [`ThroughputSection`](crate::ThroughputSection) seams that the `rmp #245` scaffold stubbed (with
+//! This module fills the [`crate::StorageSection`] and the
+//! [`crate::ThroughputSection`] seams that the `rmp #245` scaffold stubbed (with
 //! the CPU/memory seams filled by `rmp #246`). It provides three cooperating pieces:
 //!
 //! - [`StorageMeter`] — measures the **real on-disk footprint** of a store directory (and,
@@ -431,7 +431,13 @@ impl StorageSection {
         Self {
             store_bytes: store.bytes,
             wal_bytes: wal.bytes,
+            store_pages: store.pages,
+            wal_pages: wal.pages,
             bytes_fsynced,
+            // Amplification ratios are only known once the caller supplies the logical figures;
+            // left at 0.0 (meaning "not measured") until set via `EvidenceCollector::record_amplification`.
+            write_amplification: 0.0,
+            space_amplification: 0.0,
         }
     }
 }
