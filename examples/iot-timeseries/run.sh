@@ -67,19 +67,30 @@ BIN_DIR="${GRAPHUS_BIN_DIR:-$REPO_ROOT/target/release}"
 
 GEN="$BIN_DIR/iot_gen"
 CHURN="$BIN_DIR/iot_churn"
+EVIDENCE_BIN="$BIN_DIR/iot_evidence"
+CMP_BIN="$BIN_DIR/iot_baseline_cmp"
 SERVER="$BIN_DIR/graphus-server"
 CLI="$BIN_DIR/graphus-cli"
 
 PROFILE="${IOT_PROFILE:-fast}"
 RUN_WIRE="${RUN_WIRE:-1}"
+# Long-running steady-state knob: override the number of churn ticks the evidence run drives. The
+# default is the profile's own (short, CI-fast) tick count; set IOT_TICKS for a longer steady-state
+# demonstration (the plateau holds for as many ticks as you ask — the footprint stays flat). It is
+# applied to the EVIDENCE run only, so the deterministic structural metrics the baseline gate holds
+# (page high-water, plateau footprint) are unaffected by the tick count, only how long the plateau is
+# observed. Leave unset for the committed-baseline-comparable default.
+IOT_TICKS="${IOT_TICKS:-}"
 
-# The hermetic generator is always needed; the churn driver needs the `churn` feature (real engine).
-if [ ! -x "$GEN" ] || [ ! -x "$CHURN" ]; then
-  section "Building the iot-timeseries generator + churn driver (release)"
+# The hermetic generator + churn driver + evidence emitter + baseline gate all live in the one crate;
+# the churn driver + evidence emitter need the `churn` feature (real engine).
+if [ ! -x "$GEN" ] || [ ! -x "$CHURN" ] || [ ! -x "$EVIDENCE_BIN" ] || [ ! -x "$CMP_BIN" ]; then
+  section "Building the iot-timeseries generator + churn driver + evidence binaries (release)"
   ( cd "$REPO_ROOT" && cargo build --release -p graphus-iot-gen --features churn --bins )
 fi
-[ -x "$GEN" ]   || { echo "${RED}fatal: iot_gen binary not found at $GEN${RESET}" >&2; exit 2; }
-[ -x "$CHURN" ] || { echo "${RED}fatal: iot_churn binary not found at $CHURN${RESET}" >&2; exit 2; }
+for b in "$GEN" "$CHURN" "$EVIDENCE_BIN" "$CMP_BIN"; do
+  [ -x "$b" ] || { echo "${RED}fatal: required binary not found at $b${RESET}" >&2; exit 2; }
+done
 
 # --------------------------------------------------------------------------------------------------
 # Workspace: a private temp dir for generated artifacts, removed on exit. The evidence/ dir is
@@ -87,6 +98,7 @@ fi
 # --------------------------------------------------------------------------------------------------
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/graphus-iot-XXXXXX")"
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
+BASELINE="$SCRIPT_DIR/baseline.json"
 SAMPLES_JSON="$WORKDIR/samples.json"
 cleanup() { rm -rf "$WORKDIR"; }
 trap cleanup EXIT INT TERM
@@ -178,10 +190,52 @@ else
 fi
 
 # ==================================================================================================
+# Step 5 — standardized evidence (footprint plateau + RSS series + throughput + time) + baseline gate
+#          [rmp #297 / #298 / #300]
+# ==================================================================================================
+section "Step 5 — collect performance evidence (footprint plateau + RSS + throughput + time)"
+# Drive the SAME in-process churn run as Step 2 through the evidence emitter, which additionally
+# samples RSS over the loop and folds the footprint time series + page high-water + plateau_ratio +
+# RSS series + throughput + end-to-end time into a schema-versioned report.json + report.md.
+rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
+EVIDENCE_ARGS=( --evidence-dir "$EVIDENCE_DIR" --profile "$PROFILE" )
+# The long-running steady-state knob (#298): more ticks => the plateau is observed for longer. It does
+# NOT change the deterministic structural metrics the baseline gates, only how long the flat footprint
+# is demonstrated, so it is forwarded to the evidence run unconditionally.
+[ -n "$IOT_TICKS" ] && EVIDENCE_ARGS+=( --ticks "$IOT_TICKS" )
+EVIDENCE_OUT="$("$EVIDENCE_BIN" "${EVIDENCE_ARGS[@]}" 2>&1)" || true
+printf '%s\n' "$EVIDENCE_OUT" | sed 's/^/  /'
+assert "evidence report.json was produced" "yes" \
+  "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+assert "evidence report.md was produced" "yes" \
+  "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+
+# Regression gate (fast profile, default tick count only — the committed baseline is that run).
+# Compares ONLY the stable STRUCTURAL metrics (plateau footprint store_bytes/pages, plateau_ratio via
+# write_amplification, per-element space_amplification) against baseline.json; the machine-variant
+# RSS / throughput / CPU / wall-time families are given an effectively-infinite tolerance (see
+# iot_baseline_cmp). A custom --ticks run is not baseline-comparable (longer series, same plateau), so
+# the gate is skipped then.
+if [ "$PROFILE" = "fast" ] && [ -z "$IOT_TICKS" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+  section "regression gate vs committed baseline"
+  CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
+  printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
+  assert "fresh run is within baseline thresholds (structural plateau metrics)" "yes" \
+    "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+elif [ ! -f "$BASELINE" ]; then
+  info "no committed baseline.json yet — skipping the regression gate (generate one with this script)."
+else
+  info "regression gate skipped (non-fast profile or custom --ticks: not baseline-comparable)."
+fi
+
+# ==================================================================================================
 # Summary
 # ==================================================================================================
 section "Result"
 printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
+if [ -f "$EVIDENCE_DIR/report.json" ]; then
+  info "standardized evidence: $EVIDENCE_DIR/{report.json, report.md}"
+fi
 if [ "$FAILURES" -eq 0 ]; then
   printf '%s%sIOT-TIMESERIES DEMONSTRATION PASSED%s — the seeded generator is byte-identical, the\n' "$BOLD" "$GREEN" "$RESET"
   printf 'sustained ingest+retention churn reached a steady state (live count ~ window), and the\n'

@@ -51,6 +51,13 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
+/// The sustained ingest + retention churn workload + storage-reclamation engine (drives the REAL
+/// Graphus engine inline). Gated behind the `churn` feature so the pure generator + its determinism
+/// test do not pull in the heavy engine build. Shared by the `iot_churn` + `iot_evidence` binaries
+/// and the hermetic `churn_plateau` cargo test.
+#[cfg(feature = "churn")]
+pub mod churn;
+
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it
 /// is a *pure* integer mixing function: identical output for identical seeds on every platform, with
 /// no global state, no float, and no allocation. We never use the standard library's `HashMap`-based

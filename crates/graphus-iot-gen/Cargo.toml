@@ -26,9 +26,16 @@ path = "src/lib.rs"
 # command-dispatch code path (`graphus_cypher::TxnCoordinator` statement seam — exactly what the
 # server's `handle_run` drives) inline + single-threaded, plus the MVCC GC maintenance pass
 # (`RecordStore::gc`, reached through `with_store_mut`, gated behind `graphus-storage/dst` so the
-# durable device high-water can be metered). Kept behind a feature so the pure generator + its
-# determinism test do not pull in the heavy engine build.
-default = []
+# durable device high-water can be metered).
+#
+# `churn` is ON BY DEFAULT so the hermetic reclamation-plateau mirror (`tests/churn_plateau.rs`) runs
+# in the DEFAULT `cargo test` / `cargo test --all` (the project's CI invocation) — the same pattern
+# `graphus-durability-demo` uses (its engine dep is always-on so its scenario test runs by default).
+# `cargo test --all` builds the whole engine workspace regardless, so this adds no build the suite was
+# not already doing; the pure generator (`iot_gen`) + its determinism test remain usable with
+# `--no-default-features`. This crate is UNPUBLISHED + depended on by NOTHING in the production build
+# (notably NOT `graphus-server`), so the shipped binary is unaffected either way.
+default = ["churn"]
 churn = [
     "dep:graphus-core",
     "dep:graphus-cypher",
@@ -80,4 +87,13 @@ path = "src/bin/iot_baseline_cmp.rs"
 [[bin]]
 name = "iot_churn"
 path = "src/bin/iot_churn.rs"
+required-features = ["churn"]
+
+# The standardized evidence emitter: drives the SAME in-process churn run as `iot_churn`, sampling RSS
+# over the loop, and folds the footprint plateau + RSS-stability + throughput + time into a
+# schema-versioned report.json + report.md (opt-in: needs the `churn` feature).
+# Usage: `cargo run -p graphus-iot-gen --features churn --bin iot_evidence -- --evidence-dir <dir>`
+[[bin]]
+name = "iot_evidence"
+path = "src/bin/iot_evidence.rs"
 required-features = ["churn"]
