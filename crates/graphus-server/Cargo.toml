@@ -141,6 +141,17 @@ graphus-gds-gen = { path = "../graphus-gds-gen" }
 # `graphus-server`, so this introduces no cycle; it is a TEST-TARGET dev-dependency that never enters
 # the production build.
 graphus-kg-gen = { path = "../graphus-kg-gen" }
+# The deterministic multi-tenant security generator (DEFAULT features = serde-only generator: the
+# `dataset`/`manifest` + the allow/deny matrix; its only deps are serde + the evidence harness), so
+# the hermetic security-multitenant cargo mirror (`tests/security_multitenant.rs`) can drive the
+# SAME seeded tenants/roles/users/grants + RBAC matrix the shell demo uses through the REAL REST
+# router — fully in-process via `tower::oneshot`, no python/Node/network. The `dst-repro` feature
+# (which DOES depend on `graphus-server`) is deliberately NOT enabled here: enabling it would form a
+# dependency cycle. The mirror's encryption/rotation/backup leg instead drives the SAME crypto stack
+# (`graphus-crypto` + `graphus-storage` + `key_rotation::rotate_master_key`) directly — all already
+# direct deps of `graphus-server` — so the serde-only generator is all this dev-dep contributes and
+# no cycle is introduced. TEST-TARGET dev-dependency only; never enters the production build.
+graphus-security-gen = { path = "../graphus-security-gen" }
 # The HTTP request/response types + body collector to drive the REST `axum::Router` via
 # `tower::ServiceExt::oneshot` in the hermetic mirror (the same no-socket pattern `graphus-rest`'s
 # own router tests use). `http`/`http-body-util` track the `1`/`0.1` lines `graphus-rest` already

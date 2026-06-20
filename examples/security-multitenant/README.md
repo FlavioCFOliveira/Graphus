@@ -118,6 +118,41 @@ but they enforce a denied **read** through different layers, which is worth stat
   returns ≥1 canary row, a denied/cross-tenant read returns **0 rows**, a denied write throws
   Forbidden.
 
+### A real security bug this example caught and fixed (`#287`)
+
+Building this demonstration surfaced — and fixed — a genuine authorization bug in the REST path: the
+coarse up-front gate (`authorize_mode`) was checking the privilege against the **server-wide
+`Database` scope** rather than the **graph scope of the target tenant database**. The effect was that
+a *graph-scoped* grant (`GRANT READ ON GRAPH tenant_a TO reader_a` — exactly this example's RBAC
+model) was **false-denied on its own tenant over REST**: `alice` could not read `tenant_a` even though
+her grant authorized it. The fix makes the gate authorize against `Privilege::on_graph(action, db)`
+for the *target* database, so a graph-scoped grant correctly **allows its own tenant** while still
+**denying every sibling tenant**. The matrix's `alice → tenant_a [allow]` / `alice → tenant_b [deny]`
+cells are the direct regression guard, asserted over REST in `run.sh` **and** held in the default
+`cargo test` run by the hermetic mirror (below).
+
+## A hermetic mirror in the default `cargo test` run
+
+The wire demonstration above needs `openssl` + `python3` (and `node`/`npm` for the Bolt leg). So the
+example is **also** mirrored by an in-process integration test that runs in the ordinary, dependency-
+free `cargo test` — `crates/graphus-server/tests/security_multitenant.rs`. It is the regression gate
+for both halves of the scenario:
+
+- **RBAC matrix** — it generates the *same* deterministic fast-profile scenario (`graphus-security-gen`),
+  boots the **real `graphus_rest` axum router** over a real engine, and drives **every** matrix cell
+  through `tower::oneshot` (no TLS, no socket, no python, no Node): provisioning + per-tenant seed as
+  the admin, then each `(user, tenant, access_mode)` probe with that user's **live** Bearer JWT,
+  asserting `allow ⇒ 200` / `deny ⇒ 403` (`Neo.ClientError.Security.Forbidden`) / `unauth ⇒ 401`. The
+  `#287` allow/deny pair is asserted explicitly.
+- **Encryption at rest** — it drives the *same* crypto stack `security_verify` proves
+  (`graphus-crypto` + `graphus-storage` + `key_rotation`), asserting ciphertext-on-disk, offline key
+  rotation (old key fails closed), and the encrypted-backup roundtrip — in process, deterministically.
+
+The test depends on `graphus-security-gen` only with its **default (serde-only) features** — never the
+`dst-repro` feature (which depends on `graphus-server` and would form a cycle); the crypto leg uses
+`graphus-server`'s own direct dependencies. It is a **test-target dev-dependency**: it never enters
+the production build.
+
 ## Encryption at rest
 
 The live server is booted **encrypted** (`run.sh` step 3). The configuration adds an `[encryption]`

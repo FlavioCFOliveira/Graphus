@@ -1270,6 +1270,7 @@ dependencies = [
  "graphus-io",
  "graphus-kg-gen",
  "graphus-rest",
+ "graphus-security-gen",
  "graphus-sim",
  "graphus-storage",
  "graphus-txn",
