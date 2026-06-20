@@ -1,0 +1,83 @@
+[package]
+name = "graphus-iot-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded time-series IoT event-stream generator + sustained-churn workload for the iot-timeseries example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-fraud-gen` and
+# `graphus-examples-harness`: it exists only to support the `examples/iot-timeseries` E2E
+# demonstration and is depended upon by NOTHING in the production build. In particular,
+# `graphus-server` MUST NOT depend on it, so it adds ZERO overhead to the shipped binary.
+publish = false
+
+[lib]
+name = "graphus_iot_gen"
+path = "src/lib.rs"
+
+[features]
+# The pure generator (`gen` binary + the library) is HERMETIC: serde only, no engine, no server, no
+# network. It is always available and CI-runnable, and its determinism test stays light.
+#
+# The `churn` feature additionally pulls in the REAL Graphus engine to drive the sustained
+# ingest+retention churn workload + the storage-reclamation proof. It runs the production
+# command-dispatch code path (`graphus_cypher::TxnCoordinator` statement seam — exactly what the
+# server's `handle_run` drives) inline + single-threaded, plus the MVCC GC maintenance pass
+# (`RecordStore::gc`, reached through `with_store_mut`, gated behind `graphus-storage/dst` so the
+# durable device high-water can be metered). Kept behind a feature so the pure generator + its
+# determinism test do not pull in the heavy engine build.
+default = []
+churn = [
+    "dep:graphus-core",
+    "dep:graphus-cypher",
+    "dep:graphus-storage",
+    "dep:graphus-io",
+    "dep:graphus-wal",
+    "graphus-cypher/dst",
+    "graphus-storage/dst",
+]
+
+[dependencies]
+# The generator emits the per-tick Cypher (INSERT new + DELETE aged-out) as text and its summary as
+# JSON; serde pins match the rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The shared evidence harness, for the `StorageMeter` space/footprint helpers the reclamation proof
+# reports + the `iot_baseline_cmp` regression gate. A dev-only leaf crate (never in `graphus-server`),
+# so this keeps the production build untouched.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
+# --- `churn` feature only: the REAL engine, driven inline + single-threaded for a deterministic
+# sustained-churn workload + reclamation proof (mirrors how `graphus-fraud-gen`'s `dst_contention`
+# drives the engine, and how `graphus-dst` drives the coordinator). graphus-server does not depend on
+# this crate, so this is acyclic. ---
+graphus-core = { path = "../graphus-core", optional = true }
+graphus-cypher = { path = "../graphus-cypher", optional = true }
+graphus-storage = { path = "../graphus-storage", optional = true }
+graphus-io = { path = "../graphus-io", optional = true }
+graphus-wal = { path = "../graphus-wal", optional = true }
+
+# The deterministic generator binary: writes the per-tick Cypher stream + a summary for a profile.
+# Usage: `cargo run -p graphus-iot-gen --bin iot_gen -- --profile fast --out-dir <dir>`
+[[bin]]
+name = "iot_gen"
+path = "src/bin/iot_gen.rs"
+
+# The baseline regression gate: compares a fresh evidence report against the committed baseline using
+# only stable STRUCTURAL metrics (steady-state footprint plateau, live-count band, high-water mark).
+# Hermetic — needs only the harness, no engine, so it is always available (no `churn`).
+# Usage: `cargo run -p graphus-iot-gen --bin iot_baseline_cmp -- <baseline.json> <candidate.json>`
+[[bin]]
+name = "iot_baseline_cmp"
+path = "src/bin/iot_baseline_cmp.rs"
+
+# The sustained ingest + churn workload + storage-reclamation proof, driving the REAL engine inline
+# (opt-in: needs the `churn` feature).
+# Usage: `cargo run -p graphus-iot-gen --features churn --bin iot_churn -- --profile fast`
+[[bin]]
+name = "iot_churn"
+path = "src/bin/iot_churn.rs"
+required-features = ["churn"]
