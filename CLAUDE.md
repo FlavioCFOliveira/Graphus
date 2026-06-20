@@ -57,6 +57,18 @@ You MUST use the **DST (Deterministic Simulation Testing) simulator** of the pro
 
 Whenever you author, exercise, or validate test scenarios — especially those involving concurrency, faults, crashes, and recovery — you MUST leverage the DST simulator to model and replicate those real situations deterministically, so that issues can be reproduced reliably and verified against the project's correctness and durability guarantees.
 
+### Examples
+
+The repository MUST organize the project's demonstrative examples inside an `examples/*` folder at the root of the project. Each example MUST be contained in its own dedicated sub-folder, used exclusively for that example.
+
+The project's examples MUST **always** be **REALISTIC E2E demonstrations** of how Graphus is used. Every example MUST always fulfill the following objectives:
+
+1. **Demonstration** — a didactic purpose, showing how Graphus can be used for a given scenario or goal.
+2. **Exercise** — the example MUST always exercise the functionalities most appropriate to its scenario or overall objective. The server MUST be exercised not only in its most basic functionalities, but also in its most advanced ones, as well as in the combination of multiple functionalities with one another and of the server as a whole.
+3. **Evidence** — each example MUST allow the objective and explicit collection of evidence while its functionalities are exercised, in order to clearly evaluate ALL of Graphus's performance vectors (memory usage, CPU, storage).
+
+Examples MUST be able to act as simulations of real-world scenarios that, when run, allow observing Graphus's behavior in order to better understand its performance, as well as the opportunities for improvement in the usage of CPU, RAM, and storage.
+
 ## Core rules
 
 1. **You are NOT authorized to make decisions on your own.** Whenever the instructions are insufficient, unclear, non-specific, non-concrete, or whenever there are contradictions or ambiguities, you MUST ALWAYS ASK the user how to proceed. When asking the user:
