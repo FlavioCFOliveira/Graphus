@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "metadata": {
+    "scenario": "durability-crash-recovery",
+    "description": "Deterministic OLTP durability + crash-recovery under load, driven by the DST simulator: a concurrent overlapping-transaction workload under disk/clock faults and a seeded mid-workload crash, rebuilt via ARIES recovery, with the four ACID-durability properties (serializability / durability / atomicity / reference-model equivalence) asserted on the recovered engine against the committed-only shadow LPG.",
+    "dataset": {
+      "nodes": 22,
+      "relationships": 0
+    },
+    "workload": {
+      "clients": "6 (overlapping explicit transactions)",
+      "crashes_per_seed": "<=2 (mid-workload crash + ARIES restart)",
+      "driver": "graphus-dst VOPR safety oracle (run_safety)",
+      "focus_recovered_txns": "14",
+      "focus_recovery_records_replayed": "15",
+      "focus_seed": "7",
+      "recovery_crashes": "60",
+      "recovery_inflight_undone": "255",
+      "recovery_records_replayed": "305",
+      "scenario": "oltp-durability",
+      "seeds": "1..31"
+    },
+    "started_unix_secs": 1781950225
+  },
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_cores": 16,
+    "hostname": "ROG",
+    "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "timestamp_unix_secs": 1781950225
+  },
+  "total_millis": 0.003787,
+  "phases": [
+    {
+      "name": "durability sweep (workload + crash + ARIES recovery + 4-property oracle)",
+      "millis": 416.260731
+    }
+  ],
+  "cpu": {
+    "user_secs": 0.0,
+    "system_secs": 0.0,
+    "mean_core_utilisation": 0.0
+  },
+  "memory": {
+    "peak_rss_bytes": 0,
+    "final_rss_bytes": 0
+  },
+  "storage": {
+    "store_bytes": 0,
+    "wal_bytes": 0,
+    "store_pages": 0,
+    "wal_pages": 0,
+    "bytes_fsynced": 0,
+    "write_amplification": 0.0,
+    "space_amplification": 0.0
+  },
+  "throughput": {
+    "operations": 30,
+    "ops_per_sec": 72.07021408896723,
+    "p50_latency_ms": 0.0,
+    "p99_latency_ms": 0.0,
+    "p999_latency_ms": 0.0,
+    "abort_rate": 0.0
+  },
+  "notes": [
+    "durability oracle: 30 seed(s) checked, 0 unsafe, 0 non-deterministic \u2014 properties: [\"serializability\", \"durability\", \"atomicity\", \"reference-model-equivalence\"]",
+    "crash + ARIES restarts across sweep: 60; faults injected: 240; acked commits proven durable: 305; in-flight transactions discarded by undo: 255; non-vacuous runs (both halves of committed-or-nothing under test): 30/30",
+    "recovery work vs WAL/redo size (DETERMINISTIC, rmp #274): ARIES redo replayed 305 acked commits and undo discarded 255 in-flight transactions across 60 crash + ARIES restart(s) in this sweep. In-process there is no on-disk WAL to size, so the redo-record count (= acked commits) is the deterministic analogue of the WAL records replayed during recovery; it is byte-stable for a fixed seed range. The on-disk WAL byte footprint and the wall-clock recovery time scale with this redo set and are measured by the sibling REAL-server SIGKILL run (rmp #275), which records a `recovery` phase timing + the post-crash `storage.wal_bytes` so recovery-time-vs-WAL-size can be read directly.",
+    "deterministic-vs-machine-variant split: the recovery-work counts (recovery_records_replayed / recovery_inflight_undone / recovery_crashes), the durability verdict, the recovered hashes and the dataset size are EXACTLY reproducible (a pure function of the seed range) and are the structural metrics the committed baseline gates; the sweep wall-time / seed-rate throughput here, and the real-server WAL bytes / recovery time / peak RSS in the sibling run, are machine-variant and are NOT gated.",
+    "hermetic: this scenario runs the storage/WAL/txn engine in-process under the DST simulator (no server, no Node, no network) \u2014 so the report carries the deterministic seed-rate throughput; server CPU/RAM/on-disk storage are exercised by the sibling real-server SIGKILL run (rmp #274-276) layered over this same scenario.",
+    "COMMITTED BASELINE (rmp #278): the fast-profile (30-seed) reference run for the regression gate. The DST deterministic core is byte-stable for this seed range, so durability_baseline_cmp gates only the STRUCTURAL recovery metrics at EXACT equality \u2014 the recovered dataset size (metadata.dataset.nodes), the redo set ARIES replayed (workload.recovery_records_replayed = acked commits = WAL redo records), the undo set it discarded (workload.recovery_inflight_undone), the crash count (workload.recovery_crashes) and the seed range (workload.seeds). The sweep wall-time / seed-rate throughput here, and any real-server WAL bytes / recovery time / peak RSS a real-server report carries, are machine-variant and are NOT gated. Recorded on linux/x86_64."
+  ]
+}

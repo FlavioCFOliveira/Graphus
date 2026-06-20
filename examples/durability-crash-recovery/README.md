@@ -19,9 +19,13 @@ Everything here is **hermetic**: it runs the real storage / WAL / transaction en
 under the simulator. No server, no Bolt driver, no Node, no network — so it runs anywhere the
 workspace builds and reproduces bit-for-bit from a seed.
 
-> The **sibling real-server run** (`rmp #274`–`#276`) layers a real `graphus-server` process under an
-> actual `SIGKILL` on top of this same deterministic scenario, and collects the live CPU / RAM /
-> on-disk-storage evidence. This `run.sh` is that demonstration's deterministic core.
+This deterministic core is the example's **hermetic proof**. On top of it, the same `run.sh` then runs
+a **real-server SIGKILL phase** (`rmp #275`): it boots the actual production `graphus-server` over a
+UDS on a real on-disk store, drives a concurrent OLTP workload to build WAL, **hard-kills it
+(`SIGKILL`) mid-life**, restarts from the same store, and asserts every committed account + transfer
+survived ARIES WAL replay — measuring the **wall-clock recovery time**, the **on-disk WAL footprint**
+recovery replayed, and the **peak RSS during replay**. So the example proves the durability contract
+**twice**: deterministically in-process (the DST core), and under a real process crash.
 
 ## What it demonstrates
 
@@ -34,6 +38,7 @@ workspace builds and reproduces bit-for-bit from a seed.
 | **Durability oracle on the recovered engine** | The four ACID-durability properties — **serializability**, **durability**, **atomicity**, **reference-model equivalence** — are asserted on the **recovered** engine, comparing it **cell-by-cell** (node multiset, edge multiset, `count(n)`, per-node neighbours) against the shadow model. |
 | **Determinism** | The same seed yields an identical workload, identical crash schedule, and identical recovered state (proven by re-running each seed and comparing). |
 | **One-command replay** | A failing run dumps a self-contained `ReplayArtifact` (seed + full config + the expected trace/state hashes) that re-runs to the **identical** failure with a single command. |
+| **Real-server SIGKILL durability** | The production `graphus-server` boots over a UDS on a real store; 4 concurrent writers commit a batch of `:Account` nodes + `:TRANSFER` edges (real WAL); the process is **`SIGKILL`-ed mid-life**; it restarts and ARIES replays the WAL. Every committed account + transfer (count, balance sum, and an exact property) is asserted intact, with **no** phantom/in-flight effect — under a real process crash, not a simulated one. |
 
 ## How to run
 
@@ -46,15 +51,20 @@ examples/durability-crash-recovery/run.sh
 Reuse pre-built binaries and pick the scale:
 
 ```bash
-cargo build --release -p graphus-durability-demo -p graphus-dst
+cargo build --release -p graphus-durability-demo -p graphus-dst -p graphus-server -p graphus-cli
 GRAPHUS_BIN_DIR=target/release examples/durability-crash-recovery/run.sh   # CI-fast: 30 seeds
 DUR_PROFILE=full examples/durability-crash-recovery/run.sh                 # 100 seeds (evidence scale)
 DUR_SEEDS=250    examples/durability-crash-recovery/run.sh                 # any seed count
 DUR_FOCUS=7      examples/durability-crash-recovery/run.sh                 # which seed's crash partition to detail
+DUR_WRITERS=8 DUR_BATCHES=10 examples/durability-crash-recovery/run.sh     # heavier real-server OLTP workload
 ```
 
+The real-server SIGKILL phase (step 4) additionally needs `graphus-server` + `graphus-cli`; `run.sh`
+builds any missing binary on demand. The committed-baseline gate (step 5) runs only at the default
+fast/30-seed profile (the profile the baseline was recorded at).
+
 The script is self-contained and doubles as an executable E2E test: it asserts every step and **exits
-non-zero the moment any assertion fails**. It runs three steps:
+non-zero the moment any assertion fails**. It runs five steps:
 
 1. **The deterministic durability sweep** (`durability_demo`) — runs the OLTP workload + crash + ARIES
    recovery + four-property oracle for every seed, proves **zero violations** and full determinism,
@@ -63,6 +73,17 @@ non-zero the moment any assertion fails**. It runs three steps:
    same scenario, run through the official gate, must agree: all seeds SAFE + deterministic.
 3. **The one-command replay round-trip** (`durability_replay`) — captures a reproducer and replays it
    to the **identical** failure byte-for-byte.
+4. **The real-server SIGKILL run** (`graphus-server` + `graphus-cli`) — boots the production server
+   over a UDS, drives a concurrent OLTP workload, `SIGKILL`s it mid-life, restarts, and asserts every
+   committed account + transfer survived, measuring the wall-clock recovery time, the on-disk WAL
+   footprint, and the peak replay RSS into a real-server evidence report.
+5. **The regression gate vs the committed baseline** (`durability_baseline_cmp`, at the fast/30-seed
+   profile) — compares the fresh deterministic report against `baseline.json` and passes only when the
+   structural recovery metrics match exactly (see *Baseline & regression gate* below).
+
+> The real-server phase needs only a Unix host (no TLS / Node / network): it uses a UDS-only server
+> config bound to your uid, exactly like `examples/social-network-uds`. It is purely additive — a
+> metering hiccup is non-fatal, but every **durability assertion** is hard.
 
 ### Driving the underlying DST simulator directly
 
@@ -133,23 +154,80 @@ Run them with:
 cargo test -p graphus-durability-demo
 ```
 
+The same deterministic crash/recovery scenario also runs **in the default `cargo test`** as a
+hermetic mirror (`crates/graphus-durability-demo/tests/durability_scenario.rs`): a small seed sweep
+that asserts the durability oracle on every recovered engine, with **no server, no Node, no network**.
+So `cargo test` alone guards the core; the real-server SIGKILL part lives only in `run.sh`.
+
 ## Evidence
 
-At run time the example writes the standardized, schema-versioned evidence to
-`examples/durability-crash-recovery/evidence/` (git-ignored). It records:
+At run time the example writes **two** standardized, schema-versioned evidence reports to
+`examples/durability-crash-recovery/evidence/` (git-ignored):
+
+### `evidence/report.json` + `report.md` — the deterministic DST core
 
 - the **durability verdict** (seeds checked, violations, non-determinism) and the four certified
   properties;
-- the **aggregate crash-recovery figures** — total crash + ARIES restarts, faults injected, acked
-  commits proven durable, in-flight transactions discarded by undo, and non-vacuous-run count — as
-  report notes;
-- the **sweep timing** (the one phase) and a deterministic **seed-rate throughput** (seeds, each a
-  full crash-recovery scenario, per second).
+- the **deterministic recovery metrics** (`rmp #274`), as stable workload params:
+  `recovery_records_replayed` (acked commits ARIES redo replayed — the in-process analogue of WAL
+  redo records), `recovery_inflight_undone` (in-flight transactions undo discarded), and
+  `recovery_crashes` (crash + ARIES restarts). These are **byte-stable** for a fixed seed range;
+- the **sweep timing** and a deterministic **seed-rate throughput**.
 
-Because the engine here runs **in-process** under the simulator (no server process), the report's
-server-oriented CPU / RAM / on-disk-storage vectors are exercised by the **sibling real-server run**
-(`rmp #274`–`#276`) layered over this same scenario; a note in the report records this honestly.
+### `evidence/real-server/report.json` + `report.md` — the real-server SIGKILL run
 
-The regression gate for *this* deterministic core is **determinism itself**: any change that alters a
-recovered state, loses an acked commit, lets an in-flight effect survive, or breaks reproducibility
-flips a seed's verdict and fails the run.
+Collected from the **live, recovered `graphus-server` process** via the shared `measure_server`
+harness:
+
+- a **`recovery` phase timing** — the wall-clock time from `SIGKILL` to the server re-binding its UDS
+  (ARIES WAL replay);
+- the **on-disk `storage.wal_bytes` / `store_bytes`** the recovered server holds, plus
+  `wal_bytes_before_crash` (the WAL the crash left for recovery to replay);
+- the **peak RSS during replay** (`memory.peak_rss_bytes`) and the server's real CPU;
+- the **steady-state throughput** of the pre-crash OLTP workload.
+
+#### Reading recovery-time-vs-WAL-size
+
+This is the headline metric, split across the two reports by determinism:
+
+- The **deterministic** side (`report.json`) reports the *recovery work* — `recovery_records_replayed`
+  (the redo set) — which is a pure function of the seed range and identical on every host.
+- The **real-server** side (`real-server/report.json`) reports the *physical cost of that work* on
+  your machine — the `recovery` phase milliseconds against `wal_bytes_before_crash` (and the
+  post-crash `storage.wal_bytes`). A note in that report states both numbers explicitly, e.g.
+  *"recovery replayed a 246417-byte on-disk WAL in 106 ms wall-clock"*.
+
+So recovery time scales with WAL/redo size: the deterministic redo-record count tells you *how much*
+recovery had to do; the real-server timing tells you *how long it took here*.
+
+## Baseline & regression gate
+
+A committed baseline lives at `examples/durability-crash-recovery/baseline.json` (the `evidence/`
+directory itself is git-ignored; the baseline is a tracked, fast-profile reference run). The
+`run.sh` regression gate (`durability_baseline_cmp`, fast/30-seed profile only) compares a fresh
+deterministic `report.json` against it and **passes only when the structural recovery metrics match**.
+
+The threshold choice follows this example's sharp **deterministic-vs-machine-variant split**:
+
+| Metric | Source | Gate |
+|--------|--------|------|
+| `metadata.dataset.nodes` (recovered `:Person` rows for the focus seed) | DST core | **EXACT** |
+| `workload.recovery_records_replayed` (acked commits replayed = WAL redo records) | DST core | **EXACT** |
+| `workload.recovery_inflight_undone` (in-flight txns undo discarded) | DST core | **EXACT** |
+| `workload.recovery_crashes` (crash + ARIES restarts) | DST core | **EXACT** |
+| `workload.seeds` (seed range / profile) | DST core | **EXACT** |
+| sweep wall-time / seed-rate throughput | DST core | **ungated** (machine-variant) |
+| real-server WAL bytes / recovery time / peak RSS / CPU | real server | **ungated** (machine-variant) |
+
+The structural metrics are gated at **exact equality** because the DST core is a pure function of the
+seed range — they are integer-stable across runs and hosts, so a change to any of them means recovery
+itself drifted (a lost acked commit, a surviving in-flight effect, a different crash schedule, or a
+profile mismatch), which is precisely the regression the example exists to catch. Everything timing-
+or host-dependent (the sweep wall-time, the real-server WAL bytes / recovery time / peak RSS) is left
+**ungated** so the shared baseline never flakes across developer / CI machines. This is a *sharper*
+gate than the sibling examples' footprint band — appropriate to a scenario whose deterministic
+quantity is its **recovery work**, not an on-disk footprint.
+
+The regression gate for *this* deterministic core is, ultimately, **determinism itself**: any change
+that alters a recovered state, loses an acked commit, lets an in-flight effect survive, or breaks
+reproducibility flips a seed's verdict — failing both the run and the baseline gate.

@@ -147,7 +147,29 @@ fn build_collector(sweep: &SweepReport, focus: &DurabilityRun) -> EvidenceCollec
     .workload_param("seeds", format!("{}..{}", sweep.start, sweep.start + sweep.count))
     .workload_param("clients", "6 (overlapping explicit transactions)")
     .workload_param("crashes_per_seed", "<=2 (mid-workload crash + ARIES restart)")
-    .workload_param("focus_seed", focus.seed.to_string());
+    .workload_param("focus_seed", focus.seed.to_string())
+    // --- Deterministic recovery metrics (rmp #274). These are byte-stable for a fixed seed range
+    // and are the "recovery work" the regression gate holds: the redo set ARIES replayed (= acked
+    // commits, the in-process analogue of WAL redo records), the undo set it discarded, and how many
+    // crash + ARIES restarts fired. The on-disk WAL byte footprint + wall-clock recovery time are
+    // machine-variant and are collected by the sibling REAL-server SIGKILL run (rmp #275), not here.
+    .workload_param(
+        "recovery_records_replayed",
+        sweep.total_acked_durable().to_string(),
+    )
+    .workload_param(
+        "recovery_inflight_undone",
+        sweep.total_inflight_discarded().to_string(),
+    )
+    .workload_param("recovery_crashes", sweep.total_crashes().to_string())
+    .workload_param(
+        "focus_recovery_records_replayed",
+        focus.acked_at_last_crash().to_string(),
+    )
+    .workload_param(
+        "focus_recovered_txns",
+        focus.recovered_txns.to_string(),
+    );
 
     EvidenceCollector::new(metadata)
 }
@@ -186,6 +208,28 @@ fn finalize_evidence(dir: &str, mut c: EvidenceCollector, sweep: &SweepReport, s
         sweep.non_vacuous_runs(),
         sweep.count,
     ));
+    c.note(format!(
+        "recovery work vs WAL/redo size (DETERMINISTIC, rmp #274): ARIES redo replayed {} acked \
+         commits and undo discarded {} in-flight transactions across {} crash + ARIES restart(s) in \
+         this sweep. In-process there is no on-disk WAL to size, so the redo-record count (= acked \
+         commits) is the deterministic analogue of the WAL records replayed during recovery; it is \
+         byte-stable for a fixed seed range. The on-disk WAL byte footprint and the wall-clock \
+         recovery time scale with this redo set and are measured by the sibling REAL-server SIGKILL \
+         run (rmp #275), which records a `recovery` phase timing + the post-crash `storage.wal_bytes` \
+         so recovery-time-vs-WAL-size can be read directly.",
+        sweep.total_acked_durable(),
+        sweep.total_inflight_discarded(),
+        sweep.total_crashes(),
+    ));
+    c.note(
+        "deterministic-vs-machine-variant split: the recovery-work counts (recovery_records_replayed \
+         / recovery_inflight_undone / recovery_crashes), the durability verdict, the recovered \
+         hashes and the dataset size are EXACTLY reproducible (a pure function of the seed range) and \
+         are the structural metrics the committed baseline gates; the sweep wall-time / seed-rate \
+         throughput here, and the real-server WAL bytes / recovery time / peak RSS in the sibling \
+         run, are machine-variant and are NOT gated."
+            .to_string(),
+    );
     c.note(
         "hermetic: this scenario runs the storage/WAL/txn engine in-process under the DST simulator \
          (no server, no Node, no network) — so the report carries the deterministic seed-rate \

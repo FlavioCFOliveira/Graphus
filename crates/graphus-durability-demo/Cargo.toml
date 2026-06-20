@@ -52,6 +52,16 @@ path = "src/bin/durability_demo.rs"
 name = "durability_replay"
 path = "src/bin/durability_replay.rs"
 
+# The evidence regression gate (rmp #278): loads the committed baseline.json + a fresh run's
+# report.json and gates the run's STRUCTURAL deterministic recovery metrics (recovered dataset size,
+# acked-commits-replayed, in-flight-undone, crashes, seed range) at EXACT equality, while leaving the
+# machine-variant families (throughput / CPU / RAM / on-disk WAL bytes / recovery time) ungated. The
+# example's run.sh invokes it to compare a fresh run against the committed baseline.
+# Usage: `durability_baseline_cmp <baseline.json> <candidate-report.json>`
+[[bin]]
+name = "durability_baseline_cmp"
+path = "src/bin/durability_baseline_cmp.rs"
+
 [lib]
 name = "graphus_durability_demo"
 path = "src/lib.rs"
