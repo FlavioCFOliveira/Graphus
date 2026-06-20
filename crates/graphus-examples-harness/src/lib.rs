@@ -252,6 +252,14 @@ pub struct ThroughputSection {
     pub p99_latency_ms: f64,
     /// 99.9th-percentile per-operation latency, in milliseconds.
     pub p999_latency_ms: f64,
+    /// Transaction **abort / conflict rate** over the run, in `[0.0, 1.0]`: the fraction of
+    /// concurrent write transactions the engine aborted (e.g. under Serializable Snapshot Isolation)
+    /// rather than committed. `0.0` means "no aborts observed (or not a concurrent workload)".
+    ///
+    /// Additive field (`rmp #253`): older reports that predate it deserialize with `0.0` via
+    /// `#[serde(default)]`, so the schema stays compatible at [`SCHEMA_VERSION`] `1`.
+    #[serde(default)]
+    pub abort_rate: f64,
 }
 
 /// A single named phase of the scenario together with its measured wall-clock duration.
@@ -475,6 +483,11 @@ impl EvidenceReport {
             s,
             "| p999 latency (ms) | {:.3} |",
             self.throughput.p999_latency_ms
+        );
+        let _ = writeln!(
+            s,
+            "| abort / conflict rate | {:.3} |",
+            self.throughput.abort_rate
         );
         let _ = writeln!(s);
 
@@ -722,6 +735,7 @@ mod tests {
             p50_latency_ms: 0.2,
             p99_latency_ms: 1.1,
             p999_latency_ms: 3.4,
+            abort_rate: 0.05,
         };
         c.note("fully populated for the schema test");
         c.finish()
@@ -819,6 +833,8 @@ mod tests {
         assert!(parsed.metadata.workload.is_empty());
         assert_eq!(parsed.storage.store_pages, 0);
         assert_eq!(parsed.storage.write_amplification, 0.0);
+        // The additive `abort_rate` (rmp #253) defaults to 0.0 when absent from an older report.
+        assert_eq!(parsed.throughput.abort_rate, 0.0);
     }
 
     #[test]

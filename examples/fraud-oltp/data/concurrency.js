@@ -197,6 +197,19 @@ function lcg(seed) {
     console.log(
       'SSI invariant held: every committed transfer is reflected in the final balances (no lost update).'
     );
+    // Machine-readable evidence for the run.sh harness: commit/abort tallies + abort rate.
+    const stats = {
+      clients: CLIENTS,
+      writers,
+      readers,
+      ops_per_client: OPS,
+      hot_accounts: HOT,
+      commits,
+      aborts,
+      abort_rate: Number(abortRate.toFixed(6)),
+      read_ops: readOps,
+    };
+    console.log('GRAPHUS_STATS ' + JSON.stringify(stats));
     console.log('GRAPHUS_CONCURRENCY_OK');
     process.exit(0);
   } catch (err) {

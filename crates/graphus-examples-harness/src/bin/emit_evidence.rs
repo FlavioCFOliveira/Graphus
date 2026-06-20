@@ -79,6 +79,7 @@ fn main() -> ExitCode {
         p50_latency_ms: 0.004,
         p99_latency_ms: 0.012,
         p999_latency_ms: 0.031,
+        abort_rate: 0.0,
     };
 
     collector

@@ -23,9 +23,17 @@
 //!   --nodes <u64> --rels <u64> \
 //!   [--peak-rss-bytes <u64>] \
 //!   [--workload-ops <u64> --workload-secs <f64>] \
+//!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
 //!   [--logical-bytes-written <u64>] [--logical-graph-bytes <u64>] \
 //!   [--param key=value]... [--note <text>]... [--phase name=millis]...
 //! ```
+//!
+//! The latency-percentile and abort-rate inputs (`rmp #253`) let a shell example feed the figures
+//! its driver measured (e.g. the official Neo4j-driver workload's per-operation latencies and SSI
+//! abort tally) straight into the standardized [`ThroughputSection`]. Each is optional and defaults
+//! to `0.0` ("not measured") so an example that cannot supply them stays honest.
+//!
+//! [`ThroughputSection`]: graphus_examples_harness::ThroughputSection
 //!
 //! Every flag is parsed defensively: a missing or malformed value is a hard error (the example must
 //! pass real measured inputs), but every *metric* the server cannot supply is honestly left at its
@@ -59,6 +67,13 @@ struct Args {
     peak_rss_bytes: Option<u64>,
     workload_ops: Option<u64>,
     workload_secs: Option<f64>,
+    /// Per-operation latency percentiles, in milliseconds, as measured by the example's driver.
+    /// `None` ⇒ left at the section default (`0.0`).
+    p50_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    p999_ms: Option<f64>,
+    /// Transaction abort / conflict rate in `[0.0, 1.0]` the example's concurrency driver observed.
+    abort_rate: Option<f64>,
     logical_bytes_written: Option<u64>,
     logical_graph_bytes: Option<u64>,
     params: Vec<(String, String)>,
@@ -138,6 +153,21 @@ fn main() -> ExitCode {
             collector.throughput_mut().operations = ops;
             collector.throughput_mut().ops_per_sec = ops as f64 / secs;
         }
+    }
+    // --- Latency percentiles + abort rate: the figures the example's driver measured directly
+    // (the harness cannot read per-operation latency / SSI aborts from the server's PID). Each is
+    // applied only when supplied, so an unmeasured percentile stays at its honest 0.0 default.
+    if let Some(p50) = args.p50_ms {
+        collector.throughput_mut().p50_latency_ms = p50;
+    }
+    if let Some(p99) = args.p99_ms {
+        collector.throughput_mut().p99_latency_ms = p99;
+    }
+    if let Some(p999) = args.p999_ms {
+        collector.throughput_mut().p999_latency_ms = p999;
+    }
+    if let Some(rate) = args.abort_rate {
+        collector.throughput_mut().abort_rate = rate;
     }
 
     for note in &args.notes {
@@ -220,6 +250,18 @@ fn parse_args() -> Result<Args, String> {
                         .parse()
                         .map_err(|e| format!("--workload-secs: {e}"))?,
                 );
+            }
+            "--p50-ms" => {
+                args.p50_ms = Some(value()?.parse().map_err(|e| format!("--p50-ms: {e}"))?);
+            }
+            "--p99-ms" => {
+                args.p99_ms = Some(value()?.parse().map_err(|e| format!("--p99-ms: {e}"))?);
+            }
+            "--p999-ms" => {
+                args.p999_ms = Some(value()?.parse().map_err(|e| format!("--p999-ms: {e}"))?);
+            }
+            "--abort-rate" => {
+                args.abort_rate = Some(value()?.parse().map_err(|e| format!("--abort-rate: {e}"))?);
             }
             "--logical-bytes-written" => {
                 args.logical_bytes_written = Some(

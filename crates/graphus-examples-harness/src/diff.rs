@@ -17,6 +17,7 @@
 //! | `storage.store_bytes` / `wal_bytes` | **higher** (more disk) |
 //! | `storage.write_amplification` / `space_amplification` | **higher** (more overhead) |
 //! | `cpu.user_secs + system_secs`| **higher** (more CPU) |
+//! | `throughput.abort_rate`      | **higher** (more transactions lost to conflict) |
 //!
 //! A metric regresses when its **fractional degradation** exceeds the threshold, e.g. with the
 //! default 10%: ops/sec dropping from 1000 to 850 (−15%) regresses; dropping to 950 (−5%) does not.
@@ -58,6 +59,8 @@ pub struct RegressionThresholds {
     pub amplification_rise: f64,
     /// Max tolerated **rise** in total CPU seconds.
     pub cpu_rise: f64,
+    /// Max tolerated **rise** in the transaction abort / conflict rate (`rmp #253`).
+    pub abort_rate_rise: f64,
 }
 
 impl Default for RegressionThresholds {
@@ -78,6 +81,7 @@ impl RegressionThresholds {
             storage_rise: fraction,
             amplification_rise: fraction,
             cpu_rise: fraction,
+            abort_rate_rise: fraction,
         }
     }
 }
@@ -282,6 +286,18 @@ pub fn compare(
         &mut deltas,
     );
 
+    // Abort / conflict rate: a higher rate is worse (more contention loss). It is concurrency- and
+    // timing-dependent, so consumers that compare across machines should hold it to a generous
+    // `abort_rate_rise` (or omit it) to avoid flakiness — see the example's documented choice.
+    push(
+        "throughput.abort_rate",
+        baseline.throughput.abort_rate,
+        candidate.throughput.abort_rate,
+        HigherIsWorse,
+        thresholds.abort_rate_rise,
+        &mut deltas,
+    );
+
     let regressed = deltas.iter().any(|d| d.regressed);
     ComparisonReport {
         baseline_scenario: baseline.metadata.scenario.clone(),
@@ -348,6 +364,7 @@ mod tests {
             p50_latency_ms: 1.0,
             p99_latency_ms: 5.0,
             p999_latency_ms: 10.0,
+            abort_rate: 0.02,
         };
         *c.memory_mut() = MemorySection {
             peak_rss_bytes: 100_000_000,

@@ -32,6 +32,11 @@ dst-repro = ["dep:graphus-server", "dep:graphus-cypher", "dep:graphus-core", "de
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The shared evidence harness, for the `baseline_cmp` binary: it loads a committed baseline report +
+# a fresh run's report and runs `compare_to_baseline` (the regression gate the example invokes). A
+# dev-only leaf crate (never in `graphus-server`), so this keeps the production build untouched.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
 # --- `dst-repro` feature only: the REAL engine, driven inline + single-threaded for a deterministic
 # SSI-contention repro (mirrors how `graphus-dst` drives `LocalEngine`). graphus-server does not
 # depend on this crate, so this is acyclic. ---
@@ -47,6 +52,14 @@ graphus-wal = { path = "../graphus-wal", optional = true }
 [[bin]]
 name = "gen"
 path = "src/bin/gen.rs"
+
+# The baseline regression gate: compares a fresh evidence report against the committed baseline using
+# only stable STRUCTURAL metrics (storage bytes/pages, operation count, abort-rate band). Hermetic —
+# needs only the harness, no engine, so it is always available (no `dst-repro`).
+# Usage: `cargo run -p graphus-fraud-gen --bin baseline_cmp -- <baseline.json> <candidate.json>`
+[[bin]]
+name = "baseline_cmp"
+path = "src/bin/baseline_cmp.rs"
 
 # The deterministic in-process SSI-contention repro (opt-in: needs the `dst-repro` feature).
 # Usage: `cargo run -p graphus-fraud-gen --features dst-repro --bin dst_contention -- --seed 42`

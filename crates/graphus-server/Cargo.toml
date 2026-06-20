@@ -117,3 +117,11 @@ graphus-sim = { path = "../graphus-sim" }
 # report.json + report.md (rmp #249). This is a TEST-TARGET dev-dependency only — it never enters the
 # `graphus-server` production build (verified via `cargo tree`).
 graphus-examples-harness = { path = "../graphus-examples-harness" }
+# The deterministic fraud-graph generator (default features = serde-only generator; the heavy
+# `dst-repro` engine feature is NOT enabled here), so the hermetic fraud-oltp cargo mirror
+# (`tests/fraud_oltp_detection.rs`) can generate the SAME seeded graph + ground truth the shell demo
+# uses and assert the detection queries find exactly the planted fraud — fully in-process via
+# `LocalEngine`, no Node/network. fraud-gen's normal deps are serde + the evidence harness only, and
+# its dependency on `graphus-server` is OPTIONAL (behind `dst-repro`), so this introduces no cycle in
+# the normal build graph; it is a TEST-TARGET dev-dependency that never enters the production build.
+graphus-fraud-gen = { path = "../graphus-fraud-gen" }

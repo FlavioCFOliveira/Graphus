@@ -455,6 +455,9 @@ impl ThroughputSection {
             p50_latency_ms: duration_to_millis(p50),
             p99_latency_ms: duration_to_millis(p99),
             p999_latency_ms: duration_to_millis(p999),
+            // The collectors model successful ops only; abort rate is supplied separately by the
+            // caller (e.g. via `EvidenceCollector::throughput_mut`) when the workload is concurrent.
+            abort_rate: 0.0,
         }
     }
 
@@ -473,6 +476,8 @@ impl ThroughputSection {
             p50_latency_ms: duration_to_millis(p50),
             p99_latency_ms: duration_to_millis(p99),
             p999_latency_ms: duration_to_millis(p999),
+            // See `from_collectors`: abort rate is set separately for a concurrent workload.
+            abort_rate: 0.0,
         }
     }
 }

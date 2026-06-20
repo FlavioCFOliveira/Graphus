@@ -32,6 +32,26 @@ if (!port || !user || !password || !cypherPath || !gtPath) {
 const uri = `bolt+ssc://127.0.0.1:${port}`;
 const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
 
+// ---- Evidence: per-operation latency sample + nearest-rank percentiles (ms) --------------------
+// We time every load statement (a write op) and every detection query, accumulate the latencies,
+// and emit them as a machine-readable `GRAPHUS_STATS {json}` line the run.sh harness parses and
+// feeds into the standardized evidence report (rmp #253). Instrumentation is read-only timing — it
+// never changes a query or an assertion.
+const latenciesMs = [];
+const hrMs = () => Number(process.hrtime.bigint() / 1000n) / 1000; // sub-ms resolution
+async function timed(fn) {
+  const t0 = hrMs();
+  const out = await fn();
+  latenciesMs.push(hrMs() - t0);
+  return out;
+}
+function percentileMs(p) {
+  if (latenciesMs.length === 0) return 0;
+  const sorted = [...latenciesMs].sort((a, b) => a - b);
+  const rank = Math.round(p * (sorted.length - 1));
+  return sorted[Math.min(rank, sorted.length - 1)];
+}
+
 function fail(msg) {
   console.error('FRAUD DETECTION FAILURE: ' + msg);
   process.exit(1);
@@ -63,7 +83,7 @@ function statements(script) {
 async function collectIds(driver, query, key) {
   const s = driver.session();
   try {
-    const r = await s.run(query);
+    const r = await timed(() => s.run(query));
     return r.records.map((rec) => toNum(rec.get(key)));
   } finally {
     await s.close();
@@ -122,7 +142,7 @@ RETURN s.id AS id ORDER BY volume DESC, id`;
     for (const stmt of stmts) {
       const s = driver.session();
       try {
-        await s.run(stmt);
+        await timed(() => s.run(stmt));
         loaded += 1;
       } catch (e) {
         fail(`load statement #${loaded + 1} failed: ${stmt.slice(0, 120)}\n  ${e.message}`);
@@ -176,6 +196,16 @@ RETURN s.id AS id ORDER BY volume DESC, id`;
     console.log(
       `detection matched ground truth EXACTLY: ${gtRings.length} ring-accounts, ${gtMules.length} mules, ${expectedAll.length} fraud accounts total (0 false positives, 0 false negatives)`
     );
+    // Machine-readable evidence for the run.sh harness: operation count + latency percentiles (ms).
+    const stats = {
+      load_statements: loaded,
+      accounts_loaded: acctCount,
+      operations: latenciesMs.length,
+      p50_ms: percentileMs(0.5),
+      p99_ms: percentileMs(0.99),
+      p999_ms: percentileMs(0.999),
+    };
+    console.log('GRAPHUS_STATS ' + JSON.stringify(stats));
     console.log('GRAPHUS_FRAUD_OK');
     process.exit(0);
   } catch (err) {
