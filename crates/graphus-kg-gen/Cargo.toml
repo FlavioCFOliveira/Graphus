@@ -25,8 +25,25 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The shared evidence harness, for the `baseline_cmp` binary: it loads a committed baseline report +
+# a fresh run's report and runs `compare_to_baseline` (the regression gate the example invokes). A
+# dev-only leaf crate (never in `graphus-server`), so this keeps the production build untouched. Its
+# only deps are serde + the stdlib, so the generator + its determinism test stay light.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
 # The deterministic generator binary: writes `graph.cypher` + `reference.json` for a profile.
 # Usage: `cargo run -p graphus-kg-gen --bin kg_gen -- --profile fast --out-dir <dir>`
 [[bin]]
 name = "kg_gen"
 path = "src/bin/kg_gen.rs"
+
+# The baseline regression gate: compares a fresh evidence report against the committed baseline using
+# the STABLE structural metrics (storage bytes/pages, dataset size, EXACT payload bytes per encoding +
+# CBOR/JSON ratio) and ignoring the machine-variant families (throughput/latency/CPU/RSS). Hermetic —
+# needs only the harness, no engine, so it is always available.
+# Named `kg_baseline_cmp` (NOT `baseline_cmp`) to avoid a target/<profile>/baseline_cmp binary-name
+# collision with `graphus-fraud-gen`'s own `baseline_cmp` — both leaf crates ship a comparator.
+# Usage: `cargo run -p graphus-kg-gen --bin kg_baseline_cmp -- <baseline.json> <candidate.json>`
+[[bin]]
+name = "kg_baseline_cmp"
+path = "src/bin/kg_baseline_cmp.rs"

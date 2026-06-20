@@ -1214,6 +1214,7 @@ dependencies = [
 name = "graphus-kg-gen"
 version = "0.0.1"
 dependencies = [
+ "graphus-examples-harness",
  "serde",
  "serde_json",
 ]
@@ -1241,6 +1242,7 @@ name = "graphus-server"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "ciborium",
  "graphus-auth",
  "graphus-bolt",
  "graphus-cli",
@@ -1251,11 +1253,14 @@ dependencies = [
  "graphus-fraud-gen",
  "graphus-gds-gen",
  "graphus-io",
+ "graphus-kg-gen",
  "graphus-rest",
  "graphus-sim",
  "graphus-storage",
  "graphus-txn",
  "graphus-wal",
+ "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "rcgen",

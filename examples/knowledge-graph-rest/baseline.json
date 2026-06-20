@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "metadata": {
+    "scenario": "knowledge-graph-rest",
+    "description": "Knowledge graph served over the REST API (HTTPS + Bearer JWT): load a seeded KG, run the discovery queries against a known reference, stream NDJSON, negotiate CBOR vs JSON, and sustain concurrent clients.",
+    "dataset": {
+      "nodes": 616,
+      "relationships": 3770
+    },
+    "workload": {
+      "cbor_bytes": "7207",
+      "cbor_ratio": "0.6178",
+      "client": "python3 stdlib",
+      "clients": "16",
+      "connection": "rest-https-jwt",
+      "http_ops_per_sec": "476.5",
+      "json_bytes": "11665",
+      "ndjson_bytes": "14869",
+      "ndjson_bytes_per_sec": "12821773.5",
+      "ndjson_rows": "403",
+      "ndjson_rows_per_sec": "347513.3",
+      "profile": "fast"
+    },
+    "started_unix_secs": 1781953336
+  },
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_cores": 16,
+    "hostname": "ROG",
+    "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "timestamp_unix_secs": 1781953336
+  },
+  "total_millis": 0.028594,
+  "phases": [],
+  "cpu": {
+    "user_secs": 2.06,
+    "system_secs": 0.19,
+    "mean_core_utilisation": 0.75
+  },
+  "memory": {
+    "peak_rss_bytes": 204632064,
+    "final_rss_bytes": 204632064
+  },
+  "storage": {
+    "store_bytes": 720896,
+    "wal_bytes": 5185340,
+    "store_pages": 88,
+    "wal_pages": 633,
+    "bytes_fsynced": 5185340,
+    "write_amplification": 0.0,
+    "space_amplification": 9.224803828468612
+  },
+  "throughput": {
+    "operations": 320,
+    "ops_per_sec": 106.66666666666667,
+    "p50_latency_ms": 25.367,
+    "p99_latency_ms": 44.567,
+    "p999_latency_ms": 45.068,
+    "abort_rate": 0.0
+  },
+  "notes": [
+    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
+    "Throughput is the concurrency driver's HTTP requests over the server uptime window (a coarse proxy); the per-request latency percentiles + the payload sizes per encoding (json_bytes/cbor_bytes/cbor_ratio) + the NDJSON streaming throughput are measured by the python client (GRAPHUS_STATS) and ride in as throughput inputs + workload params.",
+    "Payload sizes per encoding (json_bytes, cbor_bytes, cbor_ratio) and the dataset size are DETERMINISTIC for a fixed seed+profile and are gated tightly; req/s, latency, CPU and RSS are machine-variant and are NOT gated (see kg_baseline_cmp).",
+    "Live measurement of graphus-server pid 1312511 over 3.000s uptime; CPU is the server's cumulative since-boot usage (the process is dedicated to this workload), RSS is sampled from the live process.",
+    "COMMITTED BASELINE (rmp #285): the fast-profile reference run for the regression gate. The DETERMINISTIC metrics — dataset size, the JSON/CBOR/NDJSON payload bytes per encoding (workload.json_bytes / cbor_bytes / ndjson_rows / ndjson_bytes) and the CBOR/JSON ratio, plus the on-disk store/WAL footprint — are gated tightly (exact, or ±band); the machine-variant families (throughput ops/sec, latency p50/p99/p999, CPU, peak RSS) are NOT gated. See crates/graphus-kg-gen/src/bin/kg_baseline_cmp.rs. Recorded on linux/x86_64."
+  ]
+}

@@ -173,17 +173,79 @@ byte-identical-generator assertion still runs.
 
 ## Evidence
 
-The workload writes a machine-readable `evidence/workload_stats.json` (git-ignored) the sibling
-evidence instrumentation (`rmp #282`–`#285`) folds into the standardized `report.json` / `report.md`.
-It captures load time, NDJSON row throughput, JSON vs CBOR payload sizes, and concurrency throughput
-+ latency percentiles. Representative `fast`-profile numbers (one developer machine):
+The python client emits a single machine-readable `GRAPHUS_STATS {…}` line; `run.sh` parses it and
+feeds it — together with the **live server process's** CPU + peak RSS and the on-disk store/WAL
+footprint — into the dev-only `measure_server` harness, which writes the standardized, schema-versioned
+**`evidence/report.json` + `evidence/report.md`** (the `evidence/` dir is git-ignored). The path is
+printed in the run summary.
+
+### What is measured
+
+| Vector | Source | Example (`fast` profile, one developer machine) |
+| --- | --- | --- |
+| **HTTP requests/sec** | concurrency driver ops over the uptime window | ≈ 490 ops/s |
+| **Latency p50 / p99 / p999** | per-request, measured client-side | ≈ 24.9 / 33.3 / 43.6 ms |
+| **NDJSON streaming throughput** | rows/sec + bytes/sec of the streamed result | ≈ 403 rows, ≈ 348k rows/s, ≈ 13 MB/s |
+| **Payload size per encoding** | response bytes for the SAME query as JSON vs CBOR | JSON `11665` B, CBOR `7207` B → **CBOR ≈ 61.8 % of JSON** |
+| **Server CPU** | the live server PID's cumulative user+system seconds | ≈ 2.0 user + 0.2 sys s |
+| **Peak server RAM (RSS)** | sampled from the live PID during the workload | ≈ 205 MB |
+| **Storage footprint** | on-disk store + WAL bytes/pages after the load | store ≈ 0.72 MB, WAL ≈ 5.2 MB |
+| **Dataset size** | nodes + relationships in the loaded graph | `616` nodes, `3770` relationships |
+
+The headline `GRAPHUS_STATS` line (parsed into the report's `workload` + `throughput` sections):
 
 ```jsonc
 {
-  "loaded_statements": 4391, "load_secs": 1.86,
-  "ndjson_rows": 403, "ndjson_rows_per_sec": 348444,
+  "loaded_statements": 4391, "load_secs": 1.83,
+  "ndjson_rows": 403, "ndjson_bytes": 14869,
+  "ndjson_rows_per_sec": 347513, "ndjson_bytes_per_sec": 12821774,
   "json_bytes": 11665, "cbor_bytes": 7207, "cbor_ratio": 0.618,  // CBOR ≈ 62% of JSON
   "concurrency_clients": 16, "concurrency_ops": 320, "concurrency_errors": 0,
-  "ops_per_sec": 491, "p50_ms": 24.6, "p99_ms": 30.8
+  "ops_per_sec": 477, "p50_ms": 25.4, "p99_ms": 44.6, "p999_ms": 45.1
 }
 ```
+
+### How to read it — the STABLE vs MACHINE-VARIANT split
+
+The evidence splits cleanly into two families, and the committed-baseline regression gate treats them
+very differently:
+
+- **Deterministic / structural** — byte-stable for a fixed seed + profile, so a drift is a genuine
+  regression and they are gated **tightly** (exact, or a tiny band):
+  - the **dataset size** (`616` nodes / `3770` relationships),
+  - the **payload sizes per encoding** (`json_bytes`, `cbor_bytes`, `ndjson_rows`, `ndjson_bytes`) and
+    the **CBOR/JSON ratio** (`cbor_ratio`, gated to ±0.01) — the headline numbers above,
+  - the **on-disk store/WAL footprint** (gated to 15 %).
+- **Machine- and timing-variant** — depend on the host's CPU speed, scheduler, allocator and OS, so
+  they are **NOT gated** (they will differ run-to-run and machine-to-machine):
+  - HTTP throughput (`ops_per_sec`), latency (`p50`/`p99`/`p999`), NDJSON rows/sec + bytes/sec,
+  - server CPU seconds, peak RSS.
+
+### Committed baseline + regression gate
+
+`examples/knowledge-graph-rest/baseline.json` is a committed `fast`-profile reference report. On every
+`fast`-profile run, `run.sh` compares the fresh report against it via the `kg_baseline_cmp` helper
+(`crates/graphus-kg-gen/src/bin/kg_baseline_cmp.rs`): it holds the **deterministic** metrics above to
+their tight bounds and ignores the **machine-variant** families, then prints `GRAPHUS_BASELINE_OK` and
+asserts the gate passed. A drift in the payload bytes per encoding, the CBOR/JSON ratio, the dataset
+size, or the storage footprint **fails the run**.
+
+## Hermetic cargo mirror (default `cargo test`)
+
+The example's REST scenario also runs as a **default-run, python-free, socket-free** cargo test:
+`crates/graphus-server/tests/knowledge_graph_rest.rs`. It generates the SAME seeded `fast`-profile
+graph (`graphus-kg-gen`), boots the **real** `graphus_rest` axum router over a real `LocalEngine` (via
+the server's `RestEngineAdapter`) and drives it with `tower::ServiceExt::oneshot` — **no TLS, no
+socket, no python**. It loads the graph over `POST /db/{db}/tx/commit`, asserts all five discovery
+answers against the generator's reference, asserts the **NDJSON** framing, and asserts the **CBOR**
+body decodes to the *same logical result* as the JSON body (the content-negotiation proof). Auth is
+still live: the request carries a real Bearer JWT minted from the live `SecurityCatalog`, and an
+unauthenticated request is asserted to be rejected `401`. Run it with:
+
+```bash
+cargo test -p graphus-server --test knowledge_graph_rest
+```
+
+Where this hermetic test proves the **REST router semantics + serialization** in CI, the shell
+`run.sh` proves the full **wire path** (HTTPS + Bearer-JWT over a real socket, driven by the stdlib
+python client) plus the standardized evidence collection.

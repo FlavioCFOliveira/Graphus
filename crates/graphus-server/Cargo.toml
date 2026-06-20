@@ -133,3 +133,21 @@ graphus-fraud-gen = { path = "../graphus-fraud-gen" }
 # NOT depend on `graphus-server`, so this introduces no cycle; it is a TEST-TARGET dev-dependency that
 # never enters the production build.
 graphus-gds-gen = { path = "../graphus-gds-gen" }
+# The deterministic knowledge-graph generator (default features = serde-only generator; its only
+# deps are serde + the evidence harness), so the hermetic knowledge-graph-rest cargo mirror
+# (`tests/knowledge_graph_rest.rs`) can generate the SAME seeded graph + analytically-known reference
+# the shell demo uses and assert the discovery answers + NDJSON/CBOR negotiation through the REAL
+# REST router — fully in-process via `tower::oneshot`, no python/network. kg-gen does NOT depend on
+# `graphus-server`, so this introduces no cycle; it is a TEST-TARGET dev-dependency that never enters
+# the production build.
+graphus-kg-gen = { path = "../graphus-kg-gen" }
+# The HTTP request/response types + body collector to drive the REST `axum::Router` via
+# `tower::ServiceExt::oneshot` in the hermetic mirror (the same no-socket pattern `graphus-rest`'s
+# own router tests use). `http`/`http-body-util` track the `1`/`0.1` lines `graphus-rest` already
+# pins, so no duplicate trees enter the build.
+http = "1"
+http-body-util = "0.1"
+# The CBOR codec (RFC 8949) so the mirror can decode the `application/cbor` response body and assert
+# it is logically identical to the JSON body — the content-negotiation proof. Same `0.2` line
+# `graphus-rest` pins.
+ciborium = "0.2"

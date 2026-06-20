@@ -408,11 +408,12 @@ def ndjson_stream(client):
     check("ndjson status => 200", st, 200)
     ctype = headers.get("Content-Type") or headers.get("content-type")
     check("ndjson content-type", ctype, "application/x-ndjson")
-    n_fields = n_rows = n_summary = 0
+    n_fields = n_rows = n_summary = n_bytes = 0
     t0 = time.time()
     # Iterating the response object yields the body line-by-line as it is read off the socket: the
     # client never materializes the whole result before processing rows.
     for raw in resp:
+        n_bytes += len(raw)
         raw = raw.strip()
         if not raw:
             continue
@@ -426,7 +427,7 @@ def ndjson_stream(client):
     elapsed = time.time() - t0
     check("ndjson framing (1 fields + N rows + 1 summary)",
           (n_fields, n_summary, n_rows > 0), (1, 1, True))
-    return n_rows, elapsed, ctype
+    return n_rows, n_bytes, elapsed, ctype
 
 
 def content_negotiation(client):
@@ -482,11 +483,19 @@ def concurrency(client_factory, clients, ops_per_client):
 
     total = clients * ops_per_client
     latencies.sort()
+
+    def pct(q):
+        if not latencies:
+            return 0.0
+        idx = min(len(latencies) - 1, int(len(latencies) * q))
+        return latencies[idx] * 1000
+
     p50 = latencies[len(latencies) // 2] * 1000 if latencies else 0.0
-    p99 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.99))] * 1000 if latencies else 0.0
+    p99 = pct(0.99)
+    p999 = pct(0.999)
     throughput = total / elapsed if elapsed > 0 else 0.0
     check("concurrency: zero errors", errors[0], 0)
-    return total, errors[0], elapsed, p50, p99, throughput
+    return total, errors[0], elapsed, p50, p99, p999, throughput
 
 
 def main():
@@ -524,10 +533,11 @@ def main():
     discovery_queries(client, ref)
 
     print("== NDJSON streaming")
-    ndjson_rows, ndjson_secs, _ = ndjson_stream(client)
+    ndjson_rows, ndjson_bytes, ndjson_secs, _ = ndjson_stream(client)
     ndjson_throughput = ndjson_rows / ndjson_secs if ndjson_secs > 0 else 0.0
-    print(f"  streamed {ndjson_rows} rows in {ndjson_secs * 1000:.1f}ms "
-          f"({ndjson_throughput:.0f} rows/s)")
+    ndjson_bytes_per_sec = ndjson_bytes / ndjson_secs if ndjson_secs > 0 else 0.0
+    print(f"  streamed {ndjson_rows} rows ({ndjson_bytes} B) in {ndjson_secs * 1000:.1f}ms "
+          f"({ndjson_throughput:.0f} rows/s, {ndjson_bytes_per_sec / 1e6:.1f} MB/s)")
 
     print("== content negotiation (JSON vs CBOR)")
     json_bytes, cbor_bytes = content_negotiation(client)
@@ -535,10 +545,10 @@ def main():
     print(f"  JSON={json_bytes} B  CBOR={cbor_bytes} B  (CBOR is {ratio * 100:.1f}% of JSON)")
 
     print("== concurrency")
-    total_ops, errors, conc_secs, p50, p99, throughput = concurrency(
+    total_ops, errors, conc_secs, p50, p99, p999, throughput = concurrency(
         lambda: RestClient(args.port, token), args.clients, args.ops_per_client)
     print(f"  clients={args.clients} ops={total_ops} errors={errors} "
-          f"throughput={throughput:.0f} ops/s p50={p50:.1f}ms p99={p99:.1f}ms")
+          f"throughput={throughput:.0f} ops/s p50={p50:.1f}ms p99={p99:.1f}ms p999={p999:.1f}ms")
 
     if FAILURES == 0:
         print("GRAPHUS_KG_REST_OK")
@@ -546,8 +556,10 @@ def main():
             "loaded_statements": loaded,
             "load_secs": round(load_secs, 3),
             "ndjson_rows": ndjson_rows,
+            "ndjson_bytes": ndjson_bytes,
             "ndjson_secs": round(ndjson_secs, 4),
             "ndjson_rows_per_sec": round(ndjson_throughput, 1),
+            "ndjson_bytes_per_sec": round(ndjson_bytes_per_sec, 1),
             "json_bytes": json_bytes,
             "cbor_bytes": cbor_bytes,
             "cbor_ratio": round(ratio, 4),
@@ -558,6 +570,7 @@ def main():
             "ops_per_sec": round(throughput, 1),
             "p50_ms": round(p50, 3),
             "p99_ms": round(p99, 3),
+            "p999_ms": round(p999, 3),
         }
         print("GRAPHUS_STATS " + json.dumps(stats, separators=(",", ":")))
         return 0

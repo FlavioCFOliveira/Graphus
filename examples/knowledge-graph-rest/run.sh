@@ -98,9 +98,22 @@ ADMIN_USER="neo4j"
 ADMIN_PW="kg-rest-demo-admin-pw-8plus"
 JWT_SECRET="kg-rest-demo-jwt-secret-32bytes-minimum!"
 
+# Evidence collection (rmp #282/#285). The standardized report.json + report.md land in the
+# git-ignored evidence/ dir; the durable store/WAL paths follow the server's single-db layout
+# (<store_path>/graphus.store, <store_path>/graphus.wal/). BASELINE is the committed reference run we
+# compare a fresh fast-profile run against.
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
+STORE_FILE="$WORKDIR/data/graphus.store"
+WAL_DIR="$WORKDIR/data/graphus.wal"
+BASELINE="$SCRIPT_DIR/baseline.json"
+PEAK_RSS_BYTES=0          # high-watermark of the server's RSS, sampled during the workload
+SERVER_START_EPOCH=0      # wall-clock epoch (s) of the server boot, for the CPU/uptime window
 
 SERVER_PID=""
+# cleanup — kill ONLY the server pid we spawned and `wait` ONLY on it (never a bare `wait`, which
+# would block on the background server itself; that hazard bit the durability example). The python
+# client is run synchronously in the foreground via command-substitution, so it has already exited
+# by the time we reach teardown — there is no client pid to reap here.
 cleanup() {
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
@@ -109,6 +122,39 @@ cleanup() {
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT INT TERM
+
+# server_rss_bytes <pid> — current resident set size of the server in bytes (Linux /proc, macOS ps).
+server_rss_bytes() {
+  local pid="$1" bytes=0
+  if [ -r "/proc/$pid/statm" ]; then
+    local pages page_sz
+    pages="$(awk '{print $2}' "/proc/$pid/statm" 2>/dev/null || echo 0)"
+    page_sz="$(getconf PAGE_SIZE 2>/dev/null || echo 4096)"
+    bytes=$(( ${pages:-0} * ${page_sz:-4096} ))
+  elif command -v ps >/dev/null 2>&1; then
+    local kib
+    kib="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)"
+    bytes=$(( ${kib:-0} * 1024 ))
+  fi
+  echo "${bytes:-0}"
+}
+
+# sample_peak_rss — read the live server's RSS once and keep the running high-watermark.
+sample_peak_rss() {
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    local rss
+    rss="$(server_rss_bytes "$SERVER_PID")"
+    if [ "${rss:-0}" -gt "$PEAK_RSS_BYTES" ]; then
+      PEAK_RSS_BYTES="$rss"
+    fi
+  fi
+}
+
+# json_field <json-blob> <key> — extract a numeric/string field from the one-line GRAPHUS_STATS JSON
+# object the python client emits, without a jq dependency (the object is flat scalars).
+json_field() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\{0,1\\}\\([^,\"}]*\\).*/\\1/p" | head -n1
+}
 
 # --------------------------------------------------------------------------------------------------
 # Step 1 — generate the deterministic knowledge graph + reference subgraph
@@ -121,6 +167,19 @@ GRAPH_CYPHER="$DATA_DIR/graph.cypher"
 REFERENCE="$DATA_DIR/reference.json"
 assert "graph.cypher generated"   "yes" "$([ -s "$GRAPH_CYPHER" ] && echo yes || echo no)"
 assert "reference.json generated" "yes" "$([ -s "$REFERENCE" ] && echo yes || echo no)"
+
+# Dataset sizing for the evidence report — counted directly off the deterministic load script (the
+# ground truth): node CREATEs are `CREATE (:Label ...)`, relationship CREATEs are `CREATE (x)-[:...`.
+# These are byte-stable for a fixed seed+profile (the schema DDL is excluded by the anchored pattern).
+NODE_COUNT="$(grep -cE '^CREATE \(:' "$GRAPH_CYPHER" || true)"
+REL_COUNT="$(grep -cE 'CREATE \([a-z]\)-\[:' "$GRAPH_CYPHER" || true)"
+NODE_COUNT="${NODE_COUNT:-0}"
+REL_COUNT="${REL_COUNT:-0}"
+# Coarse logical-bytes estimate for the space-amplification ratio (~256 B/node + ~128 B/rel covers
+# the fixed-record node/rel payloads and their small property values) — a meaningful-but-honest
+# proxy, documented in the README, not precise accounting (same convention as fraud-oltp).
+LOGICAL_GRAPH_BYTES=$(( NODE_COUNT * 256 + REL_COUNT * 128 ))
+info "dataset: $NODE_COUNT nodes, $REL_COUNT relationships"
 
 # Determinism check: regenerate and diff (the AC: byte-identical per seed/scale).
 GEN_OUT2_DIR="$WORKDIR/dataset2"
@@ -171,6 +230,7 @@ EOF
 
   "$SERVER" "$CONFIG" >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
+  SERVER_START_EPOCH="$(date +%s)"
   # Wait until the REST port is accepting connections (or the process dies).
   ready=0
   for _ in $(seq 1 100); do
@@ -205,6 +265,7 @@ EOF
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST workload passed every assertion" "yes" \
     "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_KG_REST_OK' && echo yes || echo no)"
+  sample_peak_rss   # the load + discovery + concurrency just ran; capture the server's RSS here
 
   # Harvest the machine-readable stats line for the evidence wiring (rmp #282-285).
   STATS="$(printf '%s' "$REST_OUT" | sed -n 's/^[[:space:]]*GRAPHUS_STATS //p' | head -n1)"
@@ -214,6 +275,105 @@ EOF
     info "workload stats written to $EVIDENCE_DIR/workload_stats.json"
     assert "machine-readable workload stats captured" "yes" \
       "$([ -s "$EVIDENCE_DIR/workload_stats.json" ] && echo yes || echo no)"
+  fi
+
+  # Pull the per-metric figures the python client measured (latency percentiles, payload sizes,
+  # streaming throughput) out of the stats line for the standardized report.
+  W_OPS="$(json_field "$STATS" concurrency_ops)"
+  W_P50="$(json_field "$STATS" p50_ms)"
+  W_P99="$(json_field "$STATS" p99_ms)"
+  W_P999="$(json_field "$STATS" p999_ms)"
+  W_JSON_BYTES="$(json_field "$STATS" json_bytes)"
+  W_CBOR_BYTES="$(json_field "$STATS" cbor_bytes)"
+  W_CBOR_RATIO="$(json_field "$STATS" cbor_ratio)"
+  W_NDJSON_ROWS="$(json_field "$STATS" ndjson_rows)"
+  W_NDJSON_BYTES="$(json_field "$STATS" ndjson_bytes)"
+  W_NDJSON_RPS="$(json_field "$STATS" ndjson_rows_per_sec)"
+  W_NDJSON_BPS="$(json_field "$STATS" ndjson_bytes_per_sec)"
+  W_OPS_PER_SEC="$(json_field "$STATS" ops_per_sec)"
+
+  # ------------------------------------------------------------------------------------------------
+  # Step 4 — collect standardized performance evidence (CPU / RAM / storage / throughput) (rmp #282)
+  # ------------------------------------------------------------------------------------------------
+  # The server is still alive, so we read its REAL cumulative CPU + RSS and the on-disk store/WAL
+  # footprint the workload produced, then emit the schema-versioned report.json + report.md via the
+  # dev-only measure_server harness binary. The HTTP-request/latency/streaming/payload figures the
+  # python client measured ride in as throughput inputs + workload params. This is purely ADDITIVE:
+  # it changes no assertion above, and a metering failure must not fail the demonstration.
+  section "Step 4 — collect performance evidence (CPU / RAM / storage / throughput)"
+  sample_peak_rss
+  SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))
+  [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1   # avoid a zero-length CPU window
+
+  MEASURE_BIN="$BIN_DIR/measure_server"
+  if [ ! -x "$MEASURE_BIN" ]; then
+    info "building the dev-only measure_server harness binary (debug)…"
+    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
+    MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
+  fi
+
+  if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -rf "$EVIDENCE_DIR"   # a fresh report each run; the dir is git-ignored
+    "$MEASURE_BIN" \
+      --evidence-dir "$EVIDENCE_DIR" \
+      --scenario "knowledge-graph-rest" \
+      --description "Knowledge graph served over the REST API (HTTPS + Bearer JWT): load a seeded KG, run the discovery queries against a known reference, stream NDJSON, negotiate CBOR vs JSON, and sustain concurrent clients." \
+      --pid "$SERVER_PID" \
+      --uptime-secs "$SERVER_UPTIME_SECS" \
+      --store "$STORE_FILE" \
+      --wal "$WAL_DIR" \
+      --nodes "$NODE_COUNT" \
+      --rels "$REL_COUNT" \
+      --peak-rss-bytes "$PEAK_RSS_BYTES" \
+      --workload-ops "${W_OPS:-0}" \
+      --workload-secs "$SERVER_UPTIME_SECS" \
+      --p50-ms "${W_P50:-0}" \
+      --p99-ms "${W_P99:-0}" \
+      --p999-ms "${W_P999:-0}" \
+      --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
+      --param "profile=$PROFILE" \
+      --param "connection=rest-https-jwt" \
+      --param "client=python3 stdlib" \
+      --param "clients=$CLIENTS" \
+      --param "json_bytes=${W_JSON_BYTES:-0}" \
+      --param "cbor_bytes=${W_CBOR_BYTES:-0}" \
+      --param "cbor_ratio=${W_CBOR_RATIO:-0}" \
+      --param "ndjson_rows=${W_NDJSON_ROWS:-0}" \
+      --param "ndjson_bytes=${W_NDJSON_BYTES:-0}" \
+      --param "ndjson_rows_per_sec=${W_NDJSON_RPS:-0}" \
+      --param "ndjson_bytes_per_sec=${W_NDJSON_BPS:-0}" \
+      --param "http_ops_per_sec=${W_OPS_PER_SEC:-0}" \
+      --note "Throughput is the concurrency driver's HTTP requests over the server uptime window (a coarse proxy); the per-request latency percentiles + the payload sizes per encoding (json_bytes/cbor_bytes/cbor_ratio) + the NDJSON streaming throughput are measured by the python client (GRAPHUS_STATS) and ride in as throughput inputs + workload params." \
+      --note "Payload sizes per encoding (json_bytes, cbor_bytes, cbor_ratio) and the dataset size are DETERMINISTIC for a fixed seed+profile and are gated tightly; req/s, latency, CPU and RSS are machine-variant and are NOT gated (see kg_baseline_cmp)." \
+      && info "evidence written to $EVIDENCE_DIR" \
+      || info "evidence collection failed (non-fatal); see output above"
+    assert "evidence report.json was produced" "yes" \
+      "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+    assert "evidence report.md was produced" "yes" \
+      "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+
+    # ----------------------------------------------------------------------------------------------
+    # Step 4b — regression gate vs committed baseline (fast profile only — the committed baseline is
+    # a fast-profile run). We compare the STABLE STRUCTURAL metrics (on-disk footprint, dataset size,
+    # EXACT payload bytes per encoding + CBOR/JSON ratio, NDJSON rows) against tight thresholds, and
+    # leave the machine-variant families (req/s, latency, CPU, RSS) ungated. Delegated to the
+    # kg-gen `kg_baseline_cmp` helper (named distinctly from fraud-oltp's `baseline_cmp` to avoid a
+    # target/<profile> binary-name collision — both leaf crates ship a comparator).
+    # ----------------------------------------------------------------------------------------------
+    if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+      section "Step 4b — regression gate vs committed baseline"
+      CMP_BIN="$BIN_DIR/kg_baseline_cmp"
+      if [ ! -x "$CMP_BIN" ]; then
+        ( cd "$REPO_ROOT" && cargo build -q -p graphus-kg-gen --bin kg_baseline_cmp ) || true
+        CMP_BIN="$REPO_ROOT/target/debug/kg_baseline_cmp"
+      fi
+      CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
+      printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
+      assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
+        "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+    fi
+  else
+    info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
   fi
 
   stop_pid="$SERVER_PID"
@@ -231,7 +391,9 @@ fi
 # --------------------------------------------------------------------------------------------------
 section "Result"
 printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
-if [ "$RUN_REST" = "1" ] && [ -f "$EVIDENCE_DIR/workload_stats.json" ]; then
+if [ "$RUN_REST" = "1" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+  printf 'evidence: %s {report.json, report.md}\n' "$EVIDENCE_DIR"
+elif [ "$RUN_REST" = "1" ] && [ -f "$EVIDENCE_DIR/workload_stats.json" ]; then
   printf 'workload stats: %s\n' "$EVIDENCE_DIR/workload_stats.json"
 fi
 if [ "$FAILURES" -eq 0 ]; then
