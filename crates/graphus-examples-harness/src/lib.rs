@@ -35,13 +35,24 @@
 //! The API is deliberately allocation-light and side-effect-free until [`EvidenceReport::write_to`],
 //! making it usable from DST-driven (deterministic) scenarios.
 
-#![forbid(unsafe_code)]
+//! ## `unsafe` policy
+//!
+//! The crate is `unsafe`-free except for the [`resource`] metering module, which makes a handful of
+//! `getrusage`/`sysconf` libc calls — each confined to a tiny helper with a `// SAFETY:` rationale.
+//! We therefore use `deny(unsafe_op_in_unsafe_fn)` (every `unsafe` op must sit in an explicit
+//! `unsafe` block) instead of a blanket `forbid(unsafe_code)`; the rest of the crate uses no
+//! `unsafe`.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+pub mod resource;
+
+pub use resource::{CpuMeter, CpuTimes, ResourceMeter, RssSample, RssSampler, Target};
 
 /// Identifying metadata for a single example run.
 ///
@@ -340,6 +351,16 @@ impl EvidenceCollector {
     /// Mutable access to the memory section, for `rmp #246` to populate.
     pub fn memory_mut(&mut self) -> &mut MemorySection {
         &mut self.report.memory
+    }
+
+    /// Records the CPU + memory evidence produced by a finished [`ResourceMeter`].
+    ///
+    /// Brackets a workload with [`ResourceMeter::start`], sample RSS at chosen points, then pass the
+    /// `(CpuSection, MemorySection)` from [`ResourceMeter::finish`] here to populate both seams.
+    pub fn record_resources(&mut self, sections: (CpuSection, MemorySection)) {
+        let (cpu, memory) = sections;
+        self.report.cpu = cpu;
+        self.report.memory = memory;
     }
 
     /// Mutable access to the storage section, for `rmp #247` to populate.
