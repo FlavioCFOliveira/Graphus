@@ -228,7 +228,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         &bound,
         privileges,
         extensions,
-        row_tx,
+        &row_tx,
         row_rx,
         reply,
     );
@@ -236,10 +236,14 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     let elapsed = Duration::from_nanos(clock.now_nanos().saturating_sub(started));
     metrics.observe_query_latency(elapsed);
 
-    // Auto-commit: commit on success, roll back on a runtime error (`04 §1.3` step 6).
+    // Auto-commit: commit on success, roll back on a runtime error (`04 §1.3` step 6). The commit
+    // runs while `row_tx` is still open so a commit failure (e.g. an SSI serialization abort) is
+    // delivered to the consumer as a terminal stream error — never swallowed into a false success.
     if auto_commit {
-        finish_autocommit(coordinator, open, ticket, produced_ok, metrics);
+        finish_autocommit(coordinator, open, ticket, produced_ok, &row_tx, metrics);
     }
+    // Closing the egress channel: every row (and any terminal auto-commit error) has been sent.
+    drop(row_tx);
 
     // Slow-query log (`04 §9` / NFR-10): emitted after the fact so the latency is accurate.
     if elapsed >= slow_threshold() {
@@ -297,7 +301,7 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
     bound: &graphus_cypher::BoundParameters,
     privileges: Option<EffectivePrivileges>,
     extensions: &ExtensionRegistry,
-    row_tx: RowSender,
+    row_tx: &RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> bool {
@@ -325,13 +329,13 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
     let produced_ok = match privileges {
         Some(privileges) if !privileges.is_unrestricted() => {
             let mut authz = AuthorizedGraph::new(&mut graph, privileges);
-            let ok = run_cursor(plan, bound, &mut authz, extensions, &row_tx, row_rx, reply);
+            let ok = run_cursor(plan, bound, &mut authz, extensions, row_tx, row_rx, reply);
             // Capture the decorator's write-denial (if any) before it is dropped at end of scope.
             auth_error = authz.take_auth_error();
             ok
         }
         // No restriction (no principal, or an admin): run the bare seam, byte-identically to today.
-        _ => run_cursor(plan, bound, &mut graph, extensions, &row_tx, row_rx, reply),
+        _ => run_cursor(plan, bound, &mut graph, extensions, row_tx, row_rx, reply),
     };
 
     if !produced_ok {
@@ -354,7 +358,11 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
         let _ = row_tx.send(Err(err));
         return false;
     }
-    // `row_tx` drops here, closing the channel so the consumer's `recv` ends.
+    // The caller owns `row_tx`: for an auto-commit statement it runs the COMMIT next and, on a commit
+    // failure (e.g. an SSI serialization abort), sends a terminal error through `row_tx` BEFORE
+    // dropping it — so a rolled-back auto-commit is reported to the client as a failed statement, never
+    // a silent success. When the caller drops `row_tx` the channel closes and the consumer's `recv`
+    // ends.
     true
 }
 
@@ -442,11 +450,21 @@ fn to_parameters(params: Vec<(String, graphus_core::Value)>) -> Parameters {
 
 /// Finalises an auto-commit transaction after its single statement streamed: commit on success,
 /// roll back on a runtime error (`04 §1.3` step 6). Removes the ticket from the open set either way.
+///
+/// A commit failure (an SSI serialization abort, or any [`TxnCoordinator::commit`] error) is **not**
+/// swallowed: it is sent as a **terminal error** through the still-open egress channel `row_tx`, so
+/// the consumer observes the auto-commit statement as failed and retriable. Reporting success for a
+/// transaction the engine rolled back would be an atomicity/durability violation — the client would
+/// believe a write is committed (and durable) when it was undone (`04 §1.3` step 6, ACID mandate).
+/// This was the seed-4 VOPR `EdgeMultisetMismatch` divergence (rmp #238): an auto-commit
+/// `CREATE (a)-[:KNOWS]->(b)` whose post-stream COMMIT lost the SSI dangerous-structure check was
+/// acknowledged as committed, so the model recorded the edge the engine had rolled back.
 fn finish_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
     ticket: TxTicket,
     produced_ok: bool,
+    row_tx: &RowSender,
     metrics: &Metrics,
 ) {
     let Some(tx) = open.remove(&ticket.0) else {
@@ -455,7 +473,14 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
     if produced_ok {
         match coordinator.commit(tx.txn) {
             Ok(_) => metrics.record_commit(),
-            Err(_) => metrics.record_abort(),
+            Err(e) => {
+                // The COMMIT failed (e.g. SSI serialization abort): the transaction has been rolled
+                // back. Surface the failure to the consumer as a terminal stream error so the
+                // statement is reported as failed/retriable — never a silent success over rolled-back
+                // writes (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence).
+                let _ = row_tx.send(Err(e));
+                metrics.record_abort();
+            }
         }
     } else {
         let _ = coordinator.rollback(tx.txn);

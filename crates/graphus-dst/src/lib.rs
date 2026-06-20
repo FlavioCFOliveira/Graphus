@@ -49,6 +49,7 @@ pub mod rng;
 pub mod scenarios;
 pub mod vopr;
 pub mod vopr_fault;
+pub mod vopr_oracle;
 pub mod wire;
 pub mod workload;
 
@@ -62,4 +63,5 @@ pub use rng::DetRng;
 // so they do not clash with the storage harness's crate-root `run`/`summarize`.
 pub use vopr::{VoprConfig, VoprReport};
 pub use vopr_fault::{FaultBudget, FaultScheduler, VoprFaultKind};
+pub use vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
 pub use workload::{Op, PlannedTxn, TxnOutcome, WorkloadConfig};

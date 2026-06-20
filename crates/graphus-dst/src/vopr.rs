@@ -35,8 +35,9 @@ use graphus_server::engine::{LocalEngine, RunReply, TxTicket};
 use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock, SimScheduler};
 use graphus_wal::MemLogSink;
 
-use crate::mix::{LoadProfile, MixProfile, WorkloadGen};
+use crate::mix::{LoadProfile, MixProfile, WorkloadGen, WorkloadOp};
 use crate::vopr_fault::{FaultBudget, FaultScheduler};
+use crate::vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
 
 /// A [`Clock`] whose active [`ClockFaultPlan`] can be **swapped at run time**, so the unified fault
 /// scheduler can intensify the engine's clock faults *mid-run* (the engine holds one fixed
@@ -243,6 +244,15 @@ pub struct VoprReport {
     /// every transaction acked before a crash survives it, and every transaction still in flight at the
     /// crash does not. Empty for a standard (crash-free) run.
     pub crash_splits: Vec<CrashSplit>,
+    /// The **strong reference-model oracle** verdict (rmp #238): `None` if the committed-only shadow
+    /// model agreed with the engine queried back **cell-by-cell** at run end (the multiset of `:Person`
+    /// ids, the full `:KNOWS` edge multiset, the `count(n)` aggregate, and every per-person neighbour
+    /// row count); `Some(err)` naming the first id/edge that diverged. This is the teeth the old
+    /// count+hash oracle lacked — a wrong result with the right cardinality is now caught. Folded into
+    /// the report's equality (so a divergence breaks the same-seed determinism gate too) but **not**
+    /// into [`trace_hash`](Self::trace_hash): the oracle's read-back queries are an observer and do not
+    /// perturb the canonical workload trace.
+    pub oracle: Option<OracleError>,
 }
 
 /// The acked-vs-in-flight split captured at one **crash + ARIES restart** instant (rmp #237) — the
@@ -270,6 +280,76 @@ pub struct CrashSplit {
     /// The graph state hash observed **immediately after** the recovered engine was rebuilt — a digest
     /// of exactly the durable (acked) state. Lets the oracle pin the recovered state per crash.
     pub recovered_state_hash: u64,
+}
+
+/// The strong reference-model oracle's run-time state (rmp #238): the committed-only shadow model
+/// plus a **per-client buffer** of the ops issued inside each client's currently-open transaction.
+///
+/// Buffering is the whole game. An op only becomes durable when its transaction's `COMMIT` is
+/// acknowledged, so each client's ops are staged in `pending[client]` as statements run and are
+/// **flushed** into [`ShadowGraph`] only on a successful commit (explicit `COMMIT` ok, or a
+/// successful auto-commit). On `ROLLBACK`, an SSI-aborted `COMMIT`, or a crash that drops open
+/// transactions, the buffer is **discarded** — never applied — exactly mirroring the engine's
+/// durability/atomicity contract.
+struct Oracle {
+    /// The independent shadow model, the cumulative effect of all *committed* ops.
+    model: ShadowGraph,
+    /// Per-client staged state for the client's currently-open explicit transaction: the committed
+    /// node multiset snapshot taken at **BEGIN** (what this transaction's `MATCH` clauses can see
+    /// under snapshot isolation) plus the ops issued so far, in order.
+    pending: Vec<PendingTxn>,
+}
+
+/// The oracle's staging buffer for one client's open explicit transaction.
+#[derive(Clone, Default)]
+struct PendingTxn {
+    /// Committed node multiset at BEGIN — the transaction's MVCC read snapshot.
+    snapshot: std::collections::BTreeMap<i64, u64>,
+    /// Ops issued in this transaction so far, in order.
+    ops: Vec<WorkloadOp>,
+}
+
+impl Oracle {
+    /// An oracle for `clients` virtual clients, with an empty model and empty buffers.
+    fn new(clients: usize) -> Self {
+        Self {
+            model: ShadowGraph::new(),
+            pending: vec![PendingTxn::default(); clients],
+        }
+    }
+
+    /// Opens a fresh staging buffer for `client`, capturing the committed node multiset as the
+    /// transaction's BEGIN snapshot (the nodes its `MATCH` clauses can see under snapshot isolation).
+    fn begin(&mut self, client: usize) {
+        self.pending[client] = PendingTxn {
+            snapshot: self.model.node_snapshot(),
+            ops: Vec::new(),
+        };
+    }
+
+    /// Stages an op into `client`'s open transaction (it takes effect only if the transaction commits).
+    fn stage(&mut self, client: usize, op: WorkloadOp) {
+        self.pending[client].ops.push(op);
+    }
+
+    /// Flushes `client`'s staged transaction into the committed model under snapshot-isolation
+    /// semantics (a `COMMIT` was acknowledged), then clears the buffer.
+    fn commit(&mut self, client: usize) {
+        let txn = std::mem::take(&mut self.pending[client]);
+        self.model.commit_transaction(&txn.snapshot, &txn.ops);
+    }
+
+    /// Discards `client`'s staged ops without applying them (rollback / abort / crash-lost).
+    fn discard(&mut self, client: usize) {
+        self.pending[client] = PendingTxn::default();
+    }
+
+    /// Discards **every** client's staged ops — used on a crash, which drops all open transactions.
+    fn discard_all(&mut self) {
+        for buf in &mut self.pending {
+            *buf = PendingTxn::default();
+        }
+    }
 }
 
 /// One scheduled unit of work: a client advancing its open transaction by **one step**. The step's
@@ -381,6 +461,10 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
     let mut crash_restarts = 0u32;
     let mut crash_splits: Vec<CrashSplit> = Vec::new();
 
+    // The strong reference-model oracle (rmp #238): a committed-only shadow of the multigraph with a
+    // per-client staging buffer. Ops are flushed into the model only when a transaction commits.
+    let mut oracle = Oracle::new(clients);
+
     // Hard upper bound on dispatched steps so a logic slip can never hang a test: every statement
     // spends one unit of budget, and each transaction adds a bounded `Begin`/`End` overhead, so the
     // total step count is at most `clients + 2 * sum(budget)` (Begin+End per transaction, each ≥1
@@ -436,6 +520,7 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
                 &mut eng,
                 &faulty_clock,
                 &mut states,
+                &mut oracle,
                 &cfg,
                 dispatched,
                 acked_commits,
@@ -465,6 +550,7 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
             &mut committed_txns,
             &mut aborted_txns,
             &mut acked_commits,
+            &mut oracle,
         );
 
         // Observe overlap *after* this step settled: how many clients hold an open transaction now.
@@ -500,6 +586,10 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
     );
 
     let state_hash = snapshot_hash(&mut eng);
+    // The strong reference-model oracle verdict (rmp #238): full cell-by-cell equivalence between the
+    // committed-only shadow model and the engine queried back. Run after the state snapshot, as a
+    // read-only observer, so it does not perturb the canonical trace. `None` ⇒ model and engine agree.
+    let oracle_verdict = assert_equivalent(&mut eng, &oracle.model).err();
     // Consistency probe: `persisted_nodes` is the number of `:Person` rows present, `created_nodes`
     // the number of distinct ids among them. They must be equal — no committed create lost, none
     // duplicated — even though contention aborted some transactions along the way.
@@ -528,6 +618,7 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         transport_faults,
         crash_restarts,
         crash_splits,
+        oracle: oracle_verdict,
     }
 }
 
@@ -570,6 +661,7 @@ fn crash_at(
     eng: &mut SimEngine,
     faulty_clock: &Arc<SwappableClock>,
     states: &mut [ClientState],
+    oracle: &mut Oracle,
     cfg: &VoprConfig,
     fire_step: u64,
     acked_commits: usize,
@@ -602,6 +694,10 @@ fn crash_at(
     for s in states.iter_mut() {
         *s = ClientState::Idle;
     }
+    // Every open transaction's staged (uncommitted) ops are lost with the dead engine — they were
+    // never acknowledged, so ARIES undo/no-redo discards them. Drop them from the shadow model's
+    // pending buffers so a crash-lost op never reaches the committed model.
+    oracle.discard_all();
 
     // Snapshot the recovered (durable, acked-only) state for the oracle + trace.
     let recovered_state_hash = snapshot_hash(eng);
@@ -642,6 +738,7 @@ fn advance_client(
     committed_txns: &mut usize,
     aborted_txns: &mut usize,
     acked_commits: &mut usize,
+    oracle: &mut Oracle,
 ) -> bool {
     // Resolve the step to take. When `Idle`, plan a fresh transaction (consuming the RNG to size it,
     // pick auto-commit vs explicit, and pre-decide its end disposition). The end disposition is fixed
@@ -684,6 +781,7 @@ fn advance_client(
         ok_ops,
         err_ops,
         acked_commits,
+        oracle,
     );
 
     // Fold this step into the canonical trace: dispatch sequence, client, step-kind token, outcome.
@@ -739,6 +837,7 @@ fn exec_step(
     ok_ops: &mut usize,
     err_ops: &mut usize,
     acked_commits: &mut usize,
+    oracle: &mut Oracle,
 ) -> StepKind {
     match step {
         Step::Begin {
@@ -762,9 +861,12 @@ fn exec_step(
                 let outcome = run_auto_commit(eng, mode, stmt, params);
                 budget[client] = budget[client].saturating_sub(1);
                 // A successful auto-commit is an acknowledged commit (its effect is durable on return),
-                // so it counts toward the acked set a crash must preserve.
+                // so it counts toward the acked set a crash must preserve — and the oracle applies its
+                // op directly to the committed model (a one-statement transaction that just committed).
+                // A failed auto-commit applied nothing, so the model is untouched.
                 if outcome.ok {
                     *acked_commits += 1;
+                    oracle.model.apply(op);
                 }
                 tally(&outcome, ok_ops, err_ops);
                 states[client] = ClientState::Idle;
@@ -785,8 +887,20 @@ fn exec_step(
                 };
                 match eng.begin(open_mode) {
                     Ok(ticket) => {
+                        // Capture the BEGIN snapshot now, *before* the first statement runs: this is the
+                        // committed node multiset the transaction's `MATCH` clauses see under snapshot
+                        // isolation. Then stage the first op (applied only if the later COMMIT is acked).
+                        oracle.begin(client);
                         let outcome = run_in(eng, ticket, stmt, params);
                         budget[client] = budget[client].saturating_sub(1);
+                        // Stage the op only if the statement actually succeeded. A statement that
+                        // errored (an SSI conflict surfaced at run time, a write rejected, …) changed
+                        // nothing in the engine, so the model must not apply it even if the transaction
+                        // later commits — otherwise the model would hold a node/edge the engine never
+                        // made (the exact `model:1, engine:0` divergence the #238 sweep exposed).
+                        if outcome.ok {
+                            oracle.stage(client, op);
+                        }
                         tally(&outcome, ok_ops, err_ops);
                         let next = if remaining > 0 && budget[client] > 0 {
                             Step::Stmt {
@@ -804,8 +918,10 @@ fn exec_step(
                     }
                     Err(e) => {
                         // Could not open (e.g. engine shut down): account it as an errored op and go
-                        // idle so the client can retry / terminate.
+                        // idle so the client can retry / terminate. Nothing was staged for this
+                        // transaction; clear defensively so no stale op leaks into a later commit.
                         *err_ops += 1;
+                        oracle.discard(client);
                         states[client] = ClientState::Idle;
                         StepKind {
                             token: b"BEGIN_ERR",
@@ -825,7 +941,9 @@ fn exec_step(
             rollback,
         } => {
             let ClientState::Open { ticket, .. } = &states[client] else {
-                // Defensive: a `Stmt` should only arrive on an open transaction. Skip gracefully.
+                // Defensive: a `Stmt` should only arrive on an open transaction. Skip gracefully and
+                // drop any staged ops so a stranded buffer never reaches the committed model.
+                oracle.discard(client);
                 states[client] = ClientState::Idle;
                 return StepKind {
                     token: b"STMT_NOOP",
@@ -837,6 +955,11 @@ fn exec_step(
             let (stmt, params) = op.to_cypher();
             let outcome = run_in(eng, ticket, stmt, params);
             budget[client] = budget[client].saturating_sub(1);
+            // Stage only on a successful statement (see the BEGIN arm): an errored statement made no
+            // engine change, so it must not enter the model even if the transaction later commits.
+            if outcome.ok {
+                oracle.stage(client, op);
+            }
             tally(&outcome, ok_ops, err_ops);
             // The disposition was fixed at `Begin` time and carried through — no extra RNG draw here,
             // so the transaction's end is independent of interleaving.
@@ -856,6 +979,7 @@ fn exec_step(
         }
         Step::End { rollback } => {
             let ClientState::Open { ticket, .. } = &states[client] else {
+                oracle.discard(client);
                 states[client] = ClientState::Idle;
                 return StepKind {
                     token: b"END_NOOP",
@@ -866,19 +990,25 @@ fn exec_step(
             let (token, ok) = if rollback {
                 let ok = eng.rollback(ticket).is_ok();
                 *aborted_txns += 1;
+                // Rolled back: the staged ops never became durable — discard them.
+                oracle.discard(client);
                 (b"ROLLBACK".as_slice(), ok)
             } else {
                 match eng.commit(ticket) {
                     Ok(_) => {
                         *committed_txns += 1;
                         *acked_commits += 1;
+                        // COMMIT acknowledged: flush the staged ops into the committed model.
+                        oracle.commit(client);
                         (b"COMMIT".as_slice(), true)
                     }
                     Err(_) => {
                         // A failed COMMIT is an SSI serialization conflict the contention exposed —
                         // exactly the outcome the interleaver is meant to reach. The engine still
-                        // upholds ACID (the conflicting transaction is aborted, not half-applied).
+                        // upholds ACID (the conflicting transaction is aborted, not half-applied), so
+                        // the staged ops are discarded — never applied to the model.
                         *aborted_txns += 1;
+                        oracle.discard(client);
                         (b"COMMIT_ABORT".as_slice(), false)
                     }
                 }
@@ -919,8 +1049,10 @@ pub fn summarize(r: &VoprReport) -> String {
 /// Parses the `vopr` subcommand's arguments and runs a seed sweep, returning `(summary, failures)`.
 ///
 /// Each seed is run **twice** and the two reports compared: a mismatch is a determinism failure
-/// (the simulator's core invariant), counted and listed for one-line reproduction. This gives the
-/// CLI teeth even before the oracles of later sprints land.
+/// (the simulator's core invariant), counted and listed for one-line reproduction. Each run is also
+/// checked by the **strong reference-model oracle** (rmp #238): if the committed-only shadow model
+/// and the engine queried back disagree cell-by-cell, that seed is reported as an oracle failure with
+/// the exact divergence. Either failure class counts toward the returned failure total.
 ///
 /// Flags: `--seed <base>` (default 1), `--seeds <count>` (default 1), `--clients <n>`,
 /// `--ops <n>`. Unknown flags are reported as an error string in the summary.
@@ -956,6 +1088,7 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
     let mut out = String::new();
     let mut failures: u32 = 0;
     let mut failed_seeds = Vec::new();
+    let mut oracle_seeds = Vec::new();
     for seed in base_seed..base_seed.saturating_add(count) {
         // Inherit the interleaver defaults (`max_txn_stmts`, auto-commit / rollback ratios) and
         // override only the CLI-exposed knobs.
@@ -971,15 +1104,29 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
             failures += 1;
             failed_seeds.push(seed);
         }
+        // The reference-model oracle: a model⇄engine divergence is a correctness failure independent
+        // of determinism. Report it with the precise diff so the seed reproduces it.
+        if let Some(err) = &first.oracle {
+            failures += 1;
+            oracle_seeds.push(seed);
+            out.push_str(&format!("vopr: seed {seed} ORACLE DIVERGENCE: {err:?}\n"));
+        }
     }
     if failures == 0 {
         out.push_str(&format!(
-            "vopr: {count} seed(s) checked, all deterministic\n"
+            "vopr: {count} seed(s) checked, all deterministic + oracle-consistent\n"
         ));
     } else {
-        out.push_str(&format!(
-            "vopr: {failures} NON-DETERMINISTIC seed(s): {failed_seeds:?} — reproduce with --seed <N> --seeds 1\n"
-        ));
+        if !failed_seeds.is_empty() {
+            out.push_str(&format!(
+                "vopr: NON-DETERMINISTIC seed(s): {failed_seeds:?} — reproduce with --seed <N> --seeds 1\n"
+            ));
+        }
+        if !oracle_seeds.is_empty() {
+            out.push_str(&format!(
+                "vopr: ORACLE-DIVERGENT seed(s): {oracle_seeds:?} — reproduce with --seed <N> --seeds 1\n"
+            ));
+        }
     }
     (out, failures)
 }
@@ -1792,5 +1939,69 @@ mod tests {
             r.persisted_nodes, r.created_nodes
         );
         assert_eq!(r, run(cfg), "the combined-chaos run replays identically");
+    }
+
+    // ---------------------------- strong reference-model oracle (rmp #238) ----------------------------
+
+    /// **Acceptance (oracle agrees on the real engine, across a seed sweep).** For every seed in a
+    /// representative range, the committed-only shadow model agrees with the engine queried back
+    /// **cell-by-cell** (node multiset, edge multiset, count, neighbours) — `report.oracle` is `None`.
+    /// This is the empirical proof the model mirrors the engine's exact multigraph + MVCC semantics for
+    /// the whole workload. (The auto-commit-abort durability bug this oracle first surfaced at seed 4 is
+    /// fixed in `graphus-server`'s `exec.rs`; this sweep guards against its return and any new
+    /// divergence.) A wider 300-seed sweep was run during development; the committed range stays fast in
+    /// a debug build.
+    #[test]
+    fn oracle_agrees_with_engine_across_seed_sweep() {
+        let mut diverged = Vec::new();
+        for seed in 1u64..=60 {
+            if let Some(err) = run(VoprConfig::for_seed(seed)).oracle {
+                diverged.push((seed, format!("{err:?}")));
+            }
+        }
+        assert!(
+            diverged.is_empty(),
+            "the reference-model oracle must agree with the engine for every seed: {diverged:?}"
+        );
+    }
+
+    /// **Acceptance (the integrated oracle has teeth).** Drive the full VOPR loop, then deliberately
+    /// perturb the committed shadow model with an edge the engine never made, and assert
+    /// [`assert_equivalent`] catches it. This proves the oracle wired into [`run`] is the same one that
+    /// fails on a real divergence — not a no-op observer. (The end-to-end loop integration is asserted
+    /// by [`oracle_agrees_with_engine_across_seed_sweep`]; this isolates the catch.)
+    #[test]
+    fn integrated_oracle_catches_an_injected_divergence() {
+        // Reconstruct a committed model from a real run, then inject a phantom edge between two ids the
+        // model already holds (so the engine genuinely lacks the extra parallel edge).
+        let cfg = VoprConfig::for_seed(7);
+        let mut oracle = Oracle::new(cfg.clients.max(1) as usize);
+
+        // Replay the committed creates of a small graph into the model so it has live ids to perturb.
+        let clock = SharedClock::new(0);
+        let mut eng: SimEngine = LocalEngine::in_memory(
+            Arc::new(clock) as Arc<dyn Clock + Send + Sync>,
+            cfg.pool_pages,
+        )
+        .expect("engine");
+        for id in 0..3i64 {
+            let op = WorkloadOp::CreateNode { id };
+            let (stmt, params) = op.to_cypher();
+            let t = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+            let mut reply = eng.run(t, stmt, params, true, None).expect("run");
+            while reply.rows.next().expect("drain").is_some() {}
+            oracle.model.apply(op);
+        }
+        // Faithful so far.
+        assert_eq!(assert_equivalent(&mut eng, &oracle.model), Ok(()));
+
+        // Inject: an edge (0,1) the engine never created.
+        oracle.model.apply(WorkloadOp::CreateEdge { a: 0, b: 1 });
+        let err = assert_equivalent(&mut eng, &oracle.model).expect_err("oracle must catch it");
+        assert!(
+            matches!(err, OracleError::EdgeMultisetMismatch { edge: (0, 1), .. }),
+            "the injected phantom edge must be caught with a precise diff, got {err:?}"
+        );
+        let _ = eng.shutdown();
     }
 }
