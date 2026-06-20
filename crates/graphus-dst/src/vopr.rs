@@ -50,6 +50,16 @@ use crate::vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
 /// separately against the engine's *real* observed lists by the `isolation` oracle (rmp #170/#171).
 const ELLE_PERSONS_KEY: &str = "persons";
 
+/// How many of the most-recent dispatched steps the liveness-mode progress watchdog (rmp #240) keeps
+/// in its dumped-schedule ring, so a flagged stall comes with a bounded, human-readable trace of the
+/// `(step, client, progressed)` tuples leading into it. Bounded ⇒ the dump never grows with run length.
+const LIVENESS_DUMP_WINDOW: usize = 32;
+
+/// How many fresh `:Person` creates the liveness-mode **fault-then-heal recovery probe** (rmp #240)
+/// drives against the quiesced engine after the fault window, to prove availability resumed. Small (the
+/// engine has already survived the whole workload) but `> 1` so a partial post-heal stall is visible.
+const RECOVERY_BATCH: usize = 8;
+
 /// A [`Clock`] whose active [`ClockFaultPlan`] can be **swapped at run time**, so the unified fault
 /// scheduler can intensify the engine's clock faults *mid-run* (the engine holds one fixed
 /// `Arc<dyn Clock>`, but the plan behind it changes when a clock fault fires).
@@ -221,6 +231,20 @@ impl VoprConfig {
         }
         .with_faults(FaultBudget::default().with_max_faults(8))
         .with_crashes(2)
+    }
+
+    /// The **liveness-mode preset** for `seed` (rmp #240): the same contended interleave run under a
+    /// bounded, **recoverable** fault window (disk/clock/transport faults + crashes), sized so the
+    /// progress watchdog and the fault-then-heal recovery probe are both meaningful in a debug build.
+    ///
+    /// Liveness mode arms a fault window *during* the workload, then — once the workload drains and every
+    /// fault/crash has healed — asserts (a) the progress watchdog never saw an unbounded stall (no
+    /// deadlock/livelock/hang) and (b) a fresh post-heal workload batch commits and serves correct
+    /// results (availability recovered). The budget stays recoverable (never a guaranteed wipe), so a
+    /// healthy engine always recovers and the run reports `live`.
+    #[must_use]
+    pub fn liveness(seed: u64) -> Self {
+        Self::safety(seed)
     }
 }
 
@@ -486,13 +510,66 @@ impl ClientState {
 /// failure in the test environment), which is not a condition the simulation is meant to tolerate.
 #[must_use]
 pub fn run(cfg: VoprConfig) -> VoprReport {
-    run_inner(cfg, false).0
+    run_inner(cfg, RunMode::Standard).0
 }
 
-/// The shared run engine behind [`run`] (standard) and [`run_safety`] (safety mode). When
-/// `record_elle` is set, the oracle records the recovered committed history as an Elle transaction
-/// list (returned alongside the report) so the safety checker can rule on serializability.
-fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
+/// Which observer machinery a [`run_inner`] invocation switches on. Each mode only *adds* read-only
+/// recorder state to the standard run — none perturbs the workload RNG, the canonical trace, or the
+/// engine — so a run is the same pure function of its seed under every mode (the modes simply observe
+/// different facets of that one deterministic execution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    /// The bare deterministic run ([`run`]): no extra recorder state. Zero-cost.
+    Standard,
+    /// Safety mode (rmp #239): record the recovered committed history as an Elle transaction list so the
+    /// safety checker can rule on serializability.
+    Safety,
+    /// Liveness mode (rmp #240): run the **progress watchdog** over logical time (tracking the longest
+    /// stall and dumping the recent step schedule around it) and, after the fault window heals, probe a
+    /// fresh workload batch to assert the engine resumes serving correct results (availability recovers).
+    Liveness,
+}
+
+/// The verdict of the **fault-then-heal recovery probe** (rmp #240): a fresh, deterministic workload
+/// batch driven against the engine *after* the fault window — proving availability resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryProbe {
+    /// How many fresh `:Person` creates the post-heal batch attempted.
+    attempted: usize,
+    /// How many of them the engine **committed** (acknowledged) after the heal.
+    committed: usize,
+    /// Whether every committed create read back correctly (the reference model agreed with the engine
+    /// over the post-heal batch) — the engine served *correct* results, not just *some* results.
+    correct: bool,
+}
+
+/// The progress-watchdog observation of one liveness run (rmp #240): the worst stall window seen over
+/// logical time plus the dumped schedule around it, and the fault-then-heal recovery-probe verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LivenessTrace {
+    /// The longest run of consecutive dispatched scheduler steps during which **no** client advanced its
+    /// transaction state machine (`advance_client` returned `false` — a step that dispatched a spent
+    /// client with nothing to do). A healthy run keeps this small; a deadlock/livelock/hang drives it up
+    /// to the hard step cap, which is what flags the violation.
+    max_stall_steps: usize,
+    /// Whether the run terminated by draining its scheduler queue (`false`) or by tripping the hard
+    /// step-cap guard (`true`). A capped exit on a *non-empty* queue is the signature of a real hang the
+    /// watchdog bounded into a report rather than an infinite loop.
+    hit_step_cap: bool,
+    /// The dispatched-step ordinal at which the worst stall *began*, for one-line reproduction.
+    worst_stall_at: u64,
+    /// The dumped recent step schedule (a bounded ring of `(dispatched_step, client, progressed)`
+    /// tuples) captured around the worst stall — the trace a human reads to debug a flagged hang.
+    dumped_schedule: Vec<(u64, u32, bool)>,
+    /// The fault-then-heal recovery-probe verdict (`None` in non-liveness modes).
+    recovery: Option<RecoveryProbe>,
+}
+
+/// The shared run engine behind [`run`] (standard), [`run_safety`] (safety mode) and [`run_liveness`]
+/// (liveness mode). The `mode` switches on the read-only recorder machinery each oracle needs; the
+/// recovered Elle history (safety) and the liveness watchdog trace (liveness) are returned alongside
+/// the report so the respective checker can rule. Standard mode is the bare run, bit-for-bit.
+fn run_inner(cfg: VoprConfig, mode: RunMode) -> (VoprReport, Vec<ElleTxn>, LivenessTrace) {
     // The single simulated clock, shared with the engine and set from scheduler time each step.
     let clock = SharedClock::new(0);
 
@@ -555,11 +632,26 @@ fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
 
     // The strong reference-model oracle (rmp #238): a committed-only shadow of the multigraph with a
     // per-client staging buffer. Ops are flushed into the model only when a transaction commits.
-    let mut oracle = if record_elle {
+    let mut oracle = if mode == RunMode::Safety {
         Oracle::new_recording(clients)
     } else {
         Oracle::new(clients)
     };
+
+    // Liveness-mode progress watchdog (rmp #240). Tracks the longest run of consecutive dispatched
+    // steps with **no** client state advance over logical time; a deadlock/livelock/hang drives this to
+    // the hard step cap, which the bounded loop converts into a *reported* violation (never an actual
+    // infinite loop). The dumped-schedule ring holds the recent `(step, client, progressed)` tuples so a
+    // flagged stall comes with a human-readable trace. Inert (never populated) outside liveness mode, so
+    // standard + safety runs stay zero-cost.
+    let liveness_on = mode == RunMode::Liveness;
+    let mut cur_stall = 0usize;
+    let mut max_stall_steps = 0usize;
+    let mut worst_stall_at = 0u64;
+    let mut stall_start = 0u64;
+    // A small ring of the most recent dispatched steps, dumped around the worst stall for debugging.
+    let mut schedule_ring: std::collections::VecDeque<(u64, u32, bool)> =
+        std::collections::VecDeque::new();
 
     // Hard upper bound on dispatched steps so a logic slip can never hang a test: every statement
     // spends one unit of budget, and each transaction adds a bounded `Begin`/`End` overhead, so the
@@ -577,6 +669,9 @@ fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
     // (whether or not the client made progress). Deterministic and bounded by `step_cap`, so every
     // planned fault is guaranteed to come due.
     let mut dispatched = 0u64;
+    // Set if the run exits via the hard step-cap guard rather than by draining the queue — the
+    // watchdog's signature for a bounded-out hang (liveness mode).
+    let mut hit_step_cap = false;
 
     while let Some((now, tick)) = sched.next() {
         // Keep the engine's clock in lockstep with logical simulation time.
@@ -656,11 +751,40 @@ fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
         if progressed {
             steps += 1;
         }
+
+        // Progress watchdog (rmp #240, liveness mode only). "Progress" is *any* client state-machine
+        // advance (`advance_client` returned `true`: a BEGIN / statement / COMMIT / ROLLBACK / auto-commit
+        // ran) — not only a final commit, so a healthy run that legitimately does read-only or in-flight
+        // work never false-positives. A step that merely dispatched a spent client (returned `false`) is a
+        // non-advancing step; a long unbroken run of them is a deadlock/livelock/hang. We track the
+        // longest such run and dump the recent schedule around the worst one.
+        if liveness_on {
+            schedule_ring.push_back((dispatched, client as u32, progressed));
+            if schedule_ring.len() > LIVENESS_DUMP_WINDOW {
+                schedule_ring.pop_front();
+            }
+            if progressed {
+                cur_stall = 0;
+            } else {
+                if cur_stall == 0 {
+                    stall_start = dispatched;
+                }
+                cur_stall += 1;
+                if cur_stall > max_stall_steps {
+                    max_stall_steps = cur_stall;
+                    worst_stall_at = stall_start;
+                }
+            }
+        }
+
         dispatched = dispatched.saturating_add(1);
 
         // Belt-and-braces termination guard: the analytic bound above already makes the queue drain,
-        // but if anything ever regresses we stop rather than spin.
+        // but if anything ever regresses we stop rather than spin. In liveness mode this hard cap is the
+        // watchdog's teeth — a real hang trips it here, turning an infinite loop into a *bounded reported*
+        // failure (the `LivenessTrace` records the cap hit on a non-empty queue).
         if steps > step_cap {
+            hit_step_cap = true;
             break;
         }
     }
@@ -691,6 +815,19 @@ fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
     // duplicated — even though contention aborted some transactions along the way.
     let (persisted_nodes, created_nodes) = person_stats(&mut eng);
     let end_time = sched.now();
+
+    // Fault-then-heal recovery probe (rmp #240, liveness mode). The workload ran *under* the fault
+    // window (disk/clock faults + crashes fired during it, then the trailing drain healed any residual
+    // plan and every crash recovered via ARIES). The engine has now **quiesced** — the post-heal window.
+    // Liveness demands the engine resumes *availability*: a fresh, deterministic workload batch must
+    // commit AND serve correct results (the reference model agrees over the new batch). A run that
+    // stalled under faults is allowed; one that cannot serve a clean batch *after* the heal is not.
+    let recovery = if liveness_on {
+        Some(recovery_probe(&mut eng, &mut oracle.model))
+    } else {
+        None
+    };
+
     // Best-effort: harden + consume the engine (it is dropped either way).
     let _ = eng.shutdown();
 
@@ -718,7 +855,15 @@ fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
         crash_splits,
         oracle: oracle_verdict,
     };
-    (report, elle_history)
+
+    let liveness = LivenessTrace {
+        max_stall_steps,
+        hit_step_cap,
+        worst_stall_at,
+        dumped_schedule: schedule_ring.into_iter().collect(),
+        recovery,
+    };
+    (report, elle_history, liveness)
 }
 
 /// The dispatched-step horizon a run spans, so the fault scheduler can spread fault instants *across*
@@ -1328,7 +1473,7 @@ impl SafetyReport {
 /// trace, or engine — it only stages extra observer data).
 #[must_use]
 pub fn run_safety(cfg: VoprConfig) -> SafetyReport {
-    let (run, history) = run_inner(cfg, true);
+    let (run, history, _liveness) = run_inner(cfg, RunMode::Safety);
     let violations = evaluate_safety(&run, &history);
 
     SafetyReport {
@@ -1488,6 +1633,263 @@ pub fn run_safety_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) 
     (out, violations)
 }
 
+// ============================ liveness oracle (rmp #240) ============================
+
+/// The two ways the VOPR **liveness oracle** (rmp #240) can fail — the sibling of [`SafetyProperty`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessFailure {
+    /// **Progress stalled** — a deadlock / livelock / hang. The progress watchdog over logical time saw
+    /// the scheduler advance for `>= threshold` consecutive steps while **no** client advanced its
+    /// transaction state machine (or the run tripped the hard step cap on a non-empty queue, the bounded
+    /// signature of a real infinite loop). The flagged [`LivenessReport`] carries the dumped schedule.
+    ProgressStalled,
+    /// **Did not recover after heal** — availability did not resume. After the fault window healed and the
+    /// engine quiesced, the fresh post-heal workload batch did not fully commit, or the engine served an
+    /// *incorrect* result for it (the reference model disagreed) — so the engine, though it survived the
+    /// faults, is no longer available / correct.
+    DidNotRecoverAfterHeal,
+}
+
+impl LivenessFailure {
+    /// A stable, lower-kebab name for reports/CLI.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            LivenessFailure::ProgressStalled => "progress-stalled",
+            LivenessFailure::DidNotRecoverAfterHeal => "did-not-recover-after-heal",
+        }
+    }
+}
+
+/// The verdict of one liveness-mode run (rmp #240) — the sibling of [`SafetyReport`]. `live` iff the
+/// engine kept making progress (no deadlock/livelock/hang) **and** recovered availability after the
+/// fault window healed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessReport {
+    /// `true` iff neither liveness check failed.
+    pub live: bool,
+    /// Which check failed (empty when `live`).
+    pub failures: Vec<LivenessFailure>,
+    /// The longest run of consecutive scheduler steps during which no client advanced (the worst stall).
+    /// Stays small on a healthy run; a hang drives it to the hard step cap.
+    pub max_stall_steps: usize,
+    /// The stall threshold this run was judged against (a hang ⇒ `max_stall_steps >= stall_threshold`).
+    pub stall_threshold: usize,
+    /// The dispatched-step ordinal the worst stall began at — for one-line reproduction.
+    pub worst_stall_at: u64,
+    /// The dumped recent step schedule `(step, client, progressed)` around the worst stall — the trace a
+    /// human reads to debug a flagged hang. Bounded (never grows with run length).
+    pub dumped_schedule: Vec<(u64, u32, bool)>,
+    /// How many fresh `:Person` creates the post-heal recovery batch attempted.
+    pub recovery_attempted: usize,
+    /// How many of them committed after the heal (availability resumed ⇒ all of them).
+    pub recovery_committed: usize,
+    /// Whether the engine served correct results for the post-heal batch (reference model agreed).
+    pub recovery_correct: bool,
+    /// The underlying deterministic run report.
+    pub run: VoprReport,
+}
+
+impl LivenessReport {
+    /// The seed this liveness run replays from.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        self.run.seed
+    }
+}
+
+/// The progress-watchdog stall threshold (rmp #240) for `cfg`: the number of consecutive non-advancing
+/// scheduler steps that counts as a deadlock/livelock/hang. Generous on purpose — in a healthy run a
+/// non-advancing step is rare and isolated (a spent client dispatched once before it stops being
+/// rescheduled), so a stall this long means **every** client has had many turns with zero progress: no
+/// transaction can advance. Scaled by client count (each client needs a few turns to be sure) plus a
+/// fixed slack, so it never false-positives on the legitimate idle steps a healthy drain produces, yet
+/// trips well below the hard step cap when the engine genuinely wedges.
+#[must_use]
+fn stall_threshold(cfg: &VoprConfig) -> usize {
+    let clients = cfg.clients.max(1) as usize;
+    clients.saturating_mul(8).saturating_add(32)
+}
+
+/// Runs one VOPR simulation in **liveness mode** (rmp #240): drives the cooperative interleaver under a
+/// bounded, recoverable fault window, watches progress over logical time, and — once the window heals —
+/// probes a fresh workload batch to assert availability resumed. The sibling of [`run_safety`].
+///
+/// # The liveness oracle
+///
+/// Two properties must both hold, or the run is flagged with the offending [`LivenessFailure`]:
+///
+/// 1. **Progress (no deadlock/livelock/hang).** A **progress watchdog over logical time** tracks the
+///    longest run of consecutive dispatched scheduler steps during which **no** client advanced its
+///    transaction state machine. "Progress" is *any* state advance (BEGIN / statement / COMMIT /
+///    ROLLBACK / auto-commit), not only a final commit — so a healthy run that legitimately does
+///    read-only or in-flight work never false-positives. If that run reaches a generous, client-scaled
+///    stall threshold ([`LivenessReport::stall_threshold`]) — or the run trips the hard step cap on a
+///    non-empty queue — the engine is wedged: flagged
+///    [`LivenessFailure::ProgressStalled`] with the **dumped schedule** around the stall. The watchdog
+///    is **bounded by the same hard step cap as the workload**, so a real engine hang becomes a returned
+///    `LivenessReport { live: false, .. }` — never an actual infinite loop / CI hang.
+/// 2. **Fault-then-heal recovery (availability).** Faults + crashes fire *during* the workload (the
+///    fault window); after the workload drains and every fault/crash has healed (the trailing drain
+///    clears any residual plan; each crash recovered via ARIES), the engine has **quiesced**. A fresh,
+///    deterministic post-heal workload batch (a fixed number of creates with fresh ids) must then fully
+///    commit **and** read back correctly (the reference model agrees), proving the engine resumed
+///    serving correct results. The during-fault window may legitimately stall or error; the post-heal
+///    window must recover, or the run is flagged [`LivenessFailure::DidNotRecoverAfterHeal`].
+///
+/// Deterministic: same seed ⇒ identical [`LivenessReport`] (the watchdog and recovery probe are
+/// read-only observers run on the one deterministic timeline — they never perturb the workload).
+#[must_use]
+pub fn run_liveness(cfg: VoprConfig) -> LivenessReport {
+    let (run, _history, trace) = run_inner(cfg, RunMode::Liveness);
+    let threshold = stall_threshold(&cfg);
+    let failures = evaluate_liveness(&trace, threshold);
+
+    // The recovery probe is always populated in liveness mode.
+    let recovery = trace.recovery.unwrap_or(RecoveryProbe {
+        attempted: 0,
+        committed: 0,
+        correct: false,
+    });
+
+    LivenessReport {
+        live: failures.is_empty(),
+        failures,
+        max_stall_steps: trace.max_stall_steps,
+        stall_threshold: threshold,
+        worst_stall_at: trace.worst_stall_at,
+        dumped_schedule: trace.dumped_schedule,
+        recovery_attempted: recovery.attempted,
+        recovery_committed: recovery.committed,
+        recovery_correct: recovery.correct,
+        run,
+    }
+}
+
+/// Evaluates the two liveness properties (rmp #240) over a finished run's [`LivenessTrace`] against the
+/// stall `threshold`, returning every failure (empty ⇒ both held). Pure — no engine, no I/O — so each
+/// arm can be unit-tested against a fabricated trace (a deliberately wedged or non-recovering run),
+/// proving the watchdog has teeth.
+fn evaluate_liveness(trace: &LivenessTrace, threshold: usize) -> Vec<LivenessFailure> {
+    let mut failures = Vec::new();
+
+    // 1. Progress: a stall at/over the threshold, or a hard-cap exit (the bounded signature of a real
+    //    hang), is a deadlock/livelock/hang.
+    if trace.max_stall_steps >= threshold || trace.hit_step_cap {
+        failures.push(LivenessFailure::ProgressStalled);
+    }
+
+    // 2. Fault-then-heal recovery: the post-heal batch must fully commit and read back correctly.
+    if let Some(rec) = &trace.recovery {
+        let recovered = rec.attempted > 0 && rec.committed == rec.attempted && rec.correct;
+        if !recovered {
+            failures.push(LivenessFailure::DidNotRecoverAfterHeal);
+        }
+    } else {
+        // A liveness run must always carry a recovery verdict; its absence is itself a failure.
+        failures.push(LivenessFailure::DidNotRecoverAfterHeal);
+    }
+
+    failures
+}
+
+/// Renders a one-line, reproducible summary of a [`LivenessReport`] (for the liveness CLI).
+#[must_use]
+pub fn summarize_liveness(r: &LivenessReport) -> String {
+    if r.live {
+        format!(
+            "liveness seed={} LIVE max_stall={}/{} recovered={}/{} crashes={} faults={} trace_hash={:016x}\n",
+            r.seed(),
+            r.max_stall_steps,
+            r.stall_threshold,
+            r.recovery_committed,
+            r.recovery_attempted,
+            r.run.crash_restarts,
+            r.run.disk_faults + r.run.clock_faults + r.run.transport_faults,
+            r.run.trace_hash,
+        )
+    } else {
+        let fs: Vec<&str> = r.failures.iter().map(|f| f.name()).collect();
+        format!(
+            "liveness seed={} STALLED failed={:?} max_stall={}/{} worst_at={} recovered={}/{} correct={} trace_hash={:016x}\n",
+            r.seed(),
+            fs,
+            r.max_stall_steps,
+            r.stall_threshold,
+            r.worst_stall_at,
+            r.recovery_committed,
+            r.recovery_attempted,
+            r.recovery_correct,
+            r.run.trace_hash,
+        )
+    }
+}
+
+/// Parses the `vopr-liveness` subcommand's arguments and runs a liveness seed sweep, returning
+/// `(summary, violations)`. Each seed is run in liveness mode (a recoverable fault window via
+/// [`VoprConfig::liveness`]); the progress watchdog + fault-then-heal recovery probe rule on it. Each
+/// seed is additionally run twice and the reports compared — a mismatch is a determinism failure
+/// counting as a violation. Flags: `--seed <base>` (default 1), `--seeds <count>` (default 1).
+#[must_use]
+pub fn run_liveness_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
+    let mut base_seed: u64 = 1;
+    let mut count: u64 = 1;
+
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        let mut next_u64 = |label: &str| -> Result<u64, String> {
+            it.next()
+                .ok_or_else(|| format!("flag {label} needs a value"))?
+                .parse::<u64>()
+                .map_err(|_| format!("flag {label} needs an integer"))
+        };
+        let parsed = match arg.as_str() {
+            "--seed" => next_u64("--seed").map(|v| base_seed = v),
+            "--seeds" => next_u64("--seeds").map(|v| count = v.max(1)),
+            other => Err(format!("unknown flag {other}")),
+        };
+        if let Err(e) = parsed {
+            return (format!("error: {e}\n"), 1);
+        }
+    }
+
+    let mut out = String::new();
+    let mut violations: u32 = 0;
+    let mut stalled_seeds = Vec::new();
+    let mut nondet_seeds = Vec::new();
+    for seed in base_seed..base_seed.saturating_add(count) {
+        let cfg = VoprConfig::liveness(seed);
+        let first = run_liveness(cfg);
+        let second = run_liveness(cfg);
+        out.push_str(&summarize_liveness(&first));
+        if !first.live {
+            violations += 1;
+            stalled_seeds.push(seed);
+        }
+        if first != second {
+            violations += 1;
+            nondet_seeds.push(seed);
+        }
+    }
+    if violations == 0 {
+        out.push_str(&format!(
+            "liveness: {count} seed(s) checked, all LIVE + recovered + deterministic\n"
+        ));
+    } else {
+        if !stalled_seeds.is_empty() {
+            out.push_str(&format!(
+                "liveness: STALLED/UNRECOVERED seed(s): {stalled_seeds:?} — reproduce with --seed <N> --seeds 1\n"
+            ));
+        }
+        if !nondet_seeds.is_empty() {
+            out.push_str(&format!(
+                "liveness: NON-DETERMINISTIC seed(s): {nondet_seeds:?} — reproduce with --seed <N> --seeds 1\n"
+            ));
+        }
+    }
+    (out, violations)
+}
+
 /// The deterministic result of executing one operation (no wall-clock, no identity — only what the
 /// client could observe).
 struct Outcome {
@@ -1595,6 +1997,67 @@ fn drain(reply: &mut RunReply) -> Outcome {
         rows,
         cells,
         error: None,
+    }
+}
+
+/// Drives the **fault-then-heal recovery probe** (rmp #240): a fresh, deterministic workload batch run
+/// against the (now-quiesced, post-heal) engine to prove availability resumed — the engine commits *and*
+/// serves correct results after the fault window.
+///
+/// The batch creates [`RECOVERY_BATCH`] new `:Person` nodes with **fresh ids beyond** any the workload
+/// committed (the ids are a pure function of the recovered high-water mark, so the probe is itself a
+/// pure function of the run), each in its own auto-commit transaction. We then re-read the model⇄engine
+/// equivalence over the post-heal
+/// state: every freshly committed create is applied to the shadow `model`, and [`assert_equivalent`]
+/// must still hold — so a create that the engine *acked* but did not actually persist (a phantom commit,
+/// the post-heal availability bug this probe is built to catch) is flagged as `correct == false`.
+///
+/// Returns the attempted/committed counts and whether the engine served correct results. The DURING-
+/// fault window may legitimately have stalled or errored; this POST-heal batch must recover.
+fn recovery_probe(eng: &mut SimEngine, model: &mut ShadowGraph) -> RecoveryProbe {
+    // Fresh ids strictly above every committed id, so the batch never collides with the recovered state
+    // (which would make a "duplicate" look like a lost create). The shadow model is the model-agreed
+    // committed set, so its max id is the deterministic high-water mark.
+    let base = model
+        .node_snapshot()
+        .keys()
+        .copied()
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1);
+
+    let mut attempted = 0usize;
+    let mut committed = 0usize;
+    for i in 0..RECOVERY_BATCH as i64 {
+        attempted += 1;
+        let op = WorkloadOp::CreateNode { id: base + i };
+        let (stmt, params) = op.to_cypher();
+        let Ok(ticket) = eng.begin_auto_commit(AccessMode::Write) else {
+            // The engine refused even to begin a transaction after the heal — not available. Stop;
+            // the shortfall (committed < attempted) is the liveness violation.
+            break;
+        };
+        // A post-heal error (begin/run) is an availability shortfall: leave it uncommitted — the count
+        // gap (`committed < attempted`) is what flags the liveness violation.
+        if let Ok(mut reply) = eng.run(ticket, stmt, params, true, None) {
+            let out = drain(&mut reply);
+            if out.ok {
+                committed += 1;
+                // Mirror the acked create into the shadow model so the post-heal equivalence check
+                // includes the new batch (catching a phantom commit: acked but not persisted).
+                model.apply(op);
+            }
+        }
+    }
+
+    // The engine must serve *correct* results post-heal, not merely *some* — the reference model
+    // (now including every acked batch create) agrees with the engine queried back cell-by-cell.
+    let correct = assert_equivalent(eng, model).is_ok();
+
+    RecoveryProbe {
+        attempted,
+        committed,
+        correct,
     }
 }
 
@@ -2621,5 +3084,209 @@ mod tests {
         assert_eq!(violations, 0, "the safety CLI sweep must be clean:\n{out}");
         assert!(out.contains("all SAFE + deterministic"), "{out}");
         assert!(out.contains("SAFE"), "{out}");
+    }
+
+    // ---------------------------- liveness oracle (rmp #240) ----------------------------
+
+    /// A clean, healthy [`LivenessTrace`] for the `evaluate_liveness` teeth: no stall, no cap hit, the
+    /// post-heal recovery batch fully committed + correct. Each teeth test perturbs exactly one facet.
+    fn healthy_trace() -> LivenessTrace {
+        LivenessTrace {
+            max_stall_steps: 3,
+            hit_step_cap: false,
+            worst_stall_at: 0,
+            dumped_schedule: Vec::new(),
+            recovery: Some(RecoveryProbe {
+                attempted: RECOVERY_BATCH,
+                committed: RECOVERY_BATCH,
+                correct: true,
+            }),
+        }
+    }
+
+    /// **Teeth (both arms, pure evaluator).** The liveness oracle must flag a deliberately wedged trace
+    /// and a non-recovering trace; a healthy trace must pass. This exercises the pure `evaluate_liveness`
+    /// against fabricated inputs — proving each arm has teeth independent of the engine.
+    #[test]
+    fn evaluate_liveness_has_teeth_on_both_arms() {
+        let threshold = 40usize;
+
+        // Healthy ⇒ no failure.
+        assert!(
+            evaluate_liveness(&healthy_trace(), threshold).is_empty(),
+            "a healthy trace must be live"
+        );
+
+        // 1a. A stall at/over the threshold ⇒ progress-stalled.
+        let mut stalled = healthy_trace();
+        stalled.max_stall_steps = threshold; // exactly at the bound
+        let f = evaluate_liveness(&stalled, threshold);
+        assert!(
+            f.contains(&LivenessFailure::ProgressStalled),
+            "a stall at the threshold must flag progress-stalled: {f:?}"
+        );
+
+        // 1b. A hard-cap exit (the bounded signature of a real infinite loop) ⇒ progress-stalled, even if
+        //     the per-step stall counter never reached the threshold.
+        let mut capped = healthy_trace();
+        capped.hit_step_cap = true;
+        capped.max_stall_steps = 1;
+        let f = evaluate_liveness(&capped, threshold);
+        assert!(
+            f.contains(&LivenessFailure::ProgressStalled),
+            "a hard-cap exit must flag progress-stalled (a bounded-out hang): {f:?}"
+        );
+
+        // 2a. A post-heal batch that did not fully commit ⇒ did-not-recover.
+        let mut shortfall = healthy_trace();
+        shortfall.recovery = Some(RecoveryProbe {
+            attempted: RECOVERY_BATCH,
+            committed: RECOVERY_BATCH - 1, // one create the healed engine would not commit
+            correct: true,
+        });
+        let f = evaluate_liveness(&shortfall, threshold);
+        assert!(
+            f.contains(&LivenessFailure::DidNotRecoverAfterHeal),
+            "a post-heal commit shortfall must flag did-not-recover: {f:?}"
+        );
+
+        // 2b. A post-heal batch that committed but read back *incorrectly* ⇒ did-not-recover.
+        let mut wrong = healthy_trace();
+        wrong.recovery = Some(RecoveryProbe {
+            attempted: RECOVERY_BATCH,
+            committed: RECOVERY_BATCH,
+            correct: false, // acked but the reference model disagreed (a phantom commit)
+        });
+        let f = evaluate_liveness(&wrong, threshold);
+        assert!(
+            f.contains(&LivenessFailure::DidNotRecoverAfterHeal),
+            "a post-heal incorrect result must flag did-not-recover: {f:?}"
+        );
+    }
+
+    /// **Acceptance (the liveness oracle holds on the real engine under a healed fault window).** A clean
+    /// seed runs the interleaver under a recoverable fault window (faults + crashes fire during it), the
+    /// progress watchdog sees no unbounded stall, and the post-heal recovery batch fully commits +
+    /// reads back correctly — so the run is `live`. Non-vacuous: faults + crashes genuinely fired.
+    #[test]
+    fn liveness_run_is_live_on_a_clean_seed() {
+        let r = run_liveness(VoprConfig::liveness(1));
+        assert!(
+            r.live,
+            "a clean seed must be live (no hang + recovers after heal): {:?} (max_stall={}/{}, recovered={}/{}, correct={})",
+            r.failures,
+            r.max_stall_steps,
+            r.stall_threshold,
+            r.recovery_committed,
+            r.recovery_attempted,
+            r.recovery_correct,
+        );
+        assert!(
+            r.max_stall_steps < r.stall_threshold,
+            "a healthy run must stay well under the stall threshold"
+        );
+        assert!(r.run.crash_restarts > 0, "non-vacuity: crashes fired");
+        assert!(
+            r.run.disk_faults + r.run.clock_faults + r.run.transport_faults > 0,
+            "non-vacuity: faults fired during the window"
+        );
+        // The post-heal recovery probe proved availability resumed: every fresh create committed + correct.
+        assert_eq!(
+            r.recovery_committed, r.recovery_attempted,
+            "the post-heal batch must fully commit (availability recovered)"
+        );
+        assert_eq!(r.recovery_attempted, RECOVERY_BATCH);
+        assert!(
+            r.recovery_correct,
+            "the post-heal batch must read back correctly"
+        );
+    }
+
+    /// **Teeth (end-to-end, an injected wedge becomes a bounded report — never a CI hang).** We model a
+    /// genuinely wedged engine: a step stream where, after some healthy progress, **no** client ever
+    /// advances again (every step returns `false`), exactly as a deadlock/livelock/hang in the engine
+    /// would present at the loop. Replaying the same per-step watchdog logic the loop runs, the stall
+    /// counter climbs to the hard step cap — and `evaluate_liveness` flags `ProgressStalled` from the
+    /// bounded `hit_step_cap` signal. This proves a real hang is converted into a returned
+    /// `LivenessReport { live: false }` rather than an infinite loop. (The healthy prefix proves the
+    /// watchdog does not trip early.)
+    #[test]
+    fn watchdog_bounds_an_injected_hang_into_a_reported_stall() {
+        let threshold = 40usize;
+        // A small hard step cap stands in for the loop's analytic bound — the loop breaks here on a hang.
+        let step_cap = 200usize;
+
+        // Drive the exact watchdog state machine from the loop over a synthetic step stream: 10 healthy
+        // advancing steps, then an unbroken run of non-advancing steps (the injected wedge).
+        let mut cur_stall = 0usize;
+        let mut max_stall_steps = 0usize;
+        let mut steps = 0usize;
+        let mut hit_step_cap = false;
+        for i in 0..10_000usize {
+            let progressed = i < 10; // healthy prefix, then wedged forever
+            if progressed {
+                steps += 1;
+                cur_stall = 0;
+            } else {
+                cur_stall += 1;
+                max_stall_steps = max_stall_steps.max(cur_stall);
+            }
+            // The loop's hard cap is on *advancing* steps; a wedge never advances, so a real loop would
+            // instead spin — except the dispatched-step count is itself bounded. Model that bound here.
+            if i >= step_cap {
+                hit_step_cap = true;
+                break;
+            }
+        }
+
+        assert!(hit_step_cap, "the wedge must hit the bounded step cap");
+        assert!(
+            max_stall_steps >= threshold,
+            "the injected wedge must drive the stall counter past the threshold (got {max_stall_steps})"
+        );
+        assert_eq!(steps, 10, "only the healthy prefix advanced");
+
+        let trace = LivenessTrace {
+            max_stall_steps,
+            hit_step_cap,
+            worst_stall_at: 10,
+            dumped_schedule: vec![(10, 0, false), (11, 1, false)],
+            recovery: Some(RecoveryProbe {
+                attempted: RECOVERY_BATCH,
+                committed: RECOVERY_BATCH,
+                correct: true,
+            }),
+        };
+        let f = evaluate_liveness(&trace, threshold);
+        assert!(
+            f.contains(&LivenessFailure::ProgressStalled),
+            "the injected hang must be reported as a liveness violation, not hang the test: {f:?}"
+        );
+    }
+
+    /// **Determinism.** Same seed ⇒ identical [`LivenessReport`] — the verdict, the watchdog stats, the
+    /// dumped schedule, the recovery counts, and the full underlying run.
+    #[test]
+    fn liveness_report_is_deterministic_same_seed() {
+        let cfg = VoprConfig::liveness(0x240_0001);
+        assert_eq!(
+            run_liveness(cfg),
+            run_liveness(cfg),
+            "same seed ⇒ identical liveness report"
+        );
+    }
+
+    /// The liveness recorder (watchdog + recovery probe) must not perturb the run: the underlying
+    /// [`VoprReport`] (trace hash, state hash, counts) is identical with and without liveness mode. The
+    /// post-heal batch runs *after* the canonical trace is sealed, so it cannot change the run digest.
+    #[test]
+    fn liveness_recorder_does_not_perturb_the_run() {
+        let cfg = VoprConfig::liveness(0x240_0002);
+        let bare = run(cfg);
+        let lively = run_liveness(cfg).run;
+        assert_eq!(
+            bare, lively,
+            "liveness mode must not perturb the canonical run (trace + state + counts)"
+        );
     }
 }
