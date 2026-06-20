@@ -6,9 +6,11 @@
 //! so that injected faults (crashes, I/O errors, reorderings) replay exactly.
 #![forbid(unsafe_code)]
 
+pub mod clock_fault;
 pub mod net;
 pub mod scheduler;
 
+pub use clock_fault::{ClockFaultPlan, FaultyClock};
 pub use net::{LinkId, NetConfig, Side, SimEndpoint, SimNet};
 pub use scheduler::SimScheduler;
 

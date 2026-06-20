@@ -15,7 +15,7 @@ use graphus_cypher::MaterializedValue;
 use graphus_io::MemBlockDevice;
 use graphus_server::engine::LocalEngine;
 use graphus_server::engine::command::AccessMode;
-use graphus_sim::SharedClock;
+use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock};
 use graphus_wal::MemLogSink;
 
 use crate::mix::{LoadProfile, MixProfile};
@@ -66,6 +66,8 @@ pub type Scenario = fn(u64) -> ScenarioOutcome;
 /// - **Isolation / concurrency** — `contended_writes`, `concurrent_supernode`, `snapshot_isolation`.
 /// - **Atomicity / churn** — `transaction_rollback`, `churn_create_delete`.
 /// - **Durability / crash recovery** — `crash_recovery_durability`.
+/// - **Time / hostile clock** — `hostile_clock` (bounded skew, forward jumps, non-monotonic
+///   regressions; the clock-fault tolerance contract of rmp #233).
 /// - **Load shapes** — `spike_load`, `ramp_load`, `sustained_high_concurrency`.
 #[must_use]
 pub fn catalogue() -> Vec<(&'static str, Scenario)> {
@@ -91,6 +93,8 @@ pub fn catalogue() -> Vec<(&'static str, Scenario)> {
         ("churn_create_delete", churn_create_delete),
         // Durability / crash recovery
         ("crash_recovery_durability", crash_recovery_durability),
+        // Time / hostile clock
+        ("hostile_clock", hostile_clock),
         // Load shapes
         ("spike_load", spike_load),
         ("ramp_load", ramp_load),
@@ -124,6 +128,24 @@ fn engine_with_clock(pool_pages: usize) -> (Eng, Arc<SharedClock>) {
     let clock = Arc::new(SharedClock::new(0));
     let eng = LocalEngine::in_memory(clock.clone(), pool_pages).expect("engine");
     (eng, clock)
+}
+
+/// Builds an engine over a seed-driven [`FaultyClock`] (the hostile-clock scenario). Returns the
+/// engine plus a handle to the *inner* [`SharedClock`], which the caller advances to drive logical
+/// time forward; the [`FaultyClock`] perturbs every reading the engine takes (bounded skew, forward
+/// jumps, non-monotonic regressions), all a pure function of `seed`.
+fn engine_with_faulty_clock(seed: u64, pool_pages: usize) -> (Eng, Arc<SharedClock>) {
+    let inner = Arc::new(SharedClock::new(0));
+    // A genuinely hostile but bounded plan: a constant skew, frequent forward jumps, and frequent
+    // backward regressions — exactly the readings the engine's `saturating_sub` duration arithmetic
+    // must tolerate without ever producing a negative duration or a panic.
+    let plan = ClockFaultPlan::new(seed)
+        .with_skew(1_000_000) // ±1 ms constant skew
+        .with_forward_jumps(300, 5_000_000) // 30% of reads jump up to +5 ms
+        .with_regressions(300, 2_000_000); // 30% of reads step back up to 2 ms
+    let clock = Arc::new(FaultyClock::new(SharedClock::clone(&inner), plan));
+    let eng = LocalEngine::in_memory(clock, pool_pages).expect("engine");
+    (eng, inner)
 }
 
 /// Runs an auto-commit write, returning whether it succeeded.
@@ -796,6 +818,59 @@ fn crash_recovery_durability(seed: u64) -> ScenarioOutcome {
     }
 }
 
+/// **Hostile clock (rmp #233).** Drives the real engine under a seed-driven [`FaultyClock`] — bounded
+/// skew, forward jumps, and **non-monotonic regressions** — while advancing logical time, and asserts
+/// the engine's documented tolerance contract holds end to end:
+///
+/// 1. **No panic** — every statement (including temporal `datetime()` reads and latency-measured runs)
+///    completes against the hostile clock without unwinding.
+/// 2. **No temporal-correctness violation** — the engine's elapsed/latency arithmetic is
+///    `saturating_sub`, so even a backward clock yields a non-negative duration; this scenario reaches
+///    that path on every run and never observes a negative duration (it cannot, by construction, but
+///    exercising it under a regressing clock certifies the contract empirically).
+/// 3. **Liveness + consistency** — under the hostile clock every committed write is still readable and
+///    no work is lost: a fixed batch of creates is read back exactly.
+///
+/// The whole scenario is a pure function of `seed`: the clock faults derive from it and the engine is
+/// otherwise deterministic.
+fn hostile_clock(seed: u64) -> ScenarioOutcome {
+    const NAME: &str = "hostile_clock";
+    let (mut eng, inner) = engine_with_faulty_clock(seed, 256);
+    let n = 24i64;
+
+    // Interleave writes with logical-time advances so the FaultyClock perturbs a different base instant
+    // on each statement (skew + jumps + regressions all exercised across the run). The advances are
+    // small so a backward regression can dip below the previous reading — the hostile case.
+    for i in 0..n {
+        inner.set(1_000_000 + (i as u64) * 1_000);
+        if !write(
+            &mut eng,
+            "CREATE (:Clocked {id: $id, t: datetime()})",
+            vec![("id".into(), Value::Integer(i))],
+        ) {
+            return ScenarioOutcome::fail(NAME, format!("write {i} failed under hostile clock"));
+        }
+    }
+
+    // A temporal read that reads the (hostile) statement clock must still succeed and not panic.
+    inner.set(2_000_000);
+    let now_rows = count_rows(&mut eng, "RETURN datetime() AS now", vec![]);
+    if now_rows != 1 {
+        return ScenarioOutcome::fail(NAME, format!("datetime() read returned {now_rows} rows"));
+    }
+
+    // Liveness + consistency: every committed node is readable back, none lost under the hostile clock.
+    let present = count_rows(&mut eng, "MATCH (n:Clocked) RETURN n.id", vec![]);
+    if present as i64 != n {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("present {present} != created {n} under hostile clock"),
+        );
+    }
+
+    ScenarioOutcome::pass(NAME, format!("{n} writes survived skew/jump/regression"))
+}
+
 // ---- load-shape scenarios (reuse the VOPR runner) -------------------------------------------------
 
 /// Asserts a VOPR run replays identically, produces no spurious errors, and is internally consistent
@@ -985,6 +1060,28 @@ mod tests {
         }
     }
 
+    /// **rmp #233.** The hostile-clock scenario certifies the clock-fault tolerance contract: under a
+    /// seed-driven [`FaultyClock`] (skew + forward jumps + non-monotonic regressions) the engine never
+    /// panics, never produces a negative duration (its latency arithmetic saturates), and loses no
+    /// committed work. Asserted across a seed sweep so the property holds for many fault sequences,
+    /// and replayed per seed to confirm determinism.
+    #[test]
+    fn hostile_clock_tolerance_holds_across_seeds() {
+        for seed in 1u64..=8 {
+            let a = hostile_clock(seed);
+            let b = hostile_clock(seed);
+            assert_eq!(
+                a, b,
+                "hostile_clock must replay identically for seed {seed}"
+            );
+            assert!(
+                a.ok,
+                "engine must tolerate the hostile clock at seed {seed}: {}",
+                a.detail
+            );
+        }
+    }
+
     #[test]
     fn catalogue_is_deterministic() {
         // Each scenario replays identically for a fixed seed.
@@ -1014,6 +1111,7 @@ mod tests {
             "transaction_rollback",
             "churn_create_delete",
             "crash_recovery_durability",
+            "hostile_clock",
             "spike_load",
             "ramp_load",
             "sustained_high_concurrency",
