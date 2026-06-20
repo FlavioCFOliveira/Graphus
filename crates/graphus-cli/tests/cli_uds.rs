@@ -240,7 +240,7 @@ async fn cli_status_admin_op_reports_live_server() {
         "negotiated protocol:\n{report}"
     );
     assert!(
-        report.contains("Graphus/0.0.0"),
+        report.contains(concat!("Graphus/", env!("CARGO_PKG_VERSION"))),
         "server agent string from HELLO:\n{report}"
     );
     assert!(
