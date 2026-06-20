@@ -99,7 +99,7 @@ impl VoprFaultKind {
 ///
 /// The budget caps both the **rate** (how many faults fire over the run) and the **intensity** (how
 /// aggressive any single device/clock fault is), and weights which kinds are eligible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FaultBudget {
     /// Hard cap on the total number of faults injected over the whole run (the rate cap). `0` disables
     /// fault injection entirely (the legacy fault-free run).

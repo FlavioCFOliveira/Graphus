@@ -71,7 +71,7 @@ impl WorkloadOp {
 
 /// Relative weights over the op classes. The generator draws an op class proportional to its weight;
 /// a zero-weight class never occurs. Presets cover the canonical realistic mixes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MixProfile {
     /// Weight of `CreateNode`.
     pub create_node: u32,
@@ -201,7 +201,7 @@ impl WorkloadGen {
 /// Shapes how operations arrive over the scheduler's logical time. The returned delay (ns from the
 /// previous arrival) is what a driver passes to `SimScheduler::schedule_after`, so the load curve is
 /// reproducible from the seed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LoadProfile {
     /// Constant inter-arrival delay jittered within `[min, max]`.
     Steady { min: u64, max: u64 },

@@ -1113,6 +1113,7 @@ dependencies = [
  "graphus-sim",
  "graphus-storage",
  "graphus-wal",
+ "serde",
  "serde_json",
 ]
 

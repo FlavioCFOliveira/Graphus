@@ -45,3 +45,7 @@ graphus-cypher = { path = "../graphus-cypher" }
 # Builds/parses the REST JSON request body for the transport-fault harness (rmp #234), modelling a
 # truncated/reset HTTP body before it reaches the request core. Already a transitive dep via graphus-rest.
 serde_json = "1"
+# Derive `Serialize`/`Deserialize` for `VoprConfig` (+ `MixProfile`/`LoadProfile`/`FaultBudget`) so a
+# failing run round-trips to/from a JSON reproducer artifact (rmp #242). Test/CLI-only persistence — the
+# production server crates do not depend on graphus-dst, so this never reaches a production build.
+serde = { version = "1", features = ["derive"] }

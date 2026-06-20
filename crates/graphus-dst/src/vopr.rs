@@ -124,7 +124,11 @@ impl Clock for SwappableClock {
 type SimEngine = LocalEngine<MemBlockDevice, MemLogSink>;
 
 /// Configuration for one VOPR run (everything a seed needs to become a full execution).
-#[derive(Debug, Clone, Copy)]
+///
+/// Serializes to/from JSON (rmp #242) so a failing run can be persisted as a reproducer artifact and
+/// replayed byte-identically — the whole engine is a pure function of this config, so round-tripping it
+/// is enough to reproduce the exact run. See [`vopr_repro`](crate::vopr_repro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VoprConfig {
     /// The master seed: drives the scheduler, workload and all fault choices.
     pub seed: u64,
