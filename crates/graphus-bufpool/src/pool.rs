@@ -124,6 +124,13 @@ impl<D: BlockDevice, W: WalRule> BufferPool<D, W> {
             .ok_or_else(|| Self::oob_err(f.0, self.frames.len()))
     }
 
+    /// The number of pages on the underlying device (its current size in pages). Used by crash
+    /// recovery to scan every device page (`rmp` #239) without exposing the device itself.
+    #[must_use]
+    pub fn page_count(&self) -> u64 {
+        self.device.page_count()
+    }
+
     /// Mutably borrows the page held by a pinned frame and marks it dirty.
     ///
     /// # Panics

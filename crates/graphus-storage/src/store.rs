@@ -45,7 +45,8 @@ use crate::paging;
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
     MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL, NODE_RECORD_SIZE,
-    NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_FIRST_PROP, REL_RECORD_SIZE, RelRecord,
+    NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS, REL_OFF_END_PREV,
+    REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenStore};
 use crate::valenc;
@@ -239,6 +240,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// entry here. Populated at commit and on reopen (from the durable commit records), pruned when a
     /// GC freeze settles + forgets a writer — exactly tracking [`commit_registry`](Self::commit_registry).
     unfrozen_commit_lsn: BTreeMap<TxnId, Lsn>,
+    /// The largest real transaction id present in the durable WAL at [`open`](Self::open) time (or `0`
+    /// for a freshly [`create`](Self::create)d store). Transaction ids are written into the WAL but are
+    /// not otherwise persisted, so a reopened engine must restart its id counter **past** this value or
+    /// it would reuse ids already in the log — which silently breaks ARIES loser/winner classification
+    /// on the next crash (see [`WalManager::max_recovered_txn_id`]). Surfaced through
+    /// [`recovered_txn_hw`](Self::recovered_txn_hw) so the coordinator that owns the id counter
+    /// (`graphus_cypher::TxnCoordinator`) can seed it monotonically across recovery.
+    recovered_txn_hw: u64,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -289,6 +298,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: 0,
             unfrozen_commit_lsn: BTreeMap::new(),
+            // A fresh store has no prior transactions in its (just-created) WAL.
+            recovered_txn_hw: 0,
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -322,13 +333,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // floors WAL reclamation so no commit record an unfrozen version needs is dropped.
             unfrozen_commit_lsn.insert(committed_txn, lsn);
         }
-        let stores = [
+        let mut stores = [
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0]),
             FixedStore::from_meta(StoreKind::Rel, &meta.stores[1]),
             FixedStore::from_meta(StoreKind::Prop, &meta.stores[2]),
             FixedStore::from_meta(StoreKind::Strings, &meta.stores[3]),
         ];
+        // Re-attribute every record page the device holds back to its owning store (`rmp` #239). The
+        // durable catalog persists a store's `device_pages`/`high_water` only at a *commit*; a page
+        // allocated solely by aborted transactions exists on disk (ARIES redo re-materialised it) but is
+        // mapped by no store. A committed node's `first_rel` can legitimately still reference such a page
+        // (an aborted shared-node edge leaves a not-in-use dead-link corpse the forward walk threads
+        // through, repaired lazily at GC — `rmp` #220). This reconstruction makes those orphan pages
+        // addressable again so the walk reads the corpse and threads through it to NULL, instead of
+        // failing with "store page not allocated" (the seed-10 double-crash ReadBack failure).
+        Self::reconstruct_orphan_store_pages(&mut pool, &mut stores)?;
         let shared_len = shared.with(|w| w.durable_len());
+        // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
+        // resumes *past* every id already in the log. Without this the counter would restart low and
+        // reuse ids, which breaks ARIES loser/winner classification on a later crash and can resurrect
+        // uncommitted records (the atomicity violation this fixes). See
+        // [`WalManager::max_recovered_txn_id`].
+        let recovered_txn_hw = shared.with(|w| w.max_recovered_txn_id())?;
         Ok(Self {
             pool,
             wal: shared,
@@ -344,7 +370,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: shared_len,
             unfrozen_commit_lsn,
+            recovered_txn_hw,
         })
+    }
+
+    /// The largest real transaction id present in the durable WAL when this store was opened (`0` for a
+    /// freshly created store). The transaction coordinator seeds its monotonic id counter from this so
+    /// reopened engines never reuse a transaction id across recovery (which would break ARIES
+    /// loser/winner classification — see [`WalManager::max_recovered_txn_id`]).
+    #[must_use]
+    pub fn recovered_txn_hw(&self) -> u64 {
+        self.recovered_txn_hw
     }
 
     /// Runs `f` with the shared WAL manager (test/inspection helper).
@@ -456,6 +492,90 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok((Meta::decode(&payload)?, chain))
     }
 
+    /// Re-attributes every record page on the device back to its owning fixed-record store after crash
+    /// recovery, rebuilding `device_pages` (and flooring `high_water`) for **orphan** pages the durable
+    /// catalog does not map (`rmp` #239).
+    ///
+    /// ## Why orphan pages exist
+    ///
+    /// A store's `device_pages`/`high_water` are persisted only in the durable catalog, which is
+    /// checkpointed at a transaction's **commit** ([`checkpoint_meta`](Self::checkpoint_meta)). A device
+    /// page allocated by [`ensure_store_page`](Self::ensure_store_page) for a transaction that ultimately
+    /// **aborts** (or is a crash loser) is nonetheless materialised on disk — its allocation flush
+    /// hardened the page header, and ARIES redo re-applies the record writes — yet no commit ever folded
+    /// it into the catalog. On reopen, [`FixedStore::from_meta`] therefore omits it.
+    ///
+    /// This is normally invisible (the aborted records are unreachable), but `rmp` #220 makes it
+    /// reachable: an aborted shared-node edge creation leaves a not-in-use **dead-link corpse**, and the
+    /// node head's compare-and-set undo can legitimately leave a *committed* node's `first_rel` pointing
+    /// at that corpse (the head is repaired lazily at GC, not at abort). Reading the corpse to thread the
+    /// incidence walk through it to NULL needs its page mapped — otherwise the walk fails with "store page
+    /// not allocated" (the seed-10 double-crash `ReadBack` failure).
+    ///
+    /// ## How attribution is sound
+    ///
+    /// Each record page is stamped at allocation with its store kind in the page **subtype** byte
+    /// ([`page::set_page_subtype`]). Device pages are allocated globally-monotonically and, within one
+    /// store, in ascending store-relative order, so a store's device pages are strictly increasing in
+    /// device id and the committed catalog holds the lowest (earliest) prefix. Scanning device pages in
+    /// ascending id and appending each store's *unmapped* record pages therefore preserves store-relative
+    /// order. `high_water` is floored to cover the full capacity of the now-mapped pages so the corpse id
+    /// is in range for the in-use-filtered scans and is never re-handed-out by the allocator.
+    ///
+    /// # Errors
+    /// Returns a storage error if a device page cannot be read.
+    fn reconstruct_orphan_store_pages(
+        pool: &mut BufferPool<D, SharedWal<S>>,
+        stores: &mut [FixedStore; STORE_COUNT],
+    ) -> Result<()> {
+        // Pages already mapped by some store's committed catalog must not be re-appended.
+        let mut mapped: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for s in stores.iter() {
+            for p in &s.device_pages {
+                mapped.insert(p.0);
+            }
+        }
+        let page_count = pool.page_count();
+        // Collect orphan record pages per store kind, in ascending device order (preserves store-relative
+        // order, see the doc comment).
+        let mut orphans: [Vec<PageId>; STORE_COUNT] = std::array::from_fn(|_| Vec::new());
+        for dev in 0..page_count {
+            let pid = PageId(dev);
+            if mapped.contains(&dev) {
+                continue;
+            }
+            let f = pool.fetch(pid)?;
+            let p = pool.page(f);
+            let is_record = page::page_type(p) == PAGE_TYPE_RECORD;
+            let subtype = page::page_subtype(p);
+            pool.unpin(f);
+            if !is_record {
+                continue; // META pages and never-stamped (zeroed) pages are not record-store pages
+            }
+            // The subtype indexes a `StoreKind`; ignore an out-of-range value defensively (a torn or
+            // pre-`#239` page) rather than trusting it.
+            if (subtype as usize) < STORE_COUNT {
+                orphans[subtype as usize].push(pid);
+            }
+        }
+        for (i, store_orphans) in orphans.into_iter().enumerate() {
+            if store_orphans.is_empty() {
+                continue;
+            }
+            let kind = stores[i].kind;
+            stores[i].device_pages.extend_from_slice(&store_orphans);
+            // Floor the high-water so every record slot on the now-mapped pages is addressable and the
+            // allocator never re-hands-out a corpse slot. `observe(n - 1)` lifts the high-water to `n`
+            // without inventing a fresh id (`observe` records the largest id seen).
+            let rpp = paging::records_per_page(kind.record_size()) as u64;
+            let capacity = stores[i].device_pages.len() as u64 * rpp;
+            if capacity > stores[i].alloc.high_water() {
+                stores[i].alloc.observe(capacity.saturating_sub(1));
+            }
+        }
+        Ok(())
+    }
+
     /// Persists the in-memory catalog to the metadata page as one WAL-logged update under `txn`.
     /// When `commit` is set, `txn` is begun and committed around the write (standalone catalog
     /// change, `04 §2.6`); otherwise the write joins the caller's open `txn`.
@@ -519,8 +639,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // ----------------------------- page writing -----------------------------
 
     /// Maps a store-relative page index to its device `PageId`, growing the store (extending the
-    /// device, initialising a record-page header, recording the mapping) as needed.
-    fn ensure_store_page(&mut self, kind: StoreKind, rel_page: u64) -> Result<PageId> {
+    /// device, initialising a record-page header, recording the mapping) as needed, under `txn`.
+    fn ensure_store_page(&mut self, kind: StoreKind, rel_page: u64, txn: TxnId) -> Result<PageId> {
         let rel_page = rel_page as usize;
         while self.store(kind).device_pages.len() <= rel_page {
             let (f, dev_page) = self.pool.new_page()?;
@@ -530,8 +650,50 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.pool.flush(f)?; // header durable; the record writes that follow are WAL-logged
             self.pool.unpin(f);
             self.store_mut(kind).device_pages.push(dev_page);
+            // WAL-log the record page's type+subtype header word with **undo == redo** (`rmp` #239).
+            //
+            // The per-store device-page map (`device_pages`) is persisted only in the durable catalog at
+            // a *commit*'s `checkpoint_meta`. A device page allocated solely by transactions that ABORT
+            // (never commit) is still materialised on disk — but under no-force crash recovery the device
+            // is rebuilt purely from the WAL, so a page header that was only `flush`ed (not WAL-logged) is
+            // LOST: recovery's `DeviceTarget::apply` re-creates the page from a zero image and patches
+            // only the record regions, never the type/subtype bytes. To make a store's pages
+            // re-attributable after such a recovery (so a committed node's `first_rel` can still read an
+            // aborted-edge dead-link corpse on an orphan page — `rmp` #220), the store-kind tag must be
+            // **redo-durable**. Logging the type/subtype word here means ARIES redo restores it. Using
+            // undo == redo (a no-op on abort) keeps the tag even when the allocating txn aborts: page
+            // growth is never undone, so the page stays a tagged record page regardless of txn outcome,
+            // and `reconstruct_orphan_store_pages` can rebuild `device_pages`/`high_water` on open.
+            let mut hdr = [0u8; 2];
+            hdr[0] = PAGE_TYPE_RECORD;
+            hdr[1] = kind as u8;
+            self.write_region_keep(dev_page, page::OFF_PAGE_TYPE, &hdr, txn)?;
         }
         Ok(self.store(kind).device_pages[rel_page])
+    }
+
+    /// Writes `bytes` at `offset` within device `page` as one WAL-logged update under `txn` with
+    /// **undo == redo** (a no-op on abort/recovery). Used for structural writes that must persist
+    /// regardless of the writing transaction's outcome — currently the record-page type/subtype header
+    /// stamp (`rmp` #239), since page growth is never undone.
+    fn write_region_keep(
+        &mut self,
+        page: PageId,
+        offset: usize,
+        bytes: &[u8],
+        txn: TxnId,
+    ) -> Result<()> {
+        let end = offset + bytes.len();
+        assert!(end <= PAGE_SIZE, "region runs past the page");
+        let redo = paging::encode_patch(offset, bytes);
+        let undo = redo.clone();
+        let f = self.pool.fetch(page)?;
+        let lsn = self.wal.with(|w| w.log_update(txn, page, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[offset..end].copy_from_slice(bytes);
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
     }
 
     /// Writes `bytes` at `offset` within device `page` as one WAL-logged update under `txn`:
@@ -564,7 +726,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     fn write_record(&mut self, kind: StoreKind, id: u64, buf: &[u8], txn: TxnId) -> Result<()> {
         let (rel_page, offset) = paging::record_location(id, kind.record_size());
-        let dev_page = self.ensure_store_page(kind, rel_page)?;
+        let dev_page = self.ensure_store_page(kind, rel_page, txn)?;
         self.write_region(dev_page, offset, buf, txn)
     }
 
@@ -836,9 +998,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     //     the MVCC header (marks the slot not-in-use), PRESERVING the record body (its forward chain
     //     pointers). A surviving writer that prepended onto this record then threads THROUGH the dead
     //     record to its successor instead of having the chain severed by a body-zeroing undo.
-    //   * `write_record_keep` — a side write whose plain pre-image undo would also be unsafe (e.g.
+    //   * `write_rel_field_keep` — a side write whose plain pre-image undo would also be unsafe (e.g.
     //     `relink_old_head` making the old head look like the chain head): logged with undo == redo,
-    //     a no-op on abort; the GC corpse splice re-establishes the correct neighbour state.
+    //     a no-op on abort; the GC corpse splice re-establishes the correct neighbour state. It writes
+    //     ONLY the touched chain-pointer/flags fields, never the MVCC header — so an out-of-LIFO abort
+    //     of two interleaved prependers cannot resurrect a neighbour record's in-use bit (`rmp` #239).
 
     /// Writes the 8-byte chain-head field at `field_off` of record `id` in `kind`'s store to
     /// `new_head`, logging a **compare-and-set logical undo** (`rmp` #220 / #172): redo installs
@@ -888,7 +1052,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
     ) -> Result<()> {
         let (rel_page, off) = paging::record_location(id, kind.record_size());
-        let dev = self.ensure_store_page(kind, rel_page)?;
+        let dev = self.ensure_store_page(kind, rel_page, txn)?;
         let end = off + buf.len();
         let f = self.pool.fetch(dev)?;
         // Capture the live header pre-image (the only bytes the undo restores) before overwriting.
@@ -916,39 +1080,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let mut buf = [0u8; PROP_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record_header_undo(StoreKind::Prop, id, &buf, txn)
-    }
-
-    /// Writes the full body of record `id` in `kind`'s store with **undo == redo** (a no-op on
-    /// abort/recovery). Used for a side write whose plain pre-image undo would be unsafe under
-    /// interleaving — e.g. [`relink_old_head`](Self::relink_old_head) setting the old head's `prev`
-    /// and clearing its first-in-chain flag: a plain undo would restore the old head as a chain head
-    /// and let GC reclaim it, clobbering a committed prepend. With undo == redo the write simply
-    /// stays; the GC corpse splice re-establishes the correct `prev`/flags when the corpse is removed.
-    fn write_record_keep(
-        &mut self,
-        kind: StoreKind,
-        id: u64,
-        buf: &[u8],
-        txn: TxnId,
-    ) -> Result<()> {
-        let (rel_page, off) = paging::record_location(id, kind.record_size());
-        let dev = self.ensure_store_page(kind, rel_page)?;
-        let end = off + buf.len();
-        let redo = paging::encode_patch(off, buf);
-        let undo = redo.clone();
-        let f = self.pool.fetch(dev)?;
-        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
-        let p = self.pool.page_mut(f);
-        p[off..end].copy_from_slice(buf);
-        page::set_page_lsn(p, lsn);
-        self.pool.unpin(f);
-        Ok(())
-    }
-
-    fn write_rel_keep(&mut self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
-        let mut buf = [0u8; REL_RECORD_SIZE];
-        rec.encode(&mut buf);
-        self.write_record_keep(StoreKind::Rel, id, &buf, txn)
     }
 
     /// Records that `txn` version-stamped (created) record `id` in `kind`'s store, so `commit` can
@@ -1729,21 +1860,68 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// self-loop `old_head`, where both sides face `node` but only one side is the head link; the
     /// other side's `prev` must keep pointing to the head link inside the same record.
     fn relink_old_head(&mut self, old_head: u64, node: u64, new_id: u64, txn: TxnId) -> Result<()> {
-        let mut old = self.read_rel(old_head)?;
+        let old = self.read_rel(old_head)?;
+        // Recompute the exact post-image of the two back-pointer fields and the flags byte, then write
+        // ONLY those fields (`rmp` #220 / #239). Earlier this wrote the whole record body via
+        // `write_rel_keep`, which carries the MVCC header in its undo == redo image. That was unsafe
+        // under a non-LIFO abort of two interleaved prependers (`rmp` #239, seed 10): if prepender A
+        // (older) aborts *before* prepender B (newer) — both having pushed onto the same node head and
+        // B having relinked A's record as the old head — then B's relink-undo re-applies A's full body
+        // (header included) AFTER A's own header-only creation undo already marked A's slot not-in-use.
+        // That resurrects A as `in_use=true`: A becomes a live relationship that was never committed (an
+        // atomicity violation — `first_rel` then points at a phantom edge). Restricting this write to the
+        // chain-pointer fields makes the relink touch ONLY what it actually changes (never the MVCC
+        // header), so an out-of-order abort can no longer resurrect a neighbour's in-use bit; A stays a
+        // proper not-in-use dead-link corpse that the forward walk threads through to NULL.
+        //
+        // undo == redo per field is preserved (`rmp` #220): a plain pre-image undo would restore the old
+        // head's `prev == NULL` / first-in-chain flag, making it look like the chain head and letting GC
+        // reclaim it on top of a committed prepend. The GC corpse splice re-points `prev`/flags back to
+        // head form when the new (loser) record becomes a corpse.
+        let mut start_prev = old.start_prev_rel;
+        let mut end_prev = old.end_prev_rel;
+        let mut flags = old.chain_flags;
         if old.start_node == node && old.start_prev_rel == NULL_ID {
-            old.start_prev_rel = new_id;
-            old.chain_flags &= !CHAIN_FLAG_START_FIRST;
+            start_prev = new_id;
+            flags &= !CHAIN_FLAG_START_FIRST;
         }
         if old.end_node == node && old.end_prev_rel == NULL_ID {
-            old.end_prev_rel = new_id;
-            old.chain_flags &= !CHAIN_FLAG_END_FIRST;
+            end_prev = new_id;
+            flags &= !CHAIN_FLAG_END_FIRST;
         }
-        // undo == redo (`rmp` #220): a plain pre-image undo of this relink is unsafe — it would
-        // restore the old head's `prev == NULL` / first-in-chain flag, making it look like the chain
-        // head and letting GC reclaim it on top of a committed prepend. Keeping the write means the
-        // old head correctly records `prev = new_id`; when the new (loser) record becomes a dead-link
-        // corpse, the GC corpse splice re-points the old head's `prev`/flags back to head form.
-        self.write_rel_keep(old_head, &old, txn)
+        self.write_rel_field_keep(old_head, REL_OFF_START_PREV, &start_prev.to_le_bytes(), txn)?;
+        self.write_rel_field_keep(old_head, REL_OFF_END_PREV, &end_prev.to_le_bytes(), txn)?;
+        self.write_rel_field_keep(old_head, REL_OFF_CHAIN_FLAGS, &[flags], txn)?;
+        Ok(())
+    }
+
+    /// Writes a single field region of relationship record `id` with **undo == redo** (a no-op on
+    /// abort/recovery), touching ONLY `[field_off, field_off + bytes.len())` and never the MVCC header
+    /// (`rmp` #239). The narrow-field, header-preserving counterpart used by
+    /// [`relink_old_head`](Self::relink_old_head) so a relink's undo cannot clobber a neighbour record's
+    /// MVCC header (which an out-of-LIFO abort of interleaved prependers would otherwise use to resurrect
+    /// an aborted record's in-use bit). The undo equals the redo, so the GC corpse splice — not this
+    /// write's undo — re-establishes the correct neighbour state.
+    fn write_rel_field_keep(
+        &mut self,
+        id: u64,
+        field_off: usize,
+        bytes: &[u8],
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, REL_RECORD_SIZE);
+        let dev = self.ensure_store_page(StoreKind::Rel, rel_page, txn)?;
+        let abs = off + field_off;
+        let end = abs + bytes.len();
+        let redo = paging::encode_patch(abs, bytes);
+        let undo = redo.clone();
+        let f = self.pool.fetch(dev)?;
+        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[abs..end].copy_from_slice(bytes);
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
     }
 
     /// Reads the relationship record at physical id `id`.
@@ -3434,6 +3612,56 @@ mod tests {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         RecordStore::create(device, wal, 64, 1).expect("create store")
+    }
+
+    #[test]
+    fn recovered_txn_hw_resumes_past_every_durable_id() {
+        use crate::recovery::recover_device;
+
+        // Regression for the cross-recovery transaction-id-reuse atomicity bug (uncommitted records
+        // resurrected after a *second* crash). A reopened store must report a transaction-id high-water
+        // that is past every id written into the durable WAL, so the coordinator that seeds its id
+        // counter from it never reuses an id across recovery (which silently breaks ARIES loser/winner
+        // classification — see `WalManager::max_recovered_txn_id`).
+        let mut s = fresh();
+        assert_eq!(
+            s.recovered_txn_hw(),
+            0,
+            "a freshly created store has no prior txns"
+        );
+
+        // A committed transaction at id 5 and an in-flight loser at id 9 (no commit/abort).
+        s.begin(TxnId(5));
+        let _ = s.create_node(TxnId(5)).unwrap();
+        s.commit(TxnId(5)).unwrap();
+        s.begin(TxnId(9));
+        let _ = s.create_node(TxnId(9)).unwrap(); // uncommitted at the "crash"
+        // Model steal/no-force: the loser's log is forced durable (e.g. its dirty page was evicted
+        // under the WAL rule) even though it never committed — exactly the case recovery must undo,
+        // and the case whose id must still bound the recovered high-water.
+        s.wal.with(|w| w.flush());
+
+        // Capture the durable WAL prefix (what survives a power loss) and recover from it, exactly as
+        // a reopen does.
+        let log = s.wal.with(|w| {
+            let mut b = Vec::new();
+            w.read_durable(Lsn(0), &mut b).unwrap();
+            b
+        });
+        let mut sink = MemLogSink::new();
+        sink.append(&log);
+        sink.sync().unwrap();
+        let mut device = MemBlockDevice::new(0);
+        let mut wal = WalManager::open(sink).unwrap();
+        recover_device(&mut wal, &mut device).unwrap();
+        let reopened = RecordStore::open(device, wal, 64).unwrap();
+
+        assert_eq!(
+            reopened.recovered_txn_hw(),
+            9,
+            "the counter must resume past the largest durable id (9, the in-flight loser), so a \
+             post-recovery transaction never reuses ids 1..=9"
+        );
     }
 
     #[test]

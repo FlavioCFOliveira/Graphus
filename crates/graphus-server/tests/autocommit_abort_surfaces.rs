@@ -51,7 +51,9 @@ fn auto_commit(eng: &mut Eng, mode: AccessMode, stmt: &str) -> (bool, usize) {
 
 /// Runs one statement inside an already-open explicit transaction, draining its rows.
 fn run_in(eng: &mut Eng, ticket: graphus_server::engine::TxTicket, stmt: &str) {
-    let mut reply = eng.run(ticket, stmt, vec![], false, None).expect("run in txn");
+    let mut reply = eng
+        .run(ticket, stmt, vec![], false, None)
+        .expect("run in txn");
     while reply.rows.next().expect("drain").is_some() {}
 }
 
@@ -60,7 +62,11 @@ fn autocommit_commit_abort_is_reported_not_silently_swallowed() {
     let mut eng = engine();
 
     // Seed two nodes `(:A {v:1})`, `(:B {v:1})` in a committed auto-commit.
-    let (ok, _) = auto_commit(&mut eng, AccessMode::Write, "CREATE (:A {v: 1}), (:B {v: 1})");
+    let (ok, _) = auto_commit(
+        &mut eng,
+        AccessMode::Write,
+        "CREATE (:A {v: 1}), (:B {v: 1})",
+    );
     assert!(ok, "seed must commit");
 
     // Open an explicit SERIALIZABLE writer that reads label A (full scan, predicate SIREAD) and

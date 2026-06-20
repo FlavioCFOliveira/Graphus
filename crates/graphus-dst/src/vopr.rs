@@ -35,9 +35,20 @@ use graphus_server::engine::{LocalEngine, RunReply, TxTicket};
 use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock, SimScheduler};
 use graphus_wal::MemLogSink;
 
+use graphus_elle::{Op as ElleOp, Transaction as ElleTxn, check as elle_check};
+
 use crate::mix::{LoadProfile, MixProfile, WorkloadGen, WorkloadOp};
 use crate::vopr_fault::{FaultBudget, FaultScheduler};
 use crate::vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
+
+/// The single Elle object key the safety oracle records the `:Person` id space under. Every committed
+/// `CreateNode{id}` is an [`ElleOp::Append`] of `id` to this key; the generator's ids are monotonic +
+/// unique, so the recovered appends form a **self-recoverable version order** — Elle's requirement for
+/// the list-append model (Kingsbury & Alvaro). The history is **append-only**: the workload's reads
+/// (`CountNodes`/`Neighbors`) cannot yield a faithful observed id-list (a count is not a list), so
+/// synthesising reads would inject phantom anomalies; read-transaction serializability is certified
+/// separately against the engine's *real* observed lists by the `isolation` oracle (rmp #170/#171).
+const ELLE_PERSONS_KEY: &str = "persons";
 
 /// A [`Clock`] whose active [`ClockFaultPlan`] can be **swapped at run time**, so the unified fault
 /// scheduler can intensify the engine's clock faults *mid-run* (the engine holds one fixed
@@ -187,6 +198,30 @@ impl VoprConfig {
         self.auto_commit_permille = 1000;
         self
     }
+
+    /// The **safety-mode preset** for `seed` (rmp #239): a contended interleave (explicit overlapping
+    /// transactions under a write-heavy mix) run **under faults + crashes**, sized to stay fast in a
+    /// debug build while guaranteeing acked commits and in-flight transactions coexist at a crash. This
+    /// is the config [`run_safety`] certifies the full four-property safety bundle against, every run.
+    ///
+    /// It enables a bounded fault budget *and* crashes so the safety properties are asserted **while
+    /// faults fire during concurrent interleaved work** — the whole point of the mode. The budget stays
+    /// recoverable (it never guarantees a total wipe), so the engine can uphold its ACID contract.
+    #[must_use]
+    pub fn safety(seed: u64) -> Self {
+        Self {
+            clients: 6,
+            ops_per_client: 24,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            max_txn_stmts: 5,
+            auto_commit_permille: 200,
+            rollback_permille: 100,
+            ..Self::for_seed(seed)
+        }
+        .with_faults(FaultBudget::default().with_max_faults(8))
+        .with_crashes(2)
+    }
 }
 
 /// The deterministic outcome of one VOPR run.
@@ -294,57 +329,107 @@ pub struct CrashSplit {
 struct Oracle {
     /// The independent shadow model, the cumulative effect of all *committed* ops.
     model: ShadowGraph,
-    /// Per-client staged state for the client's currently-open explicit transaction: the committed
-    /// node multiset snapshot taken at **BEGIN** (what this transaction's `MATCH` clauses can see
-    /// under snapshot isolation) plus the ops issued so far, in order.
+    /// Per-client staged state for the client's currently-open explicit transaction.
     pending: Vec<PendingTxn>,
+    /// The recovered Elle history (rmp #239 safety mode). `None` for a standard run.
+    elle_history: Option<Vec<ElleTxn>>,
+    /// Monotonic Elle transaction id, assigned in commit order so the recorded history is stable.
+    elle_next_id: u64,
 }
 
-/// The oracle's staging buffer for one client's open explicit transaction.
 #[derive(Clone, Default)]
 struct PendingTxn {
-    /// Committed node multiset at BEGIN — the transaction's MVCC read snapshot.
     snapshot: std::collections::BTreeMap<i64, u64>,
-    /// Ops issued in this transaction so far, in order.
     ops: Vec<WorkloadOp>,
+    elle_ops: Vec<ElleOp>,
 }
 
 impl Oracle {
-    /// An oracle for `clients` virtual clients, with an empty model and empty buffers.
     fn new(clients: usize) -> Self {
         Self {
             model: ShadowGraph::new(),
             pending: vec![PendingTxn::default(); clients],
+            elle_history: None,
+            elle_next_id: 1,
         }
     }
 
-    /// Opens a fresh staging buffer for `client`, capturing the committed node multiset as the
-    /// transaction's BEGIN snapshot (the nodes its `MATCH` clauses can see under snapshot isolation).
+    fn new_recording(clients: usize) -> Self {
+        Self {
+            elle_history: Some(Vec::new()),
+            ..Self::new(clients)
+        }
+    }
+
     fn begin(&mut self, client: usize) {
         self.pending[client] = PendingTxn {
             snapshot: self.model.node_snapshot(),
             ops: Vec::new(),
+            elle_ops: Vec::new(),
         };
     }
 
-    /// Stages an op into `client`'s open transaction (it takes effect only if the transaction commits).
     fn stage(&mut self, client: usize, op: WorkloadOp) {
         self.pending[client].ops.push(op);
+        if self.elle_history.is_some() {
+            self.stage_elle(client, op);
+        }
     }
 
-    /// Flushes `client`'s staged transaction into the committed model under snapshot-isolation
-    /// semantics (a `COMMIT` was acknowledged), then clears the buffer.
+    /// Projects `op` into the recorded Elle history for `client`'s open transaction (recorder-on path).
+    ///
+    /// Only **writes** are recorded, as [`ElleOp::Append`] of the created `id` to [`ELLE_PERSONS_KEY`].
+    /// We deliberately do **not** synthesise reads: the workload's `CountNodes` yields only a *count*
+    /// (never the id list), so a read's `observed` order cannot be recovered from what the engine
+    /// actually returned — fabricating it from the model snapshot would inject reads that disagree with
+    /// the true serialization order under contention/crashes and make the Elle checker report *phantom*
+    /// cycles that are artifacts of the recorder, not engine anomalies. (Measured: every such "cycle"
+    /// was read-driven, never a duplicate append.) The end-to-end SSI serializability of *reading*
+    /// transactions is certified separately, against the engine's real observed lists, by the
+    /// `isolation` oracle (rmp #170/#171). Here the append-only history — with the generator's unique,
+    /// monotonic ids — is self-recoverable and its serializability check has real teeth: it fails iff
+    /// the recovered history contains a **duplicate or impossible version order** (e.g. the same id
+    /// committed twice, or a create lost-then-duplicated across recovery), exactly the corruption a
+    /// crash-recovery defect would produce.
+    fn stage_elle(&mut self, client: usize, op: WorkloadOp) {
+        if let WorkloadOp::CreateNode { id } = op {
+            self.pending[client].elle_ops.push(ElleOp::Append {
+                key: ELLE_PERSONS_KEY.to_owned(),
+                val: id,
+            });
+        }
+    }
+
     fn commit(&mut self, client: usize) {
         let txn = std::mem::take(&mut self.pending[client]);
         self.model.commit_transaction(&txn.snapshot, &txn.ops);
+        if let Some(history) = self.elle_history.as_mut() {
+            if !txn.elle_ops.is_empty() {
+                let id = self.elle_next_id;
+                self.elle_next_id += 1;
+                history.push(ElleTxn::committed(id, txn.elle_ops));
+            }
+        }
     }
 
-    /// Discards `client`'s staged ops without applying them (rollback / abort / crash-lost).
+    fn record_auto_commit(&mut self, op: WorkloadOp) {
+        if let (Some(history), WorkloadOp::CreateNode { id }) = (self.elle_history.as_mut(), op) {
+            let txn_id = self.elle_next_id;
+            self.elle_next_id += 1;
+            history.push(ElleTxn::committed(
+                txn_id,
+                vec![ElleOp::Append {
+                    key: ELLE_PERSONS_KEY.to_owned(),
+                    val: id,
+                }],
+            ));
+        }
+    }
+
     fn discard(&mut self, client: usize) {
         self.pending[client] = PendingTxn::default();
     }
 
-    /// Discards **every** client's staged ops — used on a crash, which drops all open transactions.
     fn discard_all(&mut self) {
         for buf in &mut self.pending {
             *buf = PendingTxn::default();
@@ -401,6 +486,13 @@ impl ClientState {
 /// failure in the test environment), which is not a condition the simulation is meant to tolerate.
 #[must_use]
 pub fn run(cfg: VoprConfig) -> VoprReport {
+    run_inner(cfg, false).0
+}
+
+/// The shared run engine behind [`run`] (standard) and [`run_safety`] (safety mode). When
+/// `record_elle` is set, the oracle records the recovered committed history as an Elle transaction
+/// list (returned alongside the report) so the safety checker can rule on serializability.
+fn run_inner(cfg: VoprConfig, record_elle: bool) -> (VoprReport, Vec<ElleTxn>) {
     // The single simulated clock, shared with the engine and set from scheduler time each step.
     let clock = SharedClock::new(0);
 
@@ -463,7 +555,11 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
 
     // The strong reference-model oracle (rmp #238): a committed-only shadow of the multigraph with a
     // per-client staging buffer. Ops are flushed into the model only when a transaction commits.
-    let mut oracle = Oracle::new(clients);
+    let mut oracle = if record_elle {
+        Oracle::new_recording(clients)
+    } else {
+        Oracle::new(clients)
+    };
 
     // Hard upper bound on dispatched steps so a logic slip can never hang a test: every statement
     // spends one unit of budget, and each transaction adds a bounded `Begin`/`End` overhead, so the
@@ -600,7 +696,9 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
 
     let (disk_faults, clock_faults, transport_faults) = faults.tally();
 
-    VoprReport {
+    let elle_history = oracle.elle_history.take().unwrap_or_default();
+
+    let report = VoprReport {
         seed: cfg.seed,
         steps,
         ok_ops,
@@ -619,7 +717,8 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         crash_restarts,
         crash_splits,
         oracle: oracle_verdict,
-    }
+    };
+    (report, elle_history)
 }
 
 /// The dispatched-step horizon a run spans, so the fault scheduler can spread fault instants *across*
@@ -867,6 +966,7 @@ fn exec_step(
                 if outcome.ok {
                     *acked_commits += 1;
                     oracle.model.apply(op);
+                    oracle.record_auto_commit(op);
                 }
                 tally(&outcome, ok_ops, err_ops);
                 states[client] = ClientState::Idle;
@@ -1129,6 +1229,263 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
         }
     }
     (out, failures)
+}
+
+/// The four inviolable safety properties the VOPR safety mode certifies (rmp #239).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyProperty {
+    /// **Serializability** (ACID "I"). The recovered committed history — the `:Person` creates recorded
+    /// as an append-only [`graphus_elle::History`] over the id space — is acyclic and order-consistent
+    /// under Adya's formalism ([`graphus_elle::check`] returns `serializable`). With the generator's
+    /// unique ids this fails iff the recovered history is corrupt (a duplicate or impossible version
+    /// order — e.g. an id committed twice, or a create lost-then-duplicated across recovery).
+    Serializability,
+    /// **Durability.** Every commit the engine acknowledged before a crash survives the ARIES restart:
+    /// the cumulative acked count is non-decreasing across every [`CrashSplit`] (no acked commit
+    /// vanished at a restart), and — with reference equivalence — the surviving state is exactly the
+    /// acked set.
+    Durability,
+    /// **Atomicity (committed-or-nothing).** No partial / uncommitted / rolled-back / in-flight-at-crash
+    /// effect survives: the per-`:Person` create-count probe holds (no duplicated/lost create) and the
+    /// reference model (which applies only acked ops) matches the engine, excluding any half-applied
+    /// effect.
+    Atomicity,
+    /// **Reference-model equivalence.** The independent #238 shadow model agrees with the engine queried
+    /// back cell-by-cell (node multiset, edge multiset, count, neighbours): [`VoprReport::oracle`] is
+    /// `None`. A wrong result with the right cardinality is caught here.
+    ReferenceModel,
+}
+
+impl SafetyProperty {
+    /// A stable, lower-kebab name for reports/CLI.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            SafetyProperty::Serializability => "serializability",
+            SafetyProperty::Durability => "durability",
+            SafetyProperty::Atomicity => "atomicity",
+            SafetyProperty::ReferenceModel => "reference-model-equivalence",
+        }
+    }
+}
+
+/// One violated safety property with a human-readable detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyViolation {
+    /// Which property was violated.
+    pub property: SafetyProperty,
+    /// A precise, reproducible description of the violation.
+    pub detail: String,
+}
+
+/// The verdict of one safety-mode run (rmp #239): the four-property bundle asserted on the recovered
+/// state, plus the underlying [`VoprReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyReport {
+    /// `true` iff no property was violated.
+    pub safe: bool,
+    /// The number of committed/recovered transactions the Elle checker ruled on.
+    pub checked_txns: usize,
+    /// Every property that broke (empty when `safe`).
+    pub violations: Vec<SafetyViolation>,
+    /// The underlying deterministic run report.
+    pub run: VoprReport,
+}
+
+impl SafetyReport {
+    /// The seed this safety run replays from.
+    #[must_use]
+    pub fn seed(&self) -> u64 {
+        self.run.seed
+    }
+}
+
+/// Runs one VOPR simulation in **safety mode** (rmp #239): records the recovered Elle history and
+/// asserts the full four-property safety bundle against the recovered state, while faults and crashes
+/// fire during concurrent, interleaved work.
+///
+/// # The safety oracle bundle
+///
+/// The interleaver (rmp #235) runs under the unified fault + crash scheduler (rmp #236/#237) with a
+/// bounded, recoverable budget ([`VoprConfig::safety`]). As transactions commit/abort/crash, the
+/// recovered **committed** history is recorded into an append-only [`graphus_elle::History`] over the
+/// `:Person` id space (each committed `CreateNode{id}` an append; an in-flight-at-crash transaction is
+/// dropped, so the history spans exactly the durable, recovered state). After the run, **all four** of
+/// these must hold simultaneously, or the run is flagged with the offending property (see
+/// [`SafetyProperty`]):
+///
+/// 1. **Serializability** — [`graphus_elle::check`] certifies the recorded history acyclic + order-
+///    consistent (fails iff a duplicate/impossible version order, e.g. a create lost-then-duplicated
+///    across recovery).
+/// 2. **Durability** — every [`CrashSplit`]'s acked commits survived (the cumulative acked count is
+///    monotone across crashes; the surviving state is the acked set, by equivalence #4).
+/// 3. **Atomicity** — no in-flight / rolled-back effect persisted (the per-`:Person` create-count probe
+///    shows no duplicate/lost create; the reference model applies only acked ops).
+/// 4. **Reference-model equivalence** — the #238 shadow model agrees with the engine cell-by-cell
+///    (node multiset, edge multiset, count, neighbours), so wrong-result-right-cardinality is caught.
+///
+/// Deterministic: same seed ⇒ identical [`SafetyReport`] (the recorder never perturbs the workload,
+/// trace, or engine — it only stages extra observer data).
+#[must_use]
+pub fn run_safety(cfg: VoprConfig) -> SafetyReport {
+    let (run, history) = run_inner(cfg, true);
+    let violations = evaluate_safety(&run, &history);
+
+    SafetyReport {
+        safe: violations.is_empty(),
+        checked_txns: history.len(),
+        violations,
+        run,
+    }
+}
+
+/// Evaluates the four safety properties (rmp #239) over a finished run and its recorded Elle history,
+/// returning every violation (empty ⇒ all four held). Pure — no engine, no I/O — so each arm can be
+/// unit-tested against fabricated inputs (a broken build), proving the bundle has teeth.
+fn evaluate_safety(run: &VoprReport, history: &[ElleTxn]) -> Vec<SafetyViolation> {
+    let mut violations = Vec::new();
+
+    // 1. Serializability: the Elle checker rules on the recovered committed history.
+    let verdict = elle_check(&history.to_vec());
+    if !verdict.serializable {
+        violations.push(SafetyViolation {
+            property: SafetyProperty::Serializability,
+            detail: verdict
+                .anomaly
+                .unwrap_or_else(|| "non-serializable history".to_owned()),
+        });
+    }
+
+    // 2. Durability: every crash's acked-commit set must survive — the cumulative acked count is
+    //    non-decreasing across crashes (a lost acked commit would drop it). That the *surviving* state
+    //    is exactly the acked set is the reference-equivalence property #4, below.
+    let mut prev_acked = 0usize;
+    for (i, split) in run.crash_splits.iter().enumerate() {
+        if split.acked_commits < prev_acked {
+            violations.push(SafetyViolation {
+                property: SafetyProperty::Durability,
+                detail: format!(
+                    "acked-commit count regressed at crash #{i} (fire_step={}): {} < {prev_acked} \
+                     — an acknowledged commit was lost across recovery",
+                    split.fire_step, split.acked_commits
+                ),
+            });
+        }
+        prev_acked = split.acked_commits;
+    }
+
+    // 3. Atomicity (committed-or-nothing): persisted == distinct committed ids. A half-applied
+    //    in-flight or rolled-back create would skew this; the reference model (#4) additionally proves
+    //    persisted == acked-only, excluding any partial effect.
+    if run.persisted_nodes != run.created_nodes {
+        violations.push(SafetyViolation {
+            property: SafetyProperty::Atomicity,
+            detail: format!(
+                "persisted :Person rows ({}) != distinct committed ids ({}) — a partial or \
+                 duplicated effect survived",
+                run.persisted_nodes, run.created_nodes
+            ),
+        });
+    }
+
+    // 4. Reference-model equivalence: the #238 shadow model agrees with the engine cell-by-cell.
+    if let Some(err) = &run.oracle {
+        violations.push(SafetyViolation {
+            property: SafetyProperty::ReferenceModel,
+            detail: format!("{err:?}"),
+        });
+    }
+
+    violations
+}
+
+/// Renders a one-line, reproducible summary of a [`SafetyReport`] (for the safety CLI).
+#[must_use]
+pub fn summarize_safety(r: &SafetyReport) -> String {
+    if r.safe {
+        format!(
+            "safety seed={} SAFE checked_txns={} crashes={} faults={} trace_hash={:016x}\n",
+            r.seed(),
+            r.checked_txns,
+            r.run.crash_restarts,
+            r.run.disk_faults + r.run.clock_faults + r.run.transport_faults,
+            r.run.trace_hash,
+        )
+    } else {
+        let props: Vec<&str> = r.violations.iter().map(|v| v.property.name()).collect();
+        format!(
+            "safety seed={} UNSAFE violated={:?} checked_txns={} trace_hash={:016x}\n",
+            r.seed(),
+            props,
+            r.checked_txns,
+            r.run.trace_hash,
+        )
+    }
+}
+
+/// Parses the `vopr-safety` subcommand's arguments and runs a safety seed sweep, returning
+/// `(summary, violations)`. Each seed is run in safety mode (faults + crashes via
+/// [`VoprConfig::safety`]); the four-property bundle is asserted on the recovered state. Each seed is
+/// additionally run twice and the reports compared — a mismatch is a determinism failure counting as a
+/// violation. Flags: `--seed <base>` (default 1), `--seeds <count>` (default 1).
+#[must_use]
+pub fn run_safety_cli<I: IntoIterator<Item = String>>(args: I) -> (String, u32) {
+    let mut base_seed: u64 = 1;
+    let mut count: u64 = 1;
+
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        let mut next_u64 = |label: &str| -> Result<u64, String> {
+            it.next()
+                .ok_or_else(|| format!("flag {label} needs a value"))?
+                .parse::<u64>()
+                .map_err(|_| format!("flag {label} needs an integer"))
+        };
+        let parsed = match arg.as_str() {
+            "--seed" => next_u64("--seed").map(|v| base_seed = v),
+            "--seeds" => next_u64("--seeds").map(|v| count = v.max(1)),
+            other => Err(format!("unknown flag {other}")),
+        };
+        if let Err(e) = parsed {
+            return (format!("error: {e}\n"), 1);
+        }
+    }
+
+    let mut out = String::new();
+    let mut violations: u32 = 0;
+    let mut unsafe_seeds = Vec::new();
+    let mut nondet_seeds = Vec::new();
+    for seed in base_seed..base_seed.saturating_add(count) {
+        let cfg = VoprConfig::safety(seed);
+        let first = run_safety(cfg);
+        let second = run_safety(cfg);
+        out.push_str(&summarize_safety(&first));
+        if !first.safe {
+            violations += 1;
+            unsafe_seeds.push(seed);
+        }
+        if first != second {
+            violations += 1;
+            nondet_seeds.push(seed);
+        }
+    }
+    if violations == 0 {
+        out.push_str(&format!(
+            "safety: {count} seed(s) checked, all SAFE + deterministic\n"
+        ));
+    } else {
+        if !unsafe_seeds.is_empty() {
+            out.push_str(&format!(
+                "safety: UNSAFE seed(s): {unsafe_seeds:?} — reproduce with --seed <N> --seeds 1\n"
+            ));
+        }
+        if !nondet_seeds.is_empty() {
+            out.push_str(&format!(
+                "safety: NON-DETERMINISTIC seed(s): {nondet_seeds:?} — reproduce with --seed <N> --seeds 1\n"
+            ));
+        }
+    }
+    (out, violations)
 }
 
 /// The deterministic result of executing one operation (no wall-clock, no identity — only what the
@@ -2003,5 +2360,266 @@ mod tests {
             "the injected phantom edge must be caught with a precise diff, got {err:?}"
         );
         let _ = eng.shutdown();
+    }
+
+    // ---------------------------- safety oracle bundle (rmp #239) ----------------------------
+
+    /// **Acceptance (the full safety bundle holds under faults+crashes, across a seed sweep).** For
+    /// every seed in a representative range, [`run_safety`] runs the interleaver under the unified
+    /// fault + crash scheduler and asserts all four properties simultaneously — serializability,
+    /// durability, atomicity, reference-model equivalence — and reports `safe`. This is the core
+    /// correctness oracle: zero violations with faults firing during concurrent interleaved work. The
+    /// `vopr_safety_teeth` integration suite + the safety CLI run a wider 1..=100 sweep; the committed
+    /// range stays fast in a debug build.
+    ///
+    /// This sweep surfaced — and the engine fixes here closed — three real recovery defects across a
+    /// double crash (rmp #239): a `crash_restart` that opened the store on a *clone* of the WAL (losing
+    /// undo CLRs/ABORTs), TxnId reuse across recovery (ARIES mis-classifying a loser as a winner), and a
+    /// non-LIFO-abort phantom relationship left by an orphan store page. With all three fixed the bundle
+    /// is clean.
+    #[test]
+    fn safety_bundle_holds_across_seed_sweep_under_faults() {
+        let mut unsafe_seeds = Vec::new();
+        let mut faults_seen = false;
+        let mut crashes_seen = false;
+        let mut any_history = false;
+        for seed in 1u64..=40 {
+            let r = run_safety(VoprConfig::safety(seed));
+            if !r.safe {
+                unsafe_seeds.push((seed, r.violations.clone()));
+            }
+            faults_seen |= r.run.disk_faults + r.run.clock_faults + r.run.transport_faults > 0;
+            crashes_seen |= r.run.crash_restarts > 0;
+            any_history |= r.checked_txns > 0;
+        }
+        assert!(
+            unsafe_seeds.is_empty(),
+            "the four-property safety bundle must hold for every seed under faults+crashes: {unsafe_seeds:?}"
+        );
+        // Non-vacuity: the sweep genuinely exercised faults, crashes, and a real recorded history.
+        assert!(faults_seen, "the safety sweep must actually inject faults");
+        assert!(
+            crashes_seen,
+            "the safety sweep must actually crash + recover"
+        );
+        assert!(
+            any_history,
+            "the safety sweep must record a non-empty Elle history (the check is non-vacuous)"
+        );
+    }
+
+    /// **Acceptance (determinism).** Same seed ⇒ identical [`SafetyReport`] — the safety verdict, the
+    /// recorded-history length, the violation list and the full underlying run all replay bit-for-bit
+    /// (the recorder never perturbs the workload, trace, or engine).
+    #[test]
+    fn safety_report_is_deterministic_same_seed() {
+        let cfg = VoprConfig::safety(0x239_0001);
+        let a = run_safety(cfg);
+        let b = run_safety(cfg);
+        assert_eq!(a, b, "same seed ⇒ identical safety report");
+        assert!(a.safe, "the determinism check runs on a clean (safe) seed");
+        assert!(
+            a.run.crash_restarts > 0
+                && a.run.disk_faults + a.run.clock_faults + a.run.transport_faults > 0,
+            "the determinism check is non-vacuous (faults + crashes actually fired)"
+        );
+    }
+
+    /// The safety recorder is a **pure observer**: turning it on does not change the canonical run — the
+    /// trace hash, state hash, and full [`VoprReport`] for a fixed config are identical with and without
+    /// recording. This guarantees the legacy [`run`] path stays bit-for-bit unchanged (zero-cost gating).
+    #[test]
+    fn safety_recorder_does_not_perturb_the_run() {
+        let cfg = VoprConfig::safety(0x239_0002);
+        let plain = run(cfg);
+        let recorded = run_safety(cfg).run;
+        assert_eq!(
+            plain, recorded,
+            "the Elle recorder must not perturb the canonical run (trace/state/counts)"
+        );
+    }
+
+    /// Teeth (serializability arm): the bundle catches a deliberately non-serializable history. We feed
+    /// a fabricated write-skew history straight to the same [`elle_check`] the safety oracle uses,
+    /// proving the arm has teeth. (The other three arms are exercised against the real engine in the
+    /// `vopr_safety_teeth` integration suite.)
+    #[test]
+    fn serializability_arm_catches_a_fabricated_cycle() {
+        let history = vec![
+            ElleTxn::committed(
+                1,
+                vec![
+                    ElleOp::Read {
+                        key: ELLE_PERSONS_KEY.to_owned(),
+                        observed: vec![],
+                    },
+                    ElleOp::Append {
+                        key: ELLE_PERSONS_KEY.to_owned(),
+                        val: 1,
+                    },
+                ],
+            ),
+            ElleTxn::committed(
+                2,
+                vec![
+                    ElleOp::Read {
+                        key: ELLE_PERSONS_KEY.to_owned(),
+                        observed: vec![],
+                    },
+                    ElleOp::Append {
+                        key: ELLE_PERSONS_KEY.to_owned(),
+                        val: 2,
+                    },
+                ],
+            ),
+        ];
+        let verdict = elle_check(&history);
+        assert!(
+            !verdict.serializable,
+            "the serializability checker must flag the fabricated cycle: {verdict:?}"
+        );
+    }
+
+    /// The recorded history is **append-only** (writes only — see [`Oracle::stage_elle`]), so for the
+    /// real workload it is always internally consistent: no fabricated read injects a phantom cycle. A
+    /// clean safety run therefore records a non-empty, serializable history.
+    #[test]
+    fn recorded_history_is_append_only_and_serializable() {
+        let r = run_safety(VoprConfig::safety(0x239_0003));
+        assert!(r.safe, "a clean seed must be safe: {:?}", r.violations);
+        assert!(
+            r.checked_txns > 0,
+            "the recorded history must be non-empty (non-vacuous)"
+        );
+    }
+
+    /// A clean baseline [`VoprReport`] for the `evaluate_safety` teeth: no faults, no crashes, the
+    /// reference oracle agreeing, persisted == created. Each teeth test perturbs exactly one field.
+    fn clean_report() -> VoprReport {
+        VoprReport {
+            seed: 1,
+            steps: 10,
+            ok_ops: 10,
+            err_ops: 0,
+            trace_hash: 0,
+            state_hash: 0,
+            end_time: 0,
+            created_nodes: 5,
+            persisted_nodes: 5,
+            max_open_txns: 2,
+            committed_txns: 5,
+            aborted_txns: 0,
+            disk_faults: 0,
+            clock_faults: 0,
+            transport_faults: 0,
+            crash_restarts: 0,
+            crash_splits: Vec::new(),
+            oracle: None,
+        }
+    }
+
+    /// A faithful append-only history matching `clean_report` (5 committed creates) — serializable.
+    fn clean_history() -> Vec<ElleTxn> {
+        (0..5i64)
+            .map(|id| {
+                ElleTxn::committed(
+                    id as u64 + 1,
+                    vec![ElleOp::Append {
+                        key: ELLE_PERSONS_KEY.to_owned(),
+                        val: id,
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    /// Teeth (all four arms via the pure evaluator): the bundle is clean on a faithful run, and each
+    /// of the four properties is independently caught when its evidence is broken. This is the "broken
+    /// build" mutation test the acceptance criteria require — one falsifiable arm per property.
+    #[test]
+    fn evaluate_safety_has_teeth_per_property() {
+        // Baseline: a faithful run + history is clean.
+        assert!(
+            evaluate_safety(&clean_report(), &clean_history()).is_empty(),
+            "a faithful run must report no safety violations"
+        );
+
+        // 1. Serializability: a fabricated duplicate append (the same id committed by two txns) is an
+        //    impossible version order the checker flags.
+        let mut dup_history = clean_history();
+        dup_history.push(ElleTxn::committed(
+            99,
+            vec![ElleOp::Append {
+                key: ELLE_PERSONS_KEY.to_owned(),
+                val: 0, // id 0 was already appended by txn 1 — a duplicate version
+            }],
+        ));
+        let v = evaluate_safety(&clean_report(), &dup_history);
+        assert!(
+            v.iter()
+                .any(|x| x.property == SafetyProperty::Serializability),
+            "a duplicate append must trip the serializability arm: {v:?}"
+        );
+
+        // 2. Durability: a fabricated acked-commit regression across crashes (an acked commit lost at a
+        //    restart) is flagged.
+        let mut durability_broken = clean_report();
+        durability_broken.crash_restarts = 2;
+        durability_broken.crash_splits = vec![
+            CrashSplit {
+                fire_step: 10,
+                acked_commits: 5,
+                inflight_txns: 1,
+                recovered_state_hash: 0,
+            },
+            CrashSplit {
+                fire_step: 20,
+                acked_commits: 3, // REGRESSION: fewer acked after the second crash — a lost commit
+                inflight_txns: 0,
+                recovered_state_hash: 0,
+            },
+        ];
+        let v = evaluate_safety(&durability_broken, &clean_history());
+        assert!(
+            v.iter().any(|x| x.property == SafetyProperty::Durability),
+            "an acked-commit regression must trip the durability arm: {v:?}"
+        );
+
+        // 3. Atomicity: a fabricated persisted != created gap (a partial/duplicated effect survived) is
+        //    flagged.
+        let mut atomicity_broken = clean_report();
+        atomicity_broken.persisted_nodes = 6; // one more row than distinct committed ids
+        let v = evaluate_safety(&atomicity_broken, &clean_history());
+        assert!(
+            v.iter().any(|x| x.property == SafetyProperty::Atomicity),
+            "a persisted!=created gap must trip the atomicity arm: {v:?}"
+        );
+
+        // 4. Reference-model: a fabricated oracle divergence is flagged.
+        let mut refmodel_broken = clean_report();
+        refmodel_broken.oracle = Some(OracleError::NodeMultisetMismatch {
+            id: 7,
+            model: 0,
+            engine: 1,
+        });
+        let v = evaluate_safety(&refmodel_broken, &clean_history());
+        assert!(
+            v.iter()
+                .any(|x| x.property == SafetyProperty::ReferenceModel),
+            "an oracle divergence must trip the reference-model arm: {v:?}"
+        );
+    }
+
+    /// The safety CLI runs a clean sweep with faults+crashes and reports zero violations.
+    #[test]
+    fn safety_cli_clean_sweep_reports_no_violations() {
+        let (out, violations) = run_safety_cli(
+            ["--seed", "1", "--seeds", "10"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(violations, 0, "the safety CLI sweep must be clean:\n{out}");
+        assert!(out.contains("all SAFE + deterministic"), "{out}");
+        assert!(out.contains("SAFE"), "{out}");
     }
 }

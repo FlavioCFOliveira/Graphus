@@ -484,3 +484,76 @@ fn automatic_checkpoint_cadence_emits_a_checkpoint() {
         "the automatic cadence must have emitted at least one checkpoint (redo_start past header)"
     );
 }
+
+/// Regression for `rmp` #239 (seed 10): a committed node's `first_rel` must not point at a phantom
+/// relationship after a DOUBLE crash, and the relationship store's orphan page (allocated only by
+/// transactions that abort) must remain readable so the incidence walk threads through the resulting
+/// dead-link corpse to NULL.
+///
+/// The defect had two coupled causes, both fixed:
+///   1. `relink_old_head` wrote a whole-record undo (header included), so an **out-of-LIFO abort** of
+///      two interleaved prependers resurrected the older prepender's MVCC `in_use` bit — a phantom,
+///      never-committed edge (atomicity violation).
+///   2. The relationship store's `device_pages`/`high_water` were rebuilt purely from the durable
+///      catalog, which never maps a page touched only by aborted transactions. Under no-force recovery
+///      the page header's store tag was lost, so the page could not be re-attributed and the corpse the
+///      committed `first_rel` legitimately referenced was unreadable ("store page not allocated").
+///
+/// Scenario (mirrors seed 10): node A is created and committed. Two later transactions each prepend a
+/// self-loop edge onto A's chain — T_inner first (head A->r1->0), then T_outer (head A->r2->r1->0) —
+/// and then roll back in **non-LIFO** order (T_inner before T_outer). No edge ever commits, so the
+/// rel store's catalog stays empty and r1/r2 live only on an orphan device page. The store is crashed
+/// and recovered (no-force) twice. A must read back with **zero** incident relationships, with no error.
+#[test]
+fn double_crash_aborted_prependers_leave_no_phantom_edge() {
+    let mut s = fresh(64);
+
+    // Commit node A on its own (a durable node whose first_rel will be exercised).
+    let t0 = TxnId(1);
+    s.begin(t0);
+    let (a, _eid) = s.create_node(t0).unwrap();
+    let kt = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    s.commit(t0).unwrap();
+
+    // Two interleaved transactions prepend a self-loop edge onto A's chain, then abort out of LIFO
+    // order: T_inner pushes r1 first, T_outer pushes r2 on top, T_inner aborts before T_outer.
+    let t_inner = TxnId(2);
+    let t_outer = TxnId(3);
+    s.begin(t_inner);
+    let (_r1, _) = s.create_rel(t_inner, kt, a, a).unwrap(); // head: A -> r1 -> 0
+    s.begin(t_outer);
+    let (_r2, _) = s.create_rel(t_outer, kt, a, a).unwrap(); // head: A -> r2 -> r1 -> 0
+    // Non-LIFO rollback: the inner (older) prepender unwinds first.
+    s.rollback(t_inner).unwrap();
+    s.rollback(t_outer).unwrap();
+
+    // A is already back to zero edges in the live store.
+    assert!(
+        s.incident_rels(a).unwrap().is_empty(),
+        "live store: A has no edges after both prependers abort"
+    );
+
+    // First no-force crash + recovery.
+    let s = recover_no_force(&s);
+    let mut s = s;
+    assert!(
+        s.node(a).unwrap().mvcc.in_use(),
+        "committed node A survives the first crash"
+    );
+    assert!(
+        s.incident_rels(a).unwrap().is_empty(),
+        "after 1 crash: A's incidence walk threads through the dead-link corpse to NULL (0 edges), \
+         not a resurrected phantom edge, and the orphan rel page is readable"
+    );
+
+    // Second no-force crash + recovery (the double-crash the safety oracle exercises).
+    let mut s = recover_no_force(&s);
+    assert!(
+        s.node(a).unwrap().mvcc.in_use(),
+        "committed node A survives the second crash"
+    );
+    assert!(
+        s.incident_rels(a).unwrap().is_empty(),
+        "after 2 crashes: still no phantom edge and the orphan rel page is still readable (rmp #239)"
+    );
+}

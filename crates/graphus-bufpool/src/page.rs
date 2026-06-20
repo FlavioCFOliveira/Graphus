@@ -11,7 +11,10 @@ use graphus_io::{PAGE_SIZE, Page};
 pub const HEADER_SIZE: usize = 24;
 
 const OFF_CHECKSUM: usize = 0; // u32
-const OFF_PAGE_TYPE: usize = 4; // u32 (low byte = type)
+/// Byte offset of the 4-byte type/flags word: low byte = page type, second byte = subtype (store
+/// kind for record pages, `rmp` #239), remaining bytes reserved flags. Public so the storage layer
+/// can WAL-log the type/subtype stamp at offset (a redo-durable, undo == redo structural write).
+pub const OFF_PAGE_TYPE: usize = 4; // u32 (low byte = type)
 const OFF_PAGE_LSN: usize = 8; // u64
 const OFF_PAGE_ID: usize = 16; // u64
 
@@ -79,6 +82,19 @@ pub fn page_type(page: &Page) -> u8 {
 /// Sets the page type byte (the other three bytes of the type/flags word are left intact).
 pub fn set_page_type(page: &mut Page, ty: u8) {
     page[OFF_PAGE_TYPE] = ty;
+}
+
+/// Returns the page **subtype** byte: the second byte of the 4-byte type/flags word (`05 §6`'s
+/// reserved flag bytes). The storage layer uses it to tag a record page with the fixed-record store
+/// it belongs to, so crash recovery can attribute device pages back to their store (`rmp` #239).
+#[must_use]
+pub fn page_subtype(page: &Page) -> u8 {
+    page[OFF_PAGE_TYPE + 1]
+}
+
+/// Sets the page subtype byte (the other three bytes of the type/flags word are left intact).
+pub fn set_page_subtype(page: &mut Page, subtype: u8) {
+    page[OFF_PAGE_TYPE + 1] = subtype;
 }
 
 #[cfg(test)]

@@ -324,11 +324,19 @@ impl LocalEngine<MemBlockDevice, MemLogSink> {
         sink.append(&log);
         sink.sync()?;
 
+        // Recover the device and open the store on the **same** WAL manager. ARIES undo writes per-loser
+        // CLRs and an ABORT end-record into the WAL during recovery; the store must continue on the WAL
+        // that carries them. A previous version recovered into one `WalManager` and then opened the store
+        // on a fresh `WalManager` over a *clone* of the pre-recovery sink — leaving those CLRs/ABORT
+        // markers only in the throwaway clone. A *subsequent* crash then replayed a durable WAL whose
+        // loser transactions were never neutralized and resurrected their uncommitted effects (an
+        // atomicity violation: uncommitted `:Person` nodes reappearing after a second crash, surfaced by
+        // the rmp #239 safety oracle). Opening the store on the post-recovery `wal` keeps the loser
+        // markers durable, so every later recovery sees the losers correctly aborted.
         let mut device = MemBlockDevice::new(0);
-        let mut wal = WalManager::open(sink.clone())?;
+        let mut wal = WalManager::open(sink)?;
         recover_device(&mut wal, &mut device)?;
 
-        let wal = WalManager::open(sink)?;
         let store = RecordStore::open(device, wal, pool_pages)?;
         let coordinator = TxnCoordinator::new(store);
         Ok(Self::new(coordinator, clock))

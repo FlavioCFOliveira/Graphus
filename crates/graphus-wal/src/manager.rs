@@ -202,6 +202,57 @@ impl<S: LogSink> WalManager<S> {
         Ok(out)
     }
 
+    /// Scans the durable log and returns the **largest real transaction id** that appears in *any*
+    /// record (begin, update, commit, abort, CLR), or `0` if the log holds no real transaction.
+    ///
+    /// This is how a reopened engine restores a **monotonic, crash-durable transaction-id counter**:
+    /// transaction ids are written into the durable WAL but are *not* otherwise persisted, so a fresh
+    /// coordinator that restarted its counter from `0` would **reuse** ids already present in the log.
+    /// A reused id is catastrophic for ARIES recovery: a later crash's analysis pass collapses both
+    /// incarnations of the id into a single Active-Transaction-Table entry, so if the post-recovery
+    /// incarnation committed, the analysis marks the id `committed`/`ended` and the **pre-crash,
+    /// uncommitted incarnation is no longer classified as a loser** — its redone effects are never
+    /// undone and an uncommitted record survives (an atomicity violation). Seeding the counter past
+    /// every id in the durable log makes ids globally unique across recovery, which the loser/winner
+    /// classification depends on.
+    ///
+    /// The system sentinel [`TxnId(u64::MAX)`] (used for internal catalog/checkpoint writes) and the
+    /// null id `0` are excluded: the issued-id space is `1..u64::MAX`, so the sentinel must never
+    /// become the high-water (it would overflow the next `+= 1`).
+    ///
+    /// # Errors
+    /// Propagates a sink read error. (Corruption is handled exactly as
+    /// [`committed_transactions`](Self::committed_transactions): a torn tail stops the scan; interior
+    /// corruption is rejected by the recovery path that runs alongside this, so this scan simply stops
+    /// at the first undecodable record and never reads past it.)
+    pub fn max_recovered_txn_id(&self) -> Result<u64> {
+        let mut log = Vec::new();
+        self.read_durable(Lsn(0), &mut log)?;
+        let mut max_id = 0u64;
+        let mut cursor = HEADER_LEN as usize;
+        // Skip a reclaimed (zero) prefix to the first surviving record (`rmp` #114; see
+        // `recover_from`). A real record never begins with a zero byte.
+        while cursor < log.len() && log[cursor] == 0 {
+            cursor += 1;
+        }
+        while cursor < log.len() {
+            match LogRecordRef::decode(&log[cursor..]) {
+                Ok((rec, n)) => {
+                    cursor += n;
+                    let id = rec.txn_id.0;
+                    if id != 0 && id != u64::MAX {
+                        max_id = max_id.max(id);
+                    }
+                }
+                // A torn tail (or any undecodable record): stop. The recovery path running over the
+                // same log fails loud on interior corruption (`recover_from`); here we only need a
+                // safe upper bound for the id counter, and a torn tail carries no committed work.
+                Err(_) => break,
+            }
+        }
+        Ok(max_id)
+    }
+
     /// Logs the start of transaction `txn`.
     pub fn begin(&mut self, txn: TxnId) -> Lsn {
         let mut r = LogRecord::new(RecordType::Begin, txn, PageId(0));
@@ -458,6 +509,39 @@ mod tests {
         assert_eq!(wal.durable_len(), HEADER_LEN);
         let sink = wal.sink().clone();
         assert!(WalManager::open(sink).is_ok());
+    }
+
+    #[test]
+    fn max_recovered_txn_id_is_the_high_water_excluding_sentinels() {
+        // Regression for the cross-recovery transaction-id-reuse atomicity bug: a reopened engine must
+        // resume its id counter PAST every id already in the durable WAL (begin/update/commit/abort),
+        // or it reuses ids and a later crash mis-classifies a pre-crash loser as committed/ended,
+        // resurrecting its uncommitted effects. The fresh log has no real txns; ids appear via records;
+        // the system sentinel `TxnId(u64::MAX)` and the null id `0` must be excluded.
+        let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+        assert_eq!(
+            wal.max_recovered_txn_id().unwrap(),
+            0,
+            "fresh log has no real txns"
+        );
+
+        wal.begin(TxnId(3));
+        wal.log_update(TxnId(3), PageId(1), b"r".to_vec(), b"u".to_vec());
+        wal.commit(TxnId(3)).unwrap();
+        wal.begin(TxnId(7)); // an in-flight loser (no commit/abort) still bumps the high-water
+        wal.log_update(TxnId(7), PageId(2), b"r".to_vec(), b"u".to_vec());
+        // A system-sentinel write (catalog/checkpoint) must NOT become the high-water (it would
+        // overflow the next `+= 1`).
+        wal.begin(TxnId(u64::MAX));
+        wal.flush();
+
+        let sink = wal.sink().clone();
+        let reopened = WalManager::open(sink).unwrap();
+        assert_eq!(
+            reopened.max_recovered_txn_id().unwrap(),
+            7,
+            "high-water is the largest real id (7), never the u64::MAX sentinel"
+        );
     }
 
     #[test]

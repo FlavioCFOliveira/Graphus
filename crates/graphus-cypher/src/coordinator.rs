@@ -231,13 +231,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// rebuild here.
     #[must_use]
     pub fn new(store: RecordStore<D, S>) -> Self {
+        // Seed the transaction-id counter **past** every id already in the durable WAL. Transaction
+        // ids are written into the WAL but are not otherwise persisted, so a reopened coordinator that
+        // restarted its counter from `0` would reuse ids from before the crash. A reused id is fatal to
+        // ARIES recovery: a later crash's analysis collapses both incarnations into one
+        // Active-Transaction-Table entry, and if the post-recovery incarnation committed, the pre-crash
+        // *uncommitted* incarnation stops being classified as a loser — its redone effects are never
+        // undone and an uncommitted record survives (an atomicity violation). Resuming past the
+        // recovered high-water keeps ids globally unique across recovery. (`0` for a fresh store.)
+        let recovered_txn_hw = store.recovered_txn_hw();
         let store = Rc::new(RefCell::new(store));
         let index = Rc::new(RefCell::new(IndexSet::new()));
         Self::rebuild_index(&store, &index);
         // Promote any index left `Populating` by an interrupted `rmp` task #91 build: the rebuild
-        // above already fully populated it from the recovered store, so it is complete. Done with a
-        // local txn-id of 0 (no transaction is open yet, and `begin` only ever issues ids `>= 1`).
-        let next_txn_id = Self::promote_recovered_populating_indexes(&store, &index, 0);
+        // above already fully populated it from the recovered store, so it is complete. Minted from the
+        // recovered id high-water so even the promotion transaction never reuses a pre-crash id.
+        let next_txn_id =
+            Self::promote_recovered_populating_indexes(&store, &index, recovered_txn_hw);
         Self {
             store,
             ssi: Rc::new(RefCell::new(SsiTracker::new())),

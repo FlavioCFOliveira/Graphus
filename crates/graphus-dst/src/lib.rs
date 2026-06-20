@@ -61,7 +61,9 @@ pub use model::{AckLedger, Model};
 pub use rng::DetRng;
 // The wire-level VOPR core (rmp #162). Its `run`/`summarize` are kept module-qualified (`vopr::run`)
 // so they do not clash with the storage harness's crate-root `run`/`summarize`.
-pub use vopr::{VoprConfig, VoprReport};
+// The safety oracle bundle (rmp #239) is re-exported by type; the runners `vopr::run_safety` /
+// `vopr::run_safety_cli` stay module-qualified beside `vopr::run` (avoiding the crate-root `run` clash).
+pub use vopr::{SafetyProperty, SafetyReport, SafetyViolation, VoprConfig, VoprReport};
 pub use vopr_fault::{FaultBudget, FaultScheduler, VoprFaultKind};
 pub use vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
 pub use workload::{Op, PlannedTxn, TxnOutcome, WorkloadConfig};
