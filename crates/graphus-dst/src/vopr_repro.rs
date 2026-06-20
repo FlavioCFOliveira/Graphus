@@ -99,7 +99,10 @@ impl ReplayMode {
     }
 
     /// Parses a mode name (`standard` / `safety` / `liveness`), case-insensitively.
-    fn parse(s: &str) -> Result<Self, String> {
+    ///
+    /// # Errors
+    /// Returns a message naming the accepted set if `s` is not a known mode.
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "standard" => Ok(ReplayMode::Standard),
             "safety" => Ok(ReplayMode::Safety),

@@ -8,7 +8,7 @@
 
 use std::process::ExitCode;
 
-use graphus_dst::{cli, vopr, vopr_repro};
+use graphus_dst::{cli, vopr, vopr_fuzz, vopr_repro};
 
 fn main() -> ExitCode {
     // The `vopr` subcommand drives the wire-level VOPR simulator core (rmp #162); `vopr-repro` drives the
@@ -25,7 +25,14 @@ fn main() -> ExitCode {
         };
     }
     if raw.peek().map(String::as_str) == Some("vopr") {
-        let (summary, failures) = vopr::run_cli(raw.skip(1));
+        let mut vopr_args = raw.skip(1).peekable();
+        // `vopr fuzz …` drives the continuous, time-budgeted, multi-core soak fuzzer (rmp #243); plain
+        // `vopr …` is the serial determinism+oracle seed sweep (rmp #162/#238).
+        let (summary, failures) = if vopr_args.peek().map(String::as_str) == Some("fuzz") {
+            vopr_fuzz::run_fuzz_cli(vopr_args.skip(1))
+        } else {
+            vopr::run_cli(vopr_args)
+        };
         print!("{summary}");
         return if failures == 0 {
             ExitCode::SUCCESS

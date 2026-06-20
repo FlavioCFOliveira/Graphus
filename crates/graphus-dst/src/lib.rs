@@ -49,6 +49,7 @@ pub mod rng;
 pub mod scenarios;
 pub mod vopr;
 pub mod vopr_fault;
+pub mod vopr_fuzz;
 pub mod vopr_oracle;
 pub mod vopr_repro;
 pub mod wire;
@@ -70,6 +71,11 @@ pub use vopr::{
     VoprReport,
 };
 pub use vopr_fault::{FaultBudget, FaultScheduler, VoprFaultKind};
+// The continuous, time-budgeted, multi-core soak fuzzer (rmp #243). Module-qualified runners
+// (`vopr_fuzz::fuzz` / `vopr_fuzz::sweep_range` / `vopr_fuzz::run_fuzz_cli`) stay beside the types.
+pub use vopr_fuzz::{
+    FuzzBudget, FuzzFailure, FuzzPredicate, FuzzReport, FuzzRun, SeedVerdict, SweepRange,
+};
 // The replay-artifact + deterministic shrinker tools (rmp #242). Module-qualified runners
 // (`vopr_repro::run_repro_cli` / `vopr_repro::shrink` / `vopr_repro::replay_from_file`) stay beside the
 // re-exported types.
