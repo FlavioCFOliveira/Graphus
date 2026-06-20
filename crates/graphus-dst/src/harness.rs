@@ -89,6 +89,7 @@ fn pick_fault(rng: &mut DetRng) -> FaultKind {
         0 => FaultKind::Crash { steal: false },
         1 => FaultKind::TornWalTail,
         2 => FaultKind::TornDataPage,
+        3 => FaultKind::WriteReordering,
         // Weighted toward the steal crash, the richest path (undo of stolen, uncommitted pages).
         _ => FaultKind::Crash { steal: true },
     }
@@ -497,6 +498,7 @@ impl Driver {
                 self.recover_no_force(Some(keep))
             }
             FaultKind::TornDataPage => self.recover_torn_data_page(rng),
+            FaultKind::WriteReordering => self.recover_write_reordering(rng),
         }
     }
 
@@ -681,6 +683,65 @@ impl Driver {
                     .expect("stage page");
             }
             device.sync_all().expect("persist disk image");
+        }
+
+        let log = self.store.with_wal(|w| w.sink().durable_bytes().to_vec());
+        let mut sink = MemLogSink::new();
+        sink.append(&log);
+        sink.sync().expect("sync log prefix");
+
+        let mut wal = WalManager::open(sink.clone()).expect("open wal");
+        let report = recover_device(&mut wal, &mut device).expect("recover");
+        let wal = WalManager::open(sink).expect("reopen wal");
+        self.store = RecordStore::open(device, wal, 64).expect("open store");
+        RecoverySummary {
+            losers: report.losers,
+            tail_truncated: report.tail_truncated,
+        }
+    }
+
+    /// Write-reordering recovery: a steal flush whose home sync went through a **reordering device**,
+    /// i.e. a sync that did *not* atomically drain the page cache. Flush dirty pages home as usual,
+    /// but stage them onto a device armed with [`graphus_io::FaultPlan::with_write_reordering`]; that
+    /// device's `sync_all` persists only a seeded subset of the staged pages and leaves the rest
+    /// crash-losable, then [`MemBlockDevice::crash`] drops them. The recovered home image is therefore
+    /// missing an arbitrary seeded subset of committed pages, and ARIES redo from the durable WAL must
+    /// reconstruct every one of them — the committed-or-nothing guarantee under a non-atomic flush.
+    ///
+    /// Shares `recover_steal`'s flush + snapshot + `recover_device` spine; the only difference is the
+    /// reordering `FaultPlan` on the staging device. The post-recovery checker (`crate::checker`)
+    /// fails loudly if any committed page the sync dropped was not redone, so a pass is real evidence
+    /// redo closed the hole.
+    fn recover_write_reordering(&mut self, rng: &mut DetRng) -> RecoverySummary {
+        self.store.flush().expect("flush (reorder)");
+        let pages = self.store.mapped_pages();
+        let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
+        let mut device = MemBlockDevice::new(max + 1);
+
+        // A seeded persist fraction in 25..=75%: low enough that the sync provably drops *some*
+        // committed page (so redo has work to do), high enough that *some* survives (so the run is
+        // not a degenerate full re-redo). The plan is a pure function of the seed, so the dropped
+        // subset is reproducible.
+        let persist_percent = 25 + rng.below(51);
+        let plan = graphus_io::FaultPlan::new(self.seed).with_write_reordering(persist_percent);
+        device.arm_fault_plan(plan);
+
+        {
+            let mut staged: Vec<(u64, Box<Page>)> = Vec::with_capacity(pages.len());
+            for p in &pages {
+                staged.push((
+                    p.0,
+                    self.store.read_device_page(*p).expect("read device page"),
+                ));
+            }
+            for (idx, bytes) in staged {
+                device
+                    .write_page(graphus_core::PageId(idx), &bytes)
+                    .expect("stage page");
+            }
+            // The reordering sync persists only the seeded subset home; the crash drops the rest.
+            device.sync_all().expect("reordering sync");
+            device.crash();
         }
 
         let log = self.store.with_wal(|w| w.sink().durable_bytes().to_vec());

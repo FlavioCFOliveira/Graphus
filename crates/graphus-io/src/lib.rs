@@ -65,7 +65,7 @@ mod uring;
 pub use block::{BlockDevice, PAGE_SIZE, Page};
 pub use file::FileBlockDevice;
 pub use fullsync::{full_sync_all, full_sync_data};
-pub use mem::MemBlockDevice;
+pub use mem::{FaultPlan, MemBlockDevice};
 pub use replace::atomic_replace_file;
 
 #[cfg(not(loom))]

@@ -26,6 +26,12 @@
 //!   seeded byte strictly *after* the last committed record (so no acknowledged commit is lost);
 //!   ARIES analysis stops cleanly at the last intact record ([`graphus_wal::recover`] treats a
 //!   decode failure as the end of the durable log), which is the committed-or-nothing guarantee.
+//! * **Write reordering** — a sync that does *not* atomically drain the page cache. Modelled with
+//!   [`graphus_io::FaultPlan::with_write_reordering`]: the steal flush's sync persists only a seeded
+//!   subset of dirty pages home, so the crash drops the rest. Recovery (ARIES redo from the durable
+//!   WAL) must reconstruct every committed page the reordered sync failed to persist, which is the
+//!   committed-or-nothing guarantee under a non-atomic flush. Verified through the full `RecordStore`
+//!   engine; this is why it is a [`FaultKind`], not a [`DeferredFault`].
 //!
 //! ## What is exercised at the layer the public API permits
 //!
@@ -53,9 +59,6 @@
 //!   the abort via `std::panic::catch_unwind` and treating it as a crash; that adds no new coverage
 //!   over the crash fault (post-abort recovery *is* the crash path) and couples the harness to panic
 //!   unwinding, so it is deliberately out of scope and cross-referenced.
-//! * **Write reordering** — the current [`graphus_io::MemBlockDevice`] does not model write
-//!   reordering (a sync drains the whole cache atomically); there is no device knob to reorder
-//!   writes, so a reordering fault cannot be honestly injected. Deferred until the device models it.
 
 /// A fault the harness actually injects into a scenario through the full engine and verifies through
 /// recovery.
@@ -76,6 +79,11 @@ pub enum FaultKind {
     /// must repair it from the doublewrite buffer (`05 §3`, `04 §4.5`) before ARIES redo reads its
     /// `page_lsn`, so the checksum-detected tear is repaired rather than served.
     TornDataPage,
+    /// A power loss whose steal flush synced through a **reordering device**: the sync persisted only
+    /// a seeded subset of dirty pages home, so the crash dropped the rest. ARIES redo from the
+    /// durable WAL must reconstruct every committed page the non-atomic sync failed to persist
+    /// ([`graphus_io::FaultPlan::with_write_reordering`]).
+    WriteReordering,
 }
 
 impl FaultKind {
@@ -87,17 +95,19 @@ impl FaultKind {
             FaultKind::Crash { steal: true } => "crash(steal)",
             FaultKind::TornWalTail => "torn-wal-tail",
             FaultKind::TornDataPage => "torn-data-page",
+            FaultKind::WriteReordering => "write-reordering",
         }
     }
 
     /// Every fault label the harness can emit, for initialising per-kind tallies in the report.
     #[must_use]
-    pub fn all_labels() -> [&'static str; 4] {
+    pub fn all_labels() -> [&'static str; 5] {
         [
             FaultKind::Crash { steal: false }.label(),
             FaultKind::Crash { steal: true }.label(),
             FaultKind::TornWalTail.label(),
             FaultKind::TornDataPage.label(),
+            FaultKind::WriteReordering.label(),
         ]
     }
 }
@@ -113,8 +123,6 @@ pub enum DeferredFault {
     /// `fdatasync` EIO — the controlled-PANIC path (`04 §4.9`); covered by a WAL unit test, out of
     /// scope here to avoid coupling to panic unwinding (adds no coverage over the crash path).
     FsyncEio,
-    /// Write reordering — the in-memory device does not model write reordering today.
-    WriteReordering,
 }
 
 impl DeferredFault {
@@ -124,7 +132,6 @@ impl DeferredFault {
         match self {
             DeferredFault::WriteIoErrorFullEngine => "write-io-error(full-engine)",
             DeferredFault::FsyncEio => "fsync-eio",
-            DeferredFault::WriteReordering => "write-reordering",
         }
     }
 
@@ -141,20 +148,15 @@ impl DeferredFault {
                 "controlled-PANIC path (04 §4.9); covered by graphus-wal \
                  manager::tests::fsync_failure_panics; out of scope here (no new coverage over crash)"
             }
-            DeferredFault::WriteReordering => {
-                "graphus-io MemBlockDevice does not model write reordering (sync drains the cache \
-                 atomically); no device knob to reorder writes"
-            }
         }
     }
 
     /// Every deferred fault, for listing in the report.
     #[must_use]
-    pub fn all() -> [DeferredFault; 3] {
+    pub fn all() -> [DeferredFault; 2] {
         [
             DeferredFault::WriteIoErrorFullEngine,
             DeferredFault::FsyncEio,
-            DeferredFault::WriteReordering,
         ]
     }
 }
@@ -172,6 +174,7 @@ mod tests {
         assert!(labels.contains(&FaultKind::Crash { steal: true }.label()));
         assert!(labels.contains(&FaultKind::TornWalTail.label()));
         assert!(labels.contains(&FaultKind::TornDataPage.label()));
+        assert!(labels.contains(&FaultKind::WriteReordering.label()));
     }
 
     #[test]

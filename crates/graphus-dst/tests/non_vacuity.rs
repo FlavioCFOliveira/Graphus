@@ -82,4 +82,12 @@ fn all_supported_fault_kinds_occur() {
     );
     assert!(kinds.contains("crash(steal)"), "no steal crash occurred");
     assert!(kinds.contains("torn-wal-tail"), "no torn-WAL-tail occurred");
+    assert!(
+        kinds.contains("torn-data-page"),
+        "no torn-data-page occurred"
+    );
+    assert!(
+        kinds.contains("write-reordering"),
+        "no write-reordering occurred"
+    );
 }
