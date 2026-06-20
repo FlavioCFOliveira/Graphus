@@ -1,0 +1,56 @@
+[package]
+name = "graphus-fraud-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded fraud-graph generator + ground-truth emitter for the fraud-oltp example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-examples-harness` and
+# `graphus-bench`: it exists only to support the `examples/fraud-oltp` E2E demonstration and is
+# depended upon by NOTHING in the production build. In particular, `graphus-server` MUST NOT depend
+# on it, so it adds ZERO overhead to the shipped binary.
+publish = false
+
+[lib]
+name = "graphus_fraud_gen"
+path = "src/lib.rs"
+
+[features]
+# The pure generator (`gen` binary + the library) is hermetic: serde only, no engine, no Node, no
+# network. It is always available and CI-runnable. The `dst-repro` feature additionally pulls in the
+# real engine (`graphus-server`'s `LocalEngine`) for the deterministic in-process SSI-contention
+# repro binary. Kept behind a feature so the pure generator + its determinism test stay light and so
+# the heavy engine build is opt-in.
+default = []
+dst-repro = ["dep:graphus-server", "dep:graphus-cypher", "dep:graphus-core", "dep:graphus-sim", "dep:graphus-io", "dep:graphus-wal"]
+
+[dependencies]
+# The generator emits ground-truth as JSON and the Cypher load script as text; serde pins match the
+# rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- `dst-repro` feature only: the REAL engine, driven inline + single-threaded for a deterministic
+# SSI-contention repro (mirrors how `graphus-dst` drives `LocalEngine`). graphus-server does not
+# depend on this crate, so this is acyclic. ---
+graphus-server = { path = "../graphus-server", features = ["dst"], optional = true }
+graphus-cypher = { path = "../graphus-cypher", optional = true }
+graphus-core = { path = "../graphus-core", optional = true }
+graphus-sim = { path = "../graphus-sim", optional = true }
+graphus-io = { path = "../graphus-io", optional = true }
+graphus-wal = { path = "../graphus-wal", optional = true }
+
+# The deterministic generator binary: writes `graph.cypher` + `ground_truth.json` for a profile.
+# Usage: `cargo run -p graphus-fraud-gen --bin gen -- --profile fast --out-dir <dir>`
+[[bin]]
+name = "gen"
+path = "src/bin/gen.rs"
+
+# The deterministic in-process SSI-contention repro (opt-in: needs the `dst-repro` feature).
+# Usage: `cargo run -p graphus-fraud-gen --features dst-repro --bin dst_contention -- --seed 42`
+[[bin]]
+name = "dst_contention"
+path = "src/bin/dst_contention.rs"
+required-features = ["dst-repro"]

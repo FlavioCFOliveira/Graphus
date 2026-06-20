@@ -1134,6 +1134,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-fraud-gen"
+version = "0.0.1"
+dependencies = [
+ "graphus-core",
+ "graphus-cypher",
+ "graphus-io",
+ "graphus-server",
+ "graphus-sim",
+ "graphus-wal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-gds"
 version = "0.0.1"
 dependencies = [
