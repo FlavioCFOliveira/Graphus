@@ -85,11 +85,12 @@ impl ScenarioReport {
 /// Picks the fault kind for a scenario deterministically from `rng`. Crashes dominate (the central
 /// DST fault), with the torn-WAL-tail fault mixed in.
 fn pick_fault(rng: &mut DetRng) -> FaultKind {
-    match rng.below(5) {
+    match rng.below(6) {
         0 => FaultKind::Crash { steal: false },
         1 => FaultKind::TornWalTail,
         2 => FaultKind::TornDataPage,
         3 => FaultKind::WriteReordering,
+        4 => FaultKind::WriteIoError,
         // Weighted toward the steal crash, the richest path (undo of stolen, uncommitted pages).
         _ => FaultKind::Crash { steal: true },
     }
@@ -499,7 +500,103 @@ impl Driver {
             }
             FaultKind::TornDataPage => self.recover_torn_data_page(rng),
             FaultKind::WriteReordering => self.recover_write_reordering(rng),
+            FaultKind::WriteIoError => self.recover_write_io_error(rng),
         }
+    }
+
+    /// Write-I/O-error recovery: arm a write I/O error **and** a read corruption on the *live*
+    /// device of the running store (the `dst`-gated [`graphus_storage::RecordStore::device_mut`]
+    /// seam, rmp #232), prove the engine SURFACES both rather than serving or committing corrupt
+    /// data, then crash and recover from the durable WAL so committed work survives intact.
+    ///
+    /// Three phases, all through the full engine:
+    ///
+    /// 1. **Write I/O error, live.** Arm [`graphus_io::MemBlockDevice::arm_io_error`] on the live
+    ///    device and force a home write via [`flush`](graphus_storage::RecordStore::flush): the
+    ///    flush MUST return `Err` (the engine surfaces the failed write; it does not silently
+    ///    drop or corrupt the page). The committed data is unharmed — it is still in the durable WAL.
+    /// 2. **Read corruption, full engine.** Snapshot the durable on-disk image into a fresh device,
+    ///    arm a bit-rot [`graphus_io::FaultPlan`] on a committed record page, and **open a fresh
+    ///    store** over it (a cold pool, so the read truly hits the device). Reading that page back
+    ///    through the engine ([`read_device_page`](graphus_storage::RecordStore::read_device_page),
+    ///    the same fetch + checksum path the engine's record reads use) MUST return `Err` (the page
+    ///    checksum rejects the flipped bytes; corrupt data is never served as valid).
+    /// 3. **Recover.** Rebuild onto a fresh, un-faulted device from the durable WAL prefix and reopen,
+    ///    exactly as the no-force crash does. The post-recovery checker then proves every committed
+    ///    record survived — uncorrupted — despite the injected faults.
+    fn recover_write_io_error(&mut self, rng: &mut DetRng) -> RecoverySummary {
+        // Make sure there is at least one dirty page to flush home, so the armed write error has a
+        // write to fail. A no-op write keeps the workload's committed state unchanged.
+        let tid = self.fresh_txn();
+        self.store.begin(tid);
+        let (id, _eid) = self.store.create_node(tid).expect("io-error seed node");
+        self.store.commit(tid).expect("commit io-error seed");
+        self.model.add_node(id);
+        self.live_nodes.push(id);
+        self.ledger.record_commit();
+
+        // Phase 1: a write I/O error armed on the live device must surface through the engine flush.
+        self.store.device_mut().arm_io_error();
+        let flush = self.store.flush();
+        assert!(
+            flush.is_err(),
+            "seed {}: an armed write I/O error must surface through RecordStore::flush, \
+             not be silently swallowed",
+            self.seed
+        );
+        // The one-shot error has cleared; a retry flush now succeeds and persists the committed page
+        // home (so the read-corruption phase has a durable on-disk page to corrupt).
+        self.store
+            .flush()
+            .expect("retry flush after io error clears");
+
+        // Phase 2: a bit-rot corruption on a committed record page must surface as a checksum error
+        // on read — the engine never serves the corrupt bytes as valid. Snapshot the durable on-disk
+        // image into a fresh device and open a fresh store over it (a cold pool, so the read provably
+        // hits the device where bit-rot lands), then read the victim page through the engine.
+        let pages = self.store.mapped_pages();
+        let victim = pages.iter().map(|p| p.0).filter(|&p| p != 0).max();
+        if let Some(target) = victim {
+            let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
+            let mut device = MemBlockDevice::new(max + 1);
+            for p in &pages {
+                let bytes = self
+                    .store
+                    .read_device_page(*p)
+                    .expect("snapshot device page");
+                device
+                    .write_page(graphus_core::PageId(p.0), &bytes)
+                    .expect("stage snapshot page");
+            }
+            device.sync_all().expect("persist snapshot");
+
+            let log = self.store.with_wal(|w| w.sink().durable_bytes().to_vec());
+            let mut sink = MemLogSink::new();
+            sink.append(&log);
+            sink.sync().expect("sync log prefix");
+            let wal = WalManager::open(sink).expect("open wal for corrupt-read store");
+            // A 1-frame pool guarantees the victim page is not pre-resident after open: reading it
+            // forces a device fetch, where the armed bit-rot lands and the fetch's checksum rejects.
+            let mut corrupt_store = RecordStore::open(device, wal, 1).expect("open corrupt store");
+            // Arm bit-rot on the *live* device of the freshly-opened store (the `dst` seam again),
+            // after open so the catalog read above sees the intact image. Flip enough bytes that the
+            // corruption is overwhelmingly certain to break the victim page's checksum.
+            let plan = graphus_io::FaultPlan::new(self.seed)
+                .with_bit_rot(graphus_core::PageId(target), 64);
+            corrupt_store.device_mut().arm_fault_plan(plan);
+            let read = corrupt_store.read_device_page(graphus_core::PageId(target));
+            assert!(
+                read.is_err(),
+                "seed {}: bit-rot on committed page {target} must surface as a checksum error, \
+                 not be served as valid data",
+                self.seed
+            );
+        }
+        let _ = rng; // recovery point is deterministic from the durable WAL; no extra draw needed.
+
+        // Phase 3: recover from the durable WAL onto a fresh device. The committed-or-nothing
+        // guarantee holds despite the injected faults: every committed record is reconstructed clean.
+        self.recover_no_force(None)
     }
 
     /// Torn-data-page recovery: flush dirty pages home **under doublewrite protection**, snapshot
@@ -859,6 +956,42 @@ mod tests {
             let a = run_scenario(seed);
             let b = run_scenario(seed);
             assert_eq!(a, b, "seed {seed} is not deterministic");
+        }
+    }
+
+    /// The write-I/O-error fault, driven explicitly through the full `RecordStore` engine (rmp
+    /// #232): arming a write I/O error and a read corruption on a live store mid-workload must leave
+    /// committed data intact and the run must still verify all four invariants. The internal phase
+    /// asserts surface-not-corrupt (the flush errors, the corrupt read errors); a passing run here is
+    /// the end-to-end proof that those injected faults never corrupted the committed graph.
+    #[test]
+    fn write_io_error_fault_surfaces_and_preserves_committed_data() {
+        let mut any_non_vacuous = false;
+        for seed in 1..=20u64 {
+            let mut rng = DetRng::new(seed);
+            let r = run_with_fault(seed, FaultKind::WriteIoError, &mut rng);
+            assert!(
+                r.passed(),
+                "seed {seed}: write-io-error run must preserve committed data: {:?}",
+                r.result
+            );
+            assert_eq!(r.fault, FaultKind::WriteIoError);
+            any_non_vacuous |= r.non_vacuous;
+        }
+        assert!(
+            any_non_vacuous,
+            "no seed produced a non-vacuous write-io-error run"
+        );
+    }
+
+    /// The write-I/O-error scenario is a pure function of its seed (re-running replays the exact
+    /// faults and the exact pass/fail), as every DST scenario must be.
+    #[test]
+    fn write_io_error_fault_is_deterministic() {
+        for seed in [3u64, 7, 19, 64] {
+            let a = run_with_fault(seed, FaultKind::WriteIoError, &mut DetRng::new(seed));
+            let b = run_with_fault(seed, FaultKind::WriteIoError, &mut DetRng::new(seed));
+            assert_eq!(a, b, "seed {seed} write-io-error run is not deterministic");
         }
     }
 }

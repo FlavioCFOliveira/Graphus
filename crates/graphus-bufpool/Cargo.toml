@@ -8,6 +8,12 @@ repository.workspace = true
 authors.workspace = true
 description = "Self-managed buffer pool, page header and CRC32C checksums for Graphus."
 
+[features]
+# Deterministic Simulation Testing seam (`04 §11`): exposes `BufferPool::device_mut`, letting a DST
+# harness reach the live block device of a running pool to arm a fault model mid-workload. OFF by
+# default, so the production build never compiles the seam and the device stays encapsulated.
+dst = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }

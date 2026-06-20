@@ -33,21 +33,18 @@
 //!   committed-or-nothing guarantee under a non-atomic flush. Verified through the full `RecordStore`
 //!   engine; this is why it is a [`FaultKind`], not a [`DeferredFault`].
 //!
-//! ## What is exercised at the layer the public API permits
-//!
-//! * **Write I/O error** ([`graphus_io::MemBlockDevice::arm_io_error`]) — see
-//!   [`DeferredFault::WriteIoErrorFullEngine`] for *why the full-engine path is deferred*. The
-//!   error contract ("surface, never corrupt") **is** verified at the buffer-pool write path, the
-//!   layer where the public API lets the harness own and arm the device; see
-//!   `tests/write_io_error.rs`. That test is real coverage of the fault at the component where it
-//!   can be honestly injected, not a stand-in for full-engine coverage.
+//! * **Write I/O error, full `RecordStore` engine** — a write I/O error armed on the *live* device
+//!   of a running store, plus a read corruption (bit-rot), through the full engine. Modelled with
+//!   the `dst`-gated [`graphus_storage::RecordStore::device_mut`] seam (rmp #232):
+//!   [`graphus_io::MemBlockDevice::arm_io_error`] fails the next home write so a flush surfaces a
+//!   hard error, and [`graphus_io::FaultPlan::with_bit_rot`] corrupts a later read so its page
+//!   checksum rejects it. The engine therefore SURFACES the error and never serves or commits
+//!   corrupt data — the surface-not-corrupt contract, now end-to-end and not just at the buffer-pool
+//!   layer (which is why it is a [`FaultKind`], no longer a [`DeferredFault`]). The component-level
+//!   buffer-pool coverage in `graphus-storage`'s `tests/write_io_error.rs` remains as a unit check.
 //!
 //! ## What is deferred (machinery or seam not yet available) — see [`DeferredFault`]
 //!
-//! * **Write I/O error, full `RecordStore` write path** — `RecordStore` exposes no public seam to
-//!   reach its device after construction, and the task forbids modifying other crates, so the error
-//!   cannot be armed mid-workload on the live store. Deferred until `graphus-storage` exposes a
-//!   device-fault hook; covered at the buffer-pool layer in the meantime (above).
 //! * **Torn DATA page (DWB-repaired)** — now exercised through the full engine, *not* deferred. The
 //!   [`graphus_io::MemBlockDevice::arm_torn_write`] device tears a home page mid-write; recovery
 //!   repairs it from the **doublewrite buffer** (`05 §3`, `04 §4.5`,
@@ -84,6 +81,13 @@ pub enum FaultKind {
     /// durable WAL must reconstruct every committed page the non-atomic sync failed to persist
     /// ([`graphus_io::FaultPlan::with_write_reordering`]).
     WriteReordering,
+    /// A **write I/O error plus a read corruption** armed on the *live* device of a running store
+    /// (rmp #232, via the `dst`-gated [`graphus_storage::RecordStore::device_mut`] seam): the next
+    /// home write hard-fails ([`graphus_io::MemBlockDevice::arm_io_error`]) and a later read flips
+    /// seeded bytes ([`graphus_io::FaultPlan::with_bit_rot`]) so its page checksum rejects it. The
+    /// engine must SURFACE the error and never serve or commit corrupt data — the surface-not-corrupt
+    /// contract through the full engine, not just the buffer-pool layer.
+    WriteIoError,
 }
 
 impl FaultKind {
@@ -96,18 +100,20 @@ impl FaultKind {
             FaultKind::TornWalTail => "torn-wal-tail",
             FaultKind::TornDataPage => "torn-data-page",
             FaultKind::WriteReordering => "write-reordering",
+            FaultKind::WriteIoError => "write-io-error(full-engine)",
         }
     }
 
     /// Every fault label the harness can emit, for initialising per-kind tallies in the report.
     #[must_use]
-    pub fn all_labels() -> [&'static str; 5] {
+    pub fn all_labels() -> [&'static str; 6] {
         [
             FaultKind::Crash { steal: false }.label(),
             FaultKind::Crash { steal: true }.label(),
             FaultKind::TornWalTail.label(),
             FaultKind::TornDataPage.label(),
             FaultKind::WriteReordering.label(),
+            FaultKind::WriteIoError.label(),
         ]
     }
 }
@@ -117,9 +123,6 @@ impl FaultKind {
 /// silently skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredFault {
-    /// Write I/O error against the full `RecordStore` write path — no public device seam; covered at
-    /// the buffer-pool layer instead (`tests/write_io_error.rs`).
-    WriteIoErrorFullEngine,
     /// `fdatasync` EIO — the controlled-PANIC path (`04 §4.9`); covered by a WAL unit test, out of
     /// scope here to avoid coupling to panic unwinding (adds no coverage over the crash path).
     FsyncEio,
@@ -130,7 +133,6 @@ impl DeferredFault {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            DeferredFault::WriteIoErrorFullEngine => "write-io-error(full-engine)",
             DeferredFault::FsyncEio => "fsync-eio",
         }
     }
@@ -139,11 +141,6 @@ impl DeferredFault {
     #[must_use]
     pub fn reason(self) -> &'static str {
         match self {
-            DeferredFault::WriteIoErrorFullEngine => {
-                "RecordStore exposes no public device seam to arm an I/O error mid-workload, and the \
-                 task forbids modifying other crates; the surface-not-corrupt contract is verified \
-                 at the buffer-pool write path instead (tests/write_io_error.rs)"
-            }
             DeferredFault::FsyncEio => {
                 "controlled-PANIC path (04 §4.9); covered by graphus-wal \
                  manager::tests::fsync_failure_panics; out of scope here (no new coverage over crash)"
@@ -153,11 +150,8 @@ impl DeferredFault {
 
     /// Every deferred fault, for listing in the report.
     #[must_use]
-    pub fn all() -> [DeferredFault; 2] {
-        [
-            DeferredFault::WriteIoErrorFullEngine,
-            DeferredFault::FsyncEio,
-        ]
+    pub fn all() -> [DeferredFault; 1] {
+        [DeferredFault::FsyncEio]
     }
 }
 
@@ -175,6 +169,7 @@ mod tests {
         assert!(labels.contains(&FaultKind::TornWalTail.label()));
         assert!(labels.contains(&FaultKind::TornDataPage.label()));
         assert!(labels.contains(&FaultKind::WriteReordering.label()));
+        assert!(labels.contains(&FaultKind::WriteIoError.label()));
     }
 
     #[test]

@@ -138,6 +138,18 @@ impl<D: BlockDevice, W: WalRule> BufferPool<D, W> {
         &mut fr.data
     }
 
+    /// Mutably borrows the underlying block device, for **Deterministic Simulation Testing only**
+    /// (`04 §11`): a DST harness uses it to arm a [`graphus_io::FaultPlan`] (or a one-shot I/O
+    /// error / torn write) on the *live* device of a running pool, so a fault can be injected
+    /// mid-workload rather than only on a device the harness owns before construction.
+    ///
+    /// Gated behind the `dst` cargo feature so the production build never compiles this seam — the
+    /// device stays fully encapsulated on the production path (zero-cost: the method does not exist).
+    #[cfg(feature = "dst")]
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.device
+    }
+
     fn oob_msg(idx: usize, capacity: usize) -> String {
         format!(
             "frame handle {idx} out of bounds (capacity {capacity}): handles must be pool-minted"

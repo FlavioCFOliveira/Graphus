@@ -3308,6 +3308,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(bytes)
     }
 
+    /// Mutably borrows the underlying block device, for **Deterministic Simulation Testing only**
+    /// (`04 §11`). A DST harness uses it to arm a [`graphus_io::FaultPlan`] (or the one-shot
+    /// `arm_io_error` / `arm_torn_write` seams) on the *live* device of a **running** store, so a
+    /// fault can be injected mid-workload — a write I/O error on the next home write, bit-rot on a
+    /// later read — instead of only on a device the harness owned before construction. This composes
+    /// with the existing crash/recover spine: arm the fault, drive more work (the next flush /
+    /// eviction surfaces a write error; the next fetch surfaces a read corruption), then crash and
+    /// run ARIES recovery exactly as the un-faulted scenarios do.
+    ///
+    /// Gated behind the `dst` cargo feature (which forwards to `graphus-bufpool/dst`) so the
+    /// production build never compiles this seam — the device stays encapsulated and the cost is
+    /// zero (the method does not exist on the production path).
+    #[cfg(feature = "dst")]
+    pub fn device_mut(&mut self) -> &mut D {
+        self.pool.device_mut()
+    }
+
     // ---------------------------- consistency checker ----------------------------
     //
     // Read-only accessors and a fetch wrapper the offline consistency checker

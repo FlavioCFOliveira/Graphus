@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Record store with index-free adjacency, tokens and element-ID mapping for Graphus."
 
+[features]
+# Deterministic Simulation Testing seam (`04 §11`): exposes `RecordStore::device_mut`, letting a DST
+# harness reach the live block device of a running store to arm a fault model (I/O error, bit-rot,
+# torn write, ...) mid-workload. Forwards to `graphus-bufpool/dst`. OFF by default, so the production
+# build never compiles the seam and the device stays encapsulated.
+dst = ["graphus-bufpool/dst"]
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
