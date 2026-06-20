@@ -1,0 +1,32 @@
+[package]
+name = "graphus-kg-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded knowledge-graph generator + analytically-known reference subgraph for the knowledge-graph-rest example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-fraud-gen`, `graphus-gds-gen`,
+# `graphus-bulk-gen`, `graphus-examples-harness` and `graphus-bench`: it exists only to support the
+# `examples/knowledge-graph-rest` E2E demonstration and is depended upon by NOTHING in the production
+# build. In particular, `graphus-server` MUST NOT depend on it, so it adds ZERO overhead to the
+# shipped binary.
+publish = false
+
+[lib]
+name = "graphus_kg_gen"
+path = "src/lib.rs"
+
+[dependencies]
+# The generator emits the reference ground-truth as JSON and the Cypher load script as text; serde
+# pins match the rest of the workspace. Hermetic: serde only, no engine, no network — always
+# available and CI-runnable.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The deterministic generator binary: writes `graph.cypher` + `reference.json` for a profile.
+# Usage: `cargo run -p graphus-kg-gen --bin kg_gen -- --profile fast --out-dir <dir>`
+[[bin]]
+name = "kg_gen"
+path = "src/bin/kg_gen.rs"

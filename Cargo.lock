@@ -1211,6 +1211,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-kg-gen"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-rest"
 version = "0.0.1"
 dependencies = [
