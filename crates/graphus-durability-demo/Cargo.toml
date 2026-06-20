@@ -1,0 +1,57 @@
+[package]
+name = "graphus-durability-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic OLTP durability + crash-recovery demonstration driver for the durability-crash-recovery example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-gds-gen`, `graphus-fraud-gen`,
+# `graphus-examples-harness` and `graphus-bench`: it exists ONLY to support the
+# `examples/durability-crash-recovery` E2E demonstration and is depended upon by NOTHING in the
+# production build. In particular, `graphus-server` MUST NOT depend on it, so it adds ZERO overhead
+# to the shipped binary. The deterministic durability scenario itself is NOT reimplemented here — it
+# is driven entirely through the existing `graphus-dst` VOPR safety oracle (`run_safety`), the crash
+# fault + ARIES restart (`CrashSplit`), and the replay-artifact machinery (`vopr_repro`).
+publish = false
+
+[dependencies]
+# The Deterministic Simulation Testing harness: the OLTP workload interleaver, the committed-only
+# shadow LPG reference model, the crash + ARIES-restart fault, the four-property safety oracle, and
+# the replay-artifact tools are ALL provided here and REUSED — this crate only orchestrates them into
+# the example's durability scenario and surfaces the evidence. `graphus-server` does NOT depend on
+# this crate, so the production build is untouched.
+graphus-dst = { path = "../graphus-dst" }
+
+# The shared evidence harness, for the standardized, schema-versioned report.json + report.md
+# (durability/atomicity verdict, acked/in-flight CrashSplit partition, sweep timing). A dev-only leaf
+# crate (never in `graphus-server`), keeping the production build untouched.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
+# The replay artifact (and the planted-failure round-trip) serialize to/from JSON; pins match the
+# rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The deterministic durability-scenario driver: runs the VOPR safety oracle (OLTP workload + shadow
+# model + crash + ARIES recovery + the four-property durability oracle) over a seed range, surfaces a
+# seed's acked/in-flight CrashSplit partition, and emits the standardized evidence report.
+# Usage: `cargo run -p graphus-durability-demo --bin durability_demo -- --seed 1 --seeds 100 ...`
+[[bin]]
+name = "durability_demo"
+path = "src/bin/durability_demo.rs"
+
+# The planted-failure replay round-trip (rmp #277): the real engine has NO failing seed, so this
+# binary plants a SYNTHETIC failure via the #242 `FailurePredicate` path, captures it into a
+# `ReplayArtifact`, writes it to disk, and replays it to the IDENTICAL failure — making the README's
+# one-command replay real and verified, hermetically, without a real engine bug.
+# Usage: `cargo run -p graphus-durability-demo --bin durability_replay -- --capture <file>`
+#        `cargo run -p graphus-durability-demo --bin durability_replay -- --replay  <file>`
+[[bin]]
+name = "durability_replay"
+path = "src/bin/durability_replay.rs"
+
+[lib]
+name = "graphus_durability_demo"
+path = "src/lib.rs"

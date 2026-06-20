@@ -194,6 +194,7 @@ GRAPHUS_BIN_DIR=target/release examples/<scenario-name>/run.sh
 |---------|--------------|
 | [`smoke-evidence`](smoke-evidence/) | The scaffold itself: sources the shell helper and invokes the Rust harness to produce an evidence directory. Fast, self-contained — proves the harness works end to end. |
 | [`social-network-uds`](social-network-uds/) | MVP over Bolt/UDS: a social graph stored, searched, manipulated, and preserved across a graceful restart and a hard crash. |
+| [`durability-crash-recovery`](durability-crash-recovery/) | DST-driven durability & crash recovery under load: a concurrent OLTP workload under faults + a seeded mid-workload crash, ARIES recovery, and the four ACID-durability properties asserted on the recovered engine (every acked commit survives, no in-flight effect does), with a one-command replay reproducer. |
 
 The forthcoming scenario examples (`rmp #27`–`#33`) MUST follow the layout above and consume the
 shared harness.
