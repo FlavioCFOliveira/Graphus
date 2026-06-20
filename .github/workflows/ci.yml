@@ -31,3 +31,18 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test --all
+      # Deterministic Simulation Testing gate (rmp #244): a fast, bounded VOPR seed sweep asserting
+      # every seed is SAFE (strict serializability + durability + atomicity + reference-model
+      # equivalence under injected disk/clock/crash faults), LIVE (progress watchdog + fault-then-heal
+      # recovery), and deterministic + oracle-consistent. Any violation, non-determinism, or oracle
+      # divergence fails the PR. Bounded (256 seeds/mode) so it stays a quick gate; the nightly job
+      # soaks far deeper. Runs once on the x86_64 Linux leg to keep the matrix fast.
+      - name: DST safety sweep
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr safety --seed 1 --seeds 256
+      - name: DST liveness sweep
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr liveness --seed 1 --seeds 256
+      - name: DST determinism + reference-model sweep
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr --seed 1 --seeds 256

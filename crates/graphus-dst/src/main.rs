@@ -27,11 +27,14 @@ fn main() -> ExitCode {
     if raw.peek().map(String::as_str) == Some("vopr") {
         let mut vopr_args = raw.skip(1).peekable();
         // `vopr fuzz …` drives the continuous, time-budgeted, multi-core soak fuzzer (rmp #243); plain
-        // `vopr …` is the serial determinism+oracle seed sweep (rmp #162/#238).
-        let (summary, failures) = if vopr_args.peek().map(String::as_str) == Some("fuzz") {
-            vopr_fuzz::run_fuzz_cli(vopr_args.skip(1))
-        } else {
-            vopr::run_cli(vopr_args)
+        // `vopr safety …` / `vopr liveness …` drive the bounded safety/liveness seed sweeps
+        // (rmp #239/#240), used as the PR CI gate; plain `vopr …` is the serial determinism+oracle
+        // seed sweep (rmp #162/#238).
+        let (summary, failures) = match vopr_args.peek().map(String::as_str) {
+            Some("fuzz") => vopr_fuzz::run_fuzz_cli(vopr_args.skip(1)),
+            Some("safety") => vopr::run_safety_cli(vopr_args.skip(1)),
+            Some("liveness") => vopr::run_liveness_cli(vopr_args.skip(1)),
+            _ => vopr::run_cli(vopr_args),
         };
         print!("{summary}");
         return if failures == 0 {

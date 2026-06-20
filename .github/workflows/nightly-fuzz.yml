@@ -1,0 +1,53 @@
+name: Nightly DST fuzz
+
+# Long-running Deterministic Simulation Testing soak (rmp #244, D3). Every night the VOPR fuzzer
+# runs for a wall-clock budget, swarming the full simulator configuration per seed (clients, pool
+# size, mix, fault/crash budget, latency) so each seed explores a different environment at
+# hyper-speed. On any failing seed it persists a self-contained replay artifact (seed + full config
+# + expected trace/state hashes) that reproduces the exact failure via `vopr-repro --replay`; the
+# job uploads those artifacts and fails. Can also be dispatched manually.
+
+on:
+  schedule:
+    # 03:17 UTC daily (off the hour to avoid the cron stampede).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      secs:
+        description: "Wall-clock soak budget per mode, in seconds"
+        required: false
+        default: "1200"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  soak:
+    name: VOPR soak (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [safety, liveness, standard]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build fuzzer (release)
+        run: cargo build --release -p graphus-dst --bin graphus-dst
+      - name: Soak
+        run: |
+          mkdir -p dst-artifacts
+          ./target/release/graphus-dst vopr fuzz \
+            --mode ${{ matrix.mode }} \
+            --swarm \
+            --secs ${{ github.event.inputs.secs || '1200' }} \
+            --keep-going \
+            --write-artifacts dst-artifacts
+      - name: Upload replay artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-replay-artifacts-${{ matrix.mode }}
+          path: dst-artifacts/
+          if-no-files-found: ignore
