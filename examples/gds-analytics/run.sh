@@ -9,20 +9,25 @@
 #      inter-field :CROSS edges, and a small :Ref/:LINKS reference subgraph whose PageRank /
 #      centrality / connected-component / shortest-path / community results are ANALYTICALLY KNOWN —
 #      emitted as reference.json;
-#   2. boots the REAL `graphus-server` exposing Bolt-over-TCP secured with a self-signed TLS cert;
-#   3. loads the graph over Bolt via the OFFICIAL `neo4j-driver` npm package (`bolt+ssc://`), then
-#      projects the CSR (`CALL gds.graph.project`) and runs the FULL algorithm suite through the
-#      `CALL gds.*.stream` procedure surface (PageRank, degree/betweenness/closeness centrality,
-#      WCC/SCC, triangleCount, labelPropagation, Dijkstra/Bellman-Ford), asserting the reference
-#      outputs match ground truth within tolerance, and dropping the projections cleanly;
-#   4. runs the HERMETIC scalability + CSR-footprint sweep (`gds_sweep`): graphus-gds is
+#   2. runs the HERMETIC scalability + CSR-footprint sweep (`gds_sweep`): graphus-gds is
 #      SINGLE-THREADED (no rayon / thread pool / core knob — verified), so the sweep honestly varies
 #      GRAPH SIZE, reporting per-algorithm time vs size and the CSR footprint in bytes-per-node /
-#      bytes-per-edge. Its JSON lands in evidence/ for the report.
+#      bytes-per-edge. Its JSON lands in evidence/ for the report. (Run first so the evidence step can
+#      read it while the server is still alive.)
+#   3. (opt-in) boots the REAL `graphus-server` (Bolt-over-TCP + self-signed TLS) and loads the graph
+#      over Bolt via the OFFICIAL `neo4j-driver` npm package (`bolt+ssc://`), then projects the CSR
+#      (`CALL gds.graph.project`) and runs the FULL algorithm suite through the `CALL gds.*.stream`
+#      procedure surface (PageRank, degree/betweenness/closeness centrality, WCC/SCC, triangleCount,
+#      labelPropagation, Dijkstra/Bellman-Ford), asserting the reference outputs match ground truth
+#      within tolerance, and dropping the projections cleanly;
+#   4. emits the standardized, schema-versioned report.json + report.md (per-algorithm timings as
+#      phases + the CSR footprint, plus the live server's CPU/RAM/storage when the driver path ran)
+#      via the dev-only `gds_evidence` harness binary, and gates a fresh fast-profile run against the
+#      committed baseline.json (structural metrics only) via `gds_baseline_cmp`.
 #
 # Step 3 needs Node + npm + network (for `npm install neo4j-driver`); it is OPT-IN via RUN_DRIVER=1
-# (default ON when `node`/`npm` are present, else skipped with a clear note). The generator (step 1)
-# and the sweep (step 4) are HERMETIC and always run.
+# (default ON when `node`/`npm` are present, else skipped with a clear note). The generator (step 1),
+# the sweep (step 2), and the evidence (step 4) are HERMETIC and always run.
 #
 # Usage:
 #   examples/gds-analytics/run.sh                       # builds binaries if needed, then runs
@@ -107,15 +112,20 @@ ADMIN_USER="neo4j"
 ADMIN_PW="gds-analytics-demo-pw-32bytes-minimum!"
 JWT_SECRET="gds-analytics-demo-jwt-secret-32bytes-ok!"
 
-# Evidence collection. The sibling #260-263 tasks wire the standardized report.json + report.md; this
-# script produces the machine-readable inputs they consume (the driver's GRAPHUS_STATS + the sweep
-# JSON). The evidence/ dir is git-ignored.
+# Evidence collection (rmp #260-263). The standardized, schema-versioned report.json + report.md are
+# emitted by the dev-only `gds_evidence` harness binary from the always-hermetic sweep JSON (per-
+# algorithm timings + CSR footprint), enriched with the live server's CPU/RAM/storage when the driver
+# path ran. BASELINE is the committed fast-profile reference run the regression gate compares a fresh
+# run against. The evidence/ dir is git-ignored; baseline.json lives at a non-ignored path.
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
 STORE_FILE="$WORKDIR/data/graphus.store"
 WAL_DIR="$WORKDIR/data/graphus.wal"
 SWEEP_JSON="$EVIDENCE_DIR/sweep.json"
+BASELINE="$SCRIPT_DIR/baseline.json"
 PEAK_RSS_BYTES=0
 SERVER_START_EPOCH=0
+# Live-server enrichment captured during the driver path (zero when the driver path is skipped).
+SERVER_UPTIME_SECS=0
 
 SERVER_PID=""
 cleanup() {
@@ -191,7 +201,25 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
-# Step 2 — decide whether to run the official-driver step
+# Step 2 — hermetic single-threaded scalability + CSR-footprint sweep (always runs)
+# --------------------------------------------------------------------------------------------------
+# Run the hermetic sweep FIRST so its JSON exists before the (optional) driver path: this lets the
+# evidence step (below) emit the standardized report while the server is still alive, harvesting the
+# server's live CPU/RAM/storage alongside the sweep's per-algorithm timings + CSR footprint. The sweep
+# is order-independent (no server, deterministic), so running it early changes nothing it measures.
+section "Step 2 — scalability + CSR-footprint sweep (single-threaded, hermetic)"
+info "graphus-gds is single-threaded (no rayon / thread pool / core knob) — the sweep varies GRAPH SIZE"
+"$SWEEP" --out "$SWEEP_JSON" --sizes "$SWEEP_SIZES" --repeats 3 2>&1 | sed 's/^/  /'
+assert "sweep JSON was produced" "yes" "$([ -s "$SWEEP_JSON" ] && echo yes || echo no)"
+assert "sweep honestly reports single-threaded engine" "yes" \
+  "$(grep -q '"engine_parallelism": "single-threaded"' "$SWEEP_JSON" && echo yes || echo no)"
+assert "sweep reports a core_knob=false (no core sweep to fabricate)" "yes" \
+  "$(grep -q '"core_knob": false' "$SWEEP_JSON" && echo yes || echo no)"
+assert "sweep reports CSR bytes-per-node / bytes-per-edge" "yes" \
+  "$(grep -q 'bytes_per_node' "$SWEEP_JSON" && grep -q 'bytes_per_edge' "$SWEEP_JSON" && echo yes || echo no)"
+
+# --------------------------------------------------------------------------------------------------
+# Step 3 — decide whether to run the official-driver step
 # --------------------------------------------------------------------------------------------------
 RUN_DRIVER="${RUN_DRIVER:-auto}"
 if [ "$RUN_DRIVER" = "auto" ]; then
@@ -207,13 +235,76 @@ ANALYZE_P50=0
 ANALYZE_P99=0
 ANALYZE_P999=0
 
+# --------------------------------------------------------------------------------------------------
+# emit_evidence — build (if needed) and run the dev-only `gds_evidence` harness binary, turning the
+# sweep JSON (per-algorithm timings + CSR footprint) plus the supplied live-server metrics into the
+# standardized, schema-versioned report.json + report.md. Purely ADDITIVE: a metering failure must
+# not fail the demonstration. Args: it reads the globals (SWEEP_JSON, EVIDENCE_DIR, PROFILE, …) and
+# the optional live-server enrichment ($1=pid $2=uptime $3=store $4=wal $5=peak_rss; pass "" to skip).
+EVIDENCE_BIN="$BIN_DIR/gds_evidence"
+CMP_BIN="$BIN_DIR/gds_baseline_cmp"
+emit_evidence() {
+  local pid="$1" uptime="$2" store="$3" wal="$4" peak="$5"
+  if [ ! -x "$EVIDENCE_BIN" ]; then
+    info "building the dev-only gds_evidence harness binary (debug)…"
+    ( cd "$REPO_ROOT" && cargo build -q -p graphus-gds-gen --bin gds_evidence ) || true
+    EVIDENCE_BIN="$REPO_ROOT/target/debug/gds_evidence"
+  fi
+  [ -x "$EVIDENCE_BIN" ] || { info "gds_evidence unavailable; skipping evidence (non-fatal)"; return 0; }
+
+  local args=(
+    --evidence-dir "$EVIDENCE_DIR"
+    --sweep "$SWEEP_JSON"
+    --scenario "gds-analytics"
+    --description "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, run the full gds.* suite over the CSR projection, assert the analytically-known reference outputs, and characterise single-threaded per-algorithm scaling + CSR footprint."
+    --param "profile=$PROFILE"
+    --param "connection=bolt-tcp-tls"
+  )
+  if [ -n "$pid" ]; then
+    args+=( --pid "$pid" --uptime-secs "$uptime" --store "$store" --wal "$wal" --peak-rss-bytes "$peak" )
+    args+=( --nodes "$NODE_COUNT" --rels "$REL_COUNT" --param "driver=official neo4j-driver" )
+    [ -n "${ANALYZE_OPS:-}" ] && args+=( --workload-ops "$ANALYZE_OPS" )
+    [ -n "${ANALYZE_P50:-}" ] && args+=( --p50-ms "$ANALYZE_P50" )
+    [ -n "${ANALYZE_P99:-}" ] && args+=( --p99-ms "$ANALYZE_P99" )
+    [ -n "${ANALYZE_P999:-}" ] && args+=( --p999-ms "$ANALYZE_P999" )
+  else
+    args+=( --param "driver=none (hermetic sweep only)" )
+  fi
+
+  # Refresh only the report files (NOT sweep.json, which gds_evidence reads); the dir is git-ignored.
+  rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
+  "$EVIDENCE_BIN" "${args[@]}" >/dev/null 2>&1 \
+    && info "evidence written to $EVIDENCE_DIR" \
+    || info "evidence collection failed (non-fatal); see output above"
+  assert "evidence report.json was produced" "yes" \
+    "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+  assert "evidence report.md was produced" "yes" \
+    "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+
+  # Regression gate (fast profile only — the committed baseline is a fast-profile run). Compares only
+  # the STABLE STRUCTURAL metrics (reference graph size, algorithm count, CSR footprint) against the
+  # committed baseline; CPU/RAM/wall-time are machine-variant and are NOT gated.
+  if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+    section "regression gate vs committed baseline"
+    if [ ! -x "$CMP_BIN" ]; then
+      ( cd "$REPO_ROOT" && cargo build -q -p graphus-gds-gen --bin gds_baseline_cmp ) || true
+      CMP_BIN="$REPO_ROOT/target/debug/gds_baseline_cmp"
+    fi
+    local cmp_out
+    cmp_out="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
+    printf '%s\n' "$cmp_out" | sed 's/^/  /'
+    assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
+      "$(printf '%s' "$cmp_out" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+  fi
+}
+
 if [ "$RUN_DRIVER" = "1" ]; then
   command -v openssl >/dev/null 2>&1 || { echo "${RED}fatal: openssl required for the TLS cert${RESET}" >&2; exit 2; }
 
   # ------------------------------------------------------------------------------------------------
   # Step 2 — boot a Bolt-TCP + TLS server
   # ------------------------------------------------------------------------------------------------
-  section "Step 2 — boot graphus-server (Bolt-over-TCP + TLS)"
+  section "Step 3a — boot graphus-server (Bolt-over-TCP + TLS)"
 
   openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY" -out "$CERT" \
     -days 2 -subj "/CN=localhost" \
@@ -274,7 +365,7 @@ EOF
 EOF
   cp "$SCRIPT_DIR/data/analyze.js" "$NODE_PROJ/analyze.js"
 
-  section "Step 3 — load + analyze the influence network over Bolt (OFFICIAL neo4j-driver)"
+  section "Step 3b — load + analyze the influence network over Bolt (OFFICIAL neo4j-driver)"
   info "installing neo4j-driver (npm)…"
   ( cd "$NODE_PROJ" && npm install --no-audit --no-fund --loglevel=error ) >>"$SERVER_LOG" 2>&1 \
     || { echo "${RED}npm install neo4j-driver failed; see $SERVER_LOG${RESET}" >&2; exit 1; }
@@ -292,28 +383,24 @@ EOF
   ANALYZE_P999="$(json_field "$ANALYZE_STATS" p999_ms)"
 
   sample_peak_rss
+  # Standardized evidence (rmp #260-263) WHILE the server is still alive, so its real CPU/RAM/storage
+  # are readable. The store/WAL follow the server's single-db layout (<store_path>/graphus.store and
+  # <store_path>/graphus.wal/). This also runs the committed-baseline regression gate (fast profile).
+  section "Step 4 — collect performance evidence (per-algorithm + CPU / RAM / storage)"
+  SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))
+  [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1   # avoid a zero-length CPU window
+  emit_evidence "$SERVER_PID" "$SERVER_UPTIME_SECS" "$STORE_FILE" "$WAL_DIR" "$PEAK_RSS_BYTES"
+
   stop_pid="$SERVER_PID"
   kill -TERM "$stop_pid" 2>/dev/null || true
   wait "$stop_pid" 2>/dev/null || true
   SERVER_PID=""
 else
-  section "Steps 2–3 — official-driver path SKIPPED (RUN_DRIVER=0 or node/npm absent)"
-  info "the hermetic generator + scalability sweep below still run and assert their invariants"
+  section "Step 3 — official-driver path SKIPPED (RUN_DRIVER=0 or node/npm absent)"
+  info "the hermetic generator + scalability sweep still ran; emitting hermetic evidence below"
+  section "Step 4 — collect performance evidence (per-algorithm + CSR footprint, hermetic)"
+  emit_evidence "" "" "" "" ""
 fi
-
-# --------------------------------------------------------------------------------------------------
-# Step 4 — hermetic single-threaded scalability + CSR-footprint sweep (always runs)
-# --------------------------------------------------------------------------------------------------
-section "Step 4 — scalability + CSR-footprint sweep (single-threaded, hermetic)"
-info "graphus-gds is single-threaded (no rayon / thread pool / core knob) — the sweep varies GRAPH SIZE"
-"$SWEEP" --out "$SWEEP_JSON" --sizes "$SWEEP_SIZES" --repeats 3 2>&1 | sed 's/^/  /'
-assert "sweep JSON was produced" "yes" "$([ -s "$SWEEP_JSON" ] && echo yes || echo no)"
-assert "sweep honestly reports single-threaded engine" "yes" \
-  "$(grep -q '"engine_parallelism": "single-threaded"' "$SWEEP_JSON" && echo yes || echo no)"
-assert "sweep reports a core_knob=false (no core sweep to fabricate)" "yes" \
-  "$(grep -q '"core_knob": false' "$SWEEP_JSON" && echo yes || echo no)"
-assert "sweep reports CSR bytes-per-node / bytes-per-edge" "yes" \
-  "$(grep -q 'bytes_per_node' "$SWEEP_JSON" && grep -q 'bytes_per_edge' "$SWEEP_JSON" && echo yes || echo no)"
 
 # --------------------------------------------------------------------------------------------------
 # Summary
@@ -321,6 +408,9 @@ assert "sweep reports CSR bytes-per-node / bytes-per-edge" "yes" \
 section "Result"
 printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
 info "sweep evidence: $SWEEP_JSON"
+if [ -f "$EVIDENCE_DIR/report.json" ]; then
+  info "standardized evidence: $EVIDENCE_DIR/{report.json, report.md}"
+fi
 if [ "$FAILURES" -eq 0 ]; then
   if [ "$RUN_DRIVER" = "1" ]; then
     printf '%s%sGDS-ANALYTICS DEMONSTRATION PASSED%s — Graphus loaded a seeded influence network over\n' "$BOLD" "$GREEN" "$RESET"

@@ -125,3 +125,11 @@ graphus-examples-harness = { path = "../graphus-examples-harness" }
 # its dependency on `graphus-server` is OPTIONAL (behind `dst-repro`), so this introduces no cycle in
 # the normal build graph; it is a TEST-TARGET dev-dependency that never enters the production build.
 graphus-fraud-gen = { path = "../graphus-fraud-gen" }
+# The deterministic influence/citation-network generator (its only non-serde dep is the
+# zero-runtime-dependency `graphus-gds` leaf crate, used by the `gds_sweep` binary — NOT by the lib),
+# so the hermetic gds-analytics cargo mirror (`tests/gds_analytics.rs`) can generate the SAME seeded
+# graph + reference subgraph the shell demo uses and assert the `gds.*` algorithm outputs against the
+# analytically-known ground truth — fully in-process via `LocalEngine`, no Node/network. gds-gen does
+# NOT depend on `graphus-server`, so this introduces no cycle; it is a TEST-TARGET dev-dependency that
+# never enters the production build.
+graphus-gds-gen = { path = "../graphus-gds-gen" }

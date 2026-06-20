@@ -1159,6 +1159,7 @@ dependencies = [
 name = "graphus-gds-gen"
 version = "0.0.1"
 dependencies = [
+ "graphus-examples-harness",
  "graphus-gds",
  "serde",
  "serde_json",
@@ -1216,6 +1217,7 @@ dependencies = [
  "graphus-cypher",
  "graphus-examples-harness",
  "graphus-fraud-gen",
+ "graphus-gds-gen",
  "graphus-io",
  "graphus-rest",
  "graphus-sim",

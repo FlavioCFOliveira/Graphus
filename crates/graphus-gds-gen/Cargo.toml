@@ -31,6 +31,13 @@ serde_json = "1"
 # build is untouched.
 graphus-gds = { path = "../graphus-gds" }
 
+# The shared evidence harness, for the `gds_evidence` + `gds_baseline_cmp` binaries: the former turns
+# the hermetic sweep (plus optional live-server CPU/RAM/storage) into the standardized, schema-
+# versioned report.json + report.md; the latter is the committed-baseline regression gate. The sweep
+# JSON is parsed with serde_json (already a dep). A dev-only leaf crate (never in `graphus-server`),
+# so this keeps the production build untouched.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
 # The deterministic generator binary: writes `graph.cypher` + `reference.json` for a profile.
 # Usage: `cargo run -p graphus-gds-gen --bin gds_gen -- --profile fast --out-dir <dir>`
 [[bin]]
@@ -44,3 +51,18 @@ path = "src/bin/gds_gen.rs"
 [[bin]]
 name = "gds_sweep"
 path = "src/bin/gds_sweep.rs"
+
+# Turns the hermetic sweep JSON (plus optional live-server CPU/RAM/storage) into the standardized,
+# schema-versioned evidence report.json + report.md, representing per-algorithm timings as report
+# phases. Usage: `cargo run -p graphus-gds-gen --bin gds_evidence -- --evidence-dir <d> --sweep <f>`
+[[bin]]
+name = "gds_evidence"
+path = "src/bin/gds_evidence.rs"
+
+# The committed-baseline regression gate: compares a fresh evidence report against the baseline using
+# stable STRUCTURAL metrics (reference graph size, algorithm count, CSR footprint) — machine-variant
+# CPU/RAM/wall-time are not gated. Hermetic (needs only the harness).
+# Usage: `cargo run -p graphus-gds-gen --bin gds_baseline_cmp -- <baseline.json> <candidate.json>`
+[[bin]]
+name = "gds_baseline_cmp"
+path = "src/bin/gds_baseline_cmp.rs"
