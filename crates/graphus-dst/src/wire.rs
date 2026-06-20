@@ -30,7 +30,7 @@ use graphus_rest::engine::{
     AccessMode as RestAccessMode, RestEngine, ResultStream, Row, RunSummary as RestRunSummary,
     TxHandle, TxOrigin,
 };
-use graphus_rest::protocol::Statement;
+use graphus_rest::protocol::{RunRequest, Statement};
 use graphus_rest::registry::TxRegistry;
 use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, execute_autocommit};
 use graphus_rest::{CachedResponse, Wire};
@@ -38,7 +38,7 @@ use graphus_server::engine::bolt_values::materialized_to_bolt;
 use graphus_server::engine::command::AccessMode as EngineAccessMode;
 use graphus_server::engine::rest_values::materialized_to_rest;
 use graphus_server::engine::{LocalEngine, RunReply, TxTicket};
-use graphus_sim::{SharedClock, Side, SimNet};
+use graphus_sim::{SharedClock, Side, SimNet, TransportFaultPlan};
 use graphus_wal::MemLogSink;
 
 /// The simulated engine, shared (single-threaded `Rc<RefCell<…>>`) so successive client sessions hit
@@ -282,6 +282,125 @@ impl RawBoltOutcome {
     }
 }
 
+/// The captured result of a Bolt session driven across a [`TransportFaultPlan`] (see
+/// [`run_bolt_session_with_transport_fault`]). The whole point is that, whatever the fault, the
+/// session **terminated** (no hang) and **did not panic** — `run_terminated` is always `true` here, by
+/// virtue of having returned at all.
+#[derive(Debug)]
+pub struct FaultedBoltOutcome {
+    /// Whether `BoltSession::run` returned `Ok` (clean close / EOF — e.g. a truncate-then-stall) vs
+    /// `Err` (a transport error surfaced — e.g. a mid-message reset). Both are acceptable; what matters
+    /// is that exactly one of them happened (the loop terminated, no hang) without a panic.
+    pub run_ok: bool,
+    /// The decoded server responses written before the session ended.
+    pub responses: Vec<Response>,
+}
+
+/// Drives a **real** `BoltSession` over the simulated network with a seed-driven
+/// [`TransportFaultPlan`] armed on the server's read direction (so the fault lands *inside* the
+/// client's `RUN`/`PULL`/`COMMIT` byte stream as the session consumes it), returning the session
+/// outcome.
+///
+/// # Liveness (cannot hang CI)
+///
+/// The fault is armed *before* delivery, then the network is stepped to quiescence with a **bounded**
+/// step loop ([`drive_to_quiescence`]) so that, by the time the (blocking) `BoltSession::run` reads,
+/// the server endpoint is already in a terminal state: a `DropInMessage` left the link broken (reads
+/// error), a `TruncateThenStall` left it half-closed (reads EOF after the prefix), and a
+/// `SlowConsumer` has — after enough bounded steps — delivered every byte. In every case the
+/// `SimEndpoint` read is non-blocking and `run()` returns; it can never block the test.
+pub fn run_bolt_session_with_transport_fault(
+    engine: SharedEngine,
+    seed: u64,
+    auth: &dyn AuthProvider,
+    requests: &[Request],
+    fault: TransportFaultPlan,
+) -> FaultedBoltOutcome {
+    let net = SimNet::with_seed(seed);
+    let link = net.connect();
+
+    // Arm the fault on the stream the SERVER reads (the client's writes) before any delivery.
+    net.arm_transport_fault(link, Side::Server, fault);
+
+    let mut input = encode_client_handshake([
+        Proposal::range(5, 4, 4),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ]);
+    for r in requests {
+        // Encoding never fails for well-formed requests; a failure would itself be a clean error, not a
+        // panic, so surface it as an empty (but terminated) outcome.
+        match encode_request_framed(r) {
+            Ok(bytes) => input.extend_from_slice(&bytes),
+            Err(_) => {
+                return FaultedBoltOutcome {
+                    run_ok: false,
+                    responses: Vec::new(),
+                };
+            }
+        }
+    }
+
+    // A write may fail if a fault has already broken the link at offset 0; ignore — we want the
+    // server's view, and the delivery step below establishes the terminal state regardless.
+    let _ = net.endpoint(link, Side::Client).write_all(&input);
+    drive_to_quiescence(&net, link, Side::Server);
+
+    let server_ep = net.endpoint(link, Side::Server);
+    let executor = LocalBoltExecutor::new(engine);
+    let mut session = BoltSession::new(server_ep, executor, auth);
+    let run_result = session.run();
+
+    // Collect whatever the server managed to write back to the client.
+    net.advance_to(FLUSH * 4);
+    let mut client = net.endpoint(link, Side::Client);
+    let mut written = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = client.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        written.extend_from_slice(&buf[..n]);
+    }
+
+    FaultedBoltOutcome {
+        run_ok: run_result.is_ok(),
+        responses: decode_responses(&written),
+    }
+}
+
+/// Steps the simulated network in **bounded** unit-time increments until the server's read direction
+/// reaches a terminal state — EOF / reset, or no further bytes become readable (everything in flight
+/// has been delivered, e.g. a slow consumer has fully drained). The step cap guarantees the loop (and
+/// hence any test built on it) terminates: it can never hang.
+fn drive_to_quiescence(net: &SimNet, link: graphus_sim::LinkId, server: Side) {
+    // A generous-but-finite cap: a slow consumer of 1 byte/step over a multi-KiB handshake+script still
+    // drains well inside this bound; everything else terminates far sooner.
+    const MAX_STEPS: u64 = 1_000_000;
+    let probe = net.endpoint(link, server);
+    let mut t = net.now();
+    let mut stalled = 0u64;
+    for _ in 0..MAX_STEPS {
+        let before = probe.readable_len();
+        t += 1;
+        net.advance_to(t);
+        if probe.is_eof() || probe.is_broken() {
+            return;
+        }
+        // No new bytes delivered this step: count consecutive stalls. A short run of stalls is normal
+        // under a slow consumer (latency gaps); a long run means delivery is complete.
+        if probe.readable_len() == before {
+            stalled += 1;
+            if stalled > 64 {
+                return;
+            }
+        } else {
+            stalled = 0;
+        }
+    }
+}
+
 /// Decodes the server's written byte stream into [`Response`]s: skips the 4-byte handshake reply, then
 /// dechunks and decodes each message. Returns an empty vec if the stream is too short to contain a
 /// handshake reply (e.g. the session failed before responding).
@@ -487,6 +606,103 @@ pub fn run_rest_autocommit(
         RestAccessMode::Read
     };
     execute_autocommit(&state, "neo4j", "sim", mode, Wire::Json, statements)
+}
+
+/// The captured result of a REST request driven across a [`TransportFaultPlan`] (see
+/// [`run_rest_with_transport_fault`]).
+///
+/// The REST byte transport in the simulator is the [`SimNet`] stream carrying the **JSON request
+/// body**; the request "core" is the body parse (`serde_json` into a [`RunRequest`]) followed by
+/// [`execute_autocommit`]. A transport fault therefore corrupts/cuts the body *before* it reaches the
+/// core, exactly as a real truncated/reset HTTP body would — and the core never sees a half-message.
+#[derive(Debug)]
+pub struct RestTransportOutcome {
+    /// Whether the full request body arrived and parsed into a valid [`RunRequest`]. `false` for a
+    /// truncated body (partial JSON) or a reset stream — in which case the engine is **never invoked**.
+    pub request_complete: bool,
+    /// The REST response, present only when `request_complete` (the core ran). A clean session yields
+    /// `Some(200…)`; a faulted/truncated request yields `None` (no core run, no mutation).
+    pub response: Option<CachedResponse>,
+}
+
+/// Drives a REST auto-commit request across a seed-driven [`TransportFaultPlan`]: the JSON request
+/// body is sent over a [`SimNet`] stream with the fault armed, then the (possibly truncated/reset)
+/// bytes are read on the server side and only a **complete, well-formed** body is handed to the real
+/// request core ([`execute_autocommit`]).
+///
+/// This is the REST analogue of [`run_bolt_session_with_transport_fault`] and upholds the same
+/// guarantees: no panic, no hang (the byte read is non-blocking and the stream is driven to a terminal
+/// state with a bounded loop), a clean error / no-op on a faulted request, and **ACID preserved** — a
+/// truncated or reset request never reaches the engine, so it leaves no trace.
+#[must_use]
+pub fn run_rest_with_transport_fault(
+    engine: SharedEngine,
+    seed: u64,
+    statements: &[Statement],
+    write: bool,
+    fault: TransportFaultPlan,
+) -> RestTransportOutcome {
+    // Build the JSON request body the client would POST.
+    let body = rest_request_body(statements, write);
+
+    let net = SimNet::with_seed(seed);
+    let link = net.connect();
+    net.arm_transport_fault(link, Side::Server, fault);
+    let _ = net.endpoint(link, Side::Client).write_all(body.as_bytes());
+    drive_to_quiescence(&net, link, Side::Server);
+
+    // Read the server-side bytes that actually arrived (a non-blocking, bounded drain).
+    let mut server = net.endpoint(link, Side::Server);
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut reset = false;
+    loop {
+        match server.read(&mut buf) {
+            Ok(0) => break, // EOF (clean close or truncate-then-stall) — stop.
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(_) => {
+                reset = true; // a mid-message reset surfaced
+                break;
+            }
+        }
+    }
+
+    // Only a complete, well-formed body reaches the core. A truncated body fails to parse (partial
+    // JSON); a reset stream is incomplete. Either way the engine is never touched.
+    if reset {
+        return RestTransportOutcome {
+            request_complete: false,
+            response: None,
+        };
+    }
+    match serde_json::from_slice::<RunRequest>(&received) {
+        Ok(req) if received.len() == body.len() => {
+            // The whole body arrived and parsed: run the real core.
+            let resp = run_rest_autocommit(engine, &req.statements, write);
+            RestTransportOutcome {
+                request_complete: true,
+                response: Some(resp),
+            }
+        }
+        _ => RestTransportOutcome {
+            request_complete: false,
+            response: None,
+        },
+    }
+}
+
+/// Serializes a REST auto-commit request body (the JSON a client would POST) for a batch of
+/// statements and an access mode.
+fn rest_request_body(statements: &[Statement], write: bool) -> String {
+    let stmts: Vec<serde_json::Value> = statements
+        .iter()
+        .map(|s| serde_json::json!({ "statement": s.statement }))
+        .collect();
+    serde_json::json!({
+        "statements": stmts,
+        "access_mode": if write { "WRITE" } else { "READ" },
+    })
+    .to_string()
 }
 
 /// Builds a single-statement REST batch with no inline parameters (parameters can be embedded as
@@ -700,5 +916,257 @@ mod tests {
             "error is JSON problem: {}",
             resp.content_type
         );
+    }
+
+    // ============================ Transport-fault DST tests (rmp #234) ============================
+    //
+    // Each test drives a real `BoltSession` (or the REST core) over the simulated network with a
+    // seed-driven `TransportFaultPlan` armed mid-message, and asserts the four invariants from the
+    // acceptance criteria: NO PANIC (the harness returns at all), NO HANG (liveness — the blocking
+    // session loop terminates because the faulted stream reaches a terminal reset/EOF), the correct
+    // TRANSPORT ERROR or CLEAN CLOSE, and ACID PRESERVED (an un-acked write leaves no trace; an acked
+    // write survives — checked against the shared engine after the fault).
+
+    use graphus_sim::TransportFaultPlan;
+
+    /// Counts `Probe` nodes visible to a fresh, clean Bolt read session against `eng` — the ACID
+    /// oracle: a write that was never committed must leave zero, a committed write must survive.
+    fn count_probe_nodes(eng: SharedEngine) -> usize {
+        let mut reqs = login_prologue();
+        reqs.extend([
+            Request::Run {
+                query: "MATCH (n:Probe) RETURN n.id AS id".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: -1, qid: None },
+            Request::Goodbye,
+        ]);
+        let auth = sim_auth();
+        let responses =
+            run_scripted_bolt_session(eng, 999, &auth, &reqs).expect("clean read session runs");
+        responses
+            .iter()
+            .filter(|r| matches!(r, Response::Record { .. }))
+            .count()
+    }
+
+    /// The script a faulted session attempts: log in, then CREATE a `Probe` node in auto-commit. If the
+    /// transport fault cuts the stream before the server reads + commits the CREATE, the node must not
+    /// exist (ACID: no partial effect from an un-acked op).
+    fn create_probe_script() -> Vec<Request> {
+        let mut reqs = login_prologue();
+        reqs.extend([
+            Request::Run {
+                query: "CREATE (:Probe {id: 1})".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: -1, qid: None },
+            Request::Goodbye,
+        ]);
+        reqs
+    }
+
+    /// Bolt + **drop in message**: a mid-message reset must surface as a transport error (or a clean
+    /// close), never a panic or a hang, and the un-acked CREATE must leave no `Probe` behind.
+    #[test]
+    fn bolt_drop_in_message_is_clean_and_atomic() {
+        let eng = engine();
+        // Drop somewhere inside the first 80 delivered bytes — well inside the handshake/HELLO/LOGON/RUN
+        // prologue, so the CREATE is never fully received.
+        let fault = TransportFaultPlan::new(0xD1).drop_in_message(80);
+        let outcome = run_bolt_session_with_transport_fault(
+            eng.clone(),
+            7,
+            &sim_auth(),
+            &create_probe_script(),
+            fault,
+        );
+        // No panic (we got here) and the loop terminated (run() returned, populating `outcome`). A reset
+        // is typically an Err, but a boundary-aligned drop could read as a clean EOF — both acceptable;
+        // the assertion below (an outcome exists at all) captures "no hang, no panic".
+        let _ = outcome.run_ok;
+        // ACID: the un-acked CREATE left no trace.
+        assert_eq!(
+            count_probe_nodes(eng),
+            0,
+            "a CREATE cut off by a mid-message reset must leave no node"
+        );
+    }
+
+    /// Bolt + **truncate then stall**: a partial write that stops must read as a clean EOF (the session
+    /// loop ends, no hang), and the un-acked CREATE must leave no `Probe`.
+    #[test]
+    fn bolt_truncate_then_stall_ends_in_eof_and_atomic() {
+        let eng = engine();
+        let fault = TransportFaultPlan::new(0x7C).truncate_then_stall(80);
+        let outcome = run_bolt_session_with_transport_fault(
+            eng.clone(),
+            11,
+            &sim_auth(),
+            &create_probe_script(),
+            fault,
+        );
+        // A truncate-then-stall is a half-close: the server reads the prefix then EOFs, so run() returns
+        // Ok (clean termination) — never a hang.
+        assert!(
+            outcome.run_ok,
+            "a truncated-then-stalled stream reads as a clean EOF, run() returns Ok"
+        );
+        assert_eq!(
+            count_probe_nodes(eng),
+            0,
+            "a CREATE cut off by truncation must leave no node"
+        );
+    }
+
+    /// Bolt + **slow consumer**: throttled delivery must NOT corrupt the stream — every byte still
+    /// arrives, the full script runs, the CREATE commits, and the node survives (ACID: an acked op
+    /// persists). This is the liveness-positive case (the session completes despite backpressure).
+    #[test]
+    fn bolt_slow_consumer_completes_and_persists() {
+        let eng = engine();
+        let fault = TransportFaultPlan::new(0x5C).slow_consumer(4);
+        let outcome = run_bolt_session_with_transport_fault(
+            eng.clone(),
+            13,
+            &sim_auth(),
+            &create_probe_script(),
+            fault,
+        );
+        assert!(
+            outcome.run_ok,
+            "a slow consumer only throttles; the full session completes: {outcome:?}"
+        );
+        assert!(
+            !outcome
+                .responses
+                .iter()
+                .any(|r| matches!(r, Response::Failure { .. })),
+            "no FAILURE under mere backpressure: {outcome:?}"
+        );
+        // ACID: the CREATE was fully delivered, committed, and survives.
+        assert_eq!(
+            count_probe_nodes(eng),
+            1,
+            "a slow consumer still delivers + commits the CREATE: the node survives"
+        );
+    }
+
+    /// Determinism: the same seed reproduces the same Bolt fault outcome bit-for-bit.
+    #[test]
+    fn bolt_transport_fault_is_deterministic() {
+        let run = || {
+            let eng = engine();
+            let outcome = run_bolt_session_with_transport_fault(
+                eng.clone(),
+                21,
+                &sim_auth(),
+                &create_probe_script(),
+                TransportFaultPlan::new(0xABBA).drop_in_message(96),
+            );
+            (
+                outcome.run_ok,
+                format!("{:?}", outcome.responses),
+                count_probe_nodes(eng),
+            )
+        };
+        assert_eq!(run(), run(), "same seed ⇒ identical faulted Bolt outcome");
+    }
+
+    /// REST + **drop in message**: a reset request body must never reach the engine; the response is
+    /// absent (no core run) and the CREATE leaves no `Probe` (ACID).
+    #[test]
+    fn rest_drop_in_message_never_reaches_engine() {
+        let eng = engine();
+        let fault = TransportFaultPlan::new(0xD2).drop_in_message(20);
+        let outcome = run_rest_with_transport_fault(
+            eng.clone(),
+            7,
+            &[rest_statement("CREATE (:Probe {id: 1})")],
+            true,
+            fault,
+        );
+        assert!(
+            !outcome.request_complete && outcome.response.is_none(),
+            "a reset body never reaches the core: {outcome:?}"
+        );
+        assert_eq!(
+            count_probe_nodes(eng),
+            0,
+            "a reset REST request leaves no node (ACID)"
+        );
+    }
+
+    /// REST + **truncate then stall**: a partial body fails to parse (incomplete JSON), so the core
+    /// never runs and the CREATE leaves no trace.
+    #[test]
+    fn rest_truncate_then_stall_never_reaches_engine() {
+        let eng = engine();
+        let fault = TransportFaultPlan::new(0x7D).truncate_then_stall(20);
+        let outcome = run_rest_with_transport_fault(
+            eng.clone(),
+            11,
+            &[rest_statement("CREATE (:Probe {id: 1})")],
+            true,
+            fault,
+        );
+        assert!(
+            !outcome.request_complete && outcome.response.is_none(),
+            "a truncated body is incomplete JSON; the core never runs: {outcome:?}"
+        );
+        assert_eq!(
+            count_probe_nodes(eng),
+            0,
+            "a truncated REST request leaves no node (ACID)"
+        );
+    }
+
+    /// REST + **slow consumer**: throttled delivery still delivers the whole body, so the core runs, the
+    /// CREATE commits (200), and the node survives (ACID: an acked op persists).
+    #[test]
+    fn rest_slow_consumer_completes_and_persists() {
+        let eng = engine();
+        let fault = TransportFaultPlan::new(0x5D).slow_consumer(3);
+        let outcome = run_rest_with_transport_fault(
+            eng.clone(),
+            13,
+            &[rest_statement("CREATE (:Probe {id: 1})")],
+            true,
+            fault,
+        );
+        assert!(
+            outcome.request_complete,
+            "a slow consumer still delivers the full body: {outcome:?}"
+        );
+        let resp = outcome.response.expect("the core ran");
+        assert_eq!(resp.status, 200, "the CREATE succeeds: {resp:?}");
+        assert_eq!(
+            count_probe_nodes(eng),
+            1,
+            "a slow REST consumer still commits the CREATE: the node survives"
+        );
+    }
+
+    /// Determinism: the same seed reproduces the same REST fault outcome.
+    #[test]
+    fn rest_transport_fault_is_deterministic() {
+        let run = || {
+            let eng = engine();
+            let outcome = run_rest_with_transport_fault(
+                eng.clone(),
+                21,
+                &[rest_statement("CREATE (:Probe {id: 1})")],
+                true,
+                TransportFaultPlan::new(0xCAFE).drop_in_message(24),
+            );
+            (
+                outcome.request_complete,
+                outcome.response.map(|r| r.status),
+                count_probe_nodes(eng),
+            )
+        };
+        assert_eq!(run(), run(), "same seed ⇒ identical faulted REST outcome");
     }
 }

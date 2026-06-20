@@ -42,3 +42,6 @@ graphus-rest = { path = "../graphus-rest" }
 # harness can record real transaction histories and certify serializability end-to-end.
 graphus-elle = { path = "../graphus-elle" }
 graphus-cypher = { path = "../graphus-cypher" }
+# Builds/parses the REST JSON request body for the transport-fault harness (rmp #234), modelling a
+# truncated/reset HTTP body before it reaches the request core. Already a transitive dep via graphus-rest.
+serde_json = "1"

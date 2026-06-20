@@ -11,7 +11,7 @@ pub mod net;
 pub mod scheduler;
 
 pub use clock_fault::{ClockFaultPlan, FaultyClock};
-pub use net::{LinkId, NetConfig, Side, SimEndpoint, SimNet};
+pub use net::{LinkId, NetConfig, Side, SimEndpoint, SimNet, TransportFaultPlan};
 pub use scheduler::SimScheduler;
 
 use graphus_core::capability::{Clock, Rng};
