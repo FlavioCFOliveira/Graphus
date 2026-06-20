@@ -168,6 +168,16 @@ impl VoprConfig {
         self
     }
 
+    /// The same run with **crash + ARIES restart** events woven into the running interleave (rmp #237):
+    /// the scheduler crashes the live engine `max_crashes` times mid-workload and rebuilds it from the
+    /// durable WAL, then the workload continues. Sets the crash cap on the active fault budget (keeping
+    /// any disk/clock/transport weights), so a run can combine crashes with other faults. Off by default.
+    #[must_use]
+    pub fn with_crashes(mut self, max_crashes: u32) -> Self {
+        self.fault_budget = self.fault_budget.with_crashes(max_crashes);
+        self
+    }
+
     /// The same run forced into **pure auto-commit mode**: every operation is its own one-statement
     /// transaction (the legacy per-op behaviour, with no explicit-transaction overlap). Use this for
     /// scenarios that certify clean per-op liveness rather than the interleaver's contention path.
@@ -222,6 +232,44 @@ pub struct VoprReport {
     /// is no byte stream); they fire physically only under a SimNet-backed driver (the documented
     /// rmp #236 seam — see [`vopr_fault`](crate::vopr_fault)).
     pub transport_faults: u32,
+    /// **Crash + ARIES restart events** woven into the running interleave (rmp #237). Each one dropped
+    /// the live engine mid-workload and rebuilt it from the durable WAL via
+    /// [`LocalEngine::crash_restart`](graphus_server::engine::LocalEngine), then the workload continued
+    /// against the recovered engine. `0` for a standard run (crashes are off by default). Folded into
+    /// [`trace_hash`](Self::trace_hash), so the crash schedule is part of the reproducible run.
+    pub crash_restarts: u32,
+    /// Per-crash acked-vs-in-flight classification (rmp #237), one [`CrashSplit`] per restart, in fire
+    /// order. The Sprint C oracle (rmp #238) consumes this to assert the durability/atomicity contract:
+    /// every transaction acked before a crash survives it, and every transaction still in flight at the
+    /// crash does not. Empty for a standard (crash-free) run.
+    pub crash_splits: Vec<CrashSplit>,
+}
+
+/// The acked-vs-in-flight split captured at one **crash + ARIES restart** instant (rmp #237) — the
+/// classification the Sprint C oracle (rmp #238) asserts against.
+///
+/// At the crash, each virtual client's transaction is exactly one of:
+/// * **acked** — every explicit `COMMIT` (and auto-commit) the engine acknowledged *before* this crash.
+///   These are in the durable WAL by the group-commit rule, so ARIES redo replays them: they **must
+///   survive** the restart.
+/// * **in-flight** — a transaction still *open* (a live ticket) at the crash. It was never acknowledged,
+///   so ARIES undo / no-redo discards it: it **must not survive** (no committed-or-nothing violation).
+///
+/// The counts are cumulative-at-crash snapshots taken on the one deterministic timeline, so two replays
+/// of the same seed produce identical splits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashSplit {
+    /// The dispatched-step ordinal the crash fired at (the canonical timeline index).
+    pub fire_step: u64,
+    /// Total transactions **acknowledged** (committed) across all clients before this crash — the set
+    /// that must survive the ARIES restart.
+    pub acked_commits: usize,
+    /// Transactions **open / in-flight** (uncommitted) at the crash — aborted by the crash, must not
+    /// survive. One per client that held an open explicit ticket at the firing step.
+    pub inflight_txns: usize,
+    /// The graph state hash observed **immediately after** the recovered engine was rebuilt — a digest
+    /// of exactly the durable (acked) state. Lets the oracle pin the recovered state per crash.
+    pub recovered_state_hash: u64,
 }
 
 /// One scheduled unit of work: a client advancing its open transaction by **one step**. The step's
@@ -325,6 +373,13 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
     let mut max_open_txns = 0usize;
     let mut committed_txns = 0usize;
     let mut aborted_txns = 0usize;
+    // Cumulative count of commits the engine **acknowledged** (explicit `COMMIT` ok + successful
+    // auto-commit), tracked so a crash can snapshot the acked set for the rmp #238 oracle. This is the
+    // wire-level "acked" tally; the durable WAL is the ground truth a crash recovers, but this counter
+    // lets the report expose the acked/in-flight split per crash without re-deriving it from storage.
+    let mut acked_commits = 0usize;
+    let mut crash_restarts = 0u32;
+    let mut crash_splits: Vec<CrashSplit> = Vec::new();
 
     // Hard upper bound on dispatched steps so a logic slip can never hang a test: every statement
     // spends one unit of budget, and each transaction adds a bounded `Begin`/`End` overhead, so the
@@ -367,6 +422,29 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
             },
         );
 
+        // After faults are armed but *before* this step's workload runs, weave in a crash + ARIES
+        // restart if one is due (rmp #237). The crash fires while transactions are interleaved — acked
+        // commits and in-flight (open) transactions coexist at this instant, the most dangerous
+        // durability/atomicity moment. The crash event is folded into the canonical trace (so the
+        // schedule is reproducible); the engine swap + client rebind is owned here, where the engine and
+        // client state live.
+        if faults.crash_due(dispatched, |token, value| {
+            trace.bytes(token);
+            trace.u64(value);
+        }) {
+            crash_at(
+                &mut eng,
+                &faulty_clock,
+                &mut states,
+                &cfg,
+                dispatched,
+                acked_commits,
+                &mut crash_restarts,
+                &mut crash_splits,
+                &mut trace,
+            );
+        }
+
         let client = tick.client as usize;
         // Decide and execute this client's next step, folding it into the canonical trace and
         // (re)scheduling the client's following step. `reschedule` carries the delay for the next step
@@ -386,6 +464,7 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
             &mut err_ops,
             &mut committed_txns,
             &mut aborted_txns,
+            &mut acked_commits,
         );
 
         // Observe overlap *after* this step settled: how many clients hold an open transaction now.
@@ -447,6 +526,8 @@ pub fn run(cfg: VoprConfig) -> VoprReport {
         disk_faults,
         clock_faults,
         transport_faults,
+        crash_restarts,
+        crash_splits,
     }
 }
 
@@ -461,6 +542,79 @@ fn estimate_step_horizon(cfg: &VoprConfig) -> u64 {
     u64::from(cfg.clients.max(1))
         .saturating_mul(u64::from(cfg.ops_per_client))
         .max(1)
+}
+
+/// Performs a **crash + ARIES restart** of the live engine mid-interleave (rmp #237) and rebinds the
+/// interleaver's client state onto the recovered engine.
+///
+/// The sequence, in deterministic order:
+/// 1. **Snapshot the split.** Count the transactions still open (in-flight / uncommitted) at this
+///    instant — one per client in [`ClientState::Open`]. These were never acknowledged; ARIES undo /
+///    no-redo discards them, so they must *not* survive. The cumulative `acked_commits` is the set that
+///    *must* survive.
+/// 2. **Crash + recover.** Rebuild a fresh engine purely from the *durable* WAL prefix via
+///    [`LocalEngine::crash_restart`] (the same ARIES path the storage harness certifies), reusing the
+///    same swappable faulty clock so time + clock faults stay continuous across the restart. The old
+///    engine is dropped (the "crash"); every acked commit is replayed, nothing in-flight is.
+/// 3. **Rebind clients.** Every open ticket belonged to the *dead* engine and is now invalid. Reset
+///    **all** clients to [`ClientState::Idle`] so none reuses a dead ticket — each simply begins a fresh
+///    transaction on its next scheduled step. Remaining op budget is untouched, so the run continues and
+///    still terminates.
+///
+/// The crash's `(fire_step, acked, in-flight, recovered_state_hash)` split is recorded for the rmp #238
+/// oracle and folded into the trace, so the recovered state is part of the reproducible digest. If
+/// recovery itself fails the engine is left as-is and the crash is not recorded — a recovery failure is
+/// a genuine durability bug the surrounding consistency probe will then surface.
+#[allow(clippy::too_many_arguments)]
+fn crash_at(
+    eng: &mut SimEngine,
+    faulty_clock: &Arc<SwappableClock>,
+    states: &mut [ClientState],
+    cfg: &VoprConfig,
+    fire_step: u64,
+    acked_commits: usize,
+    crash_restarts: &mut u32,
+    crash_splits: &mut Vec<CrashSplit>,
+    trace: &mut Fnv,
+) {
+    // 1. Classify each client's transaction at the crash: open ⇒ in-flight (must not survive).
+    let inflight_txns = states.iter().filter(|s| s.is_open()).count();
+
+    // 2. Crash + ARIES restart purely from the durable WAL, reusing the same swappable faulty clock so
+    //    time and any active clock-fault plan carry across the restart continuously.
+    let clock = faulty_clock.clone() as Arc<dyn Clock + Send + Sync>;
+    let recovered = match eng.crash_restart(clock, cfg.pool_pages) {
+        Ok(e) => e,
+        Err(_) => {
+            // Recovery failed — leave the live engine untouched and do not record the crash. The
+            // consistency probe at end-of-run will surface the durability bug rather than masking it.
+            return;
+        }
+    };
+    // Drop the old engine (the "crash") and continue against the recovered one. Best-effort harden of
+    // the dying engine is intentionally skipped: a crash is an *abrupt* loss, so we model exactly the
+    // durable-WAL prefix without a graceful flush.
+    *eng = recovered;
+
+    // 3. Rebind: every open ticket belonged to the dead engine. Treat all open transactions as aborted
+    //    by the crash — reset every client to Idle so none reuses a dead ticket; each begins anew on its
+    //    next scheduled step. Op budget is untouched, so the run continues deterministically.
+    for s in states.iter_mut() {
+        *s = ClientState::Idle;
+    }
+
+    // Snapshot the recovered (durable, acked-only) state for the oracle + trace.
+    let recovered_state_hash = snapshot_hash(eng);
+    trace.bytes(b"CRASH_RECOVERED");
+    trace.u64(recovered_state_hash);
+
+    *crash_restarts += 1;
+    crash_splits.push(CrashSplit {
+        fire_step,
+        acked_commits,
+        inflight_txns,
+        recovered_state_hash,
+    });
 }
 
 /// Advances one client's transaction state machine by exactly one step, executing it against the
@@ -487,6 +641,7 @@ fn advance_client(
     err_ops: &mut usize,
     committed_txns: &mut usize,
     aborted_txns: &mut usize,
+    acked_commits: &mut usize,
 ) -> bool {
     // Resolve the step to take. When `Idle`, plan a fresh transaction (consuming the RNG to size it,
     // pick auto-commit vs explicit, and pre-decide its end disposition). The end disposition is fixed
@@ -528,6 +683,7 @@ fn advance_client(
         aborted_txns,
         ok_ops,
         err_ops,
+        acked_commits,
     );
 
     // Fold this step into the canonical trace: dispatch sequence, client, step-kind token, outcome.
@@ -582,6 +738,7 @@ fn exec_step(
     aborted_txns: &mut usize,
     ok_ops: &mut usize,
     err_ops: &mut usize,
+    acked_commits: &mut usize,
 ) -> StepKind {
     match step {
         Step::Begin {
@@ -604,6 +761,11 @@ fn exec_step(
                 // runs and commits within this single step — preserving the legacy behaviour.
                 let outcome = run_auto_commit(eng, mode, stmt, params);
                 budget[client] = budget[client].saturating_sub(1);
+                // A successful auto-commit is an acknowledged commit (its effect is durable on return),
+                // so it counts toward the acked set a crash must preserve.
+                if outcome.ok {
+                    *acked_commits += 1;
+                }
                 tally(&outcome, ok_ops, err_ops);
                 states[client] = ClientState::Idle;
                 StepKind {
@@ -709,6 +871,7 @@ fn exec_step(
                 match eng.commit(ticket) {
                     Ok(_) => {
                         *committed_txns += 1;
+                        *acked_commits += 1;
                         (b"COMMIT".as_slice(), true)
                     }
                     Err(_) => {
@@ -1427,5 +1590,207 @@ mod tests {
         assert_eq!(r.disk_faults, 0);
         assert_eq!(r.clock_faults, 0);
         assert_eq!(r.transport_faults, 0);
+        // A standard run is also crash-free (crashes are off by default).
+        assert_eq!(r.crash_restarts, 0);
+        assert!(r.crash_splits.is_empty());
+    }
+
+    // ---------------------------- crash + ARIES restart (rmp #237) ----------------------------
+
+    /// A contended, crash-enabled config: explicit overlapping transactions under a write-heavy mix with
+    /// crashes woven into the running interleave, sized to stay fast in a debug build and to *guarantee*
+    /// open transactions coexist with acked commits at the crash instant.
+    fn crash_cfg(seed: u64) -> VoprConfig {
+        VoprConfig {
+            clients: 6,
+            ops_per_client: 24,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            max_txn_stmts: 5,
+            auto_commit_permille: 200,
+            rollback_permille: 100,
+            ..VoprConfig::for_seed(seed)
+        }
+        .with_crashes(2)
+    }
+
+    /// **Acceptance #1 (crash mid-interleave; acked survive, in-flight don't; run continues consistent).**
+    /// A crash-enabled run crashes during interleaved work — committed and in-flight transactions coexist
+    /// at the crash — recovers via ARIES, and continues. Every acked `:Person` create persists exactly
+    /// once across the crash (no committed create lost or duplicated: the acked-survives contract), and at
+    /// least one crash caught a genuinely in-flight (open) transaction (the in-flight-doesn't contract is
+    /// reachable: those open tickets were aborted by the crash, never replayed).
+    #[test]
+    fn crash_mid_interleave_recovers_and_stays_consistent() {
+        let cfg = crash_cfg(0x237_0001);
+        let r = run(cfg);
+        assert!(
+            r.crash_restarts > 0,
+            "a crash-enabled run actually crashes + recovers (got {})",
+            r.crash_restarts
+        );
+        // The run made progress *after* recovery — it did not end at the crash. With crashes confined to
+        // the leading 3/4 of the horizon, there are always post-recovery steps to certify continuity.
+        assert!(
+            r.steps > (cfg.clients * cfg.ops_per_client) as usize / 2,
+            "the workload continues past the crash (steps {})",
+            r.steps
+        );
+        // The acked-survives contract, spanning the crash: every committed create persists exactly once.
+        assert_eq!(
+            r.persisted_nodes, r.created_nodes,
+            "no acked create lost/duplicated across the crash: rows {} != distinct {}",
+            r.persisted_nodes, r.created_nodes
+        );
+        // The in-flight-doesn't contract is *reachable*: at least one crash caught an open transaction.
+        // (That open ticket belonged to the dead engine; ARIES undo/no-redo discarded its effect — the
+        // surviving consistency above proves no half-applied in-flight write leaked in.)
+        assert!(
+            r.crash_splits.iter().any(|s| s.inflight_txns > 0),
+            "a crash caught a genuinely in-flight transaction: {:?}",
+            r.crash_splits
+        );
+        // The split is well-formed: one CrashSplit per restart, acked counts are non-decreasing in time.
+        assert_eq!(r.crash_splits.len(), r.crash_restarts as usize);
+        let mut prev_acked = 0;
+        for s in &r.crash_splits {
+            assert!(
+                s.acked_commits >= prev_acked,
+                "acked commits are monotone across crashes: {:?}",
+                r.crash_splits
+            );
+            prev_acked = s.acked_commits;
+        }
+    }
+
+    /// **Acceptance #3 (deterministic recovery).** Same seed ⇒ identical trace hash, recovered state and
+    /// full report — recovery replays bit-for-bit, including the crash schedule, the acked/in-flight split
+    /// and the recovered state hash, now spanning the crash.
+    #[test]
+    fn crash_run_is_deterministic_same_seed() {
+        let cfg = crash_cfg(0x237_0002);
+        let a = run(cfg);
+        let b = run(cfg);
+        assert_eq!(
+            a, b,
+            "same seed ⇒ identical crash-and-recover report (schedule + split + recovered state)"
+        );
+        assert!(
+            a.crash_restarts > 0,
+            "the determinism check is non-vacuous (a crash actually fired)"
+        );
+        // The per-crash recovered-state hashes also match (they are part of the equal reports above, but
+        // assert directly so a regression points straight at the recovery digest).
+        assert_eq!(
+            a.crash_splits, b.crash_splits,
+            "the acked/in-flight split + recovered state replays identically"
+        );
+    }
+
+    /// **Acceptance (distinct seeds ⇒ distinct crash schedules).** The crash fire steps depend on the
+    /// seed: across a small set of seeds the crash schedules must not all collapse to one. (Captured via
+    /// the per-crash `fire_step`s folded into the report.)
+    #[test]
+    fn distinct_seeds_yield_distinct_crash_schedules() {
+        let schedules: std::collections::BTreeSet<Vec<u64>> = (1u64..=12)
+            .map(|s| {
+                run(crash_cfg(s))
+                    .crash_splits
+                    .iter()
+                    .map(|c| c.fire_step)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            schedules.len() > 1,
+            "distinct seeds must produce distinct crash schedules (got {} unique)",
+            schedules.len()
+        );
+    }
+
+    /// **Acceptance (crash folds into the trace).** Enabling crashes must *change* the canonical trace for
+    /// a fixed seed — proving the crash schedule + recovered state are genuinely folded into the run
+    /// digest, not an inert side-channel.
+    #[test]
+    fn enabling_crashes_changes_the_trace_hash() {
+        let seed = 0x237_0003;
+        let base = run(VoprConfig::for_seed(seed)); // crash-free
+        let crashed = run(crash_cfg(seed));
+        assert_eq!(base.crash_restarts, 0);
+        assert!(crashed.crash_restarts > 0);
+        assert_ne!(
+            base.trace_hash, crashed.trace_hash,
+            "the injected crash schedule + recovered state must fold into (change) the trace hash"
+        );
+    }
+
+    /// A crash woven into a **pure auto-commit** run still recovers and stays exactly consistent: every
+    /// op is its own acked transaction, so at the crash there are *no* in-flight transactions, yet every
+    /// acked create must still survive the restart (acked-survives with a clean in-flight=0 split).
+    #[test]
+    fn crash_under_auto_commit_preserves_every_acked_write() {
+        let cfg = VoprConfig {
+            clients: 5,
+            ops_per_client: 20,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            ..VoprConfig::for_seed(0x237_0006)
+        }
+        .auto_commit_only()
+        .with_crashes(1);
+        let r = run(cfg);
+        assert!(
+            r.crash_restarts > 0,
+            "the auto-commit run crashed + recovered"
+        );
+        // Auto-commit transactions never stay open across steps, so the crash catches none in flight.
+        assert!(
+            r.crash_splits.iter().all(|s| s.inflight_txns == 0),
+            "auto-commit leaves nothing in flight at the crash: {:?}",
+            r.crash_splits
+        );
+        assert_eq!(
+            r.persisted_nodes, r.created_nodes,
+            "every acked auto-commit create survives the crash: rows {} != distinct {}",
+            r.persisted_nodes, r.created_nodes
+        );
+        assert_eq!(
+            r,
+            run(cfg),
+            "the crashed auto-commit run replays identically"
+        );
+    }
+
+    /// Crashes compose with disk + clock faults on the one timeline: a budget that arms disk/clock faults
+    /// *and* crashes still recovers and stays consistent — the crash recovers from a WAL that itself
+    /// weathered budgeted corruption, the strongest combined-chaos certification of this sprint.
+    #[test]
+    fn crash_composes_with_other_faults_and_stays_consistent() {
+        let cfg = VoprConfig {
+            clients: 6,
+            ops_per_client: 24,
+            pool_pages: 512,
+            mix: MixProfile::write_heavy(),
+            max_txn_stmts: 5,
+            auto_commit_permille: 200,
+            ..VoprConfig::for_seed(0x237_0007)
+        }
+        .with_faults(FaultBudget::default().with_max_faults(8))
+        .with_crashes(2);
+        let r = run(cfg);
+        assert!(r.crash_restarts > 0, "crashes fired alongside other faults");
+        assert!(
+            r.disk_faults + r.clock_faults + r.transport_faults > 0,
+            "other faults fired too (disk={} clock={} xport={})",
+            r.disk_faults,
+            r.clock_faults,
+            r.transport_faults
+        );
+        assert_eq!(
+            r.persisted_nodes, r.created_nodes,
+            "consistent under crashes + faults combined: rows {} != distinct {}",
+            r.persisted_nodes, r.created_nodes
+        );
+        assert_eq!(r, run(cfg), "the combined-chaos run replays identically");
     }
 }

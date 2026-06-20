@@ -70,6 +70,15 @@ pub enum VoprFaultKind {
     Clock,
     /// A transport fault (planned + traced; physically fires only under a SimNet driver).
     Transport,
+    /// A **crash + ARIES restart** of the live engine (rmp #237): at the firing step the simulator
+    /// snapshots the durable WAL prefix, drops the live engine, and rebuilds it via
+    /// [`LocalEngine::crash_restart`](graphus_server::engine::LocalEngine::crash_restart). Every
+    /// acknowledged commit survives (it is in the durable WAL by the group-commit rule); every
+    /// transaction still open at the crash is lost (ARIES undo / no-redo). Unlike the other kinds it is
+    /// **not** applied through [`drain_due`](FaultScheduler::drain_due) — the engine swap is owned by the
+    /// main loop (which holds the engine + client state); the scheduler only *plans, gates and traces*
+    /// it via [`crash_due`](FaultScheduler::crash_due).
+    Crash,
 }
 
 impl VoprFaultKind {
@@ -79,6 +88,7 @@ impl VoprFaultKind {
             VoprFaultKind::Disk => b"FAULT:DISK",
             VoprFaultKind::Clock => b"FAULT:CLOCK",
             VoprFaultKind::Transport => b"FAULT:XPORT",
+            VoprFaultKind::Crash => b"FAULT:CRASH",
         }
     }
 }
@@ -113,6 +123,13 @@ pub struct FaultBudget {
     /// are harmless no-ops (the page is never read), so this is bounded to the simulated pool to keep
     /// faults landing on live data. Sane default sized for the harness's small pools.
     pub disk_page_span: u32,
+    /// Hard cap on the number of **crash + ARIES restart** events (rmp #237) injected over the whole
+    /// run, *separate* from [`max_faults`](Self::max_faults). A crash drops the live engine and rebuilds
+    /// it from the durable WAL mid-interleave (the most dangerous durability moment: committed and
+    /// in-flight transactions coexist at the crash). It is bounded tightly and **default `0` (off)** so a
+    /// standard run never crashes and stays bit-for-bit identical; the workload only ever loses bounded
+    /// progress (open tickets are aborted, acked commits replayed), so the run always terminates.
+    pub max_crashes: u32,
 }
 
 impl Default for FaultBudget {
@@ -128,6 +145,7 @@ impl Default for FaultBudget {
             disk_max_pages: 2,
             clock_max_ns: 5_000,
             disk_page_span: 64,
+            max_crashes: 0,
         }
     }
 }
@@ -176,6 +194,15 @@ impl FaultBudget {
         self
     }
 
+    /// Sets the **crash + ARIES restart** rate cap (rmp #237): how many times the live engine is
+    /// crashed and rebuilt from the durable WAL mid-interleave. Off by default (`0`); enable it to weave
+    /// crash recovery into the running workload. Bounded tightly so the run still makes progress.
+    #[must_use]
+    pub fn with_crashes(mut self, max: u32) -> Self {
+        self.max_crashes = max;
+        self
+    }
+
     /// Total kind weight; `0` ⇒ no kind is eligible (equivalent to no faults).
     fn total_weight(&self) -> u32 {
         self.disk_weight
@@ -217,10 +244,18 @@ pub struct FaultScheduler {
     /// [`take_transport_plan`](Self::take_transport_plan) for a SimNet driver to arm. `None` until a
     /// transport fault fires.
     pending_transport: Option<TransportFaultPlan>,
+    /// Planned crash + ARIES restart instants (rmp #237), in ascending fire-step order; consumed
+    /// front-to-back by [`crash_due`](Self::crash_due) (`crash_cursor` is the next un-fired index).
+    /// Separate from `events` because a crash is not applied through [`drain_due`](Self::drain_due) — the
+    /// engine swap is owned by the main loop. Empty unless the budget enables crashes.
+    crash_steps: Vec<u64>,
+    crash_cursor: usize,
     /// Tally of faults injected, by kind (folded into the [`VoprReport`](crate::vopr::VoprReport)).
     injected_disk: u32,
     injected_clock: u32,
     injected_transport: u32,
+    /// Tally of crash + ARIES restart events fired (rmp #237).
+    injected_crash: u32,
 }
 
 impl FaultScheduler {
@@ -258,22 +293,43 @@ impl FaultScheduler {
             events.sort_by_key(|e| (e.fire_step, kind_rank(e.kind), e.seed));
         }
 
+        // Crash + ARIES restart instants (rmp #237) are drawn *after* the disk/clock/transport events,
+        // so a budget with `max_crashes == 0` consumes no extra RNG and the pre-#237 schedule replays
+        // bit-for-bit. Crashes are spread over the *first* portion of the horizon so the run has ample
+        // steps left to continue (and prove consistency) post-recovery, and de-duplicated + sorted so
+        // two crashes never collide on one step.
+        let mut crash_steps = Vec::new();
+        if budget.max_crashes > 0 {
+            // Confine crashes to the leading 3/4 of the horizon: a crash too close to the end would
+            // leave no post-recovery work to certify the run continues consistently across it.
+            let crash_horizon = (horizon.saturating_mul(3) / 4).max(1);
+            for _ in 0..budget.max_crashes {
+                crash_steps.push(rng.below(crash_horizon));
+            }
+            crash_steps.sort_unstable();
+            crash_steps.dedup();
+        }
+
         Self {
             budget,
             events,
             cursor: 0,
             clock_plan: ClockFaultPlan::new(master_seed ^ FAULT_TAG ^ 0xC10C),
             pending_transport: None,
+            crash_steps,
+            crash_cursor: 0,
             injected_disk: 0,
             injected_clock: 0,
             injected_transport: 0,
+            injected_crash: 0,
         }
     }
 
-    /// Whether this scheduler will ever inject a fault (an inert scheduler is the legacy run).
+    /// Whether this scheduler will ever inject a fault *or* a crash (an inert scheduler is the legacy
+    /// run).
     #[must_use]
     pub fn is_inert(&self) -> bool {
-        self.events.is_empty()
+        self.events.is_empty() && self.crash_steps.is_empty()
     }
 
     /// The clock-fault plan the engine's [`FaultyClock`](graphus_sim::FaultyClock) is built over at run
@@ -331,12 +387,39 @@ impl FaultScheduler {
                     self.injected_transport += 1;
                     ev.seed
                 }
+                // Crash events live in the separate `crash_steps` list and fire via `crash_due` (the
+                // engine swap is owned by the main loop), never through `drain_due` — so the disk/clock/
+                // transport `events` list never carries one.
+                VoprFaultKind::Crash => {
+                    unreachable!("crash events are not drained through drain_due")
+                }
             };
             fold(ev.kind.token(), ev.fire_step);
             fold(b"#", effect);
             fired += 1;
         }
         fired
+    }
+
+    /// Reports whether a **crash + ARIES restart** (rmp #237) is due at `step` (the current
+    /// dispatched-step ordinal), folding the crash event into the canonical trace via `fold` when it is.
+    /// Returns `true` at most once per planned crash instant; the caller (which owns the engine + client
+    /// state) then performs the engine swap — the scheduler only *plans, gates and traces* the crash.
+    ///
+    /// At most one crash fires per call: crash instants are de-duplicated at planning time, so a single
+    /// dispatched step never triggers two restarts. The fold (kind token + fire step) is identical on
+    /// replay, so the crash schedule is a pure function of the master seed.
+    pub fn crash_due(&mut self, step: u64, mut fold: impl FnMut(&[u8], u64)) -> bool {
+        if self.crash_cursor < self.crash_steps.len() && self.crash_steps[self.crash_cursor] <= step
+        {
+            let fire_step = self.crash_steps[self.crash_cursor];
+            self.crash_cursor += 1;
+            self.injected_crash += 1;
+            fold(VoprFaultKind::Crash.token(), fire_step);
+            true
+        } else {
+            false
+        }
     }
 
     /// Takes the most recently planned transport fault, if any, for a **SimNet-backed** driver to arm
@@ -359,10 +442,16 @@ impl FaultScheduler {
         )
     }
 
-    /// Total faults injected (physically armed disk + clock + planned transport).
+    /// The number of **crash + ARIES restart** events fired (rmp #237).
+    #[must_use]
+    pub fn crashes(&self) -> u32 {
+        self.injected_crash
+    }
+
+    /// Total faults injected (physically armed disk + clock + planned transport + crash restarts).
     #[must_use]
     pub fn total_injected(&self) -> u32 {
-        self.injected_disk + self.injected_clock + self.injected_transport
+        self.injected_disk + self.injected_clock + self.injected_transport + self.injected_crash
     }
 
     /// Builds a bounded, recoverable disk [`FaultPlan`] for one fault slot from `seed`: up to
@@ -446,6 +535,9 @@ fn kind_rank(kind: VoprFaultKind) -> u8 {
         VoprFaultKind::Disk => 0,
         VoprFaultKind::Clock => 1,
         VoprFaultKind::Transport => 2,
+        // Crash events are scheduled separately (`crash_steps`) and never sorted through this tiebreak,
+        // but a total ranking keeps the helper exhaustive and panic-free.
+        VoprFaultKind::Crash => 3,
     }
 }
 
@@ -540,6 +632,93 @@ mod tests {
         let budget = FaultBudget::default().with_weights(0, 0, 1);
         let s = FaultScheduler::plan(55, budget, 10_000);
         assert!(s.events.iter().all(|e| e.kind == VoprFaultKind::Transport));
+    }
+
+    #[test]
+    fn crashes_are_off_by_default_and_consume_no_rng() {
+        // The default budget plans no crashes (max_crashes == 0), and adding crashes must not perturb
+        // the disk/clock/transport schedule (crashes are drawn *after* those events).
+        let base = FaultScheduler::plan(0x237_AAAA, FaultBudget::default(), 1_000);
+        assert!(base.crash_steps.is_empty(), "crashes are off by default");
+        let with_crash =
+            FaultScheduler::plan(0x237_AAAA, FaultBudget::default().with_crashes(3), 1_000);
+        let base_events: Vec<_> = base
+            .events
+            .iter()
+            .map(|e| (e.fire_step, kind_rank(e.kind), e.seed))
+            .collect();
+        let crash_events: Vec<_> = with_crash
+            .events
+            .iter()
+            .map(|e| (e.fire_step, kind_rank(e.kind), e.seed))
+            .collect();
+        assert_eq!(
+            base_events, crash_events,
+            "enabling crashes leaves the disk/clock/transport schedule bit-for-bit identical"
+        );
+        assert!(!with_crash.crash_steps.is_empty(), "crashes were planned");
+    }
+
+    #[test]
+    fn crash_schedule_is_seeded_bounded_sorted_and_deduped() {
+        let budget = FaultBudget::none().with_crashes(5);
+        let a = FaultScheduler::plan(123, budget, 1_000);
+        let b = FaultScheduler::plan(123, budget, 1_000);
+        assert_eq!(
+            a.crash_steps, b.crash_steps,
+            "same seed ⇒ same crash schedule"
+        );
+        assert!(
+            a.crash_steps.len() <= 5,
+            "the cap bounds the crash count (got {})",
+            a.crash_steps.len()
+        );
+        // Sorted, de-duplicated, and confined to the leading 3/4 of the horizon.
+        let mut sorted = a.crash_steps.clone();
+        sorted.dedup();
+        assert_eq!(
+            a.crash_steps, sorted,
+            "crash steps are sorted + de-duplicated"
+        );
+        assert!(
+            a.crash_steps.iter().all(|&s| s < 750),
+            "crashes are confined to the leading 3/4 of the horizon: {:?}",
+            a.crash_steps
+        );
+    }
+
+    #[test]
+    fn crash_due_fires_each_planned_instant_once_in_order() {
+        let mut s = FaultScheduler::plan(0x237_BEEF, FaultBudget::none().with_crashes(4), 1_000);
+        let planned = s.crash_steps.clone();
+        let mut fired_at = Vec::new();
+        // Advance the timeline step-by-step; crash_due fires at most once per call.
+        for step in 0..1_000u64 {
+            if s.crash_due(step, |_tok, _t| {}) {
+                fired_at.push(step);
+            }
+        }
+        // Every distinct planned instant fired exactly once, at (or just after) its planned step.
+        assert_eq!(
+            fired_at.len(),
+            planned.len(),
+            "each planned crash fires exactly once"
+        );
+        assert_eq!(s.crashes(), planned.len() as u32, "crashes are tallied");
+        let mut sorted = fired_at.clone();
+        sorted.sort_unstable();
+        assert_eq!(fired_at, sorted, "crashes fire in time order");
+    }
+
+    #[test]
+    fn distinct_seeds_distinct_crash_schedules() {
+        let budget = FaultBudget::none().with_crashes(4);
+        let a = FaultScheduler::plan(1, budget, 1_000);
+        let b = FaultScheduler::plan(2, budget, 1_000);
+        assert_ne!(
+            a.crash_steps, b.crash_steps,
+            "different seeds ⇒ different crash schedules"
+        );
     }
 
     #[test]
