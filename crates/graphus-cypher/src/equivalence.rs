@@ -19,6 +19,7 @@
 //! `NaN`), it is the correct relation for a `HashSet`/group key — see [`equivalent`].
 
 use graphus_core::Value;
+use std::hash::{Hash, Hasher};
 
 /// Returns `true` if `a` and `b` are **equivalent** for `DISTINCT`/grouping (CIP §Equality).
 ///
@@ -97,6 +98,120 @@ fn point_equivalent(x: &graphus_core::Point, y: &graphus_core::Point) -> bool {
     })
 }
 
+/// Feeds a [`Value`] into `state` so that the hash is **consistent with [`equivalent`]**: whenever
+/// `equivalent(a, b)` is `true`, `a` and `b` produce the same hash. The converse need not hold — a
+/// hash collision only ever lands two values in the same bucket, and correctness is always decided
+/// by [`equivalent`] (collision fallback). This lets grouping / `DISTINCT` bucket keys in O(1)
+/// amortised instead of an O(groups) linear scan (`rmp` #314).
+///
+/// The delicate cases mirror [`equivalent`] exactly: `INTEGER` and `FLOAT` share one hash class so
+/// `1 ≡ 1.0` hash equal; every `NaN` hashes to one canonical value (all `NaN` group together);
+/// signed zeros are normalised (`-0.0 ≡ +0.0`); maps hash order-independently.
+pub fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
+    match v {
+        Value::Null => 0u8.hash(state),
+        Value::Boolean(b) => {
+            1u8.hash(state);
+            b.hash(state);
+        }
+        // INTEGER and FLOAT are one hash class (tag 2) so number-equivalent values collide:
+        // `1 ≡ 1.0`, and `i64::MAX ≡ (i64::MAX as f64)`. Two distinct large integers that round to
+        // the same f64 also share a bucket; `equivalent`'s exact i64 compare separates them.
+        Value::Integer(_) | Value::Float(_) => {
+            2u8.hash(state);
+            let f = match v {
+                Value::Integer(i) => *i as f64,
+                Value::Float(f) => *f,
+                _ => unreachable!("guarded by the match arm"),
+            };
+            if f.is_nan() {
+                u64::MAX.hash(state); // canonical NaN bucket (NaN ≡ NaN)
+            } else if f == 0.0 {
+                0u64.hash(state); // -0.0 ≡ +0.0
+            } else {
+                f.to_bits().hash(state);
+            }
+        }
+        Value::String(s) => {
+            3u8.hash(state);
+            s.hash(state);
+        }
+        Value::Bytes(b) => {
+            4u8.hash(state);
+            b.hash(state);
+        }
+        Value::List(xs) => {
+            5u8.hash(state);
+            xs.len().hash(state);
+            for x in xs {
+                hash_value(x, state);
+            }
+        }
+        Value::Map(entries) => {
+            6u8.hash(state);
+            hash_map_unordered(entries, state);
+        }
+        Value::Date(x) => {
+            7u8.hash(state);
+            x.hash(state);
+        }
+        Value::LocalTime(x) => {
+            8u8.hash(state);
+            x.hash(state);
+        }
+        Value::ZonedTime(x) => {
+            9u8.hash(state);
+            x.hash(state);
+        }
+        Value::LocalDateTime(x) => {
+            10u8.hash(state);
+            x.hash(state);
+        }
+        Value::ZonedDateTime(x) => {
+            11u8.hash(state);
+            x.hash(state);
+        }
+        Value::Duration(x) => {
+            12u8.hash(state);
+            x.hash(state);
+        }
+        Value::Point(p) => {
+            13u8.hash(state);
+            hash_point(p, state);
+        }
+    }
+}
+
+/// Order-independent hash of a map's entries: each `(key, value)` is hashed into an isolated
+/// sub-hash and the per-entry results are XOR-combined (commutative ⇒ insertion-order-independent),
+/// matching [`map_equivalent`].
+fn hash_map_unordered<H: Hasher>(entries: &[(String, Value)], state: &mut H) {
+    entries.len().hash(state);
+    let mut acc: u64 = 0;
+    for (k, v) in entries {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        k.hash(&mut h);
+        hash_value(v, &mut h);
+        acc ^= h.finish();
+    }
+    acc.hash(state);
+}
+
+/// Hash of a [`Point`] consistent with [`point_equivalent`]: CRS plus each significant coordinate
+/// normalised the same way numbers are (`NaN` → one canonical bucket, `-0.0`/`+0.0` unified).
+fn hash_point<H: Hasher>(p: &graphus_core::Point, state: &mut H) {
+    p.crs.hash(state);
+    for c in p.coords() {
+        if c.is_nan() {
+            u64::MAX.hash(state);
+        } else if *c == 0.0 {
+            0u64.hash(state);
+        } else {
+            c.to_bits().hash(state);
+        }
+    }
+}
+
 /// Order-independent map equivalence under [`equivalent`].
 fn map_equivalent(x: &[(String, Value)], y: &[(String, Value)]) -> bool {
     if x.len() != y.len() {
@@ -129,6 +244,41 @@ mod tests {
         assert!(equivalent(&Value::Null, &Value::Null));
         assert!(!equivalent(&Value::Null, &i(1)));
         assert!(!equivalent(&i(1), &Value::Null));
+    }
+
+    /// The hash used to bucket grouping / `DISTINCT` keys (`rmp` #314) MUST be consistent with
+    /// [`equivalent`]: equivalent values hash equal (so they land in the same bucket and group
+    /// together). This is the safety invariant of the O(rows×groups)→O(rows) grouping fix.
+    fn h(v: &Value) -> u64 {
+        use std::hash::Hasher;
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        hash_value(v, &mut s);
+        s.finish()
+    }
+
+    #[test]
+    fn hash_is_consistent_with_equivalence() {
+        // Numbers: 1 ≡ 1.0, and i64::MAX ≡ (i64::MAX as f64) must hash equal (shared number class).
+        assert_eq!(h(&i(1)), h(&f(1.0)));
+        assert_eq!(h(&i(i64::MAX)), h(&f(i64::MAX as f64)));
+        // NaN ≡ NaN, -0.0 ≡ +0.0.
+        assert_eq!(h(&nan()), h(&nan()));
+        assert_eq!(h(&f(-0.0)), h(&f(0.0)));
+        // null ≡ null.
+        assert_eq!(h(&Value::Null), h(&Value::Null));
+        // Lists / maps under equivalence; maps are order-independent.
+        let l1 = Value::List(vec![i(1), f(2.0)]);
+        let l2 = Value::List(vec![f(1.0), i(2)]);
+        assert!(equivalent(&l1, &l2));
+        assert_eq!(h(&l1), h(&l2));
+        let m1 = Value::Map(vec![("a".into(), i(1)), ("b".into(), f(2.0))]);
+        let m2 = Value::Map(vec![("b".into(), i(2)), ("a".into(), f(1.0))]);
+        assert!(equivalent(&m1, &m2));
+        assert_eq!(h(&m1), h(&m2));
+        // Distinct values SHOULD generally differ (not required for correctness, but a smoke check
+        // that the hash is selective enough to matter): 1 vs 2, "a" vs "b".
+        assert_ne!(h(&i(1)), h(&i(2)));
+        assert_ne!(h(&Value::String("a".into())), h(&Value::String("b".into())));
     }
 
     #[test]

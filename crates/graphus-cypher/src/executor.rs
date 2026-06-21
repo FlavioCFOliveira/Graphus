@@ -54,7 +54,8 @@ use crate::ordering::cmp_values;
 use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound};
 use crate::procedure_registry::{self, ProcedureFailure, ProcedureRegistry};
 use crate::runtime::{
-    NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent,
+    NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cmp_row_values, hash_row_value,
+    row_values_equivalent,
 };
 use crate::statement_clock::StatementClock;
 use crate::ternary::Ternary;
@@ -2239,6 +2240,13 @@ fn aggregate_rows(
             .collect()
     };
     let mut groups: Vec<Group> = Vec::new();
+    // Hash index over `groups`: key-tuple hash → indices of groups whose key hashes there. Replaces
+    // the former O(groups) linear `position` scan per input row, which made grouping O(rows×groups)
+    // — e.g. 996k LIKE rows × 30k article groups ≈ 10^10 comparisons on the audited `top_liked`
+    // (`rmp` #314). The hash is `hash_row_value` (consistent with `row_values_equivalent`); a bucket
+    // collision still falls back to the exact equivalence check, so grouping semantics are
+    // unchanged. Groups stay in first-seen order (output order is preserved).
+    let mut index: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
 
     while let Some(row) = inner.next(ctx)? {
         ctx.check_cancelled()?;
@@ -2254,21 +2262,37 @@ fn aggregate_rows(
                 &ctx.clock,
             )?);
         }
-        let idx = match groups.iter().position(|g| {
+        // Hash the whole key tuple, then resolve within the (normally singleton) bucket by exact
+        // equivalence.
+        let key_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key_vals.len().hash(&mut h);
+            for kv in &key_vals {
+                hash_row_value(kv, &mut h);
+            }
+            h.finish()
+        };
+        let bucket = index.entry(key_hash).or_default();
+        let found = bucket.iter().copied().find(|&gi| {
+            let g = &groups[gi];
             g.keys.len() == key_vals.len()
                 && g.keys
                     .iter()
                     .zip(&key_vals)
                     .all(|(x, y)| row_values_equivalent(x, y))
-        }) {
+        });
+        let idx = match found {
             Some(i) => i,
             None => {
+                let gi = groups.len();
                 groups.push(Group {
                     keys: key_vals.clone(),
                     accs: new_accs(&plans),
                     representative: row.clone(),
                 });
-                groups.len() - 1
+                bucket.push(gi);
+                gi
             }
         };
         // Update each accumulator from this row.

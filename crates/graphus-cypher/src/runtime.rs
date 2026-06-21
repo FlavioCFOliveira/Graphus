@@ -403,6 +403,54 @@ pub fn row_values_equivalent(a: &RowValue, b: &RowValue) -> bool {
     }
 }
 
+/// Feeds a [`RowValue`] into `state` so the hash is **consistent with [`row_values_equivalent`]**:
+/// whenever two row-values are equivalent they hash equal. Collisions only share a bucket;
+/// [`row_values_equivalent`] always decides membership. Used to bucket grouping / `DISTINCT` keys
+/// in O(1) amortised (`rmp` #314). Nodes/relationships hash by identity (id), mirroring their
+/// equivalence; paths fold to a single bucket (rare as a grouping key — the equivalence fallback
+/// stays correct), structural lists hash in order, structural maps hash order-independently.
+pub fn hash_row_value<H: std::hash::Hasher>(v: &RowValue, state: &mut H) {
+    use std::hash::{Hash, Hasher};
+    match v {
+        RowValue::Value(x) => {
+            0u8.hash(state);
+            crate::equivalence::hash_value(x, state);
+        }
+        RowValue::Node(n) => {
+            1u8.hash(state);
+            n.id.hash(state);
+        }
+        RowValue::Rel(r) => {
+            2u8.hash(state);
+            r.id.hash(state);
+        }
+        RowValue::Path(_) => {
+            // Paths are essentially never grouping keys; collapse to one bucket and let
+            // `row_values_equivalent` decide. Correct, just not selective for this rare case.
+            3u8.hash(state);
+        }
+        RowValue::List(xs) => {
+            4u8.hash(state);
+            xs.len().hash(state);
+            for x in xs {
+                hash_row_value(x, state);
+            }
+        }
+        RowValue::Map(entries) => {
+            5u8.hash(state);
+            entries.len().hash(state);
+            let mut acc: u64 = 0;
+            for (k, val) in entries {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                k.hash(&mut h);
+                hash_row_value(val, &mut h);
+                acc ^= h.finish();
+            }
+            acc.hash(state);
+        }
+    }
+}
+
 /// A single executor result row: a positional tuple of [`RowValue`]s plus the variable names bound
 /// in each column (`04 §7.4`).
 ///
