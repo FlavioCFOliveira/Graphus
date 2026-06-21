@@ -179,6 +179,17 @@ fn parse_header_cell(cell: &str) -> Result<ColumnRole, HeaderError> {
     }
 }
 
+/// Decodes a single header cell into its [`ColumnRole`] — the crate-internal entry point used by the
+/// columnar transcoder ([`crate::columnar`]) to classify a column's declared type the **same** way
+/// the importer does, so the two never disagree about a column's shape.
+///
+/// # Errors
+///
+/// [`HeaderError::UnknownType`] for an unrecognised property type token; see [`parse_header_cell`].
+pub(crate) fn parse_header_cell_public(cell: &str) -> Result<ColumnRole, HeaderError> {
+    parse_header_cell(cell)
+}
+
 /// The decoded schema of a **node** CSV file: the per-column roles plus the `:ID` column index.
 #[derive(Debug, Clone)]
 pub struct NodeHeader {

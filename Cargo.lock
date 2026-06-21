@@ -1062,12 +1062,14 @@ name = "graphus-bulk"
 version = "0.0.1"
 dependencies = [
  "csv",
+ "graphus-columnar",
  "graphus-core",
  "graphus-io",
  "graphus-sim",
  "graphus-storage",
  "graphus-wal",
  "itoa",
+ "proptest",
 ]
 
 [[package]]

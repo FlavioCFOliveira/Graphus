@@ -53,11 +53,13 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod columnar;
 pub mod dump;
 pub mod header;
 pub mod import;
 pub mod value_parse;
 
+pub use columnar::{ColumnarError, csv_to_gcol, gcol_to_csv};
 pub use dump::{dump_nodes, dump_relationships};
 pub use header::{ColumnRole, HeaderError, NodeHeader, PropertyType, RelHeader, ScalarType};
 pub use import::{BulkImporter, DEFAULT_BATCH_SIZE, DuplicatePolicy, ImportStats};

@@ -1,30 +1,58 @@
-//! `graphus-bulk` — command-line offline CSV bulk importer / whole-graph dumper (FR-BK; `rmp` task
-//! #22).
+//! `graphus-bulk` — command-line offline CSV bulk importer / whole-graph dumper (FR-BK; `rmp` tasks
+//! #22 and #327).
 //!
 //! ```text
-//! graphus-bulk import --db <dir> [--nodes <file>]... [--relationships <file>]... [--delimiter <c>] [--batch <n>]
-//! graphus-bulk dump   --db <dir> --nodes-out <file> --relationships-out <file>
+//! graphus-bulk import --db <dir> [--nodes <file>]... [--relationships <file>]... [--delimiter <c>] [--batch <n>] [--format csv|gcol]
+//! graphus-bulk dump   --db <dir> --nodes-out <file> --relationships-out <file> [--format csv|gcol]
 //! ```
 //!
 //! `import` builds a **fresh** store in `<dir>` (it must not already contain a store) from the given
-//! node and relationship CSV files, then prints the measured throughput. `dump` opens an existing
-//! store in `<dir>` and writes its nodes and relationships to the two output files in the same CSV
-//! format the importer reads (so the pair round-trips).
+//! node and relationship files, then prints the measured throughput. `dump` opens an existing store
+//! in `<dir>` and writes its nodes and relationships to the two output files in the same format the
+//! importer reads (so the pair round-trips).
+//!
+//! `--format` selects the on-disk file format (default `csv`):
+//! - `csv` — the row-oriented `neo4j-admin import`-flavoured CSV (the existing path, unchanged).
+//! - `gcol` — the compact, lossless **columnar** format (`rmp` #327): the dumper transcodes its CSV
+//!   through [`csv_to_gcol`](graphus_bulk::csv_to_gcol); the importer transcodes the `.gcol` blob back
+//!   with [`gcol_to_csv`](graphus_bulk::gcol_to_csv) before feeding the existing `BulkImporter`. The
+//!   `.gcol` round-trips to byte-identical CSV, so a graph is preserved exactly across either format.
 //!
 //! A `<dir>` holds `graph.store` (the block device, a file) and `graph.wal` (the write-ahead log, a
 //! segmented directory of an `anchor` + `seg.<base>` files — `rmp` #116), matching the server's
 //! on-disk layout.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE, dump_nodes, dump_relationships};
+use graphus_bulk::{
+    BulkImporter, DEFAULT_BATCH_SIZE, csv_to_gcol, dump_nodes, dump_relationships, gcol_to_csv,
+};
 use graphus_core::GraphusError;
 use graphus_io::FileBlockDevice;
 use graphus_storage::RecordStore;
 use graphus_storage::recovery::recover_device;
 use graphus_wal::{FileLogSink, WalManager};
+
+/// The on-disk file format for a bulk dump/import (the `--format` flag). CSV is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// Row-oriented `neo4j-admin import`-flavoured CSV (the original path).
+    Csv,
+    /// Lossless columnar `.gcol` (`rmp` #327): CSV transcoded through the `graphus-columnar` codecs.
+    Gcol,
+}
+
+impl Format {
+    /// Parses the `--format` value (`csv` | `gcol`), case-insensitively.
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "csv" => Ok(Self::Csv),
+            "gcol" => Ok(Self::Gcol),
+            other => Err(format!("--format must be `csv` or `gcol`, got `{other}`")),
+        }
+    }
+}
 
 /// Buffer-pool frames for the bulk session. A bulk load is sequential-write heavy; a modest pool is
 /// plenty (pages are written through the WAL and flushed at commit).
@@ -60,11 +88,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
 /// The usage text.
 fn usage() -> String {
-    "graphus-bulk — offline CSV bulk import / whole-graph dump\n\n\
+    "graphus-bulk — offline bulk import / whole-graph dump (CSV or columnar `.gcol`)\n\n\
      USAGE:\n  \
        graphus-bulk import --db <dir> [--nodes <file>]... [--relationships <file>]... \
-     [--delimiter <c>] [--batch <n>]\n  \
-       graphus-bulk dump   --db <dir> --nodes-out <file> --relationships-out <file>\n"
+     [--delimiter <c>] [--batch <n>] [--format csv|gcol]\n  \
+       graphus-bulk dump   --db <dir> --nodes-out <file> --relationships-out <file> \
+     [--format csv|gcol]\n\n\
+     --format selects the file format (default csv); `gcol` is the lossless columnar format.\n"
         .to_owned()
 }
 
@@ -75,6 +105,7 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
     let mut rels: Vec<PathBuf> = Vec::new();
     let mut delimiter = b',';
     let mut batch = DEFAULT_BATCH_SIZE;
+    let mut format = Format::Csv;
 
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -83,6 +114,7 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
             "--nodes" => nodes.push(PathBuf::from(next_value(&mut it, "--nodes")?)),
             "--relationships" => rels.push(PathBuf::from(next_value(&mut it, "--relationships")?)),
             "--delimiter" => delimiter = parse_delimiter(&next_value(&mut it, "--delimiter")?)?,
+            "--format" => format = Format::parse(&next_value(&mut it, "--format")?)?,
             "--batch" => {
                 batch = next_value(&mut it, "--batch")?
                     .parse()
@@ -100,15 +132,15 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
     let mut importer = BulkImporter::new(store, batch, delimiter);
 
     for path in &nodes {
-        let file = File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+        let csv = read_as_csv(path, format)?;
         importer
-            .import_nodes(file)
+            .import_nodes(csv.as_slice())
             .map_err(|e| format!("importing nodes from {}: {e}", path.display()))?;
     }
     for path in &rels {
-        let file = File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+        let csv = read_as_csv(path, format)?;
         importer
-            .import_relationships(file)
+            .import_relationships(csv.as_slice())
             .map_err(|e| format!("importing relationships from {}: {e}", path.display()))?;
     }
 
@@ -129,11 +161,12 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// `dump`: open an existing store and serialise it to the two output CSV files.
+/// `dump`: open an existing store and serialise it to the two output files (CSV or `.gcol`).
 fn cmd_dump(args: Vec<String>) -> Result<(), String> {
     let mut db: Option<PathBuf> = None;
     let mut nodes_out: Option<PathBuf> = None;
     let mut rels_out: Option<PathBuf> = None;
+    let mut format = Format::Csv;
 
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -143,6 +176,7 @@ fn cmd_dump(args: Vec<String>) -> Result<(), String> {
             "--relationships-out" => {
                 rels_out = Some(PathBuf::from(next_value(&mut it, "--relationships-out")?));
             }
+            "--format" => format = Format::parse(&next_value(&mut it, "--format")?)?,
             other => return Err(format!("unexpected argument `{other}`\n\n{}", usage())),
         }
     }
@@ -152,19 +186,53 @@ fn cmd_dump(args: Vec<String>) -> Result<(), String> {
 
     let mut store = open_store(&db).map_err(|e| e.to_string())?;
 
-    let nf =
-        File::create(&nodes_out).map_err(|e| format!("creating {}: {e}", nodes_out.display()))?;
-    dump_nodes(&mut store, nf).map_err(|e| format!("dumping nodes: {e}"))?;
-    let rf =
-        File::create(&rels_out).map_err(|e| format!("creating {}: {e}", rels_out.display()))?;
-    dump_relationships(&mut store, rf).map_err(|e| format!("dumping relationships: {e}"))?;
+    // Dump each entity kind to an in-memory CSV buffer (the canonical serialisation), then write it
+    // out in the requested format. The CSV path writes the buffer verbatim; the gcol path transcodes
+    // it through the columnar codecs.
+    let mut node_csv = Vec::new();
+    dump_nodes(&mut store, &mut node_csv).map_err(|e| format!("dumping nodes: {e}"))?;
+    write_dump(&nodes_out, &node_csv, format)?;
+
+    let mut rel_csv = Vec::new();
+    dump_relationships(&mut store, &mut rel_csv)
+        .map_err(|e| format!("dumping relationships: {e}"))?;
+    write_dump(&rels_out, &rel_csv, format)?;
 
     println!(
-        "dumped graph to {} and {}",
+        "dumped graph ({}) to {} and {}",
+        match format {
+            Format::Csv => "csv",
+            Format::Gcol => "gcol",
+        },
         nodes_out.display(),
         rels_out.display()
     );
     Ok(())
+}
+
+/// The CSV delimiter the dumper emits and the importer reads (`csv::WriterBuilder::new()` default,
+/// matching [`dump`](graphus_bulk::dump_nodes)).
+const DUMP_DELIMITER: u8 = b',';
+
+/// Reads a dump file as CSV bytes, transcoding from `.gcol` when `format` is [`Format::Gcol`].
+fn read_as_csv(path: &Path, format: Format) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+    match format {
+        Format::Csv => Ok(bytes),
+        Format::Gcol => {
+            gcol_to_csv(&bytes).map_err(|e| format!("decoding columnar {}: {e}", path.display()))
+        }
+    }
+}
+
+/// Writes a dump file, transcoding the in-memory CSV to `.gcol` when `format` is [`Format::Gcol`].
+fn write_dump(path: &Path, csv: &[u8], format: Format) -> Result<(), String> {
+    let bytes = match format {
+        Format::Csv => csv.to_vec(),
+        Format::Gcol => csv_to_gcol(csv, DUMP_DELIMITER)
+            .map_err(|e| format!("encoding columnar {}: {e}", path.display()))?,
+    };
+    std::fs::write(path, &bytes).map_err(|e| format!("creating {}: {e}", path.display()))
 }
 
 /// The on-disk file pair inside a `--db` directory.
