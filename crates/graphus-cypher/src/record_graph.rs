@@ -1885,12 +1885,25 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             return None; // no usable index: scan fallback
         }
 
-        // SSI predicate footprint: an indexed equality predicate replaces the `scan_filter_eq`
-        // fallback, which read every node via `scan_nodes_by_label`. Preserve that exact read
-        // footprint so an index seek and the scan fallback are indistinguishable to SSI (`04 §5.4`,
-        // `rmp` task #46) — see `mark_all_live_nodes`.
-        self.mark_all_live_nodes();
-        // Plus the phantom-safe predicate marker (`rmp` #171): the *precise* equality predicate, so a
+        // SSI predicate footprint for an indexed equality predicate (`rmp` #316). We do NOT
+        // SIREAD-mark every live node here. The earlier `scan_filter_eq` fallback read every node,
+        // so it conservatively marked all of them; that blanket marker manufactured an rw-edge with
+        // *any* concurrent node writer — even one touching a node that does not match `(label,
+        // property, value)` and that we never examined — which under contention produced a storm of
+        // false aborts (measured: fraud-oltp abort_rate ≈ 0.97). It is also unnecessary for
+        // serializability, which is fully covered by two precise markers:
+        //   1. the per-candidate SIREAD in `filter_label_candidates` (below) marks every node the
+        //      seek actually examined, so a concurrent modify/delete of a *matching* node closes an
+        //      rw-edge; and
+        //   2. the precise `Equality` predicate marker (below) pairs with the writer's pre- and
+        //      post-image predicate writes (`note_predicate_write_preimage` + `reindex_node` in
+        //      `set_node_property`, and `create_node`'s insert footprint), so a concurrent INSERT or
+        //      an UPDATE of some other node *into* this exact `(label, property, value)` closes an
+        //      rw-edge even when the seek currently matches nothing.
+        // Together these cover every phantom the blanket marker did, without conflicting on nodes
+        // that neither match nor were examined. (The range path keeps its conservative marker — a
+        // value-change-into-range phantom is not as precisely covered; see `index_seek_range`.)
+        // The phantom-safe predicate marker (`rmp` #171): the *precise* equality predicate, so a
         // concurrent insert of a node with this exact `(label, property, value)` closes an rw-edge
         // even when the seek currently matches nothing. The value is encoded with the
         // **Cypher-equality-canonical** encoder — the same encoding the writer's

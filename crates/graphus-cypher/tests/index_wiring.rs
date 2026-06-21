@@ -166,6 +166,58 @@ fn seed_people(coord: &mut Coord) {
 }
 
 // =================================================================================================
+// SSI: an indexed equality seek must not over-abort disjoint-key writers (rmp #316)
+// =================================================================================================
+
+/// Two SERIALIZABLE transactions that each seek a DIFFERENT indexed key and write only that node
+/// are genuinely independent and MUST both commit. Before `rmp` #316, `index_seek_eq` SIREAD-marked
+/// **every live node** (mirroring the scan fallback), so each writer manufactured an rw-edge with
+/// the other's unrelated write — reciprocal edges made both transactions pivots and one aborted with
+/// a spurious serialization failure (the measured fraud-oltp abort storm). With the precise
+/// per-candidate SIREAD + `Equality` predicate marker, no false rw-edge forms, while a real
+/// conflict (same key, or an insert/update *into* the sought predicate) is still caught — proven by
+/// the unchanged write-skew / serializability batteries.
+#[test]
+fn disjoint_indexed_equality_writers_both_commit_no_false_abort() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:Account {id: 1, bal: 100}), (:Account {id: 2, bal: 100})",
+    );
+    coord
+        .create_node_property_index("Account", "id")
+        .expect("create index");
+    let cat = coord.catalog();
+
+    let p1 = compile("MATCH (a:Account {id: 1}) SET a.bal = 1", &cat);
+    let p2 = compile("MATCH (a:Account {id: 2}) SET a.bal = 2", &cat);
+    // Guard: both writes must take the index path (else this would test the scan path instead).
+    assert!(
+        has_index_seek(&p1) && has_index_seek(&p2),
+        "both write plans must use a NodeIndexSeek:\n{p1}\n{p2}"
+    );
+
+    let t1 = coord.begin_serializable();
+    let t2 = coord.begin_serializable();
+    // Each transaction touches only its own distinct, indexed node — no real dependency between them.
+    run_plan(&coord, t1, &p1);
+    run_plan(&coord, t2, &p2);
+    // Both independent transactions commit. Pre-#316, one aborted here with a false serialization
+    // failure because of the blanket all-nodes SIREAD.
+    coord.commit(t1).expect("t1 (account 1) commits");
+    coord
+        .commit(t2)
+        .expect("t2 (account 2) commits — disjoint indexed key, no false abort");
+
+    // Both writes took effect (serializable, and neither was lost to a spurious abort).
+    assert_eq!(
+        read_sorted_ints(&mut coord, &cat, "MATCH (a:Account) RETURN a.bal AS bal", "bal"),
+        vec![1, 2],
+        "both disjoint writes committed and are visible"
+    );
+}
+
+// =================================================================================================
 // Equivalence: index path == scan+filter path, with the index actually used
 // =================================================================================================
 
