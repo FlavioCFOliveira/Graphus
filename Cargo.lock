@@ -1315,6 +1315,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-social-gen"
+version = "0.0.1"
+dependencies = [
+ "graphus-bulk",
+ "graphus-core",
+ "graphus-cypher",
+ "graphus-examples-harness",
+ "graphus-io",
+ "graphus-storage",
+ "graphus-txn",
+ "graphus-wal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-storage"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "metadata": {
+    "scenario": "social-network-large",
+    "description": "Social-network LPG: a large deterministic graph (USER/ARTICLE nodes, an undirected FRIEND multigraph + directed LIKE edges) bulk-loaded into the REAL engine over an on-disk store via the production O(E) bulk path, then served the openCypher traversal/read battery (direct friends, friend-of-friend, mutual friends, top-liked articles, degree) over index-backed point lookups — capturing the durable on-disk footprint, ingest throughput, read latencies, CPU and RAM.",
+    "dataset": {
+      "nodes": 2200,
+      "relationships": 25067
+    },
+    "workload": {
+      "article_count": "200",
+      "articles": "200",
+      "avg_likes_per_user": "5",
+      "connection": "in-process (engine seam)",
+      "device_bytes": "4579328",
+      "friend_count": "15047",
+      "friend_max": "24",
+      "friend_min": "6",
+      "import_nodes_per_sec": "30675.1",
+      "import_properties": "31667",
+      "import_rels_per_sec": "44536.3",
+      "index_build_millis": "676",
+      "indexed": "true",
+      "like_count": "10020",
+      "load_wall_secs": "2.0893",
+      "logical_csv_bytes": "1885726",
+      "node_count": "2200",
+      "profile": "fast",
+      "query_latencies": "friends:5063 fof:6513 mutual:5296 top_liked:256868 degree:12559",
+      "relationship_count": "25067",
+      "seed": "5819109560120336109",
+      "store_pages": "559",
+      "store_space_amplification": "2.4284",
+      "user_count": "2000",
+      "users": "2000",
+      "wal_bytes": "28387598"
+    },
+    "started_unix_secs": 1782037225
+  },
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_cores": 16,
+    "hostname": "ROG",
+    "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "timestamp_unix_secs": 1782037225
+  },
+  "total_millis": 0.053811,
+  "phases": [
+    {
+      "name": "node load",
+      "millis": 71.0
+    },
+    {
+      "name": "rel load",
+      "millis": 562.0
+    },
+    {
+      "name": "index build",
+      "millis": 676.0
+    },
+    {
+      "name": "read battery",
+      "millis": 286.29900000000004
+    }
+  ],
+  "cpu": {
+    "user_secs": 1.926619,
+    "system_secs": 0.189158,
+    "mean_core_utilisation": 1.0126891298637646
+  },
+  "memory": {
+    "peak_rss_bytes": 171565056,
+    "final_rss_bytes": 91783168
+  },
+  "storage": {
+    "store_bytes": 4579328,
+    "wal_bytes": 28475627,
+    "store_pages": 559,
+    "wal_pages": 3477,
+    "bytes_fsynced": 28475627,
+    "write_amplification": 17.529033910546918,
+    "space_amplification": 17.529033910546918
+  },
+  "throughput": {
+    "operations": 27267,
+    "ops_per_sec": 43075.82938388625,
+    "p50_latency_ms": 0.0,
+    "p99_latency_ms": 0.0,
+    "p999_latency_ms": 0.0,
+    "abort_rate": 0.0
+  },
+  "notes": [
+    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
+    "DURABLE ON-DISK FOOTPRINT (the headline, DETERMINISTIC, GATED): bulk-loading the 2000-user / 200-article social graph (15047 FRIEND, 10020 LIKE edges; 2200 nodes, 25067 relationships read back from the engine) produced a durable store image of 4579328 bytes (559 pages) on disk, a store-only space amplification of 2.428× over the 1885726 logical CSV bytes the importer consumed. For a fixed seed+profile the bulk-imported graph is reproducible, so the realised counts, the store bytes/pages, and the store-only amplification are byte-stable — the baseline gate holds them to a tight band; a drift is a genuine storage-engine or generator regression.",
+    "WAL FOOTPRINT (machine-variant, NOT gated): the WAL directory measured 28387598 bytes after the load was flushed + synced. The WAL is a transient redo log whose on-disk length varies with segment rotation and fsync timing, so it is reported for visibility but is given effectively-infinite tolerance by the baseline gate — only the deterministic STORE image is gated.",
+    "INGEST THROUGHPUT (machine-variant, NOT gated): the production O(E) bulk path ingested 2200 nodes and 25067 relationships (31667 typed property assignments) over the node+rel load windows at 30675 nodes/s and 44536 rels/s. The bulk importer resolves each relationship endpoint through an internal external-id→internal-id hash map (O(1) per endpoint ⇒ O(E) total), so ingest scales independently of N.",
+    "READ-QUERY LATENCIES (machine-variant, NOT gated): the index-backed traversal battery ran over the loaded graph — friends 5063µs (=9), fof 6513µs (=128), mutual 5296µs (=0), top_liked 256868µs (=104), degree 12559µs (=9). Each `MATCH (:USER {id: …})` point lookup is an index SEEK (the :USER(id)/:ARTICLE(id) indexes were built before the battery), so latency stays low regardless of graph size."
+  ]
+}

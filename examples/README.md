@@ -195,6 +195,10 @@ GRAPHUS_BIN_DIR=target/release examples/<scenario-name>/run.sh
 | [`smoke-evidence`](smoke-evidence/) | The scaffold itself: sources the shell helper and invokes the Rust harness to produce an evidence directory. Fast, self-contained — proves the harness works end to end. |
 | [`social-network-uds`](social-network-uds/) | MVP over Bolt/UDS: a social graph stored, searched, manipulated, and preserved across a graceful restart and a hard crash. |
 | [`durability-crash-recovery`](durability-crash-recovery/) | DST-driven durability & crash recovery under load: a concurrent OLTP workload under faults + a seeded mid-workload crash, ARIES recovery, and the four ACID-durability properties asserted on the recovered engine (every acked commit survives, no in-flight effect does), with a one-command replay reproducer. |
-
-The forthcoming scenario examples (`rmp #27`–`#33`) MUST follow the layout above and consume the
-shared harness.
+| [`fraud-oltp`](fraud-oltp/) | Real-time financial-transaction fraud detection as an OLTP workload over Bolt/TCP. |
+| [`gds-analytics`](gds-analytics/) | Graph Data Science analytics over a large network (influence, communities, paths). |
+| [`bulk-etl`](bulk-etl/) | Offline high-throughput bulk ingest + export round-trip via `graphus-bulk` (no server, no driver). |
+| [`knowledge-graph-rest`](knowledge-graph-rest/) | A semantic knowledge graph served and queried over the Web REST API. |
+| [`security-multitenant`](security-multitenant/) | Encryption-at-rest + fine-grained RBAC over a multi-tenant deployment (REST + Bolt). |
+| [`iot-timeseries`](iot-timeseries/) | Sustained IoT/time-series ingest + sliding-window retention churn with a storage-reclamation plateau proof. |
+| [`social-network-large`](social-network-large/) | Performance under a **LARGE** social graph: ~1,000,000 USERs befriended by an undirected multigraph FRIEND (200–2000 friends each), 30,000 ARTICLEs, and USER→LIKE→ARTICLE edges. Bulk-loads at scale (`graphus-bulk`, O(E)) into an on-disk store, then measures a Cypher traversal battery (friends, friend-of-friend, mutual, top-liked, degree); evidence covers ingest throughput, on-disk footprint/amplification, peak RSS, and per-query latency. |

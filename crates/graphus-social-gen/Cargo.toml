@@ -1,0 +1,116 @@
+[package]
+name = "graphus-social-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded large social-network graph generator (configuration-model FRIEND multigraph + random LIKE edges) for the social-network performance-evaluation example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-iot-gen`,
+# `graphus-fraud-gen` and `graphus-examples-harness`: it exists only to support the
+# `examples/social-network` performance-evaluation demonstration and is depended upon by NOTHING in
+# the production build. In particular, `graphus-server` MUST NOT depend on it, so it adds ZERO
+# overhead to the shipped binary.
+publish = false
+
+[lib]
+name = "graphus_social_gen"
+path = "src/lib.rs"
+
+[features]
+# The pure generator (`social_gen` binary + the library) is HERMETIC: serde only, no engine, no
+# server, no network. It is the DEFAULT so the determinism test stays light and CI-runnable with no
+# heavy engine build.
+#
+# The `engine` feature additionally pulls in the REAL Graphus engine to drive the load + evidence
+# modules (added by later tasks: those modules do not exist yet, so `engine` only wires the optional
+# deps + the shared evidence harness for now). It runs the production command-dispatch code path
+# (`graphus_cypher::TxnCoordinator` statement seam — exactly what the server's `handle_run` drives)
+# inline + single-threaded, gated behind `graphus-storage/dst` + `graphus-cypher/dst` so durable
+# device footprint can be metered. graphus-server does not depend on this crate, so this is acyclic.
+#
+# Default features now include `engine` — matching `graphus-iot-gen` (whose engine `churn` feature is
+# on by default) so the hermetic `tests/load_fast.rs` engine-load + read-query gate runs under a
+# plain `cargo test -p graphus-social-gen` / `cargo test --all`. The pure generator path still builds
+# and runs with `--no-default-features` (the determinism test is engine-free), and the `social_gen`
+# pure binary works either way.
+default = ["engine"]
+engine = [
+    "dep:graphus-core",
+    "dep:graphus-cypher",
+    "dep:graphus-storage",
+    "dep:graphus-io",
+    "dep:graphus-wal",
+    "dep:graphus-txn",
+    "dep:graphus-bulk",
+    "graphus-cypher/dst",
+    "graphus-storage/dst",
+]
+
+[dependencies]
+# The generator emits the graph as Cypher text and its summary as key=value / JSON; serde pins match
+# the rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The shared evidence harness, for the space/footprint helpers the later load+evidence binaries will
+# report. A dev-only leaf crate (never in `graphus-server`), so this keeps the production build
+# untouched. Only actually used by the `engine` feature's modules; declared here (path dep, no
+# feature gate) exactly like `graphus-iot-gen` declares it.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
+
+# --- `engine` feature only: the REAL engine, driven inline + single-threaded for a deterministic
+# load + evidence run (mirrors how `graphus-iot-gen`'s `churn` feature drives the engine, and how
+# `graphus-dst` drives the coordinator). graphus-server does not depend on this crate, so this is
+# acyclic. These modules/binaries are added by later tasks; the deps are declared now so the crate is
+# ready. ---
+graphus-core = { path = "../graphus-core", optional = true }
+graphus-cypher = { path = "../graphus-cypher", optional = true }
+# Transaction primitives — only for `IsolationLevel::Snapshot`, the correct isolation for this
+# single-threaded bulk loader: there is no concurrency, so the full Serializable SSI commit-validation
+# (whose `detect_pivot_abort` scans the growing committed-transaction set, making a long auto-commit
+# load O(commits²) without an interleaved GC pass) is pure overhead. Snapshot keeps each commit O(1).
+graphus-txn = { path = "../graphus-txn", optional = true }
+graphus-storage = { path = "../graphus-storage", optional = true }
+graphus-io = { path = "../graphus-io", optional = true }
+graphus-wal = { path = "../graphus-wal", optional = true }
+# The offline high-throughput CSV bulk importer (FR-BK) — the PRODUCTION ingest path this loader now
+# uses for O(E) relationship endpoint resolution (internal external-id→internal-id hash map), so the
+# example scales to a large graph. Optional + `engine`-gated; `graphus-server` does not depend on this
+# crate, so this stays acyclic and adds nothing to the shipped binary.
+graphus-bulk = { path = "../graphus-bulk", optional = true }
+
+# The deterministic generator binary: writes the generated social-network Cypher + a summary for a
+# profile. Usage: `cargo run -p graphus-social-gen --bin social_gen -- --profile fast --out-dir <dir>`
+[[bin]]
+name = "social_gen"
+path = "src/bin/social_gen.rs"
+
+# The engine-driving load + traversal binary: loads the generated graph into the REAL engine over an
+# on-disk store, runs the read-query battery, and asserts the shape (`engine` feature only — it pulls
+# in the engine crates). Usage:
+#   cargo run -p graphus-social-gen --features engine --bin social_load -- --profile fast
+[[bin]]
+name = "social_load"
+path = "src/bin/social_load.rs"
+required-features = ["engine"]
+
+# The standardized evidence emitter: drives the SAME in-process bulk load + read-query battery as
+# `social_load` over an on-disk store, sampling RSS over the run, and folds the durable footprint +
+# ingest throughput + read latencies + CPU/RAM into a schema-versioned report.json + report.md
+# (`engine` feature only — it drives the real engine).
+# Usage: `cargo run -p graphus-social-gen --features engine --bin social_evidence -- --evidence-dir <dir>`
+[[bin]]
+name = "social_evidence"
+path = "src/bin/social_evidence.rs"
+required-features = ["engine"]
+
+# The baseline regression gate: compares a fresh evidence report against the committed baseline using
+# only stable STRUCTURAL metrics (realised node/relationship counts, durable store image bytes/pages,
+# store-only space amplification). HERMETIC — needs only the harness + serde, no engine, so it is
+# always available and builds under `--no-default-features`.
+# Usage: `cargo run -p graphus-social-gen --bin social_baseline_cmp -- <baseline.json> <candidate.json>`
+[[bin]]
+name = "social_baseline_cmp"
+path = "src/bin/social_baseline_cmp.rs"
