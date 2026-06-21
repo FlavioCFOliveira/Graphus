@@ -1098,6 +1098,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-columnar"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "graphus-core"
 version = "0.0.1"
 

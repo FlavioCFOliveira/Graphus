@@ -1,0 +1,14 @@
+[package]
+name = "graphus-columnar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Native columnar value codecs (dictionary, frame-of-reference + bit-packing, delta/double-delta, RLE, Gorilla XOR) — a dependency-light, round-trip-exact compression foundation for Graphus's complementary columnar paths (bulk export, cold tier, zone-maps, column segments)."
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.11.0"
