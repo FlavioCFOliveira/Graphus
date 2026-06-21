@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// [`Cancel::flag`] (an [`AtomicBool`] flipped by another thread). Any `Fn() -> bool` works via
 /// [`Cancel::from_fn`].
 pub struct Cancel<'a> {
-    check: Box<dyn Fn() -> bool + 'a>,
+    // `Send + Sync` so a single `&Cancel` can be shared across the data-parallel (rayon) source
+    // loops in the centrality algorithms. Both ready-made constructors are trivially `Send + Sync`
+    // (a no-op closure; an `&AtomicBool` load), and `from_fn` requires the predicate to be too.
+    check: Box<dyn Fn() -> bool + Send + Sync + 'a>,
 }
 
 impl<'a> Cancel<'a> {
@@ -36,7 +39,7 @@ impl<'a> Cancel<'a> {
 
     /// A check from an arbitrary predicate.
     #[must_use]
-    pub fn from_fn(f: impl Fn() -> bool + 'a) -> Self {
+    pub fn from_fn(f: impl Fn() -> bool + Send + Sync + 'a) -> Self {
         Self { check: Box::new(f) }
     }
 

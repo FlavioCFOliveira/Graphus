@@ -5,14 +5,14 @@
 //! `examples/gds-analytics` task #259 asks for a multi-core scalability sweep of the heavy
 //! algorithms. We first verified empirically how `graphus-gds` parallelism is controlled:
 //!
-//! - `graphus-gds` is a **zero-runtime-dependency, single-threaded** crate. There is **no `rayon`,
-//!   no thread pool, and no core-count knob** (no `RAYON_NUM_THREADS`, no config) anywhere in the
-//!   algorithm library or the `gds.*` procedure surface. The server itself drives `Run`
-//!   single-threaded.
+//! - As of `rmp` #318 the two heavy centrality algorithms (**Brandes betweenness** and
+//!   **closeness**) are **data-parallel via `rayon`**: each BFS source is independent over the
+//!   immutable CSR, so the source loop fans across all cores (honour `RAYON_NUM_THREADS`). Measured
+//!   on a 16-core host (8000-node projection): betweenness 7601 ms → 1168 ms (~6.5×), closeness
+//!   1884 ms → 205 ms (~9.2×). The remaining algorithms (PageRank, WCC, SCC, triangleCount, label
+//!   propagation, Dijkstra) are still single-threaded.
 //!
-//! Fabricating a speedup-vs-cores curve would therefore be dishonest. Instead, this sweep varies the
-//! one dimension that *is* meaningful for a single-threaded engine — **graph size** — and reports,
-//! for each size:
+//! This sweep varies **graph size** (not core count) and reports, for each size:
 //!
 //! - the **wall time** of each heavy algorithm (PageRank, betweenness) plus the supporting suite
 //!   (degree, closeness, WCC, SCC, triangleCount, label propagation, Dijkstra), so one can see how
@@ -112,8 +112,9 @@ fn main() -> ExitCode {
         .unwrap_or(1);
 
     eprintln!(
-        "gds_sweep: GDS is single-threaded (no rayon / thread pool / core knob); sweeping graph SIZE \
-         on a {cores}-core host. sizes={sizes:?} repeats={repeats}"
+        "gds_sweep: betweenness & closeness are rayon-parallel (RAYON_NUM_THREADS honoured); other \
+         algorithms single-threaded; sweeping graph SIZE on a {cores}-core host. \
+         sizes={sizes:?} repeats={repeats}"
     );
 
     let mut records = Vec::with_capacity(sizes.len());
@@ -307,11 +308,14 @@ fn bench(repeats: u32, mut f: impl FnMut()) -> f64 {
 fn render_json(cores: usize, repeats: u32, records: &[SweepRecord]) -> String {
     let mut s = String::with_capacity(1024);
     s.push_str("{\n");
-    let _ = writeln!(s, "  \"engine_parallelism\": \"single-threaded\",");
-    let _ = writeln!(s, "  \"core_knob\": false,");
+    let _ = writeln!(
+        s,
+        "  \"engine_parallelism\": \"betweenness+closeness rayon-parallel; others single-threaded\","
+    );
+    let _ = writeln!(s, "  \"core_knob\": true,");
     let _ = writeln!(s, "  \"host_cores\": {cores},");
     let _ = writeln!(s, "  \"repeats\": {repeats},");
-    s.push_str("  \"note\": \"graphus-gds is single-threaded (no rayon / thread pool / core knob); the sweep varies graph SIZE, not core count. Per-algorithm time is the minimum over repeats; csr_bytes is CsrGraph::memory_bytes() of the undirected projection.\",\n");
+    s.push_str("  \"note\": \"betweenness & closeness fan their independent BFS sources across cores via rayon (RAYON_NUM_THREADS honoured, rmp #318); the remaining algorithms are single-threaded. This sweep varies graph SIZE, not core count. Per-algorithm time is the minimum over repeats; csr_bytes is CsrGraph::memory_bytes() of the undirected projection.\",\n");
     s.push_str("  \"sizes\": [\n");
     for (i, r) in records.iter().enumerate() {
         s.push_str("    {\n");

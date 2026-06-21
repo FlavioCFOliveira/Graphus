@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Graphus Graph-Data-Science analytics demonstration — over Bolt-over-TCP+TLS, driven by the OFFICIAL
-# Neo4j driver, plus a hermetic single-threaded scalability + CSR-footprint sweep.
+# Neo4j driver, plus a hermetic scalability + CSR-footprint sweep.
 #
 # This script doubles as an executable E2E test. It:
 #   1. generates a DETERMINISTIC, SEEDED influence/citation network (the `gds_gen` binary): :Author
@@ -9,11 +9,11 @@
 #      inter-field :CROSS edges, and a small :Ref/:LINKS reference subgraph whose PageRank /
 #      centrality / connected-component / shortest-path / community results are ANALYTICALLY KNOWN —
 #      emitted as reference.json;
-#   2. runs the HERMETIC scalability + CSR-footprint sweep (`gds_sweep`): graphus-gds is
-#      SINGLE-THREADED (no rayon / thread pool / core knob — verified), so the sweep honestly varies
-#      GRAPH SIZE, reporting per-algorithm time vs size and the CSR footprint in bytes-per-node /
-#      bytes-per-edge. Its JSON lands in evidence/ for the report. (Run first so the evidence step can
-#      read it while the server is still alive.)
+#   2. runs the HERMETIC scalability + CSR-footprint sweep (`gds_sweep`): betweenness & closeness are
+#      rayon-parallel across cores (rmp #318; the other algorithms are single-threaded), so the sweep
+#      varies GRAPH SIZE, reporting per-algorithm time vs size and the CSR footprint in bytes-per-node
+#      / bytes-per-edge. Its JSON lands in evidence/ for the report. (Run first so the evidence step
+#      can read it while the server is still alive.)
 #   3. (opt-in) boots the REAL `graphus-server` (Bolt-over-TCP + self-signed TLS) and loads the graph
 #      over Bolt via the OFFICIAL `neo4j-driver` npm package (`bolt+ssc://`), then projects the CSR
 #      (`CALL gds.graph.project`) and runs the FULL algorithm suite through the `CALL gds.*.stream`

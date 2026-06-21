@@ -9,6 +9,9 @@ authors.workspace = true
 description = "In-memory CSR graph projection and a library of production-grade graph data science algorithms."
 
 [dependencies]
+# Data-parallel source loops for the centrality algorithms (Brandes betweenness, closeness):
+# each BFS source is independent over the immutable CSR, so rayon fans them across all cores.
+rayon = "1"
 
 [dev-dependencies]
 proptest = "1.11.0"

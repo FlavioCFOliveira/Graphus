@@ -46,8 +46,9 @@ path = "src/bin/gds_gen.rs"
 
 # The hermetic scalability + CSR-footprint sweep: projects CSR graphs of increasing size in-process
 # and reports per-algorithm wall time + CSR bytes-per-node / bytes-per-edge as machine-readable JSON.
-# GDS is single-threaded (no rayon / thread pool / core knob), so the sweep honestly varies GRAPH
-# SIZE, not core count. Usage: `cargo run -p graphus-gds-gen --bin gds_sweep -- --out <file.json>`
+# betweenness & closeness are rayon-parallel across cores (rmp #318); the other algorithms are
+# single-threaded. The sweep varies GRAPH SIZE, not core count.
+# Usage: `cargo run -p graphus-gds-gen --bin gds_sweep -- --out <file.json>`
 [[bin]]
 name = "gds_sweep"
 path = "src/bin/gds_sweep.rs"

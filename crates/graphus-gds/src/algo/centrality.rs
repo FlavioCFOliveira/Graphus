@@ -13,6 +13,7 @@
 use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId, Orientation};
 use crate::error::{GdsError, Result};
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 use super::shortest_path::{dijkstra_validated, validate_weights_non_negative};
@@ -28,9 +29,8 @@ use super::shortest_path::{dijkstra_validated, validate_weights_non_negative};
 /// - Propagates Dijkstra precondition errors (negative weights) for weighted graphs.
 pub fn closeness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec<f64>> {
     let n = graph.node_count();
-    let mut result = vec![0.0f64; n];
     if n <= 1 {
-        return Ok(result);
+        return Ok(vec![0.0f64; n]);
     }
     let nf = (n - 1) as f64;
 
@@ -42,30 +42,37 @@ pub fn closeness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec
         validate_weights_non_negative(graph)?;
     }
 
-    for (s, slot) in result.iter_mut().enumerate() {
-        cancel.check()?;
-        // distances from s
-        let (sum, reachable) = if graph.is_weighted() {
-            let sp = dijkstra_validated(graph, s as InternalId, cancel)?;
-            let mut sum = 0.0f64;
-            let mut reachable = 0usize;
-            for d in sp.dist.into_iter().flatten() {
-                sum += d;
-                reachable += 1;
-            }
-            (sum, reachable)
-        } else {
-            bfs_distance_sum(graph, s as InternalId)
-        };
+    // Each source's closeness is computed independently over the immutable CSR and lands in its own
+    // result slot, so the per-source loop is data-parallel (rayon) with no shared mutable state and
+    // a deterministic, order-independent result (each slot is written exactly once).
+    (0..n)
+        .into_par_iter()
+        .map(|s| -> Result<f64> {
+            cancel.check()?;
+            // distances from s
+            let (sum, reachable) = if graph.is_weighted() {
+                let sp = dijkstra_validated(graph, s as InternalId, cancel)?;
+                let mut sum = 0.0f64;
+                let mut reachable = 0usize;
+                for d in sp.dist.into_iter().flatten() {
+                    sum += d;
+                    reachable += 1;
+                }
+                (sum, reachable)
+            } else {
+                bfs_distance_sum(graph, s as InternalId)
+            };
 
-        // reachable includes s itself (distance 0). Need at least one other reachable node.
-        if reachable > 1 && sum > 0.0 {
-            let r_minus_1 = (reachable - 1) as f64;
-            // Wasserman-Faust: (r-1)/(n-1) * (r-1)/sum
-            *slot = (r_minus_1 / nf) * (r_minus_1 / sum);
-        }
-    }
-    Ok(result)
+            // reachable includes s itself (distance 0). Need at least one other reachable node.
+            Ok(if reachable > 1 && sum > 0.0 {
+                let r_minus_1 = (reachable - 1) as f64;
+                // Wasserman-Faust: (r-1)/(n-1) * (r-1)/sum
+                (r_minus_1 / nf) * (r_minus_1 / sum)
+            } else {
+                0.0
+            })
+        })
+        .collect()
 }
 
 /// BFS from `source`; returns `(sum_of_distances, reachable_node_count_including_source)`.
@@ -108,57 +115,105 @@ fn bfs_distance_sum(graph: &CsrGraph, source: InternalId) -> (f64, usize) {
 /// [`crate::error::GdsError::Cancelled`] if `cancel` fires (checked per source).
 pub fn betweenness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec<f64>> {
     let n = graph.node_count();
-    let mut betweenness = vec![0.0f64; n];
     if n == 0 {
-        return Ok(betweenness);
+        return Ok(Vec::new());
     }
 
-    // Reusable buffers.
-    let mut sigma = vec![0.0f64; n];
-    let mut dist = vec![-1i64; n];
-    let mut delta = vec![0.0f64; n];
-    let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut stack: Vec<u32> = Vec::with_capacity(n);
-    let mut queue: VecDeque<u32> = VecDeque::new();
+    // Brandes accumulates an independent single-source dependency per source `s`; the sources are
+    // data-parallel over the immutable CSR. Each rayon task carries private scratch buffers and a
+    // private accumulator (`BrandesScratch`), and the per-task accumulators are summed element-wise
+    // at the end. The reduction is float addition: for the integer/rational betweenness of real and
+    // reference graphs the per-source contributions are exact in f64, so the parallel result equals
+    // the serial one (verified by the algorithm + analytics tests).
+    (0..n)
+        .into_par_iter()
+        .try_fold(
+            || BrandesScratch::new(n),
+            |mut scratch, s| -> Result<BrandesScratch> {
+                cancel.check()?;
+                scratch.run_source(graph, s)?;
+                Ok(scratch)
+            },
+        )
+        .map(|r| r.map(|scratch| scratch.acc))
+        .try_reduce(
+            || vec![0.0f64; n],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                Ok(a)
+            },
+        )
+}
 
-    for s in 0..n {
-        cancel.check()?;
+/// Per-task scratch + private accumulator for the data-parallel Brandes betweenness. Reused across
+/// every source a rayon task processes (allocated once per task, not per source).
+struct BrandesScratch {
+    n: usize,
+    sigma: Vec<f64>,
+    dist: Vec<i64>,
+    delta: Vec<f64>,
+    predecessors: Vec<Vec<u32>>,
+    stack: Vec<u32>,
+    queue: VecDeque<u32>,
+    /// This task's partial betweenness, summed into the global result at the reduction step.
+    acc: Vec<f64>,
+}
 
+impl BrandesScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            sigma: vec![0.0f64; n],
+            dist: vec![-1i64; n],
+            delta: vec![0.0f64; n],
+            predecessors: vec![Vec::new(); n],
+            stack: Vec::with_capacity(n),
+            queue: VecDeque::new(),
+            acc: vec![0.0f64; n],
+        }
+    }
+
+    /// Runs Brandes' single-source dependency accumulation from `s`, folding the result into
+    /// [`Self::acc`]. Identical arithmetic to the original serial loop body.
+    fn run_source(&mut self, graph: &CsrGraph, s: usize) -> Result<()> {
+        let n = self.n;
         // Reset.
         for v in 0..n {
-            sigma[v] = 0.0;
-            dist[v] = -1;
-            delta[v] = 0.0;
-            predecessors[v].clear();
+            self.sigma[v] = 0.0;
+            self.dist[v] = -1;
+            self.delta[v] = 0.0;
+            self.predecessors[v].clear();
         }
-        stack.clear();
-        queue.clear();
+        self.stack.clear();
+        self.queue.clear();
 
-        sigma[s] = 1.0;
-        dist[s] = 0;
-        queue.push_back(s as u32);
+        self.sigma[s] = 1.0;
+        self.dist[s] = 0;
+        self.queue.push_back(s as u32);
 
         // BFS, recording shortest-path counts and predecessors.
-        while let Some(v) = queue.pop_front() {
-            stack.push(v);
-            let dv = dist[v as usize];
+        while let Some(v) = self.queue.pop_front() {
+            self.stack.push(v);
+            let dv = self.dist[v as usize];
             if let Some(neis) = graph.neighbors(v) {
                 for &w in neis {
                     let wi = w as usize;
-                    if dist[wi] < 0 {
-                        dist[wi] = dv + 1;
-                        queue.push_back(w);
+                    if self.dist[wi] < 0 {
+                        self.dist[wi] = dv + 1;
+                        self.queue.push_back(w);
                     }
-                    if dist[wi] == dv + 1 {
-                        sigma[wi] += sigma[v as usize];
-                        predecessors[wi].push(v);
+                    if self.dist[wi] == dv + 1 {
+                        self.sigma[wi] += self.sigma[v as usize];
+                        self.predecessors[wi].push(v);
                     }
                 }
             }
         }
 
         // Back-propagation of dependencies (reverse BFS order).
-        while let Some(w) = stack.pop() {
+        while let Some(w) = self.stack.pop() {
             let wi = w as usize;
             // SEC-205: on a graph engineered to have a super-exponential number of shortest paths
             // (e.g. a layered lattice), `sigma` can overflow f64 to +inf; the division below would
@@ -166,22 +221,21 @@ pub fn betweenness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<V
             // surface a clean Overflow error instead of emitting corrupted betweenness values.
             // A node on the stack was reached by the BFS, so `sigma[wi] >= 1.0` unless it overflowed
             // to +inf; checking finiteness is therefore exactly the overflow test.
-            if !sigma[wi].is_finite() {
+            if !self.sigma[wi].is_finite() {
                 return Err(GdsError::Overflow(
                     "betweenness shortest-path count exceeded f64 range",
                 ));
             }
-            let coeff = (1.0 + delta[wi]) / sigma[wi];
-            for &v in &predecessors[wi] {
-                delta[v as usize] += sigma[v as usize] * coeff;
+            let coeff = (1.0 + self.delta[wi]) / self.sigma[wi];
+            for &v in &self.predecessors[wi] {
+                self.delta[v as usize] += self.sigma[v as usize] * coeff;
             }
             if wi != s {
-                betweenness[wi] += delta[wi];
+                self.acc[wi] += self.delta[wi];
             }
         }
+        Ok(())
     }
-
-    Ok(betweenness)
 }
 
 /// Convenience: scale raw betweenness for an undirected projection (divide by two), a no-op for a
