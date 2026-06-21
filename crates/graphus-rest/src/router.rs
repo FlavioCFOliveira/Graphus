@@ -17,6 +17,7 @@
 //! | `DELETE /db/{db}/tx/{id}` | `rollback_tx` | roll back |
 //! | `POST /db/{db}/tx/commit` | `auto_commit` | single-shot auto-commit (reads `access_mode`) |
 //! | `POST /db/{db}/graph` | `graph_viz` | run a read query, return a deduplicated graph projection (rmp #77) |
+//! | `POST /db/{db}/query/columnar` | `query_columnar` | run a read query, return an **analytical columnar** result body (rmp #334) |
 //! | `GET /openapi.json` | `openapi_doc` | the static OpenAPI 3.1 document |
 //!
 //! # No sockets here
@@ -378,6 +379,7 @@ pub fn router<E: RestEngine + Send + Sync + 'static>(state: AppState<E>) -> Rout
         .route("/db/{db}/tx", post(begin::<E>))
         .route("/db/{db}/tx/commit", post(auto_commit::<E>))
         .route("/db/{db}/graph", post(graph_viz::<E>))
+        .route("/db/{db}/query/columnar", post(query_columnar::<E>))
         .route(
             "/db/{db}/tx/{id}",
             post(run_in_tx::<E>).delete(rollback_tx::<E>),
@@ -804,6 +806,136 @@ fn graph_built(graph: Json, wire: Wire) -> Built {
         // NDJSON never reaches here (the handler maps it to JSON); JSON is the default.
         _ => Built::json(StatusCode::OK, &graph),
     }
+}
+
+// =============================== analytical columnar channel (rmp #334) =======================
+
+/// `POST /db/{db}/query/columnar` → run a read query and return its result encoded **column-wise**
+/// as the analytical `gcol-result` body (rmp #334), `Content-Type: application/x-graphus-columnar`.
+///
+/// This is the **analytical / export** channel, deliberately separate from the row-wise
+/// JSON/CBOR/NDJSON paths and the inviolable Bolt/PackStream OLTP path. The rows of the statement
+/// batch are transposed into columns and each column is encoded with the type-appropriate native
+/// [`graphus_columnar`] codec (no Arrow dependency) plus a present/null bitmap — materially smaller
+/// on a large, low-cardinality, wide result than the repeated-key JSON body, while reusing the exact
+/// strict-Jolt codec for any structural / heterogeneous / non-scalar column (lossless). See
+/// [`crate::columnar`] for the wire format and the codec-selection table.
+///
+/// # Behaviour
+///
+/// Like [`graph_viz`], this is a **read** surface: the access mode is **forced to `READ`** (an
+/// analytical/export query is a read; any `access_mode` in the body is ignored), all statements run
+/// inside one auto-managed `READ` transaction, the transaction is committed on success (a read commit
+/// has no side effects) and rolled back on the first statement error (an RFC 9457 problem is
+/// returned, `06 §3.3`). The batch is treated as **one tabular result**: the column names are the
+/// first statement's `fields`, and every statement's rows are appended (the common case is a single
+/// analytical query; a same-schema paged batch also composes). Authentication, the `{db}` selection,
+/// and fine-grained RBAC are honoured **identically** to [`auto_commit`]/[`graph_viz`] — an
+/// RBAC-hidden node/relationship/property is already absent from the resolved cells, so the columnar
+/// body inherits that filtering for free.
+///
+/// # Why no content negotiation on the transactional endpoints
+///
+/// The OLTP path is inviolable, so the columnar encoding is exposed only on its **own** endpoint
+/// rather than as an `Accept` on `…/tx/commit` — a transactional client can never accidentally trip
+/// into the analytical encoding, and the analytical intent (a large buffered result) is explicit in
+/// the URL. A client still signals the format by posting here (or, equivalently, the response carries
+/// the [`crate::columnar::GCOL_RESULT_MEDIA_TYPE`] `Content-Type`).
+async fn query_columnar<E: RestEngine + 'static>(
+    State(state): State<AppState<E>>,
+    Path(db): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let outcome: Result<(RunRequest, TxHandle), Problem> = (|| {
+        let identity = authenticate(&state, &headers)?;
+        let req = decode_request(&headers, &body)?;
+        // An analytical/export query is always a READ (the safe, spec-consistent default). Any
+        // `access_mode` in the body is ignored — a write is rejected by the engine as in any read tx.
+        authorize_mode(&state, &identity, &db, AccessMode::Read)?;
+        let handle = state
+            .engine
+            .begin(
+                &db,
+                AccessMode::Read,
+                TxOrigin {
+                    principal: &identity,
+                    explicit: false,
+                },
+            )
+            .map_err(|e| Problem::from_graphus_error(&e))?;
+        Ok((req, handle))
+    })();
+
+    let (req, handle) = match outcome {
+        Ok(v) => v,
+        Err(p) => return Built::from(p).into_response(),
+    };
+
+    encode_columnar_result(&state, handle, &req.statements)
+        .unwrap_or_else(Built::problem)
+        .into_response()
+}
+
+/// Runs `statements` in the (read) transaction `handle`, accumulating every row of every statement
+/// into one tabular result (column names from the first statement), then commits and returns the
+/// `gcol-result` columnar body (rmp #334). On the first statement/runtime error the transaction is
+/// rolled back and the error is surfaced as a [`Problem`] (no partial result — `06 §3.3`).
+fn encode_columnar_result<E: RestEngine>(
+    state: &AppState<E>,
+    handle: TxHandle,
+    statements: &[Statement],
+) -> Result<Built, Problem> {
+    let mut fields: Vec<String> = Vec::new();
+    let mut rows: Vec<crate::engine::Row> = Vec::new();
+    // The summary of the **last** statement (matching how a single-statement analytical query reads);
+    // defaults to an empty read summary for an empty batch.
+    let mut summary = RunSummary::default();
+
+    for (idx, stmt) in statements.iter().enumerate() {
+        let params = match bind_parameters(stmt) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = state.engine.rollback(handle);
+                return Err(Problem::from_codec_error(&e));
+            }
+        };
+        let mut stream = match state.engine.run(handle, &stmt.statement, params) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = state.engine.rollback(handle);
+                return Err(Problem::from_graphus_error(&e));
+            }
+        };
+        if idx == 0 {
+            fields = stream.fields().to_vec();
+        }
+        loop {
+            match stream.next_row() {
+                Ok(Some(row)) => rows.push(row),
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = state.engine.rollback(handle);
+                    return Err(Problem::from_graphus_error(&e));
+                }
+            }
+        }
+        summary = stream.summary();
+    }
+
+    // A read transaction commit has no side effects; do it so the engine releases the handle.
+    state
+        .engine
+        .commit(handle)
+        .map_err(|e| Problem::from_graphus_error(&e))?;
+
+    let summary_json = encode_summary(&summary);
+    let body = crate::columnar::encode_result(&fields, &rows, &summary_json);
+    Ok(Built::new(
+        StatusCode::OK,
+        crate::columnar::GCOL_RESULT_MEDIA_TYPE,
+        body,
+    ))
 }
 
 // =============================== run + finalise ================================================

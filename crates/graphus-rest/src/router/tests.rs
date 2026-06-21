@@ -1238,3 +1238,262 @@ async fn deeply_nested_cbor_body_is_rejected_not_panic() {
     assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
     assert!(h.engine.log().is_empty());
 }
+
+// =============================== analytical columnar channel (rmp #334) =========================
+//
+// The `POST /db/{db}/query/columnar` endpoint runs through the SAME engine seam as the row-wise
+// paths (begin READ → run → commit) and returns the native `gcol-result` columnar body. These tests
+// drive the real `Router` in-process (no sockets) and round-trip the columnar body back to rows,
+// asserting equality with the row-wise JSON the existing path would emit — proving the analytical
+// channel is lossless and that the OLTP paths are untouched.
+
+use crate::columnar::{GCOL_RESULT_MEDIA_TYPE, decode_result};
+
+/// Decodes a `gcol-result` body's rows. The decoder already yields strict-Jolt JSON cells (the same
+/// shape the row-wise `data` arrays use), so this is a thin wrapper for the comparison tests.
+fn columnar_body_as_jolt_rows(body: &[u8]) -> Vec<Vec<Json>> {
+    decode_result(body).expect("decode gcol-result body").rows
+}
+
+#[tokio::test]
+async fn columnar_endpoint_round_trips_a_multi_row_multi_column_result() {
+    // The core acceptance test: a multi-row, multi-column result encoded columnar, then decoded back
+    // to rows, equals the row-wise result — AND the columnar body is smaller than the JSON body on
+    // this low-cardinality wide shape (both sizes printed).
+    let query = "MATCH (p:Person) RETURN p.id AS id, p.tier AS tier, p.active AS active";
+    let tiers = ["gold", "silver", "bronze"];
+    let n = 2_000;
+    let rows: Vec<Row> = (0..n)
+        .map(|i| {
+            vec![
+                RestValue::Value(Value::Integer(i as i64)),
+                RestValue::Value(Value::String(tiers[i % tiers.len()].to_owned())),
+                RestValue::Value(Value::Boolean(i % 2 == 0)),
+            ]
+        })
+        .collect();
+    let engine = MockEngine::new().on_query(
+        query,
+        canned_structural(&["id", "tier", "active"], rows.clone()),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    // 1) Columnar response.
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/query/columnar",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(content_type(&resp), GCOL_RESULT_MEDIA_TYPE);
+    let columnar_body = body_bytes(resp).await;
+
+    // 2) The same query over the row-wise JSON auto-commit path, for the equality + size comparison.
+    let resp_json = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp_json.status(), StatusCode::OK);
+    let json_body = body_bytes(resp_json).await;
+    let json_doc: Json = serde_json::from_slice(&json_body).unwrap();
+    let json_data = json_doc["results"][0]["data"].as_array().unwrap();
+
+    // 3) Decode the columnar body back to rows and assert cell-for-cell equality with the JSON rows.
+    let decoded_rows = columnar_body_as_jolt_rows(&columnar_body);
+    assert_eq!(decoded_rows.len(), n, "row count must match");
+    assert_eq!(decoded_rows.len(), json_data.len());
+    for (i, (col_row, json_row)) in decoded_rows.iter().zip(json_data).enumerate() {
+        let json_row = json_row.as_array().unwrap();
+        assert_eq!(col_row, json_row, "row {i} columnar vs JSON cell mismatch");
+    }
+
+    // 4) The header fields match the query projection.
+    let header = decode_result(&columnar_body).unwrap().header;
+    assert_eq!(header.fields, vec!["id", "tier", "active"]);
+    assert_eq!(header.columns[0].codec, "i64");
+    assert_eq!(header.columns[1].codec, "str");
+    assert_eq!(header.columns[2].codec, "bool");
+
+    // 5) Measured size win (printed for the record).
+    println!(
+        "[rmp #334] /query/columnar end-to-end: {n} rows x 3 cols | columnar = {} B | json = {} B | ratio = {:.2}x smaller",
+        columnar_body.len(),
+        json_body.len(),
+        json_body.len() as f64 / columnar_body.len() as f64,
+    );
+    assert!(
+        columnar_body.len() < json_body.len(),
+        "columnar ({}) must be smaller than JSON ({}) on this analytical result",
+        columnar_body.len(),
+        json_body.len()
+    );
+
+    // 6) It ran as a READ auto-commit through the same seam (begin READ → run → commit), and the
+    // registry is empty — the OLTP transaction machinery is reused unchanged.
+    let log = h.engine.log();
+    assert!(log.iter().any(|l| l.contains("mode=Read")));
+    assert!(log.iter().any(|l| l.starts_with("commit")));
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+#[tokio::test]
+async fn columnar_endpoint_round_trips_structural_and_null_cells() {
+    // A result mixing a structural (node) column, a scalar column, and a column with nulls — the
+    // lossless fallback + present-bitmap paths, end to end through the router.
+    let query = "MATCH (p) OPTIONAL MATCH (p)-[:R]->(m) RETURN p, p.score AS score";
+    let rows: Vec<Row> = vec![
+        vec![
+            viz_node(1, "Person", "Ada"),
+            RestValue::Value(Value::Integer(10)),
+        ],
+        vec![
+            viz_node(2, "Person", "Bob"),
+            RestValue::Value(Value::Null), // a null scalar cell
+        ],
+    ];
+    let engine = MockEngine::new().on_query(query, canned_structural(&["p", "score"], rows));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/query/columnar",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_bytes(resp).await;
+
+    let decoded = decode_result(&body).unwrap();
+    assert_eq!(decoded.header.columns[0].codec, "json"); // structural node → fallback
+    assert_eq!(decoded.header.columns[1].codec, "i64"); // scalar (+ a null) → typed i64
+
+    // The structural cell decodes to the same Jolt node object the row-wise path emits.
+    let jolt_rows = columnar_body_as_jolt_rows(&body);
+    assert_eq!(jolt_rows[0][0]["id"], json!(1));
+    assert_eq!(jolt_rows[0][0]["labels"], json!(["Person"]));
+    assert_eq!(jolt_rows[0][0]["properties"]["name"], json!({ "U": "Ada" }));
+    // The scalar column: int then null.
+    assert_eq!(jolt_rows[0][1], json!({ "Z": "10" }));
+    assert_eq!(jolt_rows[1][1], Json::Null);
+}
+
+#[tokio::test]
+async fn columnar_endpoint_forces_read_so_a_write_is_rejected() {
+    // Like graph_viz, the analytical channel forces READ — a write statement is rejected by the
+    // engine and rolled back (no partial side effect), surfaced as a problem+json.
+    let query = "CREATE (n:Person) RETURN n";
+    let h = Harness::new(); // unscripted write query; the mock's READ tx rejects it
+    let token = h.token("alice"); // alice has WRITE, but the endpoint forces READ regardless
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/query/columnar",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    // A write in a READ tx is a `GraphusError::Transaction` → 409 Conflict (the HTTP mapping every
+    // REST endpoint uses for a transaction error, `06 §3.3`).
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+
+    // It opened a READ tx (forced) and rolled back on the write rejection.
+    let log = h.engine.log();
+    assert!(log.iter().any(|l| l.contains("mode=Read")));
+    assert!(log.iter().any(|l| l.starts_with("rollback")));
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+#[tokio::test]
+async fn columnar_endpoint_requires_bearer() {
+    // Auth is reused unchanged: no Bearer ⇒ 401 problem+json, and the engine is never touched.
+    let h = Harness::new();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/db/neo4j/query/columnar")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "statements": [{ "statement": "MATCH (n) RETURN n" }] }))
+                .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    assert!(h.engine.log().is_empty());
+}
+
+#[tokio::test]
+async fn columnar_endpoint_enforces_rbac_for_a_database_the_user_cannot_read() {
+    // `carol` is granted READ/WRITE only on GRAPH `neo4j`; a columnar read against another database
+    // is forbidden by the same coarse transaction-mode gate the other endpoints use (403), and no
+    // transaction is opened.
+    let h = Harness::new();
+    let token = h.token("carol");
+    let resp = h
+        .send(post_json(
+            "/db/other_db/query/columnar",
+            &token,
+            json!({ "statements": [{ "statement": "MATCH (n) RETURN n" }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    // The forbidden request never reached the engine (no begin).
+    assert!(!h.engine.log().iter().any(|l| l.starts_with("begin")));
+}
+
+#[tokio::test]
+async fn columnar_endpoint_handles_an_empty_result() {
+    // A query returning no rows still produces a well-formed columnar body that decodes to zero rows.
+    let query = "MATCH (n:Nonexistent) RETURN n.id AS id";
+    let engine = MockEngine::new().on_query(query, canned_structural(&["id"], vec![]));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/query/columnar",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(content_type(&resp), GCOL_RESULT_MEDIA_TYPE);
+    let decoded = decode_result(&body_bytes(resp).await).unwrap();
+    assert_eq!(decoded.header.row_count, 0);
+    assert_eq!(decoded.header.fields, vec!["id"]);
+    assert!(decoded.rows.is_empty());
+}
+
+#[tokio::test]
+async fn columnar_endpoint_does_not_affect_the_json_path() {
+    // Zero-regression guard: the SAME query over the row-wise JSON path yields the exact JSON it did
+    // before this endpoint existed (the columnar channel is purely additive).
+    let query = "RETURN 1 AS x";
+    let engine = MockEngine::new().on_query(
+        query,
+        canned_structural(&["x"], vec![vec![RestValue::Value(Value::Integer(1))]]),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(content_type(&resp), "application/json");
+    let doc = body_json(resp).await;
+    assert_eq!(doc["results"][0]["fields"][0], "x");
+    assert_eq!(doc["results"][0]["data"][0][0], json!({ "Z": "1" }));
+}

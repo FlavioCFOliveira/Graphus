@@ -1276,6 +1276,7 @@ dependencies = [
  "bytes",
  "ciborium",
  "graphus-auth",
+ "graphus-columnar",
  "graphus-core",
  "http",
  "http-body-util",

@@ -15,6 +15,12 @@ graphus-core = { path = "../graphus-core" }
 # REST Bearer/JWT auth + RBAC resolve through `Authenticator::authenticate_bearer` / `require`
 # (`04 §8.4`, `06 §4`). No socket/TLS work happens here; the listener wires the transport (rmp #20).
 graphus-auth = { path = "../graphus-auth" }
+# The native, dependency-light, round-trip-exact columnar codecs (dictionary / FOR+bitpack /
+# delta-double-delta / Gorilla-XOR / bit-packed bool). They back the ANALYTICAL `gcol-result`
+# response channel (rmp #334) — a column-wise encoding of large results, deliberately NOT Arrow
+# (which would drag a huge dependency tree into a Raspberry-Pi-class server). A leaf crate: it adds
+# zero risk to the ACID/storage path.
+graphus-columnar = { path = "../graphus-columnar" }
 
 # The HTTP framework. axum 0.8 sits on hyper 1 + tower 0.5 and supports HTTP/2 through hyper; MSRV
 # 1.80 <= our 1.85. `tokio`/`http1`/`http2`/`json` are the features we actually use; the rest of the

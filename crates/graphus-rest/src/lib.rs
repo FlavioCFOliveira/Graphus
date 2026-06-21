@@ -14,6 +14,11 @@
 //! - [`engine`] — the [`engine::RestEngine`] **query-execution seam** the engine (rmp #20, via
 //!   `graphus-cypher`'s coordinator) implements, returning a pull-based [`engine::ResultStream`] of
 //!   [`graphus_core::Value`] rows (`04 §8.3`, §7.7). The HTTP analogue of `graphus_bolt::executor`.
+//! - [`columnar`] — the **analytical columnar result channel** (rmp #334): a compact, self-describing
+//!   *column-wise* encoding of a (large) result, built natively on [`graphus_columnar`] (no Arrow
+//!   dependency). Distinct from — and complementary to — the row-wise JSON/CBOR/NDJSON paths and the
+//!   inviolable Bolt/PackStream OLTP path; selected via `Accept: application/x-graphus-columnar` or
+//!   `POST /db/{db}/query/columnar`.
 //! - [`value`] — the **one place** `Value` becomes bytes for REST: **Jolt-style typed JSON** (with
 //!   **int53** 64-bit integers string-encoded) and **CBOR** (RFC 8949, native 64-bit ints)
 //!   (`04 §8.2`, `D-serialization`).
@@ -68,6 +73,7 @@
 //!   future async cursor turns into true incremental flushing with no API change.
 #![forbid(unsafe_code)]
 
+pub mod columnar;
 pub mod engine;
 pub mod negotiate;
 pub mod openapi;
@@ -80,6 +86,10 @@ pub mod value;
 
 // A coherent top-level re-export of the surface the server (rmp #20) and tests use most, per the
 // Rust API Guidelines (a flat, discoverable crate root).
+pub use columnar::{
+    DecodedResult, GCOL_RESULT_MEDIA_TYPE, GcolColumn, GcolError, GcolHeader, decode_result,
+    encode_result,
+};
 pub use engine::{AccessMode, RestEngine, ResultStream, Row, RunSummary, TxHandle};
 pub use negotiate::{Decode, Wire};
 pub use problem::{PROBLEM_JSON, Problem};
