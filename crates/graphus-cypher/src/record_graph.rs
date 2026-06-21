@@ -1649,6 +1649,21 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
                 return Vec::new();
             }
         };
+        // Resolve the requested rel-type names to interned type ids ONCE per expand, so the
+        // per-edge filter is an integer compare instead of a `token_name` string lookup + compare
+        // repeated across the whole incidence chain (`rmp` #319). A requested name with no interned
+        // token matches no existing edge (the absent-edge phantom is already covered by
+        // `note_rel_predicate_read` above), so it simply contributes no id. `None` means "any type".
+        let wanted_type_ids: Option<Vec<u32>> = if types.is_empty() {
+            None
+        } else {
+            Some(
+                types
+                    .iter()
+                    .filter_map(|t| store.token_id(Namespace::RelType, t))
+                    .collect(),
+            )
+        };
         let mut out = Vec::new();
         for rid in rels {
             let rec = match store.rel(rid) {
@@ -1667,12 +1682,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             if !self.visible(rec.mvcc) {
                 continue;
             }
-            // Filter by relationship type name (empty = any type).
-            if !types.is_empty() {
-                let type_ok = store
-                    .token_name(Namespace::RelType, rec.type_id)
-                    .is_some_and(|name| types.iter().any(|t| t == name));
-                if !type_ok {
+            // Filter by relationship type (empty/`None` = any type).
+            if let Some(ref ids) = wanted_type_ids {
+                if !ids.contains(&rec.type_id) {
                     continue;
                 }
             }
