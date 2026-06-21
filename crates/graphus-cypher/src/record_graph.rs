@@ -649,6 +649,74 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         }
     }
 
+    /// Reads a **single** property `key` of `node` (newest-visible-wins) WITHOUT materializing,
+    /// name-mapping or sorting the node's whole property set (`rmp` #326 — late materialization).
+    ///
+    /// The previous path (`read_node_props(node).find(k == key)`) decoded **every** property value
+    /// of the node (including overflow-heap walks for strings/lists), allocated a `Vec<(String,
+    /// Value)>`, mapped every key id back to a name and sorted it — all to keep one value. On an
+    /// analytical scan that touches one property over millions of rows (the measured `top_liked`
+    /// hot path) that amplification dominates. This probe instead resolves the key name to its
+    /// interned id once, then returns the **first visible** record of that id from the prepend-
+    /// ordered (newest-first) chain — decoding exactly one value. A key name that was never interned
+    /// cannot occur on any record, so it short-circuits to `None`. Result is identical to the old
+    /// `find` (the first visible record of a key id is its newest visible version).
+    fn read_node_prop_one(&self, node: NodeId, key: &str) -> Option<Value> {
+        let mut store = self.store.borrow_mut();
+        let key_id = store.token_id(Namespace::PropKey, key)?;
+        let chain = match store.node_properties(node.0) {
+            Ok(chain) => chain,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return None;
+            }
+        };
+        for (_pid, prop) in chain {
+            if prop.key != key_id || !self.visible(prop.mvcc) {
+                continue;
+            }
+            return match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    None
+                }
+            };
+        }
+        None
+    }
+
+    /// Relationship analogue of [`read_node_prop_one`](Self::read_node_prop_one) (`rmp` #326), over
+    /// [`RelRecord.first_prop`](graphus_storage::record::RelRecord).
+    fn read_rel_prop_one(&self, rel: RelId, key: &str) -> Option<Value> {
+        let mut store = self.store.borrow_mut();
+        let key_id = store.token_id(Namespace::PropKey, key)?;
+        let chain = match store.rel_properties(rel.0) {
+            Ok(chain) => chain,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return None;
+            }
+        };
+        for (_pid, prop) in chain {
+            if prop.key != key_id || !self.visible(prop.mvcc) {
+                continue;
+            }
+            return match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    None
+                }
+            };
+        }
+        None
+    }
+
     /// Reads `node`'s properties as newest-**visible**-wins `(key_name, value)` pairs (`rmp` task
     /// #50), decoding both inline scalars (#38) and `String`/`List` overflow values (`rmp` task #43).
     ///
@@ -1837,22 +1905,14 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         if !self.node_exists(node) {
             return None;
         }
-        self.read_node_props(node)
-            .into_iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.read_node_prop_one(node, key)
     }
 
     fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
         if !self.rel_exists(rel) {
             return None;
         }
-        // Relationship properties are stored over `RelRecord.first_prop`, the relationship analogue of
-        // the node-property path (`rmp` task #44). Read the live newest-wins set and pick `key`.
-        self.read_rel_props(rel)
-            .into_iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.read_rel_prop_one(rel, key)
     }
 
     fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
