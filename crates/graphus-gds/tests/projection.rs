@@ -210,3 +210,135 @@ proptest! {
         }
     }
 }
+
+// =================================================================================================
+// Internal-id-aligned numeric node columns + zero-copy export (rmp #333)
+// =================================================================================================
+
+#[test]
+fn node_column_attach_accessors_and_memory() {
+    let mut g = VecGraphSource {
+        nodes: vec![10, 20, 30],
+        edges: vec![(10, 20, 1.0), (20, 30, 1.0)],
+    }
+    .build(Orientation::Directed, false)
+    .unwrap();
+
+    let before = g.memory_bytes();
+    // Attach a weight column by external id: 10->5.0, 20->3.0, 30->1.0 (internal-id-aligned inside).
+    g.attach_node_column_from("weight", 0.0, |ext| match ext {
+        10 => Some(5.0),
+        20 => Some(3.0),
+        30 => Some(1.0),
+        _ => None,
+    });
+    // O(1) reads by internal id agree with the external mapping.
+    for ext in [10u64, 20, 30] {
+        let i = g.internal_id(ext).unwrap();
+        let expect = match ext {
+            10 => 5.0,
+            20 => 3.0,
+            _ => 1.0,
+        };
+        assert_eq!(g.node_value("weight", i), Some(expect));
+    }
+    assert_eq!(g.node_column("weight").unwrap().len(), 3);
+    assert!(g.node_column("missing").is_none());
+    // The column's bytes are accounted in the SEC-204 quota measure.
+    assert!(
+        g.memory_bytes() > before,
+        "node column must count toward memory_bytes"
+    );
+}
+
+#[test]
+fn attach_node_column_rejects_wrong_length() {
+    let mut g = VecGraphSource {
+        nodes: vec![1, 2, 3],
+        edges: vec![],
+    }
+    .build(Orientation::Directed, false)
+    .unwrap();
+    let err = g.attach_node_column("x", vec![1.0, 2.0]).unwrap_err();
+    assert!(matches!(err, GdsError::InvalidArgument(_)));
+}
+
+#[test]
+fn columnar_export_is_zero_copy_and_arrow_shaped() {
+    let mut g = VecGraphSource {
+        nodes: vec![0, 1, 2],
+        edges: vec![(0, 1, 2.5), (0, 2, 7.5)],
+    }
+    .build(Orientation::Directed, true)
+    .unwrap();
+    g.attach_node_column_from("seed", 0.0, |ext| Some(ext as f64));
+
+    let export = g.columnar_export();
+    assert_eq!(export.node_count, 3);
+    assert_eq!(export.edge_count, 2);
+    // offsets buffer has node_count+1 entries (Arrow ListArray offsets), targets is the values buffer.
+    assert_eq!(export.offsets.len(), 4);
+    assert_eq!(export.targets.len(), 2);
+    assert_eq!(export.weights.unwrap().len(), 2);
+    assert_eq!(export.external.len(), 3);
+    assert!(export.node_columns.contains_key("seed"));
+    // The exported slices alias the projection's own buffers (zero copy): same pointer.
+    assert_eq!(
+        export.offsets.as_ptr(),
+        g.columnar_export().offsets.as_ptr()
+    );
+}
+
+#[test]
+fn personalized_pagerank_reads_seed_column_and_biases_rank() {
+    use graphus_gds::algo::pagerank::{PageRankConfig, personalized_pagerank};
+    // A small directed graph; seed all mass on node `100`.
+    let mut g = VecGraphSource {
+        nodes: vec![100, 200, 300],
+        edges: vec![(100, 200, 1.0), (200, 300, 1.0), (300, 100, 1.0)],
+    }
+    .build(Orientation::Directed, false)
+    .unwrap();
+    g.attach_node_column_from(
+        "seed",
+        0.0,
+        |ext| if ext == 100 { Some(1.0) } else { Some(0.0) },
+    );
+
+    let cfg = PageRankConfig::default();
+    let res = personalized_pagerank(&g, "seed", cfg, &Cancel::never()).unwrap();
+    let i100 = g.internal_id(100).unwrap();
+    let sum: f64 = res.rank.iter().sum();
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "personalized rank must sum to 1, got {sum}"
+    );
+    // The seeded node must carry strictly more rank than under a uniform start in this directed ring.
+    let uniform = graphus_gds::algo::pagerank::pagerank(&g, cfg, &Cancel::never()).unwrap();
+    assert!(
+        res.rank[i100 as usize] > uniform.rank[i100 as usize],
+        "seeding node 100 must raise its rank above the unseeded run"
+    );
+}
+
+#[test]
+fn personalized_pagerank_rejects_missing_or_empty_seed() {
+    use graphus_gds::algo::pagerank::{PageRankConfig, personalized_pagerank};
+    let mut g = VecGraphSource {
+        nodes: vec![1, 2],
+        edges: vec![(1, 2, 1.0)],
+    }
+    .build(Orientation::Directed, false)
+    .unwrap();
+    // No column attached -> error.
+    assert!(matches!(
+        personalized_pagerank(&g, "seed", PageRankConfig::default(), &Cancel::never()),
+        Err(GdsError::InvalidArgument(_))
+    ));
+    // All-zero seed -> no teleport mass -> error.
+    g.attach_node_column_from("seed", 0.0, |_| Some(0.0));
+    assert!(matches!(
+        personalized_pagerank(&g, "seed", PageRankConfig::default(), &Cancel::never()),
+        Err(GdsError::InvalidArgument(_))
+    ));
+}

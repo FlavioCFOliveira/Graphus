@@ -132,3 +132,117 @@ pub fn pagerank(
         converged,
     })
 }
+
+/// **Personalized (seeded) PageRank** (`rmp` task #333): a PageRank whose teleport mass returns to a
+/// caller-supplied **seed distribution** instead of uniformly to all nodes. The seed vector is an
+/// internal-id-aligned numeric node column ([`CsrGraph::node_column`]) — read **O(1)** per node from
+/// the cached projection rather than re-walking each node's authoritative property chain — so this is
+/// exactly the class of property-driven algorithm the columnar node columns unlock.
+///
+/// `seed_column` names a non-negative numeric node column; it is normalized to a probability
+/// distribution internally (so the result still sums to ~1). A node's seed weight biases both the
+/// teleport target and the dangling-mass redistribution toward it, yielding rank personalized to the
+/// seed set. With a uniform seed column this reduces exactly to [`pagerank`].
+///
+/// # Errors
+/// - [`GdsError::InvalidArgument`] if `damping`/`tolerance` are out of range (as [`pagerank`]), if
+///   `seed_column` is not an attached column, or if the seed column has no positive mass / a negative
+///   or non-finite entry (it cannot form a teleport distribution).
+/// - [`GdsError::Cancelled`] if `cancel` fires.
+pub fn personalized_pagerank(
+    graph: &CsrGraph,
+    seed_column: &str,
+    config: PageRankConfig,
+    cancel: &Cancel<'_>,
+) -> Result<PageRankResult> {
+    if !(0.0..1.0).contains(&config.damping) || !config.damping.is_finite() {
+        return Err(GdsError::InvalidArgument(
+            "damping must be in [0, 1)".into(),
+        ));
+    }
+    if config.tolerance < 0.0 || config.tolerance.is_nan() {
+        return Err(GdsError::InvalidArgument("tolerance must be >= 0".into()));
+    }
+    let n = graph.node_count();
+    if n == 0 {
+        return Ok(PageRankResult {
+            rank: Vec::new(),
+            iterations: 0,
+            converged: true,
+        });
+    }
+    let seed = graph.node_column(seed_column).ok_or_else(|| {
+        GdsError::InvalidArgument(format!("seed column `{seed_column}` is not attached"))
+    })?;
+
+    // Normalize the seed column to a teleport probability distribution (O(1)-read per node).
+    let mut total = 0.0f64;
+    for &s in seed {
+        if !s.is_finite() || s < 0.0 {
+            return Err(GdsError::InvalidArgument(
+                "seed column must be non-negative and finite".into(),
+            ));
+        }
+        total += s;
+    }
+    if total <= 0.0 {
+        return Err(GdsError::InvalidArgument(
+            "seed column must have positive total mass".into(),
+        ));
+    }
+    let teleport_dist: Vec<f64> = seed.iter().map(|&s| s / total).collect();
+
+    let mut rank = teleport_dist.clone();
+    let mut next = vec![0.0f64; n];
+    let d = config.damping;
+    let mut iterations = 0u32;
+    let mut converged = false;
+
+    while iterations < config.max_iter {
+        cancel.check()?;
+        iterations += 1;
+
+        // Dangling mass is redistributed along the SEED distribution (personalized), not uniformly.
+        let mut dangling_sum = 0.0f64;
+        for (i, &r) in rank.iter().enumerate() {
+            if graph.out_degree(i as InternalId).unwrap_or(0) == 0 {
+                dangling_sum += r;
+            }
+        }
+        let dangling = d * dangling_sum;
+
+        // Base mass for node i = (teleport + personalized dangling) * seed_i.
+        for (slot, &p) in next.iter_mut().zip(teleport_dist.iter()) {
+            *slot = (1.0 - d) * p + dangling * p;
+        }
+
+        for (src, neis) in graph.iter_adjacency() {
+            let deg = neis.len();
+            if deg == 0 {
+                continue;
+            }
+            let share = d * rank[src as usize] / deg as f64;
+            for &dst in neis {
+                if let Some(slot) = next.get_mut(dst as usize) {
+                    *slot += share;
+                }
+            }
+        }
+
+        let mut delta = 0.0f64;
+        for (nv, rv) in next.iter().zip(rank.iter()) {
+            delta += (nv - rv).abs();
+        }
+        core::mem::swap(&mut rank, &mut next);
+        if delta <= config.tolerance {
+            converged = true;
+            break;
+        }
+    }
+
+    Ok(PageRankResult {
+        rank,
+        iterations,
+        converged,
+    })
+}

@@ -265,6 +265,7 @@ impl CsrBuilder {
             offsets,
             targets,
             weights,
+            node_columns: HashMap::new(),
         })
     }
 }
@@ -287,6 +288,16 @@ pub struct CsrGraph {
     offsets: Vec<u32>,
     targets: Vec<InternalId>,
     weights: Vec<f64>,
+    /// Optional **internal-id-aligned numeric node-property columns** (`rmp` task #328/#333), keyed by
+    /// name. Each column is a dense `Vec<f64>` of length [`node_count`](CsrGraph::node_count): the
+    /// value of that property for internal id `i` is `column[i]`, an **O(1)** read that amortizes the
+    /// authoritative row-store property-chain walk across every algorithm run over the cached
+    /// projection. These columns unlock property-/degree-weighted and **seeded / personalized**
+    /// algorithms (e.g. [`personalized_pagerank`](crate::algo::pagerank::personalized_pagerank)) that
+    /// must read a per-node scalar. Only numeric columns are held here (a string seed would need a
+    /// dictionary column); the authoritative store is untouched, and the column is derived/rebuilt with
+    /// the projection.
+    node_columns: HashMap<String, Vec<f64>>,
 }
 
 impl CsrGraph {
@@ -392,11 +403,124 @@ impl CsrGraph {
             .capacity()
             .saturating_mul(id.saturating_add(idx));
 
+        // Internal-id-aligned numeric node columns (`rmp` #333): each is a dense `Vec<f64>` of length
+        // `node_count`, plus its name string — counted so the SEC-204 projection memory quota covers
+        // them (a weighted/seeded run must not silently exceed the cap).
+        let columns: usize = self
+            .node_columns
+            .iter()
+            .map(|(name, col)| {
+                name.capacity()
+                    .saturating_add(col.capacity().saturating_mul(f))
+            })
+            .fold(0usize, usize::saturating_add);
+
         external
             .saturating_add(offsets)
             .saturating_add(targets)
             .saturating_add(weights)
             .saturating_add(map)
+            .saturating_add(columns)
             .saturating_add(core::mem::size_of::<Self>())
     }
+
+    // --------------------------------------------------------------------------------------------
+    // Internal-id-aligned numeric node columns (`rmp` task #333)
+    // --------------------------------------------------------------------------------------------
+
+    /// Attaches an internal-id-aligned numeric node column `name`, where `values[i]` is the property
+    /// value of internal id `i`. The projection is mutable only before it is shared by `Arc`, so this
+    /// is the natural point to derive a column from the same snapshot scan that built the CSR.
+    ///
+    /// # Errors
+    /// [`GdsError::InvalidArgument`] if `values.len() != node_count` (a column must cover every node).
+    pub fn attach_node_column(&mut self, name: impl Into<String>, values: Vec<f64>) -> Result<()> {
+        if values.len() != self.node_count() {
+            return Err(GdsError::InvalidArgument(format!(
+                "node column must have one value per node ({} != {})",
+                values.len(),
+                self.node_count()
+            )));
+        }
+        self.node_columns.insert(name.into(), values);
+        Ok(())
+    }
+
+    /// Builds an internal-id-aligned column from a per-**external-id** value function and attaches it
+    /// under `name` (`rmp` #333). The closure is called once per node in internal-id order with that
+    /// node's external id; a node the function has no value for uses `default`. Convenience for the
+    /// projection scan, which knows external ids.
+    pub fn attach_node_column_from(
+        &mut self,
+        name: impl Into<String>,
+        default: f64,
+        mut value_of: impl FnMut(ExternalId) -> Option<f64>,
+    ) {
+        let values: Vec<f64> = self
+            .external
+            .iter()
+            .map(|&ext| value_of(ext).unwrap_or(default))
+            .collect();
+        // Length is `node_count` by construction, so the insert cannot violate the invariant.
+        self.node_columns.insert(name.into(), values);
+    }
+
+    /// The internal-id-aligned column `name`, or `None` if no such column is attached. `column[i]` is
+    /// internal id `i`'s value — an O(1) read.
+    #[must_use]
+    pub fn node_column(&self, name: &str) -> Option<&[f64]> {
+        self.node_columns.get(name).map(Vec::as_slice)
+    }
+
+    /// Internal id `node`'s value of column `name`, or `None` if the column or id is absent — O(1).
+    #[must_use]
+    pub fn node_value(&self, name: &str, node: InternalId) -> Option<f64> {
+        self.node_columns.get(name)?.get(node as usize).copied()
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Zero-copy columnar projection export (`rmp` task #333)
+    // --------------------------------------------------------------------------------------------
+
+    /// A **zero-copy** columnar view of the projection's contiguous buffers (`rmp` #333): the CSR
+    /// offsets + targets are exactly an Arrow-`ListArray`-shaped adjacency (offsets buffer + values
+    /// buffer), and the external-id / weight / node columns are plain primitive columns. Handing these
+    /// borrowed slices to a consumer is an **O(number-of-buffers)** operation — no per-edge work —
+    /// versus an **O(E)** CSV/row serialization. The borrow keeps it allocation-free; a consumer that
+    /// needs ownership copies the slices it wants.
+    #[must_use]
+    pub fn columnar_export(&self) -> CsrColumnarExport<'_> {
+        CsrColumnarExport {
+            node_count: self.node_count(),
+            edge_count: self.edge_count(),
+            offsets: &self.offsets,
+            targets: &self.targets,
+            weights: (!self.weights.is_empty()).then_some(self.weights.as_slice()),
+            external: &self.external,
+            node_columns: &self.node_columns,
+        }
+    }
+}
+
+/// A borrowed, zero-copy columnar view of a [`CsrGraph`] for export (`rmp` task #333). All fields are
+/// slices into the projection's own buffers — constructing this is O(1) in the edge count. The
+/// `offsets` + `targets` pair is layout-compatible with an Arrow `ListArray` (a 32-bit offsets buffer
+/// over an `Int32`/`UInt32` values buffer), so a downstream Arrow bridge can wrap them without a copy;
+/// `weights` and each `node_columns` entry are primitive `f64` columns.
+#[derive(Debug, Clone, Copy)]
+pub struct CsrColumnarExport<'a> {
+    /// Number of nodes (length of `external` and of each node column; `offsets.len() == node_count+1`).
+    pub node_count: usize,
+    /// Number of directed edges stored (length of `targets` and, when present, `weights`).
+    pub edge_count: usize,
+    /// CSR row offsets, length `node_count + 1` (the Arrow `ListArray` offsets buffer).
+    pub offsets: &'a [u32],
+    /// Flattened out-neighbour internal ids (the Arrow `ListArray` values buffer).
+    pub targets: &'a [InternalId],
+    /// Parallel edge weights (length `edge_count`), or `None` when the projection is unweighted.
+    pub weights: Option<&'a [f64]>,
+    /// Internal-id → external-id table (length `node_count`).
+    pub external: &'a [ExternalId],
+    /// The attached internal-id-aligned numeric node columns, keyed by name (each length `node_count`).
+    pub node_columns: &'a HashMap<String, Vec<f64>>,
 }
