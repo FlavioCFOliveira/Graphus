@@ -36,10 +36,28 @@
 //!
 //! Materializing **every** property of every node would duplicate the whole property store in RAM and
 //! defeat the purpose. The snapshot therefore captures **only the `(label, property)` columns the
-//! caller declares** in the [`SnapshotSpec`]. A node that lacks a declared property contributes
-//! [`None`] in that column (so a column is dense — one slot per internal node — and absence is
-//! explicit, never confused with a present value). Topology and labels are always captured in full
-//! (they are compact); property *values* are opt-in.
+//! caller declares** in the [`SnapshotSpec`] — for nodes via [`SnapshotSpec::with_column`] and for
+//! relationships via [`SnapshotSpec::with_rel_column`]. An entity that lacks a declared property
+//! contributes [`None`] in that column (so a column is dense — one slot per internal node / per
+//! distinct relationship — and absence is explicit, never confused with a present value). Topology
+//! and labels are always captured in full (they are compact); property *values* are opt-in.
+//!
+//! Every captured value is a full [`graphus_core::Value`], stored verbatim, so **every** value
+//! variant — `Integer`, `Float`, `String`, `Boolean`, `Bytes`, `List`, `Map`, the temporal classes
+//! (`Date`/`LocalTime`/`ZonedTime`/`LocalDateTime`/`ZonedDateTime`/`Duration`) and `Point` — round-
+//! trips losslessly through the snapshot (proven by the `every_value_variant_round_trips` test).
+//!
+//! # Derived equality lookup (the read-only "index" piece)
+//!
+//! Beyond the dense columns, [`project`](GraphSnapshot::project) builds an in-memory
+//! `(label, property, value-key) -> [node]` map so that [`snapshot_seek_eq`](GraphSnapshot::snapshot_seek_eq)
+//! answers `MATCH (n:label) WHERE n.property = $v` in (bucket-sized) time instead of scanning the
+//! whole column. The *value-key* is built so that **Cypher-equal values collide** (so `Integer(1)`
+//! and `Float(1.0)` share a bucket, `-0.0` and `+0.0` share a bucket), and the bucket is then re-
+//! checked against the exact three-valued [`crate::equality::equals`] operator, so the result is **bit-
+//! identical to a scan-and-filter** over the same column (proven by the
+//! `seek_eq_matches_scan_and_filter` test). See [`snapshot_seek_eq`](GraphSnapshot::snapshot_seek_eq)
+//! for how `NaN`/`Null`/`List`/`Map` targets are handled.
 //!
 //! # `Send + Sync` contract
 //!
@@ -61,7 +79,9 @@
 use std::collections::HashMap;
 
 use graphus_core::Value;
+use graphus_index::keycodec;
 
+use crate::equality::equals;
 use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId};
 
 /// The dense internal node index of a [`GraphSnapshot`], in the range `0..node_count`.
@@ -88,28 +108,36 @@ pub type RelTypeId = u32;
 // (labels / rel-types), not client values, but stay on the same default for uniformity.
 type NodeIndex = HashMap<u64, SnapId>;
 
-/// The set of `(label, property)` columns to materialize when projecting a [`GraphSnapshot`].
+/// The set of property columns to materialize when projecting a [`GraphSnapshot`].
 ///
 /// Topology and labels are always captured in full; this spec selects which **property value
-/// columns** to additionally materialize (see the module-level "selective property columns" note).
+/// columns** to additionally materialize (see the module-level "selective property columns" note) —
+/// both **node** columns keyed by `(label, property)` ([`with_column`](Self::with_column)) and
+/// **relationship** columns keyed by `(rel_type, property)` ([`with_rel_column`](Self::with_rel_column)).
 ///
 /// # Examples
 ///
 /// ```
 /// use graphus_cypher::snapshot::SnapshotSpec;
 ///
-/// // Capture the `age` column for `:Person` and the `size` column for `:Company`.
+/// // Capture the `age` column for `:Person`, the `size` column for `:Company`, and the `since`
+/// // column for the `KNOWS` relationship.
 /// let spec = SnapshotSpec::new()
 ///     .with_column("Person", "age")
-///     .with_column("Company", "size");
+///     .with_column("Company", "size")
+///     .with_rel_column("KNOWS", "since");
 /// assert_eq!(spec.columns().len(), 2);
+/// assert_eq!(spec.rel_columns().len(), 1);
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[must_use]
 pub struct SnapshotSpec {
-    /// The `(label, property)` pairs whose values to materialize as dense columns. Deduplicated,
-    /// insertion order is irrelevant (the snapshot keys columns by interned ids).
+    /// The `(label, property)` pairs whose **node** values to materialize as dense columns.
+    /// Deduplicated, insertion order is irrelevant (the snapshot keys columns by interned ids).
     columns: Vec<(String, String)>,
+    /// The `(rel_type, property)` pairs whose **relationship** values to materialize as dense
+    /// columns. Deduplicated; same contract as [`columns`](Self::columns) but keyed by rel-type.
+    rel_columns: Vec<(String, String)>,
 }
 
 impl SnapshotSpec {
@@ -118,8 +146,8 @@ impl SnapshotSpec {
         Self::default()
     }
 
-    /// Declares a `(label, property)` column to materialize. Idempotent — re-declaring the same pair
-    /// is a no-op, so callers may union specs freely.
+    /// Declares a `(label, property)` **node** column to materialize. Idempotent — re-declaring the
+    /// same pair is a no-op, so callers may union specs freely.
     pub fn with_column(mut self, label: impl Into<String>, property: impl Into<String>) -> Self {
         let pair = (label.into(), property.into());
         if !self.columns.contains(&pair) {
@@ -128,10 +156,32 @@ impl SnapshotSpec {
         self
     }
 
-    /// The declared `(label, property)` column pairs.
+    /// Declares a `(rel_type, property)` **relationship** column to materialize. Idempotent — re-
+    /// declaring the same pair is a no-op. The column is dense over the snapshot's distinct
+    /// relationships (one slot per [`RelId`]), capturing the value the relationship holds *when it is
+    /// of `rel_type`* (and [`None`] when it is a different type or lacks the property).
+    pub fn with_rel_column(
+        mut self,
+        rel_type: impl Into<String>,
+        property: impl Into<String>,
+    ) -> Self {
+        let pair = (rel_type.into(), property.into());
+        if !self.rel_columns.contains(&pair) {
+            self.rel_columns.push(pair);
+        }
+        self
+    }
+
+    /// The declared `(label, property)` **node** column pairs.
     #[must_use]
     pub fn columns(&self) -> &[(String, String)] {
         &self.columns
+    }
+
+    /// The declared `(rel_type, property)` **relationship** column pairs.
+    #[must_use]
+    pub fn rel_columns(&self) -> &[(String, String)] {
+        &self.rel_columns
     }
 }
 
@@ -179,15 +229,30 @@ pub struct SnapIncident {
 ///   `label_members[l]` is the sorted internal-id list carrying label `l` (for
 ///   [`scan_nodes_by_label`](Self::scan_nodes_by_label)).
 /// * **Property columns** — `columns[(l, p)][i]` is internal `i`'s value of property `p` *when it
-///   carries label `l`* (and [`None`] when absent), for each declared `(label, property)`.
+///   carries label `l`* (and [`None`] when absent), for each declared `(label, property)`;
+///   `rel_columns[(t, p)][e]` is the value of property `p` on the relationship at internal edge
+///   index `e` *when it is of type `t`* (and [`None`] when absent), for each declared
+///   `(rel_type, property)`.
+/// * **Equality index** — `eq_index[(l, p)]` maps a Cypher-equality value-key to the internal ids of
+///   the `l`-labelled nodes whose `p` equals that key, the lookup structure behind
+///   [`snapshot_seek_eq`](Self::snapshot_seek_eq).
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct GraphSnapshot {
-    // ---- identity mapping ----
+    // ---- node identity mapping ----
     /// internal index -> external [`NodeId`] (length `node_count`).
     external: Vec<NodeId>,
     /// external `NodeId.0` -> internal index. SipHash-seeded (see [`NodeIndex`] security note).
     index_of: NodeIndex,
+
+    // ---- relationship identity mapping ----
+    /// internal edge index -> external [`RelId`] (length `edge_count`, one slot per **distinct**
+    /// relationship). A relationship that appears in both adjacencies (every non-dangling edge does:
+    /// once out of its start, once into its end) occupies a single internal edge index.
+    rel_external: Vec<RelId>,
+    /// external `RelId.0` -> internal edge index. SipHash-seeded (see [`NodeIndex`] security note;
+    /// rel ids are client-influenced just like node ids).
+    rel_index_of: NodeIndex,
 
     // ---- CSR out-adjacency ----
     /// Out-edge row offsets, length `node_count + 1`, values in `0..=out_targets.len()`.
@@ -221,16 +286,42 @@ pub struct GraphSnapshot {
     /// Declared `(label, property)` value columns, each dense over internal ids (length
     /// `node_count`). `columns[&(l, p)][i]` is `Some(v)` when internal `i` carries label `l` and has
     /// property `p = v`, else `None`.
-    columns: HashMap<(LabelId, PropId), Vec<Option<Value>>>,
-    /// Property-name text -> interned id. Property columns are addressed by `(label, property)`
-    /// *names* in the public API, so only this forward map is kept (no id->name reverse table is
-    /// needed — unlike labels/rel-types, a `PropId` never surfaces publicly).
+    columns: NodeColumns,
+    /// Property-name text -> interned id. Property columns are addressed by `(label, property)` and
+    /// `(rel_type, property)` *names* in the public API, so only this forward map is kept (no
+    /// id->name reverse table is needed — unlike labels/rel-types, a `PropId` never surfaces
+    /// publicly). Shared by node and relationship columns (a property name interns once).
     prop_ids: HashMap<String, PropId>,
+
+    // ---- relationship property columns ----
+    /// Declared `(rel_type, property)` value columns, each dense over internal edge ids (length
+    /// `edge_count`). `rel_columns[&(t, p)][e]` is `Some(v)` when the relationship at internal edge
+    /// `e` is of type `t` and has property `p = v`, else `None`.
+    rel_columns: RelColumns,
+
+    // ---- derived equality lookup index ----
+    /// `(LabelId, PropId, value-key) -> sorted internal ids`: the nodes carrying that label whose
+    /// value of that property is Cypher-equal to the value the key encodes. Built from the node
+    /// `columns` at projection time; the key (see [`equality_key`]) collides Cypher-equal values so a
+    /// seek for `Integer(1)` finds a stored `Float(1.0)`. The candidate list is re-checked against
+    /// the exact [`equals`] operator inside [`snapshot_seek_eq`](Self::snapshot_seek_eq), so it is
+    /// exact even where the key over-approximates.
+    eq_index: EqIndex,
 }
 
 /// An interned property-name id, used only as a compact key into [`GraphSnapshot::columns`]. Private
 /// because property columns are addressed by `(label, property)` *names* in the public API.
 type PropId = u32;
+
+/// The materialized **node** property columns: `(label, property) -> dense per-node value column`.
+type NodeColumns = HashMap<(LabelId, PropId), Vec<Option<Value>>>;
+
+/// The materialized **relationship** property columns: `(rel_type, property) -> dense per-edge value
+/// column` (dense over the snapshot's distinct-relationship internal edge-id space).
+type RelColumns = HashMap<(RelTypeId, PropId), Vec<Option<Value>>>;
+
+/// The derived equality lookup index: `(label, property, value-key) -> sorted internal node ids`.
+type EqIndex = HashMap<(LabelId, PropId, Vec<u8>), Vec<SnapId>>;
 
 impl GraphSnapshot {
     /// Projects a frozen, owned read-only snapshot off `graph`, capturing the topology, labels, and
@@ -275,7 +366,7 @@ impl GraphSnapshot {
         // node carries still produces an (empty-by-absence) dense column — a faithful "captured but
         // all None" view, distinct from "not captured".
         let mut prop_ids: HashMap<String, PropId> = HashMap::new();
-        let mut columns: HashMap<(LabelId, PropId), Vec<Option<Value>>> = HashMap::new();
+        let mut columns: NodeColumns = HashMap::new();
         // We pre-intern the label and property of each requested column so the keys are stable; the
         // owned `prop` name is carried alongside for the per-node `node_property` read below.
         let mut requested: Vec<(LabelId, PropId, String)> = Vec::with_capacity(spec.columns.len());
@@ -347,9 +438,30 @@ impl GraphSnapshot {
             &mut rel_type_ids,
         );
 
+        // ---- relationship identity + property columns -----------------------------------------
+        // A dense internal edge-id space keyed by RelId, captured in one pass over every included
+        // relationship (each visible node's outgoing expansion visits its out-edges once; an edge is
+        // included only when both endpoints are visible, so every snapshot edge appears here exactly
+        // once). This is independent of the CSR layout above (which keys edges by external RelId), so
+        // it does not perturb that code path.
+        let (rel_external, rel_index_of, rel_columns) = Self::build_rel_columns(
+            graph,
+            &external,
+            &index_of,
+            spec,
+            &mut rel_type_names,
+            &mut rel_type_ids,
+            &mut prop_ids,
+        );
+
+        // ---- derived equality lookup index ----------------------------------------------------
+        let eq_index = build_eq_index(&columns);
+
         Self {
             external,
             index_of,
+            rel_external,
+            rel_index_of,
             out_offsets,
             out_targets,
             in_offsets,
@@ -362,7 +474,96 @@ impl GraphSnapshot {
             rel_type_ids,
             columns,
             prop_ids,
+            rel_columns,
+            eq_index,
         }
+    }
+
+    /// Builds the relationship identity map (`RelId` -> dense internal edge id) and the declared
+    /// `(rel_type, property)` value columns, dense over that edge-id space.
+    ///
+    /// Walks each visible node's **outgoing** expansion once; an edge is included only when its far
+    /// endpoint is also visible (matching [`build_adjacency`]), so every relationship in the snapshot
+    /// is interned exactly once. For each requested `(rel_type, property)` column, the value is read
+    /// (via [`GraphAccess::rel_property`]) only when the relationship is of that type — so the column
+    /// is "the value for `rel_type`-typed relationships", and a different-typed relationship is a
+    /// faithful [`None`]. Rel-types encountered here are interned into the shared
+    /// `rel_type_names`/`rel_type_ids` (already populated by [`build_adjacency`], so this is mostly
+    /// idempotent lookups).
+    #[allow(clippy::too_many_arguments)]
+    fn build_rel_columns(
+        graph: &dyn GraphAccess,
+        external: &[NodeId],
+        index_of: &NodeIndex,
+        spec: &SnapshotSpec,
+        rel_type_names: &mut Vec<String>,
+        rel_type_ids: &mut HashMap<String, RelTypeId>,
+        prop_ids: &mut HashMap<String, PropId>,
+    ) -> (Vec<RelId>, NodeIndex, RelColumns) {
+        // Intern the requested rel columns up front: each becomes a `(RelTypeId, PropId)` key plus
+        // the owned property name carried alongside for the per-edge read.
+        let mut requested: Vec<(RelTypeId, PropId, String)> =
+            Vec::with_capacity(spec.rel_columns.len());
+        for (rel_type, prop) in &spec.rel_columns {
+            let tid = intern(rel_type_names, rel_type_ids, rel_type);
+            let pid = intern_id(prop_ids, prop);
+            requested.push((tid, pid, prop.clone()));
+        }
+
+        // First, intern every included relationship into the dense edge-id space (one slot per
+        // distinct RelId). We must know the full edge count before sizing the dense columns.
+        let mut rel_external: Vec<RelId> = Vec::new();
+        let mut rel_index_of: NodeIndex = HashMap::new();
+        // Carry the resolved type id per internal edge so the column capture below need not re-read
+        // `rel_data` once we know the edge set (the type was already resolved while interning).
+        let mut edge_type: Vec<RelTypeId> = Vec::new();
+        for ext in external {
+            for inc in graph.expand(*ext, ExpandDirection::Outgoing, &[]) {
+                // Far endpoint must be visible (keeps the snapshot self-contained, like the CSR).
+                if !index_of.contains_key(&inc.neighbour.0) {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    rel_index_of.entry(inc.rel.0)
+                {
+                    // Resolve and intern the type once, here, while we have the edge in hand.
+                    let Some(data) = graph.rel_data(inc.rel) else {
+                        // A relationship that cannot be resolved is skipped rather than guessed
+                        // (cannot happen within one synchronous snapshot; stays panic-free).
+                        continue;
+                    };
+                    let tid = intern(rel_type_names, rel_type_ids, &data.rel_type);
+                    slot.insert(rel_external.len() as SnapId);
+                    rel_external.push(inc.rel);
+                    edge_type.push(tid);
+                }
+            }
+        }
+        let edge_count = rel_external.len();
+
+        // Allocate the dense columns and fill them. A column reads the value only for relationships
+        // of its declared type (the rest stay `None`).
+        let mut rel_columns: RelColumns = HashMap::new();
+        for (tid, pid, _) in &requested {
+            rel_columns
+                .entry((*tid, *pid))
+                .or_insert_with(|| vec![None; edge_count]);
+        }
+        if !requested.is_empty() {
+            for (e, rel) in rel_external.iter().enumerate() {
+                let this_type = edge_type[e];
+                for (tid, pid, prop_name) in &requested {
+                    if *tid == this_type {
+                        let value = graph.rel_property(*rel, prop_name);
+                        if let Some(col) = rel_columns.get_mut(&(*tid, *pid)) {
+                            col[e] = value;
+                        }
+                    }
+                }
+            }
+        }
+
+        (rel_external, rel_index_of, rel_columns)
     }
 
     /// Builds one CSR adjacency (offsets + edges) by expanding every node once in `direction`,
@@ -612,7 +813,7 @@ impl GraphSnapshot {
         }
     }
 
-    /// Whether a `(label, property)` column was materialized in this snapshot.
+    /// Whether a `(label, property)` **node** column was materialized in this snapshot.
     #[must_use]
     pub fn has_column(&self, label: &str, property: &str) -> bool {
         let (Some(&lid), Some(&pid)) = (self.label_ids.get(label), self.prop_ids.get(property))
@@ -620,6 +821,161 @@ impl GraphSnapshot {
             return false;
         };
         self.columns.contains_key(&(lid, pid))
+    }
+
+    /// The value of `rel`'s `property`, restricted to a captured `(rel_type, property)` column.
+    ///
+    /// When `rel_type` is `Some(t)`, returns the value from the captured `(t, property)` column (i.e.
+    /// the value the relationship has *as a `t`-typed relationship*), or `None` if that column was
+    /// not captured, the relationship is absent from the snapshot, or the value is absent. When
+    /// `rel_type` is `None`, searches **every captured relationship column** for `property` and
+    /// returns the first present value for this relationship. Absent columns and absent values are
+    /// both `None` — distinguish them with [`has_rel_column`](Self::has_rel_column) if needed.
+    ///
+    /// Like [`node_property`](Self::node_property), this reads **only materialized columns**: a
+    /// relationship property not named in the [`SnapshotSpec`] via
+    /// [`with_rel_column`](SnapshotSpec::with_rel_column) is always `None` here.
+    #[must_use]
+    pub fn rel_property(
+        &self,
+        rel_type: Option<&str>,
+        rel: RelId,
+        property: &str,
+    ) -> Option<Value> {
+        let edge = *self.rel_index_of.get(&rel.0)? as usize;
+        let pid = self.prop_ids.get(property).copied()?;
+        match rel_type {
+            Some(t) => {
+                let tid = self.rel_type_ids.get(t).copied()?;
+                self.rel_columns
+                    .get(&(tid, pid))?
+                    .get(edge)
+                    .cloned()
+                    .flatten()
+            }
+            None => {
+                // Search every captured rel column on this property id; return the first present.
+                self.rel_columns
+                    .iter()
+                    .filter(|((_, p), _)| *p == pid)
+                    .find_map(|(_, col)| col.get(edge).cloned().flatten())
+            }
+        }
+    }
+
+    /// Whether a `(rel_type, property)` **relationship** column was materialized in this snapshot.
+    #[must_use]
+    pub fn has_rel_column(&self, rel_type: &str, property: &str) -> bool {
+        let (Some(&tid), Some(&pid)) =
+            (self.rel_type_ids.get(rel_type), self.prop_ids.get(property))
+        else {
+            return false;
+        };
+        self.rel_columns.contains_key(&(tid, pid))
+    }
+
+    /// A captured `(rel_type, property)` column as `(RelId, Value)` rows for **aggregation**: one row
+    /// per relationship of `rel_type` that has a present value for `property`, in internal edge-id
+    /// order. Returns an empty vec if the column was not captured.
+    ///
+    /// The relationship analogue of [`label_property_rows`](Self::label_property_rows): exactly the
+    /// `(rel, value)` set a `MATCH ()-[r:rel_type]->() WHERE r.property IS NOT NULL RETURN r,
+    /// r.property` would produce against this frozen view, ready to fold in parallel.
+    #[must_use]
+    pub fn rel_property_rows(&self, rel_type: &str, property: &str) -> Vec<(RelId, Value)> {
+        let (Some(&tid), Some(&pid)) =
+            (self.rel_type_ids.get(rel_type), self.prop_ids.get(property))
+        else {
+            return Vec::new();
+        };
+        let Some(col) = self.rel_columns.get(&(tid, pid)) else {
+            return Vec::new();
+        };
+        col.iter()
+            .enumerate()
+            .filter_map(|(e, v)| {
+                let value = v.clone()?;
+                let rel = self.rel_external.get(e)?;
+                Some((*rel, value))
+            })
+            .collect()
+    }
+
+    /// The number of **distinct relationships** captured in the snapshot (one per [`RelId`]).
+    ///
+    /// Equal to [`edge_count`](Self::edge_count) (each included edge is one out-edge of its start),
+    /// but expressed against the relationship identity space the relationship columns are dense over.
+    #[must_use]
+    pub fn rel_count(&self) -> usize {
+        self.rel_external.len()
+    }
+
+    // ---- derived equality lookup (the read-only "index") --------------------------------------
+
+    /// The node ids of `label` whose `property` is **Cypher-equal** to `value`, in internal-id order.
+    ///
+    /// This is the snapshot's read-only equality **index**: it returns **exactly** the set a scan-
+    /// and-filter would (`scan_nodes_by_label(label)` kept where `equals(node.property, value)` is
+    /// [`Ternary::True`](crate::ternary::Ternary::True), using [`crate::equality::equals`]), but in
+    /// bucket-sized time via the derived equality index where possible.
+    ///
+    /// # Semantics (matches Cypher `=`)
+    ///
+    /// * **Numeric cross-type** — a seek for `Integer(1)` returns nodes storing `Float(1.0)` and vice
+    ///   versa (the value-key collides them), and `-0.0`/`+0.0` are one value.
+    /// * **`NaN`** — `NaN = x` is `FALSE` for every `x` (CIP §Equality), so a `NaN` target matches
+    ///   nothing: the method returns an empty vec without scanning.
+    /// * **`Null`** — `Null = x` is `NULL` (never a definite match), so a `Null` target returns empty.
+    /// * **`List`/`Map`** — these are not key-encodable, so the fast index cannot bucket them; the
+    ///   method **falls back to a scan-and-filter** over the column, preserving exact equality
+    ///   (including three-valued list/map element comparison) at scan cost. This keeps the result
+    ///   unconditionally identical to scan-and-filter for **every** value type.
+    /// * A column that was not captured (the `(label, property)` pair is absent from the spec) yields
+    ///   an empty vec — there is nothing to seek.
+    #[must_use]
+    pub fn snapshot_seek_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+        let (Some(&lid), Some(&pid)) = (self.label_ids.get(label), self.prop_ids.get(property))
+        else {
+            return Vec::new();
+        };
+        let Some(col) = self.columns.get(&(lid, pid)) else {
+            return Vec::new();
+        };
+
+        match equality_key(value) {
+            // Key-encodable target: probe the derived bucket, then re-check exact Cypher equality.
+            // The key collides every Cypher-equal value into one bucket, so the bucket is a superset
+            // of the true match set; the `equals` re-check trims it to exactly the matches (it can
+            // only ever drop a candidate, never add one). The bucket lists are already sorted in
+            // ascending internal-id order (built in id order), so the output is too.
+            KeyOutcome::Key(key) => match self.eq_index.get(&(lid, pid, key)) {
+                None => Vec::new(),
+                Some(candidates) => candidates
+                    .iter()
+                    .filter_map(|&i| {
+                        let stored = col.get(i as usize)?.as_ref()?;
+                        equals(stored, value)
+                            .is_true()
+                            .then(|| self.external.get(i as usize).copied())
+                            .flatten()
+                    })
+                    .collect(),
+            },
+            // No definite match is possible (NaN / Null target): empty, no scan needed.
+            KeyOutcome::NoMatch => Vec::new(),
+            // Not key-encodable (List / Map): exact scan-and-filter over the column.
+            KeyOutcome::Scan => col
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| {
+                    let stored = slot.as_ref()?;
+                    equals(stored, value)
+                        .is_true()
+                        .then(|| self.external.get(i).copied())
+                        .flatten()
+                })
+                .collect(),
+        }
     }
 
     /// The total degree of `node` (out-degree + in-degree), or `0` if the node is not in the
@@ -745,6 +1101,76 @@ fn intern_id(ids: &mut HashMap<String, u32>, value: &str) -> u32 {
     id
 }
 
+/// The outcome of trying to compute an equality bucket key for a seek/index value.
+enum KeyOutcome {
+    /// A Cypher-equality-canonical byte key: two Cypher-equal values produce identical bytes here.
+    Key(Vec<u8>),
+    /// The value can never form a definite equality match (`NaN` or `Null`): a seek returns empty
+    /// and the value contributes no index entry.
+    NoMatch,
+    /// The value is comparable under Cypher `=` but **not** key-encodable (`List` / `Map`): callers
+    /// must fall back to an exact scan-and-filter rather than bucket it.
+    Scan,
+}
+
+/// Computes a value's **Cypher-equality bucket key**: two values that are Cypher-equal map to the
+/// same bytes, two unequal values (almost always) to different bytes — and the rare residual
+/// collision is harmless because every bucket hit is re-checked with [`equals`].
+///
+/// Built on [`graphus_index::keycodec::encode_equality_canonical`] (the workspace's proven SSI
+/// equality-marker encoder, which already collapses Cypher-equal `Integer`/`Float` onto one key and
+/// rejects `NaN`/`Null`/`List`/`Map`), with **one extra normalization**: `-0.0` is folded to `+0.0`
+/// before encoding, because Cypher equality treats them as equal (`equals(-0.0, +0.0)` is `TRUE`)
+/// whereas the canonical encoder — built for *ordering*-derived markers — keeps them distinct. Folding
+/// the sign of zero guarantees the bucket is a **superset** of the true match set for every type, so
+/// the [`equals`] re-check never has a missing candidate to find.
+fn equality_key(value: &Value) -> KeyOutcome {
+    // Normalize signed zero so `-0.0` and `+0.0` share a bucket (Cypher equality). Only the exact
+    // `-0.0` bit pattern is rewritten; all other floats (incl. NaN, handled below by the encoder)
+    // pass through untouched.
+    let normalized;
+    let v = match value {
+        Value::Float(f) if *f == 0.0 && f.is_sign_negative() => {
+            normalized = Value::Float(0.0);
+            &normalized
+        }
+        other => other,
+    };
+    match keycodec::encode_equality_canonical(v) {
+        Ok(key) => KeyOutcome::Key(key),
+        // The encoder rejects exactly: NaN (never equal to anything ⇒ NoMatch), Null (never a
+        // definite match ⇒ NoMatch), and List/Map (comparable but not key-encodable ⇒ Scan).
+        Err(_) => match v {
+            Value::List(_) | Value::Map(_) => KeyOutcome::Scan,
+            _ => KeyOutcome::NoMatch, // Null, NaN, or any future unindexable scalar
+        },
+    }
+}
+
+/// Builds the derived equality lookup index from the materialized node columns.
+///
+/// For every captured `(label, property)` column and every node with a present, key-encodable value,
+/// records the node's internal id under `(label, property, equality_key(value))`. A node whose value
+/// is not key-encodable (a stored `List`/`Map`, or a `NaN`) is **omitted from the index** — a seek
+/// for such a value goes through the scan-and-filter / no-match paths in
+/// [`GraphSnapshot::snapshot_seek_eq`] instead, so omitting it here costs nothing and keeps the index
+/// to bucketable scalars/temporals/points. Because the outer iteration is in ascending internal-id
+/// order, each bucket's id list is sorted by construction.
+fn build_eq_index(columns: &NodeColumns) -> EqIndex {
+    let mut index: EqIndex = HashMap::new();
+    for (&(lid, pid), col) in columns {
+        for (i, slot) in col.iter().enumerate() {
+            let Some(value) = slot else { continue };
+            // Only bucketable values get an index entry; `Scan`/`NoMatch` values are served by the
+            // seek's fallback paths, so they need none.
+            if let KeyOutcome::Key(key) = equality_key(value) {
+                index.entry((lid, pid, key)).or_default().push(i as SnapId);
+            }
+        }
+    }
+    index
+}
+
 // `GraphSnapshot` owns only `Send + Sync` data (Vec / HashMap / String / Value, all of which are
 // `Send + Sync`) — no `Rc`, `RefCell`, `Cell`, or borrows. This compile-time assertion pins that:
 // if a future field re-introduces a non-thread-safe type, the build fails here rather than at a
@@ -759,8 +1185,177 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph_access::MemGraph;
+    use crate::graph_access::{Incident, MemGraph, RelData};
     use std::collections::BTreeSet;
+
+    /// A minimal **adjacency-list-backed** [`GraphAccess`] used *only* by the measurement harness, so
+    /// projecting a 200k-node snapshot is `O(N + E)` rather than the `O(N · E)` that
+    /// [`MemGraph::expand`] (a full relationship scan per node) would impose at that scale. It is a
+    /// read-only fixture: every write method is `unreachable!` because the harness never mutates it.
+    struct FastGraph {
+        /// Per-node `(labels, age)` — every node is a `:Person` with an `age`.
+        ages: Vec<i64>,
+        /// `out[i]` = outgoing `(rel_id, neighbour_internal)` of node `i`.
+        out: Vec<Vec<(u64, u32)>>,
+        /// `inc[i]` = incoming `(rel_id, neighbour_internal)` of node `i` (the reverse edges).
+        inc: Vec<Vec<(u64, u32)>>,
+        /// `rel_endpoints[r]` = `(start_internal, end_internal)` for relationship id `r`.
+        rel_endpoints: Vec<(u32, u32)>,
+    }
+
+    impl FastGraph {
+        /// A ring of `n` `:Person { age }` nodes wired with a `KNOWS` ring + `+7` chords (mirroring
+        /// the shape of [`build_source`]'s KNOWS web), so degrees vary and the topology is realistic.
+        fn ring(n: usize) -> Self {
+            let mut g = FastGraph {
+                ages: (0..n).map(|i| (i % 80) as i64 + 18).collect(),
+                out: vec![Vec::new(); n],
+                inc: vec![Vec::new(); n],
+                rel_endpoints: Vec::new(),
+            };
+            let add = |g: &mut FastGraph, a: usize, b: usize| {
+                let r = g.rel_endpoints.len() as u64;
+                g.rel_endpoints.push((a as u32, b as u32));
+                g.out[a].push((r, b as u32));
+                g.inc[b].push((r, a as u32));
+            };
+            for i in 0..n {
+                add(&mut g, i, (i + 1) % n);
+                if i % 3 == 0 {
+                    add(&mut g, i, (i + 7) % n);
+                }
+            }
+            g
+        }
+    }
+
+    impl GraphAccess for FastGraph {
+        fn scan_nodes(&self) -> Vec<NodeId> {
+            (0..self.ages.len() as u64).map(NodeId).collect()
+        }
+        fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+            if label == "Person" {
+                self.scan_nodes()
+            } else {
+                Vec::new()
+            }
+        }
+        fn expand(
+            &self,
+            node: NodeId,
+            direction: ExpandDirection,
+            _types: &[String],
+        ) -> Vec<Incident> {
+            let i = node.0 as usize;
+            let mut out = Vec::new();
+            let want_out = matches!(direction, ExpandDirection::Outgoing | ExpandDirection::Both);
+            let want_in = matches!(direction, ExpandDirection::Incoming | ExpandDirection::Both);
+            if want_out {
+                if let Some(es) = self.out.get(i) {
+                    out.extend(es.iter().map(|&(r, nb)| Incident {
+                        rel: RelId(r),
+                        neighbour: NodeId(u64::from(nb)),
+                    }));
+                }
+            }
+            if want_in {
+                if let Some(es) = self.inc.get(i) {
+                    out.extend(es.iter().map(|&(r, nb)| Incident {
+                        rel: RelId(r),
+                        neighbour: NodeId(u64::from(nb)),
+                    }));
+                }
+            }
+            out
+        }
+        fn node_exists(&self, node: NodeId) -> bool {
+            (node.0 as usize) < self.ages.len()
+        }
+        fn rel_exists(&self, rel: RelId) -> bool {
+            (rel.0 as usize) < self.rel_endpoints.len()
+        }
+        fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
+            self.node_exists(node).then(|| vec!["Person".to_owned()])
+        }
+        fn rel_data(&self, rel: RelId) -> Option<RelData> {
+            self.rel_endpoints
+                .get(rel.0 as usize)
+                .map(|&(s, e)| RelData {
+                    rel_type: "KNOWS".to_owned(),
+                    start: NodeId(u64::from(s)),
+                    end: NodeId(u64::from(e)),
+                })
+        }
+        fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+            if key == "age" {
+                self.ages.get(node.0 as usize).map(|&a| Value::Integer(a))
+            } else {
+                None
+            }
+        }
+        fn rel_property(&self, _rel: RelId, _key: &str) -> Option<Value> {
+            None
+        }
+        fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
+            self.node_property(node, "age")
+                .map(|v| vec![("age".to_owned(), v)])
+        }
+        fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
+            self.rel_exists(rel).then(Vec::new)
+        }
+        // ---- writes: the harness is read-only, so these are never called ----
+        fn create_node(&mut self, _labels: &[String], _properties: &[(String, Value)]) -> NodeId {
+            unreachable!("FastGraph is read-only")
+        }
+        fn create_rel(
+            &mut self,
+            _rel_type: &str,
+            _start: NodeId,
+            _end: NodeId,
+            _properties: &[(String, Value)],
+        ) -> RelId {
+            unreachable!("FastGraph is read-only")
+        }
+        fn set_node_property(&mut self, _node: NodeId, _key: &str, _value: Value) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn set_rel_property(&mut self, _rel: RelId, _key: &str, _value: Value) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn add_labels(&mut self, _node: NodeId, _labels: &[String]) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn remove_labels(&mut self, _node: NodeId, _labels: &[String]) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn remove_node_property(&mut self, _node: NodeId, _key: &str) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn remove_rel_property(&mut self, _rel: RelId, _key: &str) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn replace_node_properties(&mut self, _node: NodeId, _properties: &[(String, Value)]) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn merge_node_properties(&mut self, _node: NodeId, _properties: &[(String, Value)]) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn replace_rel_properties(&mut self, _rel: RelId, _properties: &[(String, Value)]) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn merge_rel_properties(&mut self, _rel: RelId, _properties: &[(String, Value)]) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn incident_rels(&self, _node: NodeId) -> Vec<RelId> {
+            unreachable!("FastGraph is read-only")
+        }
+        fn delete_rel(&mut self, _rel: RelId) {
+            unreachable!("FastGraph is read-only")
+        }
+        fn delete_node(&mut self, _node: NodeId) {
+            unreachable!("FastGraph is read-only")
+        }
+    }
 
     /// A non-trivial source graph: `count` `:Person` nodes (each with a numeric `age`), `count / 4`
     /// `:Company` nodes (each with a numeric `size`), plus a deterministic web of `KNOWS` (person→
@@ -780,14 +1375,25 @@ mod tests {
             );
             companies.push(c);
         }
-        // KNOWS: a deterministic ring + chords so degrees vary.
+        // KNOWS: a deterministic ring + chords so degrees vary. Each KNOWS carries a numeric `since`
+        // year so the relationship property columns have data to capture.
         for i in 0..people.len() {
             let a = people[i];
             let b = people[(i + 1) % people.len()];
-            g.add_rel("KNOWS", a, b, [] as [(&str, Value); 0]);
+            g.add_rel(
+                "KNOWS",
+                a,
+                b,
+                [("since", Value::Integer(2000 + (i % 20) as i64))],
+            );
             if i % 3 == 0 {
                 let c = people[(i + 7) % people.len()];
-                g.add_rel("KNOWS", a, c, [] as [(&str, Value); 0]);
+                g.add_rel(
+                    "KNOWS",
+                    a,
+                    c,
+                    [("since", Value::Integer(1990 + (i % 10) as i64))],
+                );
             }
         }
         // WORKS_AT: each person to one company.
@@ -812,6 +1418,24 @@ mod tests {
         SnapshotSpec::new()
             .with_column("Person", "age")
             .with_column("Company", "size")
+            .with_rel_column("KNOWS", "since")
+    }
+
+    /// Ground-truth scan-and-filter: the node ids of `label` whose `property` is Cypher-equal to
+    /// `value`, computed directly over the source graph with [`equals`] (the exact reference
+    /// [`GraphSnapshot::snapshot_seek_eq`] must match). Sorted ascending for set comparison.
+    fn scan_and_filter_eq(g: &MemGraph, label: &str, property: &str, value: &Value) -> Vec<u64> {
+        let mut out: Vec<u64> = g
+            .scan_nodes_by_label(label)
+            .into_iter()
+            .filter(|&n| match g.node_property(n, property) {
+                Some(stored) => equals(&stored, value).is_true(),
+                None => false,
+            })
+            .map(|n| n.0)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// Ground-truth sum+count of `age` over `:Person`, computed directly over the source graph, with
@@ -1144,5 +1768,427 @@ mod tests {
         assert_eq!(snap.node_property(Some("Person"), ghost, "age"), None);
         assert_eq!(snap.degree(ghost), 0);
         assert!(snap.expand(ghost, ExpandDirection::Both, &[]).is_empty());
+    }
+
+    // ---- relationship property columns --------------------------------------------------------
+
+    #[test]
+    fn rel_property_columns_match_source() {
+        let (g, _people, _companies) = build_source(40);
+        let snap = GraphSnapshot::project(&g, &person_age_spec());
+
+        // The KNOWS/since column is captured; an undeclared one is not.
+        assert!(snap.has_rel_column("KNOWS", "since"));
+        assert!(!snap.has_rel_column("KNOWS", "weight"));
+        assert!(!snap.has_rel_column("WORKS_AT", "since"));
+
+        // The distinct-relationship count equals the directed-edge count (no dangling edges).
+        assert_eq!(snap.rel_count(), snap.edge_count());
+
+        // Every captured relationship value matches the source, by both the typed and the
+        // type-agnostic accessor.
+        let rows = snap.rel_property_rows("KNOWS", "since");
+        assert!(!rows.is_empty());
+        for (rel, v) in &rows {
+            assert_eq!(g.rel_property(*rel, "since"), Some(v.clone()));
+            assert_eq!(
+                snap.rel_property(Some("KNOWS"), *rel, "since"),
+                Some(v.clone())
+            );
+            assert_eq!(snap.rel_property(None, *rel, "since"), Some(v.clone()));
+        }
+
+        // The row count equals the number of KNOWS rels with a present `since` in the source.
+        let want = g
+            .scan_nodes()
+            .iter()
+            .flat_map(|&n| g.expand(n, ExpandDirection::Outgoing, &["KNOWS".to_owned()]))
+            .filter(|inc| g.rel_property(inc.rel, "since").is_some())
+            .count();
+        assert_eq!(rows.len(), want);
+
+        // A WORKS_AT relationship has no `since` column captured, so a typed read is None even
+        // though that relationship exists in the snapshot.
+        let some_works_at = g
+            .scan_nodes()
+            .iter()
+            .flat_map(|&n| g.expand(n, ExpandDirection::Outgoing, &["WORKS_AT".to_owned()]))
+            .map(|inc| inc.rel)
+            .next();
+        if let Some(rel) = some_works_at {
+            assert_eq!(snap.rel_property(Some("WORKS_AT"), rel, "since"), None);
+        }
+
+        // An undeclared column yields no rows.
+        assert!(snap.rel_property_rows("KNOWS", "weight").is_empty());
+        // An unknown relationship reads as None (no panic).
+        assert_eq!(
+            snap.rel_property(Some("KNOWS"), RelId(u64::MAX), "since"),
+            None
+        );
+    }
+
+    /// Serial and rayon-parallel aggregations over a **relationship** property column are bit-
+    /// identical to each other and to a ground truth over the source.
+    #[test]
+    fn rel_property_parallel_and_serial_are_bit_identical() {
+        use rayon::prelude::*;
+
+        let (g, _people, _companies) = build_source(600);
+        let snap = GraphSnapshot::project(&g, &person_age_spec());
+
+        let rows = snap.rel_property_rows("KNOWS", "since");
+        assert!(!rows.is_empty());
+
+        // Ground truth: sum + count of KNOWS.since over the source, in a fixed (rel-id) reduction
+        // order so a hypothetical float fold would be deterministic too.
+        let mut gt: Vec<(u64, i64)> = g
+            .scan_nodes()
+            .iter()
+            .flat_map(|&n| g.expand(n, ExpandDirection::Outgoing, &["KNOWS".to_owned()]))
+            .filter_map(|inc| match g.rel_property(inc.rel, "since") {
+                Some(Value::Integer(s)) => Some((inc.rel.0, s)),
+                _ => None,
+            })
+            .collect();
+        gt.sort_unstable();
+        let gt_sum: i64 = gt.iter().map(|(_, s)| *s).sum();
+        let gt_count = gt.len();
+
+        let serial_sum: i64 = rows
+            .iter()
+            .map(|(_, v)| match v {
+                Value::Integer(s) => *s,
+                _ => 0,
+            })
+            .sum();
+        // Integer addition is associative + commutative, so the rayon reduction tree is bit-
+        // identical to the serial sum regardless of how the work splits.
+        let parallel_sum: i64 = rows
+            .par_iter()
+            .map(|(_, v)| match v {
+                Value::Integer(s) => *s,
+                _ => 0,
+            })
+            .sum();
+
+        assert_eq!(serial_sum, parallel_sum, "serial vs parallel rel sum");
+        assert_eq!(
+            rows.len(),
+            rows.par_iter().count(),
+            "serial vs parallel count"
+        );
+        assert_eq!(serial_sum, gt_sum, "snapshot rel sum vs ground truth");
+        assert_eq!(rows.len(), gt_count, "snapshot rel count vs ground truth");
+    }
+
+    // ---- all Value variants round-trip --------------------------------------------------------
+
+    /// Every [`Value`] variant captured in a node and a relationship column round-trips losslessly
+    /// through the snapshot (the columns store the value verbatim).
+    #[test]
+    fn every_value_variant_round_trips() {
+        use graphus_core::value::spatial::{Crs, Point};
+        use graphus_core::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
+
+        // One representative of every Value variant (including nested list/map and both Point arities).
+        let variants: Vec<Value> = vec![
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Integer(i64::MIN),
+            Value::Integer(0),
+            Value::Integer(i64::MAX),
+            Value::Float(-0.0),
+            Value::Float(3.5),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::String(String::new()),
+            Value::String("héllo, world \u{1f600}".to_owned()),
+            Value::Bytes(vec![]),
+            Value::Bytes(vec![0u8, 1, 2, 255]),
+            Value::List(vec![
+                Value::Integer(1),
+                Value::String("x".to_owned()),
+                Value::Null,
+            ]),
+            Value::Map(vec![
+                ("k".to_owned(), Value::Integer(7)),
+                (
+                    "nested".to_owned(),
+                    Value::List(vec![Value::Boolean(false)]),
+                ),
+            ]),
+            Value::Date(Date {
+                days_since_epoch: -19000,
+            }),
+            Value::LocalTime(LocalTime {
+                nanos_of_day: 123_456_789,
+            }),
+            Value::ZonedTime(ZonedTime {
+                time: LocalTime {
+                    nanos_of_day: 3_600_000_000_000,
+                },
+                offset_seconds: -3600,
+            }),
+            Value::LocalDateTime(LocalDateTime {
+                epoch_seconds: -42,
+                nanos: 500,
+            }),
+            Value::zoned_date_time(ZonedDateTime {
+                local: LocalDateTime {
+                    epoch_seconds: 1_700_000_000,
+                    nanos: 1,
+                },
+                offset_seconds: 3600,
+                zone_id: "Europe/Lisbon".to_owned(),
+            }),
+            Value::Duration(Duration {
+                months: 1,
+                days: 2,
+                seconds: 3,
+                nanos: 4,
+            }),
+            Value::Point(Point::new_2d(Crs::Cartesian, 1.5, -2.5)),
+            Value::Point(Point::new_3d(Crs::Wgs84_3D, 10.0, 20.0, 30.0)),
+        ];
+
+        // Build a graph where node i carries `:T { p: variants[i] }` and is the start of a self-
+        // loop `:R { p: variants[i] }`. A Null value is not stored (Cypher does not persist null
+        // properties), so it round-trips as "absent" → None, which we assert separately.
+        let mut g = MemGraph::new();
+        let mut nodes = Vec::new();
+        let mut rels = Vec::new();
+        for v in &variants {
+            let n = g.add_node(["T"], [("p", v.clone())]);
+            nodes.push(n);
+            let r = g.add_rel("R", n, n, [("p", v.clone())]);
+            rels.push(r);
+        }
+
+        let spec = SnapshotSpec::new()
+            .with_column("T", "p")
+            .with_rel_column("R", "p");
+        let snap = GraphSnapshot::project(&g, &spec);
+
+        for (idx, v) in variants.iter().enumerate() {
+            let want = if v.is_null() { None } else { Some(v.clone()) };
+            assert_eq!(
+                snap.node_property(Some("T"), nodes[idx], "p"),
+                want.clone(),
+                "node variant {v:?} did not round-trip"
+            );
+            assert_eq!(
+                snap.rel_property(Some("R"), rels[idx], "p"),
+                want,
+                "rel variant {v:?} did not round-trip"
+            );
+        }
+    }
+
+    // ---- derived equality lookup index --------------------------------------------------------
+
+    #[test]
+    fn seek_eq_matches_scan_and_filter() {
+        // A graph whose `:Item.code` column exercises the tricky equality cases: integers, the
+        // matching float twin, signed zero, a string, and duplicates (so a bucket has >1 member).
+        let mut g = MemGraph::new();
+        g.add_node(["Item"], [("code", Value::Integer(1))]);
+        g.add_node(["Item"], [("code", Value::Integer(1))]); // duplicate of 1
+        g.add_node(["Item"], [("code", Value::Float(1.0))]); // Cypher-equal to Integer(1)
+        g.add_node(["Item"], [("code", Value::Integer(2))]);
+        g.add_node(["Item"], [("code", Value::Float(2.5))]);
+        g.add_node(["Item"], [("code", Value::Float(-0.0))]); // equal to +0.0 and Integer(0)
+        g.add_node(["Item"], [("code", Value::Integer(0))]);
+        g.add_node(["Item"], [("code", Value::String("x".to_owned()))]);
+        g.add_node(["Item"], [("code", Value::Float(f64::NAN))]); // never equal to anything
+        g.add_node(["Item"], [] as [(&str, Value); 0]); // no code → contributes to nothing
+        g.add_node(["Other"], [("code", Value::Integer(1))]); // wrong label → never matched
+
+        let snap = GraphSnapshot::project(&g, &SnapshotSpec::new().with_column("Item", "code"));
+
+        // Each probe must equal the scan-and-filter reference exactly (same set, same order).
+        let probes = [
+            Value::Integer(1),  // finds the two Integer(1) AND the Float(1.0)
+            Value::Float(1.0),  // same set as Integer(1)
+            Value::Integer(2),  // finds Integer(2) but NOT Float(2.5)
+            Value::Float(2.5),  // finds Float(2.5)
+            Value::Integer(0),  // finds Integer(0) AND Float(-0.0)
+            Value::Float(0.0),  // same set as Integer(0)
+            Value::Float(-0.0), // same set as Integer(0)
+            Value::String("x".to_owned()),
+            Value::Integer(999),                  // absent → empty
+            Value::Float(f64::NAN),               // NaN matches nothing (incl. the stored NaN)
+            Value::Null,                          // Null is never a definite match → empty
+            Value::List(vec![Value::Integer(1)]), // not key-encodable → scan path, empty here
+        ];
+        for p in &probes {
+            let mut got: Vec<u64> = snap
+                .snapshot_seek_eq("Item", "code", p)
+                .iter()
+                .map(|n| n.0)
+                .collect();
+            got.sort_unstable();
+            let want = scan_and_filter_eq(&g, "Item", "code", p);
+            assert_eq!(got, want, "seek_eq != scan_and_filter for probe {p:?}");
+        }
+
+        // Spot-check the cross-type bucket is genuinely non-trivial (1, 1, 1.0 → three nodes).
+        assert_eq!(
+            snap.snapshot_seek_eq("Item", "code", &Value::Integer(1))
+                .len(),
+            3
+        );
+        // Signed-zero + integer-zero collapse into one bucket (Integer(0), Float(-0.0)).
+        assert_eq!(
+            snap.snapshot_seek_eq("Item", "code", &Value::Float(0.0))
+                .len(),
+            2
+        );
+        // An uncaptured column seeks to empty.
+        assert!(
+            snap.snapshot_seek_eq("Item", "name", &Value::Integer(1))
+                .is_empty()
+        );
+        // An unknown label seeks to empty.
+        assert!(
+            snap.snapshot_seek_eq("Ghost", "code", &Value::Integer(1))
+                .is_empty()
+        );
+    }
+
+    /// **Measured parallel-speedup harness** (the deliverable's headline number).
+    ///
+    /// Builds a large snapshot (200k `:Person` nodes plus a relationship web), then runs the same
+    /// label-property aggregation **serially** and via **`rayon::par_iter`**, printing `serial_ms`,
+    /// `parallel_ms` and `speedup`. The work per node is a small CPU kernel over the node's property
+    /// and degree (representative of a query read that touches each row), so the run is compute-bound
+    /// enough for the parallel scaling to show; the result is asserted bit-identical between the two
+    /// paths (integer fold ⇒ order-independent) so the harness also doubles as a correctness check.
+    ///
+    /// Honours `RAYON_NUM_THREADS`. `#[ignore]`d so it never runs in the normal suite; run it with:
+    ///
+    /// ```text
+    /// RAYON_NUM_THREADS=1  cargo test -p graphus-cypher --release --lib \
+    ///     snapshot::tests::measure_parallel_speedup -- --ignored --nocapture
+    /// RAYON_NUM_THREADS=16 cargo test -p graphus-cypher --release --lib \
+    ///     snapshot::tests::measure_parallel_speedup -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement harness: run with --ignored --nocapture and RAYON_NUM_THREADS set"]
+    fn measure_parallel_speedup() {
+        use rayon::prelude::*;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // 200k :Person { age } nodes wired in a KNOWS ring + chords. `FastGraph` gives O(N+E)
+        // projection (vs MemGraph's O(N·E) full-scan expand), so building the snapshot is sub-second
+        // and the timed work below is purely the aggregation.
+        const N: usize = 200_000;
+        let g = FastGraph::ring(N);
+        let snap = GraphSnapshot::project(&g, &SnapshotSpec::new().with_column("Person", "age"));
+        let nodes = snap.scan_nodes();
+        assert_eq!(nodes.len(), N, "expected exactly {N} nodes");
+
+        // A per-node kernel representative of a query read: pull the node's age (column read), its
+        // degree (CSR read), and mix them through a few cheap arithmetic ops. Returns an i64 so the
+        // fold is associative/commutative ⇒ identical serial vs parallel.
+        let kernel = |&n: &NodeId| -> i64 {
+            let age = match snap.node_property(Some("Person"), n, "age") {
+                Some(Value::Integer(a)) => a,
+                _ => 0,
+            };
+            let deg = snap.degree(n) as i64;
+            // A handful of integer ops so the per-row cost is non-trivial but data-driven (not
+            // optimised away — inputs come from the snapshot, output is summed).
+            let mut acc = age.wrapping_mul(31).wrapping_add(deg);
+            for _ in 0..32 {
+                acc = acc.wrapping_mul(1_000_003).wrapping_add(deg).rotate_left(7);
+            }
+            acc ^ (age & deg)
+        };
+
+        // Warm both paths once (touch caches, spin up the rayon pool) before timing.
+        let warm_s: i64 = nodes.iter().map(kernel).sum();
+        let warm_p: i64 = nodes.par_iter().map(kernel).sum();
+        assert_eq!(warm_s, warm_p, "warmup serial vs parallel must agree");
+
+        // Repeat a few rounds and keep the best (least-noisy) wall-clock of each path.
+        const ROUNDS: usize = 5;
+        let mut serial_best = f64::INFINITY;
+        let mut parallel_best = f64::INFINITY;
+        let (mut s_sum, mut p_sum) = (0i64, 0i64);
+        for _ in 0..ROUNDS {
+            let t = Instant::now();
+            let s: i64 = nodes.iter().map(kernel).sum();
+            serial_best = serial_best.min(t.elapsed().as_secs_f64() * 1e3);
+            s_sum = black_box(s);
+
+            let t = Instant::now();
+            let p: i64 = nodes.par_iter().map(kernel).sum();
+            parallel_best = parallel_best.min(t.elapsed().as_secs_f64() * 1e3);
+            p_sum = black_box(p);
+        }
+        assert_eq!(
+            s_sum, p_sum,
+            "serial and parallel aggregation must be bit-identical"
+        );
+
+        let threads = rayon::current_num_threads();
+        let speedup = serial_best / parallel_best;
+        println!(
+            "snapshot parallel-read aggregation over {nodes} nodes | rayon_threads={threads} | \
+             serial_ms={serial_best:.3} parallel_ms={parallel_best:.3} speedup={speedup:.2}x",
+            nodes = nodes.len(),
+        );
+    }
+
+    /// The equality index agrees with scan-and-filter across a larger, mixed-type column, and the
+    /// seek is `Send + Sync`-safe to run from rayon workers.
+    #[test]
+    fn seek_eq_matches_scan_and_filter_at_scale() {
+        use rayon::prelude::*;
+
+        let mut g = MemGraph::new();
+        // 2000 nodes: alternating Integer / matching-Float so cross-type buckets are populated, plus
+        // a string tail. Values repeat (mod 50) so buckets carry many members.
+        for i in 0..2000i64 {
+            let v = match i % 3 {
+                0 => Value::Integer(i % 50),
+                1 => Value::Float((i % 50) as f64), // Cypher-equal to the Integer twin
+                _ => Value::String(format!("s{}", i % 50)),
+            };
+            g.add_node(["K"], [("v", v)]);
+        }
+        let snap = GraphSnapshot::project(&g, &SnapshotSpec::new().with_column("K", "v"));
+
+        // Probe every distinct value form and confirm the snapshot's seek equals scan-and-filter.
+        let probes: Vec<Value> = (0..50i64)
+            .flat_map(|k| {
+                [
+                    Value::Integer(k),
+                    Value::Float(k as f64),
+                    Value::String(format!("s{k}")),
+                ]
+            })
+            .collect();
+
+        // Run all probes in parallel — the snapshot is Sync, so workers share &snap.
+        let mismatches: usize = probes
+            .par_iter()
+            .filter(|p| {
+                let mut got: Vec<u64> = snap
+                    .snapshot_seek_eq("K", "v", p)
+                    .iter()
+                    .map(|n| n.0)
+                    .collect();
+                got.sort_unstable();
+                got != scan_and_filter_eq(&g, "K", "v", p)
+            })
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "every parallel seek must match scan-and-filter"
+        );
     }
 }

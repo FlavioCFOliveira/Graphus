@@ -88,3 +88,18 @@ graphus-sim = { path = "../graphus-sim" }
 # (`tests/proptest_keycodec.rs`, `rmp` task #27), complementing the deterministic cross-check in
 # `ordering_vs_keycodec.rs`. `std`-only pin, matching the rest of the workspace.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Criterion for the `GraphSnapshot` serial-vs-parallel read benchmark (`benches/snapshot_parallel.rs`,
+# `rmp` task #351). Same lean pin/features as the rest of the workspace (`graphus-bench`,
+# `graphus-io`): `cargo_bench_support` runs the harness; gnuplot/HTML are left off to keep the dev
+# build lean. The parallel side uses `rayon`, already a normal dependency of this crate (the snapshot
+# fans reads across cores with it), so the bench adds no new crate to the build graph.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+# The serial-vs-parallel `GraphSnapshot` aggregation benchmark (`rmp` task #351): projects a large
+# frozen snapshot, then times a label-property read aggregation folded serially vs via `rayon`,
+# proving the data-parallel read win. `cargo bench -p graphus-cypher --bench snapshot_parallel`.
+[[bench]]
+name = "snapshot_parallel"
+harness = false

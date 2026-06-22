@@ -1150,6 +1150,7 @@ dependencies = [
 name = "graphus-cypher"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "csv",
  "graphus-bufpool",
  "graphus-columnar",
