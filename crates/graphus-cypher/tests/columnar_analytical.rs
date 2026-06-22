@@ -1129,3 +1129,53 @@ fn parallel_size_gate_below_serial_above_parallel() {
 // covered deterministically by a one-thread-pool unit test in `executor::tests`
 // (`parallel_thread_gate_declines_single_worker`), because the `!Send` coordinator cannot be driven
 // inside a `rayon` `pool.install` from an integration test.
+
+/// Measurement harness (ignored): END-TO-END aggregation latency THROUGH THE EXECUTOR (compile +
+/// `project_snapshot` + fold), not just the isolated snapshot fold of
+/// `snapshot::tests::measure_parallel_speedup`. With `RAYON_NUM_THREADS=1` the gate
+/// (`current_num_threads() > 1`) fails so the executor picks the existing SERIAL vectorized tier;
+/// with `RAYON_NUM_THREADS=16` it picks the PARALLEL tier — so running this twice measures the real
+/// before/after of `rmp` #352 over the live `RecordStoreGraph` path (projection cost included).
+///
+/// Reproduce:
+///   RAYON_NUM_THREADS=1  cargo test -p graphus-cypher --release --test columnar_analytical \
+///       measure_executor_parallel_speedup -- --ignored --nocapture
+///   RAYON_NUM_THREADS=16 cargo test -p graphus-cypher --release --test columnar_analytical \
+///       measure_executor_parallel_speedup -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_executor_parallel_speedup() {
+    const MEASURE_N: i64 = 200_000;
+    const ROUNDS: u32 = 30;
+    let query = "MATCH (n:Person) RETURN sum(n.age) AS r";
+
+    let mut coord = fresh_coord();
+    bulk_seed(&mut coord, "Person", MEASURE_N);
+    coord
+        .declare_columnar_cache("Person", "age")
+        .expect("declare");
+
+    // Warm the columnar cache + one-time costs, then time a steady-state batch.
+    let _ = read_scalar(&mut coord, query, "r");
+    let hits_before = coord.parallel_scan_hits();
+    let start = std::time::Instant::now();
+    let mut last = Value::Null;
+    for _ in 0..ROUNDS {
+        last = read_scalar(&mut coord, query, "r");
+    }
+    let per_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(ROUNDS);
+    let engaged = coord.parallel_scan_hits() - hits_before;
+
+    // The result is invariant of the path taken (closed form: sum of ages 0..MEASURE_N-1).
+    assert_eq!(
+        last,
+        Value::Integer((MEASURE_N - 1) * MEASURE_N / 2),
+        "aggregate must be exact regardless of path"
+    );
+
+    println!(
+        "EXECUTOR-E2E sum(n.age) over {MEASURE_N} :Person | rayon_threads={} | per_query_ms={per_ms:.3} | rounds={ROUNDS} | parallel_engaged={} (hits+={engaged})",
+        rayon::current_num_threads(),
+        engaged > 0,
+    );
+}

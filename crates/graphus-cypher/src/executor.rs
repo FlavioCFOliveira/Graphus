@@ -2444,18 +2444,20 @@ fn try_parallel_label_property_aggregate(
         }
     }
 
-    // --- project the frozen snapshot off the seam (registers the identical SSI markers here) ---
-    // `None` ⇒ the seam declines (no columnar cache / historical read / RBAC-restricted / unsupported
-    // spec) ⇒ fall through to the serial tiers, which run verbatim.
-    let spec = crate::snapshot::SnapshotSpec::new().with_column(label.clone(), property.clone());
-    let Some(snapshot) = ctx.graph.project_snapshot(&spec) else {
+    // --- read the SAME owned candidate column the serial vectorized tier reads ---
+    // One MVCC-revalidating pass through the seam that registers the identical SSI/predicate markers
+    // (RBAC-restricted principals decline one layer up); `None` ⇒ no columnar cache / historical read
+    // ⇒ fall through to the serial tiers, which run verbatim. We then fold these owned `(node, value)`
+    // rows in parallel directly. NB (rmp #352 measurement): building a full `GraphSnapshot` here
+    // (topology + label index + a reconstructed column) measured ~1.8x SLOWER than serial — the fold
+    // never touches that structure and the dominant cost is this read, which is identical on both
+    // paths. The materialized-snapshot enabler is for compute-heavy operators (traversals/GDS), not a
+    // trivial associative fold whose bottleneck is the read.
+    let Some(scan) = ctx.graph.columnar_label_property_scan(label, &property) else {
         return Ok(None);
     };
-
-    // The present `(node, value)` rows (the only data the property folds touch) and the full label
-    // count (the `count(*)` support). These are owned, `Send + Sync`, and now detached from the seam.
-    let rows = snapshot.label_property_rows(label, &property);
-    let label_matches = snapshot.scan_nodes_by_label(label).len();
+    let rows = scan.rows;
+    let label_matches = scan.label_matches;
 
     // If any property fold (`sum`/`min`/`max`) is requested, require an ALL-INTEGER column: a
     // float/mixed column is the deferred slice (float `+` is non-associative, so a parallel reduction
@@ -4681,6 +4683,24 @@ mod tests {
             Some(crate::snapshot::GraphSnapshot::from_label_column(
                 label, property, members, rows,
             ))
+        }
+        fn columnar_label_property_scan(
+            &self,
+            label: &str,
+            property: &str,
+        ) -> Option<crate::graph_access::ColumnarScan> {
+            // The parallel aggregation tier reads its owned column from this seam (the same one the
+            // serial vectorized tier uses); supply it from the inner graph so the gate tests exercise
+            // the real engage/decline path. The size gate is still driven by the faked `statistics`.
+            let members = self.inner.scan_nodes_by_label(label);
+            let rows = members
+                .iter()
+                .filter_map(|&n| self.inner.node_property(n, property).map(|v| (n, v)))
+                .collect();
+            Some(crate::graph_access::ColumnarScan {
+                label_matches: members.len(),
+                rows,
+            })
         }
         fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
             Some(self)
