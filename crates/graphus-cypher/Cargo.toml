@@ -73,6 +73,13 @@ csv = "1.4"
 # header at read time and falls back to the authoritative row read on any mismatch, so it carries no
 # durability/ACID surface and cannot return a wrong row.
 graphus-columnar = { path = "../graphus-columnar" }
+# Data-parallel reads over the immutable `GraphSnapshot` (src/snapshot.rs, `rmp` task #350). The
+# snapshot is a frozen, owned, `Send + Sync` read-only view projected off the live `GraphAccess`
+# seam on the engine thread; once built it carries no `Rc`/`RefCell`, so query reads/aggregations
+# can fan across all cores with `rayon` exactly as `graphus-gds` already does over its CSR
+# projection. `rayon` is already in the build graph (a direct dep of `graphus-gds`), so this adds no
+# new crate. Mirrors gds's plain `rayon = "1"` (NOT a workspace dep).
+rayon = "1"
 
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.

@@ -1163,6 +1163,7 @@ dependencies = [
  "graphus-wal",
  "jiff-tzdb",
  "proptest",
+ "rayon",
  "tz-rs",
 ]
 

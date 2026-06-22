@@ -139,6 +139,7 @@ pub mod record_graph;
 pub mod result;
 pub mod runtime;
 pub mod semantics;
+pub mod snapshot;
 pub(crate) mod spatial_fns;
 pub mod statement_clock;
 pub mod static_type;
@@ -212,6 +213,7 @@ pub use semantics::{
     ValidatedQuery, analyze, analyze_to_graphus, analyze_with_extensions, analyze_with_procedures,
     check_implicit_call_parameters,
 };
+pub use snapshot::{GraphSnapshot, LabelId, RelTypeId, SnapId, SnapIncident, SnapshotSpec};
 pub use statement_clock::StatementClock;
 pub use statistics::Statistics;
 pub use ternary::Ternary;
