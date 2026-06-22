@@ -59,7 +59,7 @@ Whenever you author, exercise, or validate test scenarios — especially those i
 
 ### Examples
 
-The repository MUST organize the project's demonstrative examples inside an `examples/*` folder at the root of the project. Each example MUST be contained in its own dedicated sub-folder, used exclusively for that example.
+The repository MUST organize the project's demonstrative examples inside an `examples/*` folder at the root of the project. Each example MUST be contained in its own dedicated sub-folder, used exclusively for that example. Examples are NOT an integral part of the server; they are instruments used to exercise the server and its functionalities.
 
 The project's examples MUST **always** be **REALISTIC E2E demonstrations** of how Graphus is used. Every example MUST always fulfill the following objectives:
 
@@ -68,6 +68,8 @@ The project's examples MUST **always** be **REALISTIC E2E demonstrations** of ho
 3. **Evidence** — each example MUST allow the objective and explicit collection of evidence while its functionalities are exercised, in order to clearly evaluate ALL of Graphus's performance vectors (memory usage, CPU, storage).
 
 Examples MUST be able to act as simulations of real-world scenarios that, when run, allow observing Graphus's behavior in order to better understand its performance, as well as the opportunities for improvement in the usage of CPU, RAM, and storage.
+
+To perform the proper measurements, collect the evidence, and interpret it, you MUST use the tools most appropriate to the technology stack — tools that allow each behavior to be observed in detail so that sound conclusions can be drawn from the resulting data.
 
 ## Core rules
 
