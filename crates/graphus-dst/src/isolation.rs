@@ -274,6 +274,58 @@ mod tests {
         );
     }
 
+    /// **Guards rmp #341** (concurrency-ready SSI tracker): the SSI abort **victim is a deterministic
+    /// function of the input** — the same concurrent write-skew workload, replayed on a fresh engine,
+    /// aborts the **same** transaction every time.
+    ///
+    /// This is the engine-level "same seed ⇒ same victim" assertion the #341 design requires. #341
+    /// moved SIREAD-marker recording off the inline path into a per-statement [`SsiReadBuffer`] that
+    /// is sorted+deduped and merged at statement-end; if that merge ordering (or the
+    /// `detect_pivot_abort` `.min()` tie-break it feeds) were sensitive to anything other than the
+    /// marker *set*, the victim could vary run-to-run, breaking the DST's "same input ⇒ identical
+    /// trace" invariant. The `FxHashMap`-based tracker has no per-process seed and the merge sorts
+    /// before replay, so the victim is pinned; this replays the canonical write-skew several times and
+    /// asserts the abortee is invariant.
+    #[test]
+    fn ssi_abort_victim_is_deterministic_rmp341() {
+        // Run the identical write-skew workload on a fresh engine and report which transaction was
+        // the abort victim (`1` = t1 aborted, `2` = t2 aborted). Exactly one must abort each run.
+        fn write_skew_victim() -> u64 {
+            let mut eng = engine();
+            // Seed both single-row registers x and y (committed before the concurrent pair).
+            let s = eng.begin(AccessMode::Write).expect("begin setup");
+            append(&mut eng, s, "x", 0);
+            append(&mut eng, s, "y", 0);
+            eng.commit(s).expect("commit setup");
+
+            let t1 = eng.begin(AccessMode::Write).expect("begin t1");
+            let t2 = eng.begin(AccessMode::Write).expect("begin t2");
+            // Each reads the other's register, then writes its own — the write-skew shape.
+            let _ = read_list(&mut eng, t1, "y");
+            let _ = read_list(&mut eng, t2, "x");
+            append(&mut eng, t1, "x", 1);
+            append(&mut eng, t2, "y", 1);
+            let c1 = eng.commit(t1).is_ok();
+            let c2 = eng.commit(t2).is_ok();
+            assert!(
+                c1 ^ c2,
+                "exactly one of the write-skew pair must abort, got {c1},{c2}"
+            );
+            if c1 { 2 } else { 1 } // the one that did NOT commit is the victim
+        }
+
+        let victim = write_skew_victim();
+        // Replaying the identical workload must abort the identical transaction every time.
+        for run in 0..8 {
+            assert_eq!(
+                write_skew_victim(),
+                victim,
+                "run {run}: the SSI abort victim must be a deterministic function of the input \
+                 (rmp #341 — buffered+merged SIREAD markers must not perturb the victim)"
+            );
+        }
+    }
+
     /// **Guards rmp #171** (single-key phantom lost-update), FIXED. Both txns read the empty list for
     /// key `a` then append to it; interleaved. Each empty predicate read registers a predicate SIREAD
     /// marker that the other's concurrent insert matches, closing the rw-antidependencies that make

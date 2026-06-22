@@ -81,7 +81,8 @@ use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_io::BlockDevice;
 use graphus_storage::{ConstraintKind, MvccHeader, Namespace, RecordStore};
 use graphus_txn::{
-    CommitRegistry, LockOutcome, LockTable, PredicateRead, Snapshot, SsiTracker, is_visible,
+    CommitRegistry, LockOutcome, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
+    is_visible,
 };
 use graphus_wal::LogSink;
 
@@ -98,6 +99,113 @@ fn node_ssi_key(id: u64) -> u64 {
 /// The SSI conflict key for relationship physical id `id` (tagged into the high half of the space).
 fn rel_ssi_key(id: u64) -> u64 {
     id | REL_SSI_KEY_TAG
+}
+
+/// Holds this statement's [`SsiReadBuffer`] and merges it into the shared [`SsiTracker`] at the
+/// **single-writer merge point** (`rmp` #341).
+///
+/// Every read seam (`note_read` / `note_predicate_read`) **appends** a SIREAD marker to this buffer
+/// rather than recording it into the shared tracker directly — the universal path, single-threaded
+/// and (later) off-thread alike. The accumulated markers are merged back in exactly once, through
+/// [`SsiTracker::merge_read_buffer`] (which sorts+dedups them so the conflict graph is a
+/// deterministic function of the read *set*, byte-identical to recording each marker inline).
+///
+/// ## When the merge happens (the M1 barrier)
+///
+/// - **Universal single-threaded path (#341):** the guard's [`Drop`] runs when the per-statement
+///   [`RecordStoreGraph`] seam is dropped (statement-end). Because the engine dispatches commands
+///   serially, no other transaction's `record_write` / `detect_pivot_abort` can run between a
+///   marker's append and this drop, so the merge is timing-equivalent to inline recording. The seam
+///   is always dropped before the coordinator runs the next command (COMMIT, or the next statement),
+///   so a partner's commit-time detection always observes this reader's markers — rule M1.
+/// - **Off-thread reader pool (#336, Slice 3):** the coordinator will instead call
+///   [`flush_read_buffer`](RecordStoreGraph::flush_read_buffer) (or take the buffer via
+///   [`take_read_buffer`](Self::take)) when the reader thread retires, merging on the coordinator
+///   thread with the happens-before the retirement channel establishes. After a take/flush the
+///   buffer is empty, so the `Drop` merge is a no-op — the two delivery routes never double-apply.
+///
+/// The guard owns a **clone of the `Rc<RefCell<SsiTracker>>`** (single-threaded; the tracker is only
+/// ever touched on the coordinator thread) so the merge does not depend on the rest of the seam, and
+/// so a *partial move* of the seam's `store` (in `commit`/`rollback`/`into_store`) still drops the
+/// guard normally and performs the merge. On the standalone path (`ssi: None`) there is nothing to
+/// merge and every method is a cheap no-op (the buffer stays empty — `note_*` skip the append).
+struct ReadBufferGuard {
+    /// The shared tracker to merge into, or `None` on the standalone (un-coordinated) path.
+    ssi: Option<Rc<RefCell<SsiTracker>>>,
+    /// This statement's accumulated SIREAD markers. `None` once taken for off-thread delivery
+    /// (`rmp` #336); `Some(empty)` after an explicit flush. `RefCell` because the read seams append
+    /// through `&self`.
+    buffer: RefCell<Option<SsiReadBuffer>>,
+}
+
+impl ReadBufferGuard {
+    /// A guard for transaction `txn`, merging into `ssi` (or a no-op guard when `ssi` is `None`).
+    fn new(txn: TxnId, ssi: Option<Rc<RefCell<SsiTracker>>>) -> Self {
+        Self {
+            ssi,
+            buffer: RefCell::new(Some(SsiReadBuffer::new(txn))),
+        }
+    }
+
+    /// Appends a physical-key SIREAD marker. A no-op on the standalone path (no tracker to merge to),
+    /// matching the pre-#341 behaviour where `note_read` did nothing without a coordinator.
+    fn record_read(&self, key: u64) {
+        if self.ssi.is_some()
+            && let Some(buf) = self.buffer.borrow_mut().as_mut()
+        {
+            buf.record_read(key);
+        }
+    }
+
+    /// Appends a predicate SIREAD marker. A no-op on the standalone path.
+    fn record_predicate_read(&self, predicate: PredicateRead) {
+        if self.ssi.is_some()
+            && let Some(buf) = self.buffer.borrow_mut().as_mut()
+        {
+            buf.record_predicate_read(predicate);
+        }
+    }
+
+    /// Merges the accumulated markers into the shared tracker **now**, leaving the buffer empty so a
+    /// later `Drop` (or flush) does not re-apply them. Idempotent. The well-factored merge point
+    /// Slice 3's reader-pool retirement will call from the coordinator thread.
+    fn flush(&self) {
+        let Some(ssi) = &self.ssi else {
+            return; // standalone path: nothing to merge.
+        };
+        // Take the markers out (replacing with an empty buffer for the same txn) so the merge runs
+        // exactly once even if `flush` is called again or the `Drop` runs afterwards.
+        let drained = {
+            let mut slot = self.buffer.borrow_mut();
+            match slot.as_mut() {
+                Some(buf) if !buf.is_empty() => {
+                    let reader = buf.reader();
+                    Some(std::mem::replace(buf, SsiReadBuffer::new(reader)))
+                }
+                _ => None,
+            }
+        };
+        if let Some(buf) = drained {
+            ssi.borrow_mut().merge_read_buffer(buf);
+        }
+    }
+
+    /// Removes the buffer for **off-thread delivery** (`rmp` #336, Slice 3): the reader thread hands
+    /// the owned buffer back to the coordinator, which merges it with the retirement channel's
+    /// happens-before. After this the `Drop` merge is a no-op. `None` if already taken/flushed empty.
+    #[allow(dead_code)] // Wired by `rmp` #336 (Slice 3); kept here so the merge point is factored.
+    fn take(&self) -> Option<SsiReadBuffer> {
+        self.buffer.borrow_mut().take()
+    }
+}
+
+impl Drop for ReadBufferGuard {
+    fn drop(&mut self) {
+        // The universal single-threaded merge point: drain at statement-end (seam drop). A no-op on
+        // the standalone path, after an explicit `flush`, or after the buffer was `take`n for
+        // off-thread delivery.
+        self.flush();
+    }
 }
 
 /// Renders a [`Value`] compactly for a constraint-violation message (`rmp` task #99): a string is
@@ -181,6 +289,14 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// (`04 §5.4`, `rmp` task #46). `None` in the standalone single-transaction path (no concurrency,
     /// nothing to track).
     ssi: Option<Rc<RefCell<SsiTracker>>>,
+    /// This statement's deferred SIREAD-marker buffer + its merge-on-drop guard (`rmp` #341). Reads
+    /// (`note_read`/`note_predicate_read`) **append** their markers here instead of recording them
+    /// into the shared `ssi` tracker inline; the markers are merged back — sorted+deduped, so
+    /// byte-identically to inline recording — when this seam is dropped (statement-end, the M1
+    /// barrier) or when the coordinator explicitly drains it (the off-thread path, `rmp` #336). On
+    /// the standalone path it holds no tracker and every append is a no-op, so reads stay marker-free
+    /// exactly as before. See [`ReadBufferGuard`].
+    read_buffer: ReadBufferGuard,
     /// The shared write-lock table, present iff coordinated. A write acquires the entity's lock
     /// first-updater-wins; a conflicting concurrent writer captures a retriable serialization error
     /// (`04 §5.7`, `rmp` task #46). Reads never touch it (they never block, NFR-4).
@@ -250,6 +366,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             snapshot,
             registry,
             ssi: None,
+            // Standalone path: no coordinator ⇒ no tracker to merge into; the guard's appends are
+            // no-ops, so reads register no SIREAD markers exactly as before (`rmp` #341).
+            read_buffer: ReadBufferGuard::new(txn, None),
             locks: None,
             error: RefCell::new(None),
             // Standalone path: no coordinator, so no derived index; every access falls back to a
@@ -289,12 +408,16 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         // that commits later is excluded by the `ts` filter regardless, and this statement's own
         // in-flight writes resolve via the owner rule.
         let registry = store.borrow().commit_registry().clone();
+        // The deferred-read buffer merges into the same shared tracker; clone the `Rc` for the guard
+        // before `ssi` is moved into the field (`rmp` #341).
+        let read_buffer = ReadBufferGuard::new(txn, Some(Rc::clone(&ssi)));
         Self {
             store,
             txn,
             snapshot,
             registry,
             ssi: Some(ssi),
+            read_buffer,
             locks: Some(locks),
             error: RefCell::new(None),
             // Coordinated path: the shared derived index is present, so label scans and node-property
@@ -311,10 +434,13 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
 
     /// Records a non-blocking SIREAD marker for `key` under this transaction, if it is coordinated
     /// (`04 §5.4`); a no-op in the standalone path. Reads never block (NFR-4).
+    ///
+    /// The marker is **buffered** in this statement's [`ReadBufferGuard`] (the universal path,
+    /// `rmp` #341) rather than recorded into the shared [`SsiTracker`] inline; it is merged
+    /// (sorted/deduped, byte-identically to inline recording) at statement-end (the M1 barrier),
+    /// which lets the read run off-thread (`rmp` #336) without taking a lock on the shared tracker.
     fn note_read(&self, key: u64) {
-        if let Some(ssi) = &self.ssi {
-            ssi.borrow_mut().record_read(self.txn, key);
-        }
+        self.read_buffer.record_read(key);
     }
 
     /// Records that this transaction wrote `key`: closes rw-antidependency edges with concurrent
@@ -341,9 +467,20 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// [`note_read`](Self::note_read) cannot: a predicate read sees the *set* of matching nodes
     /// (possibly empty), so a concurrent insert that makes a node match must abort one of the two.
     fn note_predicate_read(&self, predicate: PredicateRead) {
-        if let Some(ssi) = &self.ssi {
-            ssi.borrow_mut().record_predicate_read(self.txn, predicate);
-        }
+        self.read_buffer.record_predicate_read(predicate);
+    }
+
+    /// Merges this statement's buffered SIREAD markers into the shared [`SsiTracker`] **now** (`rmp`
+    /// #341), the well-factored single-writer merge point. Idempotent and a no-op on the standalone
+    /// path; after it runs the seam's drop will not re-merge.
+    ///
+    /// The universal single-threaded path relies on the seam's drop to merge at statement-end, so
+    /// callers do **not** normally invoke this. It exists so the off-thread reader pool (`rmp` #336,
+    /// Slice 3) can drain a retired reader's buffer **on the coordinator thread** — the merge must
+    /// run where the tracker lives, never on the reader thread — keeping the merge point a single,
+    /// reused function for both delivery routes.
+    pub fn flush_read_buffer(&self) {
+        self.read_buffer.flush();
     }
 
     /// Announces the **predicate footprint** of node `node` to the SSI tracker (`rmp` #171): the set
@@ -514,6 +651,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             snapshot: Snapshot { owner: txn, ts },
             registry,
             ssi: None,
+            // Standalone snapshot path: no coordinator ⇒ no tracker; the guard's appends are no-ops
+            // (reads register no SIREAD markers, exactly as before — `rmp` #341).
+            read_buffer: ReadBufferGuard::new(txn, None),
             locks: None,
             error: RefCell::new(None),
             // Standalone snapshot path: no derived index (the index lives in the coordinator).

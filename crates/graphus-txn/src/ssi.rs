@@ -86,7 +86,17 @@ use crate::store::Key;
 /// Coarser granularity only ever causes *more* aborts among **concurrently-overlapping** transactions;
 /// it never produces a false abort for non-overlapping (serial) transactions, because every edge is
 /// gated on [`SsiTracker::are_concurrent`] just like a physical-key edge.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// ## Total order (`PartialOrd`/`Ord`)
+///
+/// `PredicateRead` derives a **total order** (variant-then-field, every field being a `u32` or
+/// `Vec<u8>`, both `Ord`). This is the determinism lever for [`SsiTracker::merge_read_buffer`]
+/// (`rmp` #341): a reader's buffered predicate markers are sorted before they are replayed into the
+/// shared tracker, so the replay order is a pure function of the marker *set* — independent of the
+/// order the reader happened to append them in (and so of any future reader-thread interleaving).
+/// The marker operations are commutative+idempotent, so the order does not change the resulting
+/// conflict graph; the sort makes that graph a deterministic function of the seed regardless.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PredicateRead {
     /// An all-nodes scan (`MATCH (n)`): the read depends on *every* node, so any node insert matches.
     AllNodes,
@@ -166,6 +176,78 @@ pub struct SsiTracker {
     /// the eager counterpart of the commit-time [`detect_pivot_abort`](Self::detect_pivot_abort),
     /// which alone cannot catch a pivot whose two rw-edges form only after it commits (`rmp` audit F9).
     doomed: HashSet<TxnId>,
+}
+
+/// A per-reader, append-only, thread-local SIREAD marker buffer (`rmp` #341).
+///
+/// A read-only transaction's entire SSI footprint is a **set** of physical-key SIREAD markers
+/// ([`record_read`](Self::record_read)) plus a **set** of predicate SIREAD markers
+/// ([`record_predicate_read`](Self::record_predicate_read)). Both are pure set-inserts whose
+/// edge-forming side effects are commutative and idempotent (see [`SsiTracker`]). This buffer lets a
+/// reader **accumulate** those markers without touching the shared [`SsiTracker`] at all: it is owned
+/// by exactly one transaction (one thread), mutated only through `&mut self`, and **moved by value**
+/// to the writer/coordinator thread, which replays it through [`SsiTracker::merge_read_buffer`].
+///
+/// There is deliberately **no shared lock, no `Rc`/`RefCell`, no `Arc`** inside it: it is a plain
+/// owned `Vec` pair, trivially [`Send`]. This is what makes recording a reader's markers callable
+/// from an off-thread reader (`rmp` #336, Slice 3) with **zero** contention — each reader mutates
+/// only its own buffer, and the single edge-forming structure (`SsiTracker`) is never shared with a
+/// reader thread. In the current single-threaded path (`rmp` #341) the buffer is held by the
+/// per-statement seam and merged when the statement ends, which is timing-equivalent to recording
+/// each marker inline (only one statement runs at a time on the engine thread, so no other
+/// transaction's command can observe the shared tracker between a marker's append and the merge).
+///
+/// # Determinism
+///
+/// The buffer preserves append order, but [`SsiTracker::merge_read_buffer`] **sorts and dedups**
+/// before replaying, so the order a reader appended markers in is invisible to the resulting conflict
+/// graph. See [`PredicateRead`] for the total order the predicate sort relies on.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct SsiReadBuffer {
+    /// The transaction whose markers these are. Every buffered marker is replayed under this id.
+    reader: TxnId,
+    /// Physical-key SIREAD markers, in append order; sorted + deduped at
+    /// [`merge`](SsiTracker::merge_read_buffer).
+    keys: Vec<Key>,
+    /// Predicate SIREAD markers, in append order; sorted + deduped at
+    /// [`merge`](SsiTracker::merge_read_buffer).
+    predicates: Vec<PredicateRead>,
+}
+
+impl SsiReadBuffer {
+    /// An empty buffer for transaction `reader`.
+    pub fn new(reader: TxnId) -> Self {
+        Self {
+            reader,
+            keys: Vec::new(),
+            predicates: Vec::new(),
+        }
+    }
+
+    /// The transaction this buffer accumulates markers for.
+    #[must_use]
+    pub fn reader(&self) -> TxnId {
+        self.reader
+    }
+
+    /// Whether the buffer holds no markers (nothing to merge).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.predicates.is_empty()
+    }
+
+    /// Buffers a physical-key SIREAD marker (`reader` read `key`). A pure append — **no** shared
+    /// lock, no conflict-graph mutation; edges form deterministically when the buffer is merged.
+    pub fn record_read(&mut self, key: Key) {
+        self.keys.push(key);
+    }
+
+    /// Buffers a predicate SIREAD marker (`reader` read the set of nodes matching `predicate`). A
+    /// pure append, like [`record_read`](Self::record_read).
+    pub fn record_predicate_read(&mut self, predicate: PredicateRead) {
+        self.predicates.push(predicate);
+    }
 }
 
 impl SsiTracker {
@@ -287,6 +369,52 @@ impl SsiTracker {
             for r in readers {
                 self.add_edge(r, writer);
             }
+        }
+    }
+
+    /// Drains a reader's [`SsiReadBuffer`] into the shared conflict graph, recomputing its rw-OUT
+    /// edges deterministically (`rmp` #341). This is the **single-writer merge point**: it must be
+    /// called on the one thread that owns the [`SsiTracker`] (the writer/coordinator thread), at the
+    /// reader's statement-end / commit, **before** any partner transaction's
+    /// [`detect_pivot_abort`](Self::detect_pivot_abort) runs (`rmp` #341 rule M1).
+    ///
+    /// ## Why this is byte-identical to recording each marker inline
+    ///
+    /// The reader's markers are replayed through the **existing** [`record_read`](Self::record_read)
+    /// and [`record_predicate_read`](Self::record_predicate_read) — the only place rw-edges form is
+    /// unchanged. Those operations are **commutative and idempotent** (set inserts into `reads` /
+    /// `readers_of` / `predicate_reads` / `predicate_readers_of`, and monotone edge unions in
+    /// `add_edge`), so the resulting `TxnConflict` graph is the *union* over the replayed markers,
+    /// independent of replay order and of how many times a marker is applied. Recording the markers
+    /// inline in statement-execution order (the pre-#341 path) therefore yields the **identical**
+    /// graph as replaying them here. Under the read-only-concurrent scope (a single writer thread)
+    /// the merge is the only point at which a reader's markers enter the graph, and it happens within
+    /// one serial coordinator step, so no other transaction can observe a partially-merged buffer.
+    ///
+    /// ## Determinism (the load-bearing sort)
+    ///
+    /// The markers are **sorted (`sort_unstable`) and deduped** before replay, so the replay order is
+    /// a pure function of the marker *set* — not of the order the reader appended them (which a future
+    /// off-thread reader could vary run-to-run). [`Key`] is `u64: Ord` and [`PredicateRead`] derives a
+    /// total order. Combined with the commutativity above, this makes the conflict graph — and hence
+    /// the [`detect_pivot_abort`](Self::detect_pivot_abort) victim — a byte-identical function of the
+    /// DST seed regardless of reader-thread interleaving. **Do not** replay in append order; the sort
+    /// is the determinism contract (`ssi.rs` module docs).
+    pub fn merge_read_buffer(&mut self, buf: SsiReadBuffer) {
+        let SsiReadBuffer {
+            reader,
+            mut keys,
+            mut predicates,
+        } = buf;
+        keys.sort_unstable();
+        keys.dedup();
+        predicates.sort_unstable();
+        predicates.dedup();
+        for key in keys {
+            self.record_read(reader, key);
+        }
+        for predicate in predicates {
+            self.record_predicate_read(reader, predicate);
         }
     }
 
@@ -830,5 +958,208 @@ mod tests {
         s.record_read(TxnId(2), 100);
         assert!(!s.is_pivot(TxnId(2)));
         assert_eq!(s.detect_pivot_abort(TxnId(2)), None);
+    }
+
+    // --- `rmp` #341: SsiReadBuffer + merge_read_buffer equivalence ---------------------------------
+
+    /// `SsiReadBuffer` must be `Send` (it is moved from a reader thread to the coordinator in Slice 3).
+    /// A compile-time assertion, mirroring the crate's other Send/Sync gates.
+    const _: () = {
+        const fn assert_send<T: Send>() {}
+        let _ = assert_send::<SsiReadBuffer>;
+    };
+
+    /// One transaction's conflict-graph fingerprint: `(id, in_conflict, out_conflict, sorted
+    /// out_edges, sorted in_edges, commit_ts, begin_ts)` — every field `detect_pivot_abort` consumes.
+    type TxnFingerprint = (u64, bool, bool, Vec<u64>, Vec<u64>, Option<u64>, u64);
+
+    /// A full conflict-graph fingerprint of every tracked transaction, used to assert that merging a
+    /// buffered read set produces a **byte-identical** graph to recording each marker inline. Two
+    /// trackers are equivalent iff every transaction's flags + edge sets + commit/begin timestamps and
+    /// the global `doomed` set match (the entire input `detect_pivot_abort` consumes).
+    fn graph_fingerprint(s: &SsiTracker) -> Vec<TxnFingerprint> {
+        let mut rows: Vec<_> = s
+            .txns
+            .iter()
+            .map(|(id, t)| {
+                let mut out_edges: Vec<u64> = t.out_edges.iter().map(|e| e.0).collect();
+                out_edges.sort_unstable();
+                let mut in_edges: Vec<u64> = t.in_edges.iter().map(|e| e.0).collect();
+                in_edges.sort_unstable();
+                (
+                    id.0,
+                    t.in_conflict,
+                    t.out_conflict,
+                    out_edges,
+                    in_edges,
+                    t.commit_ts.map(|c| c.0),
+                    t.begin_ts.0,
+                )
+            })
+            .collect();
+        rows.sort_unstable_by_key(|r| r.0);
+        rows
+    }
+
+    #[test]
+    fn merge_read_buffer_equals_inline_record_read() {
+        // The headline #341 equivalence: a reader that buffers its physical-key SIREAD markers and
+        // merges them at commit forms the EXACT same conflict graph (and abort victim) as recording
+        // each marker inline. Write-skew shape so a pivot actually forms.
+        let build_inline = || {
+            let mut s = SsiTracker::new();
+            s.register(TxnId(1), ts(1));
+            s.register(TxnId(2), ts(1));
+            s.record_read(TxnId(1), 100); // T1 reads x
+            s.record_read(TxnId(2), 200); // T2 reads y
+            s.record_write(TxnId(1), 200); // T2 --rw--> T1
+            s.record_write(TxnId(2), 100); // T1 --rw--> T2
+            s
+        };
+        let build_buffered = || {
+            let mut s = SsiTracker::new();
+            s.register(TxnId(1), ts(1));
+            s.register(TxnId(2), ts(1));
+            // Readers buffer their reads instead of recording inline.
+            let mut b1 = SsiReadBuffer::new(TxnId(1));
+            b1.record_read(100);
+            let mut b2 = SsiReadBuffer::new(TxnId(2));
+            b2.record_read(200);
+            // Merge at statement-end (here: before the writes that close the back-edges), the
+            // single-threaded M1 ordering. Under one writer this is the inline ordering.
+            s.merge_read_buffer(b1);
+            s.merge_read_buffer(b2);
+            s.record_write(TxnId(1), 200);
+            s.record_write(TxnId(2), 100);
+            s
+        };
+        let inline = build_inline();
+        let buffered = build_buffered();
+        assert_eq!(
+            graph_fingerprint(&inline),
+            graph_fingerprint(&buffered),
+            "buffered+merged read set must form a byte-identical conflict graph to inline recording"
+        );
+        // And the abort victim is identical for every committing order.
+        assert_eq!(
+            inline.detect_pivot_abort(TxnId(1)),
+            buffered.detect_pivot_abort(TxnId(1))
+        );
+        assert_eq!(
+            inline.detect_pivot_abort(TxnId(2)),
+            buffered.detect_pivot_abort(TxnId(2))
+        );
+        assert_eq!(buffered.detect_pivot_abort(TxnId(1)), Some(TxnId(1)));
+    }
+
+    #[test]
+    fn merge_read_buffer_is_append_order_independent() {
+        // Determinism lever: two readers appending the SAME marker set in DIFFERENT orders merge to
+        // the identical graph (the sort_unstable+dedup makes replay a function of the set, not order).
+        let writer_then_check = |order: &[u64]| {
+            let mut s = SsiTracker::new();
+            s.register(TxnId(1), ts(1));
+            s.register(TxnId(2), ts(1));
+            // A concurrent writer wrote three keys the reader will mark.
+            s.record_write(TxnId(2), 10);
+            s.record_write(TxnId(2), 20);
+            s.record_write(TxnId(2), 30);
+            let mut b = SsiReadBuffer::new(TxnId(1));
+            for &k in order {
+                b.record_read(k);
+            }
+            s.merge_read_buffer(b);
+            s
+        };
+        let ascending = writer_then_check(&[10, 20, 30]);
+        let descending = writer_then_check(&[30, 20, 10]);
+        let shuffled = writer_then_check(&[20, 10, 30, 20]); // includes a duplicate
+        assert_eq!(
+            graph_fingerprint(&ascending),
+            graph_fingerprint(&descending)
+        );
+        assert_eq!(graph_fingerprint(&ascending), graph_fingerprint(&shuffled));
+        // The reader took an rw-OUT edge to the concurrent writer on all three keys.
+        assert!(ascending.txns.get(&TxnId(1)).unwrap().out_conflict);
+    }
+
+    #[test]
+    fn merge_read_buffer_equals_inline_for_predicates() {
+        // The predicate-marker analogue of the headline equivalence (phantom write-skew, `rmp` #171
+        // shape): buffering predicate reads + merging == recording them inline.
+        let px = PredicateRead::Label(100);
+        let py = PredicateRead::Label(200);
+        let build_inline = || {
+            let mut s = SsiTracker::new();
+            s.register(TxnId(1), ts(1));
+            s.register(TxnId(2), ts(1));
+            s.record_predicate_read(TxnId(1), px.clone());
+            s.record_predicate_read(TxnId(2), py.clone());
+            s.record_predicate_write(TxnId(1), &[PredicateRead::AllNodes, py.clone()]);
+            s.record_predicate_write(TxnId(2), &[PredicateRead::AllNodes, px.clone()]);
+            s.record_write(TxnId(1), 1);
+            s.record_write(TxnId(2), 2);
+            s
+        };
+        let build_buffered = || {
+            let mut s = SsiTracker::new();
+            s.register(TxnId(1), ts(1));
+            s.register(TxnId(2), ts(1));
+            let mut b1 = SsiReadBuffer::new(TxnId(1));
+            b1.record_predicate_read(px.clone());
+            let mut b2 = SsiReadBuffer::new(TxnId(2));
+            b2.record_predicate_read(py.clone());
+            s.merge_read_buffer(b1);
+            s.merge_read_buffer(b2);
+            s.record_predicate_write(TxnId(1), &[PredicateRead::AllNodes, py.clone()]);
+            s.record_predicate_write(TxnId(2), &[PredicateRead::AllNodes, px.clone()]);
+            s.record_write(TxnId(1), 1);
+            s.record_write(TxnId(2), 2);
+            s
+        };
+        let inline = build_inline();
+        let buffered = build_buffered();
+        assert_eq!(graph_fingerprint(&inline), graph_fingerprint(&buffered));
+        assert_eq!(
+            inline.detect_pivot_abort(TxnId(1)),
+            buffered.detect_pivot_abort(TxnId(1))
+        );
+        assert!(buffered.is_pivot(TxnId(1)) && buffered.is_pivot(TxnId(2)));
+    }
+
+    #[test]
+    fn merge_read_buffer_case_i_edge_against_already_written_key() {
+        // Case (i): the writer wrote the key BEFORE the reader's markers are merged. Merging must
+        // close the reader's rw-OUT edge (its replayed `record_read` finds the concurrent writer),
+        // exactly as an inline read would have.
+        let mut inline = SsiTracker::new();
+        inline.register(TxnId(1), ts(1));
+        inline.register(TxnId(2), ts(1));
+        inline.record_write(TxnId(2), 100); // writer writes first
+        inline.record_read(TxnId(1), 100); // reader reads the overwritten key inline
+
+        let mut buffered = SsiTracker::new();
+        buffered.register(TxnId(1), ts(1));
+        buffered.register(TxnId(2), ts(1));
+        buffered.record_write(TxnId(2), 100);
+        let mut b = SsiReadBuffer::new(TxnId(1));
+        b.record_read(100);
+        buffered.merge_read_buffer(b); // merge after the write
+
+        assert_eq!(graph_fingerprint(&inline), graph_fingerprint(&buffered));
+        assert!(buffered.txns.get(&TxnId(1)).unwrap().out_conflict);
+        assert!(buffered.txns.get(&TxnId(2)).unwrap().in_conflict);
+    }
+
+    #[test]
+    fn empty_read_buffer_merge_is_a_noop() {
+        // A read-only statement that touched nothing leaves the graph unchanged.
+        let mut s = SsiTracker::new();
+        s.register(TxnId(1), ts(1));
+        let before = graph_fingerprint(&s);
+        let b = SsiReadBuffer::new(TxnId(1));
+        assert!(b.is_empty());
+        s.merge_read_buffer(b);
+        assert_eq!(before, graph_fingerprint(&s));
     }
 }

@@ -27,3 +27,19 @@ graphus-sim = { path = "../graphus-sim" }
 # dev-dependency idiom): the test build links graphus-txn with `test-support` on, so the gated
 # reference types are available to tests without exposing them to production consumers.
 graphus-txn = { path = ".", features = ["test-support"] }
+
+# `loom` model-checks the `rmp` #341 SsiReadBuffer handoff: it explores every legal interleaving of
+# off-thread readers buffering SIREAD markers and a single coordinator-role thread merging them +
+# detecting the abort victim, proving the conflict graph (and the deterministic victim) is unaffected
+# by reader-thread scheduling. The SSI core itself stays single-threaded (the tracker is never shared
+# with a reader thread); loom instruments only the buffer handoff (its `Arc`/`mpsc`). The loom test
+# (`tests/loom_ssi.rs`) is a separate crate, so `loom` is a dev-dependency gated on `--cfg loom`
+# (compiled only under that flag — never in a normal `cargo test`). Run with:
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-txn --test loom_ssi --release
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+# `loom` is a known custom cfg the crate sets via RUSTFLAGS; register it so `unexpected_cfgs`
+# (and therefore `clippy -D warnings`) stays quiet without a build script.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
