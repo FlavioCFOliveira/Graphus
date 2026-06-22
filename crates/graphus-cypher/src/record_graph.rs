@@ -204,6 +204,10 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// accelerator can never return a wrong row. `None` on the standalone path (every analytical scan
     /// then uses the row path).
     columns: Option<Rc<RefCell<crate::column_cache::ColumnCache>>>,
+    /// The shared derived **zone-map data-skipping sidecar** (`rmp` task #331), present only on the
+    /// coordinated path. Maintained (widening) on write by [`reindex_node`](Self::reindex_node); the
+    /// skip decision it drives is conservative, so it never changes which rows a scan returns.
+    zones: Option<Rc<RefCell<crate::zone_map::ZoneMap>>>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
@@ -243,6 +247,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // Standalone path: no derived columnar cache, so an analytical scan uses the row path
             // (`rmp` #329). The cache lives in the coordinator.
             columns: None,
+            // Standalone path: no zone-map sidecar (it lives in the coordinator); scans skip nothing.
+            zones: None,
         }
     }
 
@@ -252,6 +258,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// passes the shared `ssi` tracker so this statement's reads/writes contribute SIREAD markers and
     /// rw-edges. Unlike [`begin`](Self::begin) it does **not** begin a transaction and must not be
     /// committed/rolled back through this handle — the coordinator owns that lifecycle.
+    // Eight shared handles wired from the coordinator (store, txn, snapshot, ssi, locks, index,
+    // columns, zones) — an internal constructor where threading a struct would only obscure the seam.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         store: Rc<RefCell<RecordStore<D, S>>>,
         txn: TxnId,
@@ -260,6 +269,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         locks: Rc<RefCell<LockTable>>,
         index: Rc<RefCell<IndexSet>>,
         columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
+        zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
     ) -> Self {
         // Snapshot the shared store's Active/Recent Transaction Table for this statement's reads
         // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
@@ -281,6 +291,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // Coordinated path: the shared derived columnar cache is present, so an analytical
             // property scan can read from the contiguous column with a per-node re-check (`rmp` #329).
             columns: Some(columns),
+            // Coordinated path: the shared zone-map sidecar is present and maintained on write (`rmp` #331).
+            zones: Some(zones),
         }
     }
 
@@ -495,6 +507,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             defer_constraint_check: std::cell::Cell::new(false),
             // Standalone snapshot path: no derived columnar cache (it lives in the coordinator).
             columns: None,
+            // Standalone snapshot path: no zone-map sidecar (it lives in the coordinator).
+            zones: None,
         }
     }
 
@@ -1052,6 +1066,22 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
             if complete {
                 index.insert_composite(label_token, &property_tokens, &tuple, node.0);
+            }
+        }
+        drop(index);
+
+        // Zone-map data-skipping sidecar (`rmp` task #331): widen the node's zone for each declared
+        // `(label, property)` it carries. Widening-only — a removal/overwrite leaves the interval
+        // over-wide, which only reduces skipping (never wrongly skips), so no removal hook is needed
+        // (the scan's per-row re-check drops a since-changed value). A no-op when nothing is declared.
+        if let Some(zones) = &self.zones {
+            let mut zones = zones.borrow_mut();
+            for (label_token, prop_key) in zones.declared() {
+                if label_tokens.contains(&label_token) {
+                    if let Some((_, value)) = resolved_props.iter().find(|(k, _)| *k == prop_key) {
+                        zones.record(label_token, prop_key, node.0, value);
+                    }
+                }
             }
         }
     }

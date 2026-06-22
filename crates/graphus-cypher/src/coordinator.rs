@@ -199,6 +199,10 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// any mismatch — so the cache can be arbitrarily stale and never returns a wrong row. Maintenance
     /// is therefore **rebuild-only** (no commit-path hook), exactly the safe design `rmp` #329 mandates.
     columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
+    /// The derived per-`(label, property)` **zone-map data-skipping sidecar** (`rmp` task #331),
+    /// opt-in via [`declare_zone_map`](Self::declare_zone_map), rebuilt from the store and maintained
+    /// (widening) on write. In-memory, never persisted/recovered — a re-opened coordinator re-declares.
+    zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
     /// Open transactions (begun, not yet committed/rolled back).
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
@@ -268,6 +272,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // captured) via `declare_columnar_cache`. Derived/in-memory, never recovered (`rmp` #329),
             // so a fresh coordinator over a recovered store simply re-declares + re-captures as asked.
             columns: Rc::new(RefCell::new(crate::column_cache::ColumnCache::new())),
+            // The zone-map data-skipping sidecar (`rmp` #331) likewise starts empty; columns are
+            // declared via `declare_zone_map` and rebuilt from the store, derived/never-recovered.
+            zones: Rc::new(RefCell::new(crate::zone_map::ZoneMap::new())),
             active: HashMap::new(),
             next_txn_id,
             pending_builds: VecDeque::new(),
@@ -1047,6 +1054,154 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow()
             .bitmap_serialized_bytes(label_token, prop_key)
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Zone-map data-skipping sidecar (`rmp` task #331)
+    // --------------------------------------------------------------------------------------------
+
+    /// Declares a **zone-map data-skipping** sidecar on `(label, property)` (`rmp` task #331): a
+    /// coarse per-zone `{min, max}` summary over the node-id space that lets a non-indexed predicate
+    /// scan skip whole id zones whose range cannot match. Opt-in / derived / in-memory (only the token
+    /// interning is durable), rebuilt from the current store now and maintained (widening) on every
+    /// write. Best on a column clustered by node id (append-only timestamps / sequences); it degrades
+    /// gracefully to a full scan on an unclustered column, and never changes a query's result.
+    ///
+    /// # Errors
+    /// Returns a storage error if interning either token (or its committing transaction) fails.
+    pub fn declare_zone_map(&mut self, label: &str, property: &str) -> Result<()> {
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            (label_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        self.zones.borrow_mut().declare(label_token, prop_key);
+        self.rebuild_zone_column(label_token, prop_key);
+        Ok(())
+    }
+
+    /// Rebuilds one declared zone-map column exactly from the current store: scans the in-use nodes
+    /// that carry the label and captures `(id, value)` for the property, then installs the exact
+    /// per-zone summary. Reads committed state without a snapshot (like the index rebuild); the scan's
+    /// per-row re-check makes any later staleness harmless.
+    fn rebuild_zone_column(&self, label_token: u32, prop_key: u32) {
+        let node_ids = match self.store.borrow_mut().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(_) => return,
+        };
+        let mut rows: Vec<(u64, Value)> = Vec::new();
+        for id in node_ids {
+            let (labels, chain) = {
+                let mut store = self.store.borrow_mut();
+                let labels = match store.node_labels(id) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let chain = match store.node_property_values(id) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                (labels, chain)
+            };
+            if !labels.contains(&label_token) {
+                continue;
+            }
+            if let Some((_pid, _k, value)) = chain.iter().find(|(_, k, _)| *k == prop_key) {
+                rows.push((id, value.clone()));
+            }
+        }
+        self.zones
+            .borrow_mut()
+            .rebuild_column(label_token, prop_key, rows);
+    }
+
+    /// Candidate-and-confirmed node ids for `label` whose `property` **equals** `value`, driven by the
+    /// zone-map data-skipping sidecar (`rmp` #331): only the id zones the summary cannot exclude are
+    /// examined, and each examined node is authoritatively re-checked (in-use, current label, current
+    /// value) — so the result is **exactly** the committed matching set regardless of zone staleness.
+    /// `None` if no zone map is declared for the column (the caller scans normally). After the call,
+    /// [`zone_map_zones_skipped`](Self::zone_map_zones_skipped) reports how many zones were pruned.
+    #[must_use]
+    pub fn zone_scan_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<u64>> {
+        let (label_token, prop_key) = {
+            let store = self.store.borrow();
+            (
+                store.token_id(Namespace::Label, label)?,
+                store.token_id(Namespace::PropKey, property)?,
+            )
+        };
+        let ranges = self
+            .zones
+            .borrow()
+            .candidate_ranges_eq(label_token, prop_key, value)?;
+        let high_water = self.store.borrow().node_high_water();
+        let mut out = Vec::new();
+        for (lo, hi) in ranges {
+            for id in lo.max(1)..hi.min(high_water) {
+                let (labels, chain) = {
+                    let mut store = self.store.borrow_mut();
+                    let node = match store.node(id) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    if !node.mvcc.in_use() {
+                        continue;
+                    }
+                    let labels = match store.node_labels(id) {
+                        Ok(l) => l,
+                        Err(_) => continue,
+                    };
+                    let chain = match store.node_property_values(id) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    (labels, chain)
+                };
+                if !labels.contains(&label_token) {
+                    continue;
+                }
+                if chain
+                    .iter()
+                    .find(|(_, k, _)| *k == prop_key)
+                    .is_some_and(|(_, _, v)| v == value)
+                {
+                    out.push(id);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Zones the most recent [`zone_scan_eq`](Self::zone_scan_eq) pruned (`rmp` #331 measurement).
+    #[must_use]
+    pub fn zone_map_zones_skipped(&self) -> u64 {
+        self.zones.borrow().zones_skipped()
+    }
+
+    /// Zones the most recent [`zone_scan_eq`](Self::zone_scan_eq) kept / scanned.
+    #[must_use]
+    pub fn zone_map_zones_scanned(&self) -> u64 {
+        self.zones.borrow().zones_scanned()
     }
 
     /// Re-captures **every declared** columnar column from the current store (`rmp` #329): the
@@ -2218,6 +2373,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Rc::clone(&self.locks),
             Rc::clone(&self.index),
             Rc::clone(&self.columns),
+            Rc::clone(&self.zones),
         ))
     }
 

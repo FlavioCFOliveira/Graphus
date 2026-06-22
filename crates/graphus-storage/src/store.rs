@@ -3166,6 +3166,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.store(StoreKind::Rel).alloc.high_water()
     }
 
+    /// The node store's physical high-water mark: the exclusive upper bound of the allocated id space
+    /// (`1..high_water`). The node analogue of [`rel_high_water`](Self::rel_high_water); used by the
+    /// zone-map data-skipping scan (`rmp` #331) to bound the id ranges it examines.
+    #[must_use]
+    pub fn node_high_water(&self) -> u64 {
+        self.store(StoreKind::Node).alloc.high_water()
+    }
+
     // --------------------------------- flush --------------------------------
 
     /// Flushes every dirty page home and syncs the device. The buffer pool enforces the WAL rule
