@@ -1112,6 +1112,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-coldstore"
+version = "0.0.1"
+dependencies = [
+ "graphus-columnar",
+ "proptest",
+]
+
+[[package]]
 name = "graphus-columnar"
 version = "0.0.1"
 dependencies = [

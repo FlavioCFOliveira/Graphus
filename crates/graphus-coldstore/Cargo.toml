@@ -1,0 +1,15 @@
+[package]
+name = "graphus-coldstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Immutable columnar cold tier for aged time-series partitions: double-delta seq/ts, Gorilla value and dictionary sensor segments over graphus-columnar, with per-segment min/max skipping and late-materialized range scans. The cold half of the hot/cold tiering — read-only, derived, outside MVCC."
+
+[dependencies]
+graphus-columnar = { path = "../graphus-columnar" }
+
+[dev-dependencies]
+proptest = "1.11.0"
