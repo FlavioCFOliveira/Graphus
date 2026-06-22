@@ -211,7 +211,12 @@ fn disjoint_indexed_equality_writers_both_commit_no_false_abort() {
 
     // Both writes took effect (serializable, and neither was lost to a spurious abort).
     assert_eq!(
-        read_sorted_ints(&mut coord, &cat, "MATCH (a:Account) RETURN a.bal AS bal", "bal"),
+        read_sorted_ints(
+            &mut coord,
+            &cat,
+            "MATCH (a:Account) RETURN a.bal AS bal",
+            "bal"
+        ),
         vec![1, 2],
         "both disjoint writes committed and are visible"
     );

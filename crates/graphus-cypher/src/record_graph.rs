@@ -193,6 +193,17 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// property would spuriously trip an existence check, or a soon-to-be-overwritten value would trip
     /// a uniqueness check. The enclosing method runs the single deferred check itself.
     defer_constraint_check: std::cell::Cell<bool>,
+    /// The coordinator's derived **columnar value cache** (`rmp` tasks #329 / #330), present **only**
+    /// on the coordinated path ([`attach`](Self::attach)). When `Some` and a declared column covers
+    /// `(label, property)`, [`columnar_label_property_scan`](GraphAccess::columnar_label_property_scan)
+    /// answers an analytical property scan from the contiguous column, **re-validating** each cached
+    /// value against the node's current MVCC header (xmin/tombstone witnesses) and falling back to the
+    /// authoritative single-property read on any mismatch. Like the [`IndexSet`] it is derived,
+    /// in-memory and candidate-class, so it is never committed or recovered; unlike the index it caches
+    /// the *value* (not just a candidate id), so its read-time re-check is what guarantees the
+    /// accelerator can never return a wrong row. `None` on the standalone path (every analytical scan
+    /// then uses the row path).
+    columns: Option<Rc<RefCell<crate::column_cache::ColumnCache>>>,
 }
 
 impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
@@ -229,6 +240,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // behaviour byte-for-byte unchanged.
             index: None,
             defer_constraint_check: std::cell::Cell::new(false),
+            // Standalone path: no derived columnar cache, so an analytical scan uses the row path
+            // (`rmp` #329). The cache lives in the coordinator.
+            columns: None,
         }
     }
 
@@ -245,6 +259,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         ssi: Rc<RefCell<SsiTracker>>,
         locks: Rc<RefCell<LockTable>>,
         index: Rc<RefCell<IndexSet>>,
+        columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
     ) -> Self {
         // Snapshot the shared store's Active/Recent Transaction Table for this statement's reads
         // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
@@ -263,6 +278,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // predicates seek candidates from it and re-check them here (`rmp` task #48).
             index: Some(index),
             defer_constraint_check: std::cell::Cell::new(false),
+            // Coordinated path: the shared derived columnar cache is present, so an analytical
+            // property scan can read from the contiguous column with a per-node re-check (`rmp` #329).
+            columns: Some(columns),
         }
     }
 
@@ -475,6 +493,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // Standalone snapshot path: no derived index (the index lives in the coordinator).
             index: None,
             defer_constraint_check: std::cell::Cell::new(false),
+            // Standalone snapshot path: no derived columnar cache (it lives in the coordinator).
+            columns: None,
         }
     }
 
@@ -1512,6 +1532,215 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
         }
     }
+
+    /// The **complementary columnar** answer to an analytical property scan over `(label, property)`
+    /// (`rmp` tasks #329 / #330): the `(node, value)` pairs the row path would produce
+    /// (`scan_nodes_by_label` filtered to the nodes whose `property` is present), read from the
+    /// contiguous columnar cache where it is fresh and from the authoritative row read otherwise.
+    /// `None` when no declared column covers the pair (the caller uses the row path).
+    ///
+    /// # Why this is exactly the row-path result (the soundness contract)
+    ///
+    /// The scan is **driven off the authoritative current label-candidate set** — the very same
+    /// candidates [`scan_nodes_by_label`](GraphAccess::scan_nodes_by_label) uses — so it is **complete**:
+    /// a node that gained the label/property *after* the cache was built (hence absent from the cached
+    /// column) is still a candidate and gets the row read. The columnar cache only **accelerates the
+    /// value read** for a candidate, never decides membership. For each candidate:
+    ///
+    /// 1. The node's current MVCC header is read (one O(1) record read) and the node is dropped if it
+    ///    is invisible to this snapshot — identical to [`filter_label_candidates`](Self::filter_label_candidates).
+    /// 2. The same per-candidate SIREAD ([`note_read`](Self::note_read)) is recorded, visible or not —
+    ///    so the SSI read footprint is **byte-for-byte** the row scan's (serializability unchanged).
+    /// 3. The node must currently carry `label` (`node_has_label`), exactly as the row label scan
+    ///    requires.
+    /// 4. The value is taken from the cache **iff** the two staleness witnesses still hold (the node's
+    ///    `first_prop` chain head is unchanged ⇒ no prepend since rebuild ⇒ the cached `PropRecord` is
+    ///    still the newest version of its key, **and** that `PropRecord` re-read by id is still visible
+    ///    and the right key ⇒ not tombstoned). Otherwise the value is read by the authoritative
+    ///    [`read_node_prop_one`](Self::read_node_prop_one) — which is what the row scan would have done
+    ///    for *every* node. A node whose current value is absent contributes no row, exactly as the row
+    ///    path filters a null/missing property.
+    ///
+    /// So the cache can be arbitrarily stale and the result is still **identical** to the row scan; it
+    /// is a pure accelerator. The predicate markers ([`note_predicate_read`](Self::note_predicate_read)
+    /// `Label` + [`mark_all_live_nodes`](Self::mark_all_live_nodes)) are registered exactly as
+    /// `scan_nodes_by_label` registers them, so a concurrent phantom closes the same rw-edge.
+    fn columnar_scan_checked(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<crate::graph_access::ColumnarScan> {
+        // Only the coordinated path has a columnar cache; the standalone path declines (row scan).
+        let columns = self.columns.as_ref()?;
+        // Resolve the label + property tokens WITHOUT interning (a read must not mint a token). A
+        // never-interned label/property can have no live matching node, but a *concurrent* writer
+        // could create the first one — so registering the conservative predicate markers below (as
+        // `scan_nodes_by_label` does) is what keeps that phantom serializable; here we simply decline
+        // acceleration (return `None`) so the caller's row scan handles the empty/edge case verbatim.
+        let label_token = self.label_id_existing(label)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        // Only an explicitly declared column is accelerated; everything else uses the row path.
+        if !columns.borrow().is_declared(label_token, prop_key) {
+            return None;
+        }
+
+        // --- SSI predicate footprint: identical to `scan_nodes_by_label` (`rmp` #171 / #46) ---
+        // `MATCH (n:Label)` is a predicate read over which nodes carry the label, so a concurrent
+        // insert/relabel is a phantom that must close an rw-edge even if the scan returns nothing; and
+        // the per-node SIREADs below only cover existing nodes, so the coarse all-live-nodes marker is
+        // kept. The columnar path narrows neither the membership nor the read footprint.
+        self.note_predicate_read(PredicateRead::Label(label_token));
+        self.mark_all_live_nodes();
+
+        // --- the authoritative current candidate set (same source `scan_nodes_by_label` uses) ---
+        let candidates: Vec<u64> = if let Some(index) = &self.index {
+            index.borrow_mut().seek_label(label_token)
+        } else {
+            // No index (should not happen on the coordinated path, but stay correct): full id scan.
+            match self.store.borrow_mut().scan_node_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    self.capture(e);
+                    return Some(crate::graph_access::ColumnarScan {
+                        rows: Vec::new(),
+                        label_matches: 0,
+                    });
+                }
+            }
+        };
+
+        // --- the cached column, as an O(1)-lookup map node_id -> (cached value, witness) ---
+        // The map owns each captured `Value`; the read path **moves** it out on a fresh hit
+        // ([`HashMap::remove`] below) rather than cloning, so a `String`/`List` column is materialized
+        // exactly **once** (at decode) instead of twice (decode + per-serve clone). That double
+        // allocation is what made the string column regress vs the row path; with the move, the
+        // columnar string scan pays one allocation per served value — fewer than the row path, which
+        // also walks the `strings.store` overflow heap (`rmp` #329/#330).
+        let snapshot = columns.borrow().snapshot(label_token, prop_key);
+        let mut cached: std::collections::HashMap<
+            u64,
+            (Value, crate::column_cache::ColumnWitness),
+        > = match snapshot {
+            Some(snap) => snap
+                .ids
+                .into_iter()
+                .zip(snap.values)
+                .zip(snap.witnesses)
+                .map(|((id, value), witness)| (id, (value, witness)))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        };
+
+        let mut out: Vec<(NodeId, Value)> = Vec::new();
+        // The count of visible label-carrying nodes — the exact `count(*)` value (every matched node,
+        // present-property or not), accumulated from the same single candidate pass.
+        let mut label_matches: usize = 0;
+        // Decode accounting (`rmp` #329/#330): values served from the column (zero decode) vs read
+        // from the property chain (fallback). Published to the cache at the end of the scan.
+        let mut value_hits: u64 = 0;
+        let mut fallback_reads: u64 = 0;
+        for id in candidates {
+            // Read the node record once (visibility + label re-check + the freshness witness). A
+            // candidate whose page is unallocated (a stale index entry for a reclaimed slot) is not a
+            // live node and is dropped — exactly as `filter_label_candidates` drops it.
+            let node_rec = match self.store.borrow_mut().node(id) {
+                Ok(rec) => rec,
+                Err(_) => continue,
+            };
+            // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
+            // identical per-candidate marker `filter_label_candidates` records.
+            self.note_read(node_ssi_key(id));
+            if !self.visible(node_rec.mvcc) {
+                continue;
+            }
+            // The node must currently carry the label (the row label scan's membership test).
+            match self.store.borrow_mut().node_has_label(id, label_token) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
+                    self.capture(e);
+                    return Some(crate::graph_access::ColumnarScan {
+                        rows: Vec::new(),
+                        label_matches: 0,
+                    });
+                }
+            }
+            // A visible label-carrying node: it counts toward `count(*)` regardless of the property.
+            label_matches += 1;
+
+            // Try the cache; fall back to the authoritative single-property read on any mismatch.
+            let node = NodeId(id);
+            let value = match cached.remove(&id) {
+                Some((cached_value, witness))
+                    if self.columnar_entry_is_fresh(&node_rec, witness, prop_key) =>
+                {
+                    // Fresh: the cached value IS the node's snapshot-visible newest value of the key.
+                    // Served from the contiguous column with ZERO property-chain decode (the win),
+                    // **moved** out of the map (no clone — one allocation total for the value).
+                    value_hits += 1;
+                    Some(cached_value)
+                }
+                // Cache miss, or stale (a prepend/overwrite/tombstone since rebuild, or a concurrent
+                // writer): read the authoritative current value — exactly the row path (one decode).
+                _ => {
+                    fallback_reads += 1;
+                    self.read_node_prop_one(node, property)
+                }
+            };
+            if let Some(value) = value {
+                out.push((node, value));
+            }
+        }
+        // Publish the decode-accounting tallies (`rmp` #329/#330 measurement / observability): how many
+        // values were served from the column (zero decode) vs read from the property chain (fallback).
+        if let Some(columns) = &self.columns {
+            let cache = columns.borrow();
+            cache.record_value_hits(value_hits);
+            cache.record_fallback_reads(fallback_reads);
+        }
+        Some(crate::graph_access::ColumnarScan {
+            rows: out,
+            label_matches,
+        })
+    }
+
+    /// Whether a cached column entry for property-key `prop_key` is still **fresh** for the node whose
+    /// current record is `node_rec` (`rmp` #329). Fresh means the cached value is provably the node's
+    /// snapshot-visible *newest* value of the key, so it can be used in place of a property-chain read.
+    ///
+    /// Two O(1) witness checks (see [`ColumnWitness`](crate::column_cache::ColumnWitness) for the full
+    /// argument):
+    ///
+    /// 1. `node_rec.first_prop == witness.node_first_prop` — the property-chain head is unchanged, so
+    ///    **no prepend** happened since rebuild ⇒ the cached `PropRecord` is still the newest version
+    ///    of its key (no overwrite or addition slipped past, newest-visible-wins preserved).
+    /// 2. The cached `PropRecord` (re-read by `witness.prop_pid`) still has key `prop_key` **and is
+    ///    visible** to this snapshot — catching the one mutation `first_prop` does not: an in-place
+    ///    tombstone (`REMOVE n.p` / `SET n.p = null`), which stamps `xmax` without moving the head.
+    ///
+    /// On any storage fault reading the `PropRecord`, returns `false` (decline the cache → the caller
+    /// falls back to the authoritative read, which surfaces the fault through the captured-error
+    /// channel). Records **no** SSI marker (the per-node SIREAD is recorded by the caller for the node
+    /// key; re-reading the property record is an internal freshness probe, not an additional read of a
+    /// distinct conflict key — the property value belongs to the same node the caller already marked).
+    fn columnar_entry_is_fresh(
+        &self,
+        node_rec: &graphus_storage::record::NodeRecord,
+        witness: crate::column_cache::ColumnWitness,
+        prop_key: u32,
+    ) -> bool {
+        // Witness 1: the chain head must be byte-identical (no prepend of any kind since rebuild).
+        if node_rec.first_prop != witness.node_first_prop {
+            return false;
+        }
+        // Witness 2: the cached `PropRecord` must still be the same key AND visible (not tombstoned).
+        let prop = match self.store.borrow_mut().property(witness.prop_pid) {
+            Ok(p) => p,
+            Err(_) => return false, // a read fault: decline the cache, fall back to the row read.
+        };
+        prop.key == prop_key && self.visible(prop.mvcc)
+    }
 }
 
 /// Exact-count + histogram-backed statistics over the **real** store's durable catalogue
@@ -1698,6 +1927,17 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             }
         };
         self.filter_label_candidates(token_id, ids)
+    }
+
+    fn columnar_label_property_scan(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<crate::graph_access::ColumnarScan> {
+        // Delegates to the inherent helper, which drives off the authoritative label-candidate set,
+        // re-validates each cached value against the node's current MVCC header, and falls back to the
+        // row read on any mismatch — so the result is exactly the row-path result (`rmp` #329).
+        self.columnar_scan_checked(label, property)
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {

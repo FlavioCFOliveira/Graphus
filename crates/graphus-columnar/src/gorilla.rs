@@ -15,7 +15,11 @@ struct BitWriter {
 }
 impl BitWriter {
     fn new() -> Self {
-        Self { bytes: Vec::new(), cur: 0, nbits: 0 }
+        Self {
+            bytes: Vec::new(),
+            cur: 0,
+            nbits: 0,
+        }
     }
     fn put_bit(&mut self, bit: u8) {
         self.cur = (self.cur << 1) | (bit & 1);
@@ -48,7 +52,11 @@ struct BitReader<'a> {
 }
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, byte: 0, bit: 0 }
+        Self {
+            bytes,
+            byte: 0,
+            bit: 0,
+        }
     }
     fn get_bit(&mut self) -> u8 {
         let b = (self.bytes[self.byte] >> (7 - self.bit)) & 1;
@@ -150,7 +158,11 @@ mod tests {
         let constant = vec![42.0f64; 4096];
         let enc = encode(&constant);
         // first 64 bits + 4095 single 0-bits ≈ 8 + 512 bytes, vs 32768 raw → >50x.
-        assert!(enc.len() * 50 < constant.len() * 8, "constant series must compress hard: {}", enc.len());
+        assert!(
+            enc.len() * 50 < constant.len() * 8,
+            "constant series must compress hard: {}",
+            enc.len()
+        );
         rt(&constant);
     }
 }

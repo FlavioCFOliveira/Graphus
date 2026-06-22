@@ -112,6 +112,7 @@ pub mod authorized_graph;
 pub mod binding;
 pub mod cardinality;
 pub mod catalog;
+pub mod column_cache;
 pub mod constraint;
 pub mod coordinator;
 pub mod cost;

@@ -1763,6 +1763,17 @@ fn build_operator(
             group_keys,
             aggregates,
         } => {
+            // Vectorized fast path (`rmp` #330): an analytical `MATCH (n:Label) RETURN agg(n.p)` over
+            // a columnar-cached column folds the contiguous column in batches instead of pulling rows
+            // one at a time. It produces the IDENTICAL result (shared accumulator arithmetic over the
+            // MVCC-re-validated columnar scan) and declines to `None` for any shape it does not cover,
+            // any uncached column, or under RBAC restriction — in which case the row-at-a-time Volcano
+            // path below runs verbatim (the default + fallback).
+            if let Some(rows) =
+                try_vectorized_label_property_aggregate(input, group_keys, aggregates, ctx)?
+            {
+                return Ok(Operator::Buffered { rows });
+            }
             let inner = build_operator(input, arg, ctx)?;
             Ok(Operator::Buffered {
                 rows: aggregate_rows(inner, group_keys, aggregates, ctx)?,
@@ -2212,6 +2223,215 @@ fn compare_sort_keys(a: &[RowValue], b: &[RowValue], keys: &[SortKey]) -> std::c
 /// representative row of that group (every grouped expression agrees across the group's rows, and
 /// the semantic pass guarantees the outer composition only uses constants, grouped keys and
 /// locally-bound variables).
+///
+/// The batch size for the vectorized aggregation fold (`rmp` #330) — the column-store convention
+/// (MonetDB/X100, DuckDB): fold the columnar scan a cache-friendly chunk at a time, amortising the
+/// per-tuple interpreter overhead the Volcano path pays. The whole columnar scan is materialized by
+/// the seam, so this only governs the **fold** granularity (and the cancellation poll cadence).
+const VECTOR_BATCH: usize = 1024;
+
+/// One recognized **bare** aggregate of the vectorized fast path (`rmp` #330): the outer expression
+/// of an aggregate column is exactly one of these (no surrounding arithmetic, no `DISTINCT`).
+enum VecAgg {
+    /// `count(*)` — the matched-node count (every label-matching node, property present or not).
+    CountStar,
+    /// `count(n.p)` — the count of nodes whose property `p` is present (a columnar row each).
+    CountProp,
+    /// `sum(n.p)` / `avg(n.p)` / `min(n.p)` / `max(n.p)` — a fold over the present property values.
+    /// Carries the [`AggKind`] so the shared [`Accumulator`] computes it identically to Volcano.
+    Fold(AggKind),
+}
+
+/// Recognizes whether `expr` (an aggregate **column's** outer expression) is a bare aggregate the
+/// vectorized path supports over the single scan variable `scan_var` and property `property`
+/// (`rmp` #330). Returns the [`VecAgg`] kind, or `None` to decline (the column then forces the whole
+/// aggregation onto the Volcano path — always correct).
+///
+/// Strict by design: the column must be *exactly* the aggregate call (so the result equals the
+/// aggregate value with no outer evaluation), no `DISTINCT`, and any property argument must be
+/// `scan_var.property` for the single column the scan covers. `count(*)` needs no property.
+fn recognize_vec_agg(expr: &Expr, scan_var: &str, property: &str) -> Option<VecAgg> {
+    match &expr.kind {
+        ExprKind::CountStar => Some(VecAgg::CountStar),
+        ExprKind::FunctionCall {
+            name,
+            distinct,
+            args,
+        } => {
+            if *distinct {
+                return None; // DISTINCT folds need the distinct-set; not the vectorized fast path.
+            }
+            let kind = match name.join(".").to_ascii_lowercase().as_str() {
+                "count" => Some(AggKind::Count),
+                "sum" => Some(AggKind::Sum),
+                "avg" => Some(AggKind::Avg),
+                "min" => Some(AggKind::Min),
+                "max" => Some(AggKind::Max),
+                _ => None,
+            }?;
+            // Exactly one argument, and it must be `scan_var.property` (the column the scan covers).
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            if !is_scan_var_property(arg, scan_var, property) {
+                return None;
+            }
+            Some(match kind {
+                AggKind::Count => VecAgg::CountProp,
+                other => VecAgg::Fold(other),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` is exactly the property access `scan_var.property` (`rmp` #330 recognizer helper).
+fn is_scan_var_property(expr: &Expr, scan_var: &str, property: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Property { base, key } => {
+            key == property && matches!(&base.kind, ExprKind::Variable(v) if v == scan_var)
+        }
+        _ => false,
+    }
+}
+
+/// If `(input, group_keys, aggregates)` is the **vectorized-eligible** analytical shape
+/// `MATCH (n:Label) RETURN agg(n.p)[, …]` over a columnar-cached `(Label, p)`, runs the batched fold
+/// over the columnar scan and returns the single result row; otherwise returns `None` so the caller
+/// uses the row-at-a-time [`aggregate_rows`] (the default + fallback for everything else) — `rmp` #330.
+///
+/// # Identical results, by construction
+///
+/// The fold reuses the **same** [`Accumulator`] arithmetic the Volcano path uses (`fold_value` /
+/// `set_count_star`), and the columnar scan returns **exactly** the row-path `(node, value)` set plus
+/// the exact `count(*)` denominator (every cached value is MVCC-re-validated, with a row-read
+/// fallback) — so the produced row is byte-identical to `aggregate_rows`. The vectorization is
+/// **compute-only**: it changes how fast the values are folded, never which values, and result egress
+/// (Bolt/PackStream) is unchanged. Any shape this does not recognize, any column not cached, or any
+/// captured seam error makes it decline and the Volcano path runs verbatim.
+///
+/// # Eligibility (all required)
+/// - no grouping keys (a single group — the `RETURN agg(...)` over a whole label);
+/// - the input is a bare label scan (`NodeByLabelScan` / `TokenLookupScan`), no interposed filter;
+/// - every aggregate column is a bare recognized aggregate ([`recognize_vec_agg`]) and all
+///   property-bearing ones reference the **same** property (the one column the scan covers);
+/// - the seam offers a columnar scan for `(label, property)` (else `None`).
+fn try_vectorized_label_property_aggregate(
+    input: &PhysicalOp,
+    group_keys: &[ProjectionColumn],
+    aggregates: &[ProjectionColumn],
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    // Only the single-group `RETURN agg(...)` shape (no GROUP BY) is vectorized in this task.
+    if !group_keys.is_empty() || aggregates.is_empty() {
+        return Ok(None);
+    }
+    // The input must be a bare label scan binding one variable (no Filter/Expand between it and the
+    // aggregation — those change which rows or values feed the fold).
+    let (scan_var, label) = match input {
+        PhysicalOp::NodeByLabelScan { variable, label }
+        | PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => (&variable.name, &label.name),
+        _ => return Ok(None),
+    };
+
+    // Resolve the single covered property: the first property-bearing aggregate fixes it; every other
+    // property-bearing aggregate must agree (the scan covers exactly one column). `count(*)` is
+    // property-free and imposes no constraint.
+    let mut property: Option<String> = None;
+    for col in aggregates {
+        if let Some(p) = sole_aggregate_property(&col.expr, scan_var) {
+            match &property {
+                Some(existing) if existing != &p => return Ok(None), // two different columns
+                _ => property = Some(p),
+            }
+        }
+    }
+    // A pure `count(*)`-only aggregation has no property column to scan; let the Volcano path handle
+    // it (it is already trivially cheap, and the columnar seam keys on a property).
+    let Some(property) = property else {
+        return Ok(None);
+    };
+
+    // Recognize every column as a bare aggregate over `(scan_var, property)`; decline on the first
+    // non-conforming column (e.g. `sum(n.p) + 1`, a `DISTINCT`, or a second property).
+    let mut specs: Vec<VecAgg> = Vec::with_capacity(aggregates.len());
+    for col in aggregates {
+        match recognize_vec_agg(&col.expr, scan_var, &property) {
+            Some(spec) => specs.push(spec),
+            None => return Ok(None),
+        }
+    }
+
+    // Ask the seam for the columnar scan. `None` ⇒ no columnar cache for this column ⇒ decline (the
+    // Volcano path runs). This call registers the identical SSI/predicate read markers the row scan
+    // would (inside the seam), so serializability is unchanged whether or not we take this path.
+    let Some(scan) = ctx.graph.columnar_label_property_scan(label, &property) else {
+        return Ok(None);
+    };
+
+    // Fold the values into one accumulator per column, in cache-friendly batches (`rmp` #330).
+    let mut accs: Vec<Accumulator> = specs
+        .iter()
+        .map(|spec| match spec {
+            VecAgg::CountStar => Accumulator::for_kind(AggKind::CountStar),
+            VecAgg::CountProp => Accumulator::for_kind(AggKind::Count),
+            VecAgg::Fold(kind) => Accumulator::for_kind(*kind),
+        })
+        .collect();
+
+    // `count(*)` is the matched-node count, assigned directly (every matched node, property or not).
+    let label_matches = i64::try_from(scan.label_matches).unwrap_or(i64::MAX);
+    for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+        if matches!(spec, VecAgg::CountStar) {
+            acc.set_count_star(label_matches);
+        }
+    }
+
+    // The property folds (`count(n.p)`/`sum`/`avg`/`min`/`max`) run over the present values, batched.
+    for batch in scan.rows.chunks(VECTOR_BATCH) {
+        ctx.check_cancelled()?;
+        for (_node, value) in batch {
+            for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+                match spec {
+                    // `count(*)` was assigned up front; it does not fold per value.
+                    VecAgg::CountStar => {}
+                    // `count(n.p)` and the numeric/extreme folds fold each present value identically
+                    // to the Volcano `Accumulator` (shared arithmetic ⇒ identical result).
+                    VecAgg::CountProp | VecAgg::Fold(_) => acc.fold_value(value)?,
+                }
+            }
+        }
+    }
+
+    // Finish each column into the single output row (the aggregate value is the column value, since
+    // every column is a bare aggregate — no outer expression to evaluate).
+    let mut row = Row::empty();
+    for (col, acc) in aggregates.iter().zip(accs) {
+        row.set(col.alias.clone(), acc.finish());
+    }
+    Ok(Some(VecDeque::from(vec![row])))
+}
+
+/// The sole property name an aggregate column references on `scan_var`, if the column is a bare
+/// single-argument aggregate over `scan_var.<property>` (`rmp` #330). `count(*)` and any non-bare /
+/// multi-property column yield `None` (no single property constraint from this column).
+fn sole_aggregate_property(expr: &Expr, scan_var: &str) -> Option<String> {
+    let ExprKind::FunctionCall { args, .. } = &expr.kind else {
+        return None;
+    };
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    match &arg.kind {
+        ExprKind::Property { base, key } if matches!(&base.kind, ExprKind::Variable(v) if v == scan_var) => {
+            Some(key.clone())
+        }
+        _ => None,
+    }
+}
+
 fn aggregate_rows(
     mut inner: Operator,
     group_keys: &[ProjectionColumn],
@@ -2539,6 +2759,19 @@ impl Accumulator {
             }
             _ => (AggKind::Other, false),
         };
+        Self::zeroed(kind, distinct)
+    }
+
+    /// Builds a fresh, zeroed accumulator of `kind` (non-distinct) — the vectorized fast path's
+    /// constructor (`rmp` #330), which already knows the [`AggKind`] from the recognizer and so needs
+    /// no `Expr` to classify. Shares the exact zero-init [`new`](Self::new) uses, so a vectorized
+    /// accumulator and a Volcano one of the same kind are identical state.
+    fn for_kind(kind: AggKind) -> Self {
+        Self::zeroed(kind, false)
+    }
+
+    /// The shared zero-initialised accumulator state for `kind` / `distinct`.
+    fn zeroed(kind: AggKind, distinct: bool) -> Self {
         Self {
             kind,
             distinct,
@@ -2552,6 +2785,67 @@ impl Accumulator {
             numeric: Vec::new(),
             percentile: None,
         }
+    }
+
+    /// Folds one **bare property value** directly into the accumulator — the vectorized fast path's
+    /// per-value step (`rmp` #330), used by [`try_vectorized_label_property_aggregate`] when the value
+    /// comes straight from the columnar scan rather than from evaluating an expression over a row.
+    ///
+    /// This is **arithmetically identical** to the relevant arms of [`update`](Self::update): a null
+    /// value is ignored (Cypher `count`/`sum`/`avg`/`min`/`max` skip nulls), and the numeric / extreme
+    /// folds use the very same `int_sum`/`sum`/`sum_is_int`/`extreme` updates, so a finish produces
+    /// byte-identical results to the Volcano path. It only handles the kinds the vectorized recognizer
+    /// admits (`Count`/`Sum`/`Avg`/`Min`/`Max`); any other kind is a recognizer bug and is a no-op.
+    ///
+    /// # Errors
+    /// [`EvalError::TypeError`] if a `sum`/`avg` value is non-numeric — the same error `update` raises.
+    fn fold_value(&mut self, value: &Value) -> Result<(), ExecError> {
+        // Nulls are ignored by every aggregate here (the columnar scan never yields a null value, but
+        // this keeps the contract identical to `update` defensively).
+        if value.is_null() {
+            return Ok(());
+        }
+        match self.kind {
+            AggKind::Count => self.count += 1,
+            AggKind::Sum | AggKind::Avg => {
+                self.count += 1;
+                match value {
+                    Value::Integer(i) => {
+                        self.int_sum = self.int_sum.saturating_add(*i);
+                        self.sum += *i as f64;
+                    }
+                    Value::Float(f) => {
+                        self.sum_is_int = false;
+                        self.sum += *f;
+                    }
+                    _ => {
+                        return Err(ExecError::Eval(EvalError::TypeError {
+                            context: "sum/avg require numeric input".to_owned(),
+                        }));
+                    }
+                }
+            }
+            AggKind::Min | AggKind::Max => {
+                let want_min = self.kind == AggKind::Min;
+                let replace = self.extreme.as_ref().is_none_or(|e| {
+                    let ord = cmp_values(value, e);
+                    if want_min { ord.is_lt() } else { ord.is_gt() }
+                });
+                if replace {
+                    self.extreme = Some(value.clone());
+                }
+            }
+            // The vectorized recognizer never builds an accumulator of another kind for a value fold.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Sets the `count(*)` total directly (`rmp` #330): the vectorized path knows the matched-node
+    /// count up front (from [`ColumnarScan::label_matches`](crate::graph_access::ColumnarScan)), so it
+    /// assigns it rather than incrementing per row. Identical to `count += 1` per matched node.
+    fn set_count_star(&mut self, total: i64) {
+        self.count = total;
     }
 
     /// Folds one input row into the accumulator.

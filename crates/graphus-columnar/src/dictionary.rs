@@ -55,7 +55,10 @@ pub fn decode(bytes: &[u8], count: usize) -> Vec<Vec<u8>> {
     let width = u32::from(bytes[pos]);
     pos += 1;
     let codes = unpack(&bytes[pos..], count, width);
-    codes.into_iter().map(|c| dict[c as usize].clone()).collect()
+    codes
+        .into_iter()
+        .map(|c| dict[c as usize].clone())
+        .collect()
 }
 
 /// The number of distinct values in `values` — the signal a caller uses to decide whether dictionary
@@ -93,7 +96,11 @@ mod tests {
         let raw: usize = values.iter().map(Vec::len).sum();
         let enc = encode(&values);
         assert_eq!(decode(&enc, values.len()), values);
-        assert!(enc.len() * 4 < raw, "dict must beat 4x on 4-category data: {} vs {raw}", enc.len());
+        assert!(
+            enc.len() * 4 < raw,
+            "dict must beat 4x on 4-category data: {} vs {raw}",
+            enc.len()
+        );
     }
 
     #[test]

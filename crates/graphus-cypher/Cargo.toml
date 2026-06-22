@@ -63,6 +63,16 @@ graphus-gds = { path = "../graphus-gds" }
 # record). The *offline* bulk importer/dumper live in the separate `graphus-bulk` crate, keeping the
 # same dep out of the storage core.
 csv = "1.4"
+# The complementary columnar analytical read path (`rmp` tasks #329/#330, src/column_cache.rs): a
+# DERIVED, in-memory, rebuilt-on-open columnar value cache for declared `(label, property)` pairs
+# (same lifecycle class as the in-memory full-text/spatial indexes — never persisted, WAL-logged or
+# recovered). `graphus-columnar` is a leaf crate with ZERO dependencies and round-trip-exact codecs
+# (dictionary/integer), so the cached column is stored compactly and decoded back exactly. The edge
+# is trivially acyclic: graphus-columnar depends on nothing in the workspace. The columnar scan is a
+# pure ACCELERATOR — every cached (node, value) is re-validated against the node's current MVCC
+# header at read time and falls back to the authoritative row read on any mismatch, so it carries no
+# durability/ACID surface and cannot return a wrong row.
+graphus-columnar = { path = "../graphus-columnar" }
 
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.

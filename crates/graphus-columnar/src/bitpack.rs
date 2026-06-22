@@ -14,7 +14,11 @@
 /// The minimum number of bits needed to represent `max` (0 needs 0 bits — an all-zero column).
 #[must_use]
 pub fn bits_required(max: u64) -> u32 {
-    if max == 0 { 0 } else { 64 - max.leading_zeros() }
+    if max == 0 {
+        0
+    } else {
+        64 - max.leading_zeros()
+    }
 }
 
 /// Packs `values` at `width` bits each into a fresh byte buffer. `width` must be `0..=64` and every
@@ -30,7 +34,10 @@ pub fn pack(values: &[u64], width: u32) -> Vec<u8> {
     let mut out = vec![0u8; total_bytes];
     let mut bit_pos: u64 = 0;
     for &v in values {
-        debug_assert!(width == 64 || v < (1u64 << width), "value {v} exceeds width {width}");
+        debug_assert!(
+            width == 64 || v < (1u64 << width),
+            "value {v} exceeds width {width}"
+        );
         let mut remaining = width;
         let mut value = v;
         while remaining > 0 {
@@ -38,7 +45,11 @@ pub fn pack(values: &[u64], width: u32) -> Vec<u8> {
             let bit_off = (bit_pos % 8) as u32;
             let free = 8 - bit_off; // bits free in this byte
             let take = remaining.min(free);
-            let mask = if take == 64 { u64::MAX } else { (1u64 << take) - 1 };
+            let mask = if take == 64 {
+                u64::MAX
+            } else {
+                (1u64 << take) - 1
+            };
             let chunk = (value & mask) as u8;
             out[byte_idx] |= chunk << bit_off;
             value >>= take;
@@ -98,7 +109,11 @@ mod tests {
             let cap = if width == 0 { 1 } else { 1u64 << width };
             let values: Vec<u64> = (0..200u64).map(|i| i % cap).collect();
             let packed = pack(&values, width);
-            assert_eq!(unpack(&packed, values.len(), width), values, "width {width}");
+            assert_eq!(
+                unpack(&packed, values.len(), width),
+                values,
+                "width {width}"
+            );
         }
     }
 

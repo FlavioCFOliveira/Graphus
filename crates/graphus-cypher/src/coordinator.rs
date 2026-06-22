@@ -188,6 +188,17 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// (never visibility-filtered), so it is in-memory and never committed or recovered — a fresh
     /// coordinator over a recovered store rebuilds a store-consistent index by construction.
     index: Rc<RefCell<IndexSet>>,
+    /// The shared derived **columnar value cache** (`rmp` tasks #329 / #330): a contiguous,
+    /// graphus-columnar-encoded snapshot of each declared `(label, property)` column, used to
+    /// accelerate an analytical property scan / aggregation. Like [`Self::index`] it is derived,
+    /// in-memory and **never committed or recovered** — rebuilt from the store on [`new`](Self::new)
+    /// and re-captured on [`rebuild_columns`](Self::rebuild_columns) (a declaration / schema change).
+    /// Unlike the index it caches the *value* (not just a candidate id); correctness is guaranteed at
+    /// READ time by [`RecordStoreGraph::columnar_label_property_scan`], which re-validates every cached
+    /// value against the node's current MVCC header and falls back to the authoritative row read on
+    /// any mismatch — so the cache can be arbitrarily stale and never returns a wrong row. Maintenance
+    /// is therefore **rebuild-only** (no commit-path hook), exactly the safe design `rmp` #329 mandates.
+    columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
     /// Open transactions (begun, not yet committed/rolled back).
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
@@ -253,6 +264,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             ssi: Rc::new(RefCell::new(SsiTracker::new())),
             locks: Rc::new(RefCell::new(LockTable::new())),
             index,
+            // The columnar cache starts with no declared columns; a column is declared (and then
+            // captured) via `declare_columnar_cache`. Derived/in-memory, never recovered (`rmp` #329),
+            // so a fresh coordinator over a recovered store simply re-declares + re-captures as asked.
+            columns: Rc::new(RefCell::new(crate::column_cache::ColumnCache::new())),
             active: HashMap::new(),
             next_txn_id,
             pending_builds: VecDeque::new(),
@@ -816,6 +831,179 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         );
         Self::rebuild_index(&self.store, &self.index);
         Ok(())
+    }
+
+    /// Declares that the **complementary columnar value cache** (`rmp` tasks #329 / #330) should
+    /// cover `(label, property)`, and **captures the column now** from the current graph.
+    ///
+    /// This is opt-in per `(label, property)`, exactly like declaring a node-property index — a caller
+    /// (a server admin surface, the analytical examples/benches) declares the columns its analytical
+    /// workload scans. Unlike a node-property index, **nothing here is durable**: the cache is a
+    /// derived, in-memory, rebuilt-on-open accelerator (it has no on-disk / ACID / recovery surface),
+    /// so a re-opened coordinator that wants the acceleration simply re-declares. The label and
+    /// property-key tokens are interned (so a brand-new label/property resolves to a stable token) in
+    /// one tiny committed transaction — that token interning is the *only* durable effect, identical
+    /// to how any token is minted, and it carries no columnar data.
+    ///
+    /// After this returns, an analytical scan `MATCH (n:Label) RETURN agg(n.property)` over a
+    /// statement seam reads the column from the cache (re-validated per node) instead of decoding each
+    /// node's property chain. The result is **identical** to the row path — see
+    /// [`RecordStoreGraph::columnar_label_property_scan`](crate::record_graph::RecordStoreGraph).
+    ///
+    /// # Errors
+    /// Returns a storage error if interning either token (or its committing transaction) fails.
+    pub fn declare_columnar_cache(&mut self, label: &str, property: &str) -> Result<()> {
+        // Intern the tokens in one committed transaction (the only durable effect — no columnar data
+        // is persisted). Mirrors the token-minting prologue of `create_node_property_index`.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            (label_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Declare the column and capture it now from the current graph.
+        self.columns.borrow_mut().declare(label_token, prop_key);
+        Self::rebuild_columns(&self.store, &self.columns);
+        Ok(())
+    }
+
+    /// Re-captures **every declared** columnar column from the current store (`rmp` #329): the
+    /// derived analogue of [`rebuild_index`](Self::rebuild_index) for the columnar cache. Each
+    /// declared `(label_token, prop_key)` column is rebuilt by scanning the in-use nodes, capturing,
+    /// for every node that currently carries the label and holds an index-stable value of the key, the
+    /// tuple `(node_id, value, prop_pid, node_first_prop)` — the value plus the two staleness witnesses
+    /// the read-time re-check needs.
+    ///
+    /// Reads directly off the store with **no MVCC snapshot** (like `rebuild_index`): the cache is a
+    /// candidate-class accelerator whose every entry is re-validated at read time, so capturing each
+    /// node's *current newest in-use* value is sufficient — a value that some future reader cannot see
+    /// is harmless (the read-time visibility re-check drops it, falling back to the row read). Store
+    /// read faults on a single node skip that node best-effort (it degrades to the row path for that
+    /// node, never a wrong row). The store and the cache are borrowed in separate scopes.
+    fn rebuild_columns(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        columns: &Rc<RefCell<crate::column_cache::ColumnCache>>,
+    ) {
+        // The declared columns, captured before the scan so the cache is not borrowed across a store
+        // borrow. Drop all captured data first (keeping declarations) so a rebuild starts clean.
+        let declared: Vec<(u32, u32)> = columns.borrow().declared().to_vec();
+        columns.borrow_mut().clear();
+        if declared.is_empty() {
+            return;
+        }
+
+        let node_ids = match store.borrow_mut().scan_node_ids() {
+            Ok(ids) => ids,
+            // A whole-scan fault leaves every column empty; every reader then uses the row path.
+            Err(_) => return,
+        };
+
+        // Accumulate each declared column's rows in node-id order (the scan order).
+        let mut per_column: Vec<Vec<(u64, Value, u64, u64)>> =
+            declared.iter().map(|_| Vec::new()).collect();
+
+        for id in node_ids {
+            // Read the node's labels, first_prop chain head, and newest-in-use property values once.
+            let (label_tokens, first_prop, props): (Vec<u32>, u64, Vec<(u64, u32, Value)>) = {
+                let mut store = store.borrow_mut();
+                let node = match store.node(id) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                // Tombstoned / not-in-use slots are skipped (the index rebuild skips them too via the
+                // in-use scan; this guards a since-reclaimed slot defensively).
+                if !node.mvcc.in_use() {
+                    continue;
+                }
+                let labels = match store.node_labels(id) {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let chain = match store.node_property_values(id) {
+                    Ok(chain) => chain,
+                    Err(_) => continue,
+                };
+                (labels, node.first_prop, chain)
+            };
+
+            // For each declared column the node matches, capture its newest in-use value of the key.
+            for (ci, &(label_token, prop_key)) in declared.iter().enumerate() {
+                if !label_tokens.contains(&label_token) {
+                    continue;
+                }
+                // `node_property_values` decodes the chain newest-first, so the FIRST occurrence of the
+                // key is the newest in-use version — its pid is the staleness witness.
+                if let Some((pid, _key, value)) = props.iter().find(|(_, key, _)| *key == prop_key)
+                {
+                    // A null value is never stored as a property (Cypher), so any present record holds a
+                    // non-null value; capture it with the witnesses (pid + the node's chain head).
+                    per_column[ci].push((id, value.clone(), *pid, first_prop));
+                }
+            }
+        }
+
+        // Install the captured columns (cache borrow only).
+        let mut cache = columns.borrow_mut();
+        for ((label_token, prop_key), rows) in declared.into_iter().zip(per_column) {
+            cache.set_column(label_token, prop_key, rows);
+        }
+    }
+
+    /// The number of cached rows for the columnar column `(label, property)`, or `None` when the pair
+    /// is not a declared/captured column (`rmp` #329). A diagnostics / test accessor proving the
+    /// column was actually captured (so a measurement is not vacuously over an empty cache).
+    #[must_use]
+    pub fn columnar_column_len(&self, label: &str, property: &str) -> Option<usize> {
+        let store = self.store.borrow();
+        let label_token = store.token_id(Namespace::Label, label)?;
+        let prop_key = store.token_id(Namespace::PropKey, property)?;
+        drop(store);
+        self.columns.borrow().column_len(label_token, prop_key)
+    }
+
+    /// The number of times the columnar analytical read path served a cached column since this
+    /// coordinator was built (`rmp` #330): a cheap monitor / test signal that the accelerator was
+    /// actually engaged (a test asserts it incremented, so an equivalence check is not vacuously
+    /// comparing the row path against itself).
+    #[must_use]
+    pub fn columnar_scan_hits(&self) -> u64 {
+        self.columns.borrow().scan_hits()
+    }
+
+    /// The cumulative count of values the columnar path served straight from the contiguous column
+    /// (zero property-record decode) since this coordinator was built (`rmp` #329/#330) — the
+    /// accelerator's payoff signal, exposed for measurement.
+    #[must_use]
+    pub fn columnar_value_hits(&self) -> u64 {
+        self.columns.borrow().value_hits()
+    }
+
+    /// The cumulative count of values the columnar path read from the authoritative property chain (a
+    /// stale / missing cache entry) since this coordinator was built (`rmp` #329/#330). On a fresh
+    /// cache this stays `0`; the row path pays one such decode for every matched node, so the pair
+    /// `(columnar_value_hits, columnar_fallback_reads)` is the measured decode reduction.
+    #[must_use]
+    pub fn columnar_fallback_reads(&self) -> u64 {
+        self.columns.borrow().fallback_reads()
     }
 
     /// Declares a node-property index on `(label, property)` and starts a **non-blocking** background
@@ -1866,6 +2054,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Rc::clone(&self.ssi),
             Rc::clone(&self.locks),
             Rc::clone(&self.index),
+            Rc::clone(&self.columns),
         ))
     }
 

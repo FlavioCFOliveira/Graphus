@@ -39,7 +39,11 @@ impl Rng {
 }
 
 fn pct(after: usize, before: usize) -> f64 {
-    if before == 0 { 0.0 } else { before as f64 / after.max(1) as f64 }
+    if before == 0 {
+        0.0
+    } else {
+        before as f64 / after.max(1) as f64
+    }
 }
 
 fn report_col(name: &str, rows: usize, rowstore: usize, columnar: usize) {
@@ -73,7 +77,9 @@ fn main() {
             v
         })
         .collect();
-    let sensor: Vec<Vec<u8>> = (0..n).map(|i| format!("s-{}", i % 64).into_bytes()).collect();
+    let sensor: Vec<Vec<u8>> = (0..n)
+        .map(|i| format!("s-{}", i % 64).into_bytes())
+        .collect();
 
     let seq_rs = n * PROP_RECORD;
     let ts_rs = n * PROP_RECORD;
@@ -99,21 +105,44 @@ fn main() {
     // ---- Social columns (the bulk/analytical-scan case, rmp #327/#329) ----
     println!("\nSocial :USER {{id, name, registered}}  (id = 24-hex unique; name from a pool):");
     let names_pool: Vec<&str> = vec![
-        "Ana Silva", "João Costa", "Maria Santos", "Pedro Sousa", "Rita Oliveira", "Tiago Ferreira",
-        "Sofia Martins", "Bruno Almeida", "Inês Pereira", "Miguel Rodrigues", "Carla Gomes",
-        "Hugo Lopes", "Beatriz Marques", "André Carvalho", "Mariana Dias", "Diogo Pinto",
+        "Ana Silva",
+        "João Costa",
+        "Maria Santos",
+        "Pedro Sousa",
+        "Rita Oliveira",
+        "Tiago Ferreira",
+        "Sofia Martins",
+        "Bruno Almeida",
+        "Inês Pereira",
+        "Miguel Rodrigues",
+        "Carla Gomes",
+        "Hugo Lopes",
+        "Beatriz Marques",
+        "André Carvalho",
+        "Mariana Dias",
+        "Diogo Pinto",
     ];
     let mut rng2 = Rng(0xABCD_EF01);
     let id: Vec<Vec<u8>> = (0..n)
         .map(|_| format!("{:024x}", rng2.next() & 0xFFFF_FFFF_FFFF).into_bytes())
         .collect();
     let name: Vec<Vec<u8>> = (0..n)
-        .map(|_| names_pool[(rng2.next() as usize) % names_pool.len()].as_bytes().to_vec())
+        .map(|_| {
+            names_pool[(rng2.next() as usize) % names_pool.len()]
+                .as_bytes()
+                .to_vec()
+        })
         .collect();
     let registered: Vec<i64> = (0..n as i64).map(|i| EPOCH_MS - i * 3_600_000).collect();
 
-    let id_rs: usize = id.iter().map(|s| rowstore_string_bytes(std::str::from_utf8(s).unwrap())).sum();
-    let name_rs: usize = name.iter().map(|s| rowstore_string_bytes(std::str::from_utf8(s).unwrap())).sum();
+    let id_rs: usize = id
+        .iter()
+        .map(|s| rowstore_string_bytes(std::str::from_utf8(s).unwrap()))
+        .sum();
+    let name_rs: usize = name
+        .iter()
+        .map(|s| rowstore_string_bytes(std::str::from_utf8(s).unwrap()))
+        .sum();
     let reg_rs = n * PROP_RECORD;
     let id_c = dictionary::encode(&id).len();
     let name_c = dictionary::encode(&name).len();
@@ -126,8 +155,14 @@ fn main() {
     report_col("USER TOTAL", n, soc_rs, soc_c);
 
     println!("\nNotes:");
-    println!("  - row_store = PROP_RECORD(46B) per value + 83B/48B overflow blocks for strings (audit-verified).");
+    println!(
+        "  - row_store = PROP_RECORD(46B) per value + 83B/48B overflow blocks for strings (audit-verified)."
+    );
     println!("  - columnar = graphus-columnar encoded blob (lossless, round-trip-exact).");
-    println!("  - unique-id columns barely compress (expected: dictionary ~= raw for unique values);");
-    println!("    the dramatic wins are monotonic ints (delta), slow floats (Gorilla), low-cardinality strings (dict).");
+    println!(
+        "  - unique-id columns barely compress (expected: dictionary ~= raw for unique values);"
+    );
+    println!(
+        "    the dramatic wins are monotonic ints (delta), slow floats (Gorilla), low-cardinality strings (dict)."
+    );
 }

@@ -274,6 +274,25 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
             .collect()
     }
 
+    fn columnar_label_property_scan(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<crate::graph_access::ColumnarScan> {
+        // Forward the columnar accelerator (`rmp` #329), then compose RBAC. An unrestricted principal
+        // sees the inner result verbatim. A restricted principal is conservatively **declined**
+        // (return `None`) so the executor falls back to the row scan, which RBAC-composes exactly via
+        // `scan_nodes_by_label` + `node_property`. Declining is correct because the columnar fast path
+        // is a pure accelerator with an always-correct row fallback; reconstructing the RBAC-projected
+        // `count(*)` (the `label_matches` denominator) here would require re-deriving traverse
+        // visibility per node, duplicating the row path's gate — not worth it for the rare restricted
+        // analytical scan. The common (unrestricted) analytical workload keeps the full win.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.columnar_label_property_scan(label, property)
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         let incidents = self.inner.expand(node, direction, types);
         if self.oracle.is_unrestricted() {

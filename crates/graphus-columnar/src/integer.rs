@@ -112,7 +112,10 @@ pub fn encode_i64(values: &[i64]) -> Vec<u8> {
     }
     let b = encode_delta(values);
     let c = encode_double_delta(values);
-    [a, b, c].into_iter().min_by_key(Vec::len).expect("non-empty")
+    [a, b, c]
+        .into_iter()
+        .min_by_key(Vec::len)
+        .expect("non-empty")
 }
 
 /// Decodes an `i64` column of `count` values produced by [`encode_i64`].
@@ -201,9 +204,16 @@ mod tests {
         let values: Vec<i64> = (0..4096).map(|i| base + i * tick).collect();
         let enc = encode_i64(&values);
         let scheme = enc[0];
-        assert!(scheme == DELTA || scheme == DOUBLE_DELTA, "linear cadence picks a delta scheme, got {scheme}");
+        assert!(
+            scheme == DELTA || scheme == DOUBLE_DELTA,
+            "linear cadence picks a delta scheme, got {scheme}"
+        );
         // 4096 values, raw 8 bytes each = 32768 B; encoded must be a tiny fraction.
-        assert!(enc.len() < 64, "delta of fixed cadence is ~constant size, got {}", enc.len());
+        assert!(
+            enc.len() < 64,
+            "delta of fixed cadence is ~constant size, got {}",
+            enc.len()
+        );
         assert_eq!(decode_i64(&enc, values.len()), values);
     }
 
@@ -211,7 +221,10 @@ mod tests {
     fn bounded_range_uses_for_and_compresses() {
         let values: Vec<i64> = (0..1000).map(|i| 20 + (i % 50)).collect(); // range 50 → ~6 bits
         let enc = encode_i64(&values);
-        assert!(enc.len() < values.len() * 8 / 4, "FOR should beat 4x on a 6-bit column");
+        assert!(
+            enc.len() < values.len() * 8 / 4,
+            "FOR should beat 4x on a 6-bit column"
+        );
         assert_eq!(decode_i64(&enc, values.len()), values);
     }
 }

@@ -121,6 +121,26 @@ pub struct RelData {
     pub end: NodeId,
 }
 
+/// The result of a [`columnar_label_property_scan`](GraphAccess::columnar_label_property_scan)
+/// (`rmp` tasks #329 / #330): the matched `(node, value)` rows **plus** the total count of visible
+/// nodes carrying the label.
+///
+/// `rows` holds one entry per label-carrying, snapshot-visible node whose `property` value is
+/// **present** (a node whose property is absent contributes no row — exactly as the row path filters
+/// a null/missing property). `label_matches` is the count of **all** visible label-carrying nodes,
+/// present-property or not — the exact value of `count(*)` over `MATCH (n:Label)`, which counts every
+/// matched node regardless of whether it holds the property. Returning both from the single
+/// candidate pass lets the vectorized aggregation compute `count(*)` and a property fold
+/// (`sum`/`avg`/…) together with no second scan and no overcount/undercount.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct ColumnarScan {
+    /// The `(node, value)` rows for label-carrying visible nodes whose `property` is present.
+    pub rows: Vec<(NodeId, Value)>,
+    /// The total number of visible nodes carrying the label (the `count(*)` value).
+    pub label_matches: usize,
+}
+
 /// The graph the Cypher executor reads and writes, scoped to one logical transaction
 /// (`04 §7.4`).
 ///
@@ -279,6 +299,33 @@ pub trait GraphAccess {
     /// `None` when no such index is declared, or when the node is not in the index. Documented as a
     /// simple term-overlap count, not TF-IDF/BM25. The default returns `None`.
     fn fulltext_score(&self, _name: &str, _node: NodeId, _search: &str) -> Option<u64> {
+        None
+    }
+
+    /// An **optional COMPLEMENTARY columnar scan** of `(node, value)` for the nodes carrying `label`
+    /// whose current snapshot-visible value of `property` is present (`rmp` tasks #329 / #330).
+    ///
+    /// This is a pure **accelerator** for an analytical property scan / aggregation
+    /// (`MATCH (n:Label) RETURN sum(n.p)`): it reads each value from a contiguous, derived columnar
+    /// cache instead of decoding the node's whole property chain. It returns **exactly** the same
+    /// `(node, value)` set the row path would produce — `scan_nodes_by_label(label)` filtered to the
+    /// nodes whose `node_property(node, property)` is `Some` — including identical MVCC visibility and
+    /// identical SSI/predicate read markers (so serializability is unchanged), because every cached
+    /// value is **re-validated against the node's current MVCC header** and any stale / missing / since-
+    /// written row falls back to the authoritative single-property read.
+    ///
+    /// Returns `None` when no columnar cache covers `(label, property)` — the executor/planner then
+    /// uses the ordinary Volcano scan, which stays the default + fallback for everything this does not
+    /// cover. `Some(`[`ColumnarScan`]`)` is the **exact** result (not a candidate set): the re-check
+    /// happens *inside* the implementation, so the caller may fold the values directly. The
+    /// [`ColumnarScan::label_matches`] count is the exact `count(*)` value (every label-matching
+    /// visible node, present-property or not), so a vectorized aggregation computes `count(*)` and a
+    /// property fold together in one pass. RBAC composes through the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator exactly as for
+    /// [`scan_nodes_by_label`](Self::scan_nodes_by_label) + [`node_property`](Self::node_property).
+    ///
+    /// The default returns `None` (no columnar cache available).
+    fn columnar_label_property_scan(&self, _label: &str, _property: &str) -> Option<ColumnarScan> {
         None
     }
 

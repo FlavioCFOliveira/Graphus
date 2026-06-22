@@ -1132,6 +1132,7 @@ version = "0.0.1"
 dependencies = [
  "csv",
  "graphus-bufpool",
+ "graphus-columnar",
  "graphus-core",
  "graphus-gds",
  "graphus-index",
