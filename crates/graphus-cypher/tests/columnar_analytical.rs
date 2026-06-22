@@ -752,3 +752,380 @@ fn measure_columnar_vs_row_wide_node_aggregation() {
     );
     eprintln!("wall-time speedup: {:.2}x\n", speedup);
 }
+
+// =================================================================================================
+// Parallel label-property aggregation (rmp #352, phase 1 of #336)
+// =================================================================================================
+//
+// The executor's third aggregation tier projects a frozen `Send + Sync` snapshot off the seam (under
+// the statement's pinned read snapshot, with the IDENTICAL SSI markers the serial columnar scan
+// registers) and folds it across cores with rayon — but ONLY for a large, EXACT/associative
+// label-property aggregation (count / integer sum,min,max) over an integer column, with more than one
+// worker. The correctness property is the same one #329/#330 asserts for the vectorized tier: the
+// parallel result is **bit-identical** to the serial (row-path) result, here additionally proven to
+// actually take the parallel path (`parallel_scan_hits` increments).
+//
+// MEMORY NOTE: clearing the production size gate needs a label with > 50k *real* nodes, and the
+// in-memory DST store (`MemBlockDevice` + retaining `MemLogSink`) is heavy at that scale (several GiB
+// per coordinator pair — the WAL retains every frame; see `rmp` #313). To keep the default 16-way
+// `cargo test` within RAM, the gate-crossing scenarios are consolidated into ONE test whose
+// sub-scenarios live in their own scopes, so each pair of coordinators is **dropped** (freeing its
+// multi-GiB store) before the next sub-scenario builds its own — only one heavy pair is live at a time.
+
+/// The production size gate (`PARALLEL_AGG_MIN_ROWS` in the executor): a label needs at least this
+/// many nodes for the parallel tier to engage.
+const PARALLEL_GATE: i64 = 50_000;
+/// A label-count just above the gate, so the parallel tier is eligible (kept as small as the gate
+/// allows to bound the in-memory store footprint).
+const BIG_N: i64 = 50_100;
+
+/// Bulk-seeds `n` `(:<label> {age: i})` (ages `0..n`) into `coord` in ONE transaction via
+/// `UNWIND range` — the fast, deterministic seed (mirrors `measure_columnar_vs_row_aggregation_50k`).
+fn bulk_seed(coord: &mut Coord, label: &str, n: i64) {
+    run_write(
+        coord,
+        &format!(
+            "UNWIND range(0, {}) AS i CREATE (:{label} {{age: i}})",
+            n - 1
+        ),
+    );
+}
+
+/// Asserts the parallel tier is *eligible* to engage (more than one rayon worker) before a query that
+/// must take it; documents the requirement on a hypothetical single-core runner rather than flaking.
+/// The `!Send` coordinator is driven on the calling thread and only the owned snapshot fold fans out,
+/// so the global pool (sized to the host CPUs) supplies the parallelism — we must not `pool.install`.
+fn read_scalar_parallel(coord: &mut Coord, src: &str, col: &str) -> Value {
+    assert!(
+        rayon::current_num_threads() > 1,
+        "this test asserts the parallel tier engages; it needs a multi-worker global rayon pool \
+         (host appears single-core)"
+    );
+    read_scalar(coord, src, col)
+}
+
+/// Runs each `(query, col)` over a `par` coordinator that has **declared** `(label, property)` and a
+/// `ser` coordinator that has **not**, asserting the scalars are identical AND the parallel tier
+/// actually engaged for it (`parallel_scan_hits` rose) — so the comparison is never serial-vs-serial.
+fn assert_each_parallel_equals_serial(
+    par: &mut Coord,
+    ser: &mut Coord,
+    label: &str,
+    property: &str,
+    queries: &[(&str, &str)],
+) {
+    assert!(
+        par.columnar_column_len(label, property).is_some(),
+        "the columnar column must be declared/captured for `{label}.{property}`"
+    );
+    for (query, col) in queries {
+        let hits_before = par.parallel_scan_hits();
+        let via_parallel = read_scalar_parallel(par, query, col);
+        let via_serial = read_scalar(ser, query, col);
+        assert_eq!(
+            via_parallel, via_serial,
+            "`{query}` (col `{col}`): parallel {via_parallel:?} must equal serial {via_serial:?}"
+        );
+        assert!(
+            par.parallel_scan_hits() > hits_before,
+            "the parallel path must have engaged for `{query}` (parallel_scan_hits did not rise)"
+        );
+    }
+}
+
+/// Value-only equivalence (no engagement requirement): `par` and `ser` must return the identical
+/// scalar for `query`. Used where the parallel tier is *expected to decline* (pure `count(*)`, an
+/// undeclared column, a float fold, `avg`) — the serial fallback must still be exact. Also asserts the
+/// parallel tier did NOT engage (`parallel_scan_hits` unchanged) when `expect_decline` is set.
+fn assert_value_equals_serial_declined(par: &mut Coord, ser: &mut Coord, query: &str, col: &str) {
+    let hits_before = par.parallel_scan_hits();
+    let via_parallel = read_scalar(par, query, col);
+    let via_serial = read_scalar(ser, query, col);
+    assert_eq!(
+        via_parallel, via_serial,
+        "`{query}` (col `{col}`): result {via_parallel:?} must equal serial {via_serial:?}"
+    );
+    assert_eq!(
+        par.parallel_scan_hits(),
+        hits_before,
+        "`{query}` must DECLINE the parallel path (parallel_scan_hits must not rise)"
+    );
+}
+
+/// THE comprehensive gate-crossing equivalence test (`rmp` task #352). Every sub-scenario needs a
+/// label above the 50k size gate, so each lives in its own scope: its (heavy) coordinator pair is
+/// dropped — freeing the multi-GiB in-memory store — before the next sub-scenario allocates its own,
+/// keeping peak RAM to a single pair even under the default parallel `cargo test`.
+#[test]
+fn parallel_aggregation_equivalence_above_gate() {
+    // --- 1. FRESH integer column: every exact aggregate equals serial; closed-form values exact ---
+    {
+        let mut par = fresh_coord();
+        bulk_seed(&mut par, "Person", BIG_N);
+        run_write(&mut par, "CREATE (:Company {age: 999})"); // a non-Person carrying `age` (no leak)
+        par.declare_columnar_cache("Person", "age")
+            .expect("declare");
+        let mut ser = fresh_coord();
+        bulk_seed(&mut ser, "Person", BIG_N);
+        run_write(&mut ser, "CREATE (:Company {age: 999})");
+
+        assert_each_parallel_equals_serial(
+            &mut par,
+            &mut ser,
+            "Person",
+            "age",
+            &[
+                ("MATCH (n:Person) RETURN count(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN sum(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN min(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN max(n.age) AS r", "r"),
+                // The combined query exercises `count(*)` THROUGH the parallel path (set_count_star).
+                (
+                    "MATCH (n:Person) RETURN count(*) AS c, sum(n.age) AS s, min(n.age) AS mn, max(n.age) AS mx",
+                    "c",
+                ),
+                (
+                    "MATCH (n:Person) RETURN count(*) AS c, sum(n.age) AS s, min(n.age) AS mn, max(n.age) AS mx",
+                    "s",
+                ),
+                (
+                    "MATCH (n:Person) RETURN count(*) AS c, sum(n.age) AS s, min(n.age) AS mn, max(n.age) AS mx",
+                    "mx",
+                ),
+            ],
+        );
+        // Concrete closed-form (ages 0..BIG_N): sum=(N-1)*N/2, count=N, min/max=0/(N-1).
+        let expected_sum = (BIG_N - 1) * BIG_N / 2;
+        assert_eq!(
+            read_scalar_parallel(&mut par, "MATCH (n:Person) RETURN sum(n.age) AS r", "r"),
+            Value::Integer(expected_sum)
+        );
+        assert_eq!(
+            read_scalar_parallel(&mut par, "MATCH (n:Person) RETURN max(n.age) AS r", "r"),
+            Value::Integer(BIG_N - 1)
+        );
+        // A pure `count(*)`-only aggregation has no property column → serial tier (mirrors vectorized).
+        assert_value_equals_serial_declined(
+            &mut par,
+            &mut ser,
+            "MATCH (n:Person) RETURN count(*) AS r",
+            "r",
+        );
+    }
+
+    // --- 2. OVERWRITE since declare (stale cache → MVCC re-check + row fallback) ---
+    {
+        let overwrite = "MATCH (n:Person) WHERE n.age < 1000 SET n.age = n.age + 1000000";
+        let mut par = fresh_coord();
+        bulk_seed(&mut par, "Person", BIG_N);
+        par.declare_columnar_cache("Person", "age")
+            .expect("declare"); // declare BEFORE the overwrite → cache goes stale for touched nodes
+        run_write(&mut par, overwrite);
+        let mut ser = fresh_coord();
+        bulk_seed(&mut ser, "Person", BIG_N);
+        run_write(&mut ser, overwrite);
+
+        assert_each_parallel_equals_serial(
+            &mut par,
+            &mut ser,
+            "Person",
+            "age",
+            &[
+                ("MATCH (n:Person) RETURN sum(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN max(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN count(n.age) AS r", "r"),
+            ],
+        );
+    }
+
+    // --- 3. INSERT since declare (new nodes absent from the cache, present in the candidate set) ---
+    {
+        let insert = "UNWIND range(1, 500) AS i CREATE (:Person {age: 100000 + i})";
+        let mut par = fresh_coord();
+        bulk_seed(&mut par, "Person", BIG_N);
+        par.declare_columnar_cache("Person", "age")
+            .expect("declare");
+        run_write(&mut par, insert);
+        let mut ser = fresh_coord();
+        bulk_seed(&mut ser, "Person", BIG_N);
+        run_write(&mut ser, insert);
+
+        assert_each_parallel_equals_serial(
+            &mut par,
+            &mut ser,
+            "Person",
+            "age",
+            &[
+                (
+                    "MATCH (n:Person) RETURN count(*) AS c, sum(n.age) AS s",
+                    "c",
+                ),
+                ("MATCH (n:Person) RETURN sum(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN max(n.age) AS r", "r"),
+            ],
+        );
+    }
+
+    // --- 4. DELETE since declare (tombstones dropped by the MVCC re-check) ---
+    {
+        // Delete only a small slice so the surviving Person count stays ABOVE the size gate (the gate
+        // reads the live label count): BIG_N - 50 = 50_050 >= 50_000, so the parallel tier still
+        // engages while the tombstone drop-out path is exercised.
+        let delete = "MATCH (n:Person) WHERE n.age < 50 DELETE n";
+        let mut par = fresh_coord();
+        bulk_seed(&mut par, "Person", BIG_N);
+        par.declare_columnar_cache("Person", "age")
+            .expect("declare");
+        run_write(&mut par, delete);
+        let mut ser = fresh_coord();
+        bulk_seed(&mut ser, "Person", BIG_N);
+        run_write(&mut ser, delete);
+
+        assert_each_parallel_equals_serial(
+            &mut par,
+            &mut ser,
+            "Person",
+            "age",
+            &[
+                (
+                    "MATCH (n:Person) RETURN count(*) AS c, sum(n.age) AS s",
+                    "c",
+                ),
+                ("MATCH (n:Person) RETURN count(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN sum(n.age) AS r", "r"),
+                ("MATCH (n:Person) RETURN min(n.age) AS r", "r"),
+            ],
+        );
+    }
+
+    // --- 5. CROSS-SNAPSHOT visibility: a reader pinned before a concurrent committed update folds in
+    //        parallel and still sees the OLD values (snapshot isolation, projected under its view) ---
+    {
+        let mut coord = fresh_coord();
+        bulk_seed(&mut coord, "Person", BIG_N);
+        coord
+            .declare_columnar_cache("Person", "age")
+            .expect("declare");
+        let pre_sum = (BIG_N - 1) * BIG_N / 2; // ages 0..BIG_N
+
+        let reader = coord.begin_serializable(); // pin the snapshot here...
+        run_write(&mut coord, "MATCH (n:Person) SET n.age = n.age + 1"); // ...concurrent committed bump
+
+        assert!(
+            rayon::current_num_threads() > 1,
+            "needs a multi-worker global rayon pool to exercise the parallel fold"
+        );
+        let plan = compile("MATCH (n:Person) RETURN sum(n.age) AS r");
+        let hits_before = coord.parallel_scan_hits();
+        let rows = run_plan(&coord, reader, &plan);
+        let via_parallel = rows[0].value("r");
+        coord.commit(reader).expect("reader commits");
+        assert_eq!(
+            via_parallel,
+            Value::Integer(pre_sum),
+            "the parallel snapshot must observe the reader's pinned snapshot, not the concurrent commit"
+        );
+        assert!(
+            coord.parallel_scan_hits() > hits_before,
+            "the parallel path must have engaged for the snapshot-isolated reader"
+        );
+    }
+
+    // --- 6. FLOAT column DECLINES a numeric fold (float + is non-associative); count(*) stays exact ---
+    {
+        let seed = format!(
+            "UNWIND range(0, {}) AS i CREATE (:Meas {{v: i + 0.5}})",
+            BIG_N - 1
+        );
+        let mut par = fresh_coord();
+        run_write(&mut par, &seed);
+        par.declare_columnar_cache("Meas", "v").expect("declare");
+        let mut ser = fresh_coord();
+        run_write(&mut ser, &seed);
+        // sum over a float column must decline (and stay correct via the serial fallback).
+        assert_value_equals_serial_declined(
+            &mut par,
+            &mut ser,
+            "MATCH (n:Meas) RETURN sum(n.v) AS r",
+            "r",
+        );
+    }
+
+    // --- 7. avg DECLINES (the explicitly deferred slice), correct via serial fallback ---
+    {
+        let mut par = fresh_coord();
+        bulk_seed(&mut par, "Person", BIG_N);
+        par.declare_columnar_cache("Person", "age")
+            .expect("declare");
+        let mut ser = fresh_coord();
+        bulk_seed(&mut ser, "Person", BIG_N);
+        assert_value_equals_serial_declined(
+            &mut par,
+            &mut ser,
+            "MATCH (n:Person) RETURN avg(n.age) AS r",
+            "r",
+        );
+    }
+
+    // --- 8. UNDECLARED column DECLINES (no columnar cache covers it — the same decline path a
+    //        historical / begin_at_snapshot read takes); correct via serial fallback ---
+    {
+        let mut par = fresh_coord();
+        bulk_seed(&mut par, "Person", BIG_N); // NB: NO declare_columnar_cache
+        let mut ser = fresh_coord();
+        bulk_seed(&mut ser, "Person", BIG_N);
+        assert_value_equals_serial_declined(
+            &mut par,
+            &mut ser,
+            "MATCH (n:Person) RETURN sum(n.age) AS r",
+            "r",
+        );
+    }
+}
+
+/// The size gate, end-to-end through the real engine: a **below-threshold** label takes the serial
+/// path (no parallel-scan hit), an **above-threshold** label takes the parallel path (a hit) — and
+/// BOTH equal the pure serial coordinator. Kept separate from the big test (the below-gate half is
+/// cheap, the above-gate half reuses one heavy pair, dropped at the end of the test).
+#[test]
+fn parallel_size_gate_below_serial_above_parallel() {
+    // --- below the gate: a small label, declared, integer column → serial (cheap) ---
+    {
+        let small_n: i64 = PARALLEL_GATE / 2;
+        let mut small = fresh_coord();
+        bulk_seed(&mut small, "Small", small_n);
+        small
+            .declare_columnar_cache("Small", "age")
+            .expect("declare");
+        let mut small_row = fresh_coord();
+        bulk_seed(&mut small_row, "Small", small_n);
+        assert_value_equals_serial_declined(
+            &mut small,
+            &mut small_row,
+            "MATCH (n:Small) RETURN sum(n.age) AS r",
+            "r",
+        );
+    }
+    // --- above the gate: a large label, declared, integer column → parallel (heavy; scoped) ---
+    {
+        let mut big = fresh_coord();
+        bulk_seed(&mut big, "Big", BIG_N);
+        big.declare_columnar_cache("Big", "age").expect("declare");
+        let mut big_row = fresh_coord();
+        bulk_seed(&mut big_row, "Big", BIG_N);
+
+        let hits_before = big.parallel_scan_hits();
+        let big_par = read_scalar_parallel(&mut big, "MATCH (n:Big) RETURN sum(n.age) AS r", "r");
+        let big_ser = read_scalar(&mut big_row, "MATCH (n:Big) RETURN sum(n.age) AS r", "r");
+        assert_eq!(big_par, big_ser, "above-gate result equals serial");
+        assert!(
+            big.parallel_scan_hits() > hits_before,
+            "above the gate the parallel path MUST engage"
+        );
+    }
+}
+
+// NOTE: the single-thread *decline* — `current_num_threads() == 1` ⇒ no fan-out benefit ⇒ serial — is
+// covered deterministically by a one-thread-pool unit test in `executor::tests`
+// (`parallel_thread_gate_declines_single_worker`), because the `!Send` coordinator cannot be driven
+// inside a `rayon` `pool.install` from an integration test.

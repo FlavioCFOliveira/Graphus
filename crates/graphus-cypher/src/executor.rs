@@ -1763,6 +1763,19 @@ fn build_operator(
             group_keys,
             aggregates,
         } => {
+            // Parallel fast path (`rmp` #352, phase 1 of #336): for a *large* analytical
+            // `MATCH (n:Label) RETURN <exact-agg>(n.p)` over an integer column, project a frozen
+            // `Send + Sync` snapshot off the seam (under this statement's pinned read snapshot, with
+            // the IDENTICAL SSI markers — see `GraphAccess::project_snapshot`) and fold it across all
+            // cores with rayon. Exact/associative aggregates only (`count`, integer `sum`/`min`/`max`),
+            // so the parallel reduction is **bit-identical** to serial. Declines (falls through) for
+            // any non-conforming shape, float/avg, below-threshold, single-thread, RBAC restriction, or
+            // historical read — in which case the serial tiers below run verbatim.
+            if let Some(rows) =
+                try_parallel_label_property_aggregate(input, group_keys, aggregates, ctx)?
+            {
+                return Ok(Operator::Buffered { rows });
+            }
             // Vectorized fast path (`rmp` #330): an analytical `MATCH (n:Label) RETURN agg(n.p)` over
             // a columnar-cached column folds the contiguous column in batches instead of pulling rows
             // one at a time. It produces the IDENTICAL result (shared accumulator arithmetic over the
@@ -2292,6 +2305,233 @@ fn is_scan_var_property(expr: &Expr, scan_var: &str, property: &str) -> bool {
             key == property && matches!(&base.kind, ExprKind::Variable(v) if v == scan_var)
         }
         _ => false,
+    }
+}
+
+/// The minimum estimated cardinality at which the parallel label-property aggregation tier is even
+/// attempted (`rmp` task #352, phase 1 of #336). Below this, the snapshot-projection + rayon fan-out
+/// cannot recover its fixed cost (projecting an owned column, spinning up the rayon reduction), so the
+/// serial vectorized / Volcano tiers — which have effectively zero setup — win. Conservative on
+/// purpose: a too-low threshold would slow small queries; the win is on the *large* analytical scans
+/// (#336's motivation), where this is dwarfed by the column size. Tunable — raise it if profiling
+/// shows the crossover is higher on a given deployment, lower it if parallelism pays off sooner.
+const PARALLEL_AGG_MIN_ROWS: f64 = 50_000.0;
+
+/// Whether `kind` is an **exact, associative-and-commutative** aggregate whose rayon partition-reduce
+/// is provably bit-identical to the serial fold (`rmp` task #352): `count(*)`/`count(n.p)` (integer
+/// increment) and integer `sum`/`min`/`max`. `avg` is excluded (float division is order-sensitive and
+/// is the deferred slice), and so is any other kind. Float `sum`/`min`/`max` is excluded at the
+/// *value* level (see [`try_parallel_label_property_aggregate`]), because float addition is **not**
+/// associative — a parallel reduction tree could round differently from the serial left fold.
+fn is_exact_parallel_agg(spec: &VecAgg) -> bool {
+    match spec {
+        VecAgg::CountStar | VecAgg::CountProp => true,
+        VecAgg::Fold(kind) => matches!(kind, AggKind::Sum | AggKind::Min | AggKind::Max),
+    }
+}
+
+/// If `(plan, input, group_keys, aggregates)` is the **parallel-eligible** analytical shape — a large
+/// `MATCH (n:Label) RETURN <exact-agg>(n.p)[, …]` over an **integer** column, with more than one rayon
+/// worker available — projects a frozen `Send + Sync` [`GraphSnapshot`] off the seam and folds it
+/// across all cores, returning the single result row. Otherwise returns `None` so the caller falls
+/// through to [`try_vectorized_label_property_aggregate`] and then the serial [`aggregate_rows`], both
+/// of which run **verbatim** (`rmp` task #352, phase 1 of #336).
+///
+/// # Bit-identical to serial, by construction
+///
+/// * **Same values, same visibility, same SSI markers** — the snapshot is projected through
+///   [`GraphAccess::project_snapshot`], which (on [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph))
+///   reuses the *identical* internal candidate pass the serial columnar scan uses: the same
+///   `PredicateRead`/per-node SIREAD markers are registered on the engine thread **before** the owned
+///   snapshot is handed to rayon, and every value is the node's snapshot-visible current value. So the
+///   `(node, value)` set folded here is exactly the serial path's, and serializability is unchanged.
+/// * **Same arithmetic** — the fold reuses the shared [`Accumulator`] (`set_count_star` / `fold_value`),
+///   the very methods the serial vectorized path uses, so the per-partition results combine into the
+///   identical total. Integer `+`/`min`/`max` are associative **and** commutative, so any rayon split
+///   yields the identical value regardless of partition count or order — asserted by the equivalence
+///   tests.
+///
+/// # Eligibility (ALL required, else `None`)
+///
+/// - no grouping keys (a single `RETURN <agg>(...)` over a whole label), input a bare label scan, and
+///   every aggregate a bare recognized aggregate over the **same** single property — i.e. exactly the
+///   shape [`try_vectorized_label_property_aggregate`] recognizes;
+/// - every aggregate is **exact/associative** ([`is_exact_parallel_agg`]): `count(*)`, `count(n.p)`,
+///   or integer `sum`/`min`/`max` (NOT `avg`, NOT a float fold);
+/// - the projected column is **all integers** (a float/mixed column forces the serial path, which
+///   handles float semantics and order-sensitive rounding);
+/// - the **estimated input size** — the label scan's cardinality — is at least
+///   [`PARALLEL_AGG_MIN_ROWS`] (below which the serial tiers win, as their setup is ~free);
+/// - [`rayon::current_num_threads`] `> 1` (no point fanning out onto a single worker).
+///
+/// # Why the gate is the *input scan* estimate, not the plan-root estimate
+///
+/// The work this tier parallelizes is the **scan + fold** over the label's nodes, whose size is the
+/// label scan's cardinality. The plan **root** here is the [`Aggregation`](PhysicalOp::Aggregation),
+/// which collapses an ungrouped aggregation to exactly one output row
+/// ([`PhysicalPlan::estimated_rows`](crate::physical::PhysicalPlan::estimated_rows) is `1.0`) — the
+/// wrong quantity for this decision. So the gate is the input
+/// [`NodeByLabelScan`](PhysicalOp::NodeByLabelScan) estimate, read via the seam's
+/// [`Statistics`](crate::statistics::Statistics) (`nodes_with_label`) — the **same** source and formula
+/// the cardinality estimator applies to a `NodeByLabelScan` leaf
+/// ([`estimate_rows`](crate::cardinality::estimate_rows)). When the seam exposes no statistics, the
+/// estimate is unavailable and the tier conservatively declines (serial path), so a backend without
+/// counts is never forced onto the parallel path on a guess.
+fn try_parallel_label_property_aggregate(
+    input: &PhysicalOp,
+    group_keys: &[ProjectionColumn],
+    aggregates: &[ProjectionColumn],
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    use rayon::prelude::*;
+
+    // --- cheap gate first (no seam work): require more than one rayon worker ---
+    if rayon::current_num_threads() <= 1 {
+        return Ok(None);
+    }
+
+    // --- recognize exactly the vectorized analytical shape (single group, bare label scan) ---
+    if !group_keys.is_empty() || aggregates.is_empty() {
+        return Ok(None);
+    }
+    let (scan_var, label) = match input {
+        PhysicalOp::NodeByLabelScan { variable, label }
+        | PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => (&variable.name, &label.name),
+        _ => return Ok(None),
+    };
+
+    // --- the size gate: the label scan's estimated cardinality (the work being parallelized) ---
+    // Read from the seam's statistics — the same source + formula the cardinality estimator uses for a
+    // `NodeByLabelScan` leaf. No statistics ⇒ no estimate ⇒ conservatively decline (serial path).
+    let estimated_input = match ctx
+        .graph
+        .statistics()
+        .and_then(|s| s.nodes_with_label(label))
+    {
+        Some(count) => count as f64,
+        None => return Ok(None),
+    };
+    if !estimated_input.is_finite() || estimated_input < PARALLEL_AGG_MIN_ROWS {
+        return Ok(None);
+    }
+
+    // Resolve the single covered property (the first property-bearing aggregate fixes it; the rest
+    // must agree). A pure `count(*)`-only aggregation has no column to project — let the serial path
+    // handle it (it is already trivially cheap and the seam keys a snapshot on a property column).
+    let mut property: Option<String> = None;
+    for col in aggregates {
+        if let Some(p) = sole_aggregate_property(&col.expr, scan_var) {
+            match &property {
+                Some(existing) if existing != &p => return Ok(None),
+                _ => property = Some(p),
+            }
+        }
+    }
+    let Some(property) = property else {
+        return Ok(None);
+    };
+
+    // Recognize every column as a bare aggregate over `(scan_var, property)`, and require each to be
+    // an EXACT/associative aggregate (decline `avg`, any non-bare column, a `DISTINCT`, or a second
+    // property — the serial path covers all of those correctly).
+    let mut specs: Vec<VecAgg> = Vec::with_capacity(aggregates.len());
+    for col in aggregates {
+        match recognize_vec_agg(&col.expr, scan_var, &property) {
+            Some(spec) if is_exact_parallel_agg(&spec) => specs.push(spec),
+            _ => return Ok(None),
+        }
+    }
+
+    // --- project the frozen snapshot off the seam (registers the identical SSI markers here) ---
+    // `None` ⇒ the seam declines (no columnar cache / historical read / RBAC-restricted / unsupported
+    // spec) ⇒ fall through to the serial tiers, which run verbatim.
+    let spec = crate::snapshot::SnapshotSpec::new().with_column(label.clone(), property.clone());
+    let Some(snapshot) = ctx.graph.project_snapshot(&spec) else {
+        return Ok(None);
+    };
+
+    // The present `(node, value)` rows (the only data the property folds touch) and the full label
+    // count (the `count(*)` support). These are owned, `Send + Sync`, and now detached from the seam.
+    let rows = snapshot.label_property_rows(label, &property);
+    let label_matches = snapshot.scan_nodes_by_label(label).len();
+
+    // If any property fold (`sum`/`min`/`max`) is requested, require an ALL-INTEGER column: a
+    // float/mixed column is the deferred slice (float `+` is non-associative, so a parallel reduction
+    // could round differently than the serial left fold), so decline and let the serial path handle it
+    // exactly. A `count`/`count(*)`-only set imposes no such constraint (it never inspects the value).
+    let any_fold = specs.iter().any(|s| matches!(s, VecAgg::Fold(_)));
+    if any_fold && rows.iter().any(|(_, v)| !matches!(v, Value::Integer(_))) {
+        return Ok(None);
+    }
+
+    // Every gate passed and we are about to fold in parallel: record the engagement (observability).
+    ctx.graph.note_parallel_aggregate();
+
+    // --- the parallel reduction: one accumulator per column, folded over a FIXED partition order ---
+    // rayon's `fold` produces per-thread partial accumulators; `reduce` combines them. Integer
+    // `+`/`min`/`max` are associative + commutative, so the combine is order-independent and the total
+    // equals the serial left fold bit-for-bit (asserted by the equivalence tests). Cancellation is
+    // polled once up front (the fold itself is a tight CPU loop over owned integers — no seam access).
+    ctx.check_cancelled()?;
+
+    // The empty-input fast path keeps the reduce identity trivial and avoids a needless fan-out.
+    let folded: Result<Vec<Accumulator>, ExecError> = if rows.is_empty() {
+        Ok(specs.iter().map(new_parallel_acc).collect())
+    } else {
+        rows.par_iter()
+            .try_fold(
+                || specs.iter().map(new_parallel_acc).collect::<Vec<_>>(),
+                |mut accs, (_node, value)| {
+                    for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+                        match spec {
+                            // `count(*)` is assigned from `label_matches` after the reduce, not folded.
+                            VecAgg::CountStar => {}
+                            VecAgg::CountProp | VecAgg::Fold(_) => acc.fold_value(value)?,
+                        }
+                    }
+                    Ok(accs)
+                },
+            )
+            .try_reduce(
+                || specs.iter().map(new_parallel_acc).collect::<Vec<_>>(),
+                |mut a, b| {
+                    for (acc_a, acc_b) in a.iter_mut().zip(b) {
+                        acc_a.combine(acc_b);
+                    }
+                    Ok(a)
+                },
+            )
+    };
+    let mut accs = folded?;
+
+    // `count(*)` is the matched-node count, assigned directly (every matched node, property or not) —
+    // identical to the serial vectorized path's `set_count_star`.
+    let label_matches = i64::try_from(label_matches).unwrap_or(i64::MAX);
+    for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+        if matches!(spec, VecAgg::CountStar) {
+            acc.set_count_star(label_matches);
+        }
+    }
+
+    // Finish each column into the single output row (every column is a bare aggregate, so the
+    // aggregate value IS the column value — no outer expression to evaluate).
+    let mut row = Row::empty();
+    for (col, acc) in aggregates.iter().zip(accs) {
+        row.set(col.alias.clone(), acc.finish());
+    }
+    Ok(Some(VecDeque::from(vec![row])))
+}
+
+/// A fresh, zeroed [`Accumulator`] for a parallel partition of `spec` (`rmp` task #352) — the same
+/// zero state the serial vectorized path builds, so a partial fold here combines exactly with one
+/// from any other partition.
+fn new_parallel_acc(spec: &VecAgg) -> Accumulator {
+    match spec {
+        VecAgg::CountStar => Accumulator::for_kind(AggKind::CountStar),
+        VecAgg::CountProp => Accumulator::for_kind(AggKind::Count),
+        VecAgg::Fold(kind) => Accumulator::for_kind(*kind),
     }
 }
 
@@ -2846,6 +3086,43 @@ impl Accumulator {
     /// assigns it rather than incrementing per row. Identical to `count += 1` per matched node.
     fn set_count_star(&mut self, total: i64) {
         self.count = total;
+    }
+
+    /// Merges another partial accumulator `other` of the **same exact aggregate kind** into `self`
+    /// (`rmp` task #352): the associative-and-commutative combine step of the parallel label-property
+    /// fold. `self` and `other` must both come from [`Accumulator::for_kind`] over the same
+    /// [`AggKind`], folded over disjoint partitions of the same column; the merged accumulator is then
+    /// identical to one folded serially over the concatenation, regardless of how the partitions were
+    /// split or ordered.
+    ///
+    /// Only the kinds the parallel tier admits are merged precisely — `Count` (and `CountStar`, whose
+    /// count is assigned after the reduce), integer `Sum`, `Min`, `Max`. Every field those kinds touch
+    /// in [`fold_value`](Self::fold_value) is combined here: the row `count`, the integer/float sum
+    /// witnesses, and the running extreme (via the same [`cmp_values`] ordering `fold_value` uses, so
+    /// the tie-break is identical).
+    fn combine(&mut self, other: Accumulator) {
+        // Row count: additive for every kind (CountStar's is overwritten by `set_count_star` later).
+        self.count += other.count;
+        // Sum witnesses: additive, and the column is non-integer if *either* partition saw a float
+        // (the parallel tier gates folds to all-integer columns, so `sum_is_int` stays true in
+        // practice; combining it faithfully keeps the method correct if that gate ever widens).
+        self.int_sum = self.int_sum.saturating_add(other.int_sum);
+        self.sum += other.sum;
+        self.sum_is_int = self.sum_is_int && other.sum_is_int;
+        // Extreme: keep the min/max across partitions, using the same comparator `fold_value` uses.
+        if let Some(other_extreme) = other.extreme {
+            let take_other = match (&self.extreme, self.kind) {
+                (None, _) => true,
+                (Some(cur), AggKind::Min) => cmp_values(&other_extreme, cur).is_lt(),
+                (Some(cur), AggKind::Max) => cmp_values(&other_extreme, cur).is_gt(),
+                // Any non-extreme kind never has an `extreme`; keep `self` (defensive, unreachable
+                // for the admitted kinds).
+                (Some(_), _) => false,
+            };
+            if take_other {
+                self.extreme = Some(other_extreme);
+            }
+        }
     }
 
     /// Folds one input row into the accumulator.
@@ -4361,6 +4638,291 @@ mod tests {
     }
 
     const NO_PROPS: [(&str, Value); 0] = [];
+
+    // ---- parallel label-property aggregation gates (`rmp` task #352) ---------------------------
+
+    /// A `Send` seam (so it can be driven inside a `rayon` `pool.install`) that delegates every
+    /// `GraphAccess` read/write to an inner [`MemGraph`] but (a) reports a configurable
+    /// `nodes_with_label` count (to drive the size gate over/under the threshold) and (b) returns a
+    /// non-`None` `project_snapshot` (so a `Some` here is observable). Used to isolate the
+    /// thread-count and size gates of [`try_parallel_label_property_aggregate`], which the integration
+    /// tests cannot exercise deterministically (the real `!Send` coordinator cannot enter `install`).
+    struct ParallelGateStub {
+        inner: MemGraph,
+        label_count: u64,
+    }
+
+    impl crate::statistics::Statistics for ParallelGateStub {
+        fn total_nodes(&self) -> u64 {
+            self.label_count
+        }
+        fn nodes_with_label(&self, _label: &str) -> Option<u64> {
+            Some(self.label_count)
+        }
+        fn total_relationships(&self) -> u64 {
+            0
+        }
+        fn relationships_with_type(&self, _rel_type: &str) -> Option<u64> {
+            Some(0)
+        }
+    }
+
+    impl GraphAccess for ParallelGateStub {
+        fn project_snapshot(
+            &self,
+            spec: &crate::snapshot::SnapshotSpec,
+        ) -> Option<crate::snapshot::GraphSnapshot> {
+            let (label, property) = spec.columns().first()?;
+            let members = self.inner.scan_nodes_by_label(label);
+            let rows = members
+                .iter()
+                .filter_map(|&n| self.inner.node_property(n, property).map(|v| (n, v)))
+                .collect();
+            Some(crate::snapshot::GraphSnapshot::from_label_column(
+                label, property, members, rows,
+            ))
+        }
+        fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+            Some(self)
+        }
+        fn scan_nodes(&self) -> Vec<NodeId> {
+            self.inner.scan_nodes()
+        }
+        fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+            self.inner.scan_nodes_by_label(label)
+        }
+        fn expand(
+            &self,
+            node: NodeId,
+            direction: ExpandDirection,
+            types: &[String],
+        ) -> Vec<crate::graph_access::Incident> {
+            self.inner.expand(node, direction, types)
+        }
+        fn node_exists(&self, node: NodeId) -> bool {
+            self.inner.node_exists(node)
+        }
+        fn rel_exists(&self, rel: RelId) -> bool {
+            self.inner.rel_exists(rel)
+        }
+        fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
+            self.inner.node_labels(node)
+        }
+        fn rel_data(&self, rel: RelId) -> Option<crate::graph_access::RelData> {
+            self.inner.rel_data(rel)
+        }
+        fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+            self.inner.node_property(node, key)
+        }
+        fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
+            self.inner.rel_property(rel, key)
+        }
+        fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
+            self.inner.node_properties(node)
+        }
+        fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
+            self.inner.rel_properties(rel)
+        }
+        fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
+            self.inner.create_node(labels, properties)
+        }
+        fn create_rel(
+            &mut self,
+            rel_type: &str,
+            start: NodeId,
+            end: NodeId,
+            properties: &[(String, Value)],
+        ) -> RelId {
+            self.inner.create_rel(rel_type, start, end, properties)
+        }
+        fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
+            self.inner.set_node_property(node, key, value);
+        }
+        fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
+            self.inner.set_rel_property(rel, key, value);
+        }
+        fn add_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.inner.add_labels(node, labels);
+        }
+        fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.inner.remove_labels(node, labels);
+        }
+        fn remove_node_property(&mut self, node: NodeId, key: &str) {
+            self.inner.remove_node_property(node, key);
+        }
+        fn remove_rel_property(&mut self, rel: RelId, key: &str) {
+            self.inner.remove_rel_property(rel, key);
+        }
+        fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.inner.replace_node_properties(node, properties);
+        }
+        fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.inner.merge_node_properties(node, properties);
+        }
+        fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.inner.replace_rel_properties(rel, properties);
+        }
+        fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.inner.merge_rel_properties(rel, properties);
+        }
+        fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
+            self.inner.incident_rels(node)
+        }
+        fn delete_rel(&mut self, rel: RelId) {
+            self.inner.delete_rel(rel);
+        }
+        fn delete_node(&mut self, node: NodeId) {
+            self.inner.delete_node(node);
+        }
+    }
+
+    /// Compiles `src` and returns its root [`PhysicalOp`] (the [`PhysicalOp::Aggregation`] the gate
+    /// tests poke at directly).
+    fn aggregation_parts(src: &str) -> PhysicalOp {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        plan_physical(
+            &lower(&analyze(&ast).expect("analyze")),
+            &IndexCatalog::empty(),
+        )
+        .root
+    }
+
+    /// Drives [`try_parallel_label_property_aggregate`] once over `graph` for the aggregation `op`,
+    /// returning whether it engaged (`Some`) — a tiny harness that builds the minimal [`Ctx`].
+    fn parallel_engaged(op: &PhysicalOp, graph: &mut dyn GraphAccess) -> bool {
+        let PhysicalOp::Aggregation {
+            input,
+            group_keys,
+            aggregates,
+        } = op
+        else {
+            panic!("expected an Aggregation root");
+        };
+        let params = BoundParameters::empty();
+        let token = CancellationToken::new();
+        let functions = crate::function_registry::no_functions();
+        let procedures = crate::procedure_registry::builtins();
+        let mut ctx = Ctx {
+            params: &params,
+            token: &token,
+            graph,
+            functions,
+            procedures,
+            clock: StatementClock::capture(),
+        };
+        try_parallel_label_property_aggregate(input, group_keys, aggregates, &mut ctx)
+            .expect("no error")
+            .is_some()
+    }
+
+    /// The **single-thread** gate (`rmp` task #352): inside a one-worker `rayon` pool the parallel tier
+    /// declines (returns `None`) **even though** every other gate (huge label count, integer column,
+    /// exact aggregate, available snapshot) passes — proving the thread gate fires first. Outside the
+    /// one-thread pool (the multi-worker default global pool) the same setup engages.
+    #[test]
+    fn parallel_thread_gate_declines_single_worker() {
+        let op = aggregation_parts("MATCH (n:Person) RETURN sum(n.age) AS r");
+
+        let mut g = MemGraph::new();
+        for i in 0..10 {
+            g.add_node(["Person"], [("age", Value::Integer(i))]);
+        }
+        // A label count far above the size gate, so only the thread gate can decline.
+        let mut stub = ParallelGateStub {
+            inner: g,
+            label_count: 1_000_000,
+        };
+
+        // One worker → declines (the thread gate fires before any seam access).
+        let pool1 = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("1-thread pool");
+        let engaged_single = pool1.install(|| parallel_engaged(&op, &mut stub));
+        assert!(
+            !engaged_single,
+            "a single rayon worker must DECLINE the parallel tier"
+        );
+
+        // Multiple workers → engages (all gates pass: count, integer column, exact aggregate).
+        let pool4 = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("4-thread pool");
+        let engaged_multi = pool4.install(|| parallel_engaged(&op, &mut stub));
+        assert!(
+            engaged_multi,
+            "with multiple workers and all gates passing, the parallel tier must engage"
+        );
+    }
+
+    /// The **size** gate (`rmp` task #352): a label count below the threshold declines; at/above it
+    /// engages. Run under a multi-worker pool so the thread gate is satisfied and only the size gate
+    /// varies.
+    #[test]
+    fn parallel_size_gate_threshold() {
+        let op = aggregation_parts("MATCH (n:Person) RETURN sum(n.age) AS r");
+        let mut g = MemGraph::new();
+        for i in 0..10 {
+            g.add_node(["Person"], [("age", Value::Integer(i))]);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("4-thread pool");
+
+        // Below the threshold → declines.
+        let mut below = ParallelGateStub {
+            inner: g.clone(),
+            label_count: (PARALLEL_AGG_MIN_ROWS as u64) - 1,
+        };
+        assert!(
+            !pool.install(|| parallel_engaged(&op, &mut below)),
+            "below the size threshold the parallel tier must decline"
+        );
+
+        // At the threshold → engages.
+        let mut at = ParallelGateStub {
+            inner: g,
+            label_count: PARALLEL_AGG_MIN_ROWS as u64,
+        };
+        assert!(
+            pool.install(|| parallel_engaged(&op, &mut at)),
+            "at the size threshold the parallel tier must engage"
+        );
+    }
+
+    /// `avg` and a non-aggregate-shaped column decline regardless of size/threads (`rmp` task #352):
+    /// the shape/exactness gates. Proven with all other gates satisfied (huge count, multi-worker).
+    #[test]
+    fn parallel_shape_gate_declines_avg_and_non_bare() {
+        let mut g = MemGraph::new();
+        for i in 0..10 {
+            g.add_node(["Person"], [("age", Value::Integer(i))]);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("4-thread pool");
+
+        for src in [
+            "MATCH (n:Person) RETURN avg(n.age) AS r", // deferred aggregate
+            "MATCH (n:Person) RETURN sum(n.age) + 1 AS r", // not a bare aggregate
+            "MATCH (n:Person) RETURN count(DISTINCT n.age) AS r", // DISTINCT
+            "MATCH (n:Person) RETURN n.age AS k, sum(n.age) AS r", // grouping key present
+        ] {
+            let op = aggregation_parts(src);
+            let mut stub = ParallelGateStub {
+                inner: g.clone(),
+                label_count: 1_000_000,
+            };
+            assert!(
+                !pool.install(|| parallel_engaged(&op, &mut stub)),
+                "`{src}` must DECLINE the parallel tier (shape/exactness gate)"
+            );
+        }
+    }
 
     #[test]
     fn match_all_nodes() {

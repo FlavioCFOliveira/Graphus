@@ -479,6 +479,109 @@ impl GraphSnapshot {
         }
     }
 
+    /// Builds a **single-column** snapshot directly from an already-scanned label column (`rmp` task
+    /// #352, phase 1 of #336): the parallel-read enabler's lean projection.
+    ///
+    /// Unlike [`project`](Self::project), which performs its own full pass over a `&dyn GraphAccess`
+    /// (capturing topology + every requested column, and registering its own read footprint), this
+    /// constructor takes the result of the seam's **own** authoritative candidate pass — the exact same
+    /// pass the serial columnar scan runs, which has *already* registered the identical SSI / predicate
+    /// read-markers on the engine thread — and freezes it into an owned, `Send + Sync` view. It is the
+    /// bridge that lets the executor fold a `MATCH (n:label) RETURN <agg>(n.property)` across all cores
+    /// while keeping serializability byte-for-byte what the serial path would produce (see
+    /// [`RecordStoreGraph::project_snapshot`](crate::record_graph::RecordStoreGraph) and the
+    /// [`GraphAccess::project_snapshot`](crate::graph_access::GraphAccess::project_snapshot) contract).
+    ///
+    /// # Inputs
+    ///
+    /// * `members` — **every** visible node carrying `label` (present-property or not). This is the
+    ///   `scan_nodes_by_label(label)` set, so [`scan_nodes_by_label`](Self::scan_nodes_by_label)`.len()`
+    ///   on the result is the exact `count(*)` value.
+    /// * `rows` — the `(node, value)` pairs whose `property` is **present** (a subset of `members`),
+    ///   exactly what the row path would yield; they become the `(label, property)` column and the
+    ///   payload of [`label_property_rows`](Self::label_property_rows).
+    ///
+    /// # Topology
+    ///
+    /// No edges are captured — the parallel aggregation reads only the label membership and the one
+    /// property column. The result is therefore a faithful **node + single-column** view: `expand`,
+    /// `degree`, and relationship columns are all empty on it, which is correct for the aggregation it
+    /// serves (it never traverses).
+    ///
+    /// # Panics
+    ///
+    /// Never. A `row` whose node is not in `members` (which cannot happen for a single consistent pass,
+    /// since every present-property node is also a member) is simply ignored rather than panicking,
+    /// keeping the constructor total.
+    pub(crate) fn from_label_column(
+        label: &str,
+        property: &str,
+        members: Vec<NodeId>,
+        rows: Vec<(NodeId, Value)>,
+    ) -> Self {
+        let n = members.len();
+
+        // Dense internal id space over the label members (the snapshot's whole node set).
+        let mut external: Vec<NodeId> = Vec::with_capacity(n);
+        let mut index_of: NodeIndex = HashMap::with_capacity(n);
+        for id in &members {
+            if let std::collections::hash_map::Entry::Vacant(slot) = index_of.entry(id.0) {
+                slot.insert(external.len() as SnapId);
+                external.push(*id);
+            }
+        }
+        let n = external.len();
+
+        // One interned label; every member carries it (they came from a label scan), so the per-node
+        // label set is the single label id and the member list is the full id space in order.
+        let mut label_names: Vec<String> = Vec::new();
+        let mut label_ids: HashMap<String, LabelId> = HashMap::new();
+        let lid = intern(&mut label_names, &mut label_ids, label);
+        let node_labels: Vec<Vec<LabelId>> = vec![vec![lid]; n];
+        let label_members: Vec<Vec<SnapId>> = vec![(0..n as SnapId).collect()];
+
+        // One interned property; the dense column is filled from the present rows.
+        let mut prop_ids: HashMap<String, PropId> = HashMap::new();
+        let pid = intern_id(&mut prop_ids, property);
+        let mut column: Vec<Option<Value>> = vec![None; n];
+        for (node, value) in rows {
+            // A present-property node is necessarily a member; ignore a stray id defensively (total).
+            if let Some(&internal) = index_of.get(&node.0) {
+                column[internal as usize] = Some(value);
+            }
+        }
+        let mut columns: NodeColumns = HashMap::new();
+        columns.insert((lid, pid), column);
+
+        // The derived equality lookup over the single column (so `snapshot_seek_eq` keeps working).
+        let eq_index = build_eq_index(&columns);
+
+        // No topology / relationships captured (the aggregation never traverses): empty CSR + rel maps.
+        let out_offsets = vec![0u32; n + 1];
+        let in_offsets = vec![0u32; n + 1];
+
+        Self {
+            external,
+            index_of,
+            rel_external: Vec::new(),
+            rel_index_of: HashMap::new(),
+            out_offsets,
+            out_targets: Vec::new(),
+            in_offsets,
+            in_targets: Vec::new(),
+            label_names,
+            label_ids,
+            node_labels,
+            label_members,
+            rel_type_names: Vec::new(),
+            rel_type_ids: HashMap::new(),
+            columns,
+            prop_ids,
+            rel_columns: HashMap::new(),
+            eq_index,
+        }
+    }
+
     /// Builds the relationship identity map (`RelId` -> dense internal edge id) and the declared
     /// `(rel_type, property)` value columns, dense over that edge-id space.
     ///
@@ -1452,6 +1555,62 @@ mod tests {
             }
         }
         (sum, count)
+    }
+
+    /// `from_label_column` (`rmp` task #352): the lean single-column constructor must surface
+    /// `members` as `scan_nodes_by_label(label)` (the exact `count(*)` support) and the present `rows`
+    /// as `label_property_rows(label, property)` — and capture **no** topology (the parallel
+    /// aggregation never traverses).
+    #[test]
+    fn from_label_column_surfaces_members_and_rows() {
+        // 5 members; 3 carry a present `age` (nodes 10, 20, 40), 2 do not (30, 50).
+        let members = vec![NodeId(10), NodeId(20), NodeId(30), NodeId(40), NodeId(50)];
+        let rows = vec![
+            (NodeId(10), Value::Integer(1)),
+            (NodeId(20), Value::Integer(2)),
+            (NodeId(40), Value::Integer(4)),
+        ];
+        let snap = GraphSnapshot::from_label_column("Person", "age", members.clone(), rows.clone());
+
+        // `scan_nodes_by_label` is the full member set (so its `.len()` is the exact count(*)).
+        let mut got_members = snap.scan_nodes_by_label("Person");
+        got_members.sort_unstable();
+        assert_eq!(got_members, members, "members == scan_nodes_by_label");
+        assert_eq!(
+            snap.scan_nodes_by_label("Person").len(),
+            5,
+            "count(*) support"
+        );
+        // A label the snapshot does not carry yields nothing.
+        assert!(snap.scan_nodes_by_label("Company").is_empty());
+
+        // `label_property_rows` is exactly the present rows (in internal-id order, which matches the
+        // members' order here).
+        assert_eq!(
+            snap.label_property_rows("Person", "age"),
+            rows,
+            "present rows == label_property_rows"
+        );
+        // node_count is the member count; no edges/relationships captured.
+        assert_eq!(snap.node_count(), 5);
+        assert_eq!(snap.edge_count(), 0);
+        assert_eq!(snap.rel_count(), 0);
+        // A property-absent member reads `None` for the column; a present one reads its value.
+        assert_eq!(
+            snap.node_property(Some("Person"), NodeId(30), "age"),
+            None,
+            "property-absent member"
+        );
+        assert_eq!(
+            snap.node_property(Some("Person"), NodeId(20), "age"),
+            Some(Value::Integer(2))
+        );
+
+        // The derived equality index still works over the single column.
+        assert_eq!(
+            snap.snapshot_seek_eq("Person", "age", &Value::Integer(4)),
+            vec![NodeId(40)]
+        );
     }
 
     #[test]

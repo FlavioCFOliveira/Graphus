@@ -1324,6 +1324,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.columns.borrow().fallback_reads()
     }
 
+    /// The number of times the **parallel** label-property aggregation tier (`rmp` task #352) projected
+    /// a snapshot off this coordinator's columnar cache and folded it across cores. Distinct from
+    /// [`columnar_scan_hits`](Self::columnar_scan_hits) (which the serial columnar scan also bumps): a
+    /// test asserts this incremented to prove the parallel path was actually taken, so a
+    /// parallel-vs-serial equivalence check is not vacuously comparing serial against itself.
+    #[must_use]
+    pub fn parallel_scan_hits(&self) -> u64 {
+        self.columns.borrow().parallel_scan_hits()
+    }
+
     /// Declares a node-property index on `(label, property)` and starts a **non-blocking** background
     /// build of it (`rmp` task #91): the catalog entry is recorded durably as [`IndexState::Populating`]
     /// and a pending build is enqueued, but **no node is scanned here** — the call returns promptly so

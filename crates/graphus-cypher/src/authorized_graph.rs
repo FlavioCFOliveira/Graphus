@@ -293,6 +293,30 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.columnar_label_property_scan(label, property)
     }
 
+    fn project_snapshot(
+        &self,
+        spec: &crate::snapshot::SnapshotSpec,
+    ) -> Option<crate::snapshot::GraphSnapshot> {
+        // The parallel-read snapshot projection (`rmp` task #352), composed with RBAC exactly as
+        // `columnar_label_property_scan` above: an unrestricted principal gets the inner projection
+        // verbatim; a restricted principal is conservatively **declined** (return `None`) so the
+        // executor falls back to the serial aggregation, which RBAC-composes via
+        // `scan_nodes_by_label` + `node_property`. A restricted principal must never observe
+        // filtered-out data through a frozen snapshot, and reconstructing the RBAC-projected column +
+        // `count(*)` here would duplicate the row path's per-node traverse gate — not worth it for the
+        // rare restricted analytical scan. The common (unrestricted) workload keeps the full win.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.project_snapshot(spec)
+    }
+
+    fn note_parallel_aggregate(&self) {
+        // Pure observability bump (`rmp` task #352): forward unconditionally. A restricted principal
+        // never reaches it (its `project_snapshot` already declined), so there is nothing to gate.
+        self.inner.note_parallel_aggregate();
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         let incidents = self.inner.expand(node, direction, types);
         if self.oracle.is_unrestricted() {
@@ -955,6 +979,156 @@ mod tests {
         assert_eq!(authz.scan_nodes(), baseline);
         assert_eq!(authz.node_properties(ada), baseline_props);
         assert!(authz.take_auth_error().is_none());
+    }
+
+    /// A [`GraphAccess`] that delegates everything to an inner [`MemGraph`] but **overrides
+    /// `project_snapshot`** to return a non-`None` snapshot, so the [`AuthorizedGraph`] decorator's
+    /// RBAC composition of that method (`rmp` task #352) can be tested in isolation: the default
+    /// `MemGraph` impl returns `None` regardless of restriction, which would not distinguish "forwarded"
+    /// from "declined".
+    struct SnapshotStub(MemGraph);
+
+    impl GraphAccess for SnapshotStub {
+        fn project_snapshot(
+            &self,
+            spec: &crate::snapshot::SnapshotSpec,
+        ) -> Option<crate::snapshot::GraphSnapshot> {
+            // A faithful (if tiny) single-column snapshot for the first declared column, built from the
+            // inner graph — enough that a `Some` here is observable by the decorator test.
+            let (label, property) = spec.columns().first()?;
+            let members = self.0.scan_nodes_by_label(label);
+            let rows = members
+                .iter()
+                .filter_map(|&n| self.0.node_property(n, property).map(|v| (n, v)))
+                .collect();
+            Some(crate::snapshot::GraphSnapshot::from_label_column(
+                label, property, members, rows,
+            ))
+        }
+        // Everything else delegates to the inner MemGraph.
+        fn scan_nodes(&self) -> Vec<NodeId> {
+            self.0.scan_nodes()
+        }
+        fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+            self.0.scan_nodes_by_label(label)
+        }
+        fn expand(
+            &self,
+            node: NodeId,
+            direction: ExpandDirection,
+            types: &[String],
+        ) -> Vec<Incident> {
+            self.0.expand(node, direction, types)
+        }
+        fn node_exists(&self, node: NodeId) -> bool {
+            self.0.node_exists(node)
+        }
+        fn rel_exists(&self, rel: RelId) -> bool {
+            self.0.rel_exists(rel)
+        }
+        fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
+            self.0.node_labels(node)
+        }
+        fn rel_data(&self, rel: RelId) -> Option<RelData> {
+            self.0.rel_data(rel)
+        }
+        fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+            self.0.node_property(node, key)
+        }
+        fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
+            self.0.rel_property(rel, key)
+        }
+        fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
+            self.0.node_properties(node)
+        }
+        fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
+            self.0.rel_properties(rel)
+        }
+        fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
+            self.0.create_node(labels, properties)
+        }
+        fn create_rel(
+            &mut self,
+            rel_type: &str,
+            start: NodeId,
+            end: NodeId,
+            properties: &[(String, Value)],
+        ) -> RelId {
+            self.0.create_rel(rel_type, start, end, properties)
+        }
+        fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
+            self.0.set_node_property(node, key, value);
+        }
+        fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
+            self.0.set_rel_property(rel, key, value);
+        }
+        fn add_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.0.add_labels(node, labels);
+        }
+        fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.0.remove_labels(node, labels);
+        }
+        fn remove_node_property(&mut self, node: NodeId, key: &str) {
+            self.0.remove_node_property(node, key);
+        }
+        fn remove_rel_property(&mut self, rel: RelId, key: &str) {
+            self.0.remove_rel_property(rel, key);
+        }
+        fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.0.replace_node_properties(node, properties);
+        }
+        fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.0.merge_node_properties(node, properties);
+        }
+        fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.0.replace_rel_properties(rel, properties);
+        }
+        fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.0.merge_rel_properties(rel, properties);
+        }
+        fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
+            self.0.incident_rels(node)
+        }
+        fn delete_rel(&mut self, rel: RelId) {
+            self.0.delete_rel(rel);
+        }
+        fn delete_node(&mut self, node: NodeId) {
+            self.0.delete_node(node);
+        }
+    }
+
+    /// `rmp` task #352: the decorator **forwards** `project_snapshot` for an unrestricted principal
+    /// (the inner `Some` snapshot reaches the caller — the common analytical path keeps the parallel
+    /// win), and **declines** it (`None`) for a restricted principal, so a restricted reader can never
+    /// observe filtered-out data through a frozen snapshot and instead falls back to the serial path.
+    #[test]
+    fn project_snapshot_forwards_unrestricted_declines_restricted() {
+        let (g, _ada, _acme, _r) = seed();
+        let spec = crate::snapshot::SnapshotSpec::new().with_column("Person", "name");
+
+        // Unrestricted: the inner snapshot is forwarded verbatim.
+        let mut inner_u = SnapshotStub(g.clone());
+        let authz_u = AuthorizedGraph::new(&mut inner_u, StubOracle::unrestricted());
+        let snap_u = authz_u
+            .project_snapshot(&spec)
+            .expect("unrestricted principal gets the inner snapshot");
+        assert_eq!(
+            snap_u.scan_nodes_by_label("Person").len(),
+            1,
+            "the forwarded snapshot carries the Person members"
+        );
+
+        // Restricted (even with the exact grants needed to read the data the serial path WOULD use):
+        // the decorator still declines the snapshot, conservatively forcing the serial fallback.
+        let mut inner_r = SnapshotStub(g);
+        let oracle = StubOracle::default()
+            .traverse_label("Person")
+            .read_property("Person", "name");
+        let authz_r = AuthorizedGraph::new(&mut inner_r, oracle);
+        assert!(
+            authz_r.project_snapshot(&spec).is_none(),
+            "a restricted principal must be declined the parallel snapshot (serial fallback)"
+        );
     }
 
     #[test]

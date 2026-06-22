@@ -135,6 +135,19 @@ use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
 };
 use crate::index_set::{ConstraintRule, IndexSet};
+use crate::snapshot::{GraphSnapshot, SnapshotSpec};
+
+/// The result of the single authoritative columnar candidate pass
+/// ([`columnar_label_pass`](RecordStoreGraph::columnar_label_pass)): every visible label-carrying
+/// node id and the subset whose property is present. Shared by the serial columnar scan and the
+/// parallel-read snapshot projection so they register byte-identical SSI markers (`rmp` task #352).
+#[derive(Debug, Default)]
+struct ColumnarPass {
+    /// Every visible node carrying the label, in candidate order (the exact `count(*)` support).
+    members: Vec<NodeId>,
+    /// The `(node, value)` rows whose property is present (a subset of `members`).
+    rows: Vec<(NodeId, Value)>,
+}
 
 /// A [`GraphAccess`] implementation over a real [`RecordStore`], scoped to one transaction
 /// (`rmp` task #38; see the module docs for the supported-vs-deferred matrix).
@@ -1663,6 +1676,32 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         label: &str,
         property: &str,
     ) -> Option<crate::graph_access::ColumnarScan> {
+        // The full candidate pass (members + present rows) registers the identical SSI predicate +
+        // per-node markers; `ColumnarScan` is just the projection the seam exposes (`rmp` #329/#330).
+        let scan = self.columnar_label_pass(label, property)?;
+        Some(crate::graph_access::ColumnarScan {
+            rows: scan.rows,
+            label_matches: scan.members.len(),
+        })
+    }
+
+    /// The single authoritative candidate pass shared by the columnar scan
+    /// ([`columnar_scan_checked`](Self::columnar_scan_checked)) and the parallel-read snapshot
+    /// projection ([`project_snapshot`](GraphAccess::project_snapshot), `rmp` task #352): it returns
+    /// **both** the full set of visible `label`-carrying node ids (`members`, the exact `count(*)`
+    /// support) **and** the `(node, value)` rows whose `property` is present (`rows`), computed in one
+    /// pass over the authoritative live candidate set.
+    ///
+    /// Factoring this out is what lets the parallel aggregation reuse the **identical** SSI/predicate
+    /// read-marker registration the serial columnar scan performs (`PredicateRead::Label` +
+    /// [`mark_all_live_nodes`](Self::mark_all_live_nodes) + the per-candidate
+    /// [`note_read`](Self::note_read), all below) — the markers are recorded here, on the engine
+    /// thread, **before** the owned snapshot is handed to rayon, so serializability is byte-for-byte
+    /// what the row scan would produce regardless of which read path the executor chose. `None` when no
+    /// declared column covers the pair, exactly as the columnar scan declines (the caller then uses the
+    /// row path); see the long soundness note on [`columnar_scan_checked`](Self::columnar_scan_checked)
+    /// for why the per-value re-validation makes the result identical to a row scan-and-filter.
+    fn columnar_label_pass(&self, label: &str, property: &str) -> Option<ColumnarPass> {
         // Only the coordinated path has a columnar cache; the standalone path declines (row scan).
         let columns = self.columns.as_ref()?;
         // Resolve the label + property tokens WITHOUT interning (a read must not mint a token). A
@@ -1694,10 +1733,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 Ok(ids) => ids,
                 Err(e) => {
                     self.capture(e);
-                    return Some(crate::graph_access::ColumnarScan {
-                        rows: Vec::new(),
-                        label_matches: 0,
-                    });
+                    return Some(ColumnarPass::default());
                 }
             }
         };
@@ -1725,9 +1761,11 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         };
 
         let mut out: Vec<(NodeId, Value)> = Vec::new();
-        // The count of visible label-carrying nodes — the exact `count(*)` value (every matched node,
-        // present-property or not), accumulated from the same single candidate pass.
-        let mut label_matches: usize = 0;
+        // Every visible label-carrying node id, in candidate order — the exact `count(*)` support
+        // (every matched node, present-property or not) and the snapshot's `scan_nodes_by_label` set,
+        // accumulated from the same single candidate pass (`rmp` task #352). Its `.len()` is the
+        // `label_matches` the columnar scan reports.
+        let mut members: Vec<NodeId> = Vec::new();
         // Decode accounting (`rmp` #329/#330): values served from the column (zero decode) vs read
         // from the property chain (fallback). Published to the cache at the end of the scan.
         let mut value_hits: u64 = 0;
@@ -1753,14 +1791,11 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 Err(e) => {
                     // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
                     self.capture(e);
-                    return Some(crate::graph_access::ColumnarScan {
-                        rows: Vec::new(),
-                        label_matches: 0,
-                    });
+                    return Some(ColumnarPass::default());
                 }
             }
             // A visible label-carrying node: it counts toward `count(*)` regardless of the property.
-            label_matches += 1;
+            members.push(NodeId(id));
 
             // Try the cache; fall back to the authoritative single-property read on any mismatch.
             let node = NodeId(id);
@@ -1792,10 +1827,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             cache.record_value_hits(value_hits);
             cache.record_fallback_reads(fallback_reads);
         }
-        Some(crate::graph_access::ColumnarScan {
-            rows: out,
-            label_matches,
-        })
+        Some(ColumnarPass { members, rows: out })
     }
 
     /// Whether a cached column entry for property-key `prop_key` is still **fresh** for the node whose
@@ -2031,6 +2063,70 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // re-validates each cached value against the node's current MVCC header, and falls back to the
         // row read on any mismatch — so the result is exactly the row-path result (`rmp` #329).
         self.columnar_scan_checked(label, property)
+    }
+
+    fn project_snapshot(&self, spec: &SnapshotSpec) -> Option<GraphSnapshot> {
+        // The parallel-read enabler (`rmp` task #352, phase 1 of #336): project the single
+        // `(label, property)` column declared in `spec` into a frozen, owned `Send + Sync`
+        // [`GraphSnapshot`] the executor can fold across all cores, built **here on the engine thread
+        // under this statement's already-pinned read snapshot** before the owned copy is handed to
+        // rayon.
+        //
+        // # Why this goes through `columnar_label_pass`
+        //
+        // It deliberately reuses the **identical** internal candidate pass the serial
+        // [`columnar_label_property_scan`](GraphAccess::columnar_label_property_scan) uses
+        // ([`columnar_label_pass`](Self::columnar_label_pass)), so:
+        //
+        // * **SSI / predicate read-markers are byte-for-byte identical** — the `PredicateRead::Label`
+        //   marker, the `mark_all_live_nodes` footprint, and the per-candidate `note_read` are all
+        //   registered by that shared pass on the engine thread, *before* the snapshot is frozen. A
+        //   statement that takes the parallel path therefore closes exactly the same rw-edges (the same
+        //   phantoms) as one that took the serial columnar or row path; serializability is unchanged.
+        // * **MVCC visibility + value re-validation are identical** — every value is the node's
+        //   snapshot-visible current value (cache hit re-checked against the MVCC header, else the
+        //   authoritative row read), so the snapshot's rows are exactly the row-path
+        //   `(node, value)` set, and `members` is exactly the `scan_nodes_by_label` set.
+        //
+        // It declines (returns `None`) on exactly the set the serial columnar scan declines on: the
+        // standalone / [`begin_at_snapshot`](Self::begin_at_snapshot) historical-read path (no columnar
+        // cache, `self.columns` is `None`) and any column not declared. The caller then falls through
+        // to the serial aggregation tiers, which run verbatim.
+        //
+        // RBAC composition is handled one layer up by
+        // [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph), which declines this for a
+        // restricted principal (mirroring its `columnar_label_property_scan`), so a restricted reader
+        // can never observe filtered-out data through the snapshot.
+
+        // Phase 1 covers exactly one node column (`MATCH (n:Label) RETURN <agg>(n.p)`); a spec naming
+        // anything else (zero columns, multiple columns, or any relationship column) is not the shape
+        // the parallel aggregation requests — decline so the caller stays on the serial path.
+        let [(label, property)] = spec.columns() else {
+            return None;
+        };
+        if !spec.rel_columns().is_empty() {
+            return None;
+        }
+
+        // The single authoritative candidate pass (registers the identical SSI markers); `None` ⇒ no
+        // declared column / historical read ⇒ decline (caller uses the serial path).
+        let pass = self.columnar_label_pass(label, property)?;
+        Some(GraphSnapshot::from_label_column(
+            label,
+            property,
+            pass.members,
+            pass.rows,
+        ))
+    }
+
+    fn note_parallel_aggregate(&self) {
+        // Observability (`rmp` task #352): the executor calls this once it has committed to folding a
+        // projected snapshot in parallel (every gate passed, including the all-integer column check),
+        // so the counter measures *completed* parallel aggregations — distinct from a projection that
+        // is declined afterwards (e.g. a float `sum`) and from the serial columnar `scan_hits`.
+        if let Some(columns) = &self.columns {
+            columns.borrow().record_parallel_scan_hit();
+        }
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {

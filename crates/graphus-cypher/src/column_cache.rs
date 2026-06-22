@@ -241,6 +241,13 @@ pub struct ColumnCache {
     /// decode for **every** matched node, so `value_hits` vs `fallback_reads` is the measured decode
     /// reduction.
     fallback_reads: std::cell::Cell<u64>,
+    /// The number of times the **parallel** label-property aggregation tier (`rmp` task #352) projected
+    /// a snapshot off this cache and folded it across cores. A cheap observability counter, distinct
+    /// from [`scan_hits`](Self::scan_hits) (which the serial columnar scan also bumps): a test asserts
+    /// the *parallel* path was actually engaged (not silently declined to the serial tier, which would
+    /// make a parallel-vs-serial equivalence check vacuous). `Cell` because the projection path takes
+    /// `&self`.
+    parallel_scan_hits: std::cell::Cell<u64>,
 }
 
 impl ColumnCache {
@@ -337,6 +344,23 @@ impl ColumnCache {
     /// decode) — called by the read path with its per-scan tally (`rmp` #329/#330).
     pub fn record_value_hits(&self, n: u64) {
         self.value_hits.set(self.value_hits.get() + n);
+    }
+
+    /// Records one engagement of the parallel label-property aggregation tier (`rmp` task #352): a
+    /// snapshot was projected off this cache and folded across cores. Bumped by
+    /// [`RecordStoreGraph::project_snapshot`](crate::record_graph::RecordStoreGraph) on a successful
+    /// projection.
+    pub fn record_parallel_scan_hit(&self) {
+        self.parallel_scan_hits
+            .set(self.parallel_scan_hits.get() + 1);
+    }
+
+    /// The number of times the parallel aggregation tier projected a snapshot off this cache
+    /// (`rmp` task #352) — the parallel-path engagement count. Used by tests to prove the parallel path
+    /// actually ran (so an equivalence assertion is not vacuous).
+    #[must_use]
+    pub fn parallel_scan_hits(&self) -> u64 {
+        self.parallel_scan_hits.get()
     }
 
     /// Records that `n` candidate values had to be read from the authoritative property chain (a stale

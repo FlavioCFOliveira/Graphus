@@ -329,6 +329,47 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional** frozen, owned, `Send + Sync` read-only **snapshot** of the columns declared in
+    /// `spec`, projected off this seam under the current transaction's read view (`rmp` task #352,
+    /// phase 1 of #336 — the parallel-read enabler).
+    ///
+    /// This is the seam through which the executor obtains a [`GraphSnapshot`] it can fold across all
+    /// cores (the live [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph) is `!Send`, so a
+    /// heavy aggregation otherwise serializes on one core). The projection happens **here, on the
+    /// engine thread, under this statement's already-pinned read snapshot**, so the returned snapshot
+    /// is a frozen committed view consistent with every other read in the statement; once returned it
+    /// owns all its data and may be shared across threads (e.g. via [`rayon`](https://docs.rs/rayon)).
+    ///
+    /// # Contract (why the parallel result equals the serial one)
+    ///
+    /// An implementation that returns `Some` MUST register the **identical** SSI / predicate
+    /// read-markers, and apply the identical MVCC visibility + RBAC filtering, that the ordinary
+    /// scan/aggregation path would for the same `spec` — *during this call, before the owned snapshot
+    /// is handed off* — so that taking the parallel path never changes serializability or which data
+    /// is visible. If it cannot guarantee marker-identical, visibility-identical, RBAC-identical
+    /// behaviour, it MUST return `None` and let the caller fall back to the serial path (which is
+    /// always correct).
+    ///
+    /// Returns `None` by default (no snapshot projection available — the executor uses the serial
+    /// aggregation tiers). `None` is also the correct decline for a restricted principal (the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator returns it), for a
+    /// historical / `begin_at_snapshot` read, and for any `spec` shape the implementation does not
+    /// cover.
+    fn project_snapshot(
+        &self,
+        _spec: &crate::snapshot::SnapshotSpec,
+    ) -> Option<crate::snapshot::GraphSnapshot> {
+        None
+    }
+
+    /// An **optional** observability hook the executor calls **once** when it has committed to folding a
+    /// [`project_snapshot`] result in parallel — i.e. after every eligibility gate has passed, just
+    /// before the rayon fold (`rmp` task #352). It lets a backend count *completed* parallel
+    /// aggregations for monitoring/tests, separate from a snapshot projection that is declined
+    /// afterwards (e.g. a float column forces the serial fall-back even though the snapshot was
+    /// projected). The default is a no-op; a backend with a metrics counter overrides it.
+    fn note_parallel_aggregate(&self) {}
+
     // ---- writes -------------------------------------------------------------------------------
 
     /// Creates a node with `labels` and `properties`, returning its new id.
