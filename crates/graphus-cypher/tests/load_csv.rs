@@ -77,6 +77,13 @@ fn compile(src: &str) -> graphus_cypher::physical::PhysicalPlan {
 /// Runs `src` over `store` in one transaction, asserting no deferred storage error, committing, and
 /// returning `(rows, store)`.
 fn run_commit(src: &str, store: Store, txn: u64) -> (Vec<Row>, Store) {
+    // Install the confined import policy before any query runs. `global_import_policy()` locks its
+    // process-wide `OnceLock` to the fail-closed default on first *read*, so a parallel test whose
+    // `LOAD CSV` executed before any `import_root()` install could poison the policy to `denied` for
+    // the whole binary (the flaky "no import directory is configured" failure under heavy test
+    // oversubscription). Routing every execution path through this install first makes the `set`
+    // win the race deterministically. (Regression guard; the store is unrelated.)
+    let _ = import_root();
     let plan = compile(src);
     let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
     let mut graph = RecordStoreGraph::begin(store, TxnId(txn));
@@ -96,6 +103,7 @@ fn run_commit(src: &str, store: Store, txn: u64) -> (Vec<Row>, Store) {
 /// Runs `src` over `store` expecting the cursor itself to fail at runtime (a `LOAD CSV` runtime
 /// error such as a missing file / bad scheme), rolling back. Returns the error.
 fn run_expect_exec_error(src: &str, store: Store, txn: u64) -> ExecError {
+    let _ = import_root(); // see `run_commit`: install the confined policy before any query executes
     let plan = compile(src);
     let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
     let mut graph = RecordStoreGraph::begin(store, TxnId(txn));
