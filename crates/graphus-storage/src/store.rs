@@ -786,7 +786,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         s.free.pop().unwrap_or_else(|| s.alloc.alloc_fresh())
     }
 
-    fn read_node(&mut self, id: u64) -> Result<NodeRecord> {
+    fn read_node(&self, id: u64) -> Result<NodeRecord> {
         let (rel_page, off) = paging::record_location(id, NODE_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Node, rel_page)?;
         // `with_page_fetched` reads the resident page under a single latch (fetch + read + unpin
@@ -795,21 +795,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .with_page_fetched(dev, |p| NodeRecord::decode(&p[off..off + NODE_RECORD_SIZE]))
     }
 
-    fn read_rel(&mut self, id: u64) -> Result<RelRecord> {
+    fn read_rel(&self, id: u64) -> Result<RelRecord> {
         let (rel_page, off) = paging::record_location(id, REL_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Rel, rel_page)?;
         self.pool
             .with_page_fetched(dev, |p| RelRecord::decode(&p[off..off + REL_RECORD_SIZE]))
     }
 
-    fn read_prop(&mut self, id: u64) -> Result<PropRecord> {
+    fn read_prop(&self, id: u64) -> Result<PropRecord> {
         let (rel_page, off) = paging::record_location(id, PROP_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Prop, rel_page)?;
         self.pool
             .with_page_fetched(dev, |p| PropRecord::decode(&p[off..off + PROP_RECORD_SIZE]))
     }
 
-    fn read_block(&mut self, id: u64) -> Result<HeapBlock> {
+    fn read_block(&self, id: u64) -> Result<HeapBlock> {
         let (rel_page, off) = paging::record_location(id, STRINGS_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Strings, rel_page)?;
         self.pool.with_page_fetched(dev, |p| {
@@ -1295,7 +1295,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
     /// avoids decoding the full record when only the header words matter).
-    fn read_mvcc(&mut self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
+    fn read_mvcc(&self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
         let (rel_page, off) = paging::record_location(id, kind.record_size());
         let dev = self.device_page(kind, rel_page)?;
         // Single-latch resident read (the GC freeze sweep walks the full id range — hot, `rmp` #337).
@@ -1560,7 +1560,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if `id`'s page is not allocated.
-    pub fn node(&mut self, id: u64) -> Result<NodeRecord> {
+    pub fn node(&self, id: u64) -> Result<NodeRecord> {
         self.read_node(id)
     }
 
@@ -1578,7 +1578,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if a node store page in the range cannot be read.
-    pub fn scan_node_ids(&mut self) -> Result<Vec<u64>> {
+    pub fn scan_node_ids(&self) -> Result<Vec<u64>> {
         let high_water = self.store(StoreKind::Node).alloc.high_water();
         let mut out = Vec::new();
         for id in 1..high_water {
@@ -1599,7 +1599,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if a relationship store page in the range cannot be read.
-    pub fn scan_rel_ids(&mut self) -> Result<Vec<u64>> {
+    pub fn scan_rel_ids(&self) -> Result<Vec<u64>> {
         let high_water = self.store(StoreKind::Rel).alloc.high_water();
         let mut out = Vec::new();
         for id in 1..high_water {
@@ -1787,7 +1787,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   [`LabelError::OverflowFlagSet`](crate::labels::LabelError::OverflowFlagSet)) if the node's
     ///   bitmap is in overflow form (its labels live in a #39 token-list block this build cannot
     ///   read).
-    pub fn node_labels(&mut self, id: u64) -> Result<Vec<u32>> {
+    pub fn node_labels(&self, id: u64) -> Result<Vec<u32>> {
         let node = self.read_node(id)?;
         labels::token_ids(node.labels).map_err(GraphusError::from)
     }
@@ -1798,7 +1798,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// - [`GraphusError::Storage`] if `id`'s page is not allocated.
     /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
     ///   `label_token_id` is `>= 63`, or the node's bitmap is in overflow form (#39).
-    pub fn node_has_label(&mut self, id: u64, label_token_id: u32) -> Result<bool> {
+    pub fn node_has_label(&self, id: u64, label_token_id: u32) -> Result<bool> {
         let node = self.read_node(id)?;
         labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
     }
@@ -1985,7 +1985,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if `id`'s page is not allocated.
-    pub fn rel(&mut self, id: u64) -> Result<RelRecord> {
+    pub fn rel(&self, id: u64) -> Result<RelRecord> {
         self.read_rel(id)
     }
 
@@ -2567,7 +2567,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if `id`'s page is not allocated.
-    pub fn property(&mut self, id: u64) -> Result<PropRecord> {
+    pub fn property(&self, id: u64) -> Result<PropRecord> {
         self.read_prop(id)
     }
 
@@ -2575,7 +2575,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing.
-    pub fn node_properties(&mut self, node_id: u64) -> Result<Vec<(u64, PropRecord)>> {
+    pub fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>> {
         let node = self.read_node(node_id)?;
         let mut out = Vec::new();
         let mut cur = node.first_prop;
@@ -2711,7 +2711,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if a block page is missing, a block id is out of range, or the chain
     /// does not terminate within a cycle guard (a corrupted chain is *reported*, never looped on —
     /// mirrors the property/adjacency chain guards).
-    pub fn read_chain(&mut self, head: u64) -> Result<Vec<u8>> {
+    pub fn read_chain(&self, head: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut cur = head;
         let guard = self.store(StoreKind::Strings).alloc.high_water() + 1;
@@ -2886,7 +2886,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if the chain is unreadable/corrupt or the tag is one this build does
     /// not understand.
     pub fn decode_property_value(
-        &mut self,
+        &self,
         type_tag: u8,
         value_inline: u64,
     ) -> Result<graphus_core::Value> {
@@ -2906,7 +2906,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
     pub fn node_property_values(
-        &mut self,
+        &self,
         node_id: u64,
     ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
         let chain = self.node_properties(node_id)?;
@@ -3008,7 +3008,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain is malformed (cycle-guarded).
-    pub fn rel_properties(&mut self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
+    pub fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
         let rel = self.read_rel(rel_id)?;
         let mut out = Vec::new();
         let mut cur = rel.first_prop;
@@ -3090,10 +3090,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-    pub fn rel_property_values(
-        &mut self,
-        rel_id: u64,
-    ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
+    pub fn rel_property_values(&self, rel_id: u64) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
         let chain = self.rel_properties(rel_id)?;
         let mut out = Vec::with_capacity(chain.len());
         for (pid, prop) in chain {
@@ -3139,11 +3136,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// head pointer and stops at `NULL_ID`; an empty chain is therefore exactly `first_rel ==
     /// NULL_ID`. This avoids the full `Vec` allocation when the caller only needs emptiness (e.g. the
     /// GC reclaimability check).
-    pub fn has_incident_rels(&mut self, node_id: u64) -> Result<bool> {
+    pub fn has_incident_rels(&self, node_id: u64) -> Result<bool> {
         Ok(self.read_node(node_id)?.first_rel != NULL_ID)
     }
 
-    pub fn incident_rels(&mut self, node_id: u64) -> Result<Vec<u64>> {
+    pub fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>> {
         let node = self.read_node(node_id)?;
         let mut out = Vec::new();
         let mut cur = node.first_rel;
@@ -3196,7 +3193,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Propagates a chain-walk failure.
-    pub fn degree(&mut self, node_id: u64) -> Result<usize> {
+    pub fn degree(&self, node_id: u64) -> Result<usize> {
         Ok(self.incident_rels(node_id)?.len())
     }
 
@@ -3707,6 +3704,28 @@ mod tests {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         RecordStore::create(device, wal, 64, 1).expect("create store")
+    }
+
+    /// `rmp` #337, Slice 2: the store must be `Send + Sync` so Slice 3 (#336, gated on #341) can hand
+    /// an `Arc<RecordStore>` to off-thread readers. A compile-time assertion (no runtime body) — it
+    /// fails to build the moment a non-`Sync` field is introduced. Slice 1 already made the two shared
+    /// fields (`pool: Arc<ConcurrentBufferPool>` and `wal: SharedWal`) `Send + Sync`
+    /// ([`crate::wal_rule`] asserts the latter); every other field is plain owned data (`Vec` /
+    /// `HashMap` / `BTreeMap` / scalars / `Statistics` / `TokenStore` / `CommitRegistry`), so the auto
+    /// derivation holds with **no** `unsafe impl`. Bounded on `D, S: Send + Sync`, the bound the
+    /// concurrent pool's auto `Send + Sync` itself requires (its `Mutex<D>` / `Mutex<W>` need `D, W:
+    /// Send`, and `SharedWal<S>: Send + Sync` needs `S: Send + Sync`).
+    #[test]
+    fn record_store_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        // The concrete DST instantiation used throughout these tests (the production file device + file
+        // log instantiation is the same shape; both `D` and `S` are `Send + Sync`).
+        assert_send_sync::<Store>();
+        // And generically, so the property is stated as a bound rather than only for one `D, S` pair.
+        fn assert_generic<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>() {
+            assert_send_sync::<RecordStore<D, S>>();
+        }
+        assert_generic::<MemBlockDevice, MemLogSink>();
     }
 
     #[test]

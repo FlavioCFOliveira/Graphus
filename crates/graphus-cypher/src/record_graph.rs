@@ -412,9 +412,10 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         if self.ssi.is_none() {
             return; // standalone path: nothing to track.
         }
-        // Read the node's *current* labels (store borrow released before announcing).
+        // Read the node's *current* labels (store borrow released before announcing). Read-only:
+        // `node_labels` is `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
         let label_tokens: Vec<u32> = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow();
             match store.node_labels(node.0) {
                 Ok(ids) => ids,
                 // Cannot enumerate labels (overflow-form / missing): still announce `AllNodes` so an
@@ -709,7 +710,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// cannot occur on any record, so it short-circuits to `None`. Result is identical to the old
     /// `find` (the first visible record of a key id is its newest visible version).
     fn read_node_prop_one(&self, node: NodeId, key: &str) -> Option<Value> {
-        let mut store = self.store.borrow_mut();
+        // Read-only store access: `rmp` #337 Slice 2 made every read method (`token_id`,
+        // `node_properties`, `decode_property_value`) take `&self`, so a shared borrow suffices.
+        let store = self.store.borrow();
         let key_id = store.token_id(Namespace::PropKey, key)?;
         let chain = match store.node_properties(node.0) {
             Ok(chain) => chain,
@@ -738,7 +741,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// Relationship analogue of [`read_node_prop_one`](Self::read_node_prop_one) (`rmp` #326), over
     /// [`RelRecord.first_prop`](graphus_storage::record::RelRecord).
     fn read_rel_prop_one(&self, rel: RelId, key: &str) -> Option<Value> {
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
+        let store = self.store.borrow();
         let key_id = store.token_id(Namespace::PropKey, key)?;
         let chain = match store.rel_properties(rel.0) {
             Ok(chain) => chain,
@@ -774,7 +778,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// before its snapshot (or its own write) — never a concurrent transaction's uncommitted value.
     /// The chain is prepend-ordered (newest first), so the **first visible** record per key id wins.
     fn read_node_props(&self, node: NodeId) -> Vec<(String, Value)> {
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
+        let store = self.store.borrow();
         let chain = match store.node_properties(node.0) {
             Ok(chain) => chain,
             Err(e) => {
@@ -819,7 +824,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// discipline, over [`RelRecord.first_prop`](graphus_storage::record::RelRecord) instead of the
     /// node's `first_prop`.
     fn read_rel_props(&self, rel: RelId) -> Vec<(String, Value)> {
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
+        let store = self.store.borrow();
         let chain = match store.rel_properties(rel.0) {
             Ok(chain) => chain,
             Err(e) => {
@@ -868,7 +874,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         if self.ssi.is_none() {
             return;
         }
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `scan_node_ids` is `&self`, shared borrow.
+        let store = self.store.borrow();
         let ids = match store.scan_node_ids() {
             Ok(ids) => ids,
             Err(e) => {
@@ -892,7 +899,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     /// On a storage fault (or an overflow-form bitmap, a #39-written node) the error is captured and
     /// an empty result returned, exactly as the full scan did — never a wrong (missing/extra) row.
     fn filter_label_candidates(&self, token_id: u32, ids: Vec<u64>) -> Vec<NodeId> {
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `node` / `node_has_label` are `&self`.
+        let store = self.store.borrow();
         let mut out = Vec::new();
         for id in ids {
             // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
@@ -944,8 +952,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         };
 
         // --- read the node's current labels (store borrow, released before touching the index) ---
+        // Read-only: `node_labels` is `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
         let label_tokens: Vec<u32> = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow();
             match store.node_labels(node.0) {
                 Ok(ids) => ids,
                 // An overflow-form bitmap (#39) surfaces elsewhere as a captured error; here it just
@@ -1118,8 +1127,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             return; // nothing declared — avoid the label/property reads entirely.
         }
         // Read the node's current labels + property values (store borrows released before the index
-        // borrow), mirroring `reindex_node`.
-        let label_tokens: Vec<u32> = match self.store.borrow_mut().node_labels(node.0) {
+        // borrow), mirroring `reindex_node`. Read-only: `node_labels` is `&self` (`rmp` #337 Slice 2).
+        let label_tokens: Vec<u32> = match self.store.borrow().node_labels(node.0) {
             Ok(ids) => ids,
             Err(_) => return,
         };
@@ -1180,8 +1189,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         };
 
         // The node's current label tokens (store borrow, released before consulting the registry).
+        // Read-only: `node_labels` is `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
         let label_tokens: Vec<u32> = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow();
             match store.node_labels(node.0) {
                 Ok(ids) => ids,
                 Err(_) => return, // cannot enumerate labels: skip (a captured store error already aborts)
@@ -1729,7 +1739,8 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             index.borrow_mut().seek_label(label_token)
         } else {
             // No index (should not happen on the coordinated path, but stay correct): full id scan.
-            match self.store.borrow_mut().scan_node_ids() {
+            // Read-only: `scan_node_ids` is `&self` (`rmp` #337 Slice 2), shared borrow.
+            match self.store.borrow().scan_node_ids() {
                 Ok(ids) => ids,
                 Err(e) => {
                     self.capture(e);
@@ -1774,7 +1785,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             // Read the node record once (visibility + label re-check + the freshness witness). A
             // candidate whose page is unallocated (a stale index entry for a reclaimed slot) is not a
             // live node and is dropped — exactly as `filter_label_candidates` drops it.
-            let node_rec = match self.store.borrow_mut().node(id) {
+            let node_rec = match self.store.borrow().node(id) {
                 Ok(rec) => rec,
                 Err(_) => continue,
             };
@@ -1785,7 +1796,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
                 continue;
             }
             // The node must currently carry the label (the row label scan's membership test).
-            match self.store.borrow_mut().node_has_label(id, label_token) {
+            match self.store.borrow().node_has_label(id, label_token) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -1860,7 +1871,7 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             return false;
         }
         // Witness 2: the cached `PropRecord` must still be the same key AND visible (not tombstoned).
-        let prop = match self.store.borrow_mut().property(witness.prop_pid) {
+        let prop = match self.store.borrow().property(witness.prop_pid) {
             Ok(p) => p,
             Err(_) => return false, // a read fault: decline the cache, fall back to the row read.
         };
@@ -1964,8 +1975,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // — the per-node SIREADs below only cover nodes that already exist.
         self.note_predicate_read(PredicateRead::AllNodes);
         // `scan_node_ids` returns every slot-occupied node (live versions *and* tombstones not yet
-        // GC'd); keep only those visible to this snapshot (`04 §5.3`, `rmp` task #45).
-        let mut store = self.store.borrow_mut();
+        // GC'd); keep only those visible to this snapshot (`04 §5.3`, `rmp` task #45). Read-only:
+        // `scan_node_ids` / `node` are `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
+        let store = self.store.borrow();
         let ids = match store.scan_node_ids() {
             Ok(ids) => ids,
             Err(e) => {
@@ -2039,9 +2051,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         }
 
         // Standalone fallback: scan every live node and filter by the inline label bitmap. Correct,
-        // just O(live nodes).
+        // just O(live nodes). Read-only: `scan_node_ids` is `&self` (`rmp` #337 Slice 2).
         let ids = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow();
             match store.scan_node_ids() {
                 Ok(ids) => ids,
                 Err(e) => {
@@ -2137,7 +2149,8 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // concurrent `CREATE` of a `:T` edge). This covers the *absent* edge the per-rel SIREADs below
         // (which only mark edges that already exist) cannot.
         self.note_rel_predicate_read(types);
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `incident_rels` / `token_id` / `rel` are `&self`.
+        let store = self.store.borrow();
         let rels = match store.incident_rels(node.0) {
             Ok(rels) => rels,
             Err(e) => {
@@ -2213,7 +2226,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     fn node_exists(&self, node: NodeId) -> bool {
         // "Exists" means "visible to this query's snapshot" (`04 §5.3`): a node created after this
         // snapshot, deleted before it, or never allocated, does not exist *for us*.
-        let mvcc = match self.store.borrow_mut().node(node.0) {
+        let mvcc = match self.store.borrow().node(node.0) {
             Ok(rec) => rec.mvcc,
             // A missing page means the id was never allocated — i.e. the node does not exist. That
             // is a normal answer, not a captured storage fault.
@@ -2226,7 +2239,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn rel_exists(&self, rel: RelId) -> bool {
-        let mvcc = match self.store.borrow_mut().rel(rel.0) {
+        let mvcc = match self.store.borrow().rel(rel.0) {
             Ok(rec) => rec.mvcc,
             Err(_) => return false,
         };
@@ -2241,8 +2254,8 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // Read the node's label token ids from its inline bitmap (`05 §9`, `rmp` task #42), then map
         // each id back to its name. An overflow-form bitmap (a #39-written node) is captured as an
         // error and reported as `Some(vec![])` so the result is not silently wrong; the caller must
-        // inspect `take_error`.
-        let mut store = self.store.borrow_mut();
+        // inspect `take_error`. Read-only: `node_labels` / `token_name` are `&self` (`rmp` #337 Slice 2).
+        let store = self.store.borrow();
         let ids = match store.node_labels(node.0) {
             Ok(ids) => ids,
             Err(e) => {
@@ -2265,7 +2278,8 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `rel` / `token_name` are `&self`.
+        let store = self.store.borrow();
         let rec = match store.rel(rel.0) {
             Ok(rec) => rec,
             Err(_) => return None,
@@ -2292,7 +2306,8 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // `clauses/return/Return2.feature` [14]). We still require the *creator* to be visible (a
         // relationship never created for us, or created by a concurrent uncommitted writer, is not
         // ours to read). No `note_read`/SSI marker: reading our own tombstone has no rw-dependency.
-        let mut store = self.store.borrow_mut();
+        // Read-only store access (`rmp` #337 Slice 2): `rel` / `token_name` are `&self`.
+        let store = self.store.borrow();
         let rec = match store.rel(rel.0) {
             Ok(rec) => rec,
             Err(_) => return None,
@@ -2318,11 +2333,11 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // write records no rw-dependency, so it must not perturb serializability (the surrounding read
         // methods all mark, but this is a side-effect-free identity check).
         let mvcc = match entity {
-            DeletedEntity::Node(id) => match self.store.borrow_mut().node(id.0) {
+            DeletedEntity::Node(id) => match self.store.borrow().node(id.0) {
                 Ok(rec) => rec.mvcc,
                 Err(_) => return false,
             },
-            DeletedEntity::Rel(id) => match self.store.borrow_mut().rel(id.0) {
+            DeletedEntity::Rel(id) => match self.store.borrow().rel(id.0) {
                 Ok(rec) => rec.mvcc,
                 Err(_) => return false,
             },
@@ -2970,7 +2985,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // transaction so a deleted relationship is not reported as incident — otherwise a node's
         // DETACH check, the result-egress snapshot, and any degree-style read would observe a
         // relationship this transaction has already removed (or that another transaction deleted).
-        let ids = match self.store.borrow_mut().incident_rels(node.0) {
+        let ids = match self.store.borrow().incident_rels(node.0) {
             Ok(rels) => rels,
             Err(e) => {
                 self.capture(e);
@@ -2979,7 +2994,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         };
         ids.into_iter()
             .filter(|&rid| {
-                let mvcc = match self.store.borrow_mut().rel(rid) {
+                let mvcc = match self.store.borrow().rel(rid) {
                     Ok(rec) => rec.mvcc,
                     Err(e) => {
                         self.capture(e);
@@ -2998,7 +3013,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // or never created) is a no-op, not an error — matching the `MemGraph` contract. Visibility
         // (not raw `in_use`) is the right guard now that delete is an MVCC tombstone (the slot stays
         // in use): a second delete in the same transaction sees its own tombstone and does nothing.
-        let (mvcc, type_id) = match self.store.borrow_mut().rel(rel.0) {
+        let (mvcc, type_id) = match self.store.borrow().rel(rel.0) {
             Ok(r) => (r.mvcc, r.type_id),
             Err(_) => return,
         };
@@ -3016,7 +3031,7 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn delete_node(&mut self, node: NodeId) {
-        let mvcc = match self.store.borrow_mut().node(node.0) {
+        let mvcc = match self.store.borrow().node(node.0) {
             Ok(n) => n.mvcc,
             Err(_) => return,
         };

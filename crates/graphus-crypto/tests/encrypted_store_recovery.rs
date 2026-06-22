@@ -73,7 +73,7 @@ fn committed_graph_survives_a_crash_over_the_encrypted_device() {
 
     // Crash + recover onto a fresh encrypted device with the SAME key. The WAL redo writes every
     // committed page through the encryption seam; the reopened store reads them back decrypted.
-    let mut rec = recover_no_force(&s, &kr);
+    let rec = recover_no_force(&s, &kr);
 
     assert!(rec.node(a).unwrap().mvcc.in_use());
     assert_eq!(rec.node(a).unwrap().element_id, eid_a);
@@ -102,7 +102,7 @@ fn uncommitted_work_is_rolled_back_over_the_encrypted_device() {
     let _ = s.create_rel(t2, t, a, b).unwrap();
     s.with_wal(graphus_wal::WalManager::flush);
 
-    let mut rec = recover_no_force(&s, &kr);
+    let rec = recover_no_force(&s, &kr);
 
     assert!(rec.node(a).unwrap().mvcc.in_use());
     assert_eq!(

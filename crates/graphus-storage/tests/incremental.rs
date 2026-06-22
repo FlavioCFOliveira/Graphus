@@ -202,7 +202,7 @@ fn pitr_to_timestamp_reflects_exactly_the_committed_prefix() {
     .expect("restore @ ts2");
 
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut restored = RecordStore::open(device, wal, 64).expect("open restored");
+    let restored = RecordStore::open(device, wal, 64).expect("open restored");
     assert!(
         restored.node(a1).unwrap().mvcc.in_use(),
         "T1's node must be live at ts2"
@@ -253,7 +253,7 @@ fn pitr_to_lsn_cuts_at_a_record_boundary() {
     .expect("restore @ lsn");
 
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut restored = RecordStore::open(device, wal, 64).expect("open restored");
+    let restored = RecordStore::open(device, wal, 64).expect("open restored");
     assert!(
         restored.node(a1).unwrap().mvcc.in_use(),
         "T1 live at the LSN cut"
@@ -288,7 +288,7 @@ fn pitr_before_any_commit_restores_the_base_only() {
     .expect("restore @ ts0");
 
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut restored = RecordStore::open(device, wal, 64).expect("open restored");
+    let restored = RecordStore::open(device, wal, 64).expect("open restored");
     // The base (which included T1) is present; T2 (committed after the base) is undone.
     let t2_present = restored.node(a2).map(|n| n.mvcc.in_use()).unwrap_or(false);
     assert!(
@@ -692,7 +692,7 @@ fn chain_artifact_file_round_trip_preserves_all_committed_nodes() {
 
     // Reopen and confirm every seeded node survived.
     let dev = FileBlockDevice::open(&path).expect("reopen file");
-    let mut restored = RecordStore::open(dev, WalManager::create(MemLogSink::new()).unwrap(), 64)
+    let restored = RecordStore::open(dev, WalManager::create(MemLogSink::new()).unwrap(), 64)
         .expect("open restored store");
     let live_after = restored.scan_node_ids().expect("scan restored").len();
     assert_eq!(

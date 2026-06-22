@@ -48,8 +48,8 @@ use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
-    ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextIndexEntry, IndexState,
-    Namespace, RecordStore, SpatialIndexEntry,
+    ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextIndexEntry, GcPassReport,
+    IndexState, Namespace, RecordStore, SpatialIndexEntry,
 };
 use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
 use graphus_wal::LogSink;
@@ -552,8 +552,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         registered: &[(u32, Vec<u32>)],
     ) {
         // The node's current label tokens + its property values, read in one store-borrow scope.
+        // Read-only: `node_labels` / `node_property_values` are `&self` (`rmp` #337 Slice 2).
         let (label_tokens, props): (Vec<u32>, Vec<(u32, Value)>) = {
-            let mut store = store.borrow_mut();
+            let store = store.borrow();
             let labels = match store.node_labels(id) {
                 Ok(l) => l,
                 Err(_) => return,
@@ -1105,14 +1106,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// per-zone summary. Reads committed state without a snapshot (like the index rebuild); the scan's
     /// per-row re-check makes any later staleness harmless.
     fn rebuild_zone_column(&self, label_token: u32, prop_key: u32) {
-        let node_ids = match self.store.borrow_mut().scan_node_ids() {
+        // Read-only store access (`rmp` #337 Slice 2): the rebuild scan only reads.
+        let node_ids = match self.store.borrow().scan_node_ids() {
             Ok(ids) => ids,
             Err(_) => return,
         };
         let mut rows: Vec<(u64, Value)> = Vec::new();
         for id in node_ids {
             let (labels, chain) = {
-                let mut store = self.store.borrow_mut();
+                let store = self.store.borrow();
                 let labels = match store.node_labels(id) {
                     Ok(l) => l,
                     Err(_) => continue,
@@ -1159,7 +1161,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for (lo, hi) in ranges {
             for id in lo.max(1)..hi.min(high_water) {
                 let (labels, chain) = {
-                    let mut store = self.store.borrow_mut();
+                    // Read-only store access (`rmp` #337 Slice 2): zone-scan re-check only reads.
+                    let store = self.store.borrow();
                     let node = match store.node(id) {
                         Ok(n) => n,
                         Err(_) => continue,
@@ -1242,7 +1245,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for id in node_ids {
             // Read the node's labels, first_prop chain head, and newest-in-use property values once.
             let (label_tokens, first_prop, props): (Vec<u32>, u64, Vec<(u64, u32, Value)>) = {
-                let mut store = store.borrow_mut();
+                // Read-only store access (`rmp` #337 Slice 2): the column rebuild scan only reads.
+                let store = store.borrow();
                 let node = match store.node(id) {
                     Ok(n) => n,
                     Err(_) => continue,
@@ -2431,6 +2435,77 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.locks.borrow_mut().release_all(txn);
         self.active.remove(&txn);
         Ok(commit_ts)
+    }
+
+    /// The **oldest** read snapshot timestamp among the coordinator's open transactions — the
+    /// low-water mark of what any live reader can still observe — or `None` when no transaction is
+    /// open (`rmp` #337 Slice 2, the #220 premature-reclamation class).
+    ///
+    /// Every open transaction (read-only readers **included**: a `MATCH` that never writes still holds
+    /// a snapshot at its begin timestamp and can read any version live at that timestamp) contributes
+    /// its `snapshot.ts`; the minimum is the oldest version any of them could still need. This is the
+    /// **only** safe upper bound for a [`RecordStore::gc`] watermark while readers are open: `gc`
+    /// physically frees a slot whose `xmax` committed `<= watermark` and returns it to the free list
+    /// for reuse, so a watermark above this low-water would let `gc` reclaim — and a later writer
+    /// reuse — a slot that an older still-open reader's snapshot must still see, which is exactly the
+    /// freed/reused-slot read (a lost-version / wrong-row ACID violation) the #220 class describes.
+    ///
+    /// A read-only transaction does not advance the commit timestamp, so under a steady stream of
+    /// short readers this tracks the store's high-water; a single long-running reader pins it back to
+    /// that reader's begin timestamp, deliberately holding reclamation of everything it might read.
+    #[must_use]
+    pub fn oldest_active_snapshot(&self) -> Option<Timestamp> {
+        self.active.values().map(|a| a.snapshot.ts).min()
+    }
+
+    /// The safe GC watermark **right now**: the oldest open reader's snapshot
+    /// ([`oldest_active_snapshot`](Self::oldest_active_snapshot)), or — when no transaction is open —
+    /// the store's current snapshot high-water ([`RecordStore::snapshot_ts`]), at which everything
+    /// committed is reclaimable because no live reader can observe a reclaimed version (`rmp` #337
+    /// Slice 2). This is the watermark every GC invocation path that could run with a live reader MUST
+    /// use; [`gc`](Self::gc) computes it for the caller so a future GC trigger (`rmp` #305) cannot
+    /// reintroduce the premature-reclamation bug by passing `snapshot_ts()` directly.
+    #[must_use]
+    pub fn gc_watermark(&self) -> Timestamp {
+        self.oldest_active_snapshot()
+            .unwrap_or_else(|| self.store.borrow().snapshot_ts())
+    }
+
+    /// Runs one MVCC garbage-collection pass over the store at the **reader-safe watermark**
+    /// ([`gc_watermark`](Self::gc_watermark)), in its own internal transaction, and returns what it
+    /// reclaimed/froze (`rmp` #337 Slice 2, staging for the #305 GC trigger).
+    ///
+    /// This is the *correct-by-construction* GC entry point: it derives the watermark from the open
+    /// reader set rather than trusting the caller, so it physically reclaims **only** versions no
+    /// still-open reader can observe (the #220 premature-reclamation guard). There is no production
+    /// trigger calling it yet (`rmp` #305 owns scheduling); it stages the accounting so that when a
+    /// trigger lands it calls this — never `store.gc(snapshot_ts())` — and the regression scenario in
+    /// `graphus-dst` proves the watermark has teeth.
+    ///
+    /// The GC pass is itself a transaction the coordinator opens and commits here (its frozen headers
+    /// become durable on commit, exactly as [`RecordStore::gc`] documents); it does not run SSI
+    /// validation (a system maintenance txn touches only reclaimable tombstones, no user predicate).
+    /// It must not run while a statement seam holds the store borrow — the same discipline
+    /// [`with_store_mut`](Self::with_store_mut) requires.
+    ///
+    /// # Errors
+    /// Propagates a storage error from the GC pass or its commit.
+    pub fn gc(&mut self) -> Result<GcPassReport> {
+        let watermark = self.gc_watermark();
+        self.next_txn_id += 1;
+        let gc_txn = TxnId(self.next_txn_id);
+        let mut store = self.store.borrow_mut();
+        store.begin(gc_txn);
+        let report = match store.gc(gc_txn, watermark) {
+            Ok(report) => report,
+            Err(e) => {
+                // Best-effort undo of the partial pass so the store stays consistent for the caller.
+                let _ = store.rollback(gc_txn);
+                return Err(e);
+            }
+        };
+        store.commit(gc_txn)?;
+        Ok(report)
     }
 
     /// Rolls `txn` back: undoes its writes on the store, forgets its SSI markers, and releases its

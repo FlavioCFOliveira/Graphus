@@ -185,7 +185,7 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
     s.begin(TxnId(2));
     let _ = s.create_node(TxnId(2)).unwrap();
 
-    let mut s = recover_no_force(&s);
+    let s = recover_no_force(&s);
 
     // The committed version's header is unfrozen, yet the rebuilt table resolves it to ts 1.
     let mvcc = s.node(committed_node).unwrap().mvcc;

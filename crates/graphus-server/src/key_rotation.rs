@@ -563,7 +563,7 @@ mod tests {
 
     /// Asserts the store in `dir` opens under `master` and the graph is intact.
     fn assert_graph_intact(dir: &TempDir, master: &[u8; KEY_LEN], a: u64, b: u64, r: u64, rt: u32) {
-        let mut store = open_store(dir, master).expect("open under the expected key");
+        let store = open_store(dir, master).expect("open under the expected key");
         assert!(store.node(a).expect("node a").mvcc.in_use());
         assert!(store.node(b).expect("node b").mvcc.in_use());
         assert_eq!(store.incident_rels(a).expect("incident a"), vec![r]);

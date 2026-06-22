@@ -110,7 +110,7 @@ fn committed_nodes_and_edges_survive_a_no_force_crash() {
     let (r, eid_r) = s.create_rel(txn, t, a, b).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
 
     // Records and their stable identities survived.
     assert!(rec.node(a).unwrap().mvcc.in_use());
@@ -141,7 +141,7 @@ fn uncommitted_work_is_rolled_back_after_a_no_force_crash() {
     // Harden the loser's tail so the crash log carries it (forces undo to run).
     s.with_wal(graphus_wal::WalManager::flush);
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
 
     // The committed node a survives; the loser's effects on a's chain are undone.
     assert!(rec.node(a).unwrap().mvcc.in_use());
@@ -165,7 +165,7 @@ fn committed_state_survives_a_steal_crash() {
     let r2 = s.create_rel(txn, t, a, c).unwrap().0;
     s.commit(txn).unwrap();
 
-    let mut rec = recover_steal(&mut s);
+    let rec = recover_steal(&mut s);
 
     let mut a_inc = rec.incident_rels(a).unwrap();
     a_inc.sort_unstable();
@@ -193,7 +193,7 @@ fn stolen_uncommitted_pages_are_undone_after_a_steal_crash() {
     let _r2 = s.create_rel(t2, t, a, b).unwrap();
     s.with_wal(graphus_wal::WalManager::flush);
 
-    let mut rec = recover_steal(&mut s);
+    let rec = recover_steal(&mut s);
 
     // Only the committed edge remains; the stolen uncommitted one is undone.
     assert_eq!(rec.incident_rels(a).unwrap(), vec![r_ab]);
@@ -239,7 +239,7 @@ fn committed_node_labels_survive_a_no_force_crash() {
     s.set_node_labels(txn, a, &[person, admin]).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     // The label token namespace recovered, and the node's bitmap recovered with it.
     assert_eq!(rec.token_id(Namespace::Label, "Person"), Some(person));
     let mut ids = rec.node_labels(a).unwrap();
@@ -261,7 +261,7 @@ fn label_mutations_recover_under_a_steal_crash() {
     s.add_label(txn, a, l).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_steal(&mut s);
+    let rec = recover_steal(&mut s);
     assert_eq!(rec.node_labels(a).unwrap(), vec![l]);
 }
 
@@ -283,7 +283,7 @@ fn uncommitted_label_change_is_rolled_back_after_a_crash() {
     s.add_label(t2, a, m).unwrap();
     s.with_wal(graphus_wal::WalManager::flush);
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     // Only the committed label survives; the uncommitted one is undone.
     assert_eq!(
         rec.node_labels(a).unwrap(),
@@ -378,7 +378,7 @@ fn a_checkpoint_bounds_recovery_redo_and_replays_post_checkpoint_work() {
     let mut wal = WalManager::open(sink.clone()).expect("open wal");
     let report = recover_device(&mut wal, &mut device).expect("recover");
     let wal = WalManager::open(sink).expect("reopen wal");
-    let mut rec = RecordStore::open(device, wal, 64).expect("open store");
+    let rec = RecordStore::open(device, wal, 64).expect("open store");
 
     // Redo started at the checkpoint — well past the WAL header (bounded redo).
     assert!(
@@ -434,7 +434,7 @@ fn a_checkpoint_reclaims_the_frozen_wal_prefix() {
     );
 
     // Recovery over the reclaimed log still yields the committed graph.
-    let mut rec = recover_steal(&mut s);
+    let rec = recover_steal(&mut s);
     assert!(
         rec.node(a).unwrap().mvcc.in_use(),
         "node a survives reclaim"
@@ -465,7 +465,7 @@ fn automatic_checkpoint_cadence_emits_a_checkpoint() {
 
     // Recover via a steal crash (everything flushed): the report's redo_start must be a checkpoint
     // the automatic cadence emitted — past the WAL header.
-    let mut rec = recover_steal(&mut s);
+    let rec = recover_steal(&mut s);
     assert!(
         rec.node(last).unwrap().mvcc.in_use(),
         "the last node survives"
@@ -535,7 +535,6 @@ fn double_crash_aborted_prependers_leave_no_phantom_edge() {
 
     // First no-force crash + recovery.
     let s = recover_no_force(&s);
-    let mut s = s;
     assert!(
         s.node(a).unwrap().mvcc.in_use(),
         "committed node A survives the first crash"
@@ -547,7 +546,7 @@ fn double_crash_aborted_prependers_leave_no_phantom_edge() {
     );
 
     // Second no-force crash + recovery (the double-crash the safety oracle exercises).
-    let mut s = recover_no_force(&s);
+    let s = recover_no_force(&s);
     assert!(
         s.node(a).unwrap().mvcc.in_use(),
         "committed node A survives the second crash"
@@ -603,7 +602,7 @@ fn rollback_exceeding_pool_capacity_undoes_and_recovers() {
 
     // Crash + no-force recovery: the committed baseline survives and the aborted work stays gone —
     // proving the deferred-replay rollback is durable/crash-correct, not just in-memory correct.
-    let mut recovered = recover_no_force(&store);
+    let recovered = recover_no_force(&store);
     assert!(
         recovered
             .node(kept_id)

@@ -1183,6 +1183,7 @@ dependencies = [
  "graphus-server",
  "graphus-sim",
  "graphus-storage",
+ "graphus-txn",
  "graphus-wal",
  "serde",
  "serde_json",

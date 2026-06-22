@@ -104,7 +104,7 @@ fn sealed_backup_round_trips_an_encrypted_store_without_leaking_pages() {
     verify_backup(&opened).expect("verify_backup on the recovered artifact");
 
     let fresh_wal = WalManager::create(MemLogSink::new()).expect("fresh plaintext wal for restore");
-    let mut restored = restore(&opened, fresh_wal, 64).expect("restore");
+    let restored = restore(&opened, fresh_wal, 64).expect("restore");
 
     // The restored graph equals the original.
     assert!(restored.node(a).expect("node a").mvcc.in_use());

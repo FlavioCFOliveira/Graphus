@@ -341,7 +341,7 @@ fn assert_graph_intact(
     r: u64,
     rt: u32,
 ) -> Result<()> {
-    let mut store = open_store(store_path, wal_path, master)?;
+    let store = open_store(store_path, wal_path, master)?;
     if !store.node(a)?.mvcc.in_use() || !store.node(b)?.mvcc.in_use() {
         return Err(sec("a node is not live after rotation"));
     }

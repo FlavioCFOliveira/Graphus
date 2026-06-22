@@ -126,7 +126,7 @@ fn sec194_neutralisation_round_trips_logical_value() {
     let store2 = fresh_store();
     let mut imp2 = BulkImporter::new(store2, DEFAULT_BATCH_SIZE, b',');
     imp2.import_nodes(dump.as_slice()).expect("re-import");
-    let (mut store2, _) = imp2.finish();
+    let (store2, _) = imp2.finish();
 
     // The single re-imported node carries name == the original payload (no leading `'`).
     let ids = store2.scan_node_ids().expect("scan");

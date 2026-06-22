@@ -592,8 +592,7 @@ fn encryption_at_rest_ciphertext_rotation_backup_roundtrip() {
 
     // The NEW key opens it and the secret graph is intact.
     {
-        let mut store =
-            open_enc_store(&enc_store, &enc_wal, &MASTER_B).expect("open under new key");
+        let store = open_enc_store(&enc_store, &enc_wal, &MASTER_B).expect("open under new key");
         assert!(
             store.node(a).expect("node a").mvcc.in_use()
                 && store.node(b).expect("node b").mvcc.in_use(),

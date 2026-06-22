@@ -49,3 +49,10 @@ serde_json = "1"
 # failing run round-trips to/from a JSON reproducer artifact (rmp #242). Test/CLI-only persistence — the
 # production server crates do not depend on graphus-dst, so this never reaches a production build.
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The MVCC visibility primitives (`is_visible`/`Snapshot`/`CommitRegistry`) for the GC-watermark
+# regression guard (`tests/gc_watermark_teeth.rs`, rmp #337 Slice 2): the test resolves what an old
+# reader sees exactly as the production read path does. `graphus-txn` is foundational (storage depends
+# on it), so this is acyclic. Test-only — it never reaches a production build.
+graphus-txn = { path = "../graphus-txn" }

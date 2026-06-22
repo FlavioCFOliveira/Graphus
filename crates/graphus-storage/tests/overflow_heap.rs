@@ -199,7 +199,7 @@ fn committed_chain_survives_a_no_force_crash() {
     let head = s.alloc_chain(txn, &payload).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     assert_eq!(
         rec.read_chain(head).unwrap(),
         payload,
@@ -421,7 +421,7 @@ fn committed_temporal_property_survives_a_crash_and_recovers() {
     s.set_node_property_value(txn, n, k, &zdt).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     let vals = rec.node_property_values(n).unwrap();
     let v = vals
         .iter()
@@ -500,7 +500,7 @@ fn committed_point_property_survives_a_crash_and_recovers() {
     s.set_node_property_value(txn, n, k, &point).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     let vals = rec.node_property_values(n).unwrap();
     let v = vals
         .iter()
@@ -633,7 +633,7 @@ fn committed_overflow_property_survives_a_crash_and_recovers() {
     s.set_node_property_value(txn, n, k, &list).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     let vals = rec.node_property_values(n).unwrap();
     let v = vals
         .iter()

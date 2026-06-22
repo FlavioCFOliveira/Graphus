@@ -45,7 +45,7 @@ fn bench_traversal(c: &mut Criterion) {
     for &deg in &[2u64, 8, 32] {
         // `edges_per_node = deg` out-edges per node; with the ring-plus-chords wiring each node
         // also receives in-edges, so observed incidence degree is ~2*deg.
-        let (mut store, ids) = build_graph(NODES, deg, BUILD_BATCH);
+        let (store, ids) = build_graph(NODES, deg, BUILD_BATCH);
         // Probe a representative interior node (stable across runs).
         let probe = ids[ids.len() / 2];
         let observed_degree = store.degree(probe).expect("degree");
@@ -84,7 +84,7 @@ fn bench_scan(c: &mut Criterion) {
     for &nodes in &[1_000u64, 10_000, 20_000] {
         // 2 out-edges/node so the store is a real graph, not isolated vertices; the scan only
         // touches the node store.
-        let (mut store, _ids) = build_graph(nodes, 2, BUILD_BATCH);
+        let (store, _ids) = build_graph(nodes, 2, BUILD_BATCH);
         group.throughput(Throughput::Elements(nodes));
         group.bench_with_input(BenchmarkId::new("scan_node_ids", nodes), &nodes, |b, _| {
             b.iter(|| {
