@@ -330,3 +330,47 @@ fn loom_wal_rule_before_every_write_back() {
         );
     });
 }
+
+/// Scenario 5 (`rmp` #337): the combined read fast path [`ConcurrentBufferPool::with_page_fetched`]
+/// is correct under the same evictor race [`fetch`] guards.
+///
+/// `with_page_fetched` pins under the shard lock, then re-validates the frame's identity under the
+/// read latch *before* running the closure (falling back to the full `fetch` if it lost the race).
+/// This model runs two threads: one reads page 0 through `with_page_fetched` while the other reads a
+/// *different* page (page 1) in a 1-frame pool, forcing the second read to evict the first. On every
+/// interleaving the fast-path reader must observe the **correct stamped byte for its page** (never a
+/// torn or cross-page value), proving the single-latch fold preserves the pin/re-validate discipline.
+#[test]
+fn loom_with_page_fetched_under_eviction_reads_correct_page() {
+    loom::model(|| {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let dev = ModelDevice::new(2, reads);
+        // 1 frame: the two reads of different pages contend on the single frame, forcing eviction.
+        let pool = ConcurrentBufferPool::new(dev, 1).shared();
+
+        let p0 = pool.clone();
+        let t0 = loom::thread::spawn(move || {
+            // page 0's stamped byte is 1; the fast path must never return a torn/cross-page value.
+            let v = p0.with_page_fetched(PageId(0), |pg| pg[100]);
+            if let Ok(v) = v {
+                assert_eq!(v, 1, "with_page_fetched read the wrong byte for page 0");
+            }
+        });
+
+        let p1 = pool.clone();
+        let t1 = loom::thread::spawn(move || {
+            let v = p1.with_page_fetched(PageId(1), |pg| pg[100]);
+            if let Ok(v) = v {
+                assert_eq!(v, 2, "with_page_fetched read the wrong byte for page 1");
+            }
+        });
+
+        t0.join().unwrap();
+        t1.join().unwrap();
+
+        // No pins leaked by the fast path on any interleaving: the single frame is evictable again.
+        let f = pool.fetch(PageId(0)).unwrap();
+        pool.unpin(f);
+        assert_eq!(pool.pin_count(f), 0, "with_page_fetched must leak no pin");
+    });
+}

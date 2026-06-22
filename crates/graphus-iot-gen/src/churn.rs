@@ -169,7 +169,7 @@ fn live_readings(coord: &mut Coord) -> u64 {
 /// The durable footprint in bytes = device page high-water × page size. This is the on-disk size the
 /// example reports; with the in-memory DST device it is deterministic and reproducible.
 fn footprint_bytes(coord: &Coord) -> u64 {
-    coord.with_store_mut(|s| s.device_mut().page_count() * PAGE_SIZE as u64)
+    coord.with_store_mut(|s| s.with_device_mut(|d| d.page_count()) * PAGE_SIZE as u64)
 }
 
 /// Runs one MVCC GC maintenance pass: begin a GC txn (id in the disjoint high range), GC at the

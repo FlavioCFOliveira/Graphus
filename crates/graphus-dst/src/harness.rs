@@ -536,7 +536,7 @@ impl Driver {
         self.ledger.record_commit();
 
         // Phase 1: a write I/O error armed on the live device must surface through the engine flush.
-        self.store.device_mut().arm_io_error();
+        self.store.with_device_mut(|d| d.arm_io_error());
         let flush = self.store.flush();
         assert!(
             flush.is_err(),
@@ -583,7 +583,7 @@ impl Driver {
             // corruption is overwhelmingly certain to break the victim page's checksum.
             let plan = graphus_io::FaultPlan::new(self.seed)
                 .with_bit_rot(graphus_core::PageId(target), 64);
-            corrupt_store.device_mut().arm_fault_plan(plan);
+            corrupt_store.with_device_mut(|d| d.arm_fault_plan(plan));
             let read = corrupt_store.read_device_page(graphus_core::PageId(target));
             assert!(
                 read.is_err(),

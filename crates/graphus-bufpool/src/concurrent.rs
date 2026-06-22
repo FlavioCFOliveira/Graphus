@@ -234,6 +234,15 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         self.frames.len()
     }
 
+    /// The number of pages on the underlying device (its current size in pages). Mirrors the
+    /// single-threaded [`BufferPool::page_count`](crate::BufferPool::page_count): used by crash
+    /// recovery to scan every device page (`rmp` #239) without exposing the device itself. Takes the
+    /// device lock for the read.
+    #[must_use]
+    pub fn page_count(&self) -> u64 {
+        self.lock_device().page_count()
+    }
+
     /// Resolves a frame handle to its slot with an explicit bounds check (CWE-129 defence in
     /// depth). [`PinnedFrame`] handles are minted only by this pool, so `f.0` is in-bounds by
     /// construction today; this checked accessor makes that invariant load-bearing in code rather
@@ -285,6 +294,23 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         unwrap_lock(self.device.lock())
     }
 
+    /// Runs `func` with mutable access to the underlying block device, for **Deterministic
+    /// Simulation Testing only** (`04 §11`): a DST harness uses it to arm a [`graphus_io::FaultPlan`]
+    /// (or a one-shot I/O error / torn write) on the *live* device of a running pool, so a fault can
+    /// be injected mid-workload rather than only on a device the harness owns before construction.
+    ///
+    /// This is the concurrent-pool counterpart of the single-threaded
+    /// [`BufferPool::device_mut`](crate::BufferPool::device_mut). The device lives behind the pool's
+    /// `Mutex<D>`, so access is a closure that holds that lock for its duration (a `&mut D` cannot be
+    /// handed out from `&self`); the harness arms the fault inside `func`.
+    ///
+    /// Gated behind the `dst` cargo feature so the production build never compiles this seam — the
+    /// device stays fully encapsulated on the production path (zero-cost: the method does not exist).
+    #[cfg(feature = "dst")]
+    pub fn with_device_mut<R>(&self, func: impl FnOnce(&mut D) -> R) -> R {
+        func(&mut self.lock_device())
+    }
+
     /// Borrows the cached page held by a pinned frame and applies `func` to it.
     ///
     /// Takes the frame's **read latch** for the duration of `func`; many threads may read
@@ -305,6 +331,61 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         let slot = self.try_slot(f)?;
         let meta = unwrap_lock(slot.meta.read());
         Ok(func(&meta.data))
+    }
+
+    /// Fetches `page_id` and applies `func` to its cached bytes under a **single** read latch, then
+    /// unpins — the combined, fast counterpart of `fetch` → [`with_page`](Self::with_page) → `unpin`
+    /// for the overwhelmingly common case of reading a **resident** page.
+    ///
+    /// # Why this exists (perf, `rmp` #337 Slice 1)
+    ///
+    /// The separate three-call form takes the frame read latch **twice** on a hit: once inside
+    /// [`fetch`](Self::fetch) to re-validate the frame's identity against an evictor, and again in
+    /// [`with_page`](Self::with_page) to read. On a hot read scan (e.g. a `MATCH (n)` node-store
+    /// sweep) that doubled latch traffic is a measurable single-thread tax over the single-threaded
+    /// [`BufferPool`](crate::BufferPool) it replaced. This method folds the re-validation and the read
+    /// into **one** latch acquisition on the hit path, recovering most of that tax while preserving
+    /// the exact pin → re-validate-under-latch → eviction-race discipline `fetch` uses. The cold paths
+    /// (miss / concurrent load in progress / lost the pin race) fall back to the full `fetch` so the
+    /// load-once and publish-before-pin guarantees are unchanged.
+    ///
+    /// `func` must not block or call back into the pool with this page (it runs under the read latch).
+    ///
+    /// # Errors
+    /// Returns an error if the page must be loaded and the device read fails, the loaded page fails
+    /// its checksum, the pool is full of pinned frames, or a contended load fails to resolve within
+    /// the internal retry bound.
+    pub fn with_page_fetched<R>(
+        &self,
+        page_id: PageId,
+        func: impl FnOnce(&Page) -> R,
+    ) -> Result<R> {
+        // Hit fast path: pin under the shard lock, then take the read latch ONCE to both re-validate
+        // identity (the same evictor race `fetch` guards) and run `func`.
+        {
+            let shard = self.lock_shard(page_id);
+            if let Some(Slot::Ready(idx)) = shard.get(&page_id).copied() {
+                self.frames[idx].pin_count.fetch_add(1, Ordering::Acquire);
+                self.frames[idx].ref_bit.store(1, Ordering::Relaxed);
+                drop(shard);
+                let meta = unwrap_lock(self.frames[idx].meta.read());
+                if meta.page_id == Some(page_id) {
+                    let r = func(&meta.data);
+                    drop(meta);
+                    self.unpin(PinnedFrame(idx));
+                    return Ok(r);
+                }
+                // Lost the race with an evictor between lookup and pin: fall through to the slow path.
+                drop(meta);
+                self.unpin(PinnedFrame(idx));
+            }
+        }
+        // Cold path (miss / Loading / lost race): the full fetch keeps the load-once + publish-before-
+        // pin guarantees, then read under a fresh latch.
+        let f = self.fetch(page_id)?;
+        let r = self.with_page(f, func);
+        self.unpin(f);
+        Ok(r)
     }
 
     /// Mutably borrows the page held by a pinned frame, marks it dirty, and applies `func`.
@@ -487,7 +568,26 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// Propagates a WAL-rule or device-write failure.
     pub fn flush(&self, f: PinnedFrame) -> Result<()> {
         let mut meta = unwrap_lock(self.frames[f.0].meta.write());
-        self.write_back(&mut meta)
+        self.write_back(&mut meta, false)
+    }
+
+    /// Writes a frame back that intentionally carries **no WAL-logged change** (its `page_lsn` is
+    /// `0`), seeding a valid checksum on disk for a freshly-allocated page before its first logged
+    /// write — e.g. a record/metadata page header stamped at allocation, then filled by later
+    /// WAL-logged `with_page_mut_lsn` writes.
+    ///
+    /// This is the one legitimate exception to the WAL-before-data debug-assert in
+    /// [`write_back`](Self::write_back): an unlogged page has *nothing in the WAL that must precede
+    /// it*, so writing it home with `page_lsn == 0` (an `ensure_durable(0)` no-op) is sound — exactly
+    /// the semantics the single-threaded [`BufferPool::flush`](crate::BufferPool::flush) gave this
+    /// idiom. Use [`flush`](Self::flush) for every page that *does* carry a logged change; this method
+    /// only for the seed-checksum case.
+    ///
+    /// # Errors
+    /// Propagates a WAL-rule or device-write failure.
+    pub fn flush_unlogged(&self, f: PinnedFrame) -> Result<()> {
+        let mut meta = unwrap_lock(self.frames[f.0].meta.write());
+        self.write_back(&mut meta, true)
     }
 
     /// Writes every dirty frame back (each under its own write latch) and syncs the device.
@@ -507,7 +607,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     pub fn flush_all(&self) -> Result<()> {
         for slot in &self.frames {
             let mut meta = unwrap_lock(slot.meta.write());
-            self.write_back(&mut meta)?;
+            self.write_back(&mut meta, false)?;
         }
         self.lock_device().sync_all()
     }
@@ -596,7 +696,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// via `victim`.
     fn evict_held(&self, victim: &mut Victim<'_>) -> Result<()> {
         let old = victim.guard.page_id;
-        self.write_back(&mut victim.guard)?;
+        self.write_back(&mut victim.guard, false)?;
         if let Some(old_id) = old {
             // Remove the old mapping under the old page's shard lock (frame latch already held).
             let mut shard = self.lock_shard(old_id);
@@ -658,7 +758,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     }
 
     /// Writes a frame back if dirty. Caller holds the write latch (passed as `meta`).
-    fn write_back(&self, meta: &mut FrameMeta) -> Result<()> {
+    fn write_back(&self, meta: &mut FrameMeta, allow_unlogged: bool) -> Result<()> {
         if !meta.dirty {
             return Ok(());
         }
@@ -667,12 +767,15 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             .ok_or_else(|| GraphusError::Storage("a dirty frame must hold a page".to_owned()))?;
         page::write_checksum(&mut meta.data);
         let lsn = page::page_lsn(&meta.data);
-        // WAL-before-data invariant (storage audit F6): under a real WAL every dirty page must carry
-        // a non-zero `page_lsn`, else `ensure_durable(0)` is a no-op and the data could reach the
-        // device before its redo record is durable. A `page_lsn` of 0 here means the mutation failed
-        // to stamp it (use `with_page_mut_lsn`). Debug-only: cheap, and the production path stamps.
+        // WAL-before-data invariant (storage audit F6): under a real WAL every dirty page that
+        // carries a logged change must hold a non-zero `page_lsn`, else `ensure_durable(0)` is a
+        // no-op and the data could reach the device before its redo record is durable. A `page_lsn`
+        // of 0 means the mutation did not stamp it (use `with_page_mut_lsn`). The one legitimate
+        // exception is `allow_unlogged` (via [`flush_unlogged`]): a freshly-allocated, not-yet-logged
+        // page being seeded with a valid checksum, which by contract has nothing in the WAL that must
+        // precede it. Debug-only: cheap, and the production path stamps.
         debug_assert!(
-            lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
+            allow_unlogged || lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
             "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did not \
              stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
             page_id.0
@@ -808,6 +911,36 @@ mod tests {
         let g = p.fetch(id).unwrap();
         assert_eq!(p.with_page(g, |page| page[100]), 0xAA);
         p.unpin(g);
+    }
+
+    /// `rmp` #337: the combined read fast path reads a resident page correctly, leaves no pin, and
+    /// (on a miss) loads then reads via the fallback — matching `fetch` + `with_page` + `unpin`.
+    #[test]
+    fn with_page_fetched_reads_resident_and_loads_on_miss() {
+        let p = pool(1); // 1 frame so the second page forces an eviction + reload on the miss path.
+        let (fa, a) = p.new_page().unwrap();
+        p.with_page_mut(fa, |page| page[100] = 0xAA);
+        p.flush(fa).unwrap();
+        p.unpin(fa);
+
+        // Hit fast path: page a is resident; read it and verify no pin leaks.
+        assert_eq!(p.with_page_fetched(a, |page| page[100]).unwrap(), 0xAA);
+        let again = p.fetch(a).unwrap();
+        assert_eq!(p.pin_count(again), 1, "fast path must leave no pin behind");
+        p.unpin(again);
+
+        // Allocate a second page (evicts a), then with_page_fetched(a) must take the MISS fallback,
+        // reload a from disk (checksum-verified), and return the right byte.
+        let (fb, _b) = p.new_page().unwrap();
+        p.unpin(fb);
+        assert_eq!(
+            p.with_page_fetched(a, |page| page[100]).unwrap(),
+            0xAA,
+            "miss fallback must reload the correct page"
+        );
+        let after = p.fetch(a).unwrap();
+        assert_eq!(p.pin_count(after), 1, "miss fallback must leave no pin");
+        p.unpin(after);
     }
 
     #[test]

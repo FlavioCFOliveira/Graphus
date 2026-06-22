@@ -257,7 +257,7 @@ impl<D: BlockDevice, S: LogSink> LocalEngine<D, S> {
     pub fn with_device_mut<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> Option<R> {
         self.coordinator
             .as_ref()
-            .map(|c| c.with_store_mut(|store| f(store.device_mut())))
+            .map(|c| c.with_store_mut(|store| store.with_device_mut(f)))
     }
 
     /// Drains in-flight transactions, flushes + syncs the store, and consumes the engine. After this

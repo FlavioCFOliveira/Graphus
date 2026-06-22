@@ -27,7 +27,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use graphus_bufpool::BufferPool;
+use std::sync::Arc;
+
+use graphus_bufpool::ConcurrentBufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
@@ -182,7 +184,16 @@ struct PendingGcPrune {
 /// the production file device + file log and over the in-memory DST device + log used by the
 /// crash-recovery tests (`04 §11`).
 pub struct RecordStore<D: BlockDevice, S: LogSink> {
-    pool: BufferPool<D, SharedWal<S>>,
+    /// The page cache. `rmp` #337, Slice 1 swapped the single-threaded `BufferPool` for the
+    /// loom-validated [`ConcurrentBufferPool`] (every method `&self`, shared behind an [`Arc`]), as
+    /// the mechanical foundation for the later off-thread concurrent-read slices (#336/#339). This
+    /// slice is **behaviour-preserving and still single-threaded**: the store methods stay
+    /// `&mut self`, no reader threads are spawned, and the closure latch API (`with_page` /
+    /// `with_page_mut` / `with_page_mut_lsn`) is used on every page access so the §1.5 GC
+    /// lazy-freeze's two non-atomic 8-byte header writes are always under a per-frame write latch
+    /// (and every read under a read latch), excluding the torn-word hazard once readers do go
+    /// off-thread.
+    pool: Arc<ConcurrentBufferPool<D, SharedWal<S>>>,
     wal: SharedWal<S>,
     element_ids: ElementIdAllocator,
     tokens: TokenStore,
@@ -277,7 +288,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             ));
         }
         let shared = SharedWal::new(wal);
-        let pool = BufferPool::with_wal(device, shared.clone(), pool_capacity);
+        let pool = ConcurrentBufferPool::with_wal(device, shared.clone(), pool_capacity).shared();
         let mut store = Self {
             pool,
             wal: shared,
@@ -315,8 +326,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if the metadata page is missing or malformed.
     pub fn open(device: D, wal: WalManager<S>, pool_capacity: usize) -> Result<Self> {
         let shared = SharedWal::new(wal);
-        let mut pool = BufferPool::with_wal(device, shared.clone(), pool_capacity);
-        let (meta, meta_chain) = Self::read_meta(&mut pool)?;
+        let pool = ConcurrentBufferPool::with_wal(device, shared.clone(), pool_capacity).shared();
+        let (meta, meta_chain) = Self::read_meta(&pool)?;
         // Rebuild the Active/Recent Transaction Table from the WAL's commit records (`rmp` task #49):
         // with lazy GC-time freezing a committed version may still carry its writer's in-flight
         // `TxnId` on disk, so visibility/reclamation must resolve that id to the commit timestamp the
@@ -347,7 +358,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // through, repaired lazily at GC — `rmp` #220). This reconstruction makes those orphan pages
         // addressable again so the walk reads the corpse and threads through it to NULL, instead of
         // failing with "store page not allocated" (the seed-10 double-crash ReadBack failure).
-        Self::reconstruct_orphan_store_pages(&mut pool, &mut stores)?;
+        Self::reconstruct_orphan_store_pages(&pool, &mut stores)?;
         let shared_len = shared.with(|w| w.durable_len());
         // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
         // resumes *past* every id already in the log. Without this the counter would restart low and
@@ -431,10 +442,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 page_id.0
             )));
         }
-        let p = self.pool.page_mut(f);
-        page::set_page_type(p, PAGE_TYPE_META);
-        page::set_page_id(p, META_PAGE.0);
-        self.pool.flush(f)?; // valid checksum on disk before any fetch verifies it
+        self.pool.with_page_mut(f, |p| {
+            page::set_page_type(p, PAGE_TYPE_META);
+            page::set_page_id(p, META_PAGE.0);
+        });
+        // Seed a valid checksum on disk before any fetch verifies it. This page carries no logged
+        // change yet (its catalog bytes are written by the WAL-logged checkpoint that follows), so it
+        // is flushed via `flush_unlogged` (page_lsn 0, a no-op `ensure_durable(0)`) — `rmp` #337.
+        self.pool.flush_unlogged(f)?;
         self.pool.unpin(f);
         Ok(())
     }
@@ -447,32 +462,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a page is unreadable/fails checksum, a chunk runs past its page,
     /// the chain is cyclic, or the concatenated payload is malformed.
-    fn read_meta(pool: &mut BufferPool<D, SharedWal<S>>) -> Result<(Meta, Vec<PageId>)> {
+    fn read_meta(pool: &ConcurrentBufferPool<D, SharedWal<S>>) -> Result<(Meta, Vec<PageId>)> {
         let mut payload = Vec::new();
         let mut chain = Vec::new();
         let mut page = META_PAGE;
         loop {
             let f = pool.fetch(page)?;
-            let p = pool.page(f);
-            let chunk_len = u32::from_le_bytes(
-                p[HEADER_SIZE..HEADER_SIZE + 4]
-                    .try_into()
-                    .expect("4-byte slice"),
-            ) as usize;
-            let next = u64::from_le_bytes(
-                p[HEADER_SIZE + 4..HEADER_SIZE + 12]
-                    .try_into()
-                    .expect("8-byte slice"),
-            );
-            let start = HEADER_SIZE + 12;
-            if start + chunk_len > p.len() {
-                pool.unpin(f);
-                return Err(GraphusError::Storage(
-                    "metadata chunk runs past the page".to_owned(),
-                ));
-            }
-            payload.extend_from_slice(&p[start..start + chunk_len]);
+            // Decode the chunk header and copy out this page's catalog chunk under the read latch;
+            // the chunk bytes escape the borrow (they are appended to `payload`), so they are copied
+            // out inside the closure (`rmp` #337, Slice 1 closure-API conversion).
+            let chunk_and_next: Result<(Vec<u8>, u64)> = pool.with_page(f, |p| {
+                let chunk_len = u32::from_le_bytes(
+                    p[HEADER_SIZE..HEADER_SIZE + 4]
+                        .try_into()
+                        .expect("4-byte slice"),
+                ) as usize;
+                let next = u64::from_le_bytes(
+                    p[HEADER_SIZE + 4..HEADER_SIZE + 12]
+                        .try_into()
+                        .expect("8-byte slice"),
+                );
+                let start = HEADER_SIZE + 12;
+                if start + chunk_len > p.len() {
+                    return Err(GraphusError::Storage(
+                        "metadata chunk runs past the page".to_owned(),
+                    ));
+                }
+                Ok((p[start..start + chunk_len].to_vec(), next))
+            });
             pool.unpin(f);
+            let (chunk, next) = chunk_and_next?;
+            payload.extend_from_slice(&chunk);
             if next == 0 {
                 break;
             }
@@ -525,7 +545,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a device page cannot be read.
     fn reconstruct_orphan_store_pages(
-        pool: &mut BufferPool<D, SharedWal<S>>,
+        pool: &ConcurrentBufferPool<D, SharedWal<S>>,
         stores: &mut [FixedStore; STORE_COUNT],
     ) -> Result<()> {
         // Pages already mapped by some store's committed catalog must not be re-appended.
@@ -545,9 +565,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 continue;
             }
             let f = pool.fetch(pid)?;
-            let p = pool.page(f);
-            let is_record = page::page_type(p) == PAGE_TYPE_RECORD;
-            let subtype = page::page_subtype(p);
+            // Copy the two header bytes out under the read latch (they escape the borrow).
+            let (is_record, subtype) = pool.with_page(f, |p| {
+                (
+                    page::page_type(p) == PAGE_TYPE_RECORD,
+                    page::page_subtype(p),
+                )
+            });
             pool.unpin(f);
             if !is_record {
                 continue; // META pages and never-stamped (zeroed) pages are not record-store pages
@@ -600,10 +624,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // harmlessly unreferenced, exactly as for record-page growth (`04 §4.4`).
         while self.meta_chain.len() < n_cont {
             let (f, dev_page) = self.pool.new_page()?;
-            let p = self.pool.page_mut(f);
-            page::set_page_type(p, PAGE_TYPE_META);
-            page::set_page_id(p, dev_page.0);
-            self.pool.flush(f)?;
+            self.pool.with_page_mut(f, |p| {
+                page::set_page_type(p, PAGE_TYPE_META);
+                page::set_page_id(p, dev_page.0);
+            });
+            // The chunk + link bytes are written WAL-logged below; this only seeds a valid checksum
+            // for the freshly-allocated, not-yet-logged page (`flush_unlogged`, `rmp` #337).
+            self.pool.flush_unlogged(f)?;
             self.pool.unpin(f);
             self.meta_chain.push(dev_page);
         }
@@ -644,10 +671,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let rel_page = rel_page as usize;
         while self.store(kind).device_pages.len() <= rel_page {
             let (f, dev_page) = self.pool.new_page()?;
-            let p = self.pool.page_mut(f);
-            page::set_page_type(p, PAGE_TYPE_RECORD);
-            page::set_page_id(p, dev_page.0);
-            self.pool.flush(f)?; // header durable; the record writes that follow are WAL-logged
+            self.pool.with_page_mut(f, |p| {
+                page::set_page_type(p, PAGE_TYPE_RECORD);
+                page::set_page_id(p, dev_page.0);
+            });
+            // Seed the page header's checksum; the record writes that follow are WAL-logged (and the
+            // type/subtype is also WAL-logged via `write_region_keep` below), so this freshly-grown
+            // page carries no logged change yet — `flush_unlogged` (page_lsn 0, `rmp` #337).
+            self.pool.flush_unlogged(f)?;
             self.pool.unpin(f);
             self.store_mut(kind).device_pages.push(dev_page);
             // WAL-log the record page's type+subtype header word with **undo == redo** (`rmp` #239).
@@ -688,10 +719,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let redo = paging::encode_patch(offset, bytes);
         let undo = redo.clone();
         let f = self.pool.fetch(page)?;
+        // The WAL borrow is released (the `with` closure ends) before the pool write latch is taken,
+        // upholding the lock-ordering rule (`crate::wal_rule`): never hold the WAL lock across a pool
+        // call. `with_page_mut_lsn` stamps `page_lsn` and applies the post-image under one write
+        // latch (`rmp` #337, Slice 1).
         let lsn = self.wal.with(|w| w.log_update(txn, page, redo, undo));
-        let p = self.pool.page_mut(f);
-        p[offset..end].copy_from_slice(bytes);
-        page::set_page_lsn(p, lsn);
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[offset..end].copy_from_slice(bytes);
+        });
         self.pool.unpin(f);
         Ok(())
     }
@@ -712,14 +747,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let end = offset + bytes.len();
         assert!(end <= PAGE_SIZE, "region runs past the page");
         let f = self.pool.fetch(page)?;
-        // Build the undo patch from the still-unmodified page slice before the in-place overwrite
-        // below, avoiding an intermediate `pre` Vec copy.
-        let undo = paging::encode_patch(offset, &self.pool.page(f)[offset..end]);
+        // Build the undo patch from the still-unmodified page slice (read latch) before the in-place
+        // overwrite (write latch) below. The frame stays pinned across the two sequential — never
+        // nested — latch acquisitions (`rmp` #337, Slice 1 closure-API conversion).
+        let undo = self
+            .pool
+            .with_page(f, |p| paging::encode_patch(offset, &p[offset..end]));
         let redo = paging::encode_patch(offset, bytes);
+        // WAL borrow dropped before the pool write latch (lock-ordering rule, `crate::wal_rule`).
         let lsn = self.wal.with(|w| w.log_update(txn, page, redo, undo));
-        let p = self.pool.page_mut(f);
-        p[offset..end].copy_from_slice(bytes);
-        page::set_page_lsn(p, lsn);
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[offset..end].copy_from_slice(bytes);
+        });
         self.pool.unpin(f);
         Ok(())
     }
@@ -750,37 +789,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn read_node(&mut self, id: u64) -> Result<NodeRecord> {
         let (rel_page, off) = paging::record_location(id, NODE_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Node, rel_page)?;
-        let f = self.pool.fetch(dev)?;
-        let rec = NodeRecord::decode(&self.pool.page(f)[off..off + NODE_RECORD_SIZE]);
-        self.pool.unpin(f);
-        Ok(rec)
+        // `with_page_fetched` reads the resident page under a single latch (fetch + read + unpin
+        // folded) — the hot read path; `NodeRecord` is owned so it escapes the borrow (`rmp` #337).
+        self.pool
+            .with_page_fetched(dev, |p| NodeRecord::decode(&p[off..off + NODE_RECORD_SIZE]))
     }
 
     fn read_rel(&mut self, id: u64) -> Result<RelRecord> {
         let (rel_page, off) = paging::record_location(id, REL_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Rel, rel_page)?;
-        let f = self.pool.fetch(dev)?;
-        let rec = RelRecord::decode(&self.pool.page(f)[off..off + REL_RECORD_SIZE]);
-        self.pool.unpin(f);
-        Ok(rec)
+        self.pool
+            .with_page_fetched(dev, |p| RelRecord::decode(&p[off..off + REL_RECORD_SIZE]))
     }
 
     fn read_prop(&mut self, id: u64) -> Result<PropRecord> {
         let (rel_page, off) = paging::record_location(id, PROP_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Prop, rel_page)?;
-        let f = self.pool.fetch(dev)?;
-        let rec = PropRecord::decode(&self.pool.page(f)[off..off + PROP_RECORD_SIZE]);
-        self.pool.unpin(f);
-        Ok(rec)
+        self.pool
+            .with_page_fetched(dev, |p| PropRecord::decode(&p[off..off + PROP_RECORD_SIZE]))
     }
 
     fn read_block(&mut self, id: u64) -> Result<HeapBlock> {
         let (rel_page, off) = paging::record_location(id, STRINGS_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Strings, rel_page)?;
-        let f = self.pool.fetch(dev)?;
-        let rec = HeapBlock::decode(&self.pool.page(f)[off..off + STRINGS_RECORD_SIZE]);
-        self.pool.unpin(f);
-        Ok(rec)
+        self.pool.with_page_fetched(dev, |p| {
+            HeapBlock::decode(&p[off..off + STRINGS_RECORD_SIZE])
+        })
     }
 
     fn write_block(&mut self, id: u64, rec: &HeapBlock, txn: TxnId) -> Result<()> {
@@ -1027,9 +1061,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let undo = paging::encode_cas_patch(abs, new_head, old_head);
         let f = self.pool.fetch(dev)?;
         let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
-        let p = self.pool.page_mut(f);
-        p[abs..abs + 8].copy_from_slice(&new_head.to_le_bytes());
-        page::set_page_lsn(p, lsn);
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[abs..abs + 8].copy_from_slice(&new_head.to_le_bytes());
+        });
         self.pool.unpin(f);
         Ok(())
     }
@@ -1055,13 +1089,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let dev = self.ensure_store_page(kind, rel_page, txn)?;
         let end = off + buf.len();
         let f = self.pool.fetch(dev)?;
-        // Capture the live header pre-image (the only bytes the undo restores) before overwriting.
-        let undo = paging::encode_patch(off, &self.pool.page(f)[off..off + MVCC_HEADER_SIZE]);
+        // Capture the live header pre-image (the only bytes the undo restores) before overwriting:
+        // read latch, then a separate write latch for the post-image (frame pinned across both).
+        let undo = self.pool.with_page(f, |p| {
+            paging::encode_patch(off, &p[off..off + MVCC_HEADER_SIZE])
+        });
         let redo = paging::encode_patch(off, buf);
         let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
-        let p = self.pool.page_mut(f);
-        p[off..end].copy_from_slice(buf);
-        page::set_page_lsn(p, lsn);
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[off..end].copy_from_slice(buf);
+        });
         self.pool.unpin(f);
         Ok(())
     }
@@ -1261,10 +1298,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn read_mvcc(&mut self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
         let (rel_page, off) = paging::record_location(id, kind.record_size());
         let dev = self.device_page(kind, rel_page)?;
-        let f = self.pool.fetch(dev)?;
-        let mvcc = MvccHeader::read(&self.pool.page(f)[off..off + MVCC_HEADER_SIZE]);
-        self.pool.unpin(f);
-        Ok(mvcc)
+        // Single-latch resident read (the GC freeze sweep walks the full id range — hot, `rmp` #337).
+        self.pool
+            .with_page_fetched(dev, |p| MvccHeader::read(&p[off..off + MVCC_HEADER_SIZE]))
     }
 
     /// The `Committed(ts)` word to freeze `word` to, if it is the in-flight stamp of a writer the
@@ -1401,8 +1437,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // harmless to keep — an unused id, idempotent on re-intern).
         let pre_tokens = self.tokens.clone();
         let pre_element_next = self.element_ids.peek();
-        let mut target = pool_target::PoolTarget::new(&mut self.pool);
+        // `rmp` #337, Slice 1: drive the WAL rollback with a *recording* target that captures the
+        // compensating page images WITHOUT touching the pool while the WAL lock is held, then replay
+        // them into the pool AFTER the lock is released. This breaks the eviction-during-rollback
+        // reentrancy that would otherwise deadlock the shared WAL handle (it panicked as a RefCell
+        // double-borrow under the old single-threaded handle when a rollback's working set exceeded
+        // the pool capacity). The WAL `rollback` hardens the CLRs + ABORT before returning, so the
+        // CLRs are durable before any pool write here; a crash between the durable ABORT and this
+        // replay is recovered identically by ARIES redo of the CLRs (see `mod pool_target`).
+        let mut target = pool_target::RecordingTarget::new();
         self.wal.with(|w| w.rollback(txn, &mut target))?;
+        // Lock-free replay: the WAL lock is released, so an eviction triggered by these `fetch`es can
+        // take it with no holder. Stamp each page's `page_lsn` to the CLR's lsn via
+        // `with_page_mut_lsn` so a dirty replayed page written home later carries a real redo LSN
+        // (the WAL-before-data invariant — a page_lsn of 0 would make the pool's `ensure_durable(0)`
+        // a no-op; Tier-1 storage audit F6).
+        for comp in target.into_compensations() {
+            let f = self.pool.fetch(comp.page)?;
+            let r = self
+                .pool
+                .with_page_mut_lsn(f, comp.lsn, |p| paging::apply_patch(p, &comp.image));
+            self.pool.unpin(f);
+            r?;
+        }
         self.reload_catalog()?;
         self.tokens = pre_tokens;
         if pre_element_next > self.element_ids.peek() {
@@ -1432,7 +1489,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Rebuilds the in-memory catalog from the durable metadata page.
     fn reload_catalog(&mut self) -> Result<()> {
-        let (meta, meta_chain) = Self::read_meta(&mut self.pool)?;
+        let (meta, meta_chain) = Self::read_meta(&self.pool)?;
         self.element_ids = ElementIdAllocator::new(meta.element_id_next.max(1));
         self.commit_ts_hw = meta.commit_ts_hw;
         for (i, sm) in meta.stores.iter().enumerate() {
@@ -1917,9 +1974,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let undo = redo.clone();
         let f = self.pool.fetch(dev)?;
         let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
-        let p = self.pool.page_mut(f);
-        p[abs..end].copy_from_slice(bytes);
-        page::set_page_lsn(p, lsn);
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[abs..end].copy_from_slice(bytes);
+        });
         self.pool.unpin(f);
         Ok(())
     }
@@ -3488,27 +3545,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the page is missing or fails checksum verification.
     pub fn read_device_page(&mut self, page: PageId) -> Result<Box<graphus_io::Page>> {
-        let f = self.pool.fetch(page)?;
-        let bytes = Box::new(*self.pool.page(f));
-        self.pool.unpin(f);
-        Ok(bytes)
+        self.pool.with_page_fetched(page, |p| Box::new(*p))
     }
 
-    /// Mutably borrows the underlying block device, for **Deterministic Simulation Testing only**
-    /// (`04 §11`). A DST harness uses it to arm a [`graphus_io::FaultPlan`] (or the one-shot
-    /// `arm_io_error` / `arm_torn_write` seams) on the *live* device of a **running** store, so a
-    /// fault can be injected mid-workload — a write I/O error on the next home write, bit-rot on a
-    /// later read — instead of only on a device the harness owned before construction. This composes
+    /// Runs `f` with mutable access to the underlying block device, for **Deterministic Simulation
+    /// Testing only** (`04 §11`). A DST harness uses it to arm a [`graphus_io::FaultPlan`] (or the
+    /// one-shot `arm_io_error` / `arm_torn_write` seams) on the *live* device of a **running** store,
+    /// so a fault can be injected mid-workload — a write I/O error on the next home write, bit-rot on
+    /// a later read — instead of only on a device the harness owned before construction. This composes
     /// with the existing crash/recover spine: arm the fault, drive more work (the next flush /
     /// eviction surfaces a write error; the next fetch surfaces a read corruption), then crash and
     /// run ARIES recovery exactly as the un-faulted scenarios do.
+    ///
+    /// `rmp` #337, Slice 1: the store now builds on the concurrent buffer pool, whose device lives
+    /// behind a `Mutex<D>`, so this is a **closure** accessor (`with_device_mut`) rather than the old
+    /// `&mut D` borrow — a `&mut D` cannot be handed out from the shared pool. The harness arms the
+    /// fault inside `f`.
     ///
     /// Gated behind the `dst` cargo feature (which forwards to `graphus-bufpool/dst`) so the
     /// production build never compiles this seam — the device stays encapsulated and the cost is
     /// zero (the method does not exist on the production path).
     #[cfg(feature = "dst")]
-    pub fn device_mut(&mut self) -> &mut D {
-        self.pool.device_mut()
+    pub fn with_device_mut<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> R {
+        self.pool.with_device_mut(f)
     }
 
     // ---------------------------- consistency checker ----------------------------
@@ -3563,44 +3622,72 @@ struct CorpseRun {
     succ: u64,
 }
 
-/// A buffer-pool-backed [`ApplyTarget`](graphus_wal::ApplyTarget) used for **live rollback** only
-/// (`04 §4.4`).
+/// A **recording** [`ApplyTarget`](graphus_wal::ApplyTarget) used for **live rollback** only
+/// (`04 §4.4`, `rmp` #337 Slice 1).
 ///
 /// During live rollback the WAL manager calls only [`apply`](graphus_wal::ApplyTarget::apply)
-/// (never `page_lsn`), so this target applies each compensating intra-page patch to the cached
-/// page and re-stamps the page's `page_lsn`. Crash recovery uses [`crate::recovery::DeviceTarget`]
-/// instead, which can read each page's `page_lsn` to guard redo.
+/// (never `page_lsn`), once per compensating intra-page patch, **while holding the WAL manager
+/// lock**. On the concurrent buffer pool that lock and the pool's internal WAL-rule lock wrap the
+/// same [`WalManager`] (see [`crate::wal_rule`]): applying the patch *through the pool* inside
+/// `apply` would `fetch` a page, and if that fetch evicts a dirty victim the pool's write-back
+/// re-enters the WAL rule and tries to take the WAL lock again — a self-deadlock (it panicked as a
+/// `RefCell` double-borrow under the old single-threaded handle; the `rmp` #337 audit proved a
+/// rollback whose working set exceeds the pool capacity hits exactly this).
+///
+/// The fix (the ARIES-precedent "don't nest the buffer-pool flush under the log latch", as InnoDB /
+/// PostgreSQL / SQLite all do): this target merely **records** each `(page, lsn, image)` while the
+/// lock is held — touching the pool not at all — and [`RecordStore::rollback`] **replays** them into
+/// the pool *after* the WAL lock is released. By then the CLRs the WAL appended are already durable
+/// (rollback hardens once before returning), so an eviction during replay takes the WAL lock with no
+/// holder, and a crash between the (durable) ABORT and the replay is recovered identically by ARIES
+/// redo of the CLRs against the device. Crash recovery itself uses [`crate::recovery::DeviceTarget`]
+/// (direct device writes, no pool, no reentrancy).
 mod pool_target {
-    use super::{page, paging};
-    use graphus_bufpool::{BufferPool, WalRule};
+    use graphus_core::Lsn;
+    use graphus_core::PageId;
     use graphus_core::error::Result;
-    use graphus_core::{Lsn, PageId};
-    use graphus_io::BlockDevice;
 
-    /// See module docs.
-    pub struct PoolTarget<'a, D: BlockDevice, W: WalRule> {
-        pool: &'a mut BufferPool<D, W>,
+    /// One recorded compensating page image to replay into the pool after the WAL lock is released.
+    pub struct Compensation {
+        pub page: PageId,
+        pub lsn: Lsn,
+        pub image: Vec<u8>,
     }
 
-    impl<'a, D: BlockDevice, W: WalRule> PoolTarget<'a, D, W> {
-        /// Wraps a buffer pool for live-rollback compensation.
-        pub fn new(pool: &'a mut BufferPool<D, W>) -> Self {
-            Self { pool }
+    /// A recorder that captures the compensating images the WAL emits during rollback, applying
+    /// nothing to the pool itself (see module docs for why deferral is required and safe).
+    #[derive(Default)]
+    pub struct RecordingTarget {
+        compensations: Vec<Compensation>,
+    }
+
+    impl RecordingTarget {
+        /// A fresh recorder with no captured compensations.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Consumes the recorder, yielding the captured compensations in apply order (newest-first,
+        /// exactly as the WAL emitted them).
+        pub fn into_compensations(self) -> Vec<Compensation> {
+            self.compensations
         }
     }
 
-    impl<D: BlockDevice, W: WalRule> graphus_wal::ApplyTarget for PoolTarget<'_, D, W> {
+    impl graphus_wal::ApplyTarget for RecordingTarget {
         fn page_lsn(&self, _page: PageId) -> Lsn {
             // Never consulted during live rollback (the WAL manager calls only `apply`).
             Lsn(0)
         }
 
         fn apply(&mut self, page: PageId, lsn: Lsn, image: &[u8]) -> Result<()> {
-            let f = self.pool.fetch(page)?;
-            let p = self.pool.page_mut(f);
-            paging::apply_patch(p, image)?;
-            page::set_page_lsn(p, lsn);
-            self.pool.unpin(f);
+            // Record only — no pool access while the WAL lock is held. Replay happens lock-free in
+            // `RecordStore::rollback` after the WAL `rollback` returns.
+            self.compensations.push(Compensation {
+                page,
+                lsn,
+                image: image.to_vec(),
+            });
             Ok(())
         }
     }

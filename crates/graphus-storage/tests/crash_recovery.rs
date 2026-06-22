@@ -557,3 +557,65 @@ fn double_crash_aborted_prependers_leave_no_phantom_edge() {
         "after 2 crashes: still no phantom edge and the orphan rel page is still readable (rmp #239)"
     );
 }
+
+/// Regression for `rmp` #337 (Slice 1): a live transaction **rollback whose working set exceeds the
+/// buffer-pool capacity** must succeed and undo cleanly — and the result must survive a crash.
+///
+/// Before the fix this path crashed: `WalManager::rollback` holds the WAL manager lock while driving
+/// `PoolTarget::apply` → `pool.fetch`, and with a pool smaller than the rolled-back txn's page span
+/// that `fetch` evicts a dirty victim, whose write-back re-enters the WAL rule and re-locks the same
+/// manager (a `RefCell` double-borrow panic under the old single-threaded handle; a deadlock under the
+/// migrated `Arc<Mutex>` handle). The fix records the compensating images while the lock is held and
+/// replays them into the pool only after the lock is released (`mod pool_target`). This test forces
+/// the eviction (3-frame pool, a 2000-node aborting txn) and then proves crash-recovery correctness of
+/// the deferred replay (the CLRs the rollback hardened recover the same committed-or-nothing state).
+#[test]
+fn rollback_exceeding_pool_capacity_undoes_and_recovers() {
+    // A deliberately tiny pool so the aborting txn's page span far exceeds the frame count.
+    let mut store = fresh(3);
+
+    // Commit a baseline node first: it must SURVIVE both the rollback and the crash.
+    let keep = TxnId(1);
+    store.begin(keep);
+    let (kept_id, _) = store.create_node(keep).expect("create kept node");
+    store.commit(keep).expect("commit baseline");
+
+    // A second transaction creates many nodes — spanning many pages — then ROLLS BACK. With only 3
+    // frames the undo walk must evict dirty victims during apply (the path that used to panic).
+    let abort = TxnId(2);
+    store.begin(abort);
+    for _ in 0..2000 {
+        store
+            .create_node(abort)
+            .expect("create node in aborting txn");
+    }
+    store
+        .rollback(abort)
+        .expect("rollback exceeding pool capacity must succeed (rmp #337)");
+
+    // Live state: exactly the one committed node remains (every aborted node was undone).
+    let live: Vec<u64> = store.scan_node_ids().expect("scan after rollback");
+    assert_eq!(
+        live,
+        vec![kept_id],
+        "after a rollback exceeding pool capacity, only the committed baseline node is live"
+    );
+
+    // Crash + no-force recovery: the committed baseline survives and the aborted work stays gone —
+    // proving the deferred-replay rollback is durable/crash-correct, not just in-memory correct.
+    let mut recovered = recover_no_force(&store);
+    assert!(
+        recovered
+            .node(kept_id)
+            .expect("read kept node")
+            .mvcc
+            .in_use(),
+        "the committed baseline node survives crash recovery after the big rollback"
+    );
+    let live_after_crash: Vec<u64> = recovered.scan_node_ids().expect("scan after recovery");
+    assert_eq!(
+        live_after_crash,
+        vec![kept_id],
+        "after crash recovery, still exactly the one committed node (aborted work never resurrects)"
+    );
+}
