@@ -504,6 +504,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // backing index (`rmp` task #100). Captured before the scan so the index is not borrowed across
         // a store borrow.
         let registered_composite: Vec<(u32, Vec<u32>)> = index.borrow().registered_composite();
+        // The registered bitmap (low-cardinality) index keys (`rmp` task #328), captured before the
+        // scan like the others. The bitmap is membership-exact, so the rebuild re-captures it whole.
+        let registered_bitmap: Vec<(u32, u32)> = index.borrow().registered_bitmap();
         for id in node_ids {
             Self::index_one_node(store, index, id, &registered);
             // Repopulate the full-text inverted indexes from the same scan (`rmp` task #72), so a
@@ -520,6 +523,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // one node-key constraint is declared.
             if !registered_composite.is_empty() {
                 Self::index_one_node_composite(store, index, id, &registered_composite);
+            }
+            // Repopulate the bitmap indexes from the same scan (`rmp` task #328), only when at least
+            // one low-cardinality column is declared.
+            if !registered_bitmap.is_empty() {
+                Self::index_one_node_bitmap(store, index, id, &registered_bitmap);
             }
         }
     }
@@ -739,6 +747,54 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
+    /// (Re)captures node `id`'s current value into each `registered` `(label_token, prop_key)` bitmap
+    /// index it matches (`rmp` task #328). The bitmap analogue of [`index_one_node`](Self::index_one_node):
+    /// the same single per-node path the full rebuild drives, so a recovered store rebuilds the
+    /// low-cardinality bitmaps store-consistently. Membership is exact (the bitmap is a candidate
+    /// SOURCE): each registered column the node carries gets the node's bit set under its current
+    /// value; a node missing the label / property contributes nothing. Store and index are borrowed in
+    /// **separate, non-overlapping** scopes (the borrow discipline of this file).
+    fn index_one_node_bitmap(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        let label_tokens = match store.borrow_mut().node_labels(id) {
+            Ok(tokens) => tokens,
+            Err(_) => return,
+        };
+        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only
+        // the keys a registered bitmap index covers for one of this node's labels.
+        let mut values: Vec<(u32, Value)> = Vec::new();
+        {
+            let chain = match store.borrow_mut().node_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                let used = registered.iter().any(|&(reg_label, prop_key)| {
+                    prop_key == key && label_tokens.contains(&reg_label)
+                });
+                if used {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            for &lt in &label_tokens {
+                if index.has_bitmap(lt, *prop_key) {
+                    index.insert_bitmap_value(lt, *prop_key, value, id);
+                }
+            }
+        }
+    }
+
     /// Begins a transaction at `isolation`, returning its [`TxnId`].
     ///
     /// Its read snapshot is the store's latest commit ([`RecordStore::snapshot_ts`], `04 §5.2`), so
@@ -884,6 +940,113 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.columns.borrow_mut().declare(label_token, prop_key);
         Self::rebuild_columns(&self.store, &self.columns);
         Ok(())
+    }
+
+    /// Declares a **low-cardinality Roaring-bitmap index** on `(label, property)` (`rmp` task #328),
+    /// the complementary index for boolean / enum-like / status columns: ~100× smaller postings than
+    /// the B+-tree and microsecond multi-predicate AND via bitmap intersection (see
+    /// [`bitmap_conjunction`](Self::bitmap_conjunction)). Like the columnar cache this is an **opt-in,
+    /// derived, in-memory** structure — nothing here is durable except the token interning (the only
+    /// durable effect, identical to any token mint); a re-opened coordinator re-declares. The column is
+    /// captured now and kept **membership-exact** by the per-write re-index, so its seek result is a
+    /// correct candidate set (the caller still re-checks MVCC visibility, exactly as for every index).
+    ///
+    /// Intended for **low-cardinality** columns; on a high-cardinality column a bitmap holds one id per
+    /// value and the B+-tree (which also serves ranges) is the right structure — the declaration is the
+    /// operator's assertion that the column is low-cardinality.
+    ///
+    /// # Errors
+    /// Returns a storage error if interning either token (or its committing transaction) fails.
+    pub fn declare_bitmap_index(&mut self, label: &str, property: &str) -> Result<()> {
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            (label_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the column and capture it now from the current graph (membership-exact).
+        self.index
+            .borrow_mut()
+            .register_bitmap(label_token, prop_key);
+        let registered = [(label_token, prop_key)];
+        let node_ids = match self.store.borrow_mut().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(_) => return Ok(()), // empty graph / scan fault: an empty bitmap, rebuilt later.
+        };
+        for id in node_ids {
+            Self::index_one_node_bitmap(&self.store, &self.index, id, &registered);
+        }
+        Ok(())
+    }
+
+    /// Candidate node ids for `label` whose `property` equals `value`, via the declared bitmap index
+    /// (`rmp` #328); `None` if no bitmap index is declared for the column. Test/diagnostic surface for
+    /// the single-predicate bitmap seek (the caller re-checks visibility + the exact predicate).
+    #[must_use]
+    pub fn bitmap_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<u64>> {
+        let store = self.store.borrow();
+        let label_token = store.token_id(Namespace::Label, label)?;
+        let prop_key = store.token_id(Namespace::PropKey, property)?;
+        drop(store);
+        self.index
+            .borrow()
+            .seek_bitmap_eq(label_token, prop_key, value)
+    }
+
+    /// Candidate node ids for `label` satisfying the conjunction of `(property, value)` equalities, via
+    /// **bitmap intersection** (`rmp` #328 multi-predicate AND fast path); `None` unless every column
+    /// has a declared bitmap index. The caller re-checks MVCC visibility + the exact predicates.
+    #[must_use]
+    pub fn bitmap_conjunction(
+        &self,
+        label: &str,
+        predicates: &[(&str, &Value)],
+    ) -> Option<Vec<u64>> {
+        let store = self.store.borrow();
+        let label_token = store.token_id(Namespace::Label, label)?;
+        // Resolve each predicate's prop-key token; a never-interned property has no index ⇒ decline.
+        let mut resolved: Vec<(u32, &Value)> = Vec::with_capacity(predicates.len());
+        for &(property, value) in predicates {
+            let prop_key = store.token_id(Namespace::PropKey, property)?;
+            resolved.push((prop_key, value));
+        }
+        drop(store);
+        self.index
+            .borrow()
+            .seek_bitmap_conjunction(label_token, &resolved)
+    }
+
+    /// The serialized byte footprint of the declared `(label, property)` bitmap index, or `None` if no
+    /// bitmap index is declared. Used by the measurement harness to compare against the B+-tree
+    /// postings size. (Diagnostics only.)
+    #[must_use]
+    pub fn bitmap_serialized_bytes(&self, label: &str, property: &str) -> Option<u64> {
+        let store = self.store.borrow();
+        let label_token = store.token_id(Namespace::Label, label)?;
+        let prop_key = store.token_id(Namespace::PropKey, property)?;
+        drop(store);
+        self.index
+            .borrow()
+            .bitmap_serialized_bytes(label_token, prop_key)
     }
 
     /// Re-captures **every declared** columnar column from the current store (`rmp` #329): the

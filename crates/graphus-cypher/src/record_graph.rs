@@ -1006,6 +1006,22 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
         }
 
+        // Bitmap (low-cardinality) indexes are maintained membership-EXACT the same wholesale way
+        // (`rmp` task #328): unlike the read-only columnar cache, a bitmap is a candidate SOURCE, so a
+        // node it wrongly OMITS would make a query miss a row (a subset — never correct). For each
+        // registered bitmap `(label_token, prop_key)`, first remove this node from every value-bitmap
+        // of the column (drop any prior value's bit), then if the node currently carries the covered
+        // label AND holds an indexable value of the key, set its bit under that value. A node that
+        // lost the label or the property ends up in no bitmap, so a seek never returns a phantom.
+        for (label_token, prop_key) in index.registered_bitmap() {
+            index.remove_bitmap_node(label_token, prop_key, node.0);
+            if label_tokens.contains(&label_token) {
+                if let Some((_, value)) = resolved_props.iter().find(|(k, _)| *k == prop_key) {
+                    index.insert_bitmap_value(label_token, prop_key, value, node.0);
+                }
+            }
+        }
+
         // Composite indexes — a node-key constraint's backing index (`rmp` task #100) — are maintained
         // the same candidate-only way as the property indexes: for every registered composite index
         // `(label_token, property tuple)`, if the node currently carries the covered label AND holds the
@@ -1036,6 +1052,53 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
             }
             if complete {
                 index.insert_composite(label_token, &property_tokens, &tuple, node.0);
+            }
+        }
+    }
+
+    /// Maintains **only** the bitmap (low-cardinality) indexes (`rmp` task #328) for `node` from its
+    /// current labels + property values, used by the removal paths (`REMOVE n.p`, `REMOVE n:Label`)
+    /// that deliberately skip the full [`reindex_node`](Self::reindex_node) (the other index kinds
+    /// tolerate the resulting stale candidate, dropped by the seek's re-check — see `set_node_property`).
+    ///
+    /// The bitmap, by contrast, is exposed as a **direct** candidate source (it is intersected for
+    /// multi-predicate AND), so it is kept membership-exact even across removals: the node is dropped
+    /// from every value-bitmap of each registered column and re-inserted only under its current value
+    /// (or left out if it lost the label / property). This is O(distinct) per column — cheap, because
+    /// the column is low-cardinality by construction. A no-op on the standalone path or when no bitmap
+    /// index is declared.
+    fn reindex_node_bitmaps(&self, node: NodeId) {
+        let Some(index) = &self.index else {
+            return;
+        };
+        if index.borrow().registered_bitmap().is_empty() {
+            return; // nothing declared — avoid the label/property reads entirely.
+        }
+        // Read the node's current labels + property values (store borrows released before the index
+        // borrow), mirroring `reindex_node`.
+        let label_tokens: Vec<u32> = match self.store.borrow_mut().node_labels(node.0) {
+            Ok(ids) => ids,
+            Err(_) => return,
+        };
+        let props = self.read_node_props(node);
+        let resolved_props: Vec<(u32, Value)> = {
+            let store = self.store.borrow();
+            props
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    store
+                        .token_id(Namespace::PropKey, &name)
+                        .map(|prop_key| (prop_key, value))
+                })
+                .collect()
+        };
+        let mut index = index.borrow_mut();
+        for (label_token, prop_key) in index.registered_bitmap() {
+            index.remove_bitmap_node(label_token, prop_key, node.0);
+            if label_tokens.contains(&label_token) {
+                if let Some((_, value)) = resolved_props.iter().find(|(k, _)| *k == prop_key) {
+                    index.insert_bitmap_value(label_token, prop_key, value, node.0);
+                }
             }
         }
     }
@@ -2523,6 +2586,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
             if !self.defer_constraint_check.get() {
                 self.enforce_constraints_for_node(node);
             }
+            // Keep the bitmap candidate source membership-exact after a `SET n.p = null` removal
+            // (`rmp` #328): the node must leave the column's value-bitmaps.
+            self.reindex_node_bitmaps(node);
             return;
         }
         // Inline scalars stay inline (#38); String/List values overflow to the strings.store heap
@@ -2630,6 +2696,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
                 return;
             }
         }
+        // Keep the bitmap candidate source membership-exact after a label loss (`rmp` #328): a node
+        // that no longer carries the covered label must drop out of the column's bitmaps.
+        self.reindex_node_bitmaps(node);
     }
 
     fn remove_node_property(&mut self, node: NodeId, key: &str) {
@@ -2655,6 +2724,9 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         {
             self.capture(e);
         }
+        // Keep the bitmap candidate source membership-exact after a property removal (`rmp` #328): the
+        // node must leave the column's value-bitmaps (the other index kinds tolerate the stale entry).
+        self.reindex_node_bitmaps(node);
     }
 
     fn remove_rel_property(&mut self, rel: RelId, key: &str) {

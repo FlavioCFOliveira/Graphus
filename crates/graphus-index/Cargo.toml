@@ -13,6 +13,7 @@ graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
 graphus-bufpool = { path = "../graphus-bufpool" }
 graphus-wal = { path = "../graphus-wal" }
+roaring = { version = "0.11.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 use graphus_bufpool::BufferPool;
 use graphus_core::{TxnId, Value};
+use graphus_index::bitmap::{self, BitmapIndex};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
@@ -107,6 +108,15 @@ pub struct IndexSet {
     /// the constraint *declaration* is durable. The map key carries the whole property tuple because a
     /// label may host several node keys over different property tuples.
     composite: HashMap<(u32, Vec<u32>), CompositeIndex<Dev, Sink>>,
+    /// Declared **low-cardinality Roaring-bitmap** indexes (`rmp` task #328), keyed by `(label_token,
+    /// prop_key)`. Each value is an in-memory [`BitmapIndex`] (value → compressed node-id bitmap) over
+    /// the covered low-cardinality column. Like every other backing structure it is **ephemeral**
+    /// (rebuilt from the store on open); unlike the catalog-backed kinds it uses the **opt-in** model
+    /// (declared in-session, no durable catalog entry), exactly like the columnar value cache — so a
+    /// re-opened coordinator re-declares the columns it wants bitmap-accelerated. Because it is a
+    /// **candidate source** (not a read-only accelerator), it is kept membership-exact under writes by
+    /// the wholesale per-node re-index in [`RecordStoreGraph::reindex_node`](crate::record_graph).
+    bitmap: HashMap<(u32, u32), BitmapIndex>,
 }
 
 /// A declared constraint's in-memory rule (`rmp` tasks #99, #100): the covered label token, the
@@ -177,6 +187,7 @@ impl IndexSet {
             spatial: HashMap::new(),
             constraints: HashMap::new(),
             composite: HashMap::new(),
+            bitmap: HashMap::new(),
         }
     }
 
@@ -416,6 +427,11 @@ impl IndexSet {
         // keeping the registered `(label_token, property_tokens)` set, exactly like the property indexes.
         for (key, idx) in &mut self.composite {
             *idx = CompositeIndex::new(fresh_tree(), key.1.len());
+        }
+        // Bitmap indexes (`rmp` task #328): drop the value→id bitmaps but keep the registered
+        // `(label_token, prop_key)` set so the open-time rebuild re-captures exactly those columns.
+        for bm in self.bitmap.values_mut() {
+            *bm = BitmapIndex::new();
         }
     }
 
@@ -920,6 +936,111 @@ impl IndexSet {
     ) -> Option<Vec<u64>> {
         let sp = self.spatial.get(&(label_token, prop_key))?;
         Some(sp.index.query_bbox(min_x, max_x, min_y, max_y))
+    }
+
+    // ============================================================================================
+    // Bitmap indexes (`rmp` task #328) — low-cardinality columns, opt-in / derived
+    // ============================================================================================
+
+    /// Declares a low-cardinality bitmap index on `(label_token, prop_key)` (`rmp` task #328).
+    /// Idempotent: re-declaring keeps the existing bitmap. The column is then captured by the
+    /// coordinator rebuild and kept membership-exact by the per-write re-index.
+    pub fn register_bitmap(&mut self, label_token: u32, prop_key: u32) {
+        self.bitmap.entry((label_token, prop_key)).or_default();
+    }
+
+    /// Unregisters the bitmap index on `(label_token, prop_key)`, dropping its bitmaps. A no-op if
+    /// none is registered.
+    pub fn unregister_bitmap(&mut self, label_token: u32, prop_key: u32) {
+        self.bitmap.remove(&(label_token, prop_key));
+    }
+
+    /// Whether a bitmap index is registered for `(label_token, prop_key)`.
+    #[must_use]
+    pub fn has_bitmap(&self, label_token: u32, prop_key: u32) -> bool {
+        self.bitmap.contains_key(&(label_token, prop_key))
+    }
+
+    /// The registered bitmap index keys `(label_token, prop_key)`, ascending. Used by the
+    /// coordinator's rebuild to know which low-cardinality columns to (re-)capture.
+    #[must_use]
+    pub fn registered_bitmap(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.bitmap.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that node `node_id` currently has `value` for the `(label_token, prop_key)` bitmap
+    /// index, if one is registered (else a no-op). A `Null`/unindexable value is skipped. Maintained
+    /// membership-exact by the caller's wholesale per-node re-index (which first removes the node from
+    /// every value-bitmap of the column — see [`Self::remove_bitmap_node`] — then re-inserts here).
+    pub fn insert_bitmap_value(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+        node_id: u64,
+    ) {
+        if let Some(bm) = self.bitmap.get_mut(&(label_token, prop_key)) {
+            bm.insert(value, node_id);
+        }
+    }
+
+    /// Removes `node_id` from **every** value-bitmap of the `(label_token, prop_key)` index (a delete,
+    /// a value change, or a node that lost the covered label). A no-op if none is registered. Cheap
+    /// because the column is low-cardinality.
+    pub fn remove_bitmap_node(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
+        if let Some(bm) = self.bitmap.get_mut(&(label_token, prop_key)) {
+            bm.remove_node_everywhere(node_id);
+        }
+    }
+
+    /// Candidate node ids whose `(label_token, prop_key)` value equals `value`, ascending. `None` if
+    /// no bitmap index is registered for the column; otherwise the membership-exact set (the caller
+    /// still re-checks MVCC visibility + the exact predicate, per the candidate contract).
+    #[must_use]
+    pub fn seek_bitmap_eq(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+    ) -> Option<Vec<u64>> {
+        let bm = self.bitmap.get(&(label_token, prop_key))?;
+        Some(bm.seek_eq(value))
+    }
+
+    /// Candidate node ids satisfying the conjunction `label_token` ∧ (every `(prop_key, value)`
+    /// equality in `predicates`), ascending — the **multi-predicate bitmap-AND fast path** (`rmp`
+    /// #328). Returns `None` unless **every** predicate's column has a registered bitmap index (so the
+    /// caller can fall back to its ordinary seek+filter); otherwise intersects the per-value Roaring
+    /// bitmaps entirely inside Roaring and returns the common ids. An empty `predicates` yields `None`
+    /// (no conjunction to accelerate).
+    #[must_use]
+    pub fn seek_bitmap_conjunction(
+        &self,
+        label_token: u32,
+        predicates: &[(u32, &Value)],
+    ) -> Option<Vec<u64>> {
+        if predicates.is_empty() {
+            return None;
+        }
+        // Every conjoined column must be bitmap-indexed, else decline (the caller uses its B-tree /
+        // scan path). Collect each predicate's value-bitmap (a `None` entry = value absent ⇒ empty).
+        let mut bitmaps = Vec::with_capacity(predicates.len());
+        for &(prop_key, value) in predicates {
+            let bm = self.bitmap.get(&(label_token, prop_key))?;
+            bitmaps.push(bm.bitmap_for(value));
+        }
+        Some(bitmap::intersect(&bitmaps))
+    }
+
+    /// The serialized byte footprint of all bitmaps in the `(label_token, prop_key)` index, or `None`
+    /// if none is registered (`rmp` #328 measurement surface — the compressed posting size).
+    #[must_use]
+    pub fn bitmap_serialized_bytes(&self, label_token: u32, prop_key: u32) -> Option<u64> {
+        self.bitmap
+            .get(&(label_token, prop_key))
+            .map(BitmapIndex::serialized_bytes)
     }
 
     /// All candidate ids for `token` in `idx`, regardless of value. Used as the correct

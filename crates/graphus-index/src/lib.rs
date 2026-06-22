@@ -62,6 +62,7 @@
 //! model.
 #![forbid(unsafe_code)]
 
+pub mod bitmap;
 pub mod btree;
 pub mod constraint;
 pub mod fulltext;
@@ -72,6 +73,7 @@ pub mod node;
 pub mod recovery;
 pub mod spatial;
 
+pub use bitmap::{BitmapIndex, intersect as bitmap_intersect};
 pub use btree::BTree;
 pub use constraint::{ConstraintError, ExistenceConstraint, UniqueConstraint};
 pub use fulltext::{Analyzer, InvertedIndex, MatchSemantics};
