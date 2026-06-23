@@ -64,6 +64,7 @@ pub mod labels;
 pub mod meta;
 pub mod paging;
 pub mod propenc;
+pub mod read_view;
 pub mod record;
 pub mod recovery;
 pub mod store;
@@ -95,6 +96,7 @@ pub use meta::{
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,
 };
+pub use read_view::{MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
 pub use record::{
     ChainSide, MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE,
     PropRecord, REL_RECORD_SIZE, RelRecord,

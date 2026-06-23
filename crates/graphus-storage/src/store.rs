@@ -44,6 +44,7 @@ use crate::meta::{
     ConstraintEntry, FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta,
 };
 use crate::paging;
+use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
     MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL, NODE_RECORD_SIZE,
@@ -133,6 +134,27 @@ impl FixedStore {
             free_list: self.free.clone(),
             device_pages: self.device_pages.iter().map(|p| p.0).collect(),
         }
+    }
+}
+
+/// The live-store location oracle (`rmp` #336, Slice 3a): the `RecordStore` read path drives the
+/// single decode impl in [`crate::read_view`] through this, borrowing `&self.stores` **directly** so
+/// the hot read path allocates / clones **nothing** per call (the Slice-1 single-thread tax is not
+/// increased). The owned [`MetaSnapshot`] implements the same trait over `Arc`-shared page lists for
+/// the off-thread view.
+impl StorePages for [FixedStore; STORE_COUNT] {
+    fn device_page(&self, kind: StoreKind, rel_page: u64) -> Result<PageId> {
+        self[kind as usize]
+            .device_pages
+            .get(rel_page as usize)
+            .copied()
+            .ok_or_else(|| {
+                GraphusError::Storage(format!("{kind:?} store page {rel_page} not allocated"))
+            })
+    }
+
+    fn high_water(&self, kind: StoreKind) -> u64 {
+        self[kind as usize].alloc.high_water()
     }
 }
 
@@ -786,35 +808,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         s.free.pop().unwrap_or_else(|| s.alloc.alloc_fresh())
     }
 
+    // The read-decode methods below delegate to the single authoritative impl in
+    // [`crate::read_view`] (`rmp` #336, Slice 3a), passing `&self.stores` as the live location oracle
+    // (a direct borrow — no per-call allocation). The exact same free functions back the off-thread
+    // [`StoreReadView`], so the two read paths are byte-identical by construction (proven by the
+    // equivalence test). `with_page_fetched` reads the resident page under a single latch (the hot
+    // read path); the decoded record is owned so it escapes the borrow (`rmp` #337 Slice 1).
     fn read_node(&self, id: u64) -> Result<NodeRecord> {
-        let (rel_page, off) = paging::record_location(id, NODE_RECORD_SIZE);
-        let dev = self.device_page(StoreKind::Node, rel_page)?;
-        // `with_page_fetched` reads the resident page under a single latch (fetch + read + unpin
-        // folded) — the hot read path; `NodeRecord` is owned so it escapes the borrow (`rmp` #337).
-        self.pool
-            .with_page_fetched(dev, |p| NodeRecord::decode(&p[off..off + NODE_RECORD_SIZE]))
+        read_view::read_node(&self.pool, &self.stores, id)
     }
 
     fn read_rel(&self, id: u64) -> Result<RelRecord> {
-        let (rel_page, off) = paging::record_location(id, REL_RECORD_SIZE);
-        let dev = self.device_page(StoreKind::Rel, rel_page)?;
-        self.pool
-            .with_page_fetched(dev, |p| RelRecord::decode(&p[off..off + REL_RECORD_SIZE]))
+        read_view::read_rel(&self.pool, &self.stores, id)
     }
 
     fn read_prop(&self, id: u64) -> Result<PropRecord> {
-        let (rel_page, off) = paging::record_location(id, PROP_RECORD_SIZE);
-        let dev = self.device_page(StoreKind::Prop, rel_page)?;
-        self.pool
-            .with_page_fetched(dev, |p| PropRecord::decode(&p[off..off + PROP_RECORD_SIZE]))
+        read_view::read_prop(&self.pool, &self.stores, id)
     }
 
     fn read_block(&self, id: u64) -> Result<HeapBlock> {
-        let (rel_page, off) = paging::record_location(id, STRINGS_RECORD_SIZE);
-        let dev = self.device_page(StoreKind::Strings, rel_page)?;
-        self.pool.with_page_fetched(dev, |p| {
-            HeapBlock::decode(&p[off..off + STRINGS_RECORD_SIZE])
-        })
+        read_view::read_block(&self.pool, &self.stores, id)
     }
 
     fn write_block(&mut self, id: u64, rec: &HeapBlock, txn: TxnId) -> Result<()> {
@@ -868,6 +881,50 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn snapshot_ts(&self) -> Timestamp {
         Timestamp(self.commit_ts_hw)
+    }
+
+    /// Captures this store's per-[`StoreKind`] location metadata into an owned, `Send + Sync`
+    /// [`MetaSnapshot`] (`rmp` task #336, Slice 3a): each store's `high_water` bound + its
+    /// `device_pages` index, shared cheaply (the page lists are copied **once** here into
+    /// [`Arc<[PageId]>`]s; thereafter cloning the snapshot is a refcount bump). Call this on the engine
+    /// thread (where the store is exclusively held); the resulting snapshot drives the off-thread read
+    /// path through a [`StoreReadView`] (Slice 3b) with **no** live access to the store's mutable
+    /// fields.
+    ///
+    /// MVCC-superset-safe: the writer only **appends** to `device_pages` and **advances**
+    /// `high_water`, so a reader scanning `1..high_water` over this snapshot only ever indexes
+    /// already-existing, never-mutated entries; any id allocated later belongs to a writer that commits
+    /// after the reader's snapshot timestamp and is invisible anyway (visibility is decided above by
+    /// `graphus_txn::is_visible`).
+    #[must_use]
+    pub fn capture_read_meta(&self) -> MetaSnapshot {
+        let snap = |kind: StoreKind| {
+            let s = self.store(kind);
+            StoreMetaSnapshot {
+                high_water: s.alloc.high_water(),
+                device_pages: Arc::from(s.device_pages.as_slice()),
+            }
+        };
+        MetaSnapshot::new([
+            snap(StoreKind::Node),
+            snap(StoreKind::Rel),
+            snap(StoreKind::Prop),
+            snap(StoreKind::Strings),
+        ])
+    }
+
+    /// Builds an owned, `Send + Sync` [`StoreReadView`] over this store's committed state (`rmp` task
+    /// #336, Slice 3a): an [`Arc`]-shared clone of the page cache plus a freshly
+    /// [`capture_read_meta`](Self::capture_read_meta)d [`MetaSnapshot`]. The view exposes the same read
+    /// surface the Cypher layer drives, computed purely from `(pool, meta)`; it carries no
+    /// snapshot/visibility logic of its own (the caller filters returned records by
+    /// `graphus_txn::is_visible` against its own cloned `CommitRegistry`, exactly as the `&self` read
+    /// methods are filtered above this layer). Slice 3a is single-threaded and behaviour-preserving
+    /// (the view is proven byte-identical to the `&self` methods); Slice 3b moves it onto reader
+    /// threads.
+    #[must_use]
+    pub fn read_view(&self) -> StoreReadView<D, S> {
+        StoreReadView::new(Arc::clone(&self.pool), self.capture_read_meta())
     }
 
     /// Commits `txn`: persists the catalog under `txn`, then group-commits the WAL so all of
@@ -1296,11 +1353,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
     /// avoids decoding the full record when only the header words matter).
     fn read_mvcc(&self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
-        let (rel_page, off) = paging::record_location(id, kind.record_size());
-        let dev = self.device_page(kind, rel_page)?;
-        // Single-latch resident read (the GC freeze sweep walks the full id range — hot, `rmp` #337).
-        self.pool
-            .with_page_fetched(dev, |p| MvccHeader::read(&p[off..off + MVCC_HEADER_SIZE]))
+        read_view::read_mvcc(&self.pool, &self.stores, kind, id)
     }
 
     /// The `Committed(ts)` word to freeze `word` to, if it is the in-flight stamp of a writer the
@@ -1579,14 +1632,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a node store page in the range cannot be read.
     pub fn scan_node_ids(&self) -> Result<Vec<u64>> {
-        let high_water = self.store(StoreKind::Node).alloc.high_water();
-        let mut out = Vec::new();
-        for id in 1..high_water {
-            if self.read_node(id)?.mvcc.in_use() {
-                out.push(id);
-            }
-        }
-        Ok(out)
+        read_view::scan_node_ids(&self.pool, &self.stores)
     }
 
     /// Enumerates the physical ids of every **slot-occupied** relationship (`in_use`), in ascending
@@ -1600,14 +1646,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a relationship store page in the range cannot be read.
     pub fn scan_rel_ids(&self) -> Result<Vec<u64>> {
-        let high_water = self.store(StoreKind::Rel).alloc.high_water();
-        let mut out = Vec::new();
-        for id in 1..high_water {
-            if self.read_rel(id)?.mvcc.in_use() {
-                out.push(id);
-            }
-        }
-        Ok(out)
+        read_view::scan_rel_ids(&self.pool, &self.stores)
     }
 
     /// **MVCC-deletes** the node at `id` under `txn` by stamping its `xmax` tombstone (`04 §5.3`).
@@ -1788,8 +1827,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   bitmap is in overflow form (its labels live in a #39 token-list block this build cannot
     ///   read).
     pub fn node_labels(&self, id: u64) -> Result<Vec<u32>> {
-        let node = self.read_node(id)?;
-        labels::token_ids(node.labels).map_err(GraphusError::from)
+        read_view::node_labels(&self.pool, &self.stores, id)
     }
 
     /// Whether node `id` carries the label with `label_token_id`.
@@ -1799,8 +1837,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
     ///   `label_token_id` is `>= 63`, or the node's bitmap is in overflow form (#39).
     pub fn node_has_label(&self, id: u64, label_token_id: u32) -> Result<bool> {
-        let node = self.read_node(id)?;
-        labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
+        read_view::node_has_label(&self.pool, &self.stores, id, label_token_id)
     }
 
     // --------------------------- relationship CRUD --------------------------
@@ -2576,26 +2613,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a chain page is missing.
     pub fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        let node = self.read_node(node_id)?;
-        let mut out = Vec::new();
-        let mut cur = node.first_prop;
-        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "property chain of node {node_id} is malformed (cycle?)"
-                )));
-            }
-            let p = self.read_prop(cur)?;
-            let next = p.next_prop;
-            if p.mvcc.in_use() {
-                out.push((cur, p));
-            }
-            cur = next;
-        }
-        Ok(out)
+        read_view::node_properties(&self.pool, &self.stores, node_id)
     }
 
     /// MVCC-tombstones the **live** property records in the chain rooted at `owner_first_prop`
@@ -2712,27 +2730,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// does not terminate within a cycle guard (a corrupted chain is *reported*, never looped on —
     /// mirrors the property/adjacency chain guards).
     pub fn read_chain(&self, head: u64) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        let mut cur = head;
-        let guard = self.store(StoreKind::Strings).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "overflow chain at head {head} is malformed (cycle?)"
-                )));
-            }
-            let block = self.read_block(cur)?;
-            if !block.mvcc.in_use() {
-                return Err(GraphusError::Storage(format!(
-                    "overflow chain at head {head} references freed block {cur}"
-                )));
-            }
-            out.extend_from_slice(block.bytes());
-            cur = block.next_block;
-        }
-        Ok(out)
+        read_view::read_chain(&self.pool, &self.stores, head)
     }
 
     /// Frees every block of the chain whose head is `head`, clearing each block's `in_use` bit (a
@@ -2890,13 +2888,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         type_tag: u8,
         value_inline: u64,
     ) -> Result<graphus_core::Value> {
-        if type_tag & valenc::OVERFLOW_BIT == 0 {
-            return crate::propenc::decode_inline(type_tag, value_inline)
-                .map_err(GraphusError::from);
-        }
-        let class_tag = type_tag & !valenc::OVERFLOW_BIT;
-        let bytes = self.read_chain(value_inline)?;
-        valenc::decode(class_tag, &bytes).map_err(GraphusError::from)
+        read_view::decode_property_value(&self.pool, &self.stores, type_tag, value_inline)
     }
 
     /// Collects node `node_id`'s live properties as `(physical_id, key_token, Value)`, decoding both
@@ -3009,26 +3001,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain is malformed (cycle-guarded).
     pub fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        let rel = self.read_rel(rel_id)?;
-        let mut out = Vec::new();
-        let mut cur = rel.first_prop;
-        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "property chain of rel {rel_id} is malformed (cycle?)"
-                )));
-            }
-            let p = self.read_prop(cur)?;
-            let next = p.next_prop;
-            if p.mvcc.in_use() {
-                out.push((cur, p));
-            }
-            cur = next;
-        }
-        Ok(out)
+        read_view::rel_properties(&self.pool, &self.stores, rel_id)
     }
 
     /// Sets relationship `rel_id`'s property `key` to `value` under `txn`, **replacing** any current
@@ -3091,13 +3064,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
     pub fn rel_property_values(&self, rel_id: u64) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
-        let chain = self.rel_properties(rel_id)?;
-        let mut out = Vec::with_capacity(chain.len());
-        for (pid, prop) in chain {
-            let value = self.decode_property_value(prop.type_tag, prop.value_inline)?;
-            out.push((pid, prop.key, value));
-        }
-        Ok(out)
+        read_view::rel_property_values(&self.pool, &self.stores, rel_id)
     }
 
     /// Clears **all** of relationship `rel_id`'s properties under `txn` via per-value MVCC (`rmp`
@@ -3141,52 +3108,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     pub fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>> {
-        let node = self.read_node(node_id)?;
-        let mut out = Vec::new();
-        let mut cur = node.first_rel;
-        // The walk visits each chain link once; a self-loop contributes two links. The guard is
-        // generous (twice the rel high-water) and only catches a corrupted cycle.
-        let guard = 2 * self.store(StoreKind::Rel).alloc.high_water() + 2;
-        let mut steps = 0u64;
-        let mut prev_link = NULL_ID;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "incidence chain of node {node_id} is malformed (cycle?)"
-                )));
-            }
-            let r = self.read_rel(cur)?;
-            let is_loop = r.start_node == node_id && r.end_node == node_id;
-            // Record the rel once (dedupe a self-loop's two consecutive links), but ONLY if the slot
-            // is still in use. A not-in-use record is a **dead-link corpse**: an aborted creation undid
-            // its MVCC header header-only (`rmp` #220), leaving its forward chain pointers intact so we
-            // thread transparently THROUGH it to its committed successor without collecting it. (The
-            // higher visibility layer further filters live rels by snapshot; this gate only drops the
-            // aborted/never-committed corpses the header-only undo leaves behind.)
-            if r.mvcc.in_use() && out.last() != Some(&cur) {
-                out.push(cur);
-            }
-            // Choose the side to follow. For a self-loop, the two links are reached via the END
-            // side (head) then the START side; pick whichever side we did *not* arrive through.
-            let next = if is_loop {
-                let (end_prev, end_next) = r.chain_pointers(ChainSide::End);
-                if end_prev == prev_link || prev_link == NULL_ID {
-                    // arrived via the END side (or at head): follow END's next (the START link)
-                    end_next
-                } else {
-                    // arrived via the START side: follow START's next (past the loop)
-                    r.chain_pointers(ChainSide::Start).1
-                }
-            } else if r.start_node == node_id {
-                r.start_next_rel
-            } else {
-                r.end_next_rel
-            };
-            prev_link = cur;
-            cur = next;
-        }
-        Ok(out)
+        read_view::incident_rels(&self.pool, &self.stores, node_id)
     }
 
     /// The degree of `node_id` (distinct incident relationships, self-loops counted once).
@@ -3209,6 +3131,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let store = self.store(StoreKind::Rel);
         // ids run 1..high_water (id 0 is the reserved null), minus those returned to the free list.
         (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
+    }
+
+    /// Reads the raw MVCC header of record `id` in `kind`'s store — an inspection accessor exposing
+    /// the private `read_mvcc` so the Slice-3a read-view equivalence test (`rmp` #336) can compare the
+    /// live store's low-level header read against [`StoreReadView::read_mvcc`]. Behaviour-identical to
+    /// the internal read.
+    ///
+    /// # Errors
+    /// Returns a storage error if `id`'s page is not allocated or the read fails.
+    pub fn read_mvcc_for_test(&self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
+        self.read_mvcc(kind, id)
+    }
+
+    /// Reads the raw [`HeapBlock`] at `id` — an inspection accessor exposing the private `read_block`
+    /// so the Slice-3a read-view equivalence test (`rmp` #336) can compare the live store's low-level
+    /// block read against [`StoreReadView::read_block`]. Behaviour-identical to the internal read.
+    ///
+    /// # Errors
+    /// Returns a storage error if `id`'s page is not allocated or the read fails.
+    pub fn read_block_for_test(&self, id: u64) -> Result<HeapBlock> {
+        self.read_block(id)
     }
 
     /// The relationship store's physical high-water mark: the exclusive upper bound of the allocated
