@@ -144,6 +144,10 @@ mod tests {
     }
 
     #[test]
+    // The 3.14159 / 2.71828 literals below are arbitrary real-world-ish doubles chosen to exercise
+    // the bit-exact round-trip; their proximity to PI/E is incidental and irrelevant to the test, so
+    // the `approx_constant` lint (which assumes such literals are mistyped consts) does not apply.
+    #[allow(clippy::approx_constant)]
     fn round_trips_including_specials() {
         rt(&[]);
         rt(&[1.5]);

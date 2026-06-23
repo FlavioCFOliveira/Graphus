@@ -66,8 +66,8 @@ proptest! {
         let seg = ColdSegment::encode(&readings);
         let mut expect: Vec<Reading> = readings.into_iter().filter(|r| r.ts >= lo && r.ts <= hi).collect();
         let mut got = seg.scan_ts_range(lo, hi);
-        expect.sort_by(|a, b| (a.seq, a.ts).cmp(&(b.seq, b.ts)));
-        got.sort_by(|a, b| (a.seq, a.ts).cmp(&(b.seq, b.ts)));
+        expect.sort_by_key(|r| (r.seq, r.ts));
+        got.sort_by_key(|r| (r.seq, r.ts));
         prop_assert_eq!(got, expect);
     }
 
