@@ -74,7 +74,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphus_core::error::GraphusError;
-use graphus_core::{Timestamp, TxnId, Value, VersionStamp};
+use graphus_core::{Timestamp, TxnId, Value};
 use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
@@ -193,7 +193,8 @@ impl ReadBufferGuard {
     /// Removes the buffer for **off-thread delivery** (`rmp` #336, Slice 3): the reader thread hands
     /// the owned buffer back to the coordinator, which merges it with the retirement channel's
     /// happens-before. After this the `Drop` merge is a no-op. `None` if already taken/flushed empty.
-    #[allow(dead_code)] // Wired by `rmp` #336 (Slice 3); kept here so the merge point is factored.
+    /// Surfaced on the seam through
+    /// [`RecordStoreGraph::take_read_buffer`](RecordStoreGraph::take_read_buffer).
     fn take(&self) -> Option<SsiReadBuffer> {
         self.buffer.borrow_mut().take()
     }
@@ -243,6 +244,7 @@ use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
 };
 use crate::index_set::{ConstraintRule, IndexSet};
+use crate::read_source::{self, LiveSource, ReadSink, VisCtx};
 use crate::snapshot::{GraphSnapshot, SnapshotSpec};
 
 /// The result of the single authoritative columnar candidate pass
@@ -580,39 +582,6 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         self.note_predicate_write(&label_tokens, &resolved_props);
     }
 
-    /// Registers the **relationship-pattern** predicate read footprint for a traversal filtered by
-    /// `types` (`rmp` #171 blocker A1): a `MATCH ()-[r:T]-()` reads which relationships of type `T`
-    /// exist, so a concurrent `create_rel`/`delete_rel` of that type is a relationship phantom that
-    /// must close an rw-edge — even when the traversal returns nothing.
-    ///
-    /// * An empty `types` (an untyped `MATCH ()-[r]-()`) registers the conservative [`PredicateRead::AnyRel`]
-    ///   marker: *any* relationship create/delete matches.
-    /// * Each requested type name resolves to its [`Namespace::RelType`] token; a
-    ///   [`PredicateRead::RelType`] marker is registered per token. A type name that was **never
-    ///   interned** (no edge of that type can exist yet) registers the conservative `AnyRel` marker
-    ///   instead — a concurrent writer could `CREATE` the first edge of that type, interning a token we
-    ///   cannot know here, exactly as [`scan_nodes_by_label`](Self::scan_nodes_by_label) falls back to
-    ///   `AllNodes` for a never-seen label. Reads never intern (no durable side effect on a read path).
-    ///
-    /// A no-op in the standalone path (no SSI tracker).
-    fn note_rel_predicate_read(&self, types: &[String]) {
-        if self.ssi.is_none() {
-            return; // standalone path: nothing to track.
-        }
-        if types.is_empty() {
-            self.note_predicate_read(PredicateRead::AnyRel);
-            return;
-        }
-        for name in types {
-            match self.store.borrow().token_id(Namespace::RelType, name) {
-                Some(token) => self.note_predicate_read(PredicateRead::RelType(token)),
-                // Never-interned type: a concurrent writer could create the first edge of it (a
-                // phantom) under a token we cannot know, so register the conservative `AnyRel`.
-                None => self.note_predicate_read(PredicateRead::AnyRel),
-            }
-        }
-    }
-
     /// Announces a relationship's **predicate footprint** to the SSI tracker (`rmp` #171 blocker A1):
     /// the [`PredicateRead::AnyRel`] marker plus the [`PredicateRead::RelType`] marker for its type
     /// token, so a concurrent transaction that read a relationship-pattern predicate (`MATCH ()-[r:T]-()`,
@@ -678,21 +647,28 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         )
     }
 
-    /// Whether the version carrying `mvcc` was **deleted by this very transaction** — its creator is
-    /// visible to the snapshot (it existed before our `DELETE`) and its expirer is *our own*
-    /// in-flight stamp (`04 §5.3`). This is the discriminator openCypher needs for a same-query
-    /// `DELETE`: such an entity keeps its identity (`id`/`type`) but a property/label read on it
-    /// raises `DeletedEntityAccess` (`clauses/return/Return2.feature`).
-    ///
-    /// `is_visible(snapshot, created_ts, 0, registry)` tests creator-visibility alone (passing `0` as
-    /// the expirer = "live", so the result is true iff the creator committed at/before our snapshot or
-    /// is our own write). The deliberate side-effect-free read (no `note_read`/SSI marker) keeps the
-    /// own-write self-delete check from perturbing serializability: a transaction inspecting its *own*
-    /// tombstone has no rw-dependency to record.
-    fn deleted_by_self(&self, mvcc: MvccHeader) -> bool {
-        let creator_visible = is_visible(self.snapshot, mvcc.created_ts, 0, &self.registry);
-        creator_visible
-            && VersionStamp::from_raw(mvcc.expired_ts) == VersionStamp::InFlight(self.txn)
+    /// This statement's visibility context (snapshot + registry + txn) for the shared lifted read body
+    /// (`rmp` task #336, Slice 3b-i). The read methods pass this and a [`LiveSource`] over the live
+    /// store to [`crate::read_source`], so they run the **same** code the off-thread
+    /// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph) runs — preserving exact behaviour.
+    #[inline]
+    fn vis_ctx(&self) -> VisCtx<'_> {
+        VisCtx {
+            snapshot: self.snapshot,
+            registry: &self.registry,
+            txn: self.txn,
+        }
+    }
+
+    /// Removes this statement's accumulated SIREAD-marker buffer for **off-thread delivery** (`rmp` task
+    /// #336): the reader hands the owned buffer back to the coordinator, which merges it on the engine
+    /// thread (the merge must run where the shared tracker lives). After this the seam's drop merge is a
+    /// no-op. `None` if there is no buffer to take (already taken, or flushed empty). This is the
+    /// symmetric counterpart to [`ReadOnlyGraph::take_buffer`](crate::read_only_graph::ReadOnlyGraph::take_buffer);
+    /// in the single-threaded path the drop-merge is used instead, so this is currently exercised only by
+    /// the Slice 3b-i equivalence test.
+    pub fn take_read_buffer(&self) -> Option<SsiReadBuffer> {
+        self.read_buffer.take()
     }
 
     /// The transaction id this query runs in.
@@ -878,36 +854,6 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         None
     }
 
-    /// Relationship analogue of [`read_node_prop_one`](Self::read_node_prop_one) (`rmp` #326), over
-    /// [`RelRecord.first_prop`](graphus_storage::record::RelRecord).
-    fn read_rel_prop_one(&self, rel: RelId, key: &str) -> Option<Value> {
-        // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
-        let store = self.store.borrow();
-        let key_id = store.token_id(Namespace::PropKey, key)?;
-        let chain = match store.rel_properties(rel.0) {
-            Ok(chain) => chain,
-            Err(e) => {
-                drop(store);
-                self.capture(e);
-                return None;
-            }
-        };
-        for (_pid, prop) in chain {
-            if prop.key != key_id || !self.visible(prop.mvcc) {
-                continue;
-            }
-            return match store.decode_property_value(prop.type_tag, prop.value_inline) {
-                Ok(value) => Some(value),
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    None
-                }
-            };
-        }
-        None
-    }
-
     /// Reads `node`'s properties as newest-**visible**-wins `(key_name, value)` pairs (`rmp` task
     /// #50), decoding both inline scalars (#38) and `String`/`List` overflow values (`rmp` task #43).
     ///
@@ -932,51 +878,6 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
         for (_pid, prop) in chain {
             // MVCC visibility filter + newest-visible-wins: skip versions invisible to this snapshot,
             // and a key id already resolved to a newer visible version.
-            if !self.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
-                continue;
-            }
-            match store.decode_property_value(prop.type_tag, prop.value_inline) {
-                Ok(value) => out.push((prop.key, value)),
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    return Vec::new();
-                }
-            }
-        }
-        // Map key ids back to names and sort by name for the deterministic order the seam promises.
-        let mut named: Vec<(String, Value)> = out
-            .into_iter()
-            .filter_map(|(kid, v)| {
-                store
-                    .token_name(Namespace::PropKey, kid)
-                    .map(|name| (name.to_owned(), v))
-            })
-            .collect();
-        named.sort_by(|a, b| a.0.cmp(&b.0));
-        named
-    }
-
-    /// Reads `rel`'s live properties as newest-wins `(key_name, value)` pairs, decoding both inline
-    /// scalars (#38) and `String`/`List` values stored in the `strings.store` overflow heap
-    /// (`rmp` task #43) via [`RecordStore::rel_property_values`] (`rmp` task #44). The relationship
-    /// analogue of [`read_node_props`](Self::read_node_props) — identical newest-wins + key-sort
-    /// discipline, over [`RelRecord.first_prop`](graphus_storage::record::RelRecord) instead of the
-    /// node's `first_prop`.
-    fn read_rel_props(&self, rel: RelId) -> Vec<(String, Value)> {
-        // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
-        let store = self.store.borrow();
-        let chain = match store.rel_properties(rel.0) {
-            Ok(chain) => chain,
-            Err(e) => {
-                drop(store);
-                self.capture(e);
-                return Vec::new();
-            }
-        };
-        let mut out: Vec<(u32, Value)> = Vec::new();
-        for (_pid, prop) in chain {
-            // MVCC visibility filter + newest-visible-wins (`rmp` task #50), as for node properties.
             if !self.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
                 continue;
             }
@@ -2019,6 +1920,26 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
     }
 }
 
+/// The live seam routes the shared lifted read body's markers / errors to its **existing** channels
+/// (`rmp` task #336, Slice 3b-i): a per-record / predicate SIREAD marker goes to this statement's
+/// [`ReadBufferGuard`] (the `rmp` #341 buffer, merged into the shared `SsiTracker` at statement-end),
+/// and a captured error to the `error` cell. So calling the lifted body with `self` as the sink
+/// reproduces `RecordStoreGraph`'s prior behaviour exactly — the markers/errors land where they always
+/// did.
+impl<D: BlockDevice, S: LogSink> ReadSink for RecordStoreGraph<D, S> {
+    fn note_read(&self, key: u64) {
+        self.note_read(key);
+    }
+
+    fn note_predicate_read(&self, predicate: PredicateRead) {
+        self.note_predicate_read(predicate);
+    }
+
+    fn capture(&self, err: GraphusError) {
+        self.capture(err);
+    }
+}
+
 /// Exact-count + histogram-backed statistics over the **real** store's durable catalogue
 /// (`rmp` task #81), surfaced to the cardinality estimator ([`crate::cardinality`]).
 ///
@@ -2109,101 +2030,68 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     // ---- reads --------------------------------------------------------------------------------
 
     fn scan_nodes(&self) -> Vec<NodeId> {
-        // SSI predicate footprint (`rmp` #171): an all-nodes scan `MATCH (n)` depends on *which nodes
-        // exist*, so a concurrent insert of ANY node invalidates it. Register the `AllNodes` predicate
-        // marker so that phantom closes an rw-edge even when this scan returns nothing (an empty graph)
-        // — the per-node SIREADs below only cover nodes that already exist.
-        self.note_predicate_read(PredicateRead::AllNodes);
-        // `scan_node_ids` returns every slot-occupied node (live versions *and* tombstones not yet
-        // GC'd); keep only those visible to this snapshot (`04 §5.3`, `rmp` task #45). Read-only:
-        // `scan_node_ids` / `node` are `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
-        let store = self.store.borrow();
-        let ids = match store.scan_node_ids() {
+        // The shared lifted body (`rmp` task #336): register the `AllNodes` predicate marker, then
+        // SIREAD-mark and visibility-filter every slot-occupied node — byte-identical to the prior
+        // inline body, now also run by the off-thread reader. Read-only: `LiveSource` over the live
+        // store's `&self` read methods (`rmp` #337 Slice 2), so a shared borrow suffices.
+        read_source::scan_nodes(&LiveSource(&*self.store.borrow()), &self.vis_ctx(), self)
+    }
+
+    fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+        // The index-accelerated arm stays here (it owns the derived `IndexSet`); only the scan-fallback
+        // arm is the lifted body. On the coordinated path: register the same `Label` + `mark_all_live_
+        // nodes` predicate footprint, seek candidates from the label index, then re-check them with the
+        // **shared lifted** `filter_label_candidates` — so the index seek returns *exactly* the
+        // full-scan result over a candidate subset (`rmp` task #48), with the per-candidate SIREAD
+        // markers identical to the fallback path. Read-only: `LiveSource` over the live store.
+        if let Some(index) = &self.index {
+            // Resolve the label token without interning; a never-interned label has no live node, but a
+            // concurrent writer could create the first one — so register the conservative `AllNodes`
+            // marker rather than interning on a read path (`rmp` #171). `note_predicate_read` no-ops
+            // standalone.
+            let Some(token_id) = self.label_id_existing(label) else {
+                self.note_predicate_read(PredicateRead::AllNodes);
+                return Vec::new();
+            };
+            // `MATCH (n:Label)` is a predicate over which nodes carry the label, so a concurrent
+            // insert/relabel is a phantom that must close an rw-edge even when this scan returns nothing.
+            self.note_predicate_read(PredicateRead::Label(token_id));
+            // The index only accelerates computing the *result*, never narrows the read footprint:
+            // keep the conservative SIREAD-every-live-node marker (the deferred index-range marker is
+            // #16/#39) so write-skew over a label predicate stays serializable.
+            let src = LiveSource(&*self.store.borrow());
+            read_source::mark_all_live_nodes(&src, self);
+            let candidates = index.borrow_mut().seek_label(token_id);
+            return read_source::filter_label_candidates(
+                &src,
+                &self.vis_ctx(),
+                self,
+                token_id,
+                candidates,
+            );
+        }
+
+        // Standalone fallback (no coordinator ⇒ no index): resolve the token + register the
+        // `Label`/`AllNodes` predicate marker exactly as before (NOT `mark_all_live_nodes` — the
+        // pre-#336 standalone path did not, and standalone markers no-op anyway), then scan every live
+        // node and filter by the inline bitmap via the **shared lifted** `filter_label_candidates`.
+        // This keeps the standalone path byte-for-byte unchanged. (The off-thread `ReadOnlyGraph`, which
+        // is always coordinated and index-free, instead uses the full lifted `scan_nodes_by_label`,
+        // whose `mark_all_live_nodes` reproduces the coordinated index arm's marker footprint.)
+        let Some(token_id) = self.label_id_existing(label) else {
+            self.note_predicate_read(PredicateRead::AllNodes);
+            return Vec::new();
+        };
+        self.note_predicate_read(PredicateRead::Label(token_id));
+        let src = LiveSource(&*self.store.borrow());
+        let ids = match src.0.scan_node_ids() {
             Ok(ids) => ids,
             Err(e) => {
-                drop(store);
                 self.capture(e);
                 return Vec::new();
             }
         };
-        let mut out = Vec::new();
-        for id in ids {
-            match store.node(id) {
-                Ok(rec) => {
-                    // A full scan examines every node, so SIREAD-mark each one: a concurrent writer
-                    // of any scanned node closes an rw-edge (`04 §5.4`, `rmp` task #46).
-                    self.note_read(node_ssi_key(id));
-                    if self.visible(rec.mvcc) {
-                        out.push(NodeId(id));
-                    }
-                }
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    return Vec::new();
-                }
-            }
-        }
-        out
-    }
-
-    fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
-        // Resolve the label name -> token id without interning: if the label was never created, no
-        // live node can carry it, so the scan is correctly empty (`05 §9`, `rmp` task #42).
-        let Some(token_id) = self.label_id_existing(label) else {
-            // The label was never interned, so no node can carry it *now*. But a *concurrent* writer
-            // could `CREATE` the first node of this label (a phantom) — and it would intern a token we
-            // cannot know here. We therefore register the conservative `AllNodes` marker so any such
-            // insert closes an rw-edge, rather than interning the label on a read path (which would be
-            // a durable side effect that changes read semantics). This is the rare "label never seen"
-            // case, so the coarseness costs nothing in practice. `note_predicate_read` no-ops standalone.
-            self.note_predicate_read(PredicateRead::AllNodes);
-            return Vec::new();
-        };
-
-        // SSI predicate footprint (`rmp` #171): `MATCH (n:Label)` is a predicate over which nodes
-        // carry the label, so a concurrent insert/relabel of a node into this label is a phantom that
-        // must close an rw-edge — even when this scan returns nothing. The per-node SIREADs
-        // (`mark_all_live_nodes` / `filter_label_candidates`) only cover *existing* nodes; the `Label`
-        // predicate marker covers the not-yet-existing matching node. This same coarse `Label` marker
-        // is also the conservative footprint for the scan-fallback equality / range filters that sit
-        // on top of this scan (`scan_filter_eq` / `scan_filter_range`).
-        self.note_predicate_read(PredicateRead::Label(token_id));
-
-        // Index-accelerated path (`rmp` task #48): on the coordinated path the derived label
-        // [`IndexSet`] yields **candidate** node ids carrying this token. Candidates may be a
-        // superset (stale entries from rolled-back / overwritten / deleted nodes), so the **same**
-        // per-candidate filter the full scan applies (visibility + `node_has_label`) is re-run; the
-        // result is therefore *exactly* the full-scan result over a candidate subset.
-        if let Some(index) = &self.index {
-            // SSI predicate footprint (`04 §5.4`, `rmp` task #46): a `MATCH (n:Label)` is a
-            // **predicate read**, not a point read of the matching rows — a concurrent transaction
-            // that writes *any* node (changing which nodes match the label, the phantom case) must
-            // close an rw-edge with this scan. The per-node `SsiTracker` has no predicate/range
-            // marker yet (that is the deferred index-range-marker follow-up, still #16/#39), so we
-            // keep the conservative, **correct** approximation the pre-index full scan used: SIREAD
-            // every live node. The index only accelerates computing the *result*, never narrows the
-            // read footprint — narrowing it would drop the phantom protection that makes write-skew
-            // over a label predicate serializable.
-            self.mark_all_live_nodes();
-            let candidates = index.borrow_mut().seek_label(token_id);
-            return self.filter_label_candidates(token_id, candidates);
-        }
-
-        // Standalone fallback: scan every live node and filter by the inline label bitmap. Correct,
-        // just O(live nodes). Read-only: `scan_node_ids` is `&self` (`rmp` #337 Slice 2).
-        let ids = {
-            let store = self.store.borrow();
-            match store.scan_node_ids() {
-                Ok(ids) => ids,
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    return Vec::new();
-                }
-            }
-        };
-        self.filter_label_candidates(token_id, ids)
+        read_source::filter_label_candidates(&src, &self.vis_ctx(), self, token_id, ids)
     }
 
     fn columnar_label_property_scan(
@@ -2282,238 +2170,118 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
-        // Relationship-pattern predicate read (`rmp` #171 blocker A1): a `MATCH ()-[r:T]-()` traversal
-        // reads which relationships of the requested type(s) exist incident to the anchor. Register the
-        // rel-type (or, untyped, `AnyRel`) predicate marker so a concurrent `create_rel`/`delete_rel`
-        // of a matching type closes an rw-edge — the relationship phantom (read "no `:T` edges", then a
-        // concurrent `CREATE` of a `:T` edge). This covers the *absent* edge the per-rel SIREADs below
-        // (which only mark edges that already exist) cannot.
-        self.note_rel_predicate_read(types);
-        // Read-only store access (`rmp` #337 Slice 2): `incident_rels` / `token_id` / `rel` are `&self`.
-        let store = self.store.borrow();
-        let rels = match store.incident_rels(node.0) {
-            Ok(rels) => rels,
-            Err(e) => {
-                drop(store);
-                self.capture(e);
-                return Vec::new();
-            }
-        };
-        // Resolve the requested rel-type names to interned type ids ONCE per expand, so the
-        // per-edge filter is an integer compare instead of a `token_name` string lookup + compare
-        // repeated across the whole incidence chain (`rmp` #319). A requested name with no interned
-        // token matches no existing edge (the absent-edge phantom is already covered by
-        // `note_rel_predicate_read` above), so it simply contributes no id. `None` means "any type".
-        let wanted_type_ids: Option<Vec<u32>> = if types.is_empty() {
-            None
-        } else {
-            Some(
-                types
-                    .iter()
-                    .filter_map(|t| store.token_id(Namespace::RelType, t))
-                    .collect(),
-            )
-        };
-        let mut out = Vec::new();
-        for rid in rels {
-            let rec = match store.rel(rid) {
-                Ok(rec) => rec,
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    return Vec::new();
-                }
-            };
-            // SIREAD-mark each incident relationship the traversal examined (`04 §5.4`).
-            self.note_read(rel_ssi_key(rid));
-            // Skip relationships not visible to this snapshot — a concurrently-deleted (tombstoned)
-            // edge an older reader could still traverse, or an edge a later transaction committed
-            // (`04 §5.3`, `rmp` task #45). The incidence chain still threads them until GC.
-            if !self.visible(rec.mvcc) {
-                continue;
-            }
-            // Filter by relationship type (empty/`None` = any type).
-            if let Some(ref ids) = wanted_type_ids {
-                if !ids.contains(&rec.type_id) {
-                    continue;
-                }
-            }
-            // Report the matching side(s) relative to the anchor, exactly like `MemGraph`: a
-            // self-loop participates as both start and end and is reported once per matching
-            // direction (the executor deduplicates by rel id, `04 §2.4`). `incident_rels` already
-            // deduplicates a self-loop's two chain links to one id, so a self-loop is reported once
-            // per matching direction here.
-            let touches_as_start = rec.start_node == node.0;
-            let touches_as_end = rec.end_node == node.0;
-            let want_out = matches!(direction, ExpandDirection::Outgoing | ExpandDirection::Both);
-            let want_in = matches!(direction, ExpandDirection::Incoming | ExpandDirection::Both);
-            if touches_as_start && want_out {
-                out.push(Incident {
-                    rel: RelId(rid),
-                    neighbour: NodeId(rec.end_node),
-                });
-            }
-            if touches_as_end && want_in {
-                out.push(Incident {
-                    rel: RelId(rid),
-                    neighbour: NodeId(rec.start_node),
-                });
-            }
-        }
-        out
+        // The shared lifted body (`rmp` task #336): register the relationship-pattern predicate marker
+        // (rel-type or, untyped, `AnyRel` — the absent-edge phantom, `rmp` #171 blocker A1), walk the
+        // incidence chain resolving the requested types to ids once (`rmp` #319), and SIREAD-mark +
+        // visibility-filter each edge, reporting the matching side(s). Byte-identical to the prior inline
+        // body. Read-only: `LiveSource` over the live store's `&self` read methods.
+        read_source::expand(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            node,
+            direction,
+            types,
+        )
     }
 
     fn node_exists(&self, node: NodeId) -> bool {
-        // "Exists" means "visible to this query's snapshot" (`04 §5.3`): a node created after this
-        // snapshot, deleted before it, or never allocated, does not exist *for us*.
-        let mvcc = match self.store.borrow().node(node.0) {
-            Ok(rec) => rec.mvcc,
-            // A missing page means the id was never allocated — i.e. the node does not exist. That
-            // is a normal answer, not a captured storage fault.
-            Err(_) => return false,
-        };
-        // SIREAD marker: this transaction examined the node (independent of whether it is visible),
-        // so a concurrent writer of it closes an rw-edge (`04 §5.4`, `rmp` task #46).
-        self.note_read(node_ssi_key(node.0));
-        self.visible(mvcc)
+        // The shared lifted body (`rmp` task #336): "exists" = visible to this query's snapshot;
+        // SIREAD-marks the examined node. Byte-identical to the prior inline body.
+        read_source::node_exists(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            node,
+        )
     }
 
     fn rel_exists(&self, rel: RelId) -> bool {
-        let mvcc = match self.store.borrow().rel(rel.0) {
-            Ok(rec) => rec.mvcc,
-            Err(_) => return false,
-        };
-        self.note_read(rel_ssi_key(rel.0));
-        self.visible(mvcc)
+        read_source::rel_exists(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            rel,
+        )
     }
 
     fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
-        if !self.node_exists(node) {
-            return None;
-        }
-        // Read the node's label token ids from its inline bitmap (`05 §9`, `rmp` task #42), then map
-        // each id back to its name. An overflow-form bitmap (a #39-written node) is captured as an
-        // error and reported as `Some(vec![])` so the result is not silently wrong; the caller must
-        // inspect `take_error`. Read-only: `node_labels` / `token_name` are `&self` (`rmp` #337 Slice 2).
-        let store = self.store.borrow();
-        let ids = match store.node_labels(node.0) {
-            Ok(ids) => ids,
-            Err(e) => {
-                drop(store);
-                self.capture(e);
-                return Some(Vec::new());
-            }
-        };
-        let mut names: Vec<String> = ids
-            .into_iter()
-            .filter_map(|id| {
-                store
-                    .token_name(Namespace::Label, id)
-                    .map(ToOwned::to_owned)
-            })
-            .collect();
-        // Deterministic, name-sorted order (mirrors `MemGraph`, which keeps labels sorted).
-        names.sort();
-        Some(names)
+        // The shared lifted body (`rmp` task #336): existence check, then the node's label names
+        // mapped + name-sorted; an overflow-form bitmap is captured and reported as `Some(vec![])`
+        // (not silently wrong). Byte-identical to the prior inline body.
+        read_source::node_labels(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            node,
+        )
     }
 
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
-        // Read-only store access (`rmp` #337 Slice 2): `rel` / `token_name` are `&self`.
-        let store = self.store.borrow();
-        let rec = match store.rel(rel.0) {
-            Ok(rec) => rec,
-            Err(_) => return None,
-        };
-        self.note_read(rel_ssi_key(rel.0));
-        if !self.visible(rec.mvcc) {
-            return None;
-        }
-        let rel_type = store
-            .token_name(Namespace::RelType, rec.type_id)
-            .unwrap_or("")
-            .to_owned();
-        Some(RelData {
-            rel_type,
-            start: NodeId(rec.start_node),
-            end: NodeId(rec.end_node),
-        })
+        read_source::rel_data(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            rel,
+        )
     }
 
     fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
-        // Read the raw record. Unlike `rel_data` this does **not** apply the snapshot's expirer-hide,
-        // so a relationship this transaction deleted earlier in the same query still yields its type
-        // (openCypher keeps `type(r)`/`id(r)` accessible after `DELETE r`,
-        // `clauses/return/Return2.feature` [14]). We still require the *creator* to be visible (a
-        // relationship never created for us, or created by a concurrent uncommitted writer, is not
-        // ours to read). No `note_read`/SSI marker: reading our own tombstone has no rw-dependency.
-        // Read-only store access (`rmp` #337 Slice 2): `rel` / `token_name` are `&self`.
-        let store = self.store.borrow();
-        let rec = match store.rel(rel.0) {
-            Ok(rec) => rec,
-            Err(_) => return None,
-        };
-        // Visible normally, or a tombstone we wrote ourselves: both keep the type readable.
-        if !self.visible(rec.mvcc) && !self.deleted_by_self(rec.mvcc) {
-            return None;
-        }
-        let rel_type = store
-            .token_name(Namespace::RelType, rec.type_id)
-            .unwrap_or("")
-            .to_owned();
-        Some(RelData {
-            rel_type,
-            start: NodeId(rec.start_node),
-            end: NodeId(rec.end_node),
-        })
+        // No SIREAD marker (reading our own tombstone has no rw-dependency), so the lifted body takes
+        // no sink. Keeps `type(r)`/`id(r)` accessible after a same-query `DELETE r` (openCypher).
+        read_source::rel_data_including_deleted(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            rel,
+        )
     }
 
     fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
-        // The raw MVCC header of the physical record (a missing page = the id was never allocated, so
-        // it cannot be our self-delete). No `note_read`/SSI marker: a self-delete check on our own
-        // write records no rw-dependency, so it must not perturb serializability (the surrounding read
-        // methods all mark, but this is a side-effect-free identity check).
-        let mvcc = match entity {
-            DeletedEntity::Node(id) => match self.store.borrow().node(id.0) {
-                Ok(rec) => rec.mvcc,
-                Err(_) => return false,
-            },
-            DeletedEntity::Rel(id) => match self.store.borrow().rel(id.0) {
-                Ok(rec) => rec.mvcc,
-                Err(_) => return false,
-            },
-        };
-        self.deleted_by_self(mvcc)
+        // No SIREAD marker (a self-delete check on our own write records no rw-dependency), so the
+        // lifted body takes no sink.
+        read_source::entity_deleted_by_txn(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            entity,
+        )
     }
 
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
-        if !self.node_exists(node) {
-            return None;
-        }
-        self.read_node_prop_one(node, key)
+        read_source::node_property(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            node,
+            key,
+        )
     }
 
     fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
-        if !self.rel_exists(rel) {
-            return None;
-        }
-        self.read_rel_prop_one(rel, key)
+        read_source::rel_property(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            rel,
+            key,
+        )
     }
 
     fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
-        if !self.node_exists(node) {
-            return None;
-        }
-        Some(self.read_node_props(node))
+        read_source::node_properties(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            node,
+        )
     }
 
     fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
-        // Relationship properties are stored over `RelRecord.first_prop` (`rmp` task #44); report the
-        // live key-sorted set for a live relationship, or `None` for a missing one (mirrors
-        // `node_properties`).
-        if !self.rel_exists(rel) {
-            return None;
-        }
-        Some(self.read_rel_props(rel))
+        read_source::rel_properties(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            rel,
+        )
     }
 
     fn index_seek_eq(&self, label: &str, property: &str, seek: &Value) -> Option<Vec<NodeId>> {
@@ -3120,32 +2888,15 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
     }
 
     fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
-        // The store walks the physical incidence chain, which still threads MVCC-tombstoned
-        // relationships (their slot stays in use until vacuum). Filter to those visible to this
-        // transaction so a deleted relationship is not reported as incident — otherwise a node's
-        // DETACH check, the result-egress snapshot, and any degree-style read would observe a
-        // relationship this transaction has already removed (or that another transaction deleted).
-        let ids = match self.store.borrow().incident_rels(node.0) {
-            Ok(rels) => rels,
-            Err(e) => {
-                self.capture(e);
-                return Vec::new();
-            }
-        };
-        ids.into_iter()
-            .filter(|&rid| {
-                let mvcc = match self.store.borrow().rel(rid) {
-                    Ok(rec) => rec.mvcc,
-                    Err(e) => {
-                        self.capture(e);
-                        return false;
-                    }
-                };
-                self.note_read(rel_ssi_key(rid));
-                self.visible(mvcc)
-            })
-            .map(RelId)
-            .collect()
+        // The shared lifted body (`rmp` task #336): the relationship ids incident to `node`, filtered
+        // to those visible to this transaction (a deleted edge is not reported) and SIREAD-marked.
+        // Byte-identical to the prior inline body.
+        read_source::incident_rels(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            node,
+        )
     }
 
     fn delete_rel(&mut self, rel: RelId) {

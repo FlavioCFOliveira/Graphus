@@ -135,6 +135,8 @@ pub mod parser;
 pub mod physical;
 pub mod plan_cache;
 pub mod procedure_registry;
+pub mod read_only_graph;
+pub mod read_source;
 pub mod record_graph;
 pub mod result;
 pub mod runtime;
@@ -204,6 +206,8 @@ pub use procedure_registry::{
     FieldSpec, FieldType, ProcedureFailure, ProcedureRegistry, ProcedureSet, ProcedureSignature,
     ValueClass,
 };
+pub use read_only_graph::ReadOnlyGraph;
+pub use read_source::{LiveSource, ReadSink, ReadViewSource, StoreReadSource, VisCtx};
 pub use record_graph::RecordStoreGraph;
 pub use result::{
     MaterializedNode, MaterializedPath, MaterializedRel, MaterializedStep, MaterializedValue,

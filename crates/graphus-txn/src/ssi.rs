@@ -248,6 +248,30 @@ impl SsiReadBuffer {
     pub fn record_predicate_read(&mut self, predicate: PredicateRead) {
         self.predicates.push(predicate);
     }
+
+    /// Consumes the buffer into its **canonical** marker form: the reader id plus the sorted+deduped
+    /// physical-key markers and sorted+deduped predicate markers (`rmp` task #336, Slice 3b-i).
+    ///
+    /// This is the exact normalisation [`SsiTracker::merge_read_buffer`] applies before replaying, so
+    /// the returned tuple is a deterministic function of the marker *set* — independent of the order
+    /// markers were appended in. It is the canonical value against which two buffers produced by
+    /// different read seams (the live `RecordStoreGraph` and the off-thread `ReadOnlyGraph`) are
+    /// compared for byte-identity in the Slice 3b-i equivalence guard: equal canonical forms ⇒ the two
+    /// seams contribute the identical rw-edges to the conflict graph, so moving reads off-thread cannot
+    /// change serializability.
+    #[must_use]
+    pub fn into_sorted_markers(self) -> (TxnId, Vec<Key>, Vec<PredicateRead>) {
+        let Self {
+            reader,
+            mut keys,
+            mut predicates,
+        } = self;
+        keys.sort_unstable();
+        keys.dedup();
+        predicates.sort_unstable();
+        predicates.dedup();
+        (reader, keys, predicates)
+    }
 }
 
 impl SsiTracker {

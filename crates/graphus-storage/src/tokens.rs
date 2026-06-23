@@ -12,6 +12,7 @@
 //! within a namespace; interning an existing name returns its existing id.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use graphus_core::error::{GraphusError, Result};
 
@@ -198,6 +199,69 @@ impl TokenStore {
             }
         }
         Ok(store)
+    }
+}
+
+/// An owned, `Send + Sync`, cheap-to-clone read-only snapshot of a [`TokenStore`] (`rmp` task #336,
+/// Slice 3b-i): the `id ↔ name` resolution surface a reader needs, captured on the engine thread and
+/// moved to a reader thread.
+///
+/// # What it is and why it exists
+///
+/// The off-thread read view ([`StoreReadView`](crate::read_view::StoreReadView), Slice 3a) exposes the
+/// **decode** surface computed purely from `(Arc<pool>, MetaSnapshot)`, but it cannot resolve token
+/// `id ↔ name` (that lives in the store's `tokens` field, which the writer keeps exclusively). A
+/// name-returning read (`node_labels → Vec<String>`, `node_properties → Vec<(String, Value)>`, the
+/// relationship type) therefore needs the full reverse `id → name` dictionary for whatever tokens the
+/// surfaced records carry, which cannot be pre-resolved without knowing the result rows in advance.
+/// `TokenSnapshot` carries the whole dictionary, frozen at capture, so the reader resolves any token
+/// it meets exactly as the live store would.
+///
+/// # MVCC-superset-safe
+///
+/// The dictionary is append-only and shared behind an [`Arc`]: a token interned **after** the snapshot
+/// is captured belongs to a writer committing **after** the reader's snapshot timestamp, so the records
+/// referencing it are invisible to the reader anyway (visibility is decided above this layer by
+/// `graphus_txn::is_visible`). The snapshot is thus a strict superset of the tokens the reader could
+/// legally surface, and resolving an id it does meet is always correct.
+///
+/// Cloning a `TokenSnapshot` is one [`Arc`] refcount bump (no dictionary copy). It is captured by
+/// [`RecordStore::token_snapshot`](crate::store::RecordStore::token_snapshot).
+#[derive(Debug, Clone)]
+pub struct TokenSnapshot(Arc<TokenStore>);
+
+// `rmp` #336, Slice 3b-i: `TokenSnapshot` must be `Send + Sync` so the off-thread reader can hold it.
+// A compile-time assertion (no runtime body) — it fails to build the instant a non-`Sync` field is
+// introduced. `Arc<TokenStore>` is `Send + Sync` because `TokenStore` is (it holds only `Vec<String>`
+// + `HashMap<String, u32>`), so the auto derivation holds with no `unsafe impl`.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_token_snapshot() {
+        assert_send_sync::<TokenSnapshot>();
+    }
+    let _ = assert_token_snapshot;
+};
+
+impl TokenSnapshot {
+    /// Wraps an [`Arc`]-shared [`TokenStore`] as a read-only snapshot. Used by
+    /// [`RecordStore::token_snapshot`](crate::store::RecordStore::token_snapshot).
+    #[must_use]
+    pub fn new(tokens: Arc<TokenStore>) -> Self {
+        Self(tokens)
+    }
+
+    /// The id for token `name` in `ns`, if present — identical to
+    /// [`RecordStore::token_id`](crate::store::RecordStore::token_id).
+    #[must_use]
+    pub fn token_id(&self, ns: Namespace, name: &str) -> Option<u32> {
+        self.0.id(ns, name)
+    }
+
+    /// The name for token `id` in `ns`, if present — identical to
+    /// [`RecordStore::token_name`](crate::store::RecordStore::token_name).
+    #[must_use]
+    pub fn token_name(&self, ns: Namespace, id: u32) -> Option<&str> {
+        self.0.name(ns, id)
     }
 }
 

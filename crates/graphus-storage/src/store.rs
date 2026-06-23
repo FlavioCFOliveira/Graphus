@@ -51,7 +51,7 @@ use crate::record::{
     NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS, REL_OFF_END_PREV,
     REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
 };
-use crate::tokens::{Namespace, TokenStore};
+use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
 use crate::valenc;
 use crate::wal_rule::SharedWal;
 
@@ -1585,6 +1585,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn token_id(&self, ns: Namespace, name: &str) -> Option<u32> {
         self.tokens.id(ns, name)
+    }
+
+    /// Captures this store's token dictionary into an owned, `Send + Sync`, cheap-to-clone
+    /// [`TokenSnapshot`] (`rmp` task #336, Slice 3b-i): the `id ↔ name` resolution surface a reader
+    /// thread needs alongside its [`StoreReadView`], which lacks token access.
+    ///
+    /// Call this on the engine thread (where the store is exclusively held). The resulting snapshot
+    /// resolves `token_id` / `token_name` exactly as the live store would, frozen at this instant. It
+    /// is MVCC-superset-safe: tokens are append-only, so any token interned after capture belongs to a
+    /// writer committing after the reader's snapshot timestamp and the records referencing it are
+    /// invisible to the reader anyway (see [`TokenSnapshot`]).
+    ///
+    /// For Slice 3b-i this clones the in-memory dictionary once into a fresh [`Arc`]; the
+    /// coordinator-side epoch-cached, no-deep-clone optimisation (tokens only grow, so a cached `Arc`
+    /// can be reused while the epoch is unchanged) is Slice 3b-ii — the write path / `tokens` field
+    /// shape is **not** touched here.
+    #[must_use]
+    pub fn token_snapshot(&self) -> TokenSnapshot {
+        TokenSnapshot::new(Arc::new(self.tokens.clone()))
     }
 
     // ------------------------------- node CRUD ------------------------------
