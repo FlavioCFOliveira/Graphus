@@ -341,7 +341,9 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     zones: Option<Rc<RefCell<crate::zone_map::ZoneMap>>>,
 }
 
-impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
+impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
+    RecordStoreGraph<D, S>
+{
     /// Wraps `store` and **begins** transaction `txn`, returning a graph seam the executor can run
     /// one query against.
     ///
@@ -1926,7 +1928,9 @@ impl<D: BlockDevice, S: LogSink> RecordStoreGraph<D, S> {
 /// and a captured error to the `error` cell. So calling the lifted body with `self` as the sink
 /// reproduces `RecordStoreGraph`'s prior behaviour exactly — the markers/errors land where they always
 /// did.
-impl<D: BlockDevice, S: LogSink> ReadSink for RecordStoreGraph<D, S> {
+impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> ReadSink
+    for RecordStoreGraph<D, S>
+{
     fn note_read(&self, key: u64) {
         self.note_read(key);
     }
@@ -1965,7 +1969,9 @@ impl<D: BlockDevice, S: LogSink> ReadSink for RecordStoreGraph<D, S> {
 /// token was never interned), or when the query value / a present range bound is not index-encodable
 /// (`Null` / `List` / `Map`). A *stored* histogram over an absent value legitimately answers
 /// `Some(0.0)` (an exact "nothing matches"), distinct from the `None` "unknown" sentinel.
-impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGraph<D, S> {
+impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
+    crate::statistics::Statistics for RecordStoreGraph<D, S>
+{
     fn total_nodes(&self) -> u64 {
         self.store.borrow().total_node_count()
     }
@@ -2026,7 +2032,9 @@ impl<D: BlockDevice, S: LogSink> crate::statistics::Statistics for RecordStoreGr
     }
 }
 
-impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
+impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> GraphAccess
+    for RecordStoreGraph<D, S>
+{
     // ---- reads --------------------------------------------------------------------------------
 
     fn scan_nodes(&self) -> Vec<NodeId> {
@@ -2166,6 +2174,80 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for RecordStoreGraph<D, S> {
         // is declined afterwards (e.g. a float `sum`) and from the serial columnar `scan_hits`.
         if let Some(columns) = &self.columns {
             columns.borrow().record_parallel_scan_hit();
+        }
+    }
+
+    fn morsel_label_scan(&self, label: &str) -> Option<crate::morsel::MorselLabelScan> {
+        // The morsel-driven parallel-read enabler (`rmp` task #339, Slice 3a): capture, on the engine
+        // thread, the bundle the executor's morsel tier needs to read a bare label scan across
+        // concurrent morsels — the authoritative candidate-id vector + an erased, `Send`, cheap-cloneable
+        // read surface (an owned `StoreReadView` + `TokenSnapshot`) + this statement's visibility inputs.
+        //
+        // # Why it is the coordinated path only
+        //
+        // The morsels record their per-candidate SIREAD markers into their own buffers and the executor
+        // folds them back into THIS statement's shared `SsiTracker` via `merge_morsel_buffer`. That
+        // tracker exists only on the coordinated path (`attach`); the standalone / `begin_at_snapshot`
+        // historical-read path has no shared tracker (markers are no-ops there), and — crucially — the
+        // coordinated path is also where the candidate set comes from the derived label index. So decline
+        // (`None`) unless coordinated; the caller then runs the serial tier, which is always correct. The
+        // restricted-RBAC decline is handled one layer up by `AuthorizedGraph` (mirroring
+        // `project_snapshot`), so a restricted reader never bypasses per-node RBAC through a morsel.
+        let index = self.index.as_ref()?;
+
+        // Resolve the label token WITHOUT interning (a read must not mint a token). A never-interned
+        // label has no live matching node, but a concurrent writer could create the first one — so
+        // register the conservative `AllNodes` marker (the absent-node phantom) and decline acceleration
+        // (`None`), exactly as the serial `scan_nodes_by_label` index arm does on a missing token. The
+        // caller's serial path then handles the empty case verbatim.
+        let Some(label_token) = self.label_id_existing(label) else {
+            self.note_predicate_read(PredicateRead::AllNodes);
+            return None;
+        };
+
+        // --- the coarse SSI predicate footprint, registered ONCE on the engine thread ---
+        // Byte-identical to the serial `scan_nodes_by_label` index arm / `columnar_label_pass`: the
+        // `Label` predicate marker (a concurrent insert/relabel is a phantom) + the all-live-nodes
+        // footprint (the conservative phantom approximation the per-candidate SIREADs cannot supply for a
+        // not-yet-existing matching node). The morsels supply the per-candidate `note_read` markers into
+        // their own buffers; this coarse footprint is the part that must be on the engine thread.
+        self.note_predicate_read(PredicateRead::Label(label_token));
+        self.mark_all_live_nodes();
+        // A storage fault while marking all live nodes captured an error; the result is now untrustworthy,
+        // so decline the morsel path (the caller's serial path will surface the same captured error).
+        if self.has_error() {
+            return None;
+        }
+
+        // --- the authoritative current candidate set (the SAME source `scan_nodes_by_label` uses) ---
+        let candidates: Vec<u64> = index.borrow_mut().seek_label(label_token);
+
+        // --- the engine-thread-captured, owned, `Send` read surface (cheap to clone per morsel) ---
+        let store = self.store.borrow();
+        let source: Box<dyn crate::morsel::MorselSource> = Box::new(
+            crate::morsel::MorselView::new(store.read_view(), store.token_snapshot()),
+        );
+        drop(store);
+
+        Some(crate::morsel::MorselLabelScan {
+            candidates,
+            label_token,
+            source,
+            snapshot: self.snapshot,
+            registry: self.registry.clone(),
+            txn: self.txn,
+        })
+    }
+
+    fn merge_morsel_buffer(&self, buffer: SsiReadBuffer) {
+        // Convergence (`rmp` task #339): fold a morsel's accumulated SIREAD markers into this statement's
+        // shared `SsiTracker`, on the engine thread (the merge must run where the tracker lives). The
+        // tracker's `merge_read_buffer` sorts + dedups + replays through the existing `record_read`, so
+        // the conflict graph is the UNION of the morsels' markers — byte-identical to the serial scan's
+        // marker set. A no-op on the standalone path (no shared tracker). Mirrors the `rmp` #341 /
+        // `coordinator::merge_read_buffer` single-writer merge point.
+        if let Some(ssi) = &self.ssi {
+            ssi.borrow_mut().merge_read_buffer(buffer);
         }
     }
 

@@ -317,6 +317,27 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.note_parallel_aggregate();
     }
 
+    fn morsel_label_scan(&self, label: &str) -> Option<crate::morsel::MorselLabelScan> {
+        // The morsel-driven parallel label scan (`rmp` task #339), composed with RBAC exactly as
+        // `project_snapshot` above: an unrestricted principal gets the inner bundle verbatim; a
+        // restricted principal is conservatively **declined** (return `None`) so the executor falls back
+        // to the serial path, which RBAC-composes per node via `scan_nodes_by_label` + `node_property`.
+        // A restricted principal must never read filtered-out nodes through an off-thread morsel that has
+        // no per-node RBAC gate. Per-morsel RBAC is a follow-on; the common (unrestricted) analytical
+        // workload keeps the full win.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.morsel_label_scan(label)
+    }
+
+    fn merge_morsel_buffer(&self, buffer: graphus_txn::SsiReadBuffer) {
+        // Forward unconditionally (`rmp` task #339): a restricted principal never produced a morsel
+        // buffer (its `morsel_label_scan` declined), so there is nothing to gate. The inner seam folds
+        // the markers into the shared tracker on the engine thread.
+        self.inner.merge_morsel_buffer(buffer);
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         let incidents = self.inner.expand(node, direction, types);
         if self.oracle.is_unrestricted() {

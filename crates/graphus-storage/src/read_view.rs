@@ -498,10 +498,25 @@ pub fn incident_rels<D: BlockDevice, S: LogSink, P: StorePages>(
 ///
 /// Slice 3a is **single-threaded and behaviour-preserving**: this view is proven byte-identical to
 /// the `&RecordStore` read methods (the equivalence test). Slice 3b moves it onto reader threads.
-#[derive(Clone)]
+///
+/// Cloning a [`StoreReadView`] is **cheap** — a handful of [`Arc`] refcount bumps (the page-cache
+/// `Arc` and the [`MetaSnapshot`]'s four per-store `Arc<[PageId]>`), **no page copy**. A hand-written
+/// [`Clone`] is used instead of `#[derive(Clone)]` because the derive would spuriously require
+/// `D: Clone, S: Clone` (it bounds every type parameter), whereas the view only ever clones an
+/// `Arc<…>` — which clones regardless of `D`/`S`. This is what makes the per-morsel `clone_box`
+/// (`rmp` task #339) ~free.
 pub struct StoreReadView<D: BlockDevice, S: LogSink> {
     pool: Arc<Pool<D, S>>,
     meta: MetaSnapshot,
+}
+
+impl<D: BlockDevice, S: LogSink> Clone for StoreReadView<D, S> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+            meta: self.meta.clone(),
+        }
+    }
 }
 
 // `rmp` #336, Slice 3a: `StoreReadView<D, S>` must be `Send + Sync` so Slice 3b can move it onto a

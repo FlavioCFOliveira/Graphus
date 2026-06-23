@@ -493,6 +493,12 @@ impl EngineParams {
             Some(path) => Some(MasterKey::load_from_file(path)?),
             None => None,
         };
+        // The morsel-parallelism knob (`rmp` task #339) is a process-global read by the Cypher
+        // executor's morsel tier (mirroring how the `rmp` #352 tier reads `rayon::current_num_threads`).
+        // Set it once here from the resolved config — it applies to every database's engine (one
+        // process-wide dedicated morsel pool), and the call is idempotent across per-database
+        // `EngineSettings::from_config` invocations.
+        graphus_cypher::morsel::set_morsel_threads(config.admission.morsel_parallelism());
         Ok(Self {
             buffer_pool_pages: config.buffer_pool_pages,
             engine_queue_capacity: config.admission.engine_queue_capacity,

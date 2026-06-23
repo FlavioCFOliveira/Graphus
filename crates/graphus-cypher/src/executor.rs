@@ -186,6 +186,11 @@ struct Ctx<'a> {
     /// opened and threaded into [`crate::eval`] so that every zero-argument temporal constructor
     /// (`date()`, `datetime()`, …) in one statement observes the same instant.
     clock: StatementClock,
+    /// The effective morsel-thread count for this statement (`rmp` task #339): populated from the
+    /// process-global [`crate::morsel::morsel_threads`] at cursor-open. `<= 1` means the morsel tier
+    /// early-returns (fully serial — the RPi / determinism / library / `MemGraph` default); `>= 2`
+    /// enables morsel-driven intra-query parallelism for the bare-aggregate shape.
+    morsel_threads: usize,
 }
 
 impl Ctx<'_> {
@@ -1763,14 +1768,23 @@ fn build_operator(
             group_keys,
             aggregates,
         } => {
-            // Parallel fast path (`rmp` #352, phase 1 of #336): for a *large* analytical
-            // `MATCH (n:Label) RETURN <exact-agg>(n.p)` over an integer column, project a frozen
-            // `Send + Sync` snapshot off the seam (under this statement's pinned read snapshot, with
-            // the IDENTICAL SSI markers — see `GraphAccess::project_snapshot`) and fold it across all
-            // cores with rayon. Exact/associative aggregates only (`count`, integer `sum`/`min`/`max`),
-            // so the parallel reduction is **bit-identical** to serial. Declines (falls through) for
-            // any non-conforming shape, float/avg, below-threshold, single-thread, RBAC restriction, or
-            // historical read — in which case the serial tiers below run verbatim.
+            // Morsel-driven parallel READ path (`rmp` #339, Slice 3a — the first slice that makes a
+            // single heavy analytical query use >1 core): for a *large* bare
+            // `MATCH (n:Label) RETURN <exact-agg>(n.p)` over an integer column, with the morsel knob
+            // enabled, split the candidate-id vector into contiguous morsels and read each
+            // **concurrently** on a dedicated worker pool (parallelizing the per-candidate
+            // MVCC-revalidating read itself — the measured bottleneck the `rmp` #352 fold-parallel tier
+            // could not touch), then fold the survivors' values + converge the per-morsel SSI buffers.
+            // Bit-identical to serial (exact/associative aggregates only). Declines (falls through) for
+            // any non-conforming shape, float/avg, below-threshold, knob<=1, RBAC restriction, standalone
+            // / historical read, or a morsel read error — in which case the tiers below run verbatim.
+            if let Some(rows) = try_morsel_label_aggregate(input, group_keys, aggregates, ctx)? {
+                return Ok(Operator::Buffered { rows });
+            }
+            // Parallel FOLD fast path (`rmp` #352, phase 1 of #336): the prior tier, kept as the base for
+            // when the morsel knob is off (the global `rayon` pool's fold over a serially-projected
+            // column). Bit-identical to serial; declines for any non-conforming shape, float/avg,
+            // below-threshold, single-thread, RBAC restriction, or historical read.
             if let Some(rows) =
                 try_parallel_label_property_aggregate(input, group_keys, aggregates, ctx)?
             {
@@ -2377,6 +2391,200 @@ fn is_exact_parallel_agg(spec: &VecAgg) -> bool {
 /// ([`estimate_rows`](crate::cardinality::estimate_rows)). When the seam exposes no statistics, the
 /// estimate is unavailable and the tier conservatively declines (serial path), so a backend without
 /// counts is never forced onto the parallel path on a guess.
+/// If `(input, group_keys, aggregates)` is the **morsel-parallel-eligible** analytical shape — a large
+/// bare `MATCH (n:Label) RETURN <exact-agg>(n.p)[, …]` over an **integer** column, with the morsel knob
+/// enabled and the seam able to hand off an off-thread read bundle — reads the label scan across
+/// **contiguous morsels concurrently** on the dedicated morsel pool (parallelizing the
+/// MVCC-revalidating read itself, `rmp` task #339, Slice 3a), folds the survivors' values across the
+/// morsels, and returns the single result row. Otherwise returns `None` so the caller falls through to
+/// [`try_parallel_label_property_aggregate`] / [`try_vectorized_label_property_aggregate`] / the serial
+/// [`aggregate_rows`], all of which run **verbatim**.
+///
+/// # Why this beats the `rmp` #352 tier (and is still bit-identical to serial)
+///
+/// [`try_parallel_label_property_aggregate`] parallelizes only the **fold** over a *serially-projected*
+/// column, which measured **zero** end-to-end gain — the cost is the per-candidate MVCC-revalidating
+/// **read**, not the fold. This tier splits the candidate-id vector into contiguous morsels and reads
+/// each morsel **concurrently** (each morsel cheap-clones a `StoreReadView` and runs the same
+/// source-generic `filter_label_candidates` + `node_property` the serial path runs), so it parallelizes
+/// the read.
+///
+/// It is bit-identical to serial by the same construction the #352 tier uses, plus the morsel-specific
+/// invariants:
+/// * **Same values, same visibility** — every morsel reads through the identical lifted read body over
+///   an MVCC-superset-safe `StoreReadView`, so the `(node, value)` set is exactly the serial path's.
+/// * **Same SSI markers** — the coarse `PredicateRead::Label` + all-live-nodes footprint is registered
+///   on the engine thread by the seam (`morsel_label_scan`); each morsel records its per-candidate
+///   SIREAD markers into its own buffer, folded back via `merge_morsel_buffer`
+///   ([`SsiTracker::merge_read_buffer`] sorts + dedups + replays — commutative + idempotent), so the
+///   merged conflict graph is the union = the serial scan's marker set.
+/// * **Same arithmetic** — the morsels read values; the engine thread folds them with the shared
+///   [`Accumulator`] (`fold_value` / `set_count_star`), integer `+`/`min`/`max` being associative +
+///   commutative, so any morsel split yields the identical total. `count(*)` is the summed
+///   visible-label-carrying count across morsels.
+///
+/// # Eligibility (ALL required, else `None`)
+///
+/// - the morsel knob is enabled: [`Ctx::morsel_threads`] `> 1` (the cheap first gate; `<= 1` is the
+///   fully-serial RPi / determinism / library default);
+/// - no grouping keys, input a bare label scan, every aggregate a bare recognized **exact/associative**
+///   aggregate over the **same** single property (the [`try_vectorized_label_property_aggregate`] shape
+///   restricted to [`is_exact_parallel_agg`] — `avg` / a float fold force the serial path);
+/// - the estimated label cardinality is at least [`MORSEL_MIN_ROWS`](crate::morsel::MORSEL_MIN_ROWS)
+///   (via `statistics().nodes_with_label`; no statistics ⇒ decline);
+/// - the seam returns `Some` from [`GraphAccess::morsel_label_scan`] (it declines for a restricted
+///   principal, a standalone / historical read, and `MemGraph`).
+///
+/// After reading, if any property fold is requested and any morsel observed a **non-integer** value, the
+/// tier discards the morsel results **without folding their buffers** and returns `None` (the serial
+/// path then handles the float column and re-registers the per-candidate markers identically — the
+/// coarse footprint already registered by the seam is harmlessly idempotent under the merge).
+fn try_morsel_label_aggregate(
+    input: &PhysicalOp,
+    group_keys: &[ProjectionColumn],
+    aggregates: &[ProjectionColumn],
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    // --- cheap gate first (no seam work): the morsel knob must be enabled (>= 2 workers) ---
+    if ctx.morsel_threads <= 1 {
+        return Ok(None);
+    }
+
+    // --- recognize exactly the bare-aggregate analytical shape (single group, bare label scan) ---
+    if !group_keys.is_empty() || aggregates.is_empty() {
+        return Ok(None);
+    }
+    let (scan_var, label) = match input {
+        PhysicalOp::NodeByLabelScan { variable, label }
+        | PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => (&variable.name, &label.name),
+        _ => return Ok(None),
+    };
+
+    // --- the size gate: the label scan's estimated cardinality (the work being parallelized) ---
+    // The same source + formula the cardinality estimator uses for a `NodeByLabelScan` leaf; no
+    // statistics ⇒ no estimate ⇒ conservatively decline (serial path).
+    let estimated_input = match ctx
+        .graph
+        .statistics()
+        .and_then(|s| s.nodes_with_label(label))
+    {
+        Some(count) => count as f64,
+        None => return Ok(None),
+    };
+    if !estimated_input.is_finite() || estimated_input < crate::morsel::MORSEL_MIN_ROWS {
+        return Ok(None);
+    }
+
+    // Resolve the single covered property (the first property-bearing aggregate fixes it; the rest must
+    // agree). A pure `count(*)`-only aggregation has no column to read — let the serial path handle it
+    // (it is trivially cheap and the morsel read keys on a property column).
+    let mut property: Option<String> = None;
+    for col in aggregates {
+        if let Some(p) = sole_aggregate_property(&col.expr, scan_var) {
+            match &property {
+                Some(existing) if existing != &p => return Ok(None),
+                _ => property = Some(p),
+            }
+        }
+    }
+    let Some(property) = property else {
+        return Ok(None);
+    };
+
+    // Recognize every column as a bare aggregate over `(scan_var, property)`, and require each to be an
+    // EXACT/associative aggregate (decline `avg`, any non-bare column, a `DISTINCT`, or a second
+    // property — the serial path covers all of those correctly).
+    let mut specs: Vec<VecAgg> = Vec::with_capacity(aggregates.len());
+    for col in aggregates {
+        match recognize_vec_agg(&col.expr, scan_var, &property) {
+            Some(spec) if is_exact_parallel_agg(&spec) => specs.push(spec),
+            _ => return Ok(None),
+        }
+    }
+
+    // --- the engine-thread seam: capture the candidate vector + off-thread read surface (registers the
+    // identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
+    // fall through to the serial tiers, which run verbatim. ---
+    let Some(scan) = ctx.graph.morsel_label_scan(label) else {
+        return Ok(None);
+    };
+
+    // Cancellation is polled once up front (the per-morsel read polls nothing — it is a self-contained
+    // store read; the whole fan-out is bounded by the candidate count).
+    ctx.check_cancelled()?;
+
+    // --- read the morsels concurrently on the dedicated pool (the parallelized MVCC-revalidating read) ---
+    let outcomes = crate::morsel::run_morsels(&scan, &property, ctx.morsel_threads);
+
+    // If any morsel hit a storage / deferred-feature error, the parallel result is untrustworthy:
+    // decline (the morsel buffers are dropped — markers NOT folded). The serial fallback re-reads the
+    // same nodes through the live seam, which re-registers the identical per-candidate markers AND
+    // re-hits the same storage fault, capturing it through the normal `ReadSink::capture` channel so the
+    // statement rolls back — exactly as if the morsel path had never run.
+    if outcomes.iter().any(|o| o.error.is_some()) {
+        return Ok(None);
+    }
+
+    // The all-integer constraint (the exactness guarantee): if any property fold is requested and ANY
+    // morsel observed a non-integer value, a parallel reduction could round differently than the serial
+    // left fold (float `+` is non-associative). Discard the morsel results WITHOUT folding their buffers
+    // and decline — the serial path handles the float column exactly and re-registers the markers.
+    let any_fold = specs.iter().any(|s| matches!(s, VecAgg::Fold(_)));
+    if any_fold
+        && outcomes
+            .iter()
+            .any(|o| o.values.iter().any(|v| !matches!(v, Value::Integer(_))))
+    {
+        return Ok(None);
+    }
+
+    // Every gate passed and the read succeeded: record the engagement (observability), then fold the
+    // morsels' values + converge their SSI buffers. From here we are committed to the parallel result.
+    ctx.graph.note_parallel_aggregate();
+
+    // --- fold the survivors' values into one accumulator per column, then converge `count(*)` ---
+    let mut accs: Vec<Accumulator> = specs.iter().map(new_parallel_acc).collect();
+    let mut label_matches: usize = 0;
+    for outcome in &outcomes {
+        label_matches = label_matches.saturating_add(outcome.label_matches);
+        for value in &outcome.values {
+            for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+                match spec {
+                    // `count(*)` is assigned from `label_matches` after the fold, not folded per value.
+                    VecAgg::CountStar => {}
+                    VecAgg::CountProp | VecAgg::Fold(_) => acc.fold_value(value)?,
+                }
+            }
+        }
+    }
+
+    // `count(*)` is the matched-node count (every visible label-carrying node, property or not) —
+    // identical to the serial vectorized path's `set_count_star`.
+    let count_star = i64::try_from(label_matches).unwrap_or(i64::MAX);
+    for (spec, acc) in specs.iter().zip(accs.iter_mut()) {
+        if matches!(spec, VecAgg::CountStar) {
+            acc.set_count_star(count_star);
+        }
+    }
+
+    // --- converge the per-morsel SIREAD buffers into the statement's shared SSI tracker (engine thread,
+    // before commit — rule M1). The merge sorts + dedups + replays, so the conflict graph is the union =
+    // the serial scan's marker set. ---
+    for outcome in outcomes {
+        ctx.graph.merge_morsel_buffer(outcome.buffer);
+    }
+
+    // Finish each column into the single output row (every column is a bare aggregate, so the aggregate
+    // value IS the column value — no outer expression to evaluate).
+    let mut row = Row::empty();
+    for (col, acc) in aggregates.iter().zip(accs) {
+        row.set(col.alias.clone(), acc.finish());
+    }
+    Ok(Some(VecDeque::from(vec![row])))
+}
+
 fn try_parallel_label_property_aggregate(
     input: &PhysicalOp,
     group_keys: &[ProjectionColumn],
@@ -4052,6 +4260,10 @@ pub struct Cursor<'a> {
     /// The fixed per-statement "current instant" (`rmp` task #140), captured once at `open()` and
     /// reused for every `next()`/`pull` so the whole statement observes one instant.
     clock: StatementClock,
+    /// The effective morsel-thread count (`rmp` task #339), captured once at `open()` from the
+    /// process-global [`crate::morsel::morsel_threads`] and reused for every `next()` so the morsel
+    /// tier decision is stable across the statement's lifetime.
+    morsel_threads: usize,
     columns: Vec<String>,
     finished: bool,
     /// `false` for a write statement with no `RETURN`: the cursor drains its operator tree to apply
@@ -4089,6 +4301,7 @@ impl<'a> Cursor<'a> {
             functions: self.functions,
             procedures: self.procedures,
             clock: self.clock,
+            morsel_threads: self.morsel_threads,
         };
         // A write statement with no `RETURN` yields zero rows (openCypher write cardinality), but
         // its side effects must still happen: drain the operator tree once so every write `next()`
@@ -4277,6 +4490,9 @@ impl Executor {
         // Capture the statement clock once per open() — this is the fixed per-statement instant
         // every zero-argument temporal constructor in the statement reads (`rmp` task #140).
         let clock = StatementClock::capture();
+        // The effective morsel-thread count for this statement (`rmp` task #339), read once from the
+        // process-global knob at open and frozen for the cursor's lifetime.
+        let morsel_threads = crate::morsel::morsel_threads();
         let root = {
             let mut ctx = Ctx {
                 params: &self.params,
@@ -4285,6 +4501,7 @@ impl Executor {
                 functions,
                 procedures,
                 clock,
+                morsel_threads,
             };
             build_operator(&self.plan.root, None, &mut ctx)?
         };
@@ -4296,6 +4513,7 @@ impl Executor {
             functions,
             procedures,
             clock,
+            morsel_threads,
             columns,
             finished: false,
             emits_rows: !root_is_write(&self.plan.root),
@@ -4324,6 +4542,8 @@ impl Executor {
         let columns = result_columns(&self.plan.root, procedures);
         // Capture the statement clock once per open() — see `open_with_extensions` (`rmp` task #140).
         let clock = StatementClock::capture();
+        // The effective morsel-thread count for this statement (`rmp` task #339), frozen at open.
+        let morsel_threads = crate::morsel::morsel_threads();
         let root = {
             let mut ctx = Ctx {
                 params: &self.params,
@@ -4332,6 +4552,7 @@ impl Executor {
                 functions,
                 procedures,
                 clock,
+                morsel_threads,
             };
             build_operator(&self.plan.root, Some(seed), &mut ctx)?
         };
@@ -4343,6 +4564,7 @@ impl Executor {
             functions,
             procedures,
             clock,
+            morsel_threads,
             columns,
             finished: false,
             emits_rows: !root_is_write(&self.plan.root),
@@ -4830,6 +5052,7 @@ mod tests {
             functions,
             procedures,
             clock: StatementClock::capture(),
+            morsel_threads: crate::morsel::morsel_threads(),
         };
         try_parallel_label_property_aggregate(input, group_keys, aggregates, &mut ctx)
             .expect("no error")

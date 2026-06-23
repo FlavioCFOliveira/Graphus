@@ -146,6 +146,16 @@ pub struct AdmissionConfig {
     /// [`engine_queue_capacity`](Self::engine_queue_capacity) (which bounds the *command* channel); a
     /// full reader queue falls back to the inline engine-thread path (still correct, just serial).
     pub reader_threads: usize,
+    /// Number of **morsel worker threads** for intra-query parallelism (`rmp` task #339): a single
+    /// large analytical aggregation (`MATCH (n:Label) RETURN <exact-agg>(n.p)`) splits its label scan
+    /// into contiguous morsels read concurrently on a dedicated pool, so one heavy query scales past one
+    /// core (distinct from [`reader_threads`](Self::reader_threads), which parallelizes *separate*
+    /// read-only statements). `0` (the default) selects an automatic size of
+    /// `min(available_parallelism(), 16)`; `1` keeps every query **fully serial** (the morsel tier
+    /// early-returns — the determinism / single-core / Raspberry-Pi path); any value `> 1` pins the
+    /// morsel pool to exactly that many workers. The pool is dedicated (never the global `rayon` pool, so
+    /// it never contends with GDS or the off-thread reader pool).
+    pub morsel_parallelism: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -156,6 +166,7 @@ impl Default for AdmissionConfig {
             result_buffer_capacity: 256,
             max_connections: 1024,
             reader_threads: 0,
+            morsel_parallelism: 0,
         }
     }
 }
@@ -170,6 +181,24 @@ impl AdmissionConfig {
     pub fn reader_threads(&self) -> usize {
         if self.reader_threads > 0 {
             self.reader_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(16)
+        }
+    }
+
+    /// The effective morsel worker-pool size (`rmp` task #339): the configured
+    /// [`morsel_parallelism`](Self::morsel_parallelism), or — when that is `0` (auto) — `min(N, 16)`
+    /// where `N` is the available hardware parallelism (falling back to 1 if it cannot be queried).
+    /// Capped at 16 so the dedicated morsel pool never over-subscribes a many-core host past the point
+    /// shared-buffer-pool contention dominates (the measured `rmp` #337 Slice-1 knee). `1` keeps every
+    /// query fully serial (the morsel tier early-returns).
+    #[must_use]
+    pub fn morsel_parallelism(&self) -> usize {
+        if self.morsel_parallelism > 0 {
+            self.morsel_parallelism
         } else {
             std::thread::available_parallelism()
                 .map(std::num::NonZeroUsize::get)
@@ -607,6 +636,13 @@ impl ServerConfig {
             self.admission.reader_threads = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
                     "GRAPHUS_READER_THREADS is not a non-negative integer (0 = auto): {v:?}"
+                ))
+            })?;
+        }
+        if let Ok(v) = var("GRAPHUS_MORSEL_PARALLELISM") {
+            self.admission.morsel_parallelism = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_MORSEL_PARALLELISM is not a non-negative integer (0 = auto): {v:?}"
                 ))
             })?;
         }

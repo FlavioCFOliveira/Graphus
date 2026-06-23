@@ -375,7 +375,7 @@ fn compile(
 /// channel being clean), `false` otherwise. A full bounded `row_tx` blocks here — the intended egress
 /// backpressure (`04 §9.3`).
 #[allow(clippy::too_many_arguments)] // Threads the per-statement seam + privileges + egress channel.
-fn stream_rows<D: BlockDevice, S: LogSink>(
+fn stream_rows<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     coordinator: &mut TxnCoordinator<D, S>,
     txn: graphus_core::TxnId,
     plan: &graphus_cypher::PhysicalPlan,

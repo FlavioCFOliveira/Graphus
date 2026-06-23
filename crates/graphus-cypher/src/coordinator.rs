@@ -2416,7 +2416,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns [`GraphusError::Transaction`] if `txn` is not an open transaction.
-    pub fn statement(&self, txn: TxnId) -> Result<RecordStoreGraph<D, S>> {
+    ///
+    /// `D`/`S` carry `Send + Sync + 'static` because the returned seam can hand the executor an
+    /// off-thread morsel read view (`rmp` task #339); every real store instantiation already meets these
+    /// bounds (the `rmp` #336 off-thread reader path requires the same).
+    pub fn statement(&self, txn: TxnId) -> Result<RecordStoreGraph<D, S>>
+    where
+        D: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
         let snapshot = self.active.get(&txn).map(|a| a.snapshot).ok_or_else(|| {
             GraphusError::Transaction(format!("statement in inactive txn {}", txn.0))
         })?;

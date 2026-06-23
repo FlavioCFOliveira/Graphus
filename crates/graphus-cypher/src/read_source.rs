@@ -410,6 +410,74 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
     out
 }
 
+/// A **fused** morsel scan (`rmp` task #339, Slice 3a): for each candidate `id`, read the node **once**,
+/// SIREAD-mark it, and — if it is visible and currently carries `token_id` — read its `property` value
+/// (newest-visible-wins), returning the surviving `(visible-label-carrying node count, present-property
+/// values)`. This is the per-morsel work the parallel label-aggregate tier runs; it is
+/// **byte-identical** to [`filter_label_candidates`] followed by a per-survivor [`node_property`] over
+/// the same `ids`, but reads each candidate's node record fewer times (no separate `node_exists`
+/// existence probe), which matters under buffer-pool contention when many morsels read concurrently.
+///
+/// The returned `label_matches` counts every **visible label-carrying** node (property present or not) —
+/// the morsel's `count(*)` contribution — while `values` holds only the present-property values. The
+/// per-candidate SIREAD marker is recorded exactly **once** per examined id (identical to
+/// [`filter_label_candidates`]); the property read records no *additional* per-node marker (it re-reads
+/// the same node's chain, which is the freshness probe `columnar_label_pass` documents — not a distinct
+/// conflict key). On a storage fault the error is captured and the partial result is returned untrusted
+/// (the caller abandons the parallel path).
+///
+/// **Cross-module marker-equivalence dependency (do not break):** equivalence to the serial path holds
+/// at the *deduped set* level, not the multiset. The serial path marks each survivor **twice** (once in
+/// [`filter_label_candidates`], once again in the [`node_property`] freshness re-read), whereas this
+/// fused scan marks it **once**; the two SIREAD sets agree only because `graphus-txn`'s
+/// `SsiReadBuffer::into_sorted_markers` and `SsiTracker::merge_read_buffer` **sort + dedup** before
+/// replay. The `merge_read_buffer_*` regression tests in `graphus-txn` guard that dedup invariant; were
+/// it ever removed, the serial-vs-morsel marker multisets would diverge even though the *sets* still
+/// match.
+pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    token_id: u32,
+    property: &str,
+    ids: &[u64],
+) -> (usize, Vec<Value>) {
+    let mut label_matches = 0usize;
+    let mut values: Vec<Value> = Vec::new();
+    for &id in ids {
+        // Read the node record ONCE (visibility + label re-check). A candidate whose page is unallocated
+        // (a stale index entry for a reclaimed slot) is not a live node and is dropped — exactly as
+        // `filter_label_candidates` drops it (no SIREAD marker for a non-existent slot).
+        let rec = match src.node(id) {
+            Ok(rec) => rec,
+            Err(_) => continue,
+        };
+        // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
+        // identical per-candidate marker `filter_label_candidates` records.
+        sink.note_read(node_ssi_key(id));
+        if !ctx.visible(rec.mvcc) {
+            continue;
+        }
+        match src.node_has_label(id, token_id) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                // An overflow-form bitmap surfaces as a captured error, never a wrong row.
+                sink.capture(e);
+                return (label_matches, values);
+            }
+        }
+        // A visible label-carrying node: it counts toward `count(*)` regardless of the property.
+        label_matches += 1;
+        // Read the single property value (newest-visible-wins). `read_node_prop_one` re-walks this same
+        // node's chain (no existence re-probe), recording no additional conflict marker.
+        if let Some(value) = read_node_prop_one(src, ctx, sink, NodeId(id), property) {
+            values.push(value);
+        }
+    }
+    (label_matches, values)
+}
+
 /// The **scan-fallback** body of `RecordStoreGraph::scan_nodes_by_label` (the non-index arm): resolve
 /// the label token (no intern), register the `Label`/`AllNodes` predicate marker, then scan every live
 /// node and filter by the inline label bitmap. The index-accelerated arm stays in the `RecordStoreGraph`

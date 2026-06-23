@@ -370,6 +370,47 @@ pub trait GraphAccess {
     /// projected). The default is a no-op; a backend with a metrics counter overrides it.
     fn note_parallel_aggregate(&self) {}
 
+    /// An **optional** engine-thread-captured bundle for **morsel-driven** parallel reading of a bare
+    /// label scan (`rmp` task #339, Slice 3a — the first slice that makes a single heavy analytical
+    /// query use more than one core).
+    ///
+    /// Unlike [`project_snapshot`](Self::project_snapshot) (which the `rmp` #352 tier folds over a
+    /// *serially-projected* column — and which measured zero gain because the bottleneck is the read,
+    /// not the fold), this hands the executor the authoritative candidate-id vector plus an erased,
+    /// `Send`, cheap-cloneable read surface ([`MorselSource`](crate::morsel::MorselSource)), so the
+    /// executor can split the candidates into contiguous morsels and read each **concurrently** on a
+    /// dedicated worker pool — parallelizing the MVCC-revalidating read itself.
+    ///
+    /// # Contract (why the parallel result equals the serial one)
+    ///
+    /// An implementation that returns `Some` MUST register the **coarse** predicate read-markers the
+    /// serial label scan registers (`PredicateRead::Label` + the all-live-nodes footprint) **during
+    /// this call, on the engine thread, before the bundle is handed off**, so the phantom rw-edges are
+    /// closed identically regardless of which path the executor takes. The per-candidate SIREAD markers
+    /// are recorded by each morsel into its own buffer and folded back via
+    /// [`merge_morsel_buffer`](Self::merge_morsel_buffer); because those ops are commutative +
+    /// idempotent, the merged conflict graph is the union of the morsels' markers — identical to the
+    /// serial scan's set. If an implementation cannot guarantee marker-identical, visibility-identical,
+    /// RBAC-identical behaviour it MUST return `None` and let the caller fall back to the serial path.
+    ///
+    /// Returns `None` by default. `None` is also the correct decline for a restricted principal (the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator returns it), for a
+    /// historical / standalone read (no shared SSI tracker to fold into), and for any backend without an
+    /// off-thread read view (e.g. [`MemGraph`]).
+    fn morsel_label_scan(&self, _label: &str) -> Option<crate::morsel::MorselLabelScan> {
+        None
+    }
+
+    /// Folds a morsel's accumulated SIREAD-marker buffer (`rmp` task #339) into this statement's shared
+    /// SSI tracker, on the engine thread — the convergence counterpart to
+    /// [`morsel_label_scan`](Self::morsel_label_scan). Called once per morsel after the parallel read
+    /// completes, **before** the statement commits (so a partner's commit-time detection observes the
+    /// morsels' markers — rule M1, mirroring the `rmp` #341 / #336 single-writer merge point).
+    ///
+    /// The default is a no-op: a backend with no shared SSI tracker (e.g. [`MemGraph`], or a backend
+    /// that declined [`morsel_label_scan`](Self::morsel_label_scan)) has nothing to fold.
+    fn merge_morsel_buffer(&self, _buffer: graphus_txn::SsiReadBuffer) {}
+
     // ---- writes -------------------------------------------------------------------------------
 
     /// Creates a node with `labels` and `properties`, returning its new id.

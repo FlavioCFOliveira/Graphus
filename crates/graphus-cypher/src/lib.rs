@@ -130,6 +130,7 @@ pub mod lexer;
 pub mod loadcsv;
 pub mod logical;
 pub mod lower;
+pub mod morsel;
 pub mod ordering;
 pub mod parser;
 pub mod physical;

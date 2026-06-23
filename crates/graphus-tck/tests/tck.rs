@@ -316,6 +316,18 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>) {
 
 #[test]
 fn tck_conformance() {
+    // `rmp` task #339: optionally run the whole TCK under the morsel-parallelism knob, so conformance is
+    // proven identical with morsel intra-query parallelism enabled (`GRAPHUS_MORSEL_PARALLELISM=16`) and
+    // with it off (unset / `=1`). The morsel tier only engages above 50k label-rows, which no TCK
+    // scenario reaches, so the result is identical either way — this hook makes that explicit and
+    // testable end-to-end through the production seam.
+    if let Some(n) = std::env::var("GRAPHUS_MORSEL_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        graphus_cypher::morsel::set_morsel_threads(n);
+    }
+
     let root = graphus_tck::tck_root();
     let features_dir = root.join("features");
     let graphs_dir = root.join("graphs");
