@@ -2309,21 +2309,25 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     }
 
     fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
-        // No SIREAD marker (reading our own tombstone has no rw-dependency), so the lifted body takes
-        // no sink. Keeps `type(r)`/`id(r)` accessible after a same-query `DELETE r` (openCypher).
+        // No SIREAD *read* marker (reading our own tombstone has no rw-dependency), but the sink is
+        // passed so a storage *fault* on the lookup is captured, not swallowed into `None` (`rmp` #359
+        // defence-in-depth). Keeps `type(r)`/`id(r)` accessible after a same-query `DELETE r`.
         read_source::rel_data_including_deleted(
             &LiveSource(&*self.store.borrow()),
             &self.vis_ctx(),
+            self,
             rel,
         )
     }
 
     fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
-        // No SIREAD marker (a self-delete check on our own write records no rw-dependency), so the
-        // lifted body takes no sink.
+        // No SIREAD *read* marker (a self-delete check on our own write records no rw-dependency), but
+        // the sink is passed so a storage *fault* on the probe is captured rather than swallowed into
+        // `false` (`rmp` #359 defence-in-depth).
         read_source::entity_deleted_by_txn(
             &LiveSource(&*self.store.borrow()),
             &self.vis_ctx(),
+            self,
             entity,
         )
     }

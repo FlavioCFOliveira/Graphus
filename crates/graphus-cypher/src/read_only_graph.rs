@@ -271,13 +271,15 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for ReadOnlyGraph<D, S> {
     }
 
     fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
-        // No SIREAD marker (reading our own tombstone has no rw-dependency), so the lifted body takes no
-        // sink here.
-        read_source::rel_data_including_deleted(&self.source(), &self.ctx(), rel)
+        // No SIREAD *read* marker (reading our own tombstone has no rw-dependency), but the sink is
+        // passed so a storage *fault* is captured, not swallowed into `None` (`rmp` #359 defence-in-depth).
+        read_source::rel_data_including_deleted(&self.source(), &self.ctx(), self, rel)
     }
 
     fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
-        read_source::entity_deleted_by_txn(&self.source(), &self.ctx(), entity)
+        // Sink passed so a storage *fault* on the probe is captured, not swallowed into `false`
+        // (`rmp` #359 defence-in-depth); no SIREAD read marker (self-delete check records no rw-dep).
+        read_source::entity_deleted_by_txn(&self.source(), &self.ctx(), self, entity)
     }
 
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {

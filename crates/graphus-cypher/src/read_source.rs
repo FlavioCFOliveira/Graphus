@@ -608,8 +608,19 @@ fn note_rel_predicate_read<S: StoreReadSource, K: ReadSink>(src: &S, sink: &K, t
 }
 
 /// The body of `RecordStoreGraph::node_exists` (`GraphAccess::node_exists`): "exists" = visible to this
-/// query's snapshot. SIREAD-marks the node (it was examined) before returning visibility. An
-/// unallocated id is a normal `false`, not a captured fault.
+/// query's snapshot. SIREAD-marks the node (it was examined) before returning visibility.
+///
+/// # Error handling (`rmp` #359 defence-in-depth)
+///
+/// A storage `Err` here is **captured**, not silently swallowed into `false`. The node store never
+/// unmaps pages (its high-water is monotonic), and no caller in normal Cypher operation passes an id
+/// past high-water — every id reaching this body is scan-, traversal-, endpoint-, path- or
+/// index-candidate-sourced, hence an *allocated* slot that reads `Ok`. So a real `Err` here is only
+/// ever a genuine I/O / buffer-pool fault (or actual record corruption), in which case returning a
+/// bare `false` would silently mis-report a present node as absent — a wrong-result ACID
+/// read-integrity violation, and the exact way a transient pool error became `Value::Null`. Capturing
+/// it routes the fault through the read sink so the executor abandons the result (and, on the parallel
+/// morsel path, re-runs serial) rather than trusting a value derived from a swallowed error.
 pub fn node_exists<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
@@ -618,13 +629,19 @@ pub fn node_exists<S: StoreReadSource, K: ReadSink>(
 ) -> bool {
     let mvcc = match src.node(node.0) {
         Ok(rec) => rec.mvcc,
-        Err(_) => return false,
+        Err(e) => {
+            sink.capture(e);
+            return false;
+        }
     };
     sink.note_read(node_ssi_key(node.0));
     ctx.visible(mvcc)
 }
 
-/// The body of `RecordStoreGraph::rel_exists` (`GraphAccess::rel_exists`).
+/// The body of `RecordStoreGraph::rel_exists` (`GraphAccess::rel_exists`). A storage `Err` is
+/// **captured**, not swallowed into `false` — identical `rmp` #359 defence-in-depth reasoning as
+/// [`node_exists`] (the rel store never unmaps pages; every id reaching here is traversal-sourced and
+/// allocated, so a real `Err` is a genuine fault that must not silently read as "no such relationship").
 pub fn rel_exists<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
@@ -633,7 +650,10 @@ pub fn rel_exists<S: StoreReadSource, K: ReadSink>(
 ) -> bool {
     let mvcc = match src.rel(rel.0) {
         Ok(rec) => rec.mvcc,
-        Err(_) => return false,
+        Err(e) => {
+            sink.capture(e);
+            return false;
+        }
     };
     sink.note_read(rel_ssi_key(rel.0));
     ctx.visible(mvcc)
@@ -677,7 +697,13 @@ pub fn rel_data<S: StoreReadSource, K: ReadSink>(
 ) -> Option<RelData> {
     let rec = match src.rel(rel.0) {
         Ok(rec) => rec,
-        Err(_) => return None,
+        // A storage `Err` is captured (not swallowed into `None`): every `RelId` reaching here is
+        // expand/incidence-sourced and allocated, so a real `Err` is a genuine fault that must not
+        // silently read as a missing relationship (`rmp` #359 defence-in-depth).
+        Err(e) => {
+            sink.capture(e);
+            return None;
+        }
     };
     sink.note_read(rel_ssi_key(rel.0));
     if !ctx.visible(rec.mvcc) {
@@ -698,14 +724,22 @@ pub fn rel_data<S: StoreReadSource, K: ReadSink>(
 /// earlier in the same query still yields its type (openCypher keeps `type(r)`/`id(r)` accessible after
 /// `DELETE r`). The creator must still be visible. No SIREAD marker (reading our own tombstone has no
 /// rw-dependency).
-pub fn rel_data_including_deleted<S: StoreReadSource>(
+pub fn rel_data_including_deleted<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
+    sink: &K,
     rel: RelId,
 ) -> Option<RelData> {
     let rec = match src.rel(rel.0) {
         Ok(rec) => rec,
-        Err(_) => return None,
+        // A storage `Err` is captured (not swallowed into `None`): `rel` is a bound, expand-sourced id
+        // (allocated slot), so a real `Err` is a genuine fault, not a legitimate not-found
+        // (`rmp` #359 defence-in-depth). No SIREAD *read* marker is added (reading our own tombstone
+        // records no rw-dependency), but a *fault* must still surface.
+        Err(e) => {
+            sink.capture(e);
+            return None;
+        }
     };
     // Visible normally, or a tombstone we wrote ourselves: both keep the type readable.
     if !ctx.visible(rec.mvcc) && !ctx.deleted_by_self(rec.mvcc) {
@@ -724,19 +758,31 @@ pub fn rel_data_including_deleted<S: StoreReadSource>(
 /// The body of `RecordStoreGraph::entity_deleted_by_txn` (`GraphAccess::entity_deleted_by_txn`):
 /// whether `entity` was deleted by *this* transaction (a tombstone we wrote). No SIREAD marker — a
 /// self-delete check on our own write records no rw-dependency.
-pub fn entity_deleted_by_txn<S: StoreReadSource>(
+pub fn entity_deleted_by_txn<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
+    sink: &K,
     entity: DeletedEntity,
 ) -> bool {
+    // A storage `Err` on either probe is captured (not swallowed into `false`): the id is the same
+    // bound, scan/expand/endpoint-sourced id that already passed `node_exists`/`rel_exists` in this
+    // access path (an allocated slot), so a real `Err` is a genuine fault that must surface rather than
+    // silently read as "not self-deleted" (`rmp` #359 defence-in-depth). No SIREAD *read* marker (a
+    // self-delete check on our own write records no rw-dependency).
     let mvcc = match entity {
         DeletedEntity::Node(id) => match src.node(id.0) {
             Ok(rec) => rec.mvcc,
-            Err(_) => return false,
+            Err(e) => {
+                sink.capture(e);
+                return false;
+            }
         },
         DeletedEntity::Rel(id) => match src.rel(id.0) {
             Ok(rec) => rec.mvcc,
-            Err(_) => return false,
+            Err(e) => {
+                sink.capture(e);
+                return false;
+            }
         },
     };
     ctx.deleted_by_self(mvcc)

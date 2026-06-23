@@ -69,14 +69,15 @@ use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer};
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
-use crate::ast::Expr;
+use crate::ast::{Expr, RelDirection, RelType};
 use crate::binding::BoundParameters;
 use crate::eval::eval;
 use crate::function_registry::FunctionSet;
-use crate::logical::{ProjectionColumn, SortKey};
+use crate::graph_access::{ExpandDirection, GraphAccess};
+use crate::logical::{ProjectionColumn, SortKey, Var};
 use crate::read_only_graph::ReadOnlyGraph;
 use crate::read_source::{self, ReadSink, ReadViewSource, VisCtx};
-use crate::runtime::{NodeRef, Row, RowValue};
+use crate::runtime::{NodeRef, RelRef, Row, RowValue};
 use crate::statement_clock::StatementClock;
 
 // =================================================================================================
@@ -250,6 +251,85 @@ pub struct MorselRowsOutcome {
     pub error: Option<GraphusError>,
 }
 
+/// One contiguous-anchor morsel's contribution to a **traversal-heavy** query (`rmp` task #339,
+/// Slice 3c — the final slice, parallelizing the per-anchor `ExpandAll` of degree / friends / FoF /
+/// mutual shapes), in one of two forms depending on the shape above the expand:
+///
+/// * **Aggregate-over-expand** (`MATCH (a:L)-->(b) RETURN count(b) | count(*)`, the degree shape) —
+///   only [`partial_count`](Self::partial_count) is populated: the sum, over every anchor in this
+///   morsel's slice, of the number of relationship-expansion rows the serial `Operator::Expand`
+///   would produce for that anchor (i.e. the anchor's matching degree, after self-loop dedup +
+///   relationship-isomorphism + direction filtering). The executor sums the morsels' counts (an
+///   order-independent combine). `rows` is empty.
+/// * **Rows-over-expand** (`MATCH (a:L)-[r]->(b) RETURN <per-row projection of a/r/b>`, the
+///   neighbour-collect shape) — [`rows`](Self::rows) holds the **projected** expansion rows of every
+///   anchor in this morsel's slice, **in (anchor, then per-anchor expansion) order**, so an
+///   ascending-`lo` contiguous concat reproduces the serial scan→expand→project row sequence exactly.
+///   `partial_count` is `0`.
+///
+/// In both forms [`buffer`](Self::buffer) accumulates this morsel's SIREAD markers — the per-anchor
+/// label-scan markers AND, crucially, the relationship-pattern predicate marker + every per-edge
+/// marker the per-anchor [`GraphAccess::expand`] records (byte-identical to serial, since the morsel
+/// drives the same lifted `read_source::expand` body over a [`ReadOnlyGraph`]). A non-`None`
+/// [`error`](Self::error) aborts the parallel path (the executor discards every morsel's rows, counts,
+/// and buffers and re-runs the serial pipeline, which re-registers the markers and re-hits the fault
+/// identically).
+#[must_use]
+pub struct MorselExpandOutcome {
+    /// The projected expansion rows of every anchor in this morsel's slice (rows-over-expand shape),
+    /// **in (anchor, then per-anchor expansion) order** — empty for the aggregate-over-expand shape.
+    pub rows: Vec<Row>,
+    /// This morsel's `count(b)` / `count(*)`-over-expand contribution (aggregate-over-expand shape):
+    /// the total number of expansion rows the serial path would produce over this morsel's anchors —
+    /// `0` for the rows-over-expand shape.
+    pub partial_count: i64,
+    /// This morsel's accumulated SIREAD markers (per-anchor label-scan `note_read` + the per-anchor
+    /// `expand`'s relationship-pattern predicate + per-edge `note_read`), tagged with the query txn.
+    /// Folded into the statement tracker at convergence via `SsiTracker::merge_read_buffer`.
+    pub buffer: SsiReadBuffer,
+    /// The first storage / evaluation error the morsel hit, or `None`. While set, the morsel's
+    /// `rows` / `partial_count` are untrustworthy and the parallel path must be abandoned.
+    pub error: Option<GraphusError>,
+}
+
+/// The post-work a Slice-3c [`expand_morsel`](MorselSource::expand_morsel) performs over each
+/// expansion row, distinguishing the **aggregate-over-expand** (degree / `count`) shape from the
+/// **rows-over-expand** (neighbour-collect) shape (`rmp` task #339, Slice 3c).
+pub enum MorselExpandPostWork<'p> {
+    /// Count the expansion rows (the degree shape: `RETURN count(b)` / `count(*)`). The morsel sums
+    /// the per-anchor matching degree into its `partial_count`; no row is materialized.
+    Count,
+    /// Project each expansion row through these per-row columns (the neighbour-collect shape:
+    /// `RETURN <projection of a / r / b>`). Every column must be **pure per-row**
+    /// ([`is_pure_per_row_expr`]) — checked on the engine thread — so the contiguous concat is
+    /// provably serial-identical. The expansion row binding is the serial one: the anchor `from`, the
+    /// relationship var, and the far-endpoint `to`.
+    Project(&'p [ProjectionColumn]),
+}
+
+/// The single-hop `ExpandAll` pattern + post-work a Slice-3c [`expand_morsel`] reproduces per anchor
+/// (`rmp` task #339, Slice 3c). All fields mirror the serial `Operator::Expand` plan pieces, captured
+/// once on the engine thread and borrowed by every morsel (no per-morsel clone of the AST).
+///
+/// Scope (first cut): a **fixed-length, fresh** single hop — `range` is `None` (no variable-length
+/// `*m..n`) and the relationship variable is **not** pre-bound on the input. The executor recognizer
+/// declines anything outside this shape, so the morsel only ever runs the
+/// [`expand_into_pending`](crate::executor) equivalent.
+pub struct MorselExpandPlan<'p> {
+    /// The anchor (scanned-node) variable bound by the label scan — the `from` of the expand.
+    pub from: &'p Var,
+    /// The relationship variable the traversal binds.
+    pub relationship: &'p Var,
+    /// The far-endpoint variable the traversal binds.
+    pub to: &'p Var,
+    /// The traversal direction relative to the anchor.
+    pub direction: RelDirection,
+    /// The relationship-type alternatives; empty means "any type".
+    pub types: &'p [RelType],
+    /// The post-work over each expansion row (count, or per-row projection).
+    pub post: MorselExpandPostWork<'p>,
+}
+
 /// The store-side read surface one morsel runs over (`rmp` task #339), **object-safe** and
 /// `Send + Sync` so it can be boxed into a `(D, S)`-free [`MorselLabelScan`] bundle and cloned per
 /// morsel onto the worker pool.
@@ -325,6 +405,36 @@ pub trait MorselSource: Send + Sync {
         snapshot: Snapshot,
         registry: &CommitRegistry,
     ) -> MorselRowsOutcome;
+
+    /// Filters the contiguous **anchor** candidate slice `ids` to visible, label-carrying nodes, then
+    /// for each surviving anchor performs the single-hop `ExpandAll` described by `plan` and either
+    /// **counts** the produced rows (the degree / `count(b)` shape) or **projects** them
+    /// (`plan.projection`, the neighbour-collect shape), producing this morsel's
+    /// [`MorselExpandOutcome`] in (anchor, then per-anchor expansion) order (`rmp` task #339, Slice 3c
+    /// — the final slice, parallelizing the traversal). Records the per-anchor label-scan markers AND
+    /// the per-anchor `expand`'s relationship-pattern predicate + per-edge markers into a fresh
+    /// [`SsiReadBuffer`] tagged with `txn`.
+    ///
+    /// Internally this builds a [`ReadOnlyGraph`] over a cheap clone of this source — the **same**
+    /// `Send`, off-thread `GraphAccess` (incl. its `expand`, which routes through the identical lifted
+    /// `read_source::expand` body the live `RecordStoreGraph` uses) the `rmp` #336 Slice 3b-i reader is
+    /// built on — then reproduces the serial `Operator::Expand` semantics **exactly**: self-loops
+    /// reported once per matching side are deduplicated per anchor by relationship id, prior-pattern
+    /// relationships are excluded (relationship isomorphism), and (for the rows shape) each surviving
+    /// `(a, r, b)` is evaluated through the identical [`crate::eval::eval`] — so a morsel produces
+    /// byte-identical rows / counts, visibility, and SIREAD markers to the serial scan→expand path.
+    /// `params` supplies any `$param` the projection reads.
+    #[allow(clippy::too_many_arguments)] // a per-morsel read worker; the seams are positional
+    fn expand_morsel(
+        &self,
+        ids: &[u64],
+        label_token: u32,
+        plan: &MorselExpandPlan<'_>,
+        params: &BoundParameters,
+        txn: TxnId,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> MorselExpandOutcome;
 
     /// A **cheap** clone of this source as a fresh boxed handle (`rmp` task #339): a handful of `Arc`
     /// refcount bumps (the page-cache `Arc`, the `MetaSnapshot`'s per-store `Arc<[PageId]>`, the
@@ -540,6 +650,137 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         MorselRowsOutcome {
             rows,
             keys: keyed,
+            buffer,
+            error,
+        }
+    }
+
+    fn expand_morsel(
+        &self,
+        ids: &[u64],
+        label_token: u32,
+        plan: &MorselExpandPlan<'_>,
+        params: &BoundParameters,
+        txn: TxnId,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> MorselExpandOutcome {
+        // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
+        // `Arc` bumps, no page copy) — the identical `GraphAccess` the `rmp` #336 Slice 3b-i reader uses.
+        // Its `expand` routes through the SAME lifted `read_source::expand` body the live
+        // `RecordStoreGraph::expand` calls, so a morsel's traversal records byte-identical markers (the
+        // rel-pattern predicate + every examined edge) and visibility decisions to serial. Its own fresh
+        // `SsiReadBuffer` (tagged `txn`) catches every per-anchor label-scan marker AND every per-edge
+        // marker, taken back below and folded at convergence.
+        let graph = ReadOnlyGraph::new(
+            self.view.clone(),
+            self.tokens.clone(),
+            snapshot,
+            registry.clone(),
+            txn,
+            SsiReadBuffer::new(txn),
+        );
+
+        // The SAME visible-label-carrying ANCHOR set the serial `scan_nodes_by_label` index arm produces
+        // (the lifted `filter_label_candidates` over the same ids, recording the same per-candidate SIREAD
+        // markers into `graph`'s buffer). The slice is contiguous ⇒ survivors are in serial anchor order.
+        let anchors = graph.filter_label_candidates(label_token, ids.to_vec());
+
+        // Resolve the expand pieces ONCE (shared across every anchor in this morsel). The
+        // `ExpandDirection` mapping + the rel-type name vector are exactly what the serial
+        // `expand_into_pending` derives per call; computing them once here is a pure perf factoring, the
+        // produced incidents are identical.
+        let dir = ExpandDirection::from_pattern(plan.direction);
+        let type_names: Vec<String> = plan.types.iter().map(|t| t.name.clone()).collect();
+        let projection = match &plan.post {
+            MorselExpandPostWork::Count => None,
+            MorselExpandPostWork::Project(cols) => Some(*cols),
+        };
+
+        // The per-row evaluator state for the projection (rows shape only): the empty UDF set + a captured
+        // clock, both provably never consulted (the engine-thread purity gate rejects every projection
+        // expression containing a function call). They exist only to satisfy `eval`'s signature, exactly as
+        // the Slice-3b `read_filter_project_morsel` does.
+        let functions = empty_function_set();
+        let clock = StatementClock::capture();
+
+        let mut rows: Vec<Row> = Vec::new();
+        let mut partial_count: i64 = 0;
+        let mut first_error: Option<GraphusError> = None;
+
+        'anchors: for anchor in anchors {
+            // Reproduce the serial `Operator::Expand` / `expand_into_pending` EXACTLY (`04 §2.4`):
+            //   1. `expand` returns the incident sides (a self-loop is reported once PER matching
+            //      direction — twice for `Both` — and the live + reader paths share the body, so the
+            //      reported sides are identical);
+            //   2. a self-loop is collapsed to ONE produced row by deduplicating relationship ids per
+            //      anchor (`seen_rel`);
+            //   3. (prior-pattern isomorphism: there are no prior rels in the first-cut shape, so this is
+            //      vacuous — but kept structurally so the morsel matches serial even were it extended).
+            let incidents = graph.expand(anchor, dir, &type_names);
+            // A storage fault captured inside `expand` makes this anchor's incidents untrustworthy; bail to
+            // the post-loop error handling (the executor will discard + re-run serial).
+            if graph.has_error() {
+                break 'anchors;
+            }
+            let mut seen_rel = std::collections::BTreeSet::new();
+            for inc in incidents {
+                if !seen_rel.insert(inc.rel) {
+                    // A self-loop's second side (same rel id) — serial emits ONE row for it. Skip the dup.
+                    continue;
+                }
+                match projection {
+                    // Degree / `count` shape: every surviving expansion side is one matched row.
+                    None => {
+                        partial_count = partial_count.saturating_add(1);
+                    }
+                    // Neighbour-collect shape: build the serial expansion row binding
+                    // `{from: a, relationship: r, to: b}` and project it through the pure per-row columns.
+                    // `eval` resolves any `r`/`b` property against this same `graph` (registering its own
+                    // SIREAD markers into the morsel buffer, exactly as the serial projection's reads do).
+                    Some(cols) => {
+                        let in_row = Row::from_pairs([
+                            (
+                                plan.from.name.clone(),
+                                RowValue::Node(NodeRef { id: anchor }),
+                            ),
+                            (
+                                plan.relationship.name.clone(),
+                                RowValue::Rel(RelRef { id: inc.rel }),
+                            ),
+                            (
+                                plan.to.name.clone(),
+                                RowValue::Node(NodeRef { id: inc.neighbour }),
+                            ),
+                        ]);
+                        let mut out = Row::empty();
+                        for col in cols {
+                            match eval(&col.expr, &in_row, params, &graph, functions, &clock) {
+                                Ok(v) => out.set(col.alias.clone(), v),
+                                Err(e) => {
+                                    first_error.get_or_insert_with(|| eval_error_to_graphus(&e));
+                                    break;
+                                }
+                            }
+                        }
+                        if first_error.is_some() {
+                            break 'anchors;
+                        }
+                        rows.push(out);
+                    }
+                }
+            }
+        }
+
+        // A storage fault captured by any read (the per-anchor `expand`, or a projection property read)
+        // makes the whole morsel untrustworthy — surface it so the executor abandons the parallel path.
+        let read_error = graph.take_error();
+        let error = first_error.or(read_error);
+        let buffer = graph.take_buffer();
+
+        MorselExpandOutcome {
+            rows,
+            partial_count,
             buffer,
             error,
         }
@@ -773,6 +1014,29 @@ impl MorselLabelScan {
             filter,
             projection,
             sort_keys,
+            params,
+            self.txn,
+            self.snapshot,
+            &self.registry,
+        )
+    }
+
+    /// Expands `candidates[lo..hi]` (the anchors) as one morsel on the **current** thread (`rmp` task
+    /// #339, Slice 3c): cheap-clones the source and drives [`MorselSource::expand_morsel`] over the
+    /// slice with the single-hop `plan` + `params`. Called by [`run_expand_morsels`] inside the
+    /// dedicated worker pool, once per morsel.
+    pub fn expand_morsel(
+        &self,
+        lo: usize,
+        hi: usize,
+        plan: &MorselExpandPlan<'_>,
+        params: &BoundParameters,
+    ) -> MorselExpandOutcome {
+        let slice = &self.candidates[lo..hi];
+        self.source.clone_box().expand_morsel(
+            slice,
+            self.label_token,
+            plan,
             params,
             self.txn,
             self.snapshot,
@@ -1047,4 +1311,125 @@ fn stable_kway_merge(
         cursors[m] += 1;
     }
     out
+}
+
+// =================================================================================================
+// Slice 3c — the traversal (ExpandAll-over-anchor) runner + converge
+// =================================================================================================
+
+/// The converged result of [`run_expand_morsels`] (`rmp` task #339, Slice 3c): the converged rows
+/// (rows-over-expand shape) **or** the summed count (aggregate-over-expand shape), every morsel's
+/// SIREAD buffer (the executor folds each back via `merge_morsel_buffer`), and the first morsel error
+/// (if any). On an error the `rows` are empty / `count` is `0` and the caller discards the buffers
+/// too, falling back to the serial pipeline.
+#[must_use]
+#[derive(Default)]
+pub struct ExpandConverged {
+    /// The converged projected expansion rows in result order (contiguous concat in ascending anchor
+    /// source-index = the serial scan→expand→project order) — empty for the aggregate-over-expand
+    /// (degree) shape.
+    pub rows: Vec<Row>,
+    /// The summed `count(b)` / `count(*)`-over-expand value (aggregate-over-expand shape) — `0` for the
+    /// rows-over-expand shape. The combine is a plain saturating sum, order-independent.
+    pub count: i64,
+    /// Every morsel's SIREAD buffer, in ascending-anchor-source-index order. The executor merges each
+    /// into the statement tracker (sort + dedup ⇒ union = the serial scan→expand marker set). Returned
+    /// even on the error path so the caller can drop them explicitly.
+    pub buffers: Vec<SsiReadBuffer>,
+    /// The first morsel error, or `None`. While set, `rows`/`count` are empty and the caller runs serial.
+    pub error: Option<GraphusError>,
+}
+
+/// Runs `scan`'s anchor expand (`ExpandAll` per anchor) across contiguous morsels on the dedicated
+/// worker pool (`rmp` task #339, Slice 3c), then **converges** them **byte-identically to the serial
+/// scan→expand[→project]**:
+///
+/// * **Aggregate-over-expand (`plan.post == Count`)** — the morsels' per-anchor matching degrees are
+///   **summed** (a saturating, order-independent combine), reproducing serial `count(b)` / `count(*)`.
+/// * **Rows-over-expand (`plan.post == Project`)** — the morsels' projected expansion rows are
+///   **concatenated in ascending anchor source-index (`lo`) order**. Each morsel expands a *contiguous*
+///   anchor slice in serial anchor order (and per anchor, in the serial expansion order), so the concat
+///   reproduces the serial scan→expand→project row sequence exactly, **independent of the worker
+///   count**. (There is no ORDER BY in the first-cut 3c shape — a `Sort` above declines the tier and
+///   re-sorts the concat serially, still correct.)
+///
+/// Returns the converged rows (or count), the **concatenation** of every morsel's SIREAD buffer markers
+/// (the executor folds them back via `merge_morsel_buffer`, whose sort+dedup yields the union = the
+/// serial marker set), and the first morsel error (if any). `threads` is the effective worker count
+/// (`>= 2` when called).
+pub fn run_expand_morsels(
+    scan: &MorselLabelScan,
+    plan: &MorselExpandPlan<'_>,
+    params: &BoundParameters,
+    threads: usize,
+) -> ExpandConverged {
+    use rayon::prelude::*;
+
+    let bounds = morsel_bounds(scan.candidates.len(), threads);
+    if bounds.is_empty() {
+        return ExpandConverged::default();
+    }
+
+    // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
+    // order, so the outcomes are in ascending anchor order — the serial scan→expand order.
+    let outcomes: Vec<MorselExpandOutcome> = morsel_pool().install(|| {
+        bounds
+            .par_iter()
+            .map(|&(lo, hi)| scan.expand_morsel(lo, hi, plan, params))
+            .collect()
+    });
+
+    converge_expand_outcomes(outcomes)
+}
+
+/// Converges the per-morsel expand `outcomes` (in **ascending anchor source-index order**) into one
+/// ordered row stream + summed count + the morsels' buffers (`rmp` task #339, Slice 3c). Split out of
+/// [`run_expand_morsels`] so the fan-out and the converge are testable independently (the equivalence
+/// test drives an explicit morsel split through this exact converge):
+///
+/// * the `rows` are the **contiguous concat** in input (ascending-lo) order = the serial
+///   scan→expand→project order (rows shape; empty for the degree shape);
+/// * the `count` is the **saturating sum** of the per-morsel partial counts = serial `count` (degree
+///   shape; `0` for the rows shape);
+/// * on any morsel error the rows are returned empty / count `0` (the caller discards them + the buffers,
+///   then runs serial), with the first error surfaced.
+pub fn converge_expand_outcomes(outcomes: Vec<MorselExpandOutcome>) -> ExpandConverged {
+    let mut buffers: Vec<SsiReadBuffer> = Vec::with_capacity(outcomes.len());
+    let mut first_error: Option<GraphusError> = None;
+    let mut count: i64 = 0;
+    // The per-morsel rows in ascending-lo order — the concat input.
+    let mut runs: Vec<Vec<Row>> = Vec::with_capacity(outcomes.len());
+    for o in outcomes {
+        if first_error.is_none() && o.error.is_some() {
+            first_error = o.error;
+        }
+        count = count.saturating_add(o.partial_count);
+        buffers.push(o.buffer);
+        runs.push(o.rows);
+    }
+
+    if first_error.is_some() {
+        // The result is untrustworthy — empty rows + zero count (the caller discards them + every buffer,
+        // then runs serial). The buffers are still returned so a defensive caller could inspect.
+        return ExpandConverged {
+            rows: Vec::new(),
+            count: 0,
+            buffers,
+            error: first_error,
+        };
+    }
+
+    // Contiguous concat in ascending-lo order (each morsel's rows are already in serial anchor →
+    // per-anchor expansion order).
+    let mut rows = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+    for r in runs {
+        rows.extend(r);
+    }
+
+    ExpandConverged {
+        rows,
+        count,
+        buffers,
+        error: first_error,
+    }
 }
