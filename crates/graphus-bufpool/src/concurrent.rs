@@ -501,7 +501,22 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                     let idx = victim.idx;
                     let mut shard = self.lock_shard(page_id);
                     shard.insert(page_id, Slot::Ready(idx));
-                    self.frames[idx].pin_count.store(1, Ordering::Release);
+                    // SAFETY (pin accounting): publish OUR pin with `fetch_add(1)`, NOT an absolute
+                    // `store(1)`. The `Loading` reservation makes us the exclusive loader of this
+                    // page, but it does NOT make us the exclusive *pinner* of this frame: a hit-path
+                    // reader (`fetch`/`with_page_fetched`) that found the frame's PREVIOUS occupant
+                    // via `Ready(old)->idx` may have already done its optimistic `fetch_add(1)`
+                    // before `evict_held` removed that mapping, so a stale pin for the old page can
+                    // be in flight on this very frame. An absolute `store(1)` would *discard* that
+                    // pin; the stale reader then re-validates, sees the new `page_id`, and `unpin`s —
+                    // decrementing OUR pin instead of its own, dropping the frame's count below the
+                    // number of live holders. A later evictor would then reload the frame while a
+                    // holder is still about to read it, returning another page's bytes (the #339
+                    // read-integrity bug). `fetch_add(1)` keeps pins strictly additive: every
+                    // `fetch_add` is balanced by exactly one `unpin`, so the count always equals the
+                    // live-holder total and a pinned frame is never evicted out from under a reader.
+                    // `Release` publishes our load (the frame bytes) before the pin becomes visible.
+                    self.frames[idx].pin_count.fetch_add(1, Ordering::Release);
                     self.frames[idx].ref_bit.store(1, Ordering::Relaxed);
                     drop(shard);
                     drop(victim); // release the write latch only now, after the pin is set
@@ -555,7 +570,14 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         }
         let mut shard = self.lock_shard(page_id);
         shard.insert(page_id, Slot::Ready(idx));
-        self.frames[idx].pin_count.store(1, Ordering::Release);
+        // SAFETY (pin accounting): additive publish, NOT an absolute `store(1)` — identical
+        // reasoning to `fetch`'s publish above. A stale optimistic pin from the victim's PREVIOUS
+        // occupant (a hit-path reader that did `fetch_add(1)` on `Ready(old)->idx` before
+        // `evict_held` removed that mapping) may still be in flight on this frame; an absolute store
+        // would discard it and the subsequent stale `unpin` would then decrement OUR pin. Keeping
+        // pins strictly additive (`fetch_add`/`unpin` always balanced) is what guarantees a
+        // just-allocated page is never evicted out from under its allocator.
+        self.frames[idx].pin_count.fetch_add(1, Ordering::Release);
         self.frames[idx].ref_bit.store(1, Ordering::Relaxed);
         drop(shard);
         drop(victim); // release the write latch
@@ -747,13 +769,23 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         Ok(victim)
     }
 
-    /// Blanks a frame (after a failed load) so it is reusable as an empty slot.
+    /// Blanks a frame (after a failed load) so it is reusable as an empty slot. Caller holds the
+    /// frame's write latch via `victim`.
     fn blank(&self, victim: &mut Victim<'_>) {
         victim.guard.page_id = None;
         victim.guard.dirty = false;
-        self.frames[victim.idx]
-            .pin_count
-            .store(0, Ordering::Release);
+        // SAFETY (pin accounting): do NOT force the pin to 0. `blank` runs only on the LOAD-FAILURE
+        // path, where this thread (the loader) never added a pin — the additive `fetch_add` publish
+        // in `fetch`/`new_page` is success-only. The only pins that can be present here are stale
+        // optimistic pins placed by a hit-path reader on this frame's PREVIOUS occupant (via
+        // `Ready(old)->idx`) before `evict_held` removed that mapping; each is balanced by that
+        // reader's own `unpin`. Storing 0 would discard them and break the strictly-additive
+        // invariant (`fetch_add`⇔`unpin`) the whole protocol relies on, and could expose the frame
+        // (now `page_id == None`, an "empty" slot taken eagerly by `select_victim`) for reload while
+        // a stale `PinnedFrame(idx)` handle is still outstanding. Leaving the count alone keeps the
+        // frame reserved until its real holders unpin — `select_victim` already guaranteed
+        // `pin_count == 0` when it picked this victim, so any nonzero count here is exactly those
+        // self-balancing stale pins and can never wedge the frame.
         self.frames[victim.idx].ref_bit.store(0, Ordering::Relaxed);
     }
 
