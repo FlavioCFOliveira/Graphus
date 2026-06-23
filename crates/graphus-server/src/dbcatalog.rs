@@ -446,6 +446,11 @@ pub struct EngineParams {
     /// Per-database admission limit (each database gets its own semaphore of this many permits,
     /// applied via [`EngineHandle::with_admission_limit`]).
     pub max_concurrent_queries: usize,
+    /// The effective off-thread reader pool size (`rmp` task #336): how many reader worker threads each
+    /// database's engine spawns to run read-only auto-commit statements concurrently with its writer.
+    /// Resolved from [`AdmissionConfig::reader_threads`](crate::config::AdmissionConfig::reader_threads)
+    /// (already auto-sized when `0`).
+    pub reader_threads: usize,
     /// The encryption-at-rest master key (rmp #85), or `None` for the plaintext store path. When
     /// set, every database's store is an encrypted device (a per-store salted subkey is derived at
     /// create/open). When `None`, the store path is byte-identical to before encryption existed.
@@ -493,6 +498,7 @@ impl EngineParams {
             engine_queue_capacity: config.admission.engine_queue_capacity,
             result_buffer_capacity: config.admission.result_buffer_capacity,
             max_concurrent_queries: config.admission.max_concurrent_queries,
+            reader_threads: config.admission.reader_threads(),
             master_key,
             clock: std::sync::Arc::new(crate::server::SystemClock),
         })
@@ -693,6 +699,7 @@ fn spawn_db_engine(
         build,
         params.engine_queue_capacity,
         params.result_buffer_capacity,
+        params.reader_threads,
         metrics,
         std::sync::Arc::clone(&params.clock),
     )
@@ -1678,6 +1685,7 @@ mod tests {
             engine_queue_capacity: 64,
             result_buffer_capacity: 32,
             max_concurrent_queries: 16,
+            reader_threads: 2,
             master_key: None,
             clock: std::sync::Arc::new(crate::server::SystemClock),
         }

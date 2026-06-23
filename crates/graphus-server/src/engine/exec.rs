@@ -26,6 +26,7 @@ use graphus_wal::LogSink;
 
 use super::command::{AccessMode, Reply};
 use super::privileges::EffectivePrivileges;
+use super::read_pool::{ReadDispatch, ReadTask};
 use super::stream::{RowReceiver, RowSender};
 use super::{OpenTx, RunReply, TxTicket};
 use crate::metrics::Metrics;
@@ -143,7 +144,10 @@ fn register_builtin_extensions(reg: &mut ExtensionRegistry) {
 /// thread would block on a full channel with no consumer). A compile/bind/transaction error that
 /// occurs before the first row is delivered through `reply` as an `Err` instead.
 #[allow(clippy::too_many_arguments)] // The engine loop threads all execution context through here.
-pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
+pub(super) fn handle_run<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
     ticket: TxTicket,
@@ -151,19 +155,20 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     params: Vec<(String, graphus_core::Value)>,
     auto_commit: bool,
     privileges: Option<EffectivePrivileges>,
-    extensions: &ExtensionRegistry,
+    extensions: &Arc<ExtensionRegistry>,
+    dispatch: &ReadDispatch<D, S>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     clock: &Arc<dyn Clock + Send + Sync>,
     reply: Reply<Result<RunReply, GraphusError>>,
-) {
+) -> bool {
     // Resolve the open transaction.
     let Some(tx) = open.get(&ticket.0) else {
         let _ = reply.send(Err(GraphusError::Transaction(format!(
             "run in unknown transaction {}",
             ticket.0
         ))));
-        return;
+        return false;
     };
     let txn = tx.txn;
     let mode = tx.mode;
@@ -180,12 +185,12 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
     // are advisory cost inputs only; every cost-based rewrite is bag-preserving.
     let catalog = coordinator.catalog();
     let stats = coordinator.statistics();
-    let plan = match compile(query, &catalog, Some(&stats), extensions) {
+    let plan = match compile(query, &catalog, Some(&stats), extensions.as_ref()) {
         Ok(p) => p,
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
             let _ = reply.send(Err(e));
-            return;
+            return false;
         }
     };
     let bound = match bind_parameters(&plan, &to_parameters(params)) {
@@ -193,7 +198,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
             let _ = reply.send(Err(GraphusError::Runtime(e.to_string())));
-            return;
+            return false;
         }
     };
 
@@ -204,12 +209,85 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         let _ = reply.send(Err(GraphusError::Transaction(
             "write statement attempted in a READ transaction".to_owned(),
         )));
-        return;
+        return false;
     }
 
     // The egress channel: bounded for backpressure (`04 §9.3`), or unbounded for the inline
     // single-threaded driver (`super::stream::UNBOUNDED`, used by `super::LocalEngine`).
     let (row_tx, row_rx) = super::stream::egress(result_buffer_capacity);
+
+    // Off-thread read dispatch (`rmp` task #336, Slice 3b-ii): a **read-only auto-commit** statement is
+    // a candidate to run on a reader thread concurrently with this engine thread. We capture the owned
+    // `Send` read inputs **here on the engine thread** (so the reader never touches the live store's
+    // `Rc`/`RefCell` state), package a `ReadTask`, and submit it to the reader pool. The reader streams
+    // its rows and retires via the command channel — the engine then merges its SIREAD buffer (M1) and
+    // auto-commits. `begin` (TxnId mint + `ssi.register` + `active.insert`) already ran on this thread
+    // (the seam opened the auto-commit txn before this `Run`), so the reader's txn is in the conflict
+    // graph + active set *before* dispatch — the no-lost-edge + GC-watermark invariants.
+    //
+    // Only auto-commit Reads dispatch off-thread in this slice (explicit `BEGIN…MATCH…COMMIT` reads
+    // stay inline). A non-threaded dispatcher (DST `LocalEngine`) or a full reader queue falls through
+    // to the inline path below — always correct, just serial.
+    // Captured here so the queue-full fallback (below) can re-bind the locals the `ReadTask` consumes;
+    // `Some(..)` only on the off-thread path, reduced back to the inline locals if submission fails.
+    let mut plan = plan;
+    let mut bound = bound;
+    let mut row_tx = row_tx;
+    let mut row_rx = Some(row_rx);
+    let mut reply = Some(reply);
+    let mut privileges = privileges;
+    if mode == AccessMode::Read && auto_commit && dispatch.is_threaded() {
+        match coordinator.read_task_inputs(txn) {
+            Ok(inputs) => {
+                let task = ReadTask {
+                    txn,
+                    ticket,
+                    plan,
+                    bound,
+                    inputs,
+                    extensions: Arc::clone(extensions),
+                    privileges,
+                    row_tx,
+                    row_rx: row_rx
+                        .take()
+                        .expect("egress receiver present before dispatch"),
+                    reply: reply.take().expect("reply present before dispatch"),
+                };
+                match dispatch.try_submit(task) {
+                    Ok(()) => {
+                        // Dispatched: the reader owns the statement now. The engine does **not** commit
+                        // here — it commits when it processes the reader's retirement. The open-tx entry
+                        // stays in `open` (finalised at retirement); `active` keeps the reader's snapshot
+                        // pinning the GC watermark until then. Return `true` so the loop tracks it as an
+                        // in-flight reader (polls the retirement channel until it returns).
+                        return true;
+                    }
+                    Err(returned) => {
+                        // The reader queue is full: rather than block the engine, fall through to the
+                        // inline `stream_rows` path below (correct, just serial). Re-bind the locals the
+                        // task consumed. (We could fast-reject with `ServerBusy`, but running inline
+                        // keeps the statement serving — the admission limiter upstream bounds load.)
+                        plan = returned.plan;
+                        bound = returned.bound;
+                        row_tx = returned.row_tx;
+                        row_rx = Some(returned.row_rx);
+                        reply = Some(returned.reply);
+                        privileges = returned.privileges;
+                    }
+                }
+            }
+            Err(e) => {
+                // The txn vanished between `begin` and here (should not happen on the serial engine
+                // thread); surface it and finalise the auto-commit.
+                finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
+                let _ = reply.take().expect("reply present").send(Err(e));
+                return false;
+            }
+        }
+    }
+    // The inline locals (either we never dispatched off-thread, or the queue was full).
+    let row_rx = row_rx.expect("egress receiver present on the inline path");
+    let reply = reply.expect("reply present on the inline path");
 
     // Execute and stream. `produced_ok` is true iff streaming completed without a runtime error.
     // `stream_rows` opens the cursor, sends the `RunReply` (fields + receiver) over `reply` *before*
@@ -227,7 +305,7 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
         &plan,
         &bound,
         privileges,
-        extensions,
+        extensions.as_ref(),
         &row_tx,
         row_rx,
         reply,
@@ -255,6 +333,9 @@ pub(super) fn handle_run<D: BlockDevice, S: LogSink>(
             "slow query",
         );
     }
+    // The statement ran inline on this engine thread (it was already committed/rolled back above), so
+    // there is no off-thread reader to track.
+    false
 }
 
 /// Compiles a query string into a physical plan via the full front-end pipeline (lex → parse →
@@ -375,7 +456,7 @@ fn stream_rows<D: BlockDevice, S: LogSink>(
 /// and seam-captured deferral errors are surfaced by the caller after this returns (they live on the
 /// `graph`/wrapper, not in the runtime error channel).
 #[allow(clippy::too_many_arguments)] // Threads the seam + extension registry + egress channel.
-fn run_cursor(
+pub(super) fn run_cursor(
     plan: &graphus_cypher::PhysicalPlan,
     bound: &graphus_cypher::BoundParameters,
     graph: &mut dyn GraphAccess,

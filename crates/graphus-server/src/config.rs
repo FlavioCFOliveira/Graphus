@@ -136,6 +136,16 @@ pub struct AdmissionConfig {
     /// limit is immediately closed (load-shed) and counted in `graphus_connections_shed_total`. Must
     /// be > 0. (rmp #118)
     pub max_connections: usize,
+    /// Number of **off-thread reader worker threads** (`rmp` task #336): read-only auto-commit
+    /// statements run on this pool concurrently with the single writer (the engine thread), so multiple
+    /// `MATCH`es scale past one core. `0` (the default) selects an automatic size of
+    /// `min(available_parallelism(), 16)`; any value `> 0` pins the pool to exactly that many workers
+    /// (e.g. `1` keeps reads effectively serial for A/B comparison; a large value over-subscribes,
+    /// useful only when reads are I/O-bound). The reader work queue is bounded at
+    /// `reader_threads * 8` (floored at 16) — sized to the pool, independent of
+    /// [`engine_queue_capacity`](Self::engine_queue_capacity) (which bounds the *command* channel); a
+    /// full reader queue falls back to the inline engine-thread path (still correct, just serial).
+    pub reader_threads: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -145,6 +155,26 @@ impl Default for AdmissionConfig {
             engine_queue_capacity: 1024,
             result_buffer_capacity: 256,
             max_connections: 1024,
+            reader_threads: 0,
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// The effective off-thread reader pool size (`rmp` task #336): the configured
+    /// [`reader_threads`](Self::reader_threads), or — when that is `0` (auto) — `min(N, 16)` where `N`
+    /// is the available hardware parallelism (falling back to 1 if it cannot be queried). Capped at 16
+    /// so the pool never over-subscribes a many-core host past the point shared-buffer-pool contention
+    /// dominates (the measured Slice-1 knee); pin a larger value explicitly for an I/O-bound read mix.
+    #[must_use]
+    pub fn reader_threads(&self) -> usize {
+        if self.reader_threads > 0 {
+            self.reader_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(16)
         }
     }
 }
@@ -570,6 +600,13 @@ impl ServerConfig {
             self.admission.max_connections = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
                     "GRAPHUS_MAX_CONNECTIONS is not a positive integer: {v:?}"
+                ))
+            })?;
+        }
+        if let Ok(v) = var("GRAPHUS_READER_THREADS") {
+            self.admission.reader_threads = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_READER_THREADS is not a non-negative integer (0 = auto): {v:?}"
                 ))
             })?;
         }

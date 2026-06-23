@@ -45,6 +45,7 @@ use super::command::{
     RunSummary, reply_channel,
 };
 use super::privileges::EffectivePrivileges;
+use super::read_pool::ReadDispatch;
 use super::{OpenTx, TxTicket, dispatch_command};
 use crate::metrics::Metrics;
 
@@ -71,15 +72,26 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     open: HashMap<u64, OpenTx>,
     /// Monotonic ticket counter (same as the loop's).
     next_ticket: u64,
-    /// The compiled-in UDF/UDP + GDS registry, built once (as the engine thread does).
-    extensions: ExtensionRegistry,
+    /// The compiled-in UDF/UDP + GDS registry, built once (as the engine thread does). `Arc`-wrapped to
+    /// match the threaded engine's shape (`rmp` task #336); the inline driver never moves it to a
+    /// thread, but the shared signature keeps one execution path.
+    extensions: Arc<ExtensionRegistry>,
+    /// The read dispatcher: **always [`ReadDispatch::Inline`]** for the deterministic driver (`rmp`
+    /// task #336, Slice 3b-ii). Read-only statements run **inline on the calling thread**, not on a
+    /// reader pool — so the same seed yields the same execution (no OS thread to interleave), keeping
+    /// the DST/VOPR/Elle harness bit-deterministic. This is the load-bearing duality: production injects
+    /// [`ReadDispatch::Threaded`]; the simulator injects [`ReadDispatch::Inline`].
+    dispatch: ReadDispatch<D, S>,
+    /// A throwaway in-flight-reader counter `dispatch_command` writes through; under inline dispatch a
+    /// read never dispatches off-thread, so this stays `0` (every statement finalises synchronously).
+    readers_inflight: u64,
     /// Observability counters (a private registry; the simulator may read it for liveness checks).
     metrics: Arc<Metrics>,
     /// The injected (simulated) clock; threaded into execution so latency/timing is deterministic.
     clock: Arc<dyn Clock + Send + Sync>,
 }
 
-impl<D: BlockDevice, S: LogSink> LocalEngine<D, S> {
+impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> LocalEngine<D, S> {
     /// Builds a driver over an already-constructed coordinator and an injected clock.
     #[must_use]
     pub fn new(coordinator: TxnCoordinator<D, S>, clock: Arc<dyn Clock + Send + Sync>) -> Self {
@@ -87,7 +99,10 @@ impl<D: BlockDevice, S: LogSink> LocalEngine<D, S> {
             coordinator: Some(coordinator),
             open: HashMap::new(),
             next_ticket: 0,
-            extensions: super::exec::install_extensions(),
+            extensions: Arc::new(super::exec::install_extensions()),
+            // Inline (deterministic) read dispatch — never a pool. See the field docs.
+            dispatch: ReadDispatch::Inline,
+            readers_inflight: 0,
             metrics: Arc::new(Metrics::new()),
             clock,
         }
@@ -108,6 +123,8 @@ impl<D: BlockDevice, S: LogSink> LocalEngine<D, S> {
             &mut self.open,
             &mut self.next_ticket,
             &self.extensions,
+            &self.dispatch,
+            &mut self.readers_inflight,
             LOCAL_RESULT_BUFFER,
             &self.metrics,
             &self.clock,

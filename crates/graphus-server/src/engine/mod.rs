@@ -29,6 +29,7 @@ mod exec;
 mod handle;
 mod local;
 pub mod privileges;
+mod read_pool;
 pub mod rest_values;
 mod seam_bolt;
 mod seam_rest;
@@ -119,34 +120,66 @@ struct OpenTx {
 ///
 /// This function **blocks** the calling thread for the engine's lifetime; spawn it on a dedicated
 /// OS thread (see [`spawn_engine`]).
-fn run_engine_loop<D: BlockDevice, S: LogSink>(
+fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     coordinator: TxnCoordinator<D, S>,
     rx: std::sync::mpsc::Receiver<EngineCommand>,
     result_buffer_capacity: usize,
+    reader_threads: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) {
     let mut open: HashMap<u64, OpenTx> = HashMap::new();
     let mut next_ticket: u64 = 0;
     // The extension registry (user-defined functions/procedures, `rmp` task #75). Built **once** on
-    // the engine thread (so it need not be `Send`), it lives for the engine's lifetime and is
-    // borrowed immutably for each `Run` — sound because the engine handles commands serially.
-    let extensions = exec::install_extensions();
+    // the engine thread, then `Arc`-shared so an off-thread reader resolves UDF/UDP plans against the
+    // SAME registry that backed compilation (`rmp` task #336 — `ExtensionRegistry` is `Send + Sync`,
+    // so this is sound). The engine borrows it immutably for each `Run`; commands are serial.
+    let extensions = Arc::new(exec::install_extensions());
+    // The off-thread reader pool (`rmp` task #336, Slice 3b-ii): read-only auto-commit statements run
+    // on it concurrently with this engine thread. Workers post retirements back on a **dedicated**
+    // retirement channel (NOT the command channel — keeping it separate avoids the worker clones
+    // pinning the command channel open and lets the loop tear the pool down on a clean channel-close
+    // shutdown). The work queue is bounded (no unbounded channel — `04 §9.3`); a full queue makes the
+    // dispatch site fall back to the inline path.
+    let (retire_tx, retire_rx) = std::sync::mpsc::channel::<read_pool::ReadRetirement>();
+    let dispatch = read_pool::ReadDispatch::Threaded(read_pool::ReadPool::spawn(
+        reader_threads,
+        reader_threads.saturating_mul(8).max(16),
+        retire_tx,
+    ));
+    // How many readers are dispatched-but-not-yet-retired. While `> 0` the loop polls the retirement
+    // channel each tick so a retirement (which finalises the reader's auto-commit + closes its egress)
+    // is processed promptly even if no client command arrives. Incremented at dispatch, decremented as
+    // each retirement is processed.
+    let mut readers_inflight: u64 = 0;
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
     let mut coordinator = Some(coordinator);
 
-    loop {
-        // While a non-blocking index build is in progress (`rmp` task #91), use a *timed* receive so
-        // the build makes progress even when no command arrives; otherwise block plainly (no idle
-        // wakeups — a fully idle, build-free engine parks on `recv` exactly as before).
+    'engine: loop {
+        // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
+        // arrival order). Done first each iteration so a retirement is never starved behind a blocking
+        // command `recv`. Returns false only on `Shutdown`, which cannot arrive here (retirements are
+        // not commands), so the result is ignored.
+        process_retirements(
+            &retire_rx,
+            &mut coordinator,
+            &mut open,
+            &mut readers_inflight,
+            &metrics,
+        );
+
+        // A timed receive is needed when EITHER a non-blocking index build is in progress (`rmp` #91)
+        // OR readers are in flight (so their retirements are polled). Otherwise block plainly (no idle
+        // wakeups — a fully idle engine with no readers/builds parks on `recv` exactly as before).
         let building = coordinator
             .as_ref()
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .has_pending_index_builds();
+        let timed = building || readers_inflight > 0;
 
-        if building {
+        if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
                 Ok(cmd) => {
                     if !dispatch_command(
@@ -155,42 +188,144 @@ fn run_engine_loop<D: BlockDevice, S: LogSink>(
                         &mut open,
                         &mut next_ticket,
                         &extensions,
+                        &dispatch,
+                        &mut readers_inflight,
                         result_buffer_capacity,
                         &metrics,
                         &clock,
                     ) {
-                        break; // Shutdown handled (drained + hardened) inside the dispatch.
+                        break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
-                    // Steal a chunk after the command so a burst of commands still advances the build.
                     drive_index_build(&mut coordinator);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // No command this tick: advance the build, then loop and re-check.
+                    // No command this tick: advance any build, then loop (which drains retirements).
                     drive_index_build(&mut coordinator);
                 }
-                // Channel closed (all senders dropped) — the same end condition the old `while let
-                // Ok(..)` loop ended on. The in-flight build is durably `Populating`; it resumes on
-                // the next open (the `TxnCoordinator::new` crash-recovery path).
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // Channel closed (all client senders dropped): the engine is being torn down without a
+                // graceful `Shutdown`. Stop serving.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'engine,
             }
         } else {
-            // No build pending: a plain blocking receive (the original behaviour). `Err` is the
-            // closed-channel EOF the old `while let Ok(..)` terminated on.
-            let Ok(cmd) = rx.recv() else { break };
+            // No build pending and no readers in flight: a plain blocking receive (the original
+            // behaviour). `Err` is the closed-channel EOF the old `while let Ok(..)` terminated on.
+            let Ok(cmd) = rx.recv() else { break 'engine };
             if !dispatch_command(
                 cmd,
                 &mut coordinator,
                 &mut open,
                 &mut next_ticket,
                 &extensions,
+                &dispatch,
+                &mut readers_inflight,
                 result_buffer_capacity,
                 &metrics,
                 &clock,
             ) {
-                break;
+                break 'engine;
             }
         }
     }
+
+    // The loop has exited (Shutdown or channel close): tear down the reader pool so no worker thread
+    // outlives the engine. `shutdown` drops the work-queue sender (ending each worker's `recv`) and
+    // joins them. Any reader still in flight finished its rows already (it sends the retirement after
+    // its cursor drains); a retirement that arrives after the loop exited is dropped here — its
+    // transaction was already rolled back by `Shutdown`'s `drain_inflight`, never left half-applied.
+    if let read_pool::ReadDispatch::Threaded(pool) = dispatch {
+        pool.shutdown();
+    }
+}
+
+/// Drains and processes every reader retirement currently available on `retire_rx` (`rmp` task #336,
+/// Slice 3b-ii), on the engine thread, in arrival order. Non-blocking: stops when the channel is
+/// momentarily empty. Each retirement is finalised by [`finish_reader`].
+fn process_retirements<D: BlockDevice, S: LogSink>(
+    retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    readers_inflight: &mut u64,
+    metrics: &Metrics,
+) {
+    while let Ok(retirement) = retire_rx.try_recv() {
+        if let Some(coord) = coordinator.as_mut() {
+            finish_reader(coord, open, retirement, metrics);
+        }
+        *readers_inflight = readers_inflight.saturating_sub(1);
+        metrics.set_active_txns(coordinator.as_ref().map_or(0, |c| c.active_count() as u64));
+    }
+}
+
+/// Finalises an off-thread reader's retirement on the **engine thread** (`rmp` task #336, Slice
+/// 3b-ii) — the M1 serializability barrier + the auto-commit.
+///
+/// 1. **Merge (M1):** fold the reader's SIREAD buffer into the shared SSI tracker *before* the
+///    auto-commit's `detect_pivot_abort`, so the reader's rw-edges are present when its (or a
+///    concurrent writer's) pivot is checked. Because this runs on the single engine thread, in the
+///    retirement channel's arrival order, the no-lost-edge proof reduces to in-order event processing.
+/// 2. **Auto-commit (the terminal-error contract):** on a clean `outcome`, `commit` the reader — which
+///    may itself SSI-abort it (a writeless reader can be another transaction's pivot-victim). A commit
+///    failure is sent as a **terminal error** through the still-open egress channel `row_tx`, exactly
+///    as the inline auto-commit does (`exec::finish_autocommit`), so a rolled-back read is reported to
+///    the client as failed — never a silent success. On an `outcome` error (a runtime / captured /
+///    write-degrade error, R3) the reader is rolled back. Dropping `row_tx` here closes the stream.
+/// 3. **De-registration:** `commit`/`rollback` remove the reader from the coordinator's active set,
+///    releasing its hold on the GC watermark (`oldest_active_snapshot`) — only now, after its cursor
+///    fully drained (the reader sent this retirement post-drain). The `open` ticket is removed too.
+fn finish_reader<D: BlockDevice, S: LogSink>(
+    coordinator: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    retirement: read_pool::ReadRetirement,
+    metrics: &Metrics,
+) {
+    let read_pool::ReadRetirement {
+        txn,
+        ticket,
+        buffer,
+        outcome,
+        row_tx,
+    } = retirement;
+
+    // (1) M1: merge the reader's SIREAD markers into the shared tracker BEFORE any commit's pivot
+    // detection. On the single engine thread, so it is correctly ordered w.r.t. every other commit.
+    coordinator.merge_read_buffer(buffer);
+
+    // Remove the open-tx ticket (the engine owns its lifecycle now). A reader that the client
+    // disconnected from mid-stream still retires here and is finalised exactly once.
+    let still_open = open.remove(&ticket.0).is_some();
+
+    if !still_open {
+        // The ticket was already finalised (e.g. an explicit rollback raced the retirement). The
+        // merge above is harmless; just drop the egress channel.
+        drop(row_tx);
+        return;
+    }
+
+    // (2) Auto-commit: commit on a clean outcome, roll back on a read error (R3 — a captured
+    // deferral / write-degrade error must surface, never a silent commit over an untrustworthy read).
+    match outcome {
+        Ok(()) => match coordinator.commit(txn) {
+            Ok(_) => metrics.record_commit(),
+            Err(e) => {
+                // The COMMIT failed (e.g. an SSI serialization abort): the transaction is rolled back.
+                // Deliver the failure to the consumer as a terminal stream item BEFORE closing the
+                // egress channel — a rolled-back auto-commit must be reported as failed/retriable, never
+                // a silent success over undone work (`04 §1.3` step 6; the rmp #238 atomicity divergence).
+                let _ = row_tx.send(Err(e));
+                metrics.record_abort();
+            }
+        },
+        Err(read_err) => {
+            // The read itself errored (runtime / captured / write-degrade). The terminal error was
+            // already streamed by the reader (`run_read_task` sends it for auth/deferral errors); roll
+            // the transaction back so nothing is committed over an untrustworthy result.
+            let _ = read_err; // already surfaced to the consumer by the reader.
+            let _ = coordinator.rollback(txn);
+            metrics.record_abort();
+        }
+    }
+    // Closing the egress channel: every row + any terminal error has been sent.
+    drop(row_tx);
 }
 
 /// Advances the front non-blocking index build by one [`INDEX_BUILD_CHUNK`] (`rmp` task #91). A
@@ -208,12 +343,14 @@ fn drive_index_build<D: BlockDevice, S: LogSink>(coordinator: &mut Option<TxnCoo
 /// Factored out of [`run_engine_loop`] so the loop can choose its receive strategy (blocking vs.
 /// build-driving timed receive) without duplicating the command-dispatch arm.
 #[allow(clippy::too_many_arguments)] // The engine loop threads all execution context through here.
-fn dispatch_command<D: BlockDevice, S: LogSink>(
+fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     cmd: EngineCommand,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     open: &mut HashMap<u64, OpenTx>,
     next_ticket: &mut u64,
-    extensions: &graphus_cypher::extension::ExtensionRegistry,
+    extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
+    dispatch: &read_pool::ReadDispatch<D, S>,
+    readers_inflight: &mut u64,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
@@ -240,7 +377,7 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
             privileges,
             reply,
         } => {
-            exec::handle_run(
+            let dispatched_off_thread = exec::handle_run(
                 coord,
                 open,
                 ticket,
@@ -249,11 +386,18 @@ fn dispatch_command<D: BlockDevice, S: LogSink>(
                 auto_commit,
                 privileges.map(|p| *p),
                 extensions,
+                dispatch,
                 result_buffer_capacity,
                 metrics,
                 clock,
                 reply,
             );
+            // A read dispatched off-thread retires later (it is not yet finalised); track it so the
+            // engine loop polls the retirement channel until it returns. An inline statement already
+            // committed/rolled back here, so nothing to track.
+            if dispatched_off_thread {
+                *readers_inflight += 1;
+            }
             metrics.set_active_txns(coord.active_count() as u64);
         }
         Cmd::Commit { ticket, reply } => {
@@ -700,12 +844,13 @@ pub fn spawn_engine<D, S, B>(
     build: B,
     engine_queue_capacity: usize,
     result_buffer_capacity: usize,
+    reader_threads: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) -> Result<Engine>
 where
-    D: BlockDevice + 'static,
-    S: LogSink + 'static,
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
     B: FnOnce() -> Result<TxnCoordinator<D, S>> + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel::<EngineCommand>(engine_queue_capacity);
@@ -717,9 +862,17 @@ where
         .name("graphus-engine".to_owned())
         .spawn(move || match build() {
             Ok(coordinator) => {
-                // Startup succeeded: signal readiness, then run the loop until Shutdown.
+                // Startup succeeded: signal readiness, then run the loop until Shutdown. The loop
+                // spawns the off-thread reader pool internally (`rmp` task #336, Slice 3b-ii).
                 let _ = init_tx.send(Ok(()));
-                run_engine_loop(coordinator, rx, result_buffer_capacity, loop_metrics, clock);
+                run_engine_loop(
+                    coordinator,
+                    rx,
+                    result_buffer_capacity,
+                    reader_threads,
+                    loop_metrics,
+                    clock,
+                );
             }
             Err(e) => {
                 // Startup failed (e.g. corrupt store): report it and exit without serving.

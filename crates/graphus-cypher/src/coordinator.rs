@@ -49,9 +49,9 @@ use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
     ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextIndexEntry, GcPassReport,
-    IndexState, Namespace, RecordStore, SpatialIndexEntry,
+    IndexState, Namespace, RecordStore, SpatialIndexEntry, StoreReadView, TokenSnapshot,
 };
-use graphus_txn::{IsolationLevel, LockTable, Snapshot, SsiTracker};
+use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
 
 use crate::catalog::IndexCatalog;
@@ -171,6 +171,47 @@ struct PendingSpatialBuild {
     /// The next index into `snapshot` to process; complete once `cursor >= snapshot.len()`.
     cursor: usize,
 }
+
+/// The owned, `Send` pieces an off-thread reader needs to run a read-only statement against a
+/// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph), captured on the engine thread by
+/// [`TxnCoordinator::read_task_inputs`] (`rmp` task #336, Slice 3b-ii).
+///
+/// Every field is `Send` (compile-asserted just below), so the whole bundle moves cleanly
+/// to a reader thread. It holds **no** `Rc`/`RefCell` and no live borrow of the store: the
+/// [`StoreReadView`] is an `Arc`-shared page cache over an owned metadata snapshot, the
+/// [`CommitRegistry`] is a clone, and the [`SsiReadBuffer`] is freshly minted for the reader.
+pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
+    /// The owned decode surface over the committed store (`Arc<pool>` + `MetaSnapshot`).
+    pub view: StoreReadView<D, S>,
+    /// The owned `id ↔ name` token dictionary.
+    pub tokens: TokenSnapshot,
+    /// This reader's MVCC read snapshot (begin timestamp + owner txn).
+    pub snapshot: Snapshot,
+    /// A clone of the store's commit registry (resolves an in-flight writer to its outcome).
+    pub registry: CommitRegistry,
+    /// A fresh, empty SIREAD-marker buffer tagged with the reader's txn.
+    pub buffer: SsiReadBuffer,
+}
+
+// `rmp` #336 Slice 3b-ii: `ReadTaskInputs` is captured on the engine thread and MOVED into the
+// `ReadTask` sent to a reader thread, so it MUST be `Send`. A compile-time assertion (no runtime
+// body) that fails to build the instant a non-`Send` field is introduced — making the off-thread
+// dispatch's safety explicit here rather than only as a distant error at the `SyncSender<ReadTask>`
+// send site. Every field is `Send`: `StoreReadView`/`TokenSnapshot` are `Send + Sync` (Slice 3a),
+// `Snapshot` is `Copy`, and `CommitRegistry`/`SsiReadBuffer` are plain owned data. Asserted both for
+// the concrete DST instantiation and generically over the `D, S: Send + Sync` bound the view requires.
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn assert_read_task_inputs() {
+        assert_send::<ReadTaskInputs<graphus_io::MemBlockDevice, graphus_wal::MemLogSink>>();
+        fn assert_generic<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>() {
+            fn inner<T: Send>() {}
+            inner::<ReadTaskInputs<D, S>>();
+        }
+        assert_generic::<graphus_io::MemBlockDevice, graphus_wal::MemLogSink>();
+    }
+    let _ = assert_read_task_inputs;
+};
 
 /// Drives concurrent, serializable Cypher transactions over one shared [`RecordStore`] (`04 §5`).
 pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
@@ -2389,6 +2430,58 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Rc::clone(&self.columns),
             Rc::clone(&self.zones),
         ))
+    }
+
+    /// Captures, **on the engine thread**, the owned `Send` pieces an off-thread reader needs to run a
+    /// read-only statement for the open transaction `txn` against a
+    /// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph) — without holding any `Rc`/`RefCell`
+    /// across the thread boundary (`rmp` task #336, Slice 3b-ii).
+    ///
+    /// The returned [`ReadTaskInputs`] bundles: a [`StoreReadView`] (`Arc`-shared page cache + an owned
+    /// [`MetaSnapshot`](graphus_storage::MetaSnapshot) of the committed location metadata), a
+    /// [`TokenSnapshot`] (the `id ↔ name` dictionary), this reader's MVCC read [`Snapshot`], a **clone**
+    /// of the store's [`CommitRegistry`] (so the reader resolves an in-flight writer to its outcome
+    /// independently of the live store), and a **fresh, empty** [`SsiReadBuffer`] tagged with `txn` for
+    /// the reader to accumulate its SIREAD markers into.
+    ///
+    /// Because `txn` was registered with the SSI tracker and inserted into the active set at
+    /// [`begin`](Self::begin) — which happens **before** this capture and the subsequent dispatch — a
+    /// concurrent writer's `record_write` always sees `txn` in `ssi.txns` and forms any rw-edge against
+    /// it; and `txn` keeps pinning [`oldest_active_snapshot`](Self::oldest_active_snapshot) (so GC
+    /// cannot reclaim a version the reader still needs) until it is removed at retirement
+    /// (commit/rollback on the engine thread). The capture itself only **reads** the store (append-only
+    /// `device_pages` + monotonic `high_water`), so it is MVCC-superset-safe.
+    ///
+    /// # Errors
+    /// Returns [`GraphusError::Transaction`] if `txn` is not an open transaction.
+    pub fn read_task_inputs(&self, txn: TxnId) -> Result<ReadTaskInputs<D, S>> {
+        let snapshot = self.active.get(&txn).map(|a| a.snapshot).ok_or_else(|| {
+            GraphusError::Transaction(format!("read dispatch for inactive txn {}", txn.0))
+        })?;
+        let store = self.store.borrow();
+        Ok(ReadTaskInputs {
+            view: store.read_view(),
+            tokens: store.token_snapshot(),
+            snapshot,
+            registry: store.commit_registry().clone(),
+            buffer: SsiReadBuffer::new(txn),
+        })
+    }
+
+    /// Merges an off-thread reader's accumulated [`SsiReadBuffer`] into the shared
+    /// [`SsiTracker`](graphus_txn::SsiTracker) on the engine thread, replaying its SIREAD markers
+    /// (sorted + deduped) so the conflict graph is byte-identical to recording them inline (`rmp` tasks
+    /// #341 + #336, Slice 3b-ii).
+    ///
+    /// **This is the M1 serializability barrier.** The engine MUST call this for a retiring reader
+    /// **before** it runs [`commit`](Self::commit) for that reader (or for any concurrent writer whose
+    /// pivot detection could depend on the reader's edges) — i.e. the merge is the first step of closing
+    /// the reader. Because the merge and every [`commit`](Self::commit)'s `detect_pivot_abort` both run
+    /// on the engine thread from the single serial event stream, M1 reduces to in-order event
+    /// processing (see the Slice 3b no-lost-edge proof). Calling it for a still-open `txn` simply folds
+    /// the markers in; it does not commit or remove the transaction.
+    pub fn merge_read_buffer(&mut self, buffer: SsiReadBuffer) {
+        self.ssi.borrow_mut().merge_read_buffer(buffer);
     }
 
     /// Commits `txn`: runs SSI validation (SERIALIZABLE only, aborting a pivot on a dangerous
