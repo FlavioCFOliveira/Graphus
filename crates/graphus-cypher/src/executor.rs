@@ -1751,6 +1751,21 @@ fn build_operator(
             items,
             distinct,
         } => {
+            // Morsel-driven parallel scan→filter→project (`rmp` #339, Slice 3b): for a *large* bare
+            // `MATCH (n:Label) [WHERE <pure>] RETURN <per-row projection>` with the morsel knob enabled,
+            // read the candidates across contiguous morsels concurrently (each filtering + projecting on a
+            // `Send` `ReadOnlyGraph`), converging via a CONTIGUOUS CONCAT in ascending candidate order —
+            // row-order-identical to (and deterministic regardless of worker count, unlike) the serial
+            // pipeline. Declines (falls through) for any non-conforming / impure / below-threshold shape,
+            // knob<=1, RBAC restriction, standalone / historical read, or a morsel error. NB: a
+            // `Projection` directly under a `Sort` / `TopN` is handled by *those* sites (with the stable
+            // ORDER BY merge) before this builds the inner; if a Sort's tier declined, this concat path is
+            // still correct (the serial Sort above re-sorts the concat).
+            if !*distinct {
+                if let Some(rows) = try_morsel_scan_filter_project(op, &[], None, ctx)? {
+                    return Ok(Operator::Buffered { rows });
+                }
+            }
             let inner = build_operator(input, arg, ctx)?;
             if *distinct {
                 Ok(Operator::Buffered {
@@ -1807,6 +1822,15 @@ fn build_operator(
             })
         }
         PhysicalOp::Sort { input, keys } => {
+            // Morsel-driven parallel scan→filter→project + STABLE ORDER BY (`rmp` #339, Slice 3b): when a
+            // `Sort` sits directly above the eligible projection shape, read+filter+project the candidates
+            // across contiguous morsels, each pre-sorting its rows stably by `keys`, then converge via a
+            // STABLE k-way merge (ties broken by ascending candidate order) — byte-identical to the serial
+            // `sort_rows` stable `sort_by`. Declines (falls through to serial) for any non-conforming /
+            // impure / below-threshold shape, knob<=1, RBAC restriction, or a morsel error.
+            if let Some(rows) = try_morsel_scan_filter_project(input, keys, None, ctx)? {
+                return Ok(Operator::Buffered { rows });
+            }
             let inner = build_operator(input, arg, ctx)?;
             Ok(Operator::Buffered {
                 rows: sort_rows(inner, keys, None, ctx)?,
@@ -1814,6 +1838,13 @@ fn build_operator(
         }
         PhysicalOp::TopN { input, keys, limit } => {
             let n = eval_count(limit, ctx)?;
+            // Morsel-driven parallel scan→filter→project + STABLE top-k (`rmp` #339, Slice 3b): as the
+            // `Sort` case, but each morsel keeps its rows pre-sorted and the stable k-way merge bounds its
+            // output to the first `n` rows — byte-identical to serial `sort_rows`' stable sort + `truncate(n)`.
+            if let Some(rows) = try_morsel_scan_filter_project(input, keys, Some(n as usize), ctx)?
+            {
+                return Ok(Operator::Buffered { rows });
+            }
             let inner = build_operator(input, arg, ctx)?;
             Ok(Operator::Buffered {
                 rows: sort_rows(inner, keys, Some(n as usize), ctx)?,
@@ -2226,7 +2257,15 @@ fn sort_rows(
 
 /// Compares two rows' pre-computed sort-key vectors, honouring each key's direction and Cypher's
 /// `NULL`-largest ordering (`04 §7.6`: ascending puts `NULL` last; descending reverses).
-fn compare_sort_keys(a: &[RowValue], b: &[RowValue], keys: &[SortKey]) -> std::cmp::Ordering {
+///
+/// `pub(crate)` so the `rmp` #339 Slice-3b morsel converge ([`crate::morsel`]) uses the **same** total
+/// order — per-morsel stable sort + the engine-thread stable k-way merge — that serial `sort_rows`'
+/// stable `sort_by` uses, guaranteeing the parallel ORDER BY is row-order-identical to serial.
+pub(crate) fn compare_sort_keys(
+    a: &[RowValue],
+    b: &[RowValue],
+    keys: &[SortKey],
+) -> std::cmp::Ordering {
     for ((av, bv), key) in a.iter().zip(b.iter()).zip(keys.iter()) {
         let ord = cmp_row_values(av, bv);
         let ord = match key.direction {
@@ -2473,7 +2512,7 @@ fn try_morsel_label_aggregate(
         Some(count) => count as f64,
         None => return Ok(None),
     };
-    if !estimated_input.is_finite() || estimated_input < crate::morsel::MORSEL_MIN_ROWS {
+    if !estimated_input.is_finite() || estimated_input < crate::morsel::morsel_min_rows() {
         return Ok(None);
     }
 
@@ -2862,6 +2901,218 @@ fn try_vectorized_label_property_aggregate(
         row.set(col.alias.clone(), acc.finish());
     }
     Ok(Some(VecDeque::from(vec![row])))
+}
+
+/// The bare label-scan leaf at the bottom of a 3b shape, resolved to `(scan_var, label)` — the same two
+/// scan leaves the Slice-3a aggregate tier accepts. Returns `None` for any other op (⇒ the tier
+/// declines, serial path).
+fn morsel_label_scan_leaf(op: &PhysicalOp) -> Option<(&str, &str)> {
+    match op {
+        PhysicalOp::NodeByLabelScan { variable, label }
+        | PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => Some((&variable.name, &label.name)),
+        _ => None,
+    }
+}
+
+/// The recognized Slice-3b shape (`rmp` task #339): a bare `MATCH (n:Label) [WHERE <pure>] RETURN
+/// <per-row projection> [ORDER BY <pure keys> [LIMIT n]]`, decomposed into the pieces the morsel tier
+/// drives. Lifetimes borrow the plan (no clone of the AST).
+struct MorselScanFilterShape<'p> {
+    /// The scanned node variable.
+    scan_var: &'p str,
+    /// The scanned label name.
+    label: &'p str,
+    /// The residual `WHERE` predicate (pure per-row), or `None` for an unfiltered scan.
+    filter: Option<&'p Expr>,
+    /// The per-row projection columns.
+    projection: &'p [ProjectionColumn],
+    /// The `ORDER BY` keys (pure per-row, computed against the projected row), or empty (no sort).
+    sort_keys: &'p [SortKey],
+    /// The `TopN` row cap (a fused `ORDER BY … LIMIT n`), already evaluated, or `None`.
+    top_n: Option<usize>,
+}
+
+/// Recognizes the Slice-3b morsel scan→filter→project shape over `op` (`rmp` task #339), with optional
+/// `sort_keys` / `top_n` supplied by a `Sort` / `TopN` parent. Returns the decomposed shape, or `None`
+/// to decline (⇒ the caller runs the serial pipeline verbatim).
+///
+/// The accepted op is `Projection { items, distinct: false, input: <Filter? over a bare label scan> }`.
+/// Every recognized expression — the residual filter, every projection column, and every sort key — must
+/// be **pure per-row** ([`crate::morsel::is_pure_per_row_expr`]): no aggregates, subqueries,
+/// comprehensions, quantifiers, or function calls. That purity is what makes the contiguous concat (no
+/// sort) / stable k-way merge (sort) provably byte-identical to the serial pipeline. A `DISTINCT`
+/// projection is declined (it collapses rows cross-row; the contiguous concat cannot prove the dedup
+/// identical).
+fn recognize_morsel_scan_filter<'p>(
+    op: &'p PhysicalOp,
+    sort_keys: &'p [SortKey],
+    top_n: Option<usize>,
+) -> Option<MorselScanFilterShape<'p>> {
+    // The op must be a non-DISTINCT projection (DISTINCT is a cross-row collapse — decline).
+    let PhysicalOp::Projection {
+        input,
+        items,
+        distinct: false,
+    } = op
+    else {
+        return None;
+    };
+
+    // The projection's input is either a residual Filter over a bare label scan, or a bare label scan.
+    let (filter, scan_op): (Option<&Expr>, &PhysicalOp) = match input.as_ref() {
+        PhysicalOp::Filter {
+            input: scan,
+            predicate,
+        } => (Some(predicate), scan.as_ref()),
+        other => (None, other),
+    };
+    let (scan_var, label) = morsel_label_scan_leaf(scan_op)?;
+
+    // Every projection column, the residual filter, and every sort key must be PURE per-row (no
+    // aggregates / subqueries / comprehensions / quantifiers / function calls) — else the contiguous
+    // concat / stable merge cannot be proven order-identical to serial, so decline.
+    if !items
+        .iter()
+        .all(|c| crate::morsel::is_pure_per_row_expr(&c.expr))
+    {
+        return None;
+    }
+    if let Some(pred) = filter {
+        if !crate::morsel::is_pure_per_row_expr(pred) {
+            return None;
+        }
+    }
+    if !sort_keys
+        .iter()
+        .all(|k| crate::morsel::is_pure_per_row_expr(&k.expr))
+    {
+        return None;
+    }
+
+    Some(MorselScanFilterShape {
+        scan_var,
+        label,
+        filter,
+        projection: items,
+        sort_keys,
+        top_n,
+    })
+}
+
+/// If `op` (a `Projection`, or the `Projection` directly under a `Sort` / `TopN`) is the
+/// **morsel-parallel-eligible** scan→filter→project shape — a large bare `MATCH (n:Label) [WHERE <pure>]
+/// RETURN <per-row projection> [ORDER BY <pure keys> [LIMIT n]]`, with the morsel knob enabled and the
+/// seam able to hand off an off-thread read bundle — reads the label scan across **contiguous morsels
+/// concurrently** on the dedicated morsel pool (each morsel filtering + projecting on a `Send`
+/// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph) over a cheap-cloned read view, `rmp` task
+/// #339, Slice 3b), converges the rows **row-order-identically to serial**, and returns them. Otherwise
+/// returns `None` so the caller runs the serial pipeline verbatim.
+///
+/// # Row-order-identical to serial, by construction
+///
+/// * **No ORDER BY (contiguous concat)** — each morsel reads a *contiguous* candidate slice and
+///   `filter_label_candidates` preserves input order, so concatenating the morsels' projected rows in
+///   ascending source-index (`lo`) order reproduces the serial scan→filter→project candidate order
+///   exactly, **independent of the worker count** (the AC's determinism).
+/// * **ORDER BY / TopN (stable k-way merge)** — each morsel stably sorts its rows by the keys (ties
+///   keeping candidate order); a stable k-way merge over the per-morsel runs (same total order as serial
+///   `sort_rows`' `compare_sort_keys`, ties broken by ascending-`lo` = the serial candidate order)
+///   reproduces the serial stable `sort_by` byte-for-byte, and `top_n` truncates to the first `n` rows
+///   identically to serial's `truncate(n)`.
+/// * **Same values, visibility, SSI markers** — every morsel reads through the identical lifted read body
+///   over an MVCC-superset-safe `StoreReadView` and evaluates the filter / projection / sort keys with
+///   the identical [`eval`], so the `(node → row)` mapping and three-valued filter decisions match the
+///   serial path; the coarse `PredicateRead::Label` + all-live-nodes footprint is registered on the
+///   engine thread by the seam, and each morsel's per-candidate + per-row-read markers are folded back
+///   via `merge_morsel_buffer` (sort + dedup ⇒ union = the serial marker set).
+///
+/// # Eligibility (ALL required, else `None`)
+///
+/// - the morsel knob is enabled: [`Ctx::morsel_threads`] `> 1`;
+/// - the shape is [`recognize_morsel_scan_filter`]: a non-DISTINCT projection over a (filtered) bare
+///   label scan, every filter / projection / sort-key expression **pure per-row**;
+/// - the estimated label cardinality is at least [`MORSEL_MIN_ROWS`](crate::morsel::MORSEL_MIN_ROWS)
+///   (via `statistics().nodes_with_label`; no statistics ⇒ decline);
+/// - the seam returns `Some` from [`GraphAccess::morsel_label_scan`] (it declines for a restricted
+///   principal, a standalone / historical read, and `MemGraph`).
+///
+/// On any per-morsel error the tier discards every morsel's rows **and** buffers and returns `None`; the
+/// serial fallback re-runs the pipeline, re-registering the markers and re-raising the identical error.
+fn try_morsel_scan_filter_project(
+    op: &PhysicalOp,
+    sort_keys: &[SortKey],
+    top_n: Option<usize>,
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    // --- cheap gate first (no seam work): the morsel knob must be enabled (>= 2 workers) ---
+    if ctx.morsel_threads <= 1 {
+        return Ok(None);
+    }
+
+    // --- recognize exactly the scan→filter→project (+ optional ORDER BY / TopN) shape ---
+    let shape = match recognize_morsel_scan_filter(op, sort_keys, top_n) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // --- the size gate: the label scan's estimated cardinality (the work being parallelized) ---
+    let estimated_input = match ctx
+        .graph
+        .statistics()
+        .and_then(|s| s.nodes_with_label(shape.label))
+    {
+        Some(count) => count as f64,
+        None => return Ok(None),
+    };
+    if !estimated_input.is_finite() || estimated_input < crate::morsel::morsel_min_rows() {
+        return Ok(None);
+    }
+
+    // --- the engine-thread seam: capture the candidate vector + off-thread read surface (registers the
+    // identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
+    // fall through to the serial pipeline, which runs verbatim. ---
+    let Some(scan) = ctx.graph.morsel_label_scan(shape.label) else {
+        return Ok(None);
+    };
+
+    // Cancellation is polled once up front (the per-morsel work is a self-contained store read + pure
+    // evaluation, bounded by the candidate count).
+    ctx.check_cancelled()?;
+
+    // --- read + filter + project the morsels concurrently, converging row-order-identically to serial ---
+    let converged = crate::morsel::run_scan_filter_morsels(
+        &scan,
+        shape.scan_var,
+        shape.filter,
+        shape.projection,
+        shape.sort_keys,
+        shape.top_n,
+        ctx.params,
+        ctx.morsel_threads,
+    );
+
+    // If any morsel hit a storage / evaluation error, the parallel result is untrustworthy: decline
+    // WITHOUT folding the buffers (`converged.buffers` are dropped here). The serial fallback re-reads +
+    // re-evaluates through the live seam, re-registering the identical markers AND re-raising the
+    // identical error so the statement behaves exactly as if the morsel path had never run.
+    if converged.error.is_some() {
+        return Ok(None);
+    }
+
+    // Every gate passed and the read succeeded: record the engagement (observability), then converge the
+    // per-morsel SSI buffers. From here we are committed to the parallel result.
+    ctx.graph.note_parallel_aggregate();
+
+    // --- converge the per-morsel SIREAD buffers into the statement's shared SSI tracker (engine thread,
+    // before commit — rule M1). The merge sorts + dedups + replays, so the conflict graph is the union =
+    // the serial pipeline's marker set. ---
+    for buffer in converged.buffers {
+        ctx.graph.merge_morsel_buffer(buffer);
+    }
+
+    Ok(Some(VecDeque::from(converged.rows)))
 }
 
 /// The sole property name an aggregate column references on `scan_var`, if the column is a bare

@@ -318,14 +318,26 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<(PathBuf, String)>) {
 fn tck_conformance() {
     // `rmp` task #339: optionally run the whole TCK under the morsel-parallelism knob, so conformance is
     // proven identical with morsel intra-query parallelism enabled (`GRAPHUS_MORSEL_PARALLELISM=16`) and
-    // with it off (unset / `=1`). The morsel tier only engages above 50k label-rows, which no TCK
-    // scenario reaches, so the result is identical either way — this hook makes that explicit and
-    // testable end-to-end through the production seam.
+    // with it off (unset / `=1`).
     if let Some(n) = std::env::var("GRAPHUS_MORSEL_PARALLELISM")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
         graphus_cypher::morsel::set_morsel_threads(n);
+    }
+    // `rmp` task #339, Slice 3b: the morsel tiers normally engage only above 50k label-rows, which no TCK
+    // fixture reaches — so by default the morsel path is *gated off* in the TCK and conformance is proven
+    // identical merely by the hooks not perturbing the serial pipeline. To prove conformance ALSO flows
+    // *through* the morsel scan→filter→project + stable ORDER BY converge (the Slice-3b ordering
+    // obligation), lower the cardinality gate with `GRAPHUS_MORSEL_MIN_ROWS=0` (alongside
+    // `GRAPHUS_MORSEL_PARALLELISM=16`): every eligible bare-label-scan query — including the ORDER BY /
+    // LIMIT / list / aggregate cases — then runs the parallel converge on the small fixtures, and the
+    // result (including row order) must still be byte-identical conformance.
+    if let Some(rows) = std::env::var("GRAPHUS_MORSEL_MIN_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        graphus_cypher::morsel::set_morsel_min_rows(rows);
     }
 
     let root = graphus_tck::tck_root();

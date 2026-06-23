@@ -179,6 +179,20 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
         }
     }
 
+    /// Filters the candidate id list `ids` to the nodes that **currently** carry `label_token` and are
+    /// **visible** to this reader's snapshot, recording the per-candidate SIREAD markers into this
+    /// reader's own buffer (`rmp` task #339, Slice 3b — the morsel scan→filter→project primitive).
+    ///
+    /// This is the lifted [`read_source::filter_label_candidates`] over this reader's own
+    /// [`ReadViewSource`] + buffer/error sink, i.e. the **same** candidate filter the serial
+    /// `scan_nodes_by_label` index arm applies over the same ids — so a morsel's survivor set + markers
+    /// over a contiguous candidate slice match the serial path exactly. The coarse
+    /// `PredicateRead::Label` + all-live-nodes footprint is registered once on the **engine** thread (by
+    /// `morsel_label_scan`), never here, so taking this path does not double-register it.
+    pub fn filter_label_candidates(&self, label_token: u32, ids: Vec<u64>) -> Vec<NodeId> {
+        read_source::filter_label_candidates(&self.source(), &self.ctx(), self, label_token, ids)
+    }
+
     /// Captures `err` as the first read error (a later error never overwrites the first). Shared by the
     /// [`ReadSink`] impl and the write-degrade paths.
     fn capture_err(&self, err: GraphusError) {
