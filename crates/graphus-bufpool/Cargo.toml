@@ -14,6 +14,13 @@ description = "Self-managed buffer pool, page header and CRC32C checksums for Gr
 # default, so the production build never compiles the seam and the device stays encapsulated.
 dst = []
 
+# Eviction-diagnostics probe (`rmp` #359): exposes per-pool atomic counters classifying why a
+# `select_victim` sweep came up empty (every frame genuinely pinned vs transiently latch-contended)
+# and a wrong-page-read tripwire, so a fast runtime repro can MEASURE the precise mechanism of a
+# spurious-fetch-error / wrong-bytes bug rather than guess at it. OFF by default; the production
+# build never compiles the counters (zero cost — the methods do not exist).
+bufpool-probe = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }

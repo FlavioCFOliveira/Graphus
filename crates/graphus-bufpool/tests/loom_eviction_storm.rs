@@ -177,3 +177,194 @@ fn loom_reader_pin_never_lost_under_two_evictors() {
         }
     });
 }
+
+/// **The `rmp` #339 Slice 3c read-integrity bug: a SPURIOUS "pool full of pinned pages" fetch error
+/// under concurrent-reader eviction pressure, even though a victim frame is available.**
+///
+/// ## What the bug actually is (empirically established, not the original wrong-page hypothesis)
+///
+/// Instrumenting `with_page_fetched` proved the pool **never serves wrong bytes** — every served
+/// page's self-id matched the requested device page on every interleaving. The corruption
+/// (`b.name → Null`, `concurrent_eviction.rs` / the cypher morsel scan) was instead a **spurious
+/// read FAILURE**: on a page MISS, [`ConcurrentBufferPool::fetch`] called `select_victim`, and when
+/// that bounded `4*n` CLOCK sweep transiently came up empty — because concurrent readers held
+/// short-lived pins/latches on the frames it probed, or an evictor held a victim's write latch
+/// mid-load — `fetch` returned a hard `Err("buffer pool is full of pinned pages")` **instead of
+/// retrying**. That error propagated up the read-view chain, and the `Option`-returning
+/// `GraphAccess::node_property` collapsed it into `None` → `Value::Null` — a present property read
+/// as absent (a wrong-RESULT ACID read-integrity violation). It surfaced **only under eviction**,
+/// because a pool ≥ the working set never misses-without-a-victim, so it never hit the path (which
+/// is exactly why a large pool eliminated the corruption).
+///
+/// The fix makes the miss path treat a `select_victim` `None` as a **transient** condition (yield +
+/// retry within the existing `MAX_FETCH_RETRIES` bound) rather than a permanent failure.
+///
+/// ## What this models
+///
+/// **Two frames, three pages.** The setup pins page `A` and **keeps the pin** for the whole test, so
+/// frame-`A` is never evictable — leaving exactly **one** usable frame for `B` and `C`. Then:
+/// - `loader` does `with_page_fetched(B)` — a miss that loads `B` into the one free frame, **holding
+///   that frame's write latch for the duration of the load**, then unpins (freeing it again);
+/// - `requester` does `with_page_fetched(C)` — also a miss needing that same one frame as its victim.
+///
+/// There is an interleaving where `requester`'s `select_victim` runs while frame-`A` is pinned **and**
+/// the other frame is write-latched by `loader` mid-load: the sweep finds no victim *right then*.
+/// **Pre-fix, `requester` returns the spurious error.** Post-fix, it yields and retries; `loader`
+/// always finishes its load and unpins, so the frame becomes evictable and `requester` **always
+/// succeeds**. A victim is *guaranteed* to become available in every complete execution, so the
+/// post-fix contract is strict: `requester`'s fetch must return `Ok` on **every** interleaving.
+///
+/// Two spawned threads + a setup-held pin (3 frame-states, only 2 schedulable threads) keeps the loom
+/// search small enough to terminate on this loaded machine.
+///
+/// Run with:
+/// ```text
+/// RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 \
+///   cargo test -p graphus-bufpool --test loom_eviction_storm \
+///   loom_fetch_under_contention_never_spuriously_fails --release
+/// ```
+#[test]
+fn loom_fetch_under_contention_never_spuriously_fails() {
+    loom::model(|| {
+        const A: u64 = 0;
+        const B: u64 = 1;
+        const C: u64 = 2;
+
+        let dev = TaggedDevice::new(3);
+        // Two frames over three pages, with one frame pinned for the whole test (below): exactly ONE
+        // usable frame for B and C, so both the loader and the requester must use it as their victim.
+        let pool = ConcurrentBufferPool::new(dev, 2).shared();
+
+        // Pin A and KEEP the pin: frame-A is never evictable for the rest of the model. (Held on the
+        // main thread, so it costs no schedulable loom thread.)
+        let held = pool.fetch(PageId(A)).expect("seed fetch A");
+
+        let pl = Arc::clone(&pool);
+        let loader = loom::thread::spawn(move || {
+            // A miss: loads B into the one free frame (holding its write latch during the load), then
+            // unpins so the frame is evictable again. Whenever it succeeds it must read B's witness.
+            if let Ok(got) = pl.with_page_fetched(PageId(B), tag) {
+                assert_eq!(got, B, "loader read the wrong page: {got}");
+            }
+        });
+
+        let pr = Arc::clone(&pool);
+        let requester = loom::thread::spawn(move || {
+            // A miss needing the same one frame as its victim. A victim is GUARANTEED to become
+            // available (the loader always finishes + unpins, and frame-A is the only permanent pin),
+            // so this fetch must NEVER fail spuriously — the #339 bug is exactly such a spurious
+            // `Err("buffer pool is full of pinned pages")`. Post-fix it retries and always succeeds.
+            let got = pr.with_page_fetched(PageId(C), tag).expect(
+                "SPURIOUS FETCH FAILURE: a victim frame is guaranteed available (the loader unpins \
+                 and only frame-A is permanently pinned), yet fetch(C) returned an error — the #339 \
+                 read-integrity bug, where this error is swallowed into Value::Null by the \
+                 Option-returning node_property",
+            );
+            assert_eq!(got, C, "requester read the wrong page: {got}");
+        });
+
+        loader.join().unwrap();
+        requester.join().unwrap();
+
+        // Release the permanently-held A pin; the pool is fully evictable again.
+        pool.unpin(held);
+
+        // No pin leaked by any path on any interleaving: every frame is fetchable again.
+        for id in [A, B, C] {
+            let f = pool.fetch(PageId(id)).unwrap();
+            pool.unpin(f);
+        }
+    });
+}
+
+/// **Byte-integrity of a MULTI-HOP chain read under eviction** — the read shape the `rmp` #339/#359
+/// morsel scan actually performs (a record/overflow chain: each hop a separate
+/// [`ConcurrentBufferPool::with_page_fetched`] that reads the *next* page id out of the current
+/// page's bytes).
+///
+/// ## What this proves — and what it deliberately does NOT
+///
+/// This model asserts the **byte-integrity** invariant: whenever a chain hop's fetch *succeeds*, the
+/// frame holds **exactly** the page that hop asked for — never another page's bytes — even while two
+/// independent evictors reload the very frames the reader is walking. A wrong-page hop here would be
+/// the lost-pin corruption (`02fb803`: an absolute `store(1)` cold-path publish discarding a reader's
+/// optimistic pin, letting a second evictor reload a frame mid-read). The additive `fetch_add(1)`
+/// publish closes that window, and this model exhausts the interleavings that would expose it.
+///
+/// It **tolerates** a transient capacity error on any hop (every frame momentarily pinned by the two
+/// evictors is a legitimate, non-corrupting outcome under a 2-frame pool): this model is **not** the
+/// #359 spurious-fetch-error repro. That separate failure mode — a `select_victim` `Contended` sweep
+/// surfaced as a spurious `Err` instead of retried-with-backoff, then swallowed up the read-view chain
+/// into `Value::Null` — is modelled by
+/// [`loom_fetch_under_contention_never_spuriously_fails`] (which *guarantees* `Ok`), and reproduced at
+/// runtime by `tests/eviction_chain_repro.rs`. Here the contract is strictly byte-integrity: an `Err`
+/// is fine, wrong bytes are not.
+///
+/// Two frames over three pages, walked as a **2-hop** chain (`A → B`) by the reader while a **single**
+/// evictor churns page `C` — kept to two schedulable threads and a two-step walk so the (exhaustive)
+/// loom search terminates, while still interleaving a reader's *second* hop with a frame reload (the
+/// case a single-read model cannot reach: the reader holds no pin *between* hops, so an evictor can
+/// reload the frame the next hop will land on).
+///
+/// Run with (a modest preemption cap keeps the two-hop search fast):
+/// ```text
+/// RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=2 \
+///   cargo test -p graphus-bufpool --test loom_eviction_storm \
+///   loom_chained_read_never_crosses_pages_under_eviction --release
+/// ```
+#[test]
+fn loom_chained_read_never_crosses_pages_under_eviction() {
+    loom::model(|| {
+        const A: u64 = 0;
+        const B: u64 = 1;
+        const C: u64 = 2;
+
+        let dev = TaggedDevice::new(3);
+        let pool = ConcurrentBufferPool::new(dev, 2).shared();
+
+        // Pre-resident A so the reader's first hop takes the hit fast path (pin-before-latch — the
+        // window the lost-pin corruption lived in).
+        {
+            let f = pool.fetch(PageId(A)).expect("seed fetch A");
+            pool.unpin(f);
+        }
+
+        // The reader walks a fixed 2-hop chain A → B. At EACH hop, whenever the fetch succeeds it must
+        // read that hop's own page id (the witness equals the requested id) — never another page's. A
+        // transient capacity `Err` is tolerated (this model guards bytes, not the no-spurious-error
+        // contract); the walk simply stops.
+        let pr = Arc::clone(&pool);
+        let reader = loom::thread::spawn(move || {
+            for &cur in &[A, B] {
+                match pr.with_page_fetched(PageId(cur), tag) {
+                    Ok(witness) => assert_eq!(
+                        witness, cur,
+                        "CHAIN HOP CROSSED PAGES: asked for {cur}, frame held page {witness}'s bytes \
+                         — an evictor reloaded a frame the reader had pinned (a read-integrity / ACID \
+                         bug). This is the byte-integrity invariant, independent of the #359 \
+                         spurious-error contract."
+                    ),
+                    // A transient "pool full of pinned pages" under the 2-frame storm is legitimate and
+                    // non-corrupting; stop the walk (not the bug this model guards).
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let pc = Arc::clone(&pool);
+        let evictor_c = loom::thread::spawn(move || {
+            if let Ok(got) = pc.with_page_fetched(PageId(C), tag) {
+                assert_eq!(got, C, "evictor C read the wrong page: {got}");
+            }
+        });
+
+        reader.join().unwrap();
+        evictor_c.join().unwrap();
+
+        // No pin leaked on any interleaving.
+        for slot in 0..pool.capacity() {
+            let f = pool.fetch(PageId(slot as u64)).unwrap();
+            pool.unpin(f);
+        }
+    });
+}
