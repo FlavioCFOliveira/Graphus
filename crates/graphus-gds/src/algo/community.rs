@@ -14,8 +14,6 @@ use crate::csr::{CsrGraph, InternalId};
 use crate::error::{GdsError, Result};
 use std::collections::HashMap;
 
-use super::triangles::simple_undirected_adjacency;
-
 /// Configuration for [`label_propagation`].
 #[derive(Debug, Clone, Copy)]
 pub struct LabelPropagationConfig {
@@ -70,7 +68,10 @@ pub fn label_propagation(
         });
     }
 
-    let adj = simple_undirected_adjacency(graph);
+    // Shared, built-once flat-CSR simple-undirected adjacency (`rmp` #379): deduplicated, self-loop
+    // free, each run sorted ascending — the same set semantics LPA needs for neighbour tallies, and
+    // reused (not rebuilt) if `triangle_count` already ran over this projection.
+    let adj = graph.simple_undirected_csr();
     let mut label: Vec<InternalId> = (0..n as InternalId).collect();
 
     let mut iterations = 0u32;
@@ -88,7 +89,7 @@ pub fn label_propagation(
         let mut changed = false;
 
         for v in 0..n {
-            let neighbors = &adj[v];
+            let neighbors = adj.neighbors(v as InternalId).unwrap_or(&[]);
             if neighbors.is_empty() {
                 continue; // isolated node keeps its own label
             }

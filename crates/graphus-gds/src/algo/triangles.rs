@@ -32,8 +32,9 @@ pub struct TriangleResult {
 pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleResult> {
     let n = graph.node_count();
 
-    // Build deduplicated, self-loop-free undirected neighbour lists, each sorted ascending.
-    let adj = simple_undirected_adjacency(graph);
+    // Shared, built-once flat-CSR simple-undirected adjacency (`rmp` #379): deduplicated, self-loop
+    // free, each node's run sorted ascending. Reused by `label_propagation` on the same projection.
+    let adj = graph.simple_undirected_csr();
 
     let mut triangles = vec![0u64; n];
     let mut total = 0u64;
@@ -42,12 +43,12 @@ pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleR
     // exactly once when scanning the edge (u,v) with u < v and w > v.
     for u in 0..n {
         cancel.check()?;
-        let nu = &adj[u];
+        let nu = adj.neighbors(u as InternalId).unwrap_or(&[]);
         for &v in nu {
             if (v as usize) <= u {
                 continue;
             }
-            let nv = &adj[v as usize];
+            let nv = adj.neighbors(v).unwrap_or(&[]);
             // Intersect nu and nv, only counting w > v to avoid triple-counting. Both lists are
             // sorted ascending, so binary-search the smaller into the larger (the `w > v` filter
             // matches the original set-based version exactly).
@@ -69,7 +70,7 @@ pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleR
 
     let mut coefficient = vec![0.0f64; n];
     for i in 0..n {
-        let deg = adj[i].len() as u64;
+        let deg = adj.degree(i as InternalId) as u64;
         if deg >= 2 {
             // possible pairs = deg*(deg-1)/2; coefficient = triangles / possible_pairs.
             let pairs = deg * (deg - 1) / 2;
@@ -84,33 +85,6 @@ pub fn triangle_count(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<TriangleR
     })
 }
 
-/// Helper used by other modules: the deduplicated, self-loop-free undirected neighbour lists, each
-/// sorted in ascending [`InternalId`] order.
-///
-/// Returns contiguous `Vec<u32>` per node (rather than `BTreeSet`) for cache-friendly intersection
-/// (binary search / two-pointer merge) while preserving the same set semantics: each list is
-/// self-loop-free, has no duplicates, and is ascending — exactly the iteration order a `BTreeSet`
-/// would yield.
-#[must_use]
-pub(crate) fn simple_undirected_adjacency(graph: &CsrGraph) -> Vec<Vec<InternalId>> {
-    let n = graph.node_count();
-    let mut adj: Vec<Vec<InternalId>> = vec![Vec::new(); n];
-    for (u, neis) in graph.iter_adjacency() {
-        for &v in neis {
-            if u == v {
-                continue; // drop self-loops
-            }
-            adj[u as usize].push(v);
-            if let Some(list) = adj.get_mut(v as usize) {
-                list.push(u);
-            }
-        }
-    }
-    // Sort + dedup each list: ascending order with parallel edges collapsed, matching the prior
-    // BTreeSet semantics exactly.
-    for list in &mut adj {
-        list.sort_unstable();
-        list.dedup();
-    }
-    adj
-}
+// The simple-undirected adjacency is now built once and cached on the projection itself
+// ([`CsrGraph::simple_undirected_csr`], `rmp` #379) as a single flat CSR, replacing the prior helper
+// that allocated `n` per-node `Vec`s freshly for every consumer.
