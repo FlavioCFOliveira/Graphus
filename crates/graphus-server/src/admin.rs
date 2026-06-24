@@ -234,6 +234,17 @@ pub enum AdminCommand {
         /// The point to restore to (PITR).
         point: RestorePoint,
     },
+
+    // ---- Operator maintenance surface (rmp #305) ----
+    /// `CHECKPOINT DATABASE <name>` — drive a maintenance checkpoint of the online database `name`:
+    /// a reader-safe GC pass (reclaim dead versions + freeze committed MVCC stamps, lowering the WAL
+    /// reclaim floor) followed by a sharp checkpoint that flushes dirty pages home and physically
+    /// reclaims the WAL prefix below the floor — releasing RAM, disk and version slots that otherwise
+    /// only drain on the background cadence (`rmp` #305 / #313 / #315).
+    CheckpointDatabase {
+        /// The database to checkpoint (the catalog normalizes + validates it).
+        name: String,
+    },
 }
 
 /// The point a [`AdminCommand::RestoreDatabase`] should recover to (`rmp` task #149). Maps 1:1 onto
@@ -537,6 +548,15 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
     // first token alone (the operator backup surface, rmp #149).
     if verb == "BACKUP" || verb == "RESTORE" {
         return match parse_backup_restore(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // CHECKPOINT is never a valid Cypher statement start either, so it is CLAIMED on the first token
+    // alone (the operator maintenance surface, rmp #305).
+    if verb == "CHECKPOINT" {
+        return match parse_checkpoint(&verb, &mut lex) {
             Ok(cmd) => AdminParse::Command(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
@@ -1476,6 +1496,22 @@ fn parse_backup_restore(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand,
     Ok(AdminCommand::RestoreDatabase { name, path, point })
 }
 
+/// Parses `CHECKPOINT DATABASE <name>` (`rmp` #305), the operator maintenance trigger. Mirrors the
+/// `BACKUP DATABASE <name>` head: the `CHECKPOINT` verb is already consumed.
+fn parse_checkpoint(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
+    // DATABASE
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected DATABASE after {verb}"))?;
+    if !is_keyword(&kw, "DATABASE") {
+        return Err(unexpected_generic(&kw, &format!("DATABASE after {verb}")));
+    }
+    // <name>
+    let name = expect_security_name(lex, &format!("a database name after {verb} DATABASE"))?;
+    expect_end(lex, "CHECKPOINT DATABASE")?;
+    Ok(AdminCommand::CheckpointDatabase { name })
+}
+
 /// Parses an optional `AT (LSN | TIMESTAMP) <n>` clause for `RESTORE DATABASE` (`rmp` task #149).
 /// Absent ⇒ [`RestorePoint::Latest`]. `<n>` is a non-negative decimal integer.
 fn parse_optional_restore_point(lex: &mut Lexer<'_>) -> Result<RestorePoint, String> {
@@ -2171,6 +2207,18 @@ impl AdminContext {
                 };
                 outcome
                     .map(|()| AdminResult::empty())
+                    .map_err(|e| graphus_error_from_catalog(&e))
+            }
+
+            // ---- Operator maintenance surface (rmp #305) ----
+            AdminCommand::CheckpointDatabase { name } => {
+                let outcome = {
+                    let catalog = Arc::clone(&self.catalog);
+                    let name = name.clone();
+                    self.run_on_runtime(async move { catalog.checkpoint(&name).await })?
+                };
+                outcome
+                    .map(|_report| AdminResult::empty())
                     .map_err(|e| graphus_error_from_catalog(&e))
             }
         }
@@ -3177,5 +3225,42 @@ mod tests {
         invalid("GRANT READ ON LABEL sales.Person.extra TO reader"); // too many segments
         invalid("GRANT READ ON DATABASE reader"); // missing TO
         invalid("GRANT READ ON DATABASE TO reader extra"); // trailing
+    }
+
+    #[test]
+    fn checkpoint_database_parses_over_the_wire() {
+        // The `rmp` #305 over-the-wire maintenance trigger. `CHECKPOINT` is claimed on the first token
+        // (never valid Cypher), case-insensitive, and carries the target database name.
+        assert_eq!(
+            cmd("CHECKPOINT DATABASE sales"),
+            AdminCommand::CheckpointDatabase {
+                name: "sales".to_owned()
+            }
+        );
+        assert_eq!(
+            cmd("  checkpoint   database   Telemetry  "),
+            AdminCommand::CheckpointDatabase {
+                name: "Telemetry".to_owned() // normalization is the catalog's job
+            }
+        );
+
+        // It is audited as an admin change targeting the named database, with a secret-free detail.
+        let c = AdminCommand::CheckpointDatabase {
+            name: "sales".to_owned(),
+        };
+        assert!(crate::audit::is_mutating_admin(&c));
+        assert_eq!(
+            crate::audit::admin_target_database(&c),
+            Some("sales".to_owned())
+        );
+        assert_eq!(
+            crate::audit::redact_admin_detail(&c),
+            "CHECKPOINT DATABASE sales"
+        );
+
+        // Grammar errors are rejected (claimed, then must parse exactly) — never passed to Cypher.
+        invalid("CHECKPOINT sales"); // missing DATABASE
+        invalid("CHECKPOINT DATABASE"); // missing name
+        invalid("CHECKPOINT DATABASE sales extra"); // trailing tokens
     }
 }

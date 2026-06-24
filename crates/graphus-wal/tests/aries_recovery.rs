@@ -326,7 +326,7 @@ fn reclaim_respects_the_active_transaction_floor_and_recovery_skips_the_freed_pr
         .insert(0, (Lsn(wal.durable_len()), 100 - 10 - 7));
     store.pages.insert(1, (Lsn(wal.durable_len()), 100 + 5));
     let mut sink = MemLogSink::new();
-    sink.append(wal.sink().durable_bytes());
+    sink.append(&wal.sink().durable_bytes());
     sink.sync().unwrap();
     let mut wal2 = WalManager::open(sink).unwrap();
     let report = recover(&mut wal2, &mut store).expect("recovery over a reclaimed log succeeds");

@@ -339,6 +339,28 @@ pub enum EngineCommand {
         /// signals a corrupt source store — `backup_store` refuses to back up corruption).
         reply: Reply<Result<Vec<u8>, GraphusError>>,
     },
+    /// Drive a **maintenance checkpoint** of the live store (`rmp` #305): a reader-safe GC pass (which
+    /// reclaims dead versions and freezes committed MVCC stamps, lowering the WAL reclaim floor)
+    /// followed by a sharp checkpoint that flushes dirty pages home and physically reclaims the WAL
+    /// prefix below the floor — releasing RAM (`rmp` #313), disk (`rmp` #315) and version slots. Like
+    /// the DDL/backup commands this takes no admission permit (the engine serialises it itself) and
+    /// the caller is responsible for the admin-privilege gate beforehand. Driven by the over-the-wire
+    /// `CHECKPOINT DATABASE` admin statement **and** the engine's background maintenance cadence.
+    Checkpoint {
+        /// Reply channel: a [`CheckpointReply`] summary, or a storage error from the GC pass / flush /
+        /// reclaim.
+        reply: Reply<Result<CheckpointReply, GraphusError>>,
+    },
+}
+
+/// The summary of a [`EngineCommand::Checkpoint`] maintenance pass — what the GC sweep reclaimed/froze,
+/// surfaced to the operator (over the wire) and to observability (the background cadence logs it).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckpointReply {
+    /// MVCC version slots reclaimed (returned to the free list) by the GC pass.
+    pub reclaimed: usize,
+    /// Committed in-flight MVCC stamps settled to their durable `Committed(ts)` form by the freeze sweep.
+    pub frozen: usize,
 }
 
 /// The summary metadata for a finished result / committed transaction, unified across both seams.

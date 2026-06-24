@@ -917,7 +917,8 @@ pub fn classify_admin(cmd: &crate::admin::AdminCommand) -> AuditClass {
         | A::ShowDatabases
         | A::ShowDatabase { .. }
         | A::BackupDatabase { .. }
-        | A::RestoreDatabase { .. } => AuditClass::AdminChange,
+        | A::RestoreDatabase { .. }
+        | A::CheckpointDatabase { .. } => AuditClass::AdminChange,
     }
 }
 
@@ -943,6 +944,7 @@ pub fn is_mutating_admin(cmd: &crate::admin::AdminCommand) -> bool {
             | A::RevokePrivilege { .. }
             | A::BackupDatabase { .. }
             | A::RestoreDatabase { .. }
+            | A::CheckpointDatabase { .. }
     )
 }
 
@@ -959,7 +961,8 @@ pub fn admin_target_database(cmd: &crate::admin::AdminCommand) -> Option<String>
         | A::StopDatabase { name }
         | A::ShowDatabase { name }
         | A::BackupDatabase { name, .. }
-        | A::RestoreDatabase { name, .. } => Some(name.clone()),
+        | A::RestoreDatabase { name, .. }
+        | A::CheckpointDatabase { name } => Some(name.clone()),
         _ => None,
     }
 }
@@ -1024,6 +1027,7 @@ pub fn redact_admin_detail(cmd: &crate::admin::AdminCommand) -> String {
             };
             format!("RESTORE DATABASE {name} FROM {path}{at}")
         }
+        A::CheckpointDatabase { name } => format!("CHECKPOINT DATABASE {name}"),
     }
 }
 

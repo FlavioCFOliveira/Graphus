@@ -18,8 +18,8 @@ use tokio::sync::Semaphore;
 
 use super::TxTicket;
 use super::command::{
-    AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, ReplyReceiver,
-    RunReply, RunSummary, reply_channel,
+    AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
+    ReplyReceiver, RunReply, RunSummary, reply_channel,
 };
 use super::privileges::EffectivePrivileges;
 use crate::metrics::Metrics;
@@ -260,6 +260,22 @@ impl EngineHandle {
     pub async fn backup(&self) -> Result<Vec<u8>, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit(EngineCommand::Backup { reply }).await?;
+        recv_async(rx).await?
+    }
+
+    /// Drives a **maintenance checkpoint** of the live store (`rmp` #305): a reader-safe GC pass plus a
+    /// sharp checkpoint that reclaims RAM (the in-memory WAL tail), disk (sealed WAL segments below the
+    /// floor) and version slots — the resource leaks that previously had no production trigger (`rmp`
+    /// #305 / #313 / #315). Online: the engine runs it between commands, never stopping the database.
+    /// Like the DDL/backup commands it takes **no admission permit**; the caller (the admin surface)
+    /// applies the admin-privilege gate beforehand. Returns a [`CheckpointReply`] summary.
+    ///
+    /// # Errors
+    /// [`GraphusError::Storage`] if the GC pass, the flush, or the WAL reclaim fails, or if the engine
+    /// is shut down.
+    pub async fn checkpoint(&self) -> Result<CheckpointReply, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::Checkpoint { reply }).await?;
         recv_async(rx).await?
     }
 

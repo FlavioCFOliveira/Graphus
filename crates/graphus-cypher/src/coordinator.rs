@@ -2609,6 +2609,47 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(report)
     }
 
+    /// Drives a full **maintenance checkpoint** (`rmp` #305): a reader-safe GC pass followed by a
+    /// sharp store checkpoint, so storage actually reclaims RAM (the in-memory WAL tail), disk (the
+    /// sealed WAL segments below the floor), and version slots — the three resource leaks that had no
+    /// production trigger (`rmp` #305 / #313 / #315).
+    ///
+    /// The order is load-bearing:
+    ///
+    /// 1. **[`gc`](Self::gc)** reclaims dead versions *and* runs the freeze sweep that settles each
+    ///    committed in-flight MVCC stamp to its durable `Committed(ts)` form. Freezing is what lets
+    ///    [`RecordStore`] drop a writer from its `unfrozen_commit_lsn` map — i.e. it **lowers the WAL
+    ///    reclaim floor**. Without this pass first, the floor stays pinned at the oldest unfrozen
+    ///    commit record and a checkpoint can free almost nothing.
+    /// 2. **[`RecordStore::checkpoint`]** then flushes every dirty page home (enforcing WAL-before-data
+    ///    per page), writes the clean checkpoint marker, and physically reclaims the WAL prefix below
+    ///    the now-lowered floor.
+    ///
+    /// Durability is preserved throughout: the GC pass commits its frozen headers before the
+    /// checkpoint reads the floor, the checkpoint flush makes everything prior durable on its data
+    /// page before the WAL prefix is freed, and the reclaim floor still clamps to the oldest active
+    /// transaction's first record (loser undo) and the oldest unfrozen commit record — so ARIES
+    /// recovery over the reclaimed log is unaffected. Must run between commands on the engine thread,
+    /// never while a statement seam holds the store borrow (same discipline as
+    /// [`with_store_mut`](Self::with_store_mut)).
+    ///
+    /// # Errors
+    /// Propagates a storage error from the GC pass, its commit, or the checkpoint flush/reclaim.
+    pub fn checkpoint(&mut self) -> Result<GcPassReport> {
+        let report = self.gc()?;
+        self.store.borrow_mut().checkpoint()?;
+        Ok(report)
+    }
+
+    /// The current durable WAL length in bytes (the group-commit watermark). The engine's background
+    /// maintenance cadence (`rmp` #305) reads this to decide when enough WAL has accumulated since the
+    /// last maintenance [`checkpoint`](Self::checkpoint) to drive another one — bounding the resource
+    /// drift (RAM/disk/version slots) between operator-triggered checkpoints.
+    #[must_use]
+    pub fn wal_durable_len(&self) -> u64 {
+        self.store.borrow().with_wal(|w| w.durable_len())
+    }
+
     /// Rolls `txn` back: undoes its writes on the store, forgets its SSI markers, and releases its
     /// locks.
     ///

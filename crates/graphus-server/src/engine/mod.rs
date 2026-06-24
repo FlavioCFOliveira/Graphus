@@ -46,7 +46,8 @@ use graphus_txn::IsolationLevel;
 use graphus_wal::LogSink;
 
 pub use command::{
-    AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply, RunSummary,
+    AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
+    RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
 pub use local::LocalEngine;
@@ -80,6 +81,19 @@ const INDEX_BUILD_CHUNK: usize = 512;
 /// store finishes in a fraction of a second even with no traffic. When **no** build is pending the
 /// loop reverts to a plain blocking `recv()` — zero idle wakeups (no busy-loop).
 const INDEX_BUILD_TICK: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// WAL bytes the engine lets accumulate since the last **maintenance checkpoint** before driving the
+/// next one automatically (`rmp` #305 background cadence). A maintenance checkpoint runs a reader-safe
+/// GC pass (reclaim dead versions + freeze committed MVCC stamps, lowering the WAL reclaim floor) and a
+/// sharp checkpoint that physically reclaims the WAL prefix below the floor — so RAM (the in-memory WAL
+/// tail), disk (sealed WAL segments) and version slots are reclaimed without an operator trigger.
+///
+/// Distinct from [`graphus_storage::DEFAULT_CHECKPOINT_INTERVAL_BYTES`] (the store's own redo-bounding
+/// checkpoint, which cannot lower the floor on its own because only the GC freeze sweep settles the
+/// `unfrozen_commit_lsn` map). 256 MiB amortises the GC sweep's full-store scan against sustained write
+/// load while keeping the steady-state footprint bounded; it is checked only after a mutating command,
+/// so a fully idle engine (no WAL growth, nothing to reclaim) never wakes to run it.
+const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// An opaque handle to a transaction the engine opened.
 ///
@@ -156,6 +170,14 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
     let mut coordinator = Some(coordinator);
+    // The WAL `durable_len` captured at the last background maintenance checkpoint (`rmp` #305). The
+    // cadence fires when growth past it crosses `MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`, reclaiming
+    // RAM/disk/version slots without an operator trigger. Seeded from the current WAL length so a
+    // freshly-opened engine does not immediately run a (no-op) pass.
+    let mut wal_at_last_maintenance: u64 = coordinator
+        .as_ref()
+        .expect("INVARIANT: coordinator is Some at startup")
+        .wal_durable_len();
 
     'engine: loop {
         // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
@@ -197,6 +219,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
                     drive_index_build(&mut coordinator);
+                    maybe_run_maintenance(&mut coordinator, &mut wal_at_last_maintenance, &metrics);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
@@ -224,6 +247,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             ) {
                 break 'engine;
             }
+            maybe_run_maintenance(&mut coordinator, &mut wal_at_last_maintenance, &metrics);
         }
     }
 
@@ -328,6 +352,44 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
     drop(row_tx);
 }
 
+/// Drives the **background maintenance cadence** (`rmp` #305): once the WAL has grown by
+/// [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`] since the last maintenance pass, run a
+/// [`TxnCoordinator::checkpoint`] (reader-safe GC + sharp checkpoint) so RAM (the in-memory WAL tail),
+/// disk (sealed WAL segments below the floor) and version slots are reclaimed without an operator
+/// trigger. Called between commands on the engine thread, where the store is not borrowed by any
+/// statement seam — the same discipline [`TxnCoordinator::with_store_mut`] requires; off-thread readers
+/// hold a cloned read-view, never the store's `RefCell` borrow, so they do not conflict.
+///
+/// The GC watermark is derived from the oldest open reader's snapshot inside `checkpoint`, so a pass
+/// run with readers in flight can never reclaim a version any of them must still observe (the #220
+/// premature-reclamation guard). A maintenance failure is **logged and swallowed**: it must never take
+/// the engine down (durability is unaffected — nothing was reclaimed below the floor), and the next
+/// tick retries once more WAL accrues.
+fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    wal_at_last_maintenance: &mut u64,
+    metrics: &Metrics,
+) {
+    let Some(coord) = coordinator.as_mut() else {
+        return;
+    };
+    let durable = coord.wal_durable_len();
+    if durable.saturating_sub(*wal_at_last_maintenance) < MAINTENANCE_CHECKPOINT_INTERVAL_BYTES {
+        return;
+    }
+    match coord.checkpoint() {
+        Ok(report) => {
+            metrics.record_maintenance_checkpoint(report.reclaimed as u64, report.frozen as u64);
+        }
+        Err(e) => {
+            // Never fatal: the floor was respected, so durability is intact; just record and retry later.
+            tracing::warn!("background maintenance checkpoint failed (will retry): {e}");
+        }
+    }
+    // Re-read: the checkpoint reclaimed the WAL prefix, so anchor the next interval at the new length.
+    *wal_at_last_maintenance = coord.wal_durable_len();
+}
+
 /// Advances the front non-blocking index build by one [`INDEX_BUILD_CHUNK`] (`rmp` task #91). A
 /// no-op when no build is pending. Kept tiny and inline-friendly so the loop's two call sites read
 /// clearly.
@@ -423,6 +485,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         }
         Cmd::Backup { reply } => {
             let out = handle_backup(coord);
+            let _ = reply.send(out);
+        }
+        Cmd::Checkpoint { reply } => {
+            let out = handle_checkpoint(coord);
             let _ = reply.send(out);
         }
         Cmd::Shutdown { reply } => {
@@ -612,6 +678,21 @@ fn handle_backup<D: BlockDevice, S: LogSink>(
             },
         };
         Ok(artifact.encode())
+    })
+}
+
+/// Drives a maintenance checkpoint of the live store on the engine thread (`rmp` #305): a reader-safe
+/// GC pass (reclaim + freeze, lowering the WAL reclaim floor) followed by a sharp store checkpoint
+/// (flush dirty pages home + physically reclaim the WAL prefix below the floor). Releases RAM, disk
+/// and version slots that previously had no production reclamation trigger (`rmp` #305 / #313 / #315).
+/// Touches the (`!Send`) coordinator directly, between commands, never under a held statement seam.
+fn handle_checkpoint<D: BlockDevice, S: LogSink>(
+    coordinator: &mut TxnCoordinator<D, S>,
+) -> Result<CheckpointReply> {
+    let report = coordinator.checkpoint()?;
+    Ok(CheckpointReply {
+        reclaimed: report.reclaimed,
+        frozen: report.frozen,
     })
 }
 

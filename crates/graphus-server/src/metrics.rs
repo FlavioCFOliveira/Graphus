@@ -117,6 +117,15 @@ pub struct Metrics {
     latency: LatencyHistogram,
     /// Queries whose latency exceeded the slow-query threshold (also written to the slow-query log).
     slow_queries: AtomicU64,
+
+    // ---- storage maintenance (`rmp` #305) ----
+    /// Maintenance checkpoints run (operator-triggered `CHECKPOINT DATABASE` + the background cadence):
+    /// each reclaims RAM (the in-memory WAL tail), disk (sealed WAL segments) and version slots.
+    maintenance_checkpoints: AtomicU64,
+    /// Cumulative MVCC version slots reclaimed by maintenance GC passes.
+    maintenance_versions_reclaimed: AtomicU64,
+    /// Cumulative committed MVCC stamps frozen (settled to `Committed(ts)`) by maintenance GC passes.
+    maintenance_stamps_frozen: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -144,7 +153,20 @@ impl Metrics {
             handshake_timeouts: AtomicU64::new(0),
             latency: LatencyHistogram::new(),
             slow_queries: AtomicU64::new(0),
+            maintenance_checkpoints: AtomicU64::new(0),
+            maintenance_versions_reclaimed: AtomicU64::new(0),
+            maintenance_stamps_frozen: AtomicU64::new(0),
         }
+    }
+
+    /// Records one completed maintenance checkpoint (`rmp` #305): the number of MVCC version slots its
+    /// GC pass `reclaimed` and the number of committed stamps it `frozen`.
+    pub fn record_maintenance_checkpoint(&self, reclaimed: u64, frozen: u64) {
+        self.maintenance_checkpoints.fetch_add(1, Ordering::Relaxed);
+        self.maintenance_versions_reclaimed
+            .fetch_add(reclaimed, Ordering::Relaxed);
+        self.maintenance_stamps_frozen
+            .fetch_add(frozen, Ordering::Relaxed);
     }
 
     /// Records a committed transaction.
@@ -312,6 +334,25 @@ impl Metrics {
             "graphus_slow_queries_total",
             "Queries exceeding the slow-query threshold.",
             self.slow_queries.load(Ordering::Relaxed),
+        );
+
+        counter(
+            &mut out,
+            "graphus_maintenance_checkpoints_total",
+            "Maintenance checkpoints run (operator CHECKPOINT DATABASE + the background cadence).",
+            self.maintenance_checkpoints.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_maintenance_versions_reclaimed_total",
+            "MVCC version slots reclaimed by maintenance GC passes.",
+            self.maintenance_versions_reclaimed.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_maintenance_stamps_frozen_total",
+            "Committed MVCC stamps frozen by maintenance GC passes.",
+            self.maintenance_stamps_frozen.load(Ordering::Relaxed),
         );
 
         // The latency histogram.

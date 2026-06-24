@@ -1322,6 +1322,30 @@ impl DatabaseCatalog {
         run_blocking(move || write_file_atomic(&dest, &bytes)).await
     }
 
+    /// Drives a **maintenance checkpoint** of the online database `name` (`rmp` #305): a reader-safe GC
+    /// pass plus a sharp checkpoint that reclaims RAM (the in-memory WAL tail), disk (sealed WAL
+    /// segments below the floor) and version slots — the resource leaks that previously had no
+    /// production trigger (`rmp` #305 / #313 / #315). The database must be **online**: the maintenance
+    /// runs through its running engine ([`EngineHandle::checkpoint`]), between commands, without
+    /// stopping it. Returns the GC pass summary.
+    ///
+    /// # Errors
+    /// [`CatalogError::UnknownDatabase`] if the database is offline/unknown, [`CatalogError::Backup`]
+    /// if the GC pass, flush, or WAL reclaim fails.
+    pub async fn checkpoint(
+        &self,
+        name: &str,
+    ) -> Result<crate::engine::CheckpointReply, CatalogError> {
+        let name = normalize_db_name(name)?;
+        let handle = self
+            .handle(&name)
+            .ok_or_else(|| CatalogError::UnknownDatabase(name.clone()))?;
+        handle
+            .checkpoint()
+            .await
+            .map_err(|e| CatalogError::Backup(e.to_string()))
+    }
+
     /// **Restores** database `name` from the backup chain artifact at `src`, to `target`
     /// (`rmp` task #149): the whole committed chain (`RestoreTarget::Latest`), a chosen WAL
     /// `RestoreTarget::Lsn`, or a chosen `RestoreTarget::Timestamp` (PITR).

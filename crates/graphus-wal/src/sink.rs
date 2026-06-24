@@ -75,9 +75,10 @@ pub trait LogSink {
     /// Recovery tolerates this by skipping a leading zero prefix to the first intact record (a real
     /// record never begins with a zero byte). The **default is a no-op**: a sink that does not
     /// implement physical reclamation keeps the bytes — always correct, just not disk-bounded. The
-    /// in-memory [`MemLogSink`] implements it by zeroing the range (modelling a deleted segment) for
-    /// Deterministic Simulation Testing, and the production [`FileLogSink`] implements it by **deleting
-    /// the prefix of segment files** below the floor (`rmp` #116); the encrypted sink translates the
+    /// in-memory [`MemLogSink`] implements it by **draining the reclaimed prefix and freeing its backing
+    /// memory** (modelling a deleted segment, so RSS actually falls — `rmp` #313/#305), and the
+    /// production [`FileLogSink`] implements it by **deleting the prefix of segment files** below the
+    /// floor (`rmp` #116); the encrypted sink translates the
     /// logical range to whole frames and forwards it, and the encryption key-rotation swap handles the
     /// segmented WAL as a directory fileset.
     ///
@@ -91,9 +92,36 @@ pub trait LogSink {
 /// In-memory [`LogSink`] for Deterministic Simulation Testing. Un-synced appends live in
 /// `pending` and are dropped by [`crash`](MemLogSink::crash); a one-shot sync error can be
 /// armed to exercise the PANIC-on-fsync-failure path (`§4.9`).
+///
+/// ## Reclamation actually frees memory (`rmp` #313/#305)
+///
+/// The durable bytes are kept in two regions — mirroring the production [`FileLogSink`]'s *anchor +
+/// segments* layout — rather than one monolithic `[0, durable_len)` `Vec`:
+///
+/// - **`head`** holds the never-reclaimed prefix `[0, head_len)`. A [`reclaim`](LogSink::reclaim) is
+///   always asked to keep everything below `from` (the log header floor, [`HEADER_LEN`]); `head` is
+///   exactly that retained prefix, so the header at offset `0` — which recovery validates — always
+///   survives, exactly as [`FileLogSink`]'s `anchor` is never deleted.
+/// - **`tail`** holds the reclaimable bytes `[base, base + tail.len())`, where `base >= head_len`. A
+///   reclaim of a leading prefix `drain`s those bytes out of `tail` and advances `base`,
+///   **physically releasing the backing memory** — so RSS falls under delete-churn instead of growing
+///   forever (the old implementation only zero-*filled* the prefix, which freed nothing).
+///
+/// Crucially the **logical length and every byte offset are unchanged** (LSN == byte offset, `§4.1`):
+/// the reclaimed gap `[head_len, base)` is simply absent and reads back as **zeros**, exactly the
+/// contract recovery relies on (it skips a leading zero run to the first surviving record). No offset
+/// is ever rebased, so commit-record LSNs, `page_lsn` references, and the `unfrozen_commit_lsn` floor
+/// all stay valid across a reclaim — which is what makes this recovery-safe.
 #[derive(Debug, Default, Clone)]
 pub struct MemLogSink {
-    durable: Vec<u8>,
+    /// The never-reclaimed durable prefix `[0, head.len())` — the log header (and any bytes below the
+    /// reclaim floor `from`). Mirrors [`FileLogSink`]'s `anchor`, which is never deleted.
+    head: Vec<u8>,
+    /// Absolute byte offset where the retained reclaimable tail begins (`>= head.len()`). The gap
+    /// `[head.len(), base)` has been physically reclaimed (memory freed) and reads back as zeros.
+    base: u64,
+    /// The retained reclaimable durable bytes, covering logical offsets `[base, base + tail.len())`.
+    tail: Vec<u8>,
     pending: Vec<u8>,
     armed_sync_error: bool,
 }
@@ -115,10 +143,33 @@ impl MemLogSink {
         self.armed_sync_error = true;
     }
 
-    /// A read-only view of the durable bytes (test helper).
+    /// The logical durable length (LSN == byte offset): `base + tail.len()`, unchanged by reclaim.
+    /// (`base == head.len()` until the first reclaim opens a freed gap above the header.)
+    fn durable_end(&self) -> u64 {
+        self.base + self.tail.len() as u64
+    }
+
+    /// A copy of the full logical durable image `[0, durable_len)`, with the reclaimed gap
+    /// `[head.len(), base)` zero-filled (test/inspection helper).
+    ///
+    /// This reconstructs the offset-preserving image — exactly what recovery, the backup-chain, and
+    /// the encrypted-sink tests consume — so a reclaim is transparent to every reader of the logical
+    /// log. The freed gap is materialised as zeros only here, on demand; it is **not** retained,
+    /// so the steady-state memory footprint tracks the live (post-reclaim) tail, not the whole history.
     #[must_use]
-    pub fn durable_bytes(&self) -> &[u8] {
-        &self.durable
+    pub fn durable_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.durable_end() as usize];
+        out[..self.head.len()].copy_from_slice(&self.head);
+        let base = self.base as usize;
+        out[base..].copy_from_slice(&self.tail);
+        out
+    }
+
+    /// The number of bytes physically retained in memory for the durable log (the reclaimed gap is
+    /// excluded). Test helper proving [`reclaim`](LogSink::reclaim) actually releases memory.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.head.capacity() + self.tail.capacity()
     }
 }
 
@@ -134,36 +185,77 @@ impl LogSink for MemLogSink {
                 "injected fdatasync failure".to_owned(),
             ));
         }
-        self.durable.append(&mut self.pending);
+        self.tail.append(&mut self.pending);
         Ok(())
     }
 
     fn durable_len(&self) -> u64 {
-        self.durable.len() as u64
+        self.durable_end()
     }
 
     fn buffered_len(&self) -> u64 {
-        (self.durable.len() + self.pending.len()) as u64
+        self.durable_end() + self.pending.len() as u64
     }
 
     fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
         into.clear();
-        let from = from as usize;
-        if from <= self.durable.len() {
-            into.extend_from_slice(&self.durable[from..]);
+        let end = self.durable_end();
+        if from >= end {
+            return Ok(());
+        }
+        // Build `[from, durable_len)` zero-filled (the reclaimed gap stays zero), then overwrite the
+        // retained head and tail portions with their real bytes — exactly the `FileLogSink` (anchor +
+        // segments) read contract.
+        into.resize((end - from) as usize, 0);
+        // The retained head `[0, head.len())` (the header), clipped to the requested `from`.
+        let head_end = self.head.len() as u64;
+        if from < head_end {
+            let len = (head_end - from) as usize;
+            into[..len].copy_from_slice(&self.head[from as usize..]);
+        }
+        // The retained tail `[base, end)`.
+        let tail_start = self.base.max(from);
+        if tail_start < end {
+            let out_off = (tail_start - from) as usize;
+            let tail_off = (tail_start - self.base) as usize;
+            into[out_off..].copy_from_slice(&self.tail[tail_off..]);
         }
         Ok(())
     }
 
     fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
-        // Models physical reclamation (a deleted segment / punched hole): the range reads back as
-        // zeros — the bytes are freed — while the logical length and all offsets are preserved. Lets
-        // recovery's skip-leading-zeros path and the storage reclaim floor be exercised under DST.
-        let from = (from as usize).min(self.durable.len());
-        let up_to = (up_to as usize).min(self.durable.len());
-        if from < up_to {
-            self.durable[from..up_to].fill(0);
+        // Physically free the retained tail bytes in `[from, up_to)` (memory is RELEASED, not
+        // zero-filled), while the logical length and all offsets are preserved: the freed gap reads
+        // back as zeros, exactly the `FileLogSink` segment-deletion contract. Everything below `from`
+        // (the header floor) is retained in `head` and NEVER reclaimed — so offset 0's header survives.
+        let from = from.min(self.durable_end());
+        let up_to = up_to.min(self.durable_end()).max(from);
+
+        // Promote the never-reclaimed prefix `[0, from)` into `head` if it is not already there (the
+        // header lives in `tail` until the first reclaim). `from` is the constant header floor, so
+        // `head` stabilises at the 8-byte header after the first pass.
+        if (self.head.len() as u64) < from {
+            debug_assert_eq!(
+                self.base,
+                self.head.len() as u64,
+                "no gap below the floor yet"
+            );
+            let promote = (from - self.base) as usize;
+            self.head.extend_from_slice(&self.tail[..promote]);
+            self.tail.drain(..promote);
+            self.base = from;
         }
+
+        if up_to <= self.base {
+            return Ok(()); // nothing in the reclaimable tail below `up_to` (already freed)
+        }
+        let drop_to = (up_to - self.base) as usize;
+        // Drain the reclaimed prefix out of `tail` and shrink its backing allocation, so the freed
+        // bytes are actually returned to the allocator (RSS falls). `drain` shifts the survivors down;
+        // `shrink_to_fit` then releases the now-unused capacity of the (much smaller) live tail.
+        self.tail.drain(..drop_to);
+        self.tail.shrink_to_fit();
+        self.base = up_to;
         Ok(())
     }
 }
@@ -527,6 +619,81 @@ mod tests {
         let mut buf = Vec::new();
         s.read_durable(4, &mut buf).unwrap();
         assert_eq!(buf, b"456789");
+    }
+
+    #[test]
+    fn reclaim_frees_memory_and_preserves_offsets() {
+        // `rmp` #313/#305: reclaim must PHYSICALLY release the backing memory of the reclaimed prefix
+        // (so RSS falls under delete-churn), while keeping the logical length and every byte offset
+        // unchanged (LSN == byte offset) — the reclaimed range reads back as zeros.
+        let mut s = MemLogSink::new();
+        // 1 MiB of durable bytes (a non-trivial prefix to free).
+        let big = vec![0xABu8; 1024 * 1024];
+        s.append(&big);
+        s.append(b"TAILKEEP");
+        s.sync().unwrap();
+        let total = s.durable_len();
+        assert_eq!(total, big.len() as u64 + 8);
+        let retained_before = s.retained_bytes();
+        assert!(
+            retained_before >= big.len(),
+            "the whole durable image is retained before reclaim"
+        );
+
+        // Reclaim the 1 MiB prefix (from = header floor 0; up_to = 1 MiB).
+        s.reclaim(0, big.len() as u64).unwrap();
+
+        // Logical length and offsets are UNCHANGED.
+        assert_eq!(
+            s.durable_len(),
+            total,
+            "reclaim never shifts offsets / length"
+        );
+        // Memory was actually released: the retained tail is now tiny (just "TAILKEEP"-ish), not 1 MiB.
+        assert!(
+            s.retained_bytes() < big.len() / 2,
+            "reclaim must free the backing memory of the prefix (retained {} of {})",
+            s.retained_bytes(),
+            retained_before
+        );
+
+        // The freed prefix reads back as zeros; the surviving tail is intact at its original offset.
+        let mut buf = Vec::new();
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(buf.len(), total as usize);
+        assert!(
+            buf[..big.len()].iter().all(|&b| b == 0),
+            "the reclaimed prefix reads back as zeros"
+        );
+        assert_eq!(
+            &buf[big.len()..],
+            b"TAILKEEP",
+            "the tail survives at its offset"
+        );
+
+        // `durable_bytes()` reconstructs the same offset-preserving image (used by recovery + crypto).
+        assert_eq!(s.durable_bytes(), buf);
+
+        // Reading from within the surviving tail still works at the absolute offset.
+        let mut tail = Vec::new();
+        s.read_durable(big.len() as u64, &mut tail).unwrap();
+        assert_eq!(tail, b"TAILKEEP");
+    }
+
+    #[test]
+    fn reclaim_below_already_reclaimed_floor_is_a_noop() {
+        let mut s = MemLogSink::new();
+        s.append(b"AAAABBBBCCCC");
+        s.sync().unwrap();
+        s.reclaim(0, 8).unwrap();
+        let after_first = s.durable_bytes();
+        // A second reclaim entirely below the (already advanced) base is a no-op, not a panic.
+        s.reclaim(0, 4).unwrap();
+        assert_eq!(s.durable_bytes(), after_first);
+        // And the surviving suffix is intact.
+        let mut buf = Vec::new();
+        s.read_durable(8, &mut buf).unwrap();
+        assert_eq!(buf, b"CCCC");
     }
 
     // miri has filesystem isolation enabled by default, so the real `open`/`remove_dir_all`
