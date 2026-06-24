@@ -280,7 +280,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         self.do_handshake()?;
         loop {
             let Some(payload) = self.read_message()? else {
-                // EOF before GOODBYE: the peer dropped the connection.
+                // EOF before GOODBYE: the peer dropped the connection. `read_message` already
+                // flushed any pending response before it observed EOF, so nothing is left buffered.
                 self.state = State::Defunct;
                 return Ok(());
             };
@@ -298,7 +299,14 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             };
             match self.dispatch(request)? {
                 Flow::Continue => {}
-                Flow::Stop => return Ok(()),
+                Flow::Stop => {
+                    // Terminal return (GOODBYE / fatal): no further read will flush. GOODBYE itself
+                    // writes no response, but flush defensively so any buffered bytes a Stop path
+                    // might have written reach the client before the listener closes the socket
+                    // (rmp #317). Harmless (no-op) when the buffer is already empty.
+                    self.transport.flush()?;
+                    return Ok(());
+                }
             }
         }
     }
@@ -335,7 +343,11 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 Ok(())
             }
             None => {
-                // Replied with 00 00 00 00; the connection is rejected.
+                // Replied with 00 00 00 00; the connection is rejected. This is a terminal
+                // write-WITHOUT-a-following-read: `run` returns this `Err` and the listener closes
+                // the socket, so the rejection bytes must be flushed explicitly or a buffering
+                // transport would drop them on close, leaving the client waiting (rmp #317).
+                self.transport.flush()?;
                 self.state = State::Defunct;
                 Err(BoltError::Handshake(
                     "no mutually-supported Bolt version".to_owned(),

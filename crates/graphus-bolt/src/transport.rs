@@ -32,9 +32,32 @@ pub trait Transport {
 
     /// Writes the whole of `bytes`, retrying short writes until done.
     ///
+    /// An implementation MAY buffer the bytes rather than push them to the underlying pipe
+    /// immediately; in that case [`Transport::flush`] (or the implicit flush a real socket transport
+    /// performs before its next [`Transport::read`]) is what guarantees delivery. Buffering changes
+    /// only *when* bytes leave, never *what* bytes leave — the wire output is byte-for-byte identical.
+    ///
     /// # Errors
     /// [`BoltError::Transport`] if the underlying pipe fails before all bytes are written.
     fn write_all(&mut self, bytes: &[u8]) -> BoltResult<()>;
+
+    /// Pushes any bytes buffered by [`Transport::write_all`] to the underlying pipe.
+    ///
+    /// The default is a no-op, which is correct for unbuffered transports (e.g. the in-memory test
+    /// transport, which appends directly to its sink). A buffering socket transport overrides this to
+    /// drain its buffer to the socket.
+    ///
+    /// The state machine relies on Bolt's strict request/response discipline: the server always
+    /// returns to a read after writing a response, so flushing **before each read** delivers the full
+    /// buffered response exactly when the server next blocks for a request. The few paths that write
+    /// *without* a following read (handshake rejection, the terminal `run` returns) flush explicitly
+    /// so the client never waits on bytes stuck in the buffer.
+    ///
+    /// # Errors
+    /// [`BoltError::Transport`] if the underlying pipe fails while draining the buffer.
+    fn flush(&mut self) -> BoltResult<()> {
+        Ok(())
+    }
 }
 
 /// A mutable reference to a transport is itself a transport (mirroring `std::io::Read`/`Write` for
@@ -48,6 +71,10 @@ impl<T: Transport + ?Sized> Transport for &mut T {
 
     fn write_all(&mut self, bytes: &[u8]) -> BoltResult<()> {
         (**self).write_all(bytes)
+    }
+
+    fn flush(&mut self) -> BoltResult<()> {
+        (**self).flush()
     }
 }
 

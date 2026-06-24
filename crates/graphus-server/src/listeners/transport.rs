@@ -32,6 +32,12 @@ pub struct AsyncToBlockingTransport<S> {
     stream: S,
     handle: Handle,
     shutdown: ShutdownCoordinator,
+    /// Outbound write buffer (rmp #317). [`Transport::write_all`] appends here without touching the
+    /// socket; the bytes are pushed (one `block_on` + one `write_all` + one `flush`) by
+    /// [`Transport::flush`] — which the state machine calls before every read and at the terminal
+    /// write-without-read paths. This collapses a `PULL` of *N* rows from *N* syscalls/flushes (one
+    /// per `RECORD`) to **one** per batch, while leaving the wire bytes byte-for-byte identical.
+    write_buf: Vec<u8>,
     /// Optional per-read deadline (`None` = no deadline). Serves as the **idle/read timeout** that
     /// reaps a silent connection (rmp #118): each `read` that receives no bytes within the window
     /// returns EOF, ending the session loop cleanly. It also doubles as a drain bound during graceful
@@ -55,6 +61,7 @@ where
             stream,
             handle,
             shutdown,
+            write_buf: Vec::new(),
             read_deadline,
         }
     }
@@ -65,6 +72,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     fn read(&mut self, buf: &mut [u8]) -> BoltResult<usize> {
+        // Flush any buffered response BEFORE blocking for the next request (rmp #317). Bolt's strict
+        // request/response discipline guarantees the server always returns here after writing a
+        // response, so this delivers the full buffered response to the client at exactly the moment
+        // the server next waits for input — no deadlock, no lost bytes.
+        self.flush()?;
         let stream = &mut self.stream;
         let shutdown = &self.shutdown;
         let deadline = self.read_deadline;
@@ -89,18 +101,36 @@ where
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> BoltResult<()> {
+        // Buffer only — no syscall, no `block_on`, no flush per call (rmp #317). A `PULL` that emits
+        // one `RECORD` per row used to cost one syscall + one flush (one TLS record under TLS) +
+        // one `block_on` *per row*; now the whole batch accumulates here and leaves in a single
+        // `flush` (driven before the next read). The bytes appended are exactly the framed PackStream
+        // the caller passed, so the wire output is unchanged.
+        self.write_buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> BoltResult<()> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
         let stream = &mut self.stream;
-        self.handle.block_on(async move {
+        let buf = &self.write_buf;
+        let result = self.handle.block_on(async move {
             stream
-                .write_all(bytes)
+                .write_all(buf)
                 .await
                 .map_err(|e| BoltError::Transport(e.to_string()))?;
-            // Flush so the client sees each response promptly (Bolt is request/response). For a TLS
+            // Flush so the client sees the response promptly (Bolt is request/response). For a TLS
             // stream this also drives the record out of the rustls buffer.
             stream
                 .flush()
                 .await
                 .map_err(|e| BoltError::Transport(e.to_string()))
-        })
+        });
+        // Clear regardless of outcome: on error the connection is dead and the session ends, so the
+        // buffered bytes must not be re-sent against a future (impossible) read.
+        self.write_buf.clear();
+        result
     }
 }
