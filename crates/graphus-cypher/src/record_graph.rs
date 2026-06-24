@@ -339,6 +339,17 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// coordinated path. Maintained (widening) on write by [`reindex_node`](Self::reindex_node); the
     /// skip decision it drives is conservative, so it never changes which rows a scan returns.
     zones: Option<Rc<RefCell<crate::zone_map::ZoneMap>>>,
+    /// The coordinator's **opt-in** type-bucketed CSR adjacency accelerator (`rmp` task #324, "Win 2"),
+    /// present only on the coordinated path **and** only when the
+    /// [`csr_adjacency_enabled`](crate::read_source::csr_adjacency_enabled) knob is on. When `Some` and
+    /// **fresh**, a typed [`expand`](GraphAccess::expand) seeks matching-type candidate rel-ids from it
+    /// (so it touches no non-matching incidence-chain link) and re-checks each, instead of the Win-1
+    /// chain walk; the result and SSI markers are identical (the candidates are a re-checked superset).
+    /// It is **marked stale** on the first relationship mutation ([`create_rel`](GraphAccess::create_rel)
+    /// / [`delete_rel`](GraphAccess::delete_rel)) and then declines (`candidates` returns `None`), so the
+    /// chain walk — always store-faithful — takes over until the next rebuild-on-open. `None` on the
+    /// standalone path or when the knob is off (zero extra RAM).
+    csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
@@ -385,6 +396,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             columns: None,
             // Standalone path: no zone-map sidecar (it lives in the coordinator); scans skip nothing.
             zones: None,
+            // Standalone path: no CSR accelerator (it lives in the coordinator); typed expand always
+            // walks the live chain (`rmp` #324).
+            csr: None,
         }
     }
 
@@ -406,6 +420,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         index: Rc<RefCell<IndexSet>>,
         columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
         zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
+        csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
     ) -> Self {
         // Snapshot the shared store's Active/Recent Transaction Table for this statement's reads
         // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
@@ -433,6 +448,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             columns: Some(columns),
             // Coordinated path: the shared zone-map sidecar is present and maintained on write (`rmp` #331).
             zones: Some(zones),
+            // Coordinated path: the opt-in CSR accelerator is present only when the knob enabled it at
+            // coordinator construction (`rmp` #324, Win 2); `None` otherwise (zero extra RAM).
+            csr,
         }
     }
 
@@ -634,7 +652,54 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             columns: None,
             // Standalone snapshot path: no zone-map sidecar (it lives in the coordinator).
             zones: None,
+            // Standalone snapshot path: no CSR accelerator (it lives in the coordinator).
+            csr: None,
         }
+    }
+
+    /// Latches the opt-in CSR accelerator stale (`rmp` task #324, "Win 2"), if present. A no-op when the
+    /// knob is off / standalone (`csr` is `None`). Called from `create_rel` / `delete_rel`: any
+    /// relationship mutation invalidates the built incidence snapshot, so subsequent typed expands fall
+    /// back to the always-faithful chain walk until the next rebuild-on-open.
+    fn mark_csr_dirty(&self) {
+        if let Some(csr) = &self.csr {
+            csr.borrow_mut().mark_dirty();
+        }
+    }
+
+    /// Seeks the matching-type CSR candidate rel-ids for a typed expand of `node` over `types`, or
+    /// `None` when the chain walk must be used (`rmp` task #324, "Win 2").
+    ///
+    /// Returns `None` (⇒ Win-1 chain walk) when **any** of:
+    ///   * the CSR is absent (knob off / standalone path) — zero-RAM default;
+    ///   * the expand is **untyped** (`types` empty) — no type bucket to seek;
+    ///   * the CSR is **stale** (a relationship mutation since the last build) — handled inside
+    ///     [`CsrAdjacency::candidates`](crate::csr_adjacency::CsrAdjacency::candidates);
+    ///   * any requested type name is **un-interned** — a never-interned type matches no existing edge,
+    ///     so the chain-walk path's existing un-interned short-circuit (which also covers the absent-edge
+    ///     phantom) must run; we therefore decline to the chain walk rather than seeking a partial set.
+    ///
+    /// When it returns `Some(ids)`, the ids are matching-type candidates (re-checked by the lifted
+    /// body). Token resolution mirrors `read_source::expand`'s own `wanted_type_ids` resolution exactly,
+    /// so the CSR seek covers the identical requested-type set; the difference is purely that the body
+    /// reads the CSR's candidates rather than walking the chain.
+    fn csr_candidates_for(&self, node: NodeId, types: &[String]) -> Option<Vec<u64>> {
+        let csr = self.csr.as_ref()?;
+        if types.is_empty() {
+            return None;
+        }
+        // Resolve every requested type name to its interned id. If ANY name is un-interned we decline
+        // to the chain walk (see the doc): a read never mints a token.
+        let mut wanted: Vec<u32> = Vec::with_capacity(types.len());
+        {
+            let store = self.store.borrow();
+            for t in types {
+                wanted.push(store.token_id(Namespace::RelType, t)?);
+            }
+        }
+        // `candidates` returns `None` if the CSR is stale (the freshness gate); else the matching-type
+        // candidate ids for this node.
+        csr.borrow().candidates(node.0, &wanted)
     }
 
     /// Whether the version carrying `mvcc` is visible to this query's snapshot (`04 §5.3`): its
@@ -2257,13 +2322,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // incidence chain resolving the requested types to ids once (`rmp` #319), and SIREAD-mark +
         // visibility-filter each edge, reporting the matching side(s). Byte-identical to the prior inline
         // body. Read-only: `LiveSource` over the live store's `&self` read methods.
-        read_source::expand(
+        //
+        // `rmp` #324, "Win 2": if the opt-in CSR accelerator is present **and fresh**, and this is a
+        // typed expand, resolve the requested type names to ids and seek the matching candidate rel-ids
+        // from the CSR — so the lifted body reads only those candidates (touching no non-matching chain
+        // link) instead of walking the incidence chain. A stale/absent CSR or an untyped expand yields
+        // `None` and the body takes the Win-1 chain walk. The candidate ids are re-checked (type +
+        // visibility) by the body, so the result and SSI markers are byte-identical either way.
+        let csr_candidates = self.csr_candidates_for(node, types);
+        read_source::expand_with_csr(
             &LiveSource(&*self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,
             direction,
             types,
+            csr_candidates,
         )
     }
 
@@ -2689,6 +2763,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         };
         let rel = RelId(id);
+        // `rmp` #324, Win 2: a new edge changes incidence, so invalidate the CSR snapshot — it now
+        // declines and `expand` walks the live chain until the next rebuild-on-open. No-op when off.
+        self.mark_csr_dirty();
         self.note_write(rel_ssi_key(id));
         // Relationship phantom (`rmp` #171 blocker A1): announce this new edge's rel-type predicate
         // footprint so a concurrent transaction that read `MATCH ()-[r:T]-()` (and saw no such edge)
@@ -3014,6 +3091,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if !self.visible(mvcc) {
             return;
         }
+        // `rmp` #324, Win 2: deleting an edge changes incidence, so invalidate the CSR snapshot. No-op
+        // when off; idempotent. Marked before the store mutation so a later read in this same
+        // transaction never consults a CSR that still lists the about-to-be-removed edge.
+        self.mark_csr_dirty();
         self.note_write(rel_ssi_key(rel.0));
         // Read-then-delete relationship write-skew (`rmp` #171 blocker A1): a concurrent reader of
         // `MATCH ()-[r:T]-()` that SAW this edge must close an rw-edge into this delete. Announce the

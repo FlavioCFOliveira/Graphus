@@ -104,6 +104,7 @@ impl Coordinated {
             Rc::clone(&self.index),
             Rc::clone(&self.columns),
             Rc::clone(&self.zones),
+            None,
         )
     }
 }

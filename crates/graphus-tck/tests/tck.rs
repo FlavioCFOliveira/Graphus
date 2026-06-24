@@ -339,6 +339,17 @@ fn tck_conformance() {
     {
         graphus_cypher::morsel::set_morsel_min_rows(rows);
     }
+    // `rmp` task #324, "Win 2": optionally run the whole TCK with the opt-in CSR-adjacency accelerator
+    // ENABLED (`GRAPHUS_CSR_ADJACENCY=1`), so conformance is proven byte-identical whether a typed
+    // expand walks the incidence chain (the default, accelerator off) or seeks matching candidates from
+    // the per-coordinator CSR built on open. Off (unset) ⇒ the existing serial Win-1 path.
+    if let Ok(v) = std::env::var("GRAPHUS_CSR_ADJACENCY") {
+        let on = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        graphus_cypher::read_source::set_csr_adjacency(on);
+    }
 
     let root = graphus_tck::tck_root();
     let features_dir = root.join("features");

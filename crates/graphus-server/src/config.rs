@@ -175,6 +175,17 @@ pub struct AdmissionConfig {
     /// morsel pool to exactly that many workers. The pool is dedicated (never the global `rayon` pool, so
     /// it never contends with GDS or the off-thread reader pool).
     pub morsel_parallelism: usize,
+    /// Whether to build the **opt-in type-bucketed CSR adjacency accelerator** (`rmp` task #324,
+    /// "Win 2"). `false` (the default) builds **no** CSR — zero extra RAM, and a type-selective
+    /// `expand` behaves exactly as the Win-1 single-pass chain walk. When `true`, each per-database
+    /// engine builds a flat CSR adjacency (`~8 bytes per incident edge endpoint`) from the store on
+    /// open and consults it for typed expands, so the engine reads **only** matching-type candidate
+    /// relationships instead of walking past every non-matching incidence-chain link. The CSR is a
+    /// candidate accelerator only (every candidate is re-read and MVCC-re-checked) and is marked stale
+    /// on any relationship mutation (falling back to the chain walk until the next open), so enabling
+    /// it never changes query results — only the read cost of typed traversals on a stable graph. Keep
+    /// it off unless type-selective expand is a measured bottleneck and the per-edge RAM is acceptable.
+    pub csr_adjacency: bool,
 }
 
 impl Default for AdmissionConfig {
@@ -186,6 +197,7 @@ impl Default for AdmissionConfig {
             max_connections: 1024,
             reader_threads: 0,
             morsel_parallelism: 0,
+            csr_adjacency: false,
         }
     }
 }
@@ -683,6 +695,20 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_CSR_ADJACENCY") {
+            // Accept the common truthy / falsy spellings; the knob is opt-in so anything unrecognised
+            // is a hard error rather than a silent default (a misspelled "ture" must not leave the
+            // accelerator off without warning).
+            self.admission.csr_adjacency = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => {
+                    return Err(ConfigError::Parse(format!(
+                        "GRAPHUS_CSR_ADJACENCY is not a boolean (true/false/1/0/yes/no/on/off): {v:?}"
+                    )));
+                }
+            };
+        }
         if let Ok(v) = var("GRAPHUS_SLOW_QUERY_THRESHOLD_MS") {
             self.timing.slow_query_threshold_ms = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
@@ -1056,6 +1082,39 @@ mod tests {
         assert_eq!(cfg.timing.idle_timeout_ms, 30_000);
         assert!(cfg.tls.is_enabled());
         assert!(cfg.validate().is_ok());
+    }
+
+    /// The opt-in CSR-adjacency knob (`rmp` task #324, "Win 2") defaults **off**, and a TOML file that
+    /// omits it parses with the accelerator disabled — the zero-RAM default the task mandates.
+    #[test]
+    fn csr_adjacency_defaults_off_and_opts_in_via_toml() {
+        // Default.
+        assert!(
+            !AdmissionConfig::default().csr_adjacency,
+            "CSR adjacency must default OFF (zero extra RAM)"
+        );
+        // A TOML that does not mention it stays off.
+        let off: ServerConfig = toml::from_str(
+            r#"
+            store_path = "/x"
+            uds_path = "/run/g.sock"
+            [admission]
+            max_concurrent_queries = 8
+            "#,
+        )
+        .expect("parse");
+        assert!(!off.admission.csr_adjacency, "omitted ⇒ off");
+        // Opting in via TOML.
+        let on: ServerConfig = toml::from_str(
+            r#"
+            store_path = "/x"
+            uds_path = "/run/g.sock"
+            [admission]
+            csr_adjacency = true
+            "#,
+        )
+        .expect("parse");
+        assert!(on.admission.csr_adjacency, "csr_adjacency = true ⇒ on");
     }
 
     #[test]

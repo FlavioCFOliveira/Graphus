@@ -42,6 +42,8 @@
 //! `LiveSource(&*self.store.borrow())` + its own [`VisCtx`] + its own sink, so its observable behaviour
 //! stays **byte-identical** (the openCypher TCK and the Slice 3b-i equivalence test are the guards).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value, VersionStamp};
 use graphus_index::keycodec::encode_equality_canonical;
@@ -68,6 +70,39 @@ fn node_ssi_key(id: u64) -> u64 {
 #[inline]
 fn rel_ssi_key(id: u64) -> u64 {
     id | REL_SSI_KEY_TAG
+}
+
+// =================================================================================================
+// The opt-in CSR-adjacency knob (`rmp` task #324, "Win 2")
+// =================================================================================================
+
+/// The process-global "build + consult the type-bucketed CSR adjacency" knob (`rmp` task #324,
+/// Win 2). Default **off**: when off, the coordinator builds **no**
+/// [`CsrAdjacency`](crate::csr_adjacency::CsrAdjacency) (zero extra RAM) and a typed `expand` walks the
+/// incidence chain exactly as Win-1-only does. The server sets it from
+/// [`AdmissionConfig::csr_adjacency`](../../graphus_server/struct.AdmissionConfig.html) at startup
+/// (default `false`), mirroring the `set_morsel_threads` global-static plumbing the morsel tier
+/// (`rmp` #339) uses — a runtime knob that reaches the Cypher read path without threading a parameter
+/// through every seam constructor.
+///
+/// A process-global is sound here because, like the morsel knob, it is read once at coordinator
+/// construction (to decide whether to *build* the CSR) and is otherwise consulted only on the
+/// already-built structure. The DST simulator drives `LocalEngine`/`MemGraph` inline and never sets
+/// this, so determinism is unaffected (the knob stays off ⇒ no CSR).
+static CSR_ADJACENCY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enables or disables the opt-in CSR-adjacency accelerator process-wide (`rmp` task #324, Win 2).
+/// Called once on engine startup with `AdmissionConfig::csr_adjacency` (and by tests/benches that opt
+/// in). Off by default.
+pub fn set_csr_adjacency(enabled: bool) {
+    CSR_ADJACENCY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the opt-in CSR-adjacency accelerator is enabled (`rmp` task #324, Win 2). Read by the
+/// coordinator to decide whether to build/maintain a CSR. Default `false`.
+#[must_use]
+pub fn csr_adjacency_enabled() -> bool {
+    CSR_ADJACENCY_ENABLED.load(Ordering::Relaxed)
 }
 
 // =================================================================================================
@@ -668,6 +703,38 @@ pub fn expand<S: StoreReadSource, K: ReadSink>(
     direction: ExpandDirection,
     types: &[String],
 ) -> Vec<Incident> {
+    expand_with_csr(src, ctx, sink, node, direction, types, None)
+}
+
+/// The body of [`expand`], parameterised by an optional **CSR candidate list** (`rmp` task #324,
+/// "Win 2"). When `csr_candidates` is `None`, this is exactly the Win-1 path: walk the incidence chain
+/// once with [`incident_rels_typed`](StoreReadSource::incident_rels_typed). When it is `Some(ids)` (the
+/// caller consulted a *fresh* CSR), the ids are matching-type **candidates** read directly — the engine
+/// never touches a non-matching chain link — but each is still re-read with `rel()` and re-checked for
+/// type membership and MVCC visibility, so the result is byte-identical to the chain-walk path.
+///
+/// # Why the candidate path is result- and marker-equivalent (`rmp` #324 constraint 3)
+///
+/// The CSR is built from the same committed-edge enumeration the chain walk traverses and is consulted
+/// **only while fresh** (no relationship mutation since build), so its `(node, wanted_types)` id set is
+/// exactly `incident_rels_typed`'s id set. We:
+///   * register the **same** rel-type predicate marker (the phantom cover — unchanged);
+///   * read each candidate with `rel()` and re-apply the **same** `type_id ∈ wanted_types` filter the
+///     storage chain walk applies inline (so a CSR id whose record's type somehow no longer matches is
+///     dropped, never reported — a stale id can only be a *superset*, never a wrong row);
+///   * SIREAD-mark each **matching** candidate and visibility-filter it, exactly as the chain path
+///     marks each edge the storage walk returned.
+///
+/// A self-loop appears once in the CSR (built deduped), matching the chain walk's single emission.
+pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    node: NodeId,
+    direction: ExpandDirection,
+    types: &[String],
+    csr_candidates: Option<Vec<u64>>,
+) -> Vec<Incident> {
     // Relationship-pattern predicate read (`rmp` #171 blocker A1): register the rel-type (or, untyped,
     // `AnyRel`) marker so a concurrent create/delete of a matching type closes an rw-edge — the absent
     // edge the per-rel SIREADs below cannot cover. THIS is what covers the phantom for a matching-type
@@ -689,16 +756,48 @@ pub fn expand<S: StoreReadSource, K: ReadSink>(
         // marker `note_rel_predicate_read` registered for an un-interned name.
         return Vec::new();
     }
-    // `rmp` #324, "Win 1": read each incident relationship record ONCE during the chain walk and have
-    // the storage layer drop the non-matching types in the same pass — so a type-selective traversal
-    // no longer re-reads (`src.rel`) and SSI-marks every non-matching edge. An empty `wanted_type_ids`
-    // (untyped expand) returns every incident edge, identical to the old `incident_rels` membership.
-    let rels = match src.incident_rels_typed(node.0, &wanted_type_ids) {
-        Ok(rels) => rels,
-        Err(e) => {
-            sink.capture(e);
-            return Vec::new();
+    // The matching incident `(rel_id, record)` list to examine. Two equivalent sources (`rmp` #324):
+    //   * "Win 2" (the fast path): a fresh CSR handed us the matching-type candidate ids directly, so
+    //     we read each with `rel()` and re-apply the type filter — touching NO non-matching chain link.
+    //     `csr_candidates` is `Some` only for a typed expand over a fresh CSR (the caller's gate), so a
+    //     stale id can only be a superset (filtered out below), never a missing match (under-coverage,
+    //     which the freshness gate forbids).
+    //   * "Win 1" (the fallback): walk the incidence chain once with `incident_rels_typed`, reading
+    //     each link once and filtering type inline. Used when the CSR is off/stale or the expand is
+    //     untyped. An empty `wanted_type_ids` (untyped) returns every incident edge here.
+    let rels: Vec<(u64, RelRecord)> = match csr_candidates {
+        Some(candidate_ids) => {
+            // The CSR stores each incident rel-id of a `(node, type)` bucket exactly once (a self-loop
+            // is bucketed once at build, matching the chain walk's single emission), and an edge has a
+            // single type so it cannot appear under two requested-type buckets of the same node — hence
+            // `candidate_ids` is already duplicate-free and no `out.last()`-style dedupe is needed.
+            let mut matched: Vec<(u64, RelRecord)> = Vec::with_capacity(candidate_ids.len());
+            for rid in candidate_ids {
+                let rec = match src.rel(rid) {
+                    Ok(rec) => rec,
+                    Err(e) => {
+                        sink.capture(e);
+                        return Vec::new();
+                    }
+                };
+                // Re-apply the exact filter the storage chain walk applies inline: a candidate must be
+                // an `in_use` slot of a requested type. (`wanted_type_ids` is non-empty here — the
+                // caller only supplies CSR candidates for a typed expand.) A stale CSR id can only fail
+                // this re-check (a superset id), never silently inject a wrong row.
+                if !rec.mvcc.in_use() || !wanted_type_ids.contains(&rec.type_id) {
+                    continue;
+                }
+                matched.push((rid, rec));
+            }
+            matched
         }
+        None => match src.incident_rels_typed(node.0, &wanted_type_ids) {
+            Ok(rels) => rels,
+            Err(e) => {
+                sink.capture(e);
+                return Vec::new();
+            }
+        },
     };
     let mut out = Vec::new();
     for (rid, rec) in rels {

@@ -116,6 +116,7 @@ pub mod column_cache;
 pub mod constraint;
 pub mod coordinator;
 pub mod cost;
+pub mod csr_adjacency;
 pub mod equality;
 pub mod equivalence;
 pub mod errors;

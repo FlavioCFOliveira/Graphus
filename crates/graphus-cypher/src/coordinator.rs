@@ -244,6 +244,13 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// opt-in via [`declare_zone_map`](Self::declare_zone_map), rebuilt from the store and maintained
     /// (widening) on write. In-memory, never persisted/recovered — a re-opened coordinator re-declares.
     zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
+    /// The **opt-in** type-bucketed CSR adjacency accelerator (`rmp` task #324, "Win 2"). `None` unless
+    /// the [`csr_adjacency_enabled`](crate::read_source::csr_adjacency_enabled) knob is on at
+    /// [`new`](Self::new) — so when off there is **zero** extra RAM and a typed `expand` behaves exactly
+    /// as Win-1-only. When `Some`, it is built from the store on open (like [`Self::index`]) and handed
+    /// to each statement seam; it is **marked stale** on the first relationship mutation and consulted
+    /// only while fresh, falling back to the chain walk otherwise. Derived, in-memory, never recovered.
+    csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
     /// Open transactions (begun, not yet committed/rolled back).
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
@@ -304,6 +311,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // recovered id high-water so even the promotion transaction never reuses a pre-crash id.
         let next_txn_id =
             Self::promote_recovered_populating_indexes(&store, &index, recovered_txn_hw);
+        // The opt-in CSR adjacency (`rmp` #324, Win 2): built from the store on open ONLY when the knob
+        // is enabled, so the default (off) path allocates nothing. Like the index it is derived and
+        // never recovered — a fresh coordinator over a recovered store rebuilds a store-consistent CSR.
+        let csr = if crate::read_source::csr_adjacency_enabled() {
+            let mut adjacency = crate::csr_adjacency::CsrAdjacency::empty();
+            adjacency.build_from_store(&store.borrow());
+            Some(Rc::new(RefCell::new(adjacency)))
+        } else {
+            None
+        };
         Self {
             store,
             ssi: Rc::new(RefCell::new(SsiTracker::new())),
@@ -316,6 +333,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // The zone-map data-skipping sidecar (`rmp` #331) likewise starts empty; columns are
             // declared via `declare_zone_map` and rebuilt from the store, derived/never-recovered.
             zones: Rc::new(RefCell::new(crate::zone_map::ZoneMap::new())),
+            csr,
             active: HashMap::new(),
             next_txn_id,
             pending_builds: VecDeque::new(),
@@ -2437,6 +2455,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Rc::clone(&self.index),
             Rc::clone(&self.columns),
             Rc::clone(&self.zones),
+            self.csr.as_ref().map(Rc::clone),
         ))
     }
 

@@ -499,6 +499,11 @@ impl EngineParams {
         // process-wide dedicated morsel pool), and the call is idempotent across per-database
         // `EngineSettings::from_config` invocations.
         graphus_cypher::morsel::set_morsel_threads(config.admission.morsel_parallelism());
+        // The opt-in CSR-adjacency knob (`rmp` task #324, "Win 2") is likewise a process-global read by
+        // the Cypher read path (mirroring `set_morsel_threads`). Set it once here from the resolved
+        // config (default `false`); it decides whether each per-database coordinator builds a CSR on
+        // open. Idempotent across per-database `from_config` invocations.
+        graphus_cypher::read_source::set_csr_adjacency(config.admission.csr_adjacency);
         Ok(Self {
             buffer_pool_pages: config.buffer_pool_pages,
             engine_queue_capacity: config.admission.engine_queue_capacity,
