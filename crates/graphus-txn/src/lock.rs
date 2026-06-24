@@ -94,10 +94,144 @@ impl LockTable {
         }
     }
 
+    /// Finds the deadlock victim for the wait-for edge `waiter → holder` that [`acquire`](Self::acquire)
+    /// **just** recorded, or `None` if that edge did not close a cycle.
+    ///
+    /// This is the hot-path entry the manager uses on every write-wait. It is an `O(cycle length)`
+    /// **edge-rooted** search rather than the `O(V + E)` full-graph sweep of
+    /// [`find_deadlock_victim`](Self::find_deadlock_victim), exploiting an invariant the manager
+    /// maintains: **the wait-for graph is acyclic immediately before each `acquire`** (any earlier
+    /// cycle was already detected and broken by aborting its victim, whose
+    /// [`release_all`](Self::release_all) removed its edges). Therefore a *new* cycle can only be the
+    /// one created by the just-added edge `waiter → holder`, and every such cycle must pass *through*
+    /// that edge — i.e. it corresponds to a path `holder ⇝ waiter` in the pre-existing (acyclic)
+    /// graph. We root the search at `holder`, collect every node that lies on some `holder ⇝ waiter`
+    /// path (those, plus `waiter`, are exactly the nodes the full sweep would mark on a cycle), and
+    /// pick the **youngest** (largest [`TxnId`]) — byte-for-byte the same victim the full sweep
+    /// selects.
+    ///
+    /// In debug builds a `debug_assert!` cross-checks this narrow result against the authoritative
+    /// full sweep, so the optimization can never silently diverge.
+    #[must_use]
+    pub fn find_deadlock_victim_for(&self, waiter: TxnId, holder: TxnId) -> Option<TxnId> {
+        let victim = self.youngest_on_cycle_through(waiter, holder);
+
+        // The narrow edge-rooted search must agree with the authoritative full-graph sweep on the
+        // exact victim. The invariant that licenses the narrow search (acyclic-before-this-edge) is
+        // the manager's responsibility; this assertion is the guard that it always holds in practice.
+        debug_assert_eq!(
+            victim,
+            self.find_deadlock_victim(),
+            "edge-rooted deadlock search disagreed with the full sweep for edge {waiter:?} -> \
+             {holder:?}; the acyclic-before-acquire invariant was violated"
+        );
+
+        victim
+    }
+
+    /// Edge-rooted cycle search for the just-added edge `waiter → holder`.
+    ///
+    /// Returns the youngest [`TxnId`] on a cycle through that edge, or `None` if none closed. A cycle
+    /// through `waiter → holder` is exactly a path `holder ⇝ waiter`; the nodes on *any* such path
+    /// (together with `waiter`) are the cycle nodes. We find them in two cheap passes over the part
+    /// of the graph reachable from `holder`: an iterative DFS from `holder` that records, for each
+    /// visited node, whether it can reach `waiter` (`can_reach`). Every node with `can_reach == true`
+    /// lies on a `holder ⇝ waiter` path; `waiter` itself closes the cycle. The youngest of that set
+    /// is the victim. Because the pre-existing graph is acyclic this DFS visits each reachable node
+    /// once (`O(cycle/reachable subgraph)`), and it is iterative so a deep chain cannot overflow the
+    /// stack (SEC-199 / CWE-674).
+    fn youngest_on_cycle_through(&self, waiter: TxnId, holder: TxnId) -> Option<TxnId> {
+        // Fast path: the holder is the waiter (a self-edge would be a 1-cycle). `acquire` never
+        // records a self wait (re-entrant acquisition returns `Granted`), but guard anyway.
+        if holder == waiter {
+            return Some(waiter);
+        }
+
+        // Post-order iterative DFS from `holder`, computing `can_reach[node] = node can reach waiter`.
+        // A node can reach `waiter` iff it *is* a direct predecessor of `waiter` (has the edge
+        // `node -> waiter`) or some neighbour can reach `waiter`.
+        let mut can_reach: HashSet<TxnId> = HashSet::default();
+        let mut visited: HashSet<TxnId> = HashSet::default();
+
+        struct Frame {
+            node: TxnId,
+            targets: Vec<TxnId>,
+            next: usize,
+            reaches: bool,
+        }
+
+        let neighbours = |n: TxnId| -> Vec<TxnId> {
+            self.waits_for
+                .get(&n)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        };
+
+        let mut stack: Vec<Frame> = Vec::new();
+        visited.insert(holder);
+        stack.push(Frame {
+            node: holder,
+            targets: neighbours(holder),
+            next: 0,
+            reaches: false,
+        });
+
+        while let Some(frame) = stack.last_mut() {
+            if frame.next < frame.targets.len() {
+                let next = frame.targets[frame.next];
+                frame.next += 1;
+                if next == waiter {
+                    // Direct edge `node -> waiter`: this node reaches `waiter`.
+                    frame.reaches = true;
+                } else if can_reach.contains(&next) {
+                    // A previously-finished node already known to reach `waiter`.
+                    frame.reaches = true;
+                } else if visited.insert(next) {
+                    // Descend into an unvisited node. (The pre-existing graph is acyclic, so `next`
+                    // cannot already be on the current path — no back-edge handling needed.)
+                    let targets = neighbours(next);
+                    stack.push(Frame {
+                        node: next,
+                        targets,
+                        next: 0,
+                        reaches: false,
+                    });
+                }
+                // else: `next` was visited and does NOT reach `waiter` — contributes nothing.
+            } else {
+                // Finished this node. If it reaches `waiter`, record it and propagate to the parent.
+                let Frame { node, reaches, .. } = *frame;
+                stack.pop();
+                if reaches {
+                    can_reach.insert(node);
+                    if let Some(parent) = stack.last_mut() {
+                        parent.reaches = true;
+                    }
+                }
+            }
+        }
+
+        // No cycle: `holder` cannot reach `waiter`.
+        if !can_reach.contains(&holder) {
+            return None;
+        }
+
+        // The cycle nodes are `waiter` plus every node that can reach `waiter` (all of which are, by
+        // construction, reachable from `holder`). Pick the youngest.
+        can_reach
+            .into_iter()
+            .chain(std::iter::once(waiter))
+            .max_by_key(|t| t.0)
+    }
+
     /// Finds a transaction to abort to break a wait-for cycle, or `None` if the graph is acyclic.
     ///
     /// On a cycle the **youngest** transaction (largest [`TxnId`]) is chosen, so older transactions
     /// make progress and the same victim is picked deterministically (`04 §5.7`).
+    ///
+    /// This is the authoritative full-graph `O(V + E)` sweep. The manager uses the cheaper
+    /// [`find_deadlock_victim_for`](Self::find_deadlock_victim_for) on its hot path; this form
+    /// remains the debug-assert oracle and is convenient for tests that inspect a fully-built graph.
     #[must_use]
     pub fn find_deadlock_victim(&self) -> Option<TxnId> {
         // SEC-199 (CWE-674): cycle detection over the wait-for graph is **iterative** — an explicit
@@ -256,6 +390,128 @@ mod tests {
         lt.acquire(TxnId(2), 3);
         lt.acquire(TxnId(3), 1);
         assert_eq!(lt.find_deadlock_victim(), Some(TxnId(3)));
+    }
+
+    // ---- edge-rooted detector: must agree with the full sweep on the exact victim ----
+
+    /// The edge-rooted search returns `None` when the just-added edge does not close a cycle.
+    #[test]
+    fn edge_rooted_no_cycle() {
+        let mut lt = LockTable::new();
+        lt.acquire(TxnId(1), 100);
+        // T2 waits for T1 (edge 2 -> 1); acyclic.
+        assert!(matches!(
+            lt.acquire(TxnId(2), 100),
+            LockOutcome::Wait { .. }
+        ));
+        assert_eq!(lt.find_deadlock_victim_for(TxnId(2), TxnId(1)), None);
+        assert_eq!(lt.find_deadlock_victim(), None);
+    }
+
+    /// Two-party cycle: edge-rooted picks the youngest, same as the full sweep.
+    #[test]
+    fn edge_rooted_two_party_matches_full_sweep() {
+        let mut lt = LockTable::new();
+        lt.acquire(TxnId(1), 1);
+        lt.acquire(TxnId(2), 2);
+        // T1 waits for T2 (edge 1 -> 2); still acyclic.
+        assert!(matches!(lt.acquire(TxnId(1), 2), LockOutcome::Wait { .. }));
+        assert_eq!(lt.find_deadlock_victim_for(TxnId(1), TxnId(2)), None);
+        // T2 waits for T1 (edge 2 -> 1): closes the cycle.
+        assert!(matches!(lt.acquire(TxnId(2), 1), LockOutcome::Wait { .. }));
+        assert_eq!(
+            lt.find_deadlock_victim_for(TxnId(2), TxnId(1)),
+            Some(TxnId(2))
+        );
+        assert_eq!(lt.find_deadlock_victim(), Some(TxnId(2)));
+    }
+
+    /// Three-party cycle 1 -> 2 -> 3 -> 1 closed by the last edge: youngest is T3.
+    #[test]
+    fn edge_rooted_three_party_matches_full_sweep() {
+        let mut lt = LockTable::new();
+        lt.acquire(TxnId(1), 1);
+        lt.acquire(TxnId(2), 2);
+        lt.acquire(TxnId(3), 3);
+        lt.acquire(TxnId(1), 2); // 1 -> 2
+        lt.acquire(TxnId(2), 3); // 2 -> 3
+        lt.acquire(TxnId(3), 1); // 3 -> 1 closes the cycle; edge is 3 -> 1
+        assert_eq!(
+            lt.find_deadlock_victim_for(TxnId(3), TxnId(1)),
+            Some(TxnId(3))
+        );
+        assert_eq!(lt.find_deadlock_victim(), Some(TxnId(3)));
+    }
+
+    /// **Multiple cycles sharing the new edge.** Two disjoint `holder ⇝ waiter` paths both close on
+    /// the same new edge `waiter -> holder`; the youngest across *both* paths must be the victim, and
+    /// the edge-rooted search must agree with the full sweep. Here T1 is the waiter, T2 the holder;
+    /// paths T2 -> T5 -> T1 and T2 -> T3 -> T1 both reach T1. Youngest overall is T5.
+    #[test]
+    fn edge_rooted_multiple_cycles_through_new_edge() {
+        let mut lt = LockTable::new();
+        for (t, k) in [(1u64, 1u64), (2, 2), (3, 3), (5, 5)] {
+            lt.acquire(TxnId(t), k);
+        }
+        // Build the pre-existing (acyclic) edges: holder T2 reaches waiter T1 via two paths.
+        lt.acquire(TxnId(2), 5); // 2 -> 5
+        lt.acquire(TxnId(2), 3); // 2 -> 3
+        lt.acquire(TxnId(5), 1); // 5 -> 1
+        lt.acquire(TxnId(3), 1); // 3 -> 1
+        // The graph is still acyclic (no path back to T2). Now T1 waits for T2: edge 1 -> 2 closes
+        // BOTH cycles 1->2->5->1 and 1->2->3->1.
+        assert!(matches!(lt.acquire(TxnId(1), 2), LockOutcome::Wait { .. }));
+        let narrow = lt.find_deadlock_victim_for(TxnId(1), TxnId(2));
+        let full = lt.find_deadlock_victim();
+        assert_eq!(narrow, full, "narrow must equal full sweep");
+        assert_eq!(narrow, Some(TxnId(5)), "youngest across both cycles is T5");
+    }
+
+    /// A node reachable from the holder but NOT on a path to the waiter must be excluded from the
+    /// victim pool (it is not on any cycle), even though it is younger than the real victims.
+    #[test]
+    fn edge_rooted_excludes_off_cycle_younger_node() {
+        let mut lt = LockTable::new();
+        for (t, k) in [(1u64, 1u64), (2, 2), (3, 3), (9, 9)] {
+            lt.acquire(TxnId(t), k);
+        }
+        // holder T2 reaches waiter T1 via T2 -> T3 -> T1, and ALSO has a dead-end branch
+        // T2 -> T9 that never reaches T1. T9 is the youngest but must NOT be the victim.
+        lt.acquire(TxnId(2), 3); // 2 -> 3
+        lt.acquire(TxnId(3), 1); // 3 -> 1
+        lt.acquire(TxnId(2), 9); // 2 -> 9 (dead end)
+        assert!(matches!(lt.acquire(TxnId(1), 2), LockOutcome::Wait { .. }));
+        let narrow = lt.find_deadlock_victim_for(TxnId(1), TxnId(2));
+        assert_eq!(narrow, lt.find_deadlock_victim());
+        assert_eq!(
+            narrow,
+            Some(TxnId(3)),
+            "T9 is off-cycle; the youngest on-cycle node is T3"
+        );
+    }
+
+    /// Deep chain closed by the new edge: the edge-rooted search must not overflow the stack
+    /// (iterative) and must select the youngest, matching the full sweep (SEC-199 parity).
+    #[test]
+    fn edge_rooted_deep_chain_matches_full_sweep() {
+        const DEPTH: u64 = 50_000;
+        let mut lt = LockTable::new();
+        for i in 0..DEPTH {
+            lt.acquire(TxnId(i + 1), i);
+        }
+        for i in 1..DEPTH {
+            lt.acquire(TxnId(i + 1), i - 1); // T(i+1) -> T(i): a long chain
+        }
+        // Close the cycle: head T1 waits on the tail's key (held by T(DEPTH)). Edge is 1 -> DEPTH.
+        assert!(matches!(
+            lt.acquire(TxnId(1), DEPTH - 1),
+            LockOutcome::Wait { .. }
+        ));
+        assert_eq!(
+            lt.find_deadlock_victim_for(TxnId(1), TxnId(DEPTH)),
+            Some(TxnId(DEPTH))
+        );
+        assert_eq!(lt.find_deadlock_victim(), Some(TxnId(DEPTH)));
     }
 
     #[test]

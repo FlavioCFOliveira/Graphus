@@ -507,8 +507,10 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         match self.locks.acquire(txn, key) {
             LockOutcome::Granted => Ok(()),
             LockOutcome::Wait { holder } => {
-                // A wait-for edge was recorded; check whether it closed a deadlock cycle.
-                if let Some(victim) = self.locks.find_deadlock_victim() {
+                // A wait-for edge `txn -> holder` was just recorded; a *new* cycle can only pass
+                // through that edge, so the edge-rooted search (O(cycle length)) suffices and picks
+                // the exact same youngest victim the full O(V+E) sweep would (debug-asserted inside).
+                if let Some(victim) = self.locks.find_deadlock_victim_for(txn, holder) {
                     if victim == txn {
                         self.abort_internal(txn);
                         return Err(GraphusError::Transaction(format!(
