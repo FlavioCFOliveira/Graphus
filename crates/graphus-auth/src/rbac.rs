@@ -153,6 +153,67 @@ pub enum Resource {
     },
 }
 
+/// A **borrowed** request resource (`&str` fields): the allocation-free probe twin of [`Resource`]
+/// (rmp #320).
+///
+/// Fine-grained RBAC enforcement asks the same `(action, resource)` question for every node label,
+/// every property, and every relationship type of every row a restricted statement filters. Building
+/// an owned [`Resource`] (hence an owned [`Privilege`]) for each such probe allocates a fresh `String`
+/// per element name and clones the session database name — one allocation per
+/// `(label)` / `(label, property)` / `(rel_type)` probe over a wide restricted `MATCH`. `ResourceRef`
+/// borrows those names instead, so [`Privilege::implies_ref`] answers the **identical** containment
+/// decision with zero allocation.
+///
+/// The variants and their `db`/`label`/`rel_type`/`property` fields mirror [`Resource`] one-to-one;
+/// [`Resource::covers_ref`] is the borrowed twin of [`Resource::covers`], pinned field-for-field
+/// against it by an exhaustive oracle test so the borrowed and owned probe paths can never diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceRef<'a> {
+    /// The whole server (every database) — the borrowed twin of [`Resource::Database`].
+    Database,
+    /// A whole named database — the borrowed twin of [`Resource::Graph`].
+    Graph(&'a str),
+    /// All nodes of one label in one database — the borrowed twin of [`Resource::Label`].
+    Label {
+        /// The (canonical) database name.
+        db: &'a str,
+        /// The node label.
+        label: &'a str,
+    },
+    /// All relationships of one type in one database — the borrowed twin of [`Resource::RelType`].
+    RelType {
+        /// The (canonical) database name.
+        db: &'a str,
+        /// The relationship type.
+        rel_type: &'a str,
+    },
+    /// One property of one label's nodes in one database — the borrowed twin of [`Resource::Property`].
+    Property {
+        /// The (canonical) database name.
+        db: &'a str,
+        /// The node label the property belongs to.
+        label: &'a str,
+        /// The property key.
+        property: &'a str,
+    },
+}
+
+impl ResourceRef<'_> {
+    /// The database name a borrowed resource is scoped to, or `None` for the server-wide scope (the
+    /// borrowed twin of [`Resource::database`]).
+    #[must_use]
+    fn database(&self) -> Option<&str> {
+        match self {
+            ResourceRef::Database => None,
+            ResourceRef::Graph(db)
+            | ResourceRef::Label { db, .. }
+            | ResourceRef::RelType { db, .. }
+            | ResourceRef::Property { db, .. } => Some(db),
+        }
+    }
+}
+
 impl Resource {
     /// Returns `true` if holding a grant scoped to `self` covers a request scoped to `wanted`
     /// (the resource containment tree — module docs). Database-agnostic [`Resource::Database`]
@@ -190,6 +251,48 @@ impl Resource {
             } => matches!(
                 wanted,
                 Resource::Property { db: wdb, label: wlabel, property: wprop }
+                    if db == wdb && label == wlabel && property == wprop
+            ),
+        }
+    }
+
+    /// The borrowed twin of [`Resource::covers`]: whether a grant scoped to `self` covers a request
+    /// scoped to the borrowed `wanted`. Byte-for-byte the same containment rules as [`covers`](Self::covers),
+    /// just matching against a [`ResourceRef`] so the caller need not allocate an owned [`Resource`]
+    /// for the probe (rmp #320). Pinned equal to `covers` by an exhaustive oracle test.
+    #[must_use]
+    fn covers_ref(&self, wanted: &ResourceRef<'_>) -> bool {
+        match self {
+            // The server-wide scope covers every resource in every database.
+            Resource::Database => true,
+            // A whole database covers anything within that same database.
+            Resource::Graph(db) => wanted.database() == Some(db.as_str()),
+            // A label covers itself and its properties, within the same database.
+            Resource::Label { db, label } => match wanted {
+                ResourceRef::Label {
+                    db: wdb,
+                    label: wlabel,
+                } => db == wdb && label == wlabel,
+                ResourceRef::Property {
+                    db: wdb,
+                    label: wlabel,
+                    ..
+                } => db == wdb && label == wlabel,
+                _ => false,
+            },
+            // A relationship-type scope covers only the exact same relationship type.
+            Resource::RelType { db, rel_type } => matches!(
+                wanted,
+                ResourceRef::RelType { db: wdb, rel_type: wrt } if db == wdb && rel_type == wrt
+            ),
+            // A property is the leaf: it covers only itself.
+            Resource::Property {
+                db,
+                label,
+                property,
+            } => matches!(
+                wanted,
+                ResourceRef::Property { db: wdb, label: wlabel, property: wprop }
                     if db == wdb && label == wlabel && property == wprop
             ),
         }
@@ -308,6 +411,20 @@ impl Privilege {
     #[must_use]
     pub fn implies(&self, wanted: &Privilege) -> bool {
         self.resource.covers(&wanted.resource) && self.action.implies(wanted.action)
+    }
+
+    /// The allocation-free twin of [`implies`](Self::implies): whether holding `self` is sufficient to
+    /// satisfy a request for `wanted_action` over the **borrowed** `wanted_resource` (rmp #320).
+    ///
+    /// Identical composition to [`implies`](Self::implies) — resource containment ([`Resource::covers_ref`])
+    /// **and** action containment ([`Action::implies`]) — but the request resource is a [`ResourceRef`]
+    /// of borrowed `&str` names, so the fine-grained RBAC hot path probes per-element authority without
+    /// allocating an owned [`Resource`]/[`Privilege`] per row. The decision is byte-for-byte what
+    /// `self.implies(&Privilege::new(wanted_action, owned_resource))` would return; an exhaustive oracle
+    /// test pins the two equal.
+    #[must_use]
+    pub fn implies_ref(&self, wanted_action: Action, wanted_resource: &ResourceRef<'_>) -> bool {
+        self.resource.covers_ref(wanted_resource) && self.action.implies(wanted_action)
     }
 }
 
@@ -645,6 +762,29 @@ impl Catalog {
             .flat_map(|role| role.privileges.iter())
             .any(|granted| granted.implies(wanted))
     }
+
+    /// Snapshots `user`'s **effective privilege set**: the union of every privilege granted by every
+    /// role the user holds, deduplicated and in deterministic order (rmp #320).
+    ///
+    /// This is the consistent, owned view a caller captures under a **single** read lock at statement
+    /// start, so per-element authorization can then be answered against the snapshot
+    /// ([`Privilege::implies`] / [`Privilege::implies_ref`]) without re-walking the roles indirection
+    /// or re-taking the lock for every probe. An unknown user, or one with no roles / no grants,
+    /// yields an empty set (deny-by-default is preserved: a request implied by *nothing* is denied).
+    ///
+    /// The set is exactly the privileges [`authorize`](Self::authorize) iterates: for any `wanted`,
+    /// `self.authorize(user, &wanted) == self.effective_privileges(user).iter().any(|p| p.implies(&wanted))`.
+    #[must_use]
+    pub fn effective_privileges(&self, user: &str) -> BTreeSet<Privilege> {
+        let Some(user) = self.users.get(user) else {
+            return BTreeSet::new();
+        };
+        user.roles
+            .iter()
+            .filter_map(|role_name| self.roles.get(role_name))
+            .flat_map(|role| role.privileges.iter().cloned())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -918,6 +1058,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Maps an owned request [`Resource`] onto the borrowed [`ResourceRef`] twin for the equivalence
+    /// test (a borrow of the owned scope's own fields).
+    fn as_ref(r: &Resource) -> ResourceRef<'_> {
+        match r {
+            Resource::Database => ResourceRef::Database,
+            Resource::Graph(db) => ResourceRef::Graph(db),
+            Resource::Label { db, label } => ResourceRef::Label { db, label },
+            Resource::RelType { db, rel_type } => ResourceRef::RelType { db, rel_type },
+            Resource::Property {
+                db,
+                label,
+                property,
+            } => ResourceRef::Property {
+                db,
+                label,
+                property,
+            },
+        }
+    }
+
+    #[test]
+    fn implies_ref_is_byte_identical_to_implies() {
+        // The borrowed probe path (`implies_ref` over a `ResourceRef`) must return EXACTLY what the
+        // owned path (`implies` over an owned `Privilege`) returns, across the full 25×25 cross-product
+        // — so the allocation-free hot path (rmp #320) never diverges from the canonical decision.
+        for &ga in &actions() {
+            for grant_scope in scopes() {
+                let grant = Privilege::new(ga, grant_scope.clone());
+                for &wa in &actions() {
+                    for wanted_scope in scopes() {
+                        let wanted = Privilege::new(wa, wanted_scope.clone());
+                        let owned = grant.implies(&wanted);
+                        let borrowed = grant.implies_ref(wa, &as_ref(&wanted_scope));
+                        assert_eq!(
+                            owned, borrowed,
+                            "grant {ga:?}@{grant_scope:?} vs wanted {wa:?}@{wanted_scope:?}: \
+                             owned={owned} borrowed={borrowed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effective_privileges_matches_authorize() {
+        // The snapshot the server captures under one read lock (rmp #320) must answer every request
+        // exactly as `authorize` does: for any `wanted`, `authorize(user, wanted)` iff some privilege
+        // in `effective_privileges(user)` implies it.
+        let mut c = Catalog::new();
+        c.create_user("alice").unwrap();
+        c.create_role("reader").unwrap();
+        c.create_role("writer").unwrap();
+        c.grant_privilege("reader", Privilege::on_label(Action::Read, "db", "Person"))
+            .unwrap();
+        c.grant_privilege("writer", Privilege::on_graph(Action::Write, "db"))
+            .unwrap();
+        c.grant_role("alice", "reader").unwrap();
+        c.grant_role("alice", "writer").unwrap();
+
+        let snapshot = c.effective_privileges("alice");
+        for &a in &actions() {
+            for scope in scopes() {
+                let wanted = Privilege::new(a, scope);
+                assert_eq!(
+                    c.authorize("alice", &wanted),
+                    snapshot.iter().any(|p| p.implies(&wanted)),
+                    "snapshot must agree with authorize for {wanted:?}"
+                );
+            }
+        }
+        // An unknown user yields an empty (deny-everything) snapshot.
+        assert!(c.effective_privileges("ghost").is_empty());
     }
 
     #[test]
