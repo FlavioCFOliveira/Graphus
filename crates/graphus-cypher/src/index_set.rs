@@ -558,19 +558,15 @@ impl IndexSet {
         // `TokenIndex` has no token-enumeration API, so recover the tokens from the label index by
         // scanning the full keyspace via the underlying tree (`scan_all`, ascending). The tree is
         // the only place that holds the per-token keys.
-        let mut tokens: Vec<u32> = self
-            .labels
-            .tree_mut()
-            .scan_all()
-            .unwrap_or_default()
-            .into_iter()
-            // Each label key is `(token: u32 BE, element_id: u64 BE)`; the leading 4 bytes are the
-            // label token. Anything shorter is not a label key and is skipped defensively.
-            .filter_map(|(k, _)| {
-                k.get(0..4)
-                    .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-            })
-            .collect();
+        // Each label key is `(token: u32 BE, element_id: u64 BE)`; the leading 4 bytes are the label
+        // token. Anything shorter is not a label key and is skipped defensively. Streaming over the key
+        // slices avoids an owned `(key, value)` pair per row.
+        let mut tokens: Vec<u32> = Vec::new();
+        let _ = self.labels.tree_mut().scan_all_for_each(|k, _| {
+            if let Some(b) = k.get(0..4) {
+                tokens.push(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            }
+        });
         tokens.sort_unstable();
         tokens.dedup();
         tokens
@@ -1051,13 +1047,17 @@ impl IndexSet {
         token: u32,
     ) -> graphus_core::error::Result<Vec<u64>> {
         let prefix = token.to_be_bytes();
-        Ok(idx
-            .tree_mut()
-            .scan_all()?
-            .into_iter()
-            .filter(|(k, _)| k.get(0..4) == Some(&prefix[..]))
-            .filter_map(|(_, v)| v.as_slice().try_into().ok().map(u64::from_le_bytes))
-            .collect())
+        // Stream the whole keyspace, decoding the rid out of each matching value slice — no owned
+        // `(key, value)` pair per row. The unbounded-below superset semantics are unchanged.
+        let mut out: Vec<u64> = Vec::new();
+        idx.tree_mut().scan_all_for_each(|k, v| {
+            if k.get(0..4) == Some(&prefix[..]) {
+                if let Ok(bytes) = v.try_into() {
+                    out.push(u64::from_le_bytes(bytes));
+                }
+            }
+        })?;
+        Ok(out)
     }
 }
 

@@ -104,16 +104,28 @@ impl BitmapIndex {
     /// Candidate node ids carrying `value`, ascending. An absent value yields an empty `Vec`. The
     /// caller re-checks visibility + the exact predicate (a returned id may since have changed value
     /// — a harmless superset).
+    ///
+    /// This is a thin eager wrapper over [`Self::seek_eq_iter`], kept for callers/tests that want an
+    /// owned `Vec`. A caller that re-checks ids one at a time should prefer [`Self::seek_eq_iter`] to
+    /// avoid materializing a potentially multi-million-id flat `Vec` (the whole point of the compressed
+    /// bitmap on a low-cardinality column).
     #[must_use]
     pub fn seek_eq(&self, value: &Value) -> Vec<u64> {
-        match keycodec::encode_single(value) {
-            Ok(key) => self
-                .by_value
-                .get(&key)
-                .map(|bm| bm.iter().collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
+        self.seek_eq_iter(value)
+            .map(Iterator::collect)
+            .unwrap_or_default()
+    }
+
+    /// Streaming form of [`Self::seek_eq`]: a **lazy** ascending iterator over the candidate node ids
+    /// carrying `value`, borrowing the value-bitmap in place — `None` if the value is absent or
+    /// unindexable. The caller drives MVCC visibility + predicate re-check **per id**, exactly as the
+    /// eager `seek_eq().into_iter()` did, but without ever collecting the ids into a flat `Vec` first.
+    /// The ids are yielded in the same ascending order as [`Self::seek_eq`] (Roaring iterates
+    /// ascending), so the candidate set is identical.
+    #[must_use]
+    pub fn seek_eq_iter(&self, value: &Value) -> Option<impl Iterator<Item = u64> + '_> {
+        let key = keycodec::encode_single(value).ok()?;
+        self.by_value.get(&key).map(RoaringTreemap::iter)
     }
 
     /// The raw [`RoaringTreemap`] of node ids carrying `value`, for an in-bitmap intersection across
@@ -156,15 +168,27 @@ impl BitmapIndex {
 /// merge of sorted containers), never materializing the per-predicate candidate lists.
 #[must_use]
 pub fn intersect(bitmaps: &[Option<&RoaringTreemap>]) -> Vec<u64> {
+    intersect_treemap(bitmaps).iter().collect()
+}
+
+/// Streaming form of [`intersect`]: returns the AND of the value-bitmaps as an owned
+/// [`RoaringTreemap`] so the caller can iterate the candidates **lazily** (`.iter()`) and re-check
+/// MVCC visibility id-by-id, instead of first collecting them into a flat `Vec<u64>` — for the
+/// low-cardinality columns this index targets the conjunction can still be large, and the flat `Vec`
+/// is exactly the allocation we want to avoid. The id-set AND happens entirely inside Roaring (a merge
+/// of sorted containers), never materializing the per-predicate candidate lists. The yielded ids are
+/// the same set, ascending, as [`intersect`].
+#[must_use]
+pub fn intersect_treemap(bitmaps: &[Option<&RoaringTreemap>]) -> RoaringTreemap {
     if bitmaps.is_empty() {
-        return Vec::new();
+        return RoaringTreemap::new();
     }
     // Any absent value ⇒ the conjunction is empty.
     let mut present: Vec<&RoaringTreemap> = Vec::with_capacity(bitmaps.len());
     for b in bitmaps {
         match b {
             Some(bm) => present.push(bm),
-            None => return Vec::new(),
+            None => return RoaringTreemap::new(),
         }
     }
     // Intersect the smallest first to shrink the running set fastest (a standard AND ordering).
@@ -176,7 +200,7 @@ pub fn intersect(bitmaps: &[Option<&RoaringTreemap>]) -> Vec<u64> {
             break;
         }
     }
-    acc.iter().collect()
+    acc
 }
 
 #[cfg(test)]

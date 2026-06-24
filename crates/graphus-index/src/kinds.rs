@@ -116,12 +116,16 @@ impl<D: BlockDevice, S: LogSink> TokenIndex<D, S> {
     pub fn scan_token(&mut self, token: u32) -> Result<Vec<u64>> {
         let lo = Self::key(token, 0);
         let hi = Self::key(token, u64::MAX);
-        let mut out: Vec<u64> = self
-            .tree
-            .range(&lo, &hi)?
-            .into_iter()
-            .filter_map(|(_, v)| rid_decode(&v))
-            .collect();
+        // Stream the half-open range, decoding the 8-byte rid straight out of each value slice into
+        // `out`. This never copies the (larger) key — the prior `range(...).into_iter()` form
+        // allocated an owned `(Vec<u8>, Vec<u8>)` per row and discarded the key copy. Same ids, same
+        // ascending order (the visitor mirrors `range` exactly).
+        let mut out: Vec<u64> = Vec::new();
+        self.tree.range_for_each(&lo, &hi, |_, v| {
+            if let Some(r) = rid_decode(v) {
+                out.push(r);
+            }
+        })?;
         // Include the upper-bound element if present (range is half-open and u64::MAX is a valid id).
         if let Some(v) = self.tree.lookup(&hi)? {
             if let Some(r) = rid_decode(&v) {
@@ -182,12 +186,7 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
         let tail = encode_or_storage_err(value)?;
         let lo = token_value_lo(token, &tail);
         let hi = token_value_hi(token, &tail);
-        Ok(self
-            .tree
-            .range(&lo, &hi)?
-            .into_iter()
-            .filter_map(|(_, v)| rid_decode(&v))
-            .collect())
+        rids_in_range(&mut self.tree, &lo, &hi)
     }
 
     /// Range seek `[lo_value, hi_value)` (half-open) for `token`, ascending by `(value, id)`.
@@ -206,11 +205,18 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
     ) -> Result<Vec<u64>> {
         let lo_tail = encode_or_storage_err(lo_value)?;
         let lo = token_value_lo(token, &lo_tail);
-        let entries = match hi_value {
+        let mut out: Vec<u64> = Vec::new();
+        let push_rid = |out: &mut Vec<u64>, v: &[u8]| {
+            if let Some(r) = rid_decode(v) {
+                out.push(r);
+            }
+        };
+        match hi_value {
             Some(hv) => {
                 let hi_tail = encode_or_storage_err(hv)?;
                 let hi = token_value_lo(token, &hi_tail); // exclusive of hi_value
-                self.tree.range(&lo, &hi)?
+                self.tree
+                    .range_for_each(&lo, &hi, |_, v| push_rid(&mut out, v))?;
             }
             None => {
                 // Unbounded above *within this token*: stop at the next token.
@@ -218,16 +224,15 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
                     .checked_add(1)
                     .map_or_else(Vec::new, |t| t.to_be_bytes().to_vec());
                 if next_token_lo.is_empty() {
-                    self.tree.range_from(&lo)?
+                    self.tree
+                        .range_from_for_each(&lo, |_, v| push_rid(&mut out, v))?;
                 } else {
-                    self.tree.range(&lo, &next_token_lo)?
+                    self.tree
+                        .range_for_each(&lo, &next_token_lo, |_, v| push_rid(&mut out, v))?;
                 }
             }
-        };
-        Ok(entries
-            .into_iter()
-            .filter_map(|(_, v)| rid_decode(&v))
-            .collect())
+        }
+        Ok(out)
     }
 
     /// Builds an equi-depth [`PropertyHistogram`] over all values indexed under `token`, for the
@@ -256,23 +261,29 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
         // Bound the scan to exactly this token's key span: `[token, token+1)`. When `token == u32::MAX`
         // there is no next token, so scan from the prefix to the end of the tree.
         let lo = token.to_be_bytes().to_vec();
-        let entries = match token.checked_add(1) {
-            Some(next) => self.tree.range(&lo, &next.to_be_bytes())?,
-            None => self.tree.range_from(&lo)?,
-        };
 
         // Strip the 4-byte token prefix and the 8-byte trailing rid to recover the encoded value.
         // Every key is `token(4 BE) || encoded_value || rid(8 BE)`, so any well-formed key is at
         // least 12 bytes; a shorter key would be a corruption we simply skip (defensive, never
-        // expected for keys this index wrote).
+        // expected for keys this index wrote). Streaming over the key slices avoids materializing an
+        // owned `(key, value)` pair per row (the value is discarded here); only the recovered value
+        // bytes are copied, exactly as before.
         const PREFIX: usize = 4;
         const SUFFIX: usize = 8;
-        let values: Vec<Vec<u8>> = entries
-            .into_iter()
-            .filter_map(|(k, _)| {
-                (k.len() >= PREFIX + SUFFIX).then(|| k[PREFIX..k.len() - SUFFIX].to_vec())
-            })
-            .collect();
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        let mut on_key = |k: &[u8], _v: &[u8]| {
+            if k.len() >= PREFIX + SUFFIX {
+                values.push(k[PREFIX..k.len() - SUFFIX].to_vec());
+            }
+        };
+        // Bound the scan to exactly this token's key span: `[token, token+1)`. When `token == u32::MAX`
+        // there is no next token, so scan from the prefix to the end of the tree.
+        match token.checked_add(1) {
+            Some(next) => self
+                .tree
+                .range_for_each(&lo, &next.to_be_bytes(), &mut on_key)?,
+            None => self.tree.range_from_for_each(&lo, &mut on_key)?,
+        }
 
         Ok(PropertyHistogram::from_sorted_encoded(&values, target))
     }
@@ -340,12 +351,7 @@ impl<D: BlockDevice, S: LogSink> CompositeIndex<D, S> {
         let tail = composite_tail(values)?;
         let lo = token_value_lo(token, &tail);
         let hi = token_value_hi(token, &tail);
-        Ok(self
-            .tree
-            .range(&lo, &hi)?
-            .into_iter()
-            .filter_map(|(_, v)| rid_decode(&v))
-            .collect())
+        rids_in_range(&mut self.tree, &lo, &hi)
     }
 
     /// Leading-prefix seek: all record ids whose first `prefix.len()` properties equal `prefix`
@@ -369,12 +375,7 @@ impl<D: BlockDevice, S: LogSink> CompositeIndex<D, S> {
         let lo = token_value_lo(token, &tail);
         let mut hi = keycodec::with_token_prefix(token, &tail);
         hi.push(0xFF); // strictly greater than any key extending this prefix
-        Ok(self
-            .tree
-            .range(&lo, &hi)?
-            .into_iter()
-            .filter_map(|(_, v)| rid_decode(&v))
-            .collect())
+        rids_in_range(&mut self.tree, &lo, &hi)
     }
 
     fn check_arity(&self, got: usize) -> Result<()> {
@@ -445,6 +446,25 @@ impl<D: BlockDevice, S: LogSink> RelPropertyIndex<D, S> {
     ) -> Result<Vec<u64>> {
         self.inner.seek_range(reltype, lo_value, hi_value)
     }
+}
+
+/// Decodes the record ids in the half-open B+-tree key range `[lo, hi)` into an ascending `Vec`,
+/// **without** allocating an owned `(key, value)` pair per row. This is the shared streaming body
+/// behind every `seek_eq`/`seek_prefix` (which all decode the 8-byte rid out of each value and
+/// discard the key). The visitor yields slices borrowing the live leaf page, so only the decoded
+/// `u64`s are kept; ids and order are identical to the prior eager `range(...).filter_map(...)` form.
+fn rids_in_range<D: BlockDevice, S: LogSink>(
+    tree: &mut BTree<D, S>,
+    lo: &[u8],
+    hi: &[u8],
+) -> Result<Vec<u64>> {
+    let mut out: Vec<u64> = Vec::new();
+    tree.range_for_each(lo, hi, |_, v| {
+        if let Some(r) = rid_decode(v) {
+            out.push(r);
+        }
+    })?;
+    Ok(out)
 }
 
 /// Encodes a single value tail, mapping a [`KeyEncodeError`] to a storage error so callers work in

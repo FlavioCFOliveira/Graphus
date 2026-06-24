@@ -427,25 +427,104 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
     }
 
     fn range_impl(&mut self, lo: &[u8], hi: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut out = Vec::new();
+        use std::cell::RefCell;
+        // PERF/I3: a multi-leaf scan reserves each leaf's contribution up front (see
+        // `range_for_each_impl`'s `on_leaf` hook) so `out` grows in leaf-sized steps. The visitor
+        // emits keys/values in exactly the eager order, so the collected `Vec` is byte-identical to
+        // the prior hand-rolled loop (the `streaming_form_matches_eager_form` regression asserts it).
+        // The `on_leaf` reserve hook and the per-row push both mutate `out`, so it is shared through a
+        // single-threaded `RefCell` (the two closures borrow it disjointly in time).
+        let out: RefCell<Vec<(Vec<u8>, Vec<u8>)>> = RefCell::new(Vec::new());
+        self.range_for_each_impl(
+            lo,
+            hi,
+            |hint| out.borrow_mut().reserve(hint),
+            |k, v| out.borrow_mut().push((k.to_vec(), v.to_vec())),
+        )?;
+        Ok(out.into_inner())
+    }
+
+    /// Visits every `(key, value)` entry with `lo <= key < hi` (half-open; pass `None` for `hi` to
+    /// mean "unbounded above"), in ascending key order, **without allocating an owned pair per row**.
+    ///
+    /// This is the allocation-free streaming twin of [`Self::range`]: the prior eager form returned a
+    /// `Vec<(Vec<u8>, Vec<u8>)>` — two heap allocations per entry — even when the caller only needed
+    /// to decode an 8-byte rid out of each value and threw the key copy away (`TokenIndex::scan_token`,
+    /// `PropertyIndex::seek_*`/`build_histogram`). `range_for_each` instead hands the caller borrowed
+    /// **slices** into the live leaf page, so a caller that decodes-and-discards pays **zero** per-row
+    /// allocations.
+    ///
+    /// The visitor `f(&key, &value)` is invoked **exactly once per matching entry, in the same order
+    /// and over the same bytes** the eager [`Self::range`] would have collected — it is a pure
+    /// allocation optimization, never a behavioral change.
+    ///
+    /// ## Slice lifetime vs. page latch (soundness)
+    ///
+    /// Each yielded `&[u8]` borrows the bytes of the leaf page currently **pinned** in the buffer pool.
+    /// The scan keeps that page pinned (`fetch` … `unpin`) across the whole inner loop, so every
+    /// `f(k, v)` call for that leaf runs *while the page is valid*; only **after** the last entry of a
+    /// leaf is visited does the scan `unpin` it and fetch the next right-sibling. The borrowed slice
+    /// therefore cannot outlive the pin — the higher-ranked `FnMut(&[u8], &[u8])` bound prevents the
+    /// closure from smuggling a slice out (it would not name a lifetime long enough), so a caller can
+    /// only *use* the bytes during the callback (typically copying out a decoded id). This mirrors the
+    /// existing latch discipline of [`Self::range_impl`], which copies each cell out before unpinning.
+    ///
+    /// # Errors
+    /// Propagates a buffer-pool fetch error (or a `Storage` error from a forged-but-CRC-valid page).
+    pub fn range_for_each<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        lo: &[u8],
+        hi: &[u8],
+        f: F,
+    ) -> Result<()> {
+        self.range_for_each_impl(lo, Some(hi), |_| {}, f)
+    }
+
+    /// Like [`Self::range_for_each`] but unbounded above (`key >= lo`).
+    ///
+    /// # Errors
+    /// Propagates a buffer-pool fetch error.
+    pub fn range_from_for_each<F: FnMut(&[u8], &[u8])>(&mut self, lo: &[u8], f: F) -> Result<()> {
+        self.range_for_each_impl(lo, None, |_| {}, f)
+    }
+
+    /// Visits every entry in ascending key order (the streaming twin of [`Self::scan_all`]).
+    ///
+    /// # Errors
+    /// Propagates a buffer-pool fetch error.
+    pub fn scan_all_for_each<F: FnMut(&[u8], &[u8])>(&mut self, f: F) -> Result<()> {
+        self.range_for_each_impl(&[], None, |_| {}, f)
+    }
+
+    /// The single scan engine behind both the eager `range_*` collectors and the streaming
+    /// `range_*_for_each` visitors. `on_leaf(hint)` is called once per visited leaf with the number of
+    /// entries it will contribute (so the eager collector can reserve), then `f(key, value)` is called
+    /// for each matching entry while its leaf is pinned. Keeping one engine guarantees the eager and
+    /// streaming forms visit byte-identical keys/values in identical order.
+    fn range_for_each_impl<H: FnMut(usize), F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+        mut on_leaf: H,
+        mut f: F,
+    ) -> Result<()> {
         let Some(root) = self.root else {
-            return Ok(out);
+            return Ok(());
         };
         let mut leaf = self.descend_to_leaf(root, lo)?;
         loop {
-            let f = self.pool.fetch(leaf)?;
-            if let Err(e) = self.validate_cached(leaf, f) {
-                self.pool.unpin(f);
+            let fr = self.pool.fetch(leaf)?;
+            if let Err(e) = self.validate_cached(leaf, fr) {
+                self.pool.unpin(fr);
                 return Err(e);
             }
-            let v = NodeView::new(self.pool.page(f));
+            let v = NodeView::new(self.pool.page(fr));
             let start = v.lower_bound(lo);
-            // PERF/I3: this leaf contributes at most `slot_count - start` entries; reserve them up
-            // front so a multi-leaf scan grows `out` in leaf-sized steps instead of doubling
-            // per-item. Identical results — only the allocation schedule changes.
-            out.reserve(v.slot_count().saturating_sub(start));
+            on_leaf(v.slot_count().saturating_sub(start));
             let mut passed_hi = false;
             for i in start..v.slot_count() {
+                // `k`/`val` borrow the pinned page `fr`; the closure runs here, before any `unpin`,
+                // so the borrowed slices are always valid (see `range_for_each` soundness note).
                 let k = v.key(i);
                 if let Some(h) = hi {
                     if !h.is_empty() && k >= h {
@@ -453,16 +532,16 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
                         break;
                     }
                 }
-                out.push((k.to_vec(), v.value(i).to_vec()));
+                f(k, v.value(i));
             }
             let next = v.right_sibling();
-            self.pool.unpin(f);
+            self.pool.unpin(fr);
             if passed_hi || next == 0 {
                 break;
             }
             leaf = PageId(next);
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Descends from `from` to the leaf that would contain `key`.
