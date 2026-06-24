@@ -1165,6 +1165,7 @@ dependencies = [
  "jiff-tzdb",
  "proptest",
  "rayon",
+ "rustc-hash",
  "tz-rs",
 ]
 

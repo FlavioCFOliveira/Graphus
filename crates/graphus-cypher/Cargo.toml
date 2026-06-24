@@ -80,6 +80,15 @@ graphus-columnar = { path = "../graphus-columnar" }
 # projection. `rayon` is already in the build graph (a direct dep of `graphus-gds`), so this adds no
 # new crate. Mirrors gds's plain `rayon = "1"` (NOT a workspace dep).
 rayon = "1"
+# `FxHashMap`/`FxHashSet` (`rmp` task #371): the executor/eval hot loops key several internal maps and
+# membership sets on values that are NOT client-derived hash-flooding surfaces — the grouping index is
+# keyed on an already-DoS-resistant SipHash `u64` digest (see `group_key_hash`), and the
+# relationship-isomorphism / self-loop-dedup sets hold `RelId`s — so a fast, fixed-seed `FxHasher` is
+# both safe and a measurable allocation/CPU win there. Crucially `group_key_hash` itself stays SipHash
+# (SEC-210 / CWE-407): only the outer index OVER the digest, and the `RelId` sets, switch to Fx. Already
+# in the build graph (a direct dep of graphus-txn/graphus-bufpool), so this adds no new crate. Matches
+# the workspace pin `rustc-hash = "2"`.
+rustc-hash = "2"
 
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.

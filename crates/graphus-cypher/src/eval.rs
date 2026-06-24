@@ -227,7 +227,14 @@ pub fn eval(
             name,
             distinct: _,
             args,
-        } => call_function(&name.join("."), args, row, params, graph, functions, clock),
+        } => {
+            // `rmp` #371: a single-segment name (the overwhelmingly common case) needs no `String` —
+            // borrow the segment directly. Only a genuinely namespaced (`a.b.c`) name pays the join.
+            match name.as_slice() {
+                [single] => call_function(single, args, row, params, graph, functions, clock),
+                _ => call_function(&name.join("."), args, row, params, graph, functions, clock),
+            }
+        }
         // `count(*)` only appears as an aggregate (handled by the Aggregation operator); reaching
         // here as a scalar would be a planner bug, so produce a typed runtime error rather than panic.
         ExprKind::CountStar => Err(EvalError::TypeError {

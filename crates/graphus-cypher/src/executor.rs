@@ -278,6 +278,11 @@ enum Operator {
         to: Var,
         direction: RelDirection,
         types: Vec<RelType>,
+        /// `rmp` #371: the relationship-type names of `types`, resolved to owned `String`s **once** at
+        /// operator construction instead of once per driving (base) row. `GraphAccess::expand` takes
+        /// `&[String]`, and every base row of this operator expands over the same `types`, so this is
+        /// hoisted out of the per-row hot loop.
+        type_names: Vec<String>,
         into: bool,
         range: Option<VarLengthRange>,
         /// Relationship variables bound by earlier links of the same MATCH pattern. A candidate
@@ -573,6 +578,7 @@ impl Operator {
                 to,
                 direction,
                 types,
+                type_names,
                 into,
                 range,
                 prior_rels,
@@ -610,7 +616,7 @@ impl Operator {
                         relationship,
                         to,
                         *direction,
-                        types,
+                        type_names,
                         *into,
                         *range,
                         prior_rels,
@@ -625,7 +631,7 @@ impl Operator {
                         relationship,
                         to,
                         *direction,
-                        types,
+                        type_names,
                         *into,
                         prior_rels,
                         ctx,
@@ -966,8 +972,11 @@ fn merge_rows(left: &Row, right: &Row) -> Row {
 /// links of the same MATCH pattern have traversed. A variable bound to a single relationship
 /// contributes its id; one bound to a variable-length relationship list contributes every id in the
 /// list. Used to enforce relationship isomorphism: a hop must not re-traverse any of these.
-fn used_relationships(base: &Row, prior_rels: &[Var]) -> std::collections::BTreeSet<RelId> {
-    fn collect(v: &RowValue, out: &mut std::collections::BTreeSet<RelId>) {
+/// `rmp` #371: the set is used only for membership (`.contains`) — never iterated for output — so an
+/// unordered `FxHashSet` is byte-identical to the former `BTreeSet` and avoids the per-insert tree
+/// balancing.
+fn used_relationships(base: &Row, prior_rels: &[Var]) -> rustc_hash::FxHashSet<RelId> {
+    fn collect(v: &RowValue, out: &mut rustc_hash::FxHashSet<RelId>) {
         match v {
             RowValue::Rel(r) => {
                 out.insert(r.id);
@@ -976,7 +985,7 @@ fn used_relationships(base: &Row, prior_rels: &[Var]) -> std::collections::BTree
             _ => {}
         }
     }
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = rustc_hash::FxHashSet::default();
     for var in prior_rels {
         if let Some(v) = base.get(&var.name) {
             collect(v, &mut out);
@@ -992,7 +1001,7 @@ fn expand_into_pending(
     relationship: &Var,
     to: &Var,
     direction: RelDirection,
-    types: &[RelType],
+    type_names: &[String],
     into: bool,
     prior_rels: &[Var],
     ctx: &mut Ctx<'_>,
@@ -1008,11 +1017,17 @@ fn expand_into_pending(
         None
     };
     // Relationships already traversed by earlier links of the same pattern — none of which this hop
-    // may re-use (relationship isomorphism, `04 §2.4`).
-    let used = used_relationships(base, prior_rels);
-    let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
+    // may re-use (relationship isomorphism, `04 §2.4`). `rmp` #371: when there are no prior pattern
+    // relationships there is nothing to forbid (`used_relationships` would return ∅, so
+    // `used.contains(..)` is always false) — skip building/consulting it entirely. The per-anchor
+    // `seen_rel` self-loop dedup below stays active regardless.
+    let used = if prior_rels.is_empty() {
+        None
+    } else {
+        Some(used_relationships(base, prior_rels))
+    };
     let dir = ExpandDirection::from_pattern(direction);
-    let incidents = ctx.graph.expand(anchor, dir, &type_names);
+    let incidents = ctx.graph.expand(anchor, dir, type_names);
     // `rmp` #364: derive the produced-row shape ONCE before the loop instead of once per produced
     // edge. Build a template row by applying the same `set`s to the base; every produced row then
     // shares that template's schema (an `Arc` bump) and overwrites only the two bound columns by
@@ -1041,12 +1056,12 @@ fn expand_into_pending(
     };
     // Deduplicate self-loops reported once per side (`04 §2.4`): a relationship id appears at most
     // once per produced row set for this anchor.
-    let mut seen_rel = std::collections::BTreeSet::new();
+    let mut seen_rel = rustc_hash::FxHashSet::default();
     for inc in incidents {
         if !seen_rel.insert(inc.rel) {
             continue;
         }
-        if used.contains(&inc.rel) {
+        if used.as_ref().is_some_and(|u| u.contains(&inc.rel)) {
             continue;
         }
         if into && Some(inc.neighbour) != target {
@@ -1078,7 +1093,7 @@ fn var_expand_into_pending(
     relationship: &Var,
     to: &Var,
     direction: RelDirection,
-    types: &[RelType],
+    type_names: &[String],
     into: bool,
     range: VarLengthRange,
     prior_rels: &[Var],
@@ -1097,8 +1112,9 @@ fn var_expand_into_pending(
     };
     // Relationships earlier links of the same pattern already traversed — forbidden in this walk
     // (relationship isomorphism spans the whole pattern, not just this variable-length segment).
+    // `rmp` #371: an empty `FxHashSet` (the no-prior-rels case) allocates nothing until first insert,
+    // so this is already near-free; the dfs threads `&forbidden` at every depth.
     let forbidden = used_relationships(base, prior_rels);
-    let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
     let dir = ExpandDirection::from_pattern(direction);
     let min = range.min.unwrap_or(1);
 
@@ -1113,7 +1129,7 @@ fn var_expand_into_pending(
         target: Option<NodeId>,
         dir: ExpandDirection,
         type_names: &[String],
-        forbidden: &std::collections::BTreeSet<RelId>,
+        forbidden: &rustc_hash::FxHashSet<RelId>,
         rel_props: Option<&Expr>,
         base: &Row,
         relationship: &Var,
@@ -1144,7 +1160,7 @@ fn var_expand_into_pending(
         }
         // Deduplicate self-loops reported once per side (`04 §2.4`); the trail check enforces
         // relationship uniqueness across the whole walk.
-        let mut seen_rel = std::collections::BTreeSet::new();
+        let mut seen_rel = rustc_hash::FxHashSet::default();
         let incidents = ctx.graph.expand(current, dir, type_names);
         for inc in incidents {
             if !seen_rel.insert(inc.rel) || trail.contains(&inc.rel) || forbidden.contains(&inc.rel)
@@ -1190,7 +1206,7 @@ fn var_expand_into_pending(
         range.max,
         target,
         dir,
-        &type_names,
+        type_names,
         &forbidden,
         rel_props,
         base,
@@ -1772,6 +1788,7 @@ fn build_operator(
             relationship: relationship.clone(),
             to: to.clone(),
             direction: *direction,
+            type_names: types.iter().map(|t| t.name.clone()).collect(),
             types: types.clone(),
             into: false,
             range: *range,
@@ -1795,6 +1812,7 @@ fn build_operator(
             relationship: relationship.clone(),
             to: to.clone(),
             direction: *direction,
+            type_names: types.iter().map(|t| t.name.clone()).collect(),
             types: types.clone(),
             into: true,
             range: *range,
@@ -3621,7 +3639,12 @@ fn is_expand_degree_count(expr: &Expr, to_var: &str) -> bool {
             distinct: false,
             args,
         } => {
-            if !name.join(".").eq_ignore_ascii_case("count") {
+            // `rmp` #371: avoid the `String` join for the single-segment fast path (`count(..)`).
+            let is_count = match name.as_slice() {
+                [single] => single.eq_ignore_ascii_case("count"),
+                _ => name.join(".").eq_ignore_ascii_case("count"),
+            };
+            if !is_count {
                 return false;
             }
             let [arg] = args.as_slice() else {
@@ -3933,7 +3956,12 @@ fn aggregate_rows(
     // (`rmp` #314). The hash is `hash_row_value` (consistent with `row_values_equivalent`); a bucket
     // collision still falls back to the exact equivalence check, so grouping semantics are
     // unchanged. Groups stay in first-seen order (output order is preserved).
-    let mut index: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    //
+    // `rmp` #371: the index is keyed on the `group_key_hash` `u64` digest, which is ALREADY a
+    // DoS-resistant SipHash output (SEC-210 / CWE-407) — re-hashing it under `std`'s SipHash is pure
+    // waste, so the outer map uses `FxHasher` (`FxHashMap`). Only the digest computation stays SipHash;
+    // bucketing the digest with a fast fixed-seed hasher is safe and faster.
+    let mut index: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
 
     while let Some(row) = inner.next(ctx)? {
         ctx.check_cancelled()?;
@@ -3998,6 +4026,16 @@ fn aggregate_rows(
         let mut row = Row::empty();
         // The evaluation row for the outer expressions: the group's representative input row,
         // the projected key aliases, and the synthetic aggregate-result bindings.
+        //
+        // `rmp` #371: the representative input row is NOT dead and MUST stay. An aggregate-containing
+        // projection item may, outside its aggregate calls, reference the projection's *simple grouping
+        // keys*, which `semantics.rs` (`GroupingKeys::simple`, the `check_aggregate_item_references`
+        // rule at `semantics.rs` ~1318) defines as a bare variable OR a **variable-rooted property
+        // path** — e.g. `RETURN n.name, n.name + count(*)` is valid, and the outer expression
+        // `n.name + <agg>` reads the raw input variable `n` (rooting `n.name`), not the key *alias*.
+        // Those raw input bindings come only from the representative row; building `eval_row` fresh
+        // would make such property paths evaluate to null and diverge from the TCK. (Materializing only
+        // the key *columns* would not help — the outer expr reads the raw variable, not the alias.)
         let mut eval_row = g.representative;
         for (col, kv) in group_keys.iter().zip(g.keys) {
             eval_row.set(col.alias.clone(), kv.clone());

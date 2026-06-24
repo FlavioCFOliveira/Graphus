@@ -936,8 +936,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // values) → the indices of local groups whose key hashes there; a bucket collision falls back to
         // the same `row_values_equivalent` resolution, so grouping semantics are identical.
         let mut groups: Vec<MorselLocalGroup> = Vec::new();
-        let mut index: std::collections::HashMap<u64, Vec<usize>> =
-            std::collections::HashMap::new();
+        // `rmp` #371: keyed on the already-DoS-resistant `group_key_hash` `u64` digest, so the outer
+        // index buckets it with `FxHasher` (the digest itself stays SipHash) — byte-identical grouping,
+        // no wasted re-hash.
+        let mut index: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
         let mut first_error: Option<GraphusError> = None;
 
         for (rank, node) in members.into_iter().enumerate() {
@@ -1804,7 +1806,9 @@ pub fn converge_group_aggregate_outcomes(outcomes: Vec<MorselGroupOutcome>) -> G
         first_seen_global: u64,
     }
     let mut merged: Vec<GlobalGroup> = Vec::new();
-    let mut index: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+    // `rmp` #371: the merge index is keyed on the same already-DoS-resistant `group_key_hash` `u64`
+    // digest (the digest stays SipHash); buckets it with `FxHasher`.
+    let mut index: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
     // The running survivor prefix: the total survivor count of every morsel BEFORE the current one (in
     // ascending-`lo` order), so a local survivor rank maps into the global survivor-rank space.
     let mut survivor_prefix: u64 = 0;
