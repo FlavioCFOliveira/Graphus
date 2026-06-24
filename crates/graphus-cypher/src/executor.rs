@@ -881,8 +881,61 @@ fn predicate_truth(expr: &Expr, row: &Row, ctx: &mut Ctx<'_>) -> Result<Ternary,
     }
 }
 
+thread_local! {
+    /// Memoises the output [`RowSchema`] of a projection by its **ordered alias list** (`rmp` task
+    /// #364). A projection's output column names are identical for every row it emits, so the schema
+    /// is built once and shared (an `Arc` bump) across all produced rows instead of re-allocating the
+    /// alias `String`s per row. Keyed by the alias vector (not by slice pointer, which a planner is
+    /// free to reuse for a different projection) so the memo is always correct.
+    static PROJECTION_SCHEMA_CACHE: std::cell::RefCell<
+        std::collections::HashMap<Vec<String>, std::sync::Arc<crate::runtime::RowSchema>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The shared output schema for a projection's `items`, built once per distinct alias list and reused
+/// for every row the projection emits (`rmp` task #364 — kills the per-row alias `String` alloc).
+fn projection_schema(items: &[ProjectionColumn]) -> std::sync::Arc<crate::runtime::RowSchema> {
+    PROJECTION_SCHEMA_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // The alias list is the identity of the output shape. A `Vec<String>` clone here happens once
+        // per distinct projection shape (a handful of times per query), never per row.
+        let key: Vec<String> = items.iter().map(|c| c.alias.clone()).collect();
+        if let Some(schema) = cache.get(&key) {
+            return std::sync::Arc::clone(schema);
+        }
+        let schema =
+            std::sync::Arc::new(crate::runtime::RowSchema::from_names(key.iter().cloned()));
+        cache.insert(key, std::sync::Arc::clone(&schema));
+        schema
+    })
+}
+
 /// Projects a row to the output columns, evaluating each item against the input row.
+///
+/// The output **schema** (the alias list) is identical for every emitted row, so when the aliases are
+/// distinct it is built once and shared via [`projection_schema`]; only the evaluated `values` are
+/// produced per row, with **no** per-row column-name allocation (`rmp` task #364). On the rare case
+/// of a duplicate alias the previous `set`-based collapse semantics (last write wins, original
+/// position kept) are preserved exactly.
 fn project_row(row: &Row, items: &[ProjectionColumn], ctx: &mut Ctx<'_>) -> Result<Row, ExecError> {
+    let schema = projection_schema(items);
+    if schema.len() == items.len() {
+        // Distinct aliases (the steady state): one value per item, shared schema, zero name alloc.
+        let mut values = Vec::with_capacity(items.len());
+        for col in items {
+            let v = eval(
+                &col.expr,
+                row,
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            values.push(v);
+        }
+        return Ok(crate::runtime::Row::from_schema_values(schema, values));
+    }
+    // Duplicate alias present: fall back to the collapse-on-rebind path for byte-identical output.
     let mut out = Row::empty();
     for col in items {
         let v = eval(
@@ -960,6 +1013,32 @@ fn expand_into_pending(
     let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
     let dir = ExpandDirection::from_pattern(direction);
     let incidents = ctx.graph.expand(anchor, dir, &type_names);
+    // `rmp` #364: derive the produced-row shape ONCE before the loop instead of once per produced
+    // edge. Build a template row by applying the same `set`s to the base; every produced row then
+    // shares that template's schema (an `Arc` bump) and overwrites only the two bound columns by
+    // index — no per-edge schema allocation and no per-edge column-name clone.
+    let mut template = base.clone();
+    template.set(
+        relationship.name.clone(),
+        RowValue::Rel(RelRef { id: RelId(0) }),
+    );
+    if !into {
+        template.set(to.name.clone(), RowValue::Node(NodeRef { id: anchor }));
+    }
+    let rel_idx = template
+        .schema()
+        .index_of_pub(&relationship.name)
+        .expect("INVARIANT: relationship column was just set on the template");
+    let to_idx = if into {
+        None
+    } else {
+        Some(
+            template
+                .schema()
+                .index_of_pub(&to.name)
+                .expect("INVARIANT: to column was just set on the template"),
+        )
+    };
     // Deduplicate self-loops reported once per side (`04 §2.4`): a relationship id appears at most
     // once per produced row set for this anchor.
     let mut seen_rel = std::collections::BTreeSet::new();
@@ -973,16 +1052,10 @@ fn expand_into_pending(
         if into && Some(inc.neighbour) != target {
             continue;
         }
-        let mut row = base.clone();
-        row.set(
-            relationship.name.clone(),
-            RowValue::Rel(RelRef { id: inc.rel }),
-        );
-        if !into {
-            row.set(
-                to.name.clone(),
-                RowValue::Node(NodeRef { id: inc.neighbour }),
-            );
+        let mut row = template.clone();
+        row.set_at(rel_idx, RowValue::Rel(RelRef { id: inc.rel }));
+        if let Some(to_idx) = to_idx {
+            row.set_at(to_idx, RowValue::Node(NodeRef { id: inc.neighbour }));
         }
         pending.push_back(row);
     }

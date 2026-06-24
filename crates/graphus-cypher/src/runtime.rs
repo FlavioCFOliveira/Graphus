@@ -451,17 +451,124 @@ pub fn hash_row_value<H: std::hash::Hasher>(v: &RowValue, state: &mut H) {
     }
 }
 
-/// A single executor result row: a positional tuple of [`RowValue`]s plus the variable names bound
-/// in each column (`04 §7.4`).
+/// The **shared schema** of a [`Row`]: the ordered column names (`rmp` task #364).
 ///
-/// A row is a **name → value binding** realised as parallel `columns`/`values` vectors (positional
-/// access is the executor's hot path; the names let operators resolve variables by name and let the
-/// final projection label result columns). Column order is the introduction order of the binding.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// A schema is **immutable and shared** behind an [`Arc`]: every row produced from a parent shares
+/// the parent's schema by a cheap refcount bump, so cloning a row never re-allocates the column
+/// names. Names live here, once, instead of being deep-cloned per row. Operators that introduce a
+/// new column derive a fresh schema (copy-on-write) — but only **once per distinct row shape**, not
+/// per row, because the hot loops hoist the derivation out (see [`Row::extend`]).
+///
+/// # Why a linear name scan, not a hash map
+///
+/// [`Row::get`] resolves a variable to a positional index by scanning the name slice. Result rows are
+/// **narrow** — a query binds a handful of columns (typically 1–10) — and at that width a few short
+/// `String` comparisons are measurably faster than hashing the lookup key (a `SipHash` of a `&str`
+/// dominates the cost when N is tiny; an empirical bench at N=8 showed a hash map ~8× *slower*). The
+/// name slice is also already needed for the result labels, so a parallel index map would only add
+/// allocation to every schema derivation for no gain. Operators that resolve a column once and then
+/// touch it per row use [`index_of_pub`](RowSchema::index_of_pub) + positional access to pay the scan
+/// a single time per shape.
+#[derive(Debug, Default, PartialEq)]
+pub struct RowSchema {
+    names: Vec<String>,
+}
+
+impl RowSchema {
+    /// The empty schema (no columns).
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// The bound column names, in order.
+    #[inline]
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The positional index of `name`, if bound (a linear scan — see the type docs for why this beats
+    /// a hash map at result-row widths).
+    #[inline]
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|c| c == name)
+    }
+
+    /// The positional index of `name`, if bound (public for compile-time index resolution in hot
+    /// loops that pre-resolve a variable once, then access by index per row — `rmp` task #364).
+    #[inline]
+    #[must_use]
+    pub fn index_of_pub(&self, name: &str) -> Option<usize> {
+        self.index_of(name)
+    }
+
+    /// The number of columns.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the schema binds no columns.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Builds a schema from an ordered name sequence, **dropping** a repeated name (keeping its first
+    /// position) so the resulting `len()` is the count of distinct columns. A caller compares the
+    /// resulting `len()` against the input count to detect (and specially handle) duplicate names —
+    /// see [`Row`]'s projection path (`rmp` task #364).
+    #[must_use]
+    pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
+        let mut schema = Self::empty();
+        for name in names {
+            if !schema.names.contains(&name) {
+                schema.names.push(name);
+            }
+        }
+        schema
+    }
+
+    /// Derives a new schema with `name` appended (the caller guarantees `name` is not already bound).
+    fn appended(&self, name: String) -> Self {
+        let mut names = Vec::with_capacity(self.names.len() + 1);
+        names.extend_from_slice(&self.names);
+        names.push(name);
+        Self { names }
+    }
+}
+
+/// A single executor result row: a positional tuple of [`RowValue`]s over a **shared** [`RowSchema`]
+/// (`04 §7.4`, `rmp` task #364).
+///
+/// A row is a **name → value binding** realised as a positional `values` vector indexed through an
+/// `Arc<RowSchema>`. Positional access is the executor's hot path; the shared schema lets operators
+/// resolve variables by name (a linear scan of the shared name slice — never a per-row `String`
+/// clone) and labels the final result columns. Column order is the introduction order of the binding.
+///
+/// # Why the schema is shared (`rmp` task #364)
+///
+/// Previously a row owned `columns: Vec<String>`, so every `clone` — done once per produced edge in
+/// `expand`, once per merged row in a join — deep-cloned every column **name** (a heap allocation per
+/// name per row). Carrying the names in an `Arc<RowSchema>` makes a clone a refcount bump: **no
+/// per-row column-name allocation remains**. Only the `values` are cloned, which is unavoidable.
+#[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct Row {
-    columns: Vec<String>,
+    schema: std::sync::Arc<RowSchema>,
     values: Vec<RowValue>,
+}
+
+impl PartialEq for Row {
+    /// Two rows are equal when they bind the same names **in the same order** to equal values — the
+    /// exact semantics of the previous derived `PartialEq` over parallel `columns`/`values` vectors.
+    /// Schemas are compared structurally (not by `Arc` identity) so independently built rows with the
+    /// same shape still compare equal.
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.schema, &other.schema)
+            || self.schema.names() == other.schema.names() && self.values == other.values
+    }
 }
 
 impl Row {
@@ -480,10 +587,32 @@ impl Row {
         row
     }
 
+    /// The shared schema of this row.
+    pub fn schema(&self) -> &std::sync::Arc<RowSchema> {
+        &self.schema
+    }
+
+    /// Builds a row directly from a pre-built shared `schema` and the matching positional `values`
+    /// (`rmp` task #364). The fast path for operators (projection) whose output schema is identical
+    /// for every emitted row: the schema is built once and shared, only `values` differ per row.
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug builds) if `values.len()` does not equal `schema.len()` — the two must be the
+    /// same positional arity.
+    pub fn from_schema_values(schema: std::sync::Arc<RowSchema>, values: Vec<RowValue>) -> Self {
+        debug_assert_eq!(
+            schema.len(),
+            values.len(),
+            "from_schema_values: schema arity must match values arity"
+        );
+        Self { schema, values }
+    }
+
     /// The bound column names, in order.
     #[must_use]
     pub fn columns(&self) -> &[String] {
-        &self.columns
+        self.schema.names()
     }
 
     /// The values, in column order.
@@ -494,38 +623,64 @@ impl Row {
     /// The number of bound columns.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.columns.len()
+        self.values.len()
     }
 
     /// Whether the row binds no columns.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.values.is_empty()
     }
 
-    /// The value bound to `name`, if any.
+    /// The value bound to `name`, if any. Resolves the name to a positional index by a linear scan of
+    /// the **shared** schema's name slice (fast at result-row widths — see [`RowSchema`]), then indexes
+    /// the positional `values`. The names are no longer cloned per row (`rmp` task #364).
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&RowValue> {
-        self.columns
-            .iter()
-            .position(|c| c == name)
-            .map(|i| &self.values[i])
+        self.schema.index_of(name).map(|i| &self.values[i])
+    }
+
+    /// The value at positional column `i`, if in range (the hottest accessor once a variable has been
+    /// resolved to an index once).
+    #[inline]
+    #[must_use]
+    pub fn get_at(&self, i: usize) -> Option<&RowValue> {
+        self.values.get(i)
+    }
+
+    /// Overwrites the value at the already-existing positional column `i` (`rmp` task #364). Touches
+    /// **only** `values` — the shared schema is untouched, so no allocation. Used by hot loops that
+    /// pre-resolved a column index against the template schema and now stamp many rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is out of range — callers resolve `i` from the same schema the row carries, so
+    /// this is an invariant violation, not an expected runtime condition.
+    #[inline]
+    pub fn set_at(&mut self, i: usize, value: RowValue) {
+        self.values[i] = value;
     }
 
     /// Whether `name` is bound in this row.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.columns.iter().any(|c| c == name)
+        self.schema.index_of(name).is_some()
     }
 
     /// Binds `name` to `value`, **overwriting** an existing binding for the same name in place (so a
-    /// re-bind keeps its original column position). A new name is appended.
+    /// re-bind keeps its original column position). A new name derives an extended schema and appends
+    /// the value.
+    ///
+    /// Re-binding an existing column touches only `values` (the schema is untouched, no allocation).
+    /// Adding a new column derives a new schema via copy-on-write. Hot loops that add the **same**
+    /// new column to many rows should hoist that derivation with [`Row::extend`] /
+    /// [`Row::with_schema`] to amortise it to one allocation per row shape.
     pub fn set(&mut self, name: impl Into<String>, value: RowValue) {
         let name = name.into();
-        if let Some(i) = self.columns.iter().position(|c| *c == name) {
+        if let Some(i) = self.schema.index_of(&name) {
             self.values[i] = value;
         } else {
-            self.columns.push(name);
+            self.schema = std::sync::Arc::new(self.schema.appended(name));
             self.values.push(value);
         }
     }
@@ -536,6 +691,37 @@ impl Row {
         let mut next = self.clone();
         next.set(name, value);
         next
+    }
+
+    /// Builds the schema this row would have after appending `name` (or the existing schema if `name`
+    /// is already bound), **without** cloning the row's values. Hoist this out of a fan-out loop to
+    /// allocate the derived schema **once** and stamp it onto every produced row via
+    /// [`Row::with_schema_value`].
+    pub fn extend(&self, name: &str) -> std::sync::Arc<RowSchema> {
+        if self.schema.index_of(name).is_some() {
+            std::sync::Arc::clone(&self.schema)
+        } else {
+            std::sync::Arc::new(self.schema.appended(name.to_owned()))
+        }
+    }
+
+    /// Produces a row that is a clone of `self`'s values with one trailing `value` appended under the
+    /// pre-derived `schema` (from [`Row::extend`]). The schema must be `self`'s schema extended by
+    /// exactly one new trailing column; this is the per-row-cheap path used in fan-out loops (one
+    /// `Arc` bump + one value clone + one push, **no** schema allocation per row).
+    pub fn with_schema_value(&self, schema: &std::sync::Arc<RowSchema>, value: RowValue) -> Self {
+        debug_assert_eq!(
+            schema.len(),
+            self.values.len() + 1,
+            "with_schema_value expects a schema extended by exactly one new column"
+        );
+        let mut values = Vec::with_capacity(schema.len());
+        values.extend_from_slice(&self.values);
+        values.push(value);
+        Self {
+            schema: std::sync::Arc::clone(schema),
+            values,
+        }
     }
 
     /// The value bound to `name` as a property [`Value`], or `Value::Null` for an absent binding.

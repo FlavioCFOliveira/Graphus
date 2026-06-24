@@ -213,7 +213,9 @@ pub use record_graph::RecordStoreGraph;
 pub use result::{
     MaterializedNode, MaterializedPath, MaterializedRel, MaterializedStep, MaterializedValue,
 };
-pub use runtime::{NodeRef, RelRef, Row, RowValue, cmp_row_values, row_values_equivalent};
+pub use runtime::{
+    NodeRef, RelRef, Row, RowSchema, RowValue, cmp_row_values, row_values_equivalent,
+};
 pub use semantics::{
     ValidatedQuery, analyze, analyze_to_graphus, analyze_with_extensions, analyze_with_procedures,
     check_implicit_call_parameters,
