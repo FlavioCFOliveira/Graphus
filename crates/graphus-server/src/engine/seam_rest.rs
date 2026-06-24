@@ -218,7 +218,7 @@ impl ResultStream for RestEngineStream {
             // structural value the router serialises.
             RowSource::Engine { rows, .. } => Ok(rows
                 .next()?
-                .map(|cells| cells.iter().map(materialized_to_rest).collect())),
+                .map(|cells| cells.into_iter().map(materialized_to_rest).collect())),
             // A buffered admin row is plain property values; lift each into a `RestValue::Value`.
             RowSource::Admin(rows) => Ok(rows
                 .next()

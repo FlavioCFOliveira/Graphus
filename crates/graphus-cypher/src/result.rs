@@ -178,6 +178,51 @@ impl MaterializedPath {
 
         (nodes, rels, indices)
     }
+
+    /// Owned (consuming) counterpart of [`bolt_path_components`](Self::bolt_path_components): moves
+    /// the distinct nodes and relationships **out** of `self` instead of borrowing them, so a wire
+    /// seam can pack a path without cloning every label/property vector on the hot result path.
+    ///
+    /// Returns `(nodes, rels, indices)` with exactly the same dedup-by-id ordering and signed,
+    /// 1-based index convention as the borrowing form — the only difference is ownership.
+    #[must_use]
+    pub fn into_bolt_path_components(
+        self,
+    ) -> (Vec<MaterializedNode>, Vec<MaterializedRel>, Vec<i64>) {
+        let mut nodes: Vec<MaterializedNode> = Vec::with_capacity(self.steps.len() + 1);
+        let mut rels: Vec<MaterializedRel> = Vec::with_capacity(self.steps.len());
+        let mut indices: Vec<i64> = Vec::with_capacity(self.steps.len() * 2);
+
+        // The start node is always the first distinct node (index 0).
+        nodes.push(self.start);
+
+        for step in self.steps {
+            // Deduplicate the relationship by id, keeping first-appearance order. The signed,
+            // 1-based index encodes both *which* distinct relationship and the traversal direction.
+            let rel_pos = match rels.iter().position(|r| r.id == step.rel.id) {
+                Some(i) => i,
+                None => {
+                    rels.push(step.rel);
+                    rels.len() - 1
+                }
+            };
+            // 1-based, signed by direction.
+            let signed = i64::try_from(rel_pos + 1).unwrap_or(i64::MAX);
+            indices.push(if step.forward { signed } else { -signed });
+
+            // Deduplicate the arrival node by id (a path may revisit a node).
+            let node_pos = match nodes.iter().position(|n| n.id == step.node.id) {
+                Some(i) => i,
+                None => {
+                    nodes.push(step.node);
+                    nodes.len() - 1
+                }
+            };
+            indices.push(i64::try_from(node_pos).unwrap_or(i64::MAX));
+        }
+
+        (nodes, rels, indices)
+    }
 }
 
 /// A **materialized** result-row cell: a scalar/temporal/list/map property [`Value`] passed through,

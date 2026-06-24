@@ -239,7 +239,7 @@ impl RecordStream for BoltEngineStream {
             // structural value the PackStream encoder packs.
             RowSource::Engine { rows, .. } => Ok(rows
                 .next()?
-                .map(|cells| cells.iter().map(materialized_to_bolt).collect())),
+                .map(|cells| cells.into_iter().map(materialized_to_bolt).collect())),
             // A buffered admin row is plain property values; lift each into a `BoltValue::Value`.
             RowSource::Admin(rows) => Ok(rows
                 .next()

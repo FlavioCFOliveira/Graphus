@@ -81,7 +81,7 @@ impl RecordStream for LocalRecordStream {
         match self.reply.rows.next()? {
             // Map each materialized cell onto the Bolt structural value via the SAME mapping the real
             // server seam uses (`graphus_server::engine::bolt_values`), so packing is byte-identical.
-            Some(row) => Ok(Some(row.iter().map(materialized_to_bolt).collect())),
+            Some(row) => Ok(Some(row.into_iter().map(materialized_to_bolt).collect())),
             None => Ok(None),
         }
     }
@@ -522,7 +522,7 @@ impl ResultStream for SimRestStream {
 
     fn next_row(&mut self) -> Result<Option<Row>, GraphusError> {
         match self.reply.rows.next()? {
-            Some(row) => Ok(Some(row.iter().map(materialized_to_rest).collect())),
+            Some(row) => Ok(Some(row.into_iter().map(materialized_to_rest).collect())),
             None => Ok(None),
         }
     }
