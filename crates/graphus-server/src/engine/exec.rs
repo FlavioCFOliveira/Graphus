@@ -17,9 +17,10 @@ use graphus_cypher::extension::ExtensionRegistry;
 use graphus_cypher::function_registry::{Arity, FunctionFailure};
 use graphus_cypher::procedure_registry::{FieldSpec, FieldType, ProcedureFailure, ValueClass};
 use graphus_cypher::{
-    AuthorizedGraph, GraphAccess, IndexCatalog, Parameters, PrivilegeOracle, ProcedureSignature,
-    Statistics, TxnCoordinator, analyze_with_extensions, bind_parameters, execute_with_extensions,
-    lower, parse_tokens, plan_physical_with_stats, tokenize,
+    AuthorizedGraph, FeatureFlags, GraphAccess, IndexCatalog, Parameters, PhysicalPlan, PlanCache,
+    PlanCacheKey, PrivilegeOracle, ProcedureSignature, SchemaVersion, Statistics, TxnCoordinator,
+    analyze_with_extensions, bind_parameters, execute_with_extensions, lower, parse_tokens,
+    plan_physical_with_stats, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
@@ -30,6 +31,83 @@ use super::read_pool::{ReadDispatch, ReadTask};
 use super::stream::{RowReceiver, RowSender};
 use super::{OpenTx, RunReply, TxTicket};
 use crate::metrics::Metrics;
+
+/// The default capacity of the engine's compiled-plan cache (`rmp` task #322). A few hundred distinct
+/// query texts comfortably covers the working set of a typical application (its handful of statement
+/// templates) while bounding the memory a pathological churn of unique queries can pin; the LRU evicts
+/// the least-recently-used plan past this.
+const PLAN_CACHE_CAPACITY: usize = 512;
+
+/// The engine's per-thread compiled-plan cache plus the **schema version** the cache is keyed against
+/// (`rmp` task #322; `04 §7.5`).
+///
+/// The server's RUN path used to re-run the *entire* compile pipeline
+/// (tokenize→parse→analyze→lower→physical-plan) on **every** `Run` — a measured ~7–9 µs of pure CPU
+/// per statement that a looped concurrency workload pays on every iteration. This cache reuses the
+/// compiled [`PhysicalPlan`] for an identical query text, turning a repeated `Run` into a ~0.1 µs
+/// hash lookup + a cheap plan clone.
+///
+/// **Keying & correctness.** The key is the **verbatim query text** paired with the current
+/// [`SchemaVersion`] (and an empty [`FeatureFlags`] set — the engine compiles one feature line).
+/// Exact-text keying makes reuse trivially sound: identical text compiled under the same schema
+/// yields an identical plan, and any literal difference changes the text (so it never reuses a plan
+/// compiled for a different literal). Auto-parameterised normalisation (collapsing literal-only
+/// variants onto one plan, `plan_cache::normalize_query`) is deliberately **not** used here — it would
+/// need an AST-level literal→parameter rewrite the planner consumes, a larger and higher-risk change
+/// promoted as its own task.
+///
+/// **Invalidation.** [`bump_schema`](Self::bump_schema) advances the [`SchemaVersion`], which is part
+/// of every key, so all previously-cached plans become unreachable in one step (with eager eviction
+/// of the now-dead entries). The engine bumps it whenever the planner-visible catalog changes: any
+/// mutating index/constraint DDL, and the asynchronous promotion of an online index build
+/// (`Populating`→`Online`, which is when [`TxnCoordinator::catalog`] starts exposing the new index).
+///
+/// **Statistics freshness.** A cached plan was cost-optimised against the statistics at its
+/// compilation; reusing it under newer statistics is acceptable because every cost-based rewrite is
+/// bag-preserving (`04 §7.5`) — statistics steer *which* equivalent plan is chosen, never the rows it
+/// produces. A schema change (the thing that *can* change results, e.g. a new unique constraint or a
+/// usable index) bumps the version and invalidates.
+///
+/// This lives on the **single engine thread** and is borrowed `&mut` per `Run`, so the underlying
+/// [`PlanCache`]'s documented single-threaded contract holds with no synchronisation.
+pub(super) struct EnginePlanCache {
+    cache: PlanCache<PhysicalPlan>,
+    schema_version: SchemaVersion,
+    feature_flags: FeatureFlags,
+}
+
+impl EnginePlanCache {
+    /// Creates the engine's plan cache at the default capacity, keyed against the initial schema.
+    pub(super) fn new() -> Self {
+        Self {
+            cache: PlanCache::new(PLAN_CACHE_CAPACITY),
+            schema_version: SchemaVersion::INITIAL,
+            feature_flags: FeatureFlags::empty(),
+        }
+    }
+
+    /// Advances the schema version, invalidating every cached plan (their keys all change) and eagerly
+    /// reclaiming the now-dead entries. Called when the planner-visible catalog changes (DDL / online
+    /// index promotion).
+    pub(super) fn bump_schema(&mut self) {
+        self.schema_version = self.schema_version.next();
+        self.cache.invalidate_schema_change(self.schema_version);
+    }
+
+    /// Builds the exact-text key for `query` under the current schema/flags.
+    fn key(&self, query: &str) -> PlanCacheKey {
+        PlanCacheKey {
+            normalized_query_text: query.to_owned(),
+            schema_version: self.schema_version,
+            feature_flags: self.feature_flags.clone(),
+        }
+    }
+
+    /// Cumulative cache statistics (observability / tests).
+    pub(super) fn stats(&self) -> graphus_cypher::CacheStats {
+        self.cache.stats()
+    }
+}
 
 /// Builds the engine's [`ExtensionRegistry`] — the **v1 compiled-in registration hook** for
 /// user-defined functions/procedures (`rmp` task #75).
@@ -150,6 +228,7 @@ pub(super) fn handle_run<
 >(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
+    plan_cache: &mut EnginePlanCache,
     ticket: TxTicket,
     query: &str,
     params: Vec<(String, graphus_core::Value)>,
@@ -179,13 +258,13 @@ pub(super) fn handle_run<
     // coordinator's statistics seam activates the cost-based optimiser (`rmp` tasks #65/#82; each
     // statistics call borrows the store briefly, never across the compile).
     //
-    // Plan-reuse policy: the server compiles per-`Run` today (no plan cache in this path), so the
-    // statistics are as fresh as this compilation. If/when the plan cache is wired here, plans key
-    // on the schema version and a stale-stats plan stays acceptable until invalidation — statistics
-    // are advisory cost inputs only; every cost-based rewrite is bag-preserving.
-    let catalog = coordinator.catalog();
-    let stats = coordinator.statistics();
-    let plan = match compile(query, &catalog, Some(&stats), extensions.as_ref()) {
+    // Plan-reuse policy (`rmp` task #322): the server consults the engine's [`EnginePlanCache`] keyed
+    // on `(query text, schema_version)`. A hit reuses the compiled [`PhysicalPlan`] (a ~0.1 µs lookup
+    // + a cheap plan clone) instead of re-running the ~7–9 µs compile pipeline; a miss compiles and
+    // inserts. A cached plan keeps the statistics it was compiled against — acceptable because every
+    // cost-based rewrite is bag-preserving (`04 §7.5`), and any schema change that *could* alter
+    // results bumps the version (invalidating the cache) via [`EnginePlanCache::bump_schema`].
+    let plan = match compile_cached(plan_cache, query, coordinator, extensions.as_ref()) {
         Ok(p) => p,
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
@@ -445,6 +524,33 @@ fn open_and_drive_first(
 /// Compiles a query string into a physical plan via the full front-end pipeline (lex → parse →
 /// analyze → lower → physical-plan), consulting `catalog` for index-aware strategy choices and
 /// `stats` (the coordinator's statistics seam, `rmp` task #82) for cost-based plan refinement.
+/// Returns the compiled [`PhysicalPlan`] for `query`, consulting the engine's [`EnginePlanCache`]
+/// (`rmp` task #322).
+///
+/// On a **hit** the cached plan is cloned and returned without touching the store — no parse, no
+/// analyse, no planning, and crucially no `catalog()`/`statistics()` borrow (those are taken only to
+/// *compile* a fresh plan). On a **miss** the full [`compile`] pipeline runs against the coordinator's
+/// current catalog + statistics, and the result is inserted under the exact-text key before being
+/// returned. Reuse is sound because the key pairs the verbatim text with the current schema version
+/// (see [`EnginePlanCache`]); a compile error is never cached (only a successful plan is inserted).
+fn compile_cached<D: BlockDevice, S: LogSink>(
+    plan_cache: &mut EnginePlanCache,
+    query: &str,
+    coordinator: &TxnCoordinator<D, S>,
+    extensions: &ExtensionRegistry,
+) -> Result<PhysicalPlan, GraphusError> {
+    let key = plan_cache.key(query);
+    if let Some(plan) = plan_cache.cache.get(&key) {
+        return Ok(plan.clone());
+    }
+    // Miss: compile against the current catalog + statistics, then cache.
+    let catalog = coordinator.catalog();
+    let stats = coordinator.statistics();
+    let plan = compile(query, &catalog, Some(&stats), extensions)?;
+    plan_cache.cache.insert(key, plan.clone());
+    Ok(plan)
+}
+
 fn compile(
     query: &str,
     catalog: &IndexCatalog,

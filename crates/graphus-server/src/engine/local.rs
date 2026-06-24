@@ -85,6 +85,11 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// A throwaway in-flight-reader counter `dispatch_command` writes through; under inline dispatch a
     /// read never dispatches off-thread, so this stays `0` (every statement finalises synchronously).
     readers_inflight: u64,
+    /// The engine's compiled-plan cache (`rmp` task #322), mirroring the threaded loop. Inline and
+    /// single-threaded by construction, so the same reuse + schema-version invalidation applies, and
+    /// the same seed still yields the same execution (the cache changes *how fast* a plan is obtained,
+    /// never *which* plan — exact-text keying is deterministic).
+    plan_cache: super::exec::EnginePlanCache,
     /// Observability counters (a private registry; the simulator may read it for liveness checks).
     metrics: Arc<Metrics>,
     /// The injected (simulated) clock; threaded into execution so latency/timing is deterministic.
@@ -103,6 +108,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
             readers_inflight: 0,
+            plan_cache: super::exec::EnginePlanCache::new(),
             metrics: Arc::new(Metrics::new()),
             clock,
         }
@@ -127,6 +133,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &mut self.coordinator,
             &mut self.open,
             &mut self.next_ticket,
+            &mut self.plan_cache,
             &self.extensions,
             &self.dispatch,
             &mut self.readers_inflight,
@@ -253,6 +260,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let (reply, rx) = reply_channel();
         self.dispatch(EngineCommand::ConstraintDdl { command, reply });
         rx.recv().map_err(|_| gone())?
+    }
+
+    /// A snapshot of the engine's compiled-plan cache counters (`rmp` task #322) — cumulative hits /
+    /// misses / current size / capacity. Lets a test observe that a repeated query text reuses a cached
+    /// plan (a hit) and that a schema change invalidates it (the next compile is a miss again).
+    pub fn plan_cache_stats(&self) -> graphus_cypher::CacheStats {
+        self.plan_cache.stats()
     }
 
     /// Captures an online backup chain artifact of the live store, returning its plaintext bytes.

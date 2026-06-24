@@ -144,6 +144,18 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 ) {
     let mut open: HashMap<u64, OpenTx> = HashMap::new();
     let mut next_ticket: u64 = 0;
+    // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
+    // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
+    // (and `&mut`-borrowed on) this single engine thread, so its single-threaded contract holds with no
+    // synchronisation. Invalidated by a schema-version bump on any planner-visible catalog change (DDL
+    // or an online index build promoting `Populating`→`Online`).
+    let mut plan_cache = exec::EnginePlanCache::new();
+    // Whether an index build was pending at the end of the previous tick. A `true`→`false` transition
+    // means a build just completed (an index promoted `Populating`→`Online`), which changes the
+    // planner-visible catalog (`TxnCoordinator::catalog` now exposes the new index) and so must
+    // invalidate the plan cache. Seeded from the current state so a freshly-opened engine with a
+    // recovered pending build is handled on the tick its build finishes.
+    let mut builds_were_pending = coordinator.has_pending_index_builds();
     // The extension registry (user-defined functions/procedures, `rmp` task #75). Built **once** on
     // the engine thread, then `Arc`-shared so an off-thread reader resolves UDF/UDP plans against the
     // SAME registry that backed compilation (`rmp` task #336 — `ExtensionRegistry` is `Send + Sync`,
@@ -229,6 +241,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut coordinator,
                         &mut open,
                         &mut next_ticket,
+                        &mut plan_cache,
                         &extensions,
                         &dispatch,
                         &mut readers_inflight,
@@ -240,11 +253,21 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
                     drive_index_build(&mut coordinator);
+                    invalidate_cache_on_build_completion(
+                        &coordinator,
+                        &mut plan_cache,
+                        &mut builds_were_pending,
+                    );
                     maybe_run_maintenance(&mut coordinator, &mut wal_at_last_maintenance, &metrics);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
                     drive_index_build(&mut coordinator);
+                    invalidate_cache_on_build_completion(
+                        &coordinator,
+                        &mut plan_cache,
+                        &mut builds_were_pending,
+                    );
                 }
                 // Channel closed (all client senders dropped): the engine is being torn down without a
                 // graceful `Shutdown`. Stop serving.
@@ -259,6 +282,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &mut coordinator,
                 &mut open,
                 &mut next_ticket,
+                &mut plan_cache,
                 &extensions,
                 &dispatch,
                 &mut readers_inflight,
@@ -269,6 +293,14 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             ) {
                 break 'engine;
             }
+            // A DDL command dispatched here may have started a build; reflect that in the edge tracker
+            // so its later completion invalidates the cache (the no-build blocking path never advances
+            // a build itself, but the next `timed` tick will).
+            invalidate_cache_on_build_completion(
+                &coordinator,
+                &mut plan_cache,
+                &mut builds_were_pending,
+            );
             maybe_run_maintenance(&mut coordinator, &mut wal_at_last_maintenance, &metrics);
         }
     }
@@ -421,6 +453,28 @@ fn drive_index_build<D: BlockDevice, S: LogSink>(coordinator: &mut Option<TxnCoo
     }
 }
 
+/// Invalidates the plan cache if an asynchronous index build completed since the previous tick
+/// (`rmp` task #322). A build promoting `Populating`→`Online` makes [`TxnCoordinator::catalog`] start
+/// exposing the new index, so any plan compiled before the promotion (which fell back to a scan) is
+/// now stale and must be recompiled. Detected as a `true`→`false` transition of
+/// [`has_pending_index_builds`](TxnCoordinator::has_pending_index_builds): when the last pending build
+/// drains, bump the schema version. `builds_were_pending` is updated in place to track the edge.
+fn invalidate_cache_on_build_completion<D: BlockDevice, S: LogSink>(
+    coordinator: &Option<TxnCoordinator<D, S>>,
+    plan_cache: &mut exec::EnginePlanCache,
+    builds_were_pending: &mut bool,
+) {
+    let now_pending = coordinator
+        .as_ref()
+        .map(TxnCoordinator::has_pending_index_builds)
+        .unwrap_or(false);
+    if *builds_were_pending && !now_pending {
+        // The last in-flight build just promoted to `Online`: the catalog changed, so invalidate.
+        plan_cache.bump_schema();
+    }
+    *builds_were_pending = now_pending;
+}
+
 /// Dispatches one [`EngineCommand`] against the coordinator. Returns `true` to keep the loop running,
 /// `false` once a [`EngineCommand::Shutdown`] has drained + hardened the store (the loop then exits).
 ///
@@ -432,6 +486,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     open: &mut HashMap<u64, OpenTx>,
     next_ticket: &mut u64,
+    plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &mut u64,
@@ -465,6 +520,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let outcome = exec::handle_run(
                 coord,
                 open,
+                plan_cache,
                 ticket,
                 &query,
                 params,
@@ -511,11 +567,33 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let _ = reply.send(coord.active_count());
         }
         Cmd::IndexDdl { command, reply } => {
+            let mutating = !matches!(
+                command,
+                IndexCommand::ShowIndexes
+                    | IndexCommand::ShowFulltextIndexes
+                    | IndexCommand::ShowPointIndexes
+            );
             let out = handle_index_ddl(coord, &command);
+            // Invalidate the plan cache on a successful *mutating* index DDL (`rmp` task #322): a DROP
+            // (and a fulltext/spatial CREATE, which is synchronous) changes the planner-visible catalog
+            // immediately. A node-property CREATE only starts a `Populating` build whose later
+            // promotion is caught by `invalidate_cache_on_build_completion`, but bumping here too is
+            // harmless (it just recompiles against the unchanged catalog once) and keeps the rule
+            // simple: any mutating DDL bumps the version.
+            if mutating && out.is_ok() {
+                plan_cache.bump_schema();
+            }
             let _ = reply.send(out);
         }
         Cmd::ConstraintDdl { command, reply } => {
+            let mutating = !matches!(command, ConstraintCommand::Show);
             let out = handle_constraint_ddl(coord, &command);
+            // A successful mutating constraint DDL changes the schema (a new/dropped unique/existence/
+            // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
+            // reused (`rmp` task #322).
+            if mutating && out.is_ok() {
+                plan_cache.bump_schema();
+            }
             let _ = reply.send(out);
         }
         Cmd::Backup { reply } => {
