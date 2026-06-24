@@ -281,9 +281,102 @@ pub fn decode_property_value<D: BlockDevice, S: LogSink, P: StorePages>(
     valenc::decode(class_tag, &bytes).map_err(GraphusError::from)
 }
 
+/// **Page-batched scan primitive** (`rmp` #365): visits every record slot in the physical-id range
+/// `1..high_water` of `kind`'s store, pinning + read-latching **each device page exactly once** and
+/// walking all of that page's in-range slots under that single latch, then advancing to the next
+/// page. For each slot it invokes `visit(id, &page_slice_of_the_record)` where `page_slice` is the
+/// `record_size`-byte slice of the record at that slot — letting the caller decode just the bytes it
+/// needs (an MVCC header, a full record) without re-entering the pool per id.
+///
+/// # Why one latch per page, not per record (the perf fix)
+///
+/// The per-id read path ([`read_node`]/[`read_rel`]/[`read_mvcc`]) calls
+/// [`ConcurrentBufferPool::with_page_fetched`] once **per record id**: pin (`fetch_add`) → read
+/// latch → decode → unpin. With 125 node records / 80 rel / 177 prop per 8 KiB page, the *same*
+/// resident page is pinned + latched + unpinned 125× (resp. 80×, 177×) to read what one latch could
+/// serve. The measured `read_scan/scan_node_ids` was a flat ~58 Melem/s (~17 ns/record) independent
+/// of corpus size — dominated by that per-record synchronisation, not decode. This primitive folds
+/// the whole page's slot walk into **one** `with_page_fetched` call per page.
+///
+/// # Correctness — pin/latch protocol (concurrent.rs)
+///
+/// This delegates the pin + identity re-validation + unpin entirely to
+/// [`ConcurrentBufferPool::with_page_fetched`] (concurrent.rs:442), which on the hit path pins the
+/// frame under the shard lock (`fetch_add`, additive — never an absolute `store`, so a concurrent
+/// optimistic pin is preserved, concurrent.rs:452/654), re-validates the frame's `page_id` **under**
+/// the read latch (concurrent.rs:456), runs the closure, then `unpin`s; the cold path falls back to
+/// the full `fetch` with the load-once `Loading` reservation. So a pinned-and-latched page is never
+/// evicted out from under us (CLOCK's `select_victim` skips any frame with `pin_count > 0`,
+/// concurrent.rs:896/907), the bytes can never be torn (the read latch excludes the write-latched
+/// evictor/mutator, concurrent.rs:479), and a concurrent writer to the same page is serialised by the
+/// per-frame `RwLock` exactly as for a per-id read. Holding the read latch across a whole page's slot
+/// walk does **not** widen any lock-ordering edge: the latch is still innermost-but-the-device-lock,
+/// taken with no shard lock held, released before the next page — identical to the per-id path, just
+/// amortised. It is pure decode work (no I/O, no pool re-entry), so it cannot block writers
+/// pathologically: a single page latch is held for one page's worth of `MvccHeader::read`s.
+///
+/// **MVCC visibility is decided ABOVE this layer**: this returns *raw slot-occupied* records exactly
+/// as the per-id loop did (`mvcc.in_use()`), leaving tombstone / snapshot filtering precisely where it
+/// was (`graphus-cypher`'s `RecordStoreGraph`). It changes *how* the bytes are read, never *which*
+/// records are seen.
+///
+/// # Errors
+/// Returns a storage error if a store page in the range cannot be read (same surface as the per-id
+/// loop, raised on the first failing page).
+fn for_each_record_slot<D, S, P, F>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    mut visit: F,
+) -> Result<()>
+where
+    D: BlockDevice,
+    S: LogSink,
+    P: StorePages,
+    F: FnMut(u64, &[u8]) -> Result<()>,
+{
+    let high_water = pages.high_water(kind);
+    if high_water <= 1 {
+        return Ok(()); // ids start at 1 (id 0 is the reserved null pointer)
+    }
+    let record_size = kind.record_size();
+    let rpp = paging::records_per_page(record_size) as u64;
+    // The live id range `1..high_water` spans store-relative pages `0..=last_page` (id 1 lives on
+    // page 0 since `rpp >= 1`; the highest live id is `high_water - 1`). Walk those pages inclusively.
+    let last_page = (high_water - 1) / rpp;
+    for rel_page in 0..=last_page {
+        let dev = pages.device_page(kind, rel_page)?;
+        // The first id this page holds, and the (exclusive) id one past its last in-range slot. Clamp
+        // the upper bound to `high_water` so the final page never visits an id at or beyond the
+        // high-water mark (an unallocated slot), and clamp the lower bound to `1` so the null-pointer
+        // slot 0 of page 0 is skipped — exactly the `1..high_water` range the per-id loop covered.
+        let page_first_id = rel_page * rpp;
+        let id_lo = page_first_id.max(1);
+        let id_hi = (page_first_id + rpp).min(high_water);
+        // ONE pin + read latch for the whole page (concurrent.rs:442): walk every in-range slot under
+        // it. The closure does pure decode work; it never re-enters the pool with this page.
+        pool.with_page_fetched(dev, |p| -> Result<()> {
+            for id in id_lo..id_hi {
+                // `record_location` is the single authoritative id → (page, byte-offset) mapping
+                // (paging.rs:69): reuse it so the slot offset can never drift from the per-id path.
+                // The page index it returns equals `rel_page` by construction here.
+                let (slot_page, off) = paging::record_location(id, record_size);
+                debug_assert_eq!(slot_page, rel_page);
+                visit(id, &p[off..off + record_size])?;
+            }
+            Ok(())
+        })??;
+    }
+    Ok(())
+}
+
 /// Enumerates the slot-occupied (`in_use`) node ids in `1..high_water`, ascending (the body of
 /// `RecordStore::scan_node_ids`). The `high_water` bound comes from `pages`, so an owned snapshot
 /// scans the as-of-capture id range.
+///
+/// Page-batched (`rmp` #365): pins + read-latches each node store page **once** and walks all 125
+/// of its slots under that latch, rather than the former one-latch-per-record loop. See
+/// [`for_each_record_slot`] for the pin/latch protocol and the unchanged MVCC-visibility boundary.
 ///
 /// # Errors
 /// Returns a storage error if a node store page in the range cannot be read.
@@ -291,18 +384,22 @@ pub fn scan_node_ids<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
 ) -> Result<Vec<u64>> {
-    let high_water = pages.high_water(StoreKind::Node);
     let mut out = Vec::new();
-    for id in 1..high_water {
-        if read_node(pool, pages, id)?.mvcc.in_use() {
+    for_each_record_slot(pool, pages, StoreKind::Node, |id, rec| {
+        // The `in_use` flag lives in the first MVCC-header byte of every record (record.rs:30): read
+        // just that header from the slot, exactly as `read_node(...).mvcc.in_use()` did.
+        if MvccHeader::read(&rec[..MVCC_HEADER_SIZE]).in_use() {
             out.push(id);
         }
-    }
+        Ok(())
+    })?;
     Ok(out)
 }
 
 /// Enumerates the slot-occupied (`in_use`) relationship ids in `1..high_water`, ascending (the body
 /// of `RecordStore::scan_rel_ids`).
+///
+/// Page-batched (`rmp` #365): one pin + read latch per rel store page (80 slots), not per record.
 ///
 /// # Errors
 /// Returns a storage error if a relationship store page in the range cannot be read.
@@ -310,13 +407,42 @@ pub fn scan_rel_ids<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
 ) -> Result<Vec<u64>> {
-    let high_water = pages.high_water(StoreKind::Rel);
     let mut out = Vec::new();
-    for id in 1..high_water {
-        if read_rel(pool, pages, id)?.mvcc.in_use() {
+    for_each_record_slot(pool, pages, StoreKind::Rel, |id, rec| {
+        if MvccHeader::read(&rec[..MVCC_HEADER_SIZE]).in_use() {
             out.push(id);
         }
-    }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Page-batched enumeration of the MVCC header of every **slot-occupied** (`in_use`) record in
+/// `kind`'s store, ascending by id (`rmp` #365). Returns `(id, MvccHeader)` for each in-use slot,
+/// pinning + read-latching each store page **once** and reading all its slot headers under that
+/// latch — the read half of the GC reclaim sweep and the freeze sweep, which formerly called
+/// `read_rel`/`read_node`/`read_mvcc` once per id (store.rs GC ~1284-1320 / freeze ~1416). The
+/// returned ids let the mutating half (reclaim / header-freeze patches, which need the **write**
+/// latch and a WAL record per change) iterate only the occupied slots without re-reading them.
+///
+/// Visibility / reclaimability is still decided by the caller above this layer; this only batches
+/// the physical read.
+///
+/// # Errors
+/// Returns a storage error if a store page in the range cannot be read.
+pub fn scan_in_use_mvcc<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+) -> Result<Vec<(u64, MvccHeader)>> {
+    let mut out = Vec::new();
+    for_each_record_slot(pool, pages, kind, |id, rec| {
+        let mvcc = MvccHeader::read(&rec[..MVCC_HEADER_SIZE]);
+        if mvcc.in_use() {
+            out.push((id, mvcc));
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 

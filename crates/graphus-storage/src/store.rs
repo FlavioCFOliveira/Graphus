@@ -1264,8 +1264,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn gc(&mut self, txn: TxnId, watermark: Timestamp) -> Result<GcPassReport> {
         let mut reclaimed = 0usize;
 
-        let rel_hw = self.store(StoreKind::Rel).alloc.high_water();
-
         // Dead-link relationship **corpses** (`rmp` #220) — slots that an aborted/crashed creation
         // left `!in_use` (header-only creation undo) yet not freed, with their forward chain pointers
         // intact — are spliced out of their endpoint chains and freed by `gc_splice_corpses` BELOW,
@@ -1281,8 +1279,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // it, so no committed data is ever lost. (Singly-linked PROPERTY corpses are reclaimed by the
         // owner-driven [`gc_property_chain`] splice — they cannot tangle; relationship corpses are
         // doubly-linked into two chains, which is why their splice is walk-driven.)
-        for id in 1..rel_hw {
-            let mvcc = self.read_rel(id)?.mvcc;
+        // Page-batched read (`rmp` #365): collect every in-use rel's MVCC header with ONE pin + read
+        // latch per store page, then reclaim id-by-id. The reclaim mutation (`reclaim_rel`) still
+        // takes the per-record write latch via its WAL-logged patches — the read is batched, the
+        // write is not (no latch downgrade). `is_reclaimable` is decided on the header read here,
+        // exactly as the per-id loop did.
+        let rel_in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
+        for &(id, mvcc) in &rel_in_use {
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry) {
                 self.reclaim_rel(txn, id)?;
                 reclaimed += 1;
@@ -1295,9 +1298,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reclaimable in this same pass). Walk-driven and WAL-logged — crash-safe and live-preserving.
         reclaimed += self.gc_splice_corpses(txn)?;
 
-        let node_hw = self.store(StoreKind::Node).alloc.high_water();
-        for id in 1..node_hw {
-            let mvcc = self.read_node(id)?.mvcc;
+        // Page-batched node header read (`rmp` #365), then reclaim id-by-id. The high-water mark is
+        // re-read after the rel sweep + corpse splice (a corpse splice never grows the node store, so
+        // it is stable, but read it where the per-id loop did). `has_live_incident_rels` is a
+        // per-node chain walk that needs `&mut self`, so it stays outside the batched read closure.
+        let node_in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
+        for &(id, mvcc) in &node_in_use {
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
                 && !self.has_live_incident_rels(id)?
             {
@@ -1308,14 +1314,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
         // Sweep the property chains of the owners that survived the node/rel reclamation above. A
         // reclaimed owner's whole chain was already freed by its reclamation, so re-checking
-        // liveness here (after the sweeps) keeps each chain reclaimed exactly once.
-        for id in 1..node_hw {
-            if Self::is_live_version(self.read_node(id)?.mvcc) {
+        // liveness here (after the sweeps) keeps each chain reclaimed exactly once. Re-scan the
+        // headers (page-batched) AFTER the reclamation sweeps so a just-reclaimed slot is no longer
+        // `in_use` and is skipped — same observation point as the former per-id `read_node`/`read_rel`.
+        let node_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
+        for &(id, mvcc) in &node_live {
+            if Self::is_live_version(mvcc) {
                 reclaimed += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
             }
         }
-        for id in 1..rel_hw {
-            if Self::is_live_version(self.read_rel(id)?.mvcc) {
+        let rel_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
+        for &(id, mvcc) in &rel_live {
+            if Self::is_live_version(mvcc) {
                 reclaimed += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
             }
         }
@@ -1411,13 +1421,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Walks the full physical-id range `1..high_water`, so the sweep is complete regardless of
     /// chain reachability. Returns the number of header words frozen.
     fn freeze_store_headers(&mut self, txn: TxnId, kind: StoreKind) -> Result<usize> {
-        let high_water = self.store(kind).alloc.high_water();
+        // Page-batched read (`rmp` #365): read every in-use record's MVCC header with ONE pin + read
+        // latch per store page (was one `read_mvcc` — one latch — per id), then freeze the committed-
+        // but-unfrozen words id-by-id. `scan_in_use_mvcc` already filters to `in_use`, so the freed-
+        // slot skip the former loop did per id is folded into the scan. The freeze itself
+        // (`patch_header_word`) is a WAL-logged 8-byte patch under the per-record **write** latch — the
+        // read is batched, the mutating write is not (no latch downgrade).
+        let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?;
         let mut frozen = 0usize;
-        for id in 1..high_water {
-            let mvcc = self.read_mvcc(kind, id)?;
-            if !mvcc.in_use() {
-                continue; // freed slot (or reclaimed earlier this pass): no stamps to freeze
-            }
+        for &(id, mvcc) in &in_use {
             if let Some(word) = self.frozen_word(mvcc.created_ts) {
                 self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
                 frozen += 1;
@@ -4029,5 +4041,153 @@ mod tests {
         gc_at(&mut s, TxnId(3), latest);
         // After GC reclaims the tombstone, only the surviving relationship remains.
         assert_eq!(s.scan_rel_ids().unwrap(), vec![r2]);
+    }
+
+    // ---- `rmp` #365: page-batched scan primitive equivalence regressions ----
+    //
+    // The page-batched `scan_node_ids` / `scan_rel_ids` (one pin + read latch per page) MUST return
+    // the exact same id set as the original one-latch-per-record loop, across page boundaries, with
+    // free-list holes, and after GC. These tests assert that against an independent per-id oracle.
+
+    /// The independent per-id reference oracle: the pre-#365 loop body (`read_node`/`read_rel` per id,
+    /// keeping `in_use` slots). Equivalence of the batched scan against this proves the optimisation
+    /// preserves the returned id set exactly.
+    fn per_id_scan_node_ids(s: &Store) -> Vec<u64> {
+        let hw = s.store(StoreKind::Node).alloc.high_water();
+        (1..hw)
+            .filter(|&id| s.read_node(id).unwrap().mvcc.in_use())
+            .collect()
+    }
+
+    fn per_id_scan_rel_ids(s: &Store) -> Vec<u64> {
+        let hw = s.store(StoreKind::Rel).alloc.high_water();
+        (1..hw)
+            .filter(|&id| s.read_rel(id).unwrap().mvcc.in_use())
+            .collect()
+    }
+
+    #[test]
+    fn batched_scan_node_ids_equals_per_id_across_page_boundaries() {
+        // 125 node records per 8 KiB page (paging::records_per_page(NODE_RECORD_SIZE) == 125): create
+        // 300 nodes so the scan crosses three pages and the final page is partially filled.
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        for _ in 0..300 {
+            s.create_node(txn).unwrap();
+        }
+        s.commit(txn).unwrap();
+
+        let batched = s.scan_node_ids().unwrap();
+        let oracle = per_id_scan_node_ids(&s);
+        assert_eq!(batched, oracle, "batched scan must equal the per-id oracle");
+        // Ascending and complete: ids 1..=300, no gaps yet.
+        assert_eq!(batched, (1..=300).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn batched_scan_node_ids_equals_per_id_with_free_list_holes() {
+        // Create across pages, then delete + GC a scattered subset so the physical id space has holes
+        // (freed slots that are `!in_use`). The batched scan must skip exactly the freed slots — the
+        // same set the per-id oracle skips.
+        let mut s = fresh();
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let mut ids = Vec::new();
+        for _ in 0..260 {
+            ids.push(s.create_node(t1).unwrap().0);
+        }
+        s.commit(t1).unwrap();
+
+        // Delete a scattered subset spanning all pages (page 0: <125, page 1: 125..250, page 2: >=250).
+        let to_delete = [1u64, 7, 64, 124, 125, 130, 200, 249, 250, 259];
+        let t2 = TxnId(2);
+        s.begin(t2);
+        for &id in &to_delete {
+            s.delete_node(t2, id).unwrap();
+        }
+        s.commit(t2).unwrap();
+        let latest = s.snapshot_ts();
+        gc_at(&mut s, TxnId(3), latest); // reclaim the tombstones → free-list holes
+
+        let batched = s.scan_node_ids().unwrap();
+        let oracle = per_id_scan_node_ids(&s);
+        assert_eq!(
+            batched, oracle,
+            "batched scan must equal the per-id oracle with free-list holes"
+        );
+        for &id in &to_delete {
+            assert!(
+                !batched.contains(&id),
+                "freed slot {id} must not be scanned"
+            );
+        }
+        assert!(batched.len() < 260, "some slots were freed");
+    }
+
+    #[test]
+    fn batched_scan_rel_ids_equals_per_id_across_pages_and_after_gc() {
+        // 80 rel records per page: create 200 rels (spanning three pages), delete + GC a subset.
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        let nodes: Vec<u64> = (0..10).map(|_| s.create_node(txn).unwrap().0).collect();
+        let t = s.intern_token(Namespace::RelType, "LINK").unwrap();
+        let mut rels = Vec::new();
+        for i in 0..200u64 {
+            let a = nodes[(i as usize) % nodes.len()];
+            let b = nodes[((i + 1) as usize) % nodes.len()];
+            rels.push(s.create_rel(txn, t, a, b).unwrap().0);
+        }
+        s.commit(txn).unwrap();
+
+        assert_eq!(s.scan_rel_ids().unwrap(), per_id_scan_rel_ids(&s));
+
+        let t2 = TxnId(2);
+        s.begin(t2);
+        for &id in &[rels[0], rels[79], rels[80], rels[159], rels[199]] {
+            s.delete_rel(t2, id).unwrap();
+        }
+        s.commit(t2).unwrap();
+        let latest = s.snapshot_ts();
+        gc_at(&mut s, TxnId(3), latest);
+
+        let batched = s.scan_rel_ids().unwrap();
+        let oracle = per_id_scan_rel_ids(&s);
+        assert_eq!(
+            batched, oracle,
+            "batched rel scan must equal the per-id oracle after GC"
+        );
+    }
+
+    #[test]
+    fn batched_scan_in_use_mvcc_matches_headers_and_in_use_set() {
+        // The GC/freeze read primitive (`scan_in_use_mvcc`) must return the MVCC header of every
+        // in-use record, ids ascending, and the id subset must equal `scan_node_ids`.
+        let mut s = fresh();
+        let txn = TxnId(1);
+        s.begin(txn);
+        for _ in 0..150 {
+            s.create_node(txn).unwrap();
+        }
+        s.commit(txn).unwrap();
+
+        let scanned = read_view::scan_in_use_mvcc(&s.pool, &s.stores, StoreKind::Node).unwrap();
+        let ids: Vec<u64> = scanned.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, s.scan_node_ids().unwrap(), "in-use id sets must match");
+        // Ascending.
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids must be ascending");
+        // Each returned header equals the per-id `read_mvcc` of that id (byte-for-byte struct equal).
+        for &(id, mvcc) in &scanned {
+            assert_eq!(
+                mvcc,
+                s.read_mvcc_for_test(StoreKind::Node, id).unwrap(),
+                "batched header must equal the per-id read_mvcc for id {id}"
+            );
+            assert!(
+                mvcc.in_use(),
+                "scan_in_use_mvcc must only return in-use slots"
+            );
+        }
     }
 }
