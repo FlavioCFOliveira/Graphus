@@ -48,6 +48,7 @@ mod device;
 mod header;
 mod keyring;
 mod nonce_budget;
+mod nonce_source;
 mod raw;
 mod slot;
 mod wal_sink;

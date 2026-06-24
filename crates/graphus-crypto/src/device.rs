@@ -69,6 +69,7 @@ use crate::header::{
 };
 use crate::keyring::Keyring;
 use crate::nonce_budget::NonceBudget;
+use crate::nonce_source::NonceSource;
 use crate::raw::RawSlots;
 use crate::slot::{self, NONCE_LEN, SLOT_SIZE, Slot, TAG_LEN};
 
@@ -97,6 +98,11 @@ pub struct EncryptedBlockDevice<R: RawSlots> {
     /// from the backing and `extend` advances it in step. The header does **not** store it (see the
     /// crash-consistency note in the module docs).
     page_count: u64,
+    /// The buffered CSPRNG that mints the per-page GCM nonce (rmp #378). Seeded once from `OsRng`,
+    /// so a write-storm pays a single `getrandom` syscall instead of one per `write_page`. Held by
+    /// value behind the device's `&mut self` write path, which already serializes nonce draws (see
+    /// [`crate::nonce_source`] for the no-reuse-under-race argument).
+    nonce_source: NonceSource,
 }
 
 impl<R: RawSlots> std::fmt::Debug for EncryptedBlockDevice<R> {
@@ -149,6 +155,7 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
             budget: NonceBudget::resume_from(0),
             durable_counter: 0,
             page_count: 0,
+            nonce_source: NonceSource::from_os(),
         })
     }
 
@@ -203,6 +210,7 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
             budget: NonceBudget::resume_from(consumed),
             durable_counter: consumed,
             page_count: slot_count - HEADER_SLOTS,
+            nonce_source: NonceSource::from_os(),
         })
     }
 
@@ -361,8 +369,10 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         // subkey is reached, fail closed here rather than risk a (key, nonce) collision. The reserved
         // count is persisted on the next `sync` as the durable high-water mark.
         self.budget.reserve()?;
-        // Fresh random nonce per write (no GCM nonce reuse under a key; see module docs).
-        let nonce_bytes = random_nonce();
+        // Fresh random nonce per write (no GCM nonce reuse under a key; see module docs). Drawn from
+        // the device's buffered CSPRNG (rmp #378): userspace, no per-write syscall. The `&mut self`
+        // write path serializes draws, so two threads can never mint the same nonce.
+        let nonce_bytes = self.nonce_source.next_nonce();
         let nonce = Nonce::from(nonce_bytes);
         let aad = Self::aad(page);
         // Encrypt in place: build the slot, copy the plaintext into its ciphertext region, then
@@ -430,15 +440,6 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         self.page_count = new_count;
         Ok(())
     }
-}
-
-/// Draws a fresh random 96-bit nonce from the OS CSPRNG.
-fn random_nonce() -> [u8; NONCE_LEN] {
-    use aes_gcm::aead::OsRng;
-    use aes_gcm::aead::rand_core::RngCore;
-    let mut n = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut n);
-    n
 }
 
 /// A convenience for the common production case: the file-backed encrypted device.

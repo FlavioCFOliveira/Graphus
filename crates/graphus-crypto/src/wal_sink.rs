@@ -58,6 +58,7 @@ use graphus_wal::LogSink;
 
 use crate::keyring::Keyring;
 use crate::nonce_budget::NonceBudget;
+use crate::nonce_source::NonceSource;
 use crate::slot::{NONCE_LEN, TAG_LEN};
 
 /// Magic bytes identifying an encrypted Graphus **WAL** sink (`"GRAPHUSW"` — Graphus WAL). Distinct
@@ -172,6 +173,11 @@ pub struct EncryptedLogSink<S: LogSink> {
     /// the GCM birthday limit and fails closed when exhausted. Resumed conservatively from the last
     /// surviving frame's stored `write_count` on open; advanced once per sealed frame.
     budget: NonceBudget,
+    /// The buffered CSPRNG that mints the per-frame GCM nonce (rmp #378). Seeded once from `OsRng`,
+    /// so a sync/group-commit storm pays a single `getrandom` syscall instead of one per sealed
+    /// frame. Only reached from `sync` (`&mut self`), which serializes nonce draws (see
+    /// [`crate::nonce_source`] for the no-reuse-under-race argument).
+    nonce_source: NonceSource,
 }
 
 impl<S: LogSink> std::fmt::Debug for EncryptedLogSink<S> {
@@ -213,6 +219,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
             header_phys_len,
             pending: Vec::new(),
             budget: NonceBudget::resume_from(0),
+            nonce_source: NonceSource::from_os(),
         })
     }
 
@@ -287,6 +294,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
             header_phys_len: header_len as u64,
             pending: Vec::new(),
             budget: NonceBudget::resume_from(consumed),
+            nonce_source: NonceSource::from_os(),
         })
     }
 
@@ -331,12 +339,15 @@ impl<S: LogSink> EncryptedLogSink<S> {
     /// Seals `plaintext` into a frame at logical offset `logical_offset`, stamped with the cumulative
     /// `write_count`, and returns the framed bytes ready to append to the backing.
     fn seal_frame(
-        &self,
+        &mut self,
         logical_offset: u64,
         write_count: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>> {
-        let nonce_bytes = random_nonce();
+        // Drawn from the sink's buffered CSPRNG (rmp #378): userspace, no per-frame syscall. Reached
+        // only from `sync` (`&mut self`), so frame nonces are serialized and never drawn twice via a
+        // race.
+        let nonce_bytes = self.nonce_source.next_nonce();
         let nonce = Nonce::from(nonce_bytes);
         let aad = Self::aad(logical_offset, write_count);
         let sealed = self
@@ -391,8 +402,9 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
         // caller can retry after rotating the master key.
         let write_count = self.budget.reserve()?;
         let logical_offset = self.logical_durable_len;
-        // `seal_frame` does not borrow `self.pending` mutably, but we must not hold an immutable
-        // borrow of `pending` across the `append`; take the pending bytes out first.
+        // `seal_frame` takes `&mut self` (it advances the buffered nonce CSPRNG, rmp #378), so we
+        // must not hold any borrow of `self.pending` across the call; take the pending bytes out into
+        // an owned local first.
         let pending = std::mem::take(&mut self.pending);
         let frame = match self.seal_frame(logical_offset, write_count, &pending) {
             Ok(f) => f,
@@ -688,15 +700,6 @@ fn read8(b: &[u8], off: usize) -> [u8; 8] {
     let mut out = [0u8; 8];
     out.copy_from_slice(&b[off..off + 8]);
     out
-}
-
-/// Draws a fresh random 96-bit nonce from the OS CSPRNG (per frame; no GCM nonce reuse under a key).
-fn random_nonce() -> [u8; NONCE_LEN] {
-    use aes_gcm::aead::OsRng;
-    use aes_gcm::aead::rand_core::RngCore;
-    let mut n = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut n);
-    n
 }
 
 /// A convenience for the common production case: the file-backed encrypted WAL sink.

@@ -28,6 +28,15 @@ graphus-wal = { path = "../graphus-wal" }
 # `getrandom` feature re-exports `aead::OsRng`, a CSPRNG nonce source, so no separate `rand` dep is
 # needed. `std` is on (this is a server crate, not `no_std`).
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "getrandom", "std"] }
+# Buffered CSPRNG for per-page / per-frame nonces (rmp #378). `OsRng` is the *un-buffered* OS RNG:
+# one `getrandom(2)` syscall PER nonce, paid on every `write_page`/`seal_frame` — millions of
+# syscalls (and a kernel-lock contention point) under a write-storm/bulk-load. `ChaCha20Rng` is a
+# cryptographically secure PRNG: we seed it ONCE from `OsRng` (a full 32-byte ChaCha20 seed, one
+# syscall) and then draw the 12 nonce bytes from userspace. Its 96-bit outputs keep the exact same
+# birthday-collision bound (and unpredictability) the OS nonces had, so the nonce budget / GCM
+# birthday ceiling is UNCHANGED. Version 0.3 uses `rand_core` 0.6.4 — the same `rand_core` the
+# `aes-gcm` `getrandom` feature exposes via `aead::OsRng`, so the seed plumbing lines up exactly.
+rand_chacha = "0.3"
 # HKDF-SHA256 for purpose-separated subkey derivation (distinct `info` labels per purpose). `hkdf`
 # 0.12 / `sha2` 0.10 are already in the workspace lockfile via the auth stack.
 hkdf = "0.12"

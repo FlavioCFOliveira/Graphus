@@ -274,3 +274,93 @@ fn pristine_counter_slot_resumes_as_zero_budget() {
         "a freshly created device has consumed no nonce budget"
     );
 }
+
+/// Regression: rmp #378 (buffered-CSPRNG nonce source). After moving the per-page nonce off the
+/// per-call `OsRng` syscall and onto a per-device buffered `ChaCha20Rng` (seeded once from `OsRng`),
+/// the *critical* safety property is that **no two concurrent writers can ever mint the same nonce**.
+///
+/// Each thread owns its OWN encrypted device (the production model: one buffered CSPRNG per device,
+/// independently seeded from `OsRng`), writes many pages, and the test asserts the GLOBAL union of
+/// every nonce across every thread has zero collisions — and that every page still round-trips
+/// (decrypts) to its plaintext, proving the AEAD path is byte-for-byte intact under the new source.
+#[test]
+fn concurrent_writers_never_mint_a_duplicate_nonce_and_still_round_trip() {
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+    use std::thread;
+
+    const THREADS: usize = 8;
+    const PAGES_PER_THREAD: u64 = 2000;
+
+    let (tx, rx) = mpsc::channel::<Vec<[u8; NONCE_LEN]>>();
+    let decrypt_failures = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+
+    thread::scope(|scope| {
+        for t in 0..THREADS {
+            let tx = tx.clone();
+            let failures = std::sync::Arc::clone(&decrypt_failures);
+            scope.spawn(move || {
+                // A distinct salt per thread → a distinct keyring/subkey, just like distinct DBs.
+                let salt = [0xC0u8 + t as u8; SALT_LEN];
+                let kr = keyring(&salt);
+                let mut dev = EncryptedBlockDevice::create(InspectableSlots::new(), &kr, salt)
+                    .expect("create");
+                dev.extend(PAGES_PER_THREAD).expect("extend");
+
+                let mut local_nonces = Vec::with_capacity(PAGES_PER_THREAD as usize);
+                for p in 0..PAGES_PER_THREAD {
+                    // Distinct plaintext per page so the round-trip check is meaningful.
+                    let plaintext = [(p as u8) ^ (t as u8); PAGE_SIZE];
+                    dev.write_page(PageId(p), &plaintext).expect("write");
+                    // Read it straight back through the AEAD path: the slot must decrypt to exactly
+                    // the plaintext (the on-disk format is unchanged by the nonce-source swap).
+                    let mut readback = [0u8; PAGE_SIZE];
+                    match dev.read_page(PageId(p), &mut readback) {
+                        Ok(()) if readback == plaintext => {}
+                        Ok(()) => failures.lock().unwrap().push(format!(
+                            "thread {t} page {p}: decrypted bytes differ from plaintext"
+                        )),
+                        Err(e) => failures
+                            .lock()
+                            .unwrap()
+                            .push(format!("thread {t} page {p}: decrypt failed: {e:?}")),
+                    }
+                }
+
+                // Harvest every stored nonce from this thread's backing.
+                let backing = dev.into_backing();
+                for p in 0..PAGES_PER_THREAD {
+                    local_nonces.push(nonce_of(&backing.slot(page_slot(p))));
+                }
+                tx.send(local_nonces).expect("send nonces");
+            });
+        }
+    });
+    drop(tx);
+
+    assert!(
+        decrypt_failures.lock().unwrap().is_empty(),
+        "encrypted round-trip broke under concurrent buffered-CSPRNG writers: {:?}",
+        decrypt_failures.lock().unwrap()
+    );
+
+    // No nonce may repeat across the GLOBAL set of all concurrently-minted nonces.
+    let mut global: HashSet<[u8; NONCE_LEN]> = HashSet::new();
+    let mut total = 0usize;
+    for batch in rx {
+        for nonce in batch {
+            assert_ne!(nonce, [0u8; NONCE_LEN], "a real slot's nonce is never zero");
+            assert!(
+                global.insert(nonce),
+                "DUPLICATE nonce across concurrent buffered-CSPRNG writers — a (key,nonce) reuse risk"
+            );
+            total += 1;
+        }
+    }
+    assert_eq!(total, THREADS * PAGES_PER_THREAD as usize);
+    assert_eq!(
+        global.len(),
+        total,
+        "every concurrently-minted nonce is unique"
+    );
+}
