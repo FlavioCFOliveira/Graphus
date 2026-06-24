@@ -51,7 +51,7 @@
 //! bytes inside a synced (hence whole, authenticated) frame as durable, dropping a torn tail can
 //! never lose committed work: a group commit's frame is fully durable before `commit` returns.
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, AeadInPlace};
 use aes_gcm::{Aes256Gcm, Nonce};
 use graphus_core::error::{GraphusError, Result};
 use graphus_wal::LogSink;
@@ -350,28 +350,15 @@ impl<S: LogSink> EncryptedLogSink<S> {
         let nonce_bytes = self.nonce_source.next_nonce();
         let nonce = Nonce::from(nonce_bytes);
         let aad = Self::aad(logical_offset, write_count);
-        let sealed = self
-            .cipher
-            .encrypt(
-                &nonce,
-                aes_gcm::aead::Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| {
-                GraphusError::Storage("authenticated encryption of a WAL frame failed".to_owned())
-            })?;
-        // GCM output is ciphertext || tag; ciphertext length equals plaintext length.
-        if sealed.len() != plaintext.len() + TAG_LEN {
-            return Err(GraphusError::Storage(format!(
-                "sealed WAL frame has length {} (expected {})",
-                sealed.len(),
-                plaintext.len() + TAG_LEN
-            )));
-        }
         let logical_len = plaintext.len() as u64;
         let phys_len = (FRAME_OVERHEAD + plaintext.len()) as u64;
+        // Build the frame buffer in one allocation and encrypt the ciphertext region in place
+        // (mirrors the store device's `encrypt_in_place_detached` path, rmp #323). The header is
+        // written first; the plaintext is copied into the ciphertext region; that region is then
+        // sealed in place to obtain the **detached** 16-byte tag, which is appended last. The
+        // detached API produces byte-identical ciphertext and tag to the attached `encrypt` of
+        // `plaintext` (same key/nonce/AAD), so the on-disk frame is unchanged — but no intermediate
+        // sealed `Vec` is allocated and no concatenation copy is performed.
         let mut frame = Vec::with_capacity(phys_len as usize);
         frame.extend_from_slice(&FRAME_MAGIC); // all-non-zero: rigorous reclaim-gap resync
         frame.extend_from_slice(&phys_len.to_le_bytes());
@@ -379,7 +366,19 @@ impl<S: LogSink> EncryptedLogSink<S> {
         frame.extend_from_slice(&logical_len.to_le_bytes());
         frame.extend_from_slice(&write_count.to_le_bytes()); // v4: nonce-budget high-water mark
         frame.extend_from_slice(&nonce_bytes);
-        frame.extend_from_slice(&sealed); // ciphertext || tag
+        debug_assert_eq!(frame.len(), FR_OFF_CIPHERTEXT);
+        // Ciphertext region: starts as the plaintext, then sealed in place over it.
+        frame.extend_from_slice(plaintext);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(&nonce, &aad, &mut frame[FR_OFF_CIPHERTEXT..])
+            .map_err(|_| {
+                GraphusError::Storage("authenticated encryption of a WAL frame failed".to_owned())
+            })?;
+        // `tag` is the 16-byte GCM authentication tag (`TAG_LEN`); append it to complete the
+        // `... || ciphertext || tag` frame layout.
+        debug_assert_eq!(tag.len(), TAG_LEN);
+        frame.extend_from_slice(tag.as_ref());
         debug_assert_eq!(frame.len() as u64, phys_len);
         Ok(frame)
     }
@@ -748,6 +747,51 @@ mod tests {
         plain.read_durable(0, &mut p).expect("plain read");
         assert_eq!(e, p);
         assert_eq!(e, b"hello world!!!");
+    }
+
+    #[test]
+    fn in_place_detached_seal_is_byte_identical_to_attached() {
+        // rmp #323: the WAL sink now seals frames with `encrypt_in_place_detached` (no intermediate
+        // sealed `Vec`). This MUST be byte-for-byte identical to the previous attached
+        // `encrypt(Payload { msg, aad })` of `ciphertext || tag` for the same key, nonce, AAD, and
+        // plaintext. Prove it directly at the cipher level (the seal is otherwise nonce-random, so
+        // we fix the nonce here to make the two paths comparable). The OLD attached `encrypt`
+        // (the oracle) reaches `Aead`, already imported at module scope.
+        let kr = keyring(0x4A);
+        let cipher = kr.wal_cipher();
+
+        // A range of plaintext lengths including the empty frame and a multi-block payload.
+        for len in [0usize, 1, 15, 16, 17, 200, 1024] {
+            let plaintext: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
+            let nonce_bytes = [0x5Au8; NONCE_LEN];
+            let nonce = Nonce::from(nonce_bytes);
+            // AAD identical to a real frame's: logical_offset(8) || write_count(8), LE.
+            let aad = EncryptedLogSink::<MemLogSink>::aad(4096, 7);
+
+            // OLD path: attached encrypt → ciphertext || tag.
+            let attached = cipher
+                .encrypt(
+                    &nonce,
+                    aes_gcm::aead::Payload {
+                        msg: &plaintext,
+                        aad: &aad,
+                    },
+                )
+                .expect("attached encrypt");
+            assert_eq!(attached.len(), len + TAG_LEN);
+
+            // NEW path: build the ciphertext region in place, seal detached, append the tag.
+            let mut new_path = plaintext.clone();
+            let tag = cipher
+                .encrypt_in_place_detached(&nonce, &aad, &mut new_path)
+                .expect("in-place detached encrypt");
+            new_path.extend_from_slice(tag.as_ref());
+
+            assert_eq!(
+                attached, new_path,
+                "in-place detached seal diverged from attached at len={len}"
+            );
+        }
     }
 
     #[test]

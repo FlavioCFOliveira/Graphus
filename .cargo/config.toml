@@ -1,0 +1,51 @@
+# Per-target compile-time crypto feature pinning (rmp #323).
+#
+# Graphus encrypts store pages and WAL frames with AES-256-GCM (the `aes` + `ghash`/`polyval`
+# RustCrypto stack). By default those crates use RUNTIME CPU-feature dispatch: every encrypt/decrypt
+# pays a feature-probe branch and the hardware AES/GHASH routines are reached through a function
+# pointer, so AES-NI / ARMv8-Crypto code is never inlined into the caller. Pinning the relevant
+# target-features at compile time lets the backend be selected (and inlined) at build time, removing
+# the dispatch branch on the cold-read / crash-recovery decrypt path (warm queries pay zero crypto:
+# page plaintext is cached above the buffer pool).
+#
+# WHY PER-TARGET, NEVER `target-cpu=native` OR A GLOBAL RUSTFLAGS:
+# A binary compiled with `+aes` executes AES/PMULL instructions unconditionally. On a CPU that lacks
+# them it faults with SIGILL (illegal instruction). `target-cpu=native` bakes in *this* build host's
+# full feature set, which is non-portable and unsafe to ship. Each `[target.<triple>]` block below
+# therefore enables ONLY features that EVERY CPU in that target class is guaranteed to have, and a
+# triple that does not match a block is left completely untouched (so a feature-poor target keeps
+# pure runtime dispatch and cannot fault). AES-GCM output is byte-identical whether the hardware path
+# is compile-pinned or runtime-dispatched — same algorithm — so this changes codegen only, never the
+# ciphertext/tag on disk.
+
+# --- x86_64 (Tier-1: x86-64 Linux) ---------------------------------------------------------------
+# Minimum-CPU baseline: x86-64 with AES-NI + PCLMULQDQ. Intel Westmere (2010) / AMD Bulldozer (2011)
+# and everything newer satisfy this — i.e. effectively every 64-bit x86 server/desktop of the last
+# ~15 years. `+aes` selects the AES-NI backend in the `aes` crate, `+pclmulqdq` the CLMUL GHASH
+# backend in `polyval`, and `+ssse3` is required by the `aes` crate's intrinsics backend. The x86
+# hardware backends are stable and need no extra `--cfg`; the flags merely pin them and drop the
+# runtime probe.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Ctarget-feature=+aes,+pclmulqdq,+ssse3"]
+
+# --- aarch64 (Tier-1: aarch64 Linux incl. Raspberry Pi 5 / ARMv8, and aarch64 Apple Silicon) -----
+# Minimum-CPU baseline: ARMv8-A with the Cryptographic Extension (AES + PMULL). Apple Silicon
+# (M1/M2/M3...) and the Raspberry Pi 5 (Cortex-A76, ARMv8.2-A+crypto) both satisfy this, as do all
+# server-class aarch64 parts (Graviton, Ampere, etc.). `+aes` enables the ARMv8 AES instructions in
+# the `aes` crate AND, because `aes` implies PMULL, the PMULL GHASH path in `polyval`; `neon` is part
+# of the aarch64 baseline already. For the aes 0.8 / polyval 0.6 versions in use, the ARMv8 hardware
+# backend is additionally guarded by the `aes_armv8` / `polyval_armv8` opt-in cfgs, so they are set
+# here as well — without them the crates compile the software fallback regardless of `+aes`.
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    "-Ctarget-feature=+aes",
+    "--cfg=aes_armv8",
+    "--cfg=polyval_armv8",
+]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-Ctarget-feature=+aes",
+    "--cfg=aes_armv8",
+    "--cfg=polyval_armv8",
+]
