@@ -38,11 +38,23 @@
 //!
 //! ## Device and WAL serialization
 //!
-//! [`BlockDevice`]'s mutating methods (`write_page`, `extend`, `sync_*`) and
-//! [`WalRule::ensure_durable`] both take `&mut self`, so the pool serializes each behind its own
-//! `Mutex`. This is the simplest correct choice; a future optimization could use a `RwLock<D>`
-//! to allow concurrent device *reads*, or dedicated fsync threads (§3.6). The choice is
-//! documented here rather than guessed at.
+//! [`BlockDevice`] splits its surface by mutability: `read_page` and `page_count` take `&self`,
+//! while the mutating methods (`write_page`, `extend`, `sync_*`) take `&mut self`. The pool puts
+//! the device behind a **`RwLock<D>`** (`rmp` #362) and matches the lock mode to the access:
+//!
+//! - a **read** guard for the read-only methods — crucially the cache-**miss** physical read in
+//!   [`ConcurrentBufferPool::load_into`], so many threads that miss the pool at once read their
+//!   *distinct* pages from the device **concurrently** instead of serialising on one lock (the
+//!   structural cap that previously throttled off-thread reads (#336) and morsel parallelism (#339)
+//!   to ~1× once the working set spilled the pool);
+//! - a **write** guard for the mutating methods (`write_page` on write-back, `extend`+`page_count`
+//!   on allocation, `sync_*` on flush), which still serialise — correctly, since they need `&mut D`.
+//!
+//! [`WalRule::ensure_durable`] takes `&mut self`, so the WAL stays behind its own `Mutex`. The
+//! device `RwLock` does **not** change the lock *ordering* below: a device guard (read or write) is
+//! still taken **innermost**, only while a frame write latch is held, never while a shard lock is
+//! held — so concurrent device reads add no new wait edge. Dedicated fsync threads (§3.6) remain a
+//! separate future option.
 //!
 //! ## Lock ordering — why this is deadlock-free
 //!
@@ -55,7 +67,13 @@
 //!    the CLOCK sweep with `try_write` *only* — a frame held by anyone else is skipped — so the
 //!    reserving thread is always the exclusive holder and the acquisition can never block;
 //! 3. **device / WAL lock**: innermost, taken only while holding a frame *write* latch, never
-//!    while holding a shard lock.
+//!    while holding a shard lock. The device lock is a `RwLock<D>` (`rmp` #362): a **read** guard
+//!    on the cache-miss `read_page` (so concurrent misses on distinct frames read in parallel) and
+//!    a **write** guard on the `&mut`-mutators (`write_page`/`extend`/`sync_*`). The mode does not
+//!    change the *class*: every device guard, read or write, is still innermost and short-lived, so
+//!    making several reads concurrent introduces no new wait edge (a reader holds only a device
+//!    *read* lock plus its own frame *write* latch, which no other thread is contending — the
+//!    victim latch was won non-blocking by `try_write`).
 //!
 //! The only cross-class overlaps are:
 //!
@@ -82,13 +100,38 @@ use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 use crate::page;
 use crate::pool::{NoWal, WalRule};
 use crate::sync::{
-    Arc, AtomicUsize, Backoff, Mutex, MutexGuard, Ordering, RwLock, RwLockWriteGuard,
+    Arc, AtomicUsize, Backoff, Mutex, MutexGuard, Ordering, RwLock, RwLockReadGuard,
+    RwLockWriteGuard,
 };
 
-/// Number of frame-table shards. A small power of two keeps the loom state space tractable while
-/// still exercising the sharded lookup path; production tuning (padding shards to cache lines,
-/// §10) is a measurement-gated follow-up.
+/// Number of frame-table shards. Always a power of two, because a page maps to its shard by
+/// `hash % SHARD_COUNT` and a power-of-two modulus is the cheap masked form the optimiser lowers to.
+///
+/// The value is **cfg-split on `loom`** because the two builds optimise for opposite things:
+///
+/// - **Under `--cfg loom`** (model checking) the count is kept at the minimum that still exercises
+///   the *sharded* lookup path, `4`. loom explores an exponential interleaving space, and every
+///   extra independent lock multiplies the state to search; a small shard count keeps the model
+///   tractable (the loom models deliberately use 1–3 pages / 2 threads for the same reason). The
+///   shard count does **not** affect any correctness property loom proves — those turn on the
+///   shard-lock / frame-latch / device-lock *ordering*, which is identical regardless of how many
+///   shards exist — so shrinking it for the model loses no coverage of the invariants.
+///
+/// - **Under `#[cfg(not(loom))]`** (production) the count is `64`. The frame-table shards are the
+///   pool's contention point on the lookup path: every `fetch`/`with_page_fetched`/`new_page` takes
+///   exactly one shard `Mutex` to read or mutate the `PageId -> frame` mapping, and two pages that
+///   hash to the *same* shard serialise there even though they touch different frames. With the
+///   per-shard work now tiny (the device read itself moved out from under any shard lock and the
+///   device lock is a `RwLock` that lets concurrent cache-miss reads proceed in parallel — `rmp`
+///   #362), the shard `Mutex` is what remains to serialise concurrent lookups, so it must offer at
+///   least one independent lock per worker for a many-core host. `64` gives a 16-thread host ≥ 4
+///   shards per thread (low same-shard collision probability by the birthday bound) with ample
+///   headroom for the 16-/32-/64-core targets, while staying a power of two. Cache-line padding of
+///   the shards (§10) remains a separate measurement-gated follow-up.
+#[cfg(loom)]
 const SHARD_COUNT: usize = 4;
+#[cfg(not(loom))]
+const SHARD_COUNT: usize = 64;
 
 /// Bound on `fetch`/`new_page` victim-acquisition retries before giving up. A retry happens only on a
 /// **transient** condition — a lost hit-race, a peer already `Loading` the same page, or an empty
@@ -192,8 +235,13 @@ impl PinnedFrame {
 /// pool.unpin(g);
 /// ```
 pub struct ConcurrentBufferPool<D: BlockDevice, W: WalRule = NoWal> {
-    /// Serializes all mutating device access (`write_page`/`extend`/`sync_*`).
-    device: Mutex<D>,
+    /// The block device, behind a `RwLock<D>` (`rmp` #362). Read-only device access (`read_page`
+    /// on a cache miss, `page_count`) takes a **read** guard so concurrent misses on distinct
+    /// frames read from the device in parallel; mutating access (`write_page`/`extend`/`sync_*`,
+    /// all `&mut D`) takes a **write** guard and therefore still serialises. Always taken
+    /// innermost (only under a frame write latch, never under a shard lock), so the device-read
+    /// concurrency adds no new lock-ordering edge.
+    device: RwLock<D>,
     /// Serializes WAL-rule checks (`ensure_durable`).
     wal: Mutex<W>,
     frames: Vec<FrameSlot>,
@@ -227,7 +275,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             .map(|_| Mutex::new(HashMap::default()))
             .collect();
         Self {
-            device: Mutex::new(device),
+            device: RwLock::new(device),
             wal: Mutex::new(wal),
             frames,
             table,
@@ -258,11 +306,12 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
 
     /// The number of pages on the underlying device (its current size in pages). Mirrors the
     /// single-threaded [`BufferPool::page_count`](crate::BufferPool::page_count): used by crash
-    /// recovery to scan every device page (`rmp` #239) without exposing the device itself. Takes the
-    /// device lock for the read.
+    /// recovery to scan every device page (`rmp` #239) without exposing the device itself. Takes a
+    /// device **read** guard (`page_count` is `&self`), so it does not block concurrent cache-miss
+    /// reads.
     #[must_use]
     pub fn page_count(&self) -> u64 {
-        self.lock_device().page_count()
+        self.read_device().page_count()
     }
 
     /// Resolves a frame handle to its slot with an explicit bounds check (CWE-129 defence in
@@ -312,8 +361,20 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         unwrap_lock(self.shard_of(page_id).lock())
     }
 
-    fn lock_device(&self) -> MutexGuard<'_, D> {
-        unwrap_lock(self.device.lock())
+    /// Acquires a **shared read** guard on the device for the `&self` methods (`read_page`,
+    /// `page_count`). Many threads may hold this at once, so concurrent cache-miss reads on
+    /// distinct frames proceed in parallel (`rmp` #362). Recovers a poisoned lock (see
+    /// [`unwrap_lock`]): the device bytes are checksummed and the WAL provides recovery, so a prior
+    /// panic must not permanently wedge the pool.
+    fn read_device(&self) -> RwLockReadGuard<'_, D> {
+        unwrap_lock(self.device.read())
+    }
+
+    /// Acquires an **exclusive write** guard on the device for the `&mut`-mutators (`write_page`,
+    /// `extend`, `sync_*`). These serialise — correctly, since they need `&mut D`. Recovers a
+    /// poisoned lock for the same reason as [`read_device`](Self::read_device).
+    fn write_device(&self) -> RwLockWriteGuard<'_, D> {
+        unwrap_lock(self.device.write())
     }
 
     /// Runs `func` with mutable access to the underlying block device, for **Deterministic
@@ -323,14 +384,15 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     ///
     /// This is the concurrent-pool counterpart of the single-threaded
     /// [`BufferPool::device_mut`](crate::BufferPool::device_mut). The device lives behind the pool's
-    /// `Mutex<D>`, so access is a closure that holds that lock for its duration (a `&mut D` cannot be
-    /// handed out from `&self`); the harness arms the fault inside `func`.
+    /// `RwLock<D>`, so mutable access takes the **write** guard (exclusive) for the closure's
+    /// duration (a `&mut D` cannot be handed out from `&self`); the harness arms the fault inside
+    /// `func`.
     ///
     /// Gated behind the `dst` cargo feature so the production build never compiles this seam — the
     /// device stays fully encapsulated on the production path (zero-cost: the method does not exist).
     #[cfg(feature = "dst")]
     pub fn with_device_mut<R>(&self, func: impl FnOnce(&mut D) -> R) -> R {
-        func(&mut self.lock_device())
+        func(&mut self.write_device())
     }
 
     /// Borrows the cached page held by a pinned frame and applies `func` to it.
@@ -653,7 +715,14 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // Evict the victim's previous occupant (if any) under its write latch.
         self.evict_held(&mut victim)?;
         let page_id = {
-            let mut device = self.lock_device();
+            // Allocation needs `&mut D` (`extend`) and must read `page_count` then grow atomically,
+            // so it takes the device **write** guard. This serialises allocations against each other
+            // and excludes concurrent device reads for its (brief) duration — which is required for
+            // soundness, not just consistency: `extend` takes `&mut D` and a backing store may
+            // reallocate its buffer when it grows (e.g. a `Vec::resize`), so a concurrent `&self`
+            // `read_page` racing it would be a data race. The `RwLock`'s read/write exclusion forbids
+            // exactly that overlap, while still letting reads run concurrently with *each other*.
+            let mut device = self.write_device();
             let id = PageId(device.page_count());
             device.extend(1)?;
             id
@@ -730,7 +799,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             let mut meta = unwrap_lock(slot.meta.write());
             self.write_back(&mut meta, false)?;
         }
-        self.lock_device().sync_all()
+        self.write_device().sync_all()
     }
 
     /// A snapshot count of currently dirty frames (diagnostics / tests).
@@ -887,9 +956,19 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             self.blank(&mut victim);
             return Err((idx, e));
         }
-        // Read under the device lock into the latched frame's bytes.
+        // Read under a device **read** guard into the latched frame's bytes (`rmp` #362). This is
+        // the hot concurrency win: `read_page(&self, ...)` only reads the device, so many threads
+        // that miss the pool at once may hold the read guard *simultaneously* and read their
+        // distinct pages in parallel — they no longer serialise on one device mutex. Correctness is
+        // unchanged: each reading thread owns a *different* victim frame (its own exclusive write
+        // latch, won non-blocking by `try_write` in `select_victim`), so the two reads write to
+        // disjoint frame buffers; the read guard is the innermost lock (taken under that frame
+        // latch, never under a shard lock) and is released the instant the read returns, so the
+        // lock-ordering proof is preserved (device innermost, no new wait edge). The exclusive write
+        // guard taken by `write_page`/`extend`/`sync_*` still fences these reads against a concurrent
+        // device mutation, so a page can never be read while it is being relocated/grown.
         {
-            let device = self.lock_device();
+            let device = self.read_device();
             if let Err(e) = device.read_page(page_id, &mut victim.guard.data) {
                 drop(device);
                 self.blank(&mut victim);
@@ -954,7 +1033,10 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // WAL rule: the log must be durable through this page's LSN before the data is written
         // home (`specification` §3.2 page_lsn, §4.3 steal/no-force).
         self.ensure_durable(lsn)?;
-        self.lock_device().write_page(page_id, &meta.data)?;
+        // `write_page` is `&mut D`, so it takes the device **write** guard (exclusive): write-backs
+        // serialise against each other and against concurrent device reads — correct, since the WAL
+        // rule above (and the exclusive guard) keep the steal/no-force ordering intact.
+        self.write_device().write_page(page_id, &meta.data)?;
         meta.dirty = false;
         Ok(())
     }

@@ -26,12 +26,12 @@
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(loom)]
-pub(crate) use loom::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+pub(crate) use loom::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(loom))]
-pub(crate) use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+pub(crate) use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// An **escalating backoff** used by the buffer pool's `fetch` retry loop to drain a thundering herd
 /// of evictors that momentarily latch-contend the few free frames (`rmp` #359).
