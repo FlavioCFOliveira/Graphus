@@ -1370,6 +1370,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.columns.borrow().scan_hits()
     }
 
+    /// The number of columnar scans that **re-used a column's memoized decode** instead of decoding it
+    /// afresh (`rmp` task #375): a second scan of an un-mutated column hits this, proving the
+    /// dictionary/integer decode (and the per-query lookup map) is paid once, not per query. A test
+    /// asserts it increments on a repeat scan and stays put across a re-capture (new generation).
+    #[must_use]
+    pub fn columnar_decode_cache_hits(&self) -> u64 {
+        self.columns.borrow().decode_cache_hits()
+    }
+
     /// The cumulative count of values the columnar path served straight from the contiguous column
     /// (zero property-record decode) since this coordinator was built (`rmp` #329/#330) — the
     /// accelerator's payoff signal, exposed for measurement.

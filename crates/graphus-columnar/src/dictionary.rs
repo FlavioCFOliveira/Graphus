@@ -61,6 +61,46 @@ pub fn decode(bytes: &[u8], count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Decodes a dictionary-encoded column to its **raw codes and dictionary**, *without* materializing
+/// one owned value per row — the late-materialization primitive (`rmp` task #375).
+///
+/// Returns `(codes, dict)` where `codes[i]` is the dictionary index of row `i` and `dict[c]` is the
+/// `c`-th distinct value. A consumer doing equality / `GROUP BY` folds on the integer `codes`
+/// (no string compares, no per-row `String` rebuild) and materializes a row's value — `dict[code]` —
+/// only when it is actually needed (e.g. a fresh, snapshot-visible candidate).
+///
+/// # The canonical-dictionary guarantee (why code-equality ⟺ value-equality)
+///
+/// [`encode`] builds `dict` by `sort_unstable()` **then** `dedup()`, so it is **canonical**: sorted
+/// ascending and free of duplicates. Two distinct codes therefore index two *distinct* byte strings,
+/// and equal byte strings always share one code. Hence on this column:
+///
+/// * `codes[i] == codes[j]` **iff** `dict[codes[i]] == dict[codes[j]]` (fold equality / grouping on
+///   the codes with no false merges and no false splits), and
+/// * the code order is the byte-lexicographic value order (a code comparison is a value comparison).
+///
+/// `decode(bytes, count)` is exactly `decode_codes(bytes, count).codes.map(|c| dict[c].clone())`, so
+/// the two readers never diverge by a byte.
+#[must_use]
+pub fn decode_codes(bytes: &[u8], count: usize) -> (Vec<u32>, Vec<Vec<u8>>) {
+    let num = get_u32(bytes, 0) as usize;
+    let mut pos = 4usize;
+    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(num);
+    for _ in 0..num {
+        let len = get_u32(bytes, pos) as usize;
+        pos += 4;
+        dict.push(bytes[pos..pos + len].to_vec());
+        pos += len;
+    }
+    let width = u32::from(bytes[pos]);
+    pos += 1;
+    let codes = unpack(&bytes[pos..], count, width)
+        .into_iter()
+        .map(|c| c as u32)
+        .collect();
+    (codes, dict)
+}
+
 /// The number of distinct values in `values` — the signal a caller uses to decide whether dictionary
 /// encoding pays (low cardinality) versus storing raw (high/unique cardinality).
 #[must_use]
@@ -108,5 +148,42 @@ mod tests {
         assert_eq!(decode(&encode(&[]), 0), Vec::<Vec<u8>>::new());
         let one = vec![b("only")];
         assert_eq!(decode(&encode(&one), 1), one);
+    }
+
+    #[test]
+    fn decode_codes_is_consistent_with_decode_and_canonical() {
+        let cities = ["Lisbon", "Porto", "Madrid", "Lisbon", "Porto", "Lisbon"];
+        let values: Vec<Vec<u8>> = cities.iter().map(|s| b(s)).collect();
+        let enc = encode(&values);
+        let (codes, dict) = decode_codes(&enc, values.len());
+
+        // 1. The dictionary is canonical: sorted ascending and deduplicated.
+        assert_eq!(dict.len(), cardinality(&values));
+        assert!(
+            dict.windows(2).all(|w| w[0] < w[1]),
+            "dict must be sorted, deduped"
+        );
+
+        // 2. Late materialization (dict[code]) reproduces `decode` byte-for-byte.
+        let materialized: Vec<Vec<u8>> = codes.iter().map(|&c| dict[c as usize].clone()).collect();
+        assert_eq!(materialized, decode(&enc, values.len()));
+        assert_eq!(materialized, values);
+
+        // 3. code-equality ⟺ value-equality (the fold-on-codes soundness property).
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                assert_eq!(codes[i] == codes[j], values[i] == values[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_codes_empty_and_single() {
+        let (c, d) = decode_codes(&encode(&[]), 0);
+        assert!(c.is_empty() && d.is_empty());
+        let one = vec![b("only")];
+        let (c, d) = decode_codes(&encode(&one), 1);
+        assert_eq!(c, vec![0]);
+        assert_eq!(d, one);
     }
 }

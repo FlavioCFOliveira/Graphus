@@ -45,13 +45,14 @@
 //! touches the property chain at all.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use graphus_columnar::{dictionary, integer};
 use graphus_core::Value;
 
 /// One declared column's captured snapshot: parallel, node-id-ordered arrays plus the two staleness
-/// witnesses. Values are stored **encoded** (`encoding` selects the codec); [`Self::value_at`]
-/// decodes a single row, [`Self::decode_values`] the whole column.
+/// witnesses. Values are stored **encoded** (`encoding` selects the codec); [`Self::decode`]
+/// materializes the column (and memoizes the result for repeated scans of an un-mutated column).
 struct Column {
     /// The dense node ids, ascending (the order [`RecordStore::scan_node_ids`] yields).
     ids: Vec<u64>,
@@ -68,6 +69,43 @@ struct Column {
     /// unseen). The one mutation `first_prop` does **not** catch (an in-place tombstone) is caught by
     /// the `prop_pids` visibility re-check, so the two witnesses together are exact.
     node_first_props: Vec<u64>,
+    /// This column's **build generation** (`rmp` task #375), assigned by the cache from a monotonic
+    /// counter the instant the column is installed by [`set_column`](ColumnCache::set_column). A
+    /// column is **immutable after build** — the only mutations the cache exposes are *replacing* a
+    /// column (a fresh `set_column`, which mints a new generation) or *dropping* every column
+    /// ([`clear`](ColumnCache::clear)). So this number changing is **exactly** "this column was
+    /// re-captured", which the read path uses to invalidate its per-query lookup map (see
+    /// [`generation`](Self::generation)).
+    generation: u64,
+    /// Memoized decode of the value column (`rmp` task #375), shared (`Rc`) so a snapshot can hand it
+    /// to the read path without re-cloning. Filled on the first [`decode`](Self::decode) and reused on
+    /// every subsequent scan of this (immutable) column — repeated analytical scans of an un-mutated
+    /// column therefore pay the dictionary/integer decode **once**, not per query. Replaced wholesale
+    /// when the column is re-captured (the new `Column` starts with an empty cell), so a stale decode
+    /// can never be served after a write. `RefCell` because [`decode`](Self::decode) runs under the
+    /// cache's `&self` snapshot path.
+    decoded: std::cell::RefCell<Option<Rc<DecodedColumn>>>,
+    /// Memoized `node_id -> row index` lookup map (`rmp` task #375 (c)), shared (`Rc`) with the read
+    /// path so a repeated scan of this immutable column re-uses it instead of rebuilding an O(n)
+    /// `HashMap` per query (the [`record_graph`](crate::record_graph) hot path previously did exactly
+    /// that on every scan). Built once, on the first [`index_map`](Self::index_map); a re-capture
+    /// builds a fresh `Column` with an empty cell, so a stale map is never served.
+    index_map: std::cell::RefCell<Option<Rc<HashMap<u64, usize>>>>,
+}
+
+/// The materialized value column plus, for a dictionary-string column, its **codes and dictionary**
+/// (`rmp` task #375). A consumer that folds equality / `GROUP BY` reads `codes`/`dict` directly (no
+/// per-row `String` rebuild, no string compares); a consumer that needs the [`Value`] reads `values`.
+/// Both views are byte-identical (the canonical-dictionary guarantee, see
+/// [`graphus_columnar::dictionary::decode_codes`]).
+pub struct DecodedColumn {
+    /// The decoded [`Value`]s, index-aligned with the column's `ids`.
+    pub values: Vec<Value>,
+    /// For a **dictionary-string** column: `Some((codes, dict))` where `codes[i]` is the canonical
+    /// dictionary index of row `i` and `dict[c]` the `c`-th distinct UTF-8 string. `None` for integer
+    /// / raw columns (no dictionary to fold on). When present, `values[i] == Value::String(dict[codes[i]])`
+    /// exactly, so a code-keyed fold yields the identical groups a value-keyed fold would.
+    pub string_codes: Option<(Vec<u32>, Vec<String>)>,
 }
 
 /// The encoded form of a captured value column: a graphus-columnar codec for the homogeneous integer
@@ -89,7 +127,8 @@ enum ColumnEncoding {
 impl Column {
     /// Builds an encoded column from the captured `(id, value, prop_pid, node_first_prop)` rows,
     /// choosing the codec that fits the column's value shape. The four arrays stay index-aligned.
-    fn build(rows: Vec<(u64, Value, u64, u64)>) -> Self {
+    /// `generation` is the cache-assigned build stamp (`rmp` task #375).
+    fn build(rows: Vec<(u64, Value, u64, u64)>, generation: u64) -> Self {
         let mut ids = Vec::with_capacity(rows.len());
         let mut values = Vec::with_capacity(rows.len());
         let mut prop_pids = Vec::with_capacity(rows.len());
@@ -106,7 +145,27 @@ impl Column {
             encoded,
             prop_pids,
             node_first_props,
+            generation,
+            decoded: std::cell::RefCell::new(None),
+            index_map: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The memoized `node_id -> row index` map, built once and re-used on every subsequent scan of
+    /// this immutable column (`rmp` task #375 (c)). Later duplicate ids (which the rebuild scan never
+    /// produces — node ids are scanned once, ascending) would resolve to the first occurrence; the
+    /// arrays are dense and ascending, so the map is a faithful O(1) `id -> index`.
+    fn index_map(&self) -> Rc<HashMap<u64, usize>> {
+        if let Some(m) = self.index_map.borrow().as_ref() {
+            return Rc::clone(m);
+        }
+        let mut map = HashMap::with_capacity(self.ids.len());
+        for (i, &id) in self.ids.iter().enumerate() {
+            map.entry(id).or_insert(i);
+        }
+        let rc = Rc::new(map);
+        *self.index_map.borrow_mut() = Some(Rc::clone(&rc));
+        rc
     }
 
     /// The number of captured rows.
@@ -114,23 +173,60 @@ impl Column {
         self.ids.len()
     }
 
-    /// Decodes the whole value column (one allocation), index-aligned with `ids` / `prop_pids` /
-    /// `node_first_props`. Used by the batched (vectorized) scan, which decodes once and folds the
-    /// contiguous slice rather than decoding row-by-row.
-    fn decode_values(&self) -> Vec<Value> {
-        match &self.encoded {
-            ColumnEncoding::Integers(bytes) => integer::decode_i64(bytes, self.ids.len())
-                .into_iter()
-                .map(Value::Integer)
-                .collect(),
-            ColumnEncoding::Strings(bytes) => dictionary::decode(bytes, self.ids.len())
-                .into_iter()
-                // The bytes were captured from a valid Rust `String`, so they are valid UTF-8; a
-                // defensive lossy decode keeps this panic-free even if that ever ceased to hold.
-                .map(|b| Value::String(String::from_utf8_lossy(&b).into_owned()))
-                .collect(),
-            ColumnEncoding::Raw(values) => values.clone(),
+    /// This column's build generation (changes only when the column is re-captured).
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Decodes the column to its [`DecodedColumn`] — values, plus the canonical `(codes, dict)` for a
+    /// dictionary-string column — **memoizing** the result (`rmp` task #375). The decode (FOR/Delta
+    /// integer or dictionary bit-unpack) runs at most **once** per column build: a repeated scan of
+    /// this immutable column reuses the cached `Rc`, and a re-capture builds a fresh `Column` with an
+    /// empty cell, so a stale decode is never served. The integer/raw arms carry no codes (`None`);
+    /// only the dictionary arm exposes the fold-on-codes view.
+    fn decode(&self) -> Rc<DecodedColumn> {
+        if let Some(d) = self.decoded.borrow().as_ref() {
+            return Rc::clone(d);
         }
+        let count = self.ids.len();
+        let decoded = match &self.encoded {
+            ColumnEncoding::Integers(bytes) => DecodedColumn {
+                values: integer::decode_i64(bytes, count)
+                    .into_iter()
+                    .map(Value::Integer)
+                    .collect(),
+                string_codes: None,
+            },
+            ColumnEncoding::Strings(bytes) => {
+                // Decode the dictionary ONCE (not one owned `String` per row): the canonical codes
+                // index a deduped, sorted dict, so a consumer can fold equality / `GROUP BY` on the
+                // integer codes and materialize a `Value::String` only for the rows it actually keeps.
+                let (codes, raw_dict) = dictionary::decode_codes(bytes, count);
+                // The dict bytes were captured from valid Rust `String`s, so they are valid UTF-8; a
+                // defensive lossy decode keeps this panic-free even if that ever ceased to hold.
+                let dict: Vec<String> = raw_dict
+                    .into_iter()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .collect();
+                // `values` stays byte-identical to the old `decode` (dict[code] per row); kept so the
+                // value-consuming read path is unchanged, while the codes/dict enable code folding.
+                let values: Vec<Value> = codes
+                    .iter()
+                    .map(|&c| Value::String(dict[c as usize].clone()))
+                    .collect();
+                DecodedColumn {
+                    values,
+                    string_codes: Some((codes, dict)),
+                }
+            }
+            ColumnEncoding::Raw(values) => DecodedColumn {
+                values: values.clone(),
+                string_codes: None,
+            },
+        };
+        let rc = Rc::new(decoded);
+        *self.decoded.borrow_mut() = Some(Rc::clone(&rc));
+        rc
     }
 }
 
@@ -170,10 +266,31 @@ fn encode_column(values: &[Value]) -> ColumnEncoding {
 pub struct ColumnSnapshot {
     /// The dense node ids, ascending.
     pub ids: Vec<u64>,
-    /// The decoded values, index-aligned with [`Self::ids`].
-    pub values: Vec<Value>,
+    /// The decoded value column plus, for a dictionary-string column, its canonical `(codes, dict)`
+    /// (`rmp` task #375). Shared (`Rc`) with the cache's memoized decode, so a repeated scan of an
+    /// un-mutated column re-uses it without re-decoding. Read [`DecodedColumn::values`] for the
+    /// [`Value`] view (byte-identical to the old `values` field) or
+    /// [`DecodedColumn::string_codes`] to fold on codes.
+    pub decoded: Rc<DecodedColumn>,
     /// The per-row staleness witnesses, index-aligned with [`Self::ids`].
     pub witnesses: Vec<ColumnWitness>,
+    /// The memoized `node_id -> row index` map (`rmp` task #375 (c)), shared with the cache: the read
+    /// path looks up a candidate's row in O(1) without rebuilding a per-query `HashMap`. Index into
+    /// [`Self::ids`] / [`DecodedColumn::values`] / [`Self::witnesses`].
+    pub index_map: Rc<HashMap<u64, usize>>,
+    /// The column's build generation at the time this snapshot was taken (`rmp` task #375). The read
+    /// path keys its per-query lookup map on `(label, prop, generation)`, so an un-mutated column is
+    /// served from the prebuilt map and a re-captured column (new generation) forces a rebuild.
+    pub generation: u64,
+}
+
+impl ColumnSnapshot {
+    /// The decoded values, index-aligned with [`Self::ids`] (the [`Value`] view — byte-identical to
+    /// the pre-`rmp`-#375 `values` field).
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        &self.decoded.values
+    }
 }
 
 /// The two staleness witnesses captured for one cached `(node, value)` row (`rmp` #329).
@@ -248,6 +365,18 @@ pub struct ColumnCache {
     /// make a parallel-vs-serial equivalence check vacuous). `Cell` because the projection path takes
     /// `&self`.
     parallel_scan_hits: std::cell::Cell<u64>,
+    /// A monotonic counter that stamps each installed column's **build generation** (`rmp` task #375).
+    /// Bumped on every mutation that changes a column's contents — a [`set_column`](Self::set_column)
+    /// (which replaces a column with freshly-captured rows) and a [`clear`](Self::clear) (which drops
+    /// every column ahead of a rebuild). A column's generation therefore changes **iff** it was
+    /// re-captured, so the read path can trust a `(label, prop, generation)` key: equal generation ⇒
+    /// the column is byte-for-byte the one it last decoded ⇒ its memoized lookup map is still exact.
+    generation: std::cell::Cell<u64>,
+    /// The number of [`snapshot`](Self::snapshot) calls that **re-used the column's memoized decode**
+    /// rather than decoding afresh (`rmp` task #375). A test asserts a second scan of an un-mutated
+    /// column hits this (proving the decode is paid once), and a monitor reads it to confirm the
+    /// late-materialization cache is engaged. `Cell` because [`snapshot`](Self::snapshot) takes `&self`.
+    decode_cache_hits: std::cell::Cell<u64>,
 }
 
 impl ColumnCache {
@@ -279,8 +408,18 @@ impl ColumnCache {
 
     /// Drops every captured column's data but **keeps** the declared set, so a following rebuild
     /// re-captures exactly the declared columns. The cache-side analogue of [`IndexSet::clear`].
+    ///
+    /// Bumps the generation (`rmp` task #375): every column it drops will be re-built with a fresh
+    /// generation, so any read path holding an older `(label, prop, generation)` key is invalidated.
     pub fn clear(&mut self) {
         self.columns.clear();
+        self.bump_generation();
+    }
+
+    /// Advances the build-generation counter (`rmp` task #375). Saturating so a pathologically long-
+    /// lived cache can never wrap to a previously-served generation and serve a stale decode.
+    fn bump_generation(&self) {
+        self.generation.set(self.generation.get().saturating_add(1));
     }
 
     /// Installs the captured rows for `(label_token, prop_key)` (called by the coordinator's rebuild
@@ -292,8 +431,23 @@ impl ColumnCache {
         prop_key: u32,
         rows: Vec<(u64, Value, u64, u64)>,
     ) {
+        // A fresh generation per installed column (`rmp` task #375): replacing the column with
+        // freshly-captured rows changes its contents, so any reader's cached decode keyed on the old
+        // generation is now stale and must rebuild. The new `Column` starts with an empty decode cell.
+        self.bump_generation();
+        let generation = self.generation.get();
         self.columns
-            .insert((label_token, prop_key), Column::build(rows));
+            .insert((label_token, prop_key), Column::build(rows, generation));
+    }
+
+    /// The current build generation of the cached column for `(label_token, prop_key)`, or `None` when
+    /// the pair is not cached (`rmp` task #375). The read path captures this alongside a snapshot and
+    /// re-uses its memoized lookup map only while the generation is unchanged.
+    #[must_use]
+    pub fn column_generation(&self, label_token: u32, prop_key: u32) -> Option<u64> {
+        self.columns
+            .get(&(label_token, prop_key))
+            .map(Column::generation)
     }
 
     /// The number of cached rows for `(label_token, prop_key)`, or `None` if the column is not cached.
@@ -315,7 +469,14 @@ impl ColumnCache {
         // Count a cache hit: this is reached only when the columnar analytical read path is taken for
         // a cached column (`rmp` #330 observability / test-engagement proof).
         self.scan_hits.set(self.scan_hits.get() + 1);
-        let values = col.decode_values();
+        // If this column was already decoded by an earlier scan (and not re-captured since), the
+        // memoized `Rc` is reused — the dictionary/integer decode is paid once, not per query
+        // (`rmp` task #375). `was_cached` is read *before* `decode()` populates the cell.
+        let was_cached = col.decoded.borrow().is_some();
+        let decoded = col.decode();
+        if was_cached {
+            self.decode_cache_hits.set(self.decode_cache_hits.get() + 1);
+        }
         let witnesses = col
             .prop_pids
             .iter()
@@ -327,9 +488,19 @@ impl ColumnCache {
             .collect();
         Some(ColumnSnapshot {
             ids: col.ids.clone(),
-            values,
+            decoded,
             witnesses,
+            index_map: col.index_map(),
+            generation: col.generation(),
         })
+    }
+
+    /// The number of [`snapshot`](Self::snapshot) calls that re-used a column's memoized decode rather
+    /// than decoding afresh (`rmp` task #375) — the late-materialization cache's engagement signal.
+    /// Used by tests to prove a second scan of an un-mutated column avoids re-decoding.
+    #[must_use]
+    pub fn decode_cache_hits(&self) -> u64 {
+        self.decode_cache_hits.get()
     }
 
     /// The number of times the columnar analytical read path served a cached column (`rmp` #330) —
@@ -410,9 +581,11 @@ mod tests {
         let snap = cache.snapshot(1, 2).expect("column cached");
         assert_eq!(snap.ids, vec![1, 2, 3]);
         assert_eq!(
-            snap.values,
-            vec![Value::Integer(10), Value::Integer(20), Value::Integer(10)]
+            snap.values(),
+            &[Value::Integer(10), Value::Integer(20), Value::Integer(10)]
         );
+        // An integer column carries no fold-on-codes view.
+        assert!(snap.decoded.string_codes.is_none());
         // Witnesses index-aligned and preserved.
         assert_eq!(snap.witnesses[1].prop_pid, 20);
         assert_eq!(snap.witnesses[1].node_first_prop, 200);
@@ -430,13 +603,27 @@ mod tests {
         cache.set_column(5, 6, data);
         let snap = cache.snapshot(5, 6).expect("column cached");
         assert_eq!(
-            snap.values,
-            vec![
+            snap.values(),
+            &[
                 Value::String("red".into()),
                 Value::String("green".into()),
                 Value::String("red".into()),
             ]
         );
+        // The fold-on-codes view is present and consistent with the values: codes index a canonical
+        // (sorted, deduped) dict, so `dict[codes[i]]` reproduces the value exactly and code-equality
+        // mirrors value-equality (rows 0 and 2 are both "red" ⇒ identical code).
+        let (codes, dict) = snap
+            .decoded
+            .string_codes
+            .as_ref()
+            .expect("string column exposes codes");
+        assert!(dict.windows(2).all(|w| w[0] < w[1]), "dict canonical");
+        assert_eq!(codes[0], codes[2]);
+        assert_ne!(codes[0], codes[1]);
+        for (i, v) in snap.values().iter().enumerate() {
+            assert_eq!(*v, Value::String(dict[codes[i] as usize].clone()));
+        }
     }
 
     #[test]
@@ -451,13 +638,14 @@ mod tests {
         cache.set_column(7, 8, data);
         let snap = cache.snapshot(7, 8).expect("column cached");
         assert_eq!(
-            snap.values,
-            vec![
+            snap.values(),
+            &[
                 Value::Integer(1),
                 Value::Float(2.5),
                 Value::String("x".into())
             ]
         );
+        assert!(snap.decoded.string_codes.is_none());
     }
 
     #[test]
@@ -467,7 +655,7 @@ mod tests {
         let data = rows(&[(1, Value::Float(1.5)), (2, Value::Float(-2.0))]);
         cache.set_column(9, 10, data);
         let snap = cache.snapshot(9, 10).expect("column cached");
-        assert_eq!(snap.values, vec![Value::Float(1.5), Value::Float(-2.0)]);
+        assert_eq!(snap.values(), &[Value::Float(1.5), Value::Float(-2.0)]);
     }
 
     #[test]
@@ -492,7 +680,7 @@ mod tests {
         cache.set_column(2, 2, Vec::new());
         let snap = cache.snapshot(2, 2).expect("empty column still cached");
         assert!(snap.ids.is_empty());
-        assert!(snap.values.is_empty());
+        assert!(snap.values().is_empty());
         assert_eq!(cache.column_len(2, 2), Some(0));
     }
 
@@ -500,5 +688,61 @@ mod tests {
     fn undeclared_column_has_no_snapshot() {
         let cache = ColumnCache::new();
         assert!(cache.snapshot(99, 99).is_none());
+    }
+
+    #[test]
+    fn repeated_scan_of_unmutated_column_reuses_decode() {
+        // `rmp` #375 (c): a second scan of an un-mutated column must NOT re-decode — it reuses the
+        // memoized `Rc<DecodedColumn>` (proven by the decode-cache-hit counter and by `Rc` identity).
+        let mut cache = ColumnCache::new();
+        cache.declare(5, 6);
+        cache.set_column(
+            5,
+            6,
+            rows(&[
+                (1, Value::String("red".into())),
+                (2, Value::String("green".into())),
+            ]),
+        );
+        assert_eq!(cache.decode_cache_hits(), 0);
+        let s1 = cache.snapshot(5, 6).expect("cached");
+        assert_eq!(cache.decode_cache_hits(), 0, "first scan decodes");
+        let s2 = cache.snapshot(5, 6).expect("cached");
+        assert_eq!(cache.decode_cache_hits(), 1, "second scan reuses decode");
+        // Same underlying decode (no re-decode): the snapshots share one `Rc`.
+        assert!(Rc::ptr_eq(&s1.decoded, &s2.decoded));
+        // Generation unchanged across reads.
+        assert_eq!(s1.generation, s2.generation);
+    }
+
+    #[test]
+    fn mutation_bumps_generation_and_invalidates_decode() {
+        // `rmp` #375 (c): re-capturing the column (a `set_column`, the only content mutation the cache
+        // exposes besides `clear`) mints a new generation and a fresh decode cell — a stale decode is
+        // never served. `clear` likewise bumps the generation.
+        let mut cache = ColumnCache::new();
+        cache.declare(5, 6);
+        cache.set_column(5, 6, rows(&[(1, Value::String("red".into()))]));
+        let g0 = cache.column_generation(5, 6).expect("cached");
+        let s0 = cache.snapshot(5, 6).expect("cached");
+        assert_eq!(s0.generation, g0);
+
+        // Re-capture with different contents.
+        cache.set_column(5, 6, rows(&[(1, Value::String("blue".into()))]));
+        let g1 = cache.column_generation(5, 6).expect("cached");
+        assert!(g1 > g0, "set_column must bump the generation: {g0} -> {g1}");
+        let s1 = cache.snapshot(5, 6).expect("cached");
+        // Fresh decode (new column), and it reflects the new contents.
+        assert!(!Rc::ptr_eq(&s0.decoded, &s1.decoded));
+        assert_eq!(s1.values(), &[Value::String("blue".into())]);
+        // The fresh column starts cold (no decode-cache hit was charged for `s1`).
+        assert_eq!(cache.decode_cache_hits(), 0);
+
+        // `clear` also advances the generation (so any held key is invalidated before a rebuild).
+        let before = g1;
+        cache.clear();
+        cache.set_column(5, 6, rows(&[(1, Value::String("blue".into()))]));
+        let g2 = cache.column_generation(5, 6).expect("cached");
+        assert!(g2 > before, "clear+rebuild must bump the generation");
     }
 }

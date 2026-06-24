@@ -1857,26 +1857,32 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         };
 
-        // --- the cached column, as an O(1)-lookup map node_id -> (cached value, witness) ---
-        // The map owns each captured `Value`; the read path **moves** it out on a fresh hit
-        // ([`HashMap::remove`] below) rather than cloning, so a `String`/`List` column is materialized
-        // exactly **once** (at decode) instead of twice (decode + per-serve clone). That double
-        // allocation is what made the string column regress vs the row path; with the move, the
-        // columnar string scan pays one allocation per served value — fewer than the row path, which
-        // also walks the `strings.store` overflow heap (`rmp` #329/#330).
+        // --- the cached column, accessed by a memoized O(1) node_id -> row-index map ---
+        // (`rmp` task #375 (c)) The decode (`Rc<DecodedColumn>`) and the `id -> index` map are both
+        // **memoized on the column** and shared here by `Rc`, so a repeated scan of an un-mutated
+        // column re-uses them instead of decoding the whole column and rebuilding an O(n) `HashMap`
+        // on every query (which is what this hot path used to do). The contiguous `values` are
+        // borrowed from the shared decode; a fresh hit **clones** the one served `Value` (a short,
+        // low-cardinality `String` for the analytical hot columns) — strictly less work than the row
+        // path, which also walks the `strings.store` overflow heap (`rmp` #329/#330). Late
+        // materialization: a candidate that is invisible / mislabelled / stale never touches `values`,
+        // so no value it would discard is ever cloned.
         let snapshot = columns.borrow().snapshot(label_token, prop_key);
-        let mut cached: std::collections::HashMap<
-            u64,
-            (Value, crate::column_cache::ColumnWitness),
-        > = match snapshot {
-            Some(snap) => snap
-                .ids
-                .into_iter()
-                .zip(snap.values)
-                .zip(snap.witnesses)
-                .map(|((id, value), witness)| (id, (value, witness)))
-                .collect(),
-            None => std::collections::HashMap::new(),
+        // `(decode, id->index, witnesses)` of the cached column, or empty views when uncached.
+        let (cached_decoded, cached_index, cached_witnesses): (
+            std::rc::Rc<crate::column_cache::DecodedColumn>,
+            std::rc::Rc<std::collections::HashMap<u64, usize>>,
+            Vec<crate::column_cache::ColumnWitness>,
+        ) = match snapshot {
+            Some(snap) => (snap.decoded, snap.index_map, snap.witnesses),
+            None => (
+                std::rc::Rc::new(crate::column_cache::DecodedColumn {
+                    values: Vec::new(),
+                    string_codes: None,
+                }),
+                std::rc::Rc::new(std::collections::HashMap::new()),
+                Vec::new(),
+            ),
         };
 
         let mut out: Vec<(NodeId, Value)> = Vec::new();
@@ -1917,20 +1923,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             members.push(NodeId(id));
 
             // Try the cache; fall back to the authoritative single-property read on any mismatch.
+            // Look the candidate's row up in the memoized id->index map (O(1), no per-query rebuild),
+            // and only when the witness re-check passes do we **materialize** (clone) its value from
+            // the shared decode — late materialization (`rmp` task #375).
             let node = NodeId(id);
-            let value = match cached.remove(&id) {
-                Some((cached_value, witness))
-                    if self.columnar_entry_is_fresh(&node_rec, witness, prop_key) =>
-                {
+            let cache_row = cached_index.get(&id).copied().filter(|&i| {
+                self.columnar_entry_is_fresh(&node_rec, cached_witnesses[i], prop_key)
+            });
+            let value = match cache_row {
+                Some(i) => {
                     // Fresh: the cached value IS the node's snapshot-visible newest value of the key.
-                    // Served from the contiguous column with ZERO property-chain decode (the win),
-                    // **moved** out of the map (no clone — one allocation total for the value).
+                    // Served from the contiguous column with ZERO property-chain decode (the win);
+                    // one clone of the (short) value materialized only for this kept row.
                     value_hits += 1;
-                    Some(cached_value)
+                    Some(cached_decoded.values[i].clone())
                 }
                 // Cache miss, or stale (a prepend/overwrite/tombstone since rebuild, or a concurrent
                 // writer): read the authoritative current value — exactly the row path (one decode).
-                _ => {
+                None => {
                     fallback_reads += 1;
                     self.read_node_prop_one(node, property)
                 }
