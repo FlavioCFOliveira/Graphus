@@ -9,9 +9,11 @@
 //!
 //! # Derived / ephemeral by design (`graphus-index` crate-root seam)
 //!
-//! Every backing tree lives over an **in-memory** device ([`MemBlockDevice`]) and an in-memory log
-//! sink ([`MemLogSink`]): the index set is rebuilt from the record store on open and is never
-//! recovered after a crash, so there is no durability requirement here. Consequently the internal
+//! Every backing tree lives over an **in-memory** device ([`MemBlockDevice`]) and a non-retaining log
+//! sink ([`DiscardingLogSink`]): the index set is rebuilt from the record store on open and is never
+//! recovered after a crash, so there is no durability requirement here — the sink discards every WAL
+//! record body it is handed, eliminating the retained-WAL `Vec` (`rmp` #321/#313). Consequently the
+//! internal
 //! WAL transaction id is irrelevant — every op uses a fixed [`TxnId`]`(1)`; the buffer pool applies
 //! each mutation to its in-memory page immediately, so reads observe writes without a commit.
 //!
@@ -36,12 +38,19 @@ use graphus_index::spatial::SpatialIndex;
 use graphus_index::{BTree, CompositeIndex, PropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
-use graphus_wal::{MemLogSink, WalManager};
+use graphus_wal::{DiscardingLogSink, WalManager};
 
 /// The in-memory block device the derived indexes are built on.
 type Dev = MemBlockDevice;
-/// The in-memory log sink the derived indexes' ephemeral WAL is built on.
-type Sink = MemLogSink;
+/// The log sink the derived indexes' ephemeral WAL is built on (`rmp` task #321).
+///
+/// A derived index's WAL is **never synced, never read back, never recovered** — the index is rebuilt
+/// from the record store on open — so its records are pure overhead. A [`DiscardingLogSink`] keeps the
+/// WAL-before-page contract (LSNs advance, appends are immediately "durable") while *discarding* every
+/// record body, eliminating both the unbounded retained-WAL `Vec` (`~72 %` of a large bulk-load's peak
+/// RSS, `rmp` #313/#305) and the per-insert full-page double copy that dominated index build time
+/// (measured `2.14s → 0.93s`, 2.3x, on a 53k-node build).
+type Sink = DiscardingLogSink;
 
 /// The fixed transaction id used for every backing-tree op. The WAL is ephemeral and never
 /// recovered, so the id carries no meaning; the buffer pool applies each mutation in-memory
@@ -54,12 +63,14 @@ const POOL_FRAMES: usize = 64;
 
 /// Builds a fresh, empty in-memory [`BTree`] with its own throwaway WAL.
 ///
-/// Each call wires a brand-new [`MemBlockDevice`] + [`MemLogSink`] pair, so trees are fully
+/// Each call wires a brand-new [`MemBlockDevice`] + [`DiscardingLogSink`] pair, so trees are fully
 /// independent — exactly what [`IndexSet::clear`] needs to drop all entries by recreation.
 fn fresh_tree() -> BTree<Dev, Sink> {
-    // An in-memory sink + manager: `WalManager::create` over `MemLogSink` cannot fail in practice.
-    let wal = WalManager::create(MemLogSink::new())
-        .expect("INVARIANT: in-memory WAL creation over MemLogSink is infallible");
+    // A non-retaining sink + manager: `WalManager::create` over `DiscardingLogSink` cannot fail in
+    // practice. The sink retains only the WAL header (which `create` reads back) and discards every
+    // record body — sound because this WAL is never recovered (`rmp` task #321).
+    let wal = WalManager::create(DiscardingLogSink::new())
+        .expect("INVARIANT: in-memory WAL creation over DiscardingLogSink is infallible");
     let shared = SharedWal::new(wal);
     let pool = BufferPool::with_wal(MemBlockDevice::new(0), shared.clone(), POOL_FRAMES);
     // An in-memory B+-tree: `BTree::create` over a fresh in-memory pool cannot fail in practice.

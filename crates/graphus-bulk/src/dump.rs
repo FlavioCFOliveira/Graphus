@@ -104,17 +104,6 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-/// Collapses a property chain (newest-first, per the store's prepend order) to the **newest** value
-/// per key, keyed by the property-key token id.
-fn newest_per_key(props: Vec<(u64, u32, Value)>) -> BTreeMap<u32, Value> {
-    let mut out: BTreeMap<u32, Value> = BTreeMap::new();
-    // The chain is head-to-tail = newest-to-oldest, so the *first* occurrence of a key wins.
-    for (_pid, key_token, value) in props {
-        out.entry(key_token).or_insert(value);
-    }
-    out
-}
-
 /// PERF (C17): collapses a property chain to the newest value per key **and** resolves token ids to
 /// key names in a single pass, returning a name-keyed map ready for column lookup. This replaces the
 /// previous "build a token-keyed `BTreeMap`, then re-key into a name-keyed `BTreeMap`" double build.
@@ -154,16 +143,27 @@ pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
 ) -> Result<Vec<String>> {
     let node_ids = store.scan_node_ids()?;
 
-    // Pass 1: collect the union of property keys and infer each key's column type.
+    // SINGLE store scan of property values (`rmp` task #321): the previous dumper scanned every node's
+    // property chain twice — once to collect the key/type union, once to render the rows. Here each
+    // node's chain is decoded **once** into an owned, name-keyed, newest-wins map (`materialise_props`),
+    // its keys folded into the type union as we go, and the buffered map is rendered in the row pass.
+    // The store property-value scan now runs once per node, symmetric with the single-pass importer.
     let mut key_types: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut node_props: Vec<(u64, Vec<String>, BTreeMap<String, Value>)> =
+        Vec::with_capacity(node_ids.len());
     for &id in &node_ids {
-        let props = newest_per_key(store.node_property_values(id)?);
-        for (key_token, value) in &props {
-            let key = key_name(store, Namespace::PropKey, *key_token)?;
+        let label_tokens = store.node_labels(id)?;
+        let mut labels = Vec::with_capacity(label_tokens.len());
+        for t in label_tokens {
+            labels.push(key_name(store, Namespace::Label, t)?);
+        }
+        let by_name = newest_by_name(store, store.node_property_values(id)?)?;
+        for (key, value) in &by_name {
             key_types
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| column_type_token(value));
         }
+        node_props.push((id, labels, by_name));
     }
     let keys: Vec<String> = key_types.keys().cloned().collect();
 
@@ -175,21 +175,11 @@ pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
     }
     w.write_record(&header).map_err(csv_err)?;
 
-    // Pass 2: one row per node.
-    for &id in &node_ids {
-        let label_tokens = store.node_labels(id)?;
-        let mut labels = Vec::with_capacity(label_tokens.len());
-        for t in label_tokens {
-            labels.push(key_name(store, Namespace::Label, t)?);
-        }
-        // PERF (C17): build the name-keyed newest-value map in one pass (no token-map → name-map
-        // double build).
-        let node_props = store.node_property_values(id)?;
-        let by_name = newest_by_name(store, node_props)?;
-
+    // Row pass: render the buffered, already-resolved maps (no second store scan).
+    for (id, labels, by_name) in &node_props {
         // PERF (C19): render the u64 id via `itoa` (no digit-by-digit `Display` machinery).
         let mut id_buf = itoa::Buffer::new();
-        let mut row = vec![id_buf.format(id).to_owned(), labels.join(";")];
+        let mut row = vec![id_buf.format(*id).to_owned(), labels.join(";")];
         for key in &keys {
             row.push(by_name.get(key).map(render_value).unwrap_or_default());
         }
@@ -213,16 +203,22 @@ pub fn dump_relationships<D: BlockDevice, S: LogSink, W: Write>(
 ) -> Result<Vec<String>> {
     let rel_ids = store.scan_rel_ids()?;
 
-    // Pass 1: union of relationship property keys + inferred types.
+    // SINGLE store scan of property values (`rmp` task #321), symmetric with `dump_nodes`: each
+    // relationship's property chain is decoded once into a buffered name-keyed map, its keys folded
+    // into the type union as we go, and the buffered maps are rendered in the row pass below.
     let mut key_types: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut rel_rows: Vec<(u64, u64, String, BTreeMap<String, Value>)> =
+        Vec::with_capacity(rel_ids.len());
     for &id in &rel_ids {
-        let props = newest_per_key(store.rel_property_values(id)?);
-        for (key_token, value) in &props {
-            let key = key_name(store, Namespace::PropKey, *key_token)?;
+        let rec = store.rel(id)?;
+        let type_name = key_name(store, Namespace::RelType, rec.type_id)?;
+        let by_name = newest_by_name(store, store.rel_property_values(id)?)?;
+        for (key, value) in &by_name {
             key_types
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| column_type_token(value));
         }
+        rel_rows.push((rec.start_node, rec.end_node, type_name, by_name));
     }
     let keys: Vec<String> = key_types.keys().cloned().collect();
 
@@ -237,20 +233,14 @@ pub fn dump_relationships<D: BlockDevice, S: LogSink, W: Write>(
     }
     w.write_record(&header).map_err(csv_err)?;
 
-    for &id in &rel_ids {
-        let rec = store.rel(id)?;
-        let type_name = key_name(store, Namespace::RelType, rec.type_id)?;
-        // PERF (C17): single-pass name-keyed newest-value map (see `dump_nodes`).
-        let rel_props = store.rel_property_values(id)?;
-        let by_name = newest_by_name(store, rel_props)?;
-
+    for (start_node, end_node, type_name, by_name) in &rel_rows {
         // PERF (C19): render the endpoint u64 ids via `itoa`.
         let mut start_buf = itoa::Buffer::new();
         let mut end_buf = itoa::Buffer::new();
         let mut row = vec![
-            start_buf.format(rec.start_node).to_owned(),
-            end_buf.format(rec.end_node).to_owned(),
-            type_name,
+            start_buf.format(*start_node).to_owned(),
+            end_buf.format(*end_node).to_owned(),
+            type_name.clone(),
         ];
         for key in &keys {
             row.push(by_name.get(key).map(render_value).unwrap_or_default());

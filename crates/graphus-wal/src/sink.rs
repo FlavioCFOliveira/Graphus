@@ -260,6 +260,98 @@ impl LogSink for MemLogSink {
     }
 }
 
+/// A **non-retaining** [`LogSink`] for **ephemeral, never-recovered** logs (`rmp` tasks #321, #313,
+/// #305): it physically retains only the log **header** prefix `[0, HEADER_LEN)` and *discards* every
+/// appended record body, while still advancing a monotonic length counter so LSNs stay unique and
+/// monotone and the WAL-before-page durability rule is satisfied trivially (everything appended is
+/// reported durable the instant it is appended).
+///
+/// # Why this is sound for a derived index WAL
+///
+/// The Cypher `IndexSet` (in `graphus-cypher`) backs each secondary index with an in-memory B+-tree
+/// over an in-memory device whose WAL is **never synced, never read back, and never recovered**: the
+/// whole index is a *derived* structure, rebuilt from the record store on open. The B+-tree's pages
+/// live in its buffer pool / in-memory device; the WAL records (full-page undo+redo patches, two per
+/// mutation) exist only to satisfy the pool's `WAL-before-page` rule. A [`MemLogSink`] retains every
+/// one of those records forever in a `Vec` that nothing ever reads — `~72 %` of a large bulk-load's
+/// peak RSS (`rmp` #313) — and copies a full page payload twice per inserted key.
+///
+/// This sink keeps the durability *contract* (offsets/LSNs advance, appended bytes are immediately
+/// "durable") but throws the bytes away, because no reader of this log exists. The only bytes a reader
+/// *could* observe — the header at offset `0`, validated by [`crate::WalManager::open`] / read back
+/// inside [`crate::WalManager::create`] — are the bytes it retains. A real, recoverable WAL must use
+/// [`MemLogSink`] / [`FileLogSink`]; using this sink for one would silently lose the log.
+///
+/// # Reclaim
+///
+/// [`reclaim`](LogSink::reclaim) is a no-op: there is nothing past the header to free (the bodies were
+/// never stored), so memory never grows under append churn in the first place.
+#[derive(Debug, Default, Clone)]
+pub struct DiscardingLogSink {
+    /// The retained header prefix `[0, head.len())` — the only bytes any reader of this log observes.
+    /// Captured from the leading [`HEADER_LEN`] bytes of the first appends (the [`WalManager::create`]
+    /// header write), then frozen.
+    head: Vec<u8>,
+    /// The monotonic logical length (durable == buffered: an append is "durable" immediately, since a
+    /// never-recovered log has no crash window). Byte offset == LSN, so this keeps LSNs unique.
+    len: u64,
+}
+
+impl DiscardingLogSink {
+    /// An empty non-retaining sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl LogSink for DiscardingLogSink {
+    fn append(&mut self, bytes: &[u8]) {
+        // Retain only the bytes that fall in the header window `[0, HEADER_LEN)`; everything past it is
+        // discarded. In practice the first append is exactly the `HEADER_LEN`-byte header, so `head`
+        // ends up holding it and every later body append adds nothing but advances `len`.
+        let start = self.len;
+        let header_floor = crate::HEADER_LEN;
+        if start < header_floor {
+            let want = (header_floor - start) as usize;
+            let take = want.min(bytes.len());
+            self.head.extend_from_slice(&bytes[..take]);
+        }
+        self.len += bytes.len() as u64;
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        // A never-recovered log has no real durability boundary: appended == durable already.
+        Ok(())
+    }
+
+    fn durable_len(&self) -> u64 {
+        self.len
+    }
+
+    fn buffered_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
+        into.clear();
+        if from >= self.len {
+            return Ok(());
+        }
+        // Serve `[from, len)`: the retained header is the real bytes, everything past it reads back as
+        // zeros (the discarded bodies). A reader of an ephemeral index WAL only ever reads the header
+        // (offset 0, inside `WalManager::create`/`open`), so the zero tail is never observed in
+        // practice; modelling it as zeros keeps the contract identical to a reclaimed gap.
+        into.resize((self.len - from) as usize, 0);
+        let head_end = self.head.len() as u64;
+        if from < head_end {
+            let len = (head_end - from) as usize;
+            into[..len].copy_from_slice(&self.head[from as usize..]);
+        }
+        Ok(())
+    }
+}
+
 /// The filename holding the log header (`[0, anchor_len)`), never deleted by reclamation.
 const ANCHOR_NAME: &str = "anchor";
 /// The filename prefix of a record segment; the suffix is its zero-padded physical base offset.
@@ -839,5 +931,55 @@ mod tests {
         let mut buf = Vec::new();
         s.read_durable(0, &mut buf).unwrap();
         assert_eq!(buf, b"HEADaaaa");
+    }
+
+    // ----------------------------------------------------- DiscardingLogSink (`rmp` task #321)
+
+    #[test]
+    fn discarding_retains_header_discards_bodies_but_advances_len() {
+        let mut s = DiscardingLogSink::new();
+        // The first append is the WAL header (HEADER_LEN bytes); it must be retained verbatim.
+        let header = b"GWAL0001"; // 8 bytes == HEADER_LEN
+        assert_eq!(header.len() as u64, crate::HEADER_LEN);
+        s.append(header);
+        // A record body append: discarded, but the logical length still advances (LSNs stay unique).
+        s.append(b"a-record-body-that-is-thrown-away");
+        s.append(b"another-record-body");
+
+        // durable == buffered == total appended length (no crash window for a never-recovered log).
+        let total =
+            header.len() + "a-record-body-that-is-thrown-away".len() + "another-record-body".len();
+        assert_eq!(s.durable_len(), total as u64);
+        assert_eq!(s.buffered_len(), total as u64);
+
+        // sync is a no-op and never fails.
+        s.sync().unwrap();
+        assert_eq!(s.durable_len(), total as u64);
+
+        // Reading back the header window returns the real header; past it reads as zeros (discarded).
+        let mut buf = Vec::new();
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(&buf[..header.len()], header, "header retained verbatim");
+        assert!(
+            buf[header.len()..].iter().all(|&b| b == 0),
+            "discarded record bodies read back as zeros"
+        );
+    }
+
+    #[test]
+    fn discarding_drives_a_wal_manager_create_open_roundtrip() {
+        // A `WalManager::create` over the discarding sink must succeed (it writes + reads back the
+        // header), and a subsequent `open` over a fresh sink with the same header must validate.
+        let mgr = crate::WalManager::create(DiscardingLogSink::new()).expect("create");
+        assert_eq!(mgr.durable_len(), crate::HEADER_LEN);
+
+        // The header the create wrote is exactly what `open` needs; reconstruct it and reopen.
+        let mut hdr = Vec::new();
+        mgr.read_durable(graphus_core::Lsn(0), &mut hdr)
+            .expect("read header");
+        let mut fresh = DiscardingLogSink::new();
+        fresh.append(&hdr);
+        fresh.sync().unwrap();
+        crate::WalManager::open(fresh).expect("open validates the retained header");
     }
 }

@@ -165,6 +165,16 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// node, sets its `:LABEL` set and typed properties, and binds its `:ID` in the id map for the
     /// relationship pass. Commits every `batch_size` nodes.
     ///
+    /// # Performance: per-column token interning (`rmp` task #321)
+    ///
+    /// A property column's key is fixed for the whole file, so its `PropKey` token is interned **once**
+    /// per column (here, before the row loop) and the resolved id is reused for every cell — instead of
+    /// re-interning the same name on every row (a `HashMap` probe + UTF-8 hash per property cell, which
+    /// at millions of rows × several columns dominated the node pass). Interning is idempotent by name
+    /// (a name maps to exactly one id), so the per-column id is byte-for-byte the one the per-cell path
+    /// produced. `:LABEL` cells vary per row (a `;`-separated set), so label tokens are memoised by name
+    /// in a small per-pass cache rather than hoisted.
+    ///
     /// # Errors
     ///
     /// Returns a storage / header / value-parse error (all converted to [`graphus_core::GraphusError`])
@@ -183,6 +193,11 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         }
         let header =
             NodeHeader::parse(header_record.iter()).map_err(graphus_core::GraphusError::from)?;
+        // Intern every property column's key token ONCE (idempotent → same id as the per-cell path).
+        // `prop_key_tokens[i]` is `Some(token)` iff column `i` is a `Property` column.
+        let prop_key_tokens = self.resolve_property_key_tokens(&header.columns)?;
+        // Per-pass label-name → token memo (label cells vary per row; this dedups re-interns).
+        let mut label_tokens: HashMap<String, u32> = HashMap::new();
 
         let mut txn = self.begin_batch();
         let mut in_batch = 0usize;
@@ -198,7 +213,9 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             if !more {
                 break;
             }
-            if let Err(e) = self.ingest_node_record(txn, &header, &record) {
+            if let Err(e) =
+                self.ingest_node_record(txn, &header, &prop_key_tokens, &mut label_tokens, &record)
+            {
                 self.rollback(txn);
                 return Err(e);
             }
@@ -217,10 +234,16 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
 
     /// Ingests one node record under `txn`: create the node, set labels + typed properties, and map
     /// its external id.
+    ///
+    /// `prop_key_tokens[i]` carries the pre-interned `PropKey` token for column `i` (`Some` iff that
+    /// column is a `Property`), interned once per file rather than per cell (`rmp` task #321).
+    /// `label_memo` memoises label-name → token across rows so a repeated label is interned once.
     fn ingest_node_record(
         &mut self,
         txn: TxnId,
         header: &NodeHeader,
+        prop_key_tokens: &[Option<u32>],
+        label_memo: &mut HashMap<String, u32>,
         record: &csv::StringRecord,
     ) -> Result<()> {
         let (node_id, _eid) = self.store.create_node(txn)?;
@@ -237,7 +260,15 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             match role {
                 ColumnRole::Label => {
                     for label in cell.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        let token = self.store.intern_token(Namespace::Label, label)?;
+                        // Memoise label-name → token: intern once per distinct name, not per cell.
+                        let token = match label_memo.get(label) {
+                            Some(&t) => t,
+                            None => {
+                                let t = self.store.intern_token(Namespace::Label, label)?;
+                                label_memo.insert(label.to_owned(), t);
+                                t
+                            }
+                        };
                         label_set.insert(token);
                     }
                 }
@@ -245,7 +276,10 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
                     if let Some(value) =
                         parse_cell(cell, *ty, key).map_err(graphus_core::GraphusError::from)?
                     {
-                        let key_token = self.store.intern_token(Namespace::PropKey, key)?;
+                        // Reuse the per-column pre-interned key token (`rmp` task #321).
+                        let key_token = prop_key_tokens[i].expect(
+                            "INVARIANT: a Property column has a pre-interned PropKey token (#321)",
+                        );
                         self.store
                             .set_node_property_value(txn, node_id, key_token, &value)?;
                         self.stats.properties += 1;
@@ -317,6 +351,10 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         }
         let header =
             RelHeader::parse(header_record.iter()).map_err(graphus_core::GraphusError::from)?;
+        // Intern every property column's key token ONCE (idempotent → same id as per-cell). `:TYPE`
+        // cells vary per row, so type tokens are memoised by name in a per-pass cache (`rmp` task #321).
+        let prop_key_tokens = self.resolve_property_key_tokens(&header.columns)?;
+        let mut type_memo: HashMap<String, u32> = HashMap::new();
 
         let mut txn = self.begin_batch();
         let mut in_batch = 0usize;
@@ -332,7 +370,9 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             if !more {
                 break;
             }
-            if let Err(e) = self.ingest_rel_record(txn, &header, &record) {
+            if let Err(e) =
+                self.ingest_rel_record(txn, &header, &prop_key_tokens, &mut type_memo, &record)
+            {
                 self.rollback(txn);
                 return Err(e);
             }
@@ -354,6 +394,8 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         &mut self,
         txn: TxnId,
         header: &RelHeader,
+        prop_key_tokens: &[Option<u32>],
+        type_memo: &mut HashMap<String, u32>,
         record: &csv::StringRecord,
     ) -> Result<()> {
         let start_ext = record.get(header.start_index).unwrap_or("");
@@ -370,7 +412,15 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
                 "relationship references unknown :END_ID `{end_ext}` (no such node)"
             ))
         })?;
-        let type_token = self.store.intern_token(Namespace::RelType, type_name)?;
+        // Memoise rel-type-name → token: intern once per distinct type, not per row (`rmp` task #321).
+        let type_token = match type_memo.get(type_name) {
+            Some(&t) => t,
+            None => {
+                let t = self.store.intern_token(Namespace::RelType, type_name)?;
+                type_memo.insert(type_name.to_owned(), t);
+                t
+            }
+        };
         let (rel_id, _eid) = self.store.create_rel(txn, type_token, start_id, end_id)?;
 
         for (i, role) in header.columns.iter().enumerate() {
@@ -379,7 +429,10 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
                 if let Some(value) =
                     parse_cell(cell, *ty, key).map_err(graphus_core::GraphusError::from)?
                 {
-                    let key_token = self.store.intern_token(Namespace::PropKey, key)?;
+                    // Reuse the per-column pre-interned key token (`rmp` task #321).
+                    let key_token = prop_key_tokens[i].expect(
+                        "INVARIANT: a Property column has a pre-interned PropKey token (#321)",
+                    );
                     self.store
                         .set_rel_property_value(txn, rel_id, key_token, &value)?;
                     self.stats.properties += 1;
@@ -388,6 +441,29 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         }
         self.stats.relationships += 1;
         Ok(())
+    }
+
+    /// Interns every `Property` column's key token once and returns a vector aligned with `columns`:
+    /// `out[i]` is `Some(token)` iff column `i` is a [`ColumnRole::Property`], else `None` (`rmp` task
+    /// #321). Because token interning is idempotent by name (a name maps to exactly one id), the token
+    /// resolved here for a column equals the one a per-cell intern would have produced on every row —
+    /// so reusing it is content-identical while interning the key exactly once per file rather than
+    /// once per cell.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a store write failure from interning a new property-key token.
+    fn resolve_property_key_tokens(&mut self, columns: &[ColumnRole]) -> Result<Vec<Option<u32>>> {
+        let mut out = Vec::with_capacity(columns.len());
+        for role in columns {
+            match role {
+                ColumnRole::Property { key, .. } => {
+                    out.push(Some(self.store.intern_token(Namespace::PropKey, key)?));
+                }
+                _ => out.push(None),
+            }
+        }
+        Ok(out)
     }
 
     /// Begins the next batch transaction and returns its id.
