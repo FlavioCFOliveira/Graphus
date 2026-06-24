@@ -1813,6 +1813,16 @@ fn build_operator(
             if let Some(rows) = try_morsel_expand_aggregate(input, group_keys, aggregates, ctx)? {
                 return Ok(Operator::Buffered { rows });
             }
+            // Morsel-driven parallel GROUPED aggregation (`rmp` #360 — the actual LDBC-BI bottleneck): for
+            // a *large* bare `MATCH (n:Label) RETURN <bare group keys>, <bare mergeable aggregates>`, split
+            // the candidate-id vector into contiguous morsels, build a LOCAL group table per morsel
+            // **concurrently** on the dedicated pool, then merge the partials deterministically (serial
+            // first-seen order) on the engine thread. Byte-identical to serial (mergeable aggregates only:
+            // count/sum-no-overflow-int/min/max/collect; avg/percentile/composite/filtered shapes decline).
+            // This is the non-empty-GROUP-BY counterpart of the keyless Slice-3a tier below.
+            if let Some(rows) = try_morsel_group_aggregate(input, group_keys, aggregates, ctx)? {
+                return Ok(Operator::Buffered { rows });
+            }
             if let Some(rows) = try_morsel_label_aggregate(input, group_keys, aggregates, ctx)? {
                 return Ok(Operator::Buffered { rows });
             }
@@ -2498,6 +2508,287 @@ fn is_exact_parallel_agg(spec: &VecAgg) -> bool {
 /// tier discards the morsel results **without folding their buffers** and returns `None` (the serial
 /// path then handles the float column and re-registers the per-candidate markers identically — the
 /// coarse footprint already registered by the seam is harmlessly idempotent under the merge).
+/// Whether `expr` is a **bare, mergeable** aggregate column the `rmp` #360 grouped morsel tier admits:
+/// exactly one aggregate call (no surrounding arithmetic) of a kind whose parallel partition-merge is
+/// provably **bit-identical** to the serial fold. Returns `Some(needs_integer_gate)` for an admitted
+/// column (`needs_integer_gate == true` for `sum`, which must additionally be gated to a no-overflow
+/// integer column — see [`try_morsel_group_aggregate`]); `None` to decline the whole tier.
+///
+/// # Admitted (mergeable)
+/// - `count(*)` / `count(x)` / `count(DISTINCT x)` — pure i64 increment / order-preserving DISTINCT set
+///   (associative; DISTINCT re-deduped across partitions by [`Accumulator::combine`]);
+/// - `min(x)` / `max(x)` — idempotent selection via [`cmp_values`] (associative + commutative);
+/// - `sum(x)` — i64 add, **but only over a no-overflow integer column** (`needs_integer_gate`); float
+///   `sum` and an overflowing integer `sum` are NOT associative (`saturating_add` clamps order-
+///   dependently once any partition subtree saturates — empirically verified), so they decline to serial;
+/// - `collect(x)` / `collect(DISTINCT x)` — list-concat / order-preserving set-union in ascending-`lo`
+///   order = serial encounter order.
+///
+/// # Rejected (⇒ serial, never parallelized)
+/// - `avg(x)` — serial divides a scan-order f64 running sum; above 2^53 a parallel reduction in a
+///   different order diverges by ≥1 ULP (empirically verified), so it is never bit-identical;
+/// - `percentileCont`/`percentileDisc` — order-sensitive gather + a second argument the bare-fold path
+///   does not evaluate;
+/// - any composite column (`sum(x) + 1`, `size(collect(x))`), a non-aggregate column, or a second
+///   argument — the serial `aggregate_rows` `AggPlan` covers all of those correctly.
+fn recognize_mergeable_bare_agg(expr: &Expr, scan_var: &str) -> Option<bool> {
+    match &expr.kind {
+        // `count(*)`: pure i64 increment, always mergeable, no integer gate.
+        ExprKind::CountStar => Some(false),
+        ExprKind::FunctionCall {
+            name,
+            distinct,
+            args,
+        } => {
+            let fname = name.join(".").to_ascii_lowercase();
+            // Exactly one argument referencing the scan var (`count`/`sum`/`min`/`max`/`collect` are
+            // single-argument); the argument must be pure per-row so the off-thread eval is deterministic
+            // and cross-row-free, AND must reference the scan var (a constant-/param-only aggregate
+            // argument is unusual and left to serial).
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            if !crate::morsel::is_pure_per_row_expr(arg) || !expr_references_var(arg, scan_var) {
+                return None;
+            }
+            match fname.as_str() {
+                // DISTINCT is mergeable only for count/collect (re-deduped across partitions); a DISTINCT
+                // sum/min/max is left to serial (min/max DISTINCT == min/max, but we keep the gate tight).
+                "count" | "collect" => Some(false),
+                "min" | "max" if !*distinct => Some(false),
+                // `sum` needs the no-overflow integer gate (the caller checks the column).
+                "sum" if !*distinct => Some(true),
+                // avg / percentile / any other kind, or a DISTINCT sum/min/max: decline.
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` syntactically references the variable `var` (its property, or the bare variable) —
+/// a cheap structural walk used by the `rmp` #360 grouped recognizer to confirm an aggregate argument /
+/// group key is anchored on the scanned node (so the off-thread per-row eval is meaningful). Conservative:
+/// any reference anywhere in the expression counts.
+fn expr_references_var(expr: &Expr, var: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Variable(v) => v == var,
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::CountStar => false,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_references_var(lhs, var) || expr_references_var(rhs, var)
+        }
+        ExprKind::Unary { operand, .. } => expr_references_var(operand, var),
+        ExprKind::Predicate { operand, rhs, .. } => {
+            expr_references_var(operand, var)
+                || rhs.as_deref().is_some_and(|e| expr_references_var(e, var))
+        }
+        ExprKind::Property { base, .. } => expr_references_var(base, var),
+        ExprKind::Index { base, index } => {
+            expr_references_var(base, var) || expr_references_var(index, var)
+        }
+        ExprKind::Slice { base, low, high } => {
+            expr_references_var(base, var)
+                || low.as_deref().is_some_and(|e| expr_references_var(e, var))
+                || high.as_deref().is_some_and(|e| expr_references_var(e, var))
+        }
+        ExprKind::HasLabels { operand, .. } => expr_references_var(operand, var),
+        ExprKind::FunctionCall { args, .. } => args.iter().any(|a| expr_references_var(a, var)),
+        ExprKind::List(items) => items.iter().any(|e| expr_references_var(e, var)),
+        ExprKind::Map(entries) => entries.iter().any(|(_, v)| expr_references_var(v, var)),
+        ExprKind::Case(case) => {
+            case.subject
+                .as_deref()
+                .is_some_and(|e| expr_references_var(e, var))
+                || case.alternatives.iter().any(|alt| {
+                    expr_references_var(&alt.when, var) || expr_references_var(&alt.then, var)
+                })
+                || case
+                    .else_expr
+                    .as_deref()
+                    .is_some_and(|e| expr_references_var(e, var))
+        }
+        // Comprehensions / quantifiers / subqueries are rejected by the purity gate before this is
+        // reached, so a conservative `false` is fine (the column already declined).
+        ExprKind::ListComprehension(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::ExistsSubquery(_) => false,
+    }
+}
+
+/// If `(input, group_keys, aggregates)` is the **morsel-parallel-eligible GROUPED aggregation shape** —
+/// a large bare `MATCH (n:Label) RETURN <bare pure group keys>, <bare mergeable aggregates>` (`rmp` task
+/// #360, the grouped tier extending Slice 3a to the non-empty-GROUP-BY case, the actual LDBC-BI
+/// bottleneck) — partitions the candidate-id vector into contiguous morsels, builds a LOCAL group table
+/// per morsel **concurrently** on the dedicated pool, merges the partials deterministically on the engine
+/// thread, and returns the grouped rows. Otherwise returns `None` so the caller falls through to the
+/// keyless tiers and then the serial [`aggregate_rows`], all of which run **verbatim**.
+///
+/// # Byte-identical to serial, by construction
+///
+/// * **Same grouping** — each morsel keys its local table on the SAME SipHash digest
+///   ([`group_key_hash`]) + [`row_values_equivalent`] resolution the serial `aggregate_rows` uses (and
+///   the engine-thread merge re-keys identically), so the partition of rows into groups is identical;
+/// * **Same values / visibility / SSI markers** — each morsel reads through the identical lifted read
+///   body over an MVCC-superset-safe `StoreReadView` and evaluates keys + aggregate arguments with the
+///   identical [`eval`]; the coarse `PredicateRead::Label` + all-live-nodes footprint is registered on
+///   the engine thread by the seam, and each morsel's markers fold back via `merge_morsel_buffer` (union
+///   = the serial set);
+/// * **Same arithmetic** — every morsel folds into the SAME [`Accumulator`] type the serial path uses
+///   (via [`Accumulator::fold_bare`]); the merge combines via [`Accumulator::combine`], which is
+///   associative for `count`/`sum`/`min`/`max` and order-preserving (ascending-`lo`) for
+///   `collect`/`DISTINCT`; `sum` is gated to a **no-overflow integer** column (a `saturating_add` that
+///   never clamps is pure associative i64 add); `avg` / percentile decline (their parallel merge is not
+///   bit-identical);
+/// * **Same output order** — the merge emits groups sorted by global first-seen rank (the unique global
+///   survivor index that first created each group), which is order-isomorphic to serial first-seen order,
+///   **independent of the worker count** (the AC's determinism).
+///
+/// # Eligibility (ALL required, else `None`)
+/// - the morsel knob is enabled: [`Ctx::morsel_threads`] `> 1`;
+/// - `input` is a bare label scan (`NodeByLabelScan` / `TokenLookupScan`) — NO interposed `Filter` /
+///   `Expand` (those change which rows / the candidate order; the planner shapes
+///   `MATCH (n:Label) RETURN n.k, agg(n.p)` with the bare scan directly under the `Aggregation`, and a
+///   `WHERE` interposes a `Filter` ⇒ declines);
+/// - there is **at least one** group key (the keyless case is the existing Slice-3a tier), every group
+///   key is **pure per-row** ([`crate::morsel::is_pure_per_row_expr`]) and references the scan var;
+/// - every aggregate column is a **bare mergeable** aggregate ([`recognize_mergeable_bare_agg`]);
+/// - the estimated label cardinality is at least [`MORSEL_MIN_ROWS`](crate::morsel::MORSEL_MIN_ROWS)
+///   (via `statistics().nodes_with_label`; no statistics ⇒ decline);
+/// - if any `sum` is requested, the column is provably **no-overflow integer** (every read value an
+///   `Integer`, and the running per-morsel sub-sum cannot saturate — checked after the read);
+/// - the seam returns `Some` from [`GraphAccess::morsel_label_scan`] (it declines for a restricted
+///   principal, a standalone / historical read, and `MemGraph`).
+///
+/// On any per-morsel error the tier discards every morsel's groups + buffers and returns `None`; the
+/// serial fallback re-runs the pipeline, re-registering the markers and re-raising the identical error.
+fn try_morsel_group_aggregate(
+    input: &PhysicalOp,
+    group_keys: &[ProjectionColumn],
+    aggregates: &[ProjectionColumn],
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    // --- cheap gate first (no seam work): the morsel knob must be enabled (>= 2 workers) ---
+    if ctx.morsel_threads <= 1 {
+        return Ok(None);
+    }
+
+    // --- recognize the GROUPED bare-aggregate shape: >= 1 group key, >= 1 aggregate, bare label scan ---
+    if group_keys.is_empty() || aggregates.is_empty() {
+        return Ok(None);
+    }
+    let (scan_var, label) = match input {
+        PhysicalOp::NodeByLabelScan { variable, label }
+        | PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => (&variable.name, &label.name),
+        _ => return Ok(None),
+    };
+
+    // Every group key must be PURE per-row (so the off-thread eval is deterministic + cross-row-free) and
+    // reference the scanned node (a constant group key is degenerate and left to serial).
+    for col in group_keys {
+        if !crate::morsel::is_pure_per_row_expr(&col.expr)
+            || !expr_references_var(&col.expr, scan_var)
+        {
+            return Ok(None);
+        }
+    }
+
+    // Every aggregate column must be a BARE MERGEABLE aggregate; collect whether any requires the
+    // no-overflow integer gate (i.e. is a `sum`).
+    let mut any_sum = false;
+    for col in aggregates {
+        match recognize_mergeable_bare_agg(&col.expr, scan_var) {
+            Some(needs_integer_gate) => any_sum |= needs_integer_gate,
+            None => return Ok(None),
+        }
+    }
+
+    // --- the size gate: the label scan's estimated cardinality (the work being parallelized) ---
+    let estimated_input = match ctx
+        .graph
+        .statistics()
+        .and_then(|s| s.nodes_with_label(label))
+    {
+        Some(count) => count as f64,
+        None => return Ok(None),
+    };
+    if !estimated_input.is_finite() || estimated_input < crate::morsel::morsel_min_rows() {
+        return Ok(None);
+    }
+
+    // --- the engine-thread seam: capture the candidate vector + off-thread read surface (registers the
+    // identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
+    // serial pipeline runs verbatim. ---
+    let Some(scan) = ctx.graph.morsel_label_scan(label) else {
+        return Ok(None);
+    };
+
+    // Cancellation is polled once up front (the per-morsel work is a self-contained store read + pure
+    // evaluation + local fold, bounded by the candidate count).
+    ctx.check_cancelled()?;
+
+    let spec = crate::morsel::MorselGroupSpec {
+        scan_var,
+        group_keys,
+        aggregates,
+    };
+
+    // --- group + aggregate the morsels concurrently, merging deterministically (serial first-seen order) ---
+    let converged =
+        crate::morsel::run_group_aggregate_morsels(&scan, &spec, ctx.params, ctx.morsel_threads);
+
+    // If any morsel hit a storage / evaluation error, the parallel result is untrustworthy: decline
+    // WITHOUT folding the buffers (dropped here). The serial fallback re-reads + re-evaluates through the
+    // live seam, re-registering the identical markers AND re-raising the identical error.
+    if converged.error.is_some() {
+        return Ok(None);
+    }
+
+    // --- the no-overflow integer gate for `sum` (`rmp` #360, finding C): `saturating_add` is NOT
+    // associative once any partition subtree clamps to the i64 rail (empirically verified:
+    // `[i64::MAX, i64::MAX, -i64::MAX, -i64::MAX]` folds to MIN+1 serially but -1 under a 2+2 split), so a
+    // parallel `sum` is bit-identical to serial ONLY when no sub-sum saturates. We cannot know the column
+    // a priori, so the merged accumulators are checked here: if any `sum` accumulator's combined witnesses
+    // indicate a float was seen (non-integer column) OR a saturation occurred anywhere, discard the
+    // parallel result and fall back to serial (which folds the column exactly). This is the conservative,
+    // provably-correct gate — the parallel win is preserved for the overwhelmingly common small-magnitude
+    // analytical columns #360 targets, and a pathological near-rail column is handled correctly by serial.
+    if any_sum
+        && converged
+            .groups
+            .iter()
+            .any(|g| g.accs.iter().any(Accumulator::sum_is_parallel_unsafe))
+    {
+        return Ok(None);
+    }
+
+    // Every gate passed and the read succeeded: record the engagement (observability), then converge the
+    // per-morsel SSI buffers. From here we are committed to the parallel result.
+    ctx.graph.note_parallel_aggregate();
+    for buffer in converged.buffers {
+        ctx.graph.merge_morsel_buffer(buffer);
+    }
+
+    // Finish each merged group into its output row, in serial first-seen order. For the BARE shape the
+    // group key value IS the column value and each aggregate value IS `acc.finish()` — there is no outer
+    // expression to evaluate (the recognizer guaranteed bare columns), exactly as the keyless morsel tier
+    // builds its single row.
+    let mut out = VecDeque::with_capacity(converged.groups.len());
+    for group in converged.groups {
+        let mut row = Row::empty();
+        for (col, kv) in group_keys.iter().zip(group.key) {
+            row.set(col.alias.clone(), kv);
+        }
+        for (col, acc) in aggregates.iter().zip(group.accs) {
+            row.set(col.alias.clone(), acc.finish());
+        }
+        out.push_back(row);
+    }
+    Ok(Some(out))
+}
+
 fn try_morsel_label_aggregate(
     input: &PhysicalOp,
     group_keys: &[ProjectionColumn],
@@ -2599,11 +2890,7 @@ fn try_morsel_label_aggregate(
         return Ok(None);
     }
 
-    // Every gate passed and the read succeeded: record the engagement (observability), then fold the
-    // morsels' values + converge their SSI buffers. From here we are committed to the parallel result.
-    ctx.graph.note_parallel_aggregate();
-
-    // --- fold the survivors' values into one accumulator per column, then converge `count(*)` ---
+    // --- fold the survivors' values into one accumulator per column (NOT yet committed) ---
     let mut accs: Vec<Accumulator> = specs.iter().map(new_parallel_acc).collect();
     let mut label_matches: usize = 0;
     for outcome in &outcomes {
@@ -2618,6 +2905,21 @@ fn try_morsel_label_aggregate(
             }
         }
     }
+
+    // --- the no-overflow gate for `sum` (`rmp` #360, finding C — closing a latent bug in this pre-existing
+    // keyless tier): `saturating_add` is NOT associative once any partition subtree clamps to the i64 rail,
+    // so a parallel `sum` matches the serial left fold ONLY when no fold saturated. The all-integer gate
+    // above is necessary but NOT sufficient (an integer column can still overflow). If any `sum`
+    // accumulator's saturation witness is set, decline (WITHOUT noting / merging buffers) so the serial
+    // path folds the column exactly. The common small-magnitude analytical column never saturates and stays
+    // parallel. ---
+    if accs.iter().any(Accumulator::sum_is_parallel_unsafe) {
+        return Ok(None);
+    }
+
+    // Every gate passed and the read succeeded: record the engagement (observability), then converge the
+    // morsels' SSI buffers. From here we are committed to the parallel result.
+    ctx.graph.note_parallel_aggregate();
 
     // `count(*)` is the matched-node count (every visible label-carrying node, property or not) —
     // identical to the serial vectorized path's `set_count_star`.
@@ -2774,6 +3076,16 @@ fn try_parallel_label_property_aggregate(
             )
     };
     let mut accs = folded?;
+
+    // --- the no-overflow gate for `sum` (`rmp` #360, finding C — closing a latent bug in this pre-existing
+    // #352 tier): `saturating_add` is non-associative once any partition subtree clamps to the i64 rail, so
+    // a parallel `sum` matches the serial left fold ONLY when no fold saturated. The all-integer gate above
+    // is necessary but NOT sufficient (an integer column can still overflow). If any `sum` accumulator's
+    // saturation witness is set, decline so the serial path folds the column exactly (the markers were
+    // registered by the seam on the engine thread, so the serial re-registration is idempotent). ---
+    if accs.iter().any(Accumulator::sum_is_parallel_unsafe) {
+        return Ok(None);
+    }
 
     // `count(*)` is the matched-node count, assigned directly (every matched node, property or not) —
     // identical to the serial vectorized path's `set_count_star`.
@@ -3478,6 +3790,24 @@ fn sole_aggregate_property(expr: &Expr, scan_var: &str) -> Option<String> {
     }
 }
 
+/// The SipHash digest of a group-key tuple (`rmp` #314 grouping index, shared with the `rmp` #360 grouped
+/// morsel tier). `std`'s `DefaultHasher` is SipHash-1-3 with a per-process random seed, which is
+/// **DoS-resistant** over the client-derived property values that make up a group key (SEC-210 /
+/// CWE-407): the grouped morsel tier MUST use this exact digest — never a fixed-seed `FxHasher` over the
+/// raw key values — both to stay byte-identical to the serial group index AND to keep the hash-flooding
+/// resistance. The length is mixed in first (so `[a]` and `[a, b]` cannot collide trivially), then each
+/// element via [`hash_row_value`] (consistent with [`row_values_equivalent`]); a bucket collision still
+/// falls back to the exact equivalence check, so grouping semantics are unchanged.
+pub(crate) fn group_key_hash(key_vals: &[RowValue]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key_vals.len().hash(&mut h);
+    for kv in key_vals {
+        hash_row_value(kv, &mut h);
+    }
+    h.finish()
+}
+
 fn aggregate_rows(
     mut inner: Operator,
     group_keys: &[ProjectionColumn],
@@ -3529,16 +3859,9 @@ fn aggregate_rows(
             )?);
         }
         // Hash the whole key tuple, then resolve within the (normally singleton) bucket by exact
-        // equivalence.
-        let key_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            key_vals.len().hash(&mut h);
-            for kv in &key_vals {
-                hash_row_value(kv, &mut h);
-            }
-            h.finish()
-        };
+        // equivalence. The hash is the shared [`group_key_hash`] — the SAME digest the `rmp` #360 grouped
+        // morsel tier keys its local tables on, so serial and parallel group identically.
+        let key_hash = group_key_hash(&key_vals);
         let bucket = index.entry(key_hash).or_default();
         let found = bucket.iter().copied().find(|&gi| {
             let g = &groups[gi];
@@ -3745,7 +4068,15 @@ fn extract_aggregates(expr: &Expr, subs: &mut Vec<(String, Expr)>, col: usize) -
 
 /// One aggregate accumulator: identifies the function from the aggregate column's expression and
 /// folds values for one group.
-struct Accumulator {
+///
+/// The `rmp` #360 morsel-parallel grouped-aggregation tier ([`crate::morsel`]) builds per-morsel local
+/// group tables of the **same** accumulator type the serial `aggregate_rows` uses, then merges them via
+/// `combine` — so the parallel result is byte-identical to serial by construction (same fold arithmetic,
+/// same associative combine). The type is `pub` only so it can appear in the `pub`
+/// grouped-morsel result types ([`crate::morsel::MorselGroupOutcome`] / [`crate::morsel::MergedGroup`])
+/// that the crate's integration tests drive; its fields are private and every method is `pub(crate)`, so
+/// it cannot be constructed or used outside the crate (no usable public surface beyond the name).
+pub struct Accumulator {
     kind: AggKind,
     distinct: bool,
     count: i64,
@@ -3753,6 +4084,12 @@ struct Accumulator {
     sum: f64,
     sum_is_int: bool,
     int_sum: i64,
+    /// `true` once any integer `sum` step (a fold or a [`combine`](Self::combine)) clamped `int_sum` to
+    /// the `i64` rail (`rmp` #360, finding C). `saturating_add` is **non-associative** once it clamps, so a
+    /// parallel `sum` whose witness is set here is NOT bit-identical to the serial left fold — the grouped
+    /// morsel tier ([`sum_is_parallel_unsafe`](Self::sum_is_parallel_unsafe)) detects this and falls back
+    /// to serial. The serial path never reads this flag (its single left fold is the source of truth).
+    int_sum_saturated: bool,
     extreme: Option<Value>,
     // RowValue-typed so `collect(n)` / `collect(nodes(p))` keep their structural elements.
     collected: Vec<RowValue>,
@@ -3764,9 +4101,11 @@ struct Accumulator {
     percentile: Option<f64>,
 }
 
-/// The aggregate function an [`Accumulator`] computes.
+/// The aggregate function an [`Accumulator`] computes. `pub` (matching [`Accumulator`]) only so it can
+/// appear transitively in the `pub` grouped-morsel result types; its variants are `pub(crate)`-relevant
+/// only (the recognizer + local fold in [`crate::morsel`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AggKind {
+pub enum AggKind {
     CountStar,
     Count,
     Sum,
@@ -3786,7 +4125,9 @@ enum AggKind {
 
 impl Accumulator {
     /// Identifies the aggregate from `expr` (a `count(*)`, an aggregating `FunctionCall`, or other).
-    fn new(expr: &Expr) -> Self {
+    /// `pub(crate)` so the `rmp` #360 grouped morsel tier builds a per-column local accumulator from the
+    /// **same** column expression the serial path compiles, guaranteeing identical kind/`distinct`.
+    pub(crate) fn new(expr: &Expr) -> Self {
         let (kind, distinct) = match &expr.kind {
             ExprKind::CountStar => (AggKind::CountStar, false),
             ExprKind::FunctionCall { name, distinct, .. } => {
@@ -3826,11 +4167,34 @@ impl Accumulator {
             sum: 0.0,
             sum_is_int: true,
             int_sum: 0,
+            int_sum_saturated: false,
             extreme: None,
             collected: Vec::new(),
             numeric: Vec::new(),
             percentile: None,
         }
+    }
+
+    /// Saturating-adds `delta` into `int_sum`, recording in [`int_sum_saturated`](Self::int_sum_saturated)
+    /// whether the add clamped to the `i64` rail (`rmp` #360, finding C) — the witness the grouped morsel
+    /// tier consults to reject a non-associative parallel `sum`. Used by every integer-`sum` fold/combine
+    /// site so the witness is complete.
+    #[inline]
+    fn add_int_sum(&mut self, delta: i64) {
+        if self.int_sum.checked_add(delta).is_none() {
+            self.int_sum_saturated = true;
+        }
+        self.int_sum = self.int_sum.saturating_add(delta);
+    }
+
+    /// Whether this is a `sum` accumulator whose value was computed in a way that a parallel
+    /// partition-merge could NOT reproduce bit-identically to the serial left fold (`rmp` #360, finding C):
+    /// a **float** was seen (`!sum_is_int` — float `+` is non-associative) OR an integer step **saturated**
+    /// (`saturating_add` clamps order-dependently once any subtree hits the rail). The grouped morsel tier
+    /// checks every merged accumulator; if any returns `true` it discards the parallel result and folds the
+    /// column serially. Non-`sum` kinds always return `false` (they are associative / order-preserving).
+    pub(crate) fn sum_is_parallel_unsafe(&self) -> bool {
+        self.kind == AggKind::Sum && (!self.sum_is_int || self.int_sum_saturated)
     }
 
     /// Folds one **bare property value** directly into the accumulator — the vectorized fast path's
@@ -3857,7 +4221,7 @@ impl Accumulator {
                 self.count += 1;
                 match value {
                     Value::Integer(i) => {
-                        self.int_sum = self.int_sum.saturating_add(*i);
+                        self.add_int_sum(*i);
                         self.sum += *i as f64;
                     }
                     Value::Float(f) => {
@@ -3902,17 +4266,64 @@ impl Accumulator {
     /// split or ordered.
     ///
     /// Only the kinds the parallel tier admits are merged precisely — `Count` (and `CountStar`, whose
-    /// count is assigned after the reduce), integer `Sum`, `Min`, `Max`. Every field those kinds touch
-    /// in [`fold_value`](Self::fold_value) is combined here: the row `count`, the integer/float sum
-    /// witnesses, and the running extreme (via the same [`cmp_values`] ordering `fold_value` uses, so
-    /// the tie-break is identical).
-    fn combine(&mut self, other: Accumulator) {
+    /// count is assigned after the reduce), integer `Sum`, `Min`, `Max`, and `Collect` (`rmp` #360
+    /// extends the merge to `collect`/`collect(DISTINCT)` by list-concat / order-preserving set-union).
+    /// Every field those kinds touch in [`fold_value`](Self::fold_value) / [`fold_rowvalue`](Self::fold_rowvalue)
+    /// is combined here: the row `count`, the integer/float sum witnesses, the running extreme (via the
+    /// same [`cmp_values`] ordering the folds use, so the tie-break is identical), and — for `rmp` #360 —
+    /// the `collect` buffer and the `DISTINCT` set.
+    ///
+    /// `pub(crate)` so the `rmp` #360 grouped morsel tier merges per-morsel partial groups on the engine
+    /// thread. **Ordering contract (for the `rmp` #360 grouped tier):** for the order-sensitive kinds
+    /// (`Collect`, and the `DISTINCT` first-encounter set) the combine appends `other` AFTER `self`, so
+    /// the engine thread MUST call `self.combine(other)` with the morsels in **ascending source order**
+    /// (`self` = the lower-`lo` partition) to reproduce the serial scan-order encounter sequence. The
+    /// associative-and-commutative kinds (`Count`/`Sum`/`Min`/`Max`) are order-independent.
+    pub(crate) fn combine(&mut self, other: Accumulator) {
+        // --- DISTINCT kinds (`rmp` #360): a value seen in BOTH partitions must be counted/collected
+        // ONCE, so re-apply `self`'s cross-partition dedup over `other`'s kept-distinct elements rather
+        // than blindly adding counts. `other`'s distinct elements, in `other`'s first-encounter order,
+        // are exactly `other.seen` (every push to `seen`/`collected` for a distinct accumulator is gated
+        // by the same dedup, so `seen` IS the kept set in encounter order). Replaying them through the
+        // same `seen`-membership + `count`/`collected` updates the per-row fold uses makes the merged
+        // accumulator identical to a single serial fold over the concatenation. The caller drives
+        // `self.combine(other)` in ascending-source order, so `other` (the later partition) appends after
+        // `self` — reproducing the serial scan-order first-encounter sequence. ---
+        if self.distinct {
+            for v in &other.seen {
+                if self.seen.iter().any(|s| row_values_equivalent(s, v)) {
+                    continue; // already counted in an earlier (lower-`lo`) partition
+                }
+                self.seen.push(v.clone());
+                match self.kind {
+                    AggKind::Count => self.count += 1,
+                    AggKind::Collect => self.collected.push(v.clone()),
+                    // The `rmp` #360 grouped recognizer admits DISTINCT only on `count` / `collect`, so a
+                    // DISTINCT merge of any other kind (sum/min/max/avg DISTINCT) never reaches here. A
+                    // no-op keeps the merge total; the `debug_assert` flags a gate-widening that forgot to
+                    // extend this branch.
+                    other => {
+                        debug_assert!(
+                            matches!(other, AggKind::Count | AggKind::Collect),
+                            "combine: DISTINCT merge only supports count/collect (gate is tighter)"
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
+        // --- non-DISTINCT kinds ---
         // Row count: additive for every kind (CountStar's is overwritten by `set_count_star` later).
         self.count += other.count;
         // Sum witnesses: additive, and the column is non-integer if *either* partition saw a float
         // (the parallel tier gates folds to all-integer columns, so `sum_is_int` stays true in
-        // practice; combining it faithfully keeps the method correct if that gate ever widens).
-        self.int_sum = self.int_sum.saturating_add(other.int_sum);
+        // practice; combining it faithfully keeps the method correct if that gate ever widens). The
+        // saturation witness (`rmp` #360, finding C) propagates: a clamp in EITHER partition — or one
+        // introduced by combining the two sub-sums here (`add_int_sum`) — marks the result
+        // parallel-unsafe, so the grouped tier falls back to serial for that column.
+        self.int_sum_saturated |= other.int_sum_saturated;
+        self.add_int_sum(other.int_sum);
         self.sum += other.sum;
         self.sum_is_int = self.sum_is_int && other.sum_is_int;
         // Extreme: keep the min/max across partitions, using the same comparator `fold_value` uses.
@@ -3928,6 +4339,12 @@ impl Accumulator {
             if take_other {
                 self.extreme = Some(other_extreme);
             }
+        }
+        // `collect` (non-DISTINCT): concatenate `other`'s buffer AFTER `self`'s (`rmp` #360). The caller
+        // drives the combine in ascending-source order, so the concatenation reproduces the serial
+        // scan-order encounter sequence. Structural elements are preserved (RowValue-typed).
+        if self.kind == AggKind::Collect {
+            self.collected.extend(other.collected);
         }
     }
 
@@ -3952,28 +4369,23 @@ impl Accumulator {
             )?,
             _ => RowValue::NULL,
         };
-        // count(x), sum, avg, min, max ignore nulls (Cypher); collect drops nulls too. An entity
-        // reference is non-null.
-        if rv.is_null() {
-            return Ok(());
-        }
-        if self.distinct && self.seen.iter().any(|s| row_values_equivalent(s, &rv)) {
-            return Ok(());
-        }
-        if self.distinct {
-            self.seen.push(rv.clone());
-        }
-        // `collect` keeps the full RowValue (structural elements survive into the list).
-        if self.kind == AggKind::Collect {
-            self.collected.push(rv);
-            return Ok(());
-        }
-        // `percentileCont`/`percentileDisc(value, p)`: gather every numeric `value`, keyed by its
-        // `f64` for sorting but keeping the original `Value` so `percentileDisc` returns a real set
-        // member with its source subtype. The percentile is captured and range-validated on the
-        // first contributing (numeric, non-null) row — mirroring Neo4j's `onFirstRow`, which runs
-        // inside the per-number callback, so a leading null `value` contributes no validation.
+        // `percentileCont`/`percentileDisc(value, p)` is the one kind whose fold needs the second
+        // argument (`args[1]`) evaluated against the input row, so it stays inline here (where `expr`
+        // / `row` / `ctx` are in scope). Every other kind folds purely from the already-evaluated
+        // first-argument `rv`, via the shared [`fold_rowvalue`](Self::fold_rowvalue) — the SAME
+        // post-evaluation body the `rmp` #360 morsel-parallel grouped tier folds with off-thread, so
+        // serial and parallel are byte-identical by construction.
         if matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc) {
+            // count(x), sum, avg, min, max ignore nulls (Cypher); percentile drops nulls too.
+            if rv.is_null() {
+                return Ok(());
+            }
+            if self.distinct && self.seen.iter().any(|s| row_values_equivalent(s, &rv)) {
+                return Ok(());
+            }
+            if self.distinct {
+                self.seen.push(rv.clone());
+            }
             let argv = collapse_rv(&rv);
             let key = match &argv {
                 Value::Integer(i) => *i as f64,
@@ -3992,19 +4404,94 @@ impl Accumulator {
             self.numeric.push((key, argv));
             return Ok(());
         }
+        self.fold_rowvalue(&rv)
+    }
+
+    /// Folds one input `row` into the accumulator for a **bare aggregate column** `expr`, evaluating the
+    /// aggregate's single argument against an arbitrary `graph` / `functions` (`rmp` task #360) — the
+    /// off-thread analogue of [`update`](Self::update) the morsel-parallel grouped tier drives over its
+    /// per-morsel [`ReadOnlyGraph`](crate::read_only_graph). It is byte-identical to `update` for the
+    /// kinds the grouped recognizer admits (`count(*)` / `count` / `sum` / `min` / `max` / `collect`,
+    /// `DISTINCT` only on `count`/`collect`): `count(*)` increments the row count; every other kind
+    /// evaluates `args[0]` as a [`RowValue`] (so a bound node/relationship counts as non-null) and folds
+    /// it via the shared [`fold_rowvalue`](Self::fold_rowvalue). The percentiles are NOT admitted by the
+    /// grouped recognizer (their fold needs `args[1]`), so this method does not handle them.
+    ///
+    /// # Errors
+    /// Propagates the [`EvalError`] of the argument evaluation, or [`EvalError::TypeError`] for a
+    /// non-numeric `sum` value — the identical errors `update` raises.
+    pub(crate) fn fold_bare(
+        &mut self,
+        expr: &Expr,
+        row: &Row,
+        params: &BoundParameters,
+        graph: &dyn GraphAccess,
+        functions: &dyn FunctionRegistry,
+        clock: &StatementClock,
+    ) -> Result<(), ExecError> {
+        // `count(*)` counts every matched row (no argument to evaluate) — exactly serial `update`'s
+        // first branch.
+        if self.kind == AggKind::CountStar {
+            self.count += 1;
+            return Ok(());
+        }
+        // Evaluate the aggregate's single argument as a `RowValue` (so `count(n)` over a node binding
+        // sees a non-null entity), identical to serial `update`.
+        let rv = match &expr.kind {
+            ExprKind::FunctionCall { args, .. } if !args.is_empty() => {
+                eval(&args[0], row, params, graph, functions, clock)?
+            }
+            _ => RowValue::NULL,
+        };
+        self.fold_rowvalue(&rv)
+    }
+
+    /// Folds one **already-evaluated** aggregate-argument [`RowValue`] into the accumulator (`rmp` task
+    /// #360) — the post-argument-evaluation body of [`update`](Self::update), shared verbatim by the
+    /// serial row-at-a-time path and the morsel-parallel grouped tier, so the two produce byte-identical
+    /// group state. Handles every kind **except** the percentiles (whose fold needs the second argument
+    /// evaluated against the input row; `update` keeps that inline). Applies the identical null-skip,
+    /// `DISTINCT` dedup (via [`row_values_equivalent`]), `collect` push (structural elements preserved),
+    /// and numeric / extreme arithmetic.
+    ///
+    /// # Errors
+    /// [`EvalError::TypeError`] if a `sum`/`avg` argument is non-numeric — the same error `update` raises.
+    pub(crate) fn fold_rowvalue(&mut self, rv: &RowValue) -> Result<(), ExecError> {
+        // count(x), sum, avg, min, max ignore nulls (Cypher); collect drops nulls too. An entity
+        // reference is non-null.
+        if rv.is_null() {
+            return Ok(());
+        }
+        if self.distinct && self.seen.iter().any(|s| row_values_equivalent(s, rv)) {
+            return Ok(());
+        }
+        if self.distinct {
+            self.seen.push(rv.clone());
+        }
+        // `collect` keeps the full RowValue (structural elements survive into the list).
+        if self.kind == AggKind::Collect {
+            self.collected.push(rv.clone());
+            return Ok(());
+        }
+        // A percentile accumulator must never reach here (its fold needs `args[1]`; `update` keeps it
+        // inline). The grouped-tier recognizer excludes percentiles, so this is defensive only.
+        debug_assert!(
+            !matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc),
+            "fold_rowvalue does not handle percentiles (their fold needs the second argument)"
+        );
         // The collapsed property value for the numeric / extreme arms. An entity/path collapses to
         // `Value::Null` here (it is not a property value) and a structural list collapses
         // elementwise: `count` and `collect` keep the RowValue-aware semantics above, while
         // `sum`/`avg`/`min`/`max` over an entity argument are a type error / no-op exactly as
         // before this fix.
-        let argv = collapse_rv(&rv);
+        let argv = collapse_rv(rv);
         match self.kind {
             AggKind::Count => self.count += 1,
             AggKind::Sum | AggKind::Avg => {
                 self.count += 1;
                 match &argv {
                     Value::Integer(i) => {
-                        self.int_sum = self.int_sum.saturating_add(*i);
+                        self.add_int_sum(*i);
                         self.sum += *i as f64;
                     }
                     Value::Float(f) => {
@@ -4037,11 +4524,14 @@ impl Accumulator {
                 }
             }
             AggKind::Other => self.extreme = Some(argv),
-            // Handled by the early returns above.
+            // `Collect` returned early above; `CountStar` counts rows (not values) and is driven by the
+            // caller's per-row increment, not a value fold; the percentiles are kept inline in `update`.
+            // None of these fold a value here — a no-op keeps `fold_rowvalue` total and panic-free
+            // (the `debug_assert` above flags a percentile reaching this body in a debug build).
             AggKind::Collect
             | AggKind::CountStar
             | AggKind::PercentileCont
-            | AggKind::PercentileDisc => unreachable!(),
+            | AggKind::PercentileDisc => {}
         }
         Ok(())
     }
@@ -6556,5 +7046,164 @@ mod tests {
         let mut g = exists_tck_graph();
         let props = qualifying_props("MATCH (n) WHERE (n)-->() RETURN n", &mut g);
         assert_eq!(props, vec![1], "bare pattern predicate still selects A");
+    }
+
+    // ---- rmp #360: the Accumulator merge mechanics the grouped morsel tier relies on -------------
+
+    /// Folds a slice of integer values into a fresh `Sum` accumulator (`fold_rowvalue` — the shared
+    /// serial/parallel body).
+    fn sum_fold(values: &[i64]) -> Accumulator {
+        let mut acc = Accumulator::for_kind(AggKind::Sum);
+        for &v in values {
+            acc.fold_rowvalue(&RowValue::Value(Value::Integer(v)))
+                .expect("integer sum fold never errors");
+        }
+        acc
+    }
+
+    /// The saturation witness (`rmp` #360, finding C): a `sum` whose integer fold clamps to the i64 rail
+    /// is flagged `sum_is_parallel_unsafe` (so the grouped tier declines), and `combine` propagates the
+    /// flag — proving the GATE FIRES (the part the end-to-end test cannot isolate, since a small fixture
+    /// may keep all rail values in one morsel). Mirrors the empirically-verified divergence input.
+    #[test]
+    fn sum_saturation_is_flagged_parallel_unsafe() {
+        // A single left fold that saturates (MAX + MAX clamps).
+        let acc = sum_fold(&[i64::MAX, i64::MAX, -i64::MAX, -i64::MAX]);
+        assert!(
+            acc.sum_is_parallel_unsafe(),
+            "an integer sum that saturated must be flagged parallel-unsafe"
+        );
+        // The serial result is the incremental-saturation value (MIN+1), NOT the true total (0).
+        assert_eq!(acc.finish(), RowValue::Value(Value::Integer(i64::MIN + 1)));
+
+        // A 2+2 partition: each sub-sum saturates, so BOTH halves are flagged, and combining them keeps the
+        // flag set — the tier would see `sum_is_parallel_unsafe` on the merged accumulator and decline.
+        let mut lo = sum_fold(&[i64::MAX, i64::MAX]);
+        let hi = sum_fold(&[-i64::MAX, -i64::MAX]);
+        assert!(lo.sum_is_parallel_unsafe() && hi.sum_is_parallel_unsafe());
+        lo.combine(hi);
+        assert!(
+            lo.sum_is_parallel_unsafe(),
+            "combine must propagate the saturation witness so the merged sum is flagged"
+        );
+    }
+
+    /// A no-overflow integer `sum` is NOT flagged, and its parallel partition-merge is **bit-identical**
+    /// to the serial left fold (`rmp` #360): `saturating_add` that never clamps is pure associative i64
+    /// add. This is the common analytical case the tier keeps parallel.
+    #[test]
+    fn sum_no_overflow_is_safe_and_combine_equals_serial() {
+        let column = [1_000_000_000i64, -3, 42, -1_000_000_000, 7, 999];
+        let serial_acc = sum_fold(&column);
+        assert!(
+            !serial_acc.sum_is_parallel_unsafe(),
+            "a no-overflow integer sum must stay on the parallel path"
+        );
+        let serial_result = serial_acc.finish();
+        // Every 2-way split combines to the identical total.
+        for split in 1..column.len() {
+            let mut a = sum_fold(&column[..split]);
+            let b = sum_fold(&column[split..]);
+            a.combine(b);
+            assert!(
+                !a.sum_is_parallel_unsafe(),
+                "split at {split}: a no-overflow column must stay parallel-safe after combine"
+            );
+            assert_eq!(
+                a.finish(),
+                serial_result,
+                "split at {split}: combine must equal the serial left fold"
+            );
+        }
+    }
+
+    /// A FLOAT `sum` is flagged parallel-unsafe (`rmp` #360): float `+` is non-associative, so the tier
+    /// declines and serial folds it exactly.
+    #[test]
+    fn float_sum_is_flagged_parallel_unsafe() {
+        let mut acc = Accumulator::for_kind(AggKind::Sum);
+        acc.fold_rowvalue(&RowValue::Value(Value::Float(1.5)))
+            .unwrap();
+        acc.fold_rowvalue(&RowValue::Value(Value::Integer(2)))
+            .unwrap();
+        assert!(
+            acc.sum_is_parallel_unsafe(),
+            "a sum that saw a float must be flagged parallel-unsafe (decline to serial)"
+        );
+    }
+
+    /// `count(DISTINCT)` merge (`rmp` #360): a value seen in BOTH partitions is counted ONCE. The merge
+    /// re-applies the cross-partition dedup, so the combined count equals a single serial fold over the
+    /// concatenation.
+    #[test]
+    fn distinct_count_combine_dedups_across_partitions() {
+        let distinct_count = |vals: &[i64]| -> Accumulator {
+            let mut acc = Accumulator::zeroed(AggKind::Count, true);
+            for &v in vals {
+                acc.fold_rowvalue(&RowValue::Value(Value::Integer(v)))
+                    .unwrap();
+            }
+            acc
+        };
+        // Partition A: {1,2,3}; Partition B: {2,3,4}. Union distinct = {1,2,3,4} ⇒ count 4.
+        let mut a = distinct_count(&[1, 2, 3, 2]);
+        let b = distinct_count(&[2, 3, 4, 4]);
+        a.combine(b);
+        let merged = a.finish();
+        assert_eq!(
+            merged,
+            RowValue::Value(Value::Integer(4)),
+            "DISTINCT count across partitions must dedup the overlap (1,2,3,4 ⇒ 4)"
+        );
+        // Equals a single serial fold over the concatenation.
+        let serial = distinct_count(&[1, 2, 3, 2, 2, 3, 4, 4]);
+        assert_eq!(merged, serial.finish());
+    }
+
+    /// `collect` (non-DISTINCT) merge (`rmp` #360): the combine concatenates `other` AFTER `self`, so the
+    /// ascending-`lo` merge order reproduces the serial scan-encounter order.
+    #[test]
+    fn collect_combine_concatenates_in_order() {
+        let collect = |vals: &[i64]| -> Accumulator {
+            let mut acc = Accumulator::for_kind(AggKind::Collect);
+            for &v in vals {
+                acc.fold_rowvalue(&RowValue::Value(Value::Integer(v)))
+                    .unwrap();
+            }
+            acc
+        };
+        let mut a = collect(&[1, 2, 3]);
+        let b = collect(&[4, 5]);
+        a.combine(b); // a is the lower-`lo` partition ⇒ its elements come first
+        let serial = collect(&[1, 2, 3, 4, 5]);
+        assert_eq!(
+            a.finish(),
+            serial.finish(),
+            "collect merge in ascending-lo order must equal the serial encounter order"
+        );
+    }
+
+    /// `collect(DISTINCT)` merge (`rmp` #360): order-preserving set-union — first-encounter order across
+    /// partitions, overlap dropped.
+    #[test]
+    fn distinct_collect_combine_is_order_preserving_union() {
+        let dcollect = |vals: &[i64]| -> Accumulator {
+            let mut acc = Accumulator::zeroed(AggKind::Collect, true);
+            for &v in vals {
+                acc.fold_rowvalue(&RowValue::Value(Value::Integer(v)))
+                    .unwrap();
+            }
+            acc
+        };
+        // A: {1,2}; B: {2,3,1}. First-encounter union in ascending-lo = [1,2,3] (B's 2 and 1 are dups).
+        let mut a = dcollect(&[1, 2, 2]);
+        let b = dcollect(&[2, 3, 1]);
+        a.combine(b);
+        let serial = dcollect(&[1, 2, 2, 2, 3, 1]);
+        assert_eq!(
+            a.finish(),
+            serial.finish(),
+            "collect(DISTINCT) merge must be the order-preserving first-encounter union"
+        );
     }
 }
