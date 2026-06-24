@@ -719,8 +719,15 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.closeness.stream";
             let g = get_projected(NAME, &cat, args)?;
+            // `rmp` task #376: run the data-parallel centrality on the SHARED analytics pool (the same
+            // bounded `min(N,16)`-thread pool the morsel tier uses), not the global `rayon` pool, so the
+            // morsel + GDS peak runnable-thread sum stays `≈` core count. Determinism is unaffected:
+            // `install` changes only which workers run the `par_iter`, not the decomposition or the
+            // order-independent reduction (see `morsel::run_on_analytics_pool`).
             let scores = with_deadline(|cancel| {
-                closeness_centrality(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                crate::morsel::run_on_analytics_pool(|| {
+                    closeness_centrality(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                })
             })?;
             Ok(id_score_rows(&g, &scores))
         }),
@@ -746,8 +753,13 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.betweenness.stream";
             let g = get_projected(NAME, &cat, args)?;
+            // `rmp` task #376: run on the SHARED analytics pool (see gds.closeness.stream above) — bounds
+            // the morsel + GDS thread budget; determinism preserved (Brandes reduces by element-wise f64
+            // addition whose per-source contributions are exact, independent of worker count).
             let raw = with_deadline(|cancel| {
-                betweenness_centrality(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                crate::morsel::run_on_analytics_pool(|| {
+                    betweenness_centrality(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                })
             })?;
             let scores = undirected_scale(&g, raw);
             Ok(id_score_rows(&g, &scores))

@@ -54,10 +54,16 @@
 //! Only the bare-aggregate shape (`MATCH (n:Label) RETURN <exact-agg>(n.p)`): scan → exact/associative
 //! aggregate, with the read parallelized across morsels and the (trivial) fold + converge on the engine
 //! thread. Filter/project rows-out, ORDER BY / top-k, and expand/FoF are Slices 3b/3c. The morsel tier
-//! runs on a **dedicated** pool (never the global `rayon` pool — GDS and the `rmp` #336 reader pool must
-//! not contend) and is engaged only on the engine-thread inline path + the bench (off inside the #336
-//! reader pool, to avoid pool-on-pool oversubscription).
+//! runs on a **shared analytics** pool ([`analytics_pool`], `rmp` task #376 — never the global `rayon`
+//! pool; GDS centrality now shares *this same* pool via [`run_on_analytics_pool`] so the morsel + GDS
+//! peak runnable-thread sum is bounded to one `min(N,16)`-thread pool rather than `2 × N`). It is engaged
+//! only when **not** running on a `rmp` #336 off-thread reader-pool worker: that path clamps
+//! `Ctx.morsel_threads = 1` via the [`ReaderPoolWorkerGuard`] thread-local (`rmp` task #377), so a heavy
+//! read is **either** cross-statement-parallel (many reader threads, 1 morsel each) **or**
+//! intra-statement-parallel (the engine thread, full analytics pool), never both — the pool-on-pool
+//! oversubscription this doc once only *claimed* to prevent is now enforced in code.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -108,11 +114,77 @@ pub fn set_morsel_threads(threads: usize) {
     MORSEL_THREADS.store(threads, Ordering::Relaxed);
 }
 
+thread_local! {
+    /// Per-thread "this thread is a `rmp` #336 off-thread reader-pool worker" flag (`rmp` task #377).
+    ///
+    /// The reader pool runs `AccessMode::Read` auto-commit statements on up-to-`min(N,16)` worker
+    /// threads, concurrently with the engine thread, so *separate* reads scale across cores
+    /// (cross-statement parallelism). The morsel tier (`rmp` #339) makes a *single* heavy read scale
+    /// across cores (intra-statement parallelism) by fanning a scan onto the shared analytics pool.
+    /// Engaging **both** at once is pool-on-pool oversubscription: K concurrent large reads on K reader
+    /// threads would each fan out `min(N,16)` morsel tasks onto the *shared* `min(N,16)`-thread analytics
+    /// pool — `K × min(N,16)` tasks contending for `min(N,16)` cores, the exact thrash the morsel module
+    /// doc claims is prevented but never enforced in code.
+    ///
+    /// When this flag is set, [`morsel_threads`] reports `1`, so [`Ctx.morsel_threads`](crate::executor)
+    /// is clamped to `1` at cursor-open on a reader-pool worker and the morsel tier early-returns to the
+    /// serial pipeline. The invariant is then enforced in code: a heavy read is **either**
+    /// cross-statement-parallel (many reader threads, 1 morsel each) **or** intra-statement-parallel (the
+    /// engine thread, full analytics pool), never both. The engine-thread heavy-query path (which is not
+    /// a reader-pool worker, so the flag is unset) keeps the full morsel fan-out — the `rmp` #339/#360
+    /// wins are preserved.
+    static READER_POOL_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// An RAII guard that marks the current thread as a `rmp` #336 reader-pool worker for its lifetime
+/// (`rmp` task #377), restoring the prior value on drop. The server's reader `worker_loop` holds one of
+/// these around each [`run_read_task`](../../graphus_server) so every `Cursor::open` on that thread
+/// reads `morsel_threads() == 1` (morsel suppressed); the engine thread never holds one, so its heavy
+/// queries keep the full morsel fan-out.
+///
+/// Restoring the prior value (rather than unconditionally clearing) keeps the guard correct under
+/// nesting and panic-unwind: a worker thread is reused across many tasks, and a panic inside
+/// `run_read_task` still runs the guard's `Drop`, so the flag never leaks to the next task on that
+/// thread.
+#[must_use = "the guard clears the reader-pool-worker flag when dropped; bind it to a name"]
+pub struct ReaderPoolWorkerGuard {
+    prev: bool,
+}
+
+impl ReaderPoolWorkerGuard {
+    /// Marks the current thread as a reader-pool worker until the returned guard is dropped.
+    pub fn enter() -> Self {
+        let prev = READER_POOL_WORKER.with(|f| f.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for ReaderPoolWorkerGuard {
+    fn drop(&mut self) {
+        READER_POOL_WORKER.with(|f| f.set(self.prev));
+    }
+}
+
+/// Whether the current thread is a `rmp` #336 off-thread reader-pool worker (`rmp` task #377). Read by
+/// [`morsel_threads`] to clamp the per-statement morsel-thread count to `1` on the reader-pool path.
+#[must_use]
+pub fn is_reader_pool_worker() -> bool {
+    READER_POOL_WORKER.with(Cell::get)
+}
+
 /// The effective morsel-thread count (`rmp` task #339): the value [`set_morsel_threads`] last stored,
 /// or `1` (fully serial) when never set (the un-initialised `0` sentinel). Read at every `Ctx`
 /// construction to populate `Ctx.morsel_threads`.
+///
+/// **Reader-pool suppression (`rmp` task #377):** when the calling thread is an off-thread reader-pool
+/// worker ([`is_reader_pool_worker`]), this reports `1` regardless of the configured count, so a heavy
+/// read dispatched to the reader pool does **not** also fan out onto the shared analytics pool
+/// (pool-on-pool oversubscription). See [`ReaderPoolWorkerGuard`].
 #[must_use]
 pub fn morsel_threads() -> usize {
+    if is_reader_pool_worker() {
+        return 1;
+    }
     match MORSEL_THREADS.load(Ordering::Relaxed) {
         0 => 1,
         n => n,
@@ -160,25 +232,61 @@ pub fn morsel_min_rows() -> f64 {
 pub const MORSEL_MIN_CHUNK: usize = 4096;
 
 // =================================================================================================
-// The dedicated worker pool
+// The shared analytics pool (morsel fan-out + GDS)
 // =================================================================================================
 
-/// The dedicated [`rayon::ThreadPool`] the morsel fan-out runs on (`rmp` task #339), built lazily on
-/// first engagement and sized to [`morsel_threads`]. **Not** the global `rayon` pool: GDS uses the
-/// global pool (`graphus-gds`) and the `rmp` #336 off-thread reader pool is a separate `std::thread`
-/// pool — a dedicated pool here keeps the three from contending, and makes the morsel worker count an
-/// explicit, bounded resource.
-static MORSEL_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+/// The configured analytics-pool worker count (`rmp` task #376): `0` is the un-initialised sentinel
+/// meaning "default" → [`analytics_pool_threads`] computes `min(available_parallelism(), 16)`. The
+/// server sets this once at startup via [`set_analytics_pool_threads`] from the resolved config; a
+/// determinism-sensitive deployment may pin it. Independent of [`MORSEL_THREADS`]: the morsel
+/// *enablement* knob (`1` = serial-within-statement) must not shrink the pool GDS shares, or pinning
+/// morsel to serial would also serialise GDS.
+static ANALYTICS_POOL_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// The dedicated morsel pool, built (once) sized to the effective [`morsel_threads`]. The pool is
-/// process-global and sized at first use; a later knob change does not resize it (the engine sets the
-/// knob before the first query, so this is fixed for the process lifetime in production).
-fn morsel_pool() -> &'static rayon::ThreadPool {
-    MORSEL_POOL.get_or_init(|| {
-        let threads = morsel_threads().max(1);
+/// Sets the process-global analytics-pool worker count (`rmp` task #376), shared by the morsel tier and
+/// GDS. Called once on engine startup with the resolved core-bounded width (`min(N, 16)`); `0` restores
+/// the computed default. Has no effect after the pool is first built (see [`analytics_pool`]).
+pub fn set_analytics_pool_threads(threads: usize) {
+    ANALYTICS_POOL_THREADS.store(threads, Ordering::Relaxed);
+}
+
+/// The effective analytics-pool worker count (`rmp` task #376): the [`set_analytics_pool_threads`]
+/// value, or — when unset (`0`) — `min(available_parallelism(), 16)`, the same core-bounded default the
+/// reader and morsel pools use. This is the **single** compute-thread budget the morsel fan-out and GDS
+/// both draw from, so their peak runnable threads is `≈` core count rather than `2 ×` it.
+#[must_use]
+pub fn analytics_pool_threads() -> usize {
+    match ANALYTICS_POOL_THREADS.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16),
+        n => n,
+    }
+}
+
+/// The dedicated [`rayon::ThreadPool`] the morsel fan-out **and** GDS run on (`rmp` tasks #339, #376),
+/// built lazily on first engagement and sized to [`analytics_pool_threads`].
+///
+/// **Not** the global `rayon` pool, and **shared** between the two analytical consumers. Before `rmp`
+/// #376 GDS used the *global* pool (`= N`) while the morsel tier used this dedicated pool (`= min(N,16)`)
+/// and the `rmp` #336 reader pool was a third `min(N,16)`-thread `std::thread` pool — `≈ 3 × N` runnable
+/// compute threads under a mixed analytical + GDS + read-storm workload, causing scheduler thrash and
+/// degraded tail latency. Routing GDS onto this same pool (via
+/// [`run_on_analytics_pool`]) bounds the morsel + GDS sum to one `min(N,16)`-thread pool; with the `rmp`
+/// #377 reader-pool morsel suppression the reader pool never *also* drives this pool, so the peak is
+/// `≈ N` cores.
+static ANALYTICS_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+/// The shared analytics pool, built (once) sized to [`analytics_pool_threads`]. Process-global and sized
+/// at first use; a later knob change does not resize it (the engine sets the knob before the first query,
+/// so it is fixed for the process lifetime in production).
+fn analytics_pool() -> &'static rayon::ThreadPool {
+    ANALYTICS_POOL.get_or_init(|| {
+        let threads = analytics_pool_threads().max(1);
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .thread_name(|i| format!("graphus-morsel-{i}"))
+            .thread_name(|i| format!("graphus-analytics-{i}"))
             .build()
             .unwrap_or_else(|_| {
                 // A pool build failure is exceedingly unlikely (only on resource exhaustion); fall back
@@ -190,6 +298,57 @@ fn morsel_pool() -> &'static rayon::ThreadPool {
                     .expect("INVARIANT: a 1-thread rayon pool always builds")
             })
     })
+}
+
+/// Runs `op` on the shared analytics pool (`rmp` task #376), so any `rayon` parallelism inside it (e.g.
+/// GDS centrality's `into_par_iter`) executes on that **bounded** pool rather than the global one.
+///
+/// # Determinism (inviolable — GDS must be bit-identical regardless of thread count)
+///
+/// `rayon::ThreadPool::install` only changes *which* worker threads run the parallel work; it does not
+/// change the work decomposition or the reduction. The GDS centrality algorithms are written so their
+/// result is independent of the worker count: closeness writes each source's score into its **own**
+/// result slot (a `map` + `collect` — order-preserving, each slot written once), and Brandes betweenness
+/// reduces per-task private accumulators by **element-wise f64 addition** whose per-source contributions
+/// are exact in f64 (see `graphus-gds` `algo::centrality` docs). So the pool a `par_iter` lands on is
+/// irrelevant to the *value*; only the *threads doing the work* change. Determinism is preserved.
+///
+/// # No deadlock under nested fan-out
+///
+/// `install` runs `op` on a pool worker and **blocks the calling thread** until `op` returns, but it does
+/// not consume a pool worker for the duration — and rayon's `join`/`par_iter` use work-stealing, not
+/// blocking handoff, so a task already on this pool that *itself* fans out (nested `par_iter`) is
+/// serviced by the same workers via stealing without a thread-starvation deadlock. The morsel tier's own
+/// `install` sites and a GDS `install` are therefore safe to share one pool.
+pub fn run_on_analytics_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    analytics_pool().install(op)
+}
+
+/// A process-global count of how many times the morsel tier has **fanned out** onto the analytics pool
+/// (`rmp` task #377): incremented once per [`install_morsel_fanout`] call (i.e. per morsel-parallelised
+/// scan), *not* by GDS's [`run_on_analytics_pool`]. It exists so a test can assert the pool-on-pool
+/// invariant *directly* and deterministically: with the reader-pool morsel suppression in force, `K`
+/// concurrent large reads dispatched to the reader pool must produce **zero** morsel engagements (each
+/// read is cross-statement-parallel, never intra-statement-parallel), so no read fans `min(N,16)` morsel
+/// tasks onto the shared `min(N,16)`-thread pool. The counter is a `Relaxed` atomic on the *cold* fan-out
+/// path (a heavy scan), so it adds no measurable cost to the hot per-row path.
+static MORSEL_FANOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of morsel fan-outs since process start (`rmp` task #377) — see [`MORSEL_FANOUTS`]. A test
+/// snapshots this before and after a workload to assert the morsel tier engaged exactly as expected
+/// (e.g. `0` times on the reader-pool path).
+#[must_use]
+pub fn morsel_fanout_count() -> u64 {
+    MORSEL_FANOUTS.load(Ordering::Relaxed)
+}
+
+/// Runs a morsel fan-out `op` on the shared analytics pool, counting the engagement (`rmp` tasks #339,
+/// #377). Every morsel tier runner routes its `analytics_pool().install` through here so the
+/// [`MORSEL_FANOUTS`] counter sees exactly the morsel engagements (and GDS, via
+/// [`run_on_analytics_pool`], is excluded).
+fn install_morsel_fanout<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    MORSEL_FANOUTS.fetch_add(1, Ordering::Relaxed);
+    analytics_pool().install(op)
 }
 
 // =================================================================================================
@@ -1352,7 +1511,7 @@ pub fn run_morsels(
 
     // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
     // order, so the returned outcomes are in ascending candidate order — the serial scan order.
-    morsel_pool().install(|| {
+    install_morsel_fanout(|| {
         bounds
             .par_iter()
             .map(|&(lo, hi)| scan.read_morsel(lo, hi, property))
@@ -1416,7 +1575,7 @@ pub fn run_scan_filter_morsels(
 
     // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
     // order, so the outcomes are in ascending candidate order — the serial scan order.
-    let outcomes: Vec<MorselRowsOutcome> = morsel_pool().install(|| {
+    let outcomes: Vec<MorselRowsOutcome> = install_morsel_fanout(|| {
         bounds
             .par_iter()
             .map(|&(lo, hi)| {
@@ -1635,7 +1794,7 @@ pub fn run_expand_morsels(
 
     // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
     // order, so the outcomes are in ascending anchor order — the serial scan→expand order.
-    let outcomes: Vec<MorselExpandOutcome> = morsel_pool().install(|| {
+    let outcomes: Vec<MorselExpandOutcome> = install_morsel_fanout(|| {
         bounds
             .par_iter()
             .map(|&(lo, hi)| scan.expand_morsel(lo, hi, plan, params))
@@ -1767,7 +1926,7 @@ pub fn run_group_aggregate_morsels(
     // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
     // order, so the outcomes are in ascending candidate order — the serial scan order, which the merge
     // relies on for the survivor prefix-sum and the order-sensitive `collect` / `DISTINCT` combine.
-    let outcomes: Vec<MorselGroupOutcome> = morsel_pool().install(|| {
+    let outcomes: Vec<MorselGroupOutcome> = install_morsel_fanout(|| {
         bounds
             .par_iter()
             .map(|&(lo, hi)| scan.group_aggregate_morsel(lo, hi, spec, params))
@@ -1886,5 +2045,120 @@ pub fn converge_group_aggregate_outcomes(outcomes: Vec<MorselGroupOutcome>) -> G
         groups,
         buffers,
         error: first_error,
+    }
+}
+
+#[cfg(test)]
+mod reader_pool_suppression_tests {
+    //! `rmp` task #377: the reader-pool morsel suppression — `morsel_threads()` must clamp to `1` on a
+    //! thread holding a [`ReaderPoolWorkerGuard`], and restore exactly on drop (incl. nesting/unwind),
+    //! while the engine-thread path (no guard) keeps the configured count. Deterministic; no sleeps.
+
+    use super::*;
+
+    /// Serializes the few tests that mutate the process-global `MORSEL_THREADS`, so they cannot race on
+    /// the shared atomic when the test harness runs them on different threads.
+    static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn guard_clamps_to_one_and_restores() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let prev = MORSEL_THREADS.load(Ordering::Relaxed);
+        set_morsel_threads(8);
+
+        // Engine-thread path (no guard): full configured width.
+        assert!(!is_reader_pool_worker());
+        assert_eq!(morsel_threads(), 8);
+
+        {
+            let _g = ReaderPoolWorkerGuard::enter();
+            assert!(is_reader_pool_worker());
+            // Suppressed to serial-within-statement regardless of the configured width.
+            assert_eq!(morsel_threads(), 1);
+        }
+
+        // Restored exactly on drop.
+        assert!(!is_reader_pool_worker());
+        assert_eq!(morsel_threads(), 8);
+
+        MORSEL_THREADS.store(prev, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn guard_nesting_restores_prior_value() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let prev = MORSEL_THREADS.load(Ordering::Relaxed);
+        set_morsel_threads(4);
+
+        assert!(!is_reader_pool_worker());
+        let outer = ReaderPoolWorkerGuard::enter();
+        assert!(is_reader_pool_worker());
+        {
+            let inner = ReaderPoolWorkerGuard::enter();
+            assert!(is_reader_pool_worker());
+            drop(inner);
+            // Dropping the inner guard restores the *prior* value (still set by `outer`), not `false`.
+            assert!(is_reader_pool_worker());
+            assert_eq!(morsel_threads(), 1);
+        }
+        drop(outer);
+        assert!(!is_reader_pool_worker());
+        assert_eq!(morsel_threads(), 4);
+
+        MORSEL_THREADS.store(prev, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn guard_clears_on_panic_unwind() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let prev = MORSEL_THREADS.load(Ordering::Relaxed);
+        set_morsel_threads(8);
+
+        let r = std::panic::catch_unwind(|| {
+            let _g = ReaderPoolWorkerGuard::enter();
+            assert!(is_reader_pool_worker());
+            panic!("boom");
+        });
+        assert!(r.is_err());
+        // The guard's Drop ran during unwind, so the flag does not leak to the next task on this thread.
+        assert!(!is_reader_pool_worker());
+
+        MORSEL_THREADS.store(prev, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn flag_is_thread_local_not_global() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let _g = ReaderPoolWorkerGuard::enter();
+        assert!(is_reader_pool_worker());
+        // A freshly spawned thread does NOT inherit the flag (it is thread-local), so the engine thread
+        // is never suppressed by a reader worker's guard.
+        let observed = std::thread::spawn(|| is_reader_pool_worker())
+            .join()
+            .unwrap();
+        assert!(!observed);
+    }
+
+    #[test]
+    fn analytics_pool_width_is_bounded_and_independent_of_morsel_knob() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let prev_morsel = MORSEL_THREADS.load(Ordering::Relaxed);
+        let prev_analytics = ANALYTICS_POOL_THREADS.load(Ordering::Relaxed);
+
+        // Pinning morsel to serial must NOT shrink the analytics pool GDS shares.
+        set_morsel_threads(1);
+        set_analytics_pool_threads(0); // computed default
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(analytics_pool_threads(), cores.min(16));
+        assert!(analytics_pool_threads() >= 1);
+
+        // An explicit pin is honoured and bounded.
+        set_analytics_pool_threads(3);
+        assert_eq!(analytics_pool_threads(), 3);
+
+        set_analytics_pool_threads(prev_analytics);
+        MORSEL_THREADS.store(prev_morsel, Ordering::Relaxed);
     }
 }

@@ -332,7 +332,17 @@ fn worker_loop<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>(
             // Queue closed: the engine is shutting down. Exit so the worker can be joined.
             return;
         };
-        let retirement = run_read_task(task);
+        // `rmp` task #377: mark this thread a reader-pool worker for the read's duration so the morsel
+        // tier suppresses itself (`Ctx.morsel_threads` clamps to 1 at every `Cursor::open` on this
+        // thread). A heavy read dispatched here is cross-statement-parallel (this is one of up to
+        // `min(N,16)` reader threads) and must NOT *also* fan out onto the shared analytics pool —
+        // `K` concurrent large reads would otherwise queue `K × min(N,16)` morsel tasks on a
+        // `min(N,16)`-thread pool. The guard restores the prior flag on drop (incl. panic-unwind), so it
+        // never leaks to the next task this reused worker runs.
+        let retirement = {
+            let _morsel_suppression = graphus_cypher::morsel::ReaderPoolWorkerGuard::enter();
+            run_read_task(task)
+        };
         // Post the retirement back to the engine loop. The std `send` Release/Acquire is the
         // happens-before that publishes the buffer + all the reader's memory effects to the engine
         // thread before it merges. A closed channel (engine gone) is harmless: the reader already

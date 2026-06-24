@@ -110,6 +110,105 @@ fn preload_people(handle: &EngineHandle, n: i64) -> i64 {
     expected_sum
 }
 
+/// `rmp` task #377 (deterministic correctness gate, not a measurement): the reader-pool morsel
+/// suppression — `K` concurrent large reads dispatched to the reader pool engage the morsel tier **zero**
+/// times (no pool-on-pool oversubscription), while the identical aggregate on the engine thread *does*
+/// engage it (proving the morsel gate is otherwise open). Results stay exact (equivalent to serial).
+///
+/// This asserts the invariant **directly** via [`graphus_cypher::morsel::morsel_fanout_count`] — a count
+/// of morsel fan-outs onto the shared analytics pool — rather than sampling OS threads (which would be
+/// flaky). With suppression in force a heavy read on a reader-pool worker is cross-statement-parallel
+/// only (one of `K` reader threads), so it never fans `min(N,16)` morsel tasks onto the shared pool;
+/// `K × min(N,16)` such tasks on a `min(N,16)`-thread pool is exactly the thrash #377 prevents.
+#[test]
+fn reader_pool_suppresses_morsel_no_oversubscription() {
+    use graphus_cypher::morsel::{morsel_fanout_count, set_morsel_min_rows, set_morsel_threads};
+
+    // Enable the morsel tier and open its cardinality gate (min-rows = 0) so it WOULD engage on any
+    // aggregate shape — the suppression, not a too-small input, must be what keeps it off the reader path.
+    set_morsel_threads(4);
+    set_morsel_min_rows(0);
+
+    // A modest corpus: large enough that the aggregate is the bare-aggregate morsel shape, small enough
+    // for a fast deterministic gate (no multi-second loop).
+    let people: i64 = 5_000;
+    let k = 8usize;
+
+    let eng = engine(k);
+    let handle = eng.handle.clone();
+    let expected = preload_people(&handle, people);
+
+    // CONTROL: the identical aggregate on the ENGINE thread (Write-mode auto-commit is not dispatched to
+    // the reader pool — it runs inline on the engine thread, which holds no reader-pool guard). With the
+    // gate open it MUST engage the morsel tier, so the fan-out counter advances. This proves the morsel
+    // path is genuinely reachable for this shape/corpus — so a zero count on the reader path below is the
+    // suppression at work, not an unrelated decline.
+    let before_control = morsel_fanout_count();
+    let (ok, got) = run(
+        &handle,
+        AccessMode::Write,
+        "MATCH (n:Person) RETURN sum(n.age)",
+    );
+    assert!(ok, "engine-thread aggregate commits");
+    assert_eq!(got, Some(expected), "engine-thread aggregate is exact");
+    assert!(
+        morsel_fanout_count() > before_control,
+        "control: the morsel tier MUST engage on the engine thread with the gate open \
+         (else the reader-path zero below would be meaningless)"
+    );
+
+    // SUBJECT: `K` concurrent Read-mode auto-commit aggregates — each dispatched to a reader-pool worker.
+    // The reader worker holds a `ReaderPoolWorkerGuard`, so `Ctx.morsel_threads` clamps to 1 at
+    // `Cursor::open` and the morsel tier early-returns to serial. The fan-out counter must NOT advance.
+    let before_readers = morsel_fanout_count();
+    let done = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for _ in 0..k {
+        let h = handle.clone();
+        let done = Arc::clone(&done);
+        workers.push(std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (ok, got) = run(&h, AccessMode::Read, "MATCH (n:Person) RETURN sum(n.age)");
+                // Suppression makes the read serial-within-statement, but it must stay EQUIVALENT to
+                // serial — assert the exact aggregate so a wrong result still fails the gate.
+                assert!(ok, "reader-pool aggregate commits");
+                assert_eq!(
+                    got,
+                    Some(expected),
+                    "reader-pool aggregate is exact (serial-equivalent)"
+                );
+                done.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for w in workers {
+        w.join().expect("reader joins");
+    }
+    assert_eq!(
+        done.load(Ordering::Relaxed),
+        k * 4,
+        "every reader query ran"
+    );
+    assert_eq!(
+        morsel_fanout_count(),
+        before_readers,
+        "reader-pool morsel SUPPRESSION (#377): {k} concurrent large reads must fan out ZERO morsel \
+         tasks — no pool-on-pool oversubscription"
+    );
+
+    // Restore the process-global knobs so sibling tests in this binary see the defaults.
+    set_morsel_min_rows(u64::MAX);
+    set_morsel_threads(1);
+
+    let Engine {
+        handle: inner,
+        join,
+    } = eng;
+    drop(handle);
+    drop(inner);
+    join.join().expect("engine joins");
+}
+
 /// The concurrent-MATCH scaling measurement. Ignored (multi-second). See the module docs for how to run
 /// it under `/usr/bin/time -v` to read the mean-core AC.
 #[test]

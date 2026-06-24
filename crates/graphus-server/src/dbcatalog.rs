@@ -499,6 +499,13 @@ impl EngineParams {
         // process-wide dedicated morsel pool), and the call is idempotent across per-database
         // `EngineSettings::from_config` invocations.
         graphus_cypher::morsel::set_morsel_threads(config.admission.morsel_parallelism());
+        // The SHARED analytics pool (`rmp` task #376) is the single bounded compute-thread budget the
+        // morsel tier AND GDS centrality both draw from (GDS no longer uses the global `rayon` pool). Size
+        // it to the resolved reader-pool width (`min(N, 16)` by default, operator-tunable) — the same
+        // core-bounded compute width as the reader/morsel pools — so the morsel + GDS peak runnable-thread
+        // sum is `≈` core count, not `2 × N`. Independent of the morsel *enablement* knob above: pinning
+        // morsel to serial must not shrink the pool GDS shares. Idempotent across per-database opens.
+        graphus_cypher::morsel::set_analytics_pool_threads(config.admission.reader_threads());
         // The opt-in CSR-adjacency knob (`rmp` task #324, "Win 2") is likewise a process-global read by
         // the Cypher read path (mirroring `set_morsel_threads`). Set it once here from the resolved
         // config (default `false`); it decides whether each per-database coordinator builds a CSR on
