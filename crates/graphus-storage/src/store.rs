@@ -738,14 +738,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ) -> Result<()> {
         let end = offset + bytes.len();
         assert!(end <= PAGE_SIZE, "region runs past the page");
+        // Inline patch (`rmp` #373): undo == redo, so build it once and hand the WAL a borrowed
+        // redo plus an owned undo (the only image the WAL retains). The redo never allocates.
         let redo = paging::encode_patch(offset, bytes);
-        let undo = redo.clone();
+        let undo = redo.clone().into_vec();
         let f = self.pool.fetch(page)?;
         // The WAL borrow is released (the `with` closure ends) before the pool write latch is taken,
         // upholding the lock-ordering rule (`crate::wal_rule`): never hold the WAL lock across a pool
         // call. `with_page_mut_lsn` stamps `page_lsn` and applies the post-image under one write
         // latch (`rmp` #337, Slice 1).
-        let lsn = self.wal.with(|w| w.log_update(txn, page, redo, undo));
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, page, &redo, undo));
         self.pool.with_page_mut_lsn(f, lsn, |p| {
             p[offset..end].copy_from_slice(bytes);
         });
@@ -772,12 +776,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Build the undo patch from the still-unmodified page slice (read latch) before the in-place
         // overwrite (write latch) below. The frame stays pinned across the two sequential — never
         // nested — latch acquisitions (`rmp` #337, Slice 1 closure-API conversion).
+        // Capture the undo pre-image STRICTLY before the post-image overwrite below (`rmp` #373): the
+        // read latch reads the still-unmodified region into an inline patch; only this undo image is
+        // retained by the WAL (taken by value). The redo post-image is built inline and lent to the
+        // WAL by borrow, so the redo never heap-allocates.
         let undo = self
             .pool
-            .with_page(f, |p| paging::encode_patch(offset, &p[offset..end]));
+            .with_page(f, |p| paging::encode_patch(offset, &p[offset..end]))
+            .into_vec();
         let redo = paging::encode_patch(offset, bytes);
         // WAL borrow dropped before the pool write latch (lock-ordering rule, `crate::wal_rule`).
-        let lsn = self.wal.with(|w| w.log_update(txn, page, redo, undo));
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, page, &redo, undo));
         self.pool.with_page_mut_lsn(f, lsn, |p| {
             p[offset..end].copy_from_slice(bytes);
         });
@@ -1114,10 +1125,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let (rel_page, off) = paging::record_location(id, kind.record_size());
         let dev = self.device_page(kind, rel_page)?;
         let abs = off + field_off;
+        // CAS-undo framing is byte-identical (`rmp` #220 / #172 depend on the exact undo bytes): the
+        // logical compare-and-set undo is still produced by `encode_cas_patch`; only the in-flight
+        // buffer type changed to an inline `Patch`. Redo is lent by borrow, undo retained by value.
         let redo = paging::encode_patch(abs, &new_head.to_le_bytes());
-        let undo = paging::encode_cas_patch(abs, new_head, old_head);
+        let undo = paging::encode_cas_patch(abs, new_head, old_head).into_vec();
         let f = self.pool.fetch(dev)?;
-        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
         self.pool.with_page_mut_lsn(f, lsn, |p| {
             p[abs..abs + 8].copy_from_slice(&new_head.to_le_bytes());
         });
@@ -1148,11 +1164,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let f = self.pool.fetch(dev)?;
         // Capture the live header pre-image (the only bytes the undo restores) before overwriting:
         // read latch, then a separate write latch for the post-image (frame pinned across both).
-        let undo = self.pool.with_page(f, |p| {
-            paging::encode_patch(off, &p[off..off + MVCC_HEADER_SIZE])
-        });
+        // Header-only undo captured STRICTLY before the whole-record post-image overwrite (`rmp`
+        // #220 / #172): same bytes (the 25-byte MVCC header pre-image), inline buffer. Retained undo
+        // taken by value; redo lent by borrow.
+        let undo = self
+            .pool
+            .with_page(f, |p| {
+                paging::encode_patch(off, &p[off..off + MVCC_HEADER_SIZE])
+            })
+            .into_vec();
         let redo = paging::encode_patch(off, buf);
-        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
         self.pool.with_page_mut_lsn(f, lsn, |p| {
             p[off..end].copy_from_slice(buf);
         });
@@ -2038,10 +2062,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let dev = self.ensure_store_page(StoreKind::Rel, rel_page, txn)?;
         let abs = off + field_off;
         let end = abs + bytes.len();
+        // undo == redo no-op-on-abort image (`rmp` #239), built once as an inline patch: redo lent by
+        // borrow, undo retained by value. Byte-identical to the prior `Vec`/`clone` path.
         let redo = paging::encode_patch(abs, bytes);
-        let undo = redo.clone();
+        let undo = redo.clone().into_vec();
         let f = self.pool.fetch(dev)?;
-        let lsn = self.wal.with(|w| w.log_update(txn, dev, redo, undo));
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
         self.pool.with_page_mut_lsn(f, lsn, |p| {
             p[abs..end].copy_from_slice(bytes);
         });

@@ -618,3 +618,100 @@ fn rollback_exceeding_pool_capacity_undoes_and_recovers() {
         "after crash recovery, still exactly the one committed node (aborted work never resurrects)"
     );
 }
+
+#[test]
+fn multi_field_record_write_recovers_and_aborts_byte_identically() {
+    // `rmp` #373 end-to-end regression: a node-with-3-properties create drives the **multi-field**
+    // write path — one whole-record node body write, plus per-property (record-body creation undo +
+    // `first_prop` chain-head compare-and-set undo) — all through the allocation-lean borrowed-redo
+    // + inline-`SmallVec` patch path. The WAL-level test `borrowed_redo_update_is_byte_identical_to_
+    // owned` proves the frames are byte-identical; this test proves the batched path still REDOES and
+    // UNDOES to the exact same state through real ARIES recovery (the property #220/#172 guard).
+    let key0 = 7_u32;
+    let key1 = 8_u32;
+    let key2 = 9_u32;
+
+    // --- Committed: a node with three inline properties survives a no-force crash (redo). ---
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (node, _) = s.create_node(txn).unwrap();
+    s.add_node_property(txn, node, key0, 1, 0x1111_1111_1111_1111)
+        .unwrap();
+    s.add_node_property(txn, node, key1, 1, 0x2222_2222_2222_2222)
+        .unwrap();
+    s.add_node_property(txn, node, key2, 1, 0x3333_3333_3333_3333)
+        .unwrap();
+    s.commit(txn).unwrap();
+
+    let before: Vec<(u32, u64)> = {
+        let mut v: Vec<(u32, u64)> = s
+            .node_properties(node)
+            .unwrap()
+            .iter()
+            .map(|(_, p)| (p.key, p.value_inline))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        before,
+        vec![
+            (key0, 0x1111_1111_1111_1111),
+            (key1, 0x2222_2222_2222_2222),
+            (key2, 0x3333_3333_3333_3333),
+        ],
+        "all three properties are live before the crash"
+    );
+
+    let rec = recover_no_force(&s);
+    let mut after: Vec<(u32, u64)> = rec
+        .node_properties(node)
+        .unwrap()
+        .iter()
+        .map(|(_, p)| (p.key, p.value_inline))
+        .collect();
+    after.sort_unstable();
+    assert_eq!(
+        after, before,
+        "no-force recovery reconstructs every property field of the multi-field create exactly"
+    );
+
+    // --- Uncommitted: a second node's three-property create is fully UNDONE after a steal crash. ---
+    let mut s2 = fresh(64);
+    let t1 = TxnId(1);
+    s2.begin(t1);
+    let (kept, _) = s2.create_node(t1).unwrap();
+    s2.add_node_property(t1, kept, key0, 1, 0xAAAA).unwrap();
+    s2.commit(t1).unwrap();
+
+    let t2 = TxnId(2);
+    s2.begin(t2);
+    let (loser, _) = s2.create_node(t2).unwrap();
+    s2.add_node_property(t2, loser, key0, 1, 0xDEAD).unwrap();
+    s2.add_node_property(t2, loser, key1, 1, 0xBEEF).unwrap();
+    s2.add_node_property(t2, loser, key2, 1, 0xF00D).unwrap();
+    s2.with_wal(graphus_wal::WalManager::flush); // steal: dirty uncommitted pages written home
+
+    let rec2 = recover_steal(&mut s2);
+    // The committed node keeps exactly its one property; the loser node was never made live.
+    let kept_props: Vec<(u32, u64)> = rec2
+        .node_properties(kept)
+        .unwrap()
+        .iter()
+        .map(|(_, p)| (p.key, p.value_inline))
+        .collect();
+    assert_eq!(
+        kept_props,
+        vec![(key0, 0xAAAA)],
+        "the committed node's property survives; the multi-field undo never clobbered it"
+    );
+    assert!(
+        !rec2.node(loser).unwrap().mvcc.in_use(),
+        "the uncommitted multi-field node create is rolled back to not-in-use (header-only undo)"
+    );
+    assert!(
+        rec2.node_properties(loser).unwrap().is_empty(),
+        "the uncommitted property chain is undone (chain-head CAS undo unlinked every prop)"
+    );
+}

@@ -30,6 +30,10 @@ graphus-txn = { path = "../graphus-txn" }
 # CRC32C for the whole-payload backup digest (src/backup.rs); same crate/version the page header
 # already uses in graphus-bufpool, so no new transitive dependency enters the workspace.
 crc32c = "0.6"
+# Inline-capacity buffer for the tiny WAL redo/undo patches built on the OLTP write path
+# (`paging::Patch`, `rmp` #373): a node/rel/prop field or whole-record patch (<=128 bytes) is
+# encoded with zero heap allocation. Same crate/version already resolved in the workspace tree.
+smallvec = "1"
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

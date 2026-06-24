@@ -45,6 +45,18 @@
 
 use graphus_bufpool::page::HEADER_SIZE;
 use graphus_io::PAGE_SIZE;
+use smallvec::SmallVec;
+
+/// The in-flight encoding of a WAL redo/undo intra-page patch (`rmp` #373).
+///
+/// A patch is always tiny: a 2-byte offset prefix plus either a single fixed record body (the
+/// largest is [`crate::record::REL_RECORD_SIZE`] = 102 bytes, so 104 bytes on the wire) or one
+/// narrow field (an 8-byte MVCC/chain word, a 25-byte MVCC header, or a 20-byte compare-and-set
+/// image). The 128-byte inline capacity therefore holds **every** patch this store emits without
+/// touching the heap, so [`encode_patch`] / [`encode_cas_patch`] no longer allocate a fresh `Vec`
+/// per redo/undo image on the OLTP write path. The encoded bytes are byte-for-byte identical to the
+/// previous `Vec` encoding — `SmallVec` derefs to `&[u8]`, so the WAL frame format is unchanged.
+pub type Patch = SmallVec<[u8; 128]>;
 
 /// Bytes available for the record array in each page (after the frozen 24-byte header).
 pub const PAGE_PAYLOAD: usize = PAGE_SIZE - HEADER_SIZE;
@@ -87,12 +99,14 @@ pub fn capacity(page_count: u64, record_size: usize) -> u64 {
 /// # Panics
 /// Panics if `offset + bytes.len()` would run past [`PAGE_SIZE`].
 #[must_use]
-pub fn encode_patch(offset: usize, bytes: &[u8]) -> Vec<u8> {
+pub fn encode_patch(offset: usize, bytes: &[u8]) -> Patch {
     assert!(
         offset + bytes.len() <= PAGE_SIZE,
         "patch runs past the page"
     );
-    let mut out = Vec::with_capacity(2 + bytes.len());
+    // `SmallVec::with_capacity(n)` for `n <= 128` stays inline (no heap allocation); the bytes
+    // written are identical to the previous `Vec` path, so the WAL image is byte-for-byte unchanged.
+    let mut out = Patch::with_capacity(2 + bytes.len());
     out.extend_from_slice(&(offset as u16).to_le_bytes());
     out.extend_from_slice(bytes);
     out
@@ -114,13 +128,13 @@ pub const CAS_SENTINEL: u16 = 0xFFFF;
 /// Panics if `offset + 8` would run past [`PAGE_SIZE`], or if `offset` is not addressable as a
 /// non-sentinel `u16`.
 #[must_use]
-pub fn encode_cas_patch(offset: usize, expect: u64, new: u64) -> Vec<u8> {
+pub fn encode_cas_patch(offset: usize, expect: u64, new: u64) -> Patch {
     assert!(offset + 8 <= PAGE_SIZE, "cas patch runs past the page");
     assert!(
         offset <= u16::MAX as usize && offset as u16 != CAS_SENTINEL,
         "cas patch offset is not addressable"
     );
-    let mut out = Vec::with_capacity(2 + 2 + 8 + 8);
+    let mut out = Patch::with_capacity(2 + 2 + 8 + 8);
     out.extend_from_slice(&CAS_SENTINEL.to_le_bytes());
     out.extend_from_slice(&(offset as u16).to_le_bytes());
     out.extend_from_slice(&expect.to_le_bytes());

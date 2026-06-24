@@ -202,24 +202,47 @@ impl LogRecord {
     }
 
     /// Appends the encoded form of this record to `out`, using `lsn` as its LSN and stamping it
-    /// into the record. Returns the encoded length.
+    /// into the record, sourcing the redo/undo images from the record's own owned `Vec`s. Returns
+    /// the encoded length.
     pub fn encode_to(&mut self, lsn: Lsn, out: &mut Vec<u8>) -> usize {
+        // Borrow the owned images through `encode_header_to`: identical bytes, one code path
+        // (`rmp` #373). `std::mem::take` avoids aliasing `&self` while `&mut self` is borrowed for
+        // the header stamp; the images are restored immediately after.
+        let redo = std::mem::take(&mut self.redo);
+        let undo = std::mem::take(&mut self.undo);
+        let total = self.encode_header_to(lsn, &redo, &undo, out);
+        self.redo = redo;
+        self.undo = undo;
+        total
+    }
+
+    /// The byte-exact encoder shared by [`encode_to`](Self::encode_to) (owned images) and the
+    /// manager's borrowed-redo update path (`rmp` #373): writes the fixed prefix and the supplied
+    /// `redo`/`undo` slices, framing each with its `u32` length and a trailing CRC32C. The wire
+    /// bytes are independent of whether the images are owned or borrowed.
+    pub(crate) fn encode_header_to(
+        &mut self,
+        lsn: Lsn,
+        redo: &[u8],
+        undo: &[u8],
+        out: &mut Vec<u8>,
+    ) -> usize {
         self.lsn = lsn;
         // The redo/undo image lengths are framed as `u32` on the wire (below). A ≥4 GiB image would
         // truncate silently, producing a corrupt, undecodable record. Such an image is never produced
         // by this engine (page images are bounded), so guard with a debug assertion that fires in
         // tests/debug builds rather than emitting silent corruption.
         debug_assert!(
-            self.redo.len() <= u32::MAX as usize,
+            redo.len() <= u32::MAX as usize,
             "WAL redo image {} bytes exceeds the u32 frame limit",
-            self.redo.len()
+            redo.len()
         );
         debug_assert!(
-            self.undo.len() <= u32::MAX as usize,
+            undo.len() <= u32::MAX as usize,
             "WAL undo image {} bytes exceeds the u32 frame limit",
-            self.undo.len()
+            undo.len()
         );
-        let total = self.encoded_len();
+        let total = REC_FIXED_PREFIX + 4 + redo.len() + 4 + undo.len() + 4;
         let start = out.len();
         out.reserve(total);
         out.extend_from_slice(&(total as u32).to_le_bytes());
@@ -229,10 +252,10 @@ impl LogRecord {
         out.push(self.rec_type as u8);
         out.extend_from_slice(&self.page_id.0.to_le_bytes());
         out.extend_from_slice(&self.undo_next_lsn.0.to_le_bytes());
-        out.extend_from_slice(&(self.redo.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.redo);
-        out.extend_from_slice(&(self.undo.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.undo);
+        out.extend_from_slice(&(redo.len() as u32).to_le_bytes());
+        out.extend_from_slice(redo);
+        out.extend_from_slice(&(undo.len() as u32).to_le_bytes());
+        out.extend_from_slice(undo);
         let crc = crc32c::crc32c(&out[start..]);
         out.extend_from_slice(&crc.to_le_bytes());
         debug_assert_eq!(out.len() - start, total);

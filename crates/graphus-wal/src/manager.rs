@@ -271,16 +271,40 @@ impl<S: LogSink> WalManager<S> {
     /// Logs a page modification by `txn`: `redo` re-applies it, `undo` rolls it back. Returns the
     /// record's LSN, which the caller stamps as the page's `page_lsn`.
     pub fn log_update(&mut self, txn: TxnId, page_id: PageId, redo: Vec<u8>, undo: Vec<u8>) -> Lsn {
+        // Single code path with the borrowed-redo entry point (`rmp` #373): the redo `Vec` is only
+        // read (encoded into the durable record) and then dropped, so borrowing it here is exactly
+        // equivalent to the prior owned encoding — same LSN, same durable bytes, same `UndoEntry`.
+        self.log_update_borrowed(txn, page_id, &redo, undo)
+    }
+
+    /// Logs a page modification by `txn` taking the **redo image by borrow** (`rmp` #373): identical
+    /// in every observable respect to [`log_update`](Self::log_update) — same LSN assignment, same
+    /// durable bytes, same in-memory [`UndoEntry`] — but the caller need not heap-allocate a `Vec`
+    /// for the redo image, which this method only reads (encodes into the durable record) and never
+    /// retains. The `undo` image *is* retained (it backs rollback/recovery), so it is taken by value.
+    ///
+    /// This is the OLTP write path's allocation-lean entry point: storage builds redo/undo as inline
+    /// [`graphus_storage`-style `SmallVec`] patches and passes `redo.as_slice()` here, so a tiny
+    /// record/field patch (<=128 bytes) reaches the WAL with zero redo allocation. Because the
+    /// encoder ([`LogRecord::encode_header_to`]) sources the redo from the slice, the produced WAL
+    /// frame is byte-for-byte identical to the owned-`Vec` path.
+    pub fn log_update_borrowed(
+        &mut self,
+        txn: TxnId,
+        page_id: PageId,
+        redo: &[u8],
+        undo: Vec<u8>,
+    ) -> Lsn {
         let prev = self.active.get(&txn).map_or(Lsn(0), |s| s.last_lsn);
         let mut r = LogRecord::new(RecordType::Update, txn, page_id);
         r.prev_lsn = prev;
-        r.redo = redo;
-        r.undo = undo;
-        let lsn = self.append(&mut r);
-        // `append` has already encoded `r.undo` into the durable record, so move (rather than clone)
-        // those bytes into the in-memory UndoEntry: the encoded bytes and the stored UndoEntry.undo
-        // stay byte-identical with one fewer allocation.
-        let undo = std::mem::take(&mut r.undo);
+        // Encode directly from the borrowed `redo` and the soon-to-be-retained `undo` — no owned
+        // `r.redo`/`r.undo` Vec is built, so the redo image never allocates. Mirror `append`'s
+        // LSN-then-encode-then-sink sequence exactly so byte layout and ordering are unchanged.
+        let lsn = self.next_lsn();
+        self.buf.clear();
+        r.encode_header_to(lsn, redo, &undo, &mut self.buf);
+        self.sink.append(&self.buf);
         let st = self.active.entry(txn).or_insert(TxnState {
             first_lsn: lsn,
             last_lsn: lsn,
@@ -570,6 +594,48 @@ mod tests {
         assert_eq!(recs[2].prev_lsn, u1); // update 2 chains back to update 1
         assert_eq!(recs[3].rec_type, RecordType::Commit);
         assert_eq!(recs[3].prev_lsn, u2);
+    }
+
+    /// `rmp` #373 byte-identity guarantee: the allocation-lean borrowed-redo update path produces a
+    /// durable log byte-for-byte identical to the owned-`Vec` `log_update` path, with identical LSNs
+    /// and identical in-memory undo back-chains. This is the WAL-level proof that batching/avoiding
+    /// the redo `Vec` on the OLTP write path does NOT change the WAL frame format — the property the
+    /// CAS-undo (`#220`/`#172`) and ARIES recovery paths depend on.
+    fn drive(
+        mut log: impl FnMut(&mut WalManager<MemLogSink>, TxnId, PageId, &[u8], &[u8]),
+    ) -> Vec<u8> {
+        let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+        wal.begin(TxnId(1));
+        // A node-with-3-props create shape: a whole-record body redo (post-image) with a short
+        // MVCC-header undo, plus narrow 8-byte chain-head field writes whose undo differs in length
+        // from the redo — exercising mixed redo/undo image sizes through both paths.
+        log(&mut wal, TxnId(1), PageId(5), &[0xAB; 65], &[0x11; 25]); // node record body / header undo
+        log(&mut wal, TxnId(1), PageId(6), &[0x22; 46], &[0x33; 25]); // prop record body / header undo
+        log(&mut wal, TxnId(1), PageId(5), &[0x44; 8], &[0x55; 20]); // chain-head field / cas-style undo
+        wal.commit(TxnId(1)).unwrap();
+        wal.sink().durable_bytes()
+    }
+
+    #[test]
+    fn borrowed_redo_update_is_byte_identical_to_owned() {
+        let owned = drive(|w, t, p, redo, undo| {
+            w.log_update(t, p, redo.to_vec(), undo.to_vec());
+        });
+        let borrowed = drive(|w, t, p, redo, undo| {
+            w.log_update_borrowed(t, p, redo, undo.to_vec());
+        });
+        assert_eq!(
+            owned, borrowed,
+            "borrowed-redo WAL frames must be byte-for-byte identical to the owned-Vec path"
+        );
+
+        // The decoded records (LSNs, prev-LSN chain, redo/undo images, CRCs) must match exactly too.
+        let ro = decode_all(&owned);
+        let rb = decode_all(&borrowed);
+        assert_eq!(
+            ro, rb,
+            "decoded WAL records must be identical across both paths"
+        );
     }
 
     #[test]
