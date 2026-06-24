@@ -118,6 +118,16 @@ pub trait StoreReadSource {
     /// corpses threaded through transparently).
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError>;
 
+    /// The `(physical_id, record)` of the relationships incident to `node_id`, read once each and
+    /// filtered to `wanted_types` (empty = all), self-loops deduped, corpses threaded through (`rmp`
+    /// #324). The single-pass twin of `incident_rels` + per-id `rel()`: returning the decoded record
+    /// lets the typed-expand body skip the second read and the SSI mark of non-matching edges.
+    fn incident_rels_typed(
+        &self,
+        node_id: u64,
+        wanted_types: &[u32],
+    ) -> Result<Vec<(u64, RelRecord)>, GraphusError>;
+
     /// Decodes a property value from its `(type_tag, value_inline)` pair (inline scalar, or an overflow
     /// value reassembled from the strings heap).
     fn decode_property_value(&self, type_tag: u8, value_inline: u64)
@@ -163,6 +173,13 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     }
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError> {
         self.0.incident_rels(node_id)
+    }
+    fn incident_rels_typed(
+        &self,
+        node_id: u64,
+        wanted_types: &[u32],
+    ) -> Result<Vec<(u64, RelRecord)>, GraphusError> {
+        self.0.incident_rels_typed(node_id, wanted_types)
     }
     fn decode_property_value(
         &self,
@@ -213,6 +230,13 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
     }
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError> {
         self.view.incident_rels(node_id)
+    }
+    fn incident_rels_typed(
+        &self,
+        node_id: u64,
+        wanted_types: &[u32],
+    ) -> Result<Vec<(u64, RelRecord)>, GraphusError> {
+        self.view.incident_rels_typed(node_id, wanted_types)
     }
     fn decode_property_value(
         &self,
@@ -646,50 +670,48 @@ pub fn expand<S: StoreReadSource, K: ReadSink>(
 ) -> Vec<Incident> {
     // Relationship-pattern predicate read (`rmp` #171 blocker A1): register the rel-type (or, untyped,
     // `AnyRel`) marker so a concurrent create/delete of a matching type closes an rw-edge — the absent
-    // edge the per-rel SIREADs below cannot cover.
+    // edge the per-rel SIREADs below cannot cover. THIS is what covers the phantom for a matching-type
+    // INSERT; it is the reason skipping the per-rel SIREAD of a NON-matching edge (below) is sound.
     note_rel_predicate_read(src, sink, types);
-    let rels = match src.incident_rels(node.0) {
+    // Resolve the requested rel-type names to interned ids ONCE per expand (`rmp` #319), so the
+    // per-edge filter is an integer compare pushed into the storage chain walk. A requested name with
+    // no interned token matches no existing edge (the absent-edge phantom is covered by
+    // `note_rel_predicate_read` above), so it contributes no id — and if EVERY requested name is
+    // un-interned the resolved set is empty, which the storage layer would treat as "any type"; guard
+    // that by short-circuiting to an empty result when types were requested but none resolved.
+    let wanted_type_ids: Vec<u32> = types
+        .iter()
+        .filter_map(|t| src.token_id(Namespace::RelType, t))
+        .collect();
+    if !types.is_empty() && wanted_type_ids.is_empty() {
+        // A typed pattern whose every type name is un-interned matches no existing edge. The phantom
+        // for a concurrent first-insert of such a type is already covered by the `AnyRel` predicate
+        // marker `note_rel_predicate_read` registered for an un-interned name.
+        return Vec::new();
+    }
+    // `rmp` #324, "Win 1": read each incident relationship record ONCE during the chain walk and have
+    // the storage layer drop the non-matching types in the same pass — so a type-selective traversal
+    // no longer re-reads (`src.rel`) and SSI-marks every non-matching edge. An empty `wanted_type_ids`
+    // (untyped expand) returns every incident edge, identical to the old `incident_rels` membership.
+    let rels = match src.incident_rels_typed(node.0, &wanted_type_ids) {
         Ok(rels) => rels,
         Err(e) => {
             sink.capture(e);
             return Vec::new();
         }
     };
-    // Resolve the requested rel-type names to interned ids ONCE per expand (`rmp` #319), so the
-    // per-edge filter is an integer compare. A requested name with no interned token matches no
-    // existing edge (the absent-edge phantom is covered by `note_rel_predicate_read`), so it
-    // contributes no id. `None` means "any type".
-    let wanted_type_ids: Option<Vec<u32>> = if types.is_empty() {
-        None
-    } else {
-        Some(
-            types
-                .iter()
-                .filter_map(|t| src.token_id(Namespace::RelType, t))
-                .collect(),
-        )
-    };
     let mut out = Vec::new();
-    for rid in rels {
-        let rec = match src.rel(rid) {
-            Ok(rec) => rec,
-            Err(e) => {
-                sink.capture(e);
-                return Vec::new();
-            }
-        };
-        // SIREAD-mark each incident relationship the traversal examined (`04 §5.4`).
+    for (rid, rec) in rels {
+        // SIREAD-mark each MATCHING incident relationship the traversal examined (`04 §5.4`). Edges of
+        // a non-requested type were never examined (the storage walk filtered them), so they need no
+        // per-rel SIREAD: the rel-type predicate marker above already covers any concurrent
+        // create/delete of a matching-type edge — the only rw-conflict a typed expand can have.
         sink.note_read(rel_ssi_key(rid));
         // Skip relationships not visible to this snapshot (a concurrently-deleted tombstone an older
         // reader could still traverse, or a later-committed edge). The incidence chain threads them
         // until GC.
         if !ctx.visible(rec.mvcc) {
             continue;
-        }
-        if let Some(ref ids) = wanted_type_ids {
-            if !ids.contains(&rec.type_id) {
-                continue;
-            }
         }
         let touches_as_start = rec.start_node == node.0;
         let touches_as_end = rec.end_node == node.0;

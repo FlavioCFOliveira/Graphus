@@ -477,6 +477,74 @@ pub fn incident_rels<D: BlockDevice, S: LogSink, P: StorePages>(
     Ok(out)
 }
 
+/// Enumerates `(physical_id, record)` for the relationships incident to `node_id`, reading each
+/// chain link **exactly once** and — when `wanted_types` is non-empty — returning only the records
+/// whose `type_id` is in `wanted_types` (`rmp` #324, "Win 1"). An empty `wanted_types` returns every
+/// incident relationship (the untyped expand path), making this a strict superset enumeration
+/// identical in membership to [`incident_rels`].
+///
+/// This is the single-pass twin of `incident_rels` + a per-id `read_rel`: the Cypher `expand` body
+/// re-read every returned id with a second `rel()` call and then filtered by type, so a type-selective
+/// traversal read every non-matching edge **twice** and SSI-marked it. Returning the decoded record
+/// here lets the caller skip both the second read and the SSI mark of non-matching edges, while the
+/// chain walk itself is byte-for-byte the same traversal (same self-loop dedupe via `out.last()`
+/// identity check, same corpse threading through `!in_use` links, same cycle guard), so the #220
+/// corpse splice, multigraph parallel edges, and untyped enumeration are all unaffected. MVCC
+/// visibility is still decided **above** this layer.
+///
+/// # Errors
+/// Returns a storage error if a chain page is missing or the chain does not terminate.
+pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    node_id: u64,
+    wanted_types: &[u32],
+) -> Result<Vec<(u64, RelRecord)>> {
+    use crate::record::ChainSide;
+
+    let node = read_node(pool, pages, node_id)?;
+    let mut out: Vec<(u64, RelRecord)> = Vec::new();
+    let mut cur = node.first_rel;
+    let guard = 2 * pages.high_water(StoreKind::Rel) + 2;
+    let mut steps = 0u64;
+    let mut prev_link = NULL_ID;
+    while cur != NULL_ID {
+        steps += 1;
+        if steps > guard {
+            return Err(GraphusError::Storage(format!(
+                "incidence chain of node {node_id} is malformed (cycle?)"
+            )));
+        }
+        let r = read_rel(pool, pages, cur)?;
+        let is_loop = r.start_node == node_id && r.end_node == node_id;
+        // Self-loop dedupe is by physical-id identity exactly as `incident_rels`: a self-loop is
+        // threaded into the chain twice, so we only emit it on the first visit. The type filter is
+        // applied AFTER the in_use/dedupe gate so the emitted set is a faithful subset of
+        // `incident_rels` restricted to `wanted_types`.
+        if r.mvcc.in_use()
+            && out.last().map(|(id, _)| *id) != Some(cur)
+            && (wanted_types.is_empty() || wanted_types.contains(&r.type_id))
+        {
+            out.push((cur, r));
+        }
+        let next = if is_loop {
+            let (end_prev, end_next) = r.chain_pointers(ChainSide::End);
+            if end_prev == prev_link || prev_link == NULL_ID {
+                end_next
+            } else {
+                r.chain_pointers(ChainSide::Start).1
+            }
+        } else if r.start_node == node_id {
+            r.start_next_rel
+        } else {
+            r.end_next_rel
+        };
+        prev_link = cur;
+        cur = next;
+    }
+    Ok(out)
+}
+
 // --------------------------------- StoreReadView ---------------------------------
 
 /// An owned, `Send + Sync` read handle over a [`RecordStore`](crate::store::RecordStore)'s committed
@@ -656,6 +724,19 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
     /// Returns a storage error if a chain page is missing or the chain does not terminate.
     pub fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>> {
         incident_rels(&self.pool, &self.meta, node_id)
+    }
+
+    /// The `(physical_id, record)` of the relationships incident to `node_id`, read once each and
+    /// filtered to `wanted_types` (empty = all). See [`incident_rels_typed`] (`rmp` #324).
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain page is missing or the chain does not terminate.
+    pub fn incident_rels_typed(
+        &self,
+        node_id: u64,
+        wanted_types: &[u32],
+    ) -> Result<Vec<(u64, RelRecord)>> {
+        incident_rels_typed(&self.pool, &self.meta, node_id, wanted_types)
     }
 }
 

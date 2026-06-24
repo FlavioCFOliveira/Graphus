@@ -3130,6 +3130,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::incident_rels(&self.pool, &self.stores, node_id)
     }
 
+    /// The `(physical_id, record)` of the relationships incident to `node_id`, reading each chain link
+    /// once and filtering to `wanted_types` (empty = all). The single-pass twin of `incident_rels` +
+    /// per-id `rel()` used by the Cypher typed-expand fast path (`rmp` #324, "Win 1"). The chain walk
+    /// is byte-identical to [`incident_rels`](Self::incident_rels), so corpse threading, self-loop
+    /// dedupe, and multigraph semantics are unchanged; MVCC visibility is filtered above this layer.
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain page is missing or the chain does not terminate.
+    pub fn incident_rels_typed(
+        &self,
+        node_id: u64,
+        wanted_types: &[u32],
+    ) -> Result<Vec<(u64, RelRecord)>> {
+        read_view::incident_rels_typed(&self.pool, &self.stores, node_id, wanted_types)
+    }
+
     /// The degree of `node_id` (distinct incident relationships, self-loops counted once).
     ///
     /// # Errors
