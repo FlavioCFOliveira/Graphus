@@ -28,6 +28,8 @@
 //! This module owns [`VersionStamp`], the typed view over that one `u64`, so every other module
 //! reads and writes the convention through one place rather than re-deriving the bit twiddling.
 
+use std::collections::BTreeMap;
+
 use graphus_core::{GraphusError, Result, Timestamp};
 
 // The version-stamp convention (committed-`Timestamp` vs in-flight-`TxnId`, discriminated by the
@@ -45,9 +47,17 @@ pub use graphus_core::{MAX_TIMESTAMP, VersionStamp};
 pub struct TimestampOracle {
     /// The last timestamp handed out; the next is `next_counter + 1`.
     next_counter: u64,
-    /// Multiset of begin timestamps of currently active transactions, ascending. A `Vec` (rather
-    /// than a set) because two transactions can share a begin timestamp and both must be tracked.
-    active_begins: Vec<Timestamp>,
+    /// Multiset of begin timestamps of currently active transactions, keyed ascending with a
+    /// per-timestamp reference count. A *multiset* (count per key, not a plain set) because two
+    /// transactions can share a begin timestamp and both must be tracked independently; a `BTreeMap`
+    /// (rather than a sorted `Vec`) so the low-water mark is `first_key_value` — O(log N) — and
+    /// `release_begin` is an O(log N) decrement instead of an O(N) `Vec::remove` shift, which under
+    /// thousands of active transactions was a per-finish quadratic-under-churn serial tax.
+    ///
+    /// Invariant: every count is `>= 1`; a key whose count reaches `0` is removed, so the map holds
+    /// exactly the begin timestamps with at least one live transaction, and `first_key_value`
+    /// reproduces — byte-for-byte — what the old `active_begins[0]` returned for the same sequence.
+    active_begins: BTreeMap<Timestamp, u32>,
 }
 
 impl Default for TimestampOracle {
@@ -62,7 +72,7 @@ impl TimestampOracle {
     pub fn new() -> Self {
         Self {
             next_counter: 0,
-            active_begins: Vec::new(),
+            active_begins: BTreeMap::new(),
         }
     }
 
@@ -101,9 +111,12 @@ impl TimestampOracle {
     /// [`GraphusError::Transaction`] if the timestamp space is exhausted (see [`tick`](Self::tick)).
     pub fn begin(&mut self) -> Result<Timestamp> {
         let ts = self.tick()?;
-        // Keep `active_begins` sorted so `low_water_mark` is `active_begins[0]`.
-        let pos = self.active_begins.partition_point(|t| *t <= ts);
-        self.active_begins.insert(pos, ts);
+        // O(log N) bump of the multiset count for this begin timestamp. `begin` stays cheap: the
+        // monotonic tick means `ts` is the largest key issued so far, so this is an insert at the
+        // tail of the `BTreeMap` (amortized cheap) — there is no `Vec`-shift to pay as there was no
+        // mid-vector shift to pay before. Sharing a `ts` (count > 1) is handled by the count, never
+        // by duplicate keys we could not later tell apart.
+        *self.active_begins.entry(ts).or_insert(0) += 1;
         Ok(ts)
     }
 
@@ -122,11 +135,20 @@ impl TimestampOracle {
     /// fragile crash vector — it returns `false` so the caller can log and continue. Returns `true`
     /// when a matching active begin timestamp was found and removed.
     pub fn release_begin(&mut self, begin_ts: Timestamp) -> bool {
-        if let Some(pos) = self.active_begins.iter().position(|t| *t == begin_ts) {
-            self.active_begins.remove(pos);
-            true
-        } else {
-            false
+        // O(log N) decrement of the multiset count; remove the key only once the last transaction
+        // sharing this begin timestamp leaves. While `count > 1` the low-water mark is unaffected
+        // (the timestamp is still the snapshot of one or more live readers), exactly as removing a
+        // single duplicate from the old sorted `Vec` left the remaining duplicates in place.
+        match self.active_begins.entry(begin_ts) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let count = e.get_mut();
+                *count -= 1;
+                if *count == 0 {
+                    e.remove();
+                }
+                true
+            }
+            std::collections::btree_map::Entry::Vacant(_) => false,
         }
     }
 
@@ -137,13 +159,22 @@ impl TimestampOracle {
     /// future) snapshot and is therefore eligible for garbage collection.
     #[must_use]
     pub fn low_water_mark(&self) -> Option<Timestamp> {
-        self.active_begins.first().copied()
+        // The smallest key with a live transaction. Identical to the old `active_begins[0]` (the
+        // `BTreeMap` orders by `Timestamp`), and `None` when empty — the exact empty-case behavior
+        // the GC watermark depends on, preserved byte-for-byte.
+        self.active_begins.first_key_value().map(|(ts, _count)| *ts)
     }
 
     /// The number of currently active transactions (observability / GC metric, NFR-10).
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.active_begins.len()
+        // Multiset cardinality (the number of live transactions), matching the old `Vec::len()`:
+        // sum the per-timestamp counts, not the number of distinct keys, so two transactions sharing
+        // a begin timestamp still count as two.
+        self.active_begins
+            .values()
+            .map(|count| *count as usize)
+            .sum()
     }
 
     /// The most recently issued timestamp (`0` before any has been issued). Test/inspection aid.
@@ -207,6 +238,48 @@ mod tests {
     }
 
     #[test]
+    fn shared_begin_ts_multiset_keeps_low_water_until_all_released() {
+        // Regression (#370): the multiset must track N transactions sharing a begin timestamp by a
+        // count, not by collapsing them. Releasing one of N must leave the low-water mark pinned
+        // until the last one leaves — otherwise GC could reclaim versions still visible to a live
+        // reader (an ACID isolation violation).
+        let mut o = TimestampOracle::new();
+        // Three transactions forced onto the same begin timestamp (count == 3 at that key).
+        let shared = Timestamp(5);
+        for _ in 0..3 {
+            *o.active_begins.entry(shared).or_insert(0) += 1;
+        }
+        // A later, distinct begin timestamp from a fourth transaction.
+        let later = Timestamp(9);
+        *o.active_begins.entry(later).or_insert(0) += 1;
+
+        assert_eq!(o.low_water_mark(), Some(shared));
+        assert_eq!(
+            o.active_count(),
+            4,
+            "multiset cardinality counts duplicates"
+        );
+
+        // Release two of the three sharers: low-water mark must NOT advance.
+        assert!(o.release_begin(shared));
+        assert_eq!(o.low_water_mark(), Some(shared), "one sharer still live");
+        assert!(o.release_begin(shared));
+        assert_eq!(o.low_water_mark(), Some(shared), "last sharer still live");
+        assert_eq!(o.active_count(), 2);
+
+        // Release the final sharer: now the mark advances to the later transaction.
+        assert!(o.release_begin(shared));
+        assert_eq!(o.low_water_mark(), Some(later), "all sharers gone");
+        assert_eq!(o.active_count(), 1);
+
+        // Releasing the same timestamp once more is a defensive no-op (count already zeroed/removed).
+        assert!(!o.release_begin(shared), "over-release is a no-op");
+        assert!(o.release_begin(later));
+        assert_eq!(o.low_water_mark(), None);
+        assert_eq!(o.active_count(), 0);
+    }
+
+    #[test]
     fn tick_errors_at_exhaustion_instead_of_panicking() {
         // Regression: SEC-200/197. Drive the counter to the last legal value and confirm the next
         // issue is a recoverable error, not a panic.
@@ -217,5 +290,37 @@ mod tests {
             "exhausted oracle must refuse, not panic"
         );
         assert!(o.commit().is_err(), "commit at exhaustion must refuse too");
+    }
+
+    /// Manual micro-bench (#370): release cost vs number of active transactions. With the sorted
+    /// `Vec` this was O(N) per release (linear `position` scan + O(N) `remove` shift) ⇒ O(N²) to
+    /// drain; with the `BTreeMap` multiset it is O(log N) per release ⇒ O(N log N) to drain.
+    ///
+    /// Run with: `cargo test -p graphus-txn release_cost_curve -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual timing micro-bench, not a correctness gate"]
+    fn release_cost_curve() {
+        use std::time::Instant;
+
+        for &n in &[1_000_u64, 4_000, 16_000] {
+            let mut o = TimestampOracle::new();
+            let mut begins = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                begins.push(o.begin().expect("space"));
+            }
+            // Worst case for the old `Vec`: release oldest-first so every `remove(0)` shifts all
+            // remaining elements. The `BTreeMap` pays only O(log N) regardless of order.
+            let start = Instant::now();
+            for ts in &begins {
+                assert!(o.release_begin(*ts));
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(o.active_count(), 0);
+            println!(
+                "N={n:>6}  drain={:>10.3?}  per-release={:>8.1}ns",
+                elapsed,
+                elapsed.as_nanos() as f64 / n as f64
+            );
+        }
     }
 }
