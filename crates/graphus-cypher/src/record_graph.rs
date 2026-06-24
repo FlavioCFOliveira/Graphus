@@ -2440,6 +2440,23 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(out)
     }
 
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+        // The precise full-scan equality path (`rmp` task #325): the scan-path twin of `index_seek_eq`'s
+        // SSI footprint. The lifted body (shared with `ReadOnlyGraph`) registers the precise
+        // `Equality` predicate marker and SIREAD-marks ONLY the matching nodes — never the blanket
+        // `mark_all_live_nodes` a bare label scan registers — so two writers matching DISJOINT keys no
+        // longer conflict reciprocally (the abort-storm fix). Read-only: `LiveSource` over the live
+        // store's `&self` reads (`rmp` #337 Slice 2), so a shared borrow suffices.
+        read_source::scan_filter_eq(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label,
+            property,
+            value,
+        )
+    }
+
     fn index_seek_range(
         &self,
         label: &str,

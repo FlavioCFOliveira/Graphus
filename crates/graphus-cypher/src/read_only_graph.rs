@@ -250,6 +250,14 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for ReadOnlyGraph<D, S> {
         read_source::scan_nodes_by_label(&self.source(), &self.ctx(), self, label)
     }
 
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+        // The precise equality-filtered scan (`rmp` task #325): the same lifted body the live store runs,
+        // so an off-thread morsel reader registers the identical precise `Equality` + per-match SIREAD
+        // footprint (never the blanket `mark_all_live_nodes`) — serializability unchanged, abort storm
+        // gone. The reader holds no derived index, so the lifted body is the only path.
+        read_source::scan_filter_eq(&self.source(), &self.ctx(), self, label, property, value)
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         read_source::expand(&self.source(), &self.ctx(), self, node, direction, types)
     }

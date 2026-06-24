@@ -2270,6 +2270,16 @@ impl GraphAccess for ReadOnlyGraph<'_> {
     ) -> Option<Vec<crate::graph_access::NodeId>> {
         self.0.index_seek_eq(label, property, value)
     }
+    fn scan_filter_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+    ) -> Vec<crate::graph_access::NodeId> {
+        // Forward to the inner seam (`rmp` task #325) so the precise equality-scan SIREAD footprint is
+        // preserved through this read-only decorator, exactly as `index_seek_eq` is forwarded.
+        self.0.scan_filter_eq(label, property, value)
+    }
     fn index_seek_range(
         &self,
         label: &str,

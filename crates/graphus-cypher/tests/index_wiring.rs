@@ -586,11 +586,24 @@ fn populating_index_is_not_used_by_planner_while_online_is() {
             !has_index_seek(&plan) && !has_index_range_seek(&plan),
             "`{src}` ({kind}): a Populating index must NOT drive an index seek:\n{plan}"
         );
-        // It still uses the always-present label token-lookup (that index is unaffected by state).
-        assert!(
-            has_token_lookup(&plan),
-            "`{src}` ({kind}): must fall back to a TokenLookupScan + Filter:\n{plan}"
-        );
+        // The Populating *property* index is withheld. The exact fallback shape depends on the
+        // predicate kind:
+        //   - equality (`rmp` task #325): the precise full-scan `NodeLabelScanEq` access path (no
+        //     property index, no token-lookup — it scans every node but SIREAD-marks only the matches);
+        //   - range: the always-present label token-lookup scan + a residual `Filter`.
+        // Either way, no NodeIndexSeek/NodeIndexRangeSeek is routed (the property index is invisible).
+        let rendered = plan.to_string();
+        if kind == "eq" {
+            assert!(
+                rendered.contains("NodeLabelScanEq"),
+                "`{src}` ({kind}): a Populating index's equality fallback must use the precise NodeLabelScanEq:\n{plan}"
+            );
+        } else {
+            assert!(
+                has_token_lookup(&plan),
+                "`{src}` ({kind}): must fall back to a TokenLookupScan + Filter:\n{plan}"
+            );
+        }
         // And the fallback returns exactly the scan+filter rows.
         let via_catalog = read_sorted_ints(&mut coord, &indexed, src, "a");
         let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");

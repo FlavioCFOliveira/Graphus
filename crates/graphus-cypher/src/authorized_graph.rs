@@ -481,6 +481,19 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         )
     }
 
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+        // The precise equality scan (`rmp` task #325) is a read path: delegate to the inner seam (which
+        // owns the tight SIREAD footprint), then apply RBAC exactly as the label scan / index seek do, so
+        // the precise-scan, index-accelerated, and bare-scan paths all return the same visible rows.
+        let ids = self.inner.scan_filter_eq(label, property, value);
+        if self.oracle.is_unrestricted() {
+            return ids;
+        }
+        ids.into_iter()
+            .filter(|&id| self.node_visible(id))
+            .collect()
+    }
+
     fn index_seek_range(
         &self,
         label: &str,

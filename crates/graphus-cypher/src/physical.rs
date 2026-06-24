@@ -296,6 +296,28 @@ pub enum PhysicalOp {
         /// The catalog index backing the seek.
         index: IndexId,
     },
+    /// **Precise equality-filtered label scan** (`rmp` task #325): records of `label` whose `property`
+    /// equals the seek expression, served by a **full store scan** (the path chosen when no derived
+    /// property index covers `(label, property)`).
+    ///
+    /// Result-equivalent to a [`NodeByLabelScan`](Self::NodeByLabelScan) wrapped in an equality
+    /// [`Filter`](Self::Filter) — but it routes through the [`scan_filter_eq`](crate::graph_access::GraphAccess::scan_filter_eq)
+    /// seam, which builds an SSI read dependency on **only the matching nodes** (plus the precise
+    /// `Equality` predicate marker), instead of the blanket "mark every live node" footprint a bare label
+    /// scan registers. That blanket footprint manufactured reciprocal rw-edges between transactions
+    /// matching **disjoint** keys, producing a storm of false serialization aborts; this operator gives
+    /// the scan path the same tight footprint the indexed [`NodeIndexSeek`](Self::NodeIndexSeek) already
+    /// has. The `value` expression is the unevaluated AST, evaluated by the executor at run time.
+    NodeLabelScanEq {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label scanned for.
+        label: Label,
+        /// The equality-filtered property key.
+        property: String,
+        /// The equality seek value (unevaluated AST; commonly a parameter after auto-parameterisation).
+        value: Expr,
+    },
     /// **Index range seek**: records of `label` whose `property` satisfies a range predicate
     /// (`04 §7.1`).
     NodeIndexRangeSeek {
@@ -1117,7 +1139,34 @@ impl Planner<'_> {
             }
         }
 
-        // No index applied: label scan (possibly token-lookup) + the full predicate as a filter.
+        // No index applied. Before falling back to a bare label scan + residual filter, try to fuse a
+        // single **equality** conjunct into a precise `NodeLabelScanEq` (`rmp` task #325): it routes
+        // through the `scan_filter_eq` seam, which marks only the matching nodes for SSI instead of the
+        // blanket "every live node" footprint a bare label scan + filter registers (the abort-storm fix).
+        // The remaining conjuncts re-attach as a residual filter. Range/spatial/other conjuncts keep the
+        // plain scan + filter — only an equality predicate has a precise predicate marker to register.
+        for (i, conj) in conjuncts.iter().enumerate() {
+            if let Some(pp) = analyze_property_predicate(conj, &variable.name) {
+                if let PropertyPredicateKind::Equality { value } = &pp.kind {
+                    let seek = PhysicalOp::NodeLabelScanEq {
+                        variable: variable.clone(),
+                        label: label.clone(),
+                        property: pp.property.clone(),
+                        value: value.clone(),
+                    };
+                    let residual: Vec<&Expr> = conjuncts
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, e)| *e)
+                        .collect();
+                    return attach_residual(seek, &residual);
+                }
+            }
+        }
+
+        // No index and no equality predicate: label scan (possibly token-lookup) + the full predicate as
+        // a filter.
         let scan = self.lower_label_scan(variable, label, deps);
         PhysicalOp::Filter {
             input: Box::new(scan),
@@ -1225,6 +1274,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
@@ -1290,6 +1340,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
@@ -1430,6 +1481,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
@@ -1701,8 +1753,38 @@ fn scan_alternative_for_seek(op: &PhysicalOp, catalog: &IndexCatalog) -> Option<
         PhysicalOp::Filter { input, predicate } => (Some(predicate.clone()), input.as_ref()),
         other => (None, other),
     };
+
+    // Equality seek: the scan alternative is the **precise** `NodeLabelScanEq` access path (`rmp` task
+    // #325), NOT a bare `NodeByLabelScan`/`TokenLookupScan` + equality `Filter`. The precise op consumes
+    // the equality conjunct (narrowing the SSI read footprint to the matching rows) while re-attaching
+    // any residual; this keeps the tight footprint even when the cost model reverts a non-selective
+    // *indexed* equality to a scan (otherwise the abort storm would return for that case).
+    if let PhysicalOp::NodeIndexSeek {
+        variable,
+        label,
+        property,
+        value,
+        ..
+    } = seek
+    {
+        let scan_eq = PhysicalOp::NodeLabelScanEq {
+            variable: variable.clone(),
+            label: label.clone(),
+            property: property.clone(),
+            value: value.clone(),
+        };
+        return Some(match residual {
+            Some(r) => PhysicalOp::Filter {
+                input: Box::new(scan_eq),
+                predicate: r,
+            },
+            None => scan_eq,
+        });
+    }
+
+    // Range seek: reconstruct the consumed range predicate and re-apply it (plus any residual) as a
+    // full `Filter` over the label/token scan — a range has no precise predicate marker to register.
     let (variable, label, consumed_predicate) = seek_to_predicate(seek)?;
-    // The full predicate the scan must re-apply: the seek's own predicate, plus any residual, ANDed.
     let full = match residual {
         Some(r) => and_exprs(consumed_predicate, r),
         None => consumed_predicate,
@@ -1904,6 +1986,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
@@ -2190,8 +2273,10 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::SpatialIndexSeek { index, .. } => {
             deps.insert(*index);
         }
+        // `NodeLabelScanEq` is a full store scan (no derived index), so it declares no index dependency.
         PhysicalOp::AllNodesScan { .. }
         | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => {}
@@ -2660,6 +2745,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
+        | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. } => push_unique(out, variable.clone()),
         PhysicalOp::AllRelationshipsScan {
@@ -2822,6 +2908,17 @@ impl PhysicalOp {
             } => writeln!(
                 f,
                 "NodeIndexSeek({variable}:{} {property} = {} via {index})",
+                label.name,
+                h::expr(value),
+            ),
+            Self::NodeLabelScanEq {
+                variable,
+                label,
+                property,
+                value,
+            } => writeln!(
+                f,
+                "NodeLabelScanEq({variable}:{} {property} = {})",
                 label.name,
                 h::expr(value),
             ),
@@ -3328,13 +3425,53 @@ mod tests {
     }
 
     #[test]
-    fn no_index_falls_back_to_label_scan_and_filter() {
+    fn no_index_equality_uses_precise_scan_filter_eq() {
+        // With no index, an EQUALITY predicate over a label scan lowers to the precise full-scan
+        // access path `NodeLabelScanEq` (`rmp` task #325), NOT the bare `NodeByLabelScan` + `Filter`:
+        // the precise path narrows the SSI read footprint to the matching rows. It declares no index
+        // dependency (it is a full store scan), and no residual `Filter` remains (the single equality
+        // conjunct is fully consumed by the access path).
         let catalog = IndexCatalog::empty();
         let plan = physical("MATCH (n:Person) WHERE n.age = 30 RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeLabelScanEq"), "{rendered}");
+        assert!(!rendered.contains("NodeByLabelScan"), "{rendered}");
+        assert!(!rendered.contains("NodeIndexSeek"), "{rendered}");
+        assert!(!rendered.contains("Filter"), "{rendered}");
+        assert_eq!(plan.index_dependencies().count(), 0);
+
+        // The inline-map equality spelling lowers identically (it is the same `n.id = const` predicate).
+        let plan = physical("MATCH (n:Person {id: 5}) RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeLabelScanEq"), "{rendered}");
+        assert!(!rendered.contains("NodeByLabelScan"), "{rendered}");
+
+        // A multi-conjunct equality keeps the extra conjuncts as a residual filter above the precise
+        // equality scan (the equality is consumed, the rest re-attach).
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.age = 30 AND n.name = 'x' RETURN n",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeLabelScanEq"), "{rendered}");
+        assert!(rendered.contains("Filter"), "{rendered}");
+    }
+
+    #[test]
+    fn no_index_non_equality_falls_back_to_label_scan_and_filter() {
+        // A non-equality predicate (here a function-call condition that is neither an equality nor a
+        // range/spatial property predicate) has no precise predicate marker to register, so it keeps
+        // the bare `NodeByLabelScan` + residual `Filter` shape.
+        let catalog = IndexCatalog::empty();
+        let plan = physical(
+            "MATCH (n:Person) WHERE toUpper(n.name) = 'X' RETURN n",
+            &catalog,
+        );
         let rendered = plan.to_string();
         assert!(rendered.contains("NodeByLabelScan"), "{rendered}");
         assert!(rendered.contains("Filter"), "{rendered}");
         assert!(!rendered.contains("Seek"), "{rendered}");
+        assert!(!rendered.contains("NodeLabelScanEq"), "{rendered}");
         assert_eq!(plan.index_dependencies().count(), 0);
     }
 

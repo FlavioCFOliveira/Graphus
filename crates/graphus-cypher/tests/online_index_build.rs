@@ -268,22 +268,32 @@ fn populating_build_is_not_planner_visible_until_online() {
         .begin_online_node_property_index("Person", "age")
         .expect("begin online index");
 
-    // While Populating: the catalog withholds the index, so an eq/range predicate falls back to a
-    // TokenLookupScan + Filter — but STILL returns exactly the scan rows.
+    // While Populating: the catalog withholds the *property* index, so an eq/range predicate falls
+    // back — but STILL returns exactly the scan rows. The eq predicate uses the precise full-scan
+    // `NodeLabelScanEq` access path (`rmp` task #325; narrows the SSI footprint to the matches), the
+    // range predicate uses the always-present label token-lookup + a residual `Filter`. Neither routes
+    // a NodeIndexSeek/NodeIndexRangeSeek (the property index is invisible while Populating).
     let indexed = coord.catalog();
-    for src in [
-        "MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a",
-        "MATCH (n:Person) WHERE n.age > 30 RETURN n.age AS a",
+    for (src, is_eq) in [
+        ("MATCH (n:Person) WHERE n.age = 30 RETURN n.age AS a", true),
+        ("MATCH (n:Person) WHERE n.age > 30 RETURN n.age AS a", false),
     ] {
         let plan = compile(src, &indexed);
         assert!(
             !has_index_seek(&plan) && !has_index_range_seek(&plan),
             "a Populating index must NOT drive an index seek:\n{plan}"
         );
-        assert!(
-            has_token_lookup(&plan),
-            "the Populating fallback must use a TokenLookupScan + Filter:\n{plan}"
-        );
+        if is_eq {
+            assert!(
+                plan.to_string().contains("NodeLabelScanEq"),
+                "the Populating equality fallback must use the precise NodeLabelScanEq:\n{plan}"
+            );
+        } else {
+            assert!(
+                has_token_lookup(&plan),
+                "the Populating range fallback must use a TokenLookupScan + Filter:\n{plan}"
+            );
+        }
         let via_catalog = read_sorted_ints(&mut coord, &indexed, src, "a");
         let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
         assert_eq!(

@@ -44,6 +44,7 @@
 
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value, VersionStamp};
+use graphus_index::keycodec::encode_equality_canonical;
 use graphus_io::BlockDevice;
 use graphus_storage::record::{NodeRecord, PropRecord, RelRecord};
 use graphus_storage::{MvccHeader, Namespace, RecordStore, StoreReadView, TokenSnapshot};
@@ -509,6 +510,127 @@ pub fn scan_nodes_by_label<S: StoreReadSource, K: ReadSink>(
         }
     };
     filter_label_candidates(src, ctx, sink, token_id, ids)
+}
+
+/// The **precise** equality-filtered label-scan body for `MATCH (n:Label {prop: value})` served by a
+/// full store scan (no derived property index, `rmp` task #325). It is the scan-path twin of
+/// `RecordStoreGraph::index_seek_eq`'s SSI footprint: it reads **every** live node to evaluate the
+/// predicate but builds a read **dependency** (SIREAD marker) on **only the matching nodes**, instead
+/// of the blanket `mark_all_live_nodes` the bare label scan registers.
+///
+/// # Why this is the fix for the abort storm (`rmp` #325)
+///
+/// The old equality fallback ran `scan_nodes_by_label` (which `mark_all_live_nodes`-marks every live
+/// node) and then a residual `Filter`. That blanket marker manufactured an rw-edge with **any**
+/// concurrent node writer — even one touching a node that does not match `(label, property, value)` and
+/// that the query never selected — so two transactions equality-matching **disjoint** keys conflicted
+/// reciprocally and one was falsely aborted (measured: fraud-oltp `abort_rate ≈ 0.97`). This body marks
+/// only the rows the query actually depends on, exactly as the indexed path already does (`rmp` #316).
+///
+/// # Phantom safety (identical to the indexed path, `rmp` #171/#316)
+///
+/// Serializability is preserved by two precise markers, mirroring `index_seek_eq`:
+///   1. the per-**match** SIREAD below — a concurrent modify/delete of a *matching* node closes an
+///      rw-edge (the writer's per-record `note_write` / pre-image footprint pairs with it); and
+///   2. the precise [`PredicateRead::Equality`] marker — it pairs with the writer's post-image
+///      `note_predicate_write` (driven from `reindex_node`/`create_node`, using the **same**
+///      `encode_equality_canonical` encoder), so a concurrent INSERT or an UPDATE of some other node
+///      *into* this exact `(label, property, value)` closes an rw-edge **even when this scan currently
+///      matches nothing**. A non-matching node read here is therefore *not* under-covered: it cannot
+///      silently start matching without a writer registering the paired `Equality` marker.
+///
+/// # When the precise marker cannot be formed → coarse fallback
+///
+/// The precise `Equality` marker requires the label and property-key tokens to already exist and the
+/// seek value to be equality-encodable (`Null`/`List`/`Map`/`NaN` are not). If any is absent we cannot
+/// form a marker that a writer's footprint could match, so we **fall back to the conservative
+/// `scan_nodes_by_label` footprint** (`Label`/`AllNodes` + `mark_all_live_nodes`) and filter — exactly
+/// what the path did before, and exactly what `index_seek_eq` does when it returns `None`. This keeps
+/// the "label/property does not exist yet" phantom (a concurrent `CREATE` that interns the token and
+/// inserts the first matching node) covered by the coarse marker.
+pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    label: &str,
+    property: &str,
+    seek: &Value,
+) -> Vec<NodeId> {
+    // Resolve the label + prop-key tokens (no intern — a read never mints a token) and encode the seek
+    // value canonically. If any is unavailable, the precise `Equality` marker cannot be formed, so fall
+    // back to the conservative label-scan footprint + an equality filter (phantom-safe, see the doc).
+    let (Some(label_token), Some(prop_key), Ok(encoded)) = (
+        src.token_id(Namespace::Label, label),
+        src.token_id(Namespace::PropKey, property),
+        encode_equality_canonical(seek),
+    ) else {
+        return scan_nodes_by_label(src, ctx, sink, label)
+            .into_iter()
+            .filter(|id| {
+                node_property(src, ctx, sink, *id, property)
+                    .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
+            })
+            .collect();
+    };
+
+    // The phantom-safe predicate marker: the *precise* equality predicate, so a concurrent insert /
+    // update of a node *into* this exact `(label, property, value)` closes an rw-edge even when the scan
+    // currently matches nothing. Uses the same canonical encoder the writer's `note_predicate_write`
+    // uses, so Cypher-equal values (incl. `1` vs `1.0`) register the SAME marker (`rmp` #171 blocker C1).
+    sink.note_predicate_read(PredicateRead::Equality {
+        label: label_token,
+        property: prop_key,
+        value: encoded,
+    });
+
+    // Read every live node to evaluate the predicate, but SIREAD-mark **only** the matching rows (those
+    // that are visible, carry the label, and whose current value equals `seek` by Cypher equality). A
+    // non-matching node is examined but **not** marked, so it creates no read dependency — exactly the
+    // precision `filter_label_candidates` gives the indexed path over its candidate subset, here applied
+    // to a full scan over the matching subset.
+    let ids = match src.scan_node_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(e);
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        // Visibility first (MVCC): a tombstoned / not-yet-committed node never matches.
+        let visible = match src.node(id) {
+            Ok(rec) => ctx.visible(rec.mvcc),
+            // `scan_node_ids` only yields slot-occupied ids; a transient decode fault is a real error.
+            Err(e) => {
+                sink.capture(e);
+                return Vec::new();
+            }
+        };
+        if !visible {
+            continue;
+        }
+        // Carries the label?
+        match src.node_has_label(id, label_token) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
+                sink.capture(e);
+                return Vec::new();
+            }
+        }
+        // Current value equals `seek`? Use the non-marking property read (`read_node_prop_one`) so that
+        // probing a non-matching node does NOT register a SIREAD on it — the whole point of #325.
+        let matches = read_node_prop_one(src, ctx, sink, NodeId(id), property)
+            .is_some_and(|v| crate::equality::equals(&v, seek).is_true());
+        if matches {
+            // The node is part of the result set: build the read dependency on it now (a concurrent
+            // modify/delete of *this* matching node must abort one of the two).
+            sink.note_read(node_ssi_key(id));
+            out.push(NodeId(id));
+        }
+    }
+    out
 }
 
 /// The body of `RecordStoreGraph::expand` (`GraphAccess::expand`): register the relationship-pattern

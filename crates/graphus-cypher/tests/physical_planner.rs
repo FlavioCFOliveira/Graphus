@@ -123,12 +123,16 @@ fn equality_via_explicit_where_becomes_index_seek() {
 }
 
 #[test]
-fn no_index_falls_back_to_label_scan_plus_filter() {
+fn no_index_equality_uses_precise_scan_filter_eq() {
+    // With no index, an equality predicate over a label scan lowers to the precise full-scan
+    // `NodeLabelScanEq` access path (`rmp` task #325), which narrows the SSI read footprint to only the
+    // matching nodes (vs the blanket footprint a bare `NodeByLabelScan` + `Filter` would register). It
+    // routes no index seek and declares no index dependency (it is a full store scan).
     let catalog = IndexCatalog::empty();
     let plan = physical("MATCH (n:Person {name: 'Ada'}) RETURN n", &catalog);
     let rendered = plan.to_string();
-    assert!(rendered.contains("NodeByLabelScan(n:Person)"), "{rendered}");
-    assert!(rendered.contains("Filter("), "{rendered}");
+    assert!(rendered.contains("NodeLabelScanEq(n:Person"), "{rendered}");
+    assert!(!rendered.contains("NodeByLabelScan"), "{rendered}");
     assert!(!rendered.contains("Seek"), "{rendered}");
     assert_eq!(plan.index_dependencies().count(), 0);
 }

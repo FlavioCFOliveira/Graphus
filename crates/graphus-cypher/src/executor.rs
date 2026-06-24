@@ -1581,6 +1581,28 @@ fn build_operator(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::NodeLabelScanEq {
+            variable,
+            label,
+            property,
+            value,
+        } => {
+            // The precise equality-filtered label scan (`rmp` task #325): evaluate the seek value, then
+            // route to the `scan_filter_eq` seam, which reads every node but builds an SSI dependency on
+            // only the matching rows (+ the precise `Equality` predicate marker) — the scan-path twin of
+            // `NodeIndexSeek`'s footprint, without the bare label scan's blanket "mark every node".
+            let seek = eval_value(
+                value,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, scan_filter_eq(label, property, &seek, ctx)),
+            })
+        }
         PhysicalOp::NodeIndexRangeSeek {
             variable,
             label,
@@ -2163,17 +2185,13 @@ fn all_rels_rows(
     out
 }
 
-/// Fallback equality access: scan the label and keep nodes whose property equals `seek`.
+/// Precise equality access (`rmp` task #325): the seam's `scan_filter_eq` reads every node to evaluate
+/// the predicate but registers an SSI read dependency on **only the matching nodes** plus the precise
+/// `Equality` predicate marker — the scan-path twin of `index_seek_eq`'s footprint. This replaces the
+/// old fallback that ran `scan_nodes_by_label` (marking every live node) + a residual filter, whose
+/// blanket marker produced reciprocal false aborts between transactions matching disjoint keys.
 fn scan_filter_eq(label: &Label, property: &str, seek: &Value, ctx: &Ctx<'_>) -> Vec<NodeId> {
-    ctx.graph
-        .scan_nodes_by_label(&label.name)
-        .into_iter()
-        .filter(|id| {
-            ctx.graph
-                .node_property(*id, property)
-                .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
-        })
-        .collect()
+    ctx.graph.scan_filter_eq(&label.name, property, seek)
 }
 
 /// Fallback range access: scan the label and keep nodes whose property satisfies the range bound.
@@ -5868,6 +5886,7 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
+        | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. } => vec![variable.name.clone()],
         PhysicalOp::AllRelationshipsScan {

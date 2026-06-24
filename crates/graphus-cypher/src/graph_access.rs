@@ -243,6 +243,36 @@ pub trait GraphAccess {
         None
     }
 
+    /// A **precise** equality-filtered label scan for `MATCH (n:Label {property: value})` served by a
+    /// full store scan (the path taken when no derived property index covers `(label, property)`,
+    /// `rmp` task #325).
+    ///
+    /// Semantically `scan_nodes_by_label(label)` kept to the nodes whose current `property` equals
+    /// `value` by Cypher equality — but with a **tighter SSI read footprint**: it reads every node to
+    /// evaluate the predicate yet creates a read dependency (SIREAD marker) on **only the matching
+    /// nodes**, plus the precise [`PredicateRead::Equality`](graphus_txn::PredicateRead::Equality)
+    /// predicate marker. This is the scan-path twin of [`index_seek_eq`](Self::index_seek_eq)'s footprint
+    /// (`rmp` #316): it removes the blanket "mark every live node" dependency a bare label scan registers,
+    /// which under contention manufactured reciprocal rw-edges between transactions matching **disjoint**
+    /// keys and produced a storm of false serialization aborts (measured: fraud-oltp `abort_rate ≈ 0.97`).
+    ///
+    /// Phantom safety is unchanged: the precise `Equality` marker pairs with a concurrent writer's
+    /// post-image predicate footprint (the same canonical encoding), so an insert/update *into*
+    /// `(label, property, value)` still closes an rw-edge even when this scan matches nothing.
+    ///
+    /// The **default** implementation preserves the historical coarse behaviour exactly
+    /// (`scan_nodes_by_label` + an equality filter), so reference/test seams and the `index_seek_eq`
+    /// fallback stay correct; the live store overrides it with the precise footprint.
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+        self.scan_nodes_by_label(label)
+            .into_iter()
+            .filter(|id| {
+                self.node_property(*id, property)
+                    .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+            })
+            .collect()
+    }
+
     /// An **optional** index range seek. `lower`/`upper` are `(value, inclusive)` bounds; either may
     /// be `None` for an open side. Returns `None` when no index is usable (default).
     fn index_seek_range(

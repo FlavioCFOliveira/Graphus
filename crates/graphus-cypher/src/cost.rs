@@ -246,6 +246,22 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A precise equality-filtered label scan (`rmp` task #325): it visits *every* node of the label
+        // (full-scan work, like a `NodeByLabelScan`) but **emits** only the equality-selective rows — so
+        // its row estimate is the seek's selective estimate while its cost is the full label scan. This
+        // correctly keeps it no cheaper than a bare label scan in CPU work (it has no index to narrow the
+        // read), yet its smaller output shrinks the cost of anything above it.
+        PhysicalOp::NodeLabelScanEq {
+            label,
+            property,
+            value,
+            ..
+        } => {
+            let scanned = label_scan_rows(&label.name, stats);
+            let rows = seek_eq_rows(&label.name, property, value, stats).min(scanned);
+            CostEstimate::new(rows, scanned * COST_ROW_SCAN)
+        }
+
         // A range index seek: the histogram's range estimate for the concrete bound + value (or the
         // fallback), same cost shape as the equality seek.
         PhysicalOp::NodeIndexRangeSeek {

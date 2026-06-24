@@ -57,7 +57,17 @@ fn compile(src: &str) -> PhysicalPlan {
 fn run_stmt(coord: &Coord, txn: TxnId, src: &str) -> (Vec<Row>, bool) {
     let plan = compile(src);
     let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
-    let mut graph = coord.statement(txn).expect("statement");
+    // A SERIALIZABLE commit can abort *another* still-open transaction (the poisoned-victim model:
+    // `coordinator::commit` aborts a pivot that is another open txn so a safe member can commit). That
+    // victim's next statement then fails as "inactive txn", which is **expected** serializable behaviour,
+    // not a harness error — so treat it exactly like a captured serialization failure (`ok == false`),
+    // and let the driver roll the txn out of the active set. (Before `rmp` #325 tightened the label-scan
+    // SSI footprint, the seeds here happened never to poison a cross-txn victim; the precise footprint
+    // now reaches that legitimate structure, which this harness must tolerate.)
+    let mut graph = match coord.statement(txn) {
+        Ok(graph) => graph,
+        Err(_) => return (Vec::new(), false),
+    };
     let rows = {
         let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
         cursor.collect_all().expect("collect")
