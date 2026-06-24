@@ -175,8 +175,8 @@ pub use errors::{
 };
 pub use eval::{EvalError, EvalResult, eval, eval_value};
 pub use executor::{
-    CancellationToken, Cursor, ExecError, Executor, execute, execute_with_extensions,
-    execute_with_procedures,
+    CancellationToken, Cursor, ExecError, Executor, SuspendedCursor, execute,
+    execute_with_extensions, execute_with_procedures,
 };
 pub use extension::{ExtensionRegistry, function_handler};
 pub use function_registry::{

@@ -161,14 +161,14 @@ pub(super) fn handle_run<
     metrics: &Arc<Metrics>,
     clock: &Arc<dyn Clock + Send + Sync>,
     reply: Reply<Result<RunReply, GraphusError>>,
-) -> bool {
+) -> RunOutcome {
     // Resolve the open transaction.
     let Some(tx) = open.get(&ticket.0) else {
         let _ = reply.send(Err(GraphusError::Transaction(format!(
             "run in unknown transaction {}",
             ticket.0
         ))));
-        return false;
+        return RunOutcome::Done;
     };
     let txn = tx.txn;
     let mode = tx.mode;
@@ -190,7 +190,7 @@ pub(super) fn handle_run<
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
             let _ = reply.send(Err(e));
-            return false;
+            return RunOutcome::Done;
         }
     };
     let bound = match bind_parameters(&plan, &to_parameters(params)) {
@@ -198,7 +198,7 @@ pub(super) fn handle_run<
         Err(e) => {
             finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
             let _ = reply.send(Err(GraphusError::Runtime(e.to_string())));
-            return false;
+            return RunOutcome::Done;
         }
     };
 
@@ -209,7 +209,7 @@ pub(super) fn handle_run<
         let _ = reply.send(Err(GraphusError::Transaction(
             "write statement attempted in a READ transaction".to_owned(),
         )));
-        return false;
+        return RunOutcome::Done;
     }
 
     // The egress channel: bounded for backpressure (`04 §9.3`), or unbounded for the inline
@@ -258,9 +258,9 @@ pub(super) fn handle_run<
                         // Dispatched: the reader owns the statement now. The engine does **not** commit
                         // here — it commits when it processes the reader's retirement. The open-tx entry
                         // stays in `open` (finalised at retirement); `active` keeps the reader's snapshot
-                        // pinning the GC watermark until then. Return `true` so the loop tracks it as an
-                        // in-flight reader (polls the retirement channel until it returns).
-                        return true;
+                        // pinning the GC watermark until then. Return `OffThreadReader` so the loop
+                        // tracks it as an in-flight reader (polls the retirement channel until it returns).
+                        return RunOutcome::OffThreadReader;
                     }
                     Err(returned) => {
                         // The reader queue is full: rather than block the engine, fall through to the
@@ -281,7 +281,7 @@ pub(super) fn handle_run<
                 // thread); surface it and finalise the auto-commit.
                 finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
                 let _ = reply.take().expect("reply present").send(Err(e));
-                return false;
+                return RunOutcome::Done;
             }
         }
     }
@@ -289,53 +289,157 @@ pub(super) fn handle_run<
     let row_rx = row_rx.expect("egress receiver present on the inline path");
     let reply = reply.expect("reply present on the inline path");
 
-    // Execute and stream. `produced_ok` is true iff streaming completed without a runtime error.
-    // `stream_rows` opens the cursor, sends the `RunReply` (fields + receiver) over `reply` *before*
-    // the first row (so the consumer can drain concurrently), then streams. A compile/runtime error
-    // before the first row is delivered through `reply` instead.
     // Timing is taken from the **injected [`Clock`]** rather than `Instant::now()` so the whole
     // execution path is wall-clock-free and deterministically testable (`04 §11`): production passes a
-    // [`crate::server::SystemClock`]-backed clock (latency is wall-nanos, equivalent to the previous
-    // `Instant` source for metrics), while the deterministic [`super::LocalEngine`] passes a
-    // `SimClock` so the measured latency — and therefore every observation — replays identically.
+    // [`crate::server::SystemClock`]-backed clock, while the deterministic [`super::LocalEngine`]
+    // passes a `SimClock` so the measured latency replays identically.
     let started = clock.now_nanos();
-    let produced_ok = stream_rows(
-        coordinator,
+
+    // First visit: open the seam + cursor, send the `RunReply` (fields + receiver) over `reply`
+    // **before** the first row (so the consumer drains concurrently), then push the first batch. A
+    // compile/runtime/transaction error before the first row is delivered through `reply` instead. If
+    // the bounded egress channel fills while a slow consumer drains, the cursor is **suspended** off
+    // the coordinator borrow (`rmp` task #372) and returned to the engine loop, which resumes it one
+    // batch per tick — so the engine thread never head-of-line-blocks on a full channel.
+    let mut inflight = InFlightInline {
+        cursor: None,
         txn,
+        ticket,
+        auto_commit,
+        privileges,
+        row_tx,
+        row_rx: Some(row_rx),
+        pending_row: None,
+        seam_error: None,
+        started_nanos: started,
+        query: query.to_owned(),
+    };
+    match start_inline(
+        &mut inflight,
+        coordinator,
         &plan,
         &bound,
-        privileges,
         extensions.as_ref(),
-        &row_tx,
-        row_rx,
         reply,
+    ) {
+        BatchStep::Suspended => {
+            // The channel filled on the first visit: park the statement; the loop resumes it.
+            RunOutcome::Suspended(Box::new(inflight))
+        }
+        BatchStep::Done { produced_ok } => {
+            finalize_inflight(
+                &mut inflight,
+                coordinator,
+                open,
+                produced_ok,
+                metrics,
+                clock,
+            );
+            // The egress channel closes when `inflight` (owning `row_tx`) drops at end of scope.
+            RunOutcome::Done
+        }
+    }
+}
+
+/// Runs the **first** visit of an inline statement (`rmp` task #372): opens the per-statement seam +
+/// cursor, sends the [`RunReply`] (fields + receiver) over `reply` before the first row, then pushes
+/// the first batch into the bounded egress channel. Returns [`BatchStep::Suspended`] (channel filled —
+/// the caller parks the statement) or [`BatchStep::Done`] (cursor exhausted / runtime error /
+/// disconnect / a compile-or-seam error delivered through `reply`). On suspension the cursor state is
+/// stored into `inflight.cursor` before the seam borrow drops.
+fn start_inline<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
+    inflight: &mut InFlightInline,
+    coordinator: &mut TxnCoordinator<D, S>,
+    plan: &graphus_cypher::PhysicalPlan,
+    bound: &graphus_cypher::BoundParameters,
+    extensions: &ExtensionRegistry,
+    reply: Reply<Result<RunReply, GraphusError>>,
+) -> BatchStep {
+    // Borrow the per-statement seam (dropped at end of scope — the transaction stays open across
+    // statements; on suspension a fresh seam is taken each resume).
+    let mut graph = match coordinator.statement(inflight.txn) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return BatchStep::Done { produced_ok: false };
+        }
+    };
+
+    // RBAC (rmp #93): wrap a restricted principal's seam in `AuthorizedGraph` so reads are filtered and
+    // denied writes rejected at the boundary. Unrestricted/internal/TCK → the bare seam (zero overhead,
+    // byte-identical to before). The decorator's write-denial is harvested before it drops.
+    let (step, auth_error) = match inflight.privileges.clone() {
+        Some(privileges) if !privileges.is_unrestricted() => {
+            let mut authz = AuthorizedGraph::new(&mut graph, privileges);
+            // `open_and_drive_first` detaches the cursor into `inflight.cursor` on suspension, before
+            // the `authz`/`graph` borrows drop at end of this arm.
+            let step = open_and_drive_first(inflight, plan, bound, &mut authz, extensions, reply);
+            (step, authz.take_auth_error())
+        }
+        _ => {
+            let step = open_and_drive_first(inflight, plan, bound, &mut graph, extensions, reply);
+            (step, None)
+        }
+    };
+
+    // Harvest the seam's captured deferral error for this first visit (first one wins across visits).
+    if inflight.seam_error.is_none() {
+        if let Some(err) = auth_error.or_else(|| graph.take_error()) {
+            inflight.seam_error = Some(err);
+        }
+    }
+
+    step
+}
+
+/// Opens the cursor over `graph`, sends the [`RunReply`] before the first row, and pushes the first
+/// batch (`rmp` task #372). On a [`BatchStep::Suspended`] the cursor is detached into `inflight.cursor`
+/// before returning (so the `graph` borrow is released by the caller's scope). A compile error opening
+/// the cursor, or a consumer that disconnected before receiving the reply, is handled here.
+fn open_and_drive_first(
+    inflight: &mut InFlightInline,
+    plan: &graphus_cypher::PhysicalPlan,
+    bound: &graphus_cypher::BoundParameters,
+    graph: &mut dyn GraphAccess,
+    extensions: &ExtensionRegistry,
+    reply: Reply<Result<RunReply, GraphusError>>,
+) -> BatchStep {
+    // Open the cursor and hand the consumer its receiver up front (with the column names), so it can
+    // drain the bounded channel concurrently with production.
+    let mut cursor = match execute_with_extensions(
+        plan,
+        bound,
+        graph,
+        extensions.functions_dyn(),
+        extensions.procedures_dyn(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = reply.send(Err(GraphusError::Runtime(e.to_string())));
+            return BatchStep::Done { produced_ok: false };
+        }
+    };
+    let fields: Vec<String> = cursor.columns().to_vec();
+
+    // Send the reply (fields + the consumer's receiver) before the first row.
+    let rows = RowReceiver::new(
+        inflight
+            .row_rx
+            .take()
+            .expect("INVARIANT: the first visit owns the egress receiver"),
     );
-
-    let elapsed = Duration::from_nanos(clock.now_nanos().saturating_sub(started));
-    metrics.observe_query_latency(elapsed);
-
-    // Auto-commit: commit on success, roll back on a runtime error (`04 §1.3` step 6). The commit
-    // runs while `row_tx` is still open so a commit failure (e.g. an SSI serialization abort) is
-    // delivered to the consumer as a terminal stream error — never swallowed into a false success.
-    if auto_commit {
-        finish_autocommit(coordinator, open, ticket, produced_ok, &row_tx, metrics);
+    if reply.send(Ok(RunReply { fields, rows })).is_err() {
+        // The consumer disconnected between submit and reply: nothing to stream; finalization handles
+        // the orphaned auto-commit as a (drained) success, exactly as `run_cursor` does.
+        return BatchStep::Done { produced_ok: true };
     }
-    // Closing the egress channel: every row (and any terminal auto-commit error) has been sent.
-    drop(row_tx);
 
-    // Slow-query log (`04 §9` / NFR-10): emitted after the fact so the latency is accurate.
-    if elapsed >= slow_threshold() {
-        metrics.record_slow_query();
-        tracing::warn!(
-            target: "graphus::slow_query",
-            duration_ms = elapsed.as_millis() as u64,
-            query = %truncate_for_log(query),
-            "slow query",
-        );
+    // Push the first batch.
+    let step = drive_batch(inflight, &mut cursor);
+    if matches!(step, BatchStep::Suspended) {
+        inflight.cursor = Some(cursor.suspend());
     }
-    // The statement ran inline on this engine thread (it was already committed/rolled back above), so
-    // there is no off-thread reader to track.
-    false
+    step
 }
 
 /// Compiles a query string into a physical plan via the full front-end pipeline (lex → parse →
@@ -360,91 +464,6 @@ fn compile(
     .map_err(|e| GraphusError::Compile(e.to_string()))?;
     let logical = lower(&validated);
     Ok(plan_physical_with_stats(&logical, catalog, stats))
-}
-
-/// Opens the cursor for `plan` over a per-statement seam for `txn`, sends the [`RunReply`] (fields +
-/// receiver) over `reply`, then streams each row into `row_tx`.
-///
-/// Sending the reply (with `cursor.columns()` as the fields) **before** the first row is what lets
-/// the consumer drain the bounded egress channel concurrently with production (otherwise a full
-/// channel would deadlock the engine thread against a consumer that never received its receiver). A
-/// compile/runtime/transaction error that occurs before the first row is delivered through `reply` as
-/// an `Err` (and `row_tx`/`row_rx` are dropped unused).
-///
-/// Returns `true` if execution completed with no runtime error (including the seam's captured-error
-/// channel being clean), `false` otherwise. A full bounded `row_tx` blocks here — the intended egress
-/// backpressure (`04 §9.3`).
-#[allow(clippy::too_many_arguments)] // Threads the per-statement seam + privileges + egress channel.
-fn stream_rows<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coordinator: &mut TxnCoordinator<D, S>,
-    txn: graphus_core::TxnId,
-    plan: &graphus_cypher::PhysicalPlan,
-    bound: &graphus_cypher::BoundParameters,
-    privileges: Option<EffectivePrivileges>,
-    extensions: &ExtensionRegistry,
-    row_tx: &RowSender,
-    row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
-    reply: Reply<Result<RunReply, GraphusError>>,
-) -> bool {
-    // Borrow the per-statement seam; it is dropped at the end of this scope (the transaction stays
-    // open across statements — `coordinator.statement` doc).
-    let mut graph = match coordinator.statement(txn) {
-        Ok(g) => g,
-        Err(e) => {
-            let _ = reply.send(Err(e));
-            return false;
-        }
-    };
-
-    // RBAC enforcement (rmp #93): when a restricted principal's privileges are present, wrap the seam
-    // in an `AuthorizedGraph` so every read/traversal is filtered and every denied write rejected at
-    // the `GraphAccess` boundary — uniformly for all connection types. When `privileges` is `None`
-    // (the internal/TCK/direct path) or the principal is unrestricted (an admin), no wrapper is
-    // installed and the seam runs verbatim (zero overhead). The decorator's own write-denial error is
-    // surfaced **in addition** to the seam's captured deferral error.
-    //
-    // The cursor borrows the graph (bare or wrapped) for the whole stream, so the streaming loop runs
-    // inside a scope that drops the cursor (and the wrapper) before we inspect the seam's
-    // `take_error`. `auth_error` carries any write denial back out of that scope.
-    let mut auth_error: Option<GraphusError> = None;
-    let produced_ok = match privileges {
-        Some(privileges) if !privileges.is_unrestricted() => {
-            let mut authz = AuthorizedGraph::new(&mut graph, privileges);
-            let ok = run_cursor(plan, bound, &mut authz, extensions, row_tx, row_rx, reply);
-            // Capture the decorator's write-denial (if any) before it is dropped at end of scope.
-            auth_error = authz.take_auth_error();
-            ok
-        }
-        // No restriction (no principal, or an admin): run the bare seam, byte-identically to today.
-        _ => run_cursor(plan, bound, &mut graph, extensions, row_tx, row_rx, reply),
-    };
-
-    if !produced_ok {
-        // A runtime error (or a disconnected consumer signalled as success) was already handled inside
-        // `run_cursor`; nothing more to surface.
-        return produced_ok;
-    }
-
-    // A denied write is a hard authorization failure: surface it as a terminal error item so the
-    // statement is rolled back (never committed with a half-applied or skipped write). Checked before
-    // the seam's deferral error because an authz denial is the more specific cause.
-    if let Some(err) = auth_error {
-        let _ = row_tx.send(Err(err));
-        return false;
-    }
-
-    // The seam captures deferral errors rather than emitting silently-wrong rows (the load-bearing
-    // `RecordStoreGraph` invariant); surface any as a runtime error terminal item.
-    if let Some(err) = graph.take_error() {
-        let _ = row_tx.send(Err(err));
-        return false;
-    }
-    // The caller owns `row_tx`: for an auto-commit statement it runs the COMMIT next and, on a commit
-    // failure (e.g. an SSI serialization abort), sends a terminal error through `row_tx` BEFORE
-    // dropping it — so a rolled-back auto-commit is reported to the client as a failed statement, never
-    // a silent success. When the caller drops `row_tx` the channel closes and the consumer's `recv`
-    // ends.
-    true
 }
 
 /// Opens the cursor for `plan` over `graph` (the bare seam or an [`AuthorizedGraph`] wrapper), sends
@@ -518,6 +537,297 @@ pub(super) fn run_cursor(
         }
     }
     true
+}
+
+/// The disposition of a [`handle_run`] inline statement (`rmp` task #372).
+///
+/// A statement either finishes within its first engine visit ([`Done`](RunOutcome::Done)), is handed
+/// to an off-thread reader ([`OffThreadReader`](RunOutcome::OffThreadReader), the `rmp` #336 path), or
+/// — when a slow consumer fills the bounded egress channel — is **suspended**
+/// ([`Suspended`](RunOutcome::Suspended)) so the engine thread returns to its command loop and
+/// services other commands/writes on the same database. A suspended statement is resumed one batch
+/// per loop tick by [`resume_inflight`].
+pub(super) enum RunOutcome {
+    /// The statement completed (committed/rolled back) within this visit; nothing to track.
+    Done,
+    /// The statement was dispatched to the off-thread reader pool; it retires later (`rmp` #336).
+    OffThreadReader,
+    /// The egress channel filled with a slow consumer draining; the statement's cursor was suspended
+    /// off the coordinator borrow and must be resumed batch-by-batch.
+    Suspended(Box<InFlightInline>),
+}
+
+/// A suspended inline statement parked between batches because the bounded egress channel filled
+/// (`rmp` task #372). Owns everything needed to resume on a later loop tick **without** holding the
+/// coordinator's `&mut` borrow, so the engine thread is free to serve concurrent commands/writes on
+/// the same database while a slow (even zero-draining) consumer catches up.
+///
+/// Re-binding to a fresh per-visit seam for the **same** transaction (same MVCC snapshot + the same
+/// uncommitted write buffer) keeps the continuation coherent; suspend/resume changes neither commit
+/// timing nor durability (writes apply incrementally per `next()`; durability is at commit, which
+/// still happens once the stream is exhausted — see [`SuspendedCursor`](graphus_cypher::SuspendedCursor)).
+pub(super) struct InFlightInline {
+    /// The detached cursor execution state (`None` only transiently while a batch runs).
+    cursor: Option<graphus_cypher::SuspendedCursor>,
+    /// The transaction this statement runs in (resolved to a fresh seam each resume).
+    txn: graphus_core::TxnId,
+    /// The open-tx ticket, finalised at exhaustion.
+    ticket: TxTicket,
+    /// Whether this is an auto-commit statement (commit/rollback at finalization).
+    auto_commit: bool,
+    /// The restricted principal's privileges, re-wrapping a fresh [`AuthorizedGraph`] each visit; the
+    /// unrestricted/internal path is `None`.
+    privileges: Option<EffectivePrivileges>,
+    /// The engine end of the egress channel, kept open across visits so the consumer keeps pulling
+    /// and the terminal auto-commit/runtime error still reaches it in position.
+    row_tx: RowSender,
+    /// The consumer end of the egress channel, owned only until the first visit sends the `RunReply`
+    /// (which hands it to the consumer); `None` thereafter.
+    row_rx: Option<std::sync::mpsc::Receiver<super::stream::RowItem>>,
+    /// One materialized row produced but not yet sent (the channel was full at try_send time). Held
+    /// here so no row is lost or re-pulled; sent first on the next resume.
+    pending_row: Option<Vec<graphus_cypher::MaterializedValue>>,
+    /// The first seam-captured deferral error seen across visits (the load-bearing `RecordStoreGraph`
+    /// invariant), surfaced as the terminal item at finalization — rows precede it, byte-identically
+    /// to the single-visit ordering.
+    seam_error: Option<GraphusError>,
+    /// `clock.now_nanos()` at statement start, for an accurate latency/slow-query log at finish.
+    started_nanos: u64,
+    /// The query string, kept for the slow-query log at finish.
+    query: String,
+}
+
+/// How a single resume visit ended (`rmp` task #372): either the statement is fully done (the caller
+/// finalises it), or it filled the channel again and stays suspended for a later tick.
+enum BatchStep {
+    /// The cursor exhausted (or the consumer disconnected, or a runtime/deferral error terminated the
+    /// stream): `produced_ok` is `true` iff no runtime/deferral/auth error occurred, so the caller
+    /// runs the auto-commit accordingly.
+    Done { produced_ok: bool },
+    /// The egress channel filled again; the statement stays suspended (state already stored back).
+    Suspended,
+}
+
+/// Drives **one** resume batch of a suspended inline statement on the engine thread (`rmp` task
+/// #372): opens a fresh seam for the same txn, re-binds the cursor, sends as many rows as the bounded
+/// channel accepts (starting with any `pending_row`), and either re-suspends (channel full) or runs
+/// to a terminal condition. On a terminal condition it finalises (auto-commit + latency/slow-log) and
+/// returns; on re-suspension it stores the cursor state back into `inflight`.
+///
+/// Returns `true` while the statement is still in flight (stay subscribed), `false` once finalised.
+pub(super) fn resume_inflight<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    inflight: &mut InFlightInline,
+    coordinator: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    extensions: &ExtensionRegistry,
+    metrics: &Metrics,
+    clock: &Arc<dyn Clock + Send + Sync>,
+) -> bool {
+    let step = run_batch(inflight, coordinator, extensions);
+    match step {
+        BatchStep::Suspended => true,
+        BatchStep::Done { produced_ok } => {
+            finalize_inflight(inflight, coordinator, open, produced_ok, metrics, clock);
+            false
+        }
+    }
+}
+
+/// Runs one batch of a suspended statement: a fresh seam + (optional) [`AuthorizedGraph`] wrapper, the
+/// cursor resumed over it, rows `try_send`-ed until the channel is `Full` (re-suspend) or the cursor
+/// reaches a terminal condition. Pure batch mechanics; finalization (commit/log) is the caller's.
+fn run_batch<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
+    inflight: &mut InFlightInline,
+    coordinator: &mut TxnCoordinator<D, S>,
+    extensions: &ExtensionRegistry,
+) -> BatchStep {
+    // A fresh per-visit seam for the SAME txn: same MVCC snapshot, same uncommitted write buffer (the
+    // writes a prior visit applied are owner-visible), so the cursor continues coherently. A seam
+    // error here is terminal — surface it like a deferral error.
+    let mut graph = match coordinator.statement(inflight.txn) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = inflight.row_tx.send(Err(e));
+            return BatchStep::Done { produced_ok: false };
+        }
+    };
+
+    // Take the suspended state out; it is restored (re-suspended) or consumed (done) below.
+    let suspended = inflight
+        .cursor
+        .take()
+        .expect("INVARIANT: a suspended inflight always holds its cursor between batches");
+
+    // Re-wrap in `AuthorizedGraph` for a restricted principal (rmp #93), exactly as the first visit
+    // did, so RBAC filtering/denial compose every visit. The wrapper borrows the seam, so its
+    // auth-error is harvested before it drops at the end of this scope.
+    let (step, auth_error) = match inflight.privileges.clone() {
+        Some(privileges) if !privileges.is_unrestricted() => {
+            let mut authz = AuthorizedGraph::new(&mut graph, privileges);
+            let mut cursor = suspended.resume(
+                &mut authz,
+                extensions.functions_dyn(),
+                extensions.procedures_dyn(),
+            );
+            let step = drive_batch(inflight, &mut cursor);
+            // On a re-suspension, detach the cursor state back into `inflight` BEFORE the wrapper +
+            // seam borrows drop at end of scope (so the borrow is truly released).
+            if matches!(step, BatchStep::Suspended) {
+                inflight.cursor = Some(cursor.suspend());
+            }
+            (step, authz.take_auth_error())
+        }
+        _ => {
+            let mut cursor = suspended.resume(
+                &mut graph,
+                extensions.functions_dyn(),
+                extensions.procedures_dyn(),
+            );
+            let step = drive_batch(inflight, &mut cursor);
+            if matches!(step, BatchStep::Suspended) {
+                inflight.cursor = Some(cursor.suspend());
+            }
+            (step, None)
+        }
+    };
+
+    // Harvest the seam's captured deferral error for THIS visit (a fresh error cell per `statement()`,
+    // record_graph.rs ~308): accumulate the FIRST one across visits. The seam drops at the end of this
+    // function, merging its read buffer into the shared SSI tracker (the M1 barrier) — correct, and
+    // idempotent across visits (markers are sorted/deduped).
+    if inflight.seam_error.is_none() {
+        if let Some(err) = auth_error.or_else(|| graph.take_error()) {
+            inflight.seam_error = Some(err);
+        }
+    }
+
+    step
+}
+
+/// Sends rows from a resumed `cursor` into the egress channel until it is `Full` (re-suspend) or the
+/// cursor reaches a terminal condition. The first thing sent is any `pending_row` held from the
+/// previous visit's `Full` (so no row is lost or re-pulled).
+fn drive_batch(
+    inflight: &mut InFlightInline,
+    cursor: &mut graphus_cypher::Cursor<'_>,
+) -> BatchStep {
+    use super::stream::TrySend;
+
+    // 1) Flush the held row first, if any. A `Full` here means we still cannot make progress: stay
+    //    suspended, still HOLDING the row (no `next()` is pulled, so nothing is lost or re-pulled).
+    if let Some(row) = inflight.pending_row.take() {
+        match inflight.row_tx.try_send(Ok(row)) {
+            TrySend::Sent => {}
+            TrySend::Full(item) => {
+                inflight.pending_row = Some(unwrap_row(item));
+                return BatchStep::Suspended;
+            }
+            TrySend::Disconnected(_) => {
+                // Consumer gone: finish as a (drained) success — the orphaned auto-commit is handled
+                // by finalization exactly as a normal completion (a disconnect counts as success, as
+                // in `run_cursor`).
+                return BatchStep::Done { produced_ok: true };
+            }
+        }
+    }
+
+    // 2) Pull-and-send the rest of this batch.
+    loop {
+        match cursor.next_materialized() {
+            Ok(Some(cells)) => match inflight.row_tx.try_send(Ok(cells)) {
+                TrySend::Sent => {}
+                TrySend::Full(item) => {
+                    // Channel full: park the unsent row, suspend, and yield the engine thread.
+                    inflight.pending_row = Some(unwrap_row(item));
+                    return BatchStep::Suspended;
+                }
+                TrySend::Disconnected(_) => return BatchStep::Done { produced_ok: true },
+            },
+            Ok(None) => {
+                // Cursor exhausted. A seam deferral / auth error (harvested by the caller after the
+                // seam drops) still flips this to a failure at finalization; here we report the row
+                // production itself succeeded.
+                return BatchStep::Done { produced_ok: true };
+            }
+            Err(e) => {
+                // A runtime error mid-stream is the terminal item, in the SAME position it would have
+                // in a single visit (after the rows already sent).
+                let _ = inflight
+                    .row_tx
+                    .send(Err(GraphusError::Runtime(e.to_string())));
+                return BatchStep::Done { produced_ok: false };
+            }
+        }
+    }
+}
+
+/// Recovers the row out of the `Ok(row)` item a [`super::stream::TrySend::Full`] handed back (it is
+/// always the exact item we passed to `try_send`, so this never hits the `Err` arm in practice).
+fn unwrap_row(item: super::stream::RowItem) -> Vec<graphus_cypher::MaterializedValue> {
+    // try_send only ever returns the exact `Ok(row)` item we passed in, so the `Err` arm is
+    // unreachable; default to an empty row defensively rather than panic on a corrupt invariant.
+    item.unwrap_or_default()
+}
+
+/// Finalises a suspended inline statement once its stream is exhausted (`rmp` task #372): surfaces any
+/// accumulated seam deferral error as the terminal item (rows precede it — byte-identical ordering to
+/// the single-visit path, where `stream_rows` sent `take_error` before `handle_run`'s commit), runs
+/// the auto-commit (or rolls back on failure), closes the egress channel, and emits the latency /
+/// slow-query log from the stored `started_nanos`.
+///
+/// The auto-commit semantics are **identical** to the single-visit path: [`finish_autocommit`] is
+/// called at the same point relative to the still-open `row_tx`, so the terminal-error / auto-commit /
+/// explicit-txn contracts are preserved. An explicit (non-auto-commit) statement is not committed here
+/// — its `BEGIN…COMMIT` does that — exactly as before.
+fn finalize_inflight<D: BlockDevice, S: LogSink>(
+    inflight: &mut InFlightInline,
+    coordinator: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    produced_ok: bool,
+    metrics: &Metrics,
+    clock: &Arc<dyn Clock + Send + Sync>,
+) {
+    // A seam-captured deferral error (the load-bearing `RecordStoreGraph` invariant) is the terminal
+    // item, sent after every row — and it flips the statement to a failure so the auto-commit rolls
+    // back rather than commits silently-wrong rows.
+    let mut produced_ok = produced_ok;
+    if produced_ok {
+        if let Some(err) = inflight.seam_error.take() {
+            let _ = inflight.row_tx.send(Err(err));
+            produced_ok = false;
+        }
+    }
+
+    // Auto-commit: commit on success, roll back on a runtime/deferral error — while `row_tx` is still
+    // open so a commit failure (e.g. an SSI serialization abort) reaches the consumer as a terminal
+    // error, never swallowed into a false success (`04 §1.3` step 6; the rmp #238 atomicity divergence).
+    if inflight.auto_commit {
+        finish_autocommit(
+            coordinator,
+            open,
+            inflight.ticket,
+            produced_ok,
+            &inflight.row_tx,
+            metrics,
+        );
+    }
+
+    // Latency + slow-query log, measured from statement start (`04 §9` / NFR-10). Emitted at finish so
+    // the latency spans the whole — possibly suspended — stream, exactly as the single-visit path.
+    let elapsed = Duration::from_nanos(clock.now_nanos().saturating_sub(inflight.started_nanos));
+    metrics.observe_query_latency(elapsed);
+    if elapsed >= slow_threshold() {
+        metrics.record_slow_query();
+        tracing::warn!(
+            target: "graphus::slow_query",
+            duration_ms = elapsed.as_millis() as u64,
+            query = %truncate_for_log(&inflight.query),
+            "slow query",
+        );
+    }
 }
 
 /// Builds a [`Parameters`] set from the `(name, value)` pairs the seam passed in.

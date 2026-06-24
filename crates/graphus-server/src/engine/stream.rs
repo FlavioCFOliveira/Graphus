@@ -60,6 +60,44 @@ impl RowSender {
             RowSender::Unbounded(s) => s.send(item),
         }
     }
+
+    /// **Non-blocking** push of one row item, for the resumable-cursor egress path (`rmp` task #372).
+    ///
+    /// Unlike [`send`](Self::send) this never blocks the engine thread on a full bounded channel:
+    /// when the channel is full it returns [`TrySend::Full`] carrying the **unsent** item back, so
+    /// the caller can re-suspend its cursor while *holding* that one row (no row is lost or
+    /// re-pulled). The [`Unbounded`](RowSender::Unbounded) variant (the inline
+    /// [`super::LocalEngine`]/DST driver) never reports `Full` — its `send` cannot block — so the
+    /// resumable path collapses to today's behaviour and bit-determinism is preserved.
+    pub fn try_send(&self, item: RowItem) -> TrySend {
+        match self {
+            RowSender::Bounded(s) => match s.try_send(item) {
+                Ok(()) => TrySend::Sent,
+                Err(std::sync::mpsc::TrySendError::Full(item)) => TrySend::Full(item),
+                Err(std::sync::mpsc::TrySendError::Disconnected(item)) => {
+                    TrySend::Disconnected(item)
+                }
+            },
+            // Unbounded never blocks: a successful enqueue is `Sent`; the only failure is a dropped
+            // receiver, which is `Disconnected`. `Full` is therefore unreachable here (preserving the
+            // inline driver's determinism — see the type doc).
+            RowSender::Unbounded(s) => match s.send(item) {
+                Ok(()) => TrySend::Sent,
+                Err(std::sync::mpsc::SendError(item)) => TrySend::Disconnected(item),
+            },
+        }
+    }
+}
+
+/// The outcome of a non-blocking [`RowSender::try_send`] (`rmp` task #372).
+pub enum TrySend {
+    /// The item was enqueued.
+    Sent,
+    /// The bounded channel was full; the **unsent** item is returned so the caller can hold it and
+    /// retry after re-suspending (never produced by the unbounded variant).
+    Full(RowItem),
+    /// The consumer dropped its receiver; the item could not be delivered (early disconnect).
+    Disconnected(RowItem),
 }
 
 /// Builds an egress channel of `capacity`: bounded (backpressure) for any finite value, or unbounded

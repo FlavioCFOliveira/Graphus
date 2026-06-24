@@ -5609,6 +5609,95 @@ impl<'a> Cursor<'a> {
     pub fn materialize_row(&mut self, row: &Row) -> Vec<crate::result::MaterializedValue> {
         crate::result::materialize_row(self.graph, row)
     }
+
+    /// Detaches this cursor's **owned execution state** from the borrowed graph seam, releasing the
+    /// `&mut dyn GraphAccess` / registry borrows so another command can take the coordinator's
+    /// `&mut` (`rmp` task #372 — resumable cursor for egress backpressure without head-of-line
+    /// blocking the engine thread).
+    ///
+    /// The returned [`SuspendedCursor`] carries no lifetime: it owns the [`Operator`] state machine
+    /// (which touches the graph only transiently through a per-`next()` [`Ctx`]), the bound
+    /// parameters, the cancellation token, the per-statement clock, the morsel-thread count, the
+    /// result columns, and the `finished`/`emits_rows` flags. [`SuspendedCursor::resume`] re-binds it
+    /// to a **fresh per-visit seam for the same transaction** (the same MVCC snapshot + the same
+    /// uncommitted write buffer, so continuation is coherent) and yields an equivalent [`Cursor`].
+    ///
+    /// Suspend/resume changes neither commit timing nor durability: write side effects already apply
+    /// incrementally per `next()` into the shared store, and durability happens only at commit (after
+    /// the stream is exhausted). Resuming over a different graph state is **not** supported and would
+    /// be a logic error — the contract is "same txn, fresh seam".
+    pub fn suspend(self) -> SuspendedCursor {
+        SuspendedCursor {
+            root: self.root,
+            params: self.params,
+            token: self.token,
+            clock: self.clock,
+            morsel_threads: self.morsel_threads,
+            columns: self.columns,
+            finished: self.finished,
+            emits_rows: self.emits_rows,
+        }
+    }
+}
+
+/// A [`Cursor`]'s owned execution state, detached from any graph borrow (`rmp` task #372).
+///
+/// Produced by [`Cursor::suspend`] and turned back into a live [`Cursor`] by
+/// [`resume`](Self::resume). Holding one of these lets the engine thread park a slow consumer's
+/// stream *without* keeping the coordinator's `&mut` borrow, so it returns to its command loop and
+/// services concurrent writes/commands on the same database between batches.
+#[must_use = "a suspended cursor yields no rows unless resumed"]
+pub struct SuspendedCursor {
+    root: Operator,
+    params: BoundParameters,
+    token: CancellationToken,
+    clock: StatementClock,
+    morsel_threads: usize,
+    columns: Vec<String>,
+    finished: bool,
+    emits_rows: bool,
+}
+
+impl SuspendedCursor {
+    /// The result column names, in order — unchanged across suspend/resume.
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// `true` once the operator tree is exhausted (no more rows will ever be produced). When this is
+    /// set the engine can finalize immediately without a further [`resume`](Self::resume).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Re-binds the suspended execution state to `graph` + the function/procedure registries, for the
+    /// **same transaction** the cursor originally ran against (`rmp` task #372).
+    ///
+    /// The caller MUST pass a fresh seam for the same txn (same MVCC snapshot + the same uncommitted
+    /// write buffer); the operator state continues coherently because it reads only through the
+    /// per-`next()` [`Ctx`] built from these borrows.
+    pub fn resume<'a>(
+        self,
+        graph: &'a mut dyn GraphAccess,
+        functions: &'a dyn FunctionRegistry,
+        procedures: &'a dyn ProcedureRegistry,
+    ) -> Cursor<'a> {
+        Cursor {
+            root: self.root,
+            params: self.params,
+            token: self.token,
+            graph,
+            functions,
+            procedures,
+            clock: self.clock,
+            morsel_threads: self.morsel_threads,
+            columns: self.columns,
+            finished: self.finished,
+            emits_rows: self.emits_rows,
+        }
+    }
 }
 
 /// The compiled executor for one plan: holds the plan + parameters and opens [`Cursor`]s over a

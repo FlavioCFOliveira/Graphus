@@ -166,6 +166,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // is processed promptly even if no client command arrives. Incremented at dispatch, decremented as
     // each retirement is processed.
     let mut readers_inflight: u64 = 0;
+    // The single suspended inline statement, if any (`rmp` task #372). An inline `Run` whose bounded
+    // egress channel fills with a slow consumer draining is parked here instead of blocking this
+    // thread on `row_tx.send`; the loop resumes it one batch per tick (gated into `timed` below) until
+    // its cursor exhausts. At most one exists at a time — the engine processes one `Run` per tick.
+    let mut inflight: Option<exec::InFlightInline> = None;
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
@@ -192,14 +197,29 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &metrics,
         );
 
+        // Resume one batch of the suspended inline statement, if any (`rmp` task #372). Done each tick
+        // — before the (timed) command receive — so a draining consumer makes progress promptly even
+        // when no client command arrives. `resume_inflight` returns `false` once the statement is
+        // finalised (cursor exhausted / runtime error / disconnect), clearing the slot. Because this
+        // runs between commands, a concurrent write/command on the SAME database is serviced on the
+        // very next tick even while the consumer drains zero rows — the head-of-line block is gone.
+        if let Some(parked) = inflight.as_mut() {
+            if let Some(coord) = coordinator.as_mut() {
+                if !exec::resume_inflight(parked, coord, &mut open, &extensions, &metrics, &clock) {
+                    inflight = None;
+                }
+            }
+        }
+
         // A timed receive is needed when EITHER a non-blocking index build is in progress (`rmp` #91)
-        // OR readers are in flight (so their retirements are polled). Otherwise block plainly (no idle
-        // wakeups — a fully idle engine with no readers/builds parks on `recv` exactly as before).
+        // OR readers are in flight (so their retirements are polled) OR a suspended inline statement is
+        // parked (so it is resumed each tick even with no command). Otherwise block plainly (no idle
+        // wakeups — a fully idle engine with nothing pending parks on `recv` exactly as before).
         let building = coordinator
             .as_ref()
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .has_pending_index_builds();
-        let timed = building || readers_inflight > 0;
+        let timed = building || readers_inflight > 0 || inflight.is_some();
 
         if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
@@ -212,6 +232,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &extensions,
                         &dispatch,
                         &mut readers_inflight,
+                        &mut inflight,
                         result_buffer_capacity,
                         &metrics,
                         &clock,
@@ -241,6 +262,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &extensions,
                 &dispatch,
                 &mut readers_inflight,
+                &mut inflight,
                 result_buffer_capacity,
                 &metrics,
                 &clock,
@@ -413,6 +435,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &mut u64,
+    inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
@@ -439,7 +462,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             privileges,
             reply,
         } => {
-            let dispatched_off_thread = exec::handle_run(
+            let outcome = exec::handle_run(
                 coord,
                 open,
                 ticket,
@@ -454,11 +477,23 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 clock,
                 reply,
             );
-            // A read dispatched off-thread retires later (it is not yet finalised); track it so the
-            // engine loop polls the retirement channel until it returns. An inline statement already
-            // committed/rolled back here, so nothing to track.
-            if dispatched_off_thread {
-                *readers_inflight += 1;
+            match outcome {
+                // A read dispatched off-thread retires later (it is not yet finalised); track it so
+                // the engine loop polls the retirement channel until it returns.
+                exec::RunOutcome::OffThreadReader => *readers_inflight += 1,
+                // The egress channel filled with a slow consumer draining (`rmp` task #372): park the
+                // statement so the loop resumes it one batch per tick without head-of-line-blocking
+                // this thread. There is at most one in-flight inline statement (the engine processes
+                // one `Run` at a time), so a single slot suffices.
+                exec::RunOutcome::Suspended(parked) => {
+                    debug_assert!(
+                        inflight.is_none(),
+                        "INVARIANT: at most one suspended inline statement at a time"
+                    );
+                    *inflight = Some(*parked);
+                }
+                // An inline statement that finished within its visit already committed/rolled back.
+                exec::RunOutcome::Done => {}
             }
             metrics.set_active_txns(coord.active_count() as u64);
         }

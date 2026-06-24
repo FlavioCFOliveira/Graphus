@@ -117,6 +117,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Dispatches one command inline against the coordinator, returning whether the engine is still
     /// live (`false` after a [`EngineCommand::Shutdown`] consumed the coordinator).
     fn dispatch(&mut self, cmd: EngineCommand) -> bool {
+        // The inline DST driver uses an UNBOUNDED egress channel (`LOCAL_RESULT_BUFFER`), so
+        // `try_send` never reports `Full` and the resumable-cursor path (`rmp` task #372) never
+        // suspends — `handle_run` always returns `Done`/`OffThreadReader`. A never-populated slot
+        // preserves the inline driver's bit-determinism (asserted below).
+        let mut inflight = None;
         let live = dispatch_command(
             cmd,
             &mut self.coordinator,
@@ -125,9 +130,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &self.extensions,
             &self.dispatch,
             &mut self.readers_inflight,
+            &mut inflight,
             LOCAL_RESULT_BUFFER,
             &self.metrics,
             &self.clock,
+        );
+        debug_assert!(
+            inflight.is_none(),
+            "INVARIANT: the unbounded inline DST driver never suspends a cursor (rmp #372)"
         );
         // The threaded loop drives non-blocking index builds between commands; inline, drive any
         // pending build to completion now so a `CREATE INDEX` is fully `Online` before the next
