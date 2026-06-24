@@ -27,15 +27,24 @@
 //! `deny` and the `uring` module scopes an `allow`, with every `unsafe` block documented by a
 //! `// SAFETY:` comment. The portable default never compiles any `unsafe`.
 // `forbid(unsafe_code)` is kept for the portable, non-macOS default build. macOS needs one scoped
-// `unsafe` block (`fcntl(fd, F_FULLFSYNC)` in `fullsync.rs`) to issue a true stable-storage barrier,
-// and the optional `io-uring` feature needs the probe's `unsafe`; both relax the crate lint to
-// `deny` (so a stray `unsafe` anywhere else still fails the build) while letting those two
-// `// SAFETY:`-documented blocks compile.
+// `unsafe` block (`fcntl(fd, F_FULLFSYNC)` in `fullsync.rs`) to issue a true stable-storage barrier;
+// the optional `io-uring` feature needs the probe's `unsafe`; and the optional `pwritev` feature
+// needs the scatter/gather `pwritev(2)` block in `file.rs` (a copy-free coalesced checkpoint write,
+// Linux only, `rmp` #374). All three relax the crate lint to `deny` (so a stray `unsafe` anywhere
+// else still fails the build) while letting those `// SAFETY:`-documented blocks compile. With none
+// of them enabled, the build stays `forbid(unsafe_code)` and compiles no `unsafe` at all.
 #![cfg_attr(
-    all(not(feature = "io-uring"), not(target_os = "macos")),
+    all(
+        not(feature = "io-uring"),
+        not(feature = "pwritev"),
+        not(target_os = "macos")
+    ),
     forbid(unsafe_code)
 )]
-#![cfg_attr(any(feature = "io-uring", target_os = "macos"), deny(unsafe_code))]
+#![cfg_attr(
+    any(feature = "io-uring", feature = "pwritev", target_os = "macos"),
+    deny(unsafe_code)
+)]
 
 mod block;
 mod file;

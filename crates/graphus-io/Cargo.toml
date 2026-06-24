@@ -23,6 +23,15 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # baseline always carries correctness; this is a perf path with guaranteed fallback.
 io-uring = ["dep:libc"]
 
+# Optional Linux-only copy-free coalesced checkpoint write (`rmp` #374, `04 §3.6`). When enabled on
+# Linux, `FileBlockDevice::write_pages` emits a contiguous run of dirty pages with one scatter/gather
+# `pwritev(2)` that borrows the page buffers directly (no staging copy), instead of the portable
+# safe fallback (one concatenated `write_all_at`). It carries a single, narrowly-scoped, `// SAFETY:`
+# -documented `unsafe` block — exactly like the `io-uring` probe — so the default build (feature off)
+# stays `#![forbid(unsafe_code)]`. `libc` is already an unconditional `cfg(unix)` dependency below,
+# so this feature pulls in nothing new; it only unlocks the fast path and relaxes the crate lint.
+pwritev = []
+
 [dependencies]
 # Shared error taxonomy / IDs. The new async layer surfaces `std::io::Result` at its edges (it is a
 # low-level substrate the server (#20) maps onto `GraphusError`), so `graphus-core` is used lightly

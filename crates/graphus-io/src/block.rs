@@ -27,6 +27,34 @@ pub trait BlockDevice {
     /// Writes `buf` to page `page`. The write may be buffered until a subsequent sync.
     fn write_page(&mut self, page: PageId, buf: &Page) -> Result<()>;
 
+    /// Writes a run of `pages` to consecutive page ids starting at `base`: `pages[i]` lands on
+    /// page `base + i`. The pages are assumed to be at *contiguous* (adjacent) offsets; the caller
+    /// (the buffer pool's checkpoint/flush) groups its dirty frames into contiguous runs and emits
+    /// each run through this method so a device that supports it can collapse the run into a single
+    /// vectored/sequential write — far fewer syscalls than one `write_page` per page (`rmp` #374).
+    ///
+    /// The default implementation simply loops [`write_page`](Self::write_page), so every device
+    /// keeps working unchanged (and, crucially, the in-memory DST device keeps its per-page
+    /// fault-injection semantics — torn writes, misdirected writes, armed I/O errors all still fire
+    /// per page). A device overrides this only to coalesce the syscalls; the bytes written, the
+    /// offsets, and the per-page durability contract are identical to the per-page path.
+    ///
+    /// # Errors
+    /// Propagates the first device-write failure. On error, an unspecified prefix of the run may
+    /// have reached the device's buffers (exactly as with a sequence of `write_page` calls); the
+    /// caller's WAL + recovery make a partial write-back recoverable.
+    fn write_pages(&mut self, base: PageId, pages: &[&Page]) -> Result<()> {
+        for (i, page) in pages.iter().enumerate() {
+            let id = PageId(base.0.checked_add(i as u64).ok_or_else(|| {
+                graphus_core::error::GraphusError::Storage(
+                    "page id overflow in write_pages run".to_owned(),
+                )
+            })?);
+            self.write_page(id, page)?;
+        }
+        Ok(())
+    }
+
     /// Flushes file data (and the minimum metadata needed to read it back) durably.
     fn sync_data(&mut self) -> Result<()>;
 

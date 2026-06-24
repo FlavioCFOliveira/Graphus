@@ -795,11 +795,95 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// # Errors
     /// Propagates the first WAL-rule, device-write or sync failure.
     pub fn flush_all(&self) -> Result<()> {
-        for slot in &self.frames {
-            let mut meta = unwrap_lock(slot.meta.write());
-            self.write_back(&mut meta, false)?;
+        // Coalesced checkpoint write-back (`rmp` #374). The old loop issued one `write_page`
+        // syscall per dirty frame, each under the exclusive device guard — a checkpoint after a
+        // sequential bulk load (dirty pages with *adjacent* page ids) paid N serialised `pwrite`s.
+        // Here we sort the dirty frames by page id, coalesce contiguous runs, and emit each run as
+        // one `write_pages` call (a single `pwrite` over the concatenated run on the file device).
+        //
+        // Latch protocol: we take each dirty frame's **write** latch and hold it for the whole
+        // batch — released only after the run it belongs to has been written and the frame marked
+        // clean. Holding the latch across the device write is exactly what `write_back` does per
+        // frame; doing it for a run prevents a concurrent writer from re-dirtying/mutating a page's
+        // bytes after we staged them but before they reach the device (no torn write), and prevents
+        // the evictor (`select_victim` uses `try_write`, never blocking) from stealing a frame
+        // mid-write-back. Latches are acquired in **frame-index order** (the `self.frames` scan
+        // order), the same order eviction would, so there is no lock-ordering cycle.
+        //
+        // The per-page durability contract of `write_back` is preserved exactly: for every dirty
+        // page we stamp its checksum and run `ensure_durable(page_lsn)` (the WAL-before-data rule)
+        // *before* its bytes are written home, and the single trailing `sync_all` barrier is issued
+        // once, after the whole batch — identical to before.
+        //
+        // The documented concurrency contract (storage audit F12) is unchanged: a frame re-dirtied
+        // after its latch is released here is captured by a later `flush_all`; a sharp checkpoint
+        // still requires the (single-writer) engine to quiesce writers, which it does by construction.
+
+        // Phase 1: collect the dirty frames with their latches held. We hold every dirty frame's
+        // write guard until the batch completes; clean frames are released immediately.
+        let mut guards: Vec<(usize, RwLockWriteGuard<'_, FrameMeta>)> = Vec::new();
+        for (idx, slot) in self.frames.iter().enumerate() {
+            let meta = unwrap_lock(slot.meta.write());
+            if meta.dirty {
+                guards.push((idx, meta));
+            }
         }
-        self.write_device().sync_all()
+        if guards.is_empty() {
+            return self.write_device().sync_all();
+        }
+
+        // Phase 2: per-page WAL-before-data. Stamp each dirty page's checksum and ensure the WAL is
+        // durable through its `page_lsn` BEFORE any of its bytes are written back. This reproduces
+        // `write_back`'s ordering for every page in the batch. A `page_id` is required for a dirty
+        // frame (same invariant as `write_back`).
+        for (idx, meta) in &mut guards {
+            let page_id = meta.page_id.ok_or_else(|| {
+                GraphusError::Storage("a dirty frame must hold a page".to_owned())
+            })?;
+            page::write_checksum(&mut meta.data);
+            let lsn = page::page_lsn(&meta.data);
+            debug_assert!(
+                lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
+                "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did \
+                 not stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
+                page_id.0
+            );
+            self.ensure_durable(lsn)?;
+            let _ = idx;
+        }
+
+        // Phase 3: order the held frames by page id and coalesce contiguous runs. A gap in page
+        // ids (next.page_id != prev.page_id + 1) breaks the run, so only pages at adjacent file
+        // offsets are ever combined into one vectored/sequential device write.
+        guards.sort_by_key(|(_, meta)| meta.page_id.expect("dirty frame holds a page").0);
+        let mut device = self.write_device();
+        let mut run_start = 0usize; // index into `guards` where the current run begins
+        for i in 1..=guards.len() {
+            let break_run = i == guards.len() || {
+                let prev = guards[i - 1].1.page_id.expect("dirty frame holds a page").0;
+                let cur = guards[i].1.page_id.expect("dirty frame holds a page").0;
+                cur != prev + 1
+            };
+            if break_run {
+                let base = guards[run_start]
+                    .1
+                    .page_id
+                    .expect("dirty frame holds a page");
+                let run: Vec<&Page> = guards[run_start..i]
+                    .iter()
+                    .map(|(_, meta)| &*meta.data)
+                    .collect();
+                device.write_pages(base, &run)?;
+                run_start = i;
+            }
+        }
+
+        // Phase 4: the bytes are home — mark every flushed frame clean, then issue the single
+        // trailing durability barrier exactly once.
+        for (_, meta) in &mut guards {
+            meta.dirty = false;
+        }
+        device.sync_all()
     }
 
     /// A snapshot count of currently dirty frames (diagnostics / tests).
@@ -1499,6 +1583,209 @@ mod tests {
         );
     }
 
+    /// `rmp` #374: a `flush_all` of many dirty frames whose page ids are **contiguous** must (a)
+    /// coalesce into far fewer device write operations than one-per-page, and (b) leave a
+    /// byte-identical on-disk image. We wrap a real `FileBlockDevice` (the only device that actually
+    /// coalesces) in a counter that records every `write_pages` run and every `write_page` call,
+    /// then compare against an independently-built per-page reference image.
+    #[test]
+    fn flush_all_coalesces_contiguous_runs_and_is_byte_identical() {
+        use graphus_io::FileBlockDevice;
+
+        struct CountingFile {
+            inner: FileBlockDevice,
+            runs: StdArc<AtomicU64>, // # of write_pages calls (≈ syscalls on the file device)
+            single_writes: StdArc<AtomicU64>, // # of bare write_page calls
+        }
+        impl BlockDevice for CountingFile {
+            fn read_page(&self, page: PageId, buf: &mut Page) -> Result<()> {
+                self.inner.read_page(page, buf)
+            }
+            fn write_page(&mut self, page: PageId, buf: &Page) -> Result<()> {
+                self.single_writes.fetch_add(1, StdOrdering::SeqCst);
+                self.inner.write_page(page, buf)
+            }
+            fn write_pages(&mut self, base: PageId, pages: &[&Page]) -> Result<()> {
+                self.runs.fetch_add(1, StdOrdering::SeqCst);
+                self.inner.write_pages(base, pages)
+            }
+            fn sync_data(&mut self) -> Result<()> {
+                self.inner.sync_data()
+            }
+            fn sync_all(&mut self) -> Result<()> {
+                self.inner.sync_all()
+            }
+            fn page_count(&self) -> u64 {
+                self.inner.page_count()
+            }
+            fn extend(&mut self, additional: u64) -> Result<()> {
+                self.inner.extend(additional)
+            }
+        }
+
+        fn tmp(tag: &str) -> std::path::PathBuf {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, StdOrdering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "graphus-bufpool-374-{}-{tag}-{n}.blk",
+                std::process::id()
+            ))
+        }
+
+        const N: usize = 16;
+        let coalesced_path = tmp("coalesced");
+        let reference_path = tmp("reference");
+
+        // Build the pool over the counting file device. A pool capacity >= N keeps every page
+        // resident and dirty until the single flush_all, so the run is one contiguous span 0..N.
+        let runs = StdArc::new(AtomicU64::new(0));
+        let singles = StdArc::new(AtomicU64::new(0));
+        let dev = CountingFile {
+            inner: FileBlockDevice::open(&coalesced_path).unwrap(),
+            runs: runs.clone(),
+            single_writes: singles.clone(),
+        };
+        let pool = ConcurrentBufferPool::new(dev, N + 4);
+
+        // Allocate N pages (ids 0..N, contiguous) and stamp a distinct body byte into each.
+        let mut ids = Vec::new();
+        for i in 0..N {
+            let (f, id) = pool.new_page().unwrap();
+            pool.with_page_mut_lsn(f, Lsn((i as u64) + 1), |p| p[200] = 0xB0 ^ (i as u8));
+            pool.unpin(f);
+            ids.push(id);
+        }
+        // Sanity: page ids are the contiguous run 0..N.
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(id.0, i as u64, "expected contiguous page ids from new_page");
+        }
+
+        pool.flush_all().unwrap();
+
+        // (a) Coalescing: the whole contiguous span collapsed to a single write_pages run, and the
+        // default per-page loop was NOT taken on this path.
+        assert_eq!(
+            runs.load(StdOrdering::SeqCst),
+            1,
+            "N contiguous dirty pages must coalesce into exactly ONE write_pages run"
+        );
+        assert_eq!(
+            singles.load(StdOrdering::SeqCst),
+            0,
+            "the coalesced flush must not fall back to per-page write_page"
+        );
+
+        // Build the per-page reference image independently: same ids, same bytes, same checksums.
+        {
+            let mut ref_dev = FileBlockDevice::open(&reference_path).unwrap();
+            ref_dev.extend(N as u64).unwrap();
+            for i in 0..N {
+                let mut page = [0u8; PAGE_SIZE];
+                page::set_page_id(&mut page, i as u64);
+                page::set_page_lsn(&mut page, Lsn((i as u64) + 1));
+                page[200] = 0xB0 ^ (i as u8);
+                page::write_checksum(&mut page);
+                ref_dev.write_page(PageId(i as u64), &page).unwrap();
+            }
+            ref_dev.sync_all().unwrap();
+        }
+
+        // (b) Byte-identical on-disk image.
+        let a = std::fs::read(&coalesced_path).unwrap();
+        let b = std::fs::read(&reference_path).unwrap();
+        assert_eq!(
+            a, b,
+            "coalesced flush_all image must be byte-identical to the per-page reference image"
+        );
+
+        std::fs::remove_file(&coalesced_path).ok();
+        std::fs::remove_file(&reference_path).ok();
+    }
+
+    /// `rmp` #374: a **gap** in dirty page ids must break the coalesced run — only adjacent offsets
+    /// are combined. We make pages 0,1 and 3 dirty (page 2 untouched/clean) and assert flush_all
+    /// emits two separate runs.
+    #[test]
+    fn flush_all_gap_breaks_into_two_runs() {
+        struct RunCounter {
+            inner: MemBlockDevice,
+            runs: StdArc<AtomicU64>,
+            run_lens: StdArc<StdMutex<Vec<usize>>>,
+        }
+        impl BlockDevice for RunCounter {
+            fn read_page(&self, page: PageId, buf: &mut Page) -> Result<()> {
+                self.inner.read_page(page, buf)
+            }
+            fn write_page(&mut self, page: PageId, buf: &Page) -> Result<()> {
+                self.inner.write_page(page, buf)
+            }
+            fn write_pages(&mut self, base: PageId, pages: &[&Page]) -> Result<()> {
+                self.runs.fetch_add(1, StdOrdering::SeqCst);
+                self.run_lens.lock().unwrap().push(pages.len());
+                // Default-style fan-out to the underlying mem device (preserves its semantics).
+                for (i, p) in pages.iter().enumerate() {
+                    self.inner.write_page(PageId(base.0 + i as u64), p)?;
+                }
+                Ok(())
+            }
+            fn sync_data(&mut self) -> Result<()> {
+                self.inner.sync_data()
+            }
+            fn sync_all(&mut self) -> Result<()> {
+                self.inner.sync_all()
+            }
+            fn page_count(&self) -> u64 {
+                self.inner.page_count()
+            }
+            fn extend(&mut self, additional: u64) -> Result<()> {
+                self.inner.extend(additional)
+            }
+        }
+
+        let runs = StdArc::new(AtomicU64::new(0));
+        let run_lens = StdArc::new(StdMutex::new(Vec::new()));
+        let dev = RunCounter {
+            inner: MemBlockDevice::new(0),
+            runs: runs.clone(),
+            run_lens: run_lens.clone(),
+        };
+        let pool = ConcurrentBufferPool::new(dev, 8);
+
+        // Allocate pages 0,1,2,3. Flush 2 to disk and leave it CLEAN; dirty 0,1,3.
+        let mut frames = Vec::new();
+        for i in 0..4u64 {
+            let (f, id) = pool.new_page().unwrap();
+            assert_eq!(id.0, i);
+            frames.push(f);
+        }
+        // Dirty 0,1,3 via a stamped mutation; flush page 2 alone so it is clean at flush_all time.
+        for &i in &[0usize, 1, 3] {
+            pool.with_page_mut_lsn(frames[i], Lsn((i as u64) + 1), |p| p[10] = i as u8);
+        }
+        pool.flush(frames[2]).unwrap(); // page 2 written + marked clean
+        for f in &frames {
+            pool.unpin(*f);
+        }
+        // Reset the run counter so we only observe the flush_all below.
+        runs.store(0, StdOrdering::SeqCst);
+        run_lens.lock().unwrap().clear();
+
+        pool.flush_all().unwrap();
+
+        assert_eq!(
+            runs.load(StdOrdering::SeqCst),
+            2,
+            "dirty pages 0,1 and 3 with a clean gap at 2 must form exactly two runs"
+        );
+        let mut lens = run_lens.lock().unwrap().clone();
+        lens.sort_unstable();
+        assert_eq!(
+            lens,
+            vec![1, 2],
+            "runs must be [0,1] (len 2) and [3] (len 1)"
+        );
+    }
+
     #[test]
     fn multithreaded_stress_no_panic_and_consistent() {
         // Many threads hammer fetch/unpin/new_page on a shared pool; assert invariants hold and
@@ -1567,6 +1854,131 @@ mod tests {
         for &id in ids.iter() {
             let f = pool.fetch(id).unwrap();
             pool.unpin(f);
+        }
+    }
+
+    /// `rmp` #374 measurement (run with `--ignored --nocapture`): a checkpoint of N contiguous dirty
+    /// pages issues ONE coalesced device write versus N per-page writes, with the wall-clock for
+    /// each, over a real `FileBlockDevice` (so the syscall count is real `pwrite`s). Reports the
+    /// device-write-op count and elapsed time for both the coalesced `flush_all` and a per-page loop.
+    #[test]
+    #[ignore = "measurement bench; run explicitly with --ignored --nocapture"]
+    fn bench_flush_all_coalesced_vs_per_page() {
+        use graphus_io::FileBlockDevice;
+        use std::time::Instant;
+
+        struct CountingFile {
+            inner: FileBlockDevice,
+            ops: StdArc<AtomicU64>, // every device write op (write_page OR write_pages run)
+        }
+        impl BlockDevice for CountingFile {
+            fn read_page(&self, page: PageId, buf: &mut Page) -> Result<()> {
+                self.inner.read_page(page, buf)
+            }
+            fn write_page(&mut self, page: PageId, buf: &Page) -> Result<()> {
+                self.ops.fetch_add(1, StdOrdering::SeqCst);
+                self.inner.write_page(page, buf)
+            }
+            fn write_pages(&mut self, base: PageId, pages: &[&Page]) -> Result<()> {
+                self.ops.fetch_add(1, StdOrdering::SeqCst);
+                self.inner.write_pages(base, pages)
+            }
+            fn sync_data(&mut self) -> Result<()> {
+                self.inner.sync_data()
+            }
+            fn sync_all(&mut self) -> Result<()> {
+                self.inner.sync_all()
+            }
+            fn page_count(&self) -> u64 {
+                self.inner.page_count()
+            }
+            fn extend(&mut self, additional: u64) -> Result<()> {
+                self.inner.extend(additional)
+            }
+        }
+
+        fn tmp(tag: &str) -> std::path::PathBuf {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, StdOrdering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "graphus-bench-374-{}-{tag}-{n}.blk",
+                std::process::id()
+            ))
+        }
+
+        // Measure the device-WRITE phase in isolation (the part coalescing changes), separately
+        // from the trailing fsync barrier (identical in both paths and the dominant durability
+        // cost), across several N. For each N: stage N checksummed pages, then time (a) N per-page
+        // `write_page`s and (b) one coalesced `write_pages` run, each followed by its own fsync.
+        for &n in &[64usize, 512, 4096] {
+            // Stage the page bytes once; both paths write identical content.
+            let mut staged: Vec<Box<Page>> = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut page = Box::new([0u8; PAGE_SIZE]);
+                page::set_page_id(&mut page, i as u64);
+                page::set_page_lsn(&mut page, Lsn((i as u64) + 1));
+                page[300] = i as u8;
+                page::write_checksum(&mut page);
+                staged.push(page);
+            }
+
+            // (a) Per-page path.
+            let ppath = tmp("perpage");
+            let pops = StdArc::new(AtomicU64::new(0));
+            let mut pdev = CountingFile {
+                inner: FileBlockDevice::open(&ppath).unwrap(),
+                ops: pops.clone(),
+            };
+            pdev.extend(n as u64).unwrap();
+            let tw = Instant::now();
+            for (i, page) in staged.iter().enumerate() {
+                pdev.write_page(PageId(i as u64), page).unwrap();
+            }
+            let perpage_write = tw.elapsed();
+            let ts = Instant::now();
+            pdev.sync_all().unwrap();
+            let perpage_sync = ts.elapsed();
+            let perpage_ops = pops.load(StdOrdering::SeqCst);
+
+            // (b) Coalesced path: one write_pages run over the same contiguous pages.
+            let cpath = tmp("coalesced");
+            let cops = StdArc::new(AtomicU64::new(0));
+            let mut cdev = CountingFile {
+                inner: FileBlockDevice::open(&cpath).unwrap(),
+                ops: cops.clone(),
+            };
+            cdev.extend(n as u64).unwrap();
+            let run: Vec<&Page> = staged.iter().map(|b| &**b).collect();
+            let tw = Instant::now();
+            cdev.write_pages(PageId(0), &run).unwrap();
+            let coalesced_write = tw.elapsed();
+            let ts = Instant::now();
+            cdev.sync_all().unwrap();
+            let coalesced_sync = ts.elapsed();
+            let coalesced_ops = cops.load(StdOrdering::SeqCst);
+
+            assert_eq!(
+                coalesced_ops, 1,
+                "contiguous run must coalesce to one device write op"
+            );
+            assert_eq!(perpage_ops as usize, n, "baseline issues one op per page");
+
+            // Byte-identical image sanity.
+            assert_eq!(
+                std::fs::read(&ppath).unwrap(),
+                std::fs::read(&cpath).unwrap(),
+                "coalesced image must equal per-page image"
+            );
+
+            eprintln!(
+                "rmp#374 N={n:>4} ({} KiB): write-ops {perpage_ops}->{coalesced_ops}  | \
+                 write-phase {perpage_write:>10?} -> {coalesced_write:>10?}  | \
+                 fsync (same barrier) {perpage_sync:?} vs {coalesced_sync:?}",
+                n * PAGE_SIZE / 1024
+            );
+
+            std::fs::remove_file(&ppath).ok();
+            std::fs::remove_file(&cpath).ok();
         }
     }
 }

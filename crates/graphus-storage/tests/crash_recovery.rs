@@ -398,6 +398,83 @@ fn a_checkpoint_bounds_recovery_redo_and_replays_post_checkpoint_work() {
     assert!(rec.node(b).unwrap().mvcc.in_use());
 }
 
+/// `rmp` #374: a crash **mid-checkpoint flush** — while the coalesced `flush_all` is writing a
+/// contiguous run of dirty store pages home, but BEFORE the checkpoint completion record is durable
+/// — must recover correctly. The coalesced write-back is a steal/no-force operation: every page it
+/// writes already has its redo durable in the WAL (the WAL rule runs per page *before* any byte is
+/// written home). If the crash tears the single coalesced `pwrite` (any prefix of the run reaches
+/// disk) and the checkpoint never completes, recovery's redo floor stays at the start of the log,
+/// so the full WAL replays and reconstructs every committed change regardless of which pages landed.
+///
+/// We model exactly that: flush home (the production path coalesces this), capture the on-disk
+/// image, persist only a PREFIX of the pages onto a fresh device (the torn coalesced `pwrite`), and
+/// replay the durable WAL — which carries NO checkpoint record, so redo is from the start.
+#[test]
+fn crash_mid_checkpoint_torn_coalesced_run_recovers_all_committed_work() {
+    use graphus_io::BlockDevice;
+
+    let mut s = fresh(256);
+
+    // Many committed nodes → many dirty store pages with contiguous ids → one big coalesced run when
+    // the buffer pool's flush_all writes them home. Record handles + element ids to assert recovery.
+    let mut handles = Vec::new();
+    for i in 0..200u64 {
+        let t = TxnId(i + 1);
+        s.begin(t);
+        let (h, eid) = s.create_node(t).unwrap();
+        s.commit(t).unwrap();
+        handles.push((h, eid));
+    }
+
+    // Flush the dirty pages home via the coalesced flush_all (steal: pages reach the device after
+    // the WAL rule hardened each page's redo). This is NOT a sharp checkpoint — no checkpoint record
+    // is written — so recovery's redo floor stays at the start of the log.
+    s.flush().expect("coalesced flush home");
+
+    // Capture the on-disk image, sorted by page id (the order the coalesced run touches the file).
+    let mut captured: Vec<(u64, Box<Page>)> = s
+        .mapped_pages()
+        .into_iter()
+        .map(|p| (p.0, s.read_device_page(p).expect("read page")))
+        .collect();
+    captured.sort_by_key(|(idx, _)| *idx);
+
+    // Model the torn coalesced run: persist only the FIRST HALF of the pages onto the recovery
+    // device (the crash interrupted the single pwrite partway through). The remaining pages are left
+    // zero-filled — recovery's redo must reconstruct them from the WAL.
+    let max = captured.iter().map(|(i, _)| *i).max().unwrap_or(0);
+    let mut device = MemBlockDevice::new(max + 1);
+    let prefix = captured.len() / 2;
+    for (idx, bytes) in captured.iter().take(prefix) {
+        device
+            .write_page(graphus_core::PageId(*idx), bytes)
+            .expect("stage prefix page");
+    }
+    device.sync_all().expect("persist torn image");
+
+    // Replay the durable WAL onto the torn image (full redo from the log start).
+    let log = durable_log(&s);
+    let mut sink = MemLogSink::new();
+    sink.append(&log);
+    sink.sync().expect("sync log");
+    let mut wal = WalManager::open(sink.clone()).expect("open wal");
+    recover_device(&mut wal, &mut device).expect("recover");
+    let wal = WalManager::open(sink).expect("reopen wal");
+    let rec = RecordStore::open(device, wal, 256).expect("open store");
+
+    // Every committed node survives, regardless of whether its page was in the persisted prefix or
+    // had to be redone from the WAL — committed-or-nothing holds across a torn coalesced flush.
+    for (h, eid) in &handles {
+        let n = rec.node(*h).unwrap();
+        assert!(
+            n.mvcc.in_use(),
+            "committed node {} lost after torn flush",
+            h
+        );
+        assert_eq!(n.element_id, *eid, "node {} identity changed", h);
+    }
+}
+
 /// A checkpoint physically reclaims the WAL prefix that is below both the checkpoint (redo floor) and
 /// the oldest unfrozen committed transaction (so no commit record an unfrozen stamp needs is lost,
 /// `rmp` #114). The freed prefix reads back as zeros (the in-memory sink models a deleted segment),
