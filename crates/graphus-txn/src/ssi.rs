@@ -170,6 +170,24 @@ pub struct SsiTracker {
     /// #171). Maintained in lock-step with each `TxnConflict::predicate_reads` and cleared on
     /// [`forget`](Self::forget).
     predicate_readers_of: HashMap<PredicateRead, HashSet<TxnId>>,
+    /// For each key, the set of transactions that currently hold a **write** on it. The symmetric
+    /// mirror of [`readers_of`](Self::readers_of) for the *write* direction (`rmp` #361): just as a
+    /// write finds concurrent readers in O(readers-of-key) via `readers_of`, a [`record_read`]
+    /// (Self::record_read) finds concurrent **writers** of the read key in O(writers-of-key) via this
+    /// index — instead of the prior full scan over the entire `txns` table per marker (the
+    /// EXTREME-CONCURRENCY scaling cliff: O(rows-read × active-txns)). Maintained in lock-step with
+    /// each `TxnConflict::writes` (inserted in [`record_write`](Self::record_write)) and purged on
+    /// [`forget`](Self::forget) — exhaustively, on both the commit/GC and abort paths, since a leaked
+    /// writer entry would form a spurious future rw-edge.
+    writers_of: HashMap<Key, HashSet<TxnId>>,
+    /// For each [`PredicateRead`] marker, the set of transactions whose predicate write footprint
+    /// currently contains it. The predicate analogue of [`writers_of`](Self::writers_of) (`rmp` #361):
+    /// a [`record_predicate_read`](Self::record_predicate_read) finds the concurrent predicate-writers
+    /// of its marker in O(writers-of-predicate) instead of scanning every transaction's
+    /// `predicate_writes`. Maintained in lock-step with each `TxnConflict::predicate_writes`
+    /// (inserted in [`record_predicate_write`](Self::record_predicate_write)) and purged on
+    /// [`forget`](Self::forget).
+    predicate_writers_of: HashMap<PredicateRead, HashSet<TxnId>>,
     /// Transactions condemned to abort at their commit. Populated when a dangerous structure
     /// completes around a pivot that has **already committed** (so the pivot itself cannot be the
     /// victim): the still-active endpoint that just closed the structure is doomed instead. This is
@@ -301,13 +319,18 @@ impl SsiTracker {
         self.readers_of.entry(key).or_default().insert(reader);
 
         // If a concurrent writer already wrote this key, the reader has an outbound rw-edge to it.
+        // The `writers_of` reverse index (`rmp` #361) makes this O(writers-of-key) instead of the
+        // former full scan over every tracked transaction (O(active-txns) per marker). The candidate
+        // set is exactly the transactions whose `writes` contain `key` — identical membership to the
+        // old `t.writes.contains(&key)` filter, since `writers_of[key]` is maintained in lock-step
+        // with `TxnConflict::writes` — so the resulting rw-edge set is unchanged.
         let concurrent_writers: Vec<TxnId> = self
-            .txns
-            .iter()
-            .filter(|(id, t)| {
-                **id != reader && t.writes.contains(&key) && self.are_concurrent(reader, **id)
-            })
-            .map(|(id, _)| *id)
+            .writers_of
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|w| *w != reader && self.are_concurrent(reader, *w))
             .collect();
         for w in concurrent_writers {
             self.add_edge(reader, w);
@@ -320,6 +343,10 @@ impl SsiTracker {
         if let Some(t) = self.txns.get_mut(&writer) {
             t.writes.insert(key);
         }
+        // Maintain the write-direction reverse index (`rmp` #361), symmetric to how `record_read`
+        // maintains `readers_of`: a later concurrent `record_read` of this key now finds `writer` in
+        // O(writers-of-key). Purged in `forget` from this transaction's retained `writes` set.
+        self.writers_of.entry(key).or_default().insert(writer);
         let readers: Vec<TxnId> = self
             .readers_of
             .get(&key)
@@ -353,15 +380,17 @@ impl SsiTracker {
 
         // A concurrent writer that already announced an insert satisfying this exact predicate is an
         // outbound rw-edge target for the reader (the reader saw an absence the writer superseded).
+        // The `predicate_writers_of` reverse index (`rmp` #361) makes this O(writers-of-predicate)
+        // instead of the former full scan over every transaction's `predicate_writes`. The candidate
+        // set is exactly the transactions whose footprint contains `predicate` — identical membership
+        // to the old `t.predicate_writes.contains(&predicate)` filter — so the rw-edge set is unchanged.
         let concurrent_writers: Vec<TxnId> = self
-            .txns
-            .iter()
-            .filter(|(id, t)| {
-                **id != reader
-                    && t.predicate_writes.contains(&predicate)
-                    && self.are_concurrent(reader, **id)
-            })
-            .map(|(id, _)| *id)
+            .predicate_writers_of
+            .get(&predicate)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|w| *w != reader && self.are_concurrent(reader, *w))
             .collect();
         for w in concurrent_writers {
             self.add_edge(reader, w);
@@ -382,6 +411,14 @@ impl SsiTracker {
             if let Some(t) = self.txns.get_mut(&writer) {
                 t.predicate_writes.insert(predicate.clone());
             }
+            // Maintain the predicate write-direction reverse index (`rmp` #361), symmetric to how
+            // `record_predicate_read` maintains `predicate_readers_of`: a later concurrent predicate
+            // read of this marker now finds `writer` in O(writers-of-predicate). Purged in `forget`
+            // from this transaction's retained `predicate_writes` set.
+            self.predicate_writers_of
+                .entry(predicate.clone())
+                .or_default()
+                .insert(writer);
             let readers: Vec<TxnId> = self
                 .predicate_readers_of
                 .get(predicate)
@@ -581,6 +618,29 @@ impl SsiTracker {
                     set.remove(&txn);
                     if set.is_empty() {
                         self.predicate_readers_of.remove(&predicate);
+                    }
+                }
+            }
+            // Symmetric WRITE-direction cleanup (`rmp` #361). The new `writers_of` /
+            // `predicate_writers_of` reverse indexes must be purged of this transaction exactly as the
+            // read-direction ones above. A leaked writer entry would let a *later* concurrent reader
+            // form a spurious rw-edge against a forgotten transaction → a wrong abort decision. This is
+            // the single removal site for any finished transaction — both the commit/GC path
+            // (`prune_committed` → `forget`) and the abort path (`manager::abort_internal` →
+            // `forget`) funnel through here — so this purge covers every termination route.
+            for key in t.writes {
+                if let Some(set) = self.writers_of.get_mut(&key) {
+                    set.remove(&txn);
+                    if set.is_empty() {
+                        self.writers_of.remove(&key);
+                    }
+                }
+            }
+            for predicate in t.predicate_writes {
+                if let Some(set) = self.predicate_writers_of.get_mut(&predicate) {
+                    set.remove(&txn);
+                    if set.is_empty() {
+                        self.predicate_writers_of.remove(&predicate);
                     }
                 }
             }
@@ -1185,5 +1245,263 @@ mod tests {
         assert!(b.is_empty());
         s.merge_read_buffer(b);
         assert_eq!(before, graph_fingerprint(&s));
+    }
+
+    // --- `rmp` #361: reverse write-index (writers_of / predicate_writers_of) -----------------------
+    //
+    // These pin the invariant that the new write-direction reverse index (which turns `record_read`'s
+    // per-marker full `txns` scan into an O(writers-of-key) lookup) forms the **identical** rw-edge set
+    // the old full scan would, and that its symmetric cleanup is exhaustive on BOTH termination routes
+    // (commit/GC via `prune_committed`, and abort via `forget`). A leaked writer entry would manufacture
+    // a spurious rw-edge into a forgotten transaction → a wrong abort decision (a serializability bug).
+
+    #[test]
+    fn record_read_via_writers_index_edges_exactly_concurrent_writers() {
+        // Several transactions wrote the SAME key; a reader then reads it. The rw-OUT edge must form
+        // against EXACTLY the writers that are concurrent with the reader — the precise set the former
+        // full `txns` scan (`**id != reader && t.writes.contains(&key) && are_concurrent`) selected,
+        // now produced via the `writers_of[key]` reverse index.
+        let mut s = SsiTracker::new();
+        // W_committed_before: wrote key 100, committed BEFORE the reader begins -> NOT concurrent.
+        s.register(TxnId(1), ts(1));
+        s.record_write(TxnId(1), 100);
+        s.record_commit(TxnId(1), ts(5));
+        // W_concurrent_committed: wrote key 100, committed AFTER the reader begins -> concurrent.
+        s.register(TxnId(2), ts(1));
+        s.record_write(TxnId(2), 100);
+        // W_concurrent_inflight: wrote key 100, still in flight -> concurrent.
+        s.register(TxnId(3), ts(1));
+        s.record_write(TxnId(3), 100);
+        // W_other_key: wrote a DIFFERENT key -> never a candidate for this read.
+        s.register(TxnId(4), ts(1));
+        s.record_write(TxnId(4), 999);
+
+        // The reader begins at ts(10): after T1 committed (ts5), concurrent with T2/T3.
+        s.register(TxnId(9), ts(10));
+        // Commit the concurrent-committed writer AFTER the reader began, so it stays concurrent.
+        s.record_commit(TxnId(2), ts(11));
+        s.record_read(TxnId(9), 100);
+
+        // Exactly {T2, T3} are concurrent writers of key 100 -> reader has those two rw-OUT edges.
+        let mut out: Vec<u64> = s
+            .txns
+            .get(&TxnId(9))
+            .unwrap()
+            .out_edges
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        out.sort_unstable();
+        assert_eq!(
+            out,
+            vec![2, 3],
+            "reverse-index record_read must edge to EXACTLY the concurrent writers of the key"
+        );
+        // T1 (committed before reader began) and T4 (other key) must NOT receive an inbound edge.
+        assert!(!s.txns.get(&TxnId(1)).unwrap().in_conflict);
+        assert!(!s.txns.get(&TxnId(4)).unwrap().in_conflict);
+        // And the chosen edges are exactly mirrored on the writers' inbound side.
+        assert!(s.txns.get(&TxnId(2)).unwrap().in_conflict);
+        assert!(s.txns.get(&TxnId(3)).unwrap().in_conflict);
+    }
+
+    #[test]
+    fn record_read_reverse_index_equals_full_scan_oracle() {
+        // Stronger byte-identity proof: over a constructed topology of writers with varied
+        // begin/commit timestamps, the rw-edge set `record_read` produces via the reverse index must
+        // EQUAL the set an explicit re-implementation of the OLD full scan would. The oracle replicates
+        // the exact former predicate `id != reader && writes.contains(key) && are_concurrent(reader,id)`.
+        let key: Key = 42;
+        // (id, begin, commit_ts) for each writer of `key`. Reader begins at ts(100).
+        let writers = [
+            (1u64, 1u64, Some(50u64)), // committed before reader began -> not concurrent
+            (2u64, 1u64, Some(150u64)), // committed after reader began -> concurrent
+            (3u64, 1u64, None),        // in flight -> concurrent
+            (4u64, 200u64, None),      // began AFTER reader; still in flight -> concurrent
+            (5u64, 90u64, Some(95u64)), // committed before reader began -> not concurrent
+        ];
+        let reader = 99u64;
+        let reader_begin = 100u64;
+
+        let mut s = SsiTracker::new();
+        for &(id, begin, commit) in &writers {
+            s.register(TxnId(id), ts(begin));
+            s.record_write(TxnId(id), key);
+            if let Some(c) = commit {
+                s.record_commit(TxnId(id), ts(c));
+            }
+        }
+        s.register(TxnId(reader), ts(reader_begin));
+        s.record_read(TxnId(reader), key);
+
+        // Oracle: the OLD full-scan candidate set, computed directly from the model. Two transactions
+        // are concurrent iff neither committed at-or-before the other began.
+        let concurrent =
+            |a_begin: u64, a_commit: Option<u64>, b_begin: u64, b_commit: Option<u64>| {
+                let a_before_b = a_commit.is_some_and(|c| c <= b_begin);
+                let b_before_a = b_commit.is_some_and(|c| c <= a_begin);
+                !a_before_b && !b_before_a
+            };
+        let mut expected: Vec<u64> = writers
+            .iter()
+            .filter(|&&(id, begin, commit)| {
+                id != reader && concurrent(reader_begin, None, begin, commit)
+            })
+            .map(|&(id, _, _)| id)
+            .collect();
+        expected.sort_unstable();
+
+        let mut actual: Vec<u64> = s
+            .txns
+            .get(&TxnId(reader))
+            .unwrap()
+            .out_edges
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        actual.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "reverse-index record_read must yield the identical rw-edge set as the old full scan"
+        );
+        // Sanity on the constructed topology: {2,3,4} are the concurrent writers.
+        assert_eq!(expected, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn record_predicate_read_via_writers_index_edges_exactly_concurrent_writers() {
+        // Predicate analogue of the headline edge-identity test, over `predicate_writers_of`.
+        let p = label_pred(7);
+        let mut s = SsiTracker::new();
+        // Writer committed before reader began -> not concurrent.
+        s.register(TxnId(1), ts(1));
+        s.record_predicate_write(TxnId(1), &[PredicateRead::AllNodes, p.clone()]);
+        s.record_commit(TxnId(1), ts(5));
+        // Concurrent in-flight writer of the same predicate.
+        s.register(TxnId(2), ts(1));
+        s.record_predicate_write(TxnId(2), &[PredicateRead::AllNodes, p.clone()]);
+        // Writer of a DIFFERENT predicate -> not a candidate.
+        s.register(TxnId(3), ts(1));
+        s.record_predicate_write(TxnId(3), &[PredicateRead::AllNodes, label_pred(8)]);
+
+        s.register(TxnId(9), ts(10)); // after T1 committed, concurrent with T2
+        s.record_predicate_read(TxnId(9), p);
+
+        let mut out: Vec<u64> = s
+            .txns
+            .get(&TxnId(9))
+            .unwrap()
+            .out_edges
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        out.sort_unstable();
+        assert_eq!(
+            out,
+            vec![2],
+            "reverse-index record_predicate_read must edge to EXACTLY the concurrent predicate-writers"
+        );
+        assert!(!s.txns.get(&TxnId(1)).unwrap().in_conflict);
+        assert!(!s.txns.get(&TxnId(3)).unwrap().in_conflict);
+    }
+
+    #[test]
+    fn forget_clears_write_markers() {
+        // Symmetric cleanup on the ABORT path (`manager::abort_internal` -> `forget`). After a writer
+        // is forgotten, `writers_of` must hold no entry for it, so a LATER concurrent reader of the
+        // same key forms NO spurious rw-edge against the forgotten (aborted) writer.
+        let mut s = SsiTracker::new();
+        s.register(TxnId(1), ts(1));
+        s.record_write(TxnId(1), 100);
+        assert!(s.writers_of.contains_key(&100));
+        s.forget(TxnId(1)); // models an abort
+        assert!(
+            !s.writers_of.contains_key(&100),
+            "forget must purge the writers_of entry (no leaked writer)"
+        );
+        // A later reader of key 100 finds no concurrent writer -> no edge, no abort.
+        s.register(TxnId(2), ts(2));
+        s.record_read(TxnId(2), 100);
+        assert!(!s.txns.get(&TxnId(2)).unwrap().out_conflict);
+        assert_eq!(s.detect_pivot_abort(TxnId(2)), None);
+    }
+
+    #[test]
+    fn forget_clears_predicate_write_markers() {
+        // Predicate analogue of the abort-path cleanup: a forgotten predicate-writer leaves no entry
+        // in `predicate_writers_of`, so a later concurrent predicate-reader forms no spurious edge.
+        let p = label_pred(7);
+        let mut s = SsiTracker::new();
+        s.register(TxnId(1), ts(1));
+        s.record_predicate_write(TxnId(1), &[PredicateRead::AllNodes, p.clone()]);
+        assert!(s.predicate_writers_of.contains_key(&p));
+        s.forget(TxnId(1));
+        assert!(
+            !s.predicate_writers_of.contains_key(&p),
+            "forget must purge the predicate_writers_of entry"
+        );
+        s.register(TxnId(2), ts(2));
+        s.record_predicate_read(TxnId(2), p);
+        assert!(!s.txns.get(&TxnId(2)).unwrap().out_conflict);
+        assert_eq!(s.detect_pivot_abort(TxnId(2)), None);
+    }
+
+    #[test]
+    fn prune_committed_clears_write_markers() {
+        // Symmetric cleanup on the COMMIT/GC path (`run_gc` -> `prune_committed` -> `forget`). A
+        // committed writer pruned at the low-water mark must have its `writers_of` /
+        // `predicate_writers_of` entries removed, so a later reader cannot edge to the pruned writer.
+        let p = label_pred(7);
+        let mut s = SsiTracker::new();
+        s.register(TxnId(1), ts(1));
+        s.record_write(TxnId(1), 100);
+        s.record_predicate_write(TxnId(1), &[PredicateRead::AllNodes, p.clone()]);
+        s.record_commit(TxnId(1), ts(5));
+        assert!(s.writers_of.contains_key(&100));
+        assert!(s.predicate_writers_of.contains_key(&p));
+
+        // With no active transactions, the committed T1 is settled and pruned.
+        assert_eq!(s.prune_committed(None), 1);
+        assert!(
+            !s.writers_of.contains_key(&100),
+            "prune_committed (via forget) must purge writers_of for the pruned writer"
+        );
+        assert!(
+            !s.predicate_writers_of.contains_key(&p),
+            "prune_committed (via forget) must purge predicate_writers_of for the pruned writer"
+        );
+        // A later reader forms no edge against the pruned (forgotten) writer.
+        s.register(TxnId(2), ts(20));
+        s.record_read(TxnId(2), 100);
+        s.record_predicate_read(TxnId(2), p);
+        assert!(!s.txns.get(&TxnId(2)).unwrap().out_conflict);
+    }
+
+    #[test]
+    fn writers_index_stays_consistent_across_multi_key_writer_lifecycle() {
+        // A writer touching MULTIPLE keys + predicates is purged from EVERY reverse-index bucket on
+        // forget (no partial leak when a transaction's footprint spans many keys/predicates).
+        let pa = label_pred(1);
+        let pb = label_pred(2);
+        let mut s = SsiTracker::new();
+        s.register(TxnId(1), ts(1));
+        s.record_write(TxnId(1), 10);
+        s.record_write(TxnId(1), 20);
+        s.record_write(TxnId(1), 30);
+        s.record_predicate_write(TxnId(1), &[pa.clone(), pb.clone()]);
+        // A second writer shares key 20 -> after forgetting T1, key 20 must still resolve to T2 only.
+        s.register(TxnId(2), ts(1));
+        s.record_write(TxnId(2), 20);
+
+        s.forget(TxnId(1));
+        // T1's exclusive keys/predicates are gone entirely; the shared key 20 survives with only T2.
+        assert!(!s.writers_of.contains_key(&10));
+        assert!(!s.writers_of.contains_key(&30));
+        assert!(!s.predicate_writers_of.contains_key(&pa));
+        assert!(!s.predicate_writers_of.contains_key(&pb));
+        let shared = s.writers_of.get(&20).expect("shared key 20 must remain");
+        assert_eq!(shared.len(), 1);
+        assert!(shared.contains(&TxnId(2)));
     }
 }
