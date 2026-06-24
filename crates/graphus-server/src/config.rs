@@ -117,6 +117,17 @@ impl EncryptionConfig {
     }
 }
 
+/// Blocking-thread slack reserved on top of [`AdmissionConfig::max_connections`] when sizing the
+/// Tokio runtime's blocking pool (rmp #363).
+///
+/// Bolt sessions consume one blocking thread *each* for their whole lifetime, but the same pool also
+/// serves bursty short-lived blocking work that is **not** capped by `max_connections`: REST
+/// per-request `spawn_blocking` (rmp #20), the engine command-channel bridge (`engine/handle.rs`) and
+/// catalog persistence (`dbcatalog.rs`). This headroom keeps that work from contending with a fully
+/// subscribed connection pool. It is deliberately small: Tokio creates blocking threads lazily and
+/// reaps idle ones after ~10 s, so an unused reservation costs nothing.
+const RESERVED_HEADROOM: usize = 64;
+
 /// Admission control + load-shedding limits (`04 §9.3`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -135,6 +146,14 @@ pub struct AdmissionConfig {
     /// engages once a connection is established and submitting work. A connection accepted beyond this
     /// limit is immediately closed (load-shed) and counted in `graphus_connections_shed_total`. Must
     /// be > 0. (rmp #118)
+    ///
+    /// **Invariant (rmp #363):** the Tokio runtime's `max_blocking_threads` is *always derived* from
+    /// this value via [`blocking_thread_budget`](Self::blocking_thread_budget), never set
+    /// independently. Each accepted Bolt session occupies one blocking thread for its whole lifetime
+    /// (`spawn_blocking`), so the blocking pool must accommodate `max_connections` of them *plus*
+    /// headroom for REST per-request, engine-bridge and catalog-persistence blocking work. Deriving
+    /// the budget here makes a silent under-sizing (e.g. Tokio's 512 default starving the 513th
+    /// session) impossible: raise `max_connections` and the blocking budget grows with it.
     pub max_connections: usize,
     /// Number of **off-thread reader worker threads** (`rmp` task #336): read-only auto-commit
     /// statements run on this pool concurrently with the single writer (the engine thread), so multiple
@@ -205,6 +224,24 @@ impl AdmissionConfig {
                 .unwrap_or(1)
                 .min(16)
         }
+    }
+
+    /// The Tokio runtime's `max_blocking_threads` budget (rmp #363), *derived* from
+    /// [`max_connections`](Self::max_connections) so the two can never silently disagree.
+    ///
+    /// Returns `max_connections + `[`RESERVED_HEADROOM`]: every accepted Bolt session holds one
+    /// blocking thread for its lifetime (`spawn_blocking`), so the pool must seat `max_connections`
+    /// of them, and the headroom covers the short-lived REST / engine-bridge / catalog-persistence
+    /// blocking work that shares the same pool but is not capped by `max_connections`. Without this
+    /// derivation the pool would fall back to Tokio's 512 default and the 513th session would queue
+    /// forever once `max_connections > 512`.
+    ///
+    /// The sum is saturating: a pathologically large `max_connections` clamps to `usize::MAX` rather
+    /// than wrapping (it is validated `> 0` elsewhere, and Tokio caps the actual thread count by lazy
+    /// creation regardless of the configured ceiling).
+    #[must_use]
+    pub fn blocking_thread_budget(&self) -> usize {
+        self.max_connections.saturating_add(RESERVED_HEADROOM)
     }
 }
 
@@ -935,6 +972,56 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn blocking_thread_budget_is_derived_from_max_connections() {
+        // rmp #363: the Tokio blocking-thread budget is always `max_connections + RESERVED_HEADROOM`,
+        // so the two can never silently disagree (the 512-default-starves-the-513th-session bug).
+        let default = AdmissionConfig::default();
+        assert_eq!(default.max_connections, 1024);
+        assert_eq!(
+            default.blocking_thread_budget(),
+            1024 + RESERVED_HEADROOM,
+            "budget must be max_connections + the documented headroom"
+        );
+
+        // The default already clears Tokio's 512-thread default with room to spare, and a larger cap
+        // (the sample config sets 4096) scales the budget with it — never capping silently at 512.
+        for max_connections in [1_usize, 512, 513, 1024, 2000, 4096] {
+            let admission = AdmissionConfig {
+                max_connections,
+                ..AdmissionConfig::default()
+            };
+            let budget = admission.blocking_thread_budget();
+            assert!(
+                budget >= max_connections + RESERVED_HEADROOM,
+                "budget {budget} must seat every one of {max_connections} sessions plus headroom"
+            );
+            assert!(
+                budget > max_connections,
+                "budget {budget} must exceed max_connections {max_connections} (strict headroom)"
+            );
+        }
+
+        // The default config builds a runtime whose blocking budget clears Tokio's 512 floor: a
+        // server at the default cap can admit every session it accepts.
+        assert!(
+            AdmissionConfig::default().blocking_thread_budget() > 512,
+            "default blocking budget must exceed Tokio's 512 default so the 513th session never \
+             queues forever"
+        );
+    }
+
+    #[test]
+    fn blocking_thread_budget_saturates_on_overflow() {
+        // A pathological `max_connections` near usize::MAX must clamp, not wrap (wrapping would
+        // produce a tiny budget and silently reintroduce starvation).
+        let admission = AdmissionConfig {
+            max_connections: usize::MAX,
+            ..AdmissionConfig::default()
+        };
+        assert_eq!(admission.blocking_thread_budget(), usize::MAX);
     }
 
     #[test]
