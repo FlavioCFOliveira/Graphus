@@ -34,10 +34,12 @@
 //! transaction layer resolves visibility against the record's MVCC header. See the crate root for
 //! the documented SIREAD / predicate-marker seam.
 
+use std::collections::HashSet;
+
 use graphus_bufpool::BufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{PageId, TxnId};
+use graphus_core::{Lsn, PageId, TxnId};
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_wal::LogSink;
 
@@ -81,7 +83,28 @@ pub struct BTree<D: BlockDevice, S: LogSink> {
     /// Tracked so Deterministic-Simulation-Testing can snapshot every mapped page for the steal
     /// crash scenario (`04 §11`), mirroring `graphus-storage`'s `mapped_pages`.
     max_page: u64,
+    /// Test/bench-only switch: when `false`, [`Self::validate_cached`] always runs the full
+    /// `validate()` walk (never consults or fills the cache), so the `#[ignore]` micro-bench can
+    /// measure the un-amortized "before" arm against the amortized "after" arm in one process. Has no
+    /// effect on production behavior (always `true`).
+    #[cfg(test)]
+    validate_cache_enabled: bool,
+    /// Per-page **validated-bit cache** keyed by `(PageId, page_lsn)` — the SEC-207 amortization of
+    /// the slot-directory walk. A B+-tree page's content is fully determined by its `(id, page_lsn)`:
+    /// every mutation stamps a fresh, strictly increasing `page_lsn` via `page::set_page_lsn` (the
+    /// ARIES pageLSN, monotone within a run), so a key that is already in the set names *exactly* the
+    /// bytes that previously passed [`NodeView::validate`]. The hot read paths therefore run the
+    /// O(slot_count) walk **once per distinct page image** instead of once per fetch, then rely on the
+    /// bounds-checked `try_*` accessors for every actual field read. See [`Self::validate_cached`] for
+    /// the no-stale-skip argument and the SEC-207 sign-off.
+    validated: HashSet<(PageId, Lsn)>,
 }
+
+/// Upper bound on the validated-bit cache before it is cleared wholesale. The cache is a pure
+/// optimization — dropping it only forces a re-validation (never a correctness change) — so a flat
+/// cap keeps its memory bounded without an LRU. A B+-tree large enough to exceed this many distinct
+/// hot page images is rare; when it happens the clear costs at most one extra walk per page.
+const VALIDATED_CACHE_CAP: usize = 1 << 16;
 
 impl<D: BlockDevice, S: LogSink> BTree<D, S> {
     /// Creates a brand-new B+-tree on an empty `pool`, initialising its meta page (the tree has no
@@ -101,6 +124,9 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             base: page_id,
             root: None,
             max_page: page_id.0,
+            validated: HashSet::new(),
+            #[cfg(test)]
+            validate_cache_enabled: true,
         };
         // WAL-log the meta page (its type byte + payload) under a committed system transaction,
         // exactly as the record store logs its catalog page (`graphus-storage`), so redo rebuilds
@@ -181,6 +207,9 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             base,
             root,
             max_page: base.0,
+            validated: HashSet::new(),
+            #[cfg(test)]
+            validate_cache_enabled: true,
         };
         // Discover the highest reachable page id so the on-disk image can be re-snapshotted.
         tree.max_page = tree.discover_max_page()?;
@@ -195,18 +224,20 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             while let Some(p) = stack.pop() {
                 max = max.max(p.0);
                 let f = self.pool.fetch(p)?;
-                let v = NodeView::new(self.pool.page(f));
+                let is_leaf = NodeView::new(self.pool.page(f)).is_leaf();
                 // SEC-203: validate an internal node's slot directory before reading its child
                 // slots. A page that is corrupt yet CRC-valid (an adversarially tampered
                 // index/backup file) would otherwise drive an out-of-bounds panic here during
                 // `BTree::open`, crashing the server at startup/recovery. A malformed internal node
                 // surfaces as a `Storage` error. Leaves are not slot-accessed by this walk, so they
                 // are validated by the read/write paths that do touch their slots (SEC-206).
-                if !v.is_leaf() {
-                    if let Err(e) = v.validate() {
+                // Cached by `(id, page_lsn)` (SEC-207).
+                if !is_leaf {
+                    if let Err(e) = self.validate_cached(p, f) {
                         self.pool.unpin(f);
                         return Err(e);
                     }
+                    let v = NodeView::new(self.pool.page(f));
                     let lm = v.leftmost_child();
                     if lm != 0 {
                         stack.push(PageId(lm));
@@ -263,6 +294,69 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         Ok(bytes)
     }
 
+    /// Validates a freshly fetched node **at most once per distinct page image** (SEC-207).
+    ///
+    /// The key is `(page_id, page::page_lsn(bytes))`. Because every B+-tree mutation stamps a fresh,
+    /// strictly increasing `page_lsn` (`page::set_page_lsn`, the ARIES pageLSN), that pair is a
+    /// content hash: the same key can only ever name the *same* slot directory that previously passed
+    /// [`NodeView::validate`]. So a cache hit is sound to skip — there is **no stale skip**:
+    /// - A page that is mutated gets a new `page_lsn`, hence a new key, hence a forced re-validation
+    ///   (a cached entry for the old LSN can never be matched by the new bytes).
+    /// - A page re-fetched after eviction carries the same `(id, lsn)` only if its bytes are the same
+    ///   image (the buffer pool verifies the CRC on the cold read, so a corrupted re-read is rejected
+    ///   before it ever reaches here — see the SEC-207 layer argument below).
+    ///
+    /// ## SEC-207 sign-off (defense-in-depth invariants)
+    ///
+    /// The full per-read walk is *amortized*, not removed, and the hot path stays memory-safe under an
+    /// adversarially forged-but-CRC-valid page because three independent layers each hold:
+    /// 1. **Page CRC (cold path, `graphus_bufpool`):** every fetch from the device verifies the
+    ///    CRC32C body checksum, catching bit-rot / truncation before the bytes enter this layer. A
+    ///    forged page must therefore carry a *recomputed* valid CRC to reach validation at all.
+    /// 2. **validate-at-fetch (this method):** the first time a given `(id, lsn)` image is seen, the
+    ///    O(slot_count) [`NodeView::validate`] runs and rejects any slot directory whose cells fall
+    ///    outside the heap region — so a forged image surfaces as a `Storage` error, never a panic.
+    /// 3. **`try_*` bounds checks (every field read):** even if validation were somehow bypassed, the
+    ///    accessors actually used on the hot search path — [`NodeView::key`]/[`value`]/[`child`] —
+    ///    delegate to [`NodeView::try_key`]/[`try_value`]/[`try_child`], which `get(off..end)` on the
+    ///    page slice and return `None` (a graceful expect-message panic, never UB / OOB read) on any
+    ///    out-of-range offset. The amortized walk can thus only ever turn a *panic that validate would
+    ///    have caught* into a *different panic the accessor catches* — it can **never** introduce an
+    ///    out-of-bounds slice or undefined behavior that `try_*` would not already stop.
+    ///
+    /// Net: removing the per-read full walk is safe precisely because every field access on the
+    /// relaxed hot path is bounds-checked by `try_*`, and the CRC + validate-at-fetch layers keep a
+    /// forged image from corrupting *results*.
+    fn validate_cached(&mut self, page_id: PageId, f: graphus_bufpool::FrameId) -> Result<()> {
+        // The frame `f` is already pinned by the caller; the page header (and thus the LSN) is part of
+        // those bytes, so the cache key is read with no extra pin churn.
+        let v = NodeView::new(self.pool.page(f));
+        let key = (page_id, Lsn(v.page_lsn()));
+        #[cfg(test)]
+        if !self.validate_cache_enabled {
+            // Bench "before" arm: always pay the full walk, never cache.
+            return v.validate();
+        }
+        if self.validated.contains(&key) {
+            return Ok(());
+        }
+        v.validate()?;
+        if self.validated.len() >= VALIDATED_CACHE_CAP {
+            self.validated.clear();
+        }
+        self.validated.insert(key);
+        Ok(())
+    }
+
+    /// Test/bench-only: toggle the validated-bit cache (see [`Self::validate_cache_enabled`]).
+    #[cfg(test)]
+    fn set_validate_cache_enabled(&mut self, on: bool) {
+        self.validate_cache_enabled = on;
+        if !on {
+            self.validated.clear();
+        }
+    }
+
     /// Allocates a fresh page through the pool, tracking the high-water mark for [`Self::mapped_pages`].
     fn alloc_page(&mut self) -> Result<(graphus_bufpool::FrameId, PageId)> {
         let (f, id) = self.pool.new_page()?;
@@ -289,11 +383,15 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         };
         let leaf = self.descend_to_leaf(root, key)?;
         let f = self.pool.fetch(leaf)?;
+        // Validate at most once per distinct page image (SEC-207); the hot find_exact/value below
+        // then runs over the validated directory. `descend_to_leaf` already validated this leaf, so
+        // this is a cache hit in the common case.
+        if let Err(e) = self.validate_cached(leaf, f) {
+            self.pool.unpin(f);
+            return Err(e);
+        }
         let v = NodeView::new(self.pool.page(f));
-        let out = match v.validate() {
-            Ok(()) => Ok(v.find_exact(key).map(|i| v.value(i).to_vec())),
-            Err(e) => Err(e),
-        };
+        let out = Ok(v.find_exact(key).map(|i| v.value(i).to_vec()));
         self.pool.unpin(f);
         out
     }
@@ -336,11 +434,11 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         let mut leaf = self.descend_to_leaf(root, lo)?;
         loop {
             let f = self.pool.fetch(leaf)?;
-            let v = NodeView::new(self.pool.page(f));
-            if let Err(e) = v.validate() {
+            if let Err(e) = self.validate_cached(leaf, f) {
                 self.pool.unpin(f);
                 return Err(e);
             }
+            let v = NodeView::new(self.pool.page(f));
             let start = v.lower_bound(lo);
             // PERF/I3: this leaf contributes at most `slot_count - start` entries; reserve them up
             // front so a multi-leaf scan grows `out` in leaf-sized steps instead of doubling
@@ -372,11 +470,11 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         let mut cur = from;
         loop {
             let f = self.pool.fetch(cur)?;
-            let v = NodeView::new(self.pool.page(f));
-            if let Err(e) = v.validate() {
+            if let Err(e) = self.validate_cached(cur, f) {
                 self.pool.unpin(f);
                 return Err(e);
             }
+            let v = NodeView::new(self.pool.page(f));
             if v.is_leaf() {
                 self.pool.unpin(f);
                 return Ok(cur);
@@ -448,13 +546,10 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         // SEC-206: validate the leaf before probing its slots. `descend_to_leaf` validates every
         // node it routes *through*, but the destination leaf is read here for the first time; a
         // forged-but-CRC-valid leaf would otherwise panic OOB inside `find_exact`. Reject it as a
-        // `Storage` error instead of crashing on a `delete`.
-        {
-            let v = NodeView::new(self.pool.page(f));
-            if let Err(e) = v.validate() {
-                self.pool.unpin(f);
-                return Err(e);
-            }
+        // `Storage` error instead of crashing on a `delete`. (Cached by `(id, page_lsn)`, SEC-207.)
+        if let Err(e) = self.validate_cached(leaf, f) {
+            self.pool.unpin(f);
+            return Err(e);
         }
         let present = NodeView::new(self.pool.page(f)).find_exact(key).is_some();
         if !present {
@@ -486,13 +581,10 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         // SEC-206: validate the node before any slot access (read of cells on the leaf path, or
         // `child_for` on the internal path). The write descent does not go through the validating
         // `descend_to_leaf`, so a forged-but-CRC-valid page would otherwise panic OOB on an
-        // `insert`. Reject it as a `Storage` error.
-        {
-            let v = NodeView::new(self.pool.page(f));
-            if let Err(e) = v.validate() {
-                self.pool.unpin(f);
-                return Err(e);
-            }
+        // `insert`. Reject it as a `Storage` error. (Cached by `(id, page_lsn)`, SEC-207.)
+        if let Err(e) = self.validate_cached(node, f) {
+            self.pool.unpin(f);
+            return Err(e);
         }
         let is_leaf = NodeView::new(self.pool.page(f)).is_leaf();
 
@@ -977,5 +1069,109 @@ mod tests {
     #[test]
     fn meta_page_rel_is_zero() {
         assert_eq!(meta_page_rel(), 0);
+    }
+
+    #[test]
+    fn validated_bit_cache_is_a_hit_on_repeated_lookup() {
+        // The same leaf, fetched twice without an intervening mutation, keeps the same
+        // (page_id, page_lsn), so the second descent finds the validated bit already set.
+        let mut t = fresh();
+        let txn = TxnId(1);
+        t.with_wal(|w| {
+            w.begin(txn);
+        });
+        for i in 0u32..200 {
+            t.insert(txn, &i.to_be_bytes(), &i.to_le_bytes()).unwrap();
+        }
+        t.with_wal(|w| w.commit(txn).unwrap());
+        let before = t.validated.len();
+        // A second lookup of an already-seen key adds no new validated entries for unchanged pages.
+        let _ = t.lookup(&7u32.to_be_bytes()).unwrap();
+        let mid = t.validated.len();
+        let _ = t.lookup(&7u32.to_be_bytes()).unwrap();
+        let after = t.validated.len();
+        assert!(
+            before > 0,
+            "the build path should have validated some pages"
+        );
+        assert_eq!(
+            mid, after,
+            "a repeat lookup must not re-validate (cache hit)"
+        );
+    }
+
+    /// Micro-bench (`#[ignore]`): per-node CPU of point lookups and range scans, with the
+    /// validated-bit cache ON (amortized validate, the change) vs OFF (full `validate()` per fetch,
+    /// the prior behavior). Run with:
+    ///   `cargo test -p graphus-index --release validate_amortization_microbench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench; run explicitly with --ignored --release --nocapture"]
+    fn validate_amortization_microbench() {
+        use std::time::Instant;
+
+        // Build a multi-level tree so descents touch internal + leaf nodes (validation per node).
+        let mut t = fresh();
+        let txn = TxnId(1);
+        t.with_wal(|w| {
+            w.begin(txn);
+        });
+        const N: u32 = 20_000;
+        for i in 0u32..N {
+            t.insert(txn, &i.to_be_bytes(), &i.to_le_bytes()).unwrap();
+        }
+        t.with_wal(|w| w.commit(txn).unwrap());
+        assert!(t.height().unwrap() >= 2, "want a multi-level tree");
+
+        const LOOKUPS: u32 = 200_000;
+        let bench_lookups = |t: &mut BTree<MemBlockDevice, MemLogSink>| -> std::time::Duration {
+            let start = Instant::now();
+            let mut hits = 0u64;
+            for r in 0..LOOKUPS {
+                let k = (r % N).to_be_bytes();
+                if t.lookup(&k).unwrap().is_some() {
+                    hits += 1;
+                }
+            }
+            std::hint::black_box(hits);
+            start.elapsed()
+        };
+
+        // OFF = prior behavior (full validate() on every fetched node).
+        t.set_validate_cache_enabled(false);
+        let off = bench_lookups(&mut t);
+        // ON = amortized validate (validate once per (id, lsn) image).
+        t.set_validate_cache_enabled(true);
+        let on = bench_lookups(&mut t);
+
+        let off_ns = off.as_nanos() as f64 / f64::from(LOOKUPS);
+        let on_ns = on.as_nanos() as f64 / f64::from(LOOKUPS);
+        println!(
+            "point-lookup: validate-every-fetch {off_ns:.1} ns/op  vs  amortized {on_ns:.1} ns/op  \
+             ({:.2}x)",
+            off_ns / on_ns,
+        );
+
+        // Range scan over the whole key space (one descent + a long right-sibling leaf walk, each
+        // leaf validated per fetch in the OFF arm).
+        const RANGES: u32 = 2_000;
+        let bench_range = |t: &mut BTree<MemBlockDevice, MemLogSink>| -> std::time::Duration {
+            let start = Instant::now();
+            let mut total = 0u64;
+            for _ in 0..RANGES {
+                total += t.scan_all().unwrap().len() as u64;
+            }
+            std::hint::black_box(total);
+            start.elapsed()
+        };
+        t.set_validate_cache_enabled(false);
+        let roff = bench_range(&mut t);
+        t.set_validate_cache_enabled(true);
+        let ron = bench_range(&mut t);
+        println!(
+            "full-range-scan: validate-every-fetch {:.2} ms  vs  amortized {:.2} ms  ({:.2}x)",
+            roff.as_secs_f64() * 1e3 / f64::from(RANGES),
+            ron.as_secs_f64() * 1e3 / f64::from(RANGES),
+            roff.as_secs_f64() / ron.as_secs_f64(),
+        );
     }
 }

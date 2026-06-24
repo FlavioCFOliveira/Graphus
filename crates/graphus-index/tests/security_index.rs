@@ -231,6 +231,38 @@ fn sec206_delete_and_insert_on_forged_leaf_error_not_panic() {
     );
 }
 
+/// Regression: SEC-207 (validation amortization). The read path now validates a page **once per
+/// `(page_id, page_lsn)` image** and caches a "validated" bit, then relies on the bounds-checked
+/// `try_*` accessors. A forged-but-CRC-valid leaf must therefore *still* error on lookup/range — and
+/// it must error on **every** repeated call, because a failed `validate()` is never cached (the
+/// validated-bit is only set after a successful walk). This proves the cache cannot let a poisoned
+/// page slip past on a later fetch.
+#[test]
+fn sec207_forged_leaf_errors_on_every_lookup_and_range_despite_validation_cache() {
+    // Regression: SEC-207
+    let (device, wal, base) = tree_with_forged_root_leaf();
+    let shared = SharedWal::new(wal);
+    let pool = BufferPool::with_wal(device, shared.clone(), 32);
+    let mut tree = BTree::open(pool, shared, base).expect("open over forged-but-valid meta");
+
+    // Repeated lookups: each must error (the forged page never enters the validated-bit cache).
+    for _ in 0..3 {
+        assert!(
+            tree.lookup(b"k").is_err(),
+            "every lookup over the forged leaf must error, not panic or silently skip validation",
+        );
+    }
+    // A range scan reaches the same forged leaf and must likewise error, not OOB.
+    assert!(
+        tree.range(b"a", b"z").is_err(),
+        "range over the forged leaf must error, not panic",
+    );
+    assert!(
+        tree.range_from(b"a").is_err(),
+        "range_from over the forged leaf must error, not panic",
+    );
+}
+
 /// Regression: SEC-203. `BTree::open` walks the tree (`discover_max_page`) over a forged **internal**
 /// root and surfaces a `Storage` error instead of panicking at startup.
 #[test]

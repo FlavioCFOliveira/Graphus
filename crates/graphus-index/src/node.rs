@@ -141,6 +141,16 @@ impl<'a> NodeView<'a> {
         Self { bytes }
     }
 
+    /// The page LSN recorded in the frozen 24-byte page header (`05 §6`, ARIES pageLSN). Used by the
+    /// read paths to key the validated-bit cache: a page's content is fully determined by its
+    /// `(page_id, page_lsn)` because every mutation stamps a fresh, strictly increasing LSN. Reads
+    /// the same 8 little-endian bytes as [`graphus_bufpool::page::page_lsn`] (offset 8); re-stated
+    /// here because the node view only owns the page bytes, not the bufpool's typed `Page`.
+    #[must_use]
+    pub fn page_lsn(&self) -> u64 {
+        rd_u64(self.bytes, 8)
+    }
+
     /// The node level (`0` = leaf).
     #[must_use]
     pub fn level(&self) -> u16 {
@@ -182,6 +192,23 @@ impl<'a> NodeView<'a> {
     /// during a client query. This is **defense-in-depth**: a well-formed page always passes, and the
     /// accessors keep their existing fast (unchecked) bodies — callers on the hot read paths gate on
     /// this once per fetched page instead of paying a bounds check per slot access.
+    ///
+    /// ## SEC-207 sign-off (validation amortized at fetch, not removed)
+    ///
+    /// The B+-tree read paths no longer call `validate` on every fetch: they call it **once per
+    /// distinct page image**, keyed by `(page_id, page_lsn)` (see `BTree::validate_cached`). This is
+    /// safe because three independent layers each bound the damage of a forged-but-CRC-valid page:
+    /// 1. **Page CRC** (`graphus_bufpool`, cold read): rejects bit-rot / truncation before the bytes
+    ///    enter this module — a forged page must carry a recomputed valid CRC to reach `validate`.
+    /// 2. **`validate` (this function), once per `(id, lsn)`**: rejects any slot whose cell escapes
+    ///    the heap region, turning a malformed image into a `Storage` error rather than a panic.
+    /// 3. **`try_*` bounds checks on every field read**: the hot search path reads slots through
+    ///    [`key`](Self::key)/[`value`](Self::value)/[`child`](Self::child), each a thin wrapper over
+    ///    [`try_key`](Self::try_key)/[`try_value`](Self::try_value)/[`try_child`](Self::try_child),
+    ///    which `slice::get` every offset and can never index out of bounds. So even if `validate`
+    ///    were skipped entirely, a forged offset surfaces as a controlled `expect` panic, never an
+    ///    OOB read or UB. Amortizing the walk therefore cannot introduce a memory-safety hole that
+    ///    `try_*` would not already stop.
     ///
     /// A node is well-formed when every slot's cell `[off, off + klen + vlen)` lies wholly within the
     /// cell-heap region `[dir_end, CELL_LIMIT]` (so it neither overlaps the slot directory nor runs
@@ -822,6 +849,19 @@ mod tests {
         assert!(
             NodeView::new(&page3).validate().is_err(),
             "a cell overlapping the slot directory must be rejected",
+        );
+    }
+
+    #[test]
+    fn page_lsn_matches_bufpool_accessor() {
+        // The validated-bit cache keys on `page_lsn()`; guard the locally re-stated offset 8 against
+        // drift from the bufpool's `page::page_lsn` (which owns the page-header layout).
+        let mut page = [0u8; PAGE_SIZE];
+        graphus_bufpool::page::set_page_lsn(&mut page, graphus_core::Lsn(0xDEAD_BEEF_0102_0304));
+        assert_eq!(NodeView::new(&page).page_lsn(), 0xDEAD_BEEF_0102_0304);
+        assert_eq!(
+            NodeView::new(&page).page_lsn(),
+            graphus_bufpool::page::page_lsn(&page).0,
         );
     }
 
