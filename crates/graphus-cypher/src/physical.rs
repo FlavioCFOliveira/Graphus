@@ -75,11 +75,14 @@
 //! **range** node predicates, the **token-lookup** label scan, and single-property **relationship**
 //! predicates routed through the catalog.
 //!
-//! **Cost-based (task #65), only when statistics are supplied:** selectivity-driven **access-path
-//! choice** (index seek vs label/token scan, [the seek-vs-scan rule](self#cost-based-optimisation)),
+//! **Cost-based (task #65, #366), only when statistics are supplied:** selectivity-driven
+//! **access-path choice** (index seek vs label/token scan, [the seek-vs-scan rule](self#cost-based-optimisation)),
 //! **inner-join reordering** and **hash-join build-side selection** over independent, write-free join
-//! regions (System-R-style bottom-up dynamic programming). Expand direction stays the rule-based
-//! choice — the logical plan fixes the traversal anchor, so a cost-based *reversal* is out of scope.
+//! regions (System-R-style bottom-up dynamic programming), and **expand-direction reversal** — a
+//! binary single hop whose *far* endpoint is index-servable is re-anchored on that endpoint (`seek +
+//! reverse-expand` costed against `scan + forward-expand`, `rmp` task #366). The logical plan still
+//! fixes the *rule-based* anchor; the optimiser may flip it when the cost model says the reversal
+//! wins, enumerating the same directed edge set from the other end (see rule 3 below).
 //!
 //! **Deferred, by name:** (1) **multi-predicate composite-index seeds** beyond a single leading-key
 //! predicate, and general predicate pushdown (`04 §6.6`); (2) **`AllRelationshipsScan` index
@@ -93,7 +96,7 @@
 //! # Cost-based optimisation
 //!
 //! [`plan_physical_with_stats`] with `stats = Some(..)` runs the rule-based planner, then a single
-//! bottom-up optimisation pass over the resulting tree, applying two families of bag-preserving
+//! bottom-up optimisation pass over the resulting tree, applying three families of bag-preserving
 //! rewrites, each gated on the [cost model](crate::cost):
 //!
 //! 1. **Access-path selection (seek vs scan).** At a seek (or a scan+filter) that the rule-based
@@ -113,8 +116,21 @@
 //!    which the executor's symmetric `merge_rows` leaves bag-invariant. Correlated applies (an
 //!    [`Argument`](PhysicalOp::Argument) on the spine) and any write-bearing subtree are **never**
 //!    reordered.
+//! 3. **Expand-direction reversal (`rmp` task #366).** A fresh, fixed-length, single
+//!    [`ExpandAll`](PhysicalOp::ExpandAll) over a *pure label scan* of the anchor, whose **far**
+//!    endpoint carries an index-servable predicate (a `Filter` stack above the expand pins
+//!    `to.prop <op> v` plus `to`'s label), is re-anchored on `to`: seek `to`, then walk the
+//!    **reversed** incidence to bind `from`, with `from`'s label and the unconsumed conjuncts
+//!    re-applied as a residual filter. The optimiser costs `seek + reverse-expand` against the
+//!    rule-based `scan + forward-expand` and keeps the cheaper. **Soundness:** the pattern's
+//!    relationship direction is preserved exactly — a directed edge `a→b` is the *same* `RelId`
+//!    whether enumerated as `b`'s `Outgoing` incidence from anchor `a` or `a`'s `Incoming` incidence
+//!    from anchor `b` (the same relationship-set equality that makes `ExpandInto` sound, rule 2
+//!    above) — so the reversal binds the identical `{from, relationship, to}` columns to the
+//!    identical entities and the result bag (and any downstream order) is byte-identical.
 //!
-//! The optimiser recurses into every operand and child, so both rewrites apply throughout the tree.
+//! The optimiser recurses into every operand and child, so all three rewrites apply throughout the
+//! tree.
 //! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
 
 use crate::ast::{BinaryOp, Expr, ExprKind, Label, RelType};
@@ -1466,6 +1482,12 @@ fn optimize(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> P
     // seek node and at the filter-over-scan node.
     let op = optimize_access_path(op, catalog, stats);
 
+    // (C) Expand-direction reversal: a `Filter*`-over-`ExpandAll`-over-`label-scan` whose *far*
+    // endpoint carries a seekable predicate can be re-anchored on that far endpoint — seek it (one
+    // anchor) and walk the reverse incidence — which costs `seek + reverse-expand` against the
+    // rule-based `scan + forward-expand`. Bag-preserving (same directed edge set, same columns).
+    let op = optimize_expand_direction(op, catalog, stats);
+
     // (A) Join reordering: if this node roots a maximal reorderable join region, flatten and re-plan
     // it by bottom-up DP. (If it is not such a region root, this is a no-op returning `op`.)
     optimize_join_region(op, stats)
@@ -1908,6 +1930,180 @@ fn seek_alternative_for_filter(op: &PhysicalOp, catalog: &IndexCatalog) -> Optio
         }
     }
     None
+}
+
+// -------------------------------------------------------------------------------------------------
+// (C) Cost-based expand-direction reversal (re-anchor a single hop on its seekable far endpoint)
+// -------------------------------------------------------------------------------------------------
+
+/// Reconsiders the **traversal anchor** of a single binary hop. The rule-based planner fixes the
+/// anchor at the clause-order `from` endpoint, so `MATCH (a:Person)-[:KNOWS]->(b) WHERE b.id = $x`
+/// scans **all** `:Person` and fans forward, even though seeking `b` (one anchor) and walking the
+/// **reverse** incidence enumerates the very same edge set far more cheaply.
+///
+/// When `op` is a `Filter*`-over-`ExpandAll`-over-`label-scan` whose **far** endpoint (`to`) carries
+/// an index-servable predicate, this builds the reversed realisation — `seek(to) → ExpandAll(to →
+/// from, reversed direction)` with `from`'s label and every other conjunct re-applied as a residual
+/// `Filter` above — and keeps it iff the [cost model](crate::cost) says it is cheaper.
+///
+/// **Soundness.** The pattern's relationship *direction* (`-[:KNOWS]->`) is preserved exactly: only
+/// the anchor and the incidence walked change. A directed edge `a→b` is enumerated either as `b`'s
+/// `Outgoing` incidence from anchor `a` (`LeftToRight`) or, identically, as `a`'s `Incoming`
+/// incidence from anchor `b` (`RightToLeft`) — the *same* `RelId` reaching the *same* neighbour
+/// (see [`crate::graph_access::GraphAccess::expand`] and the `bound_rel_expand` direction match in
+/// the executor). This is the same relationship-set equality that makes
+/// [`ExpandInto`](PhysicalOp::ExpandInto) sound (module-doc rule 2). The reversal binds the identical
+/// `{from, relationship, to}` columns to the identical entities, so the result bag — and any
+/// downstream `ORDER BY` over it — is byte-identical.
+fn optimize_expand_direction(
+    op: PhysicalOp,
+    catalog: &IndexCatalog,
+    stats: &dyn Statistics,
+) -> PhysicalOp {
+    match reverse_expand_alternative(&op, catalog) {
+        Some(alt) => cheaper(op, alt, stats),
+        None => op,
+    }
+}
+
+/// Builds the seek-anchored, reverse-direction realisation of a `Filter*`-over-`ExpandAll`-over-
+/// pure-label-scan subtree whose far endpoint is index-servable; `None` when `op` is not such a site.
+fn reverse_expand_alternative(op: &PhysicalOp, catalog: &IndexCatalog) -> Option<PhysicalOp> {
+    // Peel the stacked residual `Filter`s sitting directly over the expand, gathering their
+    // conjuncts in plan order. The expand must be the immediate input below the stack.
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    let mut cursor = op;
+    while let PhysicalOp::Filter { input, predicate } = cursor {
+        for c in split_conjuncts(predicate) {
+            conjuncts.push(c.clone());
+        }
+        cursor = input.as_ref();
+    }
+    // We must have peeled at least one filter (otherwise there is no far-endpoint predicate to
+    // anchor on, and nothing to reverse).
+    if conjuncts.is_empty() {
+        return None;
+    }
+
+    // The node below the filter stack must be a **fresh, fixed-length, single** ExpandAll: a
+    // var-length range, a reused/bound relationship, prior-rel isomorphism set, or an inline
+    // rel-property map all change what "anchor at the other end" means, so we decline them.
+    let PhysicalOp::ExpandAll {
+        input,
+        from,
+        relationship,
+        to,
+        direction,
+        types,
+        range,
+        prior_rels,
+        rel_props,
+    } = cursor
+    else {
+        return None;
+    };
+    if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
+        return None;
+    }
+
+    // The expand's input must be a **pure label/all scan** binding *only* `from` (the original
+    // anchor). A pure scan consumes no property predicate, so re-deriving `from`'s membership as a
+    // residual label filter after reversal is exact. (A seek/`ExpandInto`/multi-hop input is not a
+    // re-anchoring candidate and is declined.)
+    let from_label: Option<Label> = match input.as_ref() {
+        PhysicalOp::NodeByLabelScan { variable, label } if variable.name == from.name => {
+            Some(label.clone())
+        }
+        PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } if variable.name == from.name => Some(label.clone()),
+        PhysicalOp::AllNodesScan { variable } if variable.name == from.name => None,
+        _ => return None,
+    };
+
+    // Find `to`'s label among the peeled conjuncts (a `HasLabels` predicate on `to`) — the far
+    // endpoint needs a label to drive a `label_property` index seek.
+    let to_label = conjuncts
+        .iter()
+        .find_map(|c| has_single_label(c, &to.name))?;
+
+    // Find a conjunct on `to` that an index can serve, and reconstruct the seek over `to`.
+    let idx = conjuncts.iter().position(|c| {
+        analyze_property_predicate(c, &to.name)
+            .and_then(|pp| catalog.label_property(&to_label, &pp.property))
+            .is_some()
+    })?;
+    let pp = analyze_property_predicate(&conjuncts[idx], &to.name)?;
+    let index = catalog.label_property(&to_label, &pp.property)?;
+    let seek = build_seek(to, &to_label, &pp, index.id);
+
+    // The reversed expand: anchor on `to`, bind `from` as the far endpoint, flip the arrow so the
+    // SAME directed edge set is enumerated from the other side.
+    let reversed = PhysicalOp::ExpandAll {
+        input: Box::new(seek),
+        from: to.clone(),
+        relationship: relationship.clone(),
+        to: from.clone(),
+        direction: reverse_direction(*direction),
+        types: types.clone(),
+        range: None,
+        prior_rels: Vec::new(),
+        rel_props: None,
+    };
+
+    // Re-apply, as a single residual `Filter` above the reversed expand: every conjunct *except* the
+    // one consumed by the seek, plus `from`'s label (which the rule-based plan had consumed into the
+    // now-replaced anchor scan). This preserves exactly the rows the original tree selected.
+    let mut residual: Vec<Expr> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != idx)
+        .map(|(_, e)| e.clone())
+        .collect();
+    if let Some(label) = from_label {
+        residual.push(has_labels_expr(from, &label));
+    }
+    let residual_refs: Vec<&Expr> = residual.iter().collect();
+    Some(attach_residual(reversed, &residual_refs))
+}
+
+/// If `expr` is exactly `variable:Label` (a single-label `HasLabels` predicate), returns that label.
+/// Multi-label predicates are declined: the reversal re-applies `from`'s label as a single
+/// `HasLabels`, and a multi-label seed has no single catalog `label_property` to anchor on.
+fn has_single_label(expr: &Expr, variable: &str) -> Option<Label> {
+    if let ExprKind::HasLabels { operand, labels } = &expr.kind {
+        if let ExprKind::Variable(name) = &operand.kind {
+            if name == variable && labels.len() == 1 {
+                return Some(labels[0].clone());
+            }
+        }
+    }
+    None
+}
+
+/// Builds the `variable:Label` label predicate, mirroring the logical lowering of a label scan into a
+/// residual `HasLabels` filter.
+fn has_labels_expr(variable: &Var, label: &Label) -> Expr {
+    let span = crate::lexer::Span::new(0, 0);
+    Expr::new(
+        ExprKind::HasLabels {
+            operand: Box::new(Expr::new(ExprKind::Variable(variable.name.clone()), span)),
+            labels: vec![label.clone()],
+        },
+        span,
+    )
+}
+
+/// Reverses a relationship pattern's traversal arrow: `->` becomes `<-` and vice versa, so anchoring
+/// on the opposite endpoint enumerates the **same** directed edge set. `Undirected` is symmetric and
+/// unchanged.
+fn reverse_direction(d: crate::ast::RelDirection) -> crate::ast::RelDirection {
+    use crate::ast::RelDirection::{LeftToRight, RightToLeft, Undirected};
+    match d {
+        LeftToRight => RightToLeft,
+        RightToLeft => LeftToRight,
+        Undirected => Undirected,
+    }
 }
 
 /// Returns whichever of `a` / `b` has the lower total [cost](crate::cost), breaking ties toward `a`

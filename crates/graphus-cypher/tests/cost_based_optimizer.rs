@@ -329,6 +329,192 @@ fn seek_revert_preserves_the_result_bag() {
 }
 
 // =================================================================================================
+// 8. Expand-direction reversal (`rmp` task #366): re-anchor a binary hop on its seekable far endpoint
+// =================================================================================================
+
+/// `n` `:Person` nodes, each with a distinct `id`, wired into a directed `KNOWS` clique-ish fan: every
+/// node KNOWS the next `fanout` nodes (mod `n`). The far endpoint `b.id = target` selects exactly one
+/// anchor, so seeking `b` and walking the reverse incidence is orders of magnitude cheaper than
+/// scanning all `:Person` and fanning forward.
+fn knows_graph(n: i64, fanout: i64) -> MemGraph {
+    let mut g = MemGraph::new();
+    let ids: Vec<_> = (0..n)
+        .map(|i| g.add_node(["Person"], [("id", Value::Integer(i))]))
+        .collect();
+    for i in 0..n {
+        for k in 1..=fanout {
+            let j = ((i + k) % n) as usize;
+            g.add_rel(
+                "KNOWS",
+                ids[i as usize],
+                ids[j],
+                std::iter::empty::<(&str, Value)>(),
+            );
+        }
+    }
+    g
+}
+
+/// The label/property of the leaf access path directly under the (single) expand in `op`, plus
+/// whether that expand walks `RightToLeft` (the reversed arrow). `None` if no expand is present.
+fn expand_anchor(op: &PhysicalOp) -> Option<(String, bool)> {
+    use graphus_cypher::ast::RelDirection;
+    fn find(op: &PhysicalOp) -> Option<&PhysicalOp> {
+        match op {
+            PhysicalOp::ExpandAll { .. } | PhysicalOp::ExpandInto { .. } => Some(op),
+            PhysicalOp::Filter { input, .. }
+            | PhysicalOp::Projection { input, .. }
+            | PhysicalOp::Aggregation { input, .. }
+            | PhysicalOp::Sort { input, .. }
+            | PhysicalOp::TopN { input, .. }
+            | PhysicalOp::Skip { input, .. }
+            | PhysicalOp::Limit { input, .. }
+            | PhysicalOp::Eager { input }
+            | PhysicalOp::Optional { input, .. } => find(input),
+            _ => None,
+        }
+    }
+    let (input, reversed) = match find(op)? {
+        PhysicalOp::ExpandAll {
+            input, direction, ..
+        }
+        | PhysicalOp::ExpandInto {
+            input, direction, ..
+        } => (
+            input.as_ref(),
+            matches!(direction, RelDirection::RightToLeft),
+        ),
+        _ => return None,
+    };
+    let label = match input {
+        PhysicalOp::NodeByLabelScan { label, .. }
+        | PhysicalOp::TokenLookupScan { label, .. }
+        | PhysicalOp::NodeIndexSeek { label, .. }
+        | PhysicalOp::NodeIndexRangeSeek { label, .. } => label.name.clone(),
+        _ => return None,
+    };
+    let seek = matches!(
+        input,
+        PhysicalOp::NodeIndexSeek { .. } | PhysicalOp::NodeIndexRangeSeek { .. }
+    );
+    Some((
+        format!("{label}{}", if seek { "/seek" } else { "/scan" }),
+        reversed,
+    ))
+}
+
+#[test]
+fn cost_based_plan_reverses_expand_to_anchor_on_the_seekable_endpoint() {
+    // `MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.id = $x`: the rule-based plan anchors on `a`
+    // (scan all :Person, fan forward). With statistics, the optimiser must re-anchor on the seekable
+    // far endpoint `b` (one seek) and walk the reverse incidence.
+    let g = knows_graph(1000, 5);
+    let stats = g.statistics();
+    let catalog = IndexCatalog::builder()
+        .with_label_property("Person", "id")
+        .build();
+    let log = logical("MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.id = 7 RETURN a");
+
+    let rule = plan_physical(&log, &catalog);
+    let cost = plan_physical_with_stats(&log, &catalog, stats);
+
+    // Rule-based: anchor is the *scan* of `a:Person`, forward (`->`).
+    assert_eq!(
+        expand_anchor(&rule.root),
+        Some(("Person/scan".to_owned(), false)),
+        "rule-based plan must anchor on the scanned `a` endpoint, forward:\n{rule}"
+    );
+    // Cost-based: anchor is the *seek* on `b:Person`, walking the reversed arrow (`<-`).
+    assert_eq!(
+        expand_anchor(&cost.root),
+        Some(("Person/seek".to_owned(), true)),
+        "cost-based plan must re-anchor on the seekable `b` endpoint, reversed:\n{cost}"
+    );
+
+    // The reversal must be strictly cheaper under the cost model (the whole point).
+    let rule_cost = estimate_cost(&rule.root, stats).cost;
+    let cost_cost = estimate_cost(&cost.root, stats).cost;
+    assert!(
+        cost_cost < rule_cost,
+        "reversed plan ({cost_cost}) must be cheaper than forward ({rule_cost})"
+    );
+}
+
+#[test]
+fn expand_reversal_preserves_the_result_bag() {
+    // The re-anchored plan must enumerate the IDENTICAL directed edge set and bind the identical
+    // columns: only the traversal anchor and incidence change, not the pattern's `-[:KNOWS]->`
+    // directionality. Compare result bags of the rule-based (forward) and cost-based (reversed) plans.
+    let catalog = IndexCatalog::builder()
+        .with_label_property("Person", "id")
+        .build();
+    let log =
+        logical("MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.id = 7 RETURN a.id AS a, b.id AS b");
+
+    let stats_graph = knows_graph(1000, 5);
+    let rule = plan_physical(&log, &catalog);
+    let cost = plan_physical_with_stats(&log, &catalog, stats_graph.statistics());
+    assert_ne!(rule.root, cost.root, "plans must differ to prove anything");
+
+    let mut g_rule = knows_graph(1000, 5);
+    let mut g_cost = knows_graph(1000, 5);
+    let rule_rows = run_plan(&rule, &mut g_rule);
+    let cost_rows = run_plan(&cost, &mut g_cost);
+
+    // `b.id = 7` is reached from anchors {2,3,4,5,6} (each KNOWS the next 5) -> exactly 5 rows.
+    assert_eq!(rule_rows.len(), 5, "exactly 5 anchors KNOW node id=7");
+    assert_eq!(
+        bag(&rule_rows),
+        bag(&cost_rows),
+        "the reversed-direction plan must return the identical result bag"
+    );
+}
+
+/// Wall-clock evidence for the reversal (run with `--ignored --nocapture`). The forward plan scans all
+/// `:Person` and fans forward; the reversed plan seeks the one matching `b` and walks back. On a
+/// 50k-node KNOWS fan the gap is order-of-magnitude.
+#[test]
+#[ignore = "timing benchmark; run with --ignored --nocapture"]
+fn expand_reversal_wall_clock_improvement() {
+    use std::time::Instant;
+
+    // 5k nodes already exposes the order-of-magnitude gap (the forward plan is O(n·fanout) edge
+    // walks; the reversed plan is one seek + the in-edges of a single node). At 50k the forward plan
+    // takes ~3 min, so this size keeps the benchmark runnable while still being unambiguous.
+    let n = 5_000;
+    let catalog = IndexCatalog::builder()
+        .with_label_property("Person", "id")
+        .build();
+    let log = logical("MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.id = 7 RETURN a.id AS a");
+
+    let stats_graph = knows_graph(n, 5);
+    let rule = plan_physical(&log, &catalog);
+    let cost = plan_physical_with_stats(&log, &catalog, stats_graph.statistics());
+
+    let mut g_rule = knows_graph(n, 5);
+    let mut g_cost = knows_graph(n, 5);
+
+    // Warm + time the forward (rule-based) plan.
+    let t0 = Instant::now();
+    let rule_rows = run_plan(&rule, &mut g_rule);
+    let forward = t0.elapsed();
+
+    let t1 = Instant::now();
+    let cost_rows = run_plan(&cost, &mut g_cost);
+    let reversed = t1.elapsed();
+
+    assert_eq!(bag(&rule_rows), bag(&cost_rows), "bags must match");
+    eprintln!(
+        "expand-direction reversal on {n} :Person (fanout 5):\n  forward (scan+fan):  {forward:?}\n  reversed (seek+back): {reversed:?}\n  speedup: {:.1}x",
+        forward.as_secs_f64() / reversed.as_secs_f64().max(f64::MIN_POSITIVE)
+    );
+    assert!(
+        reversed < forward,
+        "reversed plan ({reversed:?}) must beat forward ({forward:?})"
+    );
+}
+
+// =================================================================================================
 // Structural helpers
 // =================================================================================================
 
