@@ -629,6 +629,55 @@ impl FreeSlots {
     }
 }
 
+/// An escalating exponential-backoff helper for the eviction-ring claim loop (`rmp` #436).
+///
+/// This is a local mirror of `graphus_bufpool`'s crate-private `Backoff` (introduced for the buffer
+/// pool's `fetch`/victim-sweep contention at `rmp` #359): a few cheap `spin_loop` hints first, then
+/// escalating `yield_now` calls, capped so a single backoff never blocks for long. Using the **same**
+/// strategy and constants keeps the storm-handling behaviour consistent across the two contended
+/// allocators; it is mirrored rather than imported because the bufpool type is `pub(crate)` and to add
+/// no new dependency.
+///
+/// Used by [`DwbPageStager::claim_slot`] to drain the waiter herd in *time* (so in-flight evictors
+/// finish and free their ring slots) instead of a bare `yield_now` busy-spin that burns a core and
+/// prolongs the victim frame's write-latch hold under storm.
+struct Backoff {
+    step: u32,
+}
+
+impl Backoff {
+    /// A fresh backoff at the lowest (cheapest) escalation step.
+    #[inline]
+    fn new() -> Self {
+        Self { step: 0 }
+    }
+
+    /// Backs off once, escalating the patience: a short `spin_loop` burst for the first few steps
+    /// (cheap, no syscall, lets a peer holding a latch on the same core finish), then `yield_now`
+    /// (deschedule so a peer on another core can run), capped so a single backoff never blocks for
+    /// long. Each call advances the step until a ceiling. Mirrors `graphus_bufpool::Backoff::spin`.
+    #[inline]
+    fn spin(&mut self) {
+        // Spin steps 0..=5 (1, 2, 4, …, 32 pauses), then yield for higher steps. The yield steps
+        // escalate by issuing several yields, spreading heavily-contended threads further apart in
+        // time so the evictor herd drains. Capped at step 10 so the patience is bounded.
+        const SPIN_CEIL: u32 = 6;
+        const STEP_CEIL: u32 = 10;
+        if self.step < SPIN_CEIL {
+            for _ in 0..(1u32 << self.step) {
+                std::hint::spin_loop();
+            }
+        } else {
+            for _ in 0..(self.step - SPIN_CEIL + 1) {
+                std::thread::yield_now();
+            }
+        }
+        if self.step < STEP_CEIL {
+            self.step += 1;
+        }
+    }
+}
+
 /// A [`graphus_bufpool::PageStager`] over a **shared persistent doublewrite buffer** (`rmp` #407,
 /// `rmp` #431).
 ///
@@ -687,9 +736,25 @@ impl<D: BlockDevice> DwbPageStager<D> {
         }
     }
 
-    /// Claims a free eviction-ring slot, spinning with a short yield until one is free. Returns the
-    /// slot index. The free-slot lock is held only for the claim attempt itself, never across I/O.
+    /// Claims a free eviction-ring slot, **blocking** until one is free, and returns its index. The
+    /// free-slot lock is held only for the claim attempt itself, never across I/O.
+    ///
+    /// CONTRACT (`rmp` #407/#431): this MUST always return a slot — it never returns without one and
+    /// never falls back to an unprotected home write (that would reopen the torn-write hole #407). It
+    /// is **not** a livelock: progress is guaranteed because a slot WILL free as the device-guard
+    /// holders complete their home writes and call [`Self::free_slot`].
+    ///
+    /// CONTENTION (`rmp` #436): when `> DWB_EVICT_RING_SLOTS` dirty evictions are in flight at once,
+    /// the ring is momentarily exhausted and the caller is still holding the victim frame's write
+    /// latch. A bare `yield_now()` busy-spin here burns a core and prolongs that latch hold under
+    /// storm — the same positive-feedback class the buffer pool hit at `rmp` #359. We instead drain
+    /// the herd with the *same escalating backoff strategy* used there (`graphus_bufpool`'s
+    /// `Backoff`): a few `spin_loop` hints, escalating to repeated `yield_now`, spreading the waiters
+    /// in **time** so the in-flight evictors finish and free their slots, instead of re-contending the
+    /// free-slot lock in lockstep. Mirrored locally (no new dependency, and the bufpool primitive is
+    /// crate-private) but identical in behaviour and constants.
     fn claim_slot(&self) -> usize {
+        let mut backoff = Backoff::new();
         loop {
             {
                 let mut slots = self
@@ -700,9 +765,11 @@ impl<D: BlockDevice> DwbPageStager<D> {
                     return slot;
                 }
             }
-            // Every slot is in flight (>= N concurrent evictors). Yield and retry — correctness is
-            // preserved (we simply cap at N-way parallelism); this is the graceful-degradation path.
-            std::thread::yield_now();
+            // Every slot is in flight (>= N concurrent evictors). Back off (escalating spin → yield)
+            // and retry — correctness is preserved (we simply cap at N-way parallelism, never an
+            // unprotected home write); this is the graceful-degradation path. Progress is guaranteed:
+            // a device-guard holder will complete its home write and free its slot.
+            backoff.spin();
         }
     }
 

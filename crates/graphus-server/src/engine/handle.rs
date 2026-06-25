@@ -17,6 +17,7 @@ use graphus_core::{GraphusError, Value};
 use tokio::sync::Semaphore;
 
 use super::EngineDegraded;
+use super::MaintenanceDegraded;
 use super::TxTicket;
 use super::command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
@@ -66,6 +67,14 @@ pub struct EngineHandle {
     /// thread, so a degraded secondary database is surfaced as not-ready *for that database only* —
     /// every other database stays serviceable.
     degraded: EngineDegraded,
+    /// This engine's **own** maintenance/reclamation-degraded flag (`rmp` #394/#435): set once its
+    /// background checkpoint has failed `K` times consecutively (reclamation stalled), cleared the
+    /// moment a checkpoint on this engine succeeds. Read by `/health/ready`'s per-database readiness
+    /// aggregation. Shared (cloned `Arc`) with the engine thread, so a stalled-reclamation secondary
+    /// database is surfaced as not-ready *for that database only* — one tenant's stall never
+    /// blanket-503s the node, and one engine's checkpoint success never false-clears another's stall
+    /// (the residual cross-tenant breach #435 closes after #414).
+    maintenance_degraded: MaintenanceDegraded,
 }
 
 impl EngineHandle {
@@ -77,12 +86,14 @@ impl EngineHandle {
         tx: std::sync::mpsc::SyncSender<EngineCommand>,
         metrics: Arc<Metrics>,
         degraded: EngineDegraded,
+        maintenance_degraded: MaintenanceDegraded,
     ) -> Self {
         Self {
             tx,
             admission: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             metrics,
             degraded,
+            maintenance_degraded,
         }
     }
 
@@ -97,6 +108,7 @@ impl EngineHandle {
             admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
             metrics: Arc::clone(&self.metrics),
             degraded: self.degraded.clone(),
+            maintenance_degraded: self.maintenance_degraded.clone(),
         }
     }
 
@@ -113,6 +125,17 @@ impl EngineHandle {
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         self.degraded.is_degraded()
+    }
+
+    /// Whether **this** database's engine has its reclamation flagged degraded (`rmp` #394/#435): its
+    /// background maintenance checkpoint has failed `K` times consecutively, so RAM/disk/version slots
+    /// stop being reclaimed while writes accrue (a slow-motion OOM). Read by `/health/ready`'s
+    /// per-database readiness aggregation so a stalled-reclamation secondary database is surfaced as
+    /// not-ready *for that database only*, while every other database stays ready. Auto-clears the
+    /// moment a checkpoint on this engine succeeds.
+    #[must_use]
+    pub fn is_maintenance_degraded(&self) -> bool {
+        self.maintenance_degraded.is_degraded()
     }
 
     /// Tries to admit a query: acquires an admission permit without waiting, or fast-rejects with
@@ -294,6 +317,22 @@ impl EngineHandle {
     pub async fn checkpoint(&self) -> Result<CheckpointReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit(EngineCommand::Checkpoint { reply }).await?;
+        recv_async(rx).await?
+    }
+
+    /// **Test-only** (`rmp` #435, `internal-test-udf`): deterministically drives this engine's
+    /// background maintenance escalation so its per-engine reclamation-degraded flag is set (after `K`
+    /// simulated consecutive failures) or cleared (a simulated success), returning whether this engine
+    /// is degraded afterwards. Exercises the real escalation path confined to THIS engine, so the
+    /// multi-tenant isolation gate can prove a secondary database's stall never touches another's flag.
+    ///
+    /// # Errors
+    /// [`GraphusError`] if the engine is shut down.
+    #[cfg(feature = "internal-test-udf")]
+    pub async fn simulate_maintenance(&self, fail: bool) -> Result<bool, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::SimulateMaintenance { fail, reply })
+            .await?;
         recv_async(rx).await?
     }
 

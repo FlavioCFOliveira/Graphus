@@ -1142,6 +1142,41 @@ impl DatabaseCatalog {
             .is_some_and(EngineHandle::is_degraded)
     }
 
+    /// The names of every **running** database whose engine has its reclamation flagged **degraded**
+    /// (`rmp` #394/#435): its background maintenance checkpoint has failed `K` times consecutively
+    /// (RAM/disk/version slots stop being reclaimed while writes accrue — a slow-motion OOM), in name
+    /// order. Used by `/health/ready` to aggregate reclamation degradation **per database**: one stalled
+    /// secondary database is surfaced (so an orchestrator can tell which database is unhealthy) without
+    /// marking the whole node not-ready when other databases are reclaiming fine. This closes the
+    /// residual cross-tenant breach #414 left: the gating flag was a single shared-`Metrics` gauge, so
+    /// one database's stall blanket-503'd the node and another database's checkpoint success
+    /// false-cleared it; the flag is now per-engine. A brief read lock on the handle map + per-handle
+    /// atomic loads; never held across an `.await`.
+    #[must_use]
+    pub fn maintenance_degraded_databases(&self) -> Vec<String> {
+        let mut degraded: Vec<String> = self
+            .read_handles()
+            .iter()
+            .filter(|(_, h)| h.is_maintenance_degraded())
+            .map(|(name, _)| name.clone())
+            .collect();
+        degraded.sort_unstable();
+        degraded
+    }
+
+    /// Whether the **default** database's engine has its reclamation flagged degraded (`rmp`
+    /// #394/#435). The default database is the one the listeners structurally depend on, so its
+    /// reclamation stall is treated as a node-level not-ready (mirroring the pre-`rmp`-#435 whole-node
+    /// behaviour); a *secondary* database's stall is reported separately by
+    /// [`maintenance_degraded_databases`](Self::maintenance_degraded_databases) without taking the node
+    /// down.
+    #[must_use]
+    pub fn default_database_maintenance_degraded(&self) -> bool {
+        self.read_handles()
+            .get(&self.default_name)
+            .is_some_and(EngineHandle::is_maintenance_degraded)
+    }
+
     /// The number of **non-default** databases that are configured `online` but whose engine failed to
     /// open/start (`rmp` #430). Lock-free (an atomic load), so `/health/ready` can consult it without
     /// the async admin mutex. `> 0` means at least one configured database is not serving — a degraded

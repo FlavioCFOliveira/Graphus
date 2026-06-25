@@ -380,6 +380,21 @@ pub enum EngineCommand {
         /// reclaim.
         reply: Reply<Result<CheckpointReply, GraphusError>>,
     },
+    /// **Test-only** (`rmp` #435, opt-in `internal-test-udf`): deterministically drives this engine's
+    /// **background maintenance escalation** path so the per-engine reclamation-degraded flag is set
+    /// (after `K` simulated consecutive failures) or cleared (a simulated success) WITHOUT having to
+    /// grow the WAL past `MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`. Exercises the real
+    /// `record_maintenance_failure` / [`crate::engine::MaintenanceDegraded`] code on the targeted
+    /// engine only, so the multi-tenant isolation gate can prove a secondary database's stall does not
+    /// touch another engine's flag. Off in production (the variant compiles away).
+    #[cfg(feature = "internal-test-udf")]
+    SimulateMaintenance {
+        /// `true` to simulate one maintenance-checkpoint **failure** (escalating the streak), `false`
+        /// to simulate a **success** (which clears this engine's flag and resets the streak).
+        fail: bool,
+        /// Reply channel: whether this engine is degraded **after** applying the simulated outcome.
+        reply: Reply<Result<bool, GraphusError>>,
+    },
 }
 
 /// The summary of a [`EngineCommand::Checkpoint`] maintenance pass — what the GC sweep reclaimed/froze,

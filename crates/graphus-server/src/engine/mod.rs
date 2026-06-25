@@ -98,12 +98,16 @@ const INDEX_BUILD_TICK: std::time::Duration = std::time::Duration::from_millis(2
 const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// After this many **consecutive** background maintenance checkpoint failures, reclamation is treated
-/// as persistently stalled and the server is flagged **degraded** (`rmp` #394): the
-/// `maintenance_degraded` metric gauge flips to `1`, which drives `/health/ready` to `503`. A single
-/// transient failure (e.g. a brief I/O hiccup) is logged and retried without escalation; only a run of
-/// failures — the signature of a stuck reclamation that would otherwise leak memory behind a green
-/// readiness probe (a slow-motion OOM) — escalates. Any success resets the streak and clears the gauge.
-pub(crate) const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
+/// as persistently stalled and this database's engine is flagged **degraded** (`rmp` #394/#435): the
+/// **per-engine** [`MaintenanceDegraded`] flag flips, which drives `/health/ready` to `503` for that
+/// database. A single transient failure (e.g. a brief I/O hiccup) is logged and retried without
+/// escalation; only a run of failures — the signature of a stuck reclamation that would otherwise leak
+/// memory behind a green readiness probe (a slow-motion OOM) — escalates. Any success on this engine
+/// resets its streak and clears its own flag.
+///
+/// `pub` (mirroring [`arm_recovery_fault`]) so the multi-tenant readiness/isolation gate can drive
+/// exactly `K` simulated failures.
+pub const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
 
 /// A **test-only fault-injection seam** (`rmp` #409): the count of upcoming statement-recovery
 /// rollbacks/commits that should *themselves* panic, simulating the historical `RefCell`-double-borrow
@@ -180,6 +184,62 @@ impl EngineDegraded {
 
     /// Whether this engine is currently degraded — read by the per-statement gate and by
     /// `/health/ready`.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// A **per-engine** "maintenance/reclamation degraded" flag (`rmp` #394/#435): set when this
+/// database's background maintenance checkpoint has failed
+/// [`MAINTENANCE_FAILURE_ESCALATION_THRESHOLD`] times **consecutively** (reclamation is persistently
+/// stuck — RAM/disk/version slots stop being freed while writes accrue, a slow-motion OOM), cleared
+/// the moment a checkpoint on **this** engine succeeds.
+///
+/// ## Why per-engine, not on the shared [`Metrics`]
+///
+/// Every database engine shares one [`Arc<Metrics>`]. The pre-`rmp`-#435 design flagged the
+/// reclamation-degraded *gating* state on a single `maintenance_degraded` atomic *on that shared
+/// `Metrics`* (the residual sibling of the #414 `engine_degraded` cross-tenant breach). That had two
+/// symmetric multi-tenant hazards: (1) ONE database's `K` consecutive maintenance failures flipped the
+/// shared gauge, so `/health/ready` returned `503` for the **whole node** — taking a healthy default
+/// database out of rotation; (2) ANY OTHER engine's *successful* checkpoint `store(0)`d the same gauge,
+/// **false-clearing** a still-stuck database's degraded flag and masking a real stall. Moving the
+/// *gating* flag onto each engine confines both the escalation and the clear to the affected database:
+/// the engine that escalates sets its OWN flag, and a checkpoint success on engine A clears ONLY A's
+/// flag (never B's). The aggregate `graphus_maintenance_failures_total` **counter** stays on `Metrics`
+/// for observability (it is fleet-wide telemetry, not a gate).
+///
+/// Cloneable + `Send + Sync` (an `Arc<AtomicBool>`) so the same flag is shared between the engine
+/// thread (the sole writer, via [`MaintenanceDegraded::set`]/[`clear`](Self::clear)) and every
+/// [`EngineHandle`] clone + the `/health/ready` readiness aggregation (readers). Unlike
+/// [`EngineDegraded`], maintenance degradation **does** auto-clear: a checkpoint that succeeds proves
+/// reclamation is making progress again.
+#[derive(Clone, Debug, Default)]
+pub struct MaintenanceDegraded(Arc<AtomicBool>);
+
+impl MaintenanceDegraded {
+    /// A fresh, not-degraded flag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flags this engine's reclamation degraded (`K` consecutive maintenance failures, `rmp`
+    /// #394/#435). Idempotent.
+    pub fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Clears this engine's reclamation-degraded flag (a maintenance checkpoint on **this** engine
+    /// succeeded, `rmp` #394/#435). Idempotent. Clears ONLY this engine's flag — never another
+    /// engine's, which is the whole point of the #435 fix.
+    pub fn clear(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether **this** engine's reclamation is currently flagged degraded — read by `/health/ready`'s
+    /// per-database readiness aggregation.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
         self.0.load(Ordering::SeqCst)
@@ -281,6 +341,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     reader_threads: usize,
     metrics: Arc<Metrics>,
     degraded: EngineDegraded,
+    maintenance_degraded: MaintenanceDegraded,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) {
     // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
@@ -388,6 +449,18 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
                 Ok(cmd) => {
+                    // Test-only (`rmp` #435): intercept the simulated-maintenance driver here in the
+                    // loop, where the per-engine flag + the consecutive-failure streak live, so it
+                    // exercises the REAL escalation path confined to this engine. Returns the original
+                    // command if it was not a `SimulateMaintenance` (production builds: identity).
+                    let Some(cmd) = intercept_simulate_maintenance(
+                        cmd,
+                        &mut maintenance_consecutive_failures,
+                        &metrics,
+                        &maintenance_degraded,
+                    ) else {
+                        continue 'engine;
+                    };
                     if !dispatch_command(
                         cmd,
                         &mut coordinator,
@@ -401,6 +474,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         result_buffer_capacity,
                         &metrics,
                         &degraded,
+                        &maintenance_degraded,
                         &mut active_txns,
                         &clock,
                     ) {
@@ -417,6 +491,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut wal_at_last_maintenance,
                         &mut maintenance_consecutive_failures,
                         &metrics,
+                        &maintenance_degraded,
                     );
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -436,6 +511,16 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             // No build pending and no readers in flight: a plain blocking receive (the original
             // behaviour). `Err` is the closed-channel EOF the old `while let Ok(..)` terminated on.
             let Ok(cmd) = rx.recv() else { break 'engine };
+            // Test-only (`rmp` #435): intercept the simulated-maintenance driver (identity in
+            // production). See the `timed` branch for the rationale.
+            let Some(cmd) = intercept_simulate_maintenance(
+                cmd,
+                &mut maintenance_consecutive_failures,
+                &metrics,
+                &maintenance_degraded,
+            ) else {
+                continue 'engine;
+            };
             if !dispatch_command(
                 cmd,
                 &mut coordinator,
@@ -449,6 +534,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 result_buffer_capacity,
                 &metrics,
                 &degraded,
+                &maintenance_degraded,
                 &mut active_txns,
                 &clock,
             ) {
@@ -467,6 +553,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &mut wal_at_last_maintenance,
                 &mut maintenance_consecutive_failures,
                 &metrics,
+                &maintenance_degraded,
             );
         }
     }
@@ -626,6 +713,7 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     wal_at_last_maintenance: &mut u64,
     consecutive_failures: &mut u32,
     metrics: &Metrics,
+    maintenance_degraded: &MaintenanceDegraded,
 ) {
     let Some(coord) = coordinator.as_mut() else {
         return;
@@ -636,16 +724,17 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     }
     match coord.checkpoint() {
         Ok(report) => {
-            // Success: record progress and clear any degraded state (the gauge is cleared inside
-            // `record_maintenance_checkpoint`); reset the failure streak.
+            // Success: record progress (aggregate observability counters) and clear **this engine's
+            // own** reclamation-degraded flag (`rmp` #435 — never another engine's); reset the streak.
             metrics.record_maintenance_checkpoint(report.reclaimed as u64, report.frozen as u64);
+            maintenance_degraded.clear();
             *consecutive_failures = 0;
         }
         Err(e) => {
             // Never fatal: the floor was respected, so durability is intact. But surface the failure
             // (metric) and escalate a *persistent* run of failures so a stuck reclamation cannot leak
             // memory silently behind a green probe (`rmp` #394).
-            record_maintenance_failure(consecutive_failures, metrics, &e);
+            record_maintenance_failure(consecutive_failures, metrics, maintenance_degraded, &e);
         }
     }
     // Re-read: a successful checkpoint reclaimed the WAL prefix, so anchor the next interval at the new
@@ -662,12 +751,15 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
 fn record_maintenance_failure(
     consecutive_failures: &mut u32,
     metrics: &Metrics,
+    maintenance_degraded: &MaintenanceDegraded,
     err: &dyn std::fmt::Display,
 ) {
     metrics.record_maintenance_failure();
     *consecutive_failures = consecutive_failures.saturating_add(1);
     if *consecutive_failures >= MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
-        metrics.set_maintenance_degraded(true);
+        // Flag **this engine's own** reclamation degraded (`rmp` #435 — per-engine, not the shared
+        // gauge, so one tenant's stall never marks the whole node not-ready).
+        maintenance_degraded.set();
         tracing::error!(
             consecutive_failures = *consecutive_failures,
             "background maintenance checkpoint has failed repeatedly; reclamation is DEGRADED \
@@ -679,6 +771,58 @@ fn record_maintenance_failure(
             "background maintenance checkpoint failed (will retry): {err}"
         );
     }
+}
+
+/// **Test-only** (`rmp` #435, `internal-test-udf`): handles a [`EngineCommand::SimulateMaintenance`]
+/// in the engine loop, driving the REAL per-engine escalation/clear path with this engine's own
+/// `consecutive_failures` streak + [`MaintenanceDegraded`] flag, then returns `None` (the command was
+/// consumed). Any other command is returned unchanged as `Some(cmd)` so the caller dispatches it.
+///
+/// In production (feature off) this compiles to a trivial identity (`Some(cmd)`), so the engine loop
+/// is unchanged. The seam lets the multi-tenant isolation gate flag exactly one engine degraded
+/// (and clear exactly one) without growing the WAL past [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`].
+#[cfg(feature = "internal-test-udf")]
+fn intercept_simulate_maintenance(
+    cmd: EngineCommand,
+    consecutive_failures: &mut u32,
+    metrics: &Metrics,
+    maintenance_degraded: &MaintenanceDegraded,
+) -> Option<EngineCommand> {
+    match cmd {
+        EngineCommand::SimulateMaintenance { fail, reply } => {
+            if fail {
+                // Mirror the background failure arm exactly: the real escalation sets THIS engine's
+                // flag once the streak reaches the threshold.
+                record_maintenance_failure(
+                    consecutive_failures,
+                    metrics,
+                    maintenance_degraded,
+                    &"simulated maintenance failure (test)",
+                );
+            } else {
+                // Mirror the background success arm exactly: clear THIS engine's flag, reset the streak.
+                metrics.record_maintenance_checkpoint(0, 0);
+                maintenance_degraded.clear();
+                *consecutive_failures = 0;
+            }
+            let _ = reply.send(Ok(maintenance_degraded.is_degraded()));
+            None
+        }
+        other => Some(other),
+    }
+}
+
+/// Production identity (`rmp` #435): the simulated-maintenance seam is compiled out, so the engine
+/// loop dispatches every command unchanged.
+#[cfg(not(feature = "internal-test-udf"))]
+#[inline]
+fn intercept_simulate_maintenance(
+    cmd: EngineCommand,
+    _consecutive_failures: &mut u32,
+    _metrics: &Metrics,
+    _maintenance_degraded: &MaintenanceDegraded,
+) -> Option<EngineCommand> {
+    Some(cmd)
 }
 
 /// Advances the front non-blocking index build by one [`INDEX_BUILD_CHUNK`] (`rmp` task #91). A
@@ -734,6 +878,9 @@ fn reply_engine_degraded(cmd: EngineCommand) -> Option<EngineCommand> {
     match cmd {
         // Control commands that must keep working so the node can be drained / probed / restarted.
         cmd @ (Cmd::Shutdown { .. } | Cmd::Status { .. }) => Some(cmd),
+        // Test-only (`rmp` #435): a control-class driver; pass it through so the loop's intercept runs.
+        #[cfg(feature = "internal-test-udf")]
+        cmd @ Cmd::SimulateMaintenance { .. } => Some(cmd),
         Cmd::Begin { reply, .. } | Cmd::BeginAutoCommit { reply, .. } => {
             let _ = reply.send(Err(engine_degraded_error()));
             None
@@ -784,6 +931,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     degraded: &EngineDegraded,
+    maintenance_degraded: &MaintenanceDegraded,
     active_txns: &mut ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) -> bool {
@@ -907,7 +1055,25 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         }
         Cmd::Checkpoint { reply } => {
             let out = handle_checkpoint(coord);
+            // A manual (admin-triggered) checkpoint that succeeds is proof reclamation is making
+            // progress again, so clear **this engine's own** maintenance-degraded flag (`rmp` #435 —
+            // never another engine's). On failure the flag is left as-is (an operator's manual probe
+            // does not escalate the background streak).
+            if out.is_ok() {
+                maintenance_degraded.clear();
+            }
             let _ = reply.send(out);
+        }
+        // Test-only (`rmp` #435): the threaded engine loop intercepts this before dispatch, so it only
+        // reaches here on the `LocalEngine` inline path — drive the same real per-engine escalation.
+        #[cfg(feature = "internal-test-udf")]
+        Cmd::SimulateMaintenance { fail, reply } => {
+            if fail {
+                maintenance_degraded.set();
+            } else {
+                maintenance_degraded.clear();
+            }
+            let _ = reply.send(Ok(maintenance_degraded.is_degraded()));
         }
         Cmd::Shutdown { reply } => {
             // Drain stragglers through `&mut`, then consume the coordinator for the final flush. An
@@ -1617,6 +1783,13 @@ where
     // recovery double-panic confines the engine-degraded refusal to THIS database.
     let degraded = EngineDegraded::new();
     let loop_degraded = degraded.clone();
+    // This engine's OWN maintenance/reclamation-degraded flag (`rmp` #394/#435): shared (cloned)
+    // between the engine thread's maintenance pass (the sole writer) and the `EngineHandle` clones +
+    // `/health/ready` readers, so a stalled-reclamation secondary database is surfaced as not-ready
+    // for THAT database only — one tenant's stall never blanket-503s the node, and one engine's
+    // checkpoint success never false-clears another's stall.
+    let maintenance_degraded = MaintenanceDegraded::new();
+    let loop_maintenance_degraded = maintenance_degraded.clone();
     let join = std::thread::Builder::new()
         .name("graphus-engine".to_owned())
         .spawn(move || match build() {
@@ -1631,6 +1804,7 @@ where
                     reader_threads,
                     loop_metrics,
                     loop_degraded,
+                    loop_maintenance_degraded,
                     clock,
                 );
             }
@@ -1644,7 +1818,7 @@ where
     // Wait for the thread's startup result before returning a usable handle.
     match init_rx.recv() {
         Ok(Ok(())) => Ok(Engine {
-            handle: EngineHandle::new(tx, metrics, degraded),
+            handle: EngineHandle::new(tx, metrics, degraded, maintenance_degraded),
             join,
         }),
         Ok(Err(e)) => {
@@ -1665,63 +1839,99 @@ where
 mod maintenance_tests {
     use super::*;
 
-    /// rmp #394 GATE: repeated maintenance-checkpoint failures increment the failure metric on every
-    /// failure and, after K **consecutive** failures, flip the reclamation-degraded gauge (which drives
-    /// `/health/ready` to 503). A single transient failure must NOT escalate.
+    /// rmp #394/#435 GATE: repeated maintenance-checkpoint failures increment the (aggregate) failure
+    /// metric on every failure and, after K **consecutive** failures, flip **this engine's own**
+    /// reclamation-degraded flag (which drives `/health/ready` to 503 for THAT database). A single
+    /// transient failure must NOT escalate.
     #[test]
     fn repeated_maintenance_failures_escalate_to_degraded() {
         let metrics = Metrics::new();
+        let maintenance_degraded = MaintenanceDegraded::new();
         let mut consecutive: u32 = 0;
         let err = "simulated checkpoint I/O failure";
 
-        // Fewer than K failures: the metric counts each, but the node is NOT yet flagged degraded.
+        // Fewer than K failures: the metric counts each, but this engine is NOT yet flagged degraded.
         for i in 1..MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
-            record_maintenance_failure(&mut consecutive, &metrics, &err);
+            record_maintenance_failure(&mut consecutive, &metrics, &maintenance_degraded, &err);
             assert_eq!(consecutive, i);
             assert!(
-                !metrics.is_maintenance_degraded(),
+                !maintenance_degraded.is_degraded(),
                 "must not escalate before {MAINTENANCE_FAILURE_ESCALATION_THRESHOLD} consecutive failures"
             );
         }
 
-        // The K-th consecutive failure escalates: reclamation is flagged degraded.
-        record_maintenance_failure(&mut consecutive, &metrics, &err);
+        // The K-th consecutive failure escalates: this engine's reclamation is flagged degraded.
+        record_maintenance_failure(&mut consecutive, &metrics, &maintenance_degraded, &err);
         assert_eq!(consecutive, MAINTENANCE_FAILURE_ESCALATION_THRESHOLD);
         assert!(
-            metrics.is_maintenance_degraded(),
-            "K consecutive failures must flag reclamation degraded (readiness → 503)"
+            maintenance_degraded.is_degraded(),
+            "K consecutive failures must flag this engine's reclamation degraded (readiness → 503)"
         );
     }
 
-    /// rmp #394: a successful checkpoint after failures clears the degraded state and resets the
-    /// streak, so a node recovers readiness automatically once reclamation resumes. A single transient
-    /// failure (below the threshold) likewise never escalates.
+    /// rmp #394/#435: a successful checkpoint after failures clears **this engine's own** degraded
+    /// flag and resets the streak, so that database recovers readiness automatically once its
+    /// reclamation resumes. A single transient failure (below the threshold) likewise never escalates.
     #[test]
     fn a_success_clears_degraded_and_resets_the_streak() {
         let metrics = Metrics::new();
+        let maintenance_degraded = MaintenanceDegraded::new();
         let mut consecutive: u32 = 0;
         let err = "transient failure";
 
-        // Drive past the threshold so the node is degraded.
+        // Drive past the threshold so this engine is degraded.
         for _ in 0..MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
-            record_maintenance_failure(&mut consecutive, &metrics, &err);
+            record_maintenance_failure(&mut consecutive, &metrics, &maintenance_degraded, &err);
         }
-        assert!(metrics.is_maintenance_degraded());
+        assert!(maintenance_degraded.is_degraded());
 
-        // A successful checkpoint clears the gauge; mirror the loop's success arm.
+        // A successful checkpoint clears this engine's flag; mirror the loop's success arm.
         metrics.record_maintenance_checkpoint(0, 0);
+        maintenance_degraded.clear();
         consecutive = 0;
         assert!(
-            !metrics.is_maintenance_degraded(),
-            "a successful checkpoint must clear the degraded gauge"
+            !maintenance_degraded.is_degraded(),
+            "a successful checkpoint must clear this engine's degraded flag"
         );
 
         // A single subsequent transient failure does not re-escalate (streak was reset).
-        record_maintenance_failure(&mut consecutive, &metrics, &err);
+        record_maintenance_failure(&mut consecutive, &metrics, &maintenance_degraded, &err);
         assert_eq!(consecutive, 1);
         assert!(
-            !metrics.is_maintenance_degraded(),
+            !maintenance_degraded.is_degraded(),
             "one isolated failure after recovery must not flag degraded"
+        );
+    }
+
+    /// rmp #435 GATE (the residual cross-tenant breach #414 left): the reclamation-degraded flag is
+    /// **per-engine**, so (1) escalating engine A's maintenance failures NEVER flags engine B, and
+    /// (2) a checkpoint SUCCESS on engine B (which clears B's own flag) NEVER false-clears A's still-
+    /// stuck flag. Pre-#435 both engines shared a single `Metrics` gauge, so this isolation was
+    /// impossible. The aggregate failure counter is shared (fleet observability) and is unaffected.
+    #[test]
+    fn maintenance_degraded_is_isolated_per_engine() {
+        // One shared Metrics (as the catalog clones into every engine), two independent per-engine flags.
+        let metrics = Metrics::new();
+        let engine_a = MaintenanceDegraded::new();
+        let engine_b = MaintenanceDegraded::new();
+        let err = "simulated checkpoint I/O failure";
+
+        // Escalate engine A only.
+        let mut a_streak: u32 = 0;
+        for _ in 0..MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
+            record_maintenance_failure(&mut a_streak, &metrics, &engine_a, &err);
+        }
+        assert!(engine_a.is_degraded(), "engine A escalated");
+        assert!(
+            !engine_b.is_degraded(),
+            "engine A's stall must NOT flag engine B (no shared-gauge blanket-503)"
+        );
+
+        // A successful checkpoint on engine B clears ONLY B's flag — A stays degraded.
+        engine_b.clear(); // mirror the loop's success arm for B (a checkpoint on B succeeded)
+        assert!(
+            engine_a.is_degraded(),
+            "engine B's checkpoint success must NOT false-clear engine A's stuck flag (the #435 bug)"
         );
     }
 }

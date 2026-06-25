@@ -16,9 +16,18 @@
 //! * the catalog's per-database readiness aggregation **distinguishes** them: `degraded_databases()`
 //!   names `tenant_a`, while `default_database_degraded()` stays `false`.
 //!
+//! It also carries the sibling **reclamation-degradation isolation gate** (`rmp` #435), which closes
+//! the residual cross-tenant breach #414 left: the `maintenance_degraded` *gating* gauge was STILL a
+//! single shared `AtomicU64` after #414, so (1) one engine's `K` consecutive maintenance-checkpoint
+//! failures blanket-503'd the whole node (taking a healthy default DB out of rotation), and (2) any
+//! other engine's checkpoint success false-cleared a still-stuck engine's flag. That flag is now
+//! per-engine (`MaintenanceDegraded`), so a secondary DB's stall stays confined to that DB and a
+//! success on one engine never clears another's flag — see
+//! [`a_secondary_maintenance_stall_does_not_blanket_degrade_the_node`].
+//!
 //! Gated on the opt-in `internal-test-udf` feature (which registers the `ext.panic` UDF + the
-//! recovery-fault seam): run with `cargo test -p graphus-server --features internal-test-udf --test
-//! multi_db_engine_isolation`.
+//! recovery-fault seam + the `simulate_maintenance` driver): run with `cargo test -p graphus-server
+//! --features internal-test-udf --test multi_db_engine_isolation`.
 #![cfg(feature = "internal-test-udf")]
 
 use std::path::PathBuf;
@@ -208,6 +217,106 @@ async fn one_degraded_database_does_not_disable_the_rest() {
     assert!(
         !catalog.default_database_degraded(),
         "the default database must NOT be flagged degraded — only tenant_a is"
+    );
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #435: a secondary database's reclamation stall must NOT blanket-degrade the node, and one
+/// engine's checkpoint success must NOT false-clear another engine's still-stuck flag.
+///
+/// This is the sibling of [`one_degraded_database_does_not_disable_the_rest`] for the
+/// `maintenance_degraded` *gating* flag — the residual shared-`Metrics` gauge #414 left behind. It
+/// boots a real server (default `graphus` + secondary `tenant_b`), drives `tenant_b`'s engine past the
+/// consecutive-failure escalation threshold via the real per-engine escalation path, and asserts:
+///
+/// * `/health/ready`'s per-database aggregation names `tenant_b` as reclamation-degraded while the
+///   **default** stays NOT reclamation-degraded (so a healthy default is never taken out of rotation);
+/// * a checkpoint **success** on the **default** engine does NOT clear `tenant_b`'s still-stuck flag
+///   (the cross-tenant false-clear the shared `store(0)` gauge caused — the #435 bug).
+///
+/// FAIL-BEFORE: with the shared-gauge design, step 1's escalation flipped the single node-wide gauge,
+/// so `default_database_maintenance_degraded()` would have been `true` (whole node degraded), and the
+/// default's success `store(0)`'d the shared gauge, so `maintenance_degraded_databases()` would have
+/// been empty (tenant_b's stall masked). Both assertions below would have failed.
+#[tokio::test]
+async fn a_secondary_maintenance_stall_does_not_blanket_degrade_the_node() {
+    use graphus_server::engine::MAINTENANCE_FAILURE_ESCALATION_THRESHOLD;
+
+    let temp = TempStore::new("maint-isolation");
+    let handle = boot(config(&temp)).await;
+    let catalog = handle.catalog.clone();
+    let default_db = handle.engine.clone();
+
+    // A created secondary database `tenant_b` (its own independent engine + per-engine flag).
+    let tenant_b = catalog.create("tenant_b").await.expect("create tenant_b");
+
+    // Both databases start with healthy reclamation.
+    assert!(
+        catalog.maintenance_degraded_databases().is_empty(),
+        "no engine starts reclamation-degraded"
+    );
+    assert!(!catalog.default_database_maintenance_degraded());
+
+    // Drive tenant_b's engine past the escalation threshold via the REAL per-engine escalation path
+    // (the same `record_maintenance_failure` the background cadence runs). The default engine is never
+    // driven, so only tenant_b escalates.
+    let mut degraded_after = false;
+    for _ in 0..MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
+        degraded_after = tenant_b
+            .simulate_maintenance(true)
+            .await
+            .expect("simulate maintenance failure on tenant_b");
+    }
+    assert!(
+        degraded_after,
+        "K consecutive failures must flag tenant_b's own engine reclamation-degraded"
+    );
+
+    // THE KEY ISOLATION ASSERTION (`rmp` #435): the per-database readiness aggregation names tenant_b
+    // while the DEFAULT database stays healthy — the node is not blanket-degraded by one tenant's stall.
+    assert_eq!(
+        catalog.maintenance_degraded_databases(),
+        vec!["tenant_b".to_owned()],
+        "the reclamation-degraded aggregation must name exactly tenant_b"
+    );
+    assert!(
+        !catalog.default_database_maintenance_degraded(),
+        "the default database must NOT be reclamation-degraded — only tenant_b is (no shared-gauge \
+         blanket-503)"
+    );
+
+    // THE CROSS-TENANT FALSE-CLEAR ASSERTION (`rmp` #435): a checkpoint SUCCESS on the DEFAULT engine
+    // must clear ONLY its own flag (it had none) and NEVER tenant_b's still-stuck flag. Under the old
+    // shared gauge this `store(0)` would have masked tenant_b's real stall.
+    let default_degraded_after_success = default_db
+        .simulate_maintenance(false)
+        .await
+        .expect("simulate maintenance success on the default engine");
+    assert!(
+        !default_degraded_after_success,
+        "the default engine was never degraded; a success keeps it healthy"
+    );
+    assert_eq!(
+        catalog.maintenance_degraded_databases(),
+        vec!["tenant_b".to_owned()],
+        "the default's checkpoint success must NOT false-clear tenant_b's stuck flag (the #435 bug)"
+    );
+
+    // And tenant_b auto-recovers readiness the moment ITS OWN checkpoint succeeds (per-engine clear).
+    // The reply also proves tenant_b's engine is still alive — degradation is a readiness gate, not
+    // engine death.
+    let tenant_b_after_success = tenant_b
+        .simulate_maintenance(false)
+        .await
+        .expect("simulate maintenance success on tenant_b");
+    assert!(
+        !tenant_b_after_success,
+        "tenant_b's own checkpoint success clears its own flag"
+    );
+    assert!(
+        catalog.maintenance_degraded_databases().is_empty(),
+        "tenant_b recovered readiness once its own reclamation resumed"
     );
 
     handle.shutdown().await.expect("graceful shutdown");

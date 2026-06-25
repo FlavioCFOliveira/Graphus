@@ -154,12 +154,16 @@ async fn health_live() -> Response {
 /// `GET /health/ready` — readiness: `200 OK` once the store is verified + the engine is serving, and
 /// `503` while starting up or shutting down (`04 §9`).
 ///
-/// Also reports `503` when **reclamation is degraded** (`rmp` #394): if the background maintenance
-/// checkpoint has failed `K` times consecutively, reclamation has stalled (RAM/disk/version slots stop
-/// being freed while writes accrue — a slow-motion OOM). Surfacing it through readiness lets an
-/// orchestrator stop routing writes to a node that would otherwise keep accepting them behind a green
-/// probe until it OOMs. The gauge clears the moment a checkpoint succeeds, so the node recovers
-/// readiness automatically once reclamation resumes.
+/// Also reports `503` when **reclamation is degraded** (`rmp` #394/#435): if a database's background
+/// maintenance checkpoint has failed `K` times consecutively, reclamation has stalled for that database
+/// (RAM/disk/version slots stop being freed while writes accrue — a slow-motion OOM). Surfacing it
+/// through readiness lets an orchestrator stop routing writes to a node that would otherwise keep
+/// accepting them behind a green probe until it OOMs. The flag is **per-engine** (`rmp` #435, closing
+/// the residual cross-tenant breach #414 left in the shared-`Metrics` gauge): the **default** database's
+/// stall is a node-level not-ready (the listeners depend on it), while a **secondary** database's stall
+/// is reported (named) without taking the node down, so a healthy default stays serviceable. The flag
+/// clears the moment a checkpoint on that engine succeeds, so a database recovers readiness
+/// automatically once its reclamation resumes.
 ///
 /// Reports `503` when the **default database's engine is degraded** (`rmp` #409/#414): a statement
 /// panicked and the rollback/commit recovering it *also* panicked, so a deep storage/MVCC invariant is
@@ -178,10 +182,14 @@ async fn health_ready(State(state): State<ExtraState>) -> Response {
     if !state.readiness.is_ready() {
         return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
     }
-    if state.metrics.is_maintenance_degraded() {
+    // Per-database reclamation-degradation aggregation (`rmp` #394/#435). The flag is per-engine (the
+    // residual shared-`Metrics` gauge #414 left is gone): the default database's stall is a node-level
+    // not-ready (the listeners depend on it); a stalled *secondary* database is reported (named) below
+    // without false-503'ing the healthy default.
+    if state.catalog.default_database_maintenance_degraded() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "not ready: storage reclamation degraded",
+            "not ready: default database storage reclamation degraded",
         )
             .into_response();
     }
@@ -195,6 +203,7 @@ async fn health_ready(State(state): State<ExtraState>) -> Response {
         )
             .into_response();
     }
+    let maintenance_degraded = state.catalog.maintenance_degraded_databases();
     let degraded = state.catalog.degraded_databases();
     let failed_open = state.catalog.failed_open_database_count();
     // A non-default database failing to open (`rmp` #430) is a degraded signal: the node still serves
@@ -214,6 +223,19 @@ async fn health_ready(State(state): State<ExtraState>) -> Response {
             format!(
                 "not ready: database(s) engine-degraded: {}",
                 degraded.join(", ")
+            ),
+        )
+            .into_response();
+    }
+    // A *secondary* database whose reclamation has stalled (`rmp` #394/#435) is likewise surfaced
+    // (named) without taking the node down — the healthy default keeps serving. The flag being
+    // per-engine is what lets this database be named without the default being false-503'd by it.
+    if !maintenance_degraded.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "not ready: database(s) storage-reclamation-degraded: {}",
+                maintenance_degraded.join(", ")
             ),
         )
             .into_response();

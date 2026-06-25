@@ -95,6 +95,9 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// This inline engine's own degraded flag (`rmp` #414), mirroring the threaded engine. Single-
     /// engine inline driver, so it gates only itself; exposed for determinism parity with production.
     degraded: super::EngineDegraded,
+    /// This inline engine's own reclamation-degraded flag (`rmp` #394/#435), mirroring the threaded
+    /// engine. Single-engine inline driver, so it gates only itself; present for determinism parity.
+    maintenance_degraded: super::MaintenanceDegraded,
     /// This inline engine's contribution to the (private) server-wide open-transaction gauge
     /// (`rmp` #418): published additively, exactly as the threaded loop does.
     active_txns: super::ActiveTxnGauge,
@@ -117,6 +120,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             readers_inflight: 0,
             plan_cache: super::exec::EnginePlanCache::new(),
             degraded: super::EngineDegraded::new(),
+            maintenance_degraded: super::MaintenanceDegraded::new(),
             active_txns: super::ActiveTxnGauge::new(Arc::clone(&metrics)),
             metrics,
             clock,
@@ -150,6 +154,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             LOCAL_RESULT_BUFFER,
             &self.metrics,
             &self.degraded,
+            &self.maintenance_degraded,
             &mut self.active_txns,
             &self.clock,
         );

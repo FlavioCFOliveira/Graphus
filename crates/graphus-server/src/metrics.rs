@@ -185,13 +185,12 @@ pub struct Metrics {
     /// version slots stop being reclaimed while writes accrue, a slow-motion OOM. Engine-thread-only
     /// writer (the maintenance pass runs only on the engine thread), so unpadded.
     maintenance_failures: AtomicU64,
-    /// Reclamation-degraded gauge (`rmp` #394): `1` once the background maintenance checkpoint has
-    /// failed [`MAINTENANCE_FAILURE_ESCALATION_THRESHOLD`](crate::engine::MAINTENANCE_FAILURE_ESCALATION_THRESHOLD)
-    /// times **consecutively** (reclamation is persistently stuck), `0` otherwise. Drives
-    /// `/health/ready` to `503` so the degradation is surfaced (an operator/orchestrator sees the node
-    /// as not-ready) rather than silently leaking memory behind a green probe. Cleared the moment a
-    /// checkpoint succeeds. Engine-thread-only writer; read by the readiness route.
-    maintenance_degraded: AtomicU64,
+    // NOTE (`rmp` #435): the reclamation-degraded *gating* gauge that used to live here was a single
+    // shared `AtomicU64`, so one database's `K` consecutive maintenance failures flagged the WHOLE node
+    // not-ready (and any other database's checkpoint success false-cleared a still-stuck flag). It is
+    // now a **per-engine** flag ([`crate::engine::MaintenanceDegraded`], the sibling of #414's
+    // `EngineDegraded`), read by `/health/ready`'s per-database aggregation. The fleet-wide
+    // `maintenance_failures` counter above stays for observability.
 
     // ---- reliability (`rmp` #386) ----
     /// Statements whose synchronous execution **panicked** and was caught at the engine's
@@ -212,7 +211,8 @@ pub struct Metrics {
     /// (a rollback/commit itself panicked, so a deep invariant is broken and the database's in-memory
     /// state is no longer trustworthy), `0` otherwise. Drives `/health/ready` to `503` so the
     /// degradation is surfaced to an operator/orchestrator rather than silently serving over possibly
-    /// corrupt in-memory state. Mirrors the `maintenance_degraded` (`rmp` #394) readiness pattern.
+    /// corrupt in-memory state. The per-engine reclamation-degraded flag (`rmp` #394/#435) follows the
+    /// same per-database readiness pattern.
     /// Engine-thread-only writer; read by the readiness route. There is no auto-clear: a broken
     /// in-memory invariant is only safely resolved by a controlled engine/process restart.
     engine_degraded: AtomicU64,
@@ -247,7 +247,6 @@ impl Metrics {
             maintenance_versions_reclaimed: AtomicU64::new(0),
             maintenance_stamps_frozen: AtomicU64::new(0),
             maintenance_failures: AtomicU64::new(0),
-            maintenance_degraded: AtomicU64::new(0),
             statement_panics: CachePad::new(0),
             engine_recovery_panics: AtomicU64::new(0),
             engine_degraded: AtomicU64::new(0),
@@ -263,7 +262,11 @@ impl Metrics {
             .fetch_add(reclaimed, Ordering::Relaxed);
         self.maintenance_stamps_frozen
             .fetch_add(frozen, Ordering::Relaxed);
-        self.maintenance_degraded.store(0, Ordering::Relaxed);
+        // NOTE (`rmp` #435): the reclamation-degraded *gating* flag is now **per-engine**
+        // ([`crate::engine::MaintenanceDegraded`]), cleared by the engine's OWN checkpoint success — it
+        // is no longer a shared-`Metrics` gauge. This success therefore clears ONLY this engine's flag
+        // (in the engine loop), never another engine's (the cross-tenant false-clear #435 closed). The
+        // aggregate `maintenance_failures` counter stays here for fleet observability.
     }
 
     /// Records one **failed** background maintenance checkpoint (`rmp` #394). The pass logs and retries
@@ -271,20 +274,6 @@ impl Metrics {
     /// means reclamation has stalled, so the count must be observable for alerting.
     pub fn record_maintenance_failure(&self) {
         self.maintenance_failures.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Sets (or clears) the reclamation-degraded gauge (`rmp` #394): `true` once maintenance has failed
-    /// `K` times consecutively (reclamation persistently stuck → slow-motion OOM), which drives
-    /// `/health/ready` to report the node not-ready so the degradation is surfaced rather than silent.
-    pub fn set_maintenance_degraded(&self, degraded: bool) {
-        self.maintenance_degraded
-            .store(u64::from(degraded), Ordering::Relaxed);
-    }
-
-    /// Whether reclamation is currently flagged degraded (`rmp` #394) — read by the readiness route.
-    #[must_use]
-    pub fn is_maintenance_degraded(&self) -> bool {
-        self.maintenance_degraded.load(Ordering::Relaxed) != 0
     }
 
     /// Records a committed transaction.
@@ -562,12 +551,11 @@ impl Metrics {
             "Background maintenance checkpoints that failed (reclamation stalled — rmp #394).",
             self.maintenance_failures.load(Ordering::Relaxed),
         );
-        gauge(
-            &mut out,
-            "graphus_maintenance_degraded",
-            "1 if reclamation is degraded (K consecutive maintenance failures — rmp #394), else 0.",
-            self.maintenance_degraded.load(Ordering::Relaxed),
-        );
+        // NOTE (`rmp` #435): the former `graphus_maintenance_degraded` node-wide gauge was removed —
+        // reclamation degradation is now a **per-engine** gate surfaced through `/health/ready`'s
+        // per-database aggregation (the shared gauge made one tenant's stall blanket-503 the node and
+        // let another tenant's success false-clear it). `graphus_maintenance_failures_total` above
+        // remains the fleet-wide observability signal.
         counter(
             &mut out,
             "graphus_statement_panics_total",
@@ -898,9 +886,11 @@ mod size_probe {
         );
         // 10 padded counters * 64B = 640B (the 9 original + `statement_panics`, `rmp` #386 — written by
         // both the engine thread and reader-pool workers, so genuinely multi-writer), plus the unpadded
-        // engine-only fields (now including the two `rmp` #409 reliability counters,
-        // `engine_recovery_panics` + `engine_degraded`, both engine-thread-only) packed into the
-        // remaining lines: 896B total on this target.
-        assert_eq!(std::mem::size_of::<Metrics>(), 896);
+        // engine-only fields (the two `rmp` #409 reliability counters, `engine_recovery_panics` +
+        // `engine_degraded`, both engine-thread-only) packed into the remaining lines. `rmp` #435
+        // removed the shared `maintenance_degraded` gauge (the gating flag is now the per-engine
+        // [`crate::engine::MaintenanceDegraded`]), shrinking the unpadded tail by one cache line:
+        // 832B total on this target.
+        assert_eq!(std::mem::size_of::<Metrics>(), 832);
     }
 }

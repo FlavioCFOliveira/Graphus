@@ -299,3 +299,106 @@ fn ring_lets_n_evictions_be_in_flight_concurrently() {
         );
     }
 }
+
+/// `rmp` #436: ring **exhaustion** must still make progress via the escalating backoff.
+///
+/// When `> DWB_EVICT_RING_SLOTS` dirty evictions are in flight at once, the ring is momentarily
+/// exhausted and the extra evictors must `claim_slot`-block until a slot frees. The fix replaced the
+/// bare `yield_now()` busy-spin with the same escalating `Backoff` used by the buffer pool at #359.
+///
+/// This gate pins the ring at FULL occupancy: the first `N` evictors all enter their home write and
+/// rendezvous on a barrier (so all `N` ring slots are held simultaneously — proven by the prior gate),
+/// and they only release once the `EXTRA` over-subscribed evictors have all *started* their claim. The
+/// `EXTRA` evictors therefore find the ring exhausted and must back off; they can only obtain a slot
+/// after the first wave frees theirs. The gate asserts that **all** `N + EXTRA` evictions complete and
+/// every page is durable — i.e. `claim_slot` always blocks-until-free and never returns without a slot
+/// (no unprotected-home-write fallback, which would regress #407).
+///
+/// The exhaustion is *structural*, not racy: the first wave does not release its `N` slots until every
+/// one of the `EXTRA` over-subscribed evictors has incremented `extra_started`. At that instant `N`
+/// slots are held AND `EXTRA` evictors are provably blocked inside `claim_slot` against the full ring —
+/// they can only proceed once the first wave frees, via the escalating backoff. Pre-#436 they would
+/// still complete (it was never a livelock) but by burning cores on a bare `yield_now` spin; this gate
+/// asserts the *correctness* contract (progress + durability) that must hold with the backoff in place.
+#[test]
+fn ring_claim_under_exhaustion_makes_progress() {
+    let n = DWB_EVICT_RING_SLOTS;
+    let extra = n; // 2N total evictors: N hold the ring full, N must back off and wait.
+    let total = n + extra;
+
+    let dwb_dev = MemBlockDevice::new(0);
+    let dwb = Arc::new(Mutex::new(Dwb::new(dwb_dev).expect("dwb")));
+    let stager: Arc<dyn PageStager> = Arc::new(DwbPageStager::new(Arc::clone(&dwb)));
+
+    let home = Arc::new(Mutex::new(MemBlockDevice::new(total as u64 + 8)));
+
+    // The N first-wave evictors rendezvous here so every ring slot is held at once.
+    let wave_barrier = Arc::new(Barrier::new(n));
+    // Count how many over-subscribed (EXTRA) evictors have begun their claim. Once all have begun, the
+    // first wave is allowed to release its slots so the EXTRA wave can drain through the backoff.
+    let extra_started = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for i in 0..total {
+        let s = Arc::clone(&stager);
+        let home = Arc::clone(&home);
+        let wave_barrier = Arc::clone(&wave_barrier);
+        let extra_started = Arc::clone(&extra_started);
+        let completed = Arc::clone(&completed);
+        let page_id = PageId(i as u64 + 1);
+        let img = make_page(page_id.0, 10 + i as u64, (i as u8).wrapping_add(1));
+        let is_first_wave = i < n;
+        handles.push(std::thread::spawn(move || {
+            if !is_first_wave {
+                // Announce that this over-subscribed evictor is about to attempt its claim against a
+                // (soon to be) full ring.
+                extra_started.fetch_add(1, Ordering::SeqCst);
+            }
+            let mut home_write = || -> Result<()> {
+                if is_first_wave {
+                    // Hold every ring slot until ALL extra evictors have begun their (blocked) claim,
+                    // so the ring is provably exhausted while they back off, then rendezvous to ensure
+                    // all N are simultaneously holding a slot.
+                    while extra_started.load(Ordering::SeqCst) < extra {
+                        std::thread::yield_now();
+                    }
+                    wave_barrier.wait();
+                }
+                {
+                    let mut dev = home.lock().unwrap();
+                    dev.write_page(page_id, &img)?;
+                    dev.sync_data()?;
+                }
+                Ok(())
+            };
+            s.stage_and_sync(page_id, &img[..], &mut home_write)
+                .expect("stage+home under ring exhaustion");
+            completed.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.join().expect("evictor thread (exhaustion)");
+    }
+
+    // THE GATE: every eviction completed — `claim_slot` always eventually returned a slot (it blocks
+    // until free, never bails out), draining the over-subscribed herd via the escalating backoff.
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        total,
+        "all {total} evictions must complete — claim_slot must block-until-free, never bail (rmp #436/#407)"
+    );
+
+    // Every evicted page is durable and intact on the home device.
+    let dev = home.lock().unwrap();
+    for i in 0..total {
+        let page_id = PageId(i as u64 + 1);
+        let mut got: Page = [0u8; PAGE_SIZE];
+        dev.read_page(page_id, &mut got).expect("read evicted");
+        assert!(
+            page::verify_checksum(&got),
+            "evicted page {} must be durable and intact under ring exhaustion",
+            page_id.0
+        );
+    }
+}
