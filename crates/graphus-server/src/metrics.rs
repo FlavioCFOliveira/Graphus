@@ -175,6 +175,14 @@ pub struct Metrics {
     maintenance_versions_reclaimed: AtomicU64,
     /// Cumulative committed MVCC stamps frozen (settled to `Committed(ts)`) by maintenance GC passes.
     maintenance_stamps_frozen: AtomicU64,
+
+    // ---- reliability (`rmp` #386) ----
+    /// Statements whose synchronous execution **panicked** and was caught at the engine's
+    /// per-statement panic boundary (the transaction was rolled back and the engine kept alive). A
+    /// non-zero value is an operator signal of a latent executor/UDF bug to investigate; it is *not*
+    /// engine death. A multi-writer-safe `CachePad` (the engine thread is the sole writer today, but a
+    /// reader-pool worker's caught panic is accounted through the same counter at retirement).
+    statement_panics: CachePad,
 }
 
 impl Default for Metrics {
@@ -205,6 +213,7 @@ impl Metrics {
             maintenance_checkpoints: AtomicU64::new(0),
             maintenance_versions_reclaimed: AtomicU64::new(0),
             maintenance_stamps_frozen: AtomicU64::new(0),
+            statement_panics: CachePad::new(0),
         }
     }
 
@@ -231,6 +240,14 @@ impl Metrics {
     /// Sets the current open-transaction gauge (the engine publishes its coordinator's count).
     pub fn set_active_txns(&self, n: u64) {
         self.active_txns.store(n, Ordering::Relaxed);
+    }
+
+    /// The current open-transaction gauge (`rmp` #386 regression visibility): after every reader
+    /// retirement the engine republishes its coordinator's `active_count`, so a return to zero proves
+    /// no reader transaction leaked (e.g. a panicked read whose txn/ticket was rolled back).
+    #[must_use]
+    pub fn active_txns(&self) -> u64 {
+        self.active_txns.load(Ordering::Relaxed)
     }
 
     /// Records an admission fast-reject ("server busy").
@@ -293,6 +310,19 @@ impl Metrics {
     /// Records a slow query (over the configured threshold).
     pub fn record_slow_query(&self) {
         self.slow_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one statement panic caught at the engine's per-statement panic boundary (`rmp` #386):
+    /// the transaction was rolled back and the engine kept serving. Used by the regression test to
+    /// assert the boundary fired, and exported for operator visibility.
+    pub fn record_statement_panic(&self) {
+        self.statement_panics.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The number of statement panics caught so far (`rmp` #386) — observability / tests.
+    #[must_use]
+    pub fn statement_panics(&self) -> u64 {
+        self.statement_panics.load(Ordering::Relaxed)
     }
 
     /// Renders the full registry in Prometheus text-exposition format (v0.0.4).
@@ -402,6 +432,12 @@ impl Metrics {
             "graphus_maintenance_stamps_frozen_total",
             "Committed MVCC stamps frozen by maintenance GC passes.",
             self.maintenance_stamps_frozen.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_statement_panics_total",
+            "Statements whose execution panicked and was caught at the engine panic boundary (rmp #386).",
+            self.statement_panics.load(Ordering::Relaxed),
         );
 
         // The latency histogram.
@@ -675,11 +711,11 @@ mod padding_tests {
 mod size_probe {
     use super::Metrics;
 
-    /// The padded layout costs ~520 extra bytes per *process* (one `Arc<Metrics>`): 9 multi-writer
-    /// counters each occupy their own 64-byte line. That is a trivially small, one-off price for
-    /// eliminating the false-sharing ping-pong on the hottest counters; this test pins the layout so
-    /// the trade-off stays visible and any accidental padding of the engine-only counters (which
-    /// would bloat the struct without benefit) is caught.
+    /// The padded layout costs extra bytes per *process* (one `Arc<Metrics>`): each multi-writer
+    /// counter occupies its own 64-byte line. That is a trivially small, one-off price for eliminating
+    /// the false-sharing ping-pong on the hottest counters; this test pins the layout so the trade-off
+    /// stays visible and any accidental padding of the engine-only counters (which would bloat the
+    /// struct without benefit) is caught.
     #[test]
     fn metrics_struct_layout_is_cache_line_aligned() {
         assert_eq!(
@@ -687,8 +723,9 @@ mod size_probe {
             64,
             "Metrics inherits 64-byte alignment from its padded multi-writer counters"
         );
-        // 9 padded counters * 64B = 576B, plus the unpadded engine-only fields packed into the
-        // remaining lines: 768B total on this target.
-        assert_eq!(std::mem::size_of::<Metrics>(), 768);
+        // 10 padded counters * 64B = 640B (the 9 original + `statement_panics`, `rmp` #386 — written by
+        // both the engine thread and reader-pool workers, so genuinely multi-writer), plus the unpadded
+        // engine-only fields packed into the remaining lines: 832B total on this target.
+        assert_eq!(std::mem::size_of::<Metrics>(), 832);
     }
 }

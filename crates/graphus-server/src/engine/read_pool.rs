@@ -52,6 +52,7 @@ use super::exec::run_cursor;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowItem, RowSender};
 use super::{RunReply, TxTicket};
+use crate::metrics::Metrics;
 
 /// A read-only statement packaged for off-thread execution (`rmp` task #336, Slice 3b-ii).
 ///
@@ -261,7 +262,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// loop polls — kept separate from the command channel so the workers' clones never pin the command
     /// channel open). `threads` is clamped to at least 1; `queue_capacity` to at least 1.
     #[must_use]
-    pub fn spawn(threads: usize, queue_capacity: usize, retire_tx: Sender<ReadRetirement>) -> Self {
+    pub fn spawn(
+        threads: usize,
+        queue_capacity: usize,
+        retire_tx: Sender<ReadRetirement>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         let threads = threads.max(1);
         let (work_tx, work_rx) =
             std::sync::mpsc::sync_channel::<ReadTask<D, S>>(queue_capacity.max(1));
@@ -273,9 +279,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         for i in 0..threads {
             let work_rx = Arc::clone(&work_rx);
             let retire_tx = retire_tx.clone();
+            let metrics = Arc::clone(&metrics);
             let join = std::thread::Builder::new()
                 .name(format!("graphus-reader-{i}"))
-                .spawn(move || worker_loop(&work_rx, &retire_tx))
+                .spawn(move || worker_loop(&work_rx, &retire_tx, &metrics))
                 // A failure to spawn a worker is a startup-time OS resource error; surfacing it as a
                 // panic here is acceptable (the server is coming up and the pool size is bounded/small).
                 .expect("INVARIANT: spawning a bounded reader worker thread");
@@ -316,6 +323,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 fn worker_loop<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>(
     work_rx: &Arc<std::sync::Mutex<Receiver<ReadTask<D, S>>>>,
     retire_tx: &Sender<ReadRetirement>,
+    metrics: &Metrics,
 ) {
     loop {
         // Briefly lock the shared receiver to dequeue one task (released immediately so other workers
@@ -339,9 +347,50 @@ fn worker_loop<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>(
         // `K` concurrent large reads would otherwise queue `K × min(N,16)` morsel tasks on a
         // `min(N,16)`-thread pool. The guard restores the prior flag on drop (incl. panic-unwind), so it
         // never leaks to the next task this reused worker runs.
+        // `rmp` task #386: isolate the read behind a panic boundary. A panic in a read task (executor,
+        // materializer, UDF, or a `rayon`-propagated morsel/GDS worker panic re-raised on *this* worker
+        // thread) must NOT kill the worker — that would silently shrink the pool, leak
+        // `readers_inflight`, and pin the GC watermark forever (the reader's txn/ticket never retires).
+        // Instead it becomes a retirement with an `Err` outcome, so the engine rolls the reader back +
+        // decrements `readers_inflight`, and the worker stays alive to serve the next task.
+        //
+        // We snapshot the fields the catch handler needs (`txn`, `ticket`, a clone of `row_tx`, and a
+        // fresh empty SIREAD buffer) *before* moving the task into `run_read_task`, because a panic
+        // consumes the task's own copies. A fresh empty buffer is correct: an aborted read contributes
+        // no SIREAD markers, so the engine's M1 merge is a no-op before the rollback. `AssertUnwindSafe`
+        // is sound because the recovery path observes none of the task's partially-mutated state — it
+        // builds the retirement purely from the pre-captured `Send` snapshot, and the engine's
+        // `finish_reader` rolls the reader's transaction back regardless of where the panic struck.
+        let txn = task.txn;
+        let ticket = task.ticket;
+        let row_tx_fallback = task.row_tx.clone();
         let retirement = {
             let _morsel_suppression = graphus_cypher::morsel::ReaderPoolWorkerGuard::enter();
-            run_read_task(task)
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_read_task(task))) {
+                Ok(retirement) => retirement,
+                Err(panic_payload) => {
+                    metrics.record_statement_panic();
+                    tracing::error!(
+                        target: "graphus::engine",
+                        ticket = ticket.0,
+                        panic = %panic_detail(&panic_payload),
+                        "read task panicked; retiring it as a rollback and keeping the worker alive (rmp #386)",
+                    );
+                    // Deliver a clean terminal error to the consumer (no-op if the reader already sent a
+                    // terminal item or the consumer is gone), then retire as a rollback.
+                    let _ = row_tx_fallback.send(Err(GraphusError::Runtime(format!(
+                        "internal error: read statement aborted ({})",
+                        panic_detail(&panic_payload)
+                    ))));
+                    ReadRetirement {
+                        txn,
+                        ticket,
+                        buffer: graphus_txn::SsiReadBuffer::new(txn),
+                        outcome: Err(rollback_marker()),
+                        row_tx: row_tx_fallback,
+                    }
+                }
+            }
         };
         // Post the retirement back to the engine loop. The std `send` Release/Acquire is the
         // happens-before that publishes the buffer + all the reader's memory effects to the engine
@@ -359,4 +408,16 @@ fn rollback_marker() -> GraphusError {
     GraphusError::Runtime(
         "read statement rolled back (error already streamed to client)".to_owned(),
     )
+}
+
+/// Extracts a human-readable message from a caught read-task panic payload (`rmp` task #386), covering
+/// the two payload shapes the std panic hook produces (`&str` and `String`).
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }

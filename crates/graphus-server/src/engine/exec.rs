@@ -212,6 +212,26 @@ fn register_builtin_extensions(reg: &mut ExtensionRegistry) {
             Ok((*a..=*b).map(|n| vec![Value::Integer(n)]).collect())
         }),
     );
+
+    // Test-only scalar UDF: `ext.panic(n)` **panics** when `n` is non-null (returns `n` unchanged when
+    // null). Compiled in only under the opt-in `internal-test-udf` feature (OFF in production), it is
+    // the deliberately-panicking statement the `rmp` #386 regression gates drive through the real
+    // engine — a panic reachable on the production execution path (compile → bind → execute), proving
+    // the engine's per-statement panic boundary converts it to a clean statement error and survives.
+    // Used per-row inside a morsel-eligible aggregate to also prove a `rayon`-propagated worker panic
+    // is caught by the same engine boundary. (A Cargo *feature*, not `cfg(test)`, because integration
+    // tests link the non-test build of this lib, where `cfg(test)` is inactive.)
+    #[cfg(feature = "internal-test-udf")]
+    reg.register_function(
+        "ext.panic",
+        Arity::Exact(1),
+        false,
+        Box::new(|args: &[Value]| match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(_) => panic!("ext.panic: deliberate test panic (rmp #386)"),
+        }),
+    )
+    .expect("INVARIANT: test UDF `ext.panic` registers into a fresh registry");
 }
 
 /// Handles a [`super::EngineCommand::Run`]: resolves the transaction, compiles + binds the query,

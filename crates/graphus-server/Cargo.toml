@@ -24,6 +24,14 @@ neo4j-interop = []
 # never compiles the seam, so the device stays encapsulated and the cost is exactly zero.
 dst = ["graphus-cypher/dst"]
 
+# Opt-in internal test surface (rmp #386): registers a deliberately-panicking `ext.panic(n)` UDF into
+# the engine's extension registry so the panic-isolation regression gates can drive a panic through the
+# REAL production execution path (compile → bind → execute, inline / morsel / reader-pool). OFF by
+# default so the production server never exposes a panicking function; the `panic_isolation` test
+# target is gated on this feature. Run the gates with: `cargo test -p graphus-server --features
+# internal-test-udf --test panic_isolation`.
+internal-test-udf = []
+
 [dependencies]
 # The shared value model, error taxonomy and the injected `Clock` capability (used to drive REST
 # transaction expiry and JWT validity deterministically). `04 §7.2`, `§8.4`.

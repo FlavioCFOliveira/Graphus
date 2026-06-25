@@ -41,6 +41,10 @@ pub const UNBOUNDED: usize = usize::MAX;
 /// A single enum keeps the streaming code (`exec::run_cursor`) identical for both: it just calls
 /// [`RowSender::send`]. The receiving end is the same [`Receiver<RowItem>`] in both cases, so
 /// [`RowReceiver`] is unaffected.
+// `Clone` (both inner senders are `Clone`) so the reader-pool worker can keep a handle on the egress
+// channel *before* moving the task into `run_read_task` — the panic boundary (`rmp` #386) needs it to
+// build a valid retirement after a caught read-task panic consumed the task's own `row_tx`.
+#[derive(Clone)]
 pub enum RowSender {
     /// A bounded `SyncSender`: a full channel blocks the producer (the §9.3 egress backpressure).
     Bounded(SyncSender<RowItem>),

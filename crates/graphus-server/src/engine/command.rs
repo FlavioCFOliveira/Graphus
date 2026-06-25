@@ -34,6 +34,35 @@ impl<T> Reply<T> {
     pub fn send(self, value: T) -> Result<(), T> {
         self.0.send(value).map_err(|e| e.0)
     }
+
+    /// Returns a second [`Reply`] handle sharing the same one-shot channel, for use as a **panic
+    /// fallback** (`rmp` task #386).
+    ///
+    /// The engine's per-statement dispatch moves the original `Reply` into the executor; if that
+    /// execution **panics** before it delivered its reply, the unwind boundary still needs a way to
+    /// hand the waiting consumer a clean terminal error instead of letting the connection hang on
+    /// `engine_gone` forever. This clone provides exactly that: it points at the same capacity-1
+    /// channel, so a [`Self::try_send_fallback`] on it is delivered iff the original never sent (the
+    /// buffer is empty). If the original *did* send first, the buffer is full and the fallback is a
+    /// harmless no-op — the consumer already has its (possibly partial) reply and the stream is
+    /// terminated by the dropped row channel.
+    #[must_use]
+    pub fn fallback(&self) -> Self {
+        Reply(self.0.clone())
+    }
+
+    /// Best-effort, **non-blocking** terminal send used only by the panic fallback (`rmp` task #386).
+    ///
+    /// Never blocks the engine thread: a full buffer (the original reply already landed) or a gone
+    /// receiver (consumer disconnected) both resolve to `Err(value)` and are ignored by the caller.
+    /// This is the only send that may legitimately fail-and-be-dropped, because by construction the
+    /// real reply has already reached the consumer in those cases.
+    pub fn try_send_fallback(&self, value: T) -> Result<(), T> {
+        use std::sync::mpsc::TrySendError;
+        self.0.try_send(value).map_err(|e| match e {
+            TrySendError::Full(v) | TrySendError::Disconnected(v) => v,
+        })
+    }
 }
 
 /// The submitter's end of a command reply.

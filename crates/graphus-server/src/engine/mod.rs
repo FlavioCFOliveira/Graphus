@@ -172,6 +172,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         reader_threads,
         reader_threads.saturating_mul(8).max(16),
         retire_tx,
+        Arc::clone(&metrics),
     ));
     // How many readers are dispatched-but-not-yet-retired. While `> 0` the loop polls the retirement
     // channel each tick so a retirement (which finalises the reader's auto-commit + closes its egress)
@@ -517,7 +518,16 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             privileges,
             reply,
         } => {
-            let outcome = exec::handle_run(
+            // `rmp` task #386: isolate per-statement execution behind a panic boundary so a panic in
+            // the executor / materializer / a UDF (or a `rayon`-propagated morsel/GDS worker panic,
+            // which re-raises on *this* engine thread inside `handle_run`'s synchronous
+            // `analytics_pool().install`) becomes a clean terminal statement error — never engine
+            // death. `coord` is reborrowed from `coordinator` here so the borrow can be handed to the
+            // catch handler for the rollback after `catch_unwind` consumes the closure's reborrow.
+            let coord = coordinator
+                .as_mut()
+                .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
+            run_statement_isolated(
                 coord,
                 open,
                 plan_cache,
@@ -528,29 +538,13 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 privileges.map(|p| *p),
                 extensions,
                 dispatch,
+                readers_inflight,
+                inflight,
                 result_buffer_capacity,
                 metrics,
                 clock,
                 reply,
             );
-            match outcome {
-                // A read dispatched off-thread retires later (it is not yet finalised); track it so
-                // the engine loop polls the retirement channel until it returns.
-                exec::RunOutcome::OffThreadReader => *readers_inflight += 1,
-                // The egress channel filled with a slow consumer draining (`rmp` task #372): park the
-                // statement so the loop resumes it one batch per tick without head-of-line-blocking
-                // this thread. There is at most one in-flight inline statement (the engine processes
-                // one `Run` at a time), so a single slot suffices.
-                exec::RunOutcome::Suspended(parked) => {
-                    debug_assert!(
-                        inflight.is_none(),
-                        "INVARIANT: at most one suspended inline statement at a time"
-                    );
-                    *inflight = Some(*parked);
-                }
-                // An inline statement that finished within its visit already committed/rolled back.
-                exec::RunOutcome::Done => {}
-            }
             metrics.set_active_txns(coord.active_count() as u64);
         }
         Cmd::Commit { ticket, reply } => {
@@ -621,6 +615,155 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         }
     }
     true
+}
+
+/// Runs one `Run` statement behind a **panic-isolation boundary** (`rmp` task #386), then applies its
+/// [`exec::RunOutcome`] to the loop bookkeeping. This is the single production hardening that turns a
+/// panic *anywhere* in synchronous statement execution — the executor, the materializer, a UDF, or a
+/// `rayon`-propagated morsel/GDS worker panic (`rayon::install` re-raises a worker panic on the
+/// **calling** thread, which is this engine thread) — into a clean terminal statement error while
+/// keeping the engine loop alive. Without it, any such panic unwinds the engine thread, drops the
+/// command `Receiver`, and every connection to this database gets `engine_gone` forever (`dbcatalog`
+/// `stop_engine` only logs the corpse).
+///
+/// ## Unwind-safety justification (the load-bearing reasoning)
+///
+/// The closure captures `&mut TxnCoordinator` (and the open-tx map), which is `!UnwindSafe` because
+/// the coordinator transitively holds `Rc<RefCell<…>>`. [`AssertUnwindSafe`] is sound here because we
+/// **do not** observe any partially-mutated state across the boundary: on a caught panic we run
+/// [`rollback_panicked_statement`], which calls [`TxnCoordinator::rollback`] (→ ARIES
+/// `store.abort_writer` / `rollback`) on the statement's transaction, discarding the entire
+/// half-applied write buffer and restoring the last consistent state regardless of *where* mid-write
+/// the panic struck. No `RefCell` is left borrowed: the per-statement seam ([`RecordStoreGraph`])
+/// borrows the store only transiently *inside* each operation via RAII guards, so unwinding drops
+/// every live `Ref`/`RefMut` before this frame regains control. No lock is poisoned either: the
+/// coordinator's shared state lives behind `Rc<RefCell>` (single-thread, no `Mutex`), and the rollback
+/// is the explicit recovery. The transaction is therefore left *rolled back*, never half-applied.
+#[allow(clippy::too_many_arguments)]
+fn run_statement_isolated<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    coord: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    plan_cache: &mut exec::EnginePlanCache,
+    ticket: TxTicket,
+    query: &str,
+    params: Vec<(String, Value)>,
+    auto_commit: bool,
+    privileges: Option<EffectivePrivileges>,
+    extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
+    dispatch: &read_pool::ReadDispatch<D, S>,
+    readers_inflight: &mut u64,
+    inflight: &mut Option<exec::InFlightInline>,
+    result_buffer_capacity: usize,
+    metrics: &Arc<Metrics>,
+    clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    reply: command::Reply<std::result::Result<RunReply, GraphusError>>,
+) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // A second handle on the same one-shot reply channel, kept *outside* the catch boundary so that a
+    // panic *before* the executor delivered its reply can still hand the waiting consumer a clean
+    // terminal error (rather than letting the connection hang on a dropped sender). If the executor
+    // already replied, this fallback finds the capacity-1 buffer full and is a harmless no-op.
+    let fallback = reply.fallback();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        exec::handle_run(
+            coord,
+            open,
+            plan_cache,
+            ticket,
+            query,
+            params,
+            auto_commit,
+            privileges,
+            extensions,
+            dispatch,
+            result_buffer_capacity,
+            metrics,
+            clock,
+            reply,
+        )
+    }));
+
+    match result {
+        Ok(outcome) => match outcome {
+            // A read dispatched off-thread retires later (it is not yet finalised); track it so the
+            // engine loop polls the retirement channel until it returns.
+            exec::RunOutcome::OffThreadReader => *readers_inflight += 1,
+            // The egress channel filled with a slow consumer draining (`rmp` task #372): park the
+            // statement so the loop resumes it one batch per tick without head-of-line-blocking this
+            // thread. There is at most one in-flight inline statement (the engine processes one `Run`
+            // at a time), so a single slot suffices.
+            exec::RunOutcome::Suspended(parked) => {
+                debug_assert!(
+                    inflight.is_none(),
+                    "INVARIANT: at most one suspended inline statement at a time"
+                );
+                *inflight = Some(*parked);
+            }
+            // An inline statement that finished within its visit already committed/rolled back.
+            exec::RunOutcome::Done => {}
+        },
+        Err(panic_payload) => {
+            rollback_panicked_statement(coord, open, ticket, metrics, &fallback, &panic_payload);
+        }
+    }
+}
+
+/// Recovers from a statement panic caught in [`run_statement_isolated`] (`rmp` task #386): roll back
+/// the statement's transaction so no half-applied write buffer survives, account the abort, and hand
+/// the waiting consumer a clean terminal error so the connection is freed (never `engine_gone`).
+///
+/// The rollback is unconditional and idempotent: [`TxnCoordinator::rollback`] is a no-op for an
+/// already-finalised / unknown txn (e.g. the panic happened after an auto-commit already committed, or
+/// in an explicit transaction the connection will roll back itself), so this is always safe to call.
+/// For an explicit (`BEGIN`) transaction it additionally undoes the in-flight statement's writes —
+/// the connection's own later `ROLLBACK` would otherwise find the txn already gone; we remove the
+/// ticket from `open` so that later `ROLLBACK` is the documented idempotent no-op.
+fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
+    coord: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    ticket: TxTicket,
+    metrics: &Metrics,
+    fallback: &command::Reply<std::result::Result<RunReply, GraphusError>>,
+    panic_payload: &(dyn std::any::Any + Send),
+) {
+    let detail = panic_message(panic_payload);
+    tracing::error!(
+        target: "graphus::engine",
+        ticket = ticket.0,
+        panic = %detail,
+        "statement panicked; rolling back its transaction and keeping the engine alive (rmp #386)",
+    );
+    if let Some(tx) = open.remove(&ticket.0) {
+        // Discard the entire half-applied write buffer (ARIES undo). A failure here is itself
+        // best-effort: the txn is being torn down regardless and recovery would undo it anyway.
+        if coord.rollback(tx.txn).is_ok() {
+            metrics.record_abort();
+        }
+    }
+    metrics.record_statement_panic();
+    // Best-effort terminal error to the consumer (no-op if the executor already replied / consumer
+    // gone). The error is an internal-error class so a client sees a clean, retriable failure.
+    let _ = fallback.try_send_fallback(Err(GraphusError::Runtime(format!(
+        "internal error: statement aborted ({detail})"
+    ))));
+}
+
+/// Extracts a human-readable message from a caught panic payload (`rmp` task #386), covering the two
+/// payload shapes the std panic hook produces (`&str` and `String`); anything else is reported
+/// opaquely.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
 }
 
 /// Executes one index-DDL command against the coordinator's node-property index catalog (`rmp` task

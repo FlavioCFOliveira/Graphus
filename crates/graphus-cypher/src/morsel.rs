@@ -2126,6 +2126,42 @@ mod reader_pool_suppression_tests {
         MORSEL_THREADS.store(prev, Ordering::Relaxed);
     }
 
+    /// `rmp` task #386: a panic inside the work `op` of the shared analytics pool — i.e. a panic on a
+    /// `rayon` worker thread, exactly as a morsel per-row evaluation or a GDS algorithm would raise —
+    /// is **re-raised by `rayon::ThreadPool::install` on the CALLING thread**, so a `catch_unwind` on
+    /// the calling thread (the engine thread, in production) catches it. This is the proof that the
+    /// engine's per-statement panic boundary (`run_statement_isolated` in `graphus-server`) subsumes
+    /// the morsel/GDS rayon path: no separate morsel boundary is needed, because the rayon re-raise
+    /// surfaces synchronously on the very thread the boundary wraps.
+    #[test]
+    fn analytics_pool_worker_panic_reraises_on_calling_thread() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        set_morsel_threads(4); // real workers, so `op` genuinely runs on a pool worker, not inline
+
+        let caught = std::panic::catch_unwind(|| {
+            // `op` runs on a rayon worker; `install` blocks the calling thread until it returns or
+            // (here) re-raises the worker's panic on this thread.
+            run_on_analytics_pool(|| {
+                panic!("deliberate analytics-pool worker panic (rmp #386)");
+            })
+        });
+        assert!(
+            caught.is_err(),
+            "a panic on a rayon analytics-pool worker must re-raise on the calling thread so the \
+             engine's catch_unwind boundary catches it"
+        );
+
+        // The pool is still usable afterwards (a worker panic does not poison the shared pool): a
+        // subsequent install computes normally on the same thread.
+        let ok = run_on_analytics_pool(|| 21_i32 * 2);
+        assert_eq!(
+            ok, 42,
+            "the analytics pool still serves work after a worker panic"
+        );
+
+        set_morsel_threads(1);
+    }
+
     #[test]
     fn flag_is_thread_local_not_global() {
         let _lock = KNOB_LOCK.lock().unwrap();
