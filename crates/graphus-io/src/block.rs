@@ -11,6 +11,28 @@ pub const PAGE_SIZE: usize = LOGICAL_PAGE_SIZE;
 /// Exactly one page worth of bytes.
 pub type Page = [u8; PAGE_SIZE];
 
+/// The classified outcome of a [`BlockDevice::read_page_classified`] read, distinguishing a page
+/// that read back intact from one that is **genuinely torn/corrupt** (`rmp` #408).
+///
+/// On the plaintext device a torn page reads back as bytes whose CRC32C fails — the bytes *are*
+/// returned, the caller detects the tear via the checksum. On the **encrypted** device a torn slot
+/// fails its AES-GCM authentication tag, so `read_page` returns an *error* — but that same error path
+/// is also taken by a **transient** I/O failure (a momentary device read error). Collapsing the two
+/// (the historical behaviour of doublewrite recovery, which mapped *any* home-read error to "torn")
+/// let a fine-but-momentarily-unreadable home page be clobbered by a stale doublewrite copy. This
+/// enum is the structured signal that lets the caller repair **only** a genuine tear and propagate a
+/// transient error instead of silently reverting a good page.
+#[derive(Debug)]
+pub enum PageReadOutcome {
+    /// The page read back and (on the encrypted device) authenticated successfully. Its bytes are in
+    /// the caller's buffer. The caller still verifies the CRC32C to detect a plaintext tear.
+    Read,
+    /// The page is **genuinely torn/corrupt**: on the encrypted device its AES-GCM tag failed to
+    /// authenticate (a torn/partial write, a relocated page, tamper, or a wrong key). This is the
+    /// only condition under which doublewrite recovery may restore the page from its copy.
+    Torn,
+}
+
 /// A synchronous, page-addressable block device.
 ///
 /// This is the single I/O surface the buffer pool and write-ahead log build on. Two
@@ -23,6 +45,28 @@ pub type Page = [u8; PAGE_SIZE];
 pub trait BlockDevice {
     /// Reads page `page` into `buf`. Errors if `page` is out of range.
     fn read_page(&self, page: PageId, buf: &mut Page) -> Result<()>;
+
+    /// Reads page `page` into `buf`, **classifying** a read failure as a *genuine tear/corruption*
+    /// ([`PageReadOutcome::Torn`]) versus a *transient I/O error* (propagated as `Err`) — the signal
+    /// doublewrite recovery needs to repair only a genuinely torn page and never clobber a
+    /// fine-but-momentarily-unreadable one with a stale doublewrite copy (`rmp` #408).
+    ///
+    /// The **default** implementation (plaintext devices) maps `read_page` onto
+    /// [`PageReadOutcome::Read`]: a plaintext device returns torn bytes *successfully* (the caller
+    /// detects the tear via the CRC32C), and a `read_page` `Err` on a plaintext device is a genuine
+    /// I/O failure, so it propagates — exactly the desired classification with no per-device code.
+    ///
+    /// The **encrypted** device ([`graphus_crypto`]) overrides this: an AES-GCM tag failure means the
+    /// slot is genuinely torn/corrupt → [`PageReadOutcome::Torn`]; a transient backing-store read
+    /// error → `Err` (propagated, never treated as torn).
+    ///
+    /// # Errors
+    /// Returns `Err` for an out-of-range page or a **transient** I/O failure. A genuine tear is
+    /// reported as `Ok(PageReadOutcome::Torn)`, not an error.
+    fn read_page_classified(&self, page: PageId, buf: &mut Page) -> Result<PageReadOutcome> {
+        self.read_page(page, buf)?;
+        Ok(PageReadOutcome::Read)
+    }
 
     /// Writes `buf` to page `page`. The write may be buffered until a subsequent sync.
     fn write_page(&mut self, page: PageId, buf: &Page) -> Result<()>;

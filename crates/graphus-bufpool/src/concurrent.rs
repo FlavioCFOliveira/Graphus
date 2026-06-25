@@ -201,6 +201,47 @@ impl FrameSlot {
     }
 }
 
+/// Stages a single dirty data-page image into a **doublewrite area** and makes it durable, so the
+/// image survives a torn home write (`05 §3`, `04 §4.5`).
+///
+/// The buffer pool calls [`stage_and_sync`](PageStager::stage_and_sync) **before** it writes any
+/// dirty data page to its home location on the *eviction/steal* path ([`write_back`]). This closes
+/// the last doublewrite hole (`rmp` #407): without it, the evictor wrote dirty home pages directly,
+/// so a power loss mid-eviction-write could leave a torn page whose garbage `page_lsn` makes ARIES
+/// redo skip its repair — latent corruption. With it, every dirty data page (checkpoint-flushed
+/// **and** evicted) has an intact doublewrite copy at every crash point.
+///
+/// The implementation lives in `graphus-storage` over the **same persistent doublewrite buffer**
+/// the checkpoint path uses ([`graphus_storage::RecordStore`]); it serialises concurrent evictions
+/// behind its own interior lock, so this trait stays `&self`. It is `Send + Sync` because the
+/// concurrent pool is shared across threads behind an [`Arc`].
+///
+/// # Errors
+/// Returns a storage error if the doublewrite write or its sync fails. The pool **never** proceeds
+/// to the home write after a staging error: it propagates, so a home page is never written without a
+/// durable doublewrite copy (the InnoDB ordering, `05 §3`).
+pub trait PageStager: Send + Sync {
+    /// Stages `image` (the exact bytes about to be written to home page `page_id`, checksum already
+    /// stamped) into the doublewrite area and fsyncs it, so the copy is durable before the caller
+    /// writes the page home. Used by the **eviction/steal** path, which writes one page home at a
+    /// time under its frame latch.
+    fn stage_and_sync(&self, page_id: PageId, image: &[u8]) -> Result<()>;
+
+    /// Stages a whole **batch** of `(page_id, image)` pairs into the doublewrite area as ONE durable
+    /// batch (a single fsync), so every page in the batch has an intact doublewrite copy before any
+    /// of the batch's pages are written home. Used by the **checkpoint/flush** path
+    /// ([`ConcurrentBufferPool::flush_pages`]/[`flush_all`](ConcurrentBufferPool::flush_all)): it must
+    /// stage the entire batch up front because the doublewrite area holds exactly one batch at a time,
+    /// so staging pages one-by-one would leave all but the last unprotected when the home writes run.
+    ///
+    /// The caller guarantees `batch.len()` does not exceed the doublewrite area's batch capacity.
+    ///
+    /// # Errors
+    /// Returns a storage error if the doublewrite write or its sync fails; the caller must not write
+    /// any of the batch's pages home after an error.
+    fn stage_batch_and_sync(&self, batch: &[(PageId, &[u8])]) -> Result<()>;
+}
+
 /// A handle to a pinned frame, valid until it is unpinned. Kept distinct from the
 /// single-threaded [`crate::FrameId`] so the two pools' handles cannot be confused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +288,15 @@ pub struct ConcurrentBufferPool<D: BlockDevice, W: WalRule = NoWal> {
     frames: Vec<FrameSlot>,
     table: Vec<Mutex<HashMap<PageId, Slot>>>,
     clock: AtomicUsize,
+    /// The optional **doublewrite stager** that protects the *eviction/steal* home-write path
+    /// (`rmp` #407, `05 §3`). Installed once at store open via [`set_page_stager`](Self::set_page_stager)
+    /// and never replaced thereafter, so a plain cloned [`Arc`] — read under no lock — suffices; the
+    /// stager's own interior lock serialises concurrent evictions' staging. When present, [`write_back`]
+    /// stages-and-syncs each dirty *logged* data page into the doublewrite area before writing it home,
+    /// so a torn eviction write is repairable on the next open
+    /// ([`crate::page`]; `graphus_storage::recovery::recover_device_with_dwb`). `None` for a pool with
+    /// no doublewrite protection (e.g. a transient scratch store, or before the stager is attached).
+    dwb_stager: Mutex<Option<Arc<dyn PageStager>>>,
     /// Eviction-diagnostics counters (`rmp` #359, `bufpool-probe` feature only). Compiled out of the
     /// production build (zero cost: the field does not exist).
     #[cfg(feature = "bufpool-probe")]
@@ -280,9 +330,34 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             frames,
             table,
             clock: AtomicUsize::new(0),
+            dwb_stager: Mutex::new(None),
             #[cfg(feature = "bufpool-probe")]
             probe: probe::Probe::default(),
         }
+    }
+
+    /// Installs the **doublewrite stager** that protects the eviction/steal home-write path
+    /// (`rmp` #407, `05 §3`). Call this once at store open, right where the persistent doublewrite
+    /// buffer is attached, **before serving any traffic**: from then on every dirty *logged* data
+    /// page the pool writes home — on a checkpoint/flush *or* on an eviction/steal — is first
+    /// staged-and-synced into the doublewrite area, so a torn home write is repairable on the next
+    /// open.
+    ///
+    /// Takes `&self` (the pool is already shared behind an [`Arc`] by open time) and stores the
+    /// stager behind a short-lived `Mutex` whose guard is **never** held across a device write: the
+    /// home-write path clones the [`Arc`] out under the guard and drops the guard before staging, so
+    /// the stager's own interior lock (not this one) is what serialises concurrent evictions.
+    /// Idempotent-by-contract: a second install replaces the stager (used by tests); production
+    /// installs exactly once.
+    pub fn set_page_stager(&self, stager: Arc<dyn PageStager>) {
+        *unwrap_lock(self.dwb_stager.lock()) = Some(stager);
+    }
+
+    /// Clones out the currently-installed doublewrite stager (if any), holding the `dwb_stager`
+    /// guard only for the clone — never across a device write. Returns `None` when no stager is
+    /// installed (an unprotected pool), so the caller skips staging.
+    fn page_stager(&self) -> Option<Arc<dyn PageStager>> {
+        unwrap_lock(self.dwb_stager.lock()).clone()
     }
 
     /// Wraps the pool in an `Arc` (the `sync` seam's, i.e. `loom`'s under `--cfg loom`) for
@@ -938,6 +1013,30 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
 
         // Phase 3: order the held frames by page id and coalesce contiguous runs (as `flush_all`).
         guards.sort_by_key(|(_, meta)| meta.page_id.expect("dirty frame holds a page").0);
+
+        // Phase 3a: doublewrite protection (`rmp` #407, `05 §3`). When a stager is installed, stage
+        // the ENTIRE batch into the doublewrite area as one durable batch BEFORE any of its pages are
+        // written home — so every page written home below has an intact doublewrite copy and a torn
+        // home write is repairable on the next open. We stage all the selected pages here (the caller,
+        // `RecordStore::flush_protected`, bounds each `flush_pages` call to the doublewrite batch
+        // capacity). The staging takes the DWB lock AFTER the frame latches are already held (Phase 1),
+        // so the global lock order is uniformly **frame-latch → DWB**, matching the eviction path's
+        // `write_back` (frame latch held, then DWB) — no ABBA deadlock between a checkpoint and a
+        // concurrent reader-triggered eviction. The checksums were stamped in Phase 2, so the staged
+        // bytes equal the bytes about to land home.
+        if let Some(stager) = self.page_stager() {
+            let batch: Vec<(PageId, &[u8])> = guards
+                .iter()
+                .map(|(_, meta)| {
+                    (
+                        meta.page_id.expect("dirty frame holds a page"),
+                        &meta.data[..],
+                    )
+                })
+                .collect();
+            stager.stage_batch_and_sync(&batch)?;
+        }
+
         let mut device = self.write_device();
         let mut run_start = 0usize;
         for i in 1..=guards.len() {
@@ -1196,6 +1295,24 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // WAL rule: the log must be durable through this page's LSN before the data is written
         // home (`specification` §3.2 page_lsn, §4.3 steal/no-force).
         self.ensure_durable(lsn)?;
+        // Doublewrite protection of the home write (`rmp` #407, `05 §3`). Before the page reaches its
+        // home location, stage its EXACT image (checksum already stamped just above, so the staged
+        // bytes equal the bytes about to land home) into the doublewrite area and fsync it. After
+        // `stage_and_sync` returns, an intact copy of this page is durable, so a torn home write below
+        // is repairable on the next open (`recover_device_with_dwb`). This protects EVERY dirty data
+        // page written home — the checkpoint/flush path (`flush_pages`/`flush_all`, which already
+        // stage their batch in `RecordStore::flush_protected`) AND, crucially, the eviction/steal path
+        // (`evict_held`/`load_into`/`new_page`), which previously wrote dirty home pages directly with
+        // no doublewrite copy. The stager's own interior lock serialises concurrent evictions' staging.
+        //
+        // `allow_unlogged` pages are SKIPPED: a freshly-allocated, not-yet-logged page (seeded with a
+        // valid checksum via `flush_unlogged`/`new_page`'s blank-then-checksum) carries no committed
+        // data, so a torn write of it loses nothing that recovery must reconstruct — redo recreates it
+        // from the WAL once it is logged. Staging it would only cost a doublewrite fsync for no
+        // durability gain. Logged pages (the steal of a dirty, WAL-stamped page) are always staged.
+        if !allow_unlogged && let Some(stager) = self.page_stager() {
+            stager.stage_and_sync(page_id, &meta.data[..])?;
+        }
         // `write_page` is `&mut D`, so it takes the device **write** guard (exclusive): write-backs
         // serialise against each other and against concurrent device reads — correct, since the WAL
         // rule above (and the exclusive guard) keep the steal/no-force ordering intact.

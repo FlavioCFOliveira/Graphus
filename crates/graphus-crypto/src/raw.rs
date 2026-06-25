@@ -151,6 +151,11 @@ pub struct MemRawSlots {
     armed_io_error: bool,
     /// When set, the next write to this slot stores only `prefix` bytes (then clears).
     armed_torn: Option<(u64, usize)>,
+    /// When `> 0`, the next `read_slot` calls fail with a **transient** I/O error and the counter is
+    /// decremented (models a momentarily-unreadable device, `rmp` #408). `read_slot` takes `&self`,
+    /// so this is a `Cell` for interior mutability (the in-memory backing is single-threaded in
+    /// tests).
+    armed_read_errors: std::cell::Cell<u32>,
 }
 
 impl MemRawSlots {
@@ -172,6 +177,13 @@ impl MemRawSlots {
     /// leaving the rest as it was (the corruption AEAD must catch).
     pub fn arm_torn_write(&mut self, index: u64, prefix: usize) {
         self.armed_torn = Some((index, prefix.min(SLOT_SIZE)));
+    }
+
+    /// Arms `count` **transient** read I/O errors: the next `count` `read_slot` calls fail with a
+    /// transient error, then reads succeed again (models a momentarily-unreadable device, `rmp`
+    /// #408 — distinct from a genuine torn page, which fails AEAD on a successful read).
+    pub fn arm_read_io_errors(&mut self, count: u32) {
+        self.armed_read_errors.set(count);
     }
 
     /// Models power loss: discards all un-synced (cached) writes.
@@ -228,6 +240,15 @@ impl RawSlots for MemRawSlots {
         if index >= self.persisted.len() as u64 {
             return Err(GraphusError::Storage(format!(
                 "raw read out of range: slot {index}"
+            )));
+        }
+        // A transient read error (one-shot, decrementing): models a momentarily-unreadable device
+        // distinct from a genuine torn page (`rmp` #408).
+        let armed = self.armed_read_errors.get();
+        if armed > 0 {
+            self.armed_read_errors.set(armed - 1);
+            return Err(GraphusError::Storage(format!(
+                "injected transient read I/O error: slot {index}"
             )));
         }
         buf.copy_from_slice(self.current(index));

@@ -299,7 +299,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// type as the store's own device, so an encrypted store's DWB is an encrypted device sharing the
     /// store's key (no plaintext page image is ever written to the DWB area). `None` for an
     /// unprotected store (e.g. a transient in-memory scratch store with no torn-write threat).
-    dwb: Option<crate::dwb::Dwb<D>>,
+    ///
+    /// Behind an `Arc<Mutex<…>>` (`rmp` #407) because the **same** persistent DWB now protects two
+    /// home-write paths: the checkpoint/flush path here ([`flush_protected`](Self::flush_protected))
+    /// **and** the buffer pool's *eviction/steal* path, via a [`crate::dwb::DwbPageStager`] installed
+    /// into the pool at [`attach_dwb`](Self::attach_dwb). The `Mutex` makes the two share one DWB
+    /// owner and serialises their staging (one DWB-device writer at a time); the `Arc` lets the
+    /// pool's stager hold a second handle to the same DWB.
+    dwb: Option<Arc<std::sync::Mutex<crate::dwb::Dwb<D>>>>,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -3391,8 +3398,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// encrypted store gets an encrypted DWB, keeping page images off disk in plaintext). The caller
     /// constructs the (persistent) DWB device — a file alongside the store — and hands it here at
     /// open time, before serving any traffic.
-    pub fn attach_dwb(&mut self, dwb: crate::dwb::Dwb<D>) {
-        self.dwb = Some(dwb);
+    ///
+    /// Beyond routing the checkpoint/flush path through the DWB, this also installs a
+    /// [`crate::dwb::DwbPageStager`] into the buffer pool ([`ConcurrentBufferPool::set_page_stager`])
+    /// so the pool's **eviction/steal** home-write path is doublewrite-protected too (`rmp` #407):
+    /// previously the evictor wrote dirty home pages directly, so a torn eviction write had no copy to
+    /// repair from. The stager shares the **same** `Arc<Mutex<Dwb>>` as the checkpoint path, so there
+    /// is one DWB owner and concurrent evictions + checkpoints serialise their staging through the one
+    /// `Mutex`.
+    ///
+    /// Bounded on `D: Send + Sync + 'static` because the stager is handed to the (thread-shared) pool
+    /// as an `Arc<dyn PageStager>`; the production [`graphus_io`] devices satisfy this, and the bound
+    /// is only required where a DWB is actually attached.
+    pub fn attach_dwb(&mut self, dwb: crate::dwb::Dwb<D>)
+    where
+        D: Send + Sync + 'static,
+    {
+        let shared = Arc::new(std::sync::Mutex::new(dwb));
+        // Install the eviction-path stager over the SAME shared DWB before recording it, so every
+        // home write from now on — checkpoint AND eviction — is doublewrite-protected.
+        let stager = Arc::new(crate::dwb::DwbPageStager::new(Arc::clone(&shared)));
+        self.pool.set_page_stager(stager);
+        self.dwb = Some(shared);
     }
 
     /// `true` when a doublewrite buffer is attached and protecting this store's home writes.
@@ -3401,21 +3428,44 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.dwb.is_some()
     }
 
-    /// Runs [`flush_protected`](Self::flush_protected) against the **attached** DWB, temporarily
-    /// taking it out of `self` to satisfy the borrow checker (`flush_protected` borrows `&mut self`
-    /// and `&mut Dwb`), then putting it back even on error. Only called when `self.dwb.is_some()`.
+    /// Flushes every dirty home page under doublewrite protection using the **attached** shared DWB
+    /// — via the [`crate::dwb::DwbPageStager`] installed into the buffer pool by
+    /// [`attach_dwb`](Self::attach_dwb) (`rmp` #407). Only called when `self.dwb.is_some()`.
+    ///
+    /// CRITICAL — why this does NOT lock the DWB itself: the pool's
+    /// [`flush_pages`](graphus_bufpool::ConcurrentBufferPool::flush_pages) acquires its dirty frames'
+    /// write latches and *then* stages the batch into the DWB through the installed stager (lock
+    /// order **frame-latch → DWB**), matching the eviction path's `write_back`. If this method held
+    /// the shared DWB mutex across `flush_pages`, two deadlocks would arise: (1) a same-thread
+    /// reentrant lock when the staging re-locks the very mutex this method holds, and (2) a
+    /// cross-thread ABBA with a concurrent reader-triggered eviction (which holds a frame latch and
+    /// then wants the DWB). So this method holds **no** DWB lock; it only drives the dirty set through
+    /// `flush_pages` in doublewrite-batch-sized chunks (the DWB area holds one batch at a time), and
+    /// the pool does the staging under the correct lock order.
+    ///
+    /// Mirrors [`flush_protected`](Self::flush_protected)'s chunking, but lets the pool stage (rather
+    /// than staging explicitly into a borrowed `&mut Dwb`), so the production attached path and the
+    /// eviction path share one stager and one consistent lock order.
     fn flush_protected_with_attached_dwb(&mut self) -> Result<()> {
-        let mut dwb = self.dwb.take().expect(
+        // Chunk the mapped set to the DWB batch capacity. `flush_pages` only writes home the dirty
+        // members of each chunk (over-listing clean pages is harmless) and stages exactly those dirty
+        // pages via the installed stager before writing them home — the doublewrite invariant for any
+        // dirty-set size (`rmp` #385/#407).
+        let pages = self.mapped_pages();
+        for chunk in pages.chunks(crate::dwb::DWB_MAX_BATCH) {
+            self.pool.flush_pages(chunk)?;
+        }
+        // After every home page is durable the current DWB batch is no longer needed; clear it
+        // (best-effort hygiene — a stale-but-valid batch is still safe, recovery only restores a page
+        // that fails its own checksum / AEAD tag). Take the shared DWB lock transiently (no frame
+        // latch is held here, so this cannot deadlock with the pool's frame-latch→DWB order).
+        let shared = Arc::clone(self.dwb.as_ref().expect(
             "INVARIANT: flush_protected_with_attached_dwb is only called when a DWB is set",
-        );
-        let result = self.flush_protected(&mut dwb);
-        // After a successful protected flush every home page is durable, so the current DWB batch is
-        // no longer needed; clear it (best-effort hygiene — a stale-but-valid batch is still safe,
-        // recovery only restores a page that fails its own checksum). A clear failure is not fatal to
-        // the flush that already succeeded, so it is folded into the result, never masking the flush.
-        let result = result.and_then(|()| dwb.clear());
-        self.dwb = Some(dwb);
-        result
+        ));
+        let mut dwb = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dwb.clear()
     }
 
     /// Flushes every dirty page home **under doublewrite protection** (`05 §3`, `04 §4.5`): the

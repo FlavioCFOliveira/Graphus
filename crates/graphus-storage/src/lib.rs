@@ -80,7 +80,7 @@ pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, HeapChainFault,
     IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, Violation, verify_on_open,
 };
-pub use dwb::{DWB_MAX_BATCH, Dwb, dwb_device_pages};
+pub use dwb::{DWB_MAX_BATCH, Dwb, DwbPageStager, dwb_device_pages};
 /// The page-header codec (checksum / `page_id` / `page_lsn` / type accessors) the storage layer
 /// stamps on every device page, re-exported from `graphus_bufpool` so callers above this crate
 /// (the server's recovery/repair tests, offline tools) can inspect on-disk page headers without a

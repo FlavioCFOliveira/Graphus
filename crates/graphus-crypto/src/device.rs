@@ -61,7 +61,7 @@ use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
 use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
-use graphus_io::{BlockDevice, Page};
+use graphus_io::{BlockDevice, Page, PageReadOutcome};
 
 use crate::header::{
     COUNTER_SLOT_INDEX, HEADER_SLOT_INDEX, HEADER_SLOTS, Header, decode_counter_slot,
@@ -238,6 +238,15 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
         self.backing
     }
 
+    /// Mutable access to the raw backing, for **Deterministic Simulation Testing only**: a harness
+    /// arms a fault (a transient read error, a torn write) on the live backing of an open device,
+    /// without the `into_backing` → re-`open` round trip (which would itself read the header slot and
+    /// consume a one-shot read fault). The encrypted seam stays encapsulated on the production path —
+    /// callers outside tests have no reason to reach the raw backing of an open device. (`rmp` #408.)
+    pub fn backing_mut(&mut self) -> &mut R {
+        &mut self.backing
+    }
+
     /// The associated data for `page`: its 8-byte little-endian id, binding the ciphertext to its
     /// offset.
     fn aad(page: PageId) -> [u8; 8] {
@@ -271,8 +280,31 @@ impl<R: RawSlots> EncryptedBlockDevice<R> {
     }
 }
 
-impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
-    fn read_page(&self, page: PageId, buf: &mut Page) -> Result<()> {
+/// The classified result of [`EncryptedBlockDevice::read_page_inner`]: a successful read, or a
+/// **genuine AES-GCM tag failure** (the page is torn/corrupt). A *transient* backing-store read
+/// error (or an out-of-range page) is returned as the function's `Err`, never as `TagFailed`, so the
+/// two are kept strictly distinct (`rmp` #408).
+enum DecryptOutcome {
+    /// The slot authenticated; the plaintext is in the caller's buffer.
+    Ok,
+    /// The slot's AES-GCM tag failed to authenticate: the page is genuinely torn/corrupt (a
+    /// torn/partial write, a relocated page, tamper, or a wrong key). Distinct from a transient I/O
+    /// error so doublewrite recovery can repair on this — and only this — condition.
+    TagFailed,
+}
+
+impl<R: RawSlots> EncryptedBlockDevice<R> {
+    /// Shared read core for [`read_page`](BlockDevice::read_page) and
+    /// [`read_page_classified`](BlockDevice::read_page_classified). Reads and decrypts page `page`
+    /// into `buf`, distinguishing a genuine AES-GCM tag failure ([`DecryptOutcome::TagFailed`]) from
+    /// a transient backing-store read error or an out-of-range page (both returned as `Err`).
+    ///
+    /// This separation is the root-cause fix for `rmp` #408: the previous single `read_page` mapped
+    /// *both* a tag failure and a transient I/O error to one `Err`, so doublewrite recovery, which
+    /// treated any home-read `Err` as "torn", could clobber a fine-but-momentarily-unreadable page
+    /// with a stale doublewrite copy. By surfacing the tag failure separately, recovery repairs only
+    /// a genuine tear and propagates a transient error instead.
+    fn read_page_inner(&self, page: PageId, buf: &mut Page) -> Result<DecryptOutcome> {
         if page.0 >= self.page_count {
             return Err(GraphusError::Storage(format!(
                 "read out of range: page {} of {}",
@@ -280,6 +312,8 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
             )));
         }
         let mut s: Slot = [0u8; SLOT_SIZE];
+        // A backing-store read error here is a TRANSIENT I/O failure (the device could not be read),
+        // NOT a torn page — propagate it as `Err`, never classify it as `TagFailed`.
         self.backing.read_slot(page.0 + HEADER_SLOTS, &mut s)?;
 
         // A never-written page is a zero-filled slot: it reads back as a zero page, exactly as on
@@ -332,7 +366,7 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         // model were redesigned — so it adds I/O without closing the hole.
         if s.iter().all(|&b| b == 0) {
             buf.fill(0);
-            return Ok(());
+            return Ok(DecryptOutcome::Ok);
         }
 
         let v = slot::view(&s);
@@ -344,18 +378,44 @@ impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
         // against the detached tag. This is byte-identical to the attached `decrypt` of
         // `ciphertext || tag` but avoids the `combined` concatenation Vec and the result Vec.
         buf.copy_from_slice(v.ciphertext);
-        self.cipher
+        match self
+            .cipher
             .decrypt_in_place_detached(&nonce, &aad, buf.as_mut_slice(), &tag)
-            .map_err(|_| {
-                // A tag failure is the unified signal for: wrong key, tamper, torn/partial write, or
-                // a relocated page (AAD mismatch). Fail closed exactly like a CRC failure.
-                GraphusError::Storage(format!(
-                    "authenticated decryption failed for page {} (wrong key, corruption, a torn \
-                     write, or a relocated page)",
-                    page.0
-                ))
-            })?;
-        Ok(())
+        {
+            Ok(()) => Ok(DecryptOutcome::Ok),
+            // A tag failure is the unified signal for: wrong key, tamper, torn/partial write, or a
+            // relocated page (AAD mismatch). It is a GENUINE TEAR — reported as `TagFailed`, NOT a
+            // transient `Err`, so doublewrite recovery can repair on it (`rmp` #408).
+            Err(_) => Ok(DecryptOutcome::TagFailed),
+        }
+    }
+}
+
+impl<R: RawSlots> BlockDevice for EncryptedBlockDevice<R> {
+    fn read_page(&self, page: PageId, buf: &mut Page) -> Result<()> {
+        // `read_page` keeps its historical fail-closed contract: a genuine tag failure is surfaced as
+        // an `Err` exactly like a CRC failure on the plaintext device, so every existing caller (the
+        // buffer pool, recovery's read-modify-write) is unchanged. The torn-vs-transient distinction
+        // is available only through `read_page_classified`, which doublewrite recovery uses.
+        match self.read_page_inner(page, buf)? {
+            DecryptOutcome::Ok => Ok(()),
+            DecryptOutcome::TagFailed => Err(GraphusError::Storage(format!(
+                "authenticated decryption failed for page {} (wrong key, corruption, a torn \
+                 write, or a relocated page)",
+                page.0
+            ))),
+        }
+    }
+
+    fn read_page_classified(&self, page: PageId, buf: &mut Page) -> Result<PageReadOutcome> {
+        // The encrypted-device override (`rmp` #408): a genuine AES-GCM tag failure is a torn page
+        // (`PageReadOutcome::Torn`); a transient backing-store read error (or an out-of-range page)
+        // propagates as `Err` — it is NOT treated as torn, so doublewrite recovery never reverts a
+        // fine-but-momentarily-unreadable home page from a stale copy.
+        match self.read_page_inner(page, buf)? {
+            DecryptOutcome::Ok => Ok(PageReadOutcome::Read),
+            DecryptOutcome::TagFailed => Ok(PageReadOutcome::Torn),
+        }
     }
 
     fn write_page(&mut self, page: PageId, buf: &Page) -> Result<()> {

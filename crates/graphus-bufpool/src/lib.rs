@@ -31,5 +31,5 @@ pub mod page;
 mod pool;
 mod sync;
 
-pub use concurrent::{ConcurrentBufferPool, PinnedFrame};
+pub use concurrent::{ConcurrentBufferPool, PageStager, PinnedFrame};
 pub use pool::{BufferPool, FrameId, NoWal, WalRule};

@@ -2042,6 +2042,121 @@ mod tests {
         );
     }
 
+    /// `rmp` #407 — the doublewrite buffer also protects the buffer pool's **eviction/steal**
+    /// home-write path (not just checkpoint). A dirty home data page written home by the **evictor**
+    /// (pool smaller than the working set, NO checkpoint) is staged into the persistent DWB by the
+    /// installed [`graphus_storage::DwbPageStager`] before its home write; if that home write tears,
+    /// the production reopen ([`recover_device_with_dwb`] before redo) repairs it from the DWB copy
+    /// and `verify_on_open` passes.
+    ///
+    /// Before #407 the evictor wrote dirty home pages **directly**, with no DWB staging, so a torn
+    /// eviction write had no intact copy — the reopen's consistency checker would reject the corrupt
+    /// page. This test forces eviction (a tiny pool, auto-checkpoint disabled so the DWB's last batch
+    /// is an *eviction* batch, never cleared by a checkpoint), tears exactly the home page the DWB's
+    /// surviving batch protects, and asserts the production reopen repairs it. It fails before the
+    /// eviction-path stager wiring and passes after.
+    #[test]
+    fn torn_evicted_home_page_is_repaired_on_production_reopen_via_doublewrite() {
+        use graphus_core::TxnId;
+        use graphus_io::PAGE_SIZE;
+
+        let root = TempRoot::new("dwb-evict-torn-repair");
+        let dir = root.path.join("db");
+        std::fs::create_dir_all(&dir).expect("create db dir");
+        let device_file = dir.join(STORE_FILE_NAME);
+        let wal_file = dir.join(WAL_FILE_NAME);
+        let dwb_file = dir.join(DWB_FILE_NAME);
+
+        // 1. Fresh create via the production path with a TINY buffer pool, so a working set larger than
+        //    the pool forces the evictor to steal (and write home) dirty pages. Disable auto-checkpoint
+        //    so the DWB's surviving batch is an EVICTION batch — never cleared by a checkpoint's
+        //    flush_protected. The committed work is durable in the WAL regardless.
+        let pool_pages = 6;
+        {
+            let coord = open_or_create_coordinator(&device_file, &wal_file, pool_pages, None)
+                .expect("fresh create");
+            coord.with_store_mut(|s| {
+                s.set_checkpoint_interval_bytes(0); // no auto-checkpoint: keep the eviction DWB batch
+                let txn = TxnId(1);
+                s.begin(txn);
+                // Far more nodes than the tiny pool can hold resident → many record pages allocated
+                // and evicted (each eviction stages its dirty home page into the DWB, then writes it
+                // home). The LAST eviction's batch is what survives in the single-slot DWB.
+                for _ in 0..2000 {
+                    s.create_node(txn).expect("create node");
+                }
+                s.commit(txn).expect("commit");
+            });
+            drop(coord);
+        }
+        assert!(dwb_file.exists(), "the persistent DWB file must exist");
+
+        // 2. Discover which home page the DWB's surviving (eviction) batch protects, and tear EXACTLY
+        //    that page on disk — a torn eviction write whose intact copy is the DWB batch. Reading the
+        //    DWB through a fresh `Dwb` over the same file decodes its current batch's home ids.
+        let staged = {
+            let dwb = open_or_create_dwb(&device_file, None).expect("open dwb");
+            dwb.staged_home_ids().expect("decode dwb batch")
+        };
+        assert!(
+            !staged.is_empty(),
+            "the DWB must hold an eviction batch (no checkpoint cleared it) — got none, so no \
+             eviction staged into the DWB"
+        );
+
+        let mut bytes = std::fs::read(&device_file).expect("read store file");
+        let page_count = (bytes.len() / PAGE_SIZE) as u64;
+        // Pick a staged home page that is in range, non-metadata, and currently intact on disk (its
+        // home write completed), then tear a mid-body byte so its CRC32C fails — a torn home write.
+        let mut torn_page = None;
+        for home in &staged {
+            let p = home.0;
+            if p == 0 || p >= page_count {
+                continue;
+            }
+            let off = (p as usize) * PAGE_SIZE;
+            let page: &[u8; PAGE_SIZE] = bytes[off..off + PAGE_SIZE].try_into().expect("page");
+            if graphus_storage::page::verify_checksum(page)
+                && graphus_storage::page::page_id(page) == p
+            {
+                bytes[off + 1000] ^= 0xFF;
+                torn_page = Some(p as usize);
+                break;
+            }
+        }
+        let torn_page = torn_page.expect("a staged, intact, non-metadata home page to tear");
+        std::fs::write(&device_file, &bytes).expect("write torn store file");
+
+        // Precondition: the torn page now fails its checksum on disk.
+        {
+            let disk = std::fs::read(&device_file).expect("reread");
+            let off = torn_page * PAGE_SIZE;
+            let page: &[u8; PAGE_SIZE] = disk[off..off + PAGE_SIZE].try_into().expect("page");
+            assert!(
+                !graphus_storage::page::verify_checksum(page),
+                "the injected tear must corrupt evicted home page {torn_page}"
+            );
+        }
+
+        // 3. Reopen via the PRODUCTION path. `recover_device_with_dwb` repairs the torn evicted page
+        //    from the DWB before redo, and the open path's `verify_on_open` (consistency checker)
+        //    passes. Before the eviction-path stager wiring the evicted page had no DWB copy, so this
+        //    reopen would error.
+        let reopened = open_or_create_coordinator(&device_file, &wal_file, pool_pages, None).expect(
+            "production reopen must repair the torn EVICTED home page and pass the consistency checker",
+        );
+        drop(reopened);
+
+        // 4. The repaired home page is intact on disk after recovery.
+        let disk = std::fs::read(&device_file).expect("reread after recovery");
+        let off = torn_page * PAGE_SIZE;
+        let page: &[u8; PAGE_SIZE] = disk[off..off + PAGE_SIZE].try_into().expect("page");
+        assert!(
+            graphus_storage::page::verify_checksum(page),
+            "evicted home page {torn_page} must be intact after doublewrite repair"
+        );
+    }
+
     #[test]
     fn stale_tmp_is_removed_and_the_valid_file_wins() {
         let root = TempRoot::new("staletmp");

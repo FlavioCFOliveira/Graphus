@@ -49,7 +49,7 @@
 use graphus_bufpool::page;
 use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
-use graphus_io::{BlockDevice, PAGE_SIZE, Page};
+use graphus_io::{BlockDevice, PAGE_SIZE, Page, PageReadOutcome};
 
 /// Magic identifying a valid DWB header slot (`"GDWB"` + version `1`, little-endian).
 const DWB_MAGIC: u64 = 0x0000_0001_4257_4447; // 'G''D''W''B' = 0x47 0x44 0x57 0x42
@@ -226,6 +226,19 @@ impl<D: BlockDevice> Dwb<D> {
         self.device.sync_data()
     }
 
+    /// The home `PageId`s the **current** durable DWB batch protects (an empty `Vec` when the header
+    /// describes no batch). Reads and decodes the header slot; used by tests/diagnostics to discover
+    /// which home pages a staged batch (e.g. one written by the eviction-path stager, `rmp` #407)
+    /// covers, so a torn-page repair can be exercised deterministically.
+    ///
+    /// # Errors
+    /// Returns a storage error if the header slot cannot be read.
+    pub fn staged_home_ids(&self) -> Result<Vec<PageId>> {
+        let mut hdr: Page = [0u8; PAGE_SIZE];
+        self.device.read_page(PageId(DWB_HEADER_SLOT), &mut hdr)?;
+        Ok(Self::decode_header(&hdr).unwrap_or_default())
+    }
+
     /// Recovery pass: restores every torn home page from its intact DWB copy, run **before** ARIES
     /// redo. Returns the number of home pages repaired.
     ///
@@ -256,20 +269,38 @@ impl<D: BlockDevice> Dwb<D> {
             if home_id.0 >= home.page_count() {
                 continue;
             }
-            // Read the home page. On the **plaintext** device a torn page reads back as bytes whose
-            // CRC32C fails `verify_checksum`. On the **encrypted** device (`graphus_crypto`) the
-            // torn slot fails its GCM tag and `read_page` returns an *error* instead — the same
-            // "this page is unreadable/torn" signal, surfaced differently by the AEAD seam. Both must
-            // be treated identically: the page is torn and must be repaired from the DWB copy.
-            // Propagating the encrypted-device read error here (the old `?`) would make recovery
-            // *fail* on exactly the torn-page case the DWB exists to repair — so a home read error is
-            // mapped to "torn", not propagated.
+            // Read + classify the home page (`rmp` #408). On the **plaintext** device a torn page
+            // reads back as bytes whose CRC32C fails `verify_checksum` (the read itself succeeds). On
+            // the **encrypted** device (`graphus_crypto`) the torn slot fails its AES-GCM tag, which
+            // `read_page_classified` reports as `PageReadOutcome::Torn` — distinct from a **transient**
+            // I/O error, which it propagates as `Err`.
+            //
+            // ROOT-CAUSE FIX (`rmp` #408): the previous code mapped *any* home-read `Err` to "torn",
+            // so a fine-but-momentarily-unreadable home page (a transient device error) with a stale
+            // surviving DWB batch present would be CLOBBERED by the older DWB image — a durability
+            // violation (an older image written over a newer home page). We now:
+            //   - repair ONLY on a genuine tear: `PageReadOutcome::Torn`, or a successful read whose
+            //     CRC32C fails (the plaintext tear);
+            //   - PROPAGATE a transient `Err` (never silently revert) — recovery fails loudly so the
+            //     operator/retry sees it, rather than corrupting a good page from a stale copy.
             let mut home_buf: Page = [0u8; PAGE_SIZE];
-            let home_intact = match home.read_page(*home_id, &mut home_buf) {
-                Ok(()) => page::verify_checksum(&home_buf),
-                Err(_) => false, // unreadable/torn (e.g. AEAD failure on the encrypted device)
-            };
-            if home_intact {
+            // `home_trusted_lsn` is `Some(lsn)` only when the home page read back **and** its own
+            // CRC32C verifies — i.e. its header (and `page_lsn`) is trustworthy. A torn page's header
+            // is garbage, so its lsn is never trusted (`None`). Used by the lsn guard below.
+            let (home_torn, home_trusted_lsn) =
+                match home.read_page_classified(*home_id, &mut home_buf)? {
+                    // Read succeeded: intact iff its own CRC32C verifies (plaintext-tear detection).
+                    PageReadOutcome::Read => {
+                        if page::verify_checksum(&home_buf) {
+                            (false, Some(page::page_lsn(&home_buf)))
+                        } else {
+                            (true, None) // readable but CRC-failed ⇒ torn; lsn untrusted
+                        }
+                    }
+                    // Genuine AEAD-tag failure on the encrypted device: the page is torn.
+                    PageReadOutcome::Torn => (true, None),
+                };
+            if !home_torn {
                 continue; // home image intact (old or new) — redo reconciles it
             }
             // Home page is torn. Restore from the DWB copy.
@@ -300,6 +331,26 @@ impl<D: BlockDevice> Dwb<D> {
                     home_id.0
                 )));
             }
+            // Defence in depth — the lsn guard (`rmp` #408): never write an OLDER image over a NEWER
+            // home page. We only reach here when the home page is torn, so normally its lsn is
+            // untrusted (`home_trusted_lsn == None`) and the guard is a no-op — the root-cause fix
+            // (classifying transient `Err` vs genuine tear above) is what actually closes the reported
+            // clobber. But if a future caller ever reaches this restore with a home page whose header
+            // *does* verify (a trusted lsn), refuse to apply a strictly-staler DWB copy: a DWB image
+            // older than the live home page is a stale surviving batch, and restoring it would revert a
+            // committed change. (A DWB image of equal-or-greater lsn is the legitimate repair image.)
+            if let Some(home_lsn) = home_trusted_lsn {
+                let dwb_lsn = page::page_lsn(&dwb_buf);
+                if dwb_lsn < home_lsn {
+                    return Err(GraphusError::Storage(format!(
+                        "doublewrite recovery: refusing to restore home page {} from slot {}: the \
+                         doublewrite copy's page_lsn {} is OLDER than the (intact) home page's \
+                         page_lsn {} — a stale doublewrite batch must never overwrite a newer home \
+                         page",
+                        home_id.0, slot.0, dwb_lsn.0, home_lsn.0
+                    )));
+                }
+            }
             home.write_page(*home_id, &dwb_buf)?;
             repaired += 1;
         }
@@ -307,6 +358,81 @@ impl<D: BlockDevice> Dwb<D> {
             home.sync_data()?;
         }
         Ok(repaired)
+    }
+}
+
+/// A [`graphus_bufpool::PageStager`] over a **shared persistent doublewrite buffer** (`rmp` #407).
+///
+/// This is what wires the buffer pool's *eviction/steal* home-write path into the doublewrite
+/// protocol: when the pool must steal a dirty data page and write it home, it first calls
+/// [`stage_and_sync`](graphus_bufpool::PageStager::stage_and_sync) on this stager, which stages that
+/// one page image into the **same** persistent DWB the checkpoint path uses and fsyncs it — so the
+/// image is durable before the home write begins, and a torn eviction write is repairable on the
+/// next open ([`recover_device_with_dwb`](crate::recovery::recover_device_with_dwb)).
+///
+/// The DWB lives behind an `Arc<Mutex<Dwb<D>>>` shared with the owning [`RecordStore`]: the `Mutex`
+/// serialises concurrent evictions' staging against each other and against a checkpoint's
+/// `flush_protected`, so there is exactly one writer of the DWB device at a time and one DWB owner
+/// overall. A single-page batch ([`Dwb::stage_batch`] with one entry) is exactly what
+/// [`Dwb::recover_home`] already scans and repairs (it iterates every occupied slot of the recorded
+/// batch, whether the batch holds one page or many), so an evicted torn page is covered identically
+/// to a checkpoint torn page.
+///
+/// PERFORMANCE: each eviction that steals a dirty page now pays one extra DWB `write_page` + one
+/// `sync_data` (an fsync) before its home write. Under steal-heavy pressure (a working set larger
+/// than the pool) this is a real per-eviction fsync cost; correctness (no unprotected home write)
+/// takes precedence. A perf follow-up may coalesce staging across a burst of evictions, but must not
+/// weaken the stage-before-home ordering. (`rmp` #407.)
+pub struct DwbPageStager<D: BlockDevice> {
+    dwb: std::sync::Arc<std::sync::Mutex<Dwb<D>>>,
+}
+
+impl<D: BlockDevice> DwbPageStager<D> {
+    /// Wraps the shared persistent DWB so the pool can stage evicted pages into it.
+    #[must_use]
+    pub fn new(dwb: std::sync::Arc<std::sync::Mutex<Dwb<D>>>) -> Self {
+        Self { dwb }
+    }
+}
+
+impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
+    fn stage_and_sync(&self, page_id: PageId, image: &[u8]) -> Result<()> {
+        // The image is exactly one page; `stage_batch` of a single `(page_id, &Page)` writes it to a
+        // DWB data slot, records the header, and `sync_data`s — durable before the home write begins.
+        let page: &Page = image.try_into().map_err(|_| {
+            GraphusError::Storage(format!(
+                "doublewrite stage: image for page {} is {} bytes, expected {PAGE_SIZE}",
+                page_id.0,
+                image.len()
+            ))
+        })?;
+        let mut dwb = self
+            .dwb
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dwb.stage_batch(&[(page_id, page)])
+    }
+
+    fn stage_batch_and_sync(&self, batch: &[(PageId, &[u8])]) -> Result<()> {
+        // Reborrow each `&[u8]` image as a `&Page` (each is exactly one page; the pool stamped the
+        // checksum before calling). The whole batch is staged as ONE durable DWB batch (a single
+        // `sync_data` inside `stage_batch`), so every page is protected before any home write.
+        let mut pages: Vec<(PageId, &Page)> = Vec::with_capacity(batch.len());
+        for (page_id, image) in batch {
+            let page: &Page = (*image).try_into().map_err(|_| {
+                GraphusError::Storage(format!(
+                    "doublewrite stage: image for page {} is {} bytes, expected {PAGE_SIZE}",
+                    page_id.0,
+                    image.len()
+                ))
+            })?;
+            pages.push((*page_id, page));
+        }
+        let mut dwb = self
+            .dwb
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dwb.stage_batch(&pages)
     }
 }
 
