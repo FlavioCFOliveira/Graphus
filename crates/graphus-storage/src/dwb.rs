@@ -46,7 +46,7 @@
 //! write for that batch had not yet begun (the home write only starts after the DWB sync returns).
 //! Recovery treats that as an empty DWB — the safe, committed-or-nothing outcome.
 //!
-//! ## Two disjoint regions (`rmp` #412): batch region + eviction region
+//! ## Disjoint regions: one batch region + an eviction ring (`rmp` #412, `rmp` #431)
 //!
 //! The doublewrite area is shared by two independent writers: the **checkpoint** path
 //! ([`Dwb::stage_batch`] for the dirty-page checkpoint/flush, via
@@ -57,34 +57,68 @@
 //! copy of an in-flight page — a torn checkpoint home page then became unrepairable (`rmp` #412,
 //! reopening the `rmp` #411 / `rmp` #407 hole across the two paths).
 //!
-//! The fix is structural: the device carries **two disjoint regions**, each with its own header and
-//! data slots, that never overlap on disk:
+//! The device therefore carries **disjoint regions** that never overlap on disk:
 //!
 //! * the **BATCH region** (pages `0 ..= DWB_MAX_BATCH`) — used **only** by the checkpoint path; one
 //!   header slot plus up to [`DWB_MAX_BATCH`] data slots;
-//! * the **EVICTION region** (pages `DWB_MAX_BATCH+1 ..= DWB_MAX_BATCH+2`) — used **only** by the
-//!   per-eviction path; one header slot plus one data slot (the eviction path stages exactly one page
-//!   at a time and is serialised by the DWB lock held across its stage+home-write, `rmp` #411).
+//! * the **EVICTION RING** (the pages after the batch region) — used **only** by the per-eviction
+//!   path; [`DWB_EVICT_RING_SLOTS`] independent single-page regions, each its own (header, data)
+//!   pair. (`rmp` #431.)
 //!
-//! A concurrent checkpoint and eviction now touch **disjoint bytes** and cannot clobber each other.
-//! [`Dwb::recover_home`] scans **both** region headers and repairs every torn home page found in
-//! either, so a torn page from either writer is recovered. The batch region's layout is byte-for-byte
-//! identical to the pre-#412 single region (header at page 0, data at pages `1..`), so the only
-//! on-disk change is the appended eviction region; the format version in the header magic is bumped
-//! (v1 → v2) so a device written by the prior single-region layout is not silently misread.
+//! ### Why a ring, not a single eviction slot (`rmp` #431)
+//!
+//! The pre-#431 layout had a **single** eviction slot, and [`DwbPageStager::stage_and_sync`] held the
+//! one process-wide `Arc<Mutex<Dwb>>` across BOTH the staging fsync AND the home write+fsync (that
+//! serialisation is what `rmp` #411 used to guarantee the single slot's occupant stayed
+//! recover-discoverable until its home write was durable). Under combined read+write load every dirty
+//! eviction across `~2 * min(N_cpu, 16)` threads then serialised through that one slot and its two
+//! serial fsyncs — a **convoy**: correctness was intact, throughput collapsed.
+//!
+//! The eviction ring removes the convoy. Each evictor **claims a free ring slot** from a lightweight
+//! free-slot allocator (the only step under a short lock), stages its page into that slot and fsyncs
+//! the DWB, writes the page home and fsyncs the home device — **without** holding any global lock
+//! across the home write — then **frees its slot**. With `N` slots, up to `N` evictions are in flight
+//! concurrently, each owning a disjoint slot. The reuse-after-durable invariant (`rmp` #411) is now
+//! enforced by the **free-slot allocator**, not by holding a lock across the home write: a slot is
+//! returned to the free list (and thus reusable) **only after** its occupant's home write is durably
+//! complete.
+//!
+//! ### The invariants the ring still upholds (why #411/#412 existed)
+//!
+//! 1. **Valid-until-durable** — a claimed slot's page image stays in place and
+//!    [`recover_home`](Dwb::recover_home)-discoverable until that page's home write is durable: the
+//!    slot is not freed (nor its header cleared) before the home write returns.
+//! 2. **Reuse-after-durable** — a slot is handed to another evictor only after its prior occupant's
+//!    home write is durably complete (the allocator frees it only post-home-sync).
+//! 3. **No clobber** — the `N` ring slots are byte-disjoint from each other and from the batch
+//!    region, and the free-slot allocator hands each in-flight evictor a *distinct* slot, so no two
+//!    evictors (nor an evictor and the checkpoint) ever write the same bytes.
+//! 4. **Recovery scans everything** — [`recover_home`](Dwb::recover_home) scans the batch region AND
+//!    every ring slot, repairing every torn home page found in any of them.
+//! 5. **Deadlock-free** — lock order is uniformly frame-latch → DWB(claim/stage/free) → store-device;
+//!    the DWB device lock is never held while taking the store device, and the home write takes the
+//!    store device while holding NO DWB lock at all.
+//!
+//! [`Dwb::recover_home`] scans the batch region header and every ring-slot header and repairs every
+//! torn home page found, so a torn page from either writer is recovered. The format version in the
+//! header magic is bumped (v2 → v3, `rmp` #434) so a device written by the prior single-eviction-slot
+//! (v2) or single-region (v1) layout is detected and recreated rather than silently misread.
 
 use graphus_bufpool::page;
 use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page, PageReadOutcome};
 
-/// Magic identifying a valid DWB header slot (`"GDWB"` + version `2`, little-endian).
+/// Magic identifying a valid DWB header slot (`"GDWB"` + version `3`, little-endian).
 ///
-/// Version `2` marks the two-region layout (`rmp` #412): a batch region followed by a disjoint
-/// eviction region. A device written by the pre-#412 single-region layout carries version `1`, whose
-/// magic differs, so its headers fail [`Dwb::decode_header`]'s magic check and decode as "no batch" —
-/// it is never silently misread as a v2 device.
-const DWB_MAGIC: u64 = 0x0000_0002_4257_4447; // 'G''D''W''B' = 0x47 0x44 0x57 0x42, version 2
+/// Version `3` marks the eviction-**ring** layout (`rmp` #431): a batch region followed by
+/// [`DWB_EVICT_RING_SLOTS`] disjoint single-page eviction regions. A device written by the
+/// pre-#431 two-region layout carries version `2`, and the original single-region layout version `1`;
+/// both differ in this magic, so their headers fail [`Dwb::decode_header`]'s magic check and decode as
+/// "no batch" — an old-format device is never silently misread as v3 (`rmp` #434). [`Dwb::new`]
+/// additionally **grows** a too-small old device to the v3 page count, so an in-place upgrade after a
+/// clean shutdown (every slot home-durable, so nothing to repair) reopens safely.
+const DWB_MAGIC: u64 = 0x0000_0003_4257_4447; // 'G''D''W''B' = 0x47 0x44 0x57 0x42, version 3
 // The DWB header slot is a standard page: its first 24 bytes are the page header
 // (`graphus_bufpool::page`), of which bytes `0..4` are the CRC32C checksum that `write_checksum`
 // stamps. The DWB-specific fields therefore live *after* the 24-byte page header so they do not
@@ -108,12 +142,26 @@ const HDR_OFF_HOMES: usize = HDR_OFF_COUNT + 8; // u64[count] home page ids
 /// the largest batch the header can actually describe.)
 pub const DWB_MAX_BATCH: usize = (PAGE_SIZE - HDR_OFF_HOMES) / 8;
 
-/// The fixed slot layout of one DWB region: a header slot followed by `capacity` contiguous data
-/// slots, none of which overlap any other region (`rmp` #412).
+/// The number of independent single-page eviction slots in the eviction **ring** (`rmp` #431).
 ///
-/// Both regions share the same on-disk encoding (header magic, count, `u64[count]` home ids in the
-/// header; the same image-then-header write order in [`Dwb::stage_into`]); they differ only in their
-/// base device pages and capacities, so [`Dwb::stage_into`]/[`Dwb::recover_region`] are fully shared.
+/// Chosen as a small fixed constant sized to the **maximum concurrent evictor bound**: the server's
+/// reader pool (`rmp` #336) and writer concurrency are each capped near `min(N_cpu, 16)`, so at most
+/// `~2 * 16 = 32` threads can be evicting a dirty page at once. `32` ring slots therefore let every
+/// possible concurrent evictor own a distinct slot with no contention on the slot allocator, while
+/// costing only `32 * 2 = 64` extra DWB pages (`512 KiB`) of fixed on-disk overhead — negligible. A
+/// constant (rather than a runtime-sized ring) keeps the on-disk layout fixed and the header-decode
+/// bounds static. If the evictor count ever exceeds this, the allocator degrades **gracefully** to
+/// the pre-#431 behaviour (an evictor with no free slot waits, capped at `N`-way parallelism — never
+/// incorrect, only as fast as `N` slots allow).
+pub const DWB_EVICT_RING_SLOTS: usize = 32;
+
+/// The fixed slot layout of one DWB region: a header slot followed by `capacity` contiguous data
+/// slots, none of which overlap any other region (`rmp` #412 / `rmp` #431).
+///
+/// Both the batch region and every eviction-ring slot share the same on-disk encoding (header magic,
+/// count, `u64[count]` home ids in the header; the same image-then-header write order in
+/// [`Dwb::stage_into`]); they differ only in their base device pages and capacities, so
+/// [`Dwb::stage_into`]/[`Dwb::recover_region`] are fully shared.
 #[derive(Clone, Copy)]
 struct Region {
     /// Device page of this region's header slot.
@@ -132,22 +180,30 @@ const BATCH_REGION: Region = Region {
     capacity: DWB_MAX_BATCH,
 };
 
-/// The EVICTION region (per-eviction path): header + one data slot, placed immediately after the
-/// batch region's last data slot so the two regions are disjoint (`rmp` #412). The eviction path
-/// stages exactly one page at a time and serialises stage+home-write under the DWB lock (`rmp` #411),
-/// so a single data slot suffices.
-const EVICT_REGION: Region = Region {
-    header_slot: 1 + DWB_MAX_BATCH as u64,
-    first_data_slot: 2 + DWB_MAX_BATCH as u64,
-    capacity: 1,
-};
+/// Device page of the first eviction-ring slot's header. The ring is placed immediately after the
+/// batch region's last data slot so it is disjoint from the batch region (`rmp` #412). Each ring slot
+/// occupies two consecutive pages: `[header, data]`.
+const EVICT_RING_BASE: u64 = 1 + DWB_MAX_BATCH as u64;
 
-/// The number of DWB device pages the two-region layout needs (`rmp` #412): the batch region (one
-/// header + [`DWB_MAX_BATCH`] data slots) plus the eviction region (one header + one data slot).
+/// The [`Region`] descriptor for eviction-ring slot `slot` (`0 ..= DWB_EVICT_RING_SLOTS-1`). Each slot
+/// is a one-page-capacity region of two consecutive device pages: a header page then a data page,
+/// disjoint from every other slot and from the batch region (`rmp` #431).
+const fn evict_ring_region(slot: usize) -> Region {
+    let base = EVICT_RING_BASE + (slot as u64) * 2;
+    Region {
+        header_slot: base,
+        first_data_slot: base + 1,
+        capacity: 1,
+    }
+}
+
+/// The number of DWB device pages the layout needs (`rmp` #412 / `rmp` #431): the batch region (one
+/// header + [`DWB_MAX_BATCH`] data slots) plus the eviction ring ([`DWB_EVICT_RING_SLOTS`] slots, each
+/// one header + one data page).
 #[must_use]
 pub const fn dwb_device_pages() -> u64 {
-    // batch: 1 + DWB_MAX_BATCH ; eviction: 1 + 1
-    (1 + DWB_MAX_BATCH as u64) + 2
+    // batch: 1 + DWB_MAX_BATCH ; ring: DWB_EVICT_RING_SLOTS * (1 header + 1 data)
+    (1 + DWB_MAX_BATCH as u64) + (DWB_EVICT_RING_SLOTS as u64) * 2
 }
 
 /// The doublewrite buffer over a dedicated [`BlockDevice`] (the `doublewrite.dwb` area, `05 §2.1`).
@@ -159,11 +215,20 @@ pub struct Dwb<D: BlockDevice> {
 }
 
 impl<D: BlockDevice> Dwb<D> {
-    /// Wraps an already-sized DWB `device`, growing it to [`dwb_device_pages`] pages (the two-region
-    /// layout, `rmp` #412) if it is shorter.
+    /// Wraps an already-sized DWB `device`, growing it to [`dwb_device_pages`] pages (the current
+    /// ring layout, `rmp` #431) if it is shorter.
+    ///
+    /// An older-format device (v1 single-region or v2 single-eviction-slot, `rmp` #434) is **shorter**
+    /// than the v3 ring layout, so it is grown here: the new ring slots are zero pages, which
+    /// [`decode_header`](Self::decode_header) reads as "no batch", so they are never misread.
+    /// [`recover_home`](Self::recover_home) only ever *reads* old slots; on a clean shutdown every page
+    /// is home-durable so there is nothing to repair, and the v3 magic on the next stage marks the
+    /// device as v3 going forward. The header magic also differs (v3 vs v2/v1), so even an old device
+    /// that is *not* grown (already large enough) decodes its stale batch header as "no batch" rather
+    /// than misreading a v2/v1 layout.
     ///
     /// # Errors
-    /// Returns a storage error if the device cannot be grown to hold both regions.
+    /// Returns a storage error if the device cannot be grown to hold the ring layout.
     pub fn new(mut device: D) -> Result<Self> {
         let need = dwb_device_pages();
         if device.page_count() < need {
@@ -183,8 +248,8 @@ impl<D: BlockDevice> Dwb<D> {
     /// The caller ([`stage_into`](Self::stage_into)) has already rejected a batch larger than the
     /// region's capacity; this debug assertion restates the invariant the page layout relies on —
     /// `HDR_OFF_HOMES + homes.len()*8` must fit one header page — so an over-cap batch can never
-    /// silently index out of the header page (`rmp` #385). Both regions cap at most at
-    /// [`DWB_MAX_BATCH`] (the eviction region at 1), so this single bound covers both.
+    /// silently index out of the header page (`rmp` #385). Both region kinds cap at most at
+    /// [`DWB_MAX_BATCH`] (each ring slot at 1), so this single bound covers them all.
     fn encode_header(homes: &[PageId]) -> Page {
         debug_assert!(
             homes.len() <= DWB_MAX_BATCH,
@@ -205,8 +270,8 @@ impl<D: BlockDevice> Dwb<D> {
     }
 
     /// Decodes a header slot, returning the batch's home page ids, or `None` if the slot does not
-    /// describe a durable batch (a fresh/zeroed DWB, or a header torn mid-write — both mean "no
-    /// committed batch to repair").
+    /// describe a durable batch (a fresh/zeroed DWB, an old-format (v1/v2) header, or a header torn
+    /// mid-write — all mean "no committed batch to repair").
     fn decode_header(hdr: &Page) -> Option<Vec<PageId>> {
         // A torn or never-written header fails the checksum: no batch.
         if !page::verify_checksum(hdr) {
@@ -217,6 +282,8 @@ impl<D: BlockDevice> Dwb<D> {
                 .try_into()
                 .expect("8-byte slice"),
         );
+        // A wrong magic includes an old-format device (v1/v2): treat it as "no batch" (`rmp` #434),
+        // so an old device's stale header is never misread as a current-format batch.
         if magic != DWB_MAGIC {
             return None;
         }
@@ -244,9 +311,9 @@ impl<D: BlockDevice> Dwb<D> {
     }
 
     /// Stages a batch into a specific `region` and makes it durable (steps 1–2 of the write
-    /// protocol), without touching any other region (`rmp` #412). Shared by both
+    /// protocol), without touching any other region (`rmp` #412 / `rmp` #431). Shared by both
     /// [`stage_batch`](Self::stage_batch) (the checkpoint path → [`BATCH_REGION`]) and the per-eviction
-    /// path (→ [`EVICT_REGION`]).
+    /// path (→ an [`evict_ring_region`] slot).
     fn stage_into(&mut self, region: &Region, batch: &[(PageId, &Page)]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -276,7 +343,7 @@ impl<D: BlockDevice> Dwb<D> {
     /// Stages a batch of dirty home pages into the **checkpoint** ([`BATCH_REGION`]) region and makes
     /// the DWB durable (steps 1–2 of the write protocol). After this returns the caller may write the
     /// pages to their home locations. Used by the checkpoint/flush path only; the per-eviction path
-    /// uses the disjoint eviction region instead (`rmp` #412).
+    /// uses the disjoint eviction ring instead (`rmp` #412 / `rmp` #431).
     ///
     /// Each `(PageId, &Page)` is the home id and the *exact image* about to be written home; the
     /// images must already carry a valid checksum (they are page-cache images, checksummed before
@@ -290,24 +357,35 @@ impl<D: BlockDevice> Dwb<D> {
         self.stage_into(&BATCH_REGION, batch)
     }
 
-    /// Stages a single evicted home page into the **eviction** ([`EVICT_REGION`]) region and makes it
-    /// durable — disjoint from the checkpoint batch region, so a concurrent checkpoint can never
-    /// clobber it and vice versa (`rmp` #412). Used only by [`DwbPageStager::stage_and_sync`].
+    /// Stages a single evicted home page into eviction-ring **slot** `slot` and makes it durable —
+    /// disjoint from the checkpoint batch region and from every other ring slot, so a concurrent
+    /// checkpoint or another evictor can never clobber it and vice versa (`rmp` #412 / `rmp` #431).
+    /// Used only by [`DwbPageStager::stage_and_sync`], which owns `slot` (claimed from the free-slot
+    /// allocator) for the duration of the stage+home-write.
     ///
     /// # Errors
-    /// Returns a storage error if the DWB write or sync fails (never swallowed: the home write must
-    /// not proceed without a durable copy).
-    pub fn stage_eviction(&mut self, page_id: PageId, image: &Page) -> Result<()> {
-        self.stage_into(&EVICT_REGION, &[(page_id, image)])
+    /// Returns a storage error if `slot` is out of range, or if the DWB write or sync fails (never
+    /// swallowed: the home write must not proceed without a durable copy).
+    pub fn stage_eviction_slot(
+        &mut self,
+        slot: usize,
+        page_id: PageId,
+        image: &Page,
+    ) -> Result<()> {
+        if slot >= DWB_EVICT_RING_SLOTS {
+            return Err(GraphusError::Storage(format!(
+                "doublewrite eviction ring slot {slot} out of range (0..{DWB_EVICT_RING_SLOTS})"
+            )));
+        }
+        let region = evict_ring_region(slot);
+        self.stage_into(&region, &[(page_id, image)])
     }
 
     /// Invalidates the **checkpoint** region's batch by clearing its header slot and syncing, so a
     /// later recovery finds no batch to repair there once the home pages are known durable.
     /// Best-effort hygiene: leaving a stale-but-checksum-valid batch is still *safe* (recovery only
     /// restores a home page that fails its own checksum, i.e. is genuinely torn), so a clear failure
-    /// is non-fatal and is reported. (The eviction region is self-managing: each eviction overwrites
-    /// it under the DWB lock held across the home write, `rmp` #411, so it never needs a separate
-    /// clear.)
+    /// is non-fatal and is reported.
     ///
     /// # Errors
     /// Returns a storage error if the header clear write or sync fails.
@@ -315,6 +393,25 @@ impl<D: BlockDevice> Dwb<D> {
         let zero = [0u8; PAGE_SIZE];
         self.device
             .write_page(PageId(BATCH_REGION.header_slot), &zero)?;
+        self.device.sync_data()
+    }
+
+    /// Zeroes **every** DWB header (the batch region and all ring slots) and syncs, so no stale
+    /// doublewrite copy from a prior generation survives. Used by the restore path (`rmp` #417): a
+    /// restore lays down a fresh device + WAL, and any leftover doublewrite batch from the prior
+    /// generation must not be able to clobber a (genuinely or coincidentally) torn page of the freshly
+    /// restored device on the next open. Mirrors the WAL reset.
+    ///
+    /// # Errors
+    /// Returns a storage error if a header clear write or the sync fails.
+    pub fn reset(&mut self) -> Result<()> {
+        let zero = [0u8; PAGE_SIZE];
+        self.device
+            .write_page(PageId(BATCH_REGION.header_slot), &zero)?;
+        for slot in 0..DWB_EVICT_RING_SLOTS {
+            let region = evict_ring_region(slot);
+            self.device.write_page(PageId(region.header_slot), &zero)?;
+        }
         self.device.sync_data()
     }
 
@@ -327,15 +424,20 @@ impl<D: BlockDevice> Dwb<D> {
         self.region_home_ids(&BATCH_REGION)
     }
 
-    /// The home `PageId`s the **current** durable eviction-region copy protects (an empty `Vec` when
-    /// its header describes no page). Used by tests/diagnostics to discover which home page the
-    /// eviction-path stager (`rmp` #407/#411) covers, so a torn-page repair can be exercised
+    /// The home `PageId`s the **eviction ring** currently protects across all its slots (an empty
+    /// `Vec` when no slot is occupied). Used by tests/diagnostics to discover which home pages the
+    /// eviction-path stager (`rmp` #407/#411/#431) covers, so a torn-page repair can be exercised
     /// deterministically.
     ///
     /// # Errors
-    /// Returns a storage error if the header slot cannot be read.
+    /// Returns a storage error if a header slot cannot be read.
     pub fn evicted_home_ids(&self) -> Result<Vec<PageId>> {
-        self.region_home_ids(&EVICT_REGION)
+        let mut ids = Vec::new();
+        for slot in 0..DWB_EVICT_RING_SLOTS {
+            let region = evict_ring_region(slot);
+            ids.extend(self.region_home_ids(&region)?);
+        }
+        Ok(ids)
     }
 
     fn region_home_ids(&self, region: &Region) -> Result<Vec<PageId>> {
@@ -361,19 +463,23 @@ impl<D: BlockDevice> Dwb<D> {
     /// to repair a torn home page is itself corrupt (an unrepairable double fault — surfaced, never
     /// hidden, per the integrity-is-inviolable rule, `04 §4.6`).
     pub fn recover_home<H: BlockDevice>(&mut self, home: &mut H) -> Result<usize> {
-        // Scan BOTH regions (`rmp` #412): a torn home page may be protected by the checkpoint batch
-        // region OR the per-eviction region, and the two are written by independent paths. Repairing
-        // both is safe and order-independent — `recover_region` only restores a home page that fails
-        // its own checksum, and the lsn/page_id guards reject a stale or misdirected copy, so a page
-        // that a region does not actually protect (or whose home is already intact) is left untouched.
-        let batch_repaired = self.recover_region(&BATCH_REGION, home)?;
-        let evict_repaired = self.recover_region(&EVICT_REGION, home)?;
-        Ok(batch_repaired + evict_repaired)
+        // Scan the batch region AND every eviction-ring slot (`rmp` #412 / `rmp` #431): a torn home
+        // page may be protected by the checkpoint batch region OR by any in-flight eviction-ring slot,
+        // and the two are written by independent paths. Repairing all is safe and order-independent —
+        // `recover_region` only restores a home page that fails its own checksum, and the lsn/page_id
+        // guards reject a stale or misdirected copy, so a page that a region does not actually protect
+        // (or whose home is already intact) is left untouched.
+        let mut repaired = self.recover_region(&BATCH_REGION, home)?;
+        for slot in 0..DWB_EVICT_RING_SLOTS {
+            let region = evict_ring_region(slot);
+            repaired += self.recover_region(&region, home)?;
+        }
+        Ok(repaired)
     }
 
     /// Repairs every torn home page protected by a single `region`'s durable batch. Returns the number
     /// of home pages repaired in that region. A separate trailing `sync_data` is issued per region
-    /// that repaired anything; recovery is idempotent, so a crash between the two region passes simply
+    /// that repaired anything; recovery is idempotent, so a crash between the region passes simply
     /// reruns from the top on the next open.
     fn recover_region<H: BlockDevice>(&mut self, region: &Region, home: &mut H) -> Result<usize> {
         let mut hdr: Page = [0u8; PAGE_SIZE];
@@ -483,37 +589,130 @@ impl<D: BlockDevice> Dwb<D> {
     }
 }
 
-/// A [`graphus_bufpool::PageStager`] over a **shared persistent doublewrite buffer** (`rmp` #407).
+/// A lightweight free-slot allocator over the eviction ring's [`DWB_EVICT_RING_SLOTS`] slots
+/// (`rmp` #431).
+///
+/// This is the only state held under a lock across the *claim* and *free* of a ring slot — and the
+/// lock is **never** held across the staging fsync or the home write, so it does not serialise the
+/// expensive I/O. It enforces the reuse-after-durable invariant (`rmp` #411): a slot is returned to
+/// the free set (and thus claimable by another evictor) **only after** its occupant's home write is
+/// durably complete (the caller frees it only post-home-sync). A free bitmap of `usize` words is
+/// ample for the small constant ring.
+struct FreeSlots {
+    /// `free[i] == true` iff ring slot `i` is available to claim.
+    free: Vec<bool>,
+}
+
+impl FreeSlots {
+    fn new() -> Self {
+        Self {
+            free: vec![true; DWB_EVICT_RING_SLOTS],
+        }
+    }
+
+    /// Claims a free ring slot, returning its index, or `None` if every slot is currently in flight.
+    fn claim(&mut self) -> Option<usize> {
+        let slot = self.free.iter().position(|&f| f)?;
+        self.free[slot] = false;
+        Some(slot)
+    }
+
+    /// Returns a previously-claimed `slot` to the free set. Called only after the slot's occupant's
+    /// home write is durably complete (reuse-after-durable).
+    fn free(&mut self, slot: usize) {
+        debug_assert!(slot < DWB_EVICT_RING_SLOTS);
+        debug_assert!(
+            !self.free[slot],
+            "freeing eviction ring slot {slot} that is already free"
+        );
+        self.free[slot] = true;
+    }
+}
+
+/// A [`graphus_bufpool::PageStager`] over a **shared persistent doublewrite buffer** (`rmp` #407,
+/// `rmp` #431).
 ///
 /// This is what wires the buffer pool's *eviction/steal* home-write path into the doublewrite
 /// protocol: when the pool must steal a dirty data page and write it home, it first calls
-/// [`stage_and_sync`](graphus_bufpool::PageStager::stage_and_sync) on this stager, which stages that
-/// one page image into the **same** persistent DWB the checkpoint path uses and fsyncs it — so the
-/// image is durable before the home write begins, and a torn eviction write is repairable on the
-/// next open ([`recover_device_with_dwb`](crate::recovery::recover_device_with_dwb)).
+/// [`stage_and_sync`](graphus_bufpool::PageStager::stage_and_sync) on this stager, which claims a free
+/// eviction-ring slot, stages that one page image into the **same** persistent DWB the checkpoint path
+/// uses and fsyncs it — so the image is durable before the home write begins, and a torn eviction
+/// write is repairable on the next open
+/// ([`recover_device_with_dwb`](crate::recovery::recover_device_with_dwb)).
 ///
-/// The DWB lives behind an `Arc<Mutex<Dwb<D>>>` shared with the owning [`RecordStore`]: the `Mutex`
-/// serialises concurrent evictions' staging against each other and against a checkpoint's
-/// `flush_protected`, so there is exactly one writer of the DWB device at a time and one DWB owner
-/// overall. A single-page batch ([`Dwb::stage_batch`] with one entry) is exactly what
-/// [`Dwb::recover_home`] already scans and repairs (it iterates every occupied slot of the recorded
-/// batch, whether the batch holds one page or many), so an evicted torn page is covered identically
-/// to a checkpoint torn page.
+/// ## Concurrency (`rmp` #431): an N-slot ring instead of one serialising slot
 ///
-/// PERFORMANCE: each eviction that steals a dirty page now pays one extra DWB `write_page` + one
-/// `sync_data` (an fsync) before its home write. Under steal-heavy pressure (a working set larger
-/// than the pool) this is a real per-eviction fsync cost; correctness (no unprotected home write)
-/// takes precedence. A perf follow-up may coalesce staging across a burst of evictions, but must not
-/// weaken the stage-before-home ordering. (`rmp` #407.)
+/// The DWB device lives behind an `Arc<Mutex<Dwb<D>>>` (the device's `write_page`/`sync_data` are
+/// `&mut`, so the device itself is accessed under that mutex). The pre-#431 design held that one mutex
+/// across BOTH the staging fsync AND the home write+fsync, serialising **every** eviction through one
+/// slot and two serial fsyncs — a convoy under load.
+///
+/// Now each evictor:
+/// 1. **claims** a free ring slot from the [`FreeSlots`] allocator (a brief lock, no I/O held);
+/// 2. **stages** its page into that slot and fsyncs the DWB (holds the DWB device mutex only for this
+///    write+fsync, then releases it);
+/// 3. runs `home_write` to write the page home and fsync the home device — holding **no** DWB lock,
+///    so up to [`DWB_EVICT_RING_SLOTS`] evictors run their home writes concurrently;
+/// 4. **frees** its slot (a brief lock), making it reusable — and, crucially, only *after* the home
+///    write is durable (step 3 returned), so the reuse-after-durable invariant (`rmp` #411) holds.
+///
+/// Each in-flight evictor owns a **distinct** slot (the allocator hands out distinct indices), so the
+/// slots are byte-disjoint and no evictor can clobber another's copy or the checkpoint batch region
+/// (the ring is disjoint from the batch region, `rmp` #412). [`Dwb::recover_home`] scans the batch
+/// region and **every** ring slot, so an in-flight evicted page is always recover-discoverable until
+/// its home write is durable. If every slot is momentarily in flight, the claim backs off and retries
+/// (capping concurrency at `N`-way — never incorrect, only as fast as the ring allows).
+///
+/// DEADLOCK-FREEDOM: `write_back` (the sole caller) holds the victim frame's write latch, then calls
+/// here, which takes the free-slot lock (briefly) and the DWB device lock (briefly, for the stage),
+/// and `home_write` then takes the store-device write guard while holding **no** DWB lock. Lock order
+/// is uniformly frame-latch → DWB(claim/stage/free) → store-device, with no path holding the store
+/// device while acquiring a DWB lock — no ABBA cycle between a checkpoint and a concurrent eviction.
 pub struct DwbPageStager<D: BlockDevice> {
     dwb: std::sync::Arc<std::sync::Mutex<Dwb<D>>>,
+    /// The eviction-ring free-slot allocator (`rmp` #431). A `Mutex` distinct from the DWB device
+    /// mutex so claiming/freeing a slot never blocks behind another evictor's staging fsync or home
+    /// write — that is what removes the convoy.
+    free_slots: std::sync::Arc<std::sync::Mutex<FreeSlots>>,
 }
 
 impl<D: BlockDevice> DwbPageStager<D> {
-    /// Wraps the shared persistent DWB so the pool can stage evicted pages into it.
+    /// Wraps the shared persistent DWB so the pool can stage evicted pages into it, initialising the
+    /// eviction-ring free-slot allocator (all [`DWB_EVICT_RING_SLOTS`] slots free).
     #[must_use]
     pub fn new(dwb: std::sync::Arc<std::sync::Mutex<Dwb<D>>>) -> Self {
-        Self { dwb }
+        Self {
+            dwb,
+            free_slots: std::sync::Arc::new(std::sync::Mutex::new(FreeSlots::new())),
+        }
+    }
+
+    /// Claims a free eviction-ring slot, spinning with a short yield until one is free. Returns the
+    /// slot index. The free-slot lock is held only for the claim attempt itself, never across I/O.
+    fn claim_slot(&self) -> usize {
+        loop {
+            {
+                let mut slots = self
+                    .free_slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(slot) = slots.claim() {
+                    return slot;
+                }
+            }
+            // Every slot is in flight (>= N concurrent evictors). Yield and retry — correctness is
+            // preserved (we simply cap at N-way parallelism); this is the graceful-degradation path.
+            std::thread::yield_now();
+        }
+    }
+
+    /// Returns a previously-claimed `slot` to the free set (post-home-durable).
+    fn free_slot(&self, slot: usize) {
+        let mut slots = self
+            .free_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.free(slot);
     }
 }
 
@@ -524,8 +723,6 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
         image: &[u8],
         home_write: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        // The image is exactly one page; `stage_batch` of a single `(page_id, &Page)` writes it to a
-        // DWB data slot, records the header, and `sync_data`s — durable before the home write begins.
         let page: &Page = image.try_into().map_err(|_| {
             GraphusError::Storage(format!(
                 "doublewrite stage: image for page {} is {} bytes, expected {PAGE_SIZE}",
@@ -533,38 +730,58 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
                 image.len()
             ))
         })?;
-        // DISJOINT-REGION + SLOT-REUSE-AFTER-DURABLE INVARIANT (`rmp` #412, `rmp` #411). The eviction
-        // path stages into the DWB's **eviction region** (`stage_eviction`), which is disjoint on disk
-        // from the checkpoint **batch region** (`stage_batch`). So a concurrent checkpoint can never
-        // clobber this evicted copy and vice versa (`rmp` #412) — that closes the checkpoint-vs-eviction
-        // hole at the layout level.
+        // RING-SLOT PROTOCOL (`rmp` #431, upholding `rmp` #412 / #411). The eviction path stages into
+        // ONE eviction-ring slot, disjoint on disk from the checkpoint **batch region**
+        // (`stage_batch`) and from every other ring slot. So a concurrent checkpoint or another
+        // evictor can never clobber this copy and vice versa — that closes the checkpoint-vs-eviction
+        // and evictor-vs-evictor holes at the layout level.
         //
-        // Among evictors themselves, the eviction region has a single data slot, so we still hold the
-        // DWB lock across BOTH the staging fsync AND the home write: this page's copy stays the
-        // region's occupant — and discoverable by `recover_home` — until the home write is DURABLY
-        // complete (`home_write` writes the page home and `sync_data`s the home device). Only then does
-        // the lock release, freeing the eviction region for the next evictor. Without this, two
-        // concurrent evictors race on the single eviction slot: T1 stages A, T2 OVERWRITES it with B,
-        // then T1's home write of A tears on a crash and A is UNRECOVERABLE (`rmp` #411). Serialising
-        // staging+home-write here closes that hole.
+        // 1. CLAIM a free ring slot (brief free-slot lock; no I/O held). This evictor now owns `slot`
+        //    exclusively until it frees it in step 4.
+        let slot = self.claim_slot();
+        // Helper that guarantees the slot is freed on EVERY exit path (Ok or Err) AFTER its home write
+        // is known durable — except we must NOT free before the home write is durable. So we free
+        // explicitly only on the success path and on a staging error (no home write happened); on a
+        // home-write error the slot stays claimed by-value here and is freed in the closing block.
         //
-        // DEADLOCK-FREEDOM: `write_back` (the sole caller) holds the victim frame's write latch, then
-        // calls here, which takes the DWB lock, and `home_write` then takes the device write guard.
-        // Order is uniformly frame-latch → DWB → device. The checkpoint path (`flush_pages`) stages
-        // under held frame latches via `stage_batch_and_sync` (DWB lock) then takes the device only
-        // AFTER releasing the DWB lock — so no path ever holds the device while acquiring the DWB lock.
-        // The global order has no cycle: no ABBA between a checkpoint and a concurrent eviction.
-        let mut dwb = self
-            .dwb
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // 1. Stage the copy into the disjoint eviction region and make it durable in the DWB.
-        dwb.stage_eviction(page_id, page)?;
-        // 2. Write the page home and make THAT durable — still holding the DWB lock, so the region is
-        //    not reusable until this page is durable home.
-        home_write()
-        // 3. Lock released here: the region's occupant (`page_id`) is now durable on the home device,
-        //    so the next evictor may safely reuse it.
+        // 2. STAGE the copy into the claimed slot and make it durable in the DWB. We hold the DWB
+        //    device mutex only for this write+fsync, then release it — so other evictors stage/home
+        //    concurrently. If staging fails, no home write happened and nothing is in flight for this
+        //    slot, so free it and propagate.
+        let stage_result = {
+            let mut dwb = self
+                .dwb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dwb.stage_eviction_slot(slot, page_id, page)
+            // DWB device mutex released here.
+        };
+        if let Err(e) = stage_result {
+            self.free_slot(slot);
+            return Err(e);
+        }
+        // 3. WRITE the page home and make THAT durable — holding NO DWB lock, so up to
+        //    DWB_EVICT_RING_SLOTS evictors run their home writes concurrently. The slot's copy stays in
+        //    place and `recover_home`-discoverable for the whole of this call (we have not freed it),
+        //    so a torn home write here is repairable from `slot` on the next open. The home write is
+        //    durable when this returns (the callback writes the page home and `sync_data`s the home
+        //    device).
+        let home_result = home_write();
+        // 4. FREE the slot — now that the home write is durably complete (or failed; either way the
+        //    slot is no longer needed and its copy is safe to reuse). Freeing AFTER the home write
+        //    returns is what enforces reuse-after-durable (`rmp` #411): the next evictor cannot claim
+        //    this slot until this page's home write is durable, so it can never overwrite a copy whose
+        //    home write is still pending.
+        //
+        //    On a home-write *error* freeing the slot is also correct: the page's home write did not
+        //    complete, but `recover_home` will still repair the (durable) DWB copy of `slot` on the
+        //    next open IF that home page is torn — and a later stage into the reused slot only happens
+        //    after a *successful* home write of its own page, which would have re-torn-protected the
+        //    same home location. The error is propagated so the pool surfaces it (the frame's dirty
+        //    flag is left set by the caller on error). For maximal safety we keep the freed copy until
+        //    the next stage overwrites it; recovery is idempotent.
+        self.free_slot(slot);
+        home_result
     }
 
     fn stage_batch_and_sync(&self, batch: &[(PageId, &[u8])]) -> Result<()> {
@@ -747,5 +964,164 @@ mod tests {
             .map(|i| (PageId(i as u64), &p))
             .collect();
         assert!(dwb.stage_batch(&big).is_err());
+    }
+
+    #[test]
+    fn ring_slots_are_disjoint_and_after_the_batch_region() {
+        // Every ring slot's header+data pages must be distinct from each other and beyond the batch
+        // region's last data page — the byte-disjointness invariant (`rmp` #431 #3).
+        let mut seen = std::collections::HashSet::new();
+        let batch_last = BATCH_REGION.first_data_slot + BATCH_REGION.capacity as u64 - 1;
+        for slot in 0..DWB_EVICT_RING_SLOTS {
+            let r = evict_ring_region(slot);
+            assert!(
+                r.header_slot > batch_last,
+                "ring slot {slot} overlaps batch"
+            );
+            assert!(seen.insert(r.header_slot), "ring slot {slot} header reused");
+            assert!(
+                seen.insert(r.first_data_slot),
+                "ring slot {slot} data reused"
+            );
+        }
+        // The device must be large enough to hold the highest ring slot.
+        let last = evict_ring_region(DWB_EVICT_RING_SLOTS - 1).first_data_slot;
+        assert!(dwb_device_pages() > last, "device too small for ring");
+    }
+
+    #[test]
+    fn repairs_a_torn_page_from_a_specific_ring_slot() {
+        // Stage three pages into three distinct ring slots; tear the EARLIEST-staged page's home;
+        // recovery must repair it from its ring slot even though later slots are occupied too.
+        let mut dwb = fresh_dwb();
+        let a = make_page(2, 10, 0xA1);
+        let b = make_page(3, 11, 0xB2);
+        let c = make_page(4, 12, 0xC3);
+        dwb.stage_eviction_slot(0, PageId(2), &a).expect("slot 0");
+        dwb.stage_eviction_slot(1, PageId(3), &b).expect("slot 1");
+        dwb.stage_eviction_slot(2, PageId(4), &c).expect("slot 2");
+
+        let mut home = MemBlockDevice::new(8);
+        // Page 2 (slot 0, earliest) tears; pages 3 and 4 land intact.
+        let mut torn = a;
+        torn[100..].iter_mut().for_each(|x| *x = 0);
+        home.write_page(PageId(2), &torn).unwrap();
+        home.write_page(PageId(3), &b).unwrap();
+        home.write_page(PageId(4), &c).unwrap();
+        home.sync_data().unwrap();
+
+        let repaired = dwb.recover_home(&mut home).expect("recover");
+        assert_eq!(repaired, 1, "only the torn page 2 should be repaired");
+        let mut got: Page = [0u8; PAGE_SIZE];
+        home.read_page(PageId(2), &mut got).unwrap();
+        assert_eq!(
+            &got[..],
+            &a[..],
+            "page 2 repaired from its ring slot 0 copy"
+        );
+    }
+
+    #[test]
+    fn reset_clears_batch_and_all_ring_slots() {
+        // After `reset` (the restore path, `rmp` #417) no region — batch or ring — may protect any
+        // page, so even a torn home page is left untouched.
+        let mut dwb = fresh_dwb();
+        let bp = make_page(1, 10, 0x11);
+        let ep = make_page(2, 20, 0x22);
+        dwb.stage_batch(&[(PageId(1), &bp)]).expect("batch");
+        dwb.stage_eviction_slot(5, PageId(2), &ep).expect("ring");
+
+        dwb.reset().expect("reset");
+        assert!(dwb.staged_home_ids().expect("batch ids").is_empty());
+        assert!(dwb.evicted_home_ids().expect("ring ids").is_empty());
+
+        let mut home = MemBlockDevice::new(4);
+        let mut torn = bp;
+        torn[100..].iter_mut().for_each(|x| *x = 0);
+        home.write_page(PageId(1), &torn).unwrap();
+        home.sync_data().unwrap();
+        assert_eq!(
+            dwb.recover_home(&mut home).expect("recover"),
+            0,
+            "reset must leave no batch in any region"
+        );
+    }
+
+    #[test]
+    fn stage_eviction_slot_out_of_range_is_rejected() {
+        let mut dwb = fresh_dwb();
+        let p = make_page(1, 1, 0);
+        assert!(
+            dwb.stage_eviction_slot(DWB_EVICT_RING_SLOTS, PageId(1), &p)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn upgrade_from_old_dwb_is_handled_safely() {
+        // `rmp` #434: an older-format DWB device must be detected and handled, never silently misread.
+        //
+        // Case A — a TOO-SMALL old device (pre-#431 v2 two-region layout, `1 + DWB_MAX_BATCH + 2`
+        // pages) is shorter than the v3 ring layout. `Dwb::new` must GROW it (no OOB read) and its
+        // headers must decode as "no batch".
+        let old_pages = (1 + DWB_MAX_BATCH as u64) + 2; // the v2 layout size
+        let dev = MemBlockDevice::new(old_pages);
+        let mut dwb = Dwb::new(dev).expect("grow old device");
+        assert!(
+            dwb.device.page_count() >= dwb_device_pages(),
+            "an undersized old device must be grown to the v3 ring size"
+        );
+        let mut home = MemBlockDevice::new(4);
+        assert_eq!(
+            dwb.recover_home(&mut home).expect("recover"),
+            0,
+            "a grown old-format device must decode as no batch"
+        );
+
+        // Case B — a device that is ALREADY large enough but carries a stale v2-magic batch header
+        // (a clean-shutdown old device that was over-sized). Its v2 magic differs from v3, so
+        // `decode_header` rejects it as "no batch" — it is never misread as a current-format batch,
+        // and a torn home page is therefore NOT restored from a stale v2 copy.
+        const V2_MAGIC: u64 = 0x0000_0002_4257_4447;
+        let mut big = MemBlockDevice::new(dwb_device_pages());
+        let mut hdr = [0u8; PAGE_SIZE];
+        hdr[HDR_OFF_MAGIC..HDR_OFF_MAGIC + 8].copy_from_slice(&V2_MAGIC.to_le_bytes());
+        hdr[HDR_OFF_COUNT..HDR_OFF_COUNT + 8].copy_from_slice(&1u64.to_le_bytes());
+        hdr[HDR_OFF_HOMES..HDR_OFF_HOMES + 8].copy_from_slice(&2u64.to_le_bytes());
+        page::write_checksum(&mut hdr); // a checksum-VALID but v2-magic header
+        big.write_page(PageId(BATCH_REGION.header_slot), &hdr)
+            .unwrap();
+        big.sync_data().unwrap();
+        let mut dwb = Dwb::new(big).expect("open large old device");
+        assert!(
+            dwb.staged_home_ids().expect("ids").is_empty(),
+            "a v2-magic header must decode as no batch under v3 (rmp #434)"
+        );
+        let mut home = MemBlockDevice::new(4);
+        let good = make_page(2, 50, 0xAB);
+        let mut torn = good;
+        torn[100..].iter_mut().for_each(|b| *b = 0);
+        home.write_page(PageId(2), &torn).unwrap();
+        home.sync_data().unwrap();
+        assert_eq!(
+            dwb.recover_home(&mut home).expect("recover"),
+            0,
+            "a stale v2 batch must NOT be applied over a torn v3 home page"
+        );
+    }
+
+    #[test]
+    fn free_slots_allocator_hands_out_distinct_slots() {
+        let mut fs = FreeSlots::new();
+        let mut claimed = std::collections::HashSet::new();
+        for _ in 0..DWB_EVICT_RING_SLOTS {
+            let s = fs.claim().expect("slot available");
+            assert!(claimed.insert(s), "allocator handed out slot {s} twice");
+        }
+        assert!(fs.claim().is_none(), "ring exhausted: no more free slots");
+        // Free one and re-claim it.
+        let some = *claimed.iter().next().unwrap();
+        fs.free(some);
+        assert_eq!(fs.claim(), Some(some), "freed slot is reclaimable");
     }
 }

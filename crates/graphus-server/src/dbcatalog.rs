@@ -856,6 +856,10 @@ fn restore_db_file(
             .map_err(to_backup_err)?;
             // 5. Fresh empty plaintext WAL (recovery replays nothing on the next open).
             reset_wal(&wal_file, None).map_err(to_backup_err)?;
+            // 6. Drop the prior generation's doublewrite buffer (`rmp` #417): a stale DWB could
+            //    clobber a (genuinely or coincidentally) torn page of the freshly restored device on
+            //    the next open. Removing it makes the next `START DATABASE` create a fresh empty DWB.
+            reset_dwb(device_file).map_err(to_backup_err)?;
         }
         Some(key) => {
             let salt = graphus_crypto::random_salt();
@@ -879,8 +883,36 @@ fn restore_db_file(
             let wal_keyring =
                 wal_keyring_for_existing(device_file, master_key).map_err(to_backup_err)?;
             reset_wal(&wal_file, wal_keyring.as_ref()).map_err(to_backup_err)?;
+            // 6. Drop the prior generation's doublewrite buffer (`rmp` #417). For an encrypted store
+            //    the stale DWB's subkey no longer matches the restored device's fresh salt anyway;
+            //    removing it makes the next open create a fresh DWB with its own salt.
+            reset_dwb(device_file).map_err(to_backup_err)?;
         }
     }
+    Ok(())
+}
+
+/// Drops the doublewrite buffer beside `device_file` on restore (`rmp` #417), so no prior-generation
+/// doublewrite copy can survive to clobber a torn page of the freshly restored device on the next
+/// open. The DWB holds only transient page images (no committed state), so deleting it is always
+/// safe: the next [`open_or_create_dwb`] recreates a fresh empty DWB (which describes no batch, so
+/// [`recover_device_with_dwb`] finds nothing to repair). This mirrors [`reset_wal`]: the device was
+/// restored atomically *before* this runs, so a crash between the device rename and this reset is
+/// healed by re-running the idempotent (offline) restore.
+fn reset_dwb(device_file: &Path) -> Result<(), GraphusError> {
+    let dwb_file = dwb_file_for(device_file);
+    match std::fs::remove_file(&dwb_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(GraphusError::Storage(format!(
+                "removing the doublewrite buffer {} on restore: {e}",
+                dwb_file.display()
+            )));
+        }
+    }
+    // Harden the directory entry so the deletion is durable (a crash cannot resurrect the stale DWB).
+    fsync_parent_dir(&dwb_file)?;
     Ok(())
 }
 
@@ -2156,6 +2188,81 @@ mod tests {
         assert!(
             graphus_storage::page::verify_checksum(page),
             "evicted home page {torn_page} must be intact after doublewrite repair"
+        );
+    }
+
+    /// `rmp` #417 — a restore must drop the prior generation's doublewrite buffer, so no stale
+    /// doublewrite copy can clobber a (genuinely or coincidentally) torn page of the freshly restored
+    /// device on the next open.
+    ///
+    /// We build a DWB file holding a real durable batch (a staged copy of a home page), then run
+    /// [`reset_dwb`] (the companion to [`reset_wal`] the restore path calls). After it, the DWB file
+    /// must be gone — so it carries NO header/ring-slot describing any batch — and the next
+    /// [`open_or_create_dwb`] must recreate a fresh, empty DWB that [`Dwb::recover_home`] finds nothing
+    /// to repair from. This proves `restore_db_file`'s DWB reset clears every DWB header.
+    ///
+    /// Fails before the fix (no `reset_dwb`: the stale DWB file survives the restore, still describing
+    /// its old batch); passes after (the file is removed, so a fresh empty DWB is created on open).
+    #[test]
+    fn restore_resets_the_dwb() {
+        use graphus_core::{Lsn, PageId};
+        use graphus_io::{BlockDevice, PAGE_SIZE, Page};
+
+        let root = TempRoot::new("dwb-restore-reset");
+        let dir = root.path.join("db");
+        std::fs::create_dir_all(&dir).expect("create db dir");
+        let device_file = dir.join(STORE_FILE_NAME);
+        let dwb_file = dir.join(DWB_FILE_NAME);
+
+        // 1. Create a DWB beside the (notional) device and stage a real durable batch into it, so it
+        //    holds a copy describing a committed home page — the "prior generation" doublewrite copy.
+        let staged_home = PageId(2);
+        {
+            let mut dwb = open_or_create_dwb(&device_file, None).expect("open dwb");
+            let mut image: Page = [0xAB; PAGE_SIZE];
+            graphus_storage::page::set_page_id(&mut image, staged_home.0);
+            graphus_storage::page::set_page_lsn(&mut image, Lsn(50));
+            graphus_storage::page::write_checksum(&mut image);
+            dwb.stage_batch(&[(staged_home, &image)]).expect("stage");
+            assert_eq!(
+                dwb.staged_home_ids().expect("ids"),
+                vec![staged_home],
+                "precondition: the DWB must describe the staged batch before reset"
+            );
+        }
+        assert!(dwb_file.exists(), "the DWB file must exist before reset");
+
+        // 2. The restore path's DWB reset (`rmp` #417).
+        reset_dwb(&device_file).expect("reset_dwb");
+
+        // 3. THE GATE: no stale DWB copy survives — the file is gone, so it describes no batch in ANY
+        //    region (batch or ring). A fresh open recreates an empty DWB with nothing to repair.
+        assert!(
+            !dwb_file.exists(),
+            "rmp #417: the prior-generation DWB must be removed by the restore reset"
+        );
+        let fresh = open_or_create_dwb(&device_file, None).expect("recreate dwb after reset");
+        assert!(
+            fresh.staged_home_ids().expect("ids").is_empty(),
+            "the recreated DWB's batch region must describe no batch"
+        );
+        assert!(
+            fresh.evicted_home_ids().expect("ring ids").is_empty(),
+            "the recreated DWB's eviction ring must describe no batch"
+        );
+
+        // And a fresh DWB repairs nothing on a clean home device (no stale copy to apply).
+        let mut dwb = fresh;
+        let mut home = graphus_io::MemBlockDevice::new(4);
+        let mut intact: Page = [0u8; PAGE_SIZE];
+        graphus_storage::page::set_page_id(&mut intact, staged_home.0);
+        graphus_storage::page::write_checksum(&mut intact);
+        home.write_page(staged_home, &intact).expect("write home");
+        home.sync_data().expect("sync");
+        assert_eq!(
+            dwb.recover_home(&mut home).expect("recover"),
+            0,
+            "a DWB recreated after the restore reset must hold no stale copy to apply"
         );
     }
 

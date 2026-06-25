@@ -277,11 +277,15 @@ fn concurrent_evictors_earlier_staged_torn_home_page_is_repaired() {
         .expect("recover_home");
 
     // THE GATE: A must be repairable. Before the fix, B overwrote the single region before the crash
-    // snapshot, so A's copy is gone and `repaired == 0`, leaving A permanently torn.
-    assert_eq!(
-        repaired, 1,
-        "torn home page A must be repaired from the DWB — the region must still hold A's copy until \
-         A's home write was durable (rmp #411). repaired={repaired}"
+    // snapshot, so A's copy is gone and A was unrepairable. Under the `rmp` #431 ring, A's copy lives
+    // in its own slot (slot 0) untouched by B (slot 1), so A is repaired. (`repaired` may be >= 1: the
+    // crash snapshot also captured B's slot, and this test's split home device has page 5 unwritten —
+    // it reads as a coincidental tear and is also "repaired" from B's copy. The decisive fact is that A
+    // is repaired and intact, asserted next.)
+    assert!(
+        repaired >= 1,
+        "torn home page A must be repaired from the DWB — A's ring slot must still hold A's copy until \
+         A's home write was durable (rmp #411 / #431). repaired={repaired}"
     );
     let mut a_fixed: Page = [0u8; PAGE_SIZE];
     home_dev
@@ -298,12 +302,14 @@ fn concurrent_evictors_earlier_staged_torn_home_page_is_repaired() {
     );
 }
 
-/// Gate 2: a deterministic two-thread interleaving proving the earlier page's DWB region copy
-/// survives until its home write returns. Thread T1 enters `stage_and_sync` for page A and its home
-/// write blocks until B has *attempted* to stage; thread T2 calls `stage_and_sync` for page B. The
-/// fix holds the DWB lock across T1's home write, so T2 CANNOT acquire the lock (and therefore cannot
-/// overwrite the region) until T1's home write has returned. We observe that ordering directly:
-/// A's home write completes strictly BEFORE B's home write begins.
+/// Gate 2: a deterministic two-thread interleaving proving the earlier page's DWB copy survives until
+/// its home write returns. Thread T1 enters `stage_and_sync` for page A and its home write blocks
+/// until B has *attempted* to stage; thread T2 calls `stage_and_sync` for page B. Under the `rmp` #431
+/// ring, T1 claims slot 0 and T2 claims a DISTINCT slot 1, so B can never write the bytes of A's slot
+/// 0 — A's copy in slot 0 stays intact for the whole of A's in-flight home write, which we observe
+/// directly by sampling slot 0's header mid-A-home-write. (Pre-#431 the single slot relied on B
+/// parking on the DWB mutex; the ring achieves the same survival guarantee via disjoint slots, with
+/// B free to proceed concurrently.)
 ///
 /// (loom cannot model the block device's persistent bytes across a simulated crash, so this is the
 /// stated deterministic two-thread alternative the gate spec permits: a controlled signal point
@@ -402,8 +408,11 @@ fn staging_region_is_not_reused_until_the_home_write_is_durable() {
          {sampled:?}"
     );
 
-    // A is intact and durable on the home device, and the region's final occupant is B (handed over
-    // only after A's home write returned).
+    // A is intact and durable on the home device, and BOTH ring slots are still occupied: under the
+    // `rmp` #431 ring, A and B claim DISTINCT slots (A → slot 0, B → slot 1), so A's copy in slot 0 is
+    // never touched by B (slot 1). Recovery scans all slots, so both copies remain discoverable — the
+    // ring frees a slot (post-home-durable) without clearing its header, so the final `evicted_home_ids`
+    // lists both pages.
     let mut a_disk: Page = [0u8; PAGE_SIZE];
     home.lock()
         .unwrap()
@@ -417,10 +426,13 @@ fn staging_region_is_not_reused_until_the_home_write_is_durable() {
         .unwrap_or_else(|_| panic!("dwb still shared"))
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut evicted = dwb.evicted_home_ids().expect("evicted ids");
+    evicted.sort_unstable_by_key(|p| p.0);
     assert_eq!(
-        dwb.evicted_home_ids().expect("evicted ids"),
-        vec![PageId(5)],
-        "the eviction region's final occupant is B (taken only after A was durable home)"
+        evicted,
+        vec![PageId(3), PageId(5)],
+        "both ring slots stay occupied: A (id 3) in slot 0 and B (id 5) in slot 1 — A's copy survived \
+         in its own slot while B used a disjoint one (rmp #431)"
     );
 }
 
@@ -433,8 +445,8 @@ fn decode_region_homes(hdr: &Page) -> Vec<PageId> {
     const HDR_OFF_MAGIC: usize = bp::HEADER_SIZE;
     const HDR_OFF_COUNT: usize = HDR_OFF_MAGIC + 8;
     const HDR_OFF_HOMES: usize = HDR_OFF_COUNT + 8;
-    // Two-region layout, version 2 (`rmp` #412).
-    const DWB_MAGIC: u64 = 0x0000_0002_4257_4447;
+    // Eviction-ring layout, version 3 (`rmp` #431 / #434).
+    const DWB_MAGIC: u64 = 0x0000_0003_4257_4447;
     if !bp::verify_checksum(hdr) {
         return Vec::new();
     }
