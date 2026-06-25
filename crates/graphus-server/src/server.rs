@@ -40,16 +40,42 @@ use crate::observability;
 use crate::security::SecurityCatalog;
 use crate::shutdown::ShutdownCoordinator;
 
-/// A monotonic-nanoseconds [`Clock`] backed by the OS clock, for REST tx expiry + JWT validity.
+/// The production [`Clock`]: a **monotonic** timeline for elapsed/idle measurement and a separate
+/// **wall-clock** timeline for absolute timestamps (rmp #395).
 ///
-/// `04 §8.4`: the server derives the JWT `now_unix_secs` and the REST inactivity clock from its
-/// production clock; the library crates take a `Clock` so their logic stays wall-clock-free and
+/// `04 §8.4`: the server derives the JWT validity clock and the REST inactivity timeout from its
+/// production clock; the library crates take a `Clock` so their logic stays clock-agnostic and
 /// deterministically testable. This is that production clock.
+///
+/// - [`now_nanos`](Clock::now_nanos) reads [`std::time::Instant`] (the OS monotonic clock,
+///   `CLOCK_MONOTONIC`), anchored at process start via [`MONOTONIC_EPOCH`]. It never decreases, so a
+///   backwards wall-clock adjustment (NTP step, operator change) can **never** make a query-latency
+///   or transaction-idle duration wrap to zero or to a spurious multi-decade value (the rmp #395
+///   bug). This is the source `finalize_inflight` (query latency / slow-query log) and the REST
+///   transaction inactivity sweep (rmp #389) measure against.
+/// - [`now_unix_nanos`](Clock::now_unix_nanos) reads [`std::time::SystemTime`] (the wall clock) for
+///   the one place an absolute timestamp is needed: JWT validity (`04 §8.4`). It may step with the
+///   system clock; it is never used to measure an interval.
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
+/// Process-start anchor for the monotonic clock. Captured once on first read so `now_nanos` returns
+/// a non-decreasing nanosecond count since process start (a stable `u64` derived from
+/// [`std::time::Instant`], which itself is not representable as an absolute integer).
+static MONOTONIC_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
 impl Clock for SystemClock {
     fn now_nanos(&self) -> u64 {
+        // Monotonic (CLOCK_MONOTONIC via `Instant`): elapsed since the process-start anchor. `Instant`
+        // is guaranteed non-decreasing, so this never wraps; saturate the (multi-century) nanosecond
+        // range into `u64` rather than panic.
+        u64::try_from(MONOTONIC_EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn now_unix_nanos(&self) -> u64 {
+        // Wall clock: absolute nanoseconds since the Unix epoch, for JWT validity only. A pre-epoch
+        // system clock maps to 0; an out-of-range future to u64::MAX. NEVER used for elapsed time.
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -353,4 +379,42 @@ fn build_tls(
 fn read_to_string(path: &Path) -> Result<String, ServerError> {
     std::fs::read_to_string(path)
         .map_err(|e| ServerError::Auth(format!("reading {}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rmp #395: the production clock's monotonic timeline (`now_nanos`) never decreases across
+    /// successive reads, so it is safe for elapsed/idle measurement (no NTP-step regressions).
+    #[test]
+    fn system_clock_now_nanos_is_monotonic() {
+        let clock = SystemClock;
+        let mut prev = clock.now_nanos();
+        for _ in 0..1_000 {
+            let next = clock.now_nanos();
+            assert!(
+                next >= prev,
+                "monotonic clock went backwards: {prev} -> {next}"
+            );
+            prev = next;
+        }
+    }
+
+    /// rmp #395: the wall-clock timeline (`now_unix_nanos`) is an absolute Unix timestamp (well past
+    /// the 2020 epoch in any realistic test environment) and is distinct from the monotonic
+    /// process-start-relative `now_nanos`.
+    #[test]
+    fn system_clock_now_unix_nanos_is_absolute_wall_clock() {
+        let clock = SystemClock;
+        // 2020-01-01T00:00:00Z in nanoseconds since the Unix epoch.
+        const Y2020_NANOS: u64 = 1_577_836_800 * 1_000_000_000;
+        assert!(
+            clock.now_unix_nanos() > Y2020_NANOS,
+            "wall clock should report an absolute post-2020 Unix timestamp"
+        );
+        // The monotonic clock is process-start-relative, so it is far smaller than the wall clock —
+        // proving the two timelines are genuinely different sources (rmp #395).
+        assert!(clock.now_nanos() < Y2020_NANOS);
+    }
 }

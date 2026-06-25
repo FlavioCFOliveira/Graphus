@@ -257,6 +257,147 @@ async fn delete_rolls_back_the_transaction() {
     assert!(h.engine.log().iter().any(|l| l.starts_with("rollback")));
 }
 
+/// rmp #390 GATE: a transaction opened by `alice` cannot be run, committed, or rolled back by `bob`,
+/// even though Bob is fully authorized for coarse access to the database. The transaction id is a
+/// guessable sequential value, so without the principal binding Bob could drive statements inside
+/// Alice's transaction under Alice's (the opener's) fine-grained privileges. Every cross-principal
+/// operation must 404 (indistinguishable from an unknown id) and leave Alice's transaction intact.
+#[tokio::test]
+async fn tx_opened_by_alice_cannot_be_run_committed_or_rolled_back_by_bob() {
+    let h = Harness::new();
+    let alice = h.token("alice");
+    // Bob holds the `ro` role: full coarse READ access to the database, so his `authorize_mode`
+    // passes for a READ transaction — isolating the ownership check from the access-mode gate.
+    let bob = h.token("bob");
+
+    // Alice opens a READ transaction.
+    let begin = body_json(
+        h.send(post_json(
+            "/db/neo4j/tx",
+            &alice,
+            json!({ "access_mode": "READ" }),
+        ))
+        .await,
+    )
+    .await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+    assert_eq!(h.registry.open_count(), 1);
+
+    // Bob tries to RUN inside Alice's tx → 404, and Alice's tx is untouched.
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &bob,
+            json!({ "statements": [{ "statement": "RETURN 1 AS x" }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    assert_eq!(
+        h.registry.open_count(),
+        1,
+        "Bob's RUN must not reap Alice's tx"
+    );
+
+    // Bob tries to COMMIT Alice's tx → 404, still untouched.
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}/commit"),
+            &bob,
+            json!({}),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.registry.open_count(),
+        1,
+        "Bob's COMMIT must not finalise Alice's tx"
+    );
+
+    // Bob tries to DELETE (roll back) Alice's tx → 404, still untouched.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/db/neo4j/tx/{id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {bob}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        h.registry.open_count(),
+        1,
+        "Bob's DELETE must not roll back Alice's tx"
+    );
+    // The engine never saw a rollback for Alice's transaction from Bob's attempts.
+    assert!(
+        !h.engine.log().iter().any(|l| l.starts_with("rollback")),
+        "no rollback should have been issued by Bob's cross-principal attempts"
+    );
+
+    // Alice still owns it and can commit normally.
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}/commit"),
+            &alice,
+            json!({}),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+/// rmp #390 GATE: because Bob cannot adopt Alice's transaction at all (it 404s, above), he can never
+/// run a statement that the engine seam would execute under Alice's (the opener's) fine-grained
+/// privileges. This asserts the *consequence*: the engine never receives a `run` carrying Alice's
+/// ticket on Bob's behalf — the privilege-escalation surface is structurally closed.
+#[tokio::test]
+async fn adopted_tx_does_not_use_openers_fine_grained_privileges() {
+    let h = Harness::new();
+    let alice = h.token("alice");
+    let bob = h.token("bob");
+
+    // Alice opens a tx; capture how many `run` calls the engine has seen so far.
+    let begin = body_json(
+        h.send(post_json(
+            "/db/neo4j/tx",
+            &alice,
+            json!({ "access_mode": "READ" }),
+        ))
+        .await,
+    )
+    .await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+    let runs_before = h
+        .engine
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("run("))
+        .count();
+
+    // Bob attempts to run inside Alice's tx.
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &bob,
+            json!({ "statements": [{ "statement": "MATCH (n) RETURN n" }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The engine executed NO new statement on Bob's behalf inside Alice's transaction: the seam (which
+    // applies the opener's RBAC) was never reached, so Alice's privileges were never lent to Bob.
+    let runs_after = h
+        .engine
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("run("))
+        .count();
+    assert_eq!(
+        runs_after, runs_before,
+        "Bob's hijack attempt must not reach the engine seam at all"
+    );
+}
+
 #[tokio::test]
 async fn delete_unknown_transaction_is_404_problem() {
     let h = Harness::new();
@@ -270,6 +411,45 @@ async fn delete_unknown_transaction_is_404_problem() {
     let resp = h.send(req).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+}
+
+/// rmp #389 GATE: a transaction begun and then abandoned (never touched again) is rolled back by the
+/// inactivity sweep once the clock advances past its idle deadline — the open-transaction count
+/// returns to 0, so an abandoned transaction cannot leak (pinning the GC watermark / growing memory).
+#[tokio::test]
+async fn idle_transaction_is_reaped_by_the_inactivity_sweep() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    // Begin and then abandon (no further touch).
+    let begin = body_json(h.send(post_json("/db/neo4j/tx", &token, json!({}))).await).await;
+    let _id = begin["id"].as_str().unwrap().to_owned();
+    assert_eq!(h.registry.open_count(), 1);
+
+    // Before the deadline a sweep reaps nothing.
+    let reaped = h
+        .registry
+        .sweep_expired(h.clock.now_nanos(), h.engine.as_ref());
+    assert!(reaped.is_empty(), "a live transaction must not be reaped");
+    assert_eq!(h.registry.open_count(), 1);
+
+    // Advance the (injectable, deterministic) clock past the idle timeout, then run the sweep — the
+    // exact operation the server's background task performs. The abandoned transaction is rolled back.
+    h.clock.set(h.clock.now_nanos() + TTL + 1);
+    let reaped = h
+        .registry
+        .sweep_expired(h.clock.now_nanos(), h.engine.as_ref());
+    assert_eq!(reaped.len(), 1, "the idle transaction must be reaped");
+    assert_eq!(
+        h.registry.open_count(),
+        0,
+        "the open-transaction count must return to 0 after the sweep"
+    );
+    // The engine actually rolled it back (not merely dropped from the map).
+    assert!(
+        h.engine.log().iter().any(|l| l.starts_with("rollback")),
+        "the sweep must roll the abandoned transaction back at the engine"
+    );
 }
 
 #[tokio::test]

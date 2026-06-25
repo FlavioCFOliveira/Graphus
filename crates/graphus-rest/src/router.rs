@@ -340,15 +340,19 @@ impl<E: RestEngine + 'static> AppState<E> {
 // Clock accessors live in a non-`'static` block so the request helpers (`<E: RestEngine>`) can call
 // them without an unnecessary `'static` bound (only `new`'s `Arc<E>` storage needs `'static`).
 impl<E: RestEngine> AppState<E> {
-    /// The current injected-clock value in nanoseconds.
+    /// The current **monotonic** clock value in nanoseconds — the timeline transaction-idle expiry
+    /// (rmp #389) is measured against. Never decreases (rmp #395).
     fn now_nanos(&self) -> u64 {
         self.clock.now_nanos()
     }
 
-    /// The JWT expiry clock (`now_unix_secs`) derived from the injected clock (`04 §8.4`: the server
-    /// derives `now_unix_secs` from its production `Clock`). The clock is monotonic nanoseconds.
+    /// The JWT validity clock (`now_unix_secs`) — an **absolute** wall-clock timestamp (`04 §8.4`: the
+    /// server derives `now_unix_secs` from its production `Clock`). Reads
+    /// [`now_unix_nanos`](Clock::now_unix_nanos), the wall-clock timeline, NOT the monotonic
+    /// `now_nanos` used for transaction-idle expiry (rmp #395 — never measure absolute time on the
+    /// monotonic timeline, never measure an interval on the wall clock).
     fn now_unix_secs(&self) -> u64 {
-        self.now_nanos() / NANOS_PER_SEC
+        self.clock.now_unix_nanos() / NANOS_PER_SEC
     }
 }
 
@@ -433,7 +437,9 @@ async fn begin<E: RestEngine + 'static>(
             )
             .map_err(|e| Problem::from_graphus_error(&e))?;
         let now = state.now_nanos();
-        let (id, expires_at_nanos) = state.registry.open(handle, &db, mode, now);
+        // Bind the transaction to its authenticated opener (rmp #390): only `identity` may touch,
+        // run, commit or roll it back; another principal targeting this id gets a 404.
+        let (id, expires_at_nanos) = state.registry.open(handle, identity, &db, mode, now);
 
         Ok(serializable_built(
             &headers,
@@ -462,8 +468,13 @@ async fn run_in_tx<E: RestEngine + 'static>(
         let identity = authenticate(&state, &headers)?;
         let req = decode_request(&headers, &body)?;
         let now = state.now_nanos();
-        // Touch: refresh the deadline, or reap + 404 if expired (`04 §8.2`).
-        let Some(info) = state.registry.touch(&id, now, state.engine.as_ref()) else {
+        // Touch, bound to the authenticated principal (rmp #390): refresh the deadline, or 404 if
+        // expired OR owned by another principal (no cross-principal adoption). The engine seam applies
+        // the OPENER's fine-grained RBAC, so this ownership check is what stops a hijack.
+        let Some(info) = state
+            .registry
+            .touch(&id, &identity, now, state.engine.as_ref())
+        else {
             return Err(Problem::unknown_transaction(&id));
         };
         authorize_mode(&state, &identity, &db, info.mode)?;
@@ -509,14 +520,16 @@ async fn commit_tx<E: RestEngine + 'static>(
         let req = decode_request(&headers, &body)?;
         let now = state.now_nanos();
         // Reap first if expired (so a long-idle commit fails as gone rather than committing stale).
+        // Bound to the authenticated principal (rmp #390): a commit targeting another user's tx 404s
+        // and leaves the victim's transaction intact.
         if state
             .registry
-            .touch(&id, now, state.engine.as_ref())
+            .touch(&id, &identity, now, state.engine.as_ref())
             .is_none()
         {
             return Err(Problem::unknown_transaction(&id));
         }
-        let Some((handle, db, mode)) = state.registry.take(&id) else {
+        let Some((handle, db, mode)) = state.registry.take(&id, &identity) else {
             return Err(Problem::unknown_transaction(&id));
         };
         if let Err(p) = authorize_mode(&state, &identity, &db, mode) {
@@ -569,7 +582,9 @@ async fn rollback_tx<E: RestEngine + 'static>(
 ) -> Response {
     let built = (|| {
         let identity = authenticate(&state, &headers)?;
-        let Some((handle, db, mode)) = state.registry.take(&id) else {
+        // Bound to the authenticated principal (rmp #390): a DELETE targeting another user's tx 404s
+        // and leaves the victim's transaction intact.
+        let Some((handle, db, mode)) = state.registry.take(&id, &identity) else {
             return Err(Problem::unknown_transaction(&id));
         };
         if let Err(p) = authorize_mode(&state, &identity, &db, mode) {

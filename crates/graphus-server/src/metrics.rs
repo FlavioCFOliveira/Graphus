@@ -175,6 +175,18 @@ pub struct Metrics {
     maintenance_versions_reclaimed: AtomicU64,
     /// Cumulative committed MVCC stamps frozen (settled to `Committed(ts)`) by maintenance GC passes.
     maintenance_stamps_frozen: AtomicU64,
+    /// Cumulative background maintenance checkpoints that **failed** (`rmp` #394). A persistently
+    /// rising value means reclamation has stalled — RAM (the WAL tail), disk (sealed segments) and
+    /// version slots stop being reclaimed while writes accrue, a slow-motion OOM. Engine-thread-only
+    /// writer (the maintenance pass runs only on the engine thread), so unpadded.
+    maintenance_failures: AtomicU64,
+    /// Reclamation-degraded gauge (`rmp` #394): `1` once the background maintenance checkpoint has
+    /// failed [`MAINTENANCE_FAILURE_ESCALATION_THRESHOLD`](crate::engine::MAINTENANCE_FAILURE_ESCALATION_THRESHOLD)
+    /// times **consecutively** (reclamation is persistently stuck), `0` otherwise. Drives
+    /// `/health/ready` to `503` so the degradation is surfaced (an operator/orchestrator sees the node
+    /// as not-ready) rather than silently leaking memory behind a green probe. Cleared the moment a
+    /// checkpoint succeeds. Engine-thread-only writer; read by the readiness route.
+    maintenance_degraded: AtomicU64,
 
     // ---- reliability (`rmp` #386) ----
     /// Statements whose synchronous execution **panicked** and was caught at the engine's
@@ -213,18 +225,43 @@ impl Metrics {
             maintenance_checkpoints: AtomicU64::new(0),
             maintenance_versions_reclaimed: AtomicU64::new(0),
             maintenance_stamps_frozen: AtomicU64::new(0),
+            maintenance_failures: AtomicU64::new(0),
+            maintenance_degraded: AtomicU64::new(0),
             statement_panics: CachePad::new(0),
         }
     }
 
     /// Records one completed maintenance checkpoint (`rmp` #305): the number of MVCC version slots its
-    /// GC pass `reclaimed` and the number of committed stamps it `frozen`.
+    /// GC pass `reclaimed` and the number of committed stamps it `frozen`. A success also clears the
+    /// reclamation-degraded gauge (`rmp` #394) — reclamation is making progress again.
     pub fn record_maintenance_checkpoint(&self, reclaimed: u64, frozen: u64) {
         self.maintenance_checkpoints.fetch_add(1, Ordering::Relaxed);
         self.maintenance_versions_reclaimed
             .fetch_add(reclaimed, Ordering::Relaxed);
         self.maintenance_stamps_frozen
             .fetch_add(frozen, Ordering::Relaxed);
+        self.maintenance_degraded.store(0, Ordering::Relaxed);
+    }
+
+    /// Records one **failed** background maintenance checkpoint (`rmp` #394). The pass logs and retries
+    /// (durability is unaffected — nothing was reclaimed below the floor), but a persistent failure
+    /// means reclamation has stalled, so the count must be observable for alerting.
+    pub fn record_maintenance_failure(&self) {
+        self.maintenance_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sets (or clears) the reclamation-degraded gauge (`rmp` #394): `true` once maintenance has failed
+    /// `K` times consecutively (reclamation persistently stuck → slow-motion OOM), which drives
+    /// `/health/ready` to report the node not-ready so the degradation is surfaced rather than silent.
+    pub fn set_maintenance_degraded(&self, degraded: bool) {
+        self.maintenance_degraded
+            .store(u64::from(degraded), Ordering::Relaxed);
+    }
+
+    /// Whether reclamation is currently flagged degraded (`rmp` #394) — read by the readiness route.
+    #[must_use]
+    pub fn is_maintenance_degraded(&self) -> bool {
+        self.maintenance_degraded.load(Ordering::Relaxed) != 0
     }
 
     /// Records a committed transaction.
@@ -432,6 +469,18 @@ impl Metrics {
             "graphus_maintenance_stamps_frozen_total",
             "Committed MVCC stamps frozen by maintenance GC passes.",
             self.maintenance_stamps_frozen.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_maintenance_failures_total",
+            "Background maintenance checkpoints that failed (reclamation stalled — rmp #394).",
+            self.maintenance_failures.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_maintenance_degraded",
+            "1 if reclamation is degraded (K consecutive maintenance failures — rmp #394), else 0.",
+            self.maintenance_degraded.load(Ordering::Relaxed),
         );
         counter(
             &mut out,

@@ -560,8 +560,13 @@ async fn bolt_abrupt_disconnect_rolls_back_open_transaction() {
         client.handshake_and_logon("alice", "admin-pw8").await;
 
         // Open an explicit write transaction.
-        let begin = client.request_response(Request::Begin { extra: vec![] }).await;
-        assert!(matches!(begin, Response::Success { .. }), "BEGIN: {begin:?}");
+        let begin = client
+            .request_response(Request::Begin { extra: vec![] })
+            .await;
+        assert!(
+            matches!(begin, Response::Success { .. }),
+            "BEGIN: {begin:?}"
+        );
 
         // RUN a write inside it and drain its (empty) result so the statement actually executes.
         client
@@ -605,11 +610,18 @@ async fn bolt_abrupt_disconnect_rolls_back_open_transaction() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(open, 0, "the abandoned explicit tx must be rolled back, not leaked");
+    assert_eq!(
+        open, 0,
+        "the abandoned explicit tx must be rolled back, not leaked"
+    );
 
     // With nothing pinning it, a maintenance checkpoint runs cleanly and can advance the watermark
     // (the GC pass / freeze sweep would be blocked by a still-open writing tx).
-    let reply = server.engine.checkpoint().await.expect("checkpoint advances");
+    let reply = server
+        .engine
+        .checkpoint()
+        .await
+        .expect("checkpoint advances");
     let _ = (reply.reclaimed, reply.frozen);
 
     server.shutdown().await.expect("clean shutdown");

@@ -547,10 +547,34 @@ pub mod constants {
 /// `D-dst-investment`). Richer capabilities (file system, task spawning) arrive with
 /// the I/O and runtime crates.
 pub mod capability {
-    /// A monotonic clock source.
+    /// A clock source.
+    ///
+    /// [`now_nanos`](Clock::now_nanos) is the **monotonic** timeline: it never goes backwards and is
+    /// used for every *elapsed-time* and *idle/expiry* measurement (query latency, the REST
+    /// transaction inactivity timeout). A production implementation MUST back it with a monotonic OS
+    /// source (`CLOCK_MONOTONIC` / [`std::time::Instant`]) so a wall-clock adjustment (NTP step,
+    /// operator change) can never make a duration wrap to zero or to a spurious multi-decade value.
+    ///
+    /// [`now_unix_nanos`](Clock::now_unix_nanos) is the **wall-clock** timeline: nanoseconds since the
+    /// Unix epoch, used only where an *absolute* timestamp is required (e.g. JWT validity). It may
+    /// jump forwards or backwards with the system clock — never use it to measure an interval.
+    ///
+    /// For a deterministic clock (the simulator / tests) the two timelines coincide, so
+    /// `now_unix_nanos` defaults to `now_nanos`; only a clock whose monotonic and wall-clock sources
+    /// genuinely diverge (the production [`SystemClock`](../../graphus_server/struct.SystemClock.html))
+    /// overrides it.
     pub trait Clock {
-        /// Nanoseconds since an arbitrary fixed epoch (monotonic, non-decreasing).
+        /// Monotonic nanoseconds since an arbitrary fixed epoch (non-decreasing). Use for **elapsed**
+        /// and **idle/expiry** measurement only.
         fn now_nanos(&self) -> u64;
+
+        /// Wall-clock nanoseconds since the Unix epoch, for **absolute** timestamps (e.g. JWT
+        /// validity). Defaults to [`now_nanos`](Clock::now_nanos) for clocks whose monotonic and
+        /// wall-clock timelines coincide (the deterministic simulator and tests). Never use this to
+        /// measure an interval — it can step backwards with the system clock.
+        fn now_unix_nanos(&self) -> u64 {
+            self.now_nanos()
+        }
     }
 
     /// A deterministic, seedable pseudo-random source.

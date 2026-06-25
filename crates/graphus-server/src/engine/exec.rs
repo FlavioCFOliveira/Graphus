@@ -943,7 +943,15 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
 
     // Latency + slow-query log, measured from statement start (`04 §9` / NFR-10). Emitted at finish so
     // the latency spans the whole — possibly suspended — stream, exactly as the single-visit path.
-    let elapsed = Duration::from_nanos(clock.now_nanos().saturating_sub(inflight.started_nanos));
+    //
+    // Measured on the **monotonic** clock timeline (rmp #395): production's `SystemClock::now_nanos`
+    // reads `CLOCK_MONOTONIC`, so the end never precedes the start and a wall-clock NTP step cannot
+    // corrupt the duration. We still clamp defensively here — the `Clock` is injectable (tests / a
+    // future faulty source can hand back a non-monotonic value), and an observability path must never
+    // emit a wrapped-to-instant or spurious multi-decade latency. `saturating_sub` floors a backward
+    // reading at 0; `monotonic_elapsed` additionally caps an absurd forward jump at a sane ceiling so a
+    // hostile clock cannot poison the histogram or fire a bogus slow-query alert.
+    let elapsed = monotonic_elapsed(inflight.started_nanos, clock.now_nanos());
     metrics.observe_query_latency(elapsed);
     if elapsed >= slow_threshold() {
         metrics.record_slow_query();
@@ -954,6 +962,27 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             "slow query",
         );
     }
+}
+
+/// The largest elapsed duration the latency path will report (rmp #395): 24 hours. Any apparent span
+/// beyond this is treated as a clock anomaly (a forward NTP step between the start and end readings on
+/// a non-monotonic source) rather than a real query latency, and is clamped to this ceiling so it can
+/// neither poison the latency histogram's `_sum` nor fire a spurious slow-query alert claiming a
+/// multi-decade duration. No legitimate single statement runs for a day; the engine's own statement
+/// timeouts cut long queries off far sooner.
+const MAX_PLAUSIBLE_ELAPSED: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Computes a **sane** elapsed duration between a start and end reading of the monotonic clock,
+/// clamping both pathological directions a non-monotonic clock could produce (rmp #395).
+///
+/// On the production [`crate::server::SystemClock`] this is exact (`now_nanos` is `CLOCK_MONOTONIC`,
+/// so `end >= start` always and neither clamp ever engages). The clamps exist because the [`Clock`] is
+/// **injectable**: a test or a future faulty source can return a value that went backwards (NTP step)
+/// or jumped implausibly far forward. A backward reading floors at `0` (logged as instant, never an
+/// underflow wrap to ~584 years); a forward jump past [`MAX_PLAUSIBLE_ELAPSED`] caps at the ceiling.
+fn monotonic_elapsed(started_nanos: u64, now_nanos: u64) -> Duration {
+    let raw = Duration::from_nanos(now_nanos.saturating_sub(started_nanos));
+    raw.min(MAX_PLAUSIBLE_ELAPSED)
 }
 
 /// Builds a [`Parameters`] set from the `(name, value)` pairs the seam passed in.
@@ -1077,5 +1106,49 @@ fn truncate_for_log(query: &str) -> String {
             end -= 1;
         }
         format!("{}…", &query[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rmp #395 GATE: the latency elapsed computation is fed a **non-monotonic** clock (the end
+    /// reading precedes the start, as a backward NTP step would produce) and must clamp to instant
+    /// rather than underflow-wrap to a ~584-year duration. This is the defense `finalize_inflight`
+    /// relies on so a clock anomaly can never log a slow query as instant *or* as a bogus multi-decade
+    /// duration.
+    #[test]
+    fn monotonic_elapsed_clamps_a_backward_clock_step_to_instant() {
+        // started at t=1_000_000_000, "now" jumped *backwards* to t=0 (NTP step / hostile clock).
+        let elapsed = monotonic_elapsed(1_000_000_000, 0);
+        assert_eq!(
+            elapsed,
+            Duration::ZERO,
+            "a backward clock reading must floor at 0, never underflow-wrap"
+        );
+        // And it is nowhere near the wrap value a naive `now - started` would yield.
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    /// rmp #395 GATE: an implausible **forward** jump (a forward NTP step between the start and end
+    /// readings) is capped at the 24h ceiling, so it cannot poison the latency histogram's `_sum` or
+    /// fire a slow-query alert claiming a multi-decade duration.
+    #[test]
+    fn monotonic_elapsed_caps_an_implausible_forward_jump() {
+        // started at t=0, "now" jumped forward by ~584 years (near u64::MAX nanos).
+        let elapsed = monotonic_elapsed(0, u64::MAX);
+        assert_eq!(
+            elapsed, MAX_PLAUSIBLE_ELAPSED,
+            "an absurd forward jump must cap at the plausibility ceiling"
+        );
+    }
+
+    /// A normal, monotone interval is reported exactly (no clamp engages on the production path).
+    #[test]
+    fn monotonic_elapsed_reports_a_normal_interval_exactly() {
+        // 2.5 ms in nanoseconds.
+        let elapsed = monotonic_elapsed(1_000_000_000, 1_002_500_000);
+        assert_eq!(elapsed, Duration::from_micros(2_500));
     }
 }

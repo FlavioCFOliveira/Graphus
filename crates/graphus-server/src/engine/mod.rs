@@ -95,6 +95,14 @@ const INDEX_BUILD_TICK: std::time::Duration = std::time::Duration::from_millis(2
 /// so a fully idle engine (no WAL growth, nothing to reclaim) never wakes to run it.
 const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// After this many **consecutive** background maintenance checkpoint failures, reclamation is treated
+/// as persistently stalled and the server is flagged **degraded** (`rmp` #394): the
+/// `maintenance_degraded` metric gauge flips to `1`, which drives `/health/ready` to `503`. A single
+/// transient failure (e.g. a brief I/O hiccup) is logged and retried without escalation; only a run of
+/// failures — the signature of a stuck reclamation that would otherwise leak memory behind a green
+/// readiness probe (a slow-motion OOM) — escalates. Any success resets the streak and clears the gauge.
+pub(crate) const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
+
 /// An opaque handle to a transaction the engine opened.
 ///
 /// Both connectivity seams refer to a transaction by this ticket (the Bolt session tracks its single
@@ -196,6 +204,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         .as_ref()
         .expect("INVARIANT: coordinator is Some at startup")
         .wal_durable_len();
+    // Consecutive background-maintenance-checkpoint failures (`rmp` #394). Persists across maintenance
+    // ticks; once it reaches `MAINTENANCE_FAILURE_ESCALATION_THRESHOLD` the reclamation-degraded gauge
+    // is set (driving `/health/ready` to 503). Reset to 0 by any successful checkpoint.
+    let mut maintenance_consecutive_failures: u32 = 0;
 
     'engine: loop {
         // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
@@ -259,7 +271,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut plan_cache,
                         &mut builds_were_pending,
                     );
-                    maybe_run_maintenance(&mut coordinator, &mut wal_at_last_maintenance, &metrics);
+                    maybe_run_maintenance(
+                        &mut coordinator,
+                        &mut wal_at_last_maintenance,
+                        &mut maintenance_consecutive_failures,
+                        &metrics,
+                    );
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
@@ -302,7 +319,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &mut plan_cache,
                 &mut builds_were_pending,
             );
-            maybe_run_maintenance(&mut coordinator, &mut wal_at_last_maintenance, &metrics);
+            maybe_run_maintenance(
+                &mut coordinator,
+                &mut wal_at_last_maintenance,
+                &mut maintenance_consecutive_failures,
+                &metrics,
+            );
         }
     }
 
@@ -417,12 +439,23 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
 ///
 /// The GC watermark is derived from the oldest open reader's snapshot inside `checkpoint`, so a pass
 /// run with readers in flight can never reclaim a version any of them must still observe (the #220
-/// premature-reclamation guard). A maintenance failure is **logged and swallowed**: it must never take
-/// the engine down (durability is unaffected — nothing was reclaimed below the floor), and the next
-/// tick retries once more WAL accrues.
+/// premature-reclamation guard).
+///
+/// A maintenance failure is **never fatal** — durability is unaffected (nothing was reclaimed below
+/// the floor) so the engine must stay up and retry. But a *persistent* failure means reclamation has
+/// stalled while writes keep accruing — a slow-motion OOM that a swallow-and-retry would hide behind a
+/// green readiness probe (`rmp` #394). So each failure increments the `maintenance_failures` metric and
+/// the consecutive-failure streak; once the streak reaches
+/// [`MAINTENANCE_FAILURE_ESCALATION_THRESHOLD`] the server is flagged **degraded** (the
+/// `maintenance_degraded` gauge → `1`, which drives `/health/ready` to `503`). A single transient
+/// failure does not escalate. Any success resets the streak and clears the gauge.
+///
+/// `consecutive_failures` is owned by the engine loop and threaded in by `&mut` so the streak persists
+/// across maintenance ticks (each tick processes at most one checkpoint).
 fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     wal_at_last_maintenance: &mut u64,
+    consecutive_failures: &mut u32,
     metrics: &Metrics,
 ) {
     let Some(coord) = coordinator.as_mut() else {
@@ -434,15 +467,49 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     }
     match coord.checkpoint() {
         Ok(report) => {
+            // Success: record progress and clear any degraded state (the gauge is cleared inside
+            // `record_maintenance_checkpoint`); reset the failure streak.
             metrics.record_maintenance_checkpoint(report.reclaimed as u64, report.frozen as u64);
+            *consecutive_failures = 0;
         }
         Err(e) => {
-            // Never fatal: the floor was respected, so durability is intact; just record and retry later.
-            tracing::warn!("background maintenance checkpoint failed (will retry): {e}");
+            // Never fatal: the floor was respected, so durability is intact. But surface the failure
+            // (metric) and escalate a *persistent* run of failures so a stuck reclamation cannot leak
+            // memory silently behind a green probe (`rmp` #394).
+            record_maintenance_failure(consecutive_failures, metrics, &e);
         }
     }
-    // Re-read: the checkpoint reclaimed the WAL prefix, so anchor the next interval at the new length.
+    // Re-read: a successful checkpoint reclaimed the WAL prefix, so anchor the next interval at the new
+    // length. On failure the length is unchanged, so the next tick re-attempts immediately.
     *wal_at_last_maintenance = coord.wal_durable_len();
+}
+
+/// Accounts one **failed** background maintenance checkpoint and escalates a persistent run of them
+/// (`rmp` #394). Records the failure metric, bumps the consecutive-failure streak, and — once the
+/// streak reaches [`MAINTENANCE_FAILURE_ESCALATION_THRESHOLD`] — flips the reclamation-degraded gauge
+/// (driving `/health/ready` to `503`) and logs at `error`; a sub-threshold failure logs at `warn` and
+/// does not escalate. Factored out of [`maybe_run_maintenance`] so the escalation decision is unit-
+/// testable without a real failing coordinator.
+fn record_maintenance_failure(
+    consecutive_failures: &mut u32,
+    metrics: &Metrics,
+    err: &dyn std::fmt::Display,
+) {
+    metrics.record_maintenance_failure();
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    if *consecutive_failures >= MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
+        metrics.set_maintenance_degraded(true);
+        tracing::error!(
+            consecutive_failures = *consecutive_failures,
+            "background maintenance checkpoint has failed repeatedly; reclamation is DEGRADED \
+             (readiness now reports not-ready) — investigate storage/IO: {err}"
+        );
+    } else {
+        tracing::warn!(
+            consecutive_failures = *consecutive_failures,
+            "background maintenance checkpoint failed (will retry): {err}"
+        );
+    }
 }
 
 /// Advances the front non-blocking index build by one [`INDEX_BUILD_CHUNK`] (`rmp` task #91). A
@@ -1235,5 +1302,70 @@ where
                 "engine thread exited before reporting startup".to_owned(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    /// rmp #394 GATE: repeated maintenance-checkpoint failures increment the failure metric on every
+    /// failure and, after K **consecutive** failures, flip the reclamation-degraded gauge (which drives
+    /// `/health/ready` to 503). A single transient failure must NOT escalate.
+    #[test]
+    fn repeated_maintenance_failures_escalate_to_degraded() {
+        let metrics = Metrics::new();
+        let mut consecutive: u32 = 0;
+        let err = "simulated checkpoint I/O failure";
+
+        // Fewer than K failures: the metric counts each, but the node is NOT yet flagged degraded.
+        for i in 1..MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
+            record_maintenance_failure(&mut consecutive, &metrics, &err);
+            assert_eq!(consecutive, i);
+            assert!(
+                !metrics.is_maintenance_degraded(),
+                "must not escalate before {MAINTENANCE_FAILURE_ESCALATION_THRESHOLD} consecutive failures"
+            );
+        }
+
+        // The K-th consecutive failure escalates: reclamation is flagged degraded.
+        record_maintenance_failure(&mut consecutive, &metrics, &err);
+        assert_eq!(consecutive, MAINTENANCE_FAILURE_ESCALATION_THRESHOLD);
+        assert!(
+            metrics.is_maintenance_degraded(),
+            "K consecutive failures must flag reclamation degraded (readiness → 503)"
+        );
+    }
+
+    /// rmp #394: a successful checkpoint after failures clears the degraded state and resets the
+    /// streak, so a node recovers readiness automatically once reclamation resumes. A single transient
+    /// failure (below the threshold) likewise never escalates.
+    #[test]
+    fn a_success_clears_degraded_and_resets_the_streak() {
+        let metrics = Metrics::new();
+        let mut consecutive: u32 = 0;
+        let err = "transient failure";
+
+        // Drive past the threshold so the node is degraded.
+        for _ in 0..MAINTENANCE_FAILURE_ESCALATION_THRESHOLD {
+            record_maintenance_failure(&mut consecutive, &metrics, &err);
+        }
+        assert!(metrics.is_maintenance_degraded());
+
+        // A successful checkpoint clears the gauge; mirror the loop's success arm.
+        metrics.record_maintenance_checkpoint(0, 0);
+        consecutive = 0;
+        assert!(
+            !metrics.is_maintenance_degraded(),
+            "a successful checkpoint must clear the degraded gauge"
+        );
+
+        // A single subsequent transient failure does not re-escalate (streak was reset).
+        record_maintenance_failure(&mut consecutive, &metrics, &err);
+        assert_eq!(consecutive, 1);
+        assert!(
+            !metrics.is_maintenance_degraded(),
+            "one isolated failure after recovery must not flag degraded"
+        );
     }
 }

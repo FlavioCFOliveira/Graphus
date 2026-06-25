@@ -285,6 +285,15 @@ pub struct TimingConfig {
     /// hyper's `http1().header_read_timeout(...)`. In milliseconds; `0` **disables** the guard. Has no
     /// effect on the Bolt listeners (which have their own handshake/idle deadlines).
     pub header_read_timeout_ms: u64,
+    /// Maximum time an **open REST explicit transaction** may sit idle (no `run`/`commit` touching it)
+    /// before the server's inactivity sweep rolls it back (`04 §8.2`; rmp #389). A client that begins
+    /// a transaction and never returns otherwise leaks it permanently — pinning the MVCC GC watermark
+    /// and growing RAM and version slots without bound. A periodic background task rolls back every
+    /// transaction idle past this timeout. Measured on the **monotonic** clock (rmp #395), so an NTP
+    /// step cannot expire a fresh transaction or perpetually reprieve a stale one. In milliseconds;
+    /// must be `> 0`. Each `run`/`commit` refreshes the deadline, so only a genuinely abandoned
+    /// transaction is reaped.
+    pub transaction_idle_timeout_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -297,6 +306,10 @@ impl Default for TimingConfig {
             // A secure default: a well-behaved client sends its headers within seconds; 15s tolerates
             // slow networks while bounding a slow-loris drip (SEC-181).
             header_read_timeout_ms: 15_000,
+            // 60s: comfortably covers an interactive client's think-time between statements in an open
+            // transaction, while ensuring an abandoned one is reclaimed promptly (rmp #389). Each
+            // touch refreshes the deadline, so only a genuinely idle transaction is reaped.
+            transaction_idle_timeout_ms: 60_000,
         }
     }
 }
@@ -340,6 +353,13 @@ impl TimingConfig {
         } else {
             Some(Duration::from_millis(self.header_read_timeout_ms))
         }
+    }
+
+    /// The REST transaction inactivity timeout as a [`Duration`] (rmp #389). An open explicit
+    /// transaction idle past this is rolled back by the server's inactivity sweep.
+    #[must_use]
+    pub fn transaction_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.transaction_idle_timeout_ms)
     }
 }
 
@@ -786,6 +806,13 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "timing.handshake_timeout_ms must be > 0 (a zero handshake deadline would reject \
                  every TLS connection)"
+                    .to_owned(),
+            ));
+        }
+        if self.timing.transaction_idle_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "timing.transaction_idle_timeout_ms must be > 0 (a zero idle timeout would reap \
+                 every REST transaction the instant it is opened)"
                     .to_owned(),
             ));
         }

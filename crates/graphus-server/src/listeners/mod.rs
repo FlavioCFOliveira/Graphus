@@ -13,6 +13,8 @@ mod transport;
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use graphus_auth::AuthProvider;
 use graphus_core::capability::Clock;
 use graphus_io::{TcpAcceptor, UdsAcceptor};
@@ -181,6 +183,7 @@ pub async fn start_all(
             shutdown.clone(),
             readiness.clone(),
             config.metrics_scrape_token.as_deref().map(Arc::from),
+            config.timing.transaction_idle_timeout(),
         );
         tokio::spawn(rest::run_rest_accept_loop(
             acceptor,
@@ -224,12 +227,29 @@ fn build_rest_router(
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
     metrics_scrape_token: Option<Arc<str>>,
+    transaction_idle_timeout: std::time::Duration,
 ) -> axum::Router {
     use graphus_rest::registry::TxRegistry;
-    use graphus_rest::router::{AppState, DEFAULT_TX_TTL_NANOS, router};
+    use graphus_rest::router::{AppState, router};
 
     let rest_engine = Arc::new(crate::engine::RestEngineAdapter::new(context));
-    let registry = Arc::new(TxRegistry::new(DEFAULT_TX_TTL_NANOS));
+    // The transaction TTL is the configured inactivity timeout (rmp #389), on the monotonic clock
+    // (rmp #395). An open transaction idle past it is rolled back by the inactivity sweep spawned
+    // below — a transaction abandoned by a client no longer leaks (pinning the GC watermark, growing
+    // RAM/version slots) forever.
+    let registry = Arc::new(TxRegistry::new(
+        u64::try_from(transaction_idle_timeout.as_nanos()).unwrap_or(u64::MAX),
+    ));
+    // Spawn the periodic inactivity sweep (rmp #389): a single low-frequency background task that rolls
+    // back every transaction idle past the timeout. It owns its own `Arc` clones of the registry,
+    // engine and clock, runs until shutdown, and never blocks the request path.
+    spawn_tx_inactivity_sweep(
+        Arc::clone(&registry),
+        Arc::clone(&rest_engine),
+        Arc::clone(&clock),
+        transaction_idle_timeout,
+        shutdown.clone(),
+    );
     // Wire the audit observer (rmp #70) so REST Bearer-validation outcomes are recorded with the
     // `Rest` source. The observer is a tiny server-side adapter over the shared `AuditLog`.
     let observer: Arc<dyn graphus_rest::router::AuthObserver> =
@@ -248,6 +268,60 @@ fn build_rest_router(
         metrics_scrape_token,
     );
     api.merge(extra)
+}
+
+/// The largest interval the inactivity sweep will sleep between passes, regardless of how long the
+/// configured timeout is. Bounds reaping latency for a very long timeout (a transaction is reaped
+/// within `timeout + SWEEP_MAX_INTERVAL` of going idle) while keeping the task near-idle.
+const SWEEP_MAX_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Spawns the **REST transaction inactivity sweep** (rmp #389): a single low-frequency background task
+/// that periodically rolls back every open explicit transaction idle past the configured timeout, so
+/// a client that begins a transaction and never returns cannot leak it permanently (pinning the MVCC
+/// GC watermark, growing RAM and version slots without bound).
+///
+/// The sweep is **race-safe with an explicit `DELETE`/commit**: [`TxRegistry::sweep_expired`] removes
+/// each expired entry from the registry **under the registry lock** and only then calls
+/// `engine.rollback` — so a concurrent `DELETE`/commit either takes the entry first (the sweep then
+/// skips it) or loses the race (the entry is already gone, `take` returns `None`, the router 404s).
+/// `RestEngine::rollback` is idempotent, so even an interleaving where both reach the engine for the
+/// same handle is harmless. Time is read from the injected **monotonic** clock (rmp #395), so a
+/// wall-clock NTP step can neither expire a fresh transaction nor perpetually reprieve a stale one.
+///
+/// The task runs until [`ShutdownCoordinator`] fires, then exits (the final shutdown drain rolls back
+/// whatever remains). The sweep interval is the timeout (capped at [`SWEEP_MAX_INTERVAL`]) so reaping
+/// is timely without busy-spinning.
+fn spawn_tx_inactivity_sweep<E>(
+    registry: Arc<graphus_rest::registry::TxRegistry>,
+    engine: Arc<E>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    timeout: Duration,
+    shutdown: ShutdownCoordinator,
+) where
+    E: graphus_rest::engine::RestEngine + Send + Sync + 'static,
+{
+    let interval = timeout
+        .min(SWEEP_MAX_INTERVAL)
+        .max(Duration::from_millis(1));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // Cancellation-safe: `tokio::time::sleep` and `ShutdownCoordinator::wait` are both safe
+                // to drop mid-await, and the sweep itself only runs between awaits (never across one).
+                () = tokio::time::sleep(interval) => {
+                    let reaped = registry.sweep_expired(clock.now_nanos(), engine.as_ref());
+                    if !reaped.is_empty() {
+                        tracing::info!(
+                            target: "graphus::rest",
+                            count = reaped.len(),
+                            "rolled back idle REST transaction(s) past the inactivity timeout",
+                        );
+                    }
+                }
+                () = shutdown.wait() => break,
+            }
+        }
+    });
 }
 
 /// Parses a `host:port` listen address.

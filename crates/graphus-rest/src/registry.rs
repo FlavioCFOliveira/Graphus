@@ -11,11 +11,17 @@
 //! ## Lazy expiry, not a timer
 //!
 //! A transaction past its deadline is rolled back **the next time it is touched** (looked up,
-//! swept, or shut down), and the server can call [`TxRegistry::sweep_expired`] opportunistically
-//! (e.g. on an admin tick or, in production, from a single low-frequency task the listener owns).
-//! Lazy expiry keeps the registry free of its own runtime: it needs only a `Clock`, so it drops
-//! straight into the deterministic simulator. The model is "a deadline is a clock value; an
-//! operation that observes `now >= deadline` rolls the transaction back and reports it gone."
+//! swept, or shut down). Lazy expiry alone is not enough — a client that begins a transaction and
+//! never returns would never touch it again and so leak it permanently (pinning the GC watermark,
+//! growing RAM and version slots without bound). The server therefore drives
+//! [`TxRegistry::sweep_expired`] from a **single low-frequency background task** it owns (rmp #389,
+//! `crate::listeners` `spawn_tx_inactivity_sweep`), which rolls back every idle-past-deadline
+//! transaction on a periodic tick against the injected **monotonic** clock (rmp #395).
+//!
+//! Keeping the time source injected keeps the registry free of its own runtime: it needs only a
+//! `Clock`, so it drops straight into the deterministic simulator and a test advances time
+//! explicitly. The model is "a deadline is a clock value; an operation (touch, sweep, or shutdown)
+//! that observes `now >= deadline` rolls the transaction back and reports it gone."
 //!
 //! ## Concurrency
 //!
@@ -65,6 +71,14 @@ pub struct CachedResponse {
 struct Entry {
     /// The engine's handle for this transaction.
     handle: TxHandle,
+    /// The **authenticated principal that opened the transaction** (rmp #390). The transaction id is
+    /// a guessable sequential value with no secret, so binding the entry to its opener is what stops a
+    /// cross-principal hijack: a later `touch`/`take` must present the *same* authenticated principal,
+    /// or the lookup misses (the router answers `404`, as if the id did not exist). The engine seam
+    /// applies the OPENER's fine-grained RBAC to every statement, so without this binding a different
+    /// user with coarse db access could run statements under the opener's privileges inside the
+    /// opener's transaction.
+    principal: String,
     /// The database the transaction is bound to.
     db: String,
     /// The access mode (`06 §4`).
@@ -161,10 +175,16 @@ impl TxRegistry {
     /// Registers a freshly-opened transaction, returning the public id it is addressed by and the
     /// deadline it will expire at if untouched.
     ///
-    /// `now_nanos` is the current injected-clock value; the deadline is `now + ttl`.
+    /// `principal` is the **authenticated** identity that opened the transaction (rmp #390); it is
+    /// recorded so every later [`touch`](Self::touch)/[`take`](Self::take) can require the same
+    /// principal and a different user can never adopt this transaction. The caller MUST pass the
+    /// authenticated identity, never a client-supplied value.
+    ///
+    /// `now_nanos` is the current **monotonic** clock value (rmp #395); the deadline is `now + ttl`.
     pub fn open(
         &self,
         handle: TxHandle,
+        principal: &str,
         db: &str,
         mode: AccessMode,
         now_nanos: u64,
@@ -186,6 +206,7 @@ impl TxRegistry {
             id.clone(),
             Entry {
                 handle,
+                principal: principal.to_owned(),
                 db: db.to_owned(),
                 mode,
                 deadline_nanos,
@@ -194,16 +215,26 @@ impl TxRegistry {
         (id, deadline_nanos)
     }
 
-    /// Looks up an open transaction by id, **refreshing its deadline** (resetting the inactivity
-    /// timeout, `04 §8.2`) to `now + ttl`.
+    /// Looks up an open transaction by id **owned by `principal`**, refreshing its deadline (resetting
+    /// the inactivity timeout, `04 §8.2`) to `now + ttl`.
     ///
-    /// If the transaction is already past its deadline as of `now_nanos`, it is **rolled back**
-    /// (auto-rollback) and removed, and `None` is returned — exactly as if it had never existed (the
-    /// router then answers `404`). This is the lazy-expiry path: a stale id is reaped the moment it
-    /// is touched.
+    /// The lookup is bound to the **authenticated opener** (rmp #390): if the entry exists but was
+    /// opened by a *different* principal, this returns `None` **without touching the victim's
+    /// transaction** (no deadline refresh, no rollback) — the router then answers `404`, indistinguish-
+    /// able from an unknown id, so a different user can neither adopt nor disturb the transaction.
     ///
-    /// Returns `None` for an unknown (or just-expired) id.
-    pub fn touch<E: RestEngine>(&self, id: &str, now_nanos: u64, engine: &E) -> Option<TxInfo> {
+    /// If the (own) transaction is already past its deadline as of `now_nanos`, it is **rolled back**
+    /// (auto-rollback) and removed, and `None` is returned — exactly as if it had never existed. This
+    /// is the lazy-expiry path: a stale id is reaped the moment its owner touches it.
+    ///
+    /// Returns `None` for an unknown id, an id owned by another principal, or a just-expired id.
+    pub fn touch<E: RestEngine>(
+        &self,
+        id: &str,
+        principal: &str,
+        now_nanos: u64,
+        engine: &E,
+    ) -> Option<TxInfo> {
         // Take the handle to roll back *outside* the lock, so the engine call never runs under the
         // registry mutex (keeps the critical section short and lock ordering simple).
         let mut to_rollback = None;
@@ -213,6 +244,9 @@ impl TxRegistry {
                 .lock()
                 .expect("INVARIANT: registry mutex un-poisoned");
             match inner.txns.get_mut(id) {
+                // Principal mismatch: treat as absent. Do NOT reap or refresh — never let one user's
+                // request mutate another user's transaction (rmp #390 hijack defense).
+                Some(entry) if entry.principal != principal => None,
                 Some(entry) if now_nanos >= entry.deadline_nanos => {
                     to_rollback = Some(entry.handle);
                     inner.txns.remove(id);
@@ -236,20 +270,28 @@ impl TxRegistry {
         result
     }
 
-    /// Removes a transaction from the registry and returns its engine handle, so the caller can
-    /// commit or roll it back. Returns `None` if the id is unknown.
+    /// Removes a transaction **owned by `principal`** from the registry and returns its engine handle,
+    /// so the caller can commit or roll it back. Returns `None` if the id is unknown **or owned by a
+    /// different principal** (rmp #390 — a `COMMIT`/`DELETE` targeting another user's transaction is a
+    /// `404`, and the victim's transaction is left untouched).
     ///
     /// Unlike [`touch`](Self::touch) this does **not** refresh or check the deadline — it is the
     /// terminal path (`COMMIT` / `DELETE`), after which the transaction no longer exists in the
     /// registry regardless of the engine's outcome. (An expired-but-not-yet-swept id still returns
-    /// its handle here so a racing `DELETE` can finalise the rollback rather than 404; the engine's
-    /// idempotent rollback makes a double-rollback harmless.)
-    pub fn take(&self, id: &str) -> Option<(TxHandle, String, AccessMode)> {
+    /// its handle here so a racing `DELETE` by its owner can finalise the rollback rather than 404; the
+    /// engine's idempotent rollback makes a double-rollback harmless.)
+    pub fn take(&self, id: &str, principal: &str) -> Option<(TxHandle, String, AccessMode)> {
         let mut inner = self
             .inner
             .lock()
             .expect("INVARIANT: registry mutex un-poisoned");
-        inner.txns.remove(id).map(|e| (e.handle, e.db, e.mode))
+        // Peek the owner before removing: a principal mismatch must leave the victim's entry in place.
+        match inner.txns.get(id) {
+            Some(entry) if entry.principal == principal => {
+                inner.txns.remove(id).map(|e| (e.handle, e.db, e.mode))
+            }
+            _ => None,
+        }
     }
 
     /// Rolls back and removes **every** transaction whose deadline is at or before `now_nanos`
@@ -427,13 +469,15 @@ mod tests {
         let h = engine
             .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
             .unwrap();
-        let (id, deadline) = reg.open(h, "neo4j", AccessMode::Write, clock.now_nanos());
+        let (id, deadline) = reg.open(h, "alice", "neo4j", AccessMode::Write, clock.now_nanos());
         assert_eq!(deadline, TTL);
         assert_eq!(reg.open_count(), 1);
 
         // Touch at t=500: still alive, deadline pushed to 1500.
         clock.set(500);
-        let info = reg.touch(&id, clock.now_nanos(), &engine).expect("alive");
+        let info = reg
+            .touch(&id, "alice", clock.now_nanos(), &engine)
+            .expect("alive");
         assert_eq!(info.handle, h);
         assert_eq!(info.deadline_nanos, 1500);
     }
@@ -447,11 +491,14 @@ mod tests {
         let h = engine
             .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
             .unwrap();
-        let (id, _) = reg.open(h, "neo4j", AccessMode::Write, clock.now_nanos());
+        let (id, _) = reg.open(h, "alice", "neo4j", AccessMode::Write, clock.now_nanos());
 
         // Advance past the deadline; touching reaps it and returns None.
         clock.set(TTL + 1);
-        assert!(reg.touch(&id, clock.now_nanos(), &engine).is_none());
+        assert!(
+            reg.touch(&id, "alice", clock.now_nanos(), &engine)
+                .is_none()
+        );
         assert_eq!(reg.open_count(), 0);
         // The engine saw a rollback for that handle.
         assert!(
@@ -472,12 +519,12 @@ mod tests {
         let ha = engine
             .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
             .unwrap();
-        let (_id_a, _) = reg.open(ha, "neo4j", AccessMode::Write, 0);
+        let (_id_a, _) = reg.open(ha, "alice", "neo4j", AccessMode::Write, 0);
         clock.set(900);
         let hb = engine
             .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
             .unwrap();
-        let (id_b, _) = reg.open(hb, "neo4j", AccessMode::Write, clock.now_nanos());
+        let (id_b, _) = reg.open(hb, "alice", "neo4j", AccessMode::Write, clock.now_nanos());
 
         // Sweep at t=1000: only A is expired.
         clock.set(1000);
@@ -485,7 +532,10 @@ mod tests {
         assert_eq!(reaped.len(), 1);
         assert_eq!(reg.open_count(), 1);
         // B is still touchable.
-        assert!(reg.touch(&id_b, clock.now_nanos(), &engine).is_some());
+        assert!(
+            reg.touch(&id_b, "alice", clock.now_nanos(), &engine)
+                .is_some()
+        );
     }
 
     #[test]
@@ -495,15 +545,52 @@ mod tests {
         let h = engine
             .begin("neo4j", AccessMode::Read, TEST_ORIGIN)
             .unwrap();
-        let (id, _) = reg.open(h, "neo4j", AccessMode::Read, 0);
+        let (id, _) = reg.open(h, "alice", "neo4j", AccessMode::Read, 0);
 
-        let (taken, db, mode) = reg.take(&id).expect("present");
+        let (taken, db, mode) = reg.take(&id, "alice").expect("present");
         assert_eq!(taken, h);
         assert_eq!(db, "neo4j");
         assert_eq!(mode, AccessMode::Read);
         assert_eq!(reg.open_count(), 0);
         // Taking again is None.
-        assert!(reg.take(&id).is_none());
+        assert!(reg.take(&id, "alice").is_none());
+    }
+
+    /// rmp #390 GATE: a transaction opened by `alice` cannot be touched or taken by `bob` — Bob's
+    /// requests miss (as if the id were unknown) and Alice's transaction is left fully intact.
+    #[test]
+    fn tx_opened_by_alice_cannot_be_touched_or_taken_by_bob() {
+        let engine = MockEngine::new();
+        let clock = TestClock::new(0);
+        let reg = TxRegistry::new(TTL);
+
+        let h = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
+        let (id, _) = reg.open(h, "alice", "neo4j", AccessMode::Write, clock.now_nanos());
+
+        // Bob touches Alice's id: miss, no rollback, no deadline change.
+        assert!(reg.touch(&id, "bob", clock.now_nanos(), &engine).is_none());
+        assert!(
+            !engine
+                .log()
+                .iter()
+                .any(|l| l == &format!("rollback(tx={})", h.0)),
+            "a mismatched touch must NOT roll back the victim's transaction"
+        );
+        assert_eq!(reg.open_count(), 1, "Alice's tx must still be open");
+
+        // Bob takes (commit/rollback) Alice's id: miss, entry left in place.
+        assert!(reg.take(&id, "bob").is_none());
+        assert_eq!(reg.open_count(), 1, "Alice's tx must still be open");
+
+        // Alice still owns it: she can touch and then take it.
+        assert!(
+            reg.touch(&id, "alice", clock.now_nanos(), &engine)
+                .is_some()
+        );
+        assert!(reg.take(&id, "alice").is_some());
+        assert_eq!(reg.open_count(), 0);
     }
 
     #[test]
@@ -626,8 +713,8 @@ mod tests {
         let engine = MockEngine::new();
         let h1 = engine.begin("g", AccessMode::Write, TEST_ORIGIN).unwrap();
         let h2 = engine.begin("g", AccessMode::Write, TEST_ORIGIN).unwrap();
-        let (id1, _) = reg.open(h1, "g", AccessMode::Write, 0);
-        let (id2, _) = reg.open(h2, "g", AccessMode::Write, 0);
+        let (id1, _) = reg.open(h1, "alice", "g", AccessMode::Write, 0);
+        let (id2, _) = reg.open(h2, "alice", "g", AccessMode::Write, 0);
         assert_ne!(id1, id2);
         assert!(id1.starts_with("tx-"));
     }

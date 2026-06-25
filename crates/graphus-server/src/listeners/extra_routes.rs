@@ -147,12 +147,25 @@ async fn health_live() -> Response {
 
 /// `GET /health/ready` — readiness: `200 OK` once the store is verified + the engine is serving, and
 /// `503` while starting up or shutting down (`04 §9`).
+///
+/// Also reports `503` when **reclamation is degraded** (`rmp` #394): if the background maintenance
+/// checkpoint has failed `K` times consecutively, reclamation has stalled (RAM/disk/version slots stop
+/// being freed while writes accrue — a slow-motion OOM). Surfacing it through readiness lets an
+/// orchestrator stop routing writes to a node that would otherwise keep accepting them behind a green
+/// probe until it OOMs. The gauge clears the moment a checkpoint succeeds, so the node recovers
+/// readiness automatically once reclamation resumes.
 async fn health_ready(State(state): State<ExtraState>) -> Response {
-    if state.readiness.is_ready() {
-        (StatusCode::OK, "ready").into_response()
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
+    if !state.readiness.is_ready() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
     }
+    if state.metrics.is_maintenance_degraded() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: storage reclamation degraded",
+        )
+            .into_response();
+    }
+    (StatusCode::OK, "ready").into_response()
 }
 
 /// Authenticates the request's Bearer token and requires the global `Admin` privilege, returning the
@@ -171,7 +184,9 @@ fn require_admin(state: &ExtraState, headers: &HeaderMap) -> Result<String, Box<
                 .into_response(),
         )
     })?;
-    let now_unix_secs = state.clock.now_nanos() / 1_000_000_000;
+    // JWT validity is an ABSOLUTE timestamp, so it reads the wall clock (`now_unix_nanos`), not the
+    // monotonic `now_nanos` (rmp #395 — the monotonic timeline is for elapsed/idle measurement only).
+    let now_unix_secs = state.clock.now_unix_nanos() / 1_000_000_000;
     // Resolve the Bearer check + admin gate through the LIVE catalog (one brief read lock, rmp #94),
     // so a runtime-created admin is accepted at once and a just-dropped one is refused at once.
     let claims = state
