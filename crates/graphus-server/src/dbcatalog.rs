@@ -108,9 +108,9 @@ use graphus_core::GraphusError;
 use graphus_crypto::{EncryptedFileDevice, EncryptedFileLogSink, Keyring};
 use graphus_cypher::TxnCoordinator;
 use graphus_io::FileBlockDevice;
-use graphus_storage::RecordStore;
 use graphus_storage::check::verify_on_open;
-use graphus_storage::recovery::recover_device;
+use graphus_storage::recovery::recover_device_with_dwb;
+use graphus_storage::{Dwb, RecordStore};
 use graphus_wal::{FileLogSink, WalManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -130,6 +130,12 @@ pub const STORE_FILE_NAME: &str = "graphus.store";
 /// The WAL file name inside a database directory (shared with
 /// [`crate::config::ServerConfig::wal_file`]).
 pub const WAL_FILE_NAME: &str = "graphus.wal";
+
+/// The doublewrite-buffer file name inside a database directory (`rmp` #384). A persistent,
+/// fixed-size area (`graphus_storage::dwb_device_pages` pages) holding a durable copy of each batch of dirty home
+/// pages *before* they are written home, so a torn home page can be repaired from it on the next
+/// open ([`recover_device_with_dwb`]). Lives beside `graphus.store` and `graphus.wal`.
+pub const DWB_FILE_NAME: &str = "graphus.dwb";
 
 /// The durable catalog file name, directly under the data root.
 pub const CATALOG_FILE_NAME: &str = "databases.toml";
@@ -548,11 +554,21 @@ fn open_or_create_coordinator(
         let mut device = open_store_device(device_file, master_key)?;
         let mut wal = WalManager::open(open_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("opening WAL manager: {e}")))?;
-        recover_device(&mut wal, &mut device)?;
+        // Doublewrite torn-page repair MUST run BEFORE ARIES redo (`rmp` #384, `04 §4.5`,
+        // `recovery.rs` §recover_device_with_dwb): redo gates each change on the home page's own
+        // `page_lsn`, so a torn home page (garbage header → garbage `page_lsn`) would have its redo
+        // skipped and the corrupt page served. `recover_device_with_dwb` first restores every torn
+        // home page from its intact DWB copy, then runs the normal recovery.
+        let mut dwb = open_or_create_dwb(device_file, master_key)?;
+        recover_device_with_dwb(&mut wal, &mut device, &mut dwb)?;
         // Reopen the WAL fresh for serving (recovery consumed the recovery view).
         let wal = WalManager::open(open_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
-        RecordStore::open(device, wal, pool_pages)?
+        let mut store = RecordStore::open(device, wal, pool_pages)?;
+        // Attach the (now-recovered) DWB so every subsequent checkpoint/flush home write is
+        // doublewrite-protected for the rest of this store's lifetime.
+        store.attach_dwb(dwb);
+        store
     } else {
         // Fresh store on an empty device + a freshly-created WAL. Both share one freshly-generated
         // per-store salt: the device persists it in its header; the WAL subkey is derived from it.
@@ -566,7 +582,11 @@ fn open_or_create_coordinator(
         let wal = WalManager::create(create_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
         // Seed element ids from 1 (`04 §2.2`).
-        let store = RecordStore::create(device, wal, pool_pages, 1)?;
+        let mut store = RecordStore::create(device, wal, pool_pages, 1)?;
+        // Create and attach the persistent doublewrite buffer (`rmp` #384) so every checkpoint/flush
+        // from now on is torn-write protected. `RecordStore::create`'s own initial flush already ran
+        // (unprotected) above — correct, the fresh store holds no committed data yet.
+        store.attach_dwb(open_or_create_dwb(device_file, master_key)?);
         // Durable-create barrier (`04 §4.9`, storage audit F1). `RecordStore::create` flushes the
         // device and `WalManager::create` hardens the WAL header, so both files' **content** is now
         // durable — but their **directory entries** are not. On ext4/XFS/btrfs/APFS an `fdatasync`
@@ -651,6 +671,52 @@ fn open_store_device(
             )))
         }
     }
+}
+
+/// The doublewrite-buffer file path beside a database's store device (`rmp` #384).
+fn dwb_file_for(device_file: &Path) -> std::path::PathBuf {
+    device_file.with_file_name(DWB_FILE_NAME)
+}
+
+/// Opens (or, on first use / a pre-#384 upgrade, creates) the persistent doublewrite buffer beside
+/// `device_file`, returning a sized [`Dwb`] ready to protect home writes and run torn-page repair
+/// (`rmp` #384, `05 §3`).
+///
+/// The DWB device is a [`StoreDevice`] — the **same** [`graphus_io::BlockDevice`] type as the store
+/// device — so an encrypted store's DWB area is itself AES-256-GCM encrypted and **never** persists a
+/// page image in plaintext. The DWB carries its **own** independent per-file salt (read from / written
+/// to its header), so its derived store subkey is independent of the main store's: the two files do
+/// not share a GCM nonce budget. The DWB content is transient page images only — no catalog, no
+/// committed state — so creating it fresh when it is missing is always safe (a fresh DWB describes no
+/// batch, so [`Dwb::recover_home`] finds nothing to repair).
+///
+/// # Errors
+/// [`GraphusError`] if the DWB file cannot be opened/created or sized, or (encrypted path) if its
+/// header cannot be read or its key check fails.
+fn open_or_create_dwb(
+    device_file: &Path,
+    master_key: Option<&MasterKey>,
+) -> Result<Dwb<StoreDevice>, GraphusError> {
+    let dwb_file = dwb_file_for(device_file);
+    let existing = dwb_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let device = if existing {
+        // Reuse the persisted DWB (it may hold a batch a crash left mid-flight — its recovery pass
+        // runs in `recover_device_with_dwb` before redo). The encrypted path re-derives the subkey
+        // from the DWB header's own salt and fails closed on a wrong key.
+        open_store_device(&dwb_file, master_key)?
+    } else {
+        // First open (or a store created before #384 wired the DWB): create a fresh DWB file. It
+        // describes no batch, so recovery has nothing to repair from it — safe.
+        let salt = master_key.map(|_| graphus_crypto::random_salt());
+        let dev = create_store_device(&dwb_file, master_key, salt)?;
+        // Harden the new DWB file's directory entry so a crash cannot leave it unfindable (mirrors
+        // the store/WAL durable-create barrier; same directory, so this also covers the store/WAL).
+        fsync_parent_dir(&dwb_file)?;
+        dev
+    };
+    // `Dwb::new` extends the device to `dwb_device_pages()` pages if a freshly created file is
+    // shorter; the header + data slots are written on the first `stage_batch`.
+    Dwb::new(device)
 }
 
 /// Creates a **fresh** WAL sink for `wal_file`: an encrypted file sink when a `keyring` is given
@@ -1878,6 +1944,102 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{tag}: reopen failed: {e}"));
             drop(reopened);
         }
+    }
+
+    /// `rmp` #384 — the doublewrite buffer is wired into the **production** open/checkpoint path: a
+    /// torn home data page injected after a checkpoint (which stages every home page into the
+    /// persistent DWB) is **repaired** on reopen via [`open_or_create_coordinator`]
+    /// (`recover_device_with_dwb` runs before ARIES redo), and the post-recovery consistency checker
+    /// ([`verify_on_open`], invoked inside the open path) passes.
+    ///
+    /// Before this wiring the production open used the non-DWB `recover_device` and checkpoint never
+    /// staged into a DWB, so a torn home page failed `verify_on_open` and the reopen errored. The
+    /// final assertion (reopen succeeds with the checker green) therefore fails before the wiring and
+    /// passes after.
+    ///
+    /// The tear is modelled exactly as a mid-flush power loss: the DWB batch is staged-and-synced,
+    /// the home write tears, and the crash happens **before** the batch is cleared — so the DWB still
+    /// holds the intact copy when recovery runs. We drive `flush_protected` directly (which stages
+    /// without clearing) to reproduce that window, then corrupt a home record page on disk.
+    #[test]
+    fn torn_home_page_is_repaired_on_production_reopen_via_doublewrite() {
+        use graphus_core::TxnId;
+        use graphus_io::PAGE_SIZE;
+
+        let root = TempRoot::new("dwb-torn-repair");
+        let dir = root.path.join("db");
+        std::fs::create_dir_all(&dir).expect("create db dir");
+        let device_file = dir.join(STORE_FILE_NAME);
+        let wal_file = dir.join(WAL_FILE_NAME);
+        let dwb_file = dir.join(DWB_FILE_NAME);
+
+        // 1. Fresh create via the production path, then write enough nodes to allocate several record
+        //    pages and commit, so there is a real home record page to tear.
+        {
+            let coord = open_or_create_coordinator(&device_file, &wal_file, 64, None)
+                .expect("fresh create");
+            coord.with_store_mut(|s| {
+                let txn = TxnId(1);
+                s.begin(txn);
+                for _ in 0..400 {
+                    s.create_node(txn).expect("create node");
+                }
+                s.commit(txn).expect("commit");
+                // Stage every home page into the persistent DWB and write them home — WITHOUT
+                // clearing the batch (models the crash window: staged+synced, home torn, no clear).
+                let mut dwb = open_or_create_dwb(&device_file, None).expect("open dwb");
+                s.flush_protected(&mut dwb).expect("flush_protected");
+            });
+            drop(coord);
+        }
+        assert!(dwb_file.exists(), "the persistent DWB file must exist");
+
+        // 2. Find a non-metadata home page with a valid checksum and TEAR it on disk (corrupt a body
+        //    byte so its CRC32C fails) — exactly a torn home write. Its intact copy is in the DWB.
+        let mut bytes = std::fs::read(&device_file).expect("read store file");
+        let page_count = bytes.len() / PAGE_SIZE;
+        let mut torn_page = None;
+        for p in 1..page_count {
+            let off = p * PAGE_SIZE;
+            let page: &[u8; PAGE_SIZE] = bytes[off..off + PAGE_SIZE].try_into().expect("page");
+            if graphus_storage::page::verify_checksum(page)
+                && graphus_storage::page::page_id(page) != 0
+            {
+                // Corrupt a mid-page body byte (well past the 24-byte header) so the checksum fails
+                // but the page is still self-identifying (a realistic torn write).
+                bytes[off + 1000] ^= 0xFF;
+                torn_page = Some(p);
+                break;
+            }
+        }
+        let torn_page = torn_page.expect("a non-metadata home page to tear");
+        std::fs::write(&device_file, &bytes).expect("write torn store file");
+
+        // Precondition: the torn page now fails its checksum on disk.
+        {
+            let disk = std::fs::read(&device_file).expect("reread");
+            let off = torn_page * PAGE_SIZE;
+            let page: &[u8; PAGE_SIZE] = disk[off..off + PAGE_SIZE].try_into().expect("page");
+            assert!(
+                !graphus_storage::page::verify_checksum(page),
+                "the injected tear must corrupt home page {torn_page}"
+            );
+        }
+
+        // 3. Reopen via the PRODUCTION path. `recover_device_with_dwb` repairs the torn page from the
+        //    DWB before redo, and the open path's `verify_on_open` (the consistency checker) passes.
+        let reopened = open_or_create_coordinator(&device_file, &wal_file, 64, None)
+            .expect("production reopen must repair the torn page and pass the consistency checker");
+        drop(reopened);
+
+        // 4. The repaired home page is intact on disk after recovery.
+        let disk = std::fs::read(&device_file).expect("reread after recovery");
+        let off = torn_page * PAGE_SIZE;
+        let page: &[u8; PAGE_SIZE] = disk[off..off + PAGE_SIZE].try_into().expect("page");
+        assert!(
+            graphus_storage::page::verify_checksum(page),
+            "home page {torn_page} must be intact after doublewrite repair"
+        );
     }
 
     #[test]

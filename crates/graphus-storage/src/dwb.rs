@@ -53,10 +53,6 @@ use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 
 /// Magic identifying a valid DWB header slot (`"GDWB"` + version `1`, little-endian).
 const DWB_MAGIC: u64 = 0x0000_0001_4257_4447; // 'G''D''W''B' = 0x47 0x44 0x57 0x42
-/// Maximum number of home pages one DWB batch may protect. Bounds the DWB device size and guards the
-/// header decode against an attacker-/corruption-supplied length driving an unbounded read loop.
-pub const DWB_MAX_BATCH: usize = 4096;
-
 // The DWB header slot is a standard page: its first 24 bytes are the page header
 // (`graphus_bufpool::page`), of which bytes `0..4` are the CRC32C checksum that `write_checksum`
 // stamps. The DWB-specific fields therefore live *after* the 24-byte page header so they do not
@@ -64,6 +60,21 @@ pub const DWB_MAX_BATCH: usize = 4096;
 const HDR_OFF_MAGIC: usize = page::HEADER_SIZE; // u64
 const HDR_OFF_COUNT: usize = HDR_OFF_MAGIC + 8; // u64 (number of data slots in the batch)
 const HDR_OFF_HOMES: usize = HDR_OFF_COUNT + 8; // u64[count] home page ids
+
+/// Maximum number of home pages one DWB batch may protect.
+///
+/// The batch's home page ids are stored as a `u64[count]` array inside the **single** header page,
+/// starting at [`HDR_OFF_HOMES`]; the cap is therefore the number of `u64`s that fit in the header
+/// page after its fixed prefix: `(PAGE_SIZE - HDR_OFF_HOMES) / 8`. Deriving it from the page layout
+/// (rather than a hand-picked literal) keeps [`Dwb::encode_header`]/[`Dwb::decode_header`] and the
+/// DWB device size mutually consistent and makes an over-cap header physically impossible to encode.
+/// It also bounds the DWB device size and guards the header decode against an
+/// attacker-/corruption-supplied length driving an unbounded read loop.
+///
+/// (`rmp` #385: the previous literal `4096` overflowed the header page — `HDR_OFF_HOMES + 4096*8`
+/// far exceeds `PAGE_SIZE` — so a maximal batch panicked in `encode_header`; the derived value is
+/// the largest batch the header can actually describe.)
+pub const DWB_MAX_BATCH: usize = (PAGE_SIZE - HDR_OFF_HOMES) / 8;
 /// The DWB header slot lives at DWB device page 0; data slots start at page 1.
 const DWB_HEADER_SLOT: u64 = 0;
 const DWB_FIRST_DATA_SLOT: u64 = 1;
@@ -103,7 +114,17 @@ impl<D: BlockDevice> Dwb<D> {
     }
 
     /// Encodes a header slot for a batch of `homes` page ids.
+    ///
+    /// The caller ([`stage_batch`](Self::stage_batch)) has already rejected a batch larger than
+    /// [`DWB_MAX_BATCH`]; this debug assertion restates the invariant the page layout relies on —
+    /// `HDR_OFF_HOMES + homes.len()*8` must fit one header page — so an over-cap batch can never
+    /// silently index out of the header page (`rmp` #385).
     fn encode_header(homes: &[PageId]) -> Page {
+        debug_assert!(
+            homes.len() <= DWB_MAX_BATCH,
+            "DWB header batch of {} exceeds the {DWB_MAX_BATCH}-page header capacity",
+            homes.len()
+        );
         let mut hdr = [0u8; PAGE_SIZE];
         hdr[HDR_OFF_MAGIC..HDR_OFF_MAGIC + 8].copy_from_slice(&DWB_MAGIC.to_le_bytes());
         hdr[HDR_OFF_COUNT..HDR_OFF_COUNT + 8].copy_from_slice(&(homes.len() as u64).to_le_bytes());
@@ -235,16 +256,32 @@ impl<D: BlockDevice> Dwb<D> {
             if home_id.0 >= home.page_count() {
                 continue;
             }
+            // Read the home page. On the **plaintext** device a torn page reads back as bytes whose
+            // CRC32C fails `verify_checksum`. On the **encrypted** device (`graphus_crypto`) the
+            // torn slot fails its GCM tag and `read_page` returns an *error* instead — the same
+            // "this page is unreadable/torn" signal, surfaced differently by the AEAD seam. Both must
+            // be treated identically: the page is torn and must be repaired from the DWB copy.
+            // Propagating the encrypted-device read error here (the old `?`) would make recovery
+            // *fail* on exactly the torn-page case the DWB exists to repair — so a home read error is
+            // mapped to "torn", not propagated.
             let mut home_buf: Page = [0u8; PAGE_SIZE];
-            home.read_page(*home_id, &mut home_buf)?;
-            if page::verify_checksum(&home_buf) {
+            let home_intact = match home.read_page(*home_id, &mut home_buf) {
+                Ok(()) => page::verify_checksum(&home_buf),
+                Err(_) => false, // unreadable/torn (e.g. AEAD failure on the encrypted device)
+            };
+            if home_intact {
                 continue; // home image intact (old or new) — redo reconciles it
             }
             // Home page is torn. Restore from the DWB copy.
             let slot = PageId(DWB_FIRST_DATA_SLOT + i as u64);
             let mut dwb_buf: Page = [0u8; PAGE_SIZE];
-            self.device.read_page(slot, &mut dwb_buf)?;
-            if !page::verify_checksum(&dwb_buf) {
+            // A DWB-slot read that errors (an AEAD failure on an encrypted DWB device, i.e. the copy
+            // is itself torn) is the unrepairable double fault — surface it, never hide it.
+            let dwb_readable = match self.device.read_page(slot, &mut dwb_buf) {
+                Ok(()) => page::verify_checksum(&dwb_buf),
+                Err(_) => false,
+            };
+            if !dwb_readable {
                 return Err(GraphusError::Storage(format!(
                     "doublewrite recovery: home page {} is torn and its doublewrite copy in slot {} \
                      is also corrupt — unrepairable double fault",

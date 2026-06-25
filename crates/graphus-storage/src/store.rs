@@ -281,6 +281,16 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// [`recovered_txn_hw`](Self::recovered_txn_hw) so the coordinator that owns the id counter
     /// (`graphus_cypher::TxnCoordinator`) can seed it monotonically across recovery.
     recovered_txn_hw: u64,
+    /// The optional **doublewrite buffer** protecting this store's home-page writes from torn writes
+    /// (`05 §3`, `04 §4.5`; `rmp` #384). When present, [`checkpoint`](Self::checkpoint) and
+    /// [`flush`](Self::flush) route their home flush through [`flush_protected`](Self::flush_protected)
+    /// — every dirty home page is staged-and-synced into the DWB before it is written home, so a torn
+    /// home page can be repaired from its intact DWB copy on the next open
+    /// ([`crate::recovery::recover_device_with_dwb`]). The DWB device is the **same** [`BlockDevice`]
+    /// type as the store's own device, so an encrypted store's DWB is an encrypted device sharing the
+    /// store's key (no plaintext page image is ever written to the DWB area). `None` for an
+    /// unprotected store (e.g. a transient in-memory scratch store with no torn-write threat).
+    dwb: Option<crate::dwb::Dwb<D>>,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -333,6 +343,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             unfrozen_commit_lsn: BTreeMap::new(),
             // A fresh store has no prior transactions in its (just-created) WAL.
             recovered_txn_hw: 0,
+            // No doublewrite buffer until one is attached ([`attach_dwb`]); the fresh-create flush
+            // below therefore runs unprotected, which is correct — there is no committed data yet.
+            dwb: None,
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -404,6 +417,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             wal_len_at_last_checkpoint: shared_len,
             unfrozen_commit_lsn,
             recovered_txn_hw,
+            // No doublewrite buffer until the caller attaches one ([`attach_dwb`]). The DWB-aware
+            // torn-page repair runs in [`crate::recovery::recover_device_with_dwb`] *before* this
+            // `open`, so the store opens onto an already-repaired device; the attached DWB then
+            // protects subsequent checkpoint/flush home writes.
+            dwb: None,
         })
     }
 
@@ -1021,8 +1039,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`WalManager::checkpoint`].
     pub fn checkpoint(&mut self) -> Result<()> {
         // Sharp checkpoint: make every logged change durable on its data page (WAL-before-data is
-        // enforced per page inside `flush_all`), then mark the clean point in the log.
-        self.pool.flush_all()?;
+        // enforced per page inside the flush), then mark the clean point in the log. When a
+        // doublewrite buffer is attached (`rmp` #384) the home flush is routed through it, so a torn
+        // home write during the checkpoint is repairable from the DWB copy on the next open; without
+        // one it is the historical bare `flush_all`. `flush` selects the right path.
+        self.flush()?;
         // Reclaim the WAL prefix that recovery no longer needs (`rmp` #114): below the checkpoint
         // (redo floor — everything before is flushed) AND below the oldest unfrozen committed
         // transaction's commit record (so an unfrozen in-flight stamp stays resolvable). The WAL
@@ -3254,7 +3275,51 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a write-back or device sync fails.
     pub fn flush(&mut self) -> Result<()> {
-        self.pool.flush_all()
+        // When a doublewrite buffer is attached ([`attach_dwb`], `rmp` #384), route the home flush
+        // through it so a torn home write is repairable on the next open. Otherwise (no DWB attached
+        // — e.g. a transient scratch store) flush directly, the historical behaviour.
+        if self.dwb.is_some() {
+            self.flush_protected_with_attached_dwb()
+        } else {
+            self.pool.flush_all()
+        }
+    }
+
+    /// Attaches a persistent doublewrite buffer to this store (`rmp` #384). Once attached,
+    /// [`checkpoint`](Self::checkpoint) and [`flush`](Self::flush) route their home writes through
+    /// [`flush_protected`](Self::flush_protected): every dirty home page is staged-and-synced into
+    /// the DWB before it is written home, so a torn home write is repairable from the DWB copy by
+    /// [`crate::recovery::recover_device_with_dwb`] on the next open.
+    ///
+    /// The DWB device must be the **same** [`BlockDevice`] type as the store's device (so an
+    /// encrypted store gets an encrypted DWB, keeping page images off disk in plaintext). The caller
+    /// constructs the (persistent) DWB device — a file alongside the store — and hands it here at
+    /// open time, before serving any traffic.
+    pub fn attach_dwb(&mut self, dwb: crate::dwb::Dwb<D>) {
+        self.dwb = Some(dwb);
+    }
+
+    /// `true` when a doublewrite buffer is attached and protecting this store's home writes.
+    #[must_use]
+    pub fn has_dwb(&self) -> bool {
+        self.dwb.is_some()
+    }
+
+    /// Runs [`flush_protected`](Self::flush_protected) against the **attached** DWB, temporarily
+    /// taking it out of `self` to satisfy the borrow checker (`flush_protected` borrows `&mut self`
+    /// and `&mut Dwb`), then putting it back even on error. Only called when `self.dwb.is_some()`.
+    fn flush_protected_with_attached_dwb(&mut self) -> Result<()> {
+        let mut dwb = self.dwb.take().expect(
+            "INVARIANT: flush_protected_with_attached_dwb is only called when a DWB is set",
+        );
+        let result = self.flush_protected(&mut dwb);
+        // After a successful protected flush every home page is durable, so the current DWB batch is
+        // no longer needed; clear it (best-effort hygiene — a stale-but-valid batch is still safe,
+        // recovery only restores a page that fails its own checksum). A clear failure is not fatal to
+        // the flush that already succeeded, so it is folded into the result, never masking the flush.
+        let result = result.and_then(|()| dwb.clear());
+        self.dwb = Some(dwb);
+        result
     }
 
     /// Flushes every dirty page home **under doublewrite protection** (`05 §3`, `04 §4.5`): the
@@ -3266,22 +3331,33 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The current image of every mapped page is snapshotted through the pool (the dirty image if
     /// resident, else the on-disk image) and staged; over-staging a clean page is harmless (it only
     /// costs DWB I/O, never correctness — recovery restores a home page *only* if it fails its own
-    /// checksum). After the DWB sync returns the pages are written home via [`flush`](Self::flush),
-    /// so the durable-before-home ordering the protocol requires holds.
+    /// checksum).
+    ///
+    /// ## The doublewrite invariant, for **any** dirty-set size (`rmp` #385)
+    ///
+    /// The dirty set is processed in batches of [`crate::dwb::DWB_MAX_BATCH`] pages — the DWB area
+    /// holds at most one batch ([`crate::dwb::dwb_device_pages`]), so the **whole** image set cannot
+    /// be staged at once when it exceeds the cap. For each batch we therefore stage-and-sync that
+    /// batch into the DWB and only then write home **exactly the pages of that batch** via
+    /// [`ConcurrentBufferPool::flush_pages`](graphus_bufpool::ConcurrentBufferPool::flush_pages) —
+    /// never the whole dirty pool. This guarantees the protocol invariant for any dirty-set size:
+    /// *every dirty home page is staged-and-synced into the doublewrite area before it is written
+    /// home*. (The previous code flushed the **whole** pool per batch, so for a dirty set larger
+    /// than one batch the home pages of batches 2..N were written home before their DWB image
+    /// existed — a tear on such a page had no intact copy to repair from.)
+    ///
+    /// A dirty page sits in the pool with its body finalised but its **checksum field stale**: the
+    /// pool recomputes the checksum only at write-back (`graphus_bufpool` `write_back` →
+    /// `page::write_checksum`). The doublewrite copy must be the *exact image that lands home*, so we
+    /// re-stamp the checksum on our private snapshot — identical to what write-back will write.
+    /// Without this the DWB would hold a copy that fails its own checksum and could not repair a torn
+    /// home page.
     ///
     /// # Errors
     /// Returns a storage error if a page read, a DWB stage/sync, or the home flush fails. A DWB
     /// error aborts before any home write, preserving the protocol's ordering.
     pub fn flush_protected<W: BlockDevice>(&mut self, dwb: &mut crate::dwb::Dwb<W>) -> Result<()> {
         let pages = self.mapped_pages();
-        // Snapshot the current (pending) image of each page; bounded by the DWB batch cap.
-        //
-        // A dirty page sits in the pool with its body finalised but its **checksum field stale**: the
-        // pool recomputes the checksum only at write-back (`graphus_bufpool` `write_back` →
-        // `page::write_checksum`). The doublewrite copy must be the *exact image that lands home*, so
-        // we re-stamp the checksum on our private snapshot — identical to what write-back will write.
-        // Without this the DWB would hold a copy that fails its own checksum and could not repair a
-        // torn home page.
         let mut images: Vec<(PageId, Box<graphus_io::Page>)> = Vec::with_capacity(pages.len());
         for p in &pages {
             let mut img = self.read_device_page(*p)?;
@@ -3291,10 +3367,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for chunk in images.chunks(crate::dwb::DWB_MAX_BATCH) {
             let batch: Vec<(PageId, &graphus_io::Page)> =
                 chunk.iter().map(|(p, img)| (*p, img.as_ref())).collect();
+            // 1. Stage this batch's images into the DWB and make them durable.
             dwb.stage_batch(&batch)?;
-            // Home write for this batch. We flush all dirty frames; the DWB has the batch durable, so
-            // a torn home write among them is repairable.
-            self.pool.flush_all()?;
+            // 2. Only now write home EXACTLY this batch's pages — never the whole pool. Every page
+            //    written here has its intact DWB copy already durable, so a torn home write among
+            //    them is repairable; a page belonging to a later batch is not touched until its own
+            //    image is staged (the doublewrite invariant, `05 §3`).
+            let batch_ids: Vec<PageId> = chunk.iter().map(|(p, _)| *p).collect();
+            self.pool.flush_pages(&batch_ids)?;
         }
         Ok(())
     }
@@ -3744,6 +3824,304 @@ mod tests {
             assert_send_sync::<RecordStore<D, S>>();
         }
         assert_generic::<MemBlockDevice, MemLogSink>();
+    }
+
+    /// A [`BlockDevice`] wrapper that records, into a *shared* event log, the order and page id of
+    /// every page written through it. The same log is shared between the home device and the
+    /// doublewrite device so the test can reconstruct the **global** interleaving of stage-into-DWB
+    /// vs write-home events and assert the doublewrite invariant. (`rmp` #385.)
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WriteEvent {
+        /// A page image staged into the doublewrite area (the home id read from the image header).
+        Stage(u64),
+        /// A page written to its home location on the data device.
+        Home(u64),
+    }
+
+    struct RecordingDevice {
+        inner: MemBlockDevice,
+        log: std::rc::Rc<std::cell::RefCell<Vec<WriteEvent>>>,
+        /// `true` for the doublewrite device (records `Stage`), `false` for the home device
+        /// (records `Home`). A staged image self-identifies via its `page_id` header, so a DWB
+        /// data-slot write is recorded under the *home* page id it carries, not the slot id.
+        is_dwb: bool,
+    }
+
+    impl RecordingDevice {
+        fn record(&mut self, buf: &graphus_io::Page) {
+            // The DWB header slot is not a protected home page (it carries the batch's metadata,
+            // page_id 0); skip it so only real staged home images are recorded.
+            let pid = page::page_id(buf);
+            let ev = if self.is_dwb {
+                if !page::verify_checksum(buf) || page::page_type(buf) == 0 && pid == 0 {
+                    // header slot or a non-page write — not a staged home image
+                    return;
+                }
+                WriteEvent::Stage(pid)
+            } else {
+                WriteEvent::Home(pid)
+            };
+            self.log.borrow_mut().push(ev);
+        }
+    }
+
+    impl BlockDevice for RecordingDevice {
+        fn read_page(&self, page: PageId, buf: &mut graphus_io::Page) -> Result<()> {
+            self.inner.read_page(page, buf)
+        }
+        fn write_page(&mut self, page: PageId, buf: &graphus_io::Page) -> Result<()> {
+            self.record(buf);
+            self.inner.write_page(page, buf)
+        }
+        fn write_pages(&mut self, base: PageId, pages: &[&graphus_io::Page]) -> Result<()> {
+            for p in pages {
+                self.record(p);
+            }
+            self.inner.write_pages(base, pages)
+        }
+        fn sync_data(&mut self) -> Result<()> {
+            self.inner.sync_data()
+        }
+        fn sync_all(&mut self) -> Result<()> {
+            self.inner.sync_all()
+        }
+        fn page_count(&self) -> u64 {
+            self.inner.page_count()
+        }
+        fn extend(&mut self, additional: u64) -> Result<()> {
+            self.inner.extend(additional)
+        }
+    }
+
+    /// `rmp` #385 — the doublewrite invariant for a dirty set **larger than one DWB batch**: every
+    /// dirty home page must be staged-and-synced into the doublewrite area *before* it is written
+    /// home. The previous `flush_protected` flushed the **whole** pool inside its batch loop, so a
+    /// page in batch 2..N was written home by batch 1's flush, *before* its DWB image existed — a
+    /// tear on it had no intact copy to repair from. This test allocates more than
+    /// [`crate::dwb::DWB_MAX_BATCH`] mapped pages, dirties a page in the second batch (image index
+    /// `>= DWB_MAX_BATCH`) as well as the first, records every (stage, home) event through wrapper
+    /// devices sharing one log, and asserts that for **every** page its first stage precedes its
+    /// first home write.
+    #[test]
+    fn flush_protected_stages_every_page_before_any_home_write() {
+        use crate::dwb::{DWB_MAX_BATCH, Dwb};
+
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<WriteEvent>::new()));
+        let home_dev = RecordingDevice {
+            inner: MemBlockDevice::new(0),
+            log: std::rc::Rc::clone(&log),
+            is_dwb: false,
+        };
+        // A pool large enough to keep every allocated page resident-and-dirty through to the flush,
+        // so the home-write side touches a page in the second batch.
+        let pool_capacity = DWB_MAX_BATCH + 256;
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let mut store: RecordStore<RecordingDevice, MemLogSink> =
+            RecordStore::create(home_dev, wal, pool_capacity, 1).expect("create store");
+
+        // Allocate more node-store pages than one DWB batch can hold, so the image set spans >= 2
+        // batches. `ensure_store_page` allocates a page and leaves it dirty (WAL-logged type word).
+        let txn = TxnId(1);
+        store.begin(txn);
+        let target_pages = DWB_MAX_BATCH + 64; // image set crosses the first batch boundary
+        for rel_page in 0..target_pages as u64 {
+            store
+                .ensure_store_page(StoreKind::Node, rel_page, txn)
+                .expect("ensure store page");
+        }
+        store.commit(txn).expect("commit");
+
+        // The mapped image set must exceed one batch, or the test would not exercise the bug.
+        let mapped = store.mapped_pages().len();
+        assert!(
+            mapped > DWB_MAX_BATCH,
+            "test must map more than one DWB batch ({mapped} <= {DWB_MAX_BATCH})"
+        );
+
+        // Discard every write recorded during store setup (page allocation, the commit's
+        // checkpoint_meta, evictions) — only the `flush_protected` interleaving is under test.
+        log.borrow_mut().clear();
+
+        // Flush under doublewrite protection through a recording DWB device sharing the same log.
+        let dwb_dev = RecordingDevice {
+            inner: MemBlockDevice::new(0),
+            log: std::rc::Rc::clone(&log),
+            is_dwb: true,
+        };
+        let mut dwb = Dwb::new(dwb_dev).expect("dwb");
+        store.flush_protected(&mut dwb).expect("flush_protected");
+
+        // Assert the invariant: for every page that was written home, its first stage event in the
+        // global log precedes its first home-write event. A pre-#385 `flush_protected` flushed the
+        // whole pool in batch 1, so a batch-2 page's Home event appeared before its Stage event.
+        let events = log.borrow();
+        let mut first_stage: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        let mut first_home: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        for (i, ev) in events.iter().enumerate() {
+            match ev {
+                WriteEvent::Stage(p) => {
+                    first_stage.entry(*p).or_insert(i);
+                }
+                WriteEvent::Home(p) => {
+                    first_home.entry(*p).or_insert(i);
+                }
+            }
+        }
+        assert!(
+            !first_home.is_empty(),
+            "the flush must have written home pages (none recorded)"
+        );
+        let mut checked_beyond_first_batch = false;
+        for (page, &home_at) in &first_home {
+            let stage_at = first_stage.get(page).copied().unwrap_or_else(|| {
+                panic!("page {page} was written home but never staged into the DWB")
+            });
+            assert!(
+                stage_at < home_at,
+                "page {page}: home write at event {home_at} preceded its DWB stage at event \
+                 {stage_at} — the doublewrite invariant is violated (a tear on it would be \
+                 unrepairable)"
+            );
+            // Track whether at least one of the checked home pages lives in the second-or-later
+            // batch (the exact pages the pre-#385 bug wrote home unprotected).
+            if let Some(pos) = store.mapped_pages().iter().position(|m| m.0 == *page) {
+                if pos >= DWB_MAX_BATCH {
+                    checked_beyond_first_batch = true;
+                }
+            }
+        }
+        assert!(
+            checked_beyond_first_batch,
+            "the test must exercise at least one dirty home page beyond the first DWB batch \
+             (image index >= {DWB_MAX_BATCH}), which is exactly what the pre-#385 code wrote \
+             home unprotected"
+        );
+    }
+
+    /// `rmp` #385 — crash variant: a torn home page in a **beyond-first-batch** position must be
+    /// repaired by `recover_home` from its doublewrite copy. With the pre-#385 whole-pool flush, a
+    /// batch-2 page was written home before its DWB image existed, so a tear on it had **no** copy
+    /// to repair from. With the per-batch home write, the batch-2 page's DWB copy is durable before
+    /// its home write, so the tear is repaired.
+    #[test]
+    fn flush_protected_repairs_a_torn_beyond_first_batch_page() {
+        use crate::dwb::{DWB_MAX_BATCH, Dwb};
+
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let pool_capacity = DWB_MAX_BATCH + 256;
+        let mut store: Store = RecordStore::create(device, wal, pool_capacity, 1).expect("create");
+
+        let txn = TxnId(1);
+        store.begin(txn);
+        let target_pages = DWB_MAX_BATCH + 64;
+        for rel_page in 0..target_pages as u64 {
+            store
+                .ensure_store_page(StoreKind::Node, rel_page, txn)
+                .expect("ensure store page");
+        }
+        store.commit(txn).expect("commit");
+
+        // Flush under doublewrite protection into a DWB device we then snapshot.
+        let mut dwb = Dwb::new(MemBlockDevice::new(0)).expect("dwb");
+        store.flush_protected(&mut dwb).expect("flush_protected");
+
+        // Snapshot the home image; tear a page BEYOND the first DWB batch (image index
+        // >= DWB_MAX_BATCH) — exactly the page class the pre-#385 bug wrote home unprotected.
+        let mapped = store.mapped_pages();
+        assert!(
+            mapped.len() > DWB_MAX_BATCH,
+            "test must map more than one DWB batch"
+        );
+        let staged: Vec<(u64, Box<graphus_io::Page>)> = mapped
+            .iter()
+            .map(|p| (p.0, store.read_device_page(*p).expect("read device page")))
+            .collect();
+
+        // Pick a beyond-first-batch page and a prefix whose tear provably corrupts it. A torn write
+        // keeps the new image's first `prefix` bytes and reverts the rest to the home device's prior
+        // bytes (all-zero on this fresh device). A freshly-allocated record page is non-zero only in
+        // its header (checksum + page_id/type + the logged type word) and otherwise zero, so a
+        // *small* prefix that keeps the checksum field (bytes 0..4) but zeroes the page_id/type that
+        // follow makes the checksum fail — a real, repairable tear. We scan prefixes to find one.
+        let mut torn = None;
+        let mut prefix = 0usize;
+        'outer: for (image_idx, (idx, bytes)) in staged.iter().enumerate() {
+            if image_idx < DWB_MAX_BATCH || *idx == 0 {
+                continue;
+            }
+            for cut in [8usize, 16, 24, 32, 64] {
+                let mut sim = [0u8; PAGE_SIZE];
+                sim[..cut].copy_from_slice(&bytes[..cut]);
+                if !page::verify_checksum(&sim) {
+                    torn = Some(*idx);
+                    prefix = cut;
+                    break 'outer;
+                }
+            }
+        }
+        let torn = torn.expect("a beyond-first-batch page with a corrupting prefix tear");
+        assert!(
+            mapped.iter().position(|m| m.0 == torn).expect("mapped") >= DWB_MAX_BATCH,
+            "the torn page must be beyond the first DWB batch"
+        );
+
+        // Materialise the on-disk home image, tearing the chosen page.
+        let max = mapped.iter().map(|p| p.0).max().unwrap();
+        let mut home = MemBlockDevice::new(max + 1);
+        for (idx, bytes) in &staged {
+            if *idx == torn {
+                home.arm_torn_write(PageId(*idx), prefix);
+            }
+            home.write_page(PageId(*idx), bytes).expect("write home");
+        }
+        home.sync_all().expect("sync home");
+
+        // Precondition: the tear actually landed (the home page now fails its checksum).
+        let mut buf = [0u8; PAGE_SIZE];
+        home.read_page(PageId(torn), &mut buf).expect("read torn");
+        assert!(
+            !page::verify_checksum(&buf),
+            "the simulated tear must corrupt home page {torn}"
+        );
+
+        // Snapshot the DWB device and run the DWB repair pass (the recovery-side of the protocol).
+        let dwb_pages = dwb.device().page_count();
+        let mut dwb_dev = MemBlockDevice::new(dwb_pages);
+        for i in 0..dwb_pages {
+            let mut b = [0u8; PAGE_SIZE];
+            dwb.device().read_page(PageId(i), &mut b).expect("read dwb");
+            dwb_dev.write_page(PageId(i), &b).expect("stage dwb");
+        }
+        dwb_dev.sync_all().expect("sync dwb");
+        let mut dwb_restore = Dwb::new(dwb_dev).expect("dwb restore");
+
+        let repaired = dwb_restore.recover_home(&mut home).expect("recover_home");
+        assert_eq!(
+            repaired, 1,
+            "the beyond-first-batch torn page must be repaired from its DWB copy"
+        );
+
+        // The repaired home page must now be intact and equal to the staged image.
+        let mut got = [0u8; PAGE_SIZE];
+        home.read_page(PageId(torn), &mut got)
+            .expect("read repaired");
+        assert!(
+            page::verify_checksum(&got),
+            "home page {torn} must be intact after DWB repair"
+        );
+        let original = &staged
+            .iter()
+            .find(|(idx, _)| *idx == torn)
+            .expect("staged")
+            .1;
+        assert_eq!(
+            &got[..],
+            &original[..][..],
+            "repaired page must equal its doublewrite copy"
+        );
     }
 
     #[test]

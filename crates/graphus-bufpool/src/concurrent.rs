@@ -886,6 +886,90 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         device.sync_all()
     }
 
+    /// Writes back **only** the dirty frames whose home `PageId` is in `pages`, then syncs the
+    /// device once. This is the targeted counterpart of [`flush_all`](Self::flush_all): it lets a
+    /// caller flush a *bounded subset* of the dirty set home without writing the rest, which the
+    /// doublewrite-protected checkpoint requires — each batch's home pages must only be written
+    /// *after that batch's* images are durable in the doublewrite buffer, never before
+    /// ([`crate::page`]; `graphus_storage::RecordStore::flush_protected`, `05 §3`).
+    ///
+    /// Every per-page durability guarantee of `flush_all` is preserved for the selected pages: the
+    /// checksum is stamped and the WAL-before-data rule (`ensure_durable(page_lsn)`) is enforced
+    /// *before* the page's bytes are written home, frames are flushed under their write latch (held
+    /// across the device write so no concurrent mutator or the evictor can tear the in-flight
+    /// image), and a single trailing `sync_all` barrier is issued after the batch. Frames not in
+    /// `pages` are left dirty and untouched, captured by a later flush.
+    ///
+    /// The same F12 concurrency contract applies: a selected frame re-dirtied after its latch is
+    /// released here is captured by a later flush; a sharp checkpoint still requires the
+    /// (single-writer) engine to quiesce writers, which it does by construction.
+    ///
+    /// # Errors
+    /// Propagates the first WAL-rule, device-write or sync failure.
+    pub fn flush_pages(&self, pages: &[PageId]) -> Result<()> {
+        use rustc_hash::FxHashSet;
+        let wanted: FxHashSet<u64> = pages.iter().map(|p| p.0).collect();
+
+        // Phase 1: collect the dirty frames whose page id is wanted, with their write latches held.
+        let mut guards: Vec<(usize, RwLockWriteGuard<'_, FrameMeta>)> = Vec::new();
+        for (idx, slot) in self.frames.iter().enumerate() {
+            let meta = unwrap_lock(slot.meta.write());
+            if meta.dirty && meta.page_id.is_some_and(|p| wanted.contains(&p.0)) {
+                guards.push((idx, meta));
+            }
+        }
+        if guards.is_empty() {
+            return self.write_device().sync_all();
+        }
+
+        // Phase 2: per-page WAL-before-data — identical to `flush_all`.
+        for (idx, meta) in &mut guards {
+            let page_id = meta.page_id.ok_or_else(|| {
+                GraphusError::Storage("a dirty frame must hold a page".to_owned())
+            })?;
+            page::write_checksum(&mut meta.data);
+            let lsn = page::page_lsn(&meta.data);
+            debug_assert!(
+                lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
+                "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did \
+                 not stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
+                page_id.0
+            );
+            self.ensure_durable(lsn)?;
+            let _ = idx;
+        }
+
+        // Phase 3: order the held frames by page id and coalesce contiguous runs (as `flush_all`).
+        guards.sort_by_key(|(_, meta)| meta.page_id.expect("dirty frame holds a page").0);
+        let mut device = self.write_device();
+        let mut run_start = 0usize;
+        for i in 1..=guards.len() {
+            let break_run = i == guards.len() || {
+                let prev = guards[i - 1].1.page_id.expect("dirty frame holds a page").0;
+                let cur = guards[i].1.page_id.expect("dirty frame holds a page").0;
+                cur != prev + 1
+            };
+            if break_run {
+                let base = guards[run_start]
+                    .1
+                    .page_id
+                    .expect("dirty frame holds a page");
+                let run: Vec<&Page> = guards[run_start..i]
+                    .iter()
+                    .map(|(_, meta)| &*meta.data)
+                    .collect();
+                device.write_pages(base, &run)?;
+                run_start = i;
+            }
+        }
+
+        // Phase 4: the selected bytes are home — mark them clean, then the single barrier.
+        for (_, meta) in &mut guards {
+            meta.dirty = false;
+        }
+        device.sync_all()
+    }
+
     /// A snapshot count of currently dirty frames (diagnostics / tests).
     #[must_use]
     pub fn dirty_frames(&self) -> usize {

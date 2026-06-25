@@ -81,6 +81,11 @@ pub use check::{
     IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, Violation, verify_on_open,
 };
 pub use dwb::{DWB_MAX_BATCH, Dwb, dwb_device_pages};
+/// The page-header codec (checksum / `page_id` / `page_lsn` / type accessors) the storage layer
+/// stamps on every device page, re-exported from `graphus_bufpool` so callers above this crate
+/// (the server's recovery/repair tests, offline tools) can inspect on-disk page headers without a
+/// direct dependency on the buffer-pool crate.
+pub use graphus_bufpool::page;
 pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use incremental::{
