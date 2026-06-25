@@ -1116,6 +1116,7 @@ dependencies = [
 name = "graphus-coldstore"
 version = "0.0.1"
 dependencies = [
+ "crc32c",
  "graphus-columnar",
  "proptest",
 ]

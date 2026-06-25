@@ -10,6 +10,7 @@ description = "Immutable columnar cold tier for aged time-series partitions: dou
 
 [dependencies]
 graphus-columnar = { path = "../graphus-columnar" }
+crc32c = "0.6"
 
 [dev-dependencies]
 proptest = "1.11.0"

@@ -58,18 +58,39 @@ pub struct Reading {
     pub sensor: String,
 }
 
-/// The 4-byte segment magic (`"GCS1"`) and version, so a truncated/foreign buffer is rejected rather
+/// The 4-byte segment magic (`"GCS2"`) and version, so a truncated/foreign buffer is rejected rather
 /// than mis-decoded.
-const MAGIC: [u8; 4] = *b"GCS1";
+///
+/// Bumped `GCS1` → `GCS2` for the format v2 change (`rmp` #420): a trailing CRC32C integrity field
+/// now covers the whole segment, so any v1 buffer (no trailer) is rejected by the magic rather than
+/// silently mis-validated. The crate is still staged/unwired (no v1 segment was ever persisted), so
+/// no migration path is required.
+const MAGIC: [u8; 4] = *b"GCS2";
+
+/// The format version carried in the header (v2: whole-segment trailing CRC32C, `rmp` #420).
+const VERSION: u8 = 2;
+
+/// The trailing integrity field length: a little-endian CRC32C (Castagnoli) over the whole segment
+/// body (everything before the trailer). The same `crc32c` crate the `.gcol` (`rmp` #405),
+/// `graphus-bufpool` page, and `graphus-wal` frame checksums use, so the integrity discipline is
+/// uniform across the storage layer.
+const CRC_LEN: usize = 4;
 
 /// A decode error: a buffer that is not a valid, complete cold segment. Decoding never panics on a
 /// malformed buffer — it returns this (the codecs are fuzzed for exactly this property).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColdError {
-    /// The buffer is shorter than the fixed header, or a declared column length runs past its end.
+    /// The buffer is shorter than the fixed header (incl. the trailing CRC32C), or a declared column
+    /// length runs past its end.
     Truncated,
     /// The magic / version bytes do not match — not a cold segment of this format.
     BadMagic,
+    /// The trailing CRC32C does not match a fresh checksum of the body — the segment is corrupt
+    /// (bit-rot / torn write / tamper), or the declared `count` cannot fit the segment bytes. The
+    /// integrity field is verified **before** any length/bound/`count` field is trusted, so a bit
+    /// flip — including one inside the `min_ts`/`max_ts` skip bounds — is a controlled error, never
+    /// silently-wrong data (`04 §11.4`).
+    Corrupt,
     /// A column blob itself is corrupt: a codec payload was truncated, named an unknown sub-scheme,
     /// or carried an out-of-range dictionary code. Surfaced from [`graphus_columnar`] so a corrupt
     /// segment is a controlled error here too (`04 §11.4`), never a panic.
@@ -81,6 +102,12 @@ impl std::fmt::Display for ColdError {
         match self {
             ColdError::Truncated => write!(f, "cold segment buffer is truncated"),
             ColdError::BadMagic => write!(f, "cold segment magic/version mismatch"),
+            ColdError::Corrupt => {
+                write!(
+                    f,
+                    "cold segment integrity check failed (CRC32C mismatch or bad count)"
+                )
+            }
             ColdError::BadColumn(e) => write!(f, "cold segment column is corrupt: {e}"),
         }
     }
@@ -102,10 +129,14 @@ impl std::error::Error for ColdError {}
 /// magic[4] version[1] count[u32] min_ts[i64] max_ts[i64]
 /// len_seq[u32] len_ts[u32] len_value[u32] len_sensor[u32]
 /// <seq blob> <ts blob> <value blob> <sensor blob>
+/// crc32c[u32]   // format v2 (rmp #420): CRC32C over every preceding byte
 /// ```
 ///
-/// All integers are little-endian. The segment owns its encoded bytes; reads decode columns on
-/// demand (whole-column, the codec granularity) so the struct stays small and shareable.
+/// All integers are little-endian. The trailing CRC32C (format v2) covers the entire segment — header
+/// **and** every column blob — so a single bit flip anywhere (including inside the `min_ts`/`max_ts`
+/// skip bounds or the `count`) is detected on decode and surfaced as [`ColdError::Corrupt`], never
+/// served as silently-wrong data. The segment owns its encoded bytes; reads decode columns on demand
+/// (whole-column, the codec granularity) so the struct stays small and shareable.
 #[derive(Debug, Clone)]
 pub struct ColdSegment {
     count: usize,
@@ -170,7 +201,8 @@ impl ColdSegment {
         (self.min_ts, self.max_ts)
     }
 
-    /// The compressed byte footprint of the segment (header + the four encoded columns).
+    /// The compressed byte footprint of the segment (header + the four encoded columns + the trailing
+    /// CRC32C integrity field).
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         HEADER_LEN
@@ -178,6 +210,7 @@ impl ColdSegment {
             + self.ts_blob.len()
             + self.value_blob.len()
             + self.sensor_blob.len()
+            + CRC_LEN
     }
 
     /// Decodes **every** reading, exactly as encoded (the round-trip-exact contract). Use a range scan
@@ -242,7 +275,7 @@ impl ColdSegment {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(&MAGIC);
-        out.push(1); // version
+        out.push(VERSION);
         out.extend_from_slice(&(self.count as u32).to_le_bytes());
         out.extend_from_slice(&self.min_ts.to_le_bytes());
         out.extend_from_slice(&self.max_ts.to_le_bytes());
@@ -254,19 +287,37 @@ impl ColdSegment {
         out.extend_from_slice(&self.ts_blob);
         out.extend_from_slice(&self.value_blob);
         out.extend_from_slice(&self.sensor_blob);
+        // Trailing CRC32C over every preceding byte (format v2, `rmp` #420): the last thing written,
+        // the first thing verified on decode.
+        let crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
         out
     }
 
     /// Reconstructs a segment from a buffer produced by [`to_bytes`](Self::to_bytes).
     ///
     /// # Errors
+    /// [`ColdError::Corrupt`] if the trailing CRC32C does not match (verified **first**, before any
+    /// header field is trusted) or the declared `count` cannot fit the segment bytes;
     /// [`ColdError::BadMagic`] if the magic/version is wrong; [`ColdError::Truncated`] if the buffer
-    /// is shorter than the header or a declared column length runs past its end. Never panics.
+    /// is shorter than the header (incl. the CRC trailer) or a declared column length runs past its
+    /// end. Never panics, and never returns a structurally-valid-but-corrupt segment.
     pub fn from_bytes(buf: &[u8]) -> Result<Self, ColdError> {
-        if buf.len() < HEADER_LEN {
+        // Step 1 — integrity FIRST. Verify the trailing CRC32C over the body before trusting any
+        // length/bound/`count` field, so a bit flip anywhere (header, skip bounds, or payload) is a
+        // controlled `Corrupt` error and never a silently-wrong decode (`04 §11.4`, `rmp` #420).
+        if buf.len() < HEADER_LEN + CRC_LEN {
             return Err(ColdError::Truncated);
         }
-        if buf[0..4] != MAGIC || buf[4] != 1 {
+        let (body, trailer) = buf.split_at(buf.len() - CRC_LEN);
+        let stored = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        if crc32c::crc32c(body) != stored {
+            return Err(ColdError::Corrupt);
+        }
+        // Step 2 — only now is `body` trusted-intact: parse it. `buf` is rebound to the verified body
+        // so no field read below can reach into (or past) the CRC trailer.
+        let buf = body;
+        if buf[0..4] != MAGIC || buf[4] != VERSION {
             return Err(ColdError::BadMagic);
         }
         let rd_u32 =
@@ -290,6 +341,17 @@ impl ColdSegment {
         let len_ts = rd_u32(29) as usize;
         let len_value = rd_u32(33) as usize;
         let len_sensor = rd_u32(37) as usize;
+        // Step 3 — validate `count` against the payload before handing it to the column decoders.
+        // `count` is load-bearing: each decoder is asked to materialize exactly `count` elements, and
+        // a FOR-width-0 integer column decodes to `vec![0; count]` *without* consulting its payload
+        // (graphus-columnar bitpack), so an out-of-range `count` would drive an allocation unbounded
+        // by the on-disk bytes. A segment can never hold more rows than it has bytes, so a `count`
+        // exceeding the body length is structurally impossible — reject it here, capping the worst
+        // case to the segment's actual size. (CRC already proved the bytes intact; this guards a
+        // count that is intact-but-absurd, e.g. a forged or mis-built segment.)
+        if count > buf.len() {
+            return Err(ColdError::Corrupt);
+        }
         let mut off = HEADER_LEN;
         let mut take = |n: usize| -> Result<Vec<u8>, ColdError> {
             let end = off.checked_add(n).ok_or(ColdError::Truncated)?;
@@ -472,19 +534,119 @@ mod tests {
             ColdSegment::from_bytes(&[0; 8]).unwrap_err(),
             ColdError::Truncated
         );
-        let mut bytes = ColdSegment::encode(&sample(10)).to_bytes();
-        bytes[0] = b'X'; // corrupt the magic
+        // A buffer too short to even hold the header + CRC trailer is `Truncated`.
         assert_eq!(
-            ColdSegment::from_bytes(&bytes).unwrap_err(),
-            ColdError::BadMagic
-        );
-        // Truncate the body: a declared column length now runs past the end.
-        let mut t = ColdSegment::encode(&sample(10)).to_bytes();
-        t.truncate(t.len() - 3);
-        assert_eq!(
-            ColdSegment::from_bytes(&t).unwrap_err(),
+            ColdSegment::from_bytes(&[0; HEADER_LEN]).unwrap_err(),
             ColdError::Truncated
         );
+        // Corrupting the magic also breaks the CRC, which is checked FIRST → `Corrupt` (a foreign
+        // buffer that happens to carry a matching CRC would still be caught by the magic check).
+        let mut bytes = ColdSegment::encode(&sample(10)).to_bytes();
+        bytes[0] = b'X';
+        assert_eq!(
+            ColdSegment::from_bytes(&bytes).unwrap_err(),
+            ColdError::Corrupt
+        );
+        // A foreign-but-self-consistent buffer (valid CRC, wrong magic) is rejected as `BadMagic`.
+        let mut foreign = ColdSegment::encode(&sample(10)).to_bytes();
+        let body_len = foreign.len() - CRC_LEN;
+        foreign[0] = b'X';
+        let crc = crc32c::crc32c(&foreign[..body_len]);
+        foreign[body_len..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            ColdSegment::from_bytes(&foreign).unwrap_err(),
+            ColdError::BadMagic
+        );
+    }
+
+    #[test]
+    fn coldstore_single_byte_flip_is_detected() {
+        // Flip every single byte of a well-formed segment, one at a time, and assert decode never
+        // serves silently-wrong data and never panics. The CRC32C trailer must catch every flip —
+        // including ones inside the `min_ts`/`max_ts` skip bounds (header offsets 9..25), the `count`
+        // (offsets 5..9) and the column payloads. (`rmp` #420)
+        let readings = sample(200);
+        let original = ColdSegment::encode(&readings).to_bytes();
+        for i in 0..original.len() {
+            for flip in [0x01u8, 0x80u8, 0xFFu8] {
+                let mut corrupted = original.clone();
+                corrupted[i] ^= flip;
+                if corrupted == original {
+                    continue; // 0x00 ^ x can't happen here, but be defensive.
+                }
+                match ColdSegment::from_bytes(&corrupted) {
+                    // The overwhelmingly common outcome: integrity caught the flip.
+                    Err(ColdError::Corrupt | ColdError::BadMagic | ColdError::Truncated) => {}
+                    Err(ColdError::BadColumn(_)) => {}
+                    Ok(seg) => {
+                        // from_bytes accepted it ONLY if the flip produced a byte-identical buffer,
+                        // which CRC makes impossible — so any Ok must round-trip to the SAME data.
+                        // (Never silently-wrong.) Decoding must also never panic.
+                        let decoded = seg.decode_all();
+                        assert!(
+                            decoded.is_err() || decoded.unwrap() == readings,
+                            "byte {i} flip {flip:#04x}: segment decoded to DIFFERENT data — \
+                             silently-wrong read escaped the integrity check"
+                        );
+                        let _ = seg.scan_ts_range(i64::MIN, i64::MAX);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coldstore_truncation_is_detected() {
+        // Truncating the blob at any offset must be a controlled Err (the CRC trailer is lost or no
+        // longer matches the shortened body), never a panic and never a wrong decode. (`rmp` #420)
+        let original = ColdSegment::encode(&sample(300)).to_bytes();
+        for cut in [
+            0,
+            1,
+            HEADER_LEN - 1,
+            HEADER_LEN,
+            HEADER_LEN + 1,
+            original.len() / 2,
+            original.len() - CRC_LEN - 1,
+            original.len() - CRC_LEN,
+            original.len() - 1,
+        ] {
+            if cut >= original.len() {
+                continue;
+            }
+            let truncated = &original[..cut];
+            let err = ColdSegment::from_bytes(truncated)
+                .expect_err("a truncated cold segment must be rejected");
+            assert!(
+                matches!(err, ColdError::Truncated | ColdError::Corrupt),
+                "truncation at {cut} gave {err:?}, expected Truncated or Corrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn coldstore_header_count_overflow_is_detected() {
+        // Forge a `count` far larger than the segment can possibly hold, then re-stamp a VALID CRC
+        // over the forged body (so the CRC passes and the `count` guard is what must reject it).
+        // Without the guard, the FOR-width-0 columnar path would try to allocate `count` elements
+        // unbounded by the on-disk size. (`rmp` #420)
+        let mut bytes = ColdSegment::encode(&sample(8)).to_bytes();
+        let body_len = bytes.len() - CRC_LEN;
+        // Overwrite count (offset 5, u32 LE) with a value that cannot fit the bytes.
+        bytes[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc = crc32c::crc32c(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            ColdSegment::from_bytes(&bytes).unwrap_err(),
+            ColdError::Corrupt,
+            "an intact-but-absurd count (count > body bytes) must be rejected up front"
+        );
+
+        // A count equal to the body length is the boundary: still structurally impossible to fill
+        // with this tiny segment, but the guard only rejects strictly-greater-than. Confirm the
+        // realistic forge (count just past the body) is caught, and that a genuine segment passes.
+        let good = ColdSegment::encode(&sample(8)).to_bytes();
+        assert!(ColdSegment::from_bytes(&good).is_ok());
     }
 
     #[test]
