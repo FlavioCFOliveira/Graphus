@@ -444,6 +444,21 @@ impl<S: LogSink> WalManager<S> {
         self.sink.reclaim(HEADER_LEN, floor)
     }
 
+    /// The **first LSN** (its `BEGIN`, or earliest logged record) of the **oldest still-active**
+    /// (uncommitted, un-aborted) transaction, or `None` if no transaction is currently active.
+    ///
+    /// This is the WAL position at and after which an online backup must capture the log so that a
+    /// restore can roll back any transaction that was in flight when the backup was taken (`rmp`
+    /// #413). A `backup_store` steals an in-flight transaction's dirty pages into the base image
+    /// (steal/no-force), so the chain must also carry that transaction's *undo* records — every one
+    /// from its first LSN onward — or recovery's loser-undo back-chain walks a `prev_lsn` into an
+    /// LSN that is not in the restored log and silently stops, leaving uncommitted data baked into
+    /// the base as if committed (an atomicity violation).
+    #[must_use]
+    pub fn oldest_active_first_lsn(&self) -> Option<Lsn> {
+        self.active.values().map(|s| s.first_lsn).min()
+    }
+
     /// The buffer-pool **WAL rule** (`§4` / `graphus_bufpool::WalRule`): before a dirty page
     /// whose `page_lsn` is `up_to` is written home, the log must be durable through `up_to`.
     /// Because the log only ever syncs whole records, `durable_len` lands on a record boundary,

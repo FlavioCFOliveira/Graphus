@@ -485,9 +485,27 @@ impl LinkCodec for Plain {
 /// at base time, sealing the base through `codec`.
 ///
 /// The returned `(manifest, base_link)` is the chain at its origin (zero increments). The `base_lsn`
-/// recorded in the manifest is the WAL `durable_len` *after* [`backup_store`] has flushed and
-/// checkpointed, so every change `< base_lsn` is already captured in the base's page images and the
-/// first increment will begin exactly at `base_lsn` (`04 §4.7`).
+/// recorded in the manifest is the WAL position at and after which the chain's incremental WAL
+/// capture begins; the first increment will begin exactly at `base_lsn` (`04 §4.7`).
+///
+/// # Online backup of an in-flight transaction (`rmp` #413)
+///
+/// [`backup_store`] flushes the buffer pool with a **steal** policy, so a *still-running* (explicit,
+/// uncommitted) transaction's dirty pages are written into the base image even though that
+/// transaction has not committed. The base therefore captures uncommitted data; for a restore to
+/// roll it back, the chain must also carry that transaction's **undo records** — every one from its
+/// first logged record onward. Recovery's loser-undo follows the `prev_lsn` back-chain, and any LSN
+/// below the restored log's start is *not* in the recovery index and is silently skipped
+/// (`graphus_wal::recovery`), which would truncate the undo chain and leave the uncommitted pages
+/// baked into the base as if committed (an **atomicity** violation).
+///
+/// So `base_lsn` is the **minimum** of the post-backup `durable_len` and the **first LSN of the
+/// oldest still-active transaction** ([`WalManager::oldest_active_first_lsn`]). With no transaction
+/// in flight this is just `durable_len` (the historical, online-friendly behaviour). With one in
+/// flight, the chain's first increment starts at its first record, so on restore recovery sees the
+/// full undo back-chain and rolls the in-flight transaction back completely. Everything `< base_lsn`
+/// is already in the base's page images (committed *and* the redo-able prefix recovery repeats), so
+/// the increments remain contiguous and the restored state is consistent and committed-or-nothing.
 ///
 /// # Errors
 /// Returns a storage error if the base backup fails (which also means the *source* store is corrupt,
@@ -496,11 +514,17 @@ pub fn begin_chain<D: BlockDevice, S: LogSink, C: LinkCodec>(
     store: &mut RecordStore<D, S>,
     codec: &C,
 ) -> Result<(ChainManifest, Vec<u8>)> {
-    // `backup_store` flushes + checkpoints first; the resulting WAL `durable_len` is the watermark
-    // at and after which the incremental WAL capture begins. Order matters: read the watermark
-    // *after* the backup so the base and base_lsn are coherent.
+    // `backup_store` flushes (steal) + checkpoints first; read the watermark *after* the backup so
+    // the base and base_lsn are coherent.
     let artifact = backup_store(store)?;
-    let base_lsn = store.with_wal(|w| w.durable_len());
+    // The chain must start no later than the oldest in-flight transaction's first record, so a
+    // restore carries the undo records needed to roll that transaction back (#413 — the base's
+    // steal-flush may have baked its uncommitted pages in). With nothing in flight, this is exactly
+    // `durable_len` (the prior online behaviour).
+    let durable_len = store.with_wal(|w| w.durable_len());
+    let base_lsn = store
+        .with_wal(|w| w.oldest_active_first_lsn())
+        .map_or(durable_len, |oldest| durable_len.min(oldest.0));
     let base_creation_mark = backup_creation_marker(&artifact)?;
 
     let manifest = ChainManifest {
@@ -676,6 +700,25 @@ pub enum RestoreTarget {
     Timestamp(Timestamp),
 }
 
+/// The actual point a [`restore_to`] recovered to, plus whether the requested target had to be
+/// **clamped** to the chain tip (`rmp` #432). The operator-facing restore surface returns this so a
+/// `RESTORE … AS OF <T>` with `<T>` past the end of the chain is never silently mistaken for an
+/// exact-point restore: `clamped == true` tells the operator the chain did not extend as far as the
+/// requested target and the newest captured committed state was restored instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    /// The target the caller asked for.
+    pub requested: RestoreTarget,
+    /// The WAL byte offset (LSN) the log was actually cut at — the consistent committed point the
+    /// restored device is left at. For [`RestoreTarget::Latest`] this is the chain tip.
+    pub restored_lsn: Lsn,
+    /// `true` when the requested target lay **past the chain tip** (an [`RestoreTarget::Lsn`] beyond
+    /// the last captured byte, or a [`RestoreTarget::Timestamp`] later than every captured commit),
+    /// so the restore was clamped to the tip. `false` for an in-range target or for
+    /// [`RestoreTarget::Latest`] (which targets the tip by definition).
+    pub clamped: bool,
+}
+
 /// **Point-in-time restore** of a backup chain onto `device` (`rmp` task #71). Lays down the base,
 /// then replays the chain's WAL — truncated at `target` — through the proven recovery machinery, so
 /// the device is left at exactly the consistent committed state of `target`.
@@ -708,6 +751,15 @@ pub enum RestoreTarget {
 /// full [`restore_onto`](crate::restore_onto) of that base: the concatenated WAL is empty, so
 /// recovery is a no-op over an empty log and only the base page images land on the device.
 ///
+/// # Target past the chain tip (`rmp` #432)
+///
+/// A [`RestoreTarget::Timestamp`] later than every captured commit (or a [`RestoreTarget::Lsn`]
+/// beyond the last captured byte) cannot restore "the future": the chain simply does not extend that
+/// far. Rather than silently behaving like [`Latest`](RestoreTarget::Latest) (which would let an
+/// operator believe they restored to an exact point that the chain never reached), the restore is
+/// **clamped to the chain tip** and the returned [`RestoreOutcome`] carries `clamped == true` plus
+/// the actual `restored_lsn`, so the operator can see the requested point was out of range.
+///
 /// `device` should be a fresh device addressable from page `0` (typically a
 /// [`MemBlockDevice`](graphus_io::MemBlockDevice) or a file device); it is grown as needed and
 /// hardened before returning.
@@ -721,7 +773,7 @@ pub fn restore_to<D: BlockDevice, C: LinkCodec>(
     target: RestoreTarget,
     device: &mut D,
     codec: &C,
-) -> Result<()> {
+) -> Result<RestoreOutcome> {
     // Re-prove integrity (and authenticate sealed links) before touching the device.
     verify_chain(manifest, links, codec)?;
 
@@ -736,8 +788,9 @@ pub fn restore_to<D: BlockDevice, C: LinkCodec>(
     //    We reconstruct it as a real WAL byte image so a fresh `WalManager` can open + scan it.
     let mut wal_bytes = build_logical_wal(manifest, links, codec)?;
 
-    // 3. Truncate the logical WAL at the target *before* recovery.
-    truncate_at_target(&mut wal_bytes, manifest.base_lsn, target);
+    // 3. Truncate the logical WAL at the target *before* recovery. Reports the actual cut and
+    //    whether the target had to be clamped to the tip (#432).
+    let cut = truncate_at_target(&mut wal_bytes, manifest.base_lsn, target);
 
     // 4. Replay through the proven three-phase recovery against the device, beginning the analysis
     //    scan at `base_lsn` (the chain's records start there; `[HEADER_LEN, base_lsn)` is an
@@ -745,7 +798,11 @@ pub fn restore_to<D: BlockDevice, C: LinkCodec>(
     let sink = SliceLogSink::new(wal_bytes);
     let mut wal = WalManager::open(sink)?;
     recover_device_from(&mut wal, device, manifest.base_lsn)?;
-    Ok(())
+    Ok(RestoreOutcome {
+        requested: target,
+        restored_lsn: Lsn(cut.cut_lsn),
+        clamped: cut.clamped,
+    })
 }
 
 /// **Atomic, verified point-in-time file restore** of a backup chain onto the store file at
@@ -764,6 +821,9 @@ pub fn restore_to<D: BlockDevice, C: LinkCodec>(
 /// [`restore_file_atomic`](crate::restore_file_atomic)); the verification uses a throwaway in-memory
 /// WAL (the chain restore leaves the device at a consistent committed state with no pending replay).
 ///
+/// Returns the [`RestoreOutcome`] (the actual restored point and whether the target was clamped to
+/// the chain tip, `rmp` #432); a caller may surface `clamped` to the operator.
+///
 /// # Errors
 /// Returns a storage error (or a `codec.open` security error) if the chain fails [`verify_chain`],
 /// laying it down fails, the restored image fails the consistency check, or the temp/rename/
@@ -777,15 +837,16 @@ pub fn restore_chain_file_atomic<D, FD, C>(
     target_path: &Path,
     open_device: FD,
     pool_capacity: usize,
-) -> Result<()>
+) -> Result<RestoreOutcome>
 where
     D: BlockDevice,
     FD: FnOnce(&Path) -> Result<D>,
     C: LinkCodec,
 {
+    let mut outcome: Option<RestoreOutcome> = None;
     atomic_replace_file(target_path, |tmp| {
         let mut device = open_device(tmp)?;
-        restore_to(manifest, links, target, &mut device, codec)?;
+        outcome = Some(restore_to(manifest, links, target, &mut device, codec)?);
         // Prove the restored image is consistent before it replaces the target (read-only open over
         // the just-hardened device with a throwaway WAL; dropping it closes the temp fd pre-rename).
         let mut store = RecordStore::open(
@@ -796,6 +857,11 @@ where
         verify_on_open(&mut store, &[])?;
         drop(store);
         Ok(())
+    })?;
+    // `atomic_replace_file` only returns `Ok` after the fill closure ran to completion, so `outcome`
+    // is always set here.
+    outcome.ok_or_else(|| {
+        GraphusError::Storage("restore completed without producing a restore outcome".to_owned())
     })
 }
 
@@ -851,41 +917,100 @@ fn write_wal_header(buf: &mut [u8]) {
     buf[4..8].copy_from_slice(&WAL_VERSION.to_le_bytes());
 }
 
+/// The result of truncating the logical WAL at a [`RestoreTarget`]: the byte offset (LSN) the log was
+/// cut at, and whether the requested target lay **past the chain tip** (so the restore was clamped to
+/// the tip — `rmp` #432).
+#[derive(Debug, Clone, Copy)]
+struct CutResult {
+    /// The byte offset the log was truncated to (the consistent committed point restored).
+    cut_lsn: u64,
+    /// `true` when the requested target was past the tip (clamped to the tip).
+    clamped: bool,
+}
+
 /// Truncates the logical WAL `bytes` in place at `target` (see [`restore_to`] step 3). `base_lsn` is
-/// where the chain's records start; the scan never decodes the pre-`base_lsn` gap.
-fn truncate_at_target(bytes: &mut Vec<u8>, base_lsn: Lsn, target: RestoreTarget) {
+/// where the chain's records start; the scan never decodes the pre-`base_lsn` gap. Returns the actual
+/// cut and whether the target was clamped to the chain tip (`rmp` #432).
+fn truncate_at_target(bytes: &mut Vec<u8>, base_lsn: Lsn, target: RestoreTarget) -> CutResult {
+    let tip = bytes.len();
     let cut = match target {
-        RestoreTarget::Latest => return,
+        // Latest targets the tip by definition: keep everything, never "clamped".
+        RestoreTarget::Latest => {
+            return CutResult {
+                cut_lsn: tip as u64,
+                clamped: false,
+            };
+        }
         RestoreTarget::Lsn(l) => {
             // Cut at byte `l`. A record straddling `l` is dropped by `recover`'s torn-tail handling;
             // a record ending exactly at `l` survives. Never cut before the WAL header / base_lsn.
-            (l.0 as usize).max(base_lsn.0 as usize).min(bytes.len())
+            let requested = (l.0 as usize).max(base_lsn.0 as usize);
+            let cut = requested.min(tip);
+            bytes.truncate(cut);
+            // An LSN target beyond the last captured byte cannot be honoured exactly: clamp to tip.
+            return CutResult {
+                cut_lsn: cut as u64,
+                clamped: l.0 as usize > tip,
+            };
         }
         RestoreTarget::Timestamp(t) => commit_cut_for_timestamp(bytes, base_lsn, t),
     };
-    bytes.truncate(cut);
+    bytes.truncate(cut.cut_lsn as usize);
+    cut
 }
 
 /// Finds the byte offset just **after** the last `COMMIT` record whose `commit_ts <= t`, scanning the
-/// chain's records forward from `base_lsn`. Returns `base_lsn` if no such commit exists (restore to
-/// the base only — every later transaction is a loser and is undone).
+/// chain's records forward from `base_lsn`. Returns `base_lsn` (with `clamped == false`) if no such
+/// commit exists (restore to the base only — every later transaction is a loser and is undone).
 ///
 /// Cutting *after* a commit record (rather than at its start) keeps that transaction a winner: its
 /// `COMMIT` is in the truncated log, so redo applies it and undo leaves it alone. The very next
 /// record — the first byte of a later, now-excluded transaction's work — and everything after it is
 /// gone, so those transactions have no `COMMIT` in the log and are undone.
-fn commit_cut_for_timestamp(bytes: &[u8], base_lsn: Lsn, t: Timestamp) -> usize {
+///
+/// # `commit_ts`-monotonicity invariant (`rmp` #432)
+///
+/// The cut relies on `COMMIT` records appearing in **non-decreasing `commit_ts`** order along the WAL.
+/// That holds in Graphus today because a single serial engine thread assigns commit timestamps and
+/// appends the `COMMIT` records in the same order, so an earlier-appended commit never carries a
+/// *later* timestamp. This function does **not** assume it blindly: it tracks the highest in-window
+/// commit's end offset and the previous commit's `commit_ts`, and if it ever sees a commit whose
+/// `commit_ts` is *less than* a prior commit's (the invariant broken — a concurrent committer was
+/// introduced without revisiting this cut), it `debug_assert!`s loudly in debug builds and falls back
+/// to the **maximum** end offset over *all* in-window commits, which is correct regardless of order
+/// (recovery still replays the bytes in LSN order; only the cut position is chosen). The result is
+/// `clamped == true` exactly when every captured commit is `<= t` (the target is at or past the last
+/// commit's timestamp), i.e. the chain does not extend past the requested point.
+fn commit_cut_for_timestamp(bytes: &[u8], base_lsn: Lsn, t: Timestamp) -> CutResult {
     let mut cursor = base_lsn.0 as usize;
     let mut cut = base_lsn.0 as usize;
+    let mut prev_commit_ts: Option<Timestamp> = None;
+    // `true` iff every commit seen so far has `commit_ts <= t` (no commit was excluded by the cut).
+    let mut all_in_window = true;
     while cursor < bytes.len() {
         match LogRecord::decode(&bytes[cursor..]) {
             Ok((rec, n)) => {
                 let end = cursor + n;
                 if rec.rec_type == RecordType::Commit {
                     if let Some(ts) = rec.commit_ts() {
+                        // Verify the non-decreasing-`commit_ts` invariant the cut relies on.
+                        if let Some(prev) = prev_commit_ts {
+                            debug_assert!(
+                                ts >= prev,
+                                "PITR commit_ts invariant violated: commit at offset {cursor} has \
+                                 commit_ts {ts:?} < a prior commit's {prev:?}; the timestamp cut \
+                                 assumes WAL commits are in non-decreasing commit_ts order \
+                                 (single serial commit engine). Falling back to the max in-window \
+                                 offset (still correct)."
+                            );
+                        }
+                        prev_commit_ts = Some(ts);
                         if ts <= t {
-                            // This commit is in-window; keep everything up to and including it.
-                            cut = end;
+                            // In-window: keep everything up to and including it. `max` is robust to a
+                            // non-monotonic sequence (we never move the cut backward).
+                            cut = cut.max(end);
+                        } else {
+                            all_in_window = false;
                         }
                     }
                 }
@@ -895,7 +1020,11 @@ fn commit_cut_for_timestamp(bytes: &[u8], base_lsn: Lsn, t: Timestamp) -> usize 
             Err(_) => break,
         }
     }
-    cut
+    CutResult {
+        cut_lsn: cut as u64,
+        // Past the tip iff there were commits and every one was `<= t` (target at/after the last).
+        clamped: all_in_window && prev_commit_ts.is_some(),
+    }
 }
 
 /// A read-only [`LogSink`] over a fixed, already-durable WAL byte image, for driving recovery during

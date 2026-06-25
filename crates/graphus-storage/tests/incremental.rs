@@ -28,7 +28,7 @@ use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_storage::{
     ChainLinks, ChainManifest, LinkCodec, Namespace, Plain, RecordStore, RestoreTarget,
     backup_store, begin_chain, capture_increment, restore_chain_file_atomic, restore_onto,
-    restore_to, verify_chain,
+    restore_to, verify_chain, verify_on_open,
 };
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -220,6 +220,148 @@ fn pitr_to_timestamp_reflects_exactly_the_committed_prefix() {
     );
 }
 
+// =================================================================================================
+// 2c. PITR robustness (`rmp` #432): a timestamp BETWEEN two commits restores exactly the committed
+//     prefix <= T; a target PAST the chain tip is clamped to the tip and the outcome signals it.
+// =================================================================================================
+
+#[test]
+fn pitr_timestamp_between_two_commits_restores_exactly_the_prefix() {
+    let mut store = fresh(64);
+    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let mut links = ChainLinks {
+        base: base_link,
+        increments: Vec::new(),
+    };
+
+    let (a1, _, _) = commit_edge(&mut store, TxnId(1), "T1");
+    let ts1 = store.snapshot_ts();
+    links
+        .increments
+        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+
+    let (a2, _, _) = commit_edge(&mut store, TxnId(2), "T2");
+    let ts2 = store.snapshot_ts();
+    links
+        .increments
+        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc2"));
+
+    assert!(ts1 < ts2, "timestamps must be monotonic: {ts1:?} < {ts2:?}");
+
+    // A target in `[ts1, ts2)` must keep T1 (committed at ts1 <= target) and undo T2 (committed at
+    // ts2 > target). Pick the largest such value: a strict midpoint if the commits are spaced, else
+    // ts1 itself (adjacent commit timestamps — the boundary case). Either way it is `< ts2`.
+    let mid = (ts1.0 + ts2.0) / 2;
+    let between = graphus_core::Timestamp(mid.max(ts1.0));
+    assert!(
+        ts1.0 <= between.0 && between.0 < ts2.0,
+        "target must satisfy ts1 <= T < ts2 ({ts1:?} <= {between:?} < {ts2:?})"
+    );
+
+    let mut device = MemBlockDevice::new(0);
+    let outcome = restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Timestamp(between),
+        &mut device,
+        &Plain,
+    )
+    .expect("restore @ between");
+    // T2 committed after the target, so the requested point is NOT past the tip: not clamped.
+    assert!(
+        !outcome.clamped,
+        "a target between two commits is in-range, not clamped: {outcome:?}"
+    );
+
+    let wal = WalManager::create(MemLogSink::new()).expect("wal");
+    let restored = RecordStore::open(device, wal, 64).expect("open restored");
+    assert!(
+        restored.node(a1).unwrap().mvcc.in_use(),
+        "T1 (committed <= T) present"
+    );
+    assert!(
+        !restored.node(a2).map(|n| n.mvcc.in_use()).unwrap_or(false),
+        "T2 (committed > T) absent"
+    );
+}
+
+#[test]
+fn pitr_target_past_chain_tip_clamps_with_an_operator_visible_signal() {
+    let mut store = fresh(64);
+    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let mut links = ChainLinks {
+        base: base_link,
+        increments: Vec::new(),
+    };
+
+    let (a1, _, _) = commit_edge(&mut store, TxnId(1), "T1");
+    let last_ts = store.snapshot_ts();
+    links
+        .increments
+        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+
+    let tip = manifest.tip_lsn();
+
+    // (a) A TIMESTAMP far past the last commit: clamped to the tip, restored_lsn == tip, signalled.
+    let future = graphus_core::Timestamp(last_ts.0 + 1_000_000);
+    let mut dev_ts = MemBlockDevice::new(0);
+    let out_ts = restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Timestamp(future),
+        &mut dev_ts,
+        &Plain,
+    )
+    .expect("restore @ future ts");
+    assert!(
+        out_ts.clamped,
+        "a timestamp past the last commit must be clamped (not a silent Latest): {out_ts:?}"
+    );
+    assert_eq!(
+        out_ts.restored_lsn, tip,
+        "clamped timestamp restore must land at the chain tip"
+    );
+    // The committed work is still all there (clamp == restore the newest captured state).
+    let wal = WalManager::create(MemLogSink::new()).expect("wal");
+    let restored = RecordStore::open(dev_ts, wal, 64).expect("open");
+    assert!(
+        restored.node(a1).unwrap().mvcc.in_use(),
+        "T1 present at clamp"
+    );
+
+    // (b) An LSN past the last captured byte: also clamped to the tip with the signal set.
+    let mut dev_lsn = MemBlockDevice::new(0);
+    let out_lsn = restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Lsn(graphus_core::Lsn(tip.0 + 4096)),
+        &mut dev_lsn,
+        &Plain,
+    )
+    .expect("restore @ lsn past tip");
+    assert!(
+        out_lsn.clamped,
+        "an LSN past the tip must be clamped, not silently treated as exact: {out_lsn:?}"
+    );
+    assert_eq!(
+        out_lsn.restored_lsn, tip,
+        "clamped LSN restore lands at the tip"
+    );
+
+    // (c) Latest is the tip BY DEFINITION — never reported as clamped.
+    let mut dev_latest = MemBlockDevice::new(0);
+    let out_latest = restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Latest,
+        &mut dev_latest,
+        &Plain,
+    )
+    .expect("restore @ latest");
+    assert!(!out_latest.clamped, "Latest is not a clamp: {out_latest:?}");
+    assert_eq!(out_latest.restored_lsn, tip);
+}
+
 #[test]
 fn pitr_to_lsn_cuts_at_a_record_boundary() {
     let mut store = fresh(64);
@@ -294,6 +436,129 @@ fn pitr_before_any_commit_restores_the_base_only() {
     assert!(
         !t2_present,
         "T2 committed after the base must be absent at ts0"
+    );
+}
+
+// =================================================================================================
+// 2b. Online backup of an IN-FLIGHT transaction: its uncommitted data must NOT survive a restore
+//     (`rmp` #413 — atomicity). A `backup_store` steals the in-flight txn's dirty pages into the
+//     base; the chain must carry that txn's undo records (base_lsn pulled back to its first LSN) so
+//     restore's loser-undo rolls it back completely.
+// =================================================================================================
+
+/// Snapshots every node slot's liveness into a `Vec<bool>` over a freshly-opened store, the
+/// canonical "what does this durable image contain" yardstick for comparing two restores.
+fn node_liveness(device: MemBlockDevice, cap: usize) -> Vec<bool> {
+    let wal = WalManager::create(MemLogSink::new()).expect("wal");
+    let mut store = RecordStore::open(device, wal, cap).expect("open");
+    // The restored image must itself be structurally consistent.
+    verify_on_open(&mut store, &[]).expect("restored store passes the consistency checker");
+    let mut out = Vec::new();
+    let mut id = 0u64;
+    while let Ok(rec) = store.node(id) {
+        out.push(rec.mvcc.in_use());
+        id += 1;
+    }
+    out
+}
+
+#[test]
+fn online_backup_mid_inflight_txn_does_not_bake_uncommitted_data() {
+    let mut store = fresh(64);
+
+    // Committed pre-txn state: this is exactly what a mid-txn online backup must restore to.
+    let (a1, _, _) = commit_edge(&mut store, TxnId(1), "COMMITTED");
+
+    // Capture the committed image as the oracle (a full backup at the pre-txn point).
+    let pre_txn_image = {
+        let base = backup_store(&mut store).expect("oracle backup");
+        let mut dev = MemBlockDevice::new(0);
+        restore_onto(&base, &mut dev).expect("restore oracle");
+        node_liveness(dev, 64)
+    };
+
+    // Begin an EXPLICIT transaction and write — but do NOT commit. Its dirty pages are now in the
+    // pool and will be stolen into the base by `begin_chain`'s flush.
+    let inflight = TxnId(2);
+    store.begin(inflight);
+    let (a2, _) = store.create_node(inflight).expect("in-flight node");
+    let t = store
+        .intern_token(Namespace::RelType, "INFLIGHT")
+        .expect("token");
+    let (a3, _) = store.create_node(inflight).expect("in-flight node 2");
+    let _r = store
+        .create_rel(inflight, t, a2, a3)
+        .expect("in-flight rel");
+
+    // Take the ONLINE backup MID-transaction (no commit, no abort).
+    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("online begin mid-txn");
+    let mut links = ChainLinks {
+        base: base_link,
+        increments: Vec::new(),
+    };
+    // Capture the WAL appended since base_lsn (the in-flight txn's records up to now) so the chain
+    // is self-contained for a restore.
+    links
+        .increments
+        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("increment"));
+
+    // Restore the chain at Latest into a fresh device, then probe liveness of every node. This is
+    // the PRIMARY fail-before/pass-after assertion: the in-flight txn's data must be ABSENT.
+    let probe = RecordStore::open(
+        {
+            let mut d = MemBlockDevice::new(0);
+            restore_to(&manifest, &links, RestoreTarget::Latest, &mut d, &Plain)
+                .expect("restore mid-txn chain");
+            d
+        },
+        WalManager::create(MemLogSink::new()).expect("wal"),
+        64,
+    )
+    .expect("open restored");
+    assert!(
+        probe.node(a1).unwrap().mvcc.in_use(),
+        "the committed node must survive the restore"
+    );
+    // Before the #413 fix, base_lsn == durable_len excluded the in-flight txn's BEGIN/UPDATE
+    // records, recovery's loser-undo back-chain truncated at the chain boundary, and these stolen
+    // pages survived as if committed — these two assertions FAIL. With the fix they pass.
+    assert!(
+        !probe.node(a2).map(|n| n.mvcc.in_use()).unwrap_or(false),
+        "the in-flight (uncommitted) node a2 must be absent after restore (#413)"
+    );
+    assert!(
+        !probe.node(a3).map(|n| n.mvcc.in_use()).unwrap_or(false),
+        "the in-flight (uncommitted) node a3 must be absent after restore (#413)"
+    );
+    drop(probe);
+
+    // The restored image must also be structurally consistent and match the pre-txn committed
+    // oracle slot-for-slot (undone slots read back not-live either way).
+    let mut device = MemBlockDevice::new(0);
+    restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Latest,
+        &mut device,
+        &Plain,
+    )
+    .expect("re-restore");
+    let restored = node_liveness(device, 64); // calls verify_on_open internally
+    for (id, live) in pre_txn_image.iter().enumerate() {
+        assert_eq!(
+            restored.get(id).copied().unwrap_or(false),
+            *live,
+            "node slot {id} liveness must match the pre-txn committed state"
+        );
+    }
+
+    // And the chain must carry the undo back-chain (base_lsn pulled back to <= the in-flight txn's
+    // first record); a regression in `begin_chain` that re-excludes it is caught here too.
+    let oldest = store.with_wal(|w| w.oldest_active_first_lsn().map_or(u64::MAX, |l| l.0));
+    assert!(
+        manifest.base_lsn.0 <= oldest,
+        "base_lsn {} must not exclude the in-flight transaction's first record {oldest}",
+        manifest.base_lsn.0
     );
 }
 

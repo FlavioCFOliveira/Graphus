@@ -90,8 +90,8 @@ pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use incremental::{
     CHAIN_FORMAT_VERSION, ChainArtifact, ChainLinks, ChainManifest, IncrementMeta, LinkCodec,
-    Plain, RestoreTarget, begin_chain, capture_increment, restore_chain_file_atomic, restore_to,
-    verify_chain,
+    Plain, RestoreOutcome, RestoreTarget, begin_chain, capture_increment,
+    restore_chain_file_atomic, restore_to, verify_chain,
 };
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use meta::{
