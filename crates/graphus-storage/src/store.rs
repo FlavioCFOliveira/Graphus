@@ -3841,6 +3841,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub(crate) fn checker_block(&mut self, id: u64) -> Result<HeapBlock> {
         self.read_block(id)
     }
+
+    /// The number of currently **dirty** buffer-pool frames (#426). The offline consistency checker
+    /// uses this to enforce its *cold-open* contract: it verifies on-disk checksums by re-reading
+    /// pages through the pool, but a resident **dirty** page is served from cache without a disk
+    /// read, so resident corruption (or a stale checksum) would be silently missed. A cold pool has
+    /// zero dirty frames, so `checker_dirty_frames() == 0` is the precise, cheap invariant the
+    /// checker asserts before trusting its checksum pass (see [`crate::check::assert_cold_open`]).
+    ///
+    /// Gated to the `check-cold-assert` feature: it is read only by the feature-gated cold-open
+    /// enforcement, so the default build does not compile it (no dead-code).
+    #[cfg(feature = "check-cold-assert")]
+    pub(crate) fn checker_dirty_frames(&self) -> usize {
+        self.pool.dirty_frames()
+    }
 }
 
 /// Which neighbour pointer is being repaired during an unlink.

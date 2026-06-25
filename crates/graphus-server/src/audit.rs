@@ -12,10 +12,19 @@
 //! - **Append-only + line-delimited JSON (JSONL).** Each line is exactly one self-contained, compact
 //!   JSON object followed by `\n`. One object per line is what makes a torn final line (from a crash
 //!   mid-append) *detectable* — see [`AuditLog::open`].
-//! - **Crash-safe.** Security-relevant events are `fsync`'d *before the call returns*, so the event
-//!   is durable before the client learns the operation's outcome. On reopen a torn final line is
-//!   detected and truncated, so the log never accumulates partial garbage (the recovery is the core
-//!   of this module — [`AuditLog::open`]).
+//! - **Crash-safe — with a precisely-stated durability contract.** *Security-relevant* events
+//!   (auth outcomes, authorization denials, and admin/schema/security changes) are `fsync`'d
+//!   *before the recording call returns*, so the event is durable before the client learns the
+//!   operation's outcome (when [`AuditConfig::fsync_security_events`] is on, the default).
+//!   *Data-change* events ([`AuditClass::DataChange`]) are, by default, **batched** (left in the OS
+//!   page cache, hardened on the next security event or on [`AuditLog::flush`]); they are durable
+//!   *before the ack only* when [`AuditConfig::fsync_data_changes`] is enabled. With batching, a
+//!   crash between the engine's commit and the next sync can lose the data-change *audit line* — the
+//!   committed mutation itself is never lost, because **the graph WAL is the authoritative durable
+//!   record of the write**; the audit line is a secondary, forensic trail. An operator who needs the
+//!   audit line to be durable-before-ack for every audited write sets `fsync_data_changes = true`
+//!   (at a throughput cost). On reopen a torn final line is detected and truncated, so the log never
+//!   accumulates partial garbage (the recovery is the core of this module — [`AuditLog::open`]).
 //! - **Non-dropping.** The write path is synchronous, serialized behind a [`std::sync::Mutex`]:
 //!   there is no bounded queue to overflow, so there is structurally no *silent* drop. An I/O error
 //!   (e.g. a full disk) is surfaced **loudly** via `tracing` and counted, but never panics and never
@@ -30,7 +39,9 @@
 //! Each line is an on-disk record: a monotonically increasing `seq`, an RFC 3339 UTC `ts`, and the
 //! event fields (`class`, `outcome`, `source`, `actor`, `database`, `peer`, `detail`). The `seq`
 //! counter is independent of the file — it continues monotonically across rotations and is recovered
-//! (as `max valid seq + 1`) on reopen so a restart never reuses or skips a number.
+//! on reopen as `max valid seq + 1` over **both the active file and the retained rotated files**, so
+//! a restart (even one immediately following a rotation that left the active file empty) never
+//! reuses or skips a number.
 //!
 //! ## Threading
 //!
@@ -313,6 +324,16 @@ pub struct AuditConfig {
     /// volume can be very high, and the security-relevant signal is the auth/authz/admin trail; an
     /// operator opts into data auditing explicitly when the deployment requires it.
     pub audit_data_changes: bool,
+    /// Whether `DataChange` events are `fsync`'d **before the recording call returns** (like a
+    /// security event), rather than batched. **Default `false`** to preserve write throughput.
+    ///
+    /// With the default (`false`) a data-change audit line is left in the OS page cache and hardened
+    /// only on the next security event or on [`AuditLog::flush`]; a crash in that window can lose the
+    /// audit *line* (never the committed write — the graph WAL is authoritative). Set this to `true`
+    /// when the deployment requires every audited write's record to be durable before its ack, at a
+    /// per-write `fsync` cost. Has no effect unless [`audit_data_changes`](Self::audit_data_changes)
+    /// is also on (a data-change event that is not recorded cannot be synced).
+    pub fsync_data_changes: bool,
     /// The active file rotates when an append would take it to/over this many bytes. **Default 64
     /// MiB.** `0` disables size-based rotation (a single growing file).
     pub rotate_max_bytes: u64,
@@ -328,6 +349,7 @@ impl Default for AuditConfig {
             path: None,
             fsync_security_events: true,
             audit_data_changes: false,
+            fsync_data_changes: false,
             rotate_max_bytes: DEFAULT_ROTATE_MAX_BYTES,
             retain_files: DEFAULT_RETAIN_FILES,
         }
@@ -411,6 +433,9 @@ pub struct AuditLog {
     /// `audit_data_changes`: whether `DataChange` events are recorded (the seams consult this so a
     /// disabled data-change category never even builds the event).
     audit_data_changes: bool,
+    /// `fsync_data_changes`: whether `DataChange` events are `fsync`'d before returning (durable
+    /// before the audited op's ack) rather than batched. See [`AuditConfig::fsync_data_changes`].
+    fsync_data_changes: bool,
 }
 
 impl AuditLog {
@@ -430,7 +455,9 @@ impl AuditLog {
     ///    parses as JSON carrying a `seq`. A trailing partial line (bytes after the last `\n` with
     ///    no terminating newline, or a final line that fails to parse) is a TORN line from a crash
     ///    mid-append — it is **not** counted. The next `seq` is `max valid seq + 1`, or `1` for a
-    ///    new/empty file.
+    ///    new/empty file. The max is taken over the active file **and** the retained rotated files
+    ///    ([`max_rotated_seq`]) so a rotation that just emptied the active file cannot make a restart
+    ///    reuse a number already in `audit.log.1` (#425).
     /// 2. **Repair a torn tail.** If the file does **not** end with `\n`, the last write was torn
     ///    mid-append; `open` truncates the file back to the offset just past the last complete line
     ///    (the last `\n`, or `0` if there is none) with `set_len`, discarding the torn bytes. The
@@ -449,6 +476,7 @@ impl AuditLog {
         let retain_files = config.retain_files;
         let fsync_security_events = config.fsync_security_events;
         let audit_data_changes = config.audit_data_changes;
+        let fsync_data_changes = config.fsync_data_changes;
 
         if !config.enabled {
             // A disabled log never opens the audit file and never writes: every `record` call
@@ -488,6 +516,7 @@ impl AuditLog {
                 retain_files,
                 fsync_security_events,
                 audit_data_changes,
+                fsync_data_changes,
             }));
         }
 
@@ -500,7 +529,15 @@ impl AuditLog {
 
         // Scan the existing content (if any) to recover the next seq and the offset of the last
         // complete line, then repair a torn tail before opening the append handle.
-        let (next_seq_base, complete_len, total_len) = scan_existing(&path)?;
+        //
+        // #425: the next seq must be the max over the ACTIVE file AND the rotated files. A rotation
+        // followed immediately by a restart (before any line lands in the fresh `audit.log`) leaves
+        // the active file empty, so its max seq is 0 — but the highest-numbered seq lives in
+        // `audit.log.1`. Recovering only from the active file would reuse seq numbers already
+        // present in a rotated file, breaking the monotonic never-reuse guarantee. We therefore take
+        // the overall max across the active file and the retained rotated files.
+        let (active_seq, complete_len, total_len) = scan_existing(&path)?;
+        let next_seq_base = active_seq.max(max_rotated_seq(&path, retain_files));
         if total_len > complete_len {
             // The file did not end on a complete line: truncate the torn tail away.
             let f = std::fs::OpenOptions::new().write(true).open(&path)?;
@@ -528,6 +565,7 @@ impl AuditLog {
             retain_files,
             fsync_security_events,
             audit_data_changes,
+            fsync_data_changes,
         }))
     }
 
@@ -564,8 +602,10 @@ impl AuditLog {
     ///    `write_all` the line and update the byte counter.
     /// 5. `fsync` policy: a security-relevant class (auth / authz-denied / admin / schema / security)
     ///    is `sync_data`'d **before returning** (when `fsync_security_events` is on), so the event is
-    ///    durable before the client learns the operation's result. A `DataChange` is left unsynced
-    ///    (batched; flushed by the next security event or [`flush`](Self::flush)).
+    ///    durable before the client learns the operation's result. A `DataChange` is, by default,
+    ///    left unsynced (batched; flushed by the next security event or [`flush`](Self::flush)) — but
+    ///    is `sync_data`'d before returning when [`AuditConfig::fsync_data_changes`] is enabled, so
+    ///    the data-change line is durable before the audited write's ack at a per-write `fsync` cost.
     ///
     /// Every event is **also** mirrored to `tracing` (`target: "graphus::audit"`) at `info` (normal)
     /// or `warn` (failure / denial), so an operator shipping logs to a SIEM receives the trail even
@@ -655,6 +695,16 @@ impl AuditLog {
                 }
             }
             // If fsync is off, this security event is left in the OS page cache like a data change.
+        } else if self.fsync_data_changes {
+            // Opt-in: harden the data-change line before returning, so it is durable before the
+            // audited write's ack (the WAL is authoritative for the write itself; this makes the
+            // audit *line* durable-before-ack too). Same loud-not-dropping error policy as above.
+            if let Err(e) = guard.file.sync_data() {
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(target: "graphus::audit", seq, error = %e, "failed to fsync data-change audit record");
+            } else {
+                guard.pending_unsynced = false;
+            }
         } else {
             // A DataChange: batched. Mark dirty so the next security event / flush hardens it.
             guard.pending_unsynced = true;
@@ -826,6 +876,43 @@ fn scan_existing(path: &Path) -> std::io::Result<(u64, u64, u64)> {
         }
     }
     Ok((max_seq, complete_len, total_len))
+}
+
+/// Scans the rotated files (`<active>.1` … `<active>.N`, where `N` is `retain` capped to a small
+/// bound) and returns the maximum valid `seq` found across them, or `0` if none exist (#425).
+///
+/// On reopen the next seq is `max(active-file max, this) + 1`, so a rotation immediately followed by
+/// a restart — which leaves the fresh active file empty while the highest seq sits in `audit.log.1`
+/// — never reuses a number. Each rotated file is scanned with the same complete-line logic as the
+/// active file ([`scan_existing`]); a missing rotated file contributes `0`. We scan at most
+/// [`MAX_ROTATED_SCAN`] files: the seq is monotonic across rotations, so the newest rotated file
+/// (`.1`) always holds the largest seq, but we scan a few for robustness against an out-of-order or
+/// partially-written rotation (e.g. a crash mid-`rotate`). `retain == 0` (rotation disabled) scans
+/// nothing.
+fn max_rotated_seq(active_path: &Path, retain: u32) -> u64 {
+    /// How many of the newest rotated files to scan. The newest (`.1`) carries the largest seq;
+    /// scanning a handful guards against a torn/out-of-order rotation without reading every file.
+    const MAX_ROTATED_SCAN: u32 = 4;
+
+    if retain == 0 {
+        return 0;
+    }
+    let dir = active_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = active_path.file_name().map_or_else(
+        || std::ffi::OsString::from(AUDIT_FILE_NAME),
+        |n| n.to_os_string(),
+    );
+    let scan_count = retain.min(MAX_ROTATED_SCAN);
+    let mut max_seq = 0u64;
+    for n in 1..=scan_count {
+        let rotated = numbered(dir, &file_name, n);
+        // A missing/unreadable rotated file contributes nothing; we must not fail open over it
+        // (the active-file scan is the primary recovery, and reuse-avoidance is best-effort-max).
+        if let Ok((seq, _, _)) = scan_existing(&rotated) {
+            max_seq = max_seq.max(seq);
+        }
+    }
+    max_seq
 }
 
 /// The OS null device path for the disabled-log inert handle (`/dev/null` on Unix).
@@ -1517,6 +1604,141 @@ mod tests {
             lines[0].get("class").and_then(serde_json::Value::as_str),
             Some("data_change")
         );
+        // With the default (fsync_data_changes = false) the line is left batched (unsynced) until
+        // the next security event / flush — pinning the precise durability contract for #424.
+        assert!(
+            log.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_unsynced,
+            "default policy leaves a data-change line batched (unsynced) before flush"
+        );
         log.flush().expect("flush hardens the batch");
+    }
+
+    /// #424: with `fsync_data_changes = true`, a `DataChange` record is `fsync`'d **before
+    /// `record` returns** (durable before the audited op's ack), exactly like a security event —
+    /// so it leaves no pending-unsynced state and survives a crash with no further flush. The
+    /// `pending_unsynced` flag is the in-process witness of the `sync_data` call (set on a batched
+    /// write, cleared by a successful sync); asserting it is `false` immediately after `record`
+    /// proves the hardening happened synchronously, before the call returned.
+    #[test]
+    fn data_change_is_fsynced_before_ack_when_opted_in() {
+        let dir = TempDir::new("fsync-dc");
+        let config = AuditConfig {
+            enabled: true,
+            audit_data_changes: true,
+            fsync_data_changes: true,
+            ..AuditConfig::default()
+        };
+        let log = AuditLog::open(&config, &dir.path).expect("open");
+        log.record(
+            AuditEvent::new(
+                AuditClass::DataChange,
+                AuditOutcome::Success,
+                AuditSource::BoltUds,
+            )
+            .actor(Some("alice"))
+            .detail("write query (CREATE)"),
+        );
+        // The hardening happened inside `record` (before it returned): nothing is left batched.
+        assert!(
+            !log.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_unsynced,
+            "fsync_data_changes=true hardens the data-change line before record() returns"
+        );
+        // And the line survives a reopen with no explicit flush in between (durable-before-ack).
+        drop(log);
+        let lines = read_lines(&dir.path);
+        assert_eq!(lines.len(), 1, "the data-change line is on disk: {lines:?}");
+        assert_eq!(
+            lines[0].get("class").and_then(serde_json::Value::as_str),
+            Some("data_change")
+        );
+    }
+
+    /// #425: a rotation immediately followed by a restart must NOT reuse seq numbers. We write
+    /// enough to force at least one rotation (so the highest seq lives in `audit.log.1`), then
+    /// simulate the worst case: the active file is empty at restart (a rotation that produced a
+    /// fresh `audit.log` before any line was written). On reopen, the next seq must be strictly
+    /// greater than the max seq present in any rotated file — no reuse.
+    #[test]
+    fn seq_is_not_reused_after_rotation_then_restart() {
+        let dir = TempDir::new("rotate-restart");
+        let config = AuditConfig {
+            enabled: true,
+            // Large threshold: no automatic rotation here. We model the precise #425 worst case by
+            // hand: a rotation that moved every written line into `audit.log.1` and then a restart
+            // before any line landed in the fresh (empty) active file.
+            rotate_max_bytes: 0,
+            retain_files: 3,
+            ..AuditConfig::default()
+        };
+        let max_written;
+        {
+            let log = AuditLog::open(&config, &dir.path).expect("open");
+            for _ in 0..6 {
+                log.record(an_event(AuditClass::SecurityChange));
+            }
+            log.flush().expect("flush");
+            max_written = log.seq.load(Ordering::Relaxed);
+        }
+        assert_eq!(max_written, 6, "six events written, seqs 1..=6");
+
+        // Model "rotation then restart before any write": move the active file (holding the highest
+        // seqs) to audit.log.1 and leave the active file ABSENT (a fresh-rotated, unwritten state).
+        let active = dir.path.join(AUDIT_FILE_NAME);
+        let r1 = dir.path.join("audit.log.1");
+        std::fs::rename(&active, &r1).expect("rotate active -> .1");
+        assert!(!active.exists(), "the fresh active file does not exist yet");
+
+        // Active-only recovery would see max seq 0 here (the bug): the highest seq lives in .1.
+        let active_max = scan_existing(&active).unwrap().0;
+        assert_eq!(
+            active_max, 0,
+            "active-only recovery gives 0 (would REUSE seq 1)"
+        );
+        let rotated_max = max_rotated_seq(&active, config.retain_files);
+        assert_eq!(rotated_max, 6, "the rotated file carries the highest seq");
+
+        // Reopen: with the #425 fix the next seq is recovered from the rotated files too.
+        let log = AuditLog::open(&config, &dir.path).expect("reopen");
+        log.record(an_event(AuditClass::AdminChange));
+        let next = log.seq.load(Ordering::Relaxed);
+        assert!(
+            next > rotated_max,
+            "next seq {next} must exceed the max rotated seq {rotated_max} (no reuse); \
+             active-only recovery would have produced {} (REUSE of an existing seq)",
+            active_max + 1
+        );
+        assert_eq!(
+            next,
+            max_written + 1,
+            "continues monotonically past every written seq"
+        );
+    }
+
+    /// #424: the durability *contract* itself, pinned as an assertion — security events are
+    /// security-relevant (synced before ack by default), data changes are not (batched by default).
+    #[test]
+    fn durability_contract_is_pinned() {
+        // Security-relevant classes are fsync'd-before-ack (when fsync_security_events is on).
+        assert!(AuditClass::AuthSuccess.is_security_relevant());
+        assert!(AuditClass::AuthFailure.is_security_relevant());
+        assert!(AuditClass::AuthzDenied.is_security_relevant());
+        assert!(AuditClass::AdminChange.is_security_relevant());
+        assert!(AuditClass::SchemaChange.is_security_relevant());
+        assert!(AuditClass::SecurityChange.is_security_relevant());
+        // A data change is NOT security-relevant: batched unless fsync_data_changes opts in.
+        assert!(!AuditClass::DataChange.is_security_relevant());
+        // The defaults encode the contract: security synced, data changes batched.
+        let d = AuditConfig::default();
+        assert!(
+            d.fsync_security_events,
+            "security events sync-before-ack by default"
+        );
+        assert!(!d.fsync_data_changes, "data changes are batched by default");
     }
 }

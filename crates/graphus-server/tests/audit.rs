@@ -137,6 +137,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
             path: None,
             fsync_security_events: true,
             audit_data_changes: true,
+            fsync_data_changes: false,
             rotate_max_bytes: 64 * 1024 * 1024,
             retain_files: 5,
         },

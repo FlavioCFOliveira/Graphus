@@ -389,12 +389,62 @@ impl ConsistencyReport {
 ///
 /// Pass an empty `indexes` slice to check the store alone.
 ///
+/// # Cold-open contract (#426)
+///
+/// The **checksum/page-identity** sub-pass ([`check_checksums_and_page_ids`]) is a **cold-open**
+/// check: it verifies the **durable on-disk image** by re-reading each mapped page through the pool,
+/// where a disk read recomputes and verifies the CRC32C. A page that is *resident and dirty* in the
+/// pool is served from cache **without** a disk read, so its on-disk image is **not** re-verified —
+/// and a dirty page legitimately carries a stale checksum field until write-back. Consequently the
+/// checksum pass is only meaningful when the pool is *cold* (no dirty resident pages), which is
+/// exactly the state right after [`RecordStore::open`] (post-recovery, before any client write) —
+/// the single production call site, reached via [`verify_on_open`], which enforces the precondition
+/// with a `debug_assert`.
+///
+/// The structural sub-passes (referential, adjacency, property/heap chains, MVCC, free-lists, label
+/// bitmaps, index agreement) read *records* and are valid warm as well; only the on-disk-image
+/// checksum guarantee requires coldness. Calling `check_store` directly on a warm store (e.g. a
+/// test) is therefore permitted — the structural checks still hold — but its [`Violation::Checksum`]
+/// findings then cover only the *durable* image, not dirty resident pages. A future *online/warm*
+/// checker that wants resident-page checksum coverage must evict-then-reread before verifying rather
+/// than trust the cached bytes.
+///
 /// # Errors
 /// All structural inconsistencies — including unreadable/corrupt pages and unreadable records — are
 /// **reported in the [`ConsistencyReport`]**, never returned as `Err`: a corrupt page surfaces as a
 /// [`Violation::Checksum`] and its records are skipped, so the pass always completes and collects
 /// the full violation set. An `Err` is reserved for a hard I/O failure of one of the sub-passes
 /// (none of which can fail on the in-memory or file devices in normal operation).
+/// Asserts the **cold-open** precondition (#426): the buffer pool has no dirty resident pages, so
+/// the checksum sub-pass's on-disk-image verification is sound (a dirty resident page is served from
+/// cache without a disk read, carrying a stale checksum until write-back).
+///
+/// This is a **no-op** unless the `check-cold-assert` cargo feature is enabled. It is feature-gated
+/// rather than a plain `debug_assert` because there are legitimate *warm* callers of [`check_store`]
+/// / [`verify_on_open`] (a bulk importer asserting structural consistency before reopen; warm test
+/// harnesses) for whom the structural report is exactly what is wanted — an unconditional assert
+/// would break them. The startup/recovery paths can enable the feature to get fail-fast enforcement
+/// where coldness is contractually guaranteed.
+///
+/// # Panics
+/// When the `check-cold-assert` feature is enabled and the pool has any dirty frame.
+#[inline]
+pub fn assert_cold_open<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) {
+    #[cfg(feature = "check-cold-assert")]
+    {
+        assert_eq!(
+            store.checker_dirty_frames(),
+            0,
+            "cold-open contract violated (#426): the buffer pool has dirty resident pages, so the \
+             checksum pass would verify only the durable image and silently miss resident \
+             corruption. Run this cold (right after RecordStore::open, before any write), or build \
+             a warm checker that evicts-then-rereads before verifying."
+        );
+    }
+    // Reference the parameter so the signature is identical with the feature off (no dead-code lint).
+    let _ = store;
+}
+
 pub fn check_store<D: BlockDevice, S: LogSink>(
     store: &mut RecordStore<D, S>,
     indexes: &[IndexAgreement],
@@ -434,13 +484,29 @@ pub fn check_store<D: BlockDevice, S: LogSink>(
 /// work. The error message names how many violations were found and the first one, so the operator
 /// alert is actionable; the full set is available via [`check_store`] for diagnostics.
 ///
+/// This is the **cold-open** entry point (#426): the production server invokes it on a freshly-opened
+/// store whose buffer pool is cold (no dirty resident pages) — the precondition that makes the
+/// checksum sub-pass's on-disk-image guarantee sound (see [`check_store`]).
+///
+/// The precondition is checked by [`assert_cold_open`] (a no-op unless the `check-cold-assert`
+/// feature is enabled). It is **not** a `debug_assert` because the consistency guarantee here is the
+/// *structural* report, which is valid warm too: some legitimate callers (e.g. a bulk importer
+/// asserting consistency before reopen) invoke this on a warm store on purpose. The dedicated
+/// feature lets the startup/recovery paths opt into fail-fast coldness enforcement without breaking
+/// those warm callers. The checksum sub-pass always reflects only the *durable* image regardless.
+///
 /// # Errors
 /// Returns [`GraphusError::Storage`] if any violation is found, or propagates a hard I/O failure
 /// from [`check_store`].
+///
+/// # Panics
+/// Panics (only when the `check-cold-assert` feature is enabled) if the store's buffer pool has
+/// dirty resident pages — i.e. it was not invoked cold-open. The default build does not check.
 pub fn verify_on_open<D: BlockDevice, S: LogSink>(
     store: &mut RecordStore<D, S>,
     indexes: &[IndexAgreement],
 ) -> Result<()> {
+    assert_cold_open(store);
     let report = check_store(store, indexes)?;
     if report.is_consistent() {
         return Ok(());
@@ -635,12 +701,15 @@ fn check_checksums_and_page_ids<D: BlockDevice, S: LogSink>(
             // page is in range and the device is readable; the only failure mode here is the
             // verification the pool performs on the disk read).
             //
-            // Note (documented scope): a page that is *resident and dirty* in the pool is returned
-            // from cache without a disk read, so its on-disk image is not re-verified here. This
-            // check is therefore meaningful against the **durable** image — i.e. right after
-            // [`RecordStore::open`], which is the only place the startup hook runs. We do not
-            // re-verify the cached bytes, because a dirty cached page legitimately carries a stale
-            // checksum field until write-back, which would be a false positive.
+            // Note (#426, contract now enforced): a page that is *resident and dirty* in the pool is
+            // returned from cache without a disk read, so its on-disk image is not re-verified here.
+            // This check is therefore meaningful only against the **durable** image — i.e. on a cold
+            // pool, right after [`RecordStore::open`], which is the only place the startup hook runs.
+            // We deliberately do NOT re-verify cached bytes (a dirty cached page legitimately carries
+            // a stale checksum field until write-back, which would be a false positive). The
+            // cold-open precondition that makes this sound is enforced by the `debug_assert` at the
+            // top of [`check_store`]; a future warm/online checker must evict-then-reread rather than
+            // weaken this.
             Err(_) => report.push(Violation::Checksum { page: p.0 }),
             Ok(bytes) => {
                 let stored = page::page_id(&bytes);

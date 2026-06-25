@@ -457,6 +457,73 @@ fn corrupt_checksum_is_flagged() {
     );
 }
 
+/// #426: pins the **cold-open contract** of the checksum sub-pass. A freshly-opened (cold) store
+/// has no dirty resident pages, so `assert_cold_open` must accept it, and on-disk corruption of a
+/// resident page IS detected on that cold pool (the durable-image guarantee — proving the fix does
+/// NOT weaken the existing cold-open detection of `corrupt_checksum_is_flagged`/#398). This is the
+/// state the production startup hook always runs in.
+#[test]
+fn check_store_cold_open_contract_holds_on_fresh_open() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let (a, eid_a) = s.create_node(txn).unwrap();
+    let (b, _) = s.create_node(txn).unwrap();
+    let t = s.intern_token(Namespace::RelType, "E").unwrap();
+    s.create_rel(txn, t, a, b).unwrap();
+    s.commit(txn).unwrap();
+
+    let mut img = DiskImage::capture(&mut s);
+
+    // A freshly-opened store is cold: no dirty resident pages. `assert_cold_open` accepts it (and
+    // when built with `--features check-cold-assert` it actively enforces this — here it is the
+    // documented contract surface that a cold store satisfies it).
+    {
+        let clean = img.open();
+        graphus_storage::check::assert_cold_open(&clean);
+    }
+
+    // Corrupt a resident page's body byte WITHOUT refreshing the checksum, then open cold: the
+    // checksum pass re-reads the durable image from disk and flags it. This is the corruption that
+    // the cold-open contract guarantees is caught (it would be missed only on a WARM/dirty pool,
+    // which the contract forbids — the limitation the #426 doc now states explicitly).
+    let (page_id, off) = img.locate(StoreKind::Node, eid_a.0);
+    img.page_mut(page_id)[off + 30] ^= 0xFF;
+
+    let mut store = img.open();
+    graphus_storage::check::assert_cold_open(&store); // still cold right after open
+    let r = report(&mut store);
+    assert!(
+        r.violations
+            .iter()
+            .any(|v| matches!(v, Violation::Checksum { page } if *page == page_id)),
+        "cold-open checksum detection must still flag resident on-disk corruption: {:?}",
+        r.violations
+    );
+    assert!(
+        verify_on_open(&mut store, &[]).is_err(),
+        "verify_on_open refuses to serve the corrupt cold store (contract intact)"
+    );
+}
+
+/// #426: with the `check-cold-assert` feature on, calling the checker on a WARM store (dirty
+/// resident pages, e.g. right after writes with no flush) must panic — fail-fast enforcement of the
+/// cold-open contract. Gated to that feature: the default build has legitimate warm callers, so this
+/// test only runs under `--features check-cold-assert`.
+#[cfg(feature = "check-cold-assert")]
+#[test]
+#[should_panic(expected = "cold-open contract violated")]
+fn cold_open_assert_panics_on_warm_store() {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    // A write with no flush leaves dirty resident pages: the pool is warm.
+    let _ = s.create_node(txn).unwrap();
+    s.commit(txn).unwrap();
+    // The enforcement must fire on the warm pool.
+    graphus_storage::check::assert_cold_open(&s);
+}
+
 /// (b) Adjacency: break an incidence-chain pointer (dangling next) → an adjacency violation.
 #[test]
 fn corrupt_adjacency_dangling_link_is_flagged() {

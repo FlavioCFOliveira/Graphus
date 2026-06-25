@@ -15,6 +15,14 @@ description = "Record store with index-free adjacency, tokens and element-ID map
 # build never compiles the seam and the device stays encapsulated.
 dst = ["graphus-bufpool/dst"]
 
+# Cold-open contract enforcement for the consistency checker (`rmp` #426): when enabled,
+# `check::assert_cold_open` / `verify_on_open` panic if the buffer pool has dirty resident pages,
+# so a caller that runs the checksum sub-pass against a warm pool (where on-disk corruption of a
+# resident page would be silently missed) fails fast. OFF by default: there are legitimate warm
+# callers (bulk import asserting structural consistency before reopen), and the production startup
+# path is always cold-open. Recovery/startup harnesses can opt in to fail-fast enforcement.
+check-cold-assert = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
