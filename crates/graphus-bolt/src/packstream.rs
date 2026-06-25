@@ -91,8 +91,20 @@ pub(crate) const MAP_32: u8 = 0xDA;
 
 pub(crate) const TINY_STRUCT_BASE: u8 = 0xB0; // 0xB0..=0xBF: 0..=15 fields
 
-/// The largest collection (string/bytes/list/map) length PackStream's 32-bit size field can carry,
-/// and the most fields a structure (tiny-struct only) may hold.
+/// The largest collection (string/bytes/list/map) length PackStream's 32-bit size field can carry.
+///
+/// # Spec maximum vs this lenient cap (`rmp` #397 — NOT yet ratified)
+///
+/// The PackStream specification states the maximum collection length is **`i32::MAX`**
+/// (`2_147_483_647`): the `*_32` size header is read as a *signed* 32-bit big-endian integer, so a
+/// strictly conformant decoder rejects any length above `i32::MAX`. Graphus deliberately uses the
+/// **wider `u32::MAX`** here — a *lenient* choice that accepts the full unsigned 32-bit range. This is
+/// safe by construction: a wire length never sizes an allocation directly (every collection
+/// pre-allocates at most [`MAX_PREALLOC`] and grows as real elements are decoded, and each element
+/// consumes ≥1 input byte), so an over-large header cannot exhaust memory — it simply fails at
+/// end-of-input. Tightening this cap to `i32::MAX` is a behavioural change (it would start *rejecting*
+/// inputs the decoder currently accepts), so it is **pending a ratified decision** and is intentionally
+/// not changed here; the `collection_length_cap_current_behavior` test pins the present behaviour.
 const MAX_U32_LEN: usize = u32::MAX as usize;
 /// A structure has at most 15 fields (the tiny-struct nibble); Bolt never exceeds this.
 pub(crate) const MAX_STRUCT_FIELDS: usize = 15;
@@ -1388,6 +1400,74 @@ mod tests {
         p.write_bool(true);
         p.write_bool(false);
         assert_eq!(p.as_bytes(), &[NULL, TRUE, FALSE]);
+    }
+
+    /// Decodes a single `Value` from a hand-built byte slice, asserting the whole slice is consumed.
+    fn decode(bytes: &[u8]) -> Value {
+        let mut u = Unpacker::new(bytes);
+        let out = unpack_value(&mut u).expect("decode");
+        assert!(u.is_empty(), "decode left {} trailing bytes", u.remaining());
+        out
+    }
+
+    /// `rmp` #397: the PackStream spec says minimal-width encoding is *recommended*, not *mandated*, so
+    /// a conformant decoder MUST accept **non-minimal** encodings — the official Neo4j driver
+    /// ecosystem is permitted to emit them. The decoder is marker-width-driven, so it already does;
+    /// this test pins that property so a future "reject non-minimal markers" optimisation cannot
+    /// silently break wire interop. Each hand-built non-minimal byte sequence must decode to exactly
+    /// the value its minimal form encodes.
+    #[test]
+    fn non_minimal_encodings_are_accepted() {
+        // INT_16 carrying 1 (minimal form is the tiny int 0x01).
+        assert_eq!(decode(&[INT_16, 0x00, 0x01]), Value::Integer(1));
+        // INT_32 carrying 1.
+        assert_eq!(decode(&[INT_32, 0x00, 0x00, 0x00, 0x01]), Value::Integer(1));
+        // INT_64 carrying 1.
+        assert_eq!(
+            decode(&[INT_64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            Value::Integer(1)
+        );
+        // INT_8 carrying 1 (minimal form is the tiny int 0x01).
+        assert_eq!(decode(&[INT_8, 0x01]), Value::Integer(1));
+        // STRING_8 carrying the 1-byte string "a" (minimal form is TINY_STRING_BASE + 1, 'a').
+        assert_eq!(
+            decode(&[STRING_8, 0x01, b'a']),
+            Value::String("a".to_owned())
+        );
+        // STRING_16 carrying "a".
+        assert_eq!(
+            decode(&[STRING_16, 0x00, 0x01, b'a']),
+            Value::String("a".to_owned())
+        );
+        // LIST_8 carrying an empty list (minimal form is the tiny list 0x90).
+        assert_eq!(decode(&[LIST_8, 0x00]), Value::List(Vec::new()));
+        // MAP_8 carrying an empty map (minimal form is the tiny map 0xA0).
+        assert_eq!(decode(&[MAP_8, 0x00]), Value::Map(vec![]));
+        // And the minimal forms decode to the same values — proving equivalence, not just acceptance.
+        assert_eq!(decode(&[0x01]), Value::Integer(1));
+        assert_eq!(
+            decode(&[TINY_STRING_BASE + 1, b'a']),
+            Value::String("a".to_owned())
+        );
+        assert_eq!(decode(&[TINY_LIST_BASE]), Value::List(Vec::new()));
+    }
+
+    /// `rmp` #397: documents the **current** collection-length cap behaviour. The PackStream spec's
+    /// maximum is `i32::MAX`, but Graphus deliberately uses the wider unsigned [`MAX_U32_LEN`]
+    /// (`u32::MAX`) as a lenient choice (see its doc comment). This test pins that current value so any
+    /// change to the cap — in either direction — is a conscious, reviewed decision (the tightening to
+    /// `i32::MAX` is not yet ratified). The cap governs only the maximum *expressible* header length; a
+    /// header never sizes an allocation directly ([`MAX_PREALLOC`] / [`prealloc_cap`]).
+    #[test]
+    fn collection_length_cap_current_behavior() {
+        // The cap is the full unsigned 32-bit range, NOT the spec's i32::MAX — the current lenient
+        // choice. (If this assertion ever needs changing, the cap was changed; that requires a
+        // ratified decision per `rmp` #397.)
+        assert_eq!(MAX_U32_LEN, u32::MAX as usize);
+        assert!(
+            MAX_U32_LEN > i32::MAX as usize,
+            "the current cap is intentionally wider than the spec's i32::MAX maximum"
+        );
     }
 
     #[test]

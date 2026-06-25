@@ -23,8 +23,9 @@ pub trait WalRule {
 
     /// Whether this rule tracks real LSNs (a real WAL) rather than treating everything as already
     /// durable ([`NoWal`]). When `true`, every dirty page written home must carry a non-zero
-    /// `page_lsn` — otherwise the WAL-before-data rule cannot be honoured (a debug-assert in the
-    /// concurrent pool's write-back enforces this; see `ConcurrentBufferPool`). Defaults to `true`.
+    /// `page_lsn` — otherwise the WAL-before-data rule cannot be honoured (the concurrent pool's
+    /// home-write paths enforce this as a release-built invariant, returning an error rather than a
+    /// debug-assert; see `ConcurrentBufferPool::guard_wal_before_data`). Defaults to `true`.
     fn tracks_lsn(&self) -> bool {
         true
     }

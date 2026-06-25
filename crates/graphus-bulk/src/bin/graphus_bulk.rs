@@ -466,7 +466,7 @@ mod tests {
 
         // And the imported store reopens cleanly — proving the directory entries and file contents
         // that `sync_dir` made durable are present and consistent.
-        let mut store = open_store(&db).expect("reopen imported store");
+        let store = open_store(&db).expect("reopen imported store");
         assert_eq!(store.scan_node_ids().expect("scan").len(), 2);
     }
 

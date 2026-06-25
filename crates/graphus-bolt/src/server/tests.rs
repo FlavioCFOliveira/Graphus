@@ -967,7 +967,10 @@ fn logoff_in_tx_ready_is_rejected_and_rolls_back() {
         // The principal is NOT dropped by an invalid LOGOFF.
         assert_eq!(session.principal(), Some("alice"));
         // The transaction was rolled back, not left open.
-        assert!(!session.executor().tx_open, "tx rolled back on invalid LOGOFF");
+        assert!(
+            !session.executor().tx_open,
+            "tx rolled back on invalid LOGOFF"
+        );
         let log = &session.executor().log;
         assert!(
             log.contains(&"rollback".to_owned()),
@@ -993,12 +996,19 @@ fn logoff_in_ready_still_succeeds() {
     {
         let mut session = BoltSession::new(&mut transport, exec, &auth);
         session.run().unwrap();
-        assert_eq!(session.principal(), None, "READY LOGOFF clears the principal");
+        assert_eq!(
+            session.principal(),
+            None,
+            "READY LOGOFF clears the principal"
+        );
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
     // [0]HELLO [1]LOGON [2]LOGOFF SUCCESS.
-    assert!(matches!(r[2], Response::Success { .. }), "READY LOGOFF → SUCCESS");
+    assert!(
+        matches!(r[2], Response::Success { .. }),
+        "READY LOGOFF → SUCCESS"
+    );
 }
 
 // ---- Manifest-v1 handshake, ROUTE, TELEMETRY, per-connection id (rmp #95) ---------------------

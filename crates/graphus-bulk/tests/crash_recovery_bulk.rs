@@ -15,8 +15,8 @@
 
 use graphus_bulk::BulkImporter;
 use graphus_io::MemBlockDevice;
+use graphus_storage::RecordStore;
 use graphus_storage::recovery::recover_device;
-use graphus_storage::{Namespace, RecordStore};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -75,7 +75,7 @@ fn committed_batches_survive_a_crash_after_n_batches() {
     let log = durable_log(&store);
     drop(store); // model the crash: the original device/pool are gone.
 
-    let mut recovered = recover_no_force(&log);
+    let recovered = recover_no_force(&log);
     let count = recovered.scan_node_ids().expect("scan").len();
     assert_eq!(
         count, total,
@@ -118,7 +118,7 @@ fn torn_batch_after_committed_batches_recovers_to_the_boundary() {
     let log_after = durable_log(store_ref);
 
     // Recover from the post-failure durable WAL and assert we are exactly at the committed boundary.
-    let mut recovered = recover_no_force(&log_after);
+    let recovered = recover_no_force(&log_after);
     let count = recovered.scan_node_ids().expect("scan").len();
     assert_eq!(
         count, committed,
@@ -127,7 +127,7 @@ fn torn_batch_after_committed_batches_recovers_to_the_boundary() {
 
     // And recovering from the pre-failure boundary gives the same node count — the failed batch is a
     // no-op for committed node state.
-    let mut recovered_before = recover_no_force(&log_before);
+    let recovered_before = recover_no_force(&log_before);
     assert_eq!(
         recovered_before.scan_node_ids().expect("scan").len(),
         committed

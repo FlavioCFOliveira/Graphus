@@ -736,9 +736,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         // buffered. This is spec-conformant for the single-stream case a stock driver drives.)
         if let Some(requested) = qid {
             if requested != ALL && self.open_qid != Some(requested) {
-                self.fail_protocol(
-                    "PULL/DISCARD qid does not match an open result stream",
-                )?;
+                self.fail_protocol("PULL/DISCARD qid does not match an open result stream")?;
                 return Ok(Flow::Continue);
             }
         }

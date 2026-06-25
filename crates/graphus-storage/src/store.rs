@@ -96,6 +96,15 @@ pub enum StoreKind {
     Strings = 3,
 }
 
+/// The four [`StoreKind`]s indexed by their discriminant (`kind as usize`), so a subtype byte can be
+/// mapped back to its kind without a fallible `match` (`rmp` #398 orphan-page attribution).
+const ALL_STORE_KINDS: [StoreKind; STORE_COUNT] = [
+    StoreKind::Node,
+    StoreKind::Rel,
+    StoreKind::Prop,
+    StoreKind::Strings,
+];
+
 impl StoreKind {
     /// The fixed record size of this store in bytes.
     #[must_use]
@@ -584,6 +593,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if a device page cannot be read.
+    /// Cross-validates one orphan record page's bytes against the [`StoreKind`] its subtype byte
+    /// claims, to catch an in-range-but-**wrong** subtype that CRC32C cannot (`rmp` #398). Returns
+    /// `true` only if every in-use record slot — laid out densely at `kind`'s stride — carries a
+    /// well-formed MVCC header (`05 §7`):
+    ///
+    /// * an in-use record has a non-zero creator stamp (`xmin` is never the `0` none-sentinel), and
+    /// * if both `xmin` and `xmax` are *committed* timestamps, `xmin <= xmax` (no version that
+    ///   expired before it was created).
+    ///
+    /// These are the same MVCC-header invariants the offline checker enforces
+    /// ([`crate::check::MvccHeaderFault`]); applied at the *claimed* stride they reject a
+    /// mis-attributed page, because a page written at a different record size lands its dense MVCC
+    /// headers mid-record at this stride, where they are overwhelmingly malformed (an `in_use` flag
+    /// over a zero creator, or a wildly inverted timestamp pair). The scan is **page-local and
+    /// bounded** (at most `records_per_page` header reads, no chain following), so it does not change
+    /// `open`'s O(device-pages) cost.
+    ///
+    /// An entirely-empty page (no in-use slot) is accepted: it is structurally indistinguishable
+    /// across kinds and harmless to attribute (it floors no high-water beyond its capacity and
+    /// references nothing).
+    fn orphan_page_records_well_formed(page: &[u8], kind: StoreKind) -> bool {
+        let record_size = kind.record_size();
+        let rpp = paging::records_per_page(record_size);
+        for slot in 0..rpp {
+            let off = HEADER_SIZE + slot * record_size;
+            // Defensive bound (the arithmetic above never overruns for a valid `rpp`, but a future
+            // record-size change must not turn this into an out-of-bounds slice).
+            if off + MVCC_HEADER_SIZE > page.len() {
+                break;
+            }
+            let mvcc = MvccHeader::read(&page[off..off + MVCC_HEADER_SIZE]);
+            if !mvcc.in_use() {
+                continue; // free/never-written slots carry no invariant
+            }
+            // An in-use record must name its creator.
+            if VersionStamp::from_raw(mvcc.created_ts) == VersionStamp::None {
+                return false;
+            }
+            // No committed/committed timestamp inversion.
+            if let (VersionStamp::Committed(c), VersionStamp::Committed(e)) = (
+                VersionStamp::from_raw(mvcc.created_ts),
+                VersionStamp::from_raw(mvcc.expired_ts),
+            ) {
+                if c.0 > e.0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn reconstruct_orphan_store_pages(
         pool: &ConcurrentBufferPool<D, SharedWal<S>>,
         stores: &mut [FixedStore; STORE_COUNT],
@@ -612,15 +672,38 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     page::page_subtype(p),
                 )
             });
-            pool.unpin(f);
             if !is_record {
+                pool.unpin(f);
                 continue; // META pages and never-stamped (zeroed) pages are not record-store pages
             }
             // The subtype indexes a `StoreKind`; ignore an out-of-range value defensively (a torn or
             // pre-`#239` page) rather than trusting it.
-            if (subtype as usize) < STORE_COUNT {
-                orphans[subtype as usize].push(pid);
+            if (subtype as usize) >= STORE_COUNT {
+                pool.unpin(f);
+                continue;
             }
+            let kind = ALL_STORE_KINDS[subtype as usize];
+            // `rmp` #398: the subtype byte is the *only* thing attributing this orphan page to a
+            // store, and it passed CRC32C — so a byte-flip (or a page written by store Y mislabelled
+            // as X) that lands an **in-range but wrong** subtype would silently attach the page to
+            // the wrong store and floor that store's high-water to a mismatched capacity, reading
+            // every record at the wrong stride forever after. CRC alone cannot catch this (the bytes
+            // are self-consistent), so cross-validate the page's own records against the claimed
+            // kind's shape: at the wrong stride the dense MVCC headers land mid-record and are
+            // overwhelmingly malformed. A bounded, page-local scan (no chain following) keeps `open`
+            // O(device pages) as it already is. On mismatch we fail closed — Graphus's first mandate
+            // is to never serve a page it cannot trust (`04 §4.6`/§4.8 startup).
+            let well_formed = pool.with_page(f, |p| Self::orphan_page_records_well_formed(p, kind));
+            pool.unpin(f);
+            if !well_formed {
+                return Err(GraphusError::Storage(format!(
+                    "orphan record page {} carries subtype {} ({:?}) but its records are not \
+                     well-formed for that store (mis-attributed page — possible corruption); \
+                     refusing to serve",
+                    pid.0, subtype, kind
+                )));
+            }
+            orphans[subtype as usize].push(pid);
         }
         for (i, store_orphans) in orphans.into_iter().enumerate() {
             if store_orphans.is_empty() {
@@ -3802,6 +3885,152 @@ mod tests {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         RecordStore::create(device, wal, 64, 1).expect("create store")
+    }
+
+    /// Snapshots a store's flushed on-disk image into a fresh, openable [`MemBlockDevice`] (the
+    /// `recover_steal` image technique): flush the store home, then copy every mapped page into a new
+    /// device whose page count covers them. The returned device opens cleanly via
+    /// [`RecordStore::open`]; tests then perturb it before reopening.
+    fn snapshot_device(store: &mut Store) -> MemBlockDevice {
+        store.flush().expect("flush store home");
+        let pages = store.mapped_pages();
+        let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
+        let mut device = MemBlockDevice::new(max + 1);
+        for p in &pages {
+            let bytes = store.read_device_page(*p).expect("read device page");
+            device.write_page(*p, &bytes).expect("stage page");
+        }
+        device.sync_all().expect("persist disk image");
+        device
+    }
+
+    /// Builds one record page whose dense records (laid out at `record_kind`'s stride) are crafted by
+    /// `fill`, then stamps the page header as a [`PAGE_TYPE_RECORD`] page of `subtype_kind` at device
+    /// id `pid` with a valid CRC32C. Used to plant a hand-crafted **orphan** page on a device.
+    fn build_record_page(
+        pid: PageId,
+        subtype_kind: StoreKind,
+        record_kind: StoreKind,
+        fill: impl Fn(usize, &mut [u8]),
+    ) -> Box<graphus_io::Page> {
+        let mut page = Box::new([0u8; graphus_io::PAGE_SIZE]);
+        let rs = record_kind.record_size();
+        let rpp = paging::records_per_page(rs);
+        for slot in 0..rpp {
+            let off = HEADER_SIZE + slot * rs;
+            fill(slot, &mut page[off..off + rs]);
+        }
+        page::set_page_id(&mut page, pid.0);
+        page::set_page_type(&mut page, PAGE_TYPE_RECORD);
+        page::set_page_subtype(&mut page, subtype_kind as u8);
+        // A valid checksum: the corruption this models passes CRC32C, so the wrong-subtype byte
+        // cannot be caught by the per-page checksum (the whole point of `rmp` #398).
+        page::write_checksum(&mut page);
+        page
+    }
+
+    /// `rmp` #398 (unit): the bounded orphan-page cross-check rejects a page whose claimed-kind
+    /// interpretation has an in-use record with no creator stamp, and accepts a genuinely
+    /// well-formed page (and an entirely-empty one).
+    #[test]
+    fn orphan_page_well_formedness_check() {
+        // Well-formed: every slot is a live record with a real creator stamp → accepted.
+        let good = build_record_page(PageId(7), StoreKind::Rel, StoreKind::Rel, |_slot, rec| {
+            MvccHeader::live(VersionStamp::committed(Timestamp(10))).write(rec);
+        });
+        assert!(
+            RecordStore::<MemBlockDevice, MemLogSink>::orphan_page_records_well_formed(
+                &good[..],
+                StoreKind::Rel
+            )
+        );
+
+        // Empty page (no in-use slot) → harmlessly accepted.
+        let empty = build_record_page(PageId(7), StoreKind::Rel, StoreKind::Rel, |_slot, _rec| {});
+        assert!(
+            RecordStore::<MemBlockDevice, MemLogSink>::orphan_page_records_well_formed(
+                &empty[..],
+                StoreKind::Rel
+            )
+        );
+
+        // Malformed: an in-use record with created_ts == 0 (no creator) → rejected.
+        let bad = build_record_page(PageId(7), StoreKind::Rel, StoreKind::Rel, |slot, rec| {
+            if slot == 0 {
+                // in_use set but created_ts left 0 → malformed (no creator).
+                let h = MvccHeader {
+                    flags: crate::record::FLAG_IN_USE,
+                    created_ts: 0,
+                    expired_ts: 0,
+                    undo_ptr: 0,
+                };
+                h.write(rec);
+            }
+        });
+        assert!(
+            !RecordStore::<MemBlockDevice, MemLogSink>::orphan_page_records_well_formed(
+                &bad[..],
+                StoreKind::Rel
+            )
+        );
+    }
+
+    /// `rmp` #398 (gate): an orphan record page carrying a **valid CRC** but a wrong-but-in-range
+    /// subtype must be caught by `open()` (returns `Err`) rather than silently attributing the page to
+    /// the wrong store and flooring its high-water to a mismatched capacity. The page's records are
+    /// malformed for the claimed kind (an in-use slot with no creator), modelling a corruption CRC32C
+    /// cannot detect.
+    #[test]
+    fn orphan_page_with_mismatched_subtype_is_rejected_or_quarantined() {
+        // A valid, openable on-disk image (META page + node-store structure).
+        let mut s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let _ = s.create_node(t).unwrap();
+        s.commit(t).unwrap();
+        let mut device = snapshot_device(&mut s);
+
+        // Plant an orphan record page at the next free device id: subtype = Strings (in range, wrong),
+        // but its records are malformed for ANY kind (slot 0 in-use with created_ts == 0). It is NOT
+        // referenced by the durable catalog, so `reconstruct_orphan_store_pages` sees it as an orphan
+        // and attributes it by subtype — where the cross-check must reject it.
+        let orphan_id = PageId(device.page_count());
+        device.extend(1).expect("grow device for the orphan page");
+        let orphan = build_record_page(
+            orphan_id,
+            StoreKind::Strings,
+            StoreKind::Strings,
+            |slot, rec| {
+                if slot == 0 {
+                    // in_use, created_ts == 0 → malformed for ANY kind (no creator).
+                    let h = MvccHeader {
+                        flags: crate::record::FLAG_IN_USE,
+                        created_ts: 0,
+                        expired_ts: 0,
+                        undo_ptr: 0,
+                    };
+                    h.write(rec);
+                }
+            },
+        );
+        device
+            .write_page(orphan_id, &orphan)
+            .expect("plant orphan page");
+        device.sync_all().expect("persist orphan");
+
+        // Reopen onto the perturbed device. `open` rebuilds the catalog from the durable WAL of the
+        // original store, then re-attributes orphan pages — the planted page must fail closed.
+        let log = s.with_wal(|w| w.sink().durable_bytes().to_vec());
+        let mut sink = MemLogSink::new();
+        sink.append(&log);
+        sink.sync().expect("sync log");
+        let wal = WalManager::open(sink).expect("open wal");
+        let err = RecordStore::open(device, wal, 64);
+        assert!(
+            err.is_err(),
+            "open() must reject an orphan page whose in-range subtype mismatches its record shape, \
+             not silently mis-attribute it"
+        );
     }
 
     /// `rmp` #337, Slice 2: the store must be `Send + Sync` so Slice 3 (#336, gated on #341) can hand

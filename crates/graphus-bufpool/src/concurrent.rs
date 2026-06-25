@@ -490,7 +490,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// `with_page_mut`'s closure): a dirty page written home with `page_lsn == 0` under a real
     /// [`WalRule`] would make [`write_back`](Self::write_back)'s `ensure_durable(0)` a no-op and
     /// silently break WAL-before-data. `with_page_mut` is for stamp-free work only (e.g. zero-init of
-    /// a freshly allocated page); `write_back` debug-asserts the invariant.
+    /// a freshly allocated page); `write_back` enforces the invariant in release builds (it returns
+    /// an error for a logged-but-unstamped dirty page; see `guard_wal_before_data`).
     pub fn with_page_mut_lsn<R>(
         &self,
         f: PinnedFrame,
@@ -842,12 +843,10 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             })?;
             page::write_checksum(&mut meta.data);
             let lsn = page::page_lsn(&meta.data);
-            debug_assert!(
-                lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
-                "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did \
-                 not stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
-                page_id.0
-            );
+            // WAL-before-data invariant, release-enforced (`rmp` #396): batch flushes only ever
+            // write logged pages home (no `allow_unlogged` path), so a `page_lsn == 0` under a real
+            // WAL is always a caller error that must fail closed, not a silent durability hole.
+            self.guard_wal_before_data(page_id, lsn, false)?;
             self.ensure_durable(lsn)?;
             let _ = idx;
         }
@@ -929,12 +928,10 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             })?;
             page::write_checksum(&mut meta.data);
             let lsn = page::page_lsn(&meta.data);
-            debug_assert!(
-                lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
-                "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did \
-                 not stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
-                page_id.0
-            );
+            // WAL-before-data invariant, release-enforced (`rmp` #396): as in `flush_all`, this
+            // targeted batch only writes logged pages home, so a `page_lsn == 0` under a real WAL is
+            // a caller error that must fail closed.
+            self.guard_wal_before_data(page_id, lsn, false)?;
             self.ensure_durable(lsn)?;
             let _ = idx;
         }
@@ -1185,19 +1182,17 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             .ok_or_else(|| GraphusError::Storage("a dirty frame must hold a page".to_owned()))?;
         page::write_checksum(&mut meta.data);
         let lsn = page::page_lsn(&meta.data);
-        // WAL-before-data invariant (storage audit F6): under a real WAL every dirty page that
-        // carries a logged change must hold a non-zero `page_lsn`, else `ensure_durable(0)` is a
-        // no-op and the data could reach the device before its redo record is durable. A `page_lsn`
-        // of 0 means the mutation did not stamp it (use `with_page_mut_lsn`). The one legitimate
-        // exception is `allow_unlogged` (via [`flush_unlogged`]): a freshly-allocated, not-yet-logged
-        // page being seeded with a valid checksum, which by contract has nothing in the WAL that must
-        // precede it. Debug-only: cheap, and the production path stamps.
-        debug_assert!(
-            allow_unlogged || lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn(),
-            "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did not \
-             stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
-            page_id.0
-        );
+        // WAL-before-data invariant (storage audit F6, `rmp` #396): under a real WAL every dirty
+        // page that carries a logged change must hold a non-zero `page_lsn`, else `ensure_durable(0)`
+        // is a no-op and the data could reach the device before its redo record is durable. A
+        // `page_lsn` of 0 means the mutation did not stamp it (use `with_page_mut_lsn`). The one
+        // legitimate exception is `allow_unlogged` (via [`flush_unlogged`]): a freshly-allocated,
+        // not-yet-logged page being seeded with a valid checksum, which by contract has nothing in
+        // the WAL that must precede it. This is enforced as a **release-built** invariant: a single
+        // caller mistake (a logged write reaching here without a stamped LSN) would otherwise be a
+        // silent CRITICAL durability bug in release, so we fail closed with an error rather than a
+        // `debug_assert` that compiles out.
+        self.guard_wal_before_data(page_id, lsn, allow_unlogged)?;
         // WAL rule: the log must be durable through this page's LSN before the data is written
         // home (`specification` §3.2 page_lsn, §4.3 steal/no-force).
         self.ensure_durable(lsn)?;
@@ -1207,6 +1202,31 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         self.write_device().write_page(page_id, &meta.data)?;
         meta.dirty = false;
         Ok(())
+    }
+
+    /// Enforces the WAL-before-data (steal/no-force) home-write invariant as a **release-built**
+    /// check (`rmp` #396): a dirty page carrying a logged change must hold a non-zero `page_lsn` so
+    /// that [`ensure_durable`](Self::ensure_durable) actually waits for its redo record before the
+    /// bytes are written home. Returns an error (never a `debug_assert`, which compiles out in
+    /// release) when a logged-but-unstamped page would otherwise be written home, so a caller
+    /// mistake degrades to a hard failure instead of a silent durability hole.
+    ///
+    /// The sole legitimate `page_lsn == 0` path is `allow_unlogged` (a freshly-allocated,
+    /// not-yet-logged page seeded with a valid checksum via [`flush_unlogged`]), which by contract
+    /// has nothing in the WAL that must precede it.
+    ///
+    /// # Errors
+    /// Returns [`GraphusError::Storage`] if the page is logged (the WAL tracks LSNs) yet carries
+    /// `page_lsn == 0` and `allow_unlogged` is not set.
+    fn guard_wal_before_data(&self, page_id: PageId, lsn: Lsn, allow_unlogged: bool) -> Result<()> {
+        if allow_unlogged || lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn() {
+            return Ok(());
+        }
+        Err(GraphusError::Storage(format!(
+            "dirty page {} written back with page_lsn 0 under a real WAL: its mutation did not \
+             stamp page_lsn (use with_page_mut_lsn) — WAL-before-data would be violated",
+            page_id.0
+        )))
     }
 
     fn ensure_durable(&self, up_to: Lsn) -> Result<()> {
@@ -1373,6 +1393,76 @@ mod tests {
             4242,
             "write-back must harden the mutation's stamped LSN, not 0"
         );
+    }
+
+    /// `rmp` #396: the WAL-before-data home-write guard is enforced in **release** builds. A
+    /// logged-but-unstamped dirty page (dirtied via `with_page_mut`, which never stamps `page_lsn`)
+    /// under a real WAL must make `write_back` / `flush_all` / `flush_pages` return an `Err` rather
+    /// than write home — closing the silent-durability-hole window that a `debug_assert` (compiled
+    /// out in release) left open.
+    #[test]
+    fn logged_but_unstamped_dirty_page_is_rejected_on_home_write() {
+        // `RecordingWal` reports `tracks_lsn() == true` (a real WAL), so a `page_lsn == 0` dirty
+        // page is the illegal logged-but-unstamped case the guard must reject.
+        let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), RecordingWal::default(), 2);
+        let (f, _id) = p.new_page().unwrap();
+        // Dirty the page WITHOUT stamping `page_lsn` (the caller-mistake this guard catches).
+        p.with_page_mut(f, |page| page[100] = 0x7);
+
+        // write_back (held-latch core) must fail closed, not write home.
+        {
+            let slot = p.slot(f);
+            let mut meta = slot.meta.write().unwrap();
+            let err = p.write_back(&mut meta, false);
+            assert!(
+                err.is_err(),
+                "write_back of a logged-but-unstamped dirty page must return Err"
+            );
+            assert!(
+                meta.dirty,
+                "a rejected page must stay dirty (never written home)"
+            );
+        }
+
+        // flush_all (batch, all dirty) must fail closed.
+        assert!(
+            p.flush_all().is_err(),
+            "flush_all of a logged-but-unstamped dirty page must return Err"
+        );
+        // flush_pages (targeted batch) must fail closed.
+        assert!(
+            p.flush_pages(&[_id]).is_err(),
+            "flush_pages of a logged-but-unstamped dirty page must return Err"
+        );
+        assert_eq!(
+            p.dirty_frames(),
+            1,
+            "the rejected page must remain dirty after every failed home-write"
+        );
+        assert_eq!(
+            p.wal.lock().unwrap().max_hardened,
+            0,
+            "the guard must trip BEFORE ensure_durable — no LSN was hardened"
+        );
+        p.unpin(f);
+    }
+
+    /// `rmp` #396: the `allow_unlogged` seed path (a freshly-allocated, not-yet-logged page with a
+    /// valid checksum) is the one legitimate `page_lsn == 0` write-back and must still succeed under
+    /// a real WAL — the guard must not over-reject.
+    #[test]
+    fn allow_unlogged_seed_write_back_still_succeeds() {
+        let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), RecordingWal::default(), 2);
+        let (f, _id) = p.new_page().unwrap();
+        p.with_page_mut(f, |page| page[100] = 0x7);
+        {
+            let slot = p.slot(f);
+            let mut meta = slot.meta.write().unwrap();
+            p.write_back(&mut meta, true)
+                .expect("allow_unlogged write-back of an unstamped page must succeed");
+            assert!(!meta.dirty, "a successful write-back clears the dirty flag");
+        }
+        p.unpin(f);
     }
 
     /// F14: a panic inside a `with_page_mut` closure must not permanently wedge the frame — the
