@@ -2169,9 +2169,7 @@ mod reader_pool_suppression_tests {
         assert!(is_reader_pool_worker());
         // A freshly spawned thread does NOT inherit the flag (it is thread-local), so the engine thread
         // is never suppressed by a reader worker's guard.
-        let observed = std::thread::spawn(|| is_reader_pool_worker())
-            .join()
-            .unwrap();
+        let observed = std::thread::spawn(is_reader_pool_worker).join().unwrap();
         assert!(!observed);
     }
 

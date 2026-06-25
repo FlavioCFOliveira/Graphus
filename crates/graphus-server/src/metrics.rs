@@ -195,6 +195,22 @@ pub struct Metrics {
     /// engine death. A multi-writer-safe `CachePad` (the engine thread is the sole writer today, but a
     /// reader-pool worker's caught panic is accounted through the same counter at retirement).
     statement_panics: CachePad,
+
+    // ---- reliability (`rmp` #409) ----
+    /// Statement-recovery **double-panics** caught at the engine's recovery boundary (`rmp` #409): a
+    /// statement panicked AND the subsequent rollback/commit that recovers it *also* panicked. A
+    /// non-zero value means a deep storage/buffer-pool/MVCC invariant broke (the in-memory state may be
+    /// unreliable), so unlike a plain statement panic it is treated as **engine-degraded**. Engine-
+    /// thread-only writer (the recovery boundary runs only on the engine thread), so unpadded.
+    engine_recovery_panics: AtomicU64,
+    /// Engine-degraded gauge (`rmp` #409): `1` once a statement-recovery double-panic has been caught
+    /// (a rollback/commit itself panicked, so a deep invariant is broken and the database's in-memory
+    /// state is no longer trustworthy), `0` otherwise. Drives `/health/ready` to `503` so the
+    /// degradation is surfaced to an operator/orchestrator rather than silently serving over possibly
+    /// corrupt in-memory state. Mirrors the `maintenance_degraded` (`rmp` #394) readiness pattern.
+    /// Engine-thread-only writer; read by the readiness route. There is no auto-clear: a broken
+    /// in-memory invariant is only safely resolved by a controlled engine/process restart.
+    engine_degraded: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -228,6 +244,8 @@ impl Metrics {
             maintenance_failures: AtomicU64::new(0),
             maintenance_degraded: AtomicU64::new(0),
             statement_panics: CachePad::new(0),
+            engine_recovery_panics: AtomicU64::new(0),
+            engine_degraded: AtomicU64::new(0),
         }
     }
 
@@ -362,6 +380,31 @@ impl Metrics {
         self.statement_panics.load(Ordering::Relaxed)
     }
 
+    /// Records one statement-recovery **double-panic** caught at the engine's recovery boundary
+    /// (`rmp` #409): a statement panicked and its recovering rollback/commit *also* panicked. This
+    /// flags the engine **degraded** (a deep storage/MVCC invariant is broken — the in-memory state is
+    /// no longer trustworthy), driving `/health/ready` to `503`. Kept allocation-light and infallible:
+    /// it must never itself panic, since it runs in the catch handler of the very panic it records.
+    pub fn record_engine_recovery_panic(&self) {
+        self.engine_recovery_panics.fetch_add(1, Ordering::Relaxed);
+        self.engine_degraded.store(1, Ordering::Relaxed);
+    }
+
+    /// The number of statement-recovery double-panics caught so far (`rmp` #409) — observability /
+    /// tests.
+    #[must_use]
+    pub fn engine_recovery_panics(&self) -> u64 {
+        self.engine_recovery_panics.load(Ordering::Relaxed)
+    }
+
+    /// Whether the engine is currently flagged degraded by a recovery double-panic (`rmp` #409) — read
+    /// by the readiness route and the engine's per-command degraded-error gate. No auto-clear: a broken
+    /// in-memory invariant is only safely resolved by a controlled engine/process restart.
+    #[must_use]
+    pub fn is_engine_degraded(&self) -> bool {
+        self.engine_degraded.load(Ordering::Relaxed) != 0
+    }
+
     /// Renders the full registry in Prometheus text-exposition format (v0.0.4).
     ///
     /// The output is a stable, self-describing snapshot: each metric carries its `# HELP` and
@@ -487,6 +530,18 @@ impl Metrics {
             "graphus_statement_panics_total",
             "Statements whose execution panicked and was caught at the engine panic boundary (rmp #386).",
             self.statement_panics.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_engine_recovery_panics_total",
+            "Statement-recovery double-panics caught at the engine recovery boundary (rmp #409).",
+            self.engine_recovery_panics.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_engine_degraded",
+            "1 if the engine is degraded by a recovery double-panic (rmp #409), else 0.",
+            self.engine_degraded.load(Ordering::Relaxed),
         );
 
         // The latency histogram.
@@ -774,7 +829,9 @@ mod size_probe {
         );
         // 10 padded counters * 64B = 640B (the 9 original + `statement_panics`, `rmp` #386 — written by
         // both the engine thread and reader-pool workers, so genuinely multi-writer), plus the unpadded
-        // engine-only fields packed into the remaining lines: 832B total on this target.
-        assert_eq!(std::mem::size_of::<Metrics>(), 832);
+        // engine-only fields (now including the two `rmp` #409 reliability counters,
+        // `engine_recovery_panics` + `engine_degraded`, both engine-thread-only) packed into the
+        // remaining lines: 896B total on this target.
+        assert_eq!(std::mem::size_of::<Metrics>(), 896);
     }
 }

@@ -2873,6 +2873,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         } else {
             &mut chunk_iter
         };
+        // `rmp` #410: the heap block's creator stamp is `txn.0`, which becomes the in-use block's MVCC
+        // `xmin`. The #398 orphan well-formedness check's heap arm
+        // ([`orphan_page_records_well_formed`]) treats a `0` `xmin` as the `VersionStamp::None`
+        // none-sentinel and *rejects* the page as malformed — so a heap write under `TxnId(0)` would
+        // make a legitimately-written page fail orphan re-attribution on the next open. `TxnId(0)` is
+        // reserved (never handed to a real transaction) precisely so this never happens; assert it here
+        // so a future change that violates the reservation fails loudly at the write site rather than
+        // silently producing pages that vanish on recovery.
+        assert!(
+            txn.0 != 0,
+            "INVARIANT: heap writes must use a real TxnId; TxnId(0) is reserved (its 0 xmin is the \
+             MVCC none-sentinel the #398 orphan check rejects)"
+        );
         for chunk in chunks {
             let id = self.alloc_id(StoreKind::Strings);
             let block = HeapBlock::new(txn.0, chunk, next);
@@ -3972,6 +3985,26 @@ mod tests {
                 &bad[..],
                 StoreKind::Rel
             )
+        );
+    }
+
+    /// `rmp` #410: a normal heap write uses a real, non-zero `TxnId`, so the `alloc_chain` reservation
+    /// assert (`txn.0 != 0`) holds and the chain round-trips. This pins the invariant the #398 orphan
+    /// heap arm silently depends on (a `0` `xmin` is the none-sentinel it rejects), so a future change
+    /// that wrote the heap under `TxnId(0)` would fail this test (and the assert) loudly.
+    #[test]
+    fn heap_write_uses_a_nonzero_txn_id() {
+        let mut s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let head = s
+            .alloc_chain(t, b"graphus #410 heap chain")
+            .expect("alloc heap chain");
+        s.commit(t).unwrap();
+        assert_eq!(
+            s.read_chain(head).expect("read heap chain"),
+            b"graphus #410 heap chain",
+            "a heap chain written under a real TxnId round-trips"
         );
     }
 

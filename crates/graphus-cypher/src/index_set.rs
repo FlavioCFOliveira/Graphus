@@ -1005,6 +1005,16 @@ impl IndexSet {
     /// Candidate node ids whose `(label_token, prop_key)` value equals `value`, ascending. `None` if
     /// no bitmap index is registered for the column; otherwise the membership-exact set (the caller
     /// still re-checks MVCC visibility + the exact predicate, per the candidate contract).
+    ///
+    /// **`rmp` #410 — abort/panic-undo prerequisite before wiring this into the planner.** The bitmap is
+    /// a *membership-exact* index maintained by remove-then-reinsert on a property change
+    /// ([`remove_bitmap_node`](Self::remove_bitmap_node) + [`insert_bitmap_value`](Self::insert_bitmap_value)),
+    /// and a transaction abort (`coordinator::abort`) rolls back only the durable store, **not** this
+    /// in-memory index. So a panic/unwind struck *between* the remove and the reinsert would leave a
+    /// committed node's entry missing — and unlike the planner's insert-only candidate index, the
+    /// query-time re-check cannot resurrect a *missing* candidate. This is harmless **today only because
+    /// this seek has no planner consumer** (test-only). Wiring it into the planner first requires either
+    /// abort-undo of the in-memory bitmap on rollback or a dedicated panic-window regression test.
     #[must_use]
     pub fn seek_bitmap_eq(
         &self,
@@ -1022,6 +1032,11 @@ impl IndexSet {
     /// caller can fall back to its ordinary seek+filter); otherwise intersects the per-value Roaring
     /// bitmaps entirely inside Roaring and returns the common ids. An empty `predicates` yields `None`
     /// (no conjunction to accelerate).
+    ///
+    /// **`rmp` #410 — same abort/panic-undo prerequisite as [`seek_bitmap_eq`](Self::seek_bitmap_eq)
+    /// before wiring this into the planner** (membership-exact, not abort-undone; a mid-reinsert unwind
+    /// could drop a committed node's entry that the query-time re-check cannot resurrect). Safe today
+    /// only because it has no planner consumer.
     #[must_use]
     pub fn seek_bitmap_conjunction(
         &self,

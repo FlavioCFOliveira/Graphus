@@ -27,7 +27,7 @@
 //! panic_isolation`. OFF by default so the production server never exposes a panicking function.
 #![cfg(feature = "internal-test-udf")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use graphus_core::Value;
 use graphus_core::capability::Clock;
@@ -37,6 +37,19 @@ use graphus_server::engine::{Engine, EngineHandle, spawn_engine};
 use graphus_sim::SharedClock;
 use graphus_storage::RecordStore;
 use graphus_wal::{MemLogSink, WalManager};
+
+/// Serialises the tests in this binary. They share **process-global** mutable state — the morsel knobs
+/// (`set_morsel_*`) and the `rmp` #409 recovery-fault-injection static (`arm_recovery_fault`) — so they
+/// must not run concurrently or one test's global mutation would corrupt another's. cargo runs tests in
+/// one binary on multiple threads by default; each test takes this lock first to run serially. Returns a
+/// guard held for the test's duration; poisoning is irrelevant (a failed test already reports its own
+/// assertion), so a poisoned lock is recovered into.
+fn test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Spawns a threaded engine with `reader_threads` reader workers over an in-memory store sized to keep
 /// the small test working set RAM-resident.
@@ -132,11 +145,102 @@ impl Drop for SilencePanicHook {
     }
 }
 
+/// Runs an auto-commit statement and returns the engine's *reply-stage* error message (the error
+/// delivered through the `Run` reply channel before any row), if the statement failed before streaming.
+/// Distinguishes a clean engine-served error (e.g. the `rmp` #409 engine-degraded error) from a dead
+/// engine (`engine_gone`) — both surface here as an `Err`, but with different messages, so the caller
+/// can assert *which* failure occurred (a hang would instead block this call forever, which the test
+/// harness's overall timeout catches).
+fn run_reply_err(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<(), String> {
+    let ticket = handle
+        .begin_auto_commit_blocking(mode)
+        .map_err(|e| e.to_string())?;
+    handle
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Gate (`rmp` #409): a statement panics **and** its recovering rollback *also* panics (a recovery
+/// double-panic). The recovery boundary must NOT unwind the single engine thread; instead it flags the
+/// engine degraded, keeps the loop alive, and serves every subsequent request a clean engine-degraded
+/// error — never a hang, never `engine_gone` from a dead thread.
+///
+/// Mechanism: `ext.panic` makes the statement panic on the engine thread (caught by
+/// `run_statement_isolated`'s `catch_unwind`); the `arm_recovery_fault(1)` seam makes the *recovery
+/// rollback* that follows panic too, exercising the second, deeper panic boundary (`catch_recovery`).
+#[test]
+fn engine_survives_recovery_double_panic() {
+    let _guard = test_guard();
+    let _silence = SilencePanicHook::install();
+    let eng = engine(0); // a single reader worker exists, but the WRITE below runs inline on the engine
+    let handle = eng.handle.clone();
+
+    // Seed a node so the panicking RETURN has a row, and prove the engine is healthy first.
+    assert!(
+        run_collect(&handle, AccessMode::Write, "CREATE (:Probe {v: 1})").is_ok(),
+        "seed statement commits on a healthy engine"
+    );
+    assert!(
+        !handle.metrics().is_engine_degraded(),
+        "engine starts healthy (not degraded)"
+    );
+
+    // Arm the recovery fault so the rollback that recovers the next statement panic ALSO panics.
+    graphus_server::engine::arm_recovery_fault(1);
+
+    // A WRITE auto-commit panics (so it runs INLINE on the engine thread — a Read auto-commit would
+    // dispatch off-thread to the reader pool; writes never do). The statement panic is caught by the
+    // statement boundary (`run_statement_isolated`), and its recovery rollback then panics, caught by
+    // the recovery boundary (`catch_recovery`). `run_collect` returning *at all* (not blocking forever)
+    // is the first liveness signal: the engine thread did not die mid-recovery leaving the consumer hung.
+    let _ = run_collect(
+        &handle,
+        AccessMode::Write,
+        "MATCH (p:Probe) SET p.v = ext.panic(p.v) RETURN p.v",
+    );
+
+    // THE KEY ASSERTION: the engine thread SURVIVED. A later request returns a clean engine-degraded
+    // error — NOT a hang (this call would block forever on a dead thread's dropped reply) and NOT
+    // `engine_gone` (the `Transaction`-class "engine unavailable" a dead thread's dropped channel
+    // produces). The distinct `Runtime`-class "engine degraded" message proves the loop is alive and is
+    // gating requests. This request is ALSO strictly ordered after the engine finished the recovery
+    // (the single engine thread processes one command at a time), so it doubly proves recovery completed.
+    let after = run_reply_err(&handle, AccessMode::Read, "MATCH (p:Probe) RETURN count(p)");
+    let msg = after.expect_err("a degraded engine must refuse further work with a clean error");
+    assert!(
+        msg.contains("engine degraded"),
+        "the follow-up request must get the clean engine-degraded error (rmp #409), got: {msg}"
+    );
+    assert!(
+        !msg.contains("engine unavailable"),
+        "must NOT be `engine_gone` — that would mean the engine thread died, got: {msg}"
+    );
+
+    // The recovery boundary fired exactly once and flagged the engine degraded (drives /health/ready to
+    // 503). Checked after the ordered follow-up above, so the recovery is guaranteed complete.
+    assert_eq!(
+        handle.metrics().engine_recovery_panics(),
+        1,
+        "the recovery (double-panic) boundary must have caught exactly one recovery panic"
+    );
+    assert!(
+        handle.metrics().is_engine_degraded(),
+        "a recovery double-panic must flag the engine DEGRADED (drives /health/ready to 503)"
+    );
+
+    // `Status` / `Shutdown` are still honoured on a degraded engine (it must remain probeable/drainable
+    // for a controlled restart) — proven by the clean teardown below, which sends `Shutdown` and joins
+    // the still-alive engine thread without hanging.
+    shutdown(eng, handle);
+}
+
 /// Gate (a): an **inline** statement panic (a scalar UDF panic on the engine thread) is converted to a
 /// clean terminal error and the engine keeps serving — a second, unrelated statement on a fresh ticket
 /// still succeeds.
 #[test]
 fn engine_survives_inline_statement_panic() {
+    let _guard = test_guard();
     let _silence = SilencePanicHook::install();
     let eng = engine(2);
     let handle = eng.handle.clone();
@@ -203,6 +307,7 @@ fn engine_survives_inline_statement_panic() {
 fn engine_survives_morsel_worker_panic() {
     use graphus_cypher::morsel::{set_morsel_min_rows, set_morsel_threads};
 
+    let _guard = test_guard();
     let _silence = SilencePanicHook::install();
 
     // Enable the morsel tier and open its cardinality gate so the parallel machinery is live for this
@@ -263,6 +368,7 @@ fn engine_survives_morsel_worker_panic() {
 /// the GC watermark.
 #[test]
 fn read_pool_survives_read_task_panic() {
+    let _guard = test_guard();
     let _silence = SilencePanicHook::install();
     // A multi-worker pool so a read genuinely dispatches off-thread (auto-commit Reads run on the pool).
     let eng = engine(4);

@@ -103,6 +103,45 @@ const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 /// readiness probe (a slow-motion OOM) — escalates. Any success resets the streak and clears the gauge.
 pub(crate) const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
 
+/// A **test-only fault-injection seam** (`rmp` #409): the count of upcoming statement-recovery
+/// rollbacks/commits that should *themselves* panic, simulating the historical `RefCell`-double-borrow
+/// in `store.rs` (or the #359 buffer-pool replay panic class) striking inside the recovery path. Lets
+/// the double-panic regression gate drive a deterministic recovery panic through the real engine
+/// without corrupting the store. Compiled in only under the opt-in `internal-test-udf` feature (OFF in
+/// production). A process-global atomic (not a thread-local) because the arming test thread and the
+/// consuming engine thread are different OS threads.
+#[cfg(feature = "internal-test-udf")]
+static RECOVERY_FAULT_ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Arms the recovery fault-injection seam for the next `n` recovery attempts (`rmp` #409, test-only).
+#[cfg(feature = "internal-test-udf")]
+pub fn arm_recovery_fault(n: u32) {
+    RECOVERY_FAULT_ARMED.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Panics if the recovery fault seam is armed, decrementing the armed count (`rmp` #409, test-only).
+/// Called at the start of each recovery rollback/commit so an armed fault makes the recovery itself
+/// panic. A no-op (and near-zero-cost) in production, where the feature is off (the function body
+/// compiles away entirely).
+#[cfg(feature = "internal-test-udf")]
+#[inline]
+fn recovery_fault_check() {
+    use std::sync::atomic::Ordering;
+    // Decrement-if-positive: fire (and consume one arm) only while armed.
+    let fire = RECOVERY_FAULT_ARMED
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n > 0).then(|| n - 1)
+        })
+        .is_ok();
+    if fire {
+        panic!("rmp #409: deliberate recovery double-panic (test fault injection)");
+    }
+}
+
+#[cfg(not(feature = "internal-test-udf"))]
+#[inline]
+fn recovery_fault_check() {}
+
 /// An opaque handle to a transaction the engine opened.
 ///
 /// Both connectivity seams refer to a transaction by this ticket (the Bolt session tracks its single
@@ -404,10 +443,14 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
 
     // (2) Auto-commit: commit on a clean outcome, roll back on a read error (R3 — a captured
     // deferral / write-degrade error must surface, never a silent commit over an untrustworthy read).
+    // `rmp` #409: the auto-commit `commit`/`rollback` below run on the engine thread OUTSIDE any
+    // `catch_unwind`, and both are fallible WAL/buffer-pool paths that can themselves panic. Wrap each
+    // in `catch_recovery` so a recovery double-panic flags the engine degraded and keeps the loop alive,
+    // rather than unwinding the single engine thread (`engine_gone` forever — the #386 failure, deeper).
     match outcome {
-        Ok(()) => match coordinator.commit(txn) {
-            Ok(_) => metrics.record_commit(),
-            Err(e) => {
+        Ok(()) => match catch_recovery(metrics, "reader commit", || coordinator.commit(txn)) {
+            Some(Ok(_)) => metrics.record_commit(),
+            Some(Err(e)) => {
                 // The COMMIT failed (e.g. an SSI serialization abort): the transaction is rolled back.
                 // Deliver the failure to the consumer as a terminal stream item BEFORE closing the
                 // egress channel — a rolled-back auto-commit must be reported as failed/retriable, never
@@ -415,14 +458,28 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
                 let _ = row_tx.send(Err(e));
                 metrics.record_abort();
             }
+            // Recovery double-panicked: the engine is flagged degraded (gauge + metric set inside
+            // `catch_recovery`). Surface a clean terminal error to this consumer so it does not hang on
+            // the dropped egress channel; subsequent requests get the engine-degraded error.
+            None => {
+                let _ = row_tx.send(Err(GraphusError::Runtime(
+                    "internal error: engine degraded (commit recovery panicked)".to_owned(),
+                )));
+            }
         },
         Err(read_err) => {
             // The read itself errored (runtime / captured / write-degrade). The terminal error was
             // already streamed by the reader (`run_read_task` sends it for auth/deferral errors); roll
             // the transaction back so nothing is committed over an untrustworthy result.
             let _ = read_err; // already surfaced to the consumer by the reader.
-            let _ = coordinator.rollback(txn);
-            metrics.record_abort();
+            match catch_recovery(metrics, "reader rollback", || coordinator.rollback(txn)) {
+                Some(_) => metrics.record_abort(),
+                None => {
+                    let _ = row_tx.send(Err(GraphusError::Runtime(
+                        "internal error: engine degraded (rollback recovery panicked)".to_owned(),
+                    )));
+                }
+            }
         }
     }
     // Closing the egress channel: every row + any terminal error has been sent.
@@ -543,6 +600,59 @@ fn invalidate_cache_on_build_completion<D: BlockDevice, S: LogSink>(
     *builds_were_pending = now_pending;
 }
 
+/// The clean error a degraded engine returns to every request (`rmp` #409): a recovery double-panic
+/// broke a deep in-memory invariant, so the engine refuses to execute over possibly-corrupt state. A
+/// `Runtime`-class error so a client sees a definite failure (not a hang) and an orchestrator —
+/// alerted via `/health/ready` `503` — can trigger a controlled restart.
+fn engine_degraded_error() -> GraphusError {
+    GraphusError::Runtime(
+        "engine degraded: a statement-recovery rollback/commit panicked, so the in-memory state is no \
+         longer trustworthy; the engine is refusing further work pending a controlled restart (rmp #409)"
+            .to_owned(),
+    )
+}
+
+/// Serves a clean **engine-degraded** error (`rmp` #409) for an executing/transactional command when
+/// the engine has been flagged degraded by a recovery double-panic. Returns `None` once the command's
+/// reply has been answered (handled — the caller keeps the loop alive without touching the suspect
+/// coordinator), or `Some(cmd)` for the two control commands that must still run on a degraded engine —
+/// `Shutdown` (so the engine can be drained + a restart proceed) and `Status` (a cheap probe) — which
+/// the caller dispatches normally.
+fn reply_engine_degraded(cmd: EngineCommand) -> Option<EngineCommand> {
+    match cmd {
+        // Control commands that must keep working so the node can be drained / probed / restarted.
+        cmd @ (Cmd::Shutdown { .. } | Cmd::Status { .. }) => Some(cmd),
+        Cmd::Begin { reply, .. } | Cmd::BeginAutoCommit { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+        Cmd::Run { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+        Cmd::Commit { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+        Cmd::Rollback { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+        Cmd::IndexDdl { reply, .. } | Cmd::ConstraintDdl { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+        Cmd::Backup { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+        Cmd::Checkpoint { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
+    }
+}
+
 /// Dispatches one [`EngineCommand`] against the coordinator. Returns `true` to keep the loop running,
 /// `false` once a [`EngineCommand::Shutdown`] has drained + hardened the store (the loop then exits).
 ///
@@ -563,6 +673,23 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     metrics: &Arc<Metrics>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) -> bool {
+    // `rmp` #409: once a statement-recovery double-panic has flagged the engine degraded, the
+    // coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke). Stop
+    // executing statements/transactions over it — serve each request a clean engine-degraded error so a
+    // client sees a definite failure (not a hang, not `engine_gone` from a dead thread). `Shutdown` and
+    // `Status` are still honoured so the engine can be drained / probed and a controlled restart can
+    // proceed. The engine thread itself stays alive (the loop keeps spinning); the degraded gauge already
+    // drives `/health/ready` to `503`.
+    let cmd = if metrics.is_engine_degraded() {
+        match reply_engine_degraded(cmd) {
+            // Handled: a clean engine-degraded error was delivered. Keep the loop alive.
+            None => return true,
+            // Pass-through (`Shutdown` / `Status`): continue to the normal dispatch below.
+            Some(cmd) => cmd,
+        }
+    } else {
+        cmd
+    };
     let coord = coordinator
         .as_mut()
         .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
@@ -700,12 +827,33 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
 /// **do not** observe any partially-mutated state across the boundary: on a caught panic we run
 /// [`rollback_panicked_statement`], which calls [`TxnCoordinator::rollback`] (→ ARIES
 /// `store.abort_writer` / `rollback`) on the statement's transaction, discarding the entire
-/// half-applied write buffer and restoring the last consistent state regardless of *where* mid-write
-/// the panic struck. No `RefCell` is left borrowed: the per-statement seam ([`RecordStoreGraph`])
-/// borrows the store only transiently *inside* each operation via RAII guards, so unwinding drops
-/// every live `Ref`/`RefMut` before this frame regains control. No lock is poisoned either: the
-/// coordinator's shared state lives behind `Rc<RefCell>` (single-thread, no `Mutex`), and the rollback
-/// is the explicit recovery. The transaction is therefore left *rolled back*, never half-applied.
+/// half-applied write buffer and **restoring the durable store state via ARIES undo** regardless of
+/// *where* mid-write the panic struck. No `RefCell` is left borrowed: the per-statement seam
+/// ([`RecordStoreGraph`]) borrows the store only transiently *inside* each operation via RAII guards,
+/// so unwinding drops every live `Ref`/`RefMut` before this frame regains control. No lock is poisoned
+/// either: the coordinator's shared state lives behind `Rc<RefCell>` (single-thread, no `Mutex`), and
+/// the rollback is the explicit recovery. The transaction is therefore left *rolled back*, never
+/// half-applied.
+///
+/// ## What the rollback does and does NOT undo (`rmp` #410 — be precise)
+///
+/// [`coordinator::abort`](TxnCoordinator) rolls back the **durable store** (ARIES undo of the write
+/// buffer) but does **not** undo the in-memory derived secondary indexes. Two index shapes behave
+/// differently:
+///
+/// * **Insert-only candidate indexes** (the node-property index the planner actually uses) are
+///   *candidate sources* reconciled by the executor's **query-time re-check** against the MVCC store,
+///   so a stale entry left by an aborted write is dropped at read time — safe.
+/// * **Membership-exact indexes** (bitmap, full-text, spatial) maintain themselves with a
+///   *remove-then-reinsert* on a property change (`record_graph.rs`, `index_set.rs`, `fulltext.rs`),
+///   so a panic *between* the remove and the reinsert could leave a committed node's entry **missing**.
+///   This is **not** abort-undone today and is safe only because: (1) the **bitmap** index is not yet
+///   wired into the planner (test-only consumers — see the warning at its seek consumers in
+///   `index_set.rs`), so a missing bitmap entry is never read on a production plan; and (2) full-text /
+///   spatial maintenance reaches that window only on allocation failure, which **aborts** (it does not
+///   `panic`/unwind), so no production-reachable unwind strikes mid-reinsert. **Wiring bitmap into the
+///   planner — or making membership-exact maintenance able to panic — requires either abort-undo of the
+///   in-memory index or a dedicated panic-window regression test first.**
 #[allow(clippy::too_many_arguments)]
 fn run_statement_isolated<
     D: BlockDevice + Send + Sync + 'static,
@@ -808,7 +956,19 @@ fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
     if let Some(tx) = open.remove(&ticket.0) {
         // Discard the entire half-applied write buffer (ARIES undo). A failure here is itself
         // best-effort: the txn is being torn down regardless and recovery would undo it anyway.
-        if coord.rollback(tx.txn).is_ok() {
+        //
+        // `rmp` #409: the rollback is a fallible WAL-undo + buffer-pool-replay path that can *itself*
+        // panic (the historical `store.rs` `RefCell`-double-borrow, the #359 pool replay class). That
+        // recovery panic runs OUTSIDE `run_statement_isolated`'s `catch_unwind`, so without this guard
+        // it would unwind the single engine thread — the exact `engine_gone`-forever failure #386 set
+        // out to prevent, one panic deeper. Wrap it so a double-panic flags the engine degraded and
+        // keeps the loop alive instead of killing the thread.
+        let txn = tx.txn;
+        // `Some(Ok(()))` = rollback ran and succeeded → account the abort. `Some(Err(_))` (a benign
+        // rollback failure on a torn-down txn) and `None` (a caught recovery double-panic, which already
+        // flagged the engine degraded inside `catch_recovery`) both need no extra action here.
+        if let Some(Ok(())) = catch_recovery(metrics, "statement rollback", || coord.rollback(txn))
+        {
             metrics.record_abort();
         }
     }
@@ -818,6 +978,56 @@ fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
     let _ = fallback.try_send_fallback(Err(GraphusError::Runtime(format!(
         "internal error: statement aborted ({detail})"
     ))));
+}
+
+/// Runs a **statement-recovery** rollback/commit (`f`) behind its own panic boundary (`rmp` #409).
+///
+/// The recovery rollback/commit invoked after a caught statement panic (or at reader retirement) is a
+/// fallible WAL-undo + buffer-pool-replay path that can *itself* panic — and it runs OUTSIDE
+/// [`run_statement_isolated`]'s `catch_unwind`, so an un-guarded recovery panic would unwind the single
+/// engine thread and brick the database (`engine_gone` forever, the very failure `rmp` #386 fixed —
+/// one panic deeper). This wraps it so:
+///
+/// * `Some(r)` — recovery ran without panicking; the caller applies its `Result` as usual.
+/// * `None` — recovery **double-panicked**: a deep storage/buffer-pool/MVCC invariant is broken, so the
+///   database's in-memory state can no longer be trusted. We do **not** unwind the engine thread.
+///   Instead we account a recovery-panic metric and flip the engine-degraded gauge (driving
+///   `/health/ready` to `503`, mirroring the `rmp` #394 reclamation-degraded pattern); the engine loop
+///   stays alive and [`dispatch_command`] serves every subsequent request a clean engine-degraded
+///   error rather than dying.
+///
+/// The handler is deliberately **allocation-light and infallible** so it cannot itself panic inside the
+/// catch (the `label` is a `&'static str`, the metric writes are lock-free atomics, and the `tracing`
+/// call borrows the caught message): a panic in the catch handler would re-introduce the very thread
+/// death this guards against.
+///
+/// `AssertUnwindSafe` is sound here for the same reason as in [`run_statement_isolated`]: on a caught
+/// recovery panic we observe **no** partially-mutated coordinator state — the engine is flagged degraded
+/// and stops executing statements, so the possibly-inconsistent in-memory state is never read again on a
+/// success path.
+fn catch_recovery<R>(metrics: &Metrics, label: &'static str, f: impl FnOnce() -> R) -> Option<R> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    match catch_unwind(AssertUnwindSafe(|| {
+        recovery_fault_check();
+        f()
+    })) {
+        Ok(r) => Some(r),
+        Err(payload) => {
+            let detail = panic_message(payload.as_ref());
+            tracing::error!(
+                target: "graphus::engine",
+                recovery = label,
+                panic = %detail,
+                "RECOVERY DOUBLE-PANIC: a statement-recovery {label} panicked — a deep storage/MVCC \
+                 invariant is broken, flagging the engine DEGRADED (readiness now reports not-ready); \
+                 the engine stays alive but will serve an engine-degraded error until a controlled \
+                 restart (rmp #409)",
+            );
+            // Allocation-light, infallible: atomic stores only. Must never panic inside the catch.
+            metrics.record_engine_recovery_panic();
+            None
+        }
+    }
 }
 
 /// Extracts a human-readable message from a caught panic payload (`rmp` task #386), covering the two

@@ -154,6 +154,11 @@ async fn health_live() -> Response {
 /// orchestrator stop routing writes to a node that would otherwise keep accepting them behind a green
 /// probe until it OOMs. The gauge clears the moment a checkpoint succeeds, so the node recovers
 /// readiness automatically once reclamation resumes.
+///
+/// Also reports `503` when the **engine is degraded** (`rmp` #409): a statement panicked and the
+/// rollback/commit recovering it *also* panicked, so a deep storage/MVCC invariant is broken and the
+/// engine's in-memory state can no longer be trusted. Unlike reclamation-degraded this does **not**
+/// auto-clear — a controlled engine/process restart is the only safe recovery.
 async fn health_ready(State(state): State<ExtraState>) -> Response {
     if !state.readiness.is_ready() {
         return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
@@ -162,6 +167,19 @@ async fn health_ready(State(state): State<ExtraState>) -> Response {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "not ready: storage reclamation degraded",
+        )
+            .into_response();
+    }
+    // `503` when the engine is degraded by a recovery double-panic (`rmp` #409): a statement panicked
+    // AND its recovering rollback/commit *also* panicked, so a deep storage/MVCC invariant is broken and
+    // the in-memory state is no longer trustworthy. Surfacing it through readiness lets an orchestrator
+    // stop routing to a node whose engine is serving an engine-degraded error to every request (rather
+    // than the engine silently dying or serving over possibly-corrupt state). No auto-clear — a
+    // controlled restart is the only safe recovery.
+    if state.metrics.is_engine_degraded() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: engine degraded (recovery double-panic)",
         )
             .into_response();
     }
