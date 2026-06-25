@@ -222,10 +222,36 @@ impl FrameSlot {
 /// durable doublewrite copy (the InnoDB ordering, `05 §3`).
 pub trait PageStager: Send + Sync {
     /// Stages `image` (the exact bytes about to be written to home page `page_id`, checksum already
-    /// stamped) into the doublewrite area and fsyncs it, so the copy is durable before the caller
-    /// writes the page home. Used by the **eviction/steal** path, which writes one page home at a
-    /// time under its frame latch.
-    fn stage_and_sync(&self, page_id: PageId, image: &[u8]) -> Result<()>;
+    /// stamped) into the doublewrite area, fsyncs it, then runs `home_write` to write the page home
+    /// **and make that home write durable** — all while the doublewrite area's slot for this page is
+    /// still reserved. Used by the **eviction/steal** path, which writes one page home at a time under
+    /// its frame latch.
+    ///
+    /// ## Why the home write is a callback (`rmp` #411)
+    ///
+    /// The doublewrite area protected by this stager holds exactly **one** batch region. If staging
+    /// merely fsynced the copy and *returned* — letting the caller do the home write afterwards,
+    /// unserialised — two concurrent evictors would race: evictor T1 stages page A (region = {A}),
+    /// evictor T2 stages page B (region **overwritten** = {B}), then T1's home write of A tears on a
+    /// crash. Recovery reads the single region, sees only {B}, and A's torn home page is
+    /// **unrecoverable** — the corruption the doublewrite buffer exists to prevent (`rmp` #411,
+    /// reopening the `rmp` #407 hole under concurrency). The InnoDB invariant (`05 §3`) is: a
+    /// doublewrite slot must NOT be reused until the prior occupant's home write is **durably
+    /// complete**. By running the home write *inside* the staging critical section (the implementation
+    /// holds its interior lock across `home_write`), the slot's occupant is guaranteed durable on the
+    /// home device before the next evictor can reuse the region. `home_write` MUST make its home write
+    /// durable (write the page **and** sync the home device) before it returns.
+    ///
+    /// # Errors
+    /// Returns a storage error if the doublewrite write/sync fails (then `home_write` is **not** run —
+    /// no home page is written without a durable doublewrite copy), or propagates an error from
+    /// `home_write` itself (a home write/sync failure surfaces, never hidden).
+    fn stage_and_sync(
+        &self,
+        page_id: PageId,
+        image: &[u8],
+        home_write: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()>;
 
     /// Stages a whole **batch** of `(page_id, image)` pairs into the doublewrite area as ONE durable
     /// batch (a single fsync), so every page in the batch has an intact doublewrite copy before any
@@ -1310,12 +1336,42 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // data, so a torn write of it loses nothing that recovery must reconstruct — redo recreates it
         // from the WAL once it is logged. Staging it would only cost a doublewrite fsync for no
         // durability gain. Logged pages (the steal of a dirty, WAL-stamped page) are always staged.
+        //
+        // SLOT-REUSE-AFTER-DURABLE INVARIANT (`rmp` #411): the doublewrite area holds ONE batch
+        // region, so the staged copy of THIS page must remain the region's occupant until this page's
+        // home write is DURABLY complete — otherwise a concurrent evictor reuses the region and a torn
+        // home write of this page becomes unrecoverable. We therefore do the home write **inside** the
+        // stager's `stage_and_sync` callback: the stager holds its interior DWB lock across the staging
+        // fsync AND the home write below, so the region is not freed for reuse until this page is
+        // durable home. The callback writes the page home and `sync_data`s the home device (making the
+        // evicted page durable) before returning. `write_page`/`sync_data` are `&mut D`, taking the
+        // device **write** guard (exclusive): write-backs serialise against each other and against
+        // concurrent device reads — correct, the WAL rule above and the exclusive guard keep the
+        // steal/no-force ordering intact. Lock order is uniformly frame-latch → DWB → device (the
+        // checkpoint path stages under held frame latches then takes the device only after releasing
+        // the DWB lock, so nothing ever takes device-then-DWB — no ABBA deadlock, `rmp` #407).
         if !allow_unlogged && let Some(stager) = self.page_stager() {
-            stager.stage_and_sync(page_id, &meta.data[..])?;
+            // Borrow only the immutable parts the callback needs (`&meta.data` + `self`), so the
+            // closure's borrow of `meta` ends when `stage_and_sync` returns and we can clear the dirty
+            // flag afterwards.
+            let data: &Page = &meta.data;
+            {
+                let mut home_write = || -> Result<()> {
+                    let mut device = self.write_device();
+                    device.write_page(page_id, data)?;
+                    // Make the evicted home page durable BEFORE the stager releases the DWB region:
+                    // only a durable home write may free the slot for reuse (`rmp` #411).
+                    device.sync_data()
+                };
+                stager.stage_and_sync(page_id, &data[..], &mut home_write)?;
+            }
+            meta.dirty = false;
+            return Ok(());
         }
-        // `write_page` is `&mut D`, so it takes the device **write** guard (exclusive): write-backs
-        // serialise against each other and against concurrent device reads — correct, since the WAL
-        // rule above (and the exclusive guard) keep the steal/no-force ordering intact.
+        // Unprotected path (no stager installed, or an `allow_unlogged` seed write): no doublewrite
+        // region to coordinate, so the home write happens directly. `write_page` is `&mut D`, taking
+        // the device **write** guard (exclusive): write-backs serialise against each other and against
+        // concurrent device reads — correct, the WAL rule above keeps the steal/no-force ordering.
         self.write_device().write_page(page_id, &meta.data)?;
         meta.dirty = false;
         Ok(())

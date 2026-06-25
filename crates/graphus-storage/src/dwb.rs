@@ -396,7 +396,12 @@ impl<D: BlockDevice> DwbPageStager<D> {
 }
 
 impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
-    fn stage_and_sync(&self, page_id: PageId, image: &[u8]) -> Result<()> {
+    fn stage_and_sync(
+        &self,
+        page_id: PageId,
+        image: &[u8],
+        home_write: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         // The image is exactly one page; `stage_batch` of a single `(page_id, &Page)` writes it to a
         // DWB data slot, records the header, and `sync_data`s — durable before the home write begins.
         let page: &Page = image.try_into().map_err(|_| {
@@ -406,11 +411,34 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
                 image.len()
             ))
         })?;
+        // SLOT-REUSE-AFTER-DURABLE INVARIANT (`rmp` #411). The doublewrite area has ONE batch region.
+        // We hold the DWB lock across BOTH the staging fsync AND the home write, so this page's
+        // doublewrite copy stays the region's occupant — and discoverable by `recover_home` — until
+        // the home write is DURABLY complete (`home_write` writes the page home and `sync_data`s the
+        // home device). Only then does the lock release, freeing the region for the next evictor.
+        //
+        // Without this, two concurrent evictors race on the single region: T1 stages A, T2 OVERWRITES
+        // the region with B, then T1's home write of A tears on a crash — `recover_home` reads the
+        // single region, finds only B, and A's torn home page is UNRECOVERABLE (`rmp` #411, reopening
+        // the `rmp` #407 hole under concurrency). Serialising staging+home-write here closes that hole.
+        //
+        // DEADLOCK-FREEDOM: `write_back` (the sole caller) holds the victim frame's write latch, then
+        // calls here, which takes the DWB lock, and `home_write` then takes the device write guard.
+        // Order is uniformly frame-latch → DWB → device. The checkpoint path (`flush_pages`) stages
+        // under held frame latches via `stage_batch_and_sync` (DWB lock) then takes the device only
+        // AFTER releasing the DWB lock — so no path ever holds the device while acquiring the DWB lock.
+        // The global order has no cycle: no ABBA between a checkpoint and a concurrent eviction.
         let mut dwb = self
             .dwb
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dwb.stage_batch(&[(page_id, page)])
+        // 1. Stage the copy and make it durable in the DWB.
+        dwb.stage_batch(&[(page_id, page)])?;
+        // 2. Write the page home and make THAT durable — still holding the DWB lock, so the region is
+        //    not reusable until this page is durable home.
+        home_write()
+        // 3. Lock released here: the region's occupant (`page_id`) is now durable on the home device,
+        //    so the next evictor may safely reuse it.
     }
 
     fn stage_batch_and_sync(&self, batch: &[(PageId, &[u8])]) -> Result<()> {
