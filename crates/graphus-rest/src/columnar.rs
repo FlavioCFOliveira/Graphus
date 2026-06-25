@@ -136,6 +136,9 @@ pub enum GcolError {
     },
     /// A cell value failed to decode through the strict-Jolt codec (the `"json"` fallback path).
     BadValue(ValueCodecError),
+    /// A columnar codec payload (integer / float / dictionary / bitmap) was truncated, named an
+    /// unknown sub-scheme, or carried an out-of-range dictionary code — a corrupt column blob.
+    BadColumn(graphus_columnar::DecodeError),
 }
 
 impl std::fmt::Display for GcolError {
@@ -149,6 +152,7 @@ impl std::fmt::Display for GcolError {
             Self::BadHeader { detail } => write!(f, "malformed gcol-result header: {detail}"),
             Self::UnknownCodec { tag } => write!(f, "unknown gcol-result column codec `{tag}`"),
             Self::BadValue(e) => write!(f, "malformed gcol-result cell value: {e}"),
+            Self::BadColumn(e) => write!(f, "malformed gcol-result column payload: {e}"),
         }
     }
 }
@@ -158,6 +162,12 @@ impl std::error::Error for GcolError {}
 impl From<ValueCodecError> for GcolError {
     fn from(e: ValueCodecError) -> Self {
         Self::BadValue(e)
+    }
+}
+
+impl From<graphus_columnar::DecodeError> for GcolError {
+    fn from(e: graphus_columnar::DecodeError) -> Self {
+        Self::BadColumn(e)
     }
 }
 
@@ -453,7 +463,7 @@ pub fn decode_result(bytes: &[u8]) -> Result<DecodedResult, GcolError> {
                 ),
             });
         }
-        let present = graphus_columnar::decode_bool(present_bytes, row_count);
+        let present = graphus_columnar::decode_bool(present_bytes, row_count)?;
         let present_count = present.iter().filter(|&&b| b).count();
 
         let payload_len = r.u32("payload length")? as usize;
@@ -487,20 +497,20 @@ fn decode_column(
     present_count: usize,
 ) -> Result<Vec<Json>, GcolError> {
     let cells = match codec {
-        codec_tag::I64 => integer::decode_i64(payload, present_count)
+        codec_tag::I64 => integer::decode_i64(payload, present_count)?
             .into_iter()
             .map(|i| value::value_to_jolt(&Value::Integer(i)))
             .collect(),
-        codec_tag::F64 => gorilla::decode(payload, present_count)
+        codec_tag::F64 => gorilla::decode(payload, present_count)?
             .into_iter()
             .map(|f| value::value_to_jolt(&Value::Float(f)))
             .collect(),
-        codec_tag::BOOL => graphus_columnar::decode_bool(payload, present_count)
+        codec_tag::BOOL => graphus_columnar::decode_bool(payload, present_count)?
             .into_iter()
             .map(|b| value::value_to_jolt(&Value::Boolean(b)))
             .collect(),
         codec_tag::STR => {
-            let raw = dictionary::decode(payload, present_count);
+            let raw = dictionary::decode(payload, present_count)?;
             let mut out = Vec::with_capacity(raw.len());
             for bytes in raw {
                 let s = String::from_utf8(bytes).map_err(|e| {
@@ -513,7 +523,7 @@ fn decode_column(
             out
         }
         codec_tag::JSON => {
-            let raw = dictionary::decode(payload, present_count);
+            let raw = dictionary::decode(payload, present_count)?;
             let mut out = Vec::with_capacity(raw.len());
             for bytes in raw {
                 // The stored bytes ARE the strict-Jolt cell rendering; return them verbatim so a

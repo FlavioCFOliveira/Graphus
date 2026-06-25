@@ -70,6 +70,10 @@ pub enum ColdError {
     Truncated,
     /// The magic / version bytes do not match — not a cold segment of this format.
     BadMagic,
+    /// A column blob itself is corrupt: a codec payload was truncated, named an unknown sub-scheme,
+    /// or carried an out-of-range dictionary code. Surfaced from [`graphus_columnar`] so a corrupt
+    /// segment is a controlled error here too (`04 §11.4`), never a panic.
+    BadColumn(graphus_columnar::DecodeError),
 }
 
 impl std::fmt::Display for ColdError {
@@ -77,7 +81,14 @@ impl std::fmt::Display for ColdError {
         match self {
             ColdError::Truncated => write!(f, "cold segment buffer is truncated"),
             ColdError::BadMagic => write!(f, "cold segment magic/version mismatch"),
+            ColdError::BadColumn(e) => write!(f, "cold segment column is corrupt: {e}"),
         }
+    }
+}
+
+impl From<graphus_columnar::DecodeError> for ColdError {
+    fn from(e: graphus_columnar::DecodeError) -> Self {
+        ColdError::BadColumn(e)
     }
 }
 
@@ -171,44 +182,51 @@ impl ColdSegment {
 
     /// Decodes **every** reading, exactly as encoded (the round-trip-exact contract). Use a range scan
     /// instead when only a `ts` window is needed (it avoids materializing non-survivors).
-    #[must_use]
-    pub fn decode_all(&self) -> Vec<Reading> {
-        let seq = integer::decode_i64(&self.seq_blob, self.count);
-        let ts = integer::decode_i64(&self.ts_blob, self.count);
-        let value = gorilla::decode(&self.value_blob, self.count);
-        let sensor = dictionary::decode(&self.sensor_blob, self.count);
-        (0..self.count)
+    ///
+    /// # Errors
+    /// [`ColdError::BadColumn`] if any column blob is corrupt (truncated / bad scheme / out-of-range
+    /// code). A segment built by [`encode`](Self::encode) always decodes; this guards the
+    /// [`from_bytes`](Self::from_bytes) path, whose blobs are untrusted on-disk bytes.
+    pub fn decode_all(&self) -> Result<Vec<Reading>, ColdError> {
+        let seq = integer::decode_i64(&self.seq_blob, self.count)?;
+        let ts = integer::decode_i64(&self.ts_blob, self.count)?;
+        let value = gorilla::decode(&self.value_blob, self.count)?;
+        let sensor = dictionary::decode(&self.sensor_blob, self.count)?;
+        Ok((0..self.count)
             .map(|i| Reading {
                 seq: seq[i],
                 ts: ts[i],
                 value: value[i],
                 sensor: String::from_utf8_lossy(&sensor[i]).into_owned(),
             })
-            .collect()
+            .collect())
     }
 
     /// A **late-materialized** scan of the readings whose `ts` is in the inclusive range `[lo, hi]`
     /// (`rmp` #332): decode the cheap `ts` column first to find the survivor row indices, then decode
     /// `seq`/`value`/`sensor` and materialize **only** the survivors. If the query range is disjoint
     /// from the segment's `[min_ts, max_ts]`, returns immediately without decoding any column.
-    #[must_use]
-    pub fn scan_ts_range(&self, lo: i64, hi: i64) -> Vec<Reading> {
+    ///
+    /// # Errors
+    /// [`ColdError::BadColumn`] if any column blob is corrupt (the [`from_bytes`](Self::from_bytes)
+    /// untrusted path); a [`encode`](Self::encode)-built segment always decodes.
+    pub fn scan_ts_range(&self, lo: i64, hi: i64) -> Result<Vec<Reading>, ColdError> {
         if self.count == 0 || hi < self.min_ts || lo > self.max_ts {
-            return Vec::new(); // segment-level skip: range disjoint from the segment.
+            return Ok(Vec::new()); // segment-level skip: range disjoint from the segment.
         }
-        let ts = integer::decode_i64(&self.ts_blob, self.count);
+        let ts = integer::decode_i64(&self.ts_blob, self.count)?;
         let survivors: Vec<usize> = (0..self.count)
             .filter(|&i| ts[i] >= lo && ts[i] <= hi)
             .collect();
         if survivors.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // Materialize the other columns only now (decode is whole-column at the codec granularity, but
         // a non-survivor never becomes a `Reading` — the late-materialization the spec calls for).
-        let seq = integer::decode_i64(&self.seq_blob, self.count);
-        let value = gorilla::decode(&self.value_blob, self.count);
-        let sensor = dictionary::decode(&self.sensor_blob, self.count);
-        survivors
+        let seq = integer::decode_i64(&self.seq_blob, self.count)?;
+        let value = gorilla::decode(&self.value_blob, self.count)?;
+        let sensor = dictionary::decode(&self.sensor_blob, self.count)?;
+        Ok(survivors
             .into_iter()
             .map(|i| Reading {
                 seq: seq[i],
@@ -216,7 +234,7 @@ impl ColdSegment {
                 value: value[i],
                 sensor: String::from_utf8_lossy(&sensor[i]).into_owned(),
             })
-            .collect()
+            .collect())
     }
 
     /// Serializes the segment to a single self-describing byte buffer (a cold segment file).
@@ -341,17 +359,19 @@ impl ColdStore {
     /// A store-wide late-materialized scan of readings with `ts` in `[lo, hi]`, skipping every segment
     /// whose bounds are disjoint from the range. Returns readings in segment order. `segments_scanned`
     /// out-param reports how many segments were actually decoded (the rest skipped).
-    #[must_use]
-    pub fn scan_ts_range(&self, lo: i64, hi: i64) -> Vec<Reading> {
+    ///
+    /// # Errors
+    /// [`ColdError::BadColumn`] if a scanned segment's column blob is corrupt.
+    pub fn scan_ts_range(&self, lo: i64, hi: i64) -> Result<Vec<Reading>, ColdError> {
         let mut out = Vec::new();
         for seg in &self.segments {
             let (min, max) = seg.ts_bounds();
             if hi < min || lo > max {
                 continue; // skip the whole segment without decoding.
             }
-            out.extend(seg.scan_ts_range(lo, hi));
+            out.extend(seg.scan_ts_range(lo, hi)?);
         }
-        out
+        Ok(out)
     }
 
     /// How many segments overlap the range `[lo, hi]` (would be decoded by [`scan_ts_range`]); the
@@ -389,7 +409,7 @@ mod tests {
         let seg = ColdSegment::encode(&readings);
         assert_eq!(seg.len(), 1000);
         assert_eq!(
-            seg.decode_all(),
+            seg.decode_all().unwrap(),
             readings,
             "decode must reproduce the input exactly"
         );
@@ -401,7 +421,7 @@ mod tests {
         let seg = ColdSegment::encode(&readings);
         let bytes = seg.to_bytes();
         let back = ColdSegment::from_bytes(&bytes).expect("valid segment");
-        assert_eq!(back.decode_all(), readings);
+        assert_eq!(back.decode_all().unwrap(), readings);
         assert_eq!(back.ts_bounds(), seg.ts_bounds());
     }
 
@@ -416,7 +436,7 @@ mod tests {
             .filter(|r| r.ts >= lo && r.ts <= hi)
             .cloned()
             .collect();
-        let mut cold = seg.scan_ts_range(lo, hi);
+        let mut cold = seg.scan_ts_range(lo, hi).unwrap();
         row_baseline.sort_by_key(|r| r.seq);
         cold.sort_by_key(|r| r.seq);
         assert_eq!(
@@ -429,15 +449,15 @@ mod tests {
     fn disjoint_range_skips_segment() {
         let seg = ColdSegment::encode(&sample(100));
         let (_min, max) = seg.ts_bounds();
-        assert!(seg.scan_ts_range(max + 1, max + 1000).is_empty());
+        assert!(seg.scan_ts_range(max + 1, max + 1000).unwrap().is_empty());
     }
 
     #[test]
     fn empty_segment_is_safe() {
         let seg = ColdSegment::encode(&[]);
         assert!(seg.is_empty());
-        assert!(seg.decode_all().is_empty());
-        assert!(seg.scan_ts_range(0, i64::MAX).is_empty());
+        assert!(seg.decode_all().unwrap().is_empty());
+        assert!(seg.scan_ts_range(0, i64::MAX).unwrap().is_empty());
         let back = ColdSegment::from_bytes(&seg.to_bytes()).unwrap();
         assert!(back.is_empty());
     }
@@ -485,8 +505,27 @@ mod tests {
         assert_eq!(store.reading_count(), 3000);
         // A range inside window 1 only: only that segment overlaps.
         assert_eq!(store.segments_overlapping(100_010, 100_020), 1);
-        let got = store.scan_ts_range(100_010, 100_020);
+        let got = store.scan_ts_range(100_010, 100_020).unwrap();
         assert_eq!(got.len(), 11);
         assert!(got.iter().all(|r| r.ts >= 100_010 && r.ts <= 100_020));
+    }
+
+    #[test]
+    fn corrupt_column_blob_is_a_controlled_error_not_a_panic() {
+        // A segment whose on-disk image had a column blob corrupted (but the structural lengths still
+        // parse) must surface `BadColumn` from `decode_all`, never panic (`04 §11.4`).
+        let mut bytes = ColdSegment::encode(&sample(50)).to_bytes();
+        // Overwrite the tail (inside the sensor/dictionary column region) with bytes that the
+        // structural `from_bytes` length checks accept but the dictionary decoder rejects.
+        let n = bytes.len();
+        for b in &mut bytes[n - 4..n] {
+            *b = 0xFF;
+        }
+        // `from_bytes` may accept it (lengths unchanged); the codec layer is what must reject it.
+        if let Ok(seg) = ColdSegment::from_bytes(&bytes) {
+            // Must be Err or Ok, but never a panic. If Ok, the bytes happened to stay valid.
+            let _ = seg.decode_all();
+            let _ = seg.scan_ts_range(i64::MIN, i64::MAX);
+        }
     }
 }

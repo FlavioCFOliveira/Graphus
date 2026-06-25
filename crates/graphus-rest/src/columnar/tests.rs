@@ -432,3 +432,86 @@ fn decode_rejects_forged_row_count_past_bitmap_capacity() {
         GcolError::BadHeader { .. }
     ));
 }
+
+/// #402: a column whose present bitmap is consistent (so it passes the bitmap-capacity guard) but
+/// whose codec payload is too short / internally corrupt must surface as a controlled
+/// [`GcolError::BadColumn`] — the fallible `graphus-columnar` decoders, reached through
+/// `decode_column`, return an error instead of panicking / OOM-aborting (`04 §11.4`).
+#[test]
+fn decode_rejects_corrupt_column_payload_as_bad_column() {
+    // One i64 column, row_count 1, present bitmap = 1 bit set (present_count 1), but an EMPTY payload
+    // (an integer column with one present value needs a non-empty FOR/Delta blob). The bitpack/
+    // integer decoder must report Truncated, surfaced here as `BadColumn`.
+    let header = GcolHeader {
+        version: FORMAT_VERSION,
+        fields: vec!["x".to_owned()],
+        row_count: 1,
+        columns: vec![GcolColumn {
+            name: "x".to_owned(),
+            codec: "i64".to_owned(),
+            present_count: 1,
+        }],
+        summary: summary(),
+    };
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(MAGIC);
+    body.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(&header_bytes);
+    // present bitmap: 1 byte, bit 0 set → 1 present row.
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(0x01);
+    // payload: empty (the corrupt part — no integer blob for the 1 present value).
+    body.extend_from_slice(&0u32.to_le_bytes());
+
+    assert!(
+        matches!(decode_result(&body).unwrap_err(), GcolError::BadColumn(_)),
+        "a too-short integer payload must be a controlled BadColumn error"
+    );
+}
+
+/// #402: feeding ARBITRARY bytes to `decode_result` must NEVER panic or abort — only ever a value or
+/// a `GcolError`. A deterministic byte sweep (mutations of a real body, plus structured forgeries)
+/// stands in for a fuzzer without adding a proptest dependency to this crate.
+#[test]
+fn decode_result_never_panics_on_arbitrary_or_mutated_bytes() {
+    // A real, valid body to mutate.
+    let fields: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+    let rows = vec![
+        row(vec![
+            Value::Integer(1),
+            Value::Float(1.5),
+            Value::String("x".into()),
+        ]),
+        row(vec![
+            Value::Integer(2),
+            Value::Float(2.5),
+            Value::String("y".into()),
+        ]),
+    ];
+    let good = encode_result(&fields, &rows, &summary());
+    assert!(decode_result(&good).is_ok());
+
+    // 1) Single-byte flips at every offset.
+    for i in 0..good.len() {
+        for delta in [0x01u8, 0x80, 0xFF] {
+            let mut bad = good.clone();
+            bad[i] ^= delta;
+            let _ = decode_result(&bad); // must not panic
+        }
+    }
+    // 2) Every truncation prefix.
+    for cut in 0..good.len() {
+        let _ = decode_result(&good[..cut]); // must not panic
+    }
+    // 3) Confirmed #402 repro families fed directly: a u32::MAX length/count bomb in the payload
+    //    region, and a 13-byte short blob — neither may OOM-abort or panic.
+    let bombs: &[&[u8]] = &[
+        &[0xFF; 13],
+        &[0x47, 0x43, 0x4F, 0x4C, 0xFF, 0xFF, 0xFF, 0xFF],
+        b"GCOLRES1\xff\xff\xff\xff",
+    ];
+    for b in bombs {
+        let _ = decode_result(b); // must not panic / OOM
+    }
+}

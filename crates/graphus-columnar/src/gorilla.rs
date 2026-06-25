@@ -58,21 +58,29 @@ impl<'a> BitReader<'a> {
             bit: 0,
         }
     }
-    fn get_bit(&mut self) -> u8 {
-        let b = (self.bytes[self.byte] >> (7 - self.bit)) & 1;
+    /// Reads one bit, or [`DecodeError::Truncated`] if the stream is exhausted (untrusted input must
+    /// never index out of bounds — `04 §11.4`).
+    fn get_bit(&mut self) -> Result<u8, crate::DecodeError> {
+        let byte = *self
+            .bytes
+            .get(self.byte)
+            .ok_or(crate::DecodeError::Truncated {
+                what: "gorilla bit stream",
+            })?;
+        let b = (byte >> (7 - self.bit)) & 1;
         self.bit += 1;
         if self.bit == 8 {
             self.bit = 0;
             self.byte += 1;
         }
-        b
+        Ok(b)
     }
-    fn get_bits(&mut self, count: u32) -> u64 {
+    fn get_bits(&mut self, count: u32) -> Result<u64, crate::DecodeError> {
         let mut v = 0u64;
         for _ in 0..count {
-            v = (v << 1) | u64::from(self.get_bit());
+            v = (v << 1) | u64::from(self.get_bit()?);
         }
-        v
+        Ok(v)
     }
 }
 
@@ -105,29 +113,49 @@ pub fn encode(values: &[f64]) -> Vec<u8> {
 }
 
 /// Decodes `count` `f64` values produced by [`encode`].
-#[must_use]
-pub fn decode(bytes: &[u8], count: usize) -> Vec<f64> {
-    let mut out = Vec::with_capacity(count);
+///
+/// `bytes` may be **untrusted**: a stream that ends early, or one whose `(leading, meaningful)`
+/// header would index past bit 64, is reported as [`DecodeError`] rather than panicking
+/// (`specification/04-technical-design.md` §11.4). The result capacity is clamped to the most values
+/// the buffer could possibly hold so a forged `count` cannot trigger an OOM-abort.
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] if the bit stream is exhausted before `count` values are read,
+/// or if a per-value header declares `leading + meaningful > 64` (a corrupt, un-encodable run).
+pub fn decode(bytes: &[u8], count: usize) -> Result<Vec<f64>, crate::DecodeError> {
     if count == 0 {
-        return out;
+        return Ok(Vec::new());
     }
+    // Clamp the speculative allocation: the densest possible stream is one bit per value after the
+    // 64-bit seed, so `count` cannot exceed `8*len - 64 + 1` meaningful entries. A forged `count`
+    // larger than that buffer can hold is rejected below by the bit reader anyway; capping the
+    // capacity here keeps an attacker from pre-allocating gigabytes.
+    let max_possible = bytes.len().saturating_mul(8).saturating_add(1);
+    let mut out = Vec::with_capacity(count.min(max_possible));
     let mut r = BitReader::new(bytes);
-    let mut prev = r.get_bits(64);
+    let mut prev = r.get_bits(64)?;
     out.push(f64::from_bits(prev));
     for _ in 1..count {
-        if r.get_bit() == 0 {
+        if r.get_bit()? == 0 {
             out.push(f64::from_bits(prev));
         } else {
-            let lz = r.get_bits(6) as u32;
-            let meaningful = (r.get_bits(6) as u32) + 1;
+            let lz = r.get_bits(6)? as u32;
+            let meaningful = (r.get_bits(6)? as u32) + 1;
+            // `lz + meaningful` must not exceed the 64 bits of an `f64`. A corrupt header that
+            // violates this would underflow `tz` (then panic on the shift); reject it instead.
+            if lz + meaningful > 64 {
+                return Err(crate::DecodeError::Corrupt {
+                    what: "gorilla leading+meaningful exceeds 64 bits",
+                });
+            }
             let tz = 64 - lz - meaningful;
-            let mantissa = r.get_bits(meaningful);
+            let mantissa = r.get_bits(meaningful)?;
             let xor = mantissa << tz;
             prev ^= xor;
             out.push(f64::from_bits(prev));
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -136,7 +164,7 @@ mod tests {
 
     fn rt(values: &[f64]) {
         let enc = encode(values);
-        let dec = decode(&enc, values.len());
+        let dec = decode(&enc, values.len()).unwrap();
         assert_eq!(dec.len(), values.len());
         for (a, b) in dec.iter().zip(values) {
             assert_eq!(a.to_bits(), b.to_bits(), "exact bit round-trip");
@@ -168,5 +196,20 @@ mod tests {
             enc.len()
         );
         rt(&constant);
+    }
+
+    #[test]
+    fn decode_rejects_truncated_and_corrupt_without_panic() {
+        // Asking for values from an empty / too-short stream must error, not index OOB.
+        assert!(matches!(
+            decode(&[], 3),
+            Err(crate::DecodeError::Truncated { .. })
+        ));
+        assert!(matches!(
+            decode(&[0u8; 4], 3), // 4 bytes < the 8-byte seed for the first value
+            Err(crate::DecodeError::Truncated { .. })
+        ));
+        // A forged huge count over a tiny buffer must error, never pre-allocate gigabytes.
+        assert!(decode(&[0u8; 8], usize::MAX).is_err());
     }
 }

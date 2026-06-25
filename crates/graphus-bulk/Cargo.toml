@@ -31,6 +31,10 @@ csv = "1.4"
 # PERF (C19): allocation-free integer-to-decimal rendering for the per-row physical ids in the
 # dumper. Already present transitively in the lock; pinned here as a direct dependency.
 itoa = "1.0"
+# CRC32C (Castagnoli) integrity trailer over the whole `.gcol` blob (`rmp` #405) so bit-rot or
+# truncation is *detected* on read instead of decoding to wrong-but-plausible data. Same crate and
+# polynomial the storage core uses for page checksums (`graphus-bufpool::page`), hardware-accelerated.
+crc32c = "0.6"
 
 [[bin]]
 name = "graphus-bulk"

@@ -61,14 +61,39 @@ pub fn pack(values: &[u64], width: u32) -> Vec<u8> {
 }
 
 /// Unpacks `count` values of `width` bits each from `bytes` (the inverse of [`pack`]).
-#[must_use]
-pub fn unpack(bytes: &[u8], count: usize, width: u32) -> Vec<u64> {
-    debug_assert!(width <= 64);
-    let mut out = Vec::with_capacity(count);
-    if width == 0 {
-        out.resize(count, 0);
-        return out;
+///
+/// `bytes` may be **untrusted**: a `count`/`width` that would read past the buffer is reported as
+/// [`DecodeError::Truncated`] rather than panicking, and the result capacity is clamped to what the
+/// buffer can actually hold so a forged `count` cannot trigger an OOM-abort
+/// (`specification/04-technical-design.md` §11.4).
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] if `bytes` is shorter than `count * width` bits require.
+pub fn unpack(bytes: &[u8], count: usize, width: u32) -> Result<Vec<u64>, crate::DecodeError> {
+    // `width` arrives from a one-byte header field on the untrusted path; a value > 64 cannot occur
+    // in any blob `pack` produced and would overflow the `chunk << filled` shift below, so it is a
+    // controlled error rather than a panic (`04 §11.4`).
+    if width > 64 {
+        return Err(crate::DecodeError::Corrupt {
+            what: "bit-pack width exceeds 64",
+        });
     }
+    if width == 0 {
+        // Zero-width: every value is 0 and the payload is empty; no bytes are read.
+        return Ok(vec![0; count]);
+    }
+    // The exact number of payload bytes `count` values of `width` bits occupy. Validate it up front
+    // so the per-value loop can never index out of range, and so a forged `count` cannot make us
+    // pre-allocate gigabytes for a tiny buffer.
+    let total_bits = (count as u64).saturating_mul(u64::from(width));
+    let needed_bytes = total_bits.div_ceil(8) as usize;
+    if needed_bytes > bytes.len() {
+        return Err(crate::DecodeError::Truncated {
+            what: "bit-packed values",
+        });
+    }
+    // Capacity is clamped to `count` only after we have proven the buffer is large enough for it.
+    let mut out = Vec::with_capacity(count);
     let mut bit_pos: u64 = 0;
     for _ in 0..count {
         let mut value: u64 = 0;
@@ -86,7 +111,7 @@ pub fn unpack(bytes: &[u8], count: usize, width: u32) -> Vec<u64> {
         }
         out.push(value);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -110,7 +135,7 @@ mod tests {
             let values: Vec<u64> = (0..200u64).map(|i| i % cap).collect();
             let packed = pack(&values, width);
             assert_eq!(
-                unpack(&packed, values.len(), width),
+                unpack(&packed, values.len(), width).unwrap(),
                 values,
                 "width {width}"
             );
@@ -121,7 +146,7 @@ mod tests {
     fn round_trip_full_width() {
         let values = vec![0, 1, u64::MAX, u64::MAX / 2, 42, u64::MAX - 1];
         let packed = pack(&values, 64);
-        assert_eq!(unpack(&packed, values.len(), 64), values);
+        assert_eq!(unpack(&packed, values.len(), 64).unwrap(), values);
     }
 
     #[test]
@@ -129,6 +154,16 @@ mod tests {
         let values = vec![0u64; 1000];
         let packed = pack(&values, 0);
         assert!(packed.is_empty());
-        assert_eq!(unpack(&packed, 1000, 0), values);
+        assert_eq!(unpack(&packed, 1000, 0).unwrap(), values);
+    }
+
+    #[test]
+    fn unpack_rejects_a_short_buffer_without_panic_or_oom() {
+        // 1 byte holds 8 one-bit values; asking for 9 must error, not read OOB.
+        assert!(unpack(&[0u8], 9, 1).is_err());
+        // A forged huge count over a tiny buffer must error up front (no multi-GB pre-allocation).
+        assert!(unpack(&[0u8; 4], usize::MAX / 64, 64).is_err());
+        // Exactly-fitting buffers still decode.
+        assert_eq!(unpack(&[0xFFu8], 8, 1).unwrap(), vec![1u64; 8]);
     }
 }

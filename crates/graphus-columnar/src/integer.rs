@@ -13,6 +13,7 @@
 //! [`decode_i64`] is self-describing. Round-trip exact (tested here + by crate proptests). Encodings
 //! of `u64` columns go through [`encode_i64`] after a reversible `as i64` reinterpret by the caller.
 
+use crate::DecodeError;
 use crate::bitpack::{bits_required, pack, unpack};
 
 const FOR: u8 = 0;
@@ -36,18 +37,32 @@ fn for_pack(vals: &[u64]) -> (u64, u32, Vec<u8>) {
     let offs: Vec<u64> = vals.iter().map(|&v| v - min).collect();
     (min, width, pack(&offs, width))
 }
-fn for_unpack(min: u64, width: u32, payload: &[u8], count: usize) -> Vec<u64> {
-    unpack(payload, count, width)
+fn for_unpack(min: u64, width: u32, payload: &[u8], count: usize) -> Result<Vec<u64>, DecodeError> {
+    Ok(unpack(payload, count, width)?
         .into_iter()
         .map(|o| min.wrapping_add(o))
-        .collect()
+        .collect())
 }
 
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn get_u64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
+
+/// Reads a little-endian `u64` at `at`, or [`DecodeError::Truncated`] if `b` is too short (replaces
+/// a panicking fixed-offset slice on untrusted input).
+fn get_u64(b: &[u8], at: usize, what: &'static str) -> Result<u64, DecodeError> {
+    let end = at.checked_add(8).filter(|&e| e <= b.len());
+    match end {
+        Some(e) => Ok(u64::from_le_bytes(b[at..e].try_into().expect("8 bytes"))),
+        None => Err(DecodeError::Truncated { what }),
+    }
+}
+
+/// Reads the `width` byte at `at`, or [`DecodeError::Truncated`].
+fn get_width(b: &[u8], at: usize) -> Result<u32, DecodeError> {
+    b.get(at)
+        .map(|&w| u32::from(w))
+        .ok_or(DecodeError::Truncated { what: "bit width" })
 }
 
 fn encode_for(values: &[i64]) -> Vec<u8> {
@@ -119,25 +134,37 @@ pub fn encode_i64(values: &[i64]) -> Vec<u8> {
 }
 
 /// Decodes an `i64` column of `count` values produced by [`encode_i64`].
-#[must_use]
-pub fn decode_i64(bytes: &[u8], count: usize) -> Vec<i64> {
+///
+/// `bytes` may be **untrusted**: a truncated blob, an unknown scheme byte, or a payload too short for
+/// the declared width is reported as [`DecodeError`] rather than panicking
+/// (`specification/04-technical-design.md` §11.4).
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] if the blob ends before a field it must read, or
+/// [`DecodeError::BadScheme`] if the leading scheme byte is not FOR / Delta / Double-Delta.
+pub fn decode_i64(bytes: &[u8], count: usize) -> Result<Vec<i64>, DecodeError> {
     if count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    match bytes[0] {
+    let scheme = *bytes.first().ok_or(DecodeError::Truncated {
+        what: "integer scheme byte",
+    })?;
+    match scheme {
         FOR => {
-            let min = get_u64(bytes, 1);
-            let width = u32::from(bytes[9]);
-            for_unpack(min, width, &bytes[10..], count)
+            let min = get_u64(bytes, 1, "FOR min")?;
+            let width = get_width(bytes, 9)?;
+            let payload = bytes.get(10..).unwrap_or(&[]);
+            Ok(for_unpack(min, width, payload, count)?
                 .into_iter()
                 .map(|u| u as i64)
-                .collect()
+                .collect())
         }
         DELTA => {
-            let first = get_u64(bytes, 1) as i64;
-            let min = get_u64(bytes, 9);
-            let width = u32::from(bytes[17]);
-            let zz = for_unpack(min, width, &bytes[18..], count - 1);
+            let first = get_u64(bytes, 1, "Delta first")? as i64;
+            let min = get_u64(bytes, 9, "Delta min")?;
+            let width = get_width(bytes, 17)?;
+            let payload = bytes.get(18..).unwrap_or(&[]);
+            let zz = for_unpack(min, width, payload, count - 1)?;
             let mut out = Vec::with_capacity(count);
             out.push(first);
             let mut cur = first;
@@ -145,15 +172,16 @@ pub fn decode_i64(bytes: &[u8], count: usize) -> Vec<i64> {
                 cur = cur.wrapping_add(unzigzag(z));
                 out.push(cur);
             }
-            out
+            Ok(out)
         }
         DOUBLE_DELTA => {
-            let first = get_u64(bytes, 1) as i64;
-            let d1 = get_u64(bytes, 9) as i64;
-            let min = get_u64(bytes, 17);
-            let width = u32::from(bytes[25]);
+            let first = get_u64(bytes, 1, "Double-Delta first")? as i64;
+            let d1 = get_u64(bytes, 9, "Double-Delta d1")? as i64;
+            let min = get_u64(bytes, 17, "Double-Delta min")?;
+            let width = get_width(bytes, 25)?;
             let nzz = count.saturating_sub(2);
-            let zz = for_unpack(min, width, &bytes[26..], nzz);
+            let payload = bytes.get(26..).unwrap_or(&[]);
+            let zz = for_unpack(min, width, payload, nzz)?;
             let mut out = Vec::with_capacity(count);
             out.push(first);
             if count >= 2 {
@@ -166,9 +194,9 @@ pub fn decode_i64(bytes: &[u8], count: usize) -> Vec<i64> {
                     out.push(cur);
                 }
             }
-            out
+            Ok(out)
         }
-        other => panic!("unknown integer codec scheme {other}"),
+        other => Err(DecodeError::BadScheme { scheme: other }),
     }
 }
 
@@ -178,7 +206,11 @@ mod tests {
 
     fn rt(values: &[i64]) {
         let enc = encode_i64(values);
-        assert_eq!(decode_i64(&enc, values.len()), values, "round-trip");
+        assert_eq!(
+            decode_i64(&enc, values.len()).unwrap(),
+            values,
+            "round-trip"
+        );
     }
 
     #[test]
@@ -214,7 +246,32 @@ mod tests {
             "delta of fixed cadence is ~constant size, got {}",
             enc.len()
         );
-        assert_eq!(decode_i64(&enc, values.len()), values);
+        assert_eq!(decode_i64(&enc, values.len()).unwrap(), values);
+    }
+
+    #[test]
+    fn decode_rejects_malformed_blobs_without_panic() {
+        // Unknown scheme byte → BadScheme (was a `panic!`).
+        assert_eq!(
+            decode_i64(&[99, 0, 0, 0, 0, 0, 0, 0, 0, 0], 1),
+            Err(DecodeError::BadScheme { scheme: 99 })
+        );
+        // Empty blob but non-zero count → Truncated, never an index panic.
+        assert!(matches!(
+            decode_i64(&[], 5),
+            Err(DecodeError::Truncated { .. })
+        ));
+        // FOR header present but payload too short for the declared width → Truncated.
+        // scheme=FOR, min=0 (8 bytes), width=64 → needs 64*8 payload bytes that are absent.
+        let mut blob = vec![FOR];
+        blob.extend_from_slice(&0u64.to_le_bytes());
+        blob.push(64);
+        assert!(matches!(
+            decode_i64(&blob, 8),
+            Err(DecodeError::Truncated { .. })
+        ));
+        // A forged huge count over a tiny payload must error up front, not OOM-abort.
+        assert!(decode_i64(&blob, usize::MAX / 8).is_err());
     }
 
     #[test]
@@ -225,6 +282,6 @@ mod tests {
             enc.len() < values.len() * 8 / 4,
             "FOR should beat 4x on a 6-bit column"
         );
-        assert_eq!(decode_i64(&enc, values.len()), values);
+        assert_eq!(decode_i64(&enc, values.len()).unwrap(), values);
     }
 }

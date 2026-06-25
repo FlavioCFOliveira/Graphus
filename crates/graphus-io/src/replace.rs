@@ -74,6 +74,19 @@ fn fsync_parent_dir(file: &Path) -> Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
+    sync_dir(dir)
+}
+
+/// `fsync`s a **directory** so its own entries (newly created / renamed / removed files inside it)
+/// are durable. On POSIX, an `fsync` of a *file* makes the file's data durable but does **not**
+/// guarantee the directory entry that names it survives a crash; a separate `fsync` of the parent
+/// directory is required (PostgreSQL `fsync_parent_path` / `durable_rename`). After creating new
+/// files in a directory (e.g. a fresh store + WAL), call this on that directory so a crash cannot
+/// leave the entries unreferenced (`rmp` #404).
+///
+/// # Errors
+/// Returns a storage error if the directory cannot be opened or `fsync`ed.
+pub fn sync_dir(dir: &Path) -> Result<()> {
     let f = std::fs::File::open(dir)
         .map_err(|e| io_err(&format!("opening directory {} to fsync", dir.display()), &e))?;
     f.sync_all()
@@ -154,6 +167,17 @@ mod tests {
             .map_err(|e| GraphusError::Storage(format!("write temp: {e}")))?;
         f.sync_all()
             .map_err(|e| GraphusError::Storage(format!("sync temp: {e}")))
+    }
+
+    #[test]
+    fn sync_dir_hardens_an_existing_directory() {
+        // `sync_dir` must succeed on a real directory (it issues `fsync` on the dir fd) and error
+        // cleanly on a path that is not a directory / does not exist — never panic.
+        let dir = TempDir::new("syncdir");
+        std::fs::write(dir.0.join("a"), b"x").expect("seed");
+        sync_dir(&dir.0).expect("fsync of a real directory must succeed");
+        // A non-existent path is a clean error, not a panic.
+        assert!(sync_dir(&dir.0.join("does-not-exist")).is_err());
     }
 
     #[test]

@@ -149,6 +149,15 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         self
     }
 
+    /// Borrows the underlying [`RecordStore`] — a test/DST hook (`rmp` #403 crash-recovery gate) for
+    /// inspecting the durable WAL prefix mid-import without consuming the importer via
+    /// [`finish`](Self::finish).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn store_ref_for_test(&self) -> &RecordStore<D, S> {
+        &self.store
+    }
+
     /// A CSV reader builder configured with this importer's delimiter, treating the first record as a
     /// header (we read it explicitly to decode the schema).
     fn reader_builder(&self) -> csv::ReaderBuilder {

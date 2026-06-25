@@ -191,7 +191,11 @@ impl Column {
         let count = self.ids.len();
         let decoded = match &self.encoded {
             ColumnEncoding::Integers(bytes) => DecodedColumn {
+                // The blob was produced by `encode_column` from this same in-memory column, so the
+                // decode is infallible; an error here would mean memory corruption, not bad input
+                // (the untrusted-input no-panic contract lives at the REST/bulk on-disk boundaries).
                 values: integer::decode_i64(bytes, count)
+                    .expect("self-encoded integer column decodes")
                     .into_iter()
                     .map(Value::Integer)
                     .collect(),
@@ -201,7 +205,9 @@ impl Column {
                 // Decode the dictionary ONCE (not one owned `String` per row): the canonical codes
                 // index a deduped, sorted dict, so a consumer can fold equality / `GROUP BY` on the
                 // integer codes and materialize a `Value::String` only for the rows it actually keeps.
-                let (codes, raw_dict) = dictionary::decode_codes(bytes, count);
+                // The blob is self-encoded (see the integer arm), so the decode is infallible.
+                let (codes, raw_dict) = dictionary::decode_codes(bytes, count)
+                    .expect("self-encoded string column decodes");
                 // The dict bytes were captured from valid Rust `String`s, so they are valid UTF-8; a
                 // defensive lossy decode keeps this panic-free even if that ever ceased to hold.
                 let dict: Vec<String> = raw_dict

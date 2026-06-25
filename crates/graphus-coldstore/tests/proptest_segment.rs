@@ -44,7 +44,7 @@ proptest! {
     #[test]
     fn round_trip_is_exact(readings in prop::collection::vec(arb_reading_no_nan(), 0..200)) {
         let seg = ColdSegment::encode(&readings);
-        prop_assert_eq!(seg.decode_all(), readings);
+        prop_assert_eq!(seg.decode_all().unwrap(), readings);
     }
 
     /// to_bytes → from_bytes → decode reproduces the input exactly.
@@ -52,7 +52,7 @@ proptest! {
     fn byte_round_trip_is_exact(readings in prop::collection::vec(arb_reading_no_nan(), 0..200)) {
         let seg = ColdSegment::encode(&readings);
         let back = ColdSegment::from_bytes(&seg.to_bytes()).expect("valid");
-        prop_assert_eq!(back.decode_all(), readings);
+        prop_assert_eq!(back.decode_all().unwrap(), readings);
     }
 
     /// A ts-range scan always equals filtering the decoded rows by the same range.
@@ -65,7 +65,7 @@ proptest! {
         let (lo, hi) = (lo.min(hi), lo.max(hi));
         let seg = ColdSegment::encode(&readings);
         let mut expect: Vec<Reading> = readings.into_iter().filter(|r| r.ts >= lo && r.ts <= hi).collect();
-        let mut got = seg.scan_ts_range(lo, hi);
+        let mut got = seg.scan_ts_range(lo, hi).unwrap();
         expect.sort_by_key(|r| (r.seq, r.ts));
         got.sort_by_key(|r| (r.seq, r.ts));
         prop_assert_eq!(got, expect);

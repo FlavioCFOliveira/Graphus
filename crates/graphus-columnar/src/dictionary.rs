@@ -7,13 +7,57 @@
 //! store. Equality and `GROUP BY` can run directly on the integer codes (no string compares) — the
 //! late-materialization property column-stores exploit. Round-trip exact.
 
+use crate::DecodeError;
 use crate::bitpack::{bits_required, pack, unpack};
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-fn get_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"))
+
+/// Reads a little-endian `u32` at `at`, or [`DecodeError::Truncated`] if `b` is too short (replaces a
+/// panicking fixed-offset slice on untrusted input — `04 §11.4`).
+fn get_u32(b: &[u8], at: usize, what: &'static str) -> Result<u32, DecodeError> {
+    let end = at.checked_add(4).filter(|&e| e <= b.len());
+    match end {
+        Some(e) => Ok(u32::from_le_bytes(b[at..e].try_into().expect("4 bytes"))),
+        None => Err(DecodeError::Truncated { what }),
+    }
+}
+
+/// The parsed dictionary header: `(dict, code_width, codes_payload)` — the deduped dictionary
+/// entries, the bit-packed code width, and the remaining code stream.
+type DictHeader<'a> = (Vec<Vec<u8>>, u32, &'a [u8]);
+
+/// Reads the dictionary header from `bytes`, bounds-checked against the buffer. Shared by [`decode`]
+/// and [`decode_codes`] so both readers parse the dictionary identically and reject the same
+/// malformed blobs.
+///
+/// Every `with_capacity` is clamped to the bytes that remain, so a forged entry count cannot trigger
+/// an OOM-abort.
+fn read_dict_header(bytes: &[u8]) -> Result<DictHeader<'_>, DecodeError> {
+    let num = get_u32(bytes, 0, "dictionary entry count")? as usize;
+    let mut pos = 4usize;
+    // Clamp: there can be at most one entry per remaining byte (each costs a 4-byte length prefix),
+    // so a `num` larger than that is corrupt — cap the pre-allocation accordingly.
+    let cap = num.min(bytes.len().saturating_sub(pos));
+    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(cap);
+    for _ in 0..num {
+        let len = get_u32(bytes, pos, "dictionary entry length")? as usize;
+        pos += 4;
+        let end =
+            pos.checked_add(len)
+                .filter(|&e| e <= bytes.len())
+                .ok_or(DecodeError::Truncated {
+                    what: "dictionary entry bytes",
+                })?;
+        dict.push(bytes[pos..end].to_vec());
+        pos = end;
+    }
+    let width = u32::from(*bytes.get(pos).ok_or(DecodeError::Truncated {
+        what: "dictionary code width",
+    })?);
+    pos += 1;
+    Ok((dict, width, &bytes[pos..]))
 }
 
 /// Dictionary-encodes a column of byte-strings into a single self-describing blob.
@@ -29,6 +73,16 @@ pub fn encode(values: &[Vec<u8>]) -> Vec<u8> {
     let codes: Vec<u64> = values.iter().map(|v| code_of(v)).collect();
     let width = bits_required(distinct.len().saturating_sub(1) as u64);
 
+    // The entry count and code width are written into `u32`/`u8` header fields; a dictionary with
+    // more than `u32::MAX` distinct values (or a code width > 64) would silently truncate and corrupt
+    // the blob. Such a column is astronomically larger than any real graph, so this is a programming
+    // invariant, asserted rather than handled.
+    assert!(
+        distinct.len() <= u32::MAX as usize,
+        "dictionary cardinality {} exceeds the u32 code/count field",
+        distinct.len()
+    );
+
     let mut out = Vec::new();
     put_u32(&mut out, distinct.len() as u32);
     for d in &distinct {
@@ -41,24 +95,25 @@ pub fn encode(values: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Decodes `count` byte-string values produced by [`encode`].
-#[must_use]
-pub fn decode(bytes: &[u8], count: usize) -> Vec<Vec<u8>> {
-    let num = get_u32(bytes, 0) as usize;
-    let mut pos = 4usize;
-    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(num);
-    for _ in 0..num {
-        let len = get_u32(bytes, pos) as usize;
-        pos += 4;
-        dict.push(bytes[pos..pos + len].to_vec());
-        pos += len;
+///
+/// `bytes` may be **untrusted**: a truncated blob, an over-long entry length, or a code that indexes
+/// past the dictionary is reported as [`DecodeError`] rather than panicking (`04 §11.4`).
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] for a short/over-long blob or [`DecodeError::BadCode`] if a row
+/// code is `>=` the dictionary length.
+pub fn decode(bytes: &[u8], count: usize) -> Result<Vec<Vec<u8>>, DecodeError> {
+    let (dict, width, codes_payload) = read_dict_header(bytes)?;
+    let codes = unpack(codes_payload, count, width)?;
+    let mut out = Vec::with_capacity(codes.len());
+    for c in codes {
+        let entry = dict.get(c as usize).ok_or(DecodeError::BadCode {
+            code: c,
+            dict_len: dict.len(),
+        })?;
+        out.push(entry.clone());
     }
-    let width = u32::from(bytes[pos]);
-    pos += 1;
-    let codes = unpack(&bytes[pos..], count, width);
-    codes
-        .into_iter()
-        .map(|c| dict[c as usize].clone())
-        .collect()
+    Ok(out)
 }
 
 /// Decodes a dictionary-encoded column to its **raw codes and dictionary**, *without* materializing
@@ -81,24 +136,25 @@ pub fn decode(bytes: &[u8], count: usize) -> Vec<Vec<u8>> {
 ///
 /// `decode(bytes, count)` is exactly `decode_codes(bytes, count).codes.map(|c| dict[c].clone())`, so
 /// the two readers never diverge by a byte.
-#[must_use]
-pub fn decode_codes(bytes: &[u8], count: usize) -> (Vec<u32>, Vec<Vec<u8>>) {
-    let num = get_u32(bytes, 0) as usize;
-    let mut pos = 4usize;
-    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(num);
-    for _ in 0..num {
-        let len = get_u32(bytes, pos) as usize;
-        pos += 4;
-        dict.push(bytes[pos..pos + len].to_vec());
-        pos += len;
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] for a short/over-long blob, or [`DecodeError::BadCode`] if a row
+/// code is `>=` the dictionary length (so the caller's later `dict[code]` indexing cannot panic).
+pub fn decode_codes(bytes: &[u8], count: usize) -> Result<(Vec<u32>, Vec<Vec<u8>>), DecodeError> {
+    let (dict, width, codes_payload) = read_dict_header(bytes)?;
+    let raw = unpack(codes_payload, count, width)?;
+    let mut codes = Vec::with_capacity(raw.len());
+    for c in raw {
+        // Validate every code against the dictionary now, so the caller's `dict[code]` is total.
+        if c as usize >= dict.len() {
+            return Err(DecodeError::BadCode {
+                code: c,
+                dict_len: dict.len(),
+            });
+        }
+        codes.push(c as u32);
     }
-    let width = u32::from(bytes[pos]);
-    pos += 1;
-    let codes = unpack(&bytes[pos..], count, width)
-        .into_iter()
-        .map(|c| c as u32)
-        .collect();
-    (codes, dict)
+    Ok((codes, dict))
 }
 
 /// The number of distinct values in `values` — the signal a caller uses to decide whether dictionary
@@ -124,7 +180,7 @@ mod tests {
         let cities = ["Lisbon", "Porto", "Madrid", "Lisbon", "Porto", "Lisbon"];
         let values: Vec<Vec<u8>> = cities.iter().map(|s| b(s)).collect();
         let enc = encode(&values);
-        assert_eq!(decode(&enc, values.len()), values);
+        assert_eq!(decode(&enc, values.len()).unwrap(), values);
         assert_eq!(cardinality(&values), 3);
     }
 
@@ -135,7 +191,7 @@ mod tests {
         let values: Vec<Vec<u8>> = (0..10_000).map(|i| cats[i % 4].clone()).collect();
         let raw: usize = values.iter().map(Vec::len).sum();
         let enc = encode(&values);
-        assert_eq!(decode(&enc, values.len()), values);
+        assert_eq!(decode(&enc, values.len()).unwrap(), values);
         assert!(
             enc.len() * 4 < raw,
             "dict must beat 4x on 4-category data: {} vs {raw}",
@@ -145,9 +201,56 @@ mod tests {
 
     #[test]
     fn empty_and_single() {
-        assert_eq!(decode(&encode(&[]), 0), Vec::<Vec<u8>>::new());
+        assert_eq!(decode(&encode(&[]), 0).unwrap(), Vec::<Vec<u8>>::new());
         let one = vec![b("only")];
-        assert_eq!(decode(&encode(&one), 1), one);
+        assert_eq!(decode(&encode(&one), 1).unwrap(), one);
+    }
+
+    #[test]
+    fn decode_rejects_malformed_blobs_without_panic_or_oom() {
+        // Entry count 0xFFFFFFFF over a 4-byte buffer: must error up front, never allocate 4 GiB
+        // (the confirmed `dictionary.rs` OOM/OOB repro from rmp #402).
+        let bomb = 0xFFFF_FFFFu32.to_le_bytes();
+        assert!(matches!(
+            decode(&bomb, 0),
+            Err(DecodeError::Truncated { .. })
+        ));
+        assert!(matches!(
+            decode_codes(&bomb, 0),
+            Err(DecodeError::Truncated { .. })
+        ));
+        // An entry whose declared length runs past the buffer end → Truncated.
+        let mut over = Vec::new();
+        put_u32(&mut over, 1); // one entry
+        put_u32(&mut over, 0xFFFF_FFFF); // ...of 4 GiB (absent)
+        assert!(matches!(
+            decode(&over, 0),
+            Err(DecodeError::Truncated { .. })
+        ));
+        // A valid dictionary header but a code that indexes past the (1-entry) dict → BadCode.
+        // Build: num=1, len=1, byte 'x', width=8, one code byte = 5 (out of range).
+        let mut blob = Vec::new();
+        put_u32(&mut blob, 1);
+        put_u32(&mut blob, 1);
+        blob.push(b'x');
+        blob.push(8); // width
+        blob.push(5); // code 5 >= dict_len 1
+        assert!(matches!(
+            decode(&blob, 1),
+            Err(DecodeError::BadCode {
+                code: 5,
+                dict_len: 1
+            })
+        ));
+        assert!(matches!(
+            decode_codes(&blob, 1),
+            Err(DecodeError::BadCode {
+                code: 5,
+                dict_len: 1
+            })
+        ));
+        // Empty buffer → Truncated (no entry count to read).
+        assert!(matches!(decode(&[], 0), Err(DecodeError::Truncated { .. })));
     }
 
     #[test]
@@ -155,7 +258,7 @@ mod tests {
         let cities = ["Lisbon", "Porto", "Madrid", "Lisbon", "Porto", "Lisbon"];
         let values: Vec<Vec<u8>> = cities.iter().map(|s| b(s)).collect();
         let enc = encode(&values);
-        let (codes, dict) = decode_codes(&enc, values.len());
+        let (codes, dict) = decode_codes(&enc, values.len()).unwrap();
 
         // 1. The dictionary is canonical: sorted ascending and deduplicated.
         assert_eq!(dict.len(), cardinality(&values));
@@ -166,7 +269,7 @@ mod tests {
 
         // 2. Late materialization (dict[code]) reproduces `decode` byte-for-byte.
         let materialized: Vec<Vec<u8>> = codes.iter().map(|&c| dict[c as usize].clone()).collect();
-        assert_eq!(materialized, decode(&enc, values.len()));
+        assert_eq!(materialized, decode(&enc, values.len()).unwrap());
         assert_eq!(materialized, values);
 
         // 3. code-equality ⟺ value-equality (the fold-on-codes soundness property).
@@ -179,10 +282,10 @@ mod tests {
 
     #[test]
     fn decode_codes_empty_and_single() {
-        let (c, d) = decode_codes(&encode(&[]), 0);
+        let (c, d) = decode_codes(&encode(&[]), 0).unwrap();
         assert!(c.is_empty() && d.is_empty());
         let one = vec![b("only")];
-        let (c, d) = decode_codes(&encode(&one), 1);
+        let (c, d) = decode_codes(&encode(&one), 1).unwrap();
         assert_eq!(c, vec![0]);
         assert_eq!(d, one);
     }

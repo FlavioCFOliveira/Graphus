@@ -94,11 +94,28 @@ fn usage() -> String {
      [--delimiter <c>] [--batch <n>] [--format csv|gcol]\n  \
        graphus-bulk dump   --db <dir> --nodes-out <file> --relationships-out <file> \
      [--format csv|gcol]\n\n\
-     --format selects the file format (default csv); `gcol` is the lossless columnar format.\n"
+     --format selects the file format (default csv); `gcol` is the lossless columnar format.\n\n\
+     DURABILITY — IMPORTANT:\n  \
+       `import` is NON-ATOMIC. It commits in batches (--batch, default per build), so a crash or\n  \
+       error mid-import leaves a PARTIALLY loaded store containing all batches committed before the\n  \
+       failure. Import is not a transaction; there is no automatic rollback of a partial load.\n  \
+       On a failed/partial import, DELETE the --db directory and re-run the import from scratch.\n  \
+       A fully successful import is durable: the store, WAL, and their directory entries are fsynced\n  \
+       before `import` reports success.\n"
         .to_owned()
 }
 
 /// `import`: build a fresh store and load the node/relationship CSV files into it.
+///
+/// # Durability contract (NON-ATOMIC — ratified, `rmp` #403)
+///
+/// Import is **not** a single transaction. It commits in batches (`--batch`), so a crash or an error
+/// part-way through leaves a **partially loaded** store: every batch committed before the failure is
+/// durable, the torn batch and everything after it is absent. There is **no automatic rollback**. The
+/// ratified operator procedure on a failed/partial load is to **delete the `--db` directory and
+/// re-run the import** (the importer refuses to load into a non-empty store, so a stale partial load
+/// must be removed first). A fully successful import is durable end-to-end: the store contents are
+/// flushed and the `--db` directory entries are `fsync`ed before success is reported (`rmp` #404).
 fn cmd_import(args: Vec<String>) -> Result<(), String> {
     let mut db: Option<PathBuf> = None;
     let mut nodes: Vec<PathBuf> = Vec::new();
@@ -131,21 +148,46 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
     let store = create_fresh_store(&db).map_err(|e| e.to_string())?;
     let mut importer = BulkImporter::new(store, batch, delimiter);
 
-    for path in &nodes {
-        let csv = read_as_csv(path, format)?;
-        importer
-            .import_nodes(csv.as_slice())
-            .map_err(|e| format!("importing nodes from {}: {e}", path.display()))?;
-    }
-    for path in &rels {
-        let csv = read_as_csv(path, format)?;
-        importer
-            .import_relationships(csv.as_slice())
-            .map_err(|e| format!("importing relationships from {}: {e}", path.display()))?;
+    // Load all files. Any failure here may have left a PARTIAL (some batches committed) load on disk
+    // — import is non-atomic by ratified contract (`rmp` #403) — so the operator-facing error spells
+    // out the recovery procedure (delete `--db`, re-run) instead of leaving a cryptic mid-load error.
+    let load_result = (|| -> Result<(), String> {
+        for path in &nodes {
+            let csv = read_as_csv(path, format)?;
+            importer
+                .import_nodes(csv.as_slice())
+                .map_err(|e| format!("importing nodes from {}: {e}", path.display()))?;
+        }
+        for path in &rels {
+            let csv = read_as_csv(path, format)?;
+            importer
+                .import_relationships(csv.as_slice())
+                .map_err(|e| format!("importing relationships from {}: {e}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = load_result {
+        return Err(format!(
+            "{e}\n\
+             import FAILED — the load is non-atomic, so `{}` may now hold a PARTIAL store (the batches\n\
+             committed before this error are on disk). Delete that directory and re-run the import:\n  \
+               rm -rf {}\n",
+            db.display(),
+            db.display()
+        ));
     }
 
     let (mut store, stats) = importer.finish();
     store.flush().map_err(|e| format!("flushing store: {e}"))?;
+
+    // Durability (`rmp` #404): the store + WAL files were created and written inside `--db`, but the
+    // *directory entries* naming them are not guaranteed durable until the directory itself is
+    // `fsync`ed (POSIX: an `fsync` of a file does not harden the entry that names it). Without this,
+    // a crash right after a successful import could leave `--db` with no entry for `graph.store` /
+    // `graph.wal` even though their contents reached disk. `store.flush()` above already made the
+    // file contents durable; harden the directory entries now so the imported store is self-contained.
+    graphus_io::sync_dir(&db)
+        .map_err(|e| format!("hardening db directory {}: {e}", db.display()))?;
 
     println!(
         "imported {} nodes, {} relationships, {} properties",
@@ -226,13 +268,31 @@ fn read_as_csv(path: &Path, format: Format) -> Result<Vec<u8>, String> {
 }
 
 /// Writes a dump file, transcoding the in-memory CSV to `.gcol` when `format` is [`Format::Gcol`].
+///
+/// The write is **atomic and durable** (`rmp` #406): the bytes are written to a fresh sibling temp
+/// file, `fsync`ed, then `rename(2)`d over `path` with a directory `fsync`. A crash at any point
+/// therefore leaves `path` as either the old whole image or the new whole image — a partial/torn
+/// write can never destroy a pre-existing dump (the failure mode of an in-place `std::fs::write`).
 fn write_dump(path: &Path, csv: &[u8], format: Format) -> Result<(), String> {
+    use std::io::Write;
+
     let bytes = match format {
         Format::Csv => csv.to_vec(),
         Format::Gcol => csv_to_gcol(csv, DUMP_DELIMITER)
             .map_err(|e| format!("encoding columnar {}: {e}", path.display()))?,
     };
-    std::fs::write(path, &bytes).map_err(|e| format!("creating {}: {e}", path.display()))
+    graphus_io::atomic_replace_file(path, |tmp| {
+        let mut f = std::fs::File::create(tmp).map_err(|e| {
+            GraphusError::Storage(format!("creating temp dump {}: {e}", tmp.display()))
+        })?;
+        f.write_all(&bytes).map_err(|e| {
+            GraphusError::Storage(format!("writing temp dump {}: {e}", tmp.display()))
+        })?;
+        // Make the content durable before the rename, so the renamed entry never names torn bytes.
+        f.sync_all()
+            .map_err(|e| GraphusError::Storage(format!("syncing temp dump {}: {e}", tmp.display())))
+    })
+    .map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 /// The on-disk file pair inside a `--db` directory.
@@ -260,7 +320,13 @@ fn create_fresh_store(
             .map_err(|e| GraphusError::Storage(format!("creating WAL: {e}")))?,
     )
     .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
-    RecordStore::create(device, wal, POOL_PAGES, 1)
+    let store = RecordStore::create(device, wal, POOL_PAGES, 1)?;
+    // Harden the directory so the freshly-created `graph.store` / `graph.wal` entries are durable
+    // even before any data is written (`rmp` #404); the final `sync_dir` in `cmd_import` re-hardens
+    // after the import completes.
+    graphus_io::sync_dir(db)
+        .map_err(|e| GraphusError::Storage(format!("hardening db dir {}: {e}", db.display())))?;
+    Ok(store)
 }
 
 /// Opens an existing store in `db` (recovering the WAL onto the device first), for the dumper.
@@ -300,5 +366,122 @@ fn parse_delimiter(s: &str) -> Result<u8, String> {
         _ => Err(format!(
             "--delimiter must be a single ASCII character, got `{s}`"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A self-cleaning unique temp directory for a test.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let p = std::env::temp_dir()
+                .join(format!("graphus-bulk-{tag}-{nanos}-{}", std::process::id()));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).expect("seed file");
+    }
+
+    /// #406: a successful `dump` write is atomic and durable, and a *failed* `write_dump` leaves any
+    /// pre-existing target byte-for-byte intact (the in-place `std::fs::write` truncate-then-write
+    /// hazard is gone — `atomic_replace_file` aborts on the temp without touching `target`).
+    #[test]
+    fn write_dump_is_atomic_and_preserves_target_on_failure() {
+        let dir = TempDir::new("dump");
+        let target = dir.0.join("nodes.csv");
+
+        // A successful write lands the new content.
+        write_dump(&target, b":ID\n1\n", Format::Csv).expect("first dump");
+        assert_eq!(std::fs::read(&target).unwrap(), b":ID\n1\n");
+
+        // Seed a known PRIOR dump, then force a failing write_dump by making the parent directory
+        // read-only so the temp-sibling create fails. The prior target must survive untouched.
+        write_file(&target, b"PRIOR-DUMP-CONTENTS");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&dir.0).unwrap().permissions();
+            perm.set_mode(0o500); // r-x: cannot create the temp sibling
+            std::fs::set_permissions(&dir.0, perm).unwrap();
+
+            let res = write_dump(&target, b":ID\n2\n", Format::Csv);
+
+            // Restore write permission so the prior content can be read back / cleaned up.
+            let mut perm = std::fs::metadata(&dir.0).unwrap().permissions();
+            perm.set_mode(0o700);
+            std::fs::set_permissions(&dir.0, perm).unwrap();
+
+            assert!(
+                res.is_err(),
+                "the dump must fail when the temp cannot be created"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"PRIOR-DUMP-CONTENTS",
+                "a failed dump must leave the pre-existing target byte-for-byte intact"
+            );
+        }
+    }
+
+    /// #404: `create_fresh_store` + a full `cmd_import` produce a `--db` directory whose entries are
+    /// durable — verified by (a) `sync_dir` succeeding on the directory (the exact call `cmd_import`
+    /// makes) and (b) the store reopening cleanly afterwards (entries + contents are consistent).
+    #[test]
+    fn cmd_import_fsyncs_the_db_dir_and_reopens() {
+        let dir = TempDir::new("import");
+        let nodes = dir.0.join("nodes.csv");
+        write_file(
+            &nodes,
+            b":ID,:LABEL,name:string\n1,Person,Alice\n2,Person,Bob\n",
+        );
+        let db = dir.0.join("db");
+
+        cmd_import(vec![
+            "--db".into(),
+            db.to_string_lossy().into_owned(),
+            "--nodes".into(),
+            nodes.to_string_lossy().into_owned(),
+            "--batch".into(),
+            "1".into(),
+        ])
+        .expect("import");
+
+        // The directory `cmd_import` hardened must be a real, fsync-able directory.
+        graphus_io::sync_dir(&db).expect("db dir must be fsync-able (it was hardened on import)");
+
+        // And the imported store reopens cleanly — proving the directory entries and file contents
+        // that `sync_dir` made durable are present and consistent.
+        let mut store = open_store(&db).expect("reopen imported store");
+        assert_eq!(store.scan_node_ids().expect("scan").len(), 2);
+    }
+
+    /// #403: the operator-facing `--help`/usage text documents the NON-ATOMIC import contract and the
+    /// delete-and-retry recovery procedure.
+    #[test]
+    fn usage_documents_the_non_atomic_import_contract() {
+        let u = usage();
+        assert!(
+            u.contains("NON-ATOMIC"),
+            "usage must call out non-atomic import"
+        );
+        assert!(
+            u.to_lowercase().contains("delete") && u.contains("--db"),
+            "usage must tell the operator to delete --db and re-run on a partial load"
+        );
     }
 }

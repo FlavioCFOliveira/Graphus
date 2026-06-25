@@ -41,7 +41,7 @@ fn measure_cold_segment_compression() {
     );
     eprintln!("overall compression vs row records: {ratio:.1}x");
     // Round-trip sanity at scale.
-    assert_eq!(seg.decode_all().len(), N as usize);
+    assert_eq!(seg.decode_all().unwrap().len(), N as usize);
     assert!(
         ratio >= 20.0,
         "cold tier must hit the ~20-90x compression thesis (got {ratio:.1}x)"

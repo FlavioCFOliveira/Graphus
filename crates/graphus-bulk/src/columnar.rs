@@ -53,7 +53,16 @@ use crate::header::{ColumnRole, PropertyType, ScalarType};
 /// The 4-byte magic that prefixes every `.gcol` blob (`b"GCOL"`).
 const MAGIC: [u8; 4] = *b"GCOL";
 /// The on-disk format version. Bumping it is how a future incompatible layout is detected on read.
-const VERSION: u8 = 1;
+///
+/// - **v1** — magic + version + delimiter + counts + sections, no integrity check.
+/// - **v2** (`rmp` #405) — identical layout, plus a trailing little-endian **CRC32C** over every
+///   preceding byte, verified *first* on read so bit-rot / truncation is detected instead of
+///   decoding to wrong-but-plausible data. A well-formed v1 column section is byte-identical inside
+///   a v2 blob (only the version byte and the 4-byte trailer differ).
+const VERSION: u8 = 2;
+
+/// The width of the trailing CRC32C integrity field appended by [`encode_blob`] (v2+).
+const CRC_LEN: usize = 4;
 
 /// The per-column codec tag stored in the blob so [`gcol_to_csv`] dispatches the right decoder. The
 /// numeric values mirror [`graphus_columnar::CodecKind`].
@@ -163,6 +172,28 @@ impl<'a> Cursor<'a> {
         let len = self.take_u32()? as usize;
         self.take(len)
     }
+}
+
+/// Validates the trailing CRC32C integrity field (`rmp` #405) and returns the body slice (everything
+/// before the trailer) for parsing. Errors if the blob is shorter than the trailer or the stored
+/// checksum does not match a fresh CRC32C of the body — so bit-rot / truncation is a controlled
+/// error, never a wrong-but-plausible decode (`04 §11.4`).
+fn verify_crc(gcol: &[u8]) -> Result<&[u8], ColumnarError> {
+    if gcol.len() < CRC_LEN {
+        return Err(ColumnarError::Malformed(format!(
+            "blob shorter than the {CRC_LEN}-byte CRC32C trailer (len {})",
+            gcol.len()
+        )));
+    }
+    let (body, trailer) = gcol.split_at(gcol.len() - CRC_LEN);
+    let stored = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let actual = crc32c::crc32c(body);
+    if stored != actual {
+        return Err(ColumnarError::Malformed(format!(
+            "CRC32C mismatch: stored {stored:#010x}, computed {actual:#010x} (blob is corrupt or truncated)"
+        )));
+    }
+    Ok(body)
 }
 
 // =================================================================================================
@@ -285,6 +316,12 @@ fn encode_blob(delimiter: u8, header_cells: &[Vec<u8>], columns: &[Vec<Vec<u8>>]
         let column = &columns[c];
         encode_column(&mut out, name, column);
     }
+
+    // Integrity trailer (`rmp` #405): CRC32C over every byte written so far, little-endian. Verified
+    // first on read, so a single flipped bit or a truncation is *detected* rather than silently
+    // decoded into wrong-but-plausible data.
+    let crc = crc32c::crc32c(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
@@ -377,7 +414,12 @@ fn try_float_codec(values: &[&[u8]]) -> Option<Vec<u8>> {
 /// Returns [`ColumnarError::Malformed`] if `gcol` is truncated, has a bad magic / version, or names
 /// an unknown codec.
 pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
-    let mut cur = Cursor::new(gcol);
+    // Verify the CRC32C integrity trailer FIRST (`rmp` #405): a blob whose body does not match its
+    // trailing checksum is bit-rotted / truncated and must be rejected before any length field is
+    // trusted. The trailer is the last `CRC_LEN` bytes; the checksum covers everything before it.
+    let body = verify_crc(gcol)?;
+
+    let mut cur = Cursor::new(body);
 
     let magic = cur.take(4)?;
     if magic != MAGIC {
@@ -444,30 +486,33 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
 /// Decodes one column from the cursor back into its `nrows` raw cell-byte values.
 fn decode_column(cur: &mut Cursor<'_>, nrows: usize) -> Result<Vec<Vec<u8>>, ColumnarError> {
     let bitmap = cur.take_section()?;
-    let present = decode_bool(bitmap, nrows);
+    let present = decode_bool(bitmap, nrows).map_err(codec_err)?;
     let codec = Codec::from_tag(cur.take_u8()?)
         .ok_or_else(|| ColumnarError::Malformed("unknown codec tag".to_owned()))?;
     let payload = cur.take_section()?;
     let n_present = present.iter().filter(|&&p| p).count();
 
-    // Decode the present values into raw cell bytes.
+    // Decode the present values into raw cell bytes. Every codec is now fallible: a truncated /
+    // adversarial payload surfaces as a controlled `Malformed`, never a panic (`04 §11.4`, rmp #402).
     let values: Vec<Vec<u8>> = match codec {
         Codec::Integer => {
-            let nums = integer::decode_i64(payload, n_present);
+            let nums = integer::decode_i64(payload, n_present).map_err(codec_err)?;
             let mut buf = itoa::Buffer::new();
             nums.iter()
                 .map(|n| buf.format(*n).as_bytes().to_vec())
                 .collect()
         }
         Codec::Float => gorilla::decode(payload, n_present)
+            .map_err(codec_err)?
             .iter()
             .map(|f| f.to_string().into_bytes())
             .collect(),
-        Codec::Dictionary => dictionary::decode(payload, n_present),
+        Codec::Dictionary => dictionary::decode(payload, n_present).map_err(codec_err)?,
     };
 
     // Re-expand to `nrows` cells using the bitmap: a present row pulls the next decoded value, an
-    // absent row is an empty cell.
+    // absent row is an empty cell. `values` has exactly `n_present` entries by construction, so the
+    // `next` cursor can never run past it.
     let mut out = Vec::with_capacity(nrows);
     let mut next = 0usize;
     for &p in &present {
@@ -479,6 +524,12 @@ fn decode_column(cur: &mut Cursor<'_>, nrows: usize) -> Result<Vec<Vec<u8>>, Col
         }
     }
     Ok(out)
+}
+
+/// Maps a [`graphus_columnar::DecodeError`] (a malformed codec payload) into the transcoder's
+/// [`ColumnarError::Malformed`], so a corrupt `.gcol` is a controlled error rather than a panic.
+fn codec_err(e: graphus_columnar::DecodeError) -> ColumnarError {
+    ColumnarError::Malformed(format!("codec payload: {e}"))
 }
 
 #[cfg(test)]
@@ -614,6 +665,73 @@ mod tests {
         assert!(matches!(
             gcol_to_csv(&[]).unwrap_err(),
             ColumnarError::Malformed(_)
+        ));
+    }
+
+    /// A valid `.gcol` carries a CRC32C trailer; flipping ANY single byte must be detected as
+    /// `Malformed` rather than decoded into wrong data (`rmp` #405).
+    #[test]
+    fn gcol_single_byte_flip_is_detected() {
+        let csv = ":ID,:LABEL,name:string,age:int,score:float\n\
+                   1,Person,Alice,30,1.5\n\
+                   2,Person;Admin,Bob,25,2.5\n";
+        let good = csv_to_gcol(csv.as_bytes(), b',').unwrap();
+        // The good blob decodes byte-identically.
+        assert_eq!(gcol_to_csv(&good).unwrap(), csv.as_bytes());
+        // Flipping any single byte (including a CRC-trailer byte) must be caught.
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                matches!(gcol_to_csv(&bad), Err(ColumnarError::Malformed(_))),
+                "flip at byte {i} must be detected as Malformed"
+            );
+        }
+    }
+
+    /// Truncating a valid blob — at the trailer boundary or mid-section — must be a controlled error,
+    /// never a panic or a partial decode (`rmp` #405).
+    #[test]
+    fn gcol_truncation_is_detected() {
+        let csv = "id:ID,seq:int\na,1\nb,2\nc,3\n";
+        let good = csv_to_gcol(csv.as_bytes(), b',').unwrap();
+        // Drop the last byte (truncated CRC trailer) — CRC can no longer match.
+        assert!(matches!(
+            gcol_to_csv(&good[..good.len() - 1]),
+            Err(ColumnarError::Malformed(_))
+        ));
+        // Truncate on a section boundary (just past the header) — both the CRC trailer is gone and
+        // the body is short; either way it is rejected, not panicked.
+        for cut in [0, 5, 9, good.len() / 2] {
+            assert!(
+                matches!(gcol_to_csv(&good[..cut]), Err(ColumnarError::Malformed(_))),
+                "truncation to {cut} bytes must be Malformed"
+            );
+        }
+    }
+
+    /// A blob whose codec payload is internally corrupt (but the CRC happens to be recomputed over
+    /// it) must still surface as a controlled `Malformed`, never a panic — this exercises the
+    /// fallible `graphus-columnar` decoders through the transcoder (`rmp` #402).
+    #[test]
+    fn corrupt_codec_payload_is_a_controlled_error() {
+        // Build a valid blob, then corrupt a column's payload bytes *and* fix the CRC so the codec
+        // layer (not the CRC layer) is what rejects it.
+        let csv = "id:ID,seq:int\na,1\nb,2\nc,3\n";
+        let good = csv_to_gcol(csv.as_bytes(), b',').unwrap();
+        let body_len = good.len() - CRC_LEN;
+        // Replace the integer codec tag byte's payload region with a forged short payload by simply
+        // zeroing the body interior; recompute the CRC so only the decoder can object.
+        let mut tampered = good.clone();
+        for b in &mut tampered[10..body_len] {
+            *b = 0xFF;
+        }
+        let crc = crc32c::crc32c(&tampered[..body_len]);
+        tampered[body_len..].copy_from_slice(&crc.to_le_bytes());
+        // Must be Err (Malformed), and crucially must not panic/abort.
+        assert!(matches!(
+            gcol_to_csv(&tampered),
+            Err(ColumnarError::Malformed(_))
         ));
     }
 
