@@ -403,6 +403,14 @@ async fn boot_survives_a_corrupt_secondary_database() {
         flaky.error.is_some(),
         "the startup error is reported: {flaky:?}"
     );
+    // `rmp` #430 GATE: a non-default database failing to open flips a degraded readiness SIGNAL, so an
+    // orchestrator can tell a configured database is not serving (previously readiness stayed
+    // unconditionally green, hiding the failure). The count is surfaced lock-free for `/health/ready`.
+    assert_eq!(
+        handle.catalog.failed_open_database_count(),
+        1,
+        "exactly one configured (non-default) database failed to open — the degraded signal is set"
+    );
     // The default database is fully functional.
     assert_eq!(count(&handle.engine, "MATCH (n) RETURN count(n)").await, 0);
 
@@ -454,4 +462,197 @@ async fn boot_creates_a_fresh_store_for_an_online_entry_without_a_directory() {
     drop(phantom);
 
     handle.shutdown().await.expect("graceful shutdown");
+}
+
+// ------------------------------------------------------------------------------------------------
+// rmp #418: the server-wide active-transactions gauge is a SUM across databases, not last-writer-wins.
+// ------------------------------------------------------------------------------------------------
+
+/// `rmp` #418: before the fix each engine published its open-transaction count with a last-writer-wins
+/// `store`, so under multi-DB the gauge reflected whichever engine published last — a finished txn on
+/// DB `b` would clobber a still-open (leaked) txn on DB `a` back to zero, making the `rmp` #386 leak
+/// oracle ("a return to zero proves no leak") unsound. With the additive gauge, an open txn on `a`
+/// summed with a finished txn on `b` leaves the gauge `>= 1`.
+#[tokio::test]
+async fn active_txn_gauge_sums_across_databases() {
+    let temp = TempStore::new("active-txn-sum");
+    let server = boot(multi_db_config(&temp)).await;
+    let metrics = server.metrics.clone();
+    let db_a = server.engine.clone();
+    let db_b = server
+        .catalog
+        .create("tenant_b")
+        .await
+        .expect("create tenant_b");
+
+    // Leak an OPEN explicit transaction on DB `a` (begun, never committed/rolled back). DB `a`'s
+    // engine publishes its count (+1) additively into the server-wide gauge.
+    let leaked = db_a
+        .begin(AccessMode::Write)
+        .await
+        .expect("begin a leaked transaction on db a");
+
+    // Run + finish a full auto-commit transaction on DB `b`. Pre-#418 its engine's final publish of
+    // `active_count == 0` would `store(0)` over the shared gauge, masking `a`'s open txn.
+    run_query(&db_b, "CREATE (:OnB {x: 1})").await;
+
+    // THE KEY ASSERTION (`rmp` #418): the gauge reflects the SUM — `a`'s one open txn survives `b`'s
+    // publish. (It is exactly 1 here: `b` finished and retracted its contribution; `a` still holds one.)
+    assert!(
+        metrics.active_txns() >= 1,
+        "the active-transaction gauge must SUM across databases (a's open txn must survive b's finish), \
+         got {}",
+        metrics.active_txns()
+    );
+
+    // Close the leaked txn; the gauge then returns to zero (no real leak), proving the additive
+    // bookkeeping balances.
+    db_a.rollback(leaked)
+        .await
+        .expect("rollback the leaked txn");
+    // The rollback reply is sent after the engine republishes its count, so the gauge is settled.
+    assert_eq!(
+        metrics.active_txns(),
+        0,
+        "once a's txn is rolled back the server-wide gauge nets to zero"
+    );
+
+    server.shutdown().await.expect("graceful shutdown");
+}
+
+// ------------------------------------------------------------------------------------------------
+// rmp #427: a stale EngineHandle held across stop → drop → recreate can never touch the new store.
+// ------------------------------------------------------------------------------------------------
+
+/// `rmp` #427: `DatabaseCatalog::handle` hands out a cloned `EngineHandle` without the admin lock, so a
+/// caller could hold one across a `stop` + `drop` + re-`create` of the same name. `stop_engine`
+/// **unpublishes the lookup handle, then drains + joins** the engine before the directory is reused, so
+/// the stale handle's command channel is already closed by the time a new store exists under the name.
+/// This pins that join-before-remove isolation: a stale handle errors cleanly (`engine_gone`) and never
+/// reaches the freshly-created store (proven by the new store staying empty + a fresh handle seeing the
+/// new data only).
+#[tokio::test]
+async fn stale_handle_after_drop_recreate_cannot_touch_new_store() {
+    let temp = TempStore::new("stale-handle");
+    let handle = boot(multi_db_config(&temp)).await;
+
+    // Create `reused`, write a node, capture a STALE handle clone, then take it fully offline.
+    let _ = handle
+        .catalog
+        .create("reused")
+        .await
+        .expect("create reused");
+    let stale = handle
+        .catalog
+        .handle("reused")
+        .expect("handle while online");
+    run_query(&stale, "CREATE (:Gen1 {v: 1})").await;
+    assert_eq!(count(&stale, "MATCH (n) RETURN count(n)").await, 1);
+
+    handle.catalog.stop("reused").await.expect("stop reused");
+    handle
+        .catalog
+        .drop_database("reused")
+        .await
+        .expect("drop reused");
+
+    // Re-create the same name: a brand-new, empty store under the (reused) directory + a NEW engine.
+    let fresh = handle
+        .catalog
+        .create("reused")
+        .await
+        .expect("recreate reused");
+    assert_eq!(
+        count(&fresh, "MATCH (n) RETURN count(n)").await,
+        0,
+        "the recreated store is fresh and empty (Gen1's data must not resurrect)"
+    );
+
+    // THE KEY ASSERTION (`rmp` #427): the STALE handle (from the dropped generation) is now wired to a
+    // joined-and-gone engine thread. Using it errors cleanly — it never touches the new store.
+    let stale_run = stale.begin_auto_commit(AccessMode::Write).await.and(Ok(()));
+    assert!(
+        stale_run.is_err(),
+        "the stale handle must error (its engine was joined before the dir was reused), never touch \
+         the new store"
+    );
+
+    // The new store is still empty: the stale handle's attempt left no trace on it.
+    assert_eq!(
+        count(&fresh, "MATCH (n) RETURN count(n)").await,
+        0,
+        "the freshly-created store is untouched by the stale handle"
+    );
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+// ------------------------------------------------------------------------------------------------
+// rmp #423: secondary indexes are REBUILT from the store on open, never verified against a durable
+// index image — so the empty index slice passed to `verify_on_open` cannot mask a divergence.
+// ------------------------------------------------------------------------------------------------
+
+/// `rmp` #423: `open_or_create_coordinator` calls `verify_on_open(&mut store, &[])` — an empty
+/// index/base divergence slice. That is correct precisely because every Graphus secondary index is
+/// **in-memory and rebuilt from the store on each open** (`TxnCoordinator::new`), never persisted as a
+/// separate durable image that could diverge. This test pins that contract: a node-property index +
+/// data created on one boot is fully functional after a shutdown + reopen (the index was rebuilt — an
+/// indexed lookup returns the right rows), and no separate durable index file exists beside the store.
+#[tokio::test]
+async fn secondary_indexes_are_rebuilt_not_verified_on_open() {
+    let temp = TempStore::new("index-rebuilt");
+    let config = multi_db_config(&temp);
+
+    // Boot #1: declare an index, seed indexed data, shut down cleanly (the index is in-memory only).
+    {
+        let handle = boot(config.clone()).await;
+        // Index DDL is a control command (not a query): submit it via the engine's `index_ddl` seam.
+        handle
+            .engine
+            .index_ddl(
+                graphus_server::engine::command::IndexCommand::CreateNodePropertyIndex {
+                    label: "Person".to_owned(),
+                    property: "email".to_owned(),
+                },
+            )
+            .await
+            .expect("create node-property index");
+        run_query(&handle.engine, "CREATE (:Person {email: 'a@x'})").await;
+        run_query(&handle.engine, "CREATE (:Person {email: 'b@x'})").await;
+        handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    // No separate durable secondary-index file was written beside the default store: the index is
+    // rebuilt from the store, so there is no persisted image to verify (or to diverge).
+    let store_dir = temp.store_dir();
+    for entry in std::fs::read_dir(&store_dir).expect("read store dir") {
+        let name = entry.expect("dir entry").file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.contains("index") && !name.ends_with(".idx"),
+            "no durable secondary-index image must exist (indexes are rebuilt on open), found {name:?}"
+        );
+    }
+
+    // Boot #2 over the SAME store dir: opening runs `verify_on_open(&[])` then `TxnCoordinator::new`
+    // rebuilds the index from the store. The index must be live — an indexed lookup returns the right
+    // rows, proving it was reconstructed, not read from (a possibly-divergent) persisted image.
+    {
+        let handle = boot(config).await;
+        assert_eq!(
+            count(
+                &handle.engine,
+                "MATCH (p:Person) WHERE p.email = 'a@x' RETURN count(p)",
+            )
+            .await,
+            1,
+            "the index was rebuilt on open and the indexed lookup is correct"
+        );
+        assert_eq!(
+            count(&handle.engine, "MATCH (p:Person) RETURN count(p)").await,
+            2,
+            "all rows survive the reopen"
+        );
+        handle.shutdown().await.expect("graceful shutdown");
+    }
 }

@@ -226,7 +226,14 @@ fn engine_survives_recovery_double_panic() {
     );
     assert!(
         handle.metrics().is_engine_degraded(),
-        "a recovery double-panic must flag the engine DEGRADED (drives /health/ready to 503)"
+        "a recovery double-panic must flag the aggregate degraded gauge (observability)"
+    );
+    // `rmp` #414: the GATING flag is now PER-ENGINE (on the handle), not on the shared `Metrics`. This
+    // is what confines the engine-degraded refusal to THIS database (the multi-DB isolation gate in
+    // `multi_database.rs` proves a sibling database stays serviceable when only this one is degraded).
+    assert!(
+        handle.is_degraded(),
+        "a recovery double-panic must flag THIS engine's own degraded flag (rmp #414, per-engine gate)"
     );
 
     // `Status` / `Shutdown` are still honoured on a degraded engine (it must remain probeable/drainable

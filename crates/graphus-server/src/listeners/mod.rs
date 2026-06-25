@@ -45,6 +45,17 @@ pub struct Listeners {
     pub uds_path: Option<std::path::PathBuf>,
     /// The shared shutdown signal the accept loops select on.
     shutdown: ShutdownCoordinator,
+    /// The process-wide connection-admission semaphore (rmp #118): each accepted connection holds one
+    /// permit for its whole lifetime, so the count of *checked-out* permits is the count of in-flight
+    /// connections. Used by [`drain_connections`](Self::drain_connections) to observe the graceful-
+    /// shutdown connection drain (rmp #429).
+    conn_limit: Arc<tokio::sync::Semaphore>,
+    /// The configured connection cap (the semaphore's total permits) — the denominator for "all
+    /// connections drained" (`available_permits() == max_connections`).
+    max_connections: usize,
+    /// The bounded connection-drain deadline applied on graceful shutdown between
+    /// [`stop_accepting`](Self::stop_accepting) and the engine drain (rmp #429).
+    drain_deadline: Duration,
 }
 
 impl Listeners {
@@ -54,6 +65,48 @@ impl Listeners {
     /// down; this only closes the *listening* sockets (the accept loops break out of their select).
     pub fn stop_accepting(&self) {
         self.shutdown.trigger();
+    }
+
+    /// Awaits the **graceful connection drain** up to the configured deadline (rmp #429): after
+    /// [`stop_accepting`](Self::stop_accepting) has closed the listening sockets, in-flight connection
+    /// tasks (Bolt sessions on `spawn_blocking`, REST connections on the runtime) keep running until
+    /// the client finishes or this deadline elapses. Each connection holds one connection-admission
+    /// permit (rmp #118) for its whole lifetime, so the drain is observed by waiting for the semaphore
+    /// to return to full (`available_permits() == max_connections`).
+    ///
+    /// Returns `true` if every connection drained within the deadline, `false` if the deadline elapsed
+    /// with connections still in flight (the caller then proceeds to the engine drain, which rolls back
+    /// their in-flight transactions and hardens the store regardless — a forced close, never a
+    /// half-applied write). Polls on a short interval rather than awaiting a permit so a connection that
+    /// drops *after* the deadline cannot leave this future parked. Honours the documented `04 §9.4`
+    /// drain-deadline contract that the prior `stop_accepting → shutdown_all` sequence left unenforced.
+    pub async fn drain_connections(&self) -> bool {
+        // A zero deadline disables the wait (proceed straight to the engine drain).
+        if self.drain_deadline.is_zero() {
+            return self.conn_limit.available_permits() >= self.max_connections;
+        }
+        // `Semaphore::MAX_PERMITS`-capped configs aside, `available_permits()` returns to
+        // `max_connections` exactly when every accepted connection has released its permit on drop.
+        let poll = Duration::from_millis(20).min(self.drain_deadline);
+        let deadline = tokio::time::Instant::now() + self.drain_deadline;
+        loop {
+            if self.conn_limit.available_permits() >= self.max_connections {
+                return true; // every connection drained.
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let in_flight = self
+                    .max_connections
+                    .saturating_sub(self.conn_limit.available_permits());
+                tracing::warn!(
+                    in_flight,
+                    deadline_ms = self.drain_deadline.as_millis(),
+                    "connection-drain deadline elapsed with connections still in flight; proceeding \
+                     to force-close them via the engine drain (rmp #429)",
+                );
+                return false;
+            }
+            tokio::time::sleep(poll).await;
+        }
     }
 }
 
@@ -175,6 +228,7 @@ pub async fn start_all(
         let router = build_rest_router(
             engine.clone(),
             context.clone(),
+            Arc::clone(&catalog),
             Arc::clone(&auth),
             Arc::clone(&security),
             Arc::clone(&audit),
@@ -205,6 +259,9 @@ pub async fn start_all(
         bolt_tcp_addr,
         uds_path,
         shutdown,
+        conn_limit,
+        max_connections: config.admission.max_connections,
+        drain_deadline: config.timing.shutdown_drain_deadline(),
     })
 }
 
@@ -219,6 +276,7 @@ pub async fn start_all(
 fn build_rest_router(
     engine: EngineHandle,
     context: AdminContext,
+    catalog: Arc<DatabaseCatalog>,
     auth: Arc<dyn AuthProvider>,
     security: Arc<SecurityCatalog>,
     audit: Arc<AuditLog>,
@@ -261,6 +319,7 @@ fn build_rest_router(
     let extra = extra_routes::routes(
         metrics,
         engine,
+        catalog,
         security,
         clock,
         shutdown,

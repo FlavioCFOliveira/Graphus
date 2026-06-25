@@ -35,6 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use graphus_auth::Privilege;
 
+use crate::dbcatalog::DatabaseCatalog;
 use crate::engine::EngineHandle;
 use crate::metrics::Metrics;
 use crate::security::SecurityCatalog;
@@ -45,6 +46,9 @@ use crate::shutdown::ShutdownCoordinator;
 struct ExtraState {
     metrics: Arc<Metrics>,
     engine: EngineHandle,
+    /// The database catalog, for **per-database** readiness aggregation (`rmp` #414/#430): which
+    /// running databases are engine-degraded, and how many configured databases failed to open.
+    catalog: Arc<DatabaseCatalog>,
     /// The LIVE security catalog (rmp #94): every `/admin/*` Bearer check + RBAC read resolves
     /// through it under a brief read lock, so runtime user/role mutations are visible at once.
     security: Arc<SecurityCatalog>,
@@ -62,6 +66,7 @@ struct ExtraState {
 pub fn routes(
     metrics: Arc<Metrics>,
     engine: EngineHandle,
+    catalog: Arc<DatabaseCatalog>,
     security: Arc<SecurityCatalog>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     shutdown: ShutdownCoordinator,
@@ -71,6 +76,7 @@ pub fn routes(
     let state = ExtraState {
         metrics,
         engine,
+        catalog,
         security,
         clock,
         shutdown,
@@ -155,10 +161,19 @@ async fn health_live() -> Response {
 /// probe until it OOMs. The gauge clears the moment a checkpoint succeeds, so the node recovers
 /// readiness automatically once reclamation resumes.
 ///
-/// Also reports `503` when the **engine is degraded** (`rmp` #409): a statement panicked and the
-/// rollback/commit recovering it *also* panicked, so a deep storage/MVCC invariant is broken and the
-/// engine's in-memory state can no longer be trusted. Unlike reclamation-degraded this does **not**
+/// Reports `503` when the **default database's engine is degraded** (`rmp` #409/#414): a statement
+/// panicked and the rollback/commit recovering it *also* panicked, so a deep storage/MVCC invariant is
+/// broken and that engine's in-memory state can no longer be trusted. The default database is the one
+/// the listeners structurally depend on, so its degradation is a node-level not-ready. A **secondary**
+/// database's degradation does **not** take the node down (`rmp` #414 multi-tenant isolation): the node
+/// stays `200` and serviceable for the default + every healthy database, while the response body names
+/// the degraded secondary database(s) so an orchestrator can act. Engine degradation does **not**
 /// auto-clear — a controlled engine/process restart is the only safe recovery.
+///
+/// Also reports `503` when **one or more configured (non-default) databases failed to open** at boot
+/// (`rmp` #430): previously such a failure was logged but readiness stayed unconditionally green,
+/// hiding a catalog whose secondary databases all failed to open. The count is surfaced so an
+/// orchestrator can tell a configured database is not serving.
 async fn health_ready(State(state): State<ExtraState>) -> Response {
     if !state.readiness.is_ready() {
         return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
@@ -170,16 +185,36 @@ async fn health_ready(State(state): State<ExtraState>) -> Response {
         )
             .into_response();
     }
-    // `503` when the engine is degraded by a recovery double-panic (`rmp` #409): a statement panicked
-    // AND its recovering rollback/commit *also* panicked, so a deep storage/MVCC invariant is broken and
-    // the in-memory state is no longer trustworthy. Surfacing it through readiness lets an orchestrator
-    // stop routing to a node whose engine is serving an engine-degraded error to every request (rather
-    // than the engine silently dying or serving over possibly-corrupt state). No auto-clear — a
-    // controlled restart is the only safe recovery.
-    if state.metrics.is_engine_degraded() {
+    // Per-database engine-degradation aggregation (`rmp` #414). The default database failing is a
+    // node-level not-ready (the listeners depend on it); a degraded *secondary* database is reported
+    // without taking the node down so a healthy database stays serviceable.
+    if state.catalog.default_database_degraded() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "not ready: engine degraded (recovery double-panic)",
+            "not ready: default database engine degraded (recovery double-panic)",
+        )
+            .into_response();
+    }
+    let degraded = state.catalog.degraded_databases();
+    let failed_open = state.catalog.failed_open_database_count();
+    // A non-default database failing to open (`rmp` #430) is a degraded signal: the node still serves
+    // the default + healthy databases, but readiness must report not-ready so an orchestrator can tell.
+    if failed_open > 0 {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: {failed_open} configured database(s) failed to open"),
+        )
+            .into_response();
+    }
+    // A degraded *secondary* database does not take the node down, but it is surfaced (named) through
+    // readiness so an orchestrator sees which database is unhealthy. The default stays serviceable.
+    if !degraded.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "not ready: database(s) engine-degraded: {}",
+                degraded.join(", ")
+            ),
         )
             .into_response();
     }

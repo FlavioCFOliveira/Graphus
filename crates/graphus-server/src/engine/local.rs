@@ -92,6 +92,12 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     plan_cache: super::exec::EnginePlanCache,
     /// Observability counters (a private registry; the simulator may read it for liveness checks).
     metrics: Arc<Metrics>,
+    /// This inline engine's own degraded flag (`rmp` #414), mirroring the threaded engine. Single-
+    /// engine inline driver, so it gates only itself; exposed for determinism parity with production.
+    degraded: super::EngineDegraded,
+    /// This inline engine's contribution to the (private) server-wide open-transaction gauge
+    /// (`rmp` #418): published additively, exactly as the threaded loop does.
+    active_txns: super::ActiveTxnGauge,
     /// The injected (simulated) clock; threaded into execution so latency/timing is deterministic.
     clock: Arc<dyn Clock + Send + Sync>,
 }
@@ -100,6 +106,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Builds a driver over an already-constructed coordinator and an injected clock.
     #[must_use]
     pub fn new(coordinator: TxnCoordinator<D, S>, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+        let metrics = Arc::new(Metrics::new());
         Self {
             coordinator: Some(coordinator),
             open: HashMap::new(),
@@ -109,7 +116,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             dispatch: ReadDispatch::Inline,
             readers_inflight: 0,
             plan_cache: super::exec::EnginePlanCache::new(),
-            metrics: Arc::new(Metrics::new()),
+            degraded: super::EngineDegraded::new(),
+            active_txns: super::ActiveTxnGauge::new(Arc::clone(&metrics)),
+            metrics,
             clock,
         }
     }
@@ -140,6 +149,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &mut inflight,
             LOCAL_RESULT_BUFFER,
             &self.metrics,
+            &self.degraded,
+            &mut self.active_txns,
             &self.clock,
         );
         debug_assert!(

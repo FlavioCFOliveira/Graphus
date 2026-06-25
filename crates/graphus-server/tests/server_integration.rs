@@ -1224,3 +1224,119 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
 async fn settle() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 }
+
+// ----------------------------------------------------------------------------------------------
+// rmp #428: a listener-bind failure AFTER the engines are spawned tears the engines down cleanly.
+// ----------------------------------------------------------------------------------------------
+
+/// `rmp` #428: startup spawns the database engines (each on its own OS thread) *before* it binds the
+/// listeners. If a listener fails to bind, the early `Err` return must NOT drop the catalog + engine
+/// handles without a graceful teardown — there is no `Drop` that drains + hardens, so detached engine
+/// threads would leave the store never marked clean (a needless crash-recovery next open). The fix
+/// funnels the post-engine failure through `harden_on_startup_error`, which drives `shutdown_all()`
+/// (drain → flush → join, store marked clean).
+///
+/// We force a deterministic bind failure by occupying the REST port with a `TcpListener` the test
+/// holds, then pointing `rest_addr` at it. Proof of clean teardown: a SECOND server boots successfully
+/// over the SAME store dir — only possible if the first run's engines released the device/WAL file
+/// handles and left the store clean (a leaked/detached engine thread would still hold the files).
+#[tokio::test]
+async fn listener_bind_failure_after_engine_start_tears_down_engines() {
+    let temp = TempStore::new("bind-failure-teardown");
+
+    // Occupy a port so the server's REST bind to it fails (after its engines have started).
+    let occupier = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("occupy a port");
+    let busy = occupier.local_addr().expect("occupier addr");
+
+    let mut config = base_config(&temp);
+    config.rest_addr = Some(busy.to_string());
+
+    // Boot #1 must FAIL at the listener bind (the engines started first, then the bind failed).
+    match Server::new(config.clone()).start().await {
+        Ok(_) => panic!("startup must fail when the REST port is already bound"),
+        Err(graphus_server::ServerError::Listener(_)) => { /* expected */ }
+        Err(other) => panic!("the failure must be a listener-bind error, got: {other}"),
+    }
+
+    // Free the port and boot #2 over the SAME store dir. If boot #1 had detached its engine thread
+    // (no graceful teardown), the device/WAL files would still be held and/or left unclean; a clean
+    // boot here proves `harden_on_startup_error` drained + joined + hardened the engine.
+    drop(occupier);
+    config.rest_addr = Some("127.0.0.1:0".to_owned());
+    let server = boot(config).await;
+    // The store is healthy and serviceable.
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(&server, "alice").await;
+    let (status, body) = http_request(
+        rest,
+        "POST",
+        "/db/graphus/tx/commit",
+        Some(&token),
+        Some(r#"{"statements":[{"statement":"RETURN 1"}]}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "the re-booted server serves queries: {body}");
+    server.shutdown().await.expect("clean shutdown");
+}
+
+// ----------------------------------------------------------------------------------------------
+// rmp #429: graceful shutdown drains in-flight connections within a bounded deadline.
+// ----------------------------------------------------------------------------------------------
+
+/// `rmp` #429: graceful shutdown does `stop_accepting()` then `shutdown_all()`. The connection tasks
+/// (Bolt sessions on `spawn_blocking`, REST) were never joined or time-bounded, despite the `04 §9.4`
+/// docstring promising a drain deadline. The fix adds a bounded connection-drain between the two: it
+/// waits up to `shutdown_drain_deadline_ms` for in-flight connections to finish, then proceeds (the
+/// engine drain force-closes any straggler). This gate holds a connection OPEN (a UDS Bolt session that
+/// completes its handshake then sits idle) across the shutdown and asserts the whole shutdown still
+/// completes well within the deadline — the straggler is drained/force-closed, never left to hang.
+#[tokio::test]
+async fn shutdown_drains_inflight_connections_within_deadline() {
+    let temp = TempStore::new("conn-drain");
+    let mut config = base_config(&temp);
+    // A short, explicit drain deadline so the bound wait is observable and the test is quick.
+    config.timing.shutdown_drain_deadline_ms = 1_500;
+    let server = boot(config).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // Open a UDS connection and complete the Bolt handshake, then HOLD it open (idle, never GOODBYE) so
+    // it is an in-flight connection across shutdown — exactly the straggler the drain must bound.
+    let mut conn = UnixStream::connect(&uds).await.expect("connect UDS");
+    conn.write_all(&encode_client_handshake([
+        Proposal::range(5, 4, 4),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ]))
+    .await
+    .expect("send handshake");
+    let mut negotiated = [0u8; 4];
+    conn.read_exact(&mut negotiated)
+        .await
+        .expect("read negotiated version");
+    // Leave `conn` open and idle (no GOODBYE): its session task stays in-flight, holding a connection-
+    // admission permit, until the drain deadline force-closes it.
+
+    // Trigger graceful shutdown and time it. With the bounded drain (`rmp` #429) it completes within the
+    // deadline + the engine drain, NOT hanging on the idle connection.
+    let start = std::time::Instant::now();
+    let shutdown = server.shutdown();
+    let result = tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect(
+            "shutdown must complete within a hard test bound (never hang on the idle connection)",
+        );
+    result.expect("graceful shutdown returns Ok");
+    let elapsed = start.elapsed();
+
+    // It waited at most the drain deadline (1.5s) plus the engine-drain/teardown slack — and did not
+    // hang. A generous ceiling proves boundedness without flaking on slow CI.
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "shutdown must be bounded by the drain deadline, took {elapsed:?}"
+    );
+
+    drop(conn);
+}

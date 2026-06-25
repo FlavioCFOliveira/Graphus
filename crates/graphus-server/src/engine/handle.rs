@@ -16,6 +16,7 @@ use std::sync::Arc;
 use graphus_core::{GraphusError, Value};
 use tokio::sync::Semaphore;
 
+use super::EngineDegraded;
 use super::TxTicket;
 use super::command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
@@ -60,6 +61,11 @@ pub struct EngineHandle {
     admission: Arc<Semaphore>,
     /// Observability counters.
     metrics: Arc<Metrics>,
+    /// This engine's **own** degraded flag (`rmp` #414): set by its recovery double-panic boundary, read
+    /// by `/health/ready`'s per-database readiness aggregation. Shared (cloned `Arc`) with the engine
+    /// thread, so a degraded secondary database is surfaced as not-ready *for that database only* —
+    /// every other database stays serviceable.
+    degraded: EngineDegraded,
 }
 
 impl EngineHandle {
@@ -70,11 +76,13 @@ impl EngineHandle {
     pub(super) fn new(
         tx: std::sync::mpsc::SyncSender<EngineCommand>,
         metrics: Arc<Metrics>,
+        degraded: EngineDegraded,
     ) -> Self {
         Self {
             tx,
             admission: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             metrics,
+            degraded,
         }
     }
 
@@ -88,6 +96,7 @@ impl EngineHandle {
             tx: self.tx.clone(),
             admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
             metrics: Arc::clone(&self.metrics),
+            degraded: self.degraded.clone(),
         }
     }
 
@@ -95,6 +104,15 @@ impl EngineHandle {
     #[must_use]
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// Whether **this** database's engine is currently degraded by a recovery double-panic
+    /// (`rmp` #409/#414). Read by `/health/ready`'s per-database readiness aggregation so a degraded
+    /// secondary database is surfaced as not-ready *for that database only*, while every other database
+    /// stays ready. No auto-clear: a controlled engine/process restart is the only safe recovery.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.is_degraded()
     }
 
     /// Tries to admit a query: acquires an admission permit without waiting, or fast-rejects with

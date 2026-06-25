@@ -135,7 +135,12 @@ pub struct Metrics {
     commits: AtomicU64,
     /// Transactions aborted/rolled back (explicit rollback, error, or SSI victim).
     aborts: AtomicU64,
-    /// Currently-open transactions (a gauge, mirrors the engine's coordinator).
+    /// Currently-open transactions, **summed across every database engine** (a gauge). Each engine
+    /// publishes its coordinator's count *additively* via [`add_active_txns_delta`](Metrics::add_active_txns_delta)
+    /// (not a last-writer-wins `store`), so under multi-database operation the gauge equals the sum of
+    /// the per-engine counts rather than whichever engine published last (`rmp` #418). This is what
+    /// keeps the `rmp` #386 leak oracle ("a return to zero proves no reader transaction leaked") sound
+    /// when several engines report concurrently.
     active_txns: AtomicU64,
 
     // ---- admission control (`04 §9.3`) — MULTI-WRITER (Tokio worker pool), cache-padded ----
@@ -292,14 +297,52 @@ impl Metrics {
         self.aborts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Sets the current open-transaction gauge (the engine publishes its coordinator's count).
+    /// Sets the current open-transaction gauge to `n` with last-writer-wins semantics.
+    ///
+    /// **Single-engine / test use only.** Under multi-database operation this is unsound: with `N`
+    /// engines each publishing their own count, the gauge would reflect whichever engine stored last
+    /// rather than the server-wide total (`rmp` #418). Production engines therefore publish their count
+    /// *additively* through [`add_active_txns_delta`](Self::add_active_txns_delta); this setter remains
+    /// for the single-engine metrics unit tests (and as the documented building block they assert on).
     pub fn set_active_txns(&self, n: u64) {
         self.active_txns.store(n, Ordering::Relaxed);
     }
 
-    /// The current open-transaction gauge (`rmp` #386 regression visibility): after every reader
-    /// retirement the engine republishes its coordinator's `active_count`, so a return to zero proves
-    /// no reader transaction leaked (e.g. a panicked read whose txn/ticket was rolled back).
+    /// Publishes a per-engine change to the **server-wide** open-transaction gauge additively
+    /// (`rmp` #418): the engine reports the signed delta between its previous and current coordinator
+    /// `active_count`, which is folded into the shared gauge so the gauge always equals the SUM across
+    /// every engine — never whichever engine published last. A positive delta is a `fetch_add`, a
+    /// negative one a saturating `fetch_sub` (the gauge never wraps below zero even under a transient
+    /// publish reordering). A zero delta is a no-op. The per-engine "previous" bookkeeping lives in
+    /// [`crate::engine`]'s per-engine `ActiveTxnGauge` (a private engine-loop helper).
+    pub fn add_active_txns_delta(&self, delta: i64) {
+        if delta > 0 {
+            // `delta > 0`, so the cast to u64 is exact and non-negative.
+            self.active_txns
+                .fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
+        } else if delta < 0 {
+            // Saturating: never wrap below zero, even if a (buggy) over-decrement were ever attempted.
+            let dec = delta.unsigned_abs();
+            let mut cur = self.active_txns.load(Ordering::Relaxed);
+            loop {
+                let next = cur.saturating_sub(dec);
+                match self.active_txns.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
+        }
+    }
+
+    /// The current server-wide open-transaction gauge (`rmp` #386 regression visibility, `rmp` #418
+    /// multi-DB sum): after every reader retirement (and every begin/commit/rollback) each engine
+    /// republishes its coordinator's `active_count` additively, so a return to zero proves no reader
+    /// transaction leaked on **any** database (e.g. a panicked read whose txn/ticket was rolled back).
     #[must_use]
     pub fn active_txns(&self) -> u64 {
         self.active_txns.load(Ordering::Relaxed)
@@ -597,6 +640,32 @@ mod tests {
         // Self-describing: HELP + TYPE present.
         assert!(text.contains("# TYPE graphus_transactions_committed_total counter"));
         assert!(text.contains("# TYPE graphus_active_transactions gauge"));
+    }
+
+    /// `rmp` #418: the open-transaction gauge is additive, so two engines each publishing their own
+    /// count sum into the shared gauge (rather than last-writer-wins clobbering). This is the
+    /// unit-level proof of the mechanism the multi-DB integration gate exercises end-to-end.
+    #[test]
+    fn active_txns_gauge_is_additive_across_engines() {
+        let m = Metrics::new();
+        // Engine A opens 2 txns (delta +2 from 0), engine B opens 3 (delta +3 from 0).
+        m.add_active_txns_delta(2);
+        m.add_active_txns_delta(3);
+        assert_eq!(
+            m.active_txns(),
+            5,
+            "the gauge is the SUM across engines, not the last write"
+        );
+        // Engine A drops to 1 (delta -1); engine B finishes all (delta -3).
+        m.add_active_txns_delta(-1);
+        m.add_active_txns_delta(-3);
+        assert_eq!(m.active_txns(), 1);
+        // Over-decrement saturates at zero (never wraps to u64::MAX).
+        m.add_active_txns_delta(-100);
+        assert_eq!(m.active_txns(), 0);
+        // A zero delta is a no-op.
+        m.add_active_txns_delta(0);
+        assert_eq!(m.active_txns(), 0);
     }
 
     #[test]

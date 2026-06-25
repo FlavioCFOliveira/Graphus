@@ -269,7 +269,14 @@ impl Server {
         let shutdown = ShutdownCoordinator::new();
         let readiness = crate::observability::Readiness::new();
         let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
-        let bound = listeners::start_all(
+        // `rmp` #428: the engines are already running (each on its own OS thread). If any *later*
+        // startup step fails — notably a listener failing to bind — returning `Err` here would drop the
+        // catalog and the engine handles WITHOUT a graceful `shutdown_all()` (there is no `Drop` on the
+        // catalog/engine that drains + hardens), detaching the engine threads and leaving each store
+        // never marked clean (the next open then needlessly runs crash recovery). So every fallible
+        // post-engine step funnels through `harden_on_startup_error`, which drives `shutdown_all()`
+        // (drain → flush → join every engine thread, default last) before surfacing the original error.
+        let bound = match listeners::start_all(
             &config,
             handle.clone(),
             Arc::clone(&catalog),
@@ -283,7 +290,10 @@ impl Server {
             readiness.clone(),
         )
         .await
-        .map_err(ServerError::Listener)?;
+        {
+            Ok(bound) => bound,
+            Err(e) => return Err(harden_on_startup_error(&catalog, ServerError::Listener(e)).await),
+        };
 
         // 5) Ready.
         readiness.set(true);
@@ -317,6 +327,26 @@ impl Server {
     }
 }
 
+/// Drives a graceful [`DatabaseCatalog::shutdown_all`] (drain → flush → join every running engine
+/// thread, default last) before returning the startup `err` that triggered it (`rmp` #428).
+///
+/// Called when a startup step *after* the engines were spawned fails (e.g. a listener fails to bind).
+/// Without this, the early `return Err(..)` would drop the catalog and engine handles with no graceful
+/// teardown — there is no `Drop` impl on the catalog/engine that drains in-flight transactions, flushes
+/// dirty pages and `sync_all`s the device, so the engine threads would detach and each store would be
+/// left never marked clean (a needless crash-recovery on the next open). Hardening here makes a failed
+/// startup leave every store as durable + clean as a graceful shutdown would, then surfaces the
+/// original error unchanged.
+async fn harden_on_startup_error(catalog: &DatabaseCatalog, err: ServerError) -> ServerError {
+    tracing::error!(
+        error = %err,
+        "startup failed after the engines were spawned; hardening every store (drain + flush + join) \
+         before exiting (rmp #428)",
+    );
+    catalog.shutdown_all().await;
+    err
+}
+
 /// The run loop owned by the background task: awaits the shutdown trigger, then performs the §9.4
 /// graceful sequence — stop accepting (drop the listeners), then drain + flush every database engine
 /// and join its thread (additional databases first, the default last — see
@@ -336,6 +366,22 @@ async fn run_loop(
     // Stop accepting: dropping the acceptors closes the listening sockets; in-flight connection
     // tasks keep running until they finish or the drain deadline forces them down (`04 §9.4`).
     bound.stop_accepting();
+
+    // Bounded connection drain (`rmp` #429): give in-flight connections up to the configured deadline
+    // to finish on their own before the engine drain force-closes them. This enforces the drain-
+    // deadline the `04 §9.4` docstring promised but the prior `stop_accepting → shutdown_all` sequence
+    // never actually waited on (connection tasks were neither joined nor time-bounded). A connection
+    // still in flight at the deadline is not abandoned: the engine drain below rolls back its in-flight
+    // transaction and hardens the store, so it is force-closed cleanly (never `engine_gone` racing a
+    // half-applied write).
+    if bound.drain_connections().await {
+        tracing::info!("graceful shutdown: all in-flight connections drained within the deadline");
+    } else {
+        tracing::info!(
+            "graceful shutdown: drain deadline elapsed; force-closing remaining connections via the \
+             engine drain"
+        );
+    }
 
     // Drain in-flight transactions + flush + fdatasync + clean exit, on each engine's own thread.
     // Durable desired states are untouched: a database online now comes back online at next boot.

@@ -602,9 +602,18 @@ fn open_or_create_coordinator(
         store
     };
 
-    // The inviolable integrity gate (`04 §4.6`/§4.8): refuse to serve a corrupt store. The
-    // coordinator's secondary index is in-memory candidate-only (rebuilt from the store), so an
-    // empty `IndexAgreement` slice checks the store alone — correct here.
+    // The inviolable integrity gate (`04 §4.6`/§4.8): refuse to serve a corrupt store.
+    //
+    // `rmp` #423 — why the index/base divergence slice is empty (`&[]`): every Graphus secondary index
+    // (the node-property candidate index, the bitmap, full-text and spatial indexes) is **in-memory and
+    // rebuilt from the store on each open** by `TxnCoordinator::new` below — none is durably persisted
+    // independently of the store. So at open time there is no separately-durable index image that could
+    // have diverged from the store base; `verify_on_open`'s index/base divergence check has nothing to
+    // compare and is correctly a no-op here (the store-integrity half of `verify_on_open` still runs in
+    // full). The divergence check exists for a *future* wire-durable index path; passing `&[]` is not a
+    // skipped check but a faithful statement that "indexes are rebuilt, not verified, on the server open
+    // path", so divergence is structurally impossible today. The
+    // `secondary_indexes_are_rebuilt_not_verified_on_open` test pins this contract.
     verify_on_open(&mut store, &[])?;
 
     Ok(TxnCoordinator::new(store))
@@ -1006,6 +1015,16 @@ pub struct DatabaseCatalog {
     /// The concurrent lookup view: name → admission-limited [`EngineHandle`] for **running**
     /// databases. Written only inside admin-locked sections; read lock-briefly by lookups.
     handles: RwLock<HashMap<String, EngineHandle>>,
+    /// Count of **non-default** databases whose desired state is `online` but whose engine **failed to
+    /// open/start** (`rmp` #430). Maintained alongside the admin-locked `failed` map, but as a
+    /// lock-free atomic so `/health/ready` can read it without taking the async admin mutex. A non-zero
+    /// value flips a degraded readiness signal so an orchestrator can tell that a configured database is
+    /// not serving — previously such a failure was logged but readiness stayed unconditionally green
+    /// (`server.rs` `readiness.set(true)`), hiding a catalog whose secondary databases all failed to
+    /// open. The default database's open failure remains fatal (fails startup), so it is never counted
+    /// here. Tracked as a *set size* (recomputed from the admin-locked `failed` map under the lock) so
+    /// it can never drift from the authoritative map.
+    failed_open_count: std::sync::atomic::AtomicUsize,
     /// Test-only persist fault seam: how many upcoming `persist_state` calls fail *before
     /// touching the filesystem* (the durable file is untouched — exactly a pre-`rename` I/O
     /// failure). The field, like the seam, does not exist in production builds.
@@ -1057,6 +1076,7 @@ impl DatabaseCatalog {
                 failed: BTreeMap::new(),
             }),
             handles: RwLock::new(HashMap::new()),
+            failed_open_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             persist_faults: std::sync::atomic::AtomicU32::new(0),
         })
@@ -1090,6 +1110,55 @@ impl DatabaseCatalog {
     #[must_use]
     pub fn default_handle(&self) -> Option<EngineHandle> {
         self.read_handles().get(&self.default_name).cloned()
+    }
+
+    /// The names of every **running** database whose engine is currently flagged **degraded** by a
+    /// recovery double-panic (`rmp` #409/#414), in name order. Used by `/health/ready` to aggregate
+    /// degradation **per database**: one degraded secondary database is surfaced (so an orchestrator
+    /// can tell which database is unhealthy) without marking the whole node not-ready when other
+    /// databases are healthy. A brief read lock on the handle map + per-handle atomic loads; never held
+    /// across an `.await`.
+    #[must_use]
+    pub fn degraded_databases(&self) -> Vec<String> {
+        let mut degraded: Vec<String> = self
+            .read_handles()
+            .iter()
+            .filter(|(_, h)| h.is_degraded())
+            .map(|(name, _)| name.clone())
+            .collect();
+        degraded.sort_unstable();
+        degraded
+    }
+
+    /// Whether the **default** database's engine is degraded (`rmp` #414). The default database is the
+    /// one the listeners structurally depend on, so its degradation is treated as a node-level
+    /// not-ready (mirroring the pre-`rmp`-#414 whole-node behaviour); a *secondary* database's
+    /// degradation is reported separately by [`degraded_databases`](Self::degraded_databases) without
+    /// taking the node down.
+    #[must_use]
+    pub fn default_database_degraded(&self) -> bool {
+        self.read_handles()
+            .get(&self.default_name)
+            .is_some_and(EngineHandle::is_degraded)
+    }
+
+    /// The number of **non-default** databases that are configured `online` but whose engine failed to
+    /// open/start (`rmp` #430). Lock-free (an atomic load), so `/health/ready` can consult it without
+    /// the async admin mutex. `> 0` means at least one configured database is not serving — a degraded
+    /// signal an orchestrator can act on (the node still serves the default + every healthy database).
+    #[must_use]
+    pub fn failed_open_database_count(&self) -> usize {
+        self.failed_open_count
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Recomputes [`failed_open_count`](Self::failed_open_count) from the authoritative admin-locked
+    /// `failed` map (`rmp` #430). Called whenever the map changes under the admin lock, so the lock-free
+    /// readiness signal can never drift from the map. The default database is never in `failed` (its
+    /// open failure is fatal), so the map's size is exactly the non-default failed-open count.
+    fn sync_failed_count(&self, state: &AdminState) {
+        self.failed_open_count
+            .store(state.failed.len(), std::sync::atomic::Ordering::Release);
     }
 
     /// Lists every database: the default first, then the additional ones in name order, each with
@@ -1174,6 +1243,8 @@ impl DatabaseCatalog {
                 }
             }
         }
+        // Surface any boot-time open failures into the lock-free readiness signal (`rmp` #430).
+        self.sync_failed_count(&state);
     }
 
     /// Creates a new database named `name` (case-insensitive; stored lowercase). Created
@@ -1286,6 +1357,7 @@ impl DatabaseCatalog {
             Ok(engine) => Ok(self.register(&mut state, &name, engine)),
             Err(e) => {
                 state.failed.insert(name, e.to_string());
+                self.sync_failed_count(&state);
                 Err(CatalogError::Engine(e))
             }
         }
@@ -1327,6 +1399,7 @@ impl DatabaseCatalog {
             None => false,
         };
         state.failed.remove(&name);
+        self.sync_failed_count(&state);
 
         if desired == DbState::Offline && !was_running {
             // Fully idempotent: already stopped and already durable.
@@ -1380,6 +1453,7 @@ impl DatabaseCatalog {
         state.entries.remove(&name);
         self.persist_or_resync(&mut state, fallback).await?;
         state.failed.remove(&name);
+        self.sync_failed_count(&state);
 
         let dir = self.db_dir(&name);
         run_blocking(move || remove_dir(&dir)).await
@@ -1558,6 +1632,7 @@ impl DatabaseCatalog {
             },
         );
         state.failed.remove(name);
+        self.sync_failed_count(state);
         self.write_handles().insert(name.to_owned(), handle.clone());
         handle
     }

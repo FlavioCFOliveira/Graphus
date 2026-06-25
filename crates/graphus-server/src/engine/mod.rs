@@ -37,6 +37,7 @@ pub mod stream;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use graphus_core::error::{GraphusError, Result};
 use graphus_cypher::TxnCoordinator;
@@ -50,6 +51,7 @@ pub use command::{
     RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
+// `EngineDegraded` is defined in this module (below); re-export note: it is `pub` here.
 pub use local::LocalEngine;
 pub use privileges::EffectivePrivileges;
 pub use seam_bolt::BoltEngineExecutor;
@@ -142,6 +144,96 @@ fn recovery_fault_check() {
 #[inline]
 fn recovery_fault_check() {}
 
+/// A **per-engine** "degraded" flag (`rmp` #414): set when a statement-recovery double-panic
+/// (`rmp` #409) breaks a deep storage/MVCC invariant on *this* database's engine, so the engine
+/// refuses further work over its no-longer-trustworthy in-memory state.
+///
+/// ## Why per-engine, not on the shared [`Metrics`]
+///
+/// Every database engine shares one [`Arc<Metrics>`] (the catalog clones it into each engine). The
+/// pre-`rmp`-#414 design flagged degradation on a single `engine_degraded` atomic *on that shared
+/// `Metrics`*, so the moment ONE database's engine caught a recovery double-panic, the per-statement
+/// gate refused work on **every** database — a multi-tenant isolation breach (one corrupt secondary
+/// database could take down the rest, violating the `CLAUDE.md` guarantee). Moving the *gating* flag
+/// onto each engine confines the refusal to the affected database; a healthy database stays
+/// serviceable. The aggregate `graphus_engine_recovery_panics_total` **counter** stays on `Metrics`
+/// for observability (it is fleet-wide telemetry, not a gate).
+///
+/// Cloneable + `Send + Sync` (an `Arc<AtomicBool>`) so the same flag is shared between the engine
+/// thread (the sole writer, via [`EngineDegraded::set`]) and every [`EngineHandle`] clone + the
+/// `/health/ready` readiness aggregation (readers). There is **no auto-clear**: a broken in-memory
+/// invariant is only safely resolved by a controlled engine/process restart.
+#[derive(Clone, Debug, Default)]
+pub struct EngineDegraded(Arc<AtomicBool>);
+
+impl EngineDegraded {
+    /// A fresh, not-degraded flag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flags this engine degraded (the recovery double-panic boundary, `rmp` #409/#414). Idempotent.
+    pub fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this engine is currently degraded — read by the per-statement gate and by
+    /// `/health/ready`.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Per-engine bookkeeping that publishes this engine's open-transaction count into the
+/// **server-wide** additive gauge (`rmp` #418).
+///
+/// Each engine owns one. [`publish`](Self::publish) folds the *signed delta* between the engine's
+/// previously-published count and its current coordinator `active_count` into
+/// [`Metrics::add_active_txns_delta`], so the shared `graphus_active_transactions` gauge equals the
+/// SUM across every database engine — not whichever engine `store`d last (the pre-`rmp`-#418 bug that
+/// made the `rmp` #386 leak oracle unsound under multi-DB). On drop (engine teardown) it retracts its
+/// whole remaining contribution so a stopped engine leaves no phantom open-transaction count behind.
+struct ActiveTxnGauge {
+    metrics: Arc<Metrics>,
+    /// The count this engine last contributed to the shared gauge.
+    last: u64,
+}
+
+impl ActiveTxnGauge {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self { metrics, last: 0 }
+    }
+
+    /// Publishes this engine's `current` open-transaction count, folding only the delta since the last
+    /// publish into the shared additive gauge.
+    fn publish(&mut self, current: usize) {
+        let current = current as u64;
+        if current == self.last {
+            return;
+        }
+        // `i128` headroom so the subtraction never overflows `i64` for any realistic open-txn count
+        // (which is a small `usize`); clamp into `i64` for the (impossible-in-practice) saturating case.
+        let delta = (i128::from(current) - i128::from(self.last))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        self.metrics.add_active_txns_delta(delta);
+        self.last = current;
+    }
+}
+
+impl Drop for ActiveTxnGauge {
+    fn drop(&mut self) {
+        // Retract this engine's whole remaining contribution so a stopped/torn-down engine never
+        // leaves a phantom count in the server-wide gauge (`rmp` #418).
+        if self.last != 0 {
+            self.metrics
+                .add_active_txns_delta(-(i64::try_from(self.last).unwrap_or(i64::MAX)));
+            self.last = 0;
+        }
+    }
+}
+
 /// An opaque handle to a transaction the engine opened.
 ///
 /// Both connectivity seams refer to a transaction by this ticket (the Bolt session tracks its single
@@ -181,14 +273,20 @@ struct OpenTx {
 ///
 /// This function **blocks** the calling thread for the engine's lifetime; spawn it on a dedicated
 /// OS thread (see [`spawn_engine`]).
+#[allow(clippy::too_many_arguments)] // The engine loop threads its whole execution context here.
 fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     coordinator: TxnCoordinator<D, S>,
     rx: std::sync::mpsc::Receiver<EngineCommand>,
     result_buffer_capacity: usize,
     reader_threads: usize,
     metrics: Arc<Metrics>,
+    degraded: EngineDegraded,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) {
+    // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
+    // additively so the gauge sums across every database engine. Dropped (retracting its contribution)
+    // when the loop exits.
+    let mut active_txns = ActiveTxnGauge::new(Arc::clone(&metrics));
     let mut open: HashMap<u64, OpenTx> = HashMap::new();
     let mut next_ticket: u64 = 0;
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
@@ -259,6 +357,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &mut open,
             &mut readers_inflight,
             &metrics,
+            &degraded,
+            &mut active_txns,
         );
 
         // Resume one batch of the suspended inline statement, if any (`rmp` task #372). Done each tick
@@ -300,6 +400,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut inflight,
                         result_buffer_capacity,
                         &metrics,
+                        &degraded,
+                        &mut active_txns,
                         &clock,
                     ) {
                         break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
@@ -346,6 +448,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &mut inflight,
                 result_buffer_capacity,
                 &metrics,
+                &degraded,
+                &mut active_txns,
                 &clock,
             ) {
                 break 'engine;
@@ -380,19 +484,22 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 /// Drains and processes every reader retirement currently available on `retire_rx` (`rmp` task #336,
 /// Slice 3b-ii), on the engine thread, in arrival order. Non-blocking: stops when the channel is
 /// momentarily empty. Each retirement is finalised by [`finish_reader`].
+#[allow(clippy::too_many_arguments)] // The retirement path threads its execution context here.
 fn process_retirements<D: BlockDevice, S: LogSink>(
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     open: &mut HashMap<u64, OpenTx>,
     readers_inflight: &mut u64,
     metrics: &Metrics,
+    degraded: &EngineDegraded,
+    active_txns: &mut ActiveTxnGauge,
 ) {
     while let Ok(retirement) = retire_rx.try_recv() {
         if let Some(coord) = coordinator.as_mut() {
-            finish_reader(coord, open, retirement, metrics);
+            finish_reader(coord, open, retirement, metrics, degraded);
         }
         *readers_inflight = readers_inflight.saturating_sub(1);
-        metrics.set_active_txns(coordinator.as_ref().map_or(0, |c| c.active_count() as u64));
+        active_txns.publish(coordinator.as_ref().map_or(0, TxnCoordinator::active_count));
     }
 }
 
@@ -417,6 +524,7 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
     open: &mut HashMap<u64, OpenTx>,
     retirement: read_pool::ReadRetirement,
     metrics: &Metrics,
+    degraded: &EngineDegraded,
 ) {
     let read_pool::ReadRetirement {
         txn,
@@ -448,7 +556,9 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
     // in `catch_recovery` so a recovery double-panic flags the engine degraded and keeps the loop alive,
     // rather than unwinding the single engine thread (`engine_gone` forever — the #386 failure, deeper).
     match outcome {
-        Ok(()) => match catch_recovery(metrics, "reader commit", || coordinator.commit(txn)) {
+        Ok(()) => match catch_recovery(metrics, degraded, "reader commit", || {
+            coordinator.commit(txn)
+        }) {
             Some(Ok(_)) => metrics.record_commit(),
             Some(Err(e)) => {
                 // The COMMIT failed (e.g. an SSI serialization abort): the transaction is rolled back.
@@ -472,7 +582,9 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
             // already streamed by the reader (`run_read_task` sends it for auth/deferral errors); roll
             // the transaction back so nothing is committed over an untrustworthy result.
             let _ = read_err; // already surfaced to the consumer by the reader.
-            match catch_recovery(metrics, "reader rollback", || coordinator.rollback(txn)) {
+            match catch_recovery(metrics, degraded, "reader rollback", || {
+                coordinator.rollback(txn)
+            }) {
                 Some(_) => metrics.record_abort(),
                 None => {
                     let _ = row_tx.send(Err(GraphusError::Runtime(
@@ -671,16 +783,20 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
+    degraded: &EngineDegraded,
+    active_txns: &mut ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
 ) -> bool {
-    // `rmp` #409: once a statement-recovery double-panic has flagged the engine degraded, the
-    // coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke). Stop
-    // executing statements/transactions over it — serve each request a clean engine-degraded error so a
-    // client sees a definite failure (not a hang, not `engine_gone` from a dead thread). `Shutdown` and
-    // `Status` are still honoured so the engine can be drained / probed and a controlled restart can
-    // proceed. The engine thread itself stays alive (the loop keeps spinning); the degraded gauge already
-    // drives `/health/ready` to `503`.
-    let cmd = if metrics.is_engine_degraded() {
+    // `rmp` #409 / #414: once a statement-recovery double-panic has flagged **this** engine degraded,
+    // the coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke).
+    // Stop executing statements/transactions over it — serve each request a clean engine-degraded error
+    // so a client sees a definite failure (not a hang, not `engine_gone` from a dead thread). The flag is
+    // **per-engine** (`rmp` #414): a degraded secondary database refuses its own work while every other
+    // database keeps serving (no shared-`Metrics` cross-database lockout). `Shutdown` and `Status` are
+    // still honoured so this engine can be drained / probed and a controlled restart can proceed. The
+    // engine thread itself stays alive (the loop keeps spinning); the per-engine flag drives
+    // `/health/ready` to `503` for this database via the catalog's per-DB readiness aggregation.
+    let cmd = if degraded.is_degraded() {
         match reply_engine_degraded(cmd) {
             // Handled: a clean engine-degraded error was delivered. Keep the loop alive.
             None => return true,
@@ -696,12 +812,12 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     match cmd {
         Cmd::Begin { mode, reply } => {
             let ticket = open_tx(coord, open, next_ticket, mode);
-            metrics.set_active_txns(coord.active_count() as u64);
+            active_txns.publish(coord.active_count());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::BeginAutoCommit { mode, reply } => {
             let ticket = open_tx(coord, open, next_ticket, mode);
-            metrics.set_active_txns(coord.active_count() as u64);
+            active_txns.publish(coord.active_count());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::Run {
@@ -736,19 +852,20 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 inflight,
                 result_buffer_capacity,
                 metrics,
+                degraded,
                 clock,
                 reply,
             );
-            metrics.set_active_txns(coord.active_count() as u64);
+            active_txns.publish(coord.active_count());
         }
         Cmd::Commit { ticket, reply } => {
             let out = commit_tx(coord, open, ticket, metrics);
-            metrics.set_active_txns(coord.active_count() as u64);
+            active_txns.publish(coord.active_count());
             let _ = reply.send(out);
         }
         Cmd::Rollback { ticket, reply } => {
             let out = rollback_tx(coord, open, ticket, metrics);
-            metrics.set_active_txns(coord.active_count() as u64);
+            active_txns.publish(coord.active_count());
             let _ = reply.send(out);
         }
         Cmd::Status { reply } => {
@@ -802,7 +919,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 .take()
                 .expect("INVARIANT: coordinator is Some at Shutdown");
             let out = harden_store(coordinator);
-            metrics.set_active_txns(0);
+            // Retract this engine's whole contribution from the server-wide gauge (`rmp` #418); the
+            // `ActiveTxnGauge` drop at loop exit would also do this, but publishing 0 here keeps the
+            // gauge correct the instant the engine drains.
+            active_txns.publish(0);
             let _ = reply.send(out);
             // Drained + durable: signal the loop to exit so the thread can join.
             return false;
@@ -873,6 +993,7 @@ fn run_statement_isolated<
     inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
+    degraded: &EngineDegraded,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     reply: command::Reply<std::result::Result<RunReply, GraphusError>>,
 ) {
@@ -923,7 +1044,15 @@ fn run_statement_isolated<
             exec::RunOutcome::Done => {}
         },
         Err(panic_payload) => {
-            rollback_panicked_statement(coord, open, ticket, metrics, &fallback, &panic_payload);
+            rollback_panicked_statement(
+                coord,
+                open,
+                ticket,
+                metrics,
+                degraded,
+                &fallback,
+                &panic_payload,
+            );
         }
     }
 }
@@ -938,11 +1067,13 @@ fn run_statement_isolated<
 /// For an explicit (`BEGIN`) transaction it additionally undoes the in-flight statement's writes —
 /// the connection's own later `ROLLBACK` would otherwise find the txn already gone; we remove the
 /// ticket from `open` so that later `ROLLBACK` is the documented idempotent no-op.
+#[allow(clippy::too_many_arguments)] // The recovery path threads its execution context here.
 fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
     coord: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
     ticket: TxTicket,
     metrics: &Metrics,
+    degraded: &EngineDegraded,
     fallback: &command::Reply<std::result::Result<RunReply, GraphusError>>,
     panic_payload: &(dyn std::any::Any + Send),
 ) {
@@ -967,8 +1098,9 @@ fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
         // `Some(Ok(()))` = rollback ran and succeeded → account the abort. `Some(Err(_))` (a benign
         // rollback failure on a torn-down txn) and `None` (a caught recovery double-panic, which already
         // flagged the engine degraded inside `catch_recovery`) both need no extra action here.
-        if let Some(Ok(())) = catch_recovery(metrics, "statement rollback", || coord.rollback(txn))
-        {
+        if let Some(Ok(())) = catch_recovery(metrics, degraded, "statement rollback", || {
+            coord.rollback(txn)
+        }) {
             metrics.record_abort();
         }
     }
@@ -1005,7 +1137,12 @@ fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
 /// recovery panic we observe **no** partially-mutated coordinator state — the engine is flagged degraded
 /// and stops executing statements, so the possibly-inconsistent in-memory state is never read again on a
 /// success path.
-fn catch_recovery<R>(metrics: &Metrics, label: &'static str, f: impl FnOnce() -> R) -> Option<R> {
+fn catch_recovery<R>(
+    metrics: &Metrics,
+    degraded: &EngineDegraded,
+    label: &'static str,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     match catch_unwind(AssertUnwindSafe(|| {
         recovery_fault_check();
@@ -1019,12 +1156,15 @@ fn catch_recovery<R>(metrics: &Metrics, label: &'static str, f: impl FnOnce() ->
                 recovery = label,
                 panic = %detail,
                 "RECOVERY DOUBLE-PANIC: a statement-recovery {label} panicked — a deep storage/MVCC \
-                 invariant is broken, flagging the engine DEGRADED (readiness now reports not-ready); \
-                 the engine stays alive but will serve an engine-degraded error until a controlled \
-                 restart (rmp #409)",
+                 invariant is broken, flagging THIS database's engine DEGRADED (readiness now reports \
+                 not-ready for this database); the engine stays alive but will serve an engine-degraded \
+                 error until a controlled restart (rmp #409/#414)",
             );
             // Allocation-light, infallible: atomic stores only. Must never panic inside the catch.
+            // The aggregate recovery-panic COUNTER stays on the shared `Metrics` (fleet telemetry), but
+            // the GATING flag is **per-engine** (`rmp` #414) so only the affected database refuses work.
             metrics.record_engine_recovery_panic();
+            degraded.set();
             None
         }
     }
@@ -1472,6 +1612,11 @@ where
     // itself never crosses the boundary.
     let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     let loop_metrics = Arc::clone(&metrics);
+    // This engine's OWN degraded flag (`rmp` #414): shared (cloned) between the engine thread's
+    // recovery boundary (the sole writer) and the `EngineHandle` clones + `/health/ready` readers, so a
+    // recovery double-panic confines the engine-degraded refusal to THIS database.
+    let degraded = EngineDegraded::new();
+    let loop_degraded = degraded.clone();
     let join = std::thread::Builder::new()
         .name("graphus-engine".to_owned())
         .spawn(move || match build() {
@@ -1485,6 +1630,7 @@ where
                     result_buffer_capacity,
                     reader_threads,
                     loop_metrics,
+                    loop_degraded,
                     clock,
                 );
             }
@@ -1498,7 +1644,7 @@ where
     // Wait for the thread's startup result before returning a usable handle.
     match init_rx.recv() {
         Ok(Ok(())) => Ok(Engine {
-            handle: EngineHandle::new(tx, metrics),
+            handle: EngineHandle::new(tx, metrics, degraded),
             join,
         }),
         Ok(Err(e)) => {
