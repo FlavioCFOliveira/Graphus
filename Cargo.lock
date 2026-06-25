@@ -1073,6 +1073,7 @@ dependencies = [
 name = "graphus-bulk"
 version = "0.0.1"
 dependencies = [
+ "crc32c",
  "csv",
  "graphus-columnar",
  "graphus-core",
@@ -1141,6 +1142,7 @@ dependencies = [
  "graphus-storage",
  "graphus-wal",
  "hkdf",
+ "libc",
  "rand_chacha 0.3.1",
  "sha2",
  "subtle",

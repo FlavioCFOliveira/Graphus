@@ -325,6 +325,14 @@ impl<S: LogSink> EncryptedLogSink<S> {
         self.budget.consumed()
     }
 
+    /// Test-only: overrides the buffered nonce CSPRNG with a deterministically-seeded one, so two
+    /// sinks can be made to draw the **identical** nonce stream. Used by the
+    /// `wal_nonce_is_independent_of_write_count` invariant test (rmp #393).
+    #[cfg(test)]
+    pub(crate) fn set_nonce_source_for_test(&mut self, src: NonceSource) {
+        self.nonce_source = src;
+    }
+
     /// The AAD for a frame: its logical offset and cumulative write count, both 8-byte little-endian
     /// (16 bytes total). Binding the offset stops a frame being relocated/reordered (v3); binding the
     /// write count stops the durable nonce-budget high-water mark being tampered to a lower value to
@@ -792,6 +800,60 @@ mod tests {
                 "in-place detached seal diverged from attached at len={len}"
             );
         }
+    }
+
+    #[test]
+    fn wal_nonce_is_independent_of_write_count() {
+        // rmp #393 (invariant pin): the per-frame GCM nonce MUST come purely from the CSPRNG and
+        // MUST NOT be derived from the frame's `write_count`. If a future "optimization" ever made
+        // the nonce a function of `write_count` (a counter-derived nonce), then the budget's
+        // documented `write_count` reuse across a torn-tail reopen (two frames legitimately sharing a
+        // write_count) would become a real (key, nonce) reuse — catastrophic for GCM. This test
+        // fails the moment the nonce starts depending on `write_count`.
+        //
+        // Proof: seal the SAME plaintext at the SAME logical offset on two sinks whose nonce sources
+        // are seeded IDENTICALLY (same deterministic stream), but with DIFFERENT write_counts. The
+        // extracted nonce bytes must be byte-identical (nonce ⟂ write_count), while the AAD-bound
+        // write_count field and the resulting tag differ (the write_count IS authenticated).
+        let kr = keyring(0x77);
+        let seed = [0xA5u8; 32];
+
+        let mut sink_a = fresh(&kr);
+        sink_a.set_nonce_source_for_test(NonceSource::from_fixed_seed(seed));
+        let mut sink_b = fresh(&kr);
+        sink_b.set_nonce_source_for_test(NonceSource::from_fixed_seed(seed));
+
+        let plaintext = b"the nonce must not depend on the write count";
+        let logical_offset = 4096u64;
+
+        // Identical nonce stream, but write_count 1 vs 999.
+        let frame_a = sink_a
+            .seal_frame(logical_offset, 1, plaintext)
+            .expect("seal A");
+        let frame_b = sink_b
+            .seal_frame(logical_offset, 999, plaintext)
+            .expect("seal B");
+
+        let nonce_a = &frame_a[FR_OFF_NONCE..FR_OFF_NONCE + NONCE_LEN];
+        let nonce_b = &frame_b[FR_OFF_NONCE..FR_OFF_NONCE + NONCE_LEN];
+        assert_eq!(
+            nonce_a, nonce_b,
+            "WAL frame nonce depends on write_count — counter-derived nonce detected (rmp #393); \
+             this would turn the budget's write_count reuse across a torn-tail reopen into real \
+             (key, nonce) reuse"
+        );
+
+        // Sanity: the write_count field itself DID differ between the two frames (so the test is
+        // genuinely varying write_count, not silently passing on equal inputs), and so did the tag
+        // (write_count is authenticated via the AAD).
+        let wc_a = &frame_a[FR_OFF_WRITE_COUNT..FR_OFF_WRITE_COUNT + 8];
+        let wc_b = &frame_b[FR_OFF_WRITE_COUNT..FR_OFF_WRITE_COUNT + 8];
+        assert_ne!(wc_a, wc_b, "test must vary write_count to be meaningful");
+        assert_ne!(
+            &frame_a[frame_a.len() - TAG_LEN..],
+            &frame_b[frame_b.len() - TAG_LEN..],
+            "write_count must still be authenticated (tags should differ)"
+        );
     }
 
     #[test]

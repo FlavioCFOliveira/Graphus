@@ -59,3 +59,8 @@ graphus-wal = { path = "../graphus-wal" }
 # in `device::read_page`). It also uses the `page` header/checksum helpers to build a realistic
 # checksummed page, exactly as `new_page`/`write_back` produce.
 graphus-bufpool = { path = "../graphus-bufpool" }
+# Real `fork(2)` regression for the fork-safe nonce source (rmp #393): the test forks, has the child
+# draw nonces from a source opened in the parent, and asserts the child never replays a parent nonce
+# (the reseed-on-PID-change must fire). `libc` is already in the workspace lockfile transitively, so
+# this adds no new third-party crate. `#[cfg(unix)]`-gated in the test.
+libc = "0.2"
