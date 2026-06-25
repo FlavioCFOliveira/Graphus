@@ -17,6 +17,67 @@ use graphus_core::error::{GraphusError, Result};
 
 use crate::block::{BlockDevice, PAGE_SIZE, Page};
 
+/// The physical sector size a torn write is modelled at. A real power loss tears a write at the
+/// device's atomic write unit: some sectors carry the *new* bytes, some retain the *old* (pre-write)
+/// bytes, never a byte-granular split mid-sector. `4096` models a modern Advanced Format (4Kn) drive
+/// — the realistic default for contemporary storage. At [`PAGE_SIZE`] = 8192 this yields two sectors
+/// per page, enough to produce the header/body split a coarse check could miss (an OLD header sector
+/// over a NEW body sector, or the reverse). It must divide [`PAGE_SIZE`] (asserted in tests).
+pub const TORN_SECTOR_SIZE: usize = 4096;
+
+/// Computes the sector-granular torn image of writing `new` bytes over the current `old` page,
+/// seeded by `seed` — the single source of truth for the sector-tear pattern, shared by the device's
+/// injected fault ([`MemBlockDevice::arm_torn_write_sectors`]) and any caller that needs to *predict*
+/// the same image deterministically (e.g. the DST harness selecting a page whose tear provably
+/// corrupts it).
+///
+/// The page is partitioned into [`TORN_SECTOR_SIZE`] sectors; each sector independently — by a
+/// deterministic, seeded coin flip — takes the `new` bytes or keeps the `old` ones. The choice is
+/// forced non-trivial (at least one OLD sector and one NEW sector), so the result differs from both
+/// `old` and `new`: a genuine partial write a checksum must catch, never a vacuous all-old/all-new
+/// copy. The same `(old, new, seed)` always yields the identical image — determinism is load-bearing
+/// for DST. A degenerate single-sector page is split in half (old header / new body) so even then it
+/// is a real old/new mix rather than all-or-nothing.
+#[must_use]
+pub fn sector_torn_image(old: &Page, new: &Page, seed: u64) -> Page {
+    // Sector count over the page. `TORN_SECTOR_SIZE` divides `PAGE_SIZE` (8192 = 2 * 4096); the
+    // ceiling division keeps this correct even if that ever changes (a short trailing sector is
+    // still treated as one whole unit, as a device would on its last sector).
+    let sectors = PAGE_SIZE.div_ceil(TORN_SECTOR_SIZE);
+    if sectors <= 1 {
+        // A single sector cannot be a sector-wise mix; tear it in half so the page is still a
+        // genuine old/new split (header half old, body half new) rather than all-or-nothing.
+        let mut torn = *old;
+        let half = PAGE_SIZE / 2;
+        torn[half..].copy_from_slice(&new[half..]);
+        return torn;
+    }
+    // Seed the per-page stream so the same seed reproduces the identical pattern.
+    let mut rng = SplitMix64::new(seed ^ 0x7A6B_5C4D_3E2F_1A0B);
+    // Draw a fresh take/keep mask until it is non-trivial (some old, some new). With >= 2 sectors a
+    // non-uniform draw is reached almost immediately; the loop only guards the rare all-same draw.
+    let mut takes_new = vec![false; sectors];
+    loop {
+        for t in takes_new.iter_mut() {
+            *t = rng.below(2) == 1;
+        }
+        let any_new = takes_new.iter().any(|&t| t);
+        let any_old = takes_new.iter().any(|&t| !t);
+        if any_new && any_old {
+            break;
+        }
+    }
+    let mut torn = *old;
+    for (s, &take_new) in takes_new.iter().enumerate() {
+        if take_new {
+            let start = s * TORN_SECTOR_SIZE;
+            let end = (start + TORN_SECTOR_SIZE).min(PAGE_SIZE);
+            torn[start..end].copy_from_slice(&new[start..end]);
+        }
+    }
+    torn
+}
+
 /// A tiny, allocation-free [SplitMix64] PRNG, seeded explicitly. Used to derive every stochastic
 /// choice in a [`FaultPlan`] (which bytes to flip, which subset of pending writes a reordering sync
 /// drops) so a plan is reproducible from its seed alone, without pulling an external RNG crate.
@@ -144,9 +205,12 @@ impl FaultPlan {
 /// An in-memory [`BlockDevice`] whose writes land in a cache and only become durable on a sync;
 /// [`MemBlockDevice::crash`] discards un-synced writes, modelling power loss.
 ///
-/// One-shot faults can be armed to exercise recovery: an I/O error on the next write, or a torn
-/// write that stores only a prefix of a page. A richer seed-driven [`FaultPlan`] arms the full
-/// disk-corruption model (bit-rot, misdirected I/O, latent sector errors, ENOSPC, write reordering).
+/// One-shot faults can be armed to exercise recovery: an I/O error on the next write; a coarse torn
+/// write that stores only a prefix of a page ([`arm_torn_write`](MemBlockDevice::arm_torn_write)); or
+/// a faithful sector-granular torn write that mixes whole sectors of old and new bytes
+/// ([`arm_torn_write_sectors`](MemBlockDevice::arm_torn_write_sectors)), modelling a real power loss.
+/// A richer seed-driven [`FaultPlan`] arms the full disk-corruption model (bit-rot, misdirected I/O,
+/// latent sector errors, ENOSPC, write reordering).
 #[derive(Debug, Default)]
 pub struct MemBlockDevice {
     /// Pages that have been synced and would survive a crash.
@@ -157,6 +221,10 @@ pub struct MemBlockDevice {
     armed_io_error: bool,
     /// When set, the next write to this page stores only `prefix` bytes (then clears).
     armed_torn: Option<(u64, usize)>,
+    /// When set, the next write to this page is torn at sector granularity, seeded by the `u64`:
+    /// each [`TORN_SECTOR_SIZE`] sector independently keeps the OLD (pre-write) bytes or takes the
+    /// NEW bytes (then clears). Models a real power loss far more faithfully than `armed_torn`.
+    armed_torn_sectors: Option<(u64, u64)>,
     /// The seed-driven disk-corruption schedule, if armed.
     plan: Option<FaultPlan>,
 }
@@ -178,8 +246,30 @@ impl MemBlockDevice {
 
     /// Arms a one-shot torn write: the next write to `page` stores only its first `prefix`
     /// bytes, leaving the rest of the page as it was (a corruption a checksum must catch).
+    ///
+    /// This is the coarse byte-prefix model. For a faithful power-loss image use
+    /// [`arm_torn_write_sectors`](Self::arm_torn_write_sectors), which mixes whole sectors of old and
+    /// new bytes rather than a single new/old boundary.
     pub fn arm_torn_write(&mut self, page: PageId, prefix: usize) {
         self.armed_torn = Some((page.0, prefix.min(PAGE_SIZE)));
+    }
+
+    /// Arms a one-shot **sector-granular** torn write on `page`, seeded by `seed`.
+    ///
+    /// On the next write to `page`, the page is partitioned into [`TORN_SECTOR_SIZE`] sectors and
+    /// each sector independently — by a deterministic, seeded coin flip — either takes the NEW bytes
+    /// being written or retains the OLD (pre-write) bytes already on the device. This is what a real
+    /// power loss produces: the device's atomic write unit is the sector, so a torn page is a
+    /// sector-wise *mix* of old and new content, never a byte-prefix of new over a zeroed tail.
+    ///
+    /// The seeded choice is forced to be non-trivial: at least one sector keeps OLD bytes and at
+    /// least one takes NEW bytes, so the torn image genuinely differs from both the pre- and
+    /// post-write page (a vacuous "all old" or "all new" tear would not exercise recovery). The same
+    /// `seed` reproduces the identical sector pattern — determinism is load-bearing for DST. The fault
+    /// reads the device's current (pre-write) bytes for `page` at write time, so the retained sectors
+    /// are exactly the old durable/cached content.
+    pub fn arm_torn_write_sectors(&mut self, page: PageId, seed: u64) {
+        self.armed_torn_sectors = Some((page.0, seed));
     }
 
     /// Arms a seed-driven [`FaultPlan`] of disk-corruption faults. Replaces any previously armed
@@ -223,6 +313,15 @@ impl MemBlockDevice {
             let mask = (rng.below(255) as u8).wrapping_add(1);
             buf[pos] ^= mask;
         }
+    }
+
+    /// Builds the sector-granular torn image for a write of `new` bytes over the current `old` page,
+    /// seeded by `seed`. The page is split into [`TORN_SECTOR_SIZE`] sectors; each sector
+    /// deterministically (seeded) takes `new` or keeps `old`. The choice is forced non-trivial: at
+    /// least one sector keeps OLD and at least one takes NEW, so the result differs from both `old`
+    /// and `new` (a real partial write, not a vacuous all-old/all-new copy).
+    fn build_sector_torn(old: &Page, new: &Page, seed: u64) -> Page {
+        sector_torn_image(old, new, seed)
     }
 
     /// The page id a write to `idx` actually lands on (misdirected-write redirection, if armed).
@@ -292,6 +391,17 @@ impl BlockDevice for MemBlockDevice {
                 page_buf = torn;
             } else {
                 self.armed_torn = Some((tp, prefix)); // not this page; keep it armed
+            }
+        }
+        // Sector-granular torn write: a faithful power-loss image where whole sectors keep the OLD
+        // (pre-write) bytes or take the NEW ones. Reads the current bytes for the *target* page (the
+        // device's pre-write content, cache or persisted) so retained sectors carry the real old data.
+        if let Some((tp, seed)) = self.armed_torn_sectors.take() {
+            if tp == idx {
+                let old = *self.current(target);
+                page_buf = Self::build_sector_torn(&old, &page_buf, seed);
+            } else {
+                self.armed_torn_sectors = Some((tp, seed)); // not this page; keep it armed
             }
         }
         self.cache.insert(target, page_buf);
@@ -413,6 +523,150 @@ mod tests {
         dev.read_page(PageId(0), &mut buf).unwrap();
         assert!(buf[..100].iter().all(|&b| b == 0xFF));
         assert!(buf[100..].iter().all(|&b| b == 0x00)); // tail kept old bytes => torn
+    }
+
+    /// A simple whole-page CRC32 (IEEE polynomial), used only by the test below to prove a torn
+    /// page is *detectable* by a whole-page checksum without pulling the `graphus-bufpool` page codec
+    /// (which depends on this crate — a dependency cycle Cargo forbids). The realistic
+    /// header+`verify_checksum` integration gate lives in `graphus-dst`'s `torn_data_page` test,
+    /// which legitimately depends on `graphus-bufpool`.
+    fn page_crc32(page: &Page) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in page.iter() {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// A sector-granular torn write produces a sector-wise *mix* of old and new bytes (not a byte
+    /// prefix of new over old), the mix is deterministic per seed, and a whole-page checksum still
+    /// flags it as torn. This is the regression gate for rmp #433: the realistic power-loss image
+    /// where an OLD header sector can sit over a NEW body sector (or the reverse), a state a coarse
+    /// prefix tear could never produce.
+    #[test]
+    fn sector_torn_write_mixes_old_and_new_sectors_deterministically() {
+        assert_eq!(
+            PAGE_SIZE % TORN_SECTOR_SIZE,
+            0,
+            "the sector size must divide the page size for a clean sector model"
+        );
+        let sectors = PAGE_SIZE / TORN_SECTOR_SIZE;
+        assert!(sectors >= 2, "need >= 2 sectors to model an old/new split");
+
+        // OLD durable page (e.g. a valid header in sector 0); NEW page with different bytes
+        // everywhere (the write that is torn mid-flight by the power loss).
+        let old = page_of(0xA0);
+        let new = page_of(0x0B);
+
+        let run = |seed: u64| {
+            let mut dev = MemBlockDevice::new(1);
+            dev.write_page(PageId(0), &old).unwrap();
+            dev.sync_all().unwrap(); // old page durable
+            dev.arm_torn_write_sectors(PageId(0), seed);
+            dev.write_page(PageId(0), &new).unwrap(); // torn at sector granularity
+            read(&dev, 0)
+        };
+
+        // Find a seed that produces the canonical rmp #433 shape: an OLD header sector (sector 0)
+        // sitting over a NEW body sector (sector 1) — a "valid old header + new body" image the old
+        // byte-prefix model (which always kept the NEW bytes at the front) could NEVER produce. This
+        // is the realistic partial-sector state the fix exists to exercise.
+        let seed = (0..1024u64)
+            .find(|&s| {
+                let t = run(s);
+                t[..TORN_SECTOR_SIZE] == old[..TORN_SECTOR_SIZE]
+                    && t[TORN_SECTOR_SIZE..2 * TORN_SECTOR_SIZE]
+                        == new[TORN_SECTOR_SIZE..2 * TORN_SECTOR_SIZE]
+            })
+            .expect("a seed yielding an OLD-header / NEW-body sector tear must exist");
+
+        let torn_a = run(seed);
+        let torn_b = run(seed);
+
+        // The canonical shape holds: sector 0 is OLD, sector 1 is NEW — impossible under a prefix
+        // tear, where the leading bytes are always the NEW ones.
+        assert_eq!(
+            torn_a[..TORN_SECTOR_SIZE],
+            old[..TORN_SECTOR_SIZE],
+            "header sector must retain the OLD bytes (a prefix tear could never do this)"
+        );
+        assert_eq!(
+            torn_a[TORN_SECTOR_SIZE..2 * TORN_SECTOR_SIZE],
+            new[TORN_SECTOR_SIZE..2 * TORN_SECTOR_SIZE],
+            "body sector must carry the NEW bytes"
+        );
+
+        // (b) Determinism: same seed reproduces the identical torn pattern, byte for byte.
+        assert_eq!(
+            torn_a, torn_b,
+            "same seed must reproduce the identical sector-torn pattern"
+        );
+
+        // (a) Sector-wise mix, NOT a byte-prefix: classify each sector as fully-old or fully-new and
+        // require at least one of each. A prefix tear cannot make an *earlier* sector new while a
+        // *later* one is old; here the seeded choice is independent per sector.
+        let mut old_sectors = 0usize;
+        let mut new_sectors = 0usize;
+        for s in 0..sectors {
+            let start = s * TORN_SECTOR_SIZE;
+            let end = start + TORN_SECTOR_SIZE;
+            let seg = &torn_a[start..end];
+            if seg == &old[start..end] {
+                old_sectors += 1;
+            } else if seg == &new[start..end] {
+                new_sectors += 1;
+            } else {
+                panic!("sector {s} is neither fully old nor fully new — not sector-granular");
+            }
+        }
+        assert!(
+            old_sectors >= 1 && new_sectors >= 1,
+            "a sector-torn page must mix old and new sectors (saw {old_sectors} old, {new_sectors} new)"
+        );
+
+        // The torn image differs from BOTH the clean old and the clean new pages (a real partial
+        // write, not a vacuous all-old or all-new copy).
+        assert_ne!(torn_a, old, "torn page must differ from the old image");
+        assert_ne!(torn_a, new, "torn page must differ from the new image");
+
+        // (c) A whole-page checksum still flags the torn page as corrupt: its CRC differs from both
+        // the old and the new clean pages, so any whole-page checksum check rejects it.
+        let torn_crc = page_crc32(&torn_a);
+        assert_ne!(
+            torn_crc,
+            page_crc32(&old),
+            "torn page must not pass as the old page"
+        );
+        assert_ne!(
+            torn_crc,
+            page_crc32(&new),
+            "torn page must not pass as the new page"
+        );
+    }
+
+    /// A different seed tears a different set of sectors (the pattern tracks the seed), proving the
+    /// sector choice is genuinely seed-driven and not fixed.
+    #[test]
+    fn sector_torn_pattern_varies_with_seed() {
+        let old = page_of(0x11);
+        let new = page_of(0x22);
+        let run = |seed: u64| {
+            let mut dev = MemBlockDevice::new(1);
+            dev.write_page(PageId(0), &old).unwrap();
+            dev.sync_all().unwrap();
+            dev.arm_torn_write_sectors(PageId(0), seed);
+            dev.write_page(PageId(0), &new).unwrap();
+            read(&dev, 0)
+        };
+        // Scan a small seed range for two seeds that disagree. With independent per-sector coin flips
+        // over >= 2 sectors, distinct patterns are abundant, so this finds a difference quickly.
+        let base = run(1);
+        let differs = (2..=64u64).any(|s| run(s) != base);
+        assert!(differs, "the sector-torn pattern must vary with the seed");
     }
 
     #[test]

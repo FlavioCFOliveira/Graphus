@@ -635,14 +635,21 @@ impl Driver {
             })
             .collect();
 
-        // Choose a (page, prefix) tear that **provably lands**: a torn write keeps the first `prefix`
-        // bytes of the new image and leaves the rest as the device's old bytes (all-zero on this
-        // fresh device). For the tear to corrupt the page its body `prefix..PAGE_SIZE` must differ
-        // from zero (a sparse page whose tail is already zero would tear into an identical, still-valid
-        // image — a vacuous fault). We therefore simulate the tear on the staged image and pick the
-        // first candidate whose torn form fails its checksum, deterministically from the seed. The
-        // metadata head (page 0) is excluded so the tear lands on a record page.
-        let prefix = 512 + rng.index(2048);
+        // Choose a (page, seed) **sector-granular** tear that **provably lands**. A real power loss
+        // tears at sector granularity: each `TORN_SECTOR_SIZE` sector of the page independently keeps
+        // the device's OLD (pre-write) bytes — all-zero on this fresh device — or takes the NEW home
+        // bytes (`graphus_io::sector_torn_image`, the device's own fault logic). For the tear to
+        // corrupt the page, the resulting old/new sector mix must fail its checksum (a page sparse
+        // enough that every retained sector is already zero would tear into a still-valid image — a
+        // vacuous fault). We therefore simulate the exact sector image the device will produce and
+        // pick the first candidate whose torn form fails its checksum, deterministically from the
+        // seed. The metadata head (page 0) is excluded so the tear lands on a record page.
+        //
+        // The simulation uses the SAME `sector_torn_image` the armed fault applies, with the same
+        // `(old = zeros, new = staged bytes, seed)`, so the predicted torn page and the real torn
+        // page are byte-identical (the load-bearing precondition asserted below).
+        let tear_seed = rng.next_u64();
+        let zero = [0u8; PAGE_SIZE];
         let mut torn_page = None;
         // A seed-rotated scan order so different seeds tear different pages while staying deterministic.
         let start = rng.index(staged.len().max(1));
@@ -651,21 +658,20 @@ impl Driver {
             if *idx == 0 {
                 continue; // never the metadata head
             }
-            // Simulate the torn image: new prefix over a zero page.
-            let mut sim = [0u8; PAGE_SIZE];
-            sim[..prefix].copy_from_slice(&bytes[..prefix]);
+            // Simulate the exact sector-torn image: a seeded mix of zero (old) and new sectors.
+            let sim = graphus_io::sector_torn_image(&zero, bytes, tear_seed);
             if !graphus_bufpool::page::verify_checksum(&sim) {
                 torn_page = Some(*idx);
                 break;
             }
         }
         // `torn_page` is `None` only for a degenerate near-empty store where every non-head page is
-        // sparse enough that a prefix tear stays byte-identical (no record content past `prefix`).
-        // That run still exercises the DWB-protected flush + DWB-aware recovery spine end to end; it
-        // simply has no torn page to repair, which is itself a valid (committed-or-nothing) outcome.
+        // sparse enough that the seeded sector mix stays byte-identical to a valid image. That run
+        // still exercises the DWB-protected flush + DWB-aware recovery spine end to end; it simply has
+        // no torn page to repair, which is itself a valid (committed-or-nothing) outcome.
         for (idx, bytes) in &staged {
             if Some(*idx) == torn_page {
-                device.arm_torn_write(graphus_core::PageId(*idx), prefix);
+                device.arm_torn_write_sectors(graphus_core::PageId(*idx), tear_seed);
             }
             device
                 .write_page(graphus_core::PageId(*idx), bytes)
