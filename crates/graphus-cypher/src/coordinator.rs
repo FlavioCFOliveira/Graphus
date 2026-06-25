@@ -2700,6 +2700,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.active.len()
     }
 
+    /// Test-only witness that the SSI engine still tracks `txn` (a live conflict record / dangling
+    /// rw-edge). Used by the `rmp` #415 regression to assert that an abort whose durable store undo
+    /// failed/panicked nonetheless freed the transaction's SSI footprint.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn ssi_tracks(&self, txn: TxnId) -> bool {
+        self.ssi.borrow().tracks(txn)
+    }
+
     /// Reclaims the underlying store once no transaction is open and no statement seam is live
     /// (tests / shutdown).
     ///
@@ -2732,12 +2741,57 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     }
 
     /// Aborts `txn`: store undo, SSI forget, lock release, and removal from the open set.
+    ///
+    /// # Why the in-memory cleanup is unconditional (`rmp` #415)
+    ///
+    /// The durable store undo (`RecordStore::rollback`) is **fallible** and may even **panic** — the
+    /// documented `rmp` #359 buffer-pool/`RefCell`-replay class, which `rmp` #409's `catch_recovery`
+    /// now catches *and keeps the engine alive*. If we ran the undo first and bailed on its `Err`/unwind
+    /// (the historical ordering), the three pure in-memory cleanups would be skipped and the
+    /// transaction would **leak**: it would stay in [`active`](Self#structfield.active) forever, pinning
+    /// `oldest_active_snapshot`, freezing the GC watermark (unbounded version accumulation → slow OOM),
+    /// keeping its SSI rw-edges (false-aborting innocent transactions) and holding its locks.
+    ///
+    /// So the in-memory SSI / lock / active-set state is freed **unconditionally**, whether or not the
+    /// durable undo succeeds, returns `Err`, or panics. This is sound: a half-undone *durable* state is
+    /// the store's concern and is reconciled by ARIES recovery on the next open; the in-memory
+    /// bookkeeping carries no durability obligation and must never leak. A [`Cleanup`] drop guard runs
+    /// the cleanup on every exit path (normal return, `?` early-return, or unwind). The cleanup borrows
+    /// only `ssi` / `locks` (distinct `RefCell`s from `store`) and `active` (no `RefCell`), so it never
+    /// conflicts with the store borrow even when that borrow is being torn down by an unwind. Each step
+    /// is idempotent (`forget` / `release_all` / `HashMap::remove` are no-ops for an absent txn), so a
+    /// double abort cannot double-free.
     fn abort(&mut self, txn: TxnId) -> Result<()> {
-        self.store.borrow_mut().rollback(txn)?;
-        self.ssi.borrow_mut().forget(txn);
-        self.locks.borrow_mut().release_all(txn);
-        self.active.remove(&txn);
-        Ok(())
+        /// Drop guard that frees the pure in-memory transaction state. Runs on normal return **and** on
+        /// unwind, so a panicking store undo can never leak the SSI markers, locks, or `active` entry.
+        struct Cleanup<'a> {
+            ssi: &'a RefCell<SsiTracker>,
+            locks: &'a RefCell<LockTable>,
+            active: &'a mut HashMap<TxnId, ActiveTxn>,
+            txn: TxnId,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                // All three are idempotent no-ops for an already-removed txn, so this is safe even if
+                // the txn was somehow torn down concurrently / twice.
+                self.ssi.borrow_mut().forget(self.txn);
+                self.locks.borrow_mut().release_all(self.txn);
+                self.active.remove(&self.txn);
+            }
+        }
+
+        let cleanup = Cleanup {
+            ssi: &self.ssi, // `&Rc<RefCell<_>>` coerces to `&RefCell<_>` via deref.
+            locks: &self.locks,
+            active: &mut self.active,
+            txn,
+        };
+        // The durable undo runs while the guard is armed. Its borrow of `self.store` is a *different*
+        // `RefCell` from the guard's `ssi`/`locks`, so an `Err` (early `?` return) or a panic both leave
+        // the guard free to run its cleanup on scope exit / unwind without a borrow conflict.
+        let undo = self.store.borrow_mut().rollback(txn);
+        drop(cleanup); // Free the in-memory state now; on `Err`/panic above this same drop runs anyway.
+        undo
     }
 }
 
@@ -2846,5 +2900,189 @@ impl<D: BlockDevice, S: LogSink> Statistics for CoordinatorStatistics<D, S> {
 
     fn distinct_label_property_values(&self, label: &str, property: &str) -> Option<u64> {
         Some(self.decode_histogram(label, property)?.distinct())
+    }
+}
+
+#[cfg(test)]
+mod abort_failure_tests {
+    //! `rmp` #415 regression: an abort whose **durable store undo fails or panics** must still free
+    //! the transaction's pure in-memory state (SSI markers, write locks, the `active` entry), so it
+    //! can never leak — pinning `oldest_active_snapshot`, freezing the GC watermark into unbounded
+    //! version accumulation (slow OOM behind the `rmp` #409 503), or false-aborting innocent
+    //! transactions with stale rw-edges.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use graphus_core::{GraphusError, Result, TxnId};
+    use graphus_wal::{LogSink, MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::catalog::IndexCatalog;
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::{PhysicalPlan, plan_physical};
+    use crate::semantics::analyze;
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::RecordStore;
+
+    /// A [`LogSink`] wrapping [`MemLogSink`] whose `sync()` returns `Err` once a shared flag is armed.
+    /// Because [`WalManager::harden`] treats an fsync failure as unrecoverable and **panics**
+    /// (fsyncgate, `§4.9`), arming this flag turns the next `RecordStore::rollback` into the documented
+    /// panic-during-undo class (`rmp` #359 / #409) — exactly the path under test. The flag is shared via
+    /// `Arc<AtomicBool>` (the sink must be `Send + Sync` for the off-thread read bounds) so the test
+    /// keeps a handle to arm it *after* the transaction has written, while the sink itself lives inside
+    /// the coordinator's store.
+    struct FaultSink {
+        inner: MemLogSink,
+        fail_sync: Arc<AtomicBool>,
+    }
+
+    impl LogSink for FaultSink {
+        fn append(&mut self, bytes: &[u8]) {
+            self.inner.append(bytes);
+        }
+        fn sync(&mut self) -> Result<()> {
+            if self.fail_sync.load(Ordering::SeqCst) {
+                return Err(GraphusError::Storage(
+                    "injected rollback fdatasync failure (rmp #415)".to_owned(),
+                ));
+            }
+            self.inner.sync()
+        }
+        fn durable_len(&self) -> u64 {
+            self.inner.durable_len()
+        }
+        fn buffered_len(&self) -> u64 {
+            self.inner.buffered_len()
+        }
+        fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
+            self.inner.read_durable(from, into)
+        }
+        fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
+            self.inner.reclaim(from, up_to)
+        }
+    }
+
+    type Coord = TxnCoordinator<MemBlockDevice, FaultSink>;
+
+    fn fresh_coord(fail_sync: Arc<AtomicBool>) -> Coord {
+        let device = MemBlockDevice::new(0);
+        let sink = FaultSink {
+            inner: MemLogSink::new(),
+            fail_sync,
+        };
+        let wal = WalManager::create(sink).expect("create wal");
+        let store: RecordStore<MemBlockDevice, FaultSink> =
+            RecordStore::create(device, wal, 64, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    fn compile(src: &str) -> PhysicalPlan {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        plan_physical(&lower(&validated), &IndexCatalog::empty())
+    }
+
+    /// Runs one statement under `txn`, asserting it captured no error.
+    fn run_stmt(coord: &Coord, txn: TxnId, src: &str) {
+        let plan = compile(src);
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(txn).expect("statement");
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect");
+        }
+        assert!(graph.take_error().is_none(), "captured error in: {src}");
+    }
+
+    /// THE GATE. A transaction that has written (so the store undo has real work and reaches the
+    /// panicking `harden`) and built an SSI / lock footprint is aborted with the store undo armed to
+    /// **panic**. We assert that the panic propagates (proving the durable undo really failed) yet the
+    /// pure in-memory state is freed regardless: the txn is gone from `active`, its SSI footprint is
+    /// forgotten, and the GC watermark / oldest-active-snapshot can advance afterward.
+    ///
+    /// This must FAIL before the `rmp` #415 fix (old ordering ran the fallible undo first and skipped
+    /// the three cleanups on its `Err`/unwind) and PASS after (the cleanup runs in a drop guard that
+    /// fires on unwind).
+    #[test]
+    fn abort_failure_does_not_leak_active_txn_or_watermark() {
+        let fail_sync = Arc::new(AtomicBool::new(false));
+        let mut coord = fresh_coord(Arc::clone(&fail_sync));
+
+        let baseline_active = coord.active_count();
+        let baseline_watermark = coord.gc_watermark();
+
+        // Open a SERIALIZABLE txn and give it a real footprint: a committed-then-read register so the
+        // txn holds an SSI read marker + a write (the node create) the store must undo.
+        let txn = coord.begin_serializable();
+        run_stmt(&coord, txn, "CREATE (:Reg {k: 1, v: 0})");
+        // A read so the SSI engine records a read marker for this txn (dangling rw-edge candidate).
+        run_stmt(&coord, txn, "MATCH (n:Reg {k: 1}) RETURN n.v AS v");
+
+        assert!(
+            coord.ssi_tracks(txn),
+            "precondition: the open txn must be SSI-tracked before abort"
+        );
+        assert_eq!(
+            coord.active_count(),
+            baseline_active + 1,
+            "precondition: the open txn must be in the active set"
+        );
+
+        // Arm the store undo to PANIC (the `harden` fsyncgate panic), then abort. The panic is the
+        // documented `rmp` #359/#409 class that `catch_recovery` catches while keeping the engine alive.
+        fail_sync.store(true, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // `rollback` is the public entry to `abort`; it returns `Err` only for an inactive txn, so
+            // for our active txn it runs `abort`, whose store undo we have armed to panic.
+            let _ = coord.rollback(txn);
+        }));
+        assert!(
+            unwound.is_err(),
+            "the armed durable undo must actually panic (proving the failure path is exercised)"
+        );
+        // Disarm so the post-abort assertions / drop do not re-trip the fault.
+        fail_sync.store(false, Ordering::SeqCst);
+
+        // THE ASSERTIONS: the in-memory state was freed despite the panicking undo.
+        assert_eq!(
+            coord.active_count(),
+            baseline_active,
+            "active set must return to baseline — the aborted txn must not leak (rmp #415)"
+        );
+        assert!(
+            !coord.ssi_tracks(txn),
+            "SSI footprint must be forgotten — no dangling rw-edge for the aborted txn (rmp #415)"
+        );
+        assert_eq!(
+            coord.oldest_active_snapshot(),
+            None,
+            "no open reader must remain pinning the snapshot watermark"
+        );
+        // The GC watermark can advance again (it is no longer pinned by the leaked txn). It is at least
+        // the baseline; the committed CREATE before the panic advanced the store's high-water, so it is
+        // free to move forward now that no transaction is open.
+        assert!(
+            coord.gc_watermark() >= baseline_watermark,
+            "GC watermark must be free to advance once the aborted txn is gone (rmp #415)"
+        );
+
+        // And the coordinator is still usable: a fresh txn begins, writes, commits, aborts cleanly —
+        // proving neither a leaked lock nor a stale rw-edge false-aborts an innocent successor.
+        let txn2 = coord.begin_serializable();
+        run_stmt(&coord, txn2, "CREATE (:Reg {k: 2, v: 0})");
+        coord
+            .commit(txn2)
+            .expect("innocent successor txn must commit");
+        assert_eq!(
+            coord.active_count(),
+            baseline_active,
+            "coordinator must be left in a clean state after the failed abort + successful successor"
+        );
     }
 }

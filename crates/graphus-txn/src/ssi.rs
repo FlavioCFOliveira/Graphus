@@ -714,6 +714,16 @@ impl SsiTracker {
             .get(&txn)
             .is_some_and(|t| t.in_conflict && t.out_conflict)
     }
+
+    /// Whether `txn` is still tracked by the SSI engine — i.e. it has a live conflict record (and thus
+    /// possibly dangling rw-edges) that has not yet been [`forget`](Self::forget)ten. Observability /
+    /// test seam: a finished (committed-and-GC'd or aborted) transaction must read back as `false`, so
+    /// this is the direct witness that an abort actually freed a transaction's SSI footprint (`rmp`
+    /// #415 — the abort in-memory-cleanup-on-failure guard).
+    #[must_use]
+    pub fn tracks(&self, txn: TxnId) -> bool {
+        self.txns.contains_key(&txn) || self.doomed.contains(&txn)
+    }
 }
 
 #[cfg(test)]
