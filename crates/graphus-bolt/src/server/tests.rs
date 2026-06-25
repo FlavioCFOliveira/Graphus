@@ -785,6 +785,222 @@ fn logon_announces_the_principal_and_logoff_clears_it() {
     assert_eq!(session.executor().principal, None, "cleared after LOGOFF");
 }
 
+#[test]
+fn in_tx_run_emits_qid_autocommit_omits_it() {
+    // rmp #391 / Bolt message spec: a RUN inside an explicit transaction MUST return a server-
+    // assigned `qid::Integer` in its SUCCESS metadata (starting at 0, incrementing per statement);
+    // an auto-commit RUN omits `qid` entirely.
+    let exec = MockExecutor::new()
+        .on_query(
+            "RETURN 1",
+            CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+        )
+        .on_query(
+            "RETURN 2",
+            CannedResult::rows(&["y"], vec![vec![Value::Integer(2)]]),
+        )
+        .on_query(
+            "RETURN 3",
+            CannedResult::rows(&["z"], vec![vec![Value::Integer(3)]]),
+        );
+
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        // Auto-commit RUN: no qid.
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        // Explicit transaction: two RUNs, qids 0 then 1.
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "RETURN 2".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Run {
+            query: "RETURN 3".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Commit,
+        Request::Goodbye,
+    ]);
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().expect("session runs");
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+
+    let qid_of = |resp: &Response| -> Option<i64> {
+        match resp {
+            Response::Success { metadata } => {
+                metadata.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                    ("qid", Value::Integer(n)) => Some(*n),
+                    _ => None,
+                })
+            }
+            other => panic!("expected SUCCESS, got {other:?}"),
+        }
+    };
+
+    // Index map: [0]HELLO [1]LOGON [2]RUN(auto) [3]REC [4]SUMMARY [5]BEGIN
+    //            [6]RUN(tx qid0) [7]REC [8]SUMMARY [9]RUN(tx qid1) [10]REC [11]SUMMARY [12]COMMIT
+    assert_eq!(qid_of(&r[2]), None, "auto-commit RUN omits qid");
+    assert_eq!(qid_of(&r[6]), Some(0), "first in-tx RUN gets qid 0");
+    assert_eq!(qid_of(&r[9]), Some(1), "second in-tx RUN gets qid 1");
+}
+
+#[test]
+fn pull_with_unknown_qid_is_rejected() {
+    // rmp #391: PULL addressing a qid that is neither -1 ("last") nor the open stream's id must
+    // FAILURE Neo.ClientError.Request.Invalid → FAILED (the result it names is not open).
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        // The open stream is qid 0; PULL qid 99 names nothing.
+        Request::Pull {
+            n: ALL,
+            qid: Some(99),
+        },
+        Request::Goodbye,
+    ]);
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct); // GOODBYE after the FAILURE
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [0]HELLO [1]LOGON [2]BEGIN [3]RUN SUCCESS{qid:0} [4]FAILURE (bad qid).
+    match &r[4] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected FAILURE for bad qid, got {other:?}"),
+    }
+}
+
+#[test]
+fn pull_accepts_the_open_qid_and_minus_one() {
+    // rmp #391: an explicit qid that matches the open stream, and qid -1 ("last"), both address the
+    // open stream and stream normally.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        // Address the open stream by its exact qid (0).
+        Request::Pull {
+            n: ALL,
+            qid: Some(0),
+        },
+        Request::Commit,
+        Request::Goodbye,
+    ]);
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [3]RUN SUCCESS{qid:0} [4]RECORD [5]SUMMARY [6]COMMIT — no FAILURE.
+    assert!(matches!(r[4], Response::Record { .. }), "qid match streams");
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Failure(_))),
+        "a matching qid must not FAILURE: {r:?}"
+    );
+}
+
+#[test]
+fn logoff_in_tx_ready_is_rejected_and_rolls_back() {
+    // rmp #392 / Bolt spec: LOGOFF is valid only in READY. Inside an open explicit transaction it
+    // must FAILURE → FAILED, the principal must stay set (not dropped), and the open tx must be
+    // rolled back (not left dangling).
+    let exec = MockExecutor::new();
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        Request::Logoff,
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct); // GOODBYE after the FAILURE
+        // The principal is NOT dropped by an invalid LOGOFF.
+        assert_eq!(session.principal(), Some("alice"));
+        // The transaction was rolled back, not left open.
+        assert!(!session.executor().tx_open, "tx rolled back on invalid LOGOFF");
+        let log = &session.executor().log;
+        assert!(
+            log.contains(&"rollback".to_owned()),
+            "invalid LOGOFF rolls the tx back: {log:?}"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [0]HELLO [1]LOGON [2]BEGIN [3]FAILURE (invalid LOGOFF).
+    match &r[3] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected FAILURE for in-tx LOGOFF, got {other:?}"),
+    }
+}
+
+#[test]
+fn logoff_in_ready_still_succeeds() {
+    // rmp #392 regression guard: a READY-state LOGOFF still works (drops principal → AUTHENTICATION).
+    let exec = MockExecutor::new();
+    let input = session_input(&[hello(), logon_alice(), Request::Logoff, Request::Goodbye]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.principal(), None, "READY LOGOFF clears the principal");
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [0]HELLO [1]LOGON [2]LOGOFF SUCCESS.
+    assert!(matches!(r[2], Response::Success { .. }), "READY LOGOFF → SUCCESS");
+}
+
 // ---- Manifest-v1 handshake, ROUTE, TELEMETRY, per-connection id (rmp #95) ---------------------
 
 #[test]

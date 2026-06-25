@@ -167,6 +167,20 @@ pub trait BoltExecutor {
     /// [`GraphusError::Transaction`] if no transaction is open.
     fn rollback(&mut self) -> Result<(), GraphusError>;
 
+    /// **Best-effort, infallible** rollback of any explicit transaction still open on this
+    /// connection, called by the session when it ends *without* a clean `COMMIT`/`ROLLBACK` —
+    /// notably an EOF / abrupt client disconnect (rmp #388). Unlike [`rollback`](Self::rollback)
+    /// it never returns an error (there may be nothing open, and an end-of-connection path has no
+    /// client to report a failure to) and it MUST be idempotent: the session may call it once at
+    /// EOF and the executor may also call it from `Drop`, so a transaction must be rolled back at
+    /// most once.
+    ///
+    /// The default implementation is a no-op for executors that hold no transaction state of their
+    /// own (e.g. the test mock, whose lifecycle the session already drives explicitly). The engine
+    /// seam overrides it to release the engine ticket, unpinning the GC watermark so an abandoned
+    /// connection cannot leak an open transaction indefinitely.
+    fn rollback_open_tx(&mut self) {}
+
     /// Informs the executor of the session's authenticated identity: the server calls it with
     /// `Some(principal)` after a successful `LOGON` and with `None` on `LOGOFF` (`04 §8.4`).
     ///

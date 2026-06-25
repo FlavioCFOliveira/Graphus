@@ -173,6 +173,23 @@ impl BoltEngineExecutor {
     }
 }
 
+impl Drop for BoltEngineExecutor {
+    /// Final backstop against a leaked explicit transaction (rmp #388): if the session ends while a
+    /// `BEGIN` is still open — an abrupt disconnect the EOF arm did not reach, or a **panic** inside
+    /// the session loop unwinding through this executor — best-effort roll it back so it stops
+    /// pinning the GC watermark and blocking concurrent writers.
+    ///
+    /// Safe to run from `Drop`: `rollback_blocking` is synchronous (no async, no executor parking on
+    /// a Tokio worker — the Bolt session runs on a blocking task) and `rollback_open_tx` swallows any
+    /// error, so this never panics-in-drop. Idempotent via `current_tx.take()`: a clean
+    /// COMMIT/ROLLBACK/RESET or the EOF arm already emptied it, leaving nothing to do here.
+    fn drop(&mut self) {
+        if self.current_tx.is_some() {
+            self.rollback_open_tx();
+        }
+    }
+}
+
 /// Maps the Bolt crate's access mode onto the engine's neutral one.
 fn from_bolt_mode(mode: BoltAccessMode) -> AccessMode {
     match mode {
@@ -499,6 +516,15 @@ impl BoltExecutor for BoltEngineExecutor {
 
     fn set_principal(&mut self, principal: Option<&str>) {
         self.principal = principal.map(str::to_owned);
+    }
+
+    fn rollback_open_tx(&mut self) {
+        // Best-effort: roll back any explicit transaction this connection still holds. Idempotent —
+        // `current_tx.take()` means a prior explicit ROLLBACK/RESET (which already cleared it) makes
+        // this a no-op, so the session's EOF arm and `Drop` cannot double-roll-back.
+        if let Some(open) = self.current_tx.take() {
+            let _ = open.handle.rollback_blocking(open.ticket);
+        }
     }
 
     fn on_auth_success(&mut self, principal: &str) {

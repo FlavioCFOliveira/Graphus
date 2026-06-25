@@ -152,6 +152,16 @@ pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     principal: Option<String>,
     /// The in-flight result, while `STREAMING` / `TX_STREAMING`.
     open_stream: Option<OpenResult<E::Stream>>,
+    /// Inside an explicit transaction, the server assigns each `RUN` a query id (`qid`), returned in
+    /// the `RUN` `SUCCESS` and addressable by `PULL`/`DISCARD` (`04 §8.1` / Bolt message spec). It
+    /// starts at 0 for the first `RUN` after `BEGIN` and increments per statement; it is reset when a
+    /// new explicit transaction opens. The `qid` of the **currently open** stream (the only stream a
+    /// single-active-stream server can address) is tracked so `PULL`/`DISCARD` can validate the
+    /// client's `qid`. `None` in an auto-commit `RUN` (the spec returns no `qid` there).
+    next_qid: i64,
+    /// The `qid` of the currently open in-tx stream (`Some` only while `TX_STREAMING`), for
+    /// `PULL`/`DISCARD` validation.
+    open_qid: Option<i64>,
     /// Reassembles request messages from the inbound byte stream.
     dechunker: Dechunker,
     /// A scratch read buffer.
@@ -238,6 +248,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             version: None,
             principal: None,
             open_stream: None,
+            next_qid: 0,
+            open_qid: None,
             dechunker: Dechunker::new(),
             read_buf: vec![0u8; 8 * 1024],
             packer: Packer::new(),
@@ -282,6 +294,12 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             let Some(payload) = self.read_message()? else {
                 // EOF before GOODBYE: the peer dropped the connection. `read_message` already
                 // flushed any pending response before it observed EOF, so nothing is left buffered.
+                // An abrupt disconnect must NOT leak an explicit transaction: roll back any open
+                // tx here (best-effort, idempotent) so it stops pinning the GC watermark and its
+                // intents stop blocking concurrent writers (rmp #388). RESET/ROLLBACK already
+                // cleared it in the clean cases, so `rollback_open_tx` is a no-op then; the
+                // executor's `Drop` is the final backstop (covers a panic mid-session).
+                self.executor.rollback_open_tx();
                 self.state = State::Defunct;
                 return Ok(());
             };
@@ -559,6 +577,10 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 let db = db_from_extra(&extra);
                 match self.executor.begin(mode, db.as_deref()) {
                     Ok(()) => {
+                        // A fresh transaction restarts qid assignment at 0 (`04 §8.1`; qids are
+                        // scoped to the transaction — rmp #391).
+                        self.next_qid = 0;
+                        self.open_qid = None;
                         self.send(&Response::Success { metadata: vec![] })?;
                         self.state = State::TxReady;
                     }
@@ -608,12 +630,23 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 self.send(&Response::Success { metadata: vec![] })?;
                 Ok(Flow::Continue)
             }
-            (_, Request::Logoff) => {
-                // Drop the identity; back to AUTHENTICATION (5.1+ re-auth without a new connection).
+            (State::Ready, Request::Logoff) => {
+                // LOGOFF is valid ONLY in READY (`04 §8.1`; Bolt spec: "If LOGOFF is received while
+                // the server is not in the READY state, it should trigger a FAILURE"). Drop the
+                // identity; back to AUTHENTICATION (5.1+ re-auth without a new connection).
                 self.executor.set_principal(None);
                 self.principal = None;
                 self.send(&Response::Success { metadata: vec![] })?;
                 self.state = State::Authentication;
+                Ok(Flow::Continue)
+            }
+            (State::TxReady, Request::Logoff) => {
+                // LOGOFF inside an open explicit transaction is an invalid transition (the previous
+                // wildcard arm wrongly accepted it, dropping the principal and leaving the tx
+                // dangling — rmp #392). Roll the transaction back so it does not leak (mirrors RESET
+                // / the EOF arm), then FAILURE → FAILED per the spec; the client recovers with RESET.
+                let _ = self.executor.rollback();
+                self.fail_protocol("LOGOFF is only valid in the READY state")?;
                 Ok(Flow::Continue)
             }
             (_, Request::Reset) => {
@@ -627,8 +660,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// `STREAMING` / `TX_STREAMING`: `PULL`, `DISCARD`, `RESET`.
     fn dispatch_streaming(&mut self, request: Request) -> BoltResult<Flow> {
         match request {
-            Request::Pull { n, qid: _ } => self.handle_pull(n, true),
-            Request::Discard { n, qid: _ } => self.handle_pull(n, false),
+            Request::Pull { n, qid } => self.handle_pull(n, qid, true),
+            Request::Discard { n, qid } => self.handle_pull(n, qid, false),
             Request::Reset => {
                 self.handle_reset()?;
                 Ok(Flow::Continue)
@@ -654,9 +687,20 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                     .iter()
                     .map(|f| Value::String(f.clone()))
                     .collect();
-                self.send(&Response::Success {
-                    metadata: vec![("fields".to_owned(), Value::List(fields))],
-                })?;
+                let mut metadata = vec![("fields".to_owned(), Value::List(fields))];
+                // Inside an explicit transaction the server assigns this statement a `qid` and
+                // returns it in the RUN SUCCESS so `PULL`/`DISCARD` can address it (`04 §8.1`; Bolt
+                // message spec: "qid::Integer specifies the server assigned statement ID … Explicit
+                // Transaction only"). An auto-commit RUN omits `qid` entirely (rmp #391).
+                if streaming_state == State::TxStreaming {
+                    let qid = self.next_qid;
+                    self.next_qid += 1;
+                    self.open_qid = Some(qid);
+                    metadata.push(("qid".to_owned(), Value::Integer(qid)));
+                } else {
+                    self.open_qid = None;
+                }
+                self.send(&Response::Success { metadata })?;
                 self.open_stream = Some(OpenResult::new(stream));
                 self.state = streaming_state;
                 Ok(Flow::Continue)
@@ -672,7 +716,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// Emits up to `n` records (`n == -1` = all) when `emit` is true (PULL) or silently drops them
     /// when false (DISCARD), then the trailing `SUCCESS`. Honours the fetch size (`04 §7.7`) and
     /// reports an **accurate** `has_more` via the result's one-record lookahead (`06 §3.1`).
-    fn handle_pull(&mut self, n: i64, emit: bool) -> BoltResult<Flow> {
+    fn handle_pull(&mut self, n: i64, qid: Option<i64>, emit: bool) -> BoltResult<Flow> {
         // Validate the `n` domain (`04 §7.7`/`06 §3.1`): the only legal values are `-1` (fetch/throw
         // away all remaining) or a strictly positive integer. The spec is silent on `n == 0` and
         // `n < -1`; the Neo4j reference server rejects them with FAILURE
@@ -681,6 +725,22 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         if n != ALL && n < 1 {
             self.fail_protocol("PULL/DISCARD n must be -1 (all) or a positive integer")?;
             return Ok(Flow::Continue);
+        }
+        // Validate `qid` against the addressed open stream (rmp #391). `qid == -1` (or absent) means
+        // "the last/current statement" and always addresses the open stream; an explicit `qid` must
+        // equal the open stream's id. Any other value names a result this single-active-stream
+        // server does not have open → FAILURE `Neo.ClientError.Request.Invalid` → FAILED, per the
+        // Bolt message spec's `qid` semantics. (DEFERRAL: Graphus keeps at most one stream open at a
+        // time, so multiple concurrently-open result-sets addressed by distinct qids are not
+        // supported; a `qid` that is neither `-1` nor the open stream's id is rejected rather than
+        // buffered. This is spec-conformant for the single-stream case a stock driver drives.)
+        if let Some(requested) = qid {
+            if requested != ALL && self.open_qid != Some(requested) {
+                self.fail_protocol(
+                    "PULL/DISCARD qid does not match an open result stream",
+                )?;
+                return Ok(Flow::Continue);
+            }
         }
         let Some(mut result) = self.open_stream.take() else {
             // Should not happen (only reachable in a streaming state), but be defensive.
@@ -738,6 +798,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             self.send(&Response::Success {
                 metadata: summary_metadata(&summary, false),
             })?;
+            // The stream is fully consumed; its qid no longer addresses anything (rmp #391).
+            self.open_qid = None;
             self.state = self.state.ready_after_stream();
         }
         Ok(Flow::Continue)
@@ -806,6 +868,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             let _ = self.executor.rollback();
         }
         self.open_stream = None;
+        self.open_qid = None;
+        self.next_qid = 0;
         self.send(&Response::Success { metadata: vec![] })?;
         self.state = State::Ready;
         Ok(())
@@ -815,6 +879,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// stream (the fail-then-ignore rule then applies until `RESET`).
     fn fail_with(&mut self, error: &graphus_core::GraphusError) -> BoltResult<()> {
         self.open_stream = None;
+        self.open_qid = None;
         self.send_failure(failure_from_error(error))?;
         self.state = State::Failed;
         Ok(())
@@ -823,6 +888,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// Sends a protocol `FAILURE` and enters [`State::Failed`].
     fn fail_protocol(&mut self, message: &str) -> BoltResult<()> {
         self.open_stream = None;
+        self.open_qid = None;
         self.send_failure(Failure::new("Neo.ClientError.Request.Invalid", message))?;
         self.state = State::Failed;
         Ok(())

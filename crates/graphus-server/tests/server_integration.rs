@@ -537,6 +537,84 @@ async fn bolt_structural_results_node_rel_path_on_the_wire() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// rmp #388 — an abrupt disconnect with an open explicit transaction must NOT leak the transaction.
+/// A client BEGINs, RUNs a write, then drops the socket without COMMIT/ROLLBACK/GOODBYE. The engine's
+/// open-transaction count must return to 0 within a bound (the EOF arm rolls it back; the executor's
+/// `Drop` is the backstop), and a maintenance checkpoint must then be able to advance the GC
+/// watermark — proving the abandoned tx no longer pins it.
+#[tokio::test]
+async fn bolt_abrupt_disconnect_rolls_back_open_transaction() {
+    let temp = TempStore::new("bolt-leak-tx");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // Sanity: no transactions open before we start.
+    assert_eq!(
+        server.engine.status_open_txns().await.unwrap(),
+        0,
+        "no open txns at start"
+    );
+
+    {
+        let mut client = BoltUdsClient::connect(&uds).await;
+        client.handshake_and_logon("alice", "admin-pw8").await;
+
+        // Open an explicit write transaction.
+        let begin = client.request_response(Request::Begin { extra: vec![] }).await;
+        assert!(matches!(begin, Response::Success { .. }), "BEGIN: {begin:?}");
+
+        // RUN a write inside it and drain its (empty) result so the statement actually executes.
+        client
+            .send(&Request::Run {
+                query: "CREATE (:Leak {id: 1})".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            })
+            .await;
+        assert!(
+            matches!(client.recv().await, Response::Success { .. }),
+            "in-tx RUN ok"
+        );
+        client.send(&Request::Pull { n: -1, qid: None }).await;
+        loop {
+            match client.recv().await {
+                Response::Record { .. } => {}
+                Response::Success { .. } => break,
+                other => panic!("unexpected during in-tx PULL: {other:?}"),
+            }
+        }
+
+        // The transaction is now open and accounted for.
+        assert_eq!(
+            server.engine.status_open_txns().await.unwrap(),
+            1,
+            "the explicit tx is open"
+        );
+
+        // Drop the client WITHOUT COMMIT/ROLLBACK/GOODBYE — an abrupt disconnect.
+    }
+
+    // Within a bound, the engine's open-tx count must fall back to 0 (the session's EOF arm rolls the
+    // abandoned tx back; the executor's Drop is the backstop). Poll briefly: the socket close → EOF →
+    // rollback hop crosses the async listener and the blocking engine thread.
+    let mut open = usize::MAX;
+    for _ in 0..200 {
+        open = server.engine.status_open_txns().await.unwrap();
+        if open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(open, 0, "the abandoned explicit tx must be rolled back, not leaked");
+
+    // With nothing pinning it, a maintenance checkpoint runs cleanly and can advance the watermark
+    // (the GC pass / freeze sweep would be blocked by a still-open writing tx).
+    let reply = server.engine.checkpoint().await.expect("checkpoint advances");
+    let _ = (reply.reclaimed, reply.frozen);
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
 #[tokio::test]
 async fn bolt_uds_route_and_telemetry_round_trip() {
     // Over the REAL UDS path (rmp #95): a ROUTE returns a single-instance routing table and a
