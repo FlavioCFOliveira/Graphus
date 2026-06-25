@@ -9,9 +9,29 @@
 //!   standard *raw* betweenness (sum over all ordered source-target pairs of the fraction of
 //!   shortest paths through `v`). For an undirected projection each unordered pair is counted twice;
 //!   divide by two externally if you need the undirected convention (the tests state which they use).
+//!
+//! ## Multigraph σ semantics (`rmp` #416)
+//!
+//! Brandes' shortest-path count `σ` is defined over a **simple** graph: the number of *distinct
+//! shortest paths*. A multigraph projection may carry **parallel edges** (`k` edges `u → v`) and
+//! **self-loops**, but those do **not** create extra shortest paths — `k` parallel edges between
+//! adjacent nodes still form **one** shortest hop, and a self-loop never lies on a shortest path
+//! between two distinct nodes. Betweenness therefore traverses the **simple** adjacency of the
+//! projection (parallel edges deduplicated, self-loops dropped), honouring the projection's
+//! orientation: an [`Orientation::Undirected`] projection uses
+//! [`CsrGraph::simple_undirected_csr`](crate::csr::CsrGraph::simple_undirected_csr) and a
+//! [`Orientation::Directed`] one uses
+//! [`CsrGraph::simple_directed_csr`](crate::csr::CsrGraph::simple_directed_csr). Consequently a graph
+//! and the same graph with any edge duplicated yield **identical** betweenness — the multiplicity of
+//! the multigraph is collapsed to its simple structure, as the algorithm's definition requires.
+//!
+//! Closeness is **multiplicity-invariant by construction**: it scores via BFS/Dijkstra *distances*,
+//! and parallel edges or self-loops never shorten a distance (they only add redundant relaxations of
+//! an already-discovered node), so it needs no de-duplication and is left to traverse the raw
+//! adjacency.
 
 use crate::cancel::Cancel;
-use crate::csr::{CsrGraph, InternalId, Orientation};
+use crate::csr::{CsrGraph, InternalId, Orientation, SimpleUndirectedCsr};
 use crate::error::{GdsError, Result};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -119,32 +139,46 @@ pub fn betweenness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<V
         return Ok(Vec::new());
     }
 
+    // `rmp` #416: σ counts *distinct* shortest paths over a *simple* graph, so the BFS must traverse
+    // the de-duplicated (parallel-edge-free, self-loop-free) adjacency that honours the projection's
+    // orientation — not the raw multigraph CSR.
+    let adj: &SimpleUndirectedCsr = match graph.orientation() {
+        Orientation::Undirected => graph.simple_undirected_csr(),
+        Orientation::Directed => graph.simple_directed_csr(),
+    };
+
     // Brandes accumulates an independent single-source dependency per source `s`; the sources are
-    // data-parallel over the immutable CSR. Each rayon task carries private scratch buffers and a
-    // private accumulator (`BrandesScratch`), and the per-task accumulators are summed element-wise
-    // at the end. The reduction is float addition: for the integer/rational betweenness of real and
-    // reference graphs the per-source contributions are exact in f64, so the parallel result equals
-    // the serial one (verified by the algorithm + analytics tests).
-    (0..n)
+    // data-parallel over the immutable adjacency. Each rayon task carries private scratch buffers
+    // (`BrandesScratch`) and produces that source's *own* dependency contribution as a private
+    // `Vec<f64>`.
+    //
+    // `rmp` #421 — determinism: the per-source contributions are summed in a **fixed (ascending
+    // source-id) order**, independent of how rayon splits the work. We collect the per-source delta
+    // vectors into a source-indexed `Vec` (`into_par_iter().map(...).collect()` preserves input
+    // order) and fold them serially in id order. f64 addition is non-associative, so a
+    // split-dependent reduction order (the previous `try_reduce`) made the result thread-count
+    // dependent; fixing the fold order makes the betweenness **bit-identical** across pool widths.
+    // The expensive per-source BFS + dependency accumulation stays fully parallel; only the final
+    // O(n²) accumulation is serialized into a deterministic order.
+    let per_source: Vec<Vec<f64>> = (0..n)
         .into_par_iter()
-        .try_fold(
+        .map_init(
             || BrandesScratch::new(n),
-            |mut scratch, s| -> Result<BrandesScratch> {
+            |scratch, s| -> Result<Vec<f64>> {
                 cancel.check()?;
-                scratch.run_source(graph, s)?;
-                Ok(scratch)
+                scratch.run_source(adj, s)?;
+                Ok(scratch.acc.clone())
             },
         )
-        .map(|r| r.map(|scratch| scratch.acc))
-        .try_reduce(
-            || vec![0.0f64; n],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(b.iter()) {
-                    *x += *y;
-                }
-                Ok(a)
-            },
-        )
+        .collect::<Result<Vec<Vec<f64>>>>()?;
+
+    let mut acc = vec![0.0f64; n];
+    for contribution in &per_source {
+        for (x, y) in acc.iter_mut().zip(contribution.iter()) {
+            *x += *y;
+        }
+    }
+    Ok(acc)
 }
 
 /// Per-task scratch + private accumulator for the data-parallel Brandes betweenness. Reused across
@@ -157,7 +191,9 @@ struct BrandesScratch {
     predecessors: Vec<Vec<u32>>,
     stack: Vec<u32>,
     queue: VecDeque<u32>,
-    /// This task's partial betweenness, summed into the global result at the reduction step.
+    /// The current source's dependency contribution (`rmp` #421). Reset at the start of every
+    /// [`Self::run_source`] and cloned out per source, so the caller can sum contributions in a
+    /// deterministic (ascending source-id) order rather than in a rayon-split-dependent one.
     acc: Vec<f64>,
 }
 
@@ -175,16 +211,21 @@ impl BrandesScratch {
         }
     }
 
-    /// Runs Brandes' single-source dependency accumulation from `s`, folding the result into
-    /// [`Self::acc`]. Identical arithmetic to the original serial loop body.
-    fn run_source(&mut self, graph: &CsrGraph, s: usize) -> Result<()> {
+    /// Runs Brandes' single-source dependency accumulation from `s` over the **simple** adjacency
+    /// `adj` (`rmp` #416), writing this source's dependency contribution into [`Self::acc`].
+    ///
+    /// `acc` is **reset** on entry so it holds *only* this source's contribution: the caller (`rmp`
+    /// #421) clones it per source and sums the contributions in a deterministic id order, so each
+    /// `run_source` must be self-contained rather than folding into a running total.
+    fn run_source(&mut self, adj: &SimpleUndirectedCsr, s: usize) -> Result<()> {
         let n = self.n;
-        // Reset.
+        // Reset all per-source scratch, including the contribution accumulator.
         for v in 0..n {
             self.sigma[v] = 0.0;
             self.dist[v] = -1;
             self.delta[v] = 0.0;
             self.predecessors[v].clear();
+            self.acc[v] = 0.0;
         }
         self.stack.clear();
         self.queue.clear();
@@ -197,7 +238,7 @@ impl BrandesScratch {
         while let Some(v) = self.queue.pop_front() {
             self.stack.push(v);
             let dv = self.dist[v as usize];
-            if let Some(neis) = graph.neighbors(v) {
+            if let Some(neis) = adj.neighbors(v) {
                 for &w in neis {
                     let wi = w as usize;
                     if self.dist[wi] < 0 {

@@ -268,6 +268,7 @@ impl CsrBuilder {
             weights,
             node_columns: HashMap::new(),
             simple_undirected: OnceLock::new(),
+            simple_directed: OnceLock::new(),
         })
     }
 }
@@ -363,6 +364,16 @@ pub struct CsrGraph {
     /// could stale it. Excluded from [`CsrGraph::memory_bytes`] until materialized (it is `O(n + m)`
     /// when present); see [`CsrGraph::simple_undirected_csr`].
     simple_undirected: OnceLock<SimpleUndirectedCsr>,
+    /// Lazily-built **simple-directed adjacency** as a single flat CSR (`rmp` #416), the directed
+    /// counterpart of [`CsrGraph::simple_undirected`]: each node `i`'s out-neighbour run is sorted
+    /// ascending and **deduplicated** (parallel out-edges collapsed) with **self-loops dropped**, but
+    /// the edge direction is **kept** (no symmetrization). Shortest-path-count algorithms (Brandes'
+    /// betweenness) require a *simple* graph — parallel edges must not inflate the σ shortest-path
+    /// count — yet must still honour a directed projection's orientation; this adjacency is exactly
+    /// that. Built once on first request and reused thereafter (the projection is frozen, so it never
+    /// needs invalidation). Excluded from [`CsrGraph::memory_bytes`] until materialized; see
+    /// [`CsrGraph::simple_directed_csr`].
+    simple_directed: OnceLock<SimpleUndirectedCsr>,
 }
 
 impl CsrGraph {
@@ -473,6 +484,23 @@ impl CsrGraph {
         self.simple_undirected.get().is_some()
     }
 
+    /// The shared **simple-directed adjacency** for this projection (`rmp` #416), built lazily exactly
+    /// once and reused thereafter.
+    ///
+    /// This is the directed counterpart of [`CsrGraph::simple_undirected_csr`]: each node's out-edge
+    /// run is sorted ascending and **deduplicated** (parallel out-edges collapsed into one) with
+    /// **self-loops dropped**, but the **direction is preserved** (no symmetrization). It is the
+    /// adjacency a shortest-path-count algorithm (Brandes' betweenness) must traverse on a *directed*
+    /// projection: σ counts *distinct* shortest paths, so `k` parallel edges must contribute one
+    /// neighbour, not `k`. Self-loops are irrelevant to shortest paths (they never extend one) and are
+    /// dropped to match simple-graph semantics. The build is deterministic and the projection is
+    /// frozen, so the result never needs invalidation.
+    #[must_use]
+    pub fn simple_directed_csr(&self) -> &SimpleUndirectedCsr {
+        self.simple_directed
+            .get_or_init(|| self.build_simple_directed())
+    }
+
     /// Builds the simple-undirected adjacency as one flat CSR (`rmp` #379): drop self-loops, symmetrize
     /// (direction ignored), then per node sort ascending + dedup. Two passes over the directed
     /// adjacency — first count each node's undirected degree to lay out `offsets`, then scatter targets
@@ -559,6 +587,75 @@ impl CsrGraph {
         }
     }
 
+    /// Builds the simple-directed adjacency as one flat CSR (`rmp` #416): keep edge direction, drop
+    /// self-loops, then per node sort the out-neighbours ascending + dedup (collapse parallel
+    /// out-edges). One pass over the directed adjacency lays out the per-node runs; each run is then
+    /// sorted + deduped and compacted into a tight CSR. The result honours the projection's
+    /// orientation while presenting *simple* (parallel-edge-free) out-neighbour sets.
+    fn build_simple_directed(&self) -> SimpleUndirectedCsr {
+        let n = self.node_count();
+
+        // Pass 1: count each node's out-degree (self-loops excluded; parallel edges still counted,
+        // collapsed later by dedup) to size its run.
+        let mut counts = vec![0u32; n];
+        for (u, neis) in self.iter_adjacency() {
+            for &v in neis {
+                if u == v {
+                    continue; // self-loops never extend a shortest path
+                }
+                counts[u as usize] = counts[u as usize].saturating_add(1);
+            }
+        }
+
+        let mut offsets = vec![0u32; n + 1];
+        for i in 0..n {
+            offsets[i + 1] = offsets[i].saturating_add(counts[i]);
+        }
+
+        let total = *offsets.last().unwrap_or(&0) as usize;
+        let mut targets = vec![0 as InternalId; total];
+
+        // Pass 2: scatter each out-neighbour into its source node's run (direction preserved).
+        let mut cursor: Vec<u32> = offsets[..n].to_vec();
+        for (u, neis) in self.iter_adjacency() {
+            for &v in neis {
+                if u == v {
+                    continue;
+                }
+                if let Some(pos) = cursor.get_mut(u as usize) {
+                    targets[*pos as usize] = v;
+                    *pos = pos.saturating_add(1);
+                }
+            }
+        }
+
+        // Per-node sort ascending + dedup, compacting the deduped runs into a tight CSR.
+        let mut new_offsets = vec![0u32; n + 1];
+        let mut write = 0usize;
+        for i in 0..n {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            targets[start..end].sort_unstable();
+            let mut last: Option<InternalId> = None;
+            for k in start..end {
+                let val = targets[k];
+                if last != Some(val) {
+                    targets[write] = val;
+                    write += 1;
+                    last = Some(val);
+                }
+            }
+            new_offsets[i + 1] = write as u32;
+        }
+        targets.truncate(write);
+        targets.shrink_to_fit();
+
+        SimpleUndirectedCsr {
+            offsets: new_offsets,
+            targets,
+        }
+    }
+
     /// An exact accounting of the heap bytes held by this projection (excluding the `HashMap`'s
     /// internal load-factor slack, which is implementation-defined, but including its key/value
     /// storage estimate).
@@ -598,6 +695,12 @@ impl CsrGraph {
             .get()
             .map_or(0, SimpleUndirectedCsr::memory_bytes);
 
+        // Simple-directed CSR cache (`rmp` #416): likewise counted only once materialized.
+        let simple_directed = self
+            .simple_directed
+            .get()
+            .map_or(0, SimpleUndirectedCsr::memory_bytes);
+
         external
             .saturating_add(offsets)
             .saturating_add(targets)
@@ -605,6 +708,7 @@ impl CsrGraph {
             .saturating_add(map)
             .saturating_add(columns)
             .saturating_add(simple_undirected)
+            .saturating_add(simple_directed)
             .saturating_add(core::mem::size_of::<Self>())
     }
 

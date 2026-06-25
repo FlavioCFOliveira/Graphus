@@ -49,6 +49,39 @@ fn fixture() -> CsrGraph {
     )
 }
 
+/// A large (>= 200-node) **non-dyadic** graph (`rmp` #421). The small dyadic fixture above is too tiny
+/// to make rayon split the source loop across more than a couple of tasks, so it cannot expose a
+/// thread-count-dependent reduction order. This graph is large enough that rayon splits the work
+/// differently at every pool width, and it is built so betweenness carries many *fractional* σ
+/// contributions (multiple equal-length shortest paths through parallel "rungs"), whose summation
+/// order is exactly what f64 non-associativity makes thread-count sensitive.
+///
+/// Structure: a 70-rung "ladder" — two parallel rails `a_i` (ids `0..70`) and `b_i` (ids `70..140`)
+/// with rungs `a_i - b_i`, rails `a_i - a_{i+1}` and `b_i - b_{i+1}`, plus diagonals `a_i - b_{i+1}`
+/// that create many equal-length detours (so σ is fractional and dependency back-propagation produces
+/// non-terminating binary fractions). A 70-node fan (`140..210`) hangs extra leaves off the rails to
+/// push the count past 200 and lengthen the dependency sums. 210 nodes, non-power-of-two.
+fn large_non_dyadic_fixture() -> CsrGraph {
+    const RUNGS: u64 = 70;
+    let mut nodes: Vec<u64> = (0..(3 * RUNGS)).collect();
+    nodes.dedup();
+    let mut edges: Vec<(u64, u64)> = Vec::new();
+    for i in 0..RUNGS {
+        let a = i;
+        let b = RUNGS + i;
+        edges.push((a, b)); // rung
+        if i + 1 < RUNGS {
+            edges.push((a, a + 1)); // rail A
+            edges.push((b, b + 1)); // rail B
+            edges.push((a, RUNGS + i + 1)); // diagonal -> multiple equal shortest paths
+        }
+        // Fan leaf hanging off rail A (ids 140..210), giving every rail node a pendant.
+        let leaf = 2 * RUNGS + i;
+        edges.push((a, leaf));
+    }
+    undirected(&nodes, &edges)
+}
+
 /// Builds a dedicated rayon pool of `threads` workers and runs `op` on it (the same `install`
 /// mechanism `morsel::run_on_analytics_pool` uses to host GDS on the shared analytics pool).
 fn on_pool<R: Send>(threads: usize, op: impl FnOnce() -> R + Send) -> R {
@@ -88,7 +121,7 @@ fn betweenness_is_identical_across_pool_widths() {
         betweenness_centrality(&g, &cancel).expect("betweenness baseline"),
     );
 
-    for threads in [1usize, 2, 4, 8] {
+    for threads in [1usize, 2, 4, 8, 16] {
         let scores = on_pool(threads, || {
             let g = fixture();
             let raw = betweenness_centrality(&g, &Cancel::never()).expect("betweenness on pool");
@@ -97,6 +130,35 @@ fn betweenness_is_identical_across_pool_widths() {
         assert_eq!(
             scores, baseline,
             "betweenness must be bit-identical on a {threads}-thread analytics pool"
+        );
+    }
+}
+
+/// `rmp` #421 regression gate: betweenness must be **bit-identical** across pool widths on a large,
+/// non-dyadic graph whose σ contributions are fractional. This is the test the old 8-node dyadic
+/// fixture was too small to be: it fails before the fix (the rayon-split-dependent `try_reduce` fold
+/// order makes f64 sums differ across widths) and passes after (the final accumulation is folded in a
+/// fixed ascending source-id order, independent of thread count).
+#[test]
+fn betweenness_is_bit_identical_on_large_non_dyadic_graph() {
+    let g = large_non_dyadic_fixture();
+    assert!(
+        g.node_count() >= 200,
+        "fixture must exceed 200 nodes (got {})",
+        g.node_count()
+    );
+
+    // Baseline on the global pool.
+    let baseline = betweenness_centrality(&g, &Cancel::never()).expect("baseline betweenness");
+
+    for threads in [1usize, 2, 4, 8, 16] {
+        let scores = on_pool(threads, || {
+            betweenness_centrality(&large_non_dyadic_fixture(), &Cancel::never())
+                .expect("betweenness on pool")
+        });
+        assert_eq!(
+            scores, baseline,
+            "betweenness must be bit-identical on a {threads}-thread pool (large non-dyadic graph)"
         );
     }
 }

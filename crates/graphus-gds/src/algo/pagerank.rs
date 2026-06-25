@@ -8,6 +8,8 @@ use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId};
 use crate::error::{GdsError, Result};
 
+use super::shortest_path::validate_weights_non_negative;
+
 /// Configuration for [`pagerank`].
 #[derive(Debug, Clone, Copy)]
 pub struct PageRankConfig {
@@ -42,13 +44,26 @@ pub struct PageRankResult {
 
 /// Computes PageRank.
 ///
+/// # Weighted vs. unweighted (`rmp` #422)
+/// The contract follows the projection: if the projection is **weighted**
+/// ([`CsrGraph::is_weighted`]), this computes **weight-normalized PageRank** — a node `src`
+/// distributes its rank to each out-neighbour `dst` in proportion to the edge weight,
+/// `share(src → dst) ∝ w(src → dst) / Σ_k w(src → ·)` — so a heavier edge carries more rank. If the
+/// projection is **unweighted**, every out-edge carries equal share `1 / out_degree(src)` (the
+/// classic uniform transition). A node whose total out-weight is zero (or which has no out-edges) is
+/// **dangling**: its rank is collected and redistributed uniformly each iteration, exactly as in the
+/// unweighted case, so the rank vector stays a probability distribution summing to one.
+///
+/// Self-loops and parallel edges are folded into the transition naturally: each contributes its own
+/// (uniform or weighted) share, matching the multigraph's stochastic matrix.
+///
 /// # Complexity
-/// Time `O(k · (n + m))` for `k` iterations, space `O(n)`. Self-loops and parallel edges contribute
-/// to a node's out-degree exactly as the transition matrix dictates; the multigraph needs no
-/// special handling.
+/// Time `O(k · (n + m))` for `k` iterations, space `O(n)`.
 ///
 /// # Errors
-/// - [`GdsError::InvalidArgument`] if `damping` is not in `[0, 1)` or `tolerance` is negative.
+/// - [`GdsError::InvalidArgument`] if `damping` is not in `[0, 1)` or `tolerance` is negative, or if
+///   the projection is weighted and carries a negative or non-finite edge weight (a weighted PageRank
+///   transition requires non-negative finite weights).
 /// - [`GdsError::Cancelled`] if `cancel` fires (checked once per iteration).
 pub fn pagerank(
     graph: &CsrGraph,
@@ -62,6 +77,11 @@ pub fn pagerank(
     }
     if config.tolerance < 0.0 || config.tolerance.is_nan() {
         return Err(GdsError::InvalidArgument("tolerance must be >= 0".into()));
+    }
+    // `rmp` #422: a weighted transition needs non-negative finite weights, else the per-node weight
+    // normalization is meaningless (negative shares, NaN). Validate once up front.
+    if graph.is_weighted() {
+        validate_weights_non_negative(graph)?;
     }
 
     let n = graph.node_count();
@@ -80,6 +100,32 @@ pub fn pagerank(
 
     let d = config.damping;
     let teleport = (1.0 - d) / nf;
+    let weighted = graph.is_weighted();
+
+    // `rmp` #422: for a weighted projection, precompute each node's total out-weight once. It serves
+    // two purposes per iteration: (1) a node is dangling iff its out-weight sum is `0` (no usable
+    // out-edge to carry rank), and (2) the per-edge share is normalized by it. Unweighted projections
+    // fall back to neighbour count (the classic uniform transition); `out_weight` is unused then.
+    let out_weight: Vec<f64> = if weighted {
+        (0..n)
+            .map(|i| {
+                graph
+                    .neighbor_weights(i as InternalId)
+                    .map_or(0.0, |ws| ws.iter().copied().sum())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // A node carries rank forward iff it has a usable out-transition; otherwise it is dangling.
+    let is_dangling = |i: usize| -> bool {
+        if weighted {
+            out_weight[i] <= 0.0
+        } else {
+            graph.out_degree(i as InternalId).unwrap_or(0) == 0
+        }
+    };
 
     let mut iterations = 0u32;
     let mut converged = false;
@@ -88,10 +134,10 @@ pub fn pagerank(
         cancel.check()?;
         iterations += 1;
 
-        // Collect dangling mass (nodes with no out-edges keep all their rank, which we redistribute).
+        // Collect dangling mass (nodes with no usable out-edge keep all their rank, redistributed).
         let mut dangling_sum = 0.0f64;
         for (i, &r) in rank.iter().enumerate() {
-            if graph.out_degree(i as InternalId).unwrap_or(0) == 0 {
+            if is_dangling(i) {
                 dangling_sum += r;
             }
         }
@@ -102,14 +148,29 @@ pub fn pagerank(
         }
 
         for (src, neis) in graph.iter_adjacency() {
-            let deg = neis.len();
-            if deg == 0 {
+            let si = src as usize;
+            if neis.is_empty() {
                 continue;
             }
-            let share = d * rank[src as usize] / deg as f64;
-            for &dst in neis {
-                if let Some(slot) = next.get_mut(dst as usize) {
-                    *slot += share;
+            if weighted {
+                let total = out_weight[si];
+                if total <= 0.0 {
+                    continue; // dangling: its mass is handled via `dangling_share` above
+                }
+                // Weight-normalized transition: heavier edges carry more rank (`rmp` #422).
+                let mass = d * rank[si];
+                let ws = graph.neighbor_weights(src).unwrap_or(&[]);
+                for (&dst, &w) in neis.iter().zip(ws.iter()) {
+                    if let Some(slot) = next.get_mut(dst as usize) {
+                        *slot += mass * (w / total);
+                    }
+                }
+            } else {
+                let share = d * rank[si] / neis.len() as f64;
+                for &dst in neis {
+                    if let Some(slot) = next.get_mut(dst as usize) {
+                        *slot += share;
+                    }
                 }
             }
         }

@@ -84,6 +84,56 @@ fn pagerank_star_centre_dominates() {
     assert!((sum - 1.0).abs() < 1e-6);
 }
 
+// `rmp` #422: PageRank on a WEIGHTED projection must honour edge weights — a node distributes rank to
+// each out-neighbour in proportion to the edge weight. Before the fix `neighbor_weights` was ignored,
+// so a weighted star silently produced the unweighted (equal-rank) result. After the fix the heavier
+// edge carries more rank.
+#[test]
+fn pagerank_weighted_directed_star_respects_weights() {
+    // 0 -> 1 (w=1), 0 -> 2 (w=100). 1 and 2 are dangling sinks; the heavy edge must give 2 >> 1.
+    let g = weighted(
+        &[0, 1, 2],
+        &[(0, 1, 1.0), (0, 2, 100.0)],
+        Orientation::Directed,
+    );
+    let r = pagerank(&g, PageRankConfig::default(), &Cancel::never()).unwrap();
+    assert!(
+        r.rank[2] > r.rank[1] + 1e-6,
+        "weighted PageRank must rank the heavy-edge target higher: rank[2]={} rank[1]={}",
+        r.rank[2],
+        r.rank[1]
+    );
+    // Sanity: with EQUAL weights the same shape must yield equal ranks (degenerates to unweighted).
+    let g_eq = weighted(
+        &[0, 1, 2],
+        &[(0, 1, 5.0), (0, 2, 5.0)],
+        Orientation::Directed,
+    );
+    let r_eq = pagerank(&g_eq, PageRankConfig::default(), &Cancel::never()).unwrap();
+    assert!(
+        (r_eq.rank[1] - r_eq.rank[2]).abs() < 1e-9,
+        "equal weights must give equal ranks: {} vs {}",
+        r_eq.rank[1],
+        r_eq.rank[2]
+    );
+    // Mass must still be conserved (dangling + teleport handling intact).
+    let sum: f64 = r.rank.iter().sum();
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "weighted PageRank mass leak: {sum}"
+    );
+}
+
+// `rmp` #422: a weighted projection with a negative edge weight cannot form a valid transition.
+#[test]
+fn pagerank_weighted_rejects_negative_weight() {
+    let g = weighted(&[0, 1], &[(0, 1, -1.0)], Orientation::Directed);
+    assert!(matches!(
+        pagerank(&g, PageRankConfig::default(), &Cancel::never()),
+        Err(GdsError::InvalidArgument(_))
+    ));
+}
+
 #[test]
 fn pagerank_rejects_bad_damping() {
     let g = directed(&[0, 1], &[(0, 1)]);
@@ -219,6 +269,66 @@ fn betweenness_star_graph() {
     assert!((bc[0] - expected_centre).abs() < EPS, "centre {}", bc[0]);
     for (leaf, &score) in bc.iter().enumerate().skip(1) {
         assert!(score.abs() < EPS, "leaf {leaf} = {score}");
+    }
+}
+
+// `rmp` #416: Brandes' shortest-path count σ is defined over a SIMPLE graph. A multigraph projection
+// may carry parallel edges, but duplicating an edge must NOT inflate the shortest-path count — `k`
+// parallel edges between adjacent nodes are still one shortest hop. Before the fix the BFS walked the
+// raw multigraph adjacency, so a doubled S–A edge counted as two distinct shortest paths and skewed
+// betweenness; after the fix betweenness traverses the deduplicated simple adjacency, so the doubled
+// graph equals the simple one.
+#[test]
+fn betweenness_multigraph_equals_simple_graph() {
+    // Diamond S(0)-A(1)-T(3), S(0)-B(2)-T(3): A and B are symmetric, each on one of two equal-length
+    // shortest S→T paths, so their betweenness must be equal.
+    let simple = undirected(&[0, 1, 2, 3], &[(0, 1), (1, 3), (0, 2), (2, 3)]);
+    let simple_bc = undirected_scale(
+        &simple,
+        betweenness_centrality(&simple, &Cancel::never()).unwrap(),
+    );
+
+    // Same diamond, but the S–A edge is DOUBLED (a genuine multigraph). On a simple graph this is the
+    // identical graph; the parallel edge must be collapsed, so betweenness must be unchanged.
+    let doubled = undirected(&[0, 1, 2, 3], &[(0, 1), (0, 1), (1, 3), (0, 2), (2, 3)]);
+    let doubled_bc = undirected_scale(
+        &doubled,
+        betweenness_centrality(&doubled, &Cancel::never()).unwrap(),
+    );
+
+    for i in 0..4 {
+        assert!(
+            (simple_bc[i] - doubled_bc[i]).abs() < EPS,
+            "node {i}: doubled-edge betweenness {} != simple-graph {}",
+            doubled_bc[i],
+            simple_bc[i]
+        );
+    }
+    // The diamond's A and B are symmetric: their betweenness must be equal (the bug made A != B).
+    assert!(
+        (doubled_bc[1] - doubled_bc[2]).abs() < EPS,
+        "A ({}) and B ({}) must have equal betweenness on the doubled diamond",
+        doubled_bc[1],
+        doubled_bc[2]
+    );
+}
+
+// `rmp` #416: a directed multigraph must likewise collapse parallel out-edges for σ, while keeping
+// direction. Doubling a directed edge must not change directed betweenness.
+#[test]
+fn directed_betweenness_multigraph_equals_simple_graph() {
+    // Directed diamond 0->1->3, 0->2->3.
+    let simple = directed(&[0, 1, 2, 3], &[(0, 1), (1, 3), (0, 2), (2, 3)]);
+    let simple_bc = betweenness_centrality(&simple, &Cancel::never()).unwrap();
+    let doubled = directed(&[0, 1, 2, 3], &[(0, 1), (0, 1), (1, 3), (0, 2), (2, 3)]);
+    let doubled_bc = betweenness_centrality(&doubled, &Cancel::never()).unwrap();
+    for i in 0..4 {
+        assert!(
+            (simple_bc[i] - doubled_bc[i]).abs() < EPS,
+            "directed node {i}: doubled {} != simple {}",
+            doubled_bc[i],
+            simple_bc[i]
+        );
     }
 }
 
