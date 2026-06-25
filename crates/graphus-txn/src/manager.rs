@@ -524,14 +524,30 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
                     // The key may now be free; re-acquire.
                     return match self.locks.acquire(txn, key) {
                         LockOutcome::Granted => Ok(()),
-                        LockOutcome::Wait { holder } => Err(GraphusError::Transaction(format!(
-                            "write-write conflict: key {key} held by transaction {}; retry",
-                            holder.0
-                        ))),
+                        LockOutcome::Wait { holder } => {
+                            // The re-acquire still waits (the freed key was immediately taken by a
+                            // third party). This wait fails fast too, so drop the pending wait edge
+                            // `txn -> holder` that `acquire` just recorded; `txn` stays active and
+                            // keeps the locks it already holds, but it is no longer waiting on anyone
+                            // — leaving the edge would let a later wait close a phantom cycle through
+                            // it and abort an innocent transaction (`rmp` #387).
+                            self.locks.clear_waits(txn);
+                            Err(GraphusError::Transaction(format!(
+                                "write-write conflict: key {key} held by transaction {}; retry",
+                                holder.0
+                            )))
+                        }
                     };
                 }
                 // No deadlock, but the key is held: first-updater-wins, the second writer fails
                 // fast with a retriable error (NFR — readers stay non-blocking regardless).
+                //
+                // Drop the pending wait edge `txn -> holder` that `acquire` just recorded: `txn`
+                // stays active (and keeps any locks it already holds) but is no longer waiting on
+                // `holder`. A stale edge here violates the "wait-for graph is acyclic before each
+                // acquire" invariant and would let a later legitimate wait fabricate a phantom cycle
+                // through it, aborting an innocent transaction (`rmp` #387).
+                self.locks.clear_waits(txn);
                 Err(GraphusError::Transaction(format!(
                     "write-write conflict: key {key} held by transaction {}; retry",
                     holder.0

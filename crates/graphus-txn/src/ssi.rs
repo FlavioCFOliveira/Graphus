@@ -644,6 +644,40 @@ impl SsiTracker {
                     }
                 }
             }
+
+            // rw-edge cleanup (`rmp` #399). Remove `txn` from every surviving transaction's
+            // `out_edges`/`in_edges` and recompute its `out_conflict`/`in_conflict` flag from the
+            // edges that *remain*. Leaving these dangling was safe (a forgotten partner re-resolves
+            // via `txns.get` to `None`, so it can only ever cause a *false-positive* abort, never a
+            // false-negative) but unclean: the conflict graph kept naming a transaction that no longer
+            // exists, and the flags — being monotone — never reflected that its sole contributing edge
+            // was gone, a latent spurious-abort source.
+            //
+            // This is a no-false-negative cleanup. `forget` only ever runs on a *terminated*
+            // transaction: an abort (irrelevant to any future structure) or a GC retirement, which
+            // `prune_committed` performs only once the partner committed before every still-active
+            // transaction began — i.e. it is concurrent with no live transaction, so no live
+            // transaction holds an actionable rw-edge to or from it. Every edge we drop here is
+            // therefore already non-actionable, and a flag is cleared only when *no other* edge in
+            // that direction survives (an edge to a different — possibly already-forgotten — partner
+            // keeps the flag set, the conservative choice). Hence no real dangerous structure that
+            // `detect_pivot_abort` would have caught can be hidden by this cleanup.
+            //
+            // Targeted, not a full scan: the forgotten transaction's own `out_edges` name the
+            // survivors that hold `txn` in *their* `in_edges`, and its `in_edges` name those that hold
+            // `txn` in *their* `out_edges` — so the cost is O(degree of the forgotten node).
+            for target in t.out_edges {
+                if let Some(survivor) = self.txns.get_mut(&target) {
+                    survivor.in_edges.remove(&txn);
+                    survivor.in_conflict = !survivor.in_edges.is_empty();
+                }
+            }
+            for source in t.in_edges {
+                if let Some(survivor) = self.txns.get_mut(&source) {
+                    survivor.out_edges.remove(&txn);
+                    survivor.out_conflict = !survivor.out_edges.is_empty();
+                }
+            }
         }
     }
 
@@ -688,6 +722,11 @@ mod tests {
 
     fn ts(n: u64) -> Timestamp {
         Timestamp(n)
+    }
+
+    /// Builds a `HashSet<TxnId>` from a list of raw ids, for comparing edge sets in tests.
+    fn set<const N: usize>(ids: [u64; N]) -> HashSet<TxnId> {
+        ids.into_iter().map(TxnId).collect()
     }
 
     #[test]
@@ -761,6 +800,90 @@ mod tests {
         s.register(TxnId(2), ts(2));
         s.record_write(TxnId(2), 100);
         assert_eq!(s.detect_pivot_abort(TxnId(2)), None);
+    }
+
+    /// `rmp` #399: `forget(partner)` must scrub `partner` from every survivor's `out_edges`/
+    /// `in_edges` and recompute their conflict flags from the edges that remain — no dangling
+    /// references, and a flag stays set only if a *live* edge still supports it.
+    #[test]
+    fn forget_removes_rw_edges_from_survivors_and_recomputes_flags() {
+        let mut s = SsiTracker::new();
+        // Three concurrent transactions. Build edges:  T1 --rw--> T2 --rw--> T3.
+        // T2 is the only transaction with both an inbound (from T1) and outbound (to T3) edge.
+        s.register(TxnId(1), ts(1));
+        s.register(TxnId(2), ts(1));
+        s.register(TxnId(3), ts(1));
+        s.add_edge(TxnId(1), TxnId(2)); // T1 --rw--> T2
+        s.add_edge(TxnId(2), TxnId(3)); // T2 --rw--> T3
+
+        // Pre-condition: the graph is fully wired and flags agree with the edge sets.
+        assert_eq!(s.txns.get(&TxnId(1)).unwrap().out_edges, set([2]));
+        assert!(s.txns.get(&TxnId(1)).unwrap().out_conflict);
+        assert_eq!(s.txns.get(&TxnId(2)).unwrap().in_edges, set([1]));
+        assert_eq!(s.txns.get(&TxnId(2)).unwrap().out_edges, set([3]));
+        assert!(
+            s.txns.get(&TxnId(2)).unwrap().in_conflict
+                && s.txns.get(&TxnId(2)).unwrap().out_conflict
+        );
+        assert_eq!(s.txns.get(&TxnId(3)).unwrap().in_edges, set([2]));
+        assert!(s.txns.get(&TxnId(3)).unwrap().in_conflict);
+
+        // Forget the middle partner T2.
+        s.forget(TxnId(2));
+        assert!(!s.txns.contains_key(&TxnId(2)), "T2 is fully removed");
+
+        // T1 no longer names T2 in its out_edges, and with no other outbound edge its out_conflict
+        // is now false (recomputed from live edges only).
+        let t1 = s.txns.get(&TxnId(1)).unwrap();
+        assert!(
+            !t1.out_edges.contains(&TxnId(2)),
+            "T2 scrubbed from T1.out_edges"
+        );
+        assert!(t1.out_edges.is_empty());
+        assert!(
+            !t1.out_conflict,
+            "T1.out_conflict reflects only live edges (none remain)"
+        );
+
+        // T3 symmetrically: T2 gone from in_edges, in_conflict cleared.
+        let t3 = s.txns.get(&TxnId(3)).unwrap();
+        assert!(
+            !t3.in_edges.contains(&TxnId(2)),
+            "T2 scrubbed from T3.in_edges"
+        );
+        assert!(t3.in_edges.is_empty());
+        assert!(
+            !t3.in_conflict,
+            "T3.in_conflict reflects only live edges (none remain)"
+        );
+    }
+
+    /// A flag that is *also* supported by a second, live edge must NOT be cleared when one partner is
+    /// forgotten — the cleanup recomputes from the surviving edges, it does not blindly reset (`rmp`
+    /// #399). Guards against introducing a false-negative by over-clearing.
+    #[test]
+    fn forget_keeps_flag_when_a_live_edge_still_supports_it() {
+        let mut s = SsiTracker::new();
+        // T1 --rw--> T2 and T1 --rw--> T3: T1 has two outbound edges.
+        for id in 1..=3 {
+            s.register(TxnId(id), ts(1));
+        }
+        s.add_edge(TxnId(1), TxnId(2));
+        s.add_edge(TxnId(1), TxnId(3));
+        assert_eq!(s.txns.get(&TxnId(1)).unwrap().out_edges, set([2, 3]));
+
+        // Forget T2 only. T1 keeps the live edge to T3, so out_conflict must stay set.
+        s.forget(TxnId(2));
+        let t1 = s.txns.get(&TxnId(1)).unwrap();
+        assert_eq!(
+            t1.out_edges,
+            set([3]),
+            "only the forgotten partner is scrubbed"
+        );
+        assert!(
+            t1.out_conflict,
+            "the live T1 --rw--> T3 edge must keep out_conflict set (no over-clearing)"
+        );
     }
 
     #[test]

@@ -94,6 +94,27 @@ impl LockTable {
         }
     }
 
+    /// Drops every *pending wait-for edge* of `txn` (its outgoing `waiter → holder` edges) **without**
+    /// releasing any write lock `txn` legitimately holds.
+    ///
+    /// This is the surgical counterpart to [`release_all`](Self::release_all) for the case where a
+    /// write *wait* fails fast (write-write conflict, retriable) but the transaction **stays active**
+    /// and must keep the locks it already holds. [`acquire`](Self::acquire) records the wait-for edge
+    /// `waiter → holder` *before* the manager decides to fail the wait; if that edge is left behind, it
+    /// becomes **stale** — the transaction is no longer waiting on anyone, yet the graph still says it
+    /// is. A later legitimate wait could then close a *phantom* cycle through the stale edge and abort
+    /// an innocent transaction (`rmp` #387).
+    ///
+    /// Removing only the *outgoing* edges of `txn` is exactly right: `txn` is the waiter on the failed
+    /// acquire, so the spurious edges are the ones it authored (`waits_for[txn]`). Its incoming edges
+    /// (other transactions waiting on the locks `txn` still holds) and the lock holdings themselves are
+    /// **preserved**, because they remain true.
+    ///
+    /// Idempotent: clearing the wait edges of a transaction that has none is a no-op.
+    pub fn clear_waits(&mut self, txn: TxnId) {
+        self.waits_for.remove(&txn);
+    }
+
     /// Finds the deadlock victim for the wait-for edge `waiter → holder` that [`acquire`](Self::acquire)
     /// **just** recorded, or `None` if that edge did not close a cycle.
     ///
@@ -512,6 +533,44 @@ mod tests {
             Some(TxnId(DEPTH))
         );
         assert_eq!(lt.find_deadlock_victim(), Some(TxnId(DEPTH)));
+    }
+
+    /// `clear_waits` removes only the waiter's outgoing wait edges; it preserves the locks it holds
+    /// and the incoming edges of transactions waiting on those locks (`rmp` #387).
+    #[test]
+    fn clear_waits_drops_only_pending_wait_edges() {
+        let mut lt = LockTable::new();
+        // T1 holds key 1; T2 holds key 2.
+        lt.acquire(TxnId(1), 1);
+        lt.acquire(TxnId(2), 2);
+        // T2 waits on T1 for key 1 (edge 2 -> 1). This is the edge a fast-fail would leave stale.
+        assert!(matches!(lt.acquire(TxnId(2), 1), LockOutcome::Wait { .. }));
+        // T1 waits on T2 for key 2 (edge 1 -> 2): an *incoming* edge to T2.
+        assert!(matches!(lt.acquire(TxnId(1), 2), LockOutcome::Wait { .. }));
+
+        // The graph now has a cycle 1 <-> 2; clearing T2's pending waits must break it without
+        // touching the locks T2 holds or the edge T1 -> T2 (which is still a real wait).
+        lt.clear_waits(TxnId(2));
+
+        // T2 still holds key 2 (lock preserved).
+        assert_eq!(lt.holder_of(2), Some(TxnId(2)));
+        // T2's outgoing edge (2 -> 1) is gone, so there is no cycle anymore.
+        assert_eq!(lt.find_deadlock_victim(), None);
+        // T1's incoming-to-T2 wait edge (1 -> 2) is preserved: T1 still legitimately waits on T2.
+        // Releasing T2 must therefore free key 2 for T1.
+        lt.release_all(TxnId(2));
+        assert_eq!(lt.acquire(TxnId(1), 2), LockOutcome::Granted);
+    }
+
+    /// Clearing the waits of a transaction that holds no pending edge is a harmless no-op.
+    #[test]
+    fn clear_waits_is_idempotent_no_op_without_edges() {
+        let mut lt = LockTable::new();
+        lt.acquire(TxnId(1), 1);
+        lt.clear_waits(TxnId(1)); // T1 waits on nobody.
+        lt.clear_waits(TxnId(2)); // T2 is unknown.
+        assert_eq!(lt.holder_of(1), Some(TxnId(1)));
+        assert_eq!(lt.find_deadlock_victim(), None);
     }
 
     #[test]
