@@ -42,6 +42,13 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_storage::dwb::{Dwb, DwbPageStager};
 
+/// The device page of the EVICTION region's header slot (`rmp` #412): the batch region occupies pages
+/// `0 ..= DWB_MAX_BATCH`, and the eviction region's header is the next page. Mirrors `dwb.rs`'s
+/// `EVICT_REGION.header_slot` without exposing that private constant.
+fn evict_header_slot() -> u64 {
+    1 + graphus_storage::DWB_MAX_BATCH as u64
+}
+
 /// Builds a valid, checksummed page that self-identifies as `id` with `page_lsn` and a body fill.
 fn make_page(id: u64, lsn: u64, fill: u8) -> Page {
     let mut p = [fill; PAGE_SIZE];
@@ -339,13 +346,15 @@ fn staging_region_is_not_reused_until_the_home_write_is_durable() {
                 }
                 std::thread::yield_now();
             }
-            // SAMPLE the region's occupant while A's home write is still in flight (before it
+            // SAMPLE the eviction region's occupant while A's home write is still in flight (before it
             // completes/returns). The region MUST still describe A: its copy may not be evicted until
-            // A's home write is durable.
+            // A's home write is durable. The eviction path stages into the DWB's EVICTION region
+            // (header at page `1 + DWB_MAX_BATCH`, disjoint from the checkpoint batch region, `rmp`
+            // #412), so we read that header, not page 0.
             let mut hdr: Page = [0u8; PAGE_SIZE];
             dwb_dev1
-                .read_page(PageId(0), &mut hdr)
-                .expect("read dwb header");
+                .read_page(PageId(evict_header_slot()), &mut hdr)
+                .expect("read dwb eviction header");
             *region_sample.lock().unwrap() = Some(decode_region_homes(&hdr));
             write_back_home(&home1, PageId(3), &pa)
         };
@@ -409,9 +418,9 @@ fn staging_region_is_not_reused_until_the_home_write_is_durable() {
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(
-        dwb.staged_home_ids().expect("staged ids"),
+        dwb.evicted_home_ids().expect("evicted ids"),
         vec![PageId(5)],
-        "the region's final occupant is B (taken only after A was durable home)"
+        "the eviction region's final occupant is B (taken only after A was durable home)"
     );
 }
 
@@ -424,7 +433,8 @@ fn decode_region_homes(hdr: &Page) -> Vec<PageId> {
     const HDR_OFF_MAGIC: usize = bp::HEADER_SIZE;
     const HDR_OFF_COUNT: usize = HDR_OFF_MAGIC + 8;
     const HDR_OFF_HOMES: usize = HDR_OFF_COUNT + 8;
-    const DWB_MAGIC: u64 = 0x0000_0001_4257_4447;
+    // Two-region layout, version 2 (`rmp` #412).
+    const DWB_MAGIC: u64 = 0x0000_0002_4257_4447;
     if !bp::verify_checksum(hdr) {
         return Vec::new();
     }

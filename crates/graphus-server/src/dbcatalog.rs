@@ -2096,12 +2096,14 @@ mod tests {
         //    DWB through a fresh `Dwb` over the same file decodes its current batch's home ids.
         let staged = {
             let dwb = open_or_create_dwb(&device_file, None).expect("open dwb");
-            dwb.staged_home_ids().expect("decode dwb batch")
+            // The eviction path stages into the DWB's EVICTION region (disjoint from the checkpoint
+            // batch region, `rmp` #412), so read the eviction region's occupant, not the batch region.
+            dwb.evicted_home_ids().expect("decode dwb eviction batch")
         };
         assert!(
             !staged.is_empty(),
-            "the DWB must hold an eviction batch (no checkpoint cleared it) — got none, so no \
-             eviction staged into the DWB"
+            "the DWB eviction region must hold an eviction batch (no checkpoint cleared it) — got \
+             none, so no eviction staged into the DWB"
         );
 
         let mut bytes = std::fs::read(&device_file).expect("read store file");
