@@ -4748,6 +4748,16 @@ impl Accumulator {
         // `percentile` is `Some` whenever `numeric` is non-empty (both are set together in `update`).
         let perc = self.percentile.unwrap_or(0.0);
 
+        // Consumer-side bound (`rmp` #400, defense in depth): every index below is derived from
+        // `perc * count` and is in-range for the `perc ∈ [0.0, 1.0]` invariant `Accumulator::update`
+        // enforces at intake — no OOB is reachable on the current single-threaded fold. But the raw
+        // slice index lives one function away from its guard, and a future parallel-percentile path
+        // could feed an unvalidated `perc`. `clamp_idx` collapses any rogue index to the last in-set
+        // element rather than panicking, so an out-of-range value degrades to a defined in-set result
+        // instead of an OOB index. `count >= 1` here (the `count == 0` early-return above), so
+        // `count - 1` is the well-defined upper bound.
+        let clamp_idx = |idx: usize| idx.min(count - 1);
+
         match self.kind {
             AggKind::PercentileDisc => {
                 // Nearest-rank: returns a real value of the set (original subtype preserved).
@@ -4762,7 +4772,7 @@ impl Accumulator {
                         to_int - 1
                     }
                 };
-                self.numeric[idx].1.clone()
+                self.numeric[clamp_idx(idx)].1.clone()
             }
             AggKind::PercentileCont => {
                 // Linear interpolation; always yields a `Float`.
@@ -4770,8 +4780,8 @@ impl Accumulator {
                     return Value::Float(self.numeric[count - 1].0);
                 }
                 let float_idx = perc * (count - 1) as f64;
-                let floor = float_idx as usize; // truncation toward zero
-                let ceil = float_idx.ceil() as usize;
+                let floor = clamp_idx(float_idx as usize); // truncation toward zero
+                let ceil = clamp_idx(float_idx.ceil() as usize);
                 let value = if ceil == floor || floor == count - 1 {
                     self.numeric[floor].0
                 } else {

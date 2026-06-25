@@ -7,6 +7,7 @@
 //! returns correct results.
 
 use graphus_core::Value;
+use graphus_cypher::EvalError;
 use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::executor::{CancellationToken, ExecError, Executor, execute};
@@ -2205,4 +2206,139 @@ fn foreach_over_non_list_is_a_runtime_type_error() {
         "FOREACH over a non-list value is a runtime TypeError, got {err:?}"
     );
     assert_eq!(g.node_count(), 0, "no side effect ran for the bad list");
+}
+
+// =================================================================================================
+// Percentile aggregates — boundary safety (`rmp` task #400)
+// =================================================================================================
+
+/// Compiles and runs `src`, returning the first row's first column as a `Value`, panicking on any
+/// runtime error. Used to assert percentile boundary values never panic and return an in-set value.
+fn run_one(src: &str, graph: &mut MemGraph) -> Value {
+    let rows = run(src, graph);
+    assert_eq!(rows.len(), 1, "expected a single aggregate row for {src:?}");
+    let row = &rows[0];
+    row.value("p")
+}
+
+/// Compiles and runs `src`, returning the captured runtime error (expects one).
+fn run_expect_err(src: &str, graph: &mut MemGraph) -> ExecError {
+    let toks = tokenize(src).expect("lex");
+    let ast = parse_tokens(&toks, src).expect("parse");
+    let plan = plan_physical(&lower(&analyze(&ast).unwrap()), &IndexCatalog::empty());
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    // The percentile range is validated at intake (`Accumulator::update`), which runs as the
+    // aggregation consumes its input — surfacing either when the cursor is opened (eager aggregate
+    // drive) or on `collect_all`. Capture from whichever stage raises it.
+    match execute(&plan, &bound, graph) {
+        Err(e) => e,
+        Ok(mut cursor) => cursor
+            .collect_all()
+            .expect_err("expected a runtime error from the percentile query"),
+    }
+}
+
+#[test]
+fn percentile_disc_boundaries_never_panic_and_return_in_set_value() {
+    // The `rmp` #400 consumer-side bound, exercised at the dangerous edges. A LARGE group (so the
+    // `perc * count` index arithmetic is non-trivial) of the integers 0..1000; percentileDisc must
+    // return a real member of the set for every boundary `p` and never panic on an out-of-range index.
+    let mut g = MemGraph::new();
+    // p = 0.0 → smallest element (0).
+    assert_eq!(
+        run_one(
+            "UNWIND range(0, 999) AS x RETURN percentileDisc(x, 0.0) AS p",
+            &mut g
+        ),
+        i(0),
+        "percentileDisc(_, 0.0) is the minimum element"
+    );
+    // p = 1.0 → largest element (999). This is the index = count-1 boundary the clamp guards.
+    assert_eq!(
+        run_one(
+            "UNWIND range(0, 999) AS x RETURN percentileDisc(x, 1.0) AS p",
+            &mut g
+        ),
+        i(999),
+        "percentileDisc(_, 1.0) is the maximum element"
+    );
+    // p = 0.9999999 → very close to 1.0 but not equal: the index must still be in-set (== 999 by
+    // nearest-rank), and must NOT round up to an out-of-bounds index.
+    assert_eq!(
+        run_one(
+            "UNWIND range(0, 999) AS x RETURN percentileDisc(x, 0.9999999) AS p",
+            &mut g
+        ),
+        i(999),
+        "percentileDisc near 1.0 stays in-set (no OOB index)"
+    );
+    // A mid value is a genuine set member. By Neo4j's nearest-rank algorithm over 1000 elements,
+    // `float_idx = 0.5 * 1000 = 500.0` is an exact integer, so the rank is `500 - 1 = 499` (element
+    // value 499). The point is that it is a real member of the set, never an OOB index.
+    assert_eq!(
+        run_one(
+            "UNWIND range(0, 999) AS x RETURN percentileDisc(x, 0.5) AS p",
+            &mut g
+        ),
+        i(499),
+        "percentileDisc(_, 0.5) is a real set member (Neo4j nearest-rank)"
+    );
+}
+
+#[test]
+fn percentile_cont_boundaries_never_panic_and_return_in_set_value() {
+    // percentileCont over the same large group: every boundary `p` yields a defined Float within the
+    // value range [0, 999], never an OOB index panic.
+    let mut g = MemGraph::new();
+    assert_eq!(
+        run_one(
+            "UNWIND range(0, 999) AS x RETURN percentileCont(x, 0.0) AS p",
+            &mut g
+        ),
+        Value::Float(0.0),
+        "percentileCont(_, 0.0) is the minimum"
+    );
+    assert_eq!(
+        run_one(
+            "UNWIND range(0, 999) AS x RETURN percentileCont(x, 1.0) AS p",
+            &mut g
+        ),
+        Value::Float(999.0),
+        "percentileCont(_, 1.0) is the maximum"
+    );
+    // p just under 1.0: interpolates between 998 and 999, strictly inside the range — and crucially
+    // the `ceil` index is clamped so it can never index past count-1.
+    match run_one(
+        "UNWIND range(0, 999) AS x RETURN percentileCont(x, 0.9999999) AS p",
+        &mut g,
+    ) {
+        Value::Float(v) => assert!(
+            (998.0..=999.0).contains(&v),
+            "percentileCont near 1.0 stays in [998, 999], got {v}"
+        ),
+        other => panic!("percentileCont returns a Float, got {other:?}"),
+    }
+}
+
+#[test]
+fn percentile_out_of_range_is_number_out_of_range_error() {
+    // p > 1.0 and NaN must be rejected with `NumberOutOfRange` (the validator at intake), never reach
+    // the index path. NaN is rejected because it is not in `[0.0, 1.0]`.
+    let mut g = MemGraph::new();
+    let err = run_expect_err(
+        "UNWIND range(0, 999) AS x RETURN percentileDisc(x, 1.5) AS p",
+        &mut g,
+    );
+    assert!(
+        matches!(err, ExecError::Eval(EvalError::NumberOutOfRange { .. })),
+        "p > 1.0 is NumberOutOfRange, got {err:?}"
+    );
+    let err = run_expect_err(
+        "UNWIND range(0, 999) AS x RETURN percentileCont(x, (0.0/0.0)) AS p",
+        &mut g,
+    );
+    assert!(
+        matches!(err, ExecError::Eval(EvalError::NumberOutOfRange { .. })),
+        "NaN percentile is NumberOutOfRange, got {err:?}"
+    );
 }

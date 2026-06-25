@@ -1544,6 +1544,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
         // SSI predicate footprint: a composite-tuple equality replaces the label-scan fallback, so
         // preserve that exact read footprint (`04 §5.4`).
+        //
+        // The `mark_all_live_nodes` physical-key SIREADs alone are INSUFFICIENT for the node-key
+        // *absence* phantom (`rmp` #401): two concurrent CREATEs of a brand-new tuple with no
+        // existing holder each see an empty candidate set — neither node is in the other's live-set,
+        // so no physical-key rw-edge forms, and both commit a duplicate node-key. The label-scan
+        // fallback (`scan_nodes_by_label`) closes this hole by registering `PredicateRead::Label`,
+        // which pairs with every node insert's `note_predicate_write` `Label(L)` write footprint
+        // (`reindex_node`); the composite-index seek bypasses that fallback, so it must register the
+        // same coarse `Label` predicate read here. A coarse `Label` (rather than a precise composite
+        // `Equality` variant) is sound — it only adds an rw-edge between concurrent same-label
+        // writers, exactly as the scan fallback already did. (The single-property `IS UNIQUE` path
+        // `index_seek_eq` is unaffected: it registers a precise `Equality` predicate read, `rmp`
+        // #316, which already pairs with the writer's single-prop `Equality` write footprint.)
+        self.note_predicate_read(PredicateRead::Label(rule.label_token));
         self.mark_all_live_nodes();
         let candidates = index
             .borrow_mut()
