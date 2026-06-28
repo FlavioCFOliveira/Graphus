@@ -445,6 +445,93 @@ async fn idle_reaping_disabled_keeps_session_open() {
 }
 
 // ----------------------------------------------------------------------------------------------
+// 4b. F-NET-1 (rmp #469): an UNAUTHENTICATED connected-but-silent peer is reaped by the pre-auth
+//     deadline EVEN WITH idle reaping disabled, so it can never pin a slot/thread/socket forever.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn silent_unauthenticated_bolt_connection_is_reaped_pre_auth() {
+    // The headline slow-loris regression: a peer that connects over UDS but NEVER sends the Bolt
+    // handshake — a connected-but-silent UNAUTHENTICATED client — must not pin a connection slot +
+    // blocking thread + socket indefinitely. With idle reaping DISABLED (`idle_timeout_ms = 0`, the
+    // production default), the pre-auth deadline (= `handshake_timeout_ms`) still reaps it. Before the
+    // fix, idle disabled meant the post-handshake read had NO deadline at all and the connection was
+    // pinned until server shutdown — a trivial pre-auth connection-exhaustion DoS (F-NET-1).
+    let temp = TempStore::new("preauth-silent");
+    let mut config = base_config(&temp);
+    config.timing.idle_timeout_ms = 0; // idle reaping DISABLED (the production default)
+    config.timing.handshake_timeout_ms = 300; // strict pre-auth slow-loris guard
+    let server = boot(config).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // Connect and send NOTHING (no Bolt handshake). The server must reap us at the pre-auth deadline,
+    // closing the socket; our blocking read then returns EOF (or a reset).
+    let mut stream = UnixStream::connect(&uds).await.expect("connect UDS");
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("the server must reap the silent unauthenticated connection well within 5s");
+    match read {
+        Ok(0) => {} // clean EOF — the pre-auth deadline ended the session and closed the socket
+        Ok(n) => panic!("a reaped pre-auth connection must not yield bytes, got {n}"),
+        Err(_) => {} // a reset is equally valid evidence the server closed it
+    }
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn hello_without_logon_then_silent_is_reaped_pre_auth() {
+    // The pre-auth deadline spans the WHOLE pre-authentication phase, not just the opening handshake:
+    // a client that completes the Bolt handshake and sends HELLO but then withholds LOGON (still
+    // UNAUTHENTICATED) is reaped even with idle reaping disabled (rmp #469, F-NET-1).
+    let temp = TempStore::new("preauth-hello");
+    let mut config = base_config(&temp);
+    config.timing.idle_timeout_ms = 0;
+    config.timing.handshake_timeout_ms = 300;
+    let server = boot(config).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut stream = UnixStream::connect(&uds).await.expect("connect UDS");
+    // Handshake → reply, then HELLO → SUCCESS, then go silent (never LOGON).
+    let hs = encode_client_handshake([
+        Proposal::range(5, 4, 4),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ]);
+    stream.write_all(&hs).await.unwrap();
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [0x00, 0x00, 0x04, 0x05], "negotiated Bolt 5.4");
+    let mut dechunker = Dechunker::new();
+    send(
+        &mut stream,
+        &graphus_bolt::Request::Hello {
+            extra: vec![("user_agent".to_owned(), Value::String("preauth".to_owned()))],
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut stream, &mut dechunker).await,
+        graphus_bolt::Response::Success { .. }
+    ));
+
+    // Now silent before LOGON: still unauthenticated, so the pre-auth deadline must reap us.
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("the server must reap the unauthenticated (HELLO-only) session within 5s");
+    match read {
+        Ok(0) => {}
+        Ok(n) => panic!("a reaped pre-auth session must not yield bytes, got {n}"),
+        Err(_) => {}
+    }
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+// ----------------------------------------------------------------------------------------------
 // 5. Graceful shutdown still drains cleanly with the admission knobs in effect.
 // ----------------------------------------------------------------------------------------------
 

@@ -282,13 +282,27 @@ pub struct TimingConfig {
     /// Maximum time a newly-accepted network connection may take to complete its **TLS handshake**
     /// before the server drops it (`04 §8.4`; rmp #118). A stalled handshake otherwise pins an accept-
     /// side task and an open socket indefinitely, a classic slow-loris resource-exhaustion vector. In
-    /// milliseconds; must be > 0. UDS is exempt (no TLS — it is admitted by peer-cred at accept time).
+    /// milliseconds; must be > 0.
+    ///
+    /// It **also** serves as the Bolt **pre-authentication read deadline** (rmp #469, F-NET-1): after
+    /// the transport handshake, the same bound caps how long the still-unauthenticated client may take
+    /// over the Bolt handshake / `HELLO` / `LOGON` before it is reaped, so a connected-but-silent client
+    /// can never pin a connection slot + blocking thread + socket indefinitely. This pre-auth use
+    /// applies on **both** transports — including UDS, which has no TLS handshake but whose
+    /// peer-cred-admitted local client could otherwise stall the Bolt handshake. Once a session
+    /// authenticates, the (separate) [`idle_timeout_ms`](Self::idle_timeout_ms) governs it instead.
     pub handshake_timeout_ms: u64,
-    /// Maximum time a connection may sit **idle** (no inbound bytes) before the server reaps it, as a
-    /// read deadline applied to the per-connection session (`04 §9`; rmp #118). `0` **disables** idle
-    /// reaping (the default, so existing long-lived idle sessions are unaffected); any value `> 0`
-    /// enables it. Applies to the Bolt sessions (UDS + TCP) via the read bridge; the REST listener's
-    /// hyper stack manages its own connection lifetimes.
+    /// Maximum time an **authenticated** connection may sit **idle** (no inbound bytes) before the
+    /// server reaps it, as a read deadline applied to the per-connection session (`04 §9`; rmp #118).
+    /// `0` **disables** idle reaping (the default, so existing long-lived idle authenticated sessions —
+    /// e.g. a driver's pooled connections — are unaffected, matching Neo4j); any value `> 0` enables
+    /// it. Applies to the Bolt sessions (UDS + TCP) via the read bridge; the REST listener's hyper
+    /// stack manages its own connection lifetimes.
+    ///
+    /// This governs the connection **only after it authenticates**: the *pre*-authentication phase is
+    /// always bounded by [`handshake_timeout_ms`](Self::handshake_timeout_ms) (rmp #469, F-NET-1)
+    /// regardless of this value, so disabling idle reaping never re-opens the unauthenticated
+    /// slow-loris hole.
     pub idle_timeout_ms: u64,
     /// Maximum time the REST listener will wait for a client to send the **complete HTTP request
     /// headers** before it drops the connection (SEC-181; rmp #181). The TLS-handshake deadline

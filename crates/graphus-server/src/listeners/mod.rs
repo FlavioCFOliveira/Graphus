@@ -180,6 +180,10 @@ pub async fn start_all(
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
             idle_timeout,
+            // The Bolt pre-authentication read deadline (slow-loris guard, rmp #469 F-NET-1) reuses the
+            // handshake deadline: UDS has no TLS handshake, but the guard still bounds how long a
+            // peer-cred-admitted local client may withhold the Bolt handshake / HELLO / LOGON.
+            Some(handshake_timeout),
             shutdown.clone(),
         ));
         Some(bound)

@@ -60,7 +60,9 @@ fn session_config(advertised_bolt_address: Option<String>) -> SessionConfig {
 /// shared database-targeting + admin surface every per-connection executor routes through (rmp #84).
 /// `advertised_bolt_address` is the address routing drivers are told to reconnect to in a `ROUTE`
 /// reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore (rmp #118);
-/// `idle_timeout` reaps idle sessions when set (`None` = disabled).
+/// `idle_timeout` reaps idle sessions when set (`None` = disabled); `pre_auth_timeout` is the stricter
+/// slow-loris guard that reaps a connected-but-silent *unauthenticated* client before it can pin a slot
+/// (rmp #469, F-NET-1) — UDS is peer-cred gated, but the guard still bounds a misbehaving local client.
 #[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_uds_accept_loop(
     acceptor: UdsAcceptor,
@@ -70,6 +72,7 @@ pub async fn run_uds_accept_loop(
     metrics: Arc<Metrics>,
     conn_limit: Arc<Semaphore>,
     idle_timeout: Option<Duration>,
+    pre_auth_timeout: Option<Duration>,
     shutdown: ShutdownCoordinator,
 ) {
     let handle = Handle::current();
@@ -118,6 +121,7 @@ pub async fn run_uds_accept_loop(
                     Arc::clone(&auth),
                     session_config(advertised_bolt_address.clone()),
                     idle_timeout,
+                    pre_auth_timeout,
                     permit,
                     shutdown.clone(),
                 );
@@ -152,7 +156,9 @@ fn try_admit(
 /// (native LOGON auth happens inside the session). `context` is the shared database-targeting + admin
 /// surface (rmp #84). `advertised_bolt_address` is the address routing drivers are told to reconnect
 /// to in a `ROUTE` reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore,
-/// `handshake_timeout` bounds the TLS handshake, and `idle_timeout` reaps idle sessions (rmp #118).
+/// `handshake_timeout` bounds the TLS handshake **and** doubles as the Bolt pre-authentication read
+/// deadline (rmp #469, F-NET-1) reaping a client that completes TLS then withholds the Bolt
+/// handshake / `HELLO` / `LOGON`, and `idle_timeout` reaps idle *authenticated* sessions (rmp #118).
 #[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_tcp_accept_loop(
     acceptor: TcpAcceptor,
@@ -214,6 +220,11 @@ pub async fn run_tcp_accept_loop(
                                 auth,
                                 session_config(advertised),
                                 idle_timeout,
+                                // Reuse the handshake deadline as the Bolt pre-authentication read
+                                // deadline: after TLS, it bounds the time the (now unauthenticated)
+                                // client may take over the Bolt handshake / HELLO / LOGON before it is
+                                // reaped (rmp #469, F-NET-1).
+                                Some(handshake_timeout),
                                 permit,
                                 shutdown,
                             );
@@ -287,7 +298,11 @@ impl PeerCredSource for FixedPeerCred {
 ///
 /// `idle_timeout`, when set, is installed as the transport's per-read deadline so a session that goes
 /// silent (no inbound bytes) within the window is reaped: the bridged read returns EOF and the session
-/// loop ends cleanly (rmp #118). `permit` is the connection-admission permit (rmp #118); it is moved
+/// loop ends cleanly (rmp #118). `pre_auth_timeout` is the **stricter** read deadline applied until the
+/// session authenticates (rmp #469, F-NET-1): it reaps a connected-but-silent *unauthenticated* client
+/// that withholds the Bolt handshake / `HELLO` / `LOGON`, so such a client can never pin a connection
+/// slot + blocking thread + socket indefinitely; on `LOGON` success the transport relaxes to
+/// `idle_timeout`. `permit` is the connection-admission permit (rmp #118); it is moved
 /// into the task and held for the whole session, releasing the global connection-budget slot on drop
 /// when the connection ends.
 ///
@@ -304,6 +319,7 @@ fn spawn_session<S>(
     auth: Arc<dyn AuthProvider>,
     session_config: SessionConfig,
     idle_timeout: Option<Duration>,
+    pre_auth_timeout: Option<Duration>,
     permit: OwnedSemaphorePermit,
     shutdown: ShutdownCoordinator,
 ) where
@@ -313,7 +329,8 @@ fn spawn_session<S>(
         // Hold the connection-admission permit for the session's lifetime; it releases on drop when
         // this task returns (rmp #118).
         let _permit = permit;
-        let transport = AsyncToBlockingTransport::new(stream, handle, shutdown, idle_timeout);
+        let transport =
+            AsyncToBlockingTransport::new(stream, handle, shutdown, idle_timeout, pre_auth_timeout);
         let executor = BoltEngineExecutor::new(context, source);
         let mut session =
             BoltSession::with_config(transport, executor, auth.as_ref(), session_config);

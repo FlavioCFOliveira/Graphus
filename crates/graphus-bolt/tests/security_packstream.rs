@@ -101,6 +101,73 @@ fn list_with_real_elements_is_bounded_by_input_length() {
     );
 }
 
+// ---- decode-bomb amplification quantification (rmp #469) --------------------------------------
+
+/// Quantifies the worst-case memory **amplification** of the PackStream decoder: a small adversarial
+/// input must never force an allocation sized by a *claimed* count. Two invariants are pinned, which
+/// together bound the absolute transient-memory ceiling of one in-flight message decode:
+///
+/// 1. **Per-collection pre-allocation is decoupled from the header.** A `LIST_32` / `MAP_32` claiming
+///    `u32::MAX` (~4.29e9) elements with no body errors cleanly (the decode loop fails at
+///    end-of-input) — it never reserves ~4 billion slots. The pre-allocation is capped at
+///    `MAX_PREALLOC` (1024) regardless of the claim, so the worst case for one collection is
+///    `1024 × size_of::<slot>()`, NOT `claimed × size_of::<slot>()` (the difference between a few KiB
+///    and hundreds of GiB / a process abort).
+///
+/// 2. **The multiplicative (nested) pre-allocation is capped by `MAX_DECODE_DEPTH`.** The only way to
+///    stack many capped reservations live at once is to nest collections; that is bounded at
+///    `MAX_DECODE_DEPTH` (256) levels, above which decoding is rejected. So the absolute worst-case
+///    transient allocation for ONE message decode is `MAX_DECODE_DEPTH × MAX_PREALLOC ×
+///    size_of::<slot>()` — a *fixed* ceiling in the low tens of MiB, independent of the claimed counts
+///    and of the (64 MiB-capped) wire message size, and freed the instant the decode returns/errors.
+///
+/// The measured amplification ratio is therefore bounded: from ~1.5 KiB of crafted input (the nested
+/// bomb below) the peak transient is `MAX_DECODE_DEPTH × MAX_PREALLOC × slot` ≈ 10–17 MiB — a hard,
+/// constant ceiling — whereas an unbounded decoder would have turned the same input into a multi-GiB
+/// abort. This test asserts both bounds and that the ceiling stays small.
+#[test]
+fn decode_amplification_is_bounded_not_header_driven() {
+    use graphus_bolt::packstream::MAX_DECODE_DEPTH;
+
+    // (1) A single max-width collection header with NO body must error, never reserve from the header.
+    assert!(
+        dec(&[0xD6, 0xFF, 0xFF, 0xFF, 0xFF]).is_err(),
+        "LIST_32 claiming u32::MAX with no body must error, not reserve ~4 billion slots"
+    );
+    assert!(
+        dec(&[0xDA, 0xFF, 0xFF, 0xFF, 0xFF]).is_err(),
+        "MAP_32 claiming u32::MAX with no body must error, not reserve ~4 billion slots"
+    );
+
+    // (2) The multiplicative depth bound: LIST_32s each claiming u32::MAX, nested past the depth
+    //     limit, are rejected with a depth error — so at most MAX_DECODE_DEPTH capped reservations can
+    //     ever be live at once (the factor that bounds total transient memory). This input is ~1.5 KiB
+    //     yet would, without the cap, demand 4 billion slots PER level.
+    let mut bomb = Vec::new();
+    for _ in 0..(MAX_DECODE_DEPTH + 50) {
+        bomb.extend_from_slice(&[0xD6, 0xFF, 0xFF, 0xFF, 0xFF]); // LIST_32 claiming u32::MAX
+    }
+    let err = dec(&bomb).expect_err("a nested decode bomb past the depth limit must be rejected");
+    assert!(
+        format!("{err}").contains("depth"),
+        "expected a depth-limit error (the multiplicative-prealloc cap), got: {err}"
+    );
+
+    // Document/verify the ceiling numerically from the real constants and the worst-case (map) slot —
+    // a regression tripwire if either the depth cap or the value layout balloons. MAX_PREALLOC is 1024
+    // (the crate's documented, `pub(crate)` cap); the map slot `(String, Value)` is the largest a
+    // collection element can be.
+    const MAX_PREALLOC: usize = 1024;
+    let map_slot = std::mem::size_of::<(String, graphus_core::Value)>();
+    let ceiling_bytes = MAX_DECODE_DEPTH * MAX_PREALLOC * map_slot;
+    assert!(
+        ceiling_bytes <= 32 * 1024 * 1024,
+        "worst-case transient prealloc ceiling ({ceiling_bytes} bytes = {MAX_DECODE_DEPTH} depth × \
+         {MAX_PREALLOC} prealloc × {map_slot}-byte map slots) must stay in the low tens of MiB; a \
+         larger value means the decode-bomb amplification ceiling has regressed"
+    );
+}
+
 // ---- deep nesting / stack overflow ------------------------------------------------------------
 
 #[test]

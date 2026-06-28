@@ -213,6 +213,97 @@ mod tests {
         );
     }
 
+    /// State-machine abuse — **RESET storm** (rmp #469): a flood of `RESET`s after login must be
+    /// handled one-for-one with bounded state and no panic. `RESET` in `READY` is always valid (it
+    /// clears any failure and returns to `READY`), so each is acknowledged `SUCCESS`; the response set
+    /// stays bounded (one per request) and the session ends cleanly. This pins that repeated control
+    /// messages cannot accumulate unbounded state or wedge the state machine.
+    #[test]
+    fn reset_storm_is_bounded_and_never_panics() {
+        let auth = sim_auth();
+        const STORM: usize = 2000;
+        let mut reqs = login_prologue();
+        reqs.extend((0..STORM).map(|_| Request::Reset));
+        reqs.push(Request::Goodbye);
+        let responses = run_scripted_bolt_session(engine(), 1, &auth, &reqs).expect("runs");
+        // No FAILURE/IGNORED: every RESET in READY is acknowledged. Bounded: one response per request
+        // (2 login + STORM resets), GOODBYE writes none.
+        assert!(
+            !responses
+                .iter()
+                .any(|r| matches!(r, graphus_bolt::Response::Failure { .. })),
+            "a RESET storm in READY must never FAIL: {:?}",
+            &responses[..responses.len().min(8)],
+        );
+        assert_eq!(
+            responses.len(),
+            STORM + 2,
+            "exactly one response per request (login + each RESET), no runaway/accumulation",
+        );
+    }
+
+    /// State-machine abuse — **BEGIN-without-COMMIT loop** (rmp #469): a client that opens an explicit
+    /// transaction then sends `BEGIN` again (and again …) must NOT stack nested transactions. The
+    /// first `BEGIN` succeeds (→ `TX_READY`); the second is an unexpected message in `TX_READY` →
+    /// `FAILURE` → `FAILED`; every subsequent `BEGIN` is `IGNORED` until the connection closes (the
+    /// abandoned tx is rolled back on `GOODBYE`). Only one transaction is ever open — bounded state,
+    /// deterministic rejection, no panic, no unbounded tx accumulation.
+    #[test]
+    fn begin_without_commit_loop_opens_at_most_one_tx() {
+        let auth = sim_auth();
+        const LOOP: usize = 1000;
+        let mut reqs = login_prologue();
+        reqs.extend((0..LOOP).map(|_| Request::Begin { extra: vec![] }));
+        reqs.push(Request::Goodbye);
+        let responses = run_scripted_bolt_session(engine(), 2, &auth, &reqs).expect("runs");
+        let failures = responses
+            .iter()
+            .filter(|r| matches!(r, graphus_bolt::Response::Failure { .. }))
+            .count();
+        let ignored = responses
+            .iter()
+            .filter(|r| matches!(r, graphus_bolt::Response::Ignored))
+            .count();
+        // Exactly one repeated-BEGIN rejection (the 2nd BEGIN), then the rest are IGNORED in FAILED.
+        assert_eq!(
+            failures, 1,
+            "a second BEGIN must be rejected exactly once (no nested tx): {failures} failures",
+        );
+        assert_eq!(
+            ignored,
+            LOOP - 2,
+            "every BEGIN after the rejection is IGNORED until close (bounded state)",
+        );
+        // Bounded: 2 login SUCCESS + 1 BEGIN SUCCESS + 1 FAILURE + (LOOP-2) IGNORED.
+        assert_eq!(responses.len(), LOOP + 2);
+    }
+
+    /// State-machine abuse — **oversized HELLO metadata map** (rmp #469): a `HELLO` whose `extra`
+    /// dictionary carries a large number of entries (framing-bounded, but far beyond anything a real
+    /// driver sends) must be decoded with input-bounded memory (the PackStream pre-allocation cap) and
+    /// handled deterministically — never a panic or an unbounded allocation. With a valid `user_agent`
+    /// present the HELLO is accepted; the point is that a huge metadata map is processed in bounded
+    /// space and time.
+    #[test]
+    fn oversized_hello_metadata_is_bounded() {
+        let auth = sim_auth();
+        let mut extra: Vec<(String, Value)> = (0..20_000)
+            .map(|i| (format!("k{i}"), Value::Integer(i)))
+            .collect();
+        extra.push(("user_agent".to_owned(), Value::String("flood".to_owned())));
+        let reqs = vec![Request::Hello { extra }, Request::Goodbye];
+        let responses = run_scripted_bolt_session(engine(), 3, &auth, &reqs).expect("runs");
+        // A defined, bounded outcome (HELLO SUCCESS acknowledging the connection), no panic/runaway.
+        assert!(
+            responses
+                .iter()
+                .any(|r| matches!(r, graphus_bolt::Response::Success { .. })),
+            "an oversized-but-valid HELLO is accepted in bounded space: {:?}",
+            &responses[..responses.len().min(4)],
+        );
+        assert!(responses.len() < 100, "bounded response set");
+    }
+
     /// Determinism: a malformed stream produces the identical outcome on replay.
     #[test]
     fn misbehaviour_is_deterministic() {

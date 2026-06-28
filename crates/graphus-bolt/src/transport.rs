@@ -58,6 +58,20 @@ pub trait Transport {
     fn flush(&mut self) -> BoltResult<()> {
         Ok(())
     }
+
+    /// Signals that the connection has just **authenticated** (a `LOGON` succeeded and the session
+    /// reached `READY`). It is called **once**, at the single transition out of the pre-authentication
+    /// phase (`CONNECTED`/`AUTHENTICATION` → `READY`).
+    ///
+    /// A transport that enforces a stricter **pre-authentication read deadline** — to reap a
+    /// connected-but-silent peer that completes the transport handshake but then withholds the Bolt
+    /// handshake / `HELLO` / `LOGON` (a slow-loris / connection-pinning denial of service by an
+    /// *unauthenticated* client) — uses this signal to **relax** that deadline to its steady-state idle
+    /// policy, so a legitimate long-lived authenticated session is not reaped. The default is a no-op:
+    /// a transport with no deadline (the in-memory test transport, the simulator's byte pipe) ignores
+    /// it, so this is a pure additive hardening seam with no behavioural change for existing
+    /// transports.
+    fn on_authenticated(&mut self) {}
 }
 
 /// A mutable reference to a transport is itself a transport (mirroring `std::io::Read`/`Write` for
@@ -75,6 +89,10 @@ impl<T: Transport + ?Sized> Transport for &mut T {
 
     fn flush(&mut self) -> BoltResult<()> {
         (**self).flush()
+    }
+
+    fn on_authenticated(&mut self) {
+        (**self).on_authenticated();
     }
 }
 

@@ -533,6 +533,12 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                         self.principal = Some(user);
                         self.send(&Response::Success { metadata: vec![] })?;
                         self.state = State::Ready;
+                        // The connection has authenticated: relax the transport's stricter
+                        // *pre-authentication* read deadline (the slow-loris guard that reaps a
+                        // connected-but-silent unauthenticated client) to its steady-state idle policy,
+                        // so a legitimate long-lived authenticated session is not reaped (rmp #469,
+                        // F-NET-1). A no-op on transports without a deadline.
+                        self.transport.on_authenticated();
                     }
                     Err(failure) => {
                         // Record the failed attempt for audit (rmp #70) before the FAILURE goes out.
