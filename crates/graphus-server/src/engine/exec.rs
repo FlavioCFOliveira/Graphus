@@ -258,6 +258,7 @@ pub(super) fn handle_run<
     dispatch: &ReadDispatch<D, S>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
+    db: &str,
     clock: &Arc<dyn Clock + Send + Sync>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> RunOutcome {
@@ -287,7 +288,7 @@ pub(super) fn handle_run<
     let plan = match compile_cached(plan_cache, query, coordinator, extensions.as_ref()) {
         Ok(p) => p,
         Err(e) => {
-            finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
+            finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics, db);
             let _ = reply.send(Err(e));
             return RunOutcome::Done;
         }
@@ -295,7 +296,7 @@ pub(super) fn handle_run<
     let bound = match bind_parameters(&plan, &to_parameters(params)) {
         Ok(b) => b,
         Err(e) => {
-            finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
+            finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics, db);
             let _ = reply.send(Err(GraphusError::Runtime(e.to_string())));
             return RunOutcome::Done;
         }
@@ -304,7 +305,7 @@ pub(super) fn handle_run<
     // Reject a write in a read-only transaction (`06 §4`). The physical plan carries whether it
     // mutates; we detect it structurally via the plan's writes flag.
     if mode == AccessMode::Read && plan_writes(&plan) {
-        finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
+        finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics, db);
         let _ = reply.send(Err(GraphusError::Transaction(
             "write statement attempted in a READ transaction".to_owned(),
         )));
@@ -378,7 +379,7 @@ pub(super) fn handle_run<
             Err(e) => {
                 // The txn vanished between `begin` and here (should not happen on the serial engine
                 // thread); surface it and finalise the auto-commit.
-                finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics);
+                finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics, db);
                 let _ = reply.take().expect("reply present").send(Err(e));
                 return RunOutcome::Done;
             }
@@ -432,6 +433,7 @@ pub(super) fn handle_run<
                 open,
                 produced_ok,
                 metrics,
+                db,
                 clock,
             );
             // The egress channel closes when `inflight` (owning `row_tx`) drops at end of scope.
@@ -750,13 +752,14 @@ pub(super) fn resume_inflight<
     open: &mut HashMap<u64, OpenTx>,
     extensions: &ExtensionRegistry,
     metrics: &Metrics,
+    db: &str,
     clock: &Arc<dyn Clock + Send + Sync>,
 ) -> bool {
     let step = run_batch(inflight, coordinator, extensions);
     match step {
         BatchStep::Suspended => true,
         BatchStep::Done { produced_ok } => {
-            finalize_inflight(inflight, coordinator, open, produced_ok, metrics, clock);
+            finalize_inflight(inflight, coordinator, open, produced_ok, metrics, db, clock);
             false
         }
     }
@@ -914,6 +917,7 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
     open: &mut HashMap<u64, OpenTx>,
     produced_ok: bool,
     metrics: &Metrics,
+    db: &str,
     clock: &Arc<dyn Clock + Send + Sync>,
 ) {
     // A seam-captured deferral error (the load-bearing `RecordStoreGraph` invariant) is the terminal
@@ -938,6 +942,7 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             produced_ok,
             &inflight.row_tx,
             metrics,
+            db,
         );
     }
 
@@ -952,9 +957,9 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
     // reading at 0; `monotonic_elapsed` additionally caps an absurd forward jump at a sane ceiling so a
     // hostile clock cannot poison the histogram or fire a bogus slow-query alert.
     let elapsed = monotonic_elapsed(inflight.started_nanos, clock.now_nanos());
-    metrics.observe_query_latency(elapsed);
+    metrics.observe_query_latency_for(db, elapsed);
     if elapsed >= slow_threshold() {
-        metrics.record_slow_query();
+        metrics.record_slow_query_for(db);
         tracing::warn!(
             target: "graphus::slow_query",
             duration_ms = elapsed.as_millis() as u64,
@@ -1012,25 +1017,26 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
     produced_ok: bool,
     row_tx: &RowSender,
     metrics: &Metrics,
+    db: &str,
 ) {
     let Some(tx) = open.remove(&ticket.0) else {
         return;
     };
     if produced_ok {
         match coordinator.commit(tx.txn) {
-            Ok(_) => metrics.record_commit(),
+            Ok(_) => metrics.record_commit_for(db),
             Err(e) => {
                 // The COMMIT failed (e.g. SSI serialization abort): the transaction has been rolled
                 // back. Surface the failure to the consumer as a terminal stream error so the
                 // statement is reported as failed/retriable — never a silent success over rolled-back
                 // writes (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence).
                 let _ = row_tx.send(Err(e));
-                metrics.record_abort();
+                metrics.record_abort_for(db);
             }
         }
     } else {
         let _ = coordinator.rollback(tx.txn);
-        metrics.record_abort();
+        metrics.record_abort_for(db);
     }
 }
 
@@ -1042,13 +1048,14 @@ fn finish_failed_autocommit<D: BlockDevice, S: LogSink>(
     ticket: TxTicket,
     auto_commit: bool,
     metrics: &Metrics,
+    db: &str,
 ) {
     if !auto_commit {
         return;
     }
     if let Some(tx) = open.remove(&ticket.0) {
         let _ = coordinator.rollback(tx.txn);
-        metrics.record_abort();
+        metrics.record_abort_for(db);
     }
 }
 

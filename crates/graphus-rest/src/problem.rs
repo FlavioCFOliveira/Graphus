@@ -234,6 +234,23 @@ impl Problem {
         .with_code(CODE_REQUEST_INVALID)
     }
 
+    /// A **429 Too Many Requests** when the open-transaction cap is reached (rmp #448, CWE-770): one
+    /// authenticated principal cannot accumulate unbounded open explicit transactions (each pins the MVCC
+    /// GC watermark and grows memory on a shared engine — a slow-motion OOM affecting co-tenants). It is
+    /// a **retriable** load-shed: the client should back off and retry once an in-flight transaction
+    /// commits/expires and frees a slot, so it carries a *transient* (not client-fault) Neo error code,
+    /// matching how a "server busy" admission reject is surfaced.
+    #[must_use]
+    pub fn too_many_transactions(detail: impl Into<String>) -> Self {
+        Problem::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too-many-transactions",
+            "too many open transactions",
+            detail,
+        )
+        .with_code(CODE_TXN_TERMINATED)
+    }
+
     /// A **404 Not Found** for an unknown transaction id (`04 §8.2`).
     #[must_use]
     pub fn unknown_transaction(id: &str) -> Self {

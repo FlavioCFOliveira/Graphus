@@ -238,6 +238,7 @@ pub async fn start_all(
             readiness.clone(),
             config.metrics_scrape_token.as_deref().map(Arc::from),
             config.timing.transaction_idle_timeout(),
+            config.admission.max_open_transactions,
         );
         tokio::spawn(rest::run_rest_accept_loop(
             acceptor,
@@ -286,6 +287,7 @@ fn build_rest_router(
     readiness: crate::observability::Readiness,
     metrics_scrape_token: Option<Arc<str>>,
     transaction_idle_timeout: std::time::Duration,
+    max_open_transactions: usize,
 ) -> axum::Router {
     use graphus_rest::registry::TxRegistry;
     use graphus_rest::router::{AppState, router};
@@ -294,10 +296,13 @@ fn build_rest_router(
     // The transaction TTL is the configured inactivity timeout (rmp #389), on the monotonic clock
     // (rmp #395). An open transaction idle past it is rolled back by the inactivity sweep spawned
     // below — a transaction abandoned by a client no longer leaks (pinning the GC watermark, growing
-    // RAM/version slots) forever.
-    let registry = Arc::new(TxRegistry::new(
-        u64::try_from(transaction_idle_timeout.as_nanos()).unwrap_or(u64::MAX),
-    ));
+    // RAM/version slots) forever. The open-transaction CAP (rmp #448, CWE-770) bounds the LIVE count
+    // within that window: a `BEGIN` past `max_open_transactions` is `429`-rejected, so one authenticated
+    // principal cannot accumulate unbounded GC-watermark-pinning snapshots on the shared engine.
+    let registry = Arc::new(
+        TxRegistry::new(u64::try_from(transaction_idle_timeout.as_nanos()).unwrap_or(u64::MAX))
+            .with_max_open_transactions(max_open_transactions),
+    );
     // Spawn the periodic inactivity sweep (rmp #389): a single low-frequency background task that rolls
     // back every transaction idle past the timeout. It owns its own `Arc` clones of the registry,
     // engine and clock, runs until shutdown, and never blocks the request path.

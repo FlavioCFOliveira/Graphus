@@ -55,6 +55,23 @@ pub const IDEMPOTENCY_MAX_ENTRIES: usize = 4096;
 /// thread, exactly as the transaction-expiry path works).
 pub const IDEMPOTENCY_TTL_NANOS: u64 = 5 * 60 * 1_000_000_000;
 
+/// Default ceiling on the number of **concurrently-open explicit REST transactions** the registry will
+/// admit (rmp #448, CWE-770).
+///
+/// A REST explicit transaction is stateless and URL-named: it outlives the connection that opened it
+/// and is bounded *only* by its inactivity TTL (a 60s window — rmp #389), so within that window an
+/// authenticated principal can `POST /db/{db}/tx` in a tight loop and accumulate open transactions
+/// without limit. Each one eagerly captures a snapshot and **pins the MVCC GC watermark**, freezing
+/// reclamation on that database's engine and growing RAM + version slots — a slow-motion OOM on a
+/// **shared** engine that affects co-tenants (the catalog's single registry spans every database). This
+/// cap bounds the live count so the open path is `429`-rejected past it (the client backs off and
+/// retries), exactly as the connection-admission cap bounds connections and the idempotency cache is
+/// capped — a bounded, self-limiting structure rather than an unbounded map. `1024` comfortably covers a
+/// busy multi-client deployment's legitimate concurrent explicit transactions while capping a hostile or
+/// buggy client's accumulation. Override per deployment via
+/// [`TxRegistry::with_max_open_transactions`](crate::registry::TxRegistry::with_max_open_transactions).
+pub const DEFAULT_MAX_OPEN_TRANSACTIONS: usize = 1024;
+
 /// A cached idempotent response: exactly the bytes (and content type + status) to replay for a
 /// repeated `Idempotency-Key` (`04 §8.2`).
 #[derive(Debug, Clone)]
@@ -108,10 +125,37 @@ pub struct TxRegistry {
     inner: Mutex<Inner>,
     /// How long an idle transaction lives, in nanoseconds on the injected clock's timeline.
     ttl_nanos: u64,
+    /// Hard ceiling on the number of concurrently-open transactions (rmp #448, CWE-770). The capped
+    /// open path ([`try_open`](Self::try_open)) refuses past this — bounding the registry's memory and,
+    /// transitively, the number of GC-watermark-pinning snapshots a client can hold open. Defaults to
+    /// [`DEFAULT_MAX_OPEN_TRANSACTIONS`]; set via [`with_max_open_transactions`](Self::with_max_open_transactions).
+    max_open_transactions: usize,
     /// Monotonic counter minting the public, URL-facing transaction ids (`tx-<n>`), distinct from
     /// the engine's internal [`TxHandle`] ticket so the engine's id is never exposed.
     next_id: Mutex<u64>,
 }
+
+/// The capped open path ([`TxRegistry::try_open`]) refused a `BEGIN` because the registry already holds
+/// [`TxRegistry::max_open_transactions`] open transactions (rmp #448, CWE-770). It is a **retriable**
+/// load-shed (the client should back off and retry — an in-flight transaction will commit/expire and
+/// free a slot), which the router renders as `429 Too Many Requests`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyOpenTransactions {
+    /// The configured ceiling that was reached.
+    pub limit: usize,
+}
+
+impl std::fmt::Display for TooManyOpenTransactions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "too many open transactions (limit {}); retry after an in-flight transaction completes",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for TooManyOpenTransactions {}
 
 /// A stored idempotency entry: the bytes to replay plus the clock value at which it expires
 /// (rmp #184). The expiry is evaluated lazily against the injected clock on each access.
@@ -162,14 +206,34 @@ impl Inner {
 }
 
 impl TxRegistry {
-    /// Creates an empty registry whose transactions expire after `ttl_nanos` of inactivity.
+    /// Creates an empty registry whose transactions expire after `ttl_nanos` of inactivity, with the
+    /// default open-transaction cap ([`DEFAULT_MAX_OPEN_TRANSACTIONS`], rmp #448). Override the cap with
+    /// [`with_max_open_transactions`](Self::with_max_open_transactions).
     #[must_use]
     pub fn new(ttl_nanos: u64) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             ttl_nanos,
+            max_open_transactions: DEFAULT_MAX_OPEN_TRANSACTIONS,
             next_id: Mutex::new(0),
         }
+    }
+
+    /// Sets the maximum number of concurrently-open transactions (rmp #448, CWE-770): the capped open
+    /// path ([`try_open`](Self::try_open)) refuses past `max` with a retriable
+    /// [`TooManyOpenTransactions`]. Returns `self` for chaining at construction. A `0` is clamped to `1`
+    /// (a zero cap would reject every `BEGIN`, making the transactional surface unusable — almost
+    /// certainly a misconfiguration; one open transaction is the smallest workable budget).
+    #[must_use]
+    pub fn with_max_open_transactions(mut self, max: usize) -> Self {
+        self.max_open_transactions = max.max(1);
+        self
+    }
+
+    /// The configured open-transaction cap (rmp #448) — for tests / an observability gauge.
+    #[must_use]
+    pub fn max_open_transactions(&self) -> usize {
+        self.max_open_transactions
     }
 
     /// Registers a freshly-opened transaction, returning the public id it is addressed by and the
@@ -213,6 +277,64 @@ impl TxRegistry {
             },
         );
         (id, deadline_nanos)
+    }
+
+    /// Like [`open`](Self::open), but **refuses past the open-transaction cap** (rmp #448, CWE-770):
+    /// returns [`TooManyOpenTransactions`] (a retriable load-shed → `429`) when the registry already
+    /// holds [`max_open_transactions`](Self::max_open_transactions) open transactions, rather than
+    /// admitting an unbounded number of GC-watermark-pinning snapshots.
+    ///
+    /// The cap check and the insert happen **atomically under the registry lock**, so two concurrent
+    /// `BEGIN`s at the boundary cannot both slip past the cap (no TOCTOU over-admission). On rejection
+    /// the caller (the router) must **not** have opened an engine transaction — and it does not: this is
+    /// called *after* `RestEngine::begin` succeeds, so a rejection here means the engine transaction was
+    /// already opened. To keep that path leak-free the caller rolls the just-opened handle back on a cap
+    /// rejection (see the router's `begin` handler). The lock order (`next_id` then `inner`) matches
+    /// [`open`](Self::open), so there is no lock-ordering inversion; a rejected attempt consumes one
+    /// (opaque, monotonic, never-reused) id number, which is harmless.
+    ///
+    /// `principal`/`now_nanos` carry the same meaning as [`open`](Self::open).
+    ///
+    /// # Errors
+    /// [`TooManyOpenTransactions`] when the live open-transaction count is already at the cap.
+    pub fn try_open(
+        &self,
+        handle: TxHandle,
+        principal: &str,
+        db: &str,
+        mode: AccessMode,
+        now_nanos: u64,
+    ) -> Result<(String, u64), TooManyOpenTransactions> {
+        let id = {
+            let mut n = self
+                .next_id
+                .lock()
+                .expect("INVARIANT: id mutex un-poisoned");
+            *n += 1;
+            format!("tx-{n}")
+        };
+        let deadline_nanos = now_nanos.saturating_add(self.ttl_nanos);
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("INVARIANT: registry mutex un-poisoned");
+        // Cap check + insert are atomic under `inner`: no two concurrent BEGINs can both pass.
+        if inner.txns.len() >= self.max_open_transactions {
+            return Err(TooManyOpenTransactions {
+                limit: self.max_open_transactions,
+            });
+        }
+        inner.txns.insert(
+            id.clone(),
+            Entry {
+                handle,
+                principal: principal.to_owned(),
+                db: db.to_owned(),
+                mode,
+                deadline_nanos,
+            },
+        );
+        Ok((id, deadline_nanos))
     }
 
     /// Looks up an open transaction by id **owned by `principal`**, refreshing its deadline (resetting
@@ -717,5 +839,76 @@ mod tests {
         let (id2, _) = reg.open(h2, "alice", "g", AccessMode::Write, 0);
         assert_ne!(id1, id2);
         assert!(id1.starts_with("tx-"));
+    }
+
+    /// `rmp` #448 REGRESSION GATE (registry-level): `try_open` admits up to the configured
+    /// `max_open_transactions` and **refuses the next one** with the retriable [`TooManyOpenTransactions`]
+    /// — mirroring `idempotency_cache_is_capped_with_fifo_eviction`, but for the open-transaction cap
+    /// (the slow-OOM bound). A freed slot (a committed/expired transaction `take`n out) admits a new one
+    /// again, so the cap bounds the LIVE count, not the cumulative count.
+    #[test]
+    fn try_open_is_capped_and_rejects_past_the_limit() {
+        let engine = MockEngine::new();
+        const CAP: usize = 3;
+        let reg = TxRegistry::new(TTL).with_max_open_transactions(CAP);
+        assert_eq!(reg.max_open_transactions(), CAP);
+
+        // Open exactly the cap as one principal — every one admitted.
+        let mut ids = Vec::new();
+        for _ in 0..CAP {
+            let h = engine
+                .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+                .unwrap();
+            let (id, _) = reg
+                .try_open(h, "alice", "neo4j", AccessMode::Write, 0)
+                .expect("under the cap, BEGIN is admitted");
+            ids.push(id);
+        }
+        assert_eq!(reg.open_count(), CAP);
+
+        // The NEXT `try_open` (still the same principal) is rejected with the retriable error.
+        let h = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
+        let err = reg
+            .try_open(h, "alice", "neo4j", AccessMode::Write, 0)
+            .expect_err("past the cap, BEGIN must be rejected (rmp #448)");
+        assert_eq!(err, TooManyOpenTransactions { limit: CAP });
+        // The rejection did NOT add an entry — the live count is still exactly the cap.
+        assert_eq!(reg.open_count(), CAP);
+
+        // Free one slot (commit/rollback `take`s the entry out), then a new BEGIN is admitted again:
+        // the cap bounds the LIVE count, not the cumulative number of transactions ever opened.
+        let freed = ids.pop().unwrap();
+        assert!(reg.take(&freed, "alice").is_some());
+        assert_eq!(reg.open_count(), CAP - 1);
+        let h = engine
+            .begin("neo4j", AccessMode::Write, TEST_ORIGIN)
+            .unwrap();
+        assert!(
+            reg.try_open(h, "alice", "neo4j", AccessMode::Write, 0)
+                .is_ok(),
+            "a freed slot admits a new BEGIN — the cap is on the live count"
+        );
+        assert_eq!(reg.open_count(), CAP);
+    }
+
+    /// `rmp` #448: a `0` cap is clamped to `1` (a zero ceiling would reject every `BEGIN`, making the
+    /// transactional surface unusable — treated as a misconfiguration). The default cap is the documented
+    /// [`DEFAULT_MAX_OPEN_TRANSACTIONS`].
+    #[test]
+    fn open_transaction_cap_clamps_zero_and_defaults() {
+        assert_eq!(
+            TxRegistry::new(TTL).max_open_transactions(),
+            DEFAULT_MAX_OPEN_TRANSACTIONS,
+            "the default cap is DEFAULT_MAX_OPEN_TRANSACTIONS"
+        );
+        assert_eq!(
+            TxRegistry::new(TTL)
+                .with_max_open_transactions(0)
+                .max_open_transactions(),
+            1,
+            "a zero cap is clamped to 1 (one open transaction is the smallest workable budget)"
+        );
     }
 }

@@ -467,6 +467,14 @@ pub struct EngineParams {
     /// engine inline with a `SimClock`), so this field exists solely so the threaded (production)
     /// engine is itself clock-injectable and never reaches for `Instant::now()` directly.
     pub clock: std::sync::Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    /// Hard deadline for one engine's graceful drain on stop/shutdown (`rmp` #450): how long
+    /// [`DatabaseCatalog::stop_engine`] waits for that engine's `Shutdown` (drain → flush → fdatasync)
+    /// to complete before it **force-detaches** the (presumed wedged) engine and proceeds. Bounds the
+    /// blast radius of a single wedged engine thread: without it, a hung storage/buffer-pool syscall
+    /// makes `shutdown_all` never return while it holds the admin lock — blocking every *other* tenant's
+    /// admin op until the process is externally `SIGKILL`ed. Sourced from
+    /// [`TimingConfig::shutdown_drain_deadline`](crate::config::TimingConfig::shutdown_drain_deadline).
+    pub engine_shutdown_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for EngineParams {
@@ -483,6 +491,7 @@ impl std::fmt::Debug for EngineParams {
                 &self.master_key.as_ref().map(|_| "<redacted>"),
             )
             .field("clock", &"<dyn Clock>")
+            .field("engine_shutdown_timeout", &self.engine_shutdown_timeout)
             .finish()
     }
 }
@@ -525,6 +534,7 @@ impl EngineParams {
             reader_threads: config.admission.reader_threads(),
             master_key,
             clock: std::sync::Arc::new(crate::server::SystemClock),
+            engine_shutdown_timeout: config.timing.shutdown_drain_deadline(),
         })
     }
 }
@@ -763,6 +773,7 @@ fn open_wal_sink(wal_file: &Path, keyring: Option<&Keyring>) -> Result<WalSink, 
 /// [`open_or_create_coordinator`]. Blocking (waits for the engine's startup result); run it off
 /// the runtime.
 fn spawn_db_engine(
+    db_name: &str,
     dir: &Path,
     params: &EngineParams,
     metrics: Arc<Metrics>,
@@ -789,6 +800,7 @@ fn spawn_db_engine(
         open_or_create_coordinator(&device_file, &wal_file, pool_pages, master_key.as_ref())
     };
     spawn_engine(
+        Arc::from(db_name),
         build,
         params.engine_queue_capacity,
         params.result_buffer_capacity,
@@ -1241,7 +1253,7 @@ impl DatabaseCatalog {
         if let Some(running) = state.running.get(&self.default_name) {
             return Ok(running.handle.clone());
         }
-        let engine = self.spawn_in(self.root.clone()).await?;
+        let engine = self.spawn_in(&self.default_name, self.root.clone()).await?;
         let name = self.default_name.clone();
         Ok(self.register(&mut state, &name, engine))
     }
@@ -1262,7 +1274,7 @@ impl DatabaseCatalog {
             .map(|(name, _)| name.clone())
             .collect();
         for name in to_start {
-            match self.spawn_in(self.db_dir(&name)).await {
+            match self.spawn_in(&name, self.db_dir(&name)).await {
                 Ok(engine) => {
                     let _ = self.register(&mut state, &name, engine);
                     tracing::info!(db = %name, "database online");
@@ -1325,7 +1337,7 @@ impl DatabaseCatalog {
         self.persist_or_resync(&mut state, fallback).await?;
 
         // 3) Start the engine (creates the fresh store + WAL in the provisioned directory).
-        match self.spawn_in(dir.clone()).await {
+        match self.spawn_in(&name, dir.clone()).await {
             Ok(engine) => Ok(self.register(&mut state, &name, engine)),
             Err(e) => {
                 // Roll the entry back: a failed create must leave no trace. If the rollback
@@ -1388,7 +1400,7 @@ impl DatabaseCatalog {
             self.persist_or_resync(&mut state, fallback).await?;
         }
 
-        match self.spawn_in(self.db_dir(&name)).await {
+        match self.spawn_in(&name, self.db_dir(&name)).await {
             Ok(engine) => Ok(self.register(&mut state, &name, engine)),
             Err(e) => {
                 state.failed.insert(name, e.to_string());
@@ -1644,10 +1656,11 @@ impl DatabaseCatalog {
 
     /// Spawns one database's engine off the runtime (the open path blocks on WAL recovery +
     /// `verify_on_open`).
-    async fn spawn_in(&self, dir: PathBuf) -> Result<Engine, GraphusError> {
+    async fn spawn_in(&self, db_name: &str, dir: PathBuf) -> Result<Engine, GraphusError> {
         let params = self.params.clone();
         let metrics = Arc::clone(&self.metrics);
-        tokio::task::spawn_blocking(move || spawn_db_engine(&dir, &params, metrics))
+        let db_name = db_name.to_owned();
+        tokio::task::spawn_blocking(move || spawn_db_engine(&db_name, &dir, &params, metrics))
             .await
             .map_err(|e| GraphusError::Storage(format!("engine spawn task join: {e}")))?
     }
@@ -1676,16 +1689,59 @@ impl DatabaseCatalog {
     /// (no new consumer obtains a handle to a draining engine), drains + hardens via the engine's
     /// `Shutdown` command, then joins its thread off the runtime. Errors are logged — at this
     /// point the engine is going away regardless.
+    ///
+    /// ## Bounded drain (`rmp` #450)
+    ///
+    /// Both the `Shutdown` round-trip **and** the subsequent thread `join` are wrapped in a
+    /// [`tokio::time::timeout`] of [`EngineParams::engine_shutdown_timeout`]. A *wedged* engine thread
+    /// (a hung storage syscall, a buffer-pool livelock) would otherwise make `shutdown().await` —
+    /// `recv_async` on the reply — block forever, and because `shutdown_all` holds the admin lock for the
+    /// whole teardown, every **other** tenant's `CREATE/DROP/START/STOP DATABASE` would block until the
+    /// process is externally `SIGKILL`ed. On elapse we **force-detach**: log the wedged engine, abandon
+    /// its (detached) thread, and return so teardown proceeds to the next database. Durability is **not**
+    /// compromised — every acked commit is already in the WAL by the group-commit rule, so a forcibly
+    /// abandoned engine recovers cleanly on next open; only the *graceful* clean-checkpoint optimisation
+    /// is skipped for that one wedged database. The healthy engines still drain within their own
+    /// deadlines.
     async fn stop_engine(&self, name: &str, engine: RunningEngine) {
         self.write_handles().remove(name);
-        if let Err(e) = engine.handle.shutdown().await {
-            tracing::error!(db = %name, error = %e, "error hardening the store on stop");
-        }
-        let join = engine.join;
-        match tokio::task::spawn_blocking(move || join.join()).await {
+        let deadline = self.params.engine_shutdown_timeout;
+        match tokio::time::timeout(deadline, engine.handle.shutdown()).await {
+            // Drain round-trip completed within the deadline (cleanly or with a flush error).
             Ok(Ok(())) => {}
-            Ok(Err(_panic)) => tracing::error!(db = %name, "engine thread panicked"),
-            Err(e) => tracing::error!(db = %name, error = %e, "joining engine thread"),
+            Ok(Err(e)) => {
+                tracing::error!(db = %name, error = %e, "error hardening the store on stop");
+            }
+            // The engine did not even acknowledge `Shutdown` within the deadline: it is wedged. Do NOT
+            // wait on the join (it would block just as long). Force-detach and proceed — the admin lock
+            // is released for the next database / other tenants' admin ops.
+            Err(_elapsed) => {
+                tracing::error!(
+                    db = %name,
+                    timeout_ms = deadline.as_millis() as u64,
+                    "engine did not drain within the shutdown deadline; force-detaching the wedged \
+                     engine and proceeding (durability is preserved — acked commits are already in the \
+                     WAL; the store recovers cleanly on next open)",
+                );
+                // Drop the join handle WITHOUT joining: the OS thread is detached and torn down with the
+                // process. Joining a wedged thread is the very hang this fix exists to prevent.
+                drop(engine.join);
+                return;
+            }
+        }
+        // The drain completed; join the (now-exiting) thread, but still bounded so a thread that
+        // acknowledged `Shutdown` yet wedged during its final flush cannot hang teardown either.
+        let join = engine.join;
+        match tokio::time::timeout(deadline, tokio::task::spawn_blocking(move || join.join())).await
+        {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(_panic))) => tracing::error!(db = %name, "engine thread panicked"),
+            Ok(Err(e)) => tracing::error!(db = %name, error = %e, "joining engine thread"),
+            Err(_elapsed) => tracing::error!(
+                db = %name,
+                timeout_ms = deadline.as_millis() as u64,
+                "engine thread did not exit within the shutdown deadline after draining; detaching it",
+            ),
         }
     }
 
@@ -1938,6 +1994,7 @@ mod tests {
             reader_threads: 2,
             master_key: None,
             clock: std::sync::Arc::new(crate::server::SystemClock),
+            engine_shutdown_timeout: std::time::Duration::from_secs(10),
         }
     }
 
@@ -2773,5 +2830,114 @@ mod tests {
         assert!(dir.join(STORE_FILE_NAME).exists());
 
         catalog.shutdown_all().await;
+    }
+
+    /// `rmp` #450 REGRESSION GATE: a **wedged** engine (armed to block far longer than the configured
+    /// drain deadline inside its `Shutdown` handler) must NOT make [`DatabaseCatalog::shutdown_all`] hang.
+    /// `stop_engine` wraps each engine's drain in a [`tokio::time::timeout`] of
+    /// [`EngineParams::engine_shutdown_timeout`] and force-detaches a non-draining engine on elapse, so
+    /// `shutdown_all` returns within a bounded multiple of that deadline (it processes engines serially)
+    /// rather than blocking forever under the admin lock — the cross-tenant availability hazard #450
+    /// describes (a single wedged thread would otherwise freeze every other tenant's admin op until a
+    /// `SIGKILL`).
+    ///
+    /// Gated on `internal-test-udf` (the `arm_shutdown_hang` fault seam). The wedged engine blocks for a
+    /// duration *much* larger than the deadline; the assertion is that `shutdown_all` nonetheless returns
+    /// well before that, proving the timeout fired and force-detached it.
+    #[cfg(feature = "internal-test-udf")]
+    #[tokio::test]
+    async fn wedged_engine_does_not_hang_shutdown_all() {
+        use std::time::{Duration, Instant};
+
+        // A catalog whose per-engine drain deadline is a short 300ms.
+        let root = TempRoot::new("wedged-shutdown");
+        let mut params = test_params();
+        params.engine_shutdown_timeout = Duration::from_millis(300);
+        let catalog = DatabaseCatalog::open(
+            root.path.clone(),
+            DEFAULT_DATABASE_NAME,
+            params,
+            Arc::new(Metrics::new()),
+        )
+        .expect("open catalog");
+
+        // Bring up the default engine + a secondary, so `shutdown_all` has multiple engines to drain.
+        catalog.start_default().await.expect("start default");
+        let _ = catalog.create("alpha").await.expect("create alpha");
+
+        // Arm ONE engine to wedge for 3s inside its `Shutdown` handler — two orders of magnitude past
+        // the 300ms deadline. Without the #450 timeout, `shutdown_all` would block on this engine's
+        // drain for the full 3s (and longer, on the unbounded join).
+        crate::engine::arm_shutdown_hang(3_000);
+
+        // `shutdown_all` must return promptly: bounded by ~deadline-per-engine (it force-detaches the
+        // wedged one on elapse). Allow generous slack for CI scheduling, but it MUST be far below the 3s
+        // hang — proving the timeout fired rather than the engine actually draining.
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), catalog.shutdown_all())
+            .await
+            .expect("shutdown_all must not hang on a wedged engine (rmp #450)");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown_all returned in {elapsed:?} — bounded by the drain deadline, not the 3s wedge"
+        );
+
+        // Disarm so a sibling test in this binary is never affected by a residual armed hang.
+        crate::engine::arm_shutdown_hang(0);
+    }
+
+    /// `rmp` #450: while one engine is wedged, the admin lock `shutdown_all` holds is released within the
+    /// bounded deadline, so **another tenant's admin op** (here, a `create`) issued concurrently is not
+    /// blocked past that deadline. This is the cross-tenant amplification the #450 fix removes: a single
+    /// wedged engine must not freeze every other tenant's control-plane operation.
+    #[cfg(feature = "internal-test-udf")]
+    #[tokio::test]
+    async fn wedged_engine_does_not_block_other_tenants_admin_ops() {
+        use std::time::{Duration, Instant};
+
+        let root = TempRoot::new("wedged-cross-tenant");
+        let mut params = test_params();
+        params.engine_shutdown_timeout = Duration::from_millis(300);
+        let catalog = Arc::new(
+            DatabaseCatalog::open(
+                root.path.clone(),
+                DEFAULT_DATABASE_NAME,
+                params,
+                Arc::new(Metrics::new()),
+            )
+            .expect("open catalog"),
+        );
+
+        catalog.start_default().await.expect("start default");
+        let _ = catalog.create("alpha").await.expect("create alpha");
+
+        // Wedge an engine for 3s on shutdown, then start `shutdown_all` in the background (it grabs the
+        // admin lock and begins draining — blocking on the wedged engine until its 300ms deadline).
+        crate::engine::arm_shutdown_hang(3_000);
+        let bg = {
+            let catalog = Arc::clone(&catalog);
+            tokio::spawn(async move { catalog.shutdown_all().await })
+        };
+
+        // A concurrent admin op on ANOTHER database (`create beta`) must complete within a bounded time —
+        // it waits only for `shutdown_all` to release the admin lock, which the #450 deadline bounds. Far
+        // below the 3s wedge. (It may fail because the catalog is shutting down; what matters is it does
+        // not HANG for the full wedge — it returns, success or a clean error, within the bound.)
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), catalog.create("beta")).await;
+        let elapsed = started.elapsed();
+        assert!(
+            outcome.is_ok(),
+            "a concurrent admin op on another tenant must not block past the drain deadline (rmp #450) \
+             — it hung for {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the concurrent admin op returned in {elapsed:?} — bounded by the deadline, not the 3s wedge"
+        );
+
+        let _ = bg.await;
+        crate::engine::arm_shutdown_hang(0);
     }
 }

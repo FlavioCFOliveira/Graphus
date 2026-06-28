@@ -43,6 +43,7 @@ fn threaded_engine(reader_threads: usize) -> Engine {
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SharedClock::new(0));
     let metrics = Arc::new(graphus_server::metrics::Metrics::new());
     spawn_engine::<MemBlockDevice, MemLogSink, _>(
+        std::sync::Arc::from("test"),
         || {
             let device = MemBlockDevice::new(0);
             let wal = WalManager::create(MemLogSink::new())?;

@@ -38,17 +38,63 @@ use graphus_sim::SharedClock;
 use graphus_storage::RecordStore;
 use graphus_wal::{MemLogSink, WalManager};
 
-/// Serialises the tests in this binary. They share **process-global** mutable state — the morsel knobs
-/// (`set_morsel_*`) and the `rmp` #409 recovery-fault-injection static (`arm_recovery_fault`) — so they
-/// must not run concurrently or one test's global mutation would corrupt another's. cargo runs tests in
-/// one binary on multiple threads by default; each test takes this lock first to run serially. Returns a
-/// guard held for the test's duration; poisoning is irrelevant (a failed test already reports its own
-/// assertion), so a poisoned lock is recovered into.
-fn test_guard() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Serialises the tests in this binary and **resets every process-global** they touch on teardown.
+///
+/// These tests share process-global mutable state — the morsel knobs (`set_morsel_*` in
+/// `graphus-cypher`), the global `ANALYTICS_POOL` rayon pool, and the `rmp` #409 recovery-fault-injection
+/// static (`arm_recovery_fault` in `graphus-server`). cargo runs tests in one binary on multiple threads
+/// by default, so two tests mutating these globals concurrently would corrupt each other. Worse, a global
+/// *left mutated* by one test (the historical bug: `arm_recovery_fault(1)` was never reset to `0`, and
+/// `set_morsel_threads(4)`/`set_morsel_min_rows(0)` were only reset on the happy path — a panicking
+/// assertion `?`-bailed past the manual reset) leaked into the next test in the binary, making
+/// `engine_survives_morsel_worker_panic` reproducibly FLAKY (`rmp` #449).
+///
+/// [`TestGuard`] closes both holes at once. Acquiring it takes the binary-wide serialisation lock (so the
+/// tests never run concurrently) and resets every global to its **canonical default** up front, so a test
+/// starts from a known state regardless of what ran before it — even if a *prior* test panicked before its
+/// own teardown. Its [`Drop`] then resets every global again, so this test cannot leak state forward. The
+/// reset is unconditional and runs on the panicking-unwind path too (a plain field drop never aborts,
+/// unlike `set_hook`), so a failed assertion can no longer poison a sibling test.
+///
+/// Poisoning of the lock is irrelevant (a failed test already reports its own assertion), so a poisoned
+/// lock is recovered into.
+struct TestGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl TestGuard {
+    /// Takes the binary-wide lock and resets every shared global to its canonical default, so the test
+    /// body starts from a known state no matter what ran (or panicked) before it.
+    fn acquire() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_process_globals();
+        Self { _lock: lock }
+    }
+}
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        // Unconditional teardown — runs on the normal *and* the panicking-unwind path (a struct field
+        // drop never aborts, unlike `std::panic::set_hook`). This is the load-bearing fix for `rmp` #449:
+        // a test that fails an assertion still resets every global before the next test in this binary
+        // runs, so no leaked `arm_recovery_fault`/morsel-knob state can make a sibling flaky.
+        reset_process_globals();
+    }
+}
+
+/// Resets every process-global these tests mutate back to its canonical default:
+/// * `arm_recovery_fault(0)` — disarm the `rmp` #409 recovery-fault seam (the historical never-reset);
+/// * `set_morsel_threads(1)` — fully-serial morsel tier (the determinism / single-core default);
+/// * `set_morsel_min_rows(u64::MAX)` — the morsel cardinality gate effectively closed (no fan-out).
+fn reset_process_globals() {
+    use graphus_cypher::morsel::{set_morsel_min_rows, set_morsel_threads};
+    graphus_server::engine::arm_recovery_fault(0);
+    set_morsel_threads(1);
+    set_morsel_min_rows(u64::MAX);
 }
 
 /// Spawns a threaded engine with `reader_threads` reader workers over an in-memory store sized to keep
@@ -57,6 +103,7 @@ fn engine(reader_threads: usize) -> Engine {
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SharedClock::new(0));
     let metrics = Arc::new(graphus_server::metrics::Metrics::new());
     spawn_engine::<MemBlockDevice, MemLogSink, _>(
+        std::sync::Arc::from("test"),
         || {
             let device = MemBlockDevice::new(0);
             let wal = WalManager::create(MemLogSink::new())?;
@@ -171,7 +218,7 @@ fn run_reply_err(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<
 /// rollback* that follows panic too, exercising the second, deeper panic boundary (`catch_recovery`).
 #[test]
 fn engine_survives_recovery_double_panic() {
-    let _guard = test_guard();
+    let _guard = TestGuard::acquire();
     let _silence = SilencePanicHook::install();
     let eng = engine(0); // a single reader worker exists, but the WRITE below runs inline on the engine
     let handle = eng.handle.clone();
@@ -182,8 +229,8 @@ fn engine_survives_recovery_double_panic() {
         "seed statement commits on a healthy engine"
     );
     assert!(
-        !handle.metrics().is_engine_degraded(),
-        "engine starts healthy (not degraded)"
+        !handle.is_degraded(),
+        "engine starts healthy (not degraded — the per-engine #414 flag)"
     );
 
     // Arm the recovery fault so the rollback that recovers the next statement panic ALSO panics.
@@ -217,19 +264,17 @@ fn engine_survives_recovery_double_panic() {
         "must NOT be `engine_gone` — that would mean the engine thread died, got: {msg}"
     );
 
-    // The recovery boundary fired exactly once and flagged the engine degraded (drives /health/ready to
-    // 503). Checked after the ordered follow-up above, so the recovery is guaranteed complete.
+    // The recovery boundary fired exactly once, bumping the fleet-wide observability counter (drives
+    // nothing on its own — the GATING is the per-engine flag below). Checked after the ordered follow-up
+    // above, so the recovery is guaranteed complete.
     assert_eq!(
         handle.metrics().engine_recovery_panics(),
         1,
         "the recovery (double-panic) boundary must have caught exactly one recovery panic"
     );
-    assert!(
-        handle.metrics().is_engine_degraded(),
-        "a recovery double-panic must flag the aggregate degraded gauge (observability)"
-    );
-    // `rmp` #414: the GATING flag is now PER-ENGINE (on the handle), not on the shared `Metrics`. This
-    // is what confines the engine-degraded refusal to THIS database (the multi-DB isolation gate in
+    // `rmp` #414/#451: the GATING flag is PER-ENGINE (on the handle), not a shared `Metrics` gauge — the
+    // never-cleared, un-labelled fleet-wide `engine_degraded` gauge was removed (#451). The per-engine
+    // flag is what confines the engine-degraded refusal to THIS database (the multi-DB isolation gate in
     // `multi_database.rs` proves a sibling database stays serviceable when only this one is degraded).
     assert!(
         handle.is_degraded(),
@@ -247,7 +292,7 @@ fn engine_survives_recovery_double_panic() {
 /// still succeeds.
 #[test]
 fn engine_survives_inline_statement_panic() {
-    let _guard = test_guard();
+    let _guard = TestGuard::acquire();
     let _silence = SilencePanicHook::install();
     let eng = engine(2);
     let handle = eng.handle.clone();
@@ -290,9 +335,8 @@ fn engine_survives_inline_statement_panic() {
     shutdown(eng, handle);
 }
 
-/// Gate (b): a morsel-tier-shaped aggregate whose per-row work panics for one row, with the morsel
-/// tier **enabled and its cardinality gate wide open**, must still fail cleanly and leave the engine
-/// serving.
+/// Gate (b): a morsel-eligible per-row **projection** whose per-row work panics, with the morsel tier
+/// **enabled and its cardinality gate wide open**, must still fail cleanly and leave the engine serving.
 ///
 /// ## Why this proves the rayon/morsel path is covered (and no separate morsel boundary is needed)
 ///
@@ -302,30 +346,53 @@ fn engine_survives_inline_statement_panic() {
 /// boundary required. That re-raise property is proven directly and in isolation by the `graphus-cypher`
 /// unit test `morsel::tests::analytics_pool_worker_panic_reraises_on_calling_thread`.
 ///
-/// This end-to-end gate complements that: it drives a panicking per-row aggregate through the real
+/// This end-to-end gate complements that: it drives a panicking per-row projection through the real
 /// engine with the morsel tier active (`set_morsel_min_rows(0)`, `set_morsel_threads(4)`) and asserts
-/// the boundary catches it and the engine survives. (The morsel *purity gate*,
-/// `is_pure_per_row_expr`, deliberately rejects any function-call argument, so this particular
-/// `ext.panic`-bearing aggregate evaluates serially on the engine thread rather than fanning out — but
-/// the panic still traverses the aggregate/materializer machinery the morsel path shares, and the
-/// engine boundary catches it identically. The pure-rayon-worker re-raise is the cypher unit test's
-/// job.)
+/// the boundary catches it and the engine survives. (The morsel *purity gate*, `is_pure_per_row_expr`,
+/// deliberately rejects any function-call argument, so this particular `ext.panic`-bearing projection
+/// evaluates serially on the engine thread rather than fanning out — but the panic still traverses the
+/// projection/materializer machinery the morsel path shares, and the engine boundary catches it
+/// identically. The pure-rayon-worker re-raise is the cypher unit test's job.)
+///
+/// ## Determinism (`rmp` #449)
+///
+/// Two changes make this gate deterministic where it was reproducibly flaky (the suite failed ~18%
+/// run-to-run yet the test passed 100% **in isolation** — the signature of leaked process-global state):
+///
+/// 1. [`TestGuard`] resets EVERY shared process-global up front and on teardown — the morsel knobs AND
+///    `arm_recovery_fault(0)` (the historical never-reset). Crucially the teardown is a drop guard, so a
+///    *panicking* assertion no longer `?`-skips the reset and leaks state into the next test in the binary.
+///    The hook is silenced **only** around the deliberate panic and restored *before* the assertion phase
+///    (the explicit `drop(silence)`), so a genuine future regression prints rather than vanishing into a
+///    silenced hook.
+///
+/// 2. The deliberately-panicking statement is a per-row **projection** (`MATCH (m:M) RETURN
+///    ext.panic(m.v)`), NOT an *aggregate* (`sum(ext.panic(m.v))`). A projection MUST evaluate its
+///    expression for every row, so `ext.panic` is guaranteed to fire and the boundary records ≥ 1 caught
+///    panic. The original aggregate could be planned through a morsel-aggregation path that — depending on
+///    the process-global `ANALYTICS_POOL` (a `OnceLock` built once per process by whichever sibling test
+///    ran first, hence the *order*-dependence) — *sometimes* failed via a clean pre-evaluation error with
+///    `statement_panics == 0`, which neither `== 1` nor `>= 1` could survive. The projection removes that
+///    path-dependence entirely while keeping gate (b)'s intent (the morsel tier live over many rows).
+///
+/// The count is asserted `>= 1` (the boundary fired): the engine-survival assertion below is the real
+/// #386 invariant, and a `>=` floor is robust to however many times the boundary fires.
 #[test]
 fn engine_survives_morsel_worker_panic() {
     use graphus_cypher::morsel::{set_morsel_min_rows, set_morsel_threads};
 
-    let _guard = test_guard();
-    let _silence = SilencePanicHook::install();
+    let _guard = TestGuard::acquire();
 
-    // Enable the morsel tier and open its cardinality gate so the parallel machinery is live for this
-    // statement. Restored at the end so sibling tests in this binary see the defaults.
+    // Enable the morsel tier and open its cardinality gate so the parallel machinery is LIVE for this
+    // statement (gate (b)'s intent). Teardown is the `TestGuard` drop (resets these globals on the normal
+    // AND the panicking path) — never a manual reset here, which a failed assertion would skip (#449).
     set_morsel_threads(4);
     set_morsel_min_rows(0);
 
-    let eng = engine(0); // inline reads → the aggregate runs on the engine thread, exercising its boundary
+    let eng = engine(0); // inline reads → the per-row work runs on the engine thread, exercising its boundary
     let handle = eng.handle.clone();
 
-    // A handful of :M nodes so the aggregate has rows to evaluate over.
+    // A handful of :M nodes so the per-row projection has rows to evaluate over.
     for i in 0..16 {
         assert!(
             run_collect(
@@ -338,21 +405,32 @@ fn engine_survives_morsel_worker_panic() {
         );
     }
 
-    // A per-row aggregate whose per-row work (`ext.panic`) panics. The per-statement boundary converts
-    // it to a clean failure regardless of whether it ran serially or fanned out.
-    let panicked = run_collect(
-        &handle,
-        AccessMode::Read,
-        "MATCH (m:M) RETURN sum(ext.panic(m.v))",
-    );
+    // A morsel-eligible **per-row projection** whose per-row work (`ext.panic`) panics, with the morsel
+    // tier live. A projection MUST evaluate its expression for every row (unlike an *aggregate*, whose
+    // planning could short-circuit before any per-row eval — the source of the #449 flake: a
+    // `sum(ext.panic(..))` aggregate over the morsel-agg path *sometimes* failed via a clean pre-eval
+    // error with `statement_panics == 0`). So `ext.panic` is guaranteed to fire and the per-statement
+    // boundary records at least one caught panic, deterministically. The hook is silenced ONLY for this
+    // call (the deliberate panic's backtrace is noise) and restored immediately after, so the assertion
+    // phase runs with the real hook (`rmp` #449: a regression must print, not vanish into a silenced hook).
+    let panicked = {
+        let silence = SilencePanicHook::install();
+        let outcome = run_collect(
+            &handle,
+            AccessMode::Read,
+            "MATCH (m:M) RETURN ext.panic(m.v)",
+        );
+        drop(silence);
+        outcome
+    };
     assert!(
         panicked.is_err(),
-        "the panicking aggregate must fail cleanly with the morsel tier active, not kill the engine"
+        "the panicking projection must fail cleanly with the morsel tier active, not kill the engine"
     );
-    assert_eq!(
-        handle.metrics().statement_panics(),
-        1,
-        "the engine boundary must have caught the per-row panic with the morsel tier active"
+    assert!(
+        handle.metrics().statement_panics() >= 1,
+        "the engine boundary must have caught the per-row panic with the morsel tier active (got {})",
+        handle.metrics().statement_panics()
     );
 
     // THE KEY ASSERTION: a subsequent query on the engine still succeeds.
@@ -363,8 +441,6 @@ fn engine_survives_morsel_worker_panic() {
         "a fresh statement after the panic must succeed — the engine survived"
     );
 
-    set_morsel_min_rows(u64::MAX);
-    set_morsel_threads(1);
     shutdown(eng, handle);
 }
 
@@ -375,7 +451,7 @@ fn engine_survives_morsel_worker_panic() {
 /// the GC watermark.
 #[test]
 fn read_pool_survives_read_task_panic() {
-    let _guard = test_guard();
+    let _guard = TestGuard::acquire();
     let _silence = SilencePanicHook::install();
     // A multi-worker pool so a read genuinely dispatches off-thread (auto-commit Reads run on the pool).
     let eng = engine(4);

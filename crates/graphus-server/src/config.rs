@@ -175,6 +175,18 @@ pub struct AdmissionConfig {
     /// morsel pool to exactly that many workers. The pool is dedicated (never the global `rayon` pool, so
     /// it never contends with GDS or the off-thread reader pool).
     pub morsel_parallelism: usize,
+    /// Maximum number of **concurrently-open explicit REST transactions** across all databases
+    /// (`rmp` #448, CWE-770). A REST explicit transaction is stateless and URL-named: it outlives its
+    /// connection and is otherwise bounded only by the inactivity TTL
+    /// ([`TimingConfig::transaction_idle_timeout_ms`](TimingConfig::transaction_idle_timeout_ms)), so
+    /// within that window one authenticated principal can `POST /db/{db}/tx` in a loop and accumulate
+    /// open transactions without limit — each pinning the MVCC GC watermark and growing RAM/version slots
+    /// on a **shared** engine (a slow-motion OOM affecting co-tenants, since the registry spans every
+    /// database). This caps the live count: a `BEGIN` past it is `429`-rejected (retriable), exactly as
+    /// [`max_connections`](Self::max_connections) bounds connections. Bolt is already bounded (one tx per
+    /// connection, capped by `max_connections`); this is the REST-specific equivalent. Must be > 0;
+    /// defaults to [`graphus_rest::registry::DEFAULT_MAX_OPEN_TRANSACTIONS`].
+    pub max_open_transactions: usize,
     /// Whether to build the **opt-in type-bucketed CSR adjacency accelerator** (`rmp` task #324,
     /// "Win 2"). `false` (the default) builds **no** CSR — zero extra RAM, and a type-selective
     /// `expand` behaves exactly as the Win-1 single-pass chain walk. When `true`, each per-database
@@ -197,6 +209,7 @@ impl Default for AdmissionConfig {
             max_connections: 1024,
             reader_threads: 0,
             morsel_parallelism: 0,
+            max_open_transactions: graphus_rest::registry::DEFAULT_MAX_OPEN_TRANSACTIONS,
             csr_adjacency: false,
         }
     }
@@ -701,6 +714,13 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_MAX_OPEN_TRANSACTIONS") {
+            self.admission.max_open_transactions = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_MAX_OPEN_TRANSACTIONS is not a positive integer: {v:?}"
+                ))
+            })?;
+        }
         if let Ok(v) = var("GRAPHUS_READER_THREADS") {
             self.admission.reader_threads = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
@@ -800,6 +820,13 @@ impl ServerConfig {
         if self.admission.max_connections == 0 {
             return Err(ConfigError::Invalid(
                 "admission.max_connections must be > 0".to_owned(),
+            ));
+        }
+        if self.admission.max_open_transactions == 0 {
+            return Err(ConfigError::Invalid(
+                "admission.max_open_transactions must be > 0 (a zero cap would reject every REST \
+                 BEGIN)"
+                    .to_owned(),
             ));
         }
         if self.timing.handshake_timeout_ms == 0 {

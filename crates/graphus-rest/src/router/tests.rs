@@ -106,9 +106,17 @@ struct Harness {
 
 impl Harness {
     fn with_engine(engine: MockEngine) -> Self {
+        // The default cap (rmp #448) is high; the lifecycle tests never approach it, so this is the
+        // unchanged behaviour. The cap-specific gate uses `with_engine_and_cap`.
+        Self::with_engine_and_cap(engine, crate::registry::DEFAULT_MAX_OPEN_TRANSACTIONS)
+    }
+
+    /// Builds a harness whose registry caps the number of concurrently-open transactions at `cap`
+    /// (rmp #448), so the open-transaction-cap gate can exhaust it with a handful of `BEGIN`s.
+    fn with_engine_and_cap(engine: MockEngine, cap: usize) -> Self {
         let engine = Arc::new(engine);
         let auth = Arc::new(fixture_auth());
-        let registry = Arc::new(TxRegistry::new(TTL));
+        let registry = Arc::new(TxRegistry::new(TTL).with_max_open_transactions(cap));
         let clock = Arc::new(TestClock::new(1_000_000_000)); // start at t=1s
         let state = AppState::new(
             Arc::clone(&engine),
@@ -255,6 +263,73 @@ async fn delete_rolls_back_the_transaction() {
 
     assert_eq!(h.registry.open_count(), 0);
     assert!(h.engine.log().iter().any(|l| l.starts_with("rollback")));
+}
+
+/// rmp #448 REGRESSION GATE (HTTP-level, CWE-770): an authenticated principal opening explicit
+/// transactions in a loop (`POST /db/{db}/tx`) without committing is **`429`-rejected past the configured
+/// `max_open_transactions`** — the slow-OOM bound. Mirrors the registry-level
+/// `try_open_is_capped_and_rejects_past_the_limit`, but end-to-end through the real router (so it proves
+/// the router wires `try_open` and renders the cap rejection as a retriable `429`). Freeing a slot
+/// (committing one open transaction) admits a new `BEGIN` again — the cap bounds the LIVE count.
+#[tokio::test]
+async fn open_transaction_cap_rejects_excess_begins_with_429() {
+    const CAP: usize = 3;
+    let h = Harness::with_engine_and_cap(MockEngine::new(), CAP);
+    let token = h.token("alice");
+
+    // Open exactly the cap as one principal — every BEGIN is `201 Created`.
+    let mut ids = Vec::new();
+    for _ in 0..CAP {
+        let resp = h.send(post_json("/db/neo4j/tx", &token, json!({}))).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "under the cap, BEGIN is admitted"
+        );
+        ids.push(body_json(resp).await["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(h.registry.open_count(), CAP);
+
+    // The NEXT `BEGIN` (same principal, no commits in between) is rejected `429 Too Many Requests`,
+    // as an RFC 9457 problem body — a retriable load-shed, not a crash or a silent unbounded admit.
+    let resp = h.send(post_json("/db/neo4j/tx", &token, json!({}))).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "past the cap, BEGIN must be 429-rejected (rmp #448)"
+    );
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    // The rejection did NOT leak an engine transaction: the live count is still exactly the cap, and the
+    // router rolled back the engine handle it had opened before the cap check (so no orphan engine tx).
+    assert_eq!(h.registry.open_count(), CAP);
+    let rollbacks = h
+        .engine
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("rollback"))
+        .count();
+    assert_eq!(
+        rollbacks, 1,
+        "the cap-rejected BEGIN must roll back the engine transaction it opened (no leak)"
+    );
+
+    // Commit one open transaction to free a slot, then a fresh BEGIN is admitted again.
+    let freed = &ids[0];
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{freed}/commit"),
+            &token,
+            json!({}),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.registry.open_count(), CAP - 1);
+    let resp = h.send(post_json("/db/neo4j/tx", &token, json!({}))).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a freed slot admits a new BEGIN — the cap is on the live count"
+    );
 }
 
 /// rmp #390 GATE: a transaction opened by `alice` cannot be run, committed, or rolled back by `bob`,

@@ -439,7 +439,20 @@ async fn begin<E: RestEngine + 'static>(
         let now = state.now_nanos();
         // Bind the transaction to its authenticated opener (rmp #390): only `identity` may touch,
         // run, commit or roll it back; another principal targeting this id gets a 404.
-        let (id, expires_at_nanos) = state.registry.open(handle, identity, &db, mode, now);
+        //
+        // The capped open path (rmp #448, CWE-770) refuses past `max_open_transactions` with a
+        // retriable `429`, bounding the number of GC-watermark-pinning snapshots one principal can hold.
+        // The engine transaction was already opened above, so on a cap rejection we MUST roll it back
+        // here — otherwise the engine-side transaction (and its pinned snapshot) would leak with no
+        // registry entry to ever reap it. `rollback` is idempotent, so this is always safe.
+        let (id, expires_at_nanos) = match state.registry.try_open(handle, identity, &db, mode, now)
+        {
+            Ok(opened) => opened,
+            Err(too_many) => {
+                let _ = state.engine.rollback(handle);
+                return Err(Problem::too_many_transactions(too_many.to_string()));
+            }
+        };
 
         Ok(serializable_built(
             &headers,

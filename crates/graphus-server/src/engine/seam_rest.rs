@@ -91,6 +91,16 @@ struct OpenTx {
     /// The access mode the transaction was begun in — so a `RUN` inside it can be classified as a
     /// data change (a write) for audit (rmp #70).
     mode: AccessMode,
+    /// The **admission permit `BEGIN` acquired**, held for the transaction's whole lifetime (`rmp` #448,
+    /// CWE-770). An explicit REST transaction outlives its connection and pins a GC-watermark snapshot,
+    /// so admitting it against the engine's per-database concurrency budget (`max_concurrent_queries`) —
+    /// and *keeping* the permit until the transaction is taken (committed/rolled back) — bounds how many
+    /// open transactions one principal can hold on a shared engine. `Arc` so `OpenTx` stays `Clone` (the
+    /// `lookup` path clones an entry out); the permit is released — its `Drop` returns the semaphore
+    /// slot — when the last clone drops, i.e. once the entry is `take`n AND no in-flight `run` clone of it
+    /// remains. Paired with the registry's open-transaction cap (the URL-facing bound), this is the
+    /// engine-side bound on the `seam_rest.txns` map.
+    _permit: std::sync::Arc<AdmissionPermit>,
 }
 
 impl RestEngineAdapter {
@@ -291,6 +301,15 @@ impl RestEngine for RestEngineAdapter {
         // privilege scoping of every later statement (rmp #93).
         let (name, handle) = self.context.resolve(Some(db))?;
         let engine_mode = from_rest_mode(mode);
+        // `BEGIN` consumes an **admission permit** held for the transaction's lifetime (`rmp` #448,
+        // CWE-770): an explicit REST transaction outlives its connection and pins a GC-watermark
+        // snapshot, so it must count against the engine's per-database concurrency budget. Acquire it
+        // BEFORE opening the engine transaction so a budget-exhausted server sheds the `BEGIN` without
+        // ever opening (and having to roll back) a coordinator transaction. A `ServerBusy` is a retriable
+        // load-shed (the router maps it to a `429`/`503`-class retriable error).
+        let permit = handle
+            .try_admit()
+            .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
         let ticket = handle.begin_blocking(engine_mode)?;
         // Mint the public id only after the engine accepted the begin (no orphan table entries).
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -303,6 +322,7 @@ impl RestEngine for RestEngineAdapter {
                 db: name,
                 explicit: origin.explicit,
                 mode: engine_mode,
+                _permit: std::sync::Arc::new(permit),
             },
         );
         Ok(TxHandle(id))

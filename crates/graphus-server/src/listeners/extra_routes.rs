@@ -168,10 +168,16 @@ async fn health_live() -> Response {
 /// Reports `503` when the **default database's engine is degraded** (`rmp` #409/#414): a statement
 /// panicked and the rollback/commit recovering it *also* panicked, so a deep storage/MVCC invariant is
 /// broken and that engine's in-memory state can no longer be trusted. The default database is the one
-/// the listeners structurally depend on, so its degradation is a node-level not-ready. A **secondary**
-/// database's degradation does **not** take the node down (`rmp` #414 multi-tenant isolation): the node
-/// stays `200` and serviceable for the default + every healthy database, while the response body names
-/// the degraded secondary database(s) so an orchestrator can act. Engine degradation does **not**
+/// the listeners structurally depend on, so its degradation is a node-level not-ready.
+///
+/// A **secondary** database's degradation likewise makes this readiness probe report `503`, **with the
+/// degraded database(s) named in the body** so an orchestrator can act (`rmp` #451 — the doc previously
+/// claimed the probe stayed `200` for a degraded secondary, contradicting the code below). The
+/// distinction `rmp` #414 draws is about the **DATA PLANE**, not this probe: the multi-tenant isolation
+/// fix confines the engine-degraded *query refusal* to the affected database (its own per-engine flag),
+/// so the default and every healthy database keep **serving** even while this readiness probe reports
+/// not-ready for the node. In other words: the data plane stays up for the healthy databases; the
+/// readiness signal goes red so the degraded database is surfaced. Engine degradation does **not**
 /// auto-clear — a controlled engine/process restart is the only safe recovery.
 ///
 /// Also reports `503` when **one or more configured (non-default) databases failed to open** at boot

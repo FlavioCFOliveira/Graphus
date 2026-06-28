@@ -101,6 +101,9 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// This inline engine's contribution to the (private) server-wide open-transaction gauge
     /// (`rmp` #418): published additively, exactly as the threaded loop does.
     active_txns: super::ActiveTxnGauge,
+    /// The database name labelling this inline engine's per-database metric series (`rmp` #463). A
+    /// fixed label for the single-database DST driver.
+    db_name: Arc<str>,
     /// The injected (simulated) clock; threaded into execution so latency/timing is deterministic.
     clock: Arc<dyn Clock + Send + Sync>,
 }
@@ -110,6 +113,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     #[must_use]
     pub fn new(coordinator: TxnCoordinator<D, S>, clock: Arc<dyn Clock + Send + Sync>) -> Self {
         let metrics = Arc::new(Metrics::new());
+        // The single-database DST driver labels its per-database metric series with a fixed name
+        // (`rmp` #463); the inline engine never multiplexes databases.
+        let db_name: Arc<str> = Arc::from("local");
         Self {
             coordinator: Some(coordinator),
             open: HashMap::new(),
@@ -121,7 +127,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             plan_cache: super::exec::EnginePlanCache::new(),
             degraded: super::EngineDegraded::new(),
             maintenance_degraded: super::MaintenanceDegraded::new(),
-            active_txns: super::ActiveTxnGauge::new(Arc::clone(&metrics)),
+            active_txns: super::ActiveTxnGauge::new(Arc::clone(&metrics), Arc::clone(&db_name)),
+            db_name,
             metrics,
             clock,
         }
@@ -153,6 +160,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &mut inflight,
             LOCAL_RESULT_BUFFER,
             &self.metrics,
+            &self.db_name,
             &self.degraded,
             &self.maintenance_degraded,
             &mut self.active_txns,
