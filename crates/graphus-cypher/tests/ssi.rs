@@ -224,3 +224,73 @@ fn read_only_transaction_commits_concurrently_with_a_writer() {
     coord.commit(writer).expect("writer commits");
     assert_eq!(read_vs(&mut coord, "A"), vec![2]);
 }
+
+/// `rmp` #442 — positive serializability gate for the #220-sibling class: a `DETACH DELETE n`
+/// concurrent with a `CREATE ()-[:T]->(n)` (an edge touching the deleted node's `first_rel`) must NOT
+/// commit a non-serializable outcome. The suspected hole (`create_rel`/`delete_rel` not SSI-marking
+/// the endpoint nodes) was REFUTED by running it (reliability audit 2026-06-27): `incident_rels`
+/// SIREAD-marks the new edge *pre-visibility* and `create_rel` checks the raw live bit, so SSI aborts
+/// exactly one transaction. This pins that guarantee so a future refactor (statement granularity /
+/// marker changes) cannot silently regress it. (The referential `DanglingRel` invariant is also
+/// covered by the graphus-dst checker.)
+#[test]
+fn detach_delete_vs_create_edge_is_serializable() {
+    let mut coord = fresh_coord();
+    let s = coord.begin_serializable();
+    let (_r, e) = run_stmt(&coord, s, "CREATE (:N {id: 5}), (:B {id: 9})");
+    assert!(e.is_none(), "seed error: {e:?}");
+    coord.commit(s).expect("seed commits");
+
+    let t1 = coord.begin_serializable();
+    let t2 = coord.begin_serializable();
+    // CREATE the edge first (n is live on every snapshot), then DETACH DELETE n — both statements run
+    // locally; the conflict surfaces only at commit.
+    let (_r2, e2) = run_stmt(
+        &coord,
+        t2,
+        "MATCH (n2:N {id: 5}), (b:B {id: 9}) CREATE (n2)-[:T]->(b)",
+    );
+    let (_r1, e1) = run_stmt(&coord, t1, "MATCH (n:N {id: 5}) DETACH DELETE n");
+    assert!(
+        e1.is_none() && e2.is_none(),
+        "both statements run: e1={e1:?} e2={e2:?}"
+    );
+
+    let c1 = coord.commit(t1);
+    let c2 = coord.commit(t2);
+    // SSI must abort EXACTLY ONE: committing both would be the non-serializable "n deleted yet a live
+    // :T edge dangles off it" outcome.
+    let aborts = [c1.is_err(), c2.is_err()].iter().filter(|&&x| x).count();
+    assert_eq!(aborts, 1, "exactly one must abort: c1={c1:?} c2={c2:?}");
+}
+
+/// `rmp` #442 control: a DISJOINT delete + create (no shared endpoint) must NOT be falsely aborted —
+/// proving the SSI footprint that catches the conflicting case above is PRECISE, not a blanket
+/// over-abort.
+#[test]
+fn disjoint_delete_and_create_edge_both_commit() {
+    let mut coord = fresh_coord();
+    let s = coord.begin_serializable();
+    let (_r, e) = run_stmt(&coord, s, "CREATE (:N {id: 5}), (:C {id: 1}), (:D {id: 2})");
+    assert!(e.is_none(), "seed error: {e:?}");
+    coord.commit(s).expect("seed commits");
+
+    let t1 = coord.begin_serializable();
+    let t2 = coord.begin_serializable();
+    let (_r2, e2) = run_stmt(
+        &coord,
+        t2,
+        "MATCH (c:C {id: 1}), (d:D {id: 2}) CREATE (c)-[:T]->(d)",
+    );
+    let (_r1, e1) = run_stmt(&coord, t1, "MATCH (n:N {id: 5}) DETACH DELETE n");
+    assert!(
+        e1.is_none() && e2.is_none(),
+        "both statements run: e1={e1:?} e2={e2:?}"
+    );
+    let c2 = coord.commit(t2);
+    let c1 = coord.commit(t1);
+    assert!(
+        c1.is_ok() && c2.is_ok(),
+        "disjoint delete + create must both commit: c1={c1:?} c2={c2:?}"
+    );
+}
