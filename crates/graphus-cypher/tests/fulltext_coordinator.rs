@@ -319,3 +319,57 @@ fn drop_index_then_query_errors() {
     );
     coord.rollback(txn).ok();
 }
+
+/// `rmp` #467 regression gate: a reader whose MVCC snapshot PREDATES a committed full-text term change
+/// must still match its snapshot's term through the full-text INDEX (not a strict subset). The ephemeral
+/// inverted index keeps only the latest state, so without the cross-snapshot freshness marker an older
+/// reader's indexed query for the OLD term returns a false negative (the per-candidate re-check can drop
+/// a stale candidate but cannot resurrect a now-missing one). SSI does NOT abort the reader, so the index
+/// must itself be snapshot-correct: when `snapshot.ts < effective_ft_spatial_marker()` the seam declines
+/// to a snapshot-correct scan fallback.
+#[test]
+fn fulltext_cross_snapshot_reader_sees_its_snapshot_term_467() {
+    let mut coord = fresh_coord();
+    create_index(&mut coord);
+    write(&mut coord, "CREATE (:Article {name: 'a', title: 'cat'})");
+    let a_id = id_of(&mut coord, "Article", "a");
+
+    // Reader B's snapshot is fixed BEFORE the writer changes the indexed term.
+    let b = coord.begin_serializable();
+
+    // Writer A replaces the term cat -> dog and commits (advances the #467 ft/spatial freshness marker).
+    write(
+        &mut coord,
+        "MATCH (n:Article {name: 'a'}) SET n.title = 'dog'",
+    );
+
+    // B (snapshot predates A's commit) queries the OLD term via the full-text index. Its snapshot still
+    // sees title 'cat', so it MUST find the node — the fix declines to the snapshot-correct scan fallback
+    // because `B.snapshot.ts < marker`. Without it the inverted index (re-keyed 'dog') silently misses it.
+    let plan = compile("CALL db.index.fulltext.queryNodes('ft', 'cat') YIELD node RETURN node");
+    let b_ids: Vec<u64> = run_plan(&coord, b, &plan)
+        .iter()
+        .filter_map(|r| match r.get("node") {
+            Some(RowValue::Node(n)) => Some(n.id.0),
+            _ => None,
+        })
+        .collect();
+    let _ = coord.commit(b); // B is read-only; the read result above is what we assert.
+    assert_eq!(
+        b_ids,
+        vec![a_id],
+        "the stale-snapshot reader must still match its snapshot's term 'cat' through the index"
+    );
+
+    // Contrast: a CURRENT-snapshot reader sees only the new term — proving the fix is snapshot-aware, not
+    // an unconditional scan (no perf regression for the common, up-to-date reader).
+    assert!(
+        query_ids(&mut coord, "ft", "cat").is_empty(),
+        "the current snapshot no longer matches the old term 'cat'"
+    );
+    assert_eq!(
+        query_ids(&mut coord, "ft", "dog"),
+        vec![a_id],
+        "the current snapshot matches the new term 'dog'"
+    );
+}

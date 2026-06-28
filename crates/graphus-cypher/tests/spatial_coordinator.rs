@@ -438,3 +438,65 @@ fn drop_index_falls_back_to_scan_still_correct() {
     assert_eq!(matched_ids(&mut coord, &dropped, &src), vec![a]);
     assert!(coord.list_point_indexes().is_empty());
 }
+
+/// `rmp` #467 regression gate (spatial): a reader whose MVCC snapshot PREDATES a committed point move
+/// must still find its snapshot's point through the spatial INDEX. The grid keeps only the latest point,
+/// so without the cross-snapshot freshness marker an older reader's proximity query near the OLD point
+/// gets no candidate (a false negative the per-candidate distance re-check cannot resurrect). When
+/// `snapshot.ts < effective_ft_spatial_marker()` the seam declines the spatial seek and falls back to
+/// the MVCC-correct scan + distance filter.
+#[test]
+fn spatial_cross_snapshot_reader_sees_its_snapshot_point_467() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {loc: point({x: 0, y: 0}), name: 'a'})",
+    );
+    create_index(&mut coord);
+    let catalog = coord.catalog();
+    let a = id_of(&mut coord, "a");
+    let near_origin = proximity(0.0, 0.0, 2.0);
+    assert!(
+        plan_uses_spatial_seek(&compile(&near_origin, &catalog)),
+        "the proximity query must route through the spatial seek (else the gate is vacuous)"
+    );
+
+    // Reader B's snapshot is fixed BEFORE the writer moves the point.
+    let b = coord.begin_serializable();
+    // Writer A moves the City far away and commits (advances the #467 ft/spatial freshness marker).
+    run_write(
+        &mut coord,
+        "MATCH (n:City {name: 'a'}) SET n.loc = point({x: 100, y: 100})",
+    );
+
+    // B (snapshot predates A's commit) runs the proximity query near (0,0) via the spatial INDEX. Its
+    // snapshot still sees loc (0,0), so it MUST find the node — the fix declines the spatial seek for a
+    // stale snapshot, falling back to the scan + distance filter. Without it the grid (re-keyed to
+    // (100,100)) yields no candidate near (0,0): a silent false negative.
+    let plan = compile(&near_origin, &catalog);
+    let b_ids: Vec<u64> = run_plan(&coord, b, &plan)
+        .iter()
+        .filter_map(|r| match r.get("n") {
+            Some(RowValue::Node(n)) => Some(n.id.0),
+            _ => None,
+        })
+        .collect();
+    let _ = coord.commit(b); // B is read-only; the read result above is what we assert.
+    assert_eq!(
+        b_ids,
+        vec![a],
+        "the stale-snapshot reader must still find its snapshot's point (0,0) through the index"
+    );
+
+    // Contrast: a CURRENT reader near (0,0) finds nothing (the point moved); near (100,100) finds it —
+    // proving the fix is snapshot-aware, not an unconditional scan.
+    assert!(
+        matched_ids(&mut coord, &catalog, &near_origin).is_empty(),
+        "the current snapshot's point has moved away from (0,0)"
+    );
+    assert_eq!(
+        matched_ids(&mut coord, &catalog, &proximity(100.0, 100.0, 2.0)),
+        vec![a],
+        "the current snapshot's point is at (100,100)"
+    );
+}

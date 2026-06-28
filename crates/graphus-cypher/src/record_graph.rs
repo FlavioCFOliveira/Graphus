@@ -1204,6 +1204,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 index.insert_composite(label_token, &property_tokens, &tuple, node.0);
             }
         }
+
+        // Cross-snapshot full-text/spatial freshness marker (`rmp` task #467): if the maintenance above
+        // actually changed a registered full-text inverted-index posting or spatial-grid entry (the
+        // mutation methods raised the `IndexSet`'s transient dirty flag), record THIS transaction as a
+        // full-text/spatial mutator. While such a mutator is open the index may reflect its uncommitted
+        // state, so the effective marker becomes `u64::MAX` and every reader (whose snapshot ts is
+        // always `< u64::MAX`) declines to the always-correct scan path — closing the in-flight window
+        // of the false-negative. The coordinator authoritatively retires the txn on commit (raising the
+        // marker to the commit ts) or rollback (poisoning the marker until a rebuild). A no-op (clears
+        // the flag) when nothing full-text/spatial changed, so the common write leaves the fast path
+        // untouched.
+        let _ = index.note_ft_spatial_mutator(self.txn);
         drop(index);
 
         // Zone-map data-skipping sidecar (`rmp` task #331): widen the node's zone for each declared
@@ -2670,6 +2682,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None; // no usable spatial index: scan fallback
         }
 
+        // Cross-snapshot freshness gate (`rmp` task #467): if this reader's MVCC snapshot PREDATES the
+        // last committed (or any in-flight / rolled-back) full-text/spatial mutation, the grid may have
+        // been re-keyed by a writer this snapshot cannot see — so it could return a strict SUBSET of
+        // this snapshot's matches (a false negative the residual `distance(...) <op> r` re-check cannot
+        // repair, since it filters false positives but cannot resurrect a missing candidate). Decline to
+        // the scan fallback: the executor's `scan_nodes_by_label` + residual filter re-reads each node's
+        // SNAPSHOT-visible coordinate via MVCC `node_property`, which is correct for this stale reader.
+        //
+        // This early return is BEFORE `mark_all_live_nodes()` on purpose: the scan fallback
+        // (`scan_nodes_by_label`) registers its OWN SSI footprint (`mark_all_live_nodes` + per-candidate
+        // markers), so declining here — before this method marks anything — lets the scan path own the
+        // markers exactly once (no double-marking).
+        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+            return None;
+        }
+
         // SSI predicate footprint: an indexed proximity predicate replaces the label-scan + filter
         // fallback (which read every node via `scan_nodes_by_label`). Preserve that exact read
         // footprint so the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
@@ -2698,7 +2726,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let index = self.index.as_ref()?;
         // The full-text index must be declared (by name). If it is not, return `None` so the
         // procedure raises a clear error rather than silently empty results.
-        let (label_token, _props, _analyzer) = index.borrow().fulltext_target(name)?;
+        let (label_token, prop_keys, analyzer) = index.borrow().fulltext_target(name)?;
+
+        // Cross-snapshot freshness gate (`rmp` task #467): if this reader's MVCC snapshot PREDATES the
+        // last committed (or any in-flight / rolled-back) full-text/spatial mutation, the inverted
+        // index may have been re-keyed by a writer this snapshot cannot see, so the fast path could
+        // return a strict SUBSET of this snapshot's matches (a false negative the per-candidate re-check
+        // cannot repair). Unlike the spatial seek we CANNOT signal "fall back" with `None` — the
+        // procedure treats `None` as "no such index" — so we run a snapshot-correct full-text SCAN
+        // fallback INTERNALLY and return `Some(correct_set)`. The fallback reproduces the SAME SSI
+        // footprint (`mark_all_live_nodes` + per-candidate `filter_label_candidates`) as this fast path,
+        // so serializability is unchanged.
+        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+            return Some(self.fulltext_scan_fallback(label_token, &prop_keys, analyzer, search));
+        }
 
         // SSI predicate footprint: a full-text query reads the candidate documents; preserve the same
         // read footprint as the scan fallback would by marking every live node of the covered label
@@ -2717,6 +2758,107 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out.sort_unstable();
         out.dedup();
         Some(out)
+    }
+
+    /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467).
+    ///
+    /// Used when this statement's MVCC snapshot predates a committed (or in-flight / rolled-back)
+    /// full-text mutation, so the ephemeral [`InvertedIndex`](graphus_index::fulltext::InvertedIndex)
+    /// — which keeps only the latest state — could miss a node this snapshot still matches. It computes
+    /// the matching node set **directly from the store at this snapshot**, returning a result equal to
+    /// what the fast index path would return on a current snapshot AND to what the executor's scan path
+    /// computes on this stale snapshot.
+    ///
+    /// # Match replication (mirrors [`InvertedIndex::query`] under [`MatchSemantics::Or`])
+    ///
+    /// For each snapshot-visible node carrying the covered label, the covered string properties are
+    /// read at this snapshot ([`node_property`](Self::node_property), MVCC-correct), concatenated and
+    /// analyzed **in the index's declared property order with the index's analyzer** — exactly as
+    /// [`reindex_fulltext_node`](crate::index_set::IndexSet::reindex_fulltext_node) builds a document's
+    /// terms. The `search` string is analyzed with the **same** analyzer. A node matches under the
+    /// `Or` semantics iff its analyzed term set shares **at least one** term with the analyzed search
+    /// term set (the union-of-posting-lists rule of [`InvertedIndex::query_or`]). An empty search
+    /// (all stop-words / punctuation) or an empty document yields no match, matching `query`'s
+    /// empty-`query_terms` contract.
+    ///
+    /// # SSI footprint
+    ///
+    /// Identical to the fast path's: [`mark_all_live_nodes`](Self::mark_all_live_nodes) plus the
+    /// per-candidate SIREAD markers [`filter_label_candidates`](Self::filter_label_candidates) records
+    /// while computing the snapshot-visible labelled set — so taking this path never changes which
+    /// rw-edges close.
+    fn fulltext_scan_fallback(
+        &self,
+        label_token: u32,
+        prop_keys: &[u32],
+        analyzer: graphus_index::fulltext::Analyzer,
+        search: &str,
+    ) -> Vec<NodeId> {
+        use std::collections::BTreeSet;
+
+        // SSI: mark every live node, exactly as the fast path does (`04 §5.4`).
+        self.mark_all_live_nodes();
+
+        // Enumerate every live node id, then narrow to the snapshot-visible nodes carrying the covered
+        // label via the SAME shared re-check the fast path uses on its candidates — registering the
+        // per-candidate SIREAD markers identically (so the footprint matches). Read-only store access
+        // (`rmp` #337 Slice 2): `scan_node_ids` is `&self`, a shared borrow suffices.
+        let all_ids = match self.store.borrow().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+        let labelled = self.filter_label_candidates(label_token, all_ids);
+
+        // Resolve the covered prop-key tokens to names once (so the index borrow does not overlap a
+        // store borrow during the per-node value reads below). A token without a name was never
+        // interned and cannot occur on any node, so it is skipped (contributes no terms) — mirroring
+        // `read_node_prop_one`'s never-interned short-circuit.
+        let prop_names: Vec<String> = {
+            let store = self.store.borrow();
+            prop_keys
+                .iter()
+                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .collect()
+        };
+
+        // The analyzed search terms (the query side). An empty set matches nothing (the `query`
+        // empty-`query_terms` contract), so short-circuit to no matches.
+        let search_terms: BTreeSet<String> = analyzer.analyze(search).into_iter().collect();
+        if search_terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out: Vec<NodeId> = Vec::new();
+        for node in labelled {
+            // Build the node's document terms in the index's declared property order, exactly as
+            // `reindex_fulltext_node` does: analyze each covered STRING property value (a non-string
+            // covered property contributes nothing — a full-text index covers text). Read at THIS
+            // snapshot via MVCC `node_property`, so the value is this stale reader's visible value.
+            let mut matched = false;
+            'props: for name in &prop_names {
+                let Some(Value::String(text)) = self.node_property(node, name) else {
+                    continue;
+                };
+                // A node matches under `Or` iff ANY analyzed search term appears among its terms.
+                for term in analyzer.analyze(&text) {
+                    if search_terms.contains(&term) {
+                        matched = true;
+                        break 'props;
+                    }
+                }
+            }
+            if matched {
+                out.push(node);
+            }
+        }
+        // Ascending + de-duplicated, like the fast path (`filter_label_candidates` already yields each
+        // node at most once, but keep the contract explicit and order-stable).
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {

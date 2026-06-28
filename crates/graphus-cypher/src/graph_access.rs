@@ -332,6 +332,24 @@ pub trait GraphAccess {
         None
     }
 
+    /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467): an
+    /// internal seam helper. The default is a no-op (`Vec::new()`); the store-backed
+    /// [`RecordStoreGraph`](crate::record_graph) overrides it to compute the matching node set directly
+    /// from the store at THIS MVCC snapshot. It is used when the statement's snapshot predates a
+    /// committed / in-flight / rolled-back full-text mutation, so the ephemeral inverted index (which
+    /// keeps only the latest state) could otherwise miss a node this snapshot still matches — a silent
+    /// cross-snapshot false negative. Only `RecordStoreGraph::fulltext_query` calls it (internally);
+    /// other seams keep the no-op default.
+    fn fulltext_scan_fallback(
+        &self,
+        _label_token: u32,
+        _prop_keys: &[u32],
+        _analyzer: graphus_index::fulltext::Analyzer,
+        _search: &str,
+    ) -> Vec<NodeId> {
+        Vec::new()
+    }
+
     /// An **optional COMPLEMENTARY columnar scan** of `(node, value)` for the nodes carrying `label`
     /// whose current snapshot-visible value of `property` is present (`rmp` tasks #329 / #330).
     ///

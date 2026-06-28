@@ -27,11 +27,10 @@
 //! seek deliberately exploits this when a bound cannot be expressed exactly against the backing
 //! index (see [`IndexSet::seek_node_property_range`]).
 
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use graphus_bufpool::BufferPool;
-use graphus_core::{TxnId, Value};
+use graphus_core::{Timestamp, TxnId, Value};
 use graphus_index::bitmap::{self, BitmapIndex};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
@@ -142,6 +141,66 @@ pub struct IndexSet {
     /// since a bitmap index is opt-in), so this costs nothing unless a bitmap index is declared and a
     /// covered node is written.
     dirty_bitmap_nodes: HashMap<TxnId, BTreeSet<u64>>,
+    /// The cross-snapshot freshness marker for the **full-text + spatial** indexes (`rmp` task #467).
+    ///
+    /// # The problem this closes
+    ///
+    /// Unlike every other index kind here, the full-text [`InvertedIndex`] and the [`SpatialIndex`]
+    /// hold **only the latest state** (a commit-time wholesale [`reindex_fulltext_node`](Self::reindex_fulltext_node)
+    /// / [`insert_spatial_point`](Self::insert_spatial_point), no version history). When a committed
+    /// writer A *replaces* a node's indexed term / point, a reader B whose MVCC snapshot **predates**
+    /// A's commit gets candidates keyed by A's **new** state. The per-candidate visibility re-check
+    /// filters false *positives* but **cannot resurrect a candidate that is now missing** from the
+    /// posting list — so B's indexed query for the *old* value returns a strict **subset** of what B's
+    /// own snapshot sees via the scan path: a silent false **negative** (an ACID-correctness defect;
+    /// SSI deliberately does **not** abort B — this is not a serialization retry).
+    ///
+    /// # The marker (the airtight gate)
+    ///
+    /// `ft_spatial_trustworthy_from` is the timestamp **from and after which** a reader may TRUST the
+    /// full-text/spatial index. A reader with `snapshot.ts >= effective_ft_spatial_marker()` uses the
+    /// fast index path; a reader with `snapshot.ts < effective_ft_spatial_marker()` **declines to the
+    /// scan path** (always correct — the scan re-reads the node's snapshot-visible value via MVCC).
+    /// The *effective* marker (what readers compare against, [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker))
+    /// is `u64::MAX` whenever an uncommitted full-text/spatial mutation is outstanding
+    /// (`ft_spatial_inflight` non-empty) or the index was left potentially-stale by a rolled-back
+    /// mutator (`ft_spatial_poisoned`); otherwise it is this committed value. See those fields and the
+    /// marker methods for the full correctness argument.
+    ft_spatial_trustworthy_from: Timestamp,
+    /// The set of **currently-open transactions** that have at least one *uncommitted* structural
+    /// full-text/spatial mutation in the index (`rmp` task #467). While this set is non-empty the
+    /// [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) is `u64::MAX`, so **every**
+    /// reader (whose snapshot ts is always `< u64::MAX`) declines to the scan path — correct, because
+    /// the index may reflect uncommitted state. A transaction is recorded here by
+    /// [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator) (the statement seam, on a write that
+    /// actually changed a registered posting) and removed by
+    /// [`commit_ft_spatial_marker`](Self::commit_ft_spatial_marker) /
+    /// [`rollback_ft_spatial_marker`](Self::rollback_ft_spatial_marker). Keyed by [`TxnId`] so the
+    /// gate stays `u64::MAX` until **all** concurrent full-text/spatial mutators have retired — the
+    /// property a single committed transaction's commit-ts cannot provide on its own.
+    ft_spatial_inflight: BTreeSet<TxnId>,
+    /// Whether a full-text/spatial mutator **rolled back**, possibly leaving the in-memory index with
+    /// stale postings the query-time re-check cannot repair (`rmp` task #467). A rolled-back *replace*
+    /// or *delete* can drop a still-committed node from a posting it should occupy (a false negative
+    /// the re-check cannot resurrect — unlike a rolled-back *insert*, which leaves only a re-check-
+    /// filterable false positive). Because the in-memory index is **not** transactional (an abort
+    /// rolls back only the durable store, not these structures — see the `rmp` #410 note on
+    /// [`seek_bitmap_eq`](Self::seek_bitmap_eq)), the only provably-correct response is to force every
+    /// reader onto the always-correct scan path until the index is rebuilt to committed state. So this
+    /// pins [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) at `u64::MAX` until a
+    /// full [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) (driven by the coordinator's
+    /// store-consistent rebuild) clears it. Conservative (it disables the fast path after a full-text/
+    /// spatial-mutating rollback) but never returns a wrong answer.
+    ft_spatial_poisoned: bool,
+    /// Transient "a registered full-text/spatial posting changed during the current statement" flag,
+    /// set by the structural mutation methods and consumed by
+    /// [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator) (the statement seam, which knows the
+    /// [`TxnId`]) / cleared by [`clear_ft_spatial_dirty`](Self::clear_ft_spatial_dirty) (the rebuild /
+    /// online-build path, whose insertions reflect *committed* state and must not be attributed to any
+    /// open transaction) (`rmp` task #467). It exists because the mutation methods' signatures carry no
+    /// `TxnId`, so they cannot record set membership themselves; they flag dirtiness here and the seam
+    /// converts it to a [`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) entry.
+    ft_spatial_dirty: bool,
 }
 
 /// A declared constraint's in-memory rule (`rmp` tasks #99, #100): the covered label token, the
@@ -214,6 +273,12 @@ impl IndexSet {
             composite: HashMap::new(),
             bitmap: HashMap::new(),
             dirty_bitmap_nodes: HashMap::new(),
+            // A fresh, empty index reflects committed state at the genesis timestamp: there is nothing
+            // indexed and no mutator in flight, so every reader may trust it (`ts >= 0` always holds).
+            ft_spatial_trustworthy_from: Timestamp(0),
+            ft_spatial_inflight: BTreeSet::new(),
+            ft_spatial_poisoned: false,
+            ft_spatial_dirty: false,
         }
     }
 
@@ -736,6 +801,9 @@ impl IndexSet {
     pub fn index_fulltext_document(&mut self, name: &str, node_id: u64, terms: &[String]) {
         if let Some(ft) = self.fulltext.get_mut(name) {
             ft.index.index_document(node_id, terms);
+            // A registered posting changed: flag the cross-snapshot freshness marker dirty so the
+            // statement seam records this writer as a full-text/spatial mutator (`rmp` task #467).
+            self.ft_spatial_dirty = true;
         }
     }
 
@@ -743,7 +811,12 @@ impl IndexSet {
     /// covered label). A no-op if no such index is registered.
     pub fn remove_fulltext_document(&mut self, name: &str, node_id: u64) {
         if let Some(ft) = self.fulltext.get_mut(name) {
-            ft.index.remove_document(node_id);
+            // Flag the freshness marker dirty only when a posting actually changed (`remove_document`
+            // returns whether the node was present), so a no-op removal does not needlessly force
+            // concurrent readers off the fast path (`rmp` task #467).
+            if ft.index.remove_document(node_id) {
+                self.ft_spatial_dirty = true;
+            }
         }
     }
 
@@ -767,17 +840,28 @@ impl IndexSet {
     ) {
         // Collect the work first (immutable borrows) so the mutable per-index calls do not alias.
         let names: Vec<String> = self.fulltext.keys().cloned().collect();
+        // Whether any covering full-text index's posting actually changed for this node — drives the
+        // cross-snapshot freshness marker (`rmp` task #467). A write to a node that NO registered
+        // full-text index covers (and whose terms were already absent) leaves every posting unchanged,
+        // so such a writer is not a full-text mutator and must not force concurrent readers off the
+        // fast path.
+        let mut changed = false;
         for name in names {
             let Some(ft) = self.fulltext.get(&name) else {
                 continue;
             };
             if !label_tokens.contains(&ft.label_token) {
                 // The node does not (or no longer) carries the covered label: drop it from this index.
-                self.fulltext
+                // `remove_document` reports whether it was present (a real posting change).
+                if self
+                    .fulltext
                     .get_mut(&name)
                     .expect("index present")
                     .index
-                    .remove_document(node_id);
+                    .remove_document(node_id)
+                {
+                    changed = true;
+                }
                 continue;
             }
             // Gather the covered text in the index's declared property order, then analyze it.
@@ -789,11 +873,21 @@ impl IndexSet {
                     terms.extend(analyzer.analyze(text));
                 }
             }
+            // The node carries the covered label, so `index_document` re-indexes it (a wholesale term
+            // replace that can both ADD and DROP postings — exactly the stale-reader false-negative
+            // this marker guards). Treat any covered re-index as a posting change. This is the simplest
+            // sound rule (the over-mark — identical terms re-indexed — only makes concurrent readers
+            // conservatively decline; it never returns a wrong answer) and needs no `graphus-index`
+            // presence-probe API.
+            changed = true;
             self.fulltext
                 .get_mut(&name)
                 .expect("index present")
                 .index
                 .index_document(node_id, &terms);
+        }
+        if changed {
+            self.ft_spatial_dirty = true;
         }
     }
 
@@ -913,10 +1007,15 @@ impl IndexSet {
         if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
             if let Value::Point(p) = value {
                 sp.index.index_point(node_id, *p);
+                // A point was (re)inserted: a real grid change. Flag the freshness marker dirty so the
+                // statement seam records this writer as a full-text/spatial mutator (`rmp` task #467).
+                self.ft_spatial_dirty = true;
             } else {
                 // The property is no longer a point (e.g. an update changed its type) — drop the
-                // stale grid entry so a re-check never sees a phantom.
-                sp.index.remove(node_id);
+                // stale grid entry so a re-check never sees a phantom. Only a real removal flags dirty.
+                if sp.index.remove(node_id) {
+                    self.ft_spatial_dirty = true;
+                }
             }
         }
     }
@@ -925,7 +1024,13 @@ impl IndexSet {
     /// a node that lost the covered label). A no-op if no such index is registered.
     pub fn remove_spatial_point(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
         if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
-            sp.index.remove(node_id);
+            // Flag the freshness marker dirty only when a grid entry actually existed and was removed
+            // (`remove` returns whether the node was present), so the per-write wholesale re-index's
+            // unconditional `remove_spatial_point` over UNcovered nodes does not needlessly force
+            // concurrent readers off the fast path (`rmp` task #467).
+            if sp.index.remove(node_id) {
+                self.ft_spatial_dirty = true;
+            }
         }
     }
 
@@ -961,6 +1066,170 @@ impl IndexSet {
     ) -> Option<Vec<u64>> {
         let sp = self.spatial.get(&(label_token, prop_key))?;
         Some(sp.index.query_bbox(min_x, max_x, min_y, max_y))
+    }
+
+    // ============================================================================================
+    // Cross-snapshot full-text + spatial freshness marker (`rmp` task #467)
+    // ============================================================================================
+    //
+    // The full-text [`InvertedIndex`] and the [`SpatialIndex`] keep only the LATEST state, so a reader
+    // whose MVCC snapshot predates a committed replace/delete can get a strict SUBSET of its
+    // snapshot-visible matches (a false negative the per-candidate re-check cannot repair, because it
+    // filters false positives but cannot resurrect a missing candidate). The marker below is the
+    // airtight gate: a reader TRUSTS the index iff `snapshot.ts >= effective_ft_spatial_marker()`,
+    // otherwise it declines to the always-correct scan path. See
+    // [`ft_spatial_trustworthy_from`](Self#structfield.ft_spatial_trustworthy_from) for the full
+    // rationale. The two stamping points (in-flight sentinel at mutation, authoritative commit ts at
+    // commit) make it sound against both the open-writer window and all future readers.
+
+    /// The **effective** full-text/spatial freshness marker a reader compares its `snapshot.ts`
+    /// against (`rmp` task #467): a reader with `snapshot.ts >= self` uses the fast index path; one
+    /// with `snapshot.ts < self` declines to the scan path.
+    ///
+    /// It is `u64::MAX` (so **every** reader declines — every snapshot ts is `< u64::MAX`) whenever:
+    /// - any open transaction has an *uncommitted* full-text/spatial mutation in the index
+    ///   ([`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) non-empty) — the index may
+    ///   reflect uncommitted state, so no snapshot may trust it; or
+    /// - a full-text/spatial mutator *rolled back* leaving possibly-stale postings
+    ///   ([`ft_spatial_poisoned`](Self#structfield.ft_spatial_poisoned)) — the in-memory index is not
+    ///   transactional, so the only correct response is the scan path until a rebuild.
+    ///
+    /// Otherwise it is the committed
+    /// [`ft_spatial_trustworthy_from`](Self#structfield.ft_spatial_trustworthy_from): from that ts
+    /// onward every full-text/spatial mutation is committed-visible in BOTH the index and the scan, so
+    /// the fast path is correct; an older reader correctly declines.
+    #[must_use]
+    pub fn effective_ft_spatial_marker(&self) -> Timestamp {
+        if self.ft_spatial_poisoned || !self.ft_spatial_inflight.is_empty() {
+            Timestamp(u64::MAX)
+        } else {
+            self.ft_spatial_trustworthy_from
+        }
+    }
+
+    /// Flags that a registered full-text/spatial posting changed during the current statement
+    /// (`rmp` task #467). Called by the structural mutation methods themselves (so EVERY caller — the
+    /// statement-seam [`reindex_node`](crate::record_graph) AND the coordinator's incremental online
+    /// build — is covered). Because the mutation methods carry no [`TxnId`], they only set this
+    /// transient flag; the statement seam later converts it to a
+    /// [`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) entry via
+    /// [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator), and the rebuild path discards it via
+    /// [`clear_ft_spatial_dirty`](Self::clear_ft_spatial_dirty).
+    pub fn mark_ft_spatial_mutated_inflight(&mut self) {
+        self.ft_spatial_dirty = true;
+    }
+
+    /// Converts a pending dirty flag into an in-flight-mutator record for `txn`, returning whether
+    /// `txn` was recorded (i.e. whether a full-text/spatial posting changed since the flag was last
+    /// cleared) (`rmp` task #467).
+    ///
+    /// Called by the statement seam ([`reindex_node`](crate::record_graph)) at the end of each write:
+    /// if a covered posting changed, `txn` is inserted into
+    /// [`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) (idempotent across the
+    /// transaction's many statements) so [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker)
+    /// becomes `u64::MAX` until `txn` retires. The flag is cleared either way, so a subsequent
+    /// non-mutating statement of any transaction does not inherit it.
+    pub fn note_ft_spatial_mutator(&mut self, txn: TxnId) -> bool {
+        if self.ft_spatial_dirty {
+            self.ft_spatial_inflight.insert(txn);
+            self.ft_spatial_dirty = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Discards any pending dirty flag **without** recording an in-flight mutator (`rmp` task #467).
+    ///
+    /// The rebuild / online-build path drives the same mutation methods, but its insertions reflect
+    /// the *committed* store state and must not be attributed to any open transaction (the build runs
+    /// between commands, and a `Populating` index is withheld from the planner). The coordinator calls
+    /// this after such a build so the flag the mutation methods raised does not leak into the next
+    /// user statement.
+    pub fn clear_ft_spatial_dirty(&mut self) {
+        self.ft_spatial_dirty = false;
+    }
+
+    /// Whether `txn` currently has an uncommitted full-text/spatial mutation recorded (`rmp` task
+    /// #467). Used by the coordinator to decide whether a committing/rolling-back transaction was a
+    /// full-text/spatial mutator without itself tracking that bit.
+    #[must_use]
+    pub fn is_ft_spatial_mutator(&self, txn: TxnId) -> bool {
+        self.ft_spatial_inflight.contains(&txn)
+    }
+
+    /// Retires `txn` as a **committed** full-text/spatial mutator, raising the committed marker to
+    /// `commit_ts` (`rmp` task #467). A no-op if `txn` was not a mutator.
+    ///
+    /// From `commit_ts` onward the writer's change is committed-visible in both the index and the
+    /// scan, so a reader at `commit_ts` or later may trust the index; an older reader still declines.
+    /// The marker only ever *rises* (`max` with the prior committed value). Because the in-flight set
+    /// is keyed by [`TxnId`], [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) stays
+    /// `u64::MAX` until **every** concurrent mutator has retired — so a sibling writer's still-
+    /// uncommitted mutation is never prematurely exposed by this one's commit.
+    pub fn commit_ft_spatial_marker(&mut self, txn: TxnId, commit_ts: Timestamp) {
+        if self.ft_spatial_inflight.remove(&txn) && commit_ts.0 > self.ft_spatial_trustworthy_from.0
+        {
+            self.ft_spatial_trustworthy_from = commit_ts;
+        }
+    }
+
+    /// Retires `txn` as a **rolled-back** full-text/spatial mutator (`rmp` task #467). A no-op if
+    /// `txn` was not a mutator.
+    ///
+    /// A rollback undoes the durable store but **not** the in-memory index (it is not transactional —
+    /// see the `rmp` #410 note on [`seek_bitmap_eq`](Self::seek_bitmap_eq)). A rolled-back *replace*
+    /// or *delete* can leave a still-committed node dropped from a posting it should occupy — a false
+    /// negative the query-time re-check cannot resurrect. So this **poisons** the marker
+    /// ([`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) pinned at `u64::MAX`),
+    /// forcing every reader onto the always-correct scan path until a full
+    /// [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) rebuilds the index to committed
+    /// state. Conservative — it disables the fast path after a full-text/spatial-mutating rollback —
+    /// but never returns a wrong answer.
+    pub fn rollback_ft_spatial_marker(&mut self, txn: TxnId) {
+        if self.ft_spatial_inflight.remove(&txn) {
+            self.ft_spatial_poisoned = true;
+        }
+    }
+
+    /// Raises the committed full-text/spatial marker to at least `ts` after an **incremental online
+    /// build** chunk, and discards the build's dirty flag (`rmp` task #467).
+    ///
+    /// An online build (`rmp` tasks #72/#98) re-indexes its build-snapshot nodes' *committed* values
+    /// into the inverted index / grid via the instrumented mutation methods. Those committed values
+    /// may have been written by transactions that committed **before** the index existed (so they
+    /// never bumped this marker on commit). A reader whose snapshot predates such a value would, once
+    /// the index is `Online`, get the node keyed by its newer indexed value and miss it for the older
+    /// one — the same false negative the marker guards. Stamping the marker up to the store's current
+    /// high-water at build progress forces every reader whose snapshot predates the build to decline to
+    /// the scan path (correct), while the build's postings reflect committed state at or before that
+    /// high-water (so an at-or-after reader trusts them correctly).
+    ///
+    /// Unlike [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) this only ever **raises** the
+    /// marker and does **not** clear [`ft_spatial_poisoned`](Self#structfield.ft_spatial_poisoned): an
+    /// incremental build covers only its snapshot nodes, so it cannot repair every stale posting a
+    /// rolled-back mutator may have left (e.g. on a node created after the build snapshot). Only a full
+    /// rebuild ([`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker)) is exhaustive enough to
+    /// clear the poison.
+    pub fn bump_ft_spatial_marker_after_build(&mut self, ts: Timestamp) {
+        if ts.0 > self.ft_spatial_trustworthy_from.0 {
+            self.ft_spatial_trustworthy_from = ts;
+        }
+        self.ft_spatial_dirty = false;
+    }
+
+    /// Resets the full-text/spatial freshness marker to `ts` and clears the poison / dirty flags
+    /// (`rmp` task #467), called by the coordinator after a full store-consistent index rebuild.
+    ///
+    /// The rebuilt index reflects exactly the committed state at the store's current high-water `ts`,
+    /// so a reader at `ts` or later may trust it (correct — index == committed state at `ts`) and an
+    /// older reader declines (conservative, correct). The in-flight set is **not** touched: a rebuild
+    /// runs between commands with no open transaction, so it is empty; clearing it would be wrong if a
+    /// mutator were somehow open.
+    pub fn reset_ft_spatial_marker(&mut self, ts: Timestamp) {
+        self.ft_spatial_trustworthy_from = ts;
+        self.ft_spatial_poisoned = false;
+        self.ft_spatial_dirty = false;
     }
 
     // ============================================================================================

@@ -596,6 +596,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::index_one_node_bitmap(store, index, id, &registered_bitmap);
             }
         }
+
+        // Reset the cross-snapshot full-text/spatial freshness marker (`rmp` task #467). The rebuild
+        // above re-inserted every full-text/spatial posting via the instrumented mutation methods,
+        // which raised the transient dirty flag (and, on the recovery/DDL paths, may have to clear a
+        // prior poison); the rebuilt index now reflects exactly the committed store state at the
+        // current high-water. Stamp the marker to that high-water so a reader at-or-after it trusts the
+        // index (index == committed state) and an older reader conservatively declines to the scan
+        // path — and discard the build's dirty flag so it does not leak into the next user statement.
+        let high_water = store.borrow().snapshot_ts();
+        index.borrow_mut().reset_ft_spatial_marker(high_water);
     }
 
     /// Inserts node `id`'s current composite tuples into every registered composite index whose covered
@@ -2254,6 +2264,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for id in chunk {
             Self::index_one_node_fulltext(&self.store, &self.index, id);
         }
+        // The chunk re-indexed committed text into the inverted index; raise the cross-snapshot
+        // freshness marker to the store high-water so a reader whose snapshot predates this build
+        // (and predates a covered node's current committed value, possibly written before the index
+        // existed) declines to the always-correct scan path (`rmp` task #467). Only raises; never
+        // clears a poison (an incremental build is not exhaustive — see
+        // `bump_ft_spatial_marker_after_build`). Also discards the build's transient dirty flag so it
+        // is not mis-attributed to the next user transaction.
+        let high_water = self.store.borrow().snapshot_ts();
+        self.index
+            .borrow_mut()
+            .bump_ft_spatial_marker_after_build(high_water);
 
         if !done {
             return; // more of this build remains.
@@ -2314,6 +2335,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for id in chunk {
             Self::index_one_node_spatial(&self.store, &self.index, id, &registered);
         }
+        // Raise the cross-snapshot freshness marker to the store high-water (read BEFORE the promotion
+        // commit below so it reflects the indexed nodes' committed state, not the promotion txn's ts),
+        // for the same reason as the full-text build: a reader whose snapshot predates this build must
+        // decline to the scan path (`rmp` task #467). Only raises; never clears a poison. Also clears
+        // the build's transient dirty flag.
+        let high_water = self.store.borrow().snapshot_ts();
+        self.index
+            .borrow_mut()
+            .bump_ft_spatial_marker_after_build(high_water);
 
         if !done {
             return; // more of this build remains.
@@ -2601,6 +2631,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().commit(txn)?;
         let commit_ts = self.store.borrow().snapshot_ts();
 
+        // Authoritative cross-snapshot freshness stamp (`rmp` task #467): if `txn` structurally
+        // mutated a full-text/spatial posting (recorded by the statement seam during its writes), retire
+        // it as a committed mutator and raise the marker to `commit_ts`. From `commit_ts` onward the
+        // change is committed-visible in BOTH the index and the scan, so a reader at-or-after it may
+        // trust the fast index path; an older reader correctly declines. Because the in-flight set is
+        // keyed by txn, the effective marker stays `u64::MAX` until EVERY concurrent full-text/spatial
+        // mutator retires — a sibling writer's still-uncommitted mutation is never prematurely exposed.
+        // A no-op for a non-mutating transaction.
+        self.index
+            .borrow_mut()
+            .commit_ft_spatial_marker(txn, commit_ts);
+
         // 3) Publish the outcome: record the commit in the SSI tracker (kept for later conflict
         //    resolution until GC), release write locks, and close the transaction.
         self.ssi.borrow_mut().record_commit(txn, commit_ts);
@@ -2827,15 +2869,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         struct Cleanup<'a> {
             ssi: &'a RefCell<SsiTracker>,
             locks: &'a RefCell<LockTable>,
+            index: &'a RefCell<IndexSet>,
             active: &'a mut HashMap<TxnId, ActiveTxn>,
             txn: TxnId,
         }
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
-                // All three are idempotent no-ops for an already-removed txn, so this is safe even if
-                // the txn was somehow torn down concurrently / twice.
+                // All four are idempotent no-ops for an already-removed/non-mutator txn, so this is safe
+                // even if the txn was somehow torn down concurrently / twice.
                 self.ssi.borrow_mut().forget(self.txn);
                 self.locks.borrow_mut().release_all(self.txn);
+                // Cross-snapshot freshness marker (`rmp` task #467): retire `txn` as a ROLLED-BACK
+                // full-text/spatial mutator. The store undo above (or below) does NOT roll back the
+                // in-memory inverted index / grid, so a rolled-back replace/delete may leave a still-
+                // committed node dropped from a posting it should occupy — a false negative the query-
+                // time re-check cannot resurrect. `rollback_ft_spatial_marker` therefore pins the
+                // effective marker at `u64::MAX` (every reader uses the always-correct scan path) until
+                // a full store-consistent rebuild repairs the index. A no-op if `txn` was not a mutator,
+                // so the common (non-full-text/spatial) rollback leaves the fast path untouched.
+                self.index.borrow_mut().rollback_ft_spatial_marker(self.txn);
                 self.active.remove(&self.txn);
             }
         }
@@ -2849,6 +2901,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let cleanup = Cleanup {
             ssi: &self.ssi, // `&Rc<RefCell<_>>` coerces to `&RefCell<_>` via deref.
             locks: &self.locks,
+            index: &self.index,
             active: &mut self.active,
             txn,
         };
