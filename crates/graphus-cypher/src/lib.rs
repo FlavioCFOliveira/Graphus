@@ -198,7 +198,7 @@ pub use logical::{
 };
 pub use lower::lower;
 pub use ordering::{cmp_values, compare_values};
-pub use parser::{SyntaxError, SyntaxErrorKind, parse, parse_tokens};
+pub use parser::{MAX_EXPR_DEPTH, SyntaxError, SyntaxErrorKind, parse, parse_tokens};
 pub use physical::{PhysicalOp, PhysicalPlan, RangeBound, plan_physical, plan_physical_with_stats};
 pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,

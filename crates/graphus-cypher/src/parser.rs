@@ -252,7 +252,24 @@ impl Query {
 /// large dedicated stack (the server's worker / the TCK harness's 128 MiB threads); 1 000 levels is
 /// safe there with a wide margin, while still aligning with the low-thousands guard Neo4j's Cypher
 /// parser applies. (Callers on a small default stack should likewise isolate parsing on a worker.)
-const MAX_EXPR_DEPTH: usize = 1_000;
+///
+/// Re-exported at the crate root ([`crate::MAX_EXPR_DEPTH`]) because it is the engine-wide structural
+/// depth contract. Two complementary parser guards enforce it (`rmp` task #473):
+///
+/// 1. The **recursion** guard ([`Parser::enter_recursion`]) caps directly-recursive nesting
+///    (parentheses, stacked `NOT`, nested lists/maps/functions/subqueries, nested `FOREACH`) — it
+///    trips while descending, before the stack is exhausted (on the engine's large dedicated stack).
+/// 2. The **fold budget** ([`Parser::count_fold`]) caps the number of *operator folds* in a single
+///    top-level expression. Left-associative chains (`1+1+…+1`, `a AND a AND …`, `$x.a.a.…`) are
+///    folded **iteratively** by the precedence ladder, so they never increment the recursion counter,
+///    yet each fold deepens the AST by one level — which the post-parse passes (semantics, lowering,
+///    evaluation) and even the recursive `Drop` of the tree would descend into. Counting the folds and
+///    bailing past the budget rejects such a chain *during construction*, before any deep tree is
+///    built — so it is bounded in time **and memory** (≈ the budget, not the query length) and safe on
+///    any stack. The combined worst-case AST depth is therefore ≤ `2 × MAX_EXPR_DEPTH`.
+///
+/// The server also sizes its query threads' stacks to absorb a legal at-the-limit query with margin.
+pub const MAX_EXPR_DEPTH: usize = 1_000;
 
 struct Parser<'t, 's> {
     /// The tokens to parse.
@@ -265,6 +282,18 @@ struct Parser<'t, 's> {
     /// to each recursive expression rule and decremented on exit by [`DepthGuard`], so an
     /// adversarially deep query is rejected as a `SyntaxError` instead of overflowing the stack.
     depth: usize,
+    /// Operator folds accumulated in the **current top-level expression** (`rmp` task #473). Reset to
+    /// `0` when a fresh top-level expression begins (the outermost [`Parser::parse_expr`] /
+    /// [`Parser::parse_postfix_expr`], tracked by [`Self::in_expr`]) and incremented by
+    /// [`Self::count_fold`] on every left-associative operator fold. Bounding it at [`MAX_EXPR_DEPTH`]
+    /// caps the depth of iteratively-built chains (`1+1+…+1`, `a.b.c.…`) that the recursion counter
+    /// above does not see — rejecting them *during construction*, before a deep AST is ever built.
+    expr_folds: usize,
+    /// `true` while a top-level expression is being parsed. Distinguishes the outermost expression
+    /// entry (which resets [`Self::expr_folds`]) from the nested sub-expressions it re-enters (a
+    /// parenthesised group, a function argument, an index `[…]`, a comprehension body) that must
+    /// **share** the same fold budget rather than reset it.
+    in_expr: bool,
 }
 
 /// An RAII guard that decrements [`Parser::depth`] when it is dropped, so the depth is restored on
@@ -300,7 +329,25 @@ impl<'t, 's> Parser<'t, 's> {
             source,
             pos: 0,
             depth: 0,
+            expr_folds: 0,
+            in_expr: false,
         }
+    }
+
+    /// Counts one operator fold against the current top-level expression's budget (`rmp` task #473),
+    /// erroring with [`SyntaxErrorKind::NestingTooDeep`] once it exceeds [`MAX_EXPR_DEPTH`]. Called by
+    /// every left-associative fold loop in the expression grammar, so a chain that the recursion guard
+    /// cannot see (`1+1+…+1`, `a AND a AND …`, postfix `$x.a.a.…`) is rejected before its deep AST is
+    /// built — bounding the work in time and memory.
+    fn count_fold(&mut self) -> Result<(), SyntaxError> {
+        self.expr_folds += 1;
+        if self.expr_folds > MAX_EXPR_DEPTH {
+            return Err(SyntaxError::new(
+                SyntaxErrorKind::NestingTooDeep,
+                self.here_span(),
+            ));
+        }
+        Ok(())
     }
 
     /// Enters one level of expression recursion, returning a [`DepthGuard`] that restores the depth
@@ -597,36 +644,42 @@ impl<'t, 's> Parser<'t, 's> {
     /// is a [`SyntaxError`] (`SyntaxErrorKind::Expected`). At least one update clause is required —
     /// an empty body is a syntax error.
     fn parse_foreach(&mut self) -> Result<ForeachClause, SyntaxError> {
-        let start = self.here_span().start;
-        self.expect(&TokenKind::Foreach, "FOREACH")?;
-        self.expect(&TokenKind::LParen, "'(' to begin a FOREACH")?;
-        let variable = self.parse_variable()?;
-        self.expect(&TokenKind::In, "IN in a FOREACH")?;
-        let list = self.parse_expr()?;
-        self.expect(&TokenKind::Pipe, "'|' before the FOREACH update clauses")?;
+        // Nested `FOREACH (… | FOREACH (… | …))` recurses here (line below), and unlike the
+        // expression grammar this clause is NOT otherwise depth-guarded — so without this an
+        // adversarially deep FOREACH nest would overflow the parser stack (and then the semantic /
+        // lowering / execution passes, which recurse over the nested clause list too). The shared
+        // recursion guard converts that into a recoverable `SyntaxError` (`rmp` task #473).
+        let mut me = self.enter_recursion()?;
+        let start = me.here_span().start;
+        me.expect(&TokenKind::Foreach, "FOREACH")?;
+        me.expect(&TokenKind::LParen, "'(' to begin a FOREACH")?;
+        let variable = me.parse_variable()?;
+        me.expect(&TokenKind::In, "IN in a FOREACH")?;
+        let list = me.parse_expr()?;
+        me.expect(&TokenKind::Pipe, "'|' before the FOREACH update clauses")?;
 
         let mut body = Vec::new();
-        while !self.at(&TokenKind::RParen) {
-            let kind = self
+        while !me.at(&TokenKind::RParen) {
+            let kind = me
                 .peek_kind()
-                .ok_or_else(|| self.expected_here("an update clause inside FOREACH"))?;
+                .ok_or_else(|| me.expected_here("an update clause inside FOREACH"))?;
             let clause = match kind {
-                TokenKind::Create => Clause::Create(self.parse_create()?),
-                TokenKind::Merge => Clause::Merge(self.parse_merge()?),
-                TokenKind::Set => Clause::Set(self.parse_set()?),
-                TokenKind::Detach | TokenKind::Delete => Clause::Delete(self.parse_delete()?),
-                TokenKind::Remove => Clause::Remove(self.parse_remove()?),
-                TokenKind::Foreach => Clause::Foreach(self.parse_foreach()?),
+                TokenKind::Create => Clause::Create(me.parse_create()?),
+                TokenKind::Merge => Clause::Merge(me.parse_merge()?),
+                TokenKind::Set => Clause::Set(me.parse_set()?),
+                TokenKind::Detach | TokenKind::Delete => Clause::Delete(me.parse_delete()?),
+                TokenKind::Remove => Clause::Remove(me.parse_remove()?),
+                TokenKind::Foreach => Clause::Foreach(me.parse_foreach()?),
                 // Only updating clauses are legal inside FOREACH; anything else (MATCH, WITH,
                 // RETURN, UNWIND, CALL, …) is a syntax error.
-                _ => return Err(self.expected_here("an update clause inside FOREACH")),
+                _ => return Err(me.expected_here("an update clause inside FOREACH")),
             };
             body.push(clause);
         }
         if body.is_empty() {
-            return Err(self.expected_here("an update clause inside FOREACH"));
+            return Err(me.expected_here("an update clause inside FOREACH"));
         }
-        let rparen = self.expect(&TokenKind::RParen, "')' to close the FOREACH")?;
+        let rparen = me.expect(&TokenKind::RParen, "')' to close the FOREACH")?;
         let end = rparen.span.end;
         Ok(ForeachClause {
             variable,
@@ -1523,15 +1576,36 @@ impl<'t, 's> Parser<'t, 's> {
     /// Every nested expression — a parenthesised group, a list/map literal element, a function
     /// argument, a comprehension body — re-enters here, so a single depth guard at this choke point
     /// bounds the overall recursion (stacked `NOT`, which recurses directly, is guarded separately).
+    ///
+    /// On the **outermost** call (no expression is already being parsed) the per-expression fold
+    /// budget ([`Self::expr_folds`]) is reset (`rmp` task #473): the recursion guard above bounds
+    /// *parenthesis/`NOT`* nesting, but a left-associative operator chain (`1+1+…+1`) is folded
+    /// *iteratively* by the precedence ladder below — so [`Self::count_fold`] bounds it instead, over
+    /// the whole top-level expression (every nested sub-expression shares the budget).
     fn parse_expr(&mut self) -> Result<Expr, SyntaxError> {
-        let mut guard = self.enter_recursion()?;
-        guard.parse_or()
+        let outermost = !self.in_expr;
+        if outermost {
+            self.in_expr = true;
+            self.expr_folds = 0;
+        }
+        // On the `?` error paths `in_expr` is left set, which is harmless: a parse error aborts the
+        // whole parse and the `Parser` is discarded. On success it is cleared so the next top-level
+        // expression starts fresh.
+        let expr = {
+            let mut guard = self.enter_recursion()?;
+            guard.parse_or()?
+        };
+        if outermost {
+            self.in_expr = false;
+        }
+        Ok(expr)
     }
 
     /// `OrExpression = XorExpression, { 'OR', XorExpression }` (left-assoc).
     fn parse_or(&mut self) -> Result<Expr, SyntaxError> {
         let mut lhs = self.parse_xor()?;
         while self.at(&TokenKind::Or) {
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_xor()?;
             lhs = Self::binary(BinaryOp::Or, lhs, rhs);
@@ -1543,6 +1617,7 @@ impl<'t, 's> Parser<'t, 's> {
     fn parse_xor(&mut self) -> Result<Expr, SyntaxError> {
         let mut lhs = self.parse_and()?;
         while self.at(&TokenKind::Xor) {
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_and()?;
             lhs = Self::binary(BinaryOp::Xor, lhs, rhs);
@@ -1554,6 +1629,7 @@ impl<'t, 's> Parser<'t, 's> {
     fn parse_and(&mut self) -> Result<Expr, SyntaxError> {
         let mut lhs = self.parse_not()?;
         while self.at(&TokenKind::And) {
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_not()?;
             lhs = Self::binary(BinaryOp::And, lhs, rhs);
@@ -1612,6 +1688,8 @@ impl<'t, 's> Parser<'t, 's> {
         let mut prev = second.clone();
         let mut acc = Self::binary(op, first, second);
         while let Some(next_op) = self.peek_comparison_op() {
+            // A chained comparison (`a < b < c …`) folds into a conjunction; charge the budget.
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_predicate()?;
             let link = Self::binary(next_op, prev, rhs.clone());
@@ -1642,6 +1720,23 @@ impl<'t, 's> Parser<'t, 's> {
     fn parse_predicate(&mut self) -> Result<Expr, SyntaxError> {
         let mut expr = self.parse_additive()?;
         loop {
+            // Each postfix predicate (`IN`, `STARTS/ENDS WITH`, `CONTAINS`, `=~`, `IS [NOT] NULL`)
+            // deepens the AST by one fold — count it against the budget (`rmp` task #473); bail first
+            // when the next token starts no predicate so a non-predicate iteration is not charged.
+            if !matches!(
+                self.peek_kind(),
+                Some(
+                    TokenKind::In
+                        | TokenKind::Starts
+                        | TokenKind::Ends
+                        | TokenKind::Contains
+                        | TokenKind::RegexMatch
+                        | TokenKind::Is
+                )
+            ) {
+                break;
+            }
+            self.count_fold()?;
             match self.peek_kind() {
                 Some(TokenKind::In) => {
                     self.bump();
@@ -1728,6 +1823,7 @@ impl<'t, 's> Parser<'t, 's> {
                 Some(TokenKind::Minus) => BinaryOp::Sub,
                 _ => break,
             };
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_multiplicative()?;
             lhs = Self::binary(op, lhs, rhs);
@@ -1745,6 +1841,7 @@ impl<'t, 's> Parser<'t, 's> {
                 Some(TokenKind::Percent) => BinaryOp::Mod,
                 _ => break,
             };
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_power()?;
             lhs = Self::binary(op, lhs, rhs);
@@ -1763,6 +1860,7 @@ impl<'t, 's> Parser<'t, 's> {
     fn parse_power(&mut self) -> Result<Expr, SyntaxError> {
         let mut lhs = self.parse_unary()?;
         while self.at(&TokenKind::Caret) {
+            self.count_fold()?;
             self.bump();
             let rhs = self.parse_unary()?; // left-assoc: iterate
             lhs = Self::binary(BinaryOp::Pow, lhs, rhs);
@@ -1835,10 +1933,22 @@ impl<'t, 's> Parser<'t, 's> {
     /// Parses an atom and then a postfix chain of `.key`, `[index]`, `[lo..hi]`, followed by an
     /// optional trailing `:Label...` label predicate.
     fn parse_postfix_expr(&mut self) -> Result<Expr, SyntaxError> {
+        // `SET`/`REMOVE` targets call this directly (not via `parse_expr`), so this is also a
+        // top-level-expression entry: reset the fold budget here when no expression is already open,
+        // so a deep `SET a.b.c.…` postfix chain is bounded too (`rmp` task #473). When reached from
+        // within `parse_expr` the flag is already set and the budget is shared.
+        let outermost = !self.in_expr;
+        if outermost {
+            self.in_expr = true;
+            self.expr_folds = 0;
+        }
         let mut expr = self.parse_atom()?;
         loop {
             match self.peek_kind() {
                 Some(TokenKind::Dot) => {
+                    // Each postfix step deepens the AST by one level (left-fold), so it counts against
+                    // the same budget as the operator chains.
+                    self.count_fold()?;
                     self.bump();
                     let key_span = self.here_span();
                     let key = self.parse_property_key("a property name after '.'")?;
@@ -1852,6 +1962,7 @@ impl<'t, 's> Parser<'t, 's> {
                     );
                 }
                 Some(TokenKind::LBracket) => {
+                    self.count_fold()?;
                     expr = self.parse_index_or_slice(expr)?;
                 }
                 _ => break,
@@ -1869,6 +1980,9 @@ impl<'t, 's> Parser<'t, 's> {
                 },
                 span,
             );
+        }
+        if outermost {
+            self.in_expr = false;
         }
         Ok(expr)
     }

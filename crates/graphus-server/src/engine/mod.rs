@@ -109,6 +109,22 @@ const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 /// exactly `K` simulated failures.
 pub const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
 
+/// Stack size for every thread that **compiles or evaluates a Cypher query**: the single engine
+/// thread and each off-thread reader-pool worker (`rmp` task #473).
+///
+/// The compile/execute pipeline is recursive-descent over the AST (parser, semantic analysis,
+/// lowering, evaluation), so its peak stack usage is proportional to the *structural depth* of the
+/// query's expressions/clauses. The cypher crate bounds that depth at compile time
+/// ([`graphus_cypher::MAX_EXPR_DEPTH`] ≈ 1 000) and converts anything deeper into a recoverable
+/// compile error rather than a native stack overflow — but a Rust stack overflow **aborts the whole
+/// process** (the guard-page handler calls `abort()`, which no `catch_unwind` can intercept), so the
+/// thread must carry enough stack to absorb a *legal*, at-the-limit query with comfortable margin.
+/// The default thread stack (~2 MiB on Linux) is **not** enough: a depth-1 000 expression overflows
+/// it during parsing/evaluation. 64 MiB matches the dedicated stack the TCK harness already runs the
+/// engine on and was measured (`rmp` #473) to absorb the depth bound with ≥5× headroom, while costing
+/// only reserved address space (lazily paged, a handful of threads per database).
+pub const QUERY_ENGINE_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 /// A **test-only fault-injection seam** (`rmp` #409): the count of upcoming statement-recovery
 /// rollbacks/commits that should *themselves* panic, simulating the historical `RefCell`-double-borrow
 /// in `store.rs` (or the #359 buffer-pool replay panic class) striking inside the recovery path. Lets
@@ -1871,6 +1887,10 @@ where
     let loop_maintenance_degraded = maintenance_degraded.clone();
     let join = std::thread::Builder::new()
         .name("graphus-engine".to_owned())
+        // A large stack: query compile/execute recurses on AST depth (`rmp` #473). See
+        // [`QUERY_ENGINE_STACK_SIZE`] — the default ~2 MiB stack overflows on a legal at-the-limit
+        // query, and a stack overflow aborts the whole process.
+        .stack_size(QUERY_ENGINE_STACK_SIZE)
         .spawn(move || match build() {
             Ok(coordinator) => {
                 // Startup succeeded: signal readiness, then run the loop until Shutdown. The loop

@@ -282,6 +282,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let metrics = Arc::clone(&metrics);
             let join = std::thread::Builder::new()
                 .name(format!("graphus-reader-{i}"))
+                // Reader workers run the full read pipeline (parse/analyze/lower/eval), which recurses
+                // on AST depth, so they need the same large stack as the engine thread (`rmp` #473):
+                // the default ~2 MiB stack overflows on a legal at-the-limit query and a stack overflow
+                // aborts the whole process.
+                .stack_size(super::QUERY_ENGINE_STACK_SIZE)
                 .spawn(move || worker_loop(&work_rx, &retire_tx, &metrics))
                 // A failure to spawn a worker is a startup-time OS resource error; surfacing it as a
                 // panic here is acceptable (the server is coming up and the pool size is bounded/small).
