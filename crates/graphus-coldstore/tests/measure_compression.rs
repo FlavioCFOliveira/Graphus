@@ -26,7 +26,7 @@ fn measure_cold_segment_compression() {
         })
         .collect();
 
-    let seg = ColdSegment::encode(&readings);
+    let seg = ColdSegment::encode(&readings).expect("encode");
     let cold_bytes = seg.encoded_len();
     let row_bytes = readings.len() * ROW_BYTES_PER_READING;
     let ratio = row_bytes as f64 / cold_bytes as f64;

@@ -254,6 +254,34 @@ mod tests {
     }
 
     #[test]
+    fn decode_width_zero_rejects_a_forged_unbounded_count() {
+        // A single-entry dictionary needs only `bits_required(0) == 0`-bit codes, so the code stream
+        // is EMPTY (width 0). The buffer therefore cannot bound `count`, and the underlying
+        // `bitpack::unpack` width-0 path previously did `vec![0; count]` before any check — so a
+        // forged `usize::MAX` count was an OOM-abort (`rmp` #438). It must now be a controlled error.
+        // Blob = [num=1, len=1, byte 'x', width=0], no code bytes.
+        let mut w0 = Vec::new();
+        put_u32(&mut w0, 1); // one entry
+        put_u32(&mut w0, 1); // ...of length 1
+        w0.push(b'x');
+        w0.push(0); // code width 0 (only one distinct value)
+        assert!(
+            decode(&w0, usize::MAX).is_err(),
+            "dictionary width-0 with a forged usize::MAX count must error, not OOM-abort"
+        );
+        assert!(
+            decode_codes(&w0, usize::MAX).is_err(),
+            "decode_codes must reject the same forged width-0 count"
+        );
+        // A legitimate (u32-expressible) count over the same single-value dictionary still decodes:
+        // every one of the `count` rows is the sole entry `x`.
+        assert_eq!(decode(&w0, 1000).unwrap(), vec![b("x"); 1000]);
+        let (codes, dict) = decode_codes(&w0, 1000).unwrap();
+        assert_eq!(codes, vec![0u32; 1000]);
+        assert_eq!(dict, vec![b("x")]);
+    }
+
+    #[test]
     fn decode_codes_is_consistent_with_decode_and_canonical() {
         let cities = ["Lisbon", "Porto", "Madrid", "Lisbon", "Porto", "Lisbon"];
         let values: Vec<Vec<u8>> = cities.iter().map(|s| b(s)).collect();

@@ -272,6 +272,20 @@ mod tests {
         ));
         // A forged huge count over a tiny payload must error up front, not OOM-abort.
         assert!(decode_i64(&blob, usize::MAX / 8).is_err());
+
+        // A FOR header with width 0 (an all-equal-to-`min` column) has an EMPTY payload, so the
+        // buffer cannot bound `count`; the underlying `bitpack::unpack` width-0 path previously did
+        // `vec![0; count]` before any check, so a forged `usize::MAX` count was an OOM-abort (`rmp`
+        // #438). It must now be a controlled error. Blob = [FOR, min=0 (8 bytes), width=0], no payload.
+        let mut for_w0 = vec![FOR];
+        for_w0.extend_from_slice(&0u64.to_le_bytes());
+        for_w0.push(0); // width 0
+        assert!(
+            decode_i64(&for_w0, usize::MAX).is_err(),
+            "FOR width-0 with a forged usize::MAX count must error, not OOM-abort"
+        );
+        // The same width-0 blob still decodes a legitimate (u32-expressible) count to `min` repeated.
+        assert_eq!(decode_i64(&for_w0, 1000).unwrap(), vec![0i64; 1000]);
     }
 
     #[test]

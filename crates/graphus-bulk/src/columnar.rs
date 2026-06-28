@@ -172,6 +172,13 @@ impl<'a> Cursor<'a> {
         let len = self.take_u32()? as usize;
         self.take(len)
     }
+
+    /// The number of bytes left between the cursor and the end of the blob. Used to clamp / reject a
+    /// forged element count *before* a `Vec::with_capacity`, so an attacker-controlled count cannot
+    /// drive a multi-gigabyte pre-allocation (`rmp` #439, `04 §11.4`).
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
 }
 
 /// Validates the trailing CRC32C integrity field (`rmp` #405) and returns the body slice (everything
@@ -437,7 +444,21 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
     let ncols = cur.take_u32()? as usize;
     let nrows = cur.take_u32()? as usize;
 
-    // Header section.
+    // Clamp `ncols` against the remaining body length BEFORE any `Vec::with_capacity(ncols)`: each of
+    // the `ncols` header cells consumes at least its 4-byte length prefix (and each column section a
+    // further bitmap + tag + payload), so the blob cannot describe more columns than it has bytes
+    // left. A forged `ncols` (e.g. `0xFFFF_FFFF`, ~103 GB of capacity) that passes the CRC is still
+    // structurally impossible, so reject it here rather than pre-allocate gigabytes and then fail in
+    // the read loop (`rmp` #439, mirrors `dictionary::read_dict_header` and `coldstore`'s `count`
+    // guard). The CRC has already proved the bytes intact; this guards an intact-but-absurd count.
+    if ncols > cur.remaining() {
+        return Err(ColumnarError::Malformed(format!(
+            "column count {ncols} exceeds the {} remaining body bytes (truncated or forged header)",
+            cur.remaining()
+        )));
+    }
+
+    // Header section. Capacity is clamped to `ncols`, now proven `<=` the bytes that remain.
     let mut header_cells: Vec<Vec<u8>> = Vec::with_capacity(ncols);
     for _ in 0..ncols {
         header_cells.push(cur.take_section()?.to_vec());
@@ -448,7 +469,8 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
         return Ok(Vec::new());
     }
 
-    // Column section → reconstruct each column's `nrows` cells.
+    // Column section → reconstruct each column's `nrows` cells. `ncols` is already bounded above by
+    // the body length, so this capacity cannot be an attacker-driven over-allocation either.
     let mut columns: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ncols);
     for _ in 0..ncols {
         columns.push(decode_column(&mut cur, nrows)?);
@@ -733,6 +755,37 @@ mod tests {
             gcol_to_csv(&tampered),
             Err(ColumnarError::Malformed(_))
         ));
+    }
+
+    /// A blob whose `ncols` header is forged to `u32::MAX` (with a VALID CRC, so the CRC layer cannot
+    /// reject it) must be a controlled `Malformed` and return PROMPTLY — never a ~103 GB
+    /// `Vec::with_capacity(ncols)` over-allocation (`rmp` #439, `04 §11.4`). The clamp is `ncols <=`
+    /// the remaining body bytes: a tiny body cannot describe `u32::MAX` columns.
+    #[test]
+    fn forged_ncols_is_rejected_promptly_without_oversized_alloc() {
+        // Build a minimal-but-well-framed body, then overwrite `ncols` (offset 6, u32 LE) with
+        // u32::MAX and re-stamp a fresh CRC32C so only the `ncols` guard can object.
+        // Layout: magic[4] version[1] delimiter[1] ncols[4] nrows[4] ... (see `encode_blob`).
+        let mut blob = csv_to_gcol(b":ID\n1\n", b',').unwrap();
+        let body_len = blob.len() - CRC_LEN;
+        blob[6..10].copy_from_slice(&u32::MAX.to_le_bytes()); // forge ncols
+        let crc = crc32c::crc32c(&blob[..body_len]);
+        blob[body_len..].copy_from_slice(&crc.to_le_bytes()); // valid CRC over the forged body
+
+        let start = std::time::Instant::now();
+        let result = gcol_to_csv(&blob);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ColumnarError::Malformed(_))),
+            "a forged u32::MAX ncols must be rejected as Malformed, got {result:?}"
+        );
+        // Promptly: the guard fires before any per-column allocation. A multi-GB pre-allocation would
+        // take far longer (or OOM-abort); a structural reject is sub-millisecond. Generous bound to
+        // stay robust on a loaded CI box while still failing a real ~103 GB allocation attempt.
+        assert!(
+            elapsed.as_secs() < 5,
+            "rejecting a forged ncols must be prompt (no oversized alloc), took {elapsed:?}"
+        );
     }
 
     /// Reads the codec tag of column `target` out of a blob (test introspection only).

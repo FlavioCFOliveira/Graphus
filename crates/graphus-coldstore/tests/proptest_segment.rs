@@ -43,15 +43,15 @@ proptest! {
     /// Encode → decode reproduces the input exactly for arbitrary (non-NaN-value) readings.
     #[test]
     fn round_trip_is_exact(readings in prop::collection::vec(arb_reading_no_nan(), 0..200)) {
-        let seg = ColdSegment::encode(&readings);
+        let seg = ColdSegment::encode(&readings).expect("encode");
         prop_assert_eq!(seg.decode_all().unwrap(), readings);
     }
 
     /// to_bytes → from_bytes → decode reproduces the input exactly.
     #[test]
     fn byte_round_trip_is_exact(readings in prop::collection::vec(arb_reading_no_nan(), 0..200)) {
-        let seg = ColdSegment::encode(&readings);
-        let back = ColdSegment::from_bytes(&seg.to_bytes()).expect("valid");
+        let seg = ColdSegment::encode(&readings).expect("encode");
+        let back = ColdSegment::from_bytes(&seg.to_bytes().expect("to_bytes")).expect("valid");
         prop_assert_eq!(back.decode_all().unwrap(), readings);
     }
 
@@ -63,7 +63,7 @@ proptest! {
         hi in any::<i64>(),
     ) {
         let (lo, hi) = (lo.min(hi), lo.max(hi));
-        let seg = ColdSegment::encode(&readings);
+        let seg = ColdSegment::encode(&readings).expect("encode");
         let mut expect: Vec<Reading> = readings.into_iter().filter(|r| r.ts >= lo && r.ts <= hi).collect();
         let mut got = seg.scan_ts_range(lo, hi).unwrap();
         expect.sort_by_key(|r| (r.seq, r.ts));
@@ -83,7 +83,7 @@ proptest! {
         readings in prop::collection::vec(arb_reading_no_nan(), 1..50),
         cut in 0usize..64,
     ) {
-        let mut bytes = ColdSegment::encode(&readings).to_bytes();
+        let mut bytes = ColdSegment::encode(&readings).expect("encode").to_bytes().expect("to_bytes");
         let n = bytes.len().saturating_sub(cut);
         bytes.truncate(n);
         if let Ok(seg) = ColdSegment::from_bytes(&bytes) {

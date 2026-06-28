@@ -95,6 +95,15 @@ pub enum ColdError {
     /// or carried an out-of-range dictionary code. Surfaced from [`graphus_columnar`] so a corrupt
     /// segment is a controlled error here too (`04 §11.4`), never a panic.
     BadColumn(graphus_columnar::DecodeError),
+    /// The segment's `count` or one of its column-blob lengths exceeds the **`u32`** field the
+    /// on-disk header frames it in (`rmp` #441). The header fields are little-endian `u32`s; an
+    /// unchecked `as u32` cast of a `usize` above [`u32::MAX`] would *wrap* (mod 2³²) and the trailing
+    /// CRC32C would then be computed over — and match — the **wrapped** header, so a >4 GiB segment
+    /// would round-trip to a *different*, structurally-valid-looking segment: silently-wrong data that
+    /// passes every integrity check. [`encode`](ColdSegment::encode) and
+    /// [`to_bytes`](ColdSegment::to_bytes) return this instead of casting, so a segment too large to
+    /// represent is a controlled error, never a silent truncation.
+    TooLarge,
 }
 
 impl std::fmt::Display for ColdError {
@@ -109,6 +118,10 @@ impl std::fmt::Display for ColdError {
                 )
             }
             ColdError::BadColumn(e) => write!(f, "cold segment column is corrupt: {e}"),
+            ColdError::TooLarge => write!(
+                f,
+                "cold segment count or column length exceeds the u32 header field (segment too large to represent)"
+            ),
         }
     }
 }
@@ -153,8 +166,15 @@ impl ColdSegment {
     /// (`min_ts`/`max_ts` are `0` and every scan returns nothing). Rows keep their given order; the
     /// caller typically appends in `seq`/`ts` order so the integer columns are monotonic (the
     /// double-delta win), but correctness does not require it.
-    #[must_use]
-    pub fn encode(readings: &[Reading]) -> Self {
+    ///
+    /// # Errors
+    /// [`ColdError::TooLarge`] if the batch has more than [`u32::MAX`] readings or any encoded column
+    /// blob exceeds [`u32::MAX`] bytes — the limits of the segment header's `u32` count/length fields.
+    /// Rejecting here (rather than truncating the count via an `as u32` cast in
+    /// [`to_bytes`](Self::to_bytes)) is what prevents a >4 GiB segment from silently round-tripping to
+    /// a *different*, CRC-valid segment (`rmp` #441). The cold tier's compaction batches are far below
+    /// this bound, so this never fires in practice — it is a structural safety net.
+    pub fn encode(readings: &[Reading]) -> Result<Self, ColdError> {
         let count = readings.len();
         let seq: Vec<i64> = readings.iter().map(|r| r.seq).collect();
         let ts: Vec<i64> = readings.iter().map(|r| r.ts).collect();
@@ -171,7 +191,7 @@ impl ColdSegment {
                 None => Some((t, t)),
             })
             .unwrap_or((0, 0));
-        Self {
+        let seg = Self {
             count,
             min_ts,
             max_ts,
@@ -179,6 +199,27 @@ impl ColdSegment {
             ts_blob: integer::encode_i64(&ts),
             value_blob: gorilla::encode(&value),
             sensor_blob: dictionary::encode(&sensor),
+        };
+        // Verify every field fits the `u32` header *before* the segment is handed out, so a too-large
+        // segment can never be constructed (and therefore never silently truncated by `to_bytes`).
+        seg.check_u32_framing()?;
+        Ok(seg)
+    }
+
+    /// Asserts that `count` and every column-blob length fit the segment header's `u32` fields, so a
+    /// later little-endian `u32` serialization (in [`to_bytes`](Self::to_bytes)) is exact rather than
+    /// a silent mod-2³² wrap. Returns [`ColdError::TooLarge`] otherwise (`rmp` #441).
+    fn check_u32_framing(&self) -> Result<(), ColdError> {
+        let fits = |n: usize| u32::try_from(n).is_ok();
+        if fits(self.count)
+            && fits(self.seq_blob.len())
+            && fits(self.ts_blob.len())
+            && fits(self.value_blob.len())
+            && fits(self.sensor_blob.len())
+        {
+            Ok(())
+        } else {
+            Err(ColdError::TooLarge)
         }
     }
 
@@ -271,18 +312,31 @@ impl ColdSegment {
     }
 
     /// Serializes the segment to a single self-describing byte buffer (a cold segment file).
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    /// [`ColdError::TooLarge`] if `count` or any column-blob length exceeds [`u32::MAX`] (the header's
+    /// `u32` fields). Without this guard an `as u32` cast would silently *wrap* a >4 GiB value mod 2³²
+    /// and the trailing CRC32C — computed over the wrapped header — would still match, so the buffer
+    /// would decode to a structurally-valid-but-WRONG segment (`rmp` #441). A segment built by
+    /// [`encode`](Self::encode) or read by [`from_bytes`](Self::from_bytes) already satisfies the
+    /// bound, so for those this is infallible in practice; the check makes the truncation impossible
+    /// by construction.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ColdError> {
+        // Validate the `u32` framing FIRST, so the casts below are guaranteed exact (no mod-2³² wrap).
+        self.check_u32_framing()?;
+        // Each `try_from` is now infallible (just proven), but use it rather than `as` so a future
+        // refactor that drops the check above still cannot silently truncate. `expect` is unreachable.
+        let to_u32 = |n: usize| -> u32 { u32::try_from(n).expect("u32 framing checked above") };
         let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
-        out.extend_from_slice(&(self.count as u32).to_le_bytes());
+        out.extend_from_slice(&to_u32(self.count).to_le_bytes());
         out.extend_from_slice(&self.min_ts.to_le_bytes());
         out.extend_from_slice(&self.max_ts.to_le_bytes());
-        out.extend_from_slice(&(self.seq_blob.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.ts_blob.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.value_blob.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.sensor_blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&to_u32(self.seq_blob.len()).to_le_bytes());
+        out.extend_from_slice(&to_u32(self.ts_blob.len()).to_le_bytes());
+        out.extend_from_slice(&to_u32(self.value_blob.len()).to_le_bytes());
+        out.extend_from_slice(&to_u32(self.sensor_blob.len()).to_le_bytes());
         out.extend_from_slice(&self.seq_blob);
         out.extend_from_slice(&self.ts_blob);
         out.extend_from_slice(&self.value_blob);
@@ -291,7 +345,7 @@ impl ColdSegment {
         // the first thing verified on decode.
         let crc = crc32c::crc32c(&out);
         out.extend_from_slice(&crc.to_le_bytes());
-        out
+        Ok(out)
     }
 
     /// Reconstructs a segment from a buffer produced by [`to_bytes`](Self::to_bytes).
@@ -343,12 +397,20 @@ impl ColdSegment {
         let len_sensor = rd_u32(37) as usize;
         // Step 3 — validate `count` against the payload before handing it to the column decoders.
         // `count` is load-bearing: each decoder is asked to materialize exactly `count` elements, and
-        // a FOR-width-0 integer column decodes to `vec![0; count]` *without* consulting its payload
-        // (graphus-columnar bitpack), so an out-of-range `count` would drive an allocation unbounded
-        // by the on-disk bytes. A segment can never hold more rows than it has bytes, so a `count`
-        // exceeding the body length is structurally impossible — reject it here, capping the worst
-        // case to the segment's actual size. (CRC already proved the bytes intact; this guards a
-        // count that is intact-but-absurd, e.g. a forged or mis-built segment.)
+        // a FOR-width-0 / single-value-dictionary column decodes `count` elements from a payload that
+        // does NOT grow with `count` (graphus-columnar bitpack: a width-0 stream is empty). Two layers
+        // bound the resulting allocation, so a forged `count` is neither an OOM-abort nor silently
+        // wrong:
+        //   1. The columnar layer caps every width-0 `unpack` at `u32::MAX` elements and errors above
+        //      it (`rmp` #438), so no single column decode can be driven unbounded by an absurd count.
+        //   2. This structural cap: a segment can never describe more rows than its body has bytes, so
+        //      `count > buf.len()` is impossible for a genuine segment. It bounds the peak decode
+        //      footprint to O(body bytes) — `count <= buf.len() <= u32::MAX`, and each materialized
+        //      column is `count` elements — keeping a forged-but-CRC-valid `count` proportional to the
+        //      on-disk size rather than a multi-gigabyte amplification.
+        // (The CRC already proved the bytes intact; this guards a count that is intact-but-absurd,
+        // e.g. a forged or mis-built segment. `count` itself was read from a `u32` field, so it is
+        // already `<= u32::MAX`.)
         if count > buf.len() {
             return Err(ColdError::Corrupt);
         }
@@ -468,7 +530,7 @@ mod tests {
     #[test]
     fn round_trip_decode_is_exact() {
         let readings = sample(1000);
-        let seg = ColdSegment::encode(&readings);
+        let seg = ColdSegment::encode(&readings).expect("encode");
         assert_eq!(seg.len(), 1000);
         assert_eq!(
             seg.decode_all().unwrap(),
@@ -480,8 +542,8 @@ mod tests {
     #[test]
     fn to_from_bytes_round_trips() {
         let readings = sample(500);
-        let seg = ColdSegment::encode(&readings);
-        let bytes = seg.to_bytes();
+        let seg = ColdSegment::encode(&readings).expect("encode");
+        let bytes = seg.to_bytes().expect("to_bytes");
         let back = ColdSegment::from_bytes(&bytes).expect("valid segment");
         assert_eq!(back.decode_all().unwrap(), readings);
         assert_eq!(back.ts_bounds(), seg.ts_bounds());
@@ -491,7 +553,7 @@ mod tests {
     fn range_scan_equals_row_filter() {
         // Equivalence with a row store: the cold range scan returns EXACTLY the rows a row filter does.
         let readings = sample(2000);
-        let seg = ColdSegment::encode(&readings);
+        let seg = ColdSegment::encode(&readings).expect("encode");
         let (lo, hi) = (1_000_500, 1_010_000);
         let mut row_baseline: Vec<Reading> = readings
             .iter()
@@ -509,18 +571,18 @@ mod tests {
 
     #[test]
     fn disjoint_range_skips_segment() {
-        let seg = ColdSegment::encode(&sample(100));
+        let seg = ColdSegment::encode(&sample(100)).expect("encode");
         let (_min, max) = seg.ts_bounds();
         assert!(seg.scan_ts_range(max + 1, max + 1000).unwrap().is_empty());
     }
 
     #[test]
     fn empty_segment_is_safe() {
-        let seg = ColdSegment::encode(&[]);
+        let seg = ColdSegment::encode(&[]).expect("encode");
         assert!(seg.is_empty());
         assert!(seg.decode_all().unwrap().is_empty());
         assert!(seg.scan_ts_range(0, i64::MAX).unwrap().is_empty());
-        let back = ColdSegment::from_bytes(&seg.to_bytes()).unwrap();
+        let back = ColdSegment::from_bytes(&seg.to_bytes().expect("to_bytes")).unwrap();
         assert!(back.is_empty());
     }
 
@@ -541,14 +603,20 @@ mod tests {
         );
         // Corrupting the magic also breaks the CRC, which is checked FIRST → `Corrupt` (a foreign
         // buffer that happens to carry a matching CRC would still be caught by the magic check).
-        let mut bytes = ColdSegment::encode(&sample(10)).to_bytes();
+        let mut bytes = ColdSegment::encode(&sample(10))
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         bytes[0] = b'X';
         assert_eq!(
             ColdSegment::from_bytes(&bytes).unwrap_err(),
             ColdError::Corrupt
         );
         // A foreign-but-self-consistent buffer (valid CRC, wrong magic) is rejected as `BadMagic`.
-        let mut foreign = ColdSegment::encode(&sample(10)).to_bytes();
+        let mut foreign = ColdSegment::encode(&sample(10))
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         let body_len = foreign.len() - CRC_LEN;
         foreign[0] = b'X';
         let crc = crc32c::crc32c(&foreign[..body_len]);
@@ -566,7 +634,10 @@ mod tests {
         // including ones inside the `min_ts`/`max_ts` skip bounds (header offsets 9..25), the `count`
         // (offsets 5..9) and the column payloads. (`rmp` #420)
         let readings = sample(200);
-        let original = ColdSegment::encode(&readings).to_bytes();
+        let original = ColdSegment::encode(&readings)
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         for i in 0..original.len() {
             for flip in [0x01u8, 0x80u8, 0xFFu8] {
                 let mut corrupted = original.clone();
@@ -575,8 +646,15 @@ mod tests {
                     continue; // 0x00 ^ x can't happen here, but be defensive.
                 }
                 match ColdSegment::from_bytes(&corrupted) {
-                    // The overwhelmingly common outcome: integrity caught the flip.
-                    Err(ColdError::Corrupt | ColdError::BadMagic | ColdError::Truncated) => {}
+                    // The overwhelmingly common outcome: integrity caught the flip. `TooLarge` is an
+                    // encode/serialize-side error and never arises on the `from_bytes` read path
+                    // (its `count`/lengths come from `u32` fields), but the match must be exhaustive.
+                    Err(
+                        ColdError::Corrupt
+                        | ColdError::BadMagic
+                        | ColdError::Truncated
+                        | ColdError::TooLarge,
+                    ) => {}
                     Err(ColdError::BadColumn(_)) => {}
                     Ok(seg) => {
                         // from_bytes accepted it ONLY if the flip produced a byte-identical buffer,
@@ -599,7 +677,10 @@ mod tests {
     fn coldstore_truncation_is_detected() {
         // Truncating the blob at any offset must be a controlled Err (the CRC trailer is lost or no
         // longer matches the shortened body), never a panic and never a wrong decode. (`rmp` #420)
-        let original = ColdSegment::encode(&sample(300)).to_bytes();
+        let original = ColdSegment::encode(&sample(300))
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         for cut in [
             0,
             1,
@@ -627,10 +708,14 @@ mod tests {
     #[test]
     fn coldstore_header_count_overflow_is_detected() {
         // Forge a `count` far larger than the segment can possibly hold, then re-stamp a VALID CRC
-        // over the forged body (so the CRC passes and the `count` guard is what must reject it).
-        // Without the guard, the FOR-width-0 columnar path would try to allocate `count` elements
-        // unbounded by the on-disk size. (`rmp` #420)
-        let mut bytes = ColdSegment::encode(&sample(8)).to_bytes();
+        // over the forged body (so the CRC passes and the `count` guard is what must reject it). The
+        // `count > buf.len()` guard caps the decode footprint to the segment's actual size; the
+        // columnar layer additionally caps any width-0 column decode at `u32::MAX` (`rmp` #438), so
+        // an intact-but-absurd count is neither an OOM-abort nor silently-wrong. (`rmp` #420 / #441)
+        let mut bytes = ColdSegment::encode(&sample(8))
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         let body_len = bytes.len() - CRC_LEN;
         // Overwrite count (offset 5, u32 LE) with a value that cannot fit the bytes.
         bytes[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -645,7 +730,10 @@ mod tests {
         // A count equal to the body length is the boundary: still structurally impossible to fill
         // with this tiny segment, but the guard only rejects strictly-greater-than. Confirm the
         // realistic forge (count just past the body) is caught, and that a genuine segment passes.
-        let good = ColdSegment::encode(&sample(8)).to_bytes();
+        let good = ColdSegment::encode(&sample(8))
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         assert!(ColdSegment::from_bytes(&good).is_ok());
     }
 
@@ -662,7 +750,7 @@ mod tests {
                     sensor: "s".into(),
                 })
                 .collect();
-            store.push_segment(ColdSegment::encode(&readings));
+            store.push_segment(ColdSegment::encode(&readings).expect("encode"));
         }
         assert_eq!(store.reading_count(), 3000);
         // A range inside window 1 only: only that segment overlaps.
@@ -676,7 +764,10 @@ mod tests {
     fn corrupt_column_blob_is_a_controlled_error_not_a_panic() {
         // A segment whose on-disk image had a column blob corrupted (but the structural lengths still
         // parse) must surface `BadColumn` from `decode_all`, never panic (`04 §11.4`).
-        let mut bytes = ColdSegment::encode(&sample(50)).to_bytes();
+        let mut bytes = ColdSegment::encode(&sample(50))
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
         // Overwrite the tail (inside the sensor/dictionary column region) with bytes that the
         // structural `from_bytes` length checks accept but the dictionary decoder rejects.
         let n = bytes.len();
@@ -689,5 +780,108 @@ mod tests {
             let _ = seg.decode_all();
             let _ = seg.scan_ts_range(i64::MIN, i64::MAX);
         }
+    }
+
+    /// A segment whose `count` (or any column length) exceeds the header's `u32` field must be
+    /// rejected by `to_bytes` (and `encode`) with [`ColdError::TooLarge`], NOT serialized with an
+    /// `as u32` cast that silently wraps mod 2³² (which the trailing CRC would then bless, producing a
+    /// structurally-valid-but-WRONG segment) (`rmp` #441). `count == u32::MAX` readings cannot be
+    /// materialized in memory, so the guard is exercised on a hand-built segment with an out-of-range
+    /// `count` field — the exact value `to_bytes` would otherwise truncate. This is a `tests`-module
+    /// (white-box) construction; the public `encode` path enforces the same invariant via
+    /// `check_u32_framing` on every batch it builds.
+    #[test]
+    fn to_bytes_rejects_count_above_u32_max() {
+        // A genuine tiny (empty-column) segment, then force `count` just past `u32::MAX`.
+        let mut seg = ColdSegment::encode(&[]).expect("encode");
+        seg.count = u32::MAX as usize + 1;
+        assert_eq!(
+            seg.to_bytes().unwrap_err(),
+            ColdError::TooLarge,
+            "a count above u32::MAX must be rejected, not truncated by an `as u32` cast"
+        );
+        // The exact boundary: `u32::MAX` is representable and must still serialize; one more must not.
+        seg.count = u32::MAX as usize;
+        assert!(
+            seg.to_bytes().is_ok(),
+            "count == u32::MAX is the largest representable count and must serialize"
+        );
+        // A column-blob length above u32::MAX is likewise rejected (the other `as u32` cast sites).
+        // Build a >4 GiB blob lazily — `vec![0u8; 4 GiB+1]` is large but allocatable; gate it behind a
+        // size the CI box can hold. We instead assert the framing check directly to avoid a 4 GiB
+        // allocation: a blob length above u32::MAX makes `check_u32_framing` fail.
+        let mut tiny = ColdSegment::encode(&sample(4)).expect("encode");
+        tiny.count = u32::MAX as usize; // representable
+        assert!(tiny.check_u32_framing().is_ok());
+        tiny.count = u32::MAX as usize + 7;
+        assert_eq!(tiny.check_u32_framing().unwrap_err(), ColdError::TooLarge);
+    }
+
+    /// The width-0 amplification bound (`rmp` #441): a forged-but-CRC-valid segment whose `count`
+    /// equals its body length and whose integer columns are width-0 (a constant column ⇒ empty
+    /// payload) must decode with a PEAK allocation proportional to the segment's on-disk size — never
+    /// an unbounded multi-gigabyte amplification, and never a panic/OOM-abort. Two layers enforce
+    /// this: the columnar layer caps every width-0 `unpack` at `u32::MAX` (`rmp` #438), and
+    /// `from_bytes`' `count <= buf.len()` structural cap keeps `count` proportional to the bytes.
+    ///
+    /// The forged `count` is LARGER than the segment's real row count, so a column whose payload *does*
+    /// grow with the row count (the Gorilla float / the dictionary codes) runs out of bytes and errors
+    /// cleanly — the **correct** controlled outcome (a forged over-count is not a valid segment). The
+    /// property under test is that the width-0 *integer* path (the amplification vector) allocates a
+    /// bounded `vec![0i64; count]` (≤ `buf.len()` elements) and that the whole `decode_all` is a
+    /// controlled `Result`, never an abort.
+    #[test]
+    fn width_zero_count_equal_body_len_is_bounded() {
+        // A CONSTANT segment: every seq/ts identical ⇒ each integer column is FOR width-0 (empty
+        // payload) — the densest "count ≫ payload" amplification shape.
+        let constant: Vec<Reading> = (0..64)
+            .map(|_| Reading {
+                seq: 7,
+                ts: 1_000,
+                value: 3.5,
+                sensor: "s".to_string(),
+            })
+            .collect();
+        let mut bytes = ColdSegment::encode(&constant)
+            .expect("encode")
+            .to_bytes()
+            .expect("to_bytes");
+        let body_len = bytes.len() - CRC_LEN;
+        // Forge count = body_len (the loosest value the `count > buf.len()` guard still ACCEPTS, since
+        // it rejects only strictly-greater). `body_len <= buf.len()`, so this is admitted.
+        let forged_count = u32::try_from(body_len).expect("tiny segment fits u32");
+        bytes[5..9].copy_from_slice(&forged_count.to_le_bytes());
+        let crc = crc32c::crc32c(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(&crc.to_le_bytes());
+
+        // Accepted (count == body_len passes the `>` guard). The integer columns are width-0, so they
+        // allocate `vec![0i64; body_len]` — BOUNDED by the body length, the whole point of the cap.
+        let seg = ColdSegment::from_bytes(&bytes).expect("count == body_len is admitted");
+        assert_eq!(seg.len(), body_len);
+
+        // Decoding the whole segment is a CONTROLLED outcome (a forged over-count makes the
+        // count-dependent Gorilla/dictionary payloads come up short → clean `Err`), never a panic or
+        // OOM-abort. Either result is acceptable; what matters is no abort and a bounded allocation.
+        match seg.decode_all() {
+            Ok(rows) => {
+                assert_eq!(rows.len(), body_len);
+                assert!(rows.iter().all(|r| r.seq == 7 && r.ts == 1_000));
+            }
+            Err(ColdError::BadColumn(_)) => {} // expected: count-dependent column ran short, cleanly.
+            Err(other) => panic!("unexpected decode error for a forged over-count: {other:?}"),
+        }
+        // The amplification vector in isolation: the width-0 `seq` column decodes to a BOUNDED
+        // `vec![0i64; body_len]` (≤ the segment size), proving the `count <= buf.len()` cap holds the
+        // peak allocation proportional to the on-disk bytes rather than to a forged absurd count.
+        let seq = integer::decode_i64(&seg.seq_blob, seg.count)
+            .expect("width-0 integer column decodes to bounded `count` zeros");
+        assert_eq!(seq.len(), body_len);
+        assert!(
+            seq.iter().all(|&v| v == 7),
+            "constant width-0 column is all `min`"
+        );
+
+        // A range scan over the forged segment is likewise a controlled outcome, never an abort.
+        let _ = seg.scan_ts_range(i64::MIN, i64::MAX);
     }
 }

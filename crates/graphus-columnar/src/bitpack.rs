@@ -60,6 +60,18 @@ pub fn pack(values: &[u64], width: u32) -> Vec<u8> {
     out
 }
 
+/// The hard upper bound on the element count any `unpack` will materialize, regardless of `width`.
+///
+/// Every on-disk columnar format that feeds this primitive frames its row/element count in a **`u32`**
+/// field (`dictionary` entry/code counts, `.gcol` `nrows`, the cold-segment `count`), so a count above
+/// [`u32::MAX`] cannot originate from a well-formed blob and is the signature of a forged
+/// `usize`-level value. It is the **only** bound available for a `width == 0` column — whose payload is
+/// empty by construction (see [`pack`]), so the buffer length cannot bound `count` — so an absurd
+/// width-0 `count` would otherwise drive `vec![0; count]` into an unbounded OOM-abort. Capping at
+/// `u32::MAX` rejects that while never rejecting a count any valid blob can express
+/// (`specification/04-technical-design.md` §11.4).
+const MAX_UNPACK_COUNT: usize = u32::MAX as usize;
+
 /// Unpacks `count` values of `width` bits each from `bytes` (the inverse of [`pack`]).
 ///
 /// `bytes` may be **untrusted**: a `count`/`width` that would read past the buffer is reported as
@@ -68,7 +80,9 @@ pub fn pack(values: &[u64], width: u32) -> Vec<u8> {
 /// (`specification/04-technical-design.md` §11.4).
 ///
 /// # Errors
-/// Returns [`DecodeError::Truncated`] if `bytes` is shorter than `count * width` bits require.
+/// Returns [`DecodeError::Truncated`] if `bytes` is shorter than `count * width` bits require, or if a
+/// `width == 0` column declares a `count` above [`MAX_UNPACK_COUNT`] (a forged, payload-unbounded
+/// count whose only bound is the structural `u32` count field of every columnar format).
 pub fn unpack(bytes: &[u8], count: usize, width: u32) -> Result<Vec<u64>, crate::DecodeError> {
     // `width` arrives from a one-byte header field on the untrusted path; a value > 64 cannot occur
     // in any blob `pack` produced and would overflow the `chunk << filled` shift below, so it is a
@@ -79,7 +93,18 @@ pub fn unpack(bytes: &[u8], count: usize, width: u32) -> Result<Vec<u64>, crate:
         });
     }
     if width == 0 {
-        // Zero-width: every value is 0 and the payload is empty; no bytes are read.
+        // Zero-width: every value is 0 and the payload is empty, so `count` is *not* bounded by the
+        // buffer length (the `needed_bytes > bytes.len()` gate below would always pass for it). Guard
+        // the unbounded `vec![0; count]` against a forged count here, *before* allocating: a count
+        // above the `u32` ceiling every columnar format frames its count in cannot come from a
+        // well-formed blob, so it is a controlled error rather than an OOM-abort (`04 §11.4`, rmp
+        // #438). Within the ceiling, `count` zeros are produced exactly (the documented happy path —
+        // a width-0 FOR / single-value dictionary column).
+        if count > MAX_UNPACK_COUNT {
+            return Err(crate::DecodeError::Truncated {
+                what: "bit-packed values",
+            });
+        }
         return Ok(vec![0; count]);
     }
     // The exact number of payload bytes `count` values of `width` bits occupy. Validate it up front
@@ -165,5 +190,24 @@ mod tests {
         assert!(unpack(&[0u8; 4], usize::MAX / 64, 64).is_err());
         // Exactly-fitting buffers still decode.
         assert_eq!(unpack(&[0xFFu8], 8, 1).unwrap(), vec![1u64; 8]);
+    }
+
+    /// `width == 0` is the degenerate all-zero column: its payload is empty, so the buffer length
+    /// cannot bound `count`. A forged, payload-unbounded `count` must be rejected *before* the
+    /// `vec![0; count]` allocation, not drive an OOM-abort (`rmp` #438, `04 §11.4`). The bound is the
+    /// `u32` ceiling every columnar format frames its count in: anything above it cannot come from a
+    /// well-formed blob, while every legitimate width-0 count (incl. zero payload, large count) decodes.
+    #[test]
+    fn unpack_width_zero_rejects_a_forged_unbounded_count() {
+        // The exact gate from the defect report: an empty payload with a `usize::MAX` count is the
+        // FOR-width-0 / dictionary-width-0 OOM bomb — it must be a controlled error, not an abort.
+        assert!(unpack(&[], usize::MAX, 0).is_err());
+        // Just past the ceiling errors; the ceiling and anything below it (any count a u32-framed blob
+        // can express) still decodes to that many zeros from an empty payload — the happy path.
+        assert!(unpack(&[], MAX_UNPACK_COUNT + 1, 0).is_err());
+        assert_eq!(unpack(&[], 0, 0).unwrap(), Vec::<u64>::new());
+        assert_eq!(unpack(&[], 1000, 0).unwrap(), vec![0u64; 1000]);
+        // A non-empty payload is ignored for width 0 (no bytes are read), and the count still governs.
+        assert_eq!(unpack(&[0xFF; 4], 5, 0).unwrap(), vec![0u64; 5]);
     }
 }
