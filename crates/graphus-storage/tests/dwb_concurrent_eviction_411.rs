@@ -444,9 +444,12 @@ fn decode_region_homes(hdr: &Page) -> Vec<PageId> {
     use graphus_bufpool::page as bp;
     const HDR_OFF_MAGIC: usize = bp::HEADER_SIZE;
     const HDR_OFF_COUNT: usize = HDR_OFF_MAGIC + 8;
-    const HDR_OFF_HOMES: usize = HDR_OFF_COUNT + 8;
-    // Eviction-ring layout, version 3 (`rmp` #431 / #434).
-    const DWB_MAGIC: u64 = 0x0000_0003_4257_4447;
+    // `rmp` #437 inserted a persisted checkpoint-floor LSN (u64) between the count and the home-id
+    // array, so the homes now start 8 bytes later than the v3 layout.
+    const HDR_OFF_FLOOR: usize = HDR_OFF_COUNT + 8;
+    const HDR_OFF_HOMES: usize = HDR_OFF_FLOOR + 8;
+    // Eviction-ring layout with persisted floor, version 4 (`rmp` #431 / #434 / #437).
+    const DWB_MAGIC: u64 = 0x0000_0004_4257_4447;
     if !bp::verify_checksum(hdr) {
         return Vec::new();
     }

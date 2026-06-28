@@ -109,23 +109,34 @@ use graphus_core::PageId;
 use graphus_core::error::{GraphusError, Result};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page, PageReadOutcome};
 
-/// Magic identifying a valid DWB header slot (`"GDWB"` + version `3`, little-endian).
+/// Magic identifying a valid DWB header slot (`"GDWB"` + version `4`, little-endian).
 ///
-/// Version `3` marks the eviction-**ring** layout (`rmp` #431): a batch region followed by
-/// [`DWB_EVICT_RING_SLOTS`] disjoint single-page eviction regions. A device written by the
-/// pre-#431 two-region layout carries version `2`, and the original single-region layout version `1`;
-/// both differ in this magic, so their headers fail [`Dwb::decode_header`]'s magic check and decode as
-/// "no batch" — an old-format device is never silently misread as v3 (`rmp` #434). [`Dwb::new`]
-/// additionally **grows** a too-small old device to the v3 page count, so an in-place upgrade after a
-/// clean shutdown (every slot home-durable, so nothing to repair) reopens safely.
-const DWB_MAGIC: u64 = 0x0000_0003_4257_4447; // 'G''D''W''B' = 0x47 0x44 0x57 0x42, version 3
+/// Version `4` marks the eviction-ring layout **with a persisted checkpoint-floor LSN** (`rmp` #437):
+/// the header carries [`HDR_OFF_FLOOR`] (an extra `u64` between the count and the home-id array), so a
+/// v3 header (ring, no floor) — and the older v2 (single eviction slot) and v1 (single region) — all
+/// differ in this magic and fail [`Dwb::decode_header`]'s magic check, decoding as "no batch": an
+/// old-format device is never silently misread under the v4 layout (`rmp` #434/#437). [`Dwb::new`]
+/// additionally **grows** a too-small old device to the v4 page count, so an in-place upgrade after a
+/// clean shutdown (every slot home-durable, so nothing to repair) reopens safely. A v3→v4 upgrade
+/// after a clean shutdown is therefore lossless; an unclean v3 device decodes as "no batch" and falls
+/// back to ARIES redo, which is the safe outcome (the v3 floor field did not exist, so there is no
+/// floor to lose).
+const DWB_MAGIC: u64 = 0x0000_0004_4257_4447; // 'G''D''W''B' = 0x47 0x44 0x57 0x42, version 4
 // The DWB header slot is a standard page: its first 24 bytes are the page header
 // (`graphus_bufpool::page`), of which bytes `0..4` are the CRC32C checksum that `write_checksum`
 // stamps. The DWB-specific fields therefore live *after* the 24-byte page header so they do not
 // collide with the checksum/`page_lsn`/`page_id` header fields.
 const HDR_OFF_MAGIC: usize = page::HEADER_SIZE; // u64
 const HDR_OFF_COUNT: usize = HDR_OFF_MAGIC + 8; // u64 (number of data slots in the batch)
-const HDR_OFF_HOMES: usize = HDR_OFF_COUNT + 8; // u64[count] home page ids
+/// The **persisted checkpoint-floor LSN** (`rmp` #437). Stored ONLY in the batch region header (the
+/// per-checkpoint header the [`clear`](Dwb::clear)/[`set_floor`](Dwb::set_floor) path already
+/// rewrites); ring-slot headers carry the field too (same encoding) but it is meaningful only in the
+/// batch region. It records the WAL reclaim floor of the last checkpoint, and gates eviction-ring
+/// recovery: a ring slot whose staged `page_lsn` is **below** this floor is provably superseded by a
+/// flushed home page and is never restored (it would otherwise revert a committed change — the
+/// `rmp` #437 doublewrite-stale-slot data-loss hole). See [`Dwb::recover_home`].
+const HDR_OFF_FLOOR: usize = HDR_OFF_COUNT + 8; // u64 (persisted checkpoint-floor LSN, `rmp` #437)
+const HDR_OFF_HOMES: usize = HDR_OFF_FLOOR + 8; // u64[count] home page ids
 
 /// Maximum number of home pages one DWB **batch** (checkpoint) region may protect.
 ///
@@ -206,12 +217,26 @@ pub const fn dwb_device_pages() -> u64 {
     (1 + DWB_MAX_BATCH as u64) + (DWB_EVICT_RING_SLOTS as u64) * 2
 }
 
+/// A decoded DWB region header: the home page ids the region's batch protects, and the persisted
+/// checkpoint-floor LSN (`rmp` #437, meaningful only in the batch region).
+struct DecodedHeader {
+    homes: Vec<PageId>,
+    floor: graphus_core::Lsn,
+}
+
 /// The doublewrite buffer over a dedicated [`BlockDevice`] (the `doublewrite.dwb` area, `05 §2.1`).
 ///
-/// Holds no page images itself; it is a thin, stateless protocol over its device, so it can be
-/// reconstructed on open and driven during both normal flush and recovery.
+/// Holds no page images itself beyond the in-memory mirror of the persisted checkpoint-floor LSN; it
+/// is otherwise a thin, stateless protocol over its device, so it can be reconstructed on open and
+/// driven during both normal flush and recovery.
 pub struct Dwb<D: BlockDevice> {
     device: D,
+    /// In-memory mirror of the **persisted checkpoint-floor LSN** stored in the batch region header
+    /// (`rmp` #437). Loaded on [`new`](Self::new) from the device, advanced by
+    /// [`set_floor`](Self::set_floor) at each checkpoint, and re-stamped by [`clear`](Self::clear) so
+    /// emptying the batch never drops the floor. Recovery reads the floor from the device (not this
+    /// field) so a freshly-opened recovery `Dwb` sees the durable value.
+    floor: graphus_core::Lsn,
 }
 
 impl<D: BlockDevice> Dwb<D> {
@@ -235,7 +260,13 @@ impl<D: BlockDevice> Dwb<D> {
             let grow = need - device.page_count();
             device.extend(grow)?;
         }
-        Ok(Self { device })
+        // Load the persisted checkpoint-floor LSN from the batch region header (`rmp` #437). A
+        // fresh/zeroed/old-format (pre-v4) header decodes as `None` ⇒ floor `0` (no slot is below
+        // floor 0, so every ring slot is honoured — the conservative pre-#437 behaviour until the
+        // first checkpoint advances the floor).
+        let floor = Self::read_region_header(&device, &BATCH_REGION)?
+            .map_or(graphus_core::Lsn(0), |h| h.floor);
+        Ok(Self { device, floor })
     }
 
     /// Borrows the DWB device.
@@ -243,14 +274,28 @@ impl<D: BlockDevice> Dwb<D> {
         &self.device
     }
 
-    /// Encodes a header slot for a batch of `homes` page ids.
+    /// Consumes the [`Dwb`], returning its underlying device (tests/diagnostics: reopen over the same
+    /// device to verify the persisted floor survives, `rmp` #437).
+    #[must_use]
+    pub fn into_device(self) -> D {
+        self.device
+    }
+
+    /// Encodes a header slot for a batch of `homes` page ids, stamping the persisted checkpoint-floor
+    /// LSN `floor` (`rmp` #437).
     ///
     /// The caller ([`stage_into`](Self::stage_into)) has already rejected a batch larger than the
     /// region's capacity; this debug assertion restates the invariant the page layout relies on —
     /// `HDR_OFF_HOMES + homes.len()*8` must fit one header page — so an over-cap batch can never
     /// silently index out of the header page (`rmp` #385). Both region kinds cap at most at
     /// [`DWB_MAX_BATCH`] (each ring slot at 1), so this single bound covers them all.
-    fn encode_header(homes: &[PageId]) -> Page {
+    ///
+    /// `floor` is meaningful only in the **batch** region header (the per-checkpoint header
+    /// [`clear`](Self::clear)/[`set_floor`](Self::set_floor) rewrites). A ring-slot stage passes
+    /// `Lsn(0)` for it (a ring slot never carries a floor — only the batch region does), so a ring
+    /// slot's own floor field is always 0 and is ignored by recovery, which reads the floor from the
+    /// batch region only.
+    fn encode_header(homes: &[PageId], floor: graphus_core::Lsn) -> Page {
         debug_assert!(
             homes.len() <= DWB_MAX_BATCH,
             "DWB header batch of {} exceeds the {DWB_MAX_BATCH}-page header capacity",
@@ -259,6 +304,7 @@ impl<D: BlockDevice> Dwb<D> {
         let mut hdr = [0u8; PAGE_SIZE];
         hdr[HDR_OFF_MAGIC..HDR_OFF_MAGIC + 8].copy_from_slice(&DWB_MAGIC.to_le_bytes());
         hdr[HDR_OFF_COUNT..HDR_OFF_COUNT + 8].copy_from_slice(&(homes.len() as u64).to_le_bytes());
+        hdr[HDR_OFF_FLOOR..HDR_OFF_FLOOR + 8].copy_from_slice(&floor.0.to_le_bytes());
         let mut off = HDR_OFF_HOMES;
         for h in homes {
             hdr[off..off + 8].copy_from_slice(&h.0.to_le_bytes());
@@ -269,10 +315,11 @@ impl<D: BlockDevice> Dwb<D> {
         hdr
     }
 
-    /// Decodes a header slot, returning the batch's home page ids, or `None` if the slot does not
-    /// describe a durable batch (a fresh/zeroed DWB, an old-format (v1/v2) header, or a header torn
-    /// mid-write — all mean "no committed batch to repair").
-    fn decode_header(hdr: &Page) -> Option<Vec<PageId>> {
+    /// Decodes a header slot into its batch's home page ids and persisted checkpoint-floor LSN
+    /// (`rmp` #437), or `None` if the slot does not describe a durable batch (a fresh/zeroed DWB, an
+    /// old-format (v1/v2/v3) header, or a header torn mid-write — all mean "no committed batch to
+    /// repair").
+    fn decode_header(hdr: &Page) -> Option<DecodedHeader> {
         // A torn or never-written header fails the checksum: no batch.
         if !page::verify_checksum(hdr) {
             return None;
@@ -282,13 +329,18 @@ impl<D: BlockDevice> Dwb<D> {
                 .try_into()
                 .expect("8-byte slice"),
         );
-        // A wrong magic includes an old-format device (v1/v2): treat it as "no batch" (`rmp` #434),
-        // so an old device's stale header is never misread as a current-format batch.
+        // A wrong magic includes an old-format device (v1/v2/v3): treat it as "no batch" (`rmp`
+        // #434/#437), so an old device's stale header is never misread as a current-format batch.
         if magic != DWB_MAGIC {
             return None;
         }
         let count = u64::from_le_bytes(
             hdr[HDR_OFF_COUNT..HDR_OFF_COUNT + 8]
+                .try_into()
+                .expect("8-byte slice"),
+        );
+        let floor = u64::from_le_bytes(
+            hdr[HDR_OFF_FLOOR..HDR_OFF_FLOOR + 8]
                 .try_into()
                 .expect("8-byte slice"),
         );
@@ -307,14 +359,25 @@ impl<D: BlockDevice> Dwb<D> {
             homes.push(PageId(id));
             off += 8;
         }
-        Some(homes)
+        Some(DecodedHeader {
+            homes,
+            floor: graphus_core::Lsn(floor),
+        })
     }
 
     /// Stages a batch into a specific `region` and makes it durable (steps 1–2 of the write
     /// protocol), without touching any other region (`rmp` #412 / `rmp` #431). Shared by both
     /// [`stage_batch`](Self::stage_batch) (the checkpoint path → [`BATCH_REGION`]) and the per-eviction
     /// path (→ an [`evict_ring_region`] slot).
-    fn stage_into(&mut self, region: &Region, batch: &[(PageId, &Page)]) -> Result<()> {
+    /// `floor` stamps the region header's persisted checkpoint-floor LSN (`rmp` #437): the **batch**
+    /// region carries the current floor ([`self.floor`](Self::floor)) so emptying/re-staging never
+    /// drops it; a ring slot carries `Lsn(0)` (the floor lives only in the batch region).
+    fn stage_into(
+        &mut self,
+        region: &Region,
+        batch: &[(PageId, &Page)],
+        floor: graphus_core::Lsn,
+    ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -333,7 +396,7 @@ impl<D: BlockDevice> Dwb<D> {
         // Write the header *after* the data slots, so a crash between the two leaves a header that
         // either is absent (no batch) or fully describes data slots that are all present.
         let homes: Vec<PageId> = batch.iter().map(|(p, _)| *p).collect();
-        let hdr = Self::encode_header(&homes);
+        let hdr = Self::encode_header(&homes, floor);
         self.device.write_page(PageId(region.header_slot), &hdr)?;
         // 2. Make the whole batch durable before the home write may begin.
         self.device.sync_data()?;
@@ -354,7 +417,9 @@ impl<D: BlockDevice> Dwb<D> {
     /// fails. A DWB write/sync error is **never** swallowed: the caller must not proceed to the home
     /// write without a durable DWB copy, so the error propagates and aborts the flush.
     pub fn stage_batch(&mut self, batch: &[(PageId, &Page)]) -> Result<()> {
-        self.stage_into(&BATCH_REGION, batch)
+        // The batch region header carries the current persisted floor (`rmp` #437), so a crash with a
+        // staged batch present still recovers the floor.
+        self.stage_into(&BATCH_REGION, batch, self.floor)
     }
 
     /// Stages a single evicted home page into eviction-ring **slot** `slot` and makes it durable —
@@ -378,22 +443,58 @@ impl<D: BlockDevice> Dwb<D> {
             )));
         }
         let region = evict_ring_region(slot);
-        self.stage_into(&region, &[(page_id, image)])
+        // A ring slot never carries a floor — only the batch region does (`rmp` #437).
+        self.stage_into(&region, &[(page_id, image)], graphus_core::Lsn(0))
     }
 
-    /// Invalidates the **checkpoint** region's batch by clearing its header slot and syncing, so a
-    /// later recovery finds no batch to repair there once the home pages are known durable.
-    /// Best-effort hygiene: leaving a stale-but-checksum-valid batch is still *safe* (recovery only
-    /// restores a home page that fails its own checksum, i.e. is genuinely torn), so a clear failure
-    /// is non-fatal and is reported.
+    /// Invalidates the **checkpoint** region's batch (so a later recovery finds no batch to repair
+    /// there once the home pages are known durable) while **preserving the persisted checkpoint-floor
+    /// LSN** (`rmp` #437): it writes an *empty-batch* header (no home ids) carrying the current
+    /// [`self.floor`](Self::floor) and syncs. Writing a zero page instead would decode as "no batch"
+    /// AND drop the floor to 0, re-opening the stale-ring-slot hole on the next open; emptying the
+    /// batch but keeping the floor closes that.
+    ///
+    /// Best-effort hygiene for the batch itself: leaving a stale-but-checksum-valid batch is still
+    /// *safe* (recovery restores a home page only if it fails its own checksum and chooses the
+    /// highest-lsn valid copy), so a clear failure is non-fatal and is reported.
     ///
     /// # Errors
-    /// Returns a storage error if the header clear write or sync fails.
+    /// Returns a storage error if the header write or sync fails.
     pub fn clear(&mut self) -> Result<()> {
-        let zero = [0u8; PAGE_SIZE];
+        // Empty batch (no homes), floor preserved.
+        let hdr = Self::encode_header(&[], self.floor);
         self.device
-            .write_page(PageId(BATCH_REGION.header_slot), &zero)?;
+            .write_page(PageId(BATCH_REGION.header_slot), &hdr)?;
         self.device.sync_data()
+    }
+
+    /// Persists a new **checkpoint-floor LSN** durably (`rmp` #437): writes the batch region header
+    /// with an empty batch and the new `floor`, then syncs. Called by the checkpoint **after** every
+    /// dirty home page is durable and **before** the WAL prefix below `floor` is reclaimed, so the
+    /// floor that gates eviction-ring recovery is durable before the WAL records a stale ring slot
+    /// would otherwise need are dropped. The floor is monotonic: a smaller value is ignored (a
+    /// checkpoint never moves the recovery floor backwards), so a late/out-of-order call cannot widen
+    /// the window of honoured stale slots.
+    ///
+    /// # Errors
+    /// Returns a storage error if the header write or sync fails.
+    pub fn set_floor(&mut self, floor: graphus_core::Lsn) -> Result<()> {
+        if floor.0 <= self.floor.0 {
+            // Monotonic: never move the floor backwards (a stale/duplicate call is a no-op).
+            return Ok(());
+        }
+        self.floor = floor;
+        // Re-stamp the batch region header (empty batch) with the new floor and make it durable.
+        let hdr = Self::encode_header(&[], self.floor);
+        self.device
+            .write_page(PageId(BATCH_REGION.header_slot), &hdr)?;
+        self.device.sync_data()
+    }
+
+    /// The current in-memory persisted checkpoint-floor LSN (`rmp` #437; tests/diagnostics).
+    #[must_use]
+    pub fn floor(&self) -> graphus_core::Lsn {
+        self.floor
     }
 
     /// Zeroes **every** DWB header (the batch region and all ring slots) and syncs, so no stale
@@ -412,6 +513,11 @@ impl<D: BlockDevice> Dwb<D> {
             let region = evict_ring_region(slot);
             self.device.write_page(PageId(region.header_slot), &zero)?;
         }
+        // A restored generation starts with no floor: the zeroed batch header decodes as "no batch"
+        // (floor 0), and the freshly restored device + reset WAL define a new history (`rmp`
+        // #417/#437). Reset the in-memory mirror to match so a later `clear`/`stage_batch` does not
+        // re-stamp a stale prior-generation floor.
+        self.floor = graphus_core::Lsn(0);
         self.device.sync_data()
     }
 
@@ -441,147 +547,186 @@ impl<D: BlockDevice> Dwb<D> {
     }
 
     fn region_home_ids(&self, region: &Region) -> Result<Vec<PageId>> {
-        let mut hdr: Page = [0u8; PAGE_SIZE];
-        self.device
-            .read_page(PageId(region.header_slot), &mut hdr)?;
-        Ok(Self::decode_header(&hdr).unwrap_or_default())
+        Ok(Self::read_region_header(&self.device, region)?
+            .map(|h| h.homes)
+            .unwrap_or_default())
     }
 
-    /// Recovery pass: restores every torn home page from its intact DWB copy, run **before** ARIES
-    /// redo. Returns the number of home pages repaired.
+    /// Reads + decodes a region's header slot from `device`. A static helper (takes `&D`, not `&self`)
+    /// so [`new`](Self::new) can load the floor before `self` exists.
+    fn read_region_header(device: &D, region: &Region) -> Result<Option<DecodedHeader>> {
+        let mut hdr: Page = [0u8; PAGE_SIZE];
+        device.read_page(PageId(region.header_slot), &mut hdr)?;
+        Ok(Self::decode_header(&hdr))
+    }
+
+    /// Recovery pass: restores every **torn** home page from the **most recent** intact DWB copy, run
+    /// **before** ARIES redo. Returns the number of home pages repaired.
     ///
-    /// For each home page the last committed DWB batch protected, reads the home page; if it fails
-    /// its checksum it is torn, so it is overwritten with the DWB copy (which must itself be
-    /// checksum-valid — a DWB slot that is *also* torn is reported as an unrepairable corruption
-    /// rather than silently restoring garbage). Pages whose home image is intact are left untouched:
-    /// they are either the old or the new image, both of which ARIES redo reconciles correctly.
+    /// ## The candidate set (`rmp` #437)
+    ///
+    /// A home page can be protected by the checkpoint **batch** region OR by any eviction-**ring** slot
+    /// (the two are written by independent paths, `rmp` #412/#431). This pass gathers, per torn home
+    /// page, **every** valid DWB copy across all regions and restores the one with the **highest
+    /// `page_lsn`** — so a stale older copy can never overwrite a fresher one (closing the
+    /// batch-vs-ring ordering fragility, `rmp` #437 F-STG-3).
+    ///
+    /// ## The floor gate (`rmp` #437)
+    ///
+    /// Ring slots are freed only in memory (the on-disk slot is not zeroed), so a **stale** ring slot —
+    /// an old eviction copy of a page that was later re-written and flushed home — can linger on disk.
+    /// Restoring such a copy over a torn newer home page would silently revert a committed change (the
+    /// `rmp` #437 data-loss hole). The **persisted checkpoint-floor LSN** (read from the batch region
+    /// header) is the cut: a ring slot whose staged `page_lsn` is **below** the floor is provably
+    /// superseded — the checkpoint that set the floor flushed that page's home durably — so it is
+    /// **ignored** (never a repair candidate). The batch region is the last checkpoint's own staging
+    /// (cleared/re-stamped each cycle), so it is never stale and is always a candidate, regardless of
+    /// the floor.
+    ///
+    /// Why the floor gate cannot drop a *needed* repair: a freed ring slot's home page is only
+    /// re-written (and thus able to tear *again* after the slot freed) by a *later* write; if that
+    /// later write is itself below the floor, the checkpoint flushed it home durably, so the genuine
+    /// repair image — if its home tears post-checkpoint — comes from a copy **at or above** the floor
+    /// (the batch region or a higher ring slot), never the gated-out stale one. If *no* valid copy at
+    /// or above the floor exists for a torn home page, the correct image is unavailable anywhere (its
+    /// newer DWB slot was reused and its WAL reclaimed), so we surface an **unrepairable fault**
+    /// (below) rather than silently restoring the stale pre-floor copy — integrity is inviolable
+    /// (`04 §4.6`).
     ///
     /// `home` is the data device whose pages are being repaired.
     ///
     /// # Errors
-    /// Returns a storage error if a home/DWB read or a home write/sync fails, or if a DWB copy needed
-    /// to repair a torn home page is itself corrupt (an unrepairable double fault — surfaced, never
-    /// hidden, per the integrity-is-inviolable rule, `04 §4.6`).
+    /// Returns a storage error if a home/DWB read or a home write/sync fails; if a DWB copy needed to
+    /// repair a torn home page is itself corrupt (an unrepairable double fault); or if a home page is
+    /// torn and **no** valid DWB copy at or above the floor protects it (the correct image is
+    /// unavailable — surfaced, never hidden, `04 §4.6`).
     pub fn recover_home<H: BlockDevice>(&mut self, home: &mut H) -> Result<usize> {
-        // Scan the batch region AND every eviction-ring slot (`rmp` #412 / `rmp` #431): a torn home
-        // page may be protected by the checkpoint batch region OR by any in-flight eviction-ring slot,
-        // and the two are written by independent paths. Repairing all is safe and order-independent —
-        // `recover_region` only restores a home page that fails its own checksum, and the lsn/page_id
-        // guards reject a stale or misdirected copy, so a page that a region does not actually protect
-        // (or whose home is already intact) is left untouched.
-        let mut repaired = self.recover_region(&BATCH_REGION, home)?;
-        for slot in 0..DWB_EVICT_RING_SLOTS {
-            let region = evict_ring_region(slot);
-            repaired += self.recover_region(&region, home)?;
+        use std::collections::HashMap;
+
+        // The durable floor: read from the batch region header on disk (not `self.floor`), so a
+        // freshly-opened recovery `Dwb` uses the persisted value (`rmp` #437).
+        let floor = Self::read_region_header(&self.device, &BATCH_REGION)?
+            .map_or(graphus_core::Lsn(0), |h| h.floor);
+
+        // 1. Gather, per home page, the highest-lsn VALID DWB copy across all regions. The batch
+        //    region is always a candidate; a ring slot is a candidate only if its staged `page_lsn`
+        //    is at or above the floor (a below-floor ring slot is provably superseded — gated out).
+        //
+        // `candidates[home_id] = (best_lsn, image)` keeps the highest-lsn VALID copy per home page.
+        // `named` is the union of every home id any region names (pre-gate), so a torn home whose only
+        // copy was floor-gated/corrupt is FLAGGED as unprotected below, never silently skipped. A
+        // corrupt/misdirected DWB slot is recorded in `had_corrupt_copy` so the surfaced fault can
+        // distinguish a genuine double-fault from a floor-gated/absent copy.
+        let mut candidates: HashMap<u64, (graphus_core::Lsn, Box<Page>)> = HashMap::new();
+        let mut named: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut had_corrupt_copy: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
+        // The batch region (never floor-gated) followed by every ring slot (floor-gated).
+        let regions = std::iter::once((BATCH_REGION, false))
+            .chain((0..DWB_EVICT_RING_SLOTS).map(|s| (evict_ring_region(s), true)));
+        for (region, floor_gated) in regions {
+            let Some(header) = Self::read_region_header(&self.device, &region)? else {
+                continue; // no durable batch in this region
+            };
+            for (i, home_id) in header.homes.iter().enumerate() {
+                named.insert(home_id.0);
+                let slot = PageId(region.first_data_slot + i as u64);
+                let mut dwb_buf: Box<Page> = Box::new([0u8; PAGE_SIZE]);
+                // A DWB-slot read that errors (an AEAD failure on an encrypted DWB device, i.e. the
+                // copy is itself torn) or whose CRC fails is not a usable candidate — record it as a
+                // corrupt copy (for the diagnostic) and skip it.
+                match self.device.read_page(slot, dwb_buf.as_mut()) {
+                    Ok(()) if page::verify_checksum(dwb_buf.as_ref()) => {}
+                    _ => {
+                        had_corrupt_copy.insert(home_id.0);
+                        continue;
+                    }
+                }
+                // The DWB copy's self-referential page_id header must name this home page (`05 §6`:
+                // page_id detects misdirected/torn writes), or it is not a copy of this home page.
+                if page::page_id(dwb_buf.as_ref()) != home_id.0 {
+                    had_corrupt_copy.insert(home_id.0);
+                    continue;
+                }
+                let dwb_lsn = page::page_lsn(dwb_buf.as_ref());
+                // Floor gate (`rmp` #437): a below-floor ring-slot copy is provably superseded.
+                if floor_gated && dwb_lsn.0 < floor.0 {
+                    continue;
+                }
+                // Keep the highest-lsn copy for this home page.
+                match candidates.get(&home_id.0) {
+                    Some((best, _)) if best.0 >= dwb_lsn.0 => {}
+                    _ => {
+                        candidates.insert(home_id.0, (dwb_lsn, dwb_buf));
+                    }
+                }
+            }
         }
-        Ok(repaired)
-    }
 
-    /// Repairs every torn home page protected by a single `region`'s durable batch. Returns the number
-    /// of home pages repaired in that region. A separate trailing `sync_data` is issued per region
-    /// that repaired anything; recovery is idempotent, so a crash between the region passes simply
-    /// reruns from the top on the next open.
-    fn recover_region<H: BlockDevice>(&mut self, region: &Region, home: &mut H) -> Result<usize> {
-        let mut hdr: Page = [0u8; PAGE_SIZE];
-        self.device
-            .read_page(PageId(region.header_slot), &mut hdr)?;
-        let Some(homes) = Self::decode_header(&hdr) else {
-            return Ok(0); // no durable batch in this region: nothing to repair
-        };
-
+        // 2. Restore each TORN home page from its highest-lsn valid candidate (if any). Iterate the
+        //    deterministic ascending `named` union so a crash mid-pass reruns identically.
         let mut repaired = 0usize;
-        for (i, home_id) in homes.iter().enumerate() {
-            // A page the DWB protected may be beyond the home device's current extent only if the
-            // home write for it never happened; redo will (re)create it, so skip — there is no torn
-            // home image to repair.
-            if home_id.0 >= home.page_count() {
+        let mut torn_unprotected: Vec<u64> = Vec::new();
+        let mut double_fault: Vec<u64> = Vec::new();
+
+        for home_id in named {
+            // A page the DWB named may be beyond the home device's current extent only if its home
+            // write never happened; redo will (re)create it, so skip — no torn home image to repair.
+            if home_id >= home.page_count() {
                 continue;
             }
-            // Read + classify the home page (`rmp` #408). On the **plaintext** device a torn page
-            // reads back as bytes whose CRC32C fails `verify_checksum` (the read itself succeeds). On
-            // the **encrypted** device (`graphus_crypto`) the torn slot fails its AES-GCM tag, which
-            // `read_page_classified` reports as `PageReadOutcome::Torn` — distinct from a **transient**
-            // I/O error, which it propagates as `Err`.
-            //
-            // ROOT-CAUSE FIX (`rmp` #408): the previous code mapped *any* home-read `Err` to "torn",
-            // so a fine-but-momentarily-unreadable home page (a transient device error) with a stale
-            // surviving DWB batch present would be CLOBBERED by the older DWB image — a durability
-            // violation (an older image written over a newer home page). We now:
-            //   - repair ONLY on a genuine tear: `PageReadOutcome::Torn`, or a successful read whose
-            //     CRC32C fails (the plaintext tear);
-            //   - PROPAGATE a transient `Err` (never silently revert) — recovery fails loudly so the
-            //     operator/retry sees it, rather than corrupting a good page from a stale copy.
+            // Read + classify the home page (`rmp` #408): a genuine tear is `PageReadOutcome::Torn`
+            // (encrypted AEAD-fail) or a successful read whose CRC32C fails (plaintext tear); a
+            // transient I/O error is PROPAGATED (never silently reverted).
             let mut home_buf: Page = [0u8; PAGE_SIZE];
-            // `home_trusted_lsn` is `Some(lsn)` only when the home page read back **and** its own
-            // CRC32C verifies — i.e. its header (and `page_lsn`) is trustworthy. A torn page's header
-            // is garbage, so its lsn is never trusted (`None`). Used by the lsn guard below.
-            let (home_torn, home_trusted_lsn) =
-                match home.read_page_classified(*home_id, &mut home_buf)? {
-                    // Read succeeded: intact iff its own CRC32C verifies (plaintext-tear detection).
-                    PageReadOutcome::Read => {
-                        if page::verify_checksum(&home_buf) {
-                            (false, Some(page::page_lsn(&home_buf)))
-                        } else {
-                            (true, None) // readable but CRC-failed ⇒ torn; lsn untrusted
-                        }
-                    }
-                    // Genuine AEAD-tag failure on the encrypted device: the page is torn.
-                    PageReadOutcome::Torn => (true, None),
-                };
+            let home_torn = match home.read_page_classified(PageId(home_id), &mut home_buf)? {
+                PageReadOutcome::Read => !page::verify_checksum(&home_buf),
+                PageReadOutcome::Torn => true,
+            };
             if !home_torn {
                 continue; // home image intact (old or new) — redo reconciles it
             }
-            // Home page is torn. Restore from this region's DWB copy.
-            let slot = PageId(region.first_data_slot + i as u64);
-            let mut dwb_buf: Page = [0u8; PAGE_SIZE];
-            // A DWB-slot read that errors (an AEAD failure on an encrypted DWB device, i.e. the copy
-            // is itself torn) is the unrepairable double fault — surface it, never hide it.
-            let dwb_readable = match self.device.read_page(slot, &mut dwb_buf) {
-                Ok(()) => page::verify_checksum(&dwb_buf),
-                Err(_) => false,
-            };
-            if !dwb_readable {
-                return Err(GraphusError::Storage(format!(
-                    "doublewrite recovery: home page {} is torn and its doublewrite copy in slot {} \
-                     is also corrupt — unrepairable double fault",
-                    home_id.0, slot.0
-                )));
-            }
-            // Defence in depth: the DWB copy's self-referential page_id header must name this home
-            // page (`05 §6`: page_id detects misdirected/torn writes), or we would restore the wrong
-            // page over a torn one.
-            if page::page_id(&dwb_buf) != home_id.0 {
-                return Err(GraphusError::Storage(format!(
-                    "doublewrite recovery: slot {} carries page_id {} but the header maps it to home \
-                     page {} — misdirected doublewrite copy, refusing to restore",
-                    slot.0,
-                    page::page_id(&dwb_buf),
-                    home_id.0
-                )));
-            }
-            // Defence in depth — the lsn guard (`rmp` #408): never write an OLDER image over a NEWER
-            // home page. We only reach here when the home page is torn, so normally its lsn is
-            // untrusted (`home_trusted_lsn == None`) and the guard is a no-op — the root-cause fix
-            // (classifying transient `Err` vs genuine tear above) is what actually closes the reported
-            // clobber. But if a future caller ever reaches this restore with a home page whose header
-            // *does* verify (a trusted lsn), refuse to apply a strictly-staler DWB copy: a DWB image
-            // older than the live home page is a stale surviving batch, and restoring it would revert a
-            // committed change. (A DWB image of equal-or-greater lsn is the legitimate repair image.)
-            if let Some(home_lsn) = home_trusted_lsn {
-                let dwb_lsn = page::page_lsn(&dwb_buf);
-                if dwb_lsn < home_lsn {
-                    return Err(GraphusError::Storage(format!(
-                        "doublewrite recovery: refusing to restore home page {} from slot {}: the \
-                         doublewrite copy's page_lsn {} is OLDER than the (intact) home page's \
-                         page_lsn {} — a stale doublewrite batch must never overwrite a newer home \
-                         page",
-                        home_id.0, slot.0, dwb_lsn.0, home_lsn.0
-                    )));
+            // Home page is torn: it MUST be restored from its highest-lsn valid candidate.
+            match candidates.get(&home_id) {
+                Some((_lsn, image)) => {
+                    home.write_page(PageId(home_id), image.as_ref())?;
+                    repaired += 1;
+                }
+                None if had_corrupt_copy.contains(&home_id) => {
+                    // A doublewrite copy of this torn home page exists but is ITSELF corrupt (torn
+                    // DWB slot / misdirected) and no other valid copy protects it — the classic
+                    // unrepairable double fault (`04 §4.6`).
+                    double_fault.push(home_id);
+                }
+                None => {
+                    // Torn home with NO valid candidate at or above the floor (and no corrupt copy
+                    // either — its DWB slot was reused, or was floor-gated as a provably-superseded
+                    // stale copy). The correct image is unavailable (a newer DWB slot was reused and
+                    // its WAL reclaimed), so we must NOT silently restore a gated-out stale copy:
+                    // record it and fail loudly below — better a surfaced unrepairable fault than a
+                    // silent revert to an older committed image (`rmp` #437, integrity-is-inviolable).
+                    torn_unprotected.push(home_id);
                 }
             }
-            home.write_page(*home_id, &dwb_buf)?;
-            repaired += 1;
         }
+
+        if !double_fault.is_empty() || !torn_unprotected.is_empty() {
+            // Sync whatever we did repair (idempotent) before surfacing the fault, so a retry sees the
+            // partial progress and the same deterministic outcome.
+            if repaired > 0 {
+                home.sync_data()?;
+            }
+            return Err(GraphusError::Storage(format!(
+                "doublewrite recovery: unrepairable fault. Home page(s) {double_fault:?} are torn \
+                 and their doublewrite copy is also corrupt (double fault); home page(s) \
+                 {torn_unprotected:?} are torn and have no doublewrite copy at or above the \
+                 checkpoint floor {} — the correct image is unavailable, so a stale below-floor ring \
+                 slot is NOT restored over a newer torn home page. Surfacing rather than silently \
+                 reverting a committed change (rmp #437, integrity-is-inviolable 04 §4.6)",
+                floor.0
+            )));
+        }
+
         if repaired > 0 {
             home.sync_data()?;
         }

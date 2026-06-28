@@ -1139,11 +1139,38 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // transaction's commit record (so an unfrozen in-flight stamp stays resolvable). The WAL
         // additionally clamps to the oldest active transaction's first record (loser undo).
         let oldest_unfrozen = self.unfrozen_commit_lsn.values().map(|l| l.0).min();
-        self.wal.with(|w| -> Result<()> {
+        // Compute the EXACT reclaim floor here (the same clamp `reclaim` applies, including the WAL's
+        // oldest-active-first-lsn), so the doublewrite floor we persist below matches the WAL prefix
+        // about to be dropped.
+        let (ckpt_lsn, reclaim_floor) = self.wal.with(|w| {
             let ckpt_lsn = w.checkpoint(&[]);
             let floor = oldest_unfrozen.map_or(ckpt_lsn.0, |u| ckpt_lsn.0.min(u));
-            w.reclaim(Lsn(floor))
-        })?;
+            let floor = w
+                .oldest_active_first_lsn()
+                .map_or(floor, |oldest| floor.min(oldest.0));
+            (ckpt_lsn, floor)
+        });
+        let _ = ckpt_lsn;
+        // DOUBLEWRITE FLOOR (`rmp` #437): persist the reclaim floor durably in the DWB **before** the
+        // WAL prefix below it is reclaimed. On the next open, eviction-ring recovery ignores any ring
+        // slot whose staged `page_lsn` is below this floor (provably superseded by a flushed home
+        // page), so a stale ring slot can never restore an older committed image over a torn newer
+        // home page once the redo records that would have rolled it forward are gone. Ordering is the
+        // crux: the floor is durable (write + sync of the DWB batch header inside `set_floor`) before
+        // `reclaim` drops the records — so a crash between the two leaves either the old floor + the
+        // not-yet-reclaimed WAL (safe) or the new floor + the reclaimed WAL (safe). The floor is
+        // monotonic inside `set_floor`. No per-eviction fsync is added (the #431 convoy property is
+        // preserved): this is one extra header fsync **per checkpoint**, on the checkpoint thread.
+        if let Some(dwb) = self.dwb.as_ref() {
+            let dwb = Arc::clone(dwb);
+            let mut guard = dwb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.set_floor(Lsn(reclaim_floor))?;
+        }
+        // Now reclaim the WAL prefix below the (now durable) floor.
+        self.wal
+            .with(|w| -> Result<()> { w.reclaim(Lsn(reclaim_floor)) })?;
         self.wal_len_at_last_checkpoint = self.wal.with(|w| w.durable_len());
         Ok(())
     }
