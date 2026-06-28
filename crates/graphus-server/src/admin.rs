@@ -2006,6 +2006,55 @@ impl AdminContext {
         }
     }
 
+    /// Authorizes `principal` for **schema/DDL** on the database `db` — index and constraint DDL
+    /// (`CREATE`/`DROP INDEX`, `CREATE`/`DROP CONSTRAINT`; rmp #457). The principal must be
+    /// authenticated and hold [`Action::Schema`](graphus_auth::Action::Schema) **scoped to that
+    /// database's graph** ([`Privilege::on_graph`]). This is the gate that makes
+    /// `GRANT SCHEMA ON GRAPH x` meaningful: an operator can delegate index/constraint management on
+    /// one database without granting the global `Admin` super-privilege (which would also grant all
+    /// data read/write and all security administration).
+    ///
+    /// **Fail-closed and never an escalation.** `Schema` does *not* imply any data action, and a
+    /// graph-scoped grant never crosses database boundaries, so `SCHEMA ON GRAPH x` authorizes DDL on
+    /// `x` and *nothing* on `y` (RBAC scope containment) and no data writes (RBAC action containment).
+    /// Holders of `Admin` are unaffected: by the RBAC containment rules `Admin` over `Graph(x)`
+    /// implies `Schema` over `Graph(x)`, and global `Admin` over [`Resource::Database`] covers every
+    /// graph, so every existing admin still passes this gate. The check reads the **live** security
+    /// catalog (a brief read lock), so a just-granted/revoked `SCHEMA` privilege takes effect on the
+    /// very next DDL statement.
+    ///
+    /// Authorization happens before any side effect, so a denied command leaves the system untouched.
+    /// Audit of a denial is the **caller's** responsibility (rmp #70): the seams audit the schema-DDL
+    /// denial as `authz_denied` via [`audit`](Self::audit) so the event carries the right detail.
+    ///
+    /// # Errors
+    /// [`GraphusError::Security`] when the principal is absent (unauthenticated) or holds neither
+    /// `Schema` on `db` nor a privilege that implies it (e.g. `Admin`) — with a message the wire
+    /// renderers classify as `Neo.ClientError.Security.Forbidden` / HTTP 403.
+    pub fn authorize_schema(&self, principal: Option<&str>, db: &str) -> Result<(), GraphusError> {
+        let principal = principal.ok_or_else(|| {
+            GraphusError::Security(
+                "schema (DDL) commands require an authenticated principal".to_owned(),
+            )
+        })?;
+        // Read through the live security catalog (a brief read lock): a runtime grant/revoke of
+        // `SCHEMA ON GRAPH db` is in effect immediately. `Admin` (graph- or server-scoped) satisfies
+        // this through the RBAC containment rules, so admins are never blocked by the new gate.
+        let wanted = Privilege::on_graph(graphus_auth::Action::Schema, db);
+        let authorized = self
+            .security
+            .with_auth(|auth| auth.authorize(principal, &wanted));
+        if authorized {
+            Ok(())
+        } else {
+            Err(GraphusError::Security(format!(
+                "permission denied: schema (index/constraint DDL) on database {db:?} requires the \
+                 SCHEMA privilege on that database (user {principal:?} holds neither SCHEMA nor a \
+                 privilege that implies it, such as ADMIN)"
+            )))
+        }
+    }
+
     /// Executes an administrative command on behalf of `principal`, recording the audit trail
     /// (rmp #70): an authorization denial is always audited as `authz_denied` (with no side
     /// effects), and a *mutating* command's outcome is audited as `admin_change`/`security_change`

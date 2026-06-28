@@ -5,9 +5,25 @@
 //!
 //! ## Why audit logging is its own subsystem
 //!
-//! An auditor or a SIEM needs an **independent, tamper-evident, durable** trail of *who did what,
-//! when, and whether it was allowed*, separate from the operational store. A compliance review (or a
-//! breach investigation) reads the audit log, not the graph. So the log is:
+//! An auditor or a SIEM needs an **independent, append-integrity-checked, durable** trail of *who
+//! did what, when, and whether it was allowed*, separate from the operational store. A compliance
+//! review (or a breach investigation) reads the audit log, not the graph.
+//!
+//! ## Integrity posture (what this log does and does NOT guarantee)
+//!
+//! This log provides **append integrity**: a strictly monotonic `seq` (never reused, never skipped,
+//! recovered across rotations and restarts — see [`AuditLog::open`]), one self-contained JSON object
+//! per line, a synchronous non-dropping write path, `fsync`-before-ack for security events, and
+//! torn-tail repair on reopen. It is **not** cryptographically *tamper-evident*: there is no HMAC or
+//! `prev_hash` chain on the records, so an adversary who can already write the audit file could
+//! delete or rewrite an interior record; the only on-disk signal that would leave is a **`seq` gap**
+//! (which no shipped Graphus tool checks for you). For a true tamper-evidence requirement, pair this
+//! log with an **external WORM / append-only SIEM sink** (every event is also mirrored to `tracing`
+//! under `target: "graphus::audit"` precisely so it can be shipped to such a sink in real time) or
+//! ship the records to a system that signs/chains them off-box. The on-box durability guarantees
+//! below are what this module owns; cryptographic non-repudiation is explicitly out of scope for v1.
+//!
+//! So the log is:
 //!
 //! - **Append-only + line-delimited JSON (JSONL).** Each line is exactly one self-contained, compact
 //!   JSON object followed by `\n`. One object per line is what makes a torn final line (from a crash
@@ -42,6 +58,14 @@
 //! on reopen as `max valid seq + 1` over **both the active file and the retained rotated files**, so
 //! a restart (even one immediately following a rotation that left the active file empty) never
 //! reuses or skips a number.
+//!
+//! **`seq` order == on-disk line order, even under concurrency** (#456): `seq` is stamped *inside*
+//! the append lock (see [`AuditLog::record`]), so the line carrying `seq N` is also the N-th line in
+//! the file. A consumer (SIEM, `jq`, forensic reconstruction) may therefore read the JSONL
+//! top-to-bottom and trust that line order is event order — concurrent connections cannot interleave
+//! the lines out of `seq` order. (Even so, sorting by `seq` is the robust choice across files,
+//! because a rotation splits the stream into `audit.log`, `audit.log.1`, … — line order holds
+//! *within* a file; `seq` order holds *across* all of them.)
 //!
 //! ## Threading
 //!
@@ -595,10 +619,18 @@ impl AuditLog {
     /// event is never silently dropped. Steps:
     ///
     /// 1. If disabled, return immediately (nothing written).
-    /// 2. Assign the next `seq` and build the RFC 3339 UTC `ts`.
+    /// 2. Acquire the serialization mutex, then — **under the lock** — assign the next `seq` and build
+    ///    the RFC 3339 UTC `ts`. Stamping `seq` while holding the append lock is what guarantees
+    ///    **on-disk line order == `seq` order** (#456): the thread that wins the lock both takes the
+    ///    lower `seq` and appends its line first, so a SIEM or forensic tool reading the JSONL
+    ///    top-to-bottom reconstructs events in `seq` order even when many connections audit
+    ///    concurrently. (Stamping `seq` *before* the lock — as an earlier version did — let two racing
+    ///    `record` calls take `seq N`/`N+1` then acquire the lock in the opposite order, writing the
+    ///    lines out of `seq` order. The counter never reused/skipped a number, but the documented
+    ///    monotonic line-order guarantee was false under load.)
     /// 3. Serialize the on-disk record to a **compact** JSON line (`serde_json` produces no embedded
     ///    newlines) and append `\n`, so the line stays exactly one JSON object.
-    /// 4. Under the mutex: rotate first if the append would cross `rotate_max_bytes`, then
+    /// 4. Still under the mutex: rotate first if the append would cross `rotate_max_bytes`, then
     ///    `write_all` the line and update the byte counter.
     /// 5. `fsync` policy: a security-relevant class (auth / authz-denied / admin / schema / security)
     ///    is `sync_data`'d **before returning** (when `fsync_security_events` is on), so the event is
@@ -609,7 +641,8 @@ impl AuditLog {
     ///
     /// Every event is **also** mirrored to `tracing` (`target: "graphus::audit"`) at `info` (normal)
     /// or `warn` (failure / denial), so an operator shipping logs to a SIEM receives the trail even
-    /// without the file.
+    /// without the file. The mirror is emitted under the lock too, so the `tracing` stream carries the
+    /// same `seq` order as the file — one consistent ordering for both consumers.
     ///
     /// On an I/O error the event is **not** dropped silently: it is logged loudly via
     /// `tracing::error!` and counted in [`write_errors`](Self::write_errors); the call still returns
@@ -620,13 +653,21 @@ impl AuditLog {
             return;
         }
 
-        // Assign the sequence number (monotonic, 1-based) and timestamp first, outside the file
-        // lock — they do not touch the file and the atomic is the only ordering concern.
+        let security_relevant = event.class.is_security_relevant();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Assign the sequence number (monotonic, 1-based) and timestamp **under the append lock** so
+        // the line stamped `seq N` is also the N-th line appended — on-disk order == seq order (#456).
+        // `Relaxed` suffices: the mutex already establishes the happens-before edge between successive
+        // `record` calls, so this counter needs only atomicity, not ordering, of its own.
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let ts = rfc3339_utc(SystemTime::now());
 
-        // Mirror to tracing unconditionally, so the trail reaches a SIEM even if the file write
-        // fails below. Failures/denials are warnings; everything else is info.
+        // Mirror to tracing under the lock (in seq order), so the trail reaches a SIEM even if the
+        // file write fails below. Failures/denials are warnings; everything else is info.
         self.mirror_to_tracing(seq, &ts, &event);
 
         let record = AuditRecord {
@@ -657,12 +698,6 @@ impl AuditLog {
             "compact serde_json must not embed newlines"
         );
         line.push('\n');
-
-        let security_relevant = event.class.is_security_relevant();
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Rotation check FIRST (before the write), so the threshold bounds the active file.
         let line_len = line.len() as u64;

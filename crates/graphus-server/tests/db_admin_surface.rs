@@ -496,7 +496,12 @@ struct IndexRow {
 
 /// Runs `SHOW INDEXES` on `client` (against the default database) and decodes the rows.
 async fn show_indexes(client: &mut BoltClient) -> Vec<IndexRow> {
-    let rows = client.run_ok("SHOW INDEXES", None).await;
+    show_indexes_on(client, None).await
+}
+
+/// `SHOW INDEXES` against a specific database (the Bolt `db` extra), or the default when `None`.
+async fn show_indexes_on(client: &mut BoltClient, db: Option<&str>) -> Vec<IndexRow> {
+    let rows = client.run_ok("SHOW INDEXES", db).await;
     rows.into_iter()
         .map(|row| {
             assert_eq!(row.len(), 3, "label, property, state: {row:?}");
@@ -655,6 +660,100 @@ async fn index_ddl_privilege_and_transaction_rules() {
     );
 
     c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// Regression (#457): the `SCHEMA` privilege is enforced and is **graph-scoped**. A principal granted
+/// `SCHEMA ON GRAPH dbx` may run index/constraint DDL on `dbx`, but **NOT** on a different database
+/// `dby`, and **NOT** any data write (`SCHEMA` is orthogonal to the read/write chain). This delegates
+/// DDL on one database without the global `Admin` super-privilege (least-privilege). Holders of
+/// `Admin` are unaffected — `Admin` satisfies `SCHEMA` through RBAC containment.
+///
+/// Before the fix, `SCHEMA` was grantable and persisted but never consulted: DDL was gated by global
+/// `Admin`, so `GRANT SCHEMA ON GRAPH dbx` granted nothing and `carol` would have been denied DDL on
+/// `dbx` too (forcing the operator to over-privilege with `Admin`).
+#[tokio::test]
+async fn schema_privilege_scopes_ddl_to_its_database_and_grants_no_data_write() {
+    let temp = TempStore::new("schema-priv-scope");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // Admin sets up two databases and a SCHEMA-on-dbx-only principal (carol), with NO data or admin
+    // privileges. carol authenticates by password LOGON; the test process's own uid still gates UDS
+    // admission (mapped to alice), but the session principal is whoever the LOGON authenticates.
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("CREATE DATABASE dbx", None).await;
+    admin.run_ok("CREATE DATABASE dby", None).await;
+    admin
+        .run_ok("CREATE USER carol SET PASSWORD 'carol-pw8'", None)
+        .await;
+    admin.run_ok("CREATE ROLE ddl_dbx", None).await;
+    // The delegation: SCHEMA on dbx ONLY. No READ/WRITE, no ADMIN, nothing on dby.
+    admin
+        .run_ok("GRANT SCHEMA ON GRAPH dbx TO ddl_dbx", None)
+        .await;
+    admin.run_ok("GRANT ROLE ddl_dbx TO carol", None).await;
+    admin.goodbye().await;
+
+    let mut carol = BoltClient::connect(&uds).await;
+    carol.handshake_and_logon("carol", "carol-pw8").await;
+
+    // (1) PERMITTED: index DDL on the granted database dbx.
+    let rows = carol
+        .run_ok("CREATE INDEX FOR (n:Person) ON (n.name)", Some("dbx"))
+        .await;
+    assert!(rows.is_empty(), "CREATE INDEX returns no rows");
+    // Constraint DDL on dbx is the same SCHEMA gate — also permitted.
+    carol
+        .run_ok(
+            "CREATE CONSTRAINT c_email FOR (n:Person) REQUIRE n.email IS UNIQUE",
+            Some("dbx"),
+        )
+        .await;
+
+    // (2) DENIED: the SAME index DDL on a DIFFERENT database dby — graph-scoped SCHEMA never crosses
+    //     database boundaries (RBAC scope containment). Fail-closed, no escalation.
+    let f = carol
+        .run_on_db("CREATE INDEX FOR (n:Person) ON (n.name)", Some("dby"))
+        .await
+        .expect_err("SCHEMA on dbx must NOT authorize DDL on dby");
+    assert!(
+        f.code.contains("Security.Forbidden"),
+        "cross-database DDL is forbidden: {f:?}"
+    );
+    assert!(f.message.contains("permission denied"), "{f:?}");
+    carol.reset().await;
+
+    // (3) DENIED: a data WRITE on dbx — SCHEMA is orthogonal to the read/write chain, so it grants no
+    //     data mutation (RBAC action containment). This is the least-privilege guarantee: a delegated
+    //     DDL manager cannot read or change data.
+    let f = carol
+        .run_on_db("CREATE (n:Person {name: 'mallory'})", Some("dbx"))
+        .await
+        .expect_err("SCHEMA must NOT authorize a data write");
+    assert!(
+        f.code.contains("Security.Forbidden"),
+        "a data write under a SCHEMA-only grant is forbidden: {f:?}"
+    );
+    carol.reset().await;
+    carol.goodbye().await;
+
+    // (4) REGRESSION: the global admin (alice) is UNAFFECTED — Admin satisfies the SCHEMA gate via
+    //     RBAC containment, on any database.
+    let mut admin2 = BoltClient::connect(&uds).await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
+    admin2
+        .run_ok("CREATE INDEX FOR (n:Company) ON (n.ticker)", Some("dby"))
+        .await;
+    let idx = show_indexes_on(&mut admin2, Some("dby")).await;
+    assert!(
+        idx.iter()
+            .any(|r| r.label == "Company" && r.property == "ticker"),
+        "admin's DDL on dby succeeded: {idx:?}"
+    );
+    admin2.goodbye().await;
+
     server.shutdown().await.expect("clean shutdown");
 }
 

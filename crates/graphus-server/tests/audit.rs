@@ -666,6 +666,90 @@ async fn audit_survives_restart_and_ordering() {
     );
 }
 
+/// Regression (#456): the on-disk record order must equal `seq` order **under concurrency**.
+///
+/// `K` connections authenticate **concurrently**, each emitting one security-relevant
+/// (`auth_success`, `fsync`'d) audit event. Because `seq` is now stamped *inside* the append lock
+/// (audit.rs `record`), the thread that takes the lower `seq` also appends its line first, so the
+/// file's line order equals `seq` order. We assert the audited `seq`s are a **gap-free permutation
+/// of `1..=N`** (no reuse, no gap — the security-critical property) **and** that they are **strictly
+/// ascending in file (line) order** (the presentation property a SIEM relies on, which the earlier
+/// stamp-before-lock code violated under load).
+///
+/// Before the fix, two racing `record` calls could stamp `seq N`/`N+1` then acquire the lock in the
+/// opposite order, so the line-order assertion below would fail (adjacent on-disk `seq` inversions)
+/// even though the permutation stayed gap-free.
+#[tokio::test]
+async fn audit_seq_order_matches_disk_order_under_concurrency() {
+    // Enough concurrency to make the race observable while keeping the test fast and deterministic.
+    const K: usize = 32;
+
+    let temp = TempStore::new("seq-order-concurrency");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // Fire K concurrent sessions, each performing exactly one audited action (the LOGON, a
+    // security-relevant event). Every connection contends for the single audit append lock, which is
+    // exactly the path the fix serializes.
+    let mut handles = Vec::with_capacity(K);
+    for _ in 0..K {
+        let uds = uds.clone();
+        handles.push(tokio::spawn(async move {
+            let mut c = BoltClient::connect(&uds).await;
+            c.handshake_and_logon("alice", "admin-pw8").await;
+            c.goodbye().await;
+        }));
+    }
+    for h in handles {
+        h.await.expect("session task joined");
+    }
+
+    server.shutdown().await.expect("clean shutdown");
+
+    // Read the file top-to-bottom; this is the order a SIEM/forensic tool consumes.
+    let lines = read_audit_lines(&temp.audit_file());
+    let seqs: Vec<u64> = lines
+        .iter()
+        .map(|l| {
+            l.get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .expect("every line has a numeric seq")
+        })
+        .collect();
+
+    // At least our K LOGON events landed (the bootstrap may add a few more security events; the
+    // properties below hold regardless of the exact count).
+    let auth_successes = classes(&lines)
+        .iter()
+        .filter(|c| c.as_str() == "auth_success")
+        .count();
+    assert!(
+        auth_successes >= K,
+        "all {K} concurrent LOGON successes are audited: got {auth_successes}"
+    );
+
+    // (1) Gap-free permutation of 1..=N: no reuse, no gap. Sorting the on-disk seqs must yield
+    //     exactly 1, 2, …, N — the security-critical never-reuse/never-skip property.
+    let n = seqs.len() as u64;
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    let expected: Vec<u64> = (1..=n).collect();
+    assert_eq!(
+        sorted, expected,
+        "on-disk seqs must be a gap-free permutation of 1..={n} (no reuse, no gap): {seqs:?}"
+    );
+
+    // (2) Strictly ascending in line order: with seq stamped under the append lock, file order ==
+    //     seq order. Combined with (1), this means the lines are literally 1, 2, …, N in order.
+    for window in seqs.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "on-disk line order must be strictly ascending in seq (file order == seq order, \
+             #456): adjacent inversion in {seqs:?}"
+        );
+    }
+}
+
 /// With audit disabled, no audit file is written even though events would otherwise occur.
 #[tokio::test]
 async fn disabled_audit_writes_no_file() {

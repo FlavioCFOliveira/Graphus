@@ -357,9 +357,14 @@ impl RestEngine for RestEngineAdapter {
                 if open.explicit {
                     return Err(admin_in_explicit_tx());
                 }
-                // Authorization first — no side effects on denial (shared gate with the DB surface).
-                // The seam audits the index-DDL denial / schema change itself (rmp #70).
-                if let Err(e) = self.context.authorize_admin(Some(&open.principal)) {
+                // Authorization first — no side effects on denial. Index DDL requires the SCHEMA
+                // privilege on the transaction's pinned database (`Admin` still satisfies it via RBAC
+                // containment), so `GRANT SCHEMA ON GRAPH x` can delegate DDL without full Admin (rmp
+                // #457). The seam audits the index-DDL denial / schema change itself (rmp #70).
+                if let Err(e) = self
+                    .context
+                    .authorize_schema(Some(&open.principal), &open.db)
+                {
                     self.context.audit().record(
                         AuditEvent::new(
                             AuditClass::AuthzDenied,
@@ -367,6 +372,7 @@ impl RestEngine for RestEngineAdapter {
                             AuditSource::Rest,
                         )
                         .actor(Some(&open.principal))
+                        .database(Some(&open.db))
                         .detail(redact_index_detail(&cmd)),
                     );
                     return Err(e);
@@ -409,8 +415,13 @@ impl RestEngine for RestEngineAdapter {
                 if open.explicit {
                     return Err(admin_in_explicit_tx());
                 }
-                // Authorization first — no side effects on denial (shared gate with the DB surface).
-                if let Err(e) = self.context.authorize_admin(Some(&open.principal)) {
+                // Authorization first — no side effects on denial. Constraint DDL requires SCHEMA on
+                // the transaction's pinned database (`Admin` still satisfies it via RBAC containment;
+                // rmp #457).
+                if let Err(e) = self
+                    .context
+                    .authorize_schema(Some(&open.principal), &open.db)
+                {
                     self.context.audit().record(
                         AuditEvent::new(
                             AuditClass::AuthzDenied,
@@ -418,6 +429,7 @@ impl RestEngine for RestEngineAdapter {
                             AuditSource::Rest,
                         )
                         .actor(Some(&open.principal))
+                        .database(Some(&open.db))
                         .detail(redact_constraint_detail(&cmd)),
                     );
                     return Err(e);

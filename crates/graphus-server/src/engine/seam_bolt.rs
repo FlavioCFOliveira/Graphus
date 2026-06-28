@@ -300,10 +300,25 @@ impl BoltExecutor for BoltEngineExecutor {
                 if matches!(tx, TxControl::InExplicit { .. }) {
                     return Err(Self::admin_in_explicit_tx());
                 }
-                // Authorization first — no side effects on denial (shared gate with the DB surface).
-                // The index command isn't an `AdminCommand`, so the seam audits its own denial /
-                // schema change (rmp #70) via `context.audit()`.
-                if let Err(e) = self.context.authorize_admin(self.principal.as_deref()) {
+                // The index command runs against the database this auto-commit RUN targets. Resolve
+                // it FIRST so authorization is scoped to the *target* database (rmp #457): the
+                // SCHEMA privilege is graph-scoped, so we must know the canonical database name
+                // before we can ask whether the principal may run DDL on it.
+                let db = match &tx {
+                    TxControl::AutoCommit { db, .. } => db.as_deref(),
+                    // Rejected above; this arm is unreachable, but keep it total.
+                    TxControl::InExplicit { .. } => None,
+                };
+                let (name, handle) = self.context.resolve(db)?;
+                // Authorization next — no side effects on denial. Index/constraint DDL requires the
+                // SCHEMA privilege on the target database (`Admin` still satisfies it via RBAC
+                // containment); this lets `GRANT SCHEMA ON GRAPH x` delegate DDL without full Admin
+                // (rmp #457). The index command isn't an `AdminCommand`, so the seam audits its own
+                // denial / schema change (rmp #70) via `context.audit()`.
+                if let Err(e) = self
+                    .context
+                    .authorize_schema(self.principal.as_deref(), &name)
+                {
                     self.context.audit().record(
                         AuditEvent::new(
                             AuditClass::AuthzDenied,
@@ -311,17 +326,11 @@ impl BoltExecutor for BoltEngineExecutor {
                             self.source,
                         )
                         .actor(self.principal.as_deref())
+                        .database(Some(&name))
                         .detail(redact_index_detail(&cmd)),
                     );
                     return Err(e);
                 }
-                // The index command runs against the database this auto-commit RUN targets.
-                let db = match &tx {
-                    TxControl::AutoCommit { db, .. } => db.as_deref(),
-                    // Rejected above; this arm is unreachable, but keep it total.
-                    TxControl::InExplicit { .. } => None,
-                };
-                let (name, handle) = self.context.resolve(db)?;
                 // `SHOW (FULLTEXT|POINT) INDEXES` is read-only — only the mutating CREATE/DROP are
                 // schema changes (`rmp` task #72/#98 add the full-text / point SHOW to the read-only
                 // set).
@@ -363,8 +372,18 @@ impl BoltExecutor for BoltEngineExecutor {
                 if matches!(tx, TxControl::InExplicit { .. }) {
                     return Err(Self::admin_in_explicit_tx());
                 }
-                // Authorization first — no side effects on denial (shared gate with the DB surface).
-                if let Err(e) = self.context.authorize_admin(self.principal.as_deref()) {
+                // Resolve the target database FIRST so authorization is scoped to it (rmp #457).
+                let db = match &tx {
+                    TxControl::AutoCommit { db, .. } => db.as_deref(),
+                    TxControl::InExplicit { .. } => None,
+                };
+                let (name, handle) = self.context.resolve(db)?;
+                // Authorization next — no side effects on denial. Constraint DDL requires SCHEMA on
+                // the target database (`Admin` still satisfies it via RBAC containment; rmp #457).
+                if let Err(e) = self
+                    .context
+                    .authorize_schema(self.principal.as_deref(), &name)
+                {
                     self.context.audit().record(
                         AuditEvent::new(
                             AuditClass::AuthzDenied,
@@ -372,15 +391,11 @@ impl BoltExecutor for BoltEngineExecutor {
                             self.source,
                         )
                         .actor(self.principal.as_deref())
+                        .database(Some(&name))
                         .detail(redact_constraint_detail(&cmd)),
                     );
                     return Err(e);
                 }
-                let db = match &tx {
-                    TxControl::AutoCommit { db, .. } => db.as_deref(),
-                    TxControl::InExplicit { .. } => None,
-                };
-                let (name, handle) = self.context.resolve(db)?;
                 // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
                 let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
                 let detail = redact_constraint_detail(&cmd);
