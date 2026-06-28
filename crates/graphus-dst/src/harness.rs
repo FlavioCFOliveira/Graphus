@@ -575,8 +575,11 @@ impl Driver {
             sink.append(&log);
             sink.sync().expect("sync log prefix");
             let wal = WalManager::open(sink).expect("open wal for corrupt-read store");
-            // A 1-frame pool guarantees the victim page is not pre-resident after open: reading it
-            // forces a device fetch, where the armed bit-rot lands and the fetch's checksum rejects.
+            // A 1-frame pool keeps at most one page resident, so the asserting read below can be
+            // forced cold by first reading any *other* page (see the eviction step). We do NOT assume
+            // `open` leaves the victim non-resident: `open` legitimately pre-reads record pages (the
+            // `rmp` #220 orphan reconstruction and the `rmp` #468 corpse high-water floor both fetch
+            // record pages), so the victim may well be cached after open.
             let mut corrupt_store = RecordStore::open(device, wal, 1).expect("open corrupt store");
             // Arm bit-rot on the *live* device of the freshly-opened store (the `dst` seam again),
             // after open so the catalog read above sees the intact image. Flip enough bytes that the
@@ -584,6 +587,12 @@ impl Driver {
             let plan = graphus_io::FaultPlan::new(self.seed)
                 .with_bit_rot(graphus_core::PageId(target), 64);
             corrupt_store.with_device_mut(|d| d.arm_fault_plan(plan));
+            // Force the victim out of the 1-frame pool so the asserting read is a genuine device
+            // fetch (where the armed bit-rot lands). Reading the meta head (page 0, always mapped and
+            // never the victim — `target` is the max *non-zero* page) evicts whatever record page
+            // `open` pre-read, including the victim. Without this, a victim cached clean by `open`
+            // would be served from the buffer cache and mask the on-disk corruption.
+            let _ = corrupt_store.read_device_page(graphus_core::PageId(0));
             let read = corrupt_store.read_device_page(graphus_core::PageId(target));
             assert!(
                 read.is_err(),

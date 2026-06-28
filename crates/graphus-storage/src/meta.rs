@@ -1625,6 +1625,7 @@ mod tests {
     ///     last mapped page) and MUST be accepted;
     ///   * `high_water == capacity + 1` is the off-by-one-page corruption (the largest claimed id needs
     ///     a page that is not mapped) and MUST be rejected.
+    ///
     /// One Rel page (store 1) maps `8168 / 102 = 80` records.
     #[test]
     fn decode_high_water_bound_boundaries() {

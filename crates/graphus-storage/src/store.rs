@@ -410,6 +410,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // addressable again so the walk reads the corpse and threads through it to NULL, instead of
         // failing with "store page not allocated" (the seed-10 double-crash ReadBack failure).
         Self::reconstruct_orphan_store_pages(&pool, &mut stores)?;
+        // Cover dead-link corpses (`rmp` #220) that ARIES redo materialised on an **already-mapped**
+        // (committed-catalog) page *above* the durable high-water — the residue self-loop churn on a
+        // single node leaves when a loser's record shares a densely-packed record page with a
+        // committed record, so `reconstruct_orphan_store_pages` (orphan-pages only) cannot reach it
+        // (`rmp` #468). Without this the incidence-walk cycle guard (`2 * high_water + 2`) is too
+        // small to thread the corpse run to the committed head, so committed relationships below the
+        // run become unreadable, and the allocator would re-hand-out a still-referenced corpse slot.
+        Self::floor_high_water_over_mapped_corpses(&pool, &mut stores);
         let shared_len = shared.with(|w| w.durable_len());
         // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
         // resumes *past* every id already in the log. Without this the counter would restart low and
@@ -728,6 +736,94 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
         Ok(())
+    }
+
+    /// Floors each store's high-water past any **dead-link corpse** (`rmp` #220) materialised on an
+    /// **already-mapped** (committed-catalog) page *above* the durable high-water — the residue a
+    /// crash recovery leaves when a loser transaction's record was allocated on the *same* record
+    /// page as an earlier committed record (`rmp` #468).
+    ///
+    /// ## The gap [`reconstruct_orphan_store_pages`] leaves
+    ///
+    /// A store's durable `high_water` is persisted only at a **commit**. ARIES redo re-materialises a
+    /// loser's record writes on the device, but the loser's high-water bump was never folded into the
+    /// catalog, so on reopen `high_water` can sit **below** corpse slots that physically exist. When
+    /// such corpses land on a *new* page, [`reconstruct_orphan_store_pages`] maps the orphan page and
+    /// floors high-water to its full capacity. But when a loser's record was allocated on the **same**
+    /// densely-packed page as an earlier committed record — e.g. self-loop churn on a single node,
+    /// where the committed self-loops and the loser self-loops share one rel page
+    /// (`records_per_page(102) == 80`) — that page IS in the committed catalog, so orphan
+    /// reconstruction skips it (`mapped.contains` → continue) and the corpse slots above `high_water`
+    /// are left uncovered. Two consequences, both ACID-critical:
+    ///
+    ///   1. The incidence-walk cycle guard is `2 * high_water + 2`; an uncovered corpse run makes the
+    ///      committed head unreachable within the guard, so [`incident_rels`](Self::incident_rels) of
+    ///      a node whose `first_rel` the CAS chain-head undo legitimately left pointing at a corpse
+    ///      (`rmp` #220) errors "malformed (cycle?)" — the committed relationships threaded below the
+    ///      corpse run become unreadable (**committed-data loss** after a crash).
+    ///   2. The allocator would **re-hand-out** a corpse slot on the next `create_rel`, overwriting a
+    ///      record the node's incidence chain still threads through (**silent chain corruption**).
+    ///
+    /// ## Why a bounded forward scan suffices
+    ///
+    /// Corpse ids form a **dense, contiguous run** starting at the durable `high_water` (the allocator
+    /// hands ids out densely and monotonically, and abort/recovery never frees a corpse slot back to
+    /// the free list — it stays allocated until GC). So a forward scan from `high_water`, stopping at
+    /// the first all-zero (never-written) slot, covers the whole run: a never-written slot is all-zero
+    /// (pages are zeroed when extended), whereas a corpse keeps its non-zero record body — only its
+    /// 25-byte MVCC header was reverted by the header-only creation undo (`rmp` #220). The common
+    /// no-corpse reopen costs a single slot read (the slot at `high_water` is empty). The scan never
+    /// crosses onto an **unmapped** page: a corpse run that spills onto a new page is already covered
+    /// by [`reconstruct_orphan_store_pages`], whose full-capacity floor lifts `high_water` past it, so
+    /// this scan starts beyond it. Flooring is via [`PhysicalAllocator::observe`], exactly as the
+    /// orphan path floors whole orphan pages, keeping `high_water <= capacity` (the `rmp` #452 bound).
+    ///
+    /// ## Robust to corruption (never fails `open`)
+    ///
+    /// An unreadable boundary page (e.g. on-disk corruption that breaks its checksum) stops the scan
+    /// for that store rather than failing [`open`](Self::open): `open` must stay robust and defer
+    /// corruption detection to [`crate::verify_on_open`], which re-reads the durable image and refuses
+    /// to serve a corrupt store. An un-floored high-water is moot for a store that will not be served;
+    /// a corrupt page also fails its checksum on fetch, so it is never cached here, preserving the
+    /// checker's cold-pool detection (`rmp` #426). For a healthy store the fetch always succeeds.
+    fn floor_high_water_over_mapped_corpses(
+        pool: &ConcurrentBufferPool<D, SharedWal<S>>,
+        stores: &mut [FixedStore; STORE_COUNT],
+    ) {
+        for store in stores.iter_mut() {
+            let record_size = store.kind.record_size();
+            let start = store.alloc.high_water();
+            let mut last_materialised = NULL_ID;
+            let mut id = start;
+            loop {
+                let (rel_page, off) = paging::record_location(id, record_size);
+                // Stop at the first slot whose page is not mapped to this store: the dense corpse run
+                // cannot cross onto an unmapped page (a spill onto a new page is already floored by
+                // `reconstruct_orphan_store_pages`).
+                let Some(pid) = store.device_pages.get(rel_page as usize).copied() else {
+                    break;
+                };
+                // An unreadable page (corruption) is left to `verify_on_open`; do not fail `open`.
+                let Ok(f) = pool.fetch(pid) else {
+                    break;
+                };
+                let materialised =
+                    pool.with_page(f, |p| p[off..off + record_size].iter().any(|&b| b != 0));
+                pool.unpin(f);
+                // A never-written slot is all-zero; the dense corpse run ends at the first such slot.
+                if !materialised {
+                    break;
+                }
+                last_materialised = id;
+                let Some(next) = id.checked_add(1) else {
+                    break;
+                };
+                id = next;
+            }
+            if last_materialised >= start {
+                store.alloc.observe(last_materialised);
+            }
+        }
     }
 
     /// Persists the in-memory catalog to the metadata page as one WAL-logged update under `txn`.
