@@ -142,6 +142,7 @@ use crate::logical::{
 };
 use crate::statistics::Statistics;
 use graphus_core::Value;
+use graphus_core::value::spatial::Crs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -1137,20 +1138,30 @@ impl Planner<'_> {
             // `distance(...) <op> r` predicate MUST be re-checked — we re-attach **all** conjuncts
             // (including this one) as the residual filter. See [`PhysicalOp::SpatialIndexSeek`].
             if let Some(sp) = analyze_spatial_predicate(conj, &variable.name) {
-                if let Some(idx) = self.catalog.label_spatial(label, &sp.property) {
-                    deps.insert(idx.id);
-                    let seek = PhysicalOp::SpatialIndexSeek {
-                        variable: variable.clone(),
-                        label: label.clone(),
-                        property: sp.property,
-                        center_x: sp.center_x,
-                        center_y: sp.center_y,
-                        radius: sp.radius,
-                        index: idx.id,
-                    };
-                    // Re-attach EVERY conjunct (the proximity predicate included) as the residual
-                    // filter: the index is a superset, the filter restores exactness.
-                    return attach_residual(seek, &conjuncts);
+                // A geographic (WGS-84) centre measures `distance` in great-circle METRES, but the grid
+                // buckets the 2D projection in coordinate DEGREES: a degree-sized bbox cannot bound a
+                // metric radius near the antimeridian (longitude wraps ±180) or the poles (longitude
+                // converges), so the grid would silently DROP true matches — a wrong result on a
+                // proximity query (`rmp` #465). Decline the seek for a geographic centre and keep the
+                // exact predicate on the scan path; the seek stays sound for a Cartesian CRS, where a
+                // degree IS the distance unit. (A per-latitude-scaled degree bbox with an antimeridian
+                // split could re-enable the index for geographic CRSs as a future optimisation.)
+                if !sp.crs.is_geographic() {
+                    if let Some(idx) = self.catalog.label_spatial(label, &sp.property) {
+                        deps.insert(idx.id);
+                        let seek = PhysicalOp::SpatialIndexSeek {
+                            variable: variable.clone(),
+                            label: label.clone(),
+                            property: sp.property,
+                            center_x: sp.center_x,
+                            center_y: sp.center_y,
+                            radius: sp.radius,
+                            index: idx.id,
+                        };
+                        // Re-attach EVERY conjunct (the proximity predicate included) as the residual
+                        // filter: the index is a superset, the filter restores exactness.
+                        return attach_residual(seek, &conjuncts);
+                    }
                 }
             }
         }
@@ -2758,6 +2769,10 @@ struct SpatialPredicate {
     center_y: f64,
     /// The constant proximity radius.
     radius: f64,
+    /// The CRS of the constant centre point. A geographic (WGS-84) CRS measures `distance` in
+    /// great-circle metres while the spatial grid buckets the 2D projection in coordinate degrees, so
+    /// the seek is only sound (degrees == distance units) for a Cartesian CRS (`rmp` #465).
+    crs: Crs,
 }
 
 /// Analyses a conjunct: is it a proximity predicate the spatial index can serve as a candidate seek?
@@ -2787,20 +2802,21 @@ fn analyze_spatial_predicate(expr: &Expr, variable: &str) -> Option<SpatialPredi
     // constant radius. (The radius-on-the-left form `r > distance(...)` is normalised by the parser to
     // property-on-left comparisons elsewhere; here we only recognise the canonical distance-on-left
     // shape, which is what `WHERE distance(n.p, c) < r` parses to.)
-    let (property, center) = distance_call_over_var(lhs, variable)?;
+    let (property, center, crs) = distance_call_over_var(lhs, variable)?;
     let radius = const_number(rhs)?;
     Some(SpatialPredicate {
         property,
         center_x: center.0,
         center_y: center.1,
         radius,
+        crs,
     })
 }
 
 /// If `expr` is a `distance(...)` (or `point.distance(...)`) call relating `var.<prop>` to a constant
 /// point, returns `(prop, (center_x, center_y))`. Accepts the two-argument symmetric forms (either
 /// argument may be the property or the constant point). Returns [`None`] otherwise.
-fn distance_call_over_var(expr: &Expr, variable: &str) -> Option<(String, (f64, f64))> {
+fn distance_call_over_var(expr: &Expr, variable: &str) -> Option<(String, (f64, f64), Crs)> {
     let ExprKind::FunctionCall { name, args, .. } = &expr.kind else {
         return None;
     };
@@ -2814,10 +2830,10 @@ fn distance_call_over_var(expr: &Expr, variable: &str) -> Option<(String, (f64, 
     // One argument must be `var.prop`; the other a constant point. Try both orderings (distance is
     // symmetric). The property argument must reference *only* the seek variable; the centre argument
     // must reference no row data at all (a plan-time constant).
-    let try_sides = |prop_side: &Expr, center_side: &Expr| -> Option<(String, (f64, f64))> {
+    let try_sides = |prop_side: &Expr, center_side: &Expr| -> Option<(String, (f64, f64), Crs)> {
         let prop = property_of(prop_side, variable)?;
-        let center = const_point_xy(center_side)?;
-        Some((prop, center))
+        let (cx, cy, crs) = const_point_xy(center_side)?;
+        Some((prop, (cx, cy), crs))
     };
     try_sides(&args[0], &args[1]).or_else(|| try_sides(&args[1], &args[0]))
 }
@@ -2825,9 +2841,9 @@ fn distance_call_over_var(expr: &Expr, variable: &str) -> Option<(String, (f64, 
 /// Evaluates a **constant** expression to its 2D `(x, y)` projection iff it is a constant
 /// `Value::Point` (`rmp` task #73). Returns [`None`] for any non-constant or non-point expression, so
 /// the planner declines a spatial seek it cannot pin to a literal centre.
-fn const_point_xy(expr: &Expr) -> Option<(f64, f64)> {
+fn const_point_xy(expr: &Expr) -> Option<(f64, f64, Crs)> {
     match const_value(expr)? {
-        Value::Point(p) => Some((p.x(), p.y())),
+        Value::Point(p) => Some((p.x(), p.y(), p.crs)),
         _ => None,
     }
 }
@@ -3744,6 +3760,42 @@ mod tests {
         assert!(rendered.contains("Filter"), "{rendered}");
         assert!(!rendered.contains("SpatialIndexSeek"), "{rendered}");
         assert_eq!(plan.index_dependencies().count(), 0);
+    }
+
+    #[test]
+    fn proximity_on_geographic_crs_declines_the_spatial_seek() {
+        // `rmp` #465 (CRITICAL regression gate): a geographic (WGS-84) centre measures `distance` in
+        // great-circle metres while the grid buckets the projection in coordinate degrees, so a
+        // degree-sized bbox cannot bound a metric radius near the antimeridian/poles — the grid would
+        // silently drop true matches. The planner MUST decline the spatial seek for a geographic centre
+        // and keep the exact predicate on the scan path (scan == the correct answer), even when a
+        // spatial index is declared. The Cartesian sibling MUST still use the index (contrast).
+        let catalog = IndexCatalog::builder()
+            .with_label_spatial("City", "loc")
+            .build();
+        // WGS-84 centre (longitude/latitude keys → geographic CRS): NO seek, scan + Filter.
+        let geo = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({longitude:0, latitude:0})) < 5 RETURN n",
+            &catalog,
+        );
+        let geo_s = geo.to_string();
+        assert!(
+            !geo_s.contains("SpatialIndexSeek"),
+            "geographic CRS must NOT use the spatial seek: {geo_s}"
+        );
+        assert!(geo_s.contains("NodeByLabelScan"), "{geo_s}");
+        assert!(geo_s.contains("Filter"), "{geo_s}");
+        assert!(geo_s.contains("distance"), "{geo_s}");
+        assert_eq!(geo.index_dependencies().count(), 0);
+        // Contrast: the Cartesian centre over the SAME indexed property still lowers to a seek.
+        let cart = physical(
+            "MATCH (n:City) WHERE distance(n.loc, point({x:0, y:0})) < 5 RETURN n",
+            &catalog,
+        );
+        assert!(
+            cart.to_string().contains("SpatialIndexSeek"),
+            "Cartesian CRS must still use the spatial seek: {cart}"
+        );
     }
 
     #[test]
