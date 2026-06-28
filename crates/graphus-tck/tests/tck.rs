@@ -450,4 +450,20 @@ fn tck_conformance() {
          Investigate the drop (a real regression) before lowering the baseline.",
         report.overall.passed
     );
+    // `rmp` #447: pin the SHAPE of "100% TCK", not just a floor on passes. A real per-scenario
+    // regression could otherwise hide if an unrelated change simultaneously added or repaired enough
+    // scenarios to keep `passed >= BASELINE`. The inviolable pillar means ZERO non-passes — every
+    // official scenario the harness loads must PASS (none failed, errored, or routed to Unsupported).
+    assert_eq!(
+        (
+            report.overall.failed,
+            report.overall.errored,
+            report.overall.unsupported
+        ),
+        (0, 0, 0),
+        "TCK is not 100%: failed={}, errored={}, unsupported={} — every official scenario must pass",
+        report.overall.failed,
+        report.overall.errored,
+        report.overall.unsupported
+    );
 }
