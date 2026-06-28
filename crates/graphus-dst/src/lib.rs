@@ -51,6 +51,7 @@ pub mod vopr;
 pub mod vopr_fault;
 pub mod vopr_fuzz;
 pub mod vopr_oracle;
+pub mod vopr_property;
 pub mod vopr_repro;
 pub mod wire;
 pub mod workload;

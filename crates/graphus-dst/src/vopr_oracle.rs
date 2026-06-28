@@ -77,6 +77,13 @@ pub struct ShadowGraph {
     nodes: BTreeMap<i64, u64>,
     /// `(src_id, dst_id)` -> number of parallel `:KNOWS` edges between persons with those ids.
     edges: BTreeMap<(i64, i64), u64>,
+    /// `id` property -> the `rank` property value shared by every `:Person` carrying that id (rmp
+    /// #461). Absent ⇒ the nodes have no `rank` property yet (created without one). `MATCH … SET`
+    /// updates **every** matched node to the same value, so a single value per id is exact even when
+    /// the id has multiplicity > 1. Cleared when the id is deleted. This is what lets the oracle catch
+    /// a wrong property value (e.g. an SSI rollback restoring a stale `rank` pre-image over a committed
+    /// `SET`) — a divergence the node/edge multisets alone cannot see.
+    ranks: BTreeMap<i64, i64>,
 }
 
 impl ShadowGraph {
@@ -106,6 +113,18 @@ impl ShadowGraph {
                 if added > 0 {
                     *self.edges.entry((a, b)).or_insert(0) += added;
                 }
+            }
+            // `SET n.rank = val` over every `:Person {id}` — only nodes that exist take the value (an
+            // empty `MATCH` sets nothing), exactly as the engine's `MATCH … SET` does. (rmp #461)
+            WorkloadOp::SetProperty { id, val } => {
+                if self.nodes.get(&id).copied().unwrap_or(0) > 0 {
+                    self.ranks.insert(id, val);
+                }
+            }
+            // `DETACH DELETE` every `:Person {id}`: drop the nodes, their `rank`, and every incident
+            // edge in both directions (the multigraph cascade). (rmp #461)
+            WorkloadOp::DeleteNode { id } => {
+                delete_id(&mut self.nodes, &mut self.edges, &mut self.ranks, id);
             }
             WorkloadOp::CountNodes | WorkloadOp::Neighbors { .. } => {}
         }
@@ -139,6 +158,23 @@ impl ShadowGraph {
                     let added = edge_cardinality(&visible, a, b);
                     if added > 0 {
                         *self.edges.entry((a, b)).or_insert(0) += added;
+                    }
+                }
+                // `SET n.rank = val`: the `MATCH` binds only nodes **visible** to this transaction
+                // (its snapshot + its own creates). A serializably-committed `SET` updates the
+                // committed rank for the id; an id the transaction never saw matches nothing. (rmp #461)
+                WorkloadOp::SetProperty { id, val } => {
+                    if visible.get(&id).copied().unwrap_or(0) > 0 {
+                        self.ranks.insert(id, val);
+                    }
+                }
+                // `DETACH DELETE`: if the id is visible to this transaction, the commit removes it from
+                // the committed model (nodes, rank, incident edges) and from `visible` so a later
+                // statement in the same transaction no longer sees it. (rmp #461)
+                WorkloadOp::DeleteNode { id } => {
+                    if visible.get(&id).copied().unwrap_or(0) > 0 {
+                        delete_id(&mut self.nodes, &mut self.edges, &mut self.ranks, id);
+                        visible.remove(&id);
                     }
                 }
                 WorkloadOp::CountNodes | WorkloadOp::Neighbors { .. } => {}
@@ -191,6 +227,45 @@ impl ShadowGraph {
             .map(|(&k, &c)| (k, c))
             .collect()
     }
+
+    /// The `rank` property value shared by every live `:Person` carrying `id`, or `None` if the id is
+    /// absent or has no `rank` set (rmp #461). Used by the property-level read-back.
+    #[must_use]
+    pub fn rank_of(&self, id: i64) -> Option<i64> {
+        if self.nodes.get(&id).copied().unwrap_or(0) > 0 {
+            self.ranks.get(&id).copied()
+        } else {
+            None
+        }
+    }
+
+    /// The set of distinct `rank` values currently assigned to any live node, ascending (rmp #461).
+    /// The index-consistency check probes each: an indexed `rank` lookup must return the same id
+    /// multiset as a full scan filtered on `rank`.
+    #[must_use]
+    pub fn distinct_ranks(&self) -> Vec<i64> {
+        let mut vals: Vec<i64> = self
+            .ranks
+            .iter()
+            .filter(|(id, _)| self.nodes.get(id).copied().unwrap_or(0) > 0)
+            .map(|(_, &v)| v)
+            .collect();
+        vals.sort_unstable();
+        vals.dedup();
+        vals
+    }
+
+    /// The `(id, multiplicity)` multiset of live `:Person` nodes whose `rank == val`, ascending by id
+    /// (rmp #461) — the model's expected answer to **both** `MATCH (n:Person) WHERE n.rank = $val` and
+    /// the indexed lookup, which the consistency check requires to agree.
+    #[must_use]
+    pub fn ids_with_rank(&self, val: i64) -> NodeMultiset {
+        self.nodes
+            .iter()
+            .filter(|(id, m)| **m > 0 && self.ranks.get(id).copied() == Some(val))
+            .map(|(&id, &m)| (id, m))
+            .collect()
+    }
 }
 
 /// The number of `:KNOWS` edges a `CreateEdge{a, b}` produces against a given visible node multiset:
@@ -200,6 +275,21 @@ fn edge_cardinality(visible: &BTreeMap<i64, u64>, a: i64, b: i64) -> u64 {
     let ma = visible.get(&a).copied().unwrap_or(0);
     let mb = visible.get(&b).copied().unwrap_or(0);
     ma.saturating_mul(mb)
+}
+
+/// Applies a `DETACH DELETE` of every `:Person` carrying `id` to the committed model (rmp #461):
+/// removes the id's multiplicity, its `rank`, and every incident edge in **both** directions (the
+/// multigraph cascade `DETACH` performs). Shared by the auto-commit ([`ShadowGraph::apply`]) and
+/// snapshot-isolation ([`ShadowGraph::commit_transaction`]) paths.
+fn delete_id(
+    nodes: &mut BTreeMap<i64, u64>,
+    edges: &mut BTreeMap<(i64, i64), u64>,
+    ranks: &mut BTreeMap<i64, i64>,
+    id: i64,
+) {
+    nodes.remove(&id);
+    ranks.remove(&id);
+    edges.retain(|&(src, dst), _| src != id && dst != id);
 }
 
 /// A precise description of a model⇄engine divergence the oracle caught.
@@ -240,6 +330,48 @@ pub enum OracleError {
         model: u64,
         /// The engine's row count.
         engine: u64,
+    },
+    /// The `rank` **property value** read back for an id disagreed with the model (rmp #461). The
+    /// model expects every `:Person` with this id to carry `model_rank`; the engine returned
+    /// `engine_rank` (`None` ⇒ no/absent `rank`). This is the class a structural multiset check is
+    /// blind to — e.g. an SSI rollback restoring a stale `rank` pre-image over a committed `SET`.
+    PropertyMismatch {
+        /// The id whose `rank` property disagreed.
+        id: i64,
+        /// The model's expected `rank` (`None` ⇒ unset).
+        model_rank: Option<i64>,
+        /// The engine's observed `rank` (`None` ⇒ unset / no such property).
+        engine_rank: Option<i64>,
+    },
+    /// An **indexed-seek-vs-model** divergence (rmp #461): the indexed `rank` lookup
+    /// (`MATCH (n:Person {rank: $v})`) returned a different **id multiset** than the model expects for
+    /// that value. Distinct from [`PropertyMismatch`](Self::PropertyMismatch) (a wrong *value* on a
+    /// known id): here the id's **multiplicity** under the probed `rank` disagrees (a phantom or a
+    /// missing indexed row), which a per-id value check would not name precisely.
+    IndexSeekMismatch {
+        /// The `rank` value probed.
+        rank: i64,
+        /// The first id whose count differs between the model and the indexed lookup.
+        id: i64,
+        /// The id's multiplicity in the **model** for this `rank`.
+        model: u64,
+        /// The id's multiplicity from the **indexed** lookup.
+        engine: u64,
+    },
+    /// A **secondary-index-vs-base-store** divergence (rmp #461): an indexed `rank` lookup
+    /// (`MATCH (n:Person {rank: $v})`) returned a different id multiset than a full scan filtered on
+    /// the same value (`MATCH (n:Person) WITH n WHERE n.rank = $v`). The two MUST agree; a disagreement
+    /// is exactly the surface of #313/#316 (a stale or missing index entry). Carries the probed value
+    /// and the first id whose multiplicity differs between the indexed and the scan answer.
+    IndexScanDivergence {
+        /// The `rank` value probed.
+        rank: i64,
+        /// The first id whose count differs between the indexed lookup and the full scan.
+        id: i64,
+        /// The id's multiplicity from the **indexed** lookup.
+        indexed: u64,
+        /// The id's multiplicity from the **full scan**.
+        scan: u64,
     },
     /// A read-back query failed against the engine (could not begin / run / drain). Carries a coarse
     /// class so the failure is reproducible without leaking incidental wording.
@@ -289,6 +421,57 @@ fn engine_neighbor_rows(eng: &mut SimEngine, a: i64) -> Result<u64, OracleError>
         "neighbors",
     )?;
     Ok(rows.len() as u64)
+}
+
+/// Reads the `rank` property of the `:Person` carrying `id` (rmp #461). The property workload keeps
+/// each probed id at multiplicity 1, so this returns the single node's `rank`: `Some(v)` when set,
+/// `None` when the property is absent/null or the node is gone. A wrong value here is exactly the
+/// property-level divergence a structural multiset check cannot see.
+fn engine_rank_of(eng: &mut SimEngine, id: i64) -> Result<Option<i64>, OracleError> {
+    let rows = run_read(
+        eng,
+        "MATCH (n:Person {id: $id}) RETURN n.rank AS rank",
+        vec![("id".to_owned(), Value::Integer(id))],
+        "rank",
+    )?;
+    // No row ⇒ the node is gone (treated as no rank). A row with a null cell ⇒ rank unset.
+    match rows.first().and_then(|r| r.first()) {
+        Some(MaterializedValue::Value(Value::Integer(v))) => Ok(Some(*v)),
+        Some(MaterializedValue::Value(Value::Null)) | None => Ok(None),
+        Some(_) => Err(OracleError::ReadBack { what: "rank" }),
+    }
+}
+
+/// The `(id, multiplicity)` multiset of `:Person` with `rank == val`, via the **indexed** property-map
+/// seek `MATCH (n:Person {rank: $v})` (rmp #461). When a `(Person, rank)` index is declared and online
+/// the planner serves this through the index; the result must equal both the model and the full-scan
+/// answer.
+fn engine_ids_with_rank_indexed(
+    eng: &mut SimEngine,
+    val: i64,
+) -> Result<NodeMultiset, OracleError> {
+    let ids = read_int_column_param(
+        eng,
+        "MATCH (n:Person {rank: $v}) RETURN n.id AS id ORDER BY n.id",
+        vec![("v".to_owned(), Value::Integer(val))],
+        "rank_indexed",
+    )?;
+    Ok(fold_multiset_single(&ids))
+}
+
+/// The `(id, multiplicity)` multiset of `:Person` with `rank == val`, via a **forced full scan**
+/// (rmp #461): the `WITH n` barrier between the bare label match and the `WHERE` defeats index
+/// push-down, so the engine label-scans `:Person` and post-filters on `rank`. This is the
+/// base-store-of-record answer the indexed seek is cross-checked against (an index-vs-base divergence
+/// = the surface of #313/#316).
+fn engine_ids_with_rank_scan(eng: &mut SimEngine, val: i64) -> Result<NodeMultiset, OracleError> {
+    let ids = read_int_column_param(
+        eng,
+        "MATCH (n:Person) WITH n WHERE n.rank = $v RETURN n.id AS id ORDER BY n.id",
+        vec![("v".to_owned(), Value::Integer(val))],
+        "rank_scan",
+    )?;
+    Ok(fold_multiset_single(&ids))
 }
 
 /// Folds a sorted integer column into an ascending `(value, count)` multiset.
@@ -429,6 +612,74 @@ pub fn assert_equivalent(eng: &mut SimEngine, model: &ShadowGraph) -> Result<(),
                 a: id,
                 model: want,
                 engine: got,
+            });
+        }
+    }
+
+    // 5. Property values + secondary-index-vs-scan consistency (rmp #461). This runs **only** when the
+    //    model carries `rank` values — i.e. a property/index workload was driven. The default 4-op
+    //    workload sets no `rank`, so `distinct_ranks()` is empty and this issues NO extra queries,
+    //    leaving the determinism gate byte-identical.
+    assert_property_index_consistent(eng, model, &want_nodes)?;
+
+    Ok(())
+}
+
+/// Asserts the property-level + secondary-index correctness the structural multisets are blind to
+/// (rmp #461). Three checks, all skipped cheaply when the model has no `rank` data:
+///
+/// 1. **Property value** — for every id the model assigned a `rank`, the engine's read-back of that
+///    id's `rank` must equal the model's. Catches a wrong property value left by a concurrency bug
+///    (e.g. an SSI rollback restoring a stale `rank` pre-image over a committed `SET`).
+/// 2. **Indexed lookup vs model** — for every distinct `rank` value, the **indexed** seek
+///    `MATCH (n:Person {rank: $v})` must return exactly the model's id multiset for that value.
+/// 3. **Index vs full scan** — the same value probed through a forced **full scan**
+///    (`MATCH (n:Person) WITH n WHERE n.rank = $v`) must return the *same* id multiset as the indexed
+///    seek. A disagreement is a secondary-index-vs-base-store divergence (the surface of #313/#316).
+///
+/// All read-backs are observer queries (their own auto-commit read transactions), never folded into
+/// the canonical trace.
+fn assert_property_index_consistent(
+    eng: &mut SimEngine,
+    model: &ShadowGraph,
+    want_nodes: &[(i64, u64)],
+) -> Result<(), OracleError> {
+    // 1. Property value per id the model knows a `rank` for.
+    for &(id, _) in want_nodes {
+        if let Some(model_rank) = model.rank_of(id) {
+            let engine_rank = engine_rank_of(eng, id)?;
+            if engine_rank != Some(model_rank) {
+                return Err(OracleError::PropertyMismatch {
+                    id,
+                    model_rank: Some(model_rank),
+                    engine_rank,
+                });
+            }
+        }
+    }
+
+    // 2 + 3. For each distinct rank value: indexed seek == model, and indexed seek == full scan.
+    for v in model.distinct_ranks() {
+        let want = model.ids_with_rank(v);
+        let indexed = engine_ids_with_rank_indexed(eng, v)?;
+        // Indexed seek must match the model's id multiset for this rank (a phantom or missing indexed
+        // row is named precisely by id + multiplicity, not conflated with a wrong-value mismatch).
+        if let Some((id, model_m, engine_m)) = diff_sorted(&want, &indexed) {
+            return Err(OracleError::IndexSeekMismatch {
+                rank: v,
+                id,
+                model: model_m,
+                engine: engine_m,
+            });
+        }
+        // Indexed seek must agree with a forced full scan (index-vs-base-store).
+        let scan = engine_ids_with_rank_scan(eng, v)?;
+        if let Some((id, indexed_m, scan_m)) = diff_sorted(&indexed, &scan) {
+            return Err(OracleError::IndexScanDivergence {
+                rank: v,
+                id,
+                indexed: indexed_m,
+                scan: scan_m,
             });
         }
     }

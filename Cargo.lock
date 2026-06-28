@@ -1182,6 +1182,7 @@ dependencies = [
  "graphus-bolt",
  "graphus-bufpool",
  "graphus-core",
+ "graphus-crypto",
  "graphus-cypher",
  "graphus-elle",
  "graphus-io",

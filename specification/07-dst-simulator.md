@@ -97,6 +97,41 @@ entire interleaving is a pure function of the seed.
   (trace, state, counts, oracle). Any mismatch is a determinism failure — the simulator's own core
   invariant — counted and listed for one-line reproduction.
 
+### 5.1 Concurrency-fidelity ceiling — what DST does **not** cover, and who owns it (rmp #460)
+
+The cooperative interleaver's "concurrency" is **overlapping transaction lifetimes on one cooperative
+OS thread**, with **each Cypher statement executed atomically to completion** before the next client's
+step begins. This is deliberate: true OS-thread parallelism would reintroduce non-determinism and break
+the seed-replay gate. The consequence is a precise, named **fidelity ceiling**: an entire class of
+**true-parallel races is structurally invisible to DST** and is therefore **owned by other suites, not
+DST**. Reviewers must not attribute a parallel-memory property to "DST-proven".
+
+What DST genuinely covers: transaction-overlap / SSI logical races (e.g. `#171`/`#172`/`#220`),
+durability and atomicity across ARIES crash-restart, determinism, single-thread disk/clock fault
+recovery, the backup/restore/key-rotation crash windows (section 10), and the property-value /
+secondary-index oracle (section 8). What DST **cannot** exercise, with its real owner:
+
+| Parallel-race class (invisible to DST) | Owning suite(s) — the authoritative proof |
+| --- | --- |
+| Off-thread reader pool (`#336`): reads run **inline** under DST (`ReadDispatch::Inline` is hardcoded in `LocalEngine`), never on the pool | `graphus-server/tests/concurrent_read_scaling.rs`, `concurrent_reader_serializability.rs` |
+| Intra-query **morsel** fan-out (`#339`): DST never sets `morsel_threads > 1`, so it runs fully serial (degree 1) | `concurrent_read_scaling.rs` (real reader pool + morsel threads) |
+| `ConcurrentBufferPool` contended victim sweep / the `#359` fetch livelock; concurrent evictors | `graphus-bufpool/tests/loom_bufpool.rs`, `loom_eviction_storm.rs`, `loom_freeze_vs_reader.rs` |
+| Doublewrite-buffer (DWB) eviction ring (`#411`/`#412`) | `graphus-bufpool/tests/loom_dwb_ring.rs`, `graphus-storage/tests/dwb_concurrent_eviction_411.rs` |
+| SSI commit-path interleavings at the memory level | `graphus-txn/tests/loom_ssi.rs` |
+| Real-OS-thread supernode write contention (the true-parallel pair to the DST `#220` logical guard) | `graphus-dst/tests/real_thread_supernode_stress.rs` |
+| Engine-thread panic isolation; blocking-thread budget under load | `graphus-server/tests/panic_isolation.rs`, `blocking_thread_budget.rs`, `connection_stress.rs`, `slow_consumer_no_head_of_line_block.rs` |
+
+These owners fall in two families: **loom** suites (exhaustive interleaving of the atomic-level memory
+operations) and **real-OS-thread** tests (genuine parallelism across threads). Both are **non-determin­istic
+by nature**, so they are run as a **soak lane** (section 13, `scripts/tsan-soak.sh`) under
+ThreadSanitizer — and that lane **must never feed the deterministic seed-replay gate**, whose
+byte-identical contract requires single-threaded execution.
+
+A second, narrower caveat (**F-DST-2**): the `#220` "concurrent writers" guard expresses K concurrency
+as **K overlapping tickets executed sequentially** (commutative-overlap-at-commit), which is narrower
+than the word "concurrent" suggests. Its true-parallel counterpart is the real-OS-thread supernode
+stress named above.
+
 ## 6. Fault models
 
 Sprints 22–25 added a composable, fully seeded fault library. Every fault is a pure function of its
@@ -218,11 +253,17 @@ guaranteed wipe.
 
 **Honest transport status.** Disk and clock faults are physically injected: disk via the `dst`-gated
 live-device seam (section 6.2), clock by intensifying the engine's `FaultyClock` plan. Transport faults
-are **scheduled, budgeted and folded into the trace** so the budget and reproducibility cover them, but
-the current VOPR driver calls `LocalEngine` in-process with no `SimNet` byte stream to reset, so the
-physical injection is a **documented seam** (`FaultScheduler::take_transport_plan`): it fires only under
-a future `SimNet`-backed Bolt/REST driver. The simulator never fakes a transport fault it cannot
-physically apply.
+are **scheduled, budgeted and folded into the trace** so the budget and reproducibility cover them. The
+main in-process VOPR loop calls `LocalEngine` directly (no `SimNet` byte stream to reset), but the
+scheduled transport plan **is physically applied** through the `SimNet`-backed Bolt driver
+(`wire::run_bolt_session_with_scheduled_transport_fault`, rmp #462, closing F-DST-4): it pulls the very
+plan the scheduler folded into the trace via `FaultScheduler::take_transport_plan` and arms it on the
+real Bolt session's link, so a mid-message-severed `RUN`/`PULL`/`COMMIT` byte stream is exercised against
+the genuine Bolt state machine. The recovery oracle asserts the state machine never panics or hangs
+(`run()` always returns) and that a severed transaction is atomic (it never half-commits). The same
+seeded `TransportFaultPlan` also drives the REST request core
+(`wire::run_rest_with_transport_fault`). The simulator never fakes a transport fault it cannot physically
+apply.
 
 ## 7. Adversarial and environment coverage
 
@@ -248,6 +289,18 @@ physically apply.
    surfaces as a precise `OracleError` naming the offending id or edge. The oracle's read-backs run in
    their own auto-commit read transactions and are not folded into the trace, so wiring it in does not
    perturb `trace_hash`.
+   - **Property values + secondary index (rmp #461).** The model additionally tracks each id's `rank`
+     property and, on every commit, the oracle cross-checks three things the structural multisets are
+     blind to: (a) each id's `rank` value (catching a wrong property left by a concurrency bug — e.g. an
+     SSI rollback restoring a stale pre-image over a committed `SET`); (b) an **indexed** `rank` seek
+     (`MATCH (n:Person {rank: $v})`) against the model; and (c) the indexed seek against a **forced full
+     scan** (`MATCH (n:Person) WITH n WHERE n.rank = $v`) — a disagreement is a secondary-index-vs-base
+     divergence (the surface of #313/#316). This check is driven by the dedicated **`property_index_oracle`**
+     scenario (section 10), which exercises `SET`/`DELETE` churn over a declared `(Person, rank)` index;
+     it runs **only** when `rank` data is present, so the default workload's `trace_hash` is unchanged. The
+     contended workload vocabulary `WorkloadOp` is extended with `SetProperty` and `DeleteNode`, generated
+     only by that scenario's driver — never by the default `WorkloadGen`, so the seed-replay gate stays
+     byte-identical.
 2. **Isolation / serializability** — `graphus-elle`: an Elle/Adya dependency-graph checker over the
    list-append model (`ww`/`wr`/`rw` edges, cycle detection). `dst::isolation` drives interleaved
    real transactions and feeds the recovered history to it.
@@ -316,7 +369,7 @@ ones drive a `LocalEngine` directly. `run_sweep(seeds)` runs every scenario acro
 the CI-friendly entry point. The in-crate battery is deliberately sized to stay fast in a debug build;
 raw scale is delegated to the `vopr` CLI seed-sweep.
 
-The catalogue holds **18 scenarios**, grouped by the production-readiness dimensions a graph database
+The catalogue holds **20 scenarios**, grouped by the production-readiness dimensions a graph database
 must satisfy under extreme concurrency and load. Each entry below names the scenario, the production
 concern it certifies, and its oracle.
 
@@ -358,6 +411,14 @@ concern it certifies, and its oracle.
   commits. *Oracle:* the reader observes the same count twice within its transaction (repeatable read),
   and a fresh read afterward then sees the new row.
 
+### Property / secondary index
+
+- `property_index_oracle` (rmp #461) — a contended `CREATE`/`SET rank`/`CREATE edge`/`DETACH DELETE`
+  workload over a declared `(Person, rank)` secondary index. *Oracle:* on every commit the extended
+  reference model (section 8) cross-checks **property values**, the **indexed `rank` seek vs the model**,
+  and the **indexed seek vs a forced full scan** (index-vs-base-store). Closes the oracle's former
+  blindness to property values, secondary indexes, and delete churn.
+
 ### Atomicity / churn
 
 - `transaction_rollback` — a write inside a rolled-back transaction. *Oracle:* the rollback leaves no
@@ -370,6 +431,15 @@ concern it certifies, and its oracle.
 
 - `crash_recovery_durability` — drives `LocalEngine::crash_restart` (ARIES recovery from the durable
   WAL). *Oracle:* an acked commit survives the crash and uncommitted work does not.
+- `backup_restore_crash` (rmp #440) — drives the genuine backup → seal → file → restore /
+  key-rotation pipeline on **real temp files** and injects a crash at each of its four atomicity windows
+  (after `seal_artifact` / before the backup rename; mid `write_file_atomic`; mid
+  `restore_chain_file_atomic` temp write; after the device temp-rename / before the WAL + DWB reset).
+  *Oracle:* at every window the database opens to a **committed-only, consistent** state **under exactly
+  the expected key** (a wrong key fails closed). Reconstructs the pipeline at the public-API level
+  (`LocalEngine::backup`, `graphus_crypto::seal_backup`/`open_backup`, `atomic_replace_file`,
+  `restore_chain_file_atomic`, `verify_on_open`), since the server's `dbcatalog` orchestration is
+  private.
 
 ### Load shapes
 
@@ -443,6 +513,20 @@ leg to keep the matrix fast.
 time-budgeted fuzzer once per mode (`safety`, `liveness`, `standard`) — `vopr fuzz --mode <m> --swarm
 --secs <budget> --keep-going --write-artifacts <dir>` — and, on any failing seed, uploads the emitted
 replay artifacts so the exact failure can be reproduced locally via `vopr-repro --replay`.
+
+**Threaded concurrency soak under ThreadSanitizer** (`scripts/tsan-soak.sh`, rmp #460). A separate,
+**non-deterministic, soak-only** lane runs the **real-OS-thread** owners of the parallel-race class
+(section 5.1) under ThreadSanitizer (`-Z sanitizer=thread`, nightly toolchain): the
+`graphus-server/tests` concurrency tests (`concurrent_read_scaling`, `concurrent_reader_serializability`,
+`panic_isolation`, `blocking_thread_budget`, `connection_stress`,
+`slow_consumer_no_head_of_line_block`), the `graphus-storage` DWB real-thread test
+(`dwb_concurrent_eviction_411`), and the `graphus-dst` real-thread supernode stress
+(`real_thread_supernode_stress`). This lane is the **named owner** of the true-parallel races DST cannot
+see; it asserts the absence of data races that a single-threaded, byte-identical seed-replay run cannot
+detect. It is **deliberately excluded from the deterministic seed-replay gate** — its thread interleaving
+is OS-scheduled, not seed-driven, so feeding it into the byte-identical gate would be a category error.
+The loom suites (`graphus-bufpool/tests/loom_*`, `graphus-txn/tests/loom_ssi`) are the exhaustive-interleaving
+complement and run on their own (`RUSTFLAGS=--cfg loom`).
 
 ## 14. Findings (engine gaps surfaced by the simulator)
 

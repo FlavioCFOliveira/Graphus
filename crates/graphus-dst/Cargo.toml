@@ -42,6 +42,12 @@ graphus-rest = { path = "../graphus-rest" }
 # harness can record real transaction histories and certify serializability end-to-end.
 graphus-elle = { path = "../graphus-elle" }
 graphus-cypher = { path = "../graphus-cypher" }
+# The backup-envelope seal/open (rmp #89: `seal_backup`/`open_backup`) so the backup→file→restore /
+# key-rotation crash scenario (rmp #440) drives the genuine encrypted-artifact pipeline and asserts a
+# restore succeeds under exactly the expected key (and fails closed under a wrong key). `graphus-crypto`
+# depends only on graphus-core/io/wal (never on graphus-dst), so this is acyclic. Already a transitive
+# dep via graphus-server; named here so the scenario can call the seal/open API directly.
+graphus-crypto = { path = "../graphus-crypto" }
 # Builds/parses the REST JSON request body for the transport-fault harness (rmp #234), modelling a
 # truncated/reset HTTP body before it reaches the request core. Already a transitive dep via graphus-rest.
 serde_json = "1"

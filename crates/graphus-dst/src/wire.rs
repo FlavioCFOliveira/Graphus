@@ -489,6 +489,62 @@ pub fn login_prologue() -> Vec<Request> {
     ]
 }
 
+/// Drives a real `BoltSession` under a transport fault **taken from the unified
+/// [`FaultScheduler`](crate::vopr_fault::FaultScheduler)** (rmp #462, closing F-DST-4) — the bridge that
+/// physically applies a *scheduled, trace-folded* transport plan to a real in-flight Bolt byte stream.
+///
+/// The pre-#462 state: the `FaultScheduler` plans, budgets and folds transport faults into the canonical
+/// trace, but its in-process `LocalEngine` driver has no byte stream to reset, so
+/// [`take_transport_plan`](crate::vopr_fault::FaultScheduler::take_transport_plan) was a documented seam
+/// with nothing to arm it on. This function closes that seam: it builds a **transport-only** fault
+/// budget, fires the scheduler over the run horizon so a transport plan comes due, pulls that plan via
+/// `take_transport_plan`, and arms it on the SimNet link the Bolt session reads — so the very plan the
+/// scheduler folded into the trace is the one physically injected.
+///
+/// Returns `(outcome, fired)`: the [`FaultedBoltOutcome`] (the recovery oracle: the Bolt state machine
+/// must not panic or hang — `run()` always returns — and an un-acked write must leave no trace) and
+/// whether the scheduler actually produced a transport plan to inject (so a test can assert the
+/// injection was non-vacuous). The whole thing is a pure function of `master_seed`.
+#[must_use]
+pub fn run_bolt_session_with_scheduled_transport_fault(
+    engine: SharedEngine,
+    master_seed: u64,
+    auth: &dyn AuthProvider,
+    requests: &[Request],
+) -> (FaultedBoltOutcome, bool) {
+    use crate::vopr_fault::{FaultBudget, FaultScheduler};
+
+    // A transport-only budget guarantees the planned fault is a transport fault (the kind that needs the
+    // SimNet byte stream). A generous rate over a short horizon makes at least one come due.
+    let budget = FaultBudget::none().with_max_faults(8).with_weights(0, 0, 1);
+    let mut scheduler = FaultScheduler::plan(master_seed, budget, 64);
+
+    // Drain the whole horizon so every planned transport fault fires; the disk/clock hooks are no-ops
+    // (a transport-only budget never arms them), and `fold` is ignored here (the trace is the VOPR
+    // loop's concern; this bridge only needs the resulting plan).
+    scheduler.drain_due(u64::MAX, |_plan| true, |_plan| {}, |_tok, _t| {});
+
+    // Pull the scheduler's most-recently-planned transport plan. If the budget produced one, arm it on a
+    // real Bolt session; otherwise fall back to an inert plan so the session still runs cleanly (the
+    // `fired` flag tells the caller which happened).
+    match scheduler.take_transport_plan() {
+        Some(plan) => (
+            run_bolt_session_with_transport_fault(engine, master_seed, auth, requests, plan),
+            true,
+        ),
+        None => (
+            run_bolt_session_with_transport_fault(
+                engine,
+                master_seed,
+                auth,
+                requests,
+                TransportFaultPlan::new(master_seed),
+            ),
+            false,
+        ),
+    }
+}
+
 // =================================== REST wire client (rmp #164) ================================
 
 /// A [`RestEngine`] over the deterministic [`LocalEngine`] — the REST analogue of
@@ -1073,6 +1129,76 @@ mod tests {
             )
         };
         assert_eq!(run(), run(), "same seed ⇒ identical faulted Bolt outcome");
+    }
+
+    /// **rmp #462 (F-DST-4 closed).** A transport fault **taken from the unified `FaultScheduler`** is
+    /// physically injected into a real in-flight Bolt session, and the recovery oracle holds:
+    ///
+    /// * **No panic** — control reaches the assertions.
+    /// * **No hang** — `run()` returned (the bounded `drive_to_quiescence` guarantees termination).
+    /// * **No half-applied / torn transaction** — the CREATE is **atomic**: the `:Probe` node count is
+    ///   `0` or `1`, never a partial or duplicated state. A cut stream (`drop`/`truncate`) leaves `0`;
+    ///   a `slow_consumer` (which only throttles, delivering everything) legitimately commits `1`. The
+    ///   precise atomicity invariant: when the session did **not** run cleanly to a successful response,
+    ///   the node is absent (a severed transaction never half-commits).
+    ///
+    /// Swept over several master seeds so the scheduler genuinely produces and arms transport plans (the
+    /// `fired` flag proves the injection is non-vacuous on at least one seed), and replayed for
+    /// determinism.
+    #[test]
+    fn scheduled_transport_fault_is_physically_injected_and_recovers() {
+        let mut any_fired = false;
+        for seed in [1u64, 7, 13, 21, 42, 99, 256, 1024] {
+            let eng = engine();
+            let (outcome, fired) = run_bolt_session_with_scheduled_transport_fault(
+                eng.clone(),
+                seed,
+                &sim_auth(),
+                &create_probe_script(),
+            );
+            any_fired |= fired;
+            let nodes = count_probe_nodes(eng);
+            // Atomicity: never a torn/duplicated state.
+            assert!(
+                nodes <= 1,
+                "seed {seed}: the CREATE must be atomic (0 or 1 node), got {nodes}"
+            );
+            // A session that produced a committed success may persist the node; a session that did not
+            // run cleanly (a mid-message reset) must leave NO node — no half-applied transaction.
+            let committed_ok = outcome.run_ok
+                && outcome
+                    .responses
+                    .iter()
+                    .any(|r| matches!(r, Response::Success { .. }));
+            if !committed_ok {
+                assert_eq!(
+                    nodes, 0,
+                    "seed {seed}: a non-clean session must not half-apply the CREATE"
+                );
+            }
+            // Determinism: same master seed ⇒ identical injection + outcome.
+            let eng2 = engine();
+            let (outcome2, fired2) = run_bolt_session_with_scheduled_transport_fault(
+                eng2.clone(),
+                seed,
+                &sim_auth(),
+                &create_probe_script(),
+            );
+            assert_eq!(
+                fired, fired2,
+                "seed {seed}: scheduler injection is deterministic"
+            );
+            assert_eq!(
+                format!("{:?}", outcome.responses),
+                format!("{:?}", outcome2.responses),
+                "seed {seed}: faulted Bolt outcome replays identically"
+            );
+        }
+        assert!(
+            any_fired,
+            "the scheduler must physically inject a transport fault on at least one master seed \
+             (otherwise the F-DST-4 bridge is vacuous)"
+        );
     }
 
     /// REST + **drop in message**: a reset request body must never reach the engine; the response is

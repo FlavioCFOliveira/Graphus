@@ -12,6 +12,18 @@ use graphus_sim::SimRng;
 
 /// One workload operation. Each maps to a concrete Cypher statement via [`WorkloadOp::to_cypher`], so
 /// the same op runs identically over the direct engine, Bolt, or REST.
+///
+/// # Variant set and the determinism contract (rmp #461)
+///
+/// The first four variants ([`WorkloadOp::CreateNode`] … [`WorkloadOp::Neighbors`]) are the *original*
+/// contended-workload vocabulary that [`WorkloadGen`] draws from. The last two
+/// ([`WorkloadOp::SetProperty`] and [`WorkloadOp::DeleteNode`]) were added by rmp #461 to give the
+/// reference-model oracle teeth over **property values** and **delete churn** — but they are
+/// **deliberately not** produced by [`WorkloadGen::next`]. Keeping the default generator's RNG draw
+/// arithmetic unchanged is what lets every existing seed replay **byte-for-byte identically** (the
+/// determinism gate). The new ops are generated only by the dedicated property/index oracle driver
+/// ([`crate::vopr_property`]), which mirrors them in an extended shadow model. Every field is a `Copy`
+/// scalar (no `String`), so `WorkloadOp: Copy` still holds — the per-client op buffers depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadOp {
     /// Create a `:Person` node with a monotonic id (a write).
@@ -22,6 +34,15 @@ pub enum WorkloadOp {
     CountNodes,
     /// One-hop `:KNOWS` neighbourhood of a person (a traversal read).
     Neighbors { a: i64 },
+    /// Set the `rank` property of **every** `:Person` carrying id `id` to `val` (a write). Mirrors the
+    /// engine's `MATCH … SET` Cartesian fan-out: it updates `mult(id)` nodes. Added by rmp #461 so the
+    /// oracle can catch a wrong *property value* under contention (e.g. an SSI rollback restoring a
+    /// stale pre-image over a committed `SET`) — a class the id/edge multisets alone are blind to.
+    SetProperty { id: i64, val: i64 },
+    /// Delete **every** `:Person` carrying id `id`, detaching its incident `:KNOWS` edges
+    /// (`DETACH DELETE`, a write). Added by rmp #461 so the oracle covers delete churn (multiplicity →
+    /// 0, incident edges cascaded) rather than create-only growth.
+    DeleteNode { id: i64 },
 }
 
 impl WorkloadOp {
@@ -33,6 +54,8 @@ impl WorkloadOp {
             WorkloadOp::CreateEdge { .. } => "create_edge",
             WorkloadOp::CountNodes => "count_nodes",
             WorkloadOp::Neighbors { .. } => "neighbors",
+            WorkloadOp::SetProperty { .. } => "set_property",
+            WorkloadOp::DeleteNode { .. } => "delete_node",
         }
     }
 
@@ -41,7 +64,10 @@ impl WorkloadOp {
     pub fn is_write(self) -> bool {
         matches!(
             self,
-            WorkloadOp::CreateNode { .. } | WorkloadOp::CreateEdge { .. }
+            WorkloadOp::CreateNode { .. }
+                | WorkloadOp::CreateEdge { .. }
+                | WorkloadOp::SetProperty { .. }
+                | WorkloadOp::DeleteNode { .. }
         )
     }
 
@@ -64,6 +90,21 @@ impl WorkloadOp {
             WorkloadOp::Neighbors { a } => (
                 "MATCH (:Person {id: $a})-[:KNOWS]->(b) RETURN b.id AS id ORDER BY b.id",
                 vec![("a".to_owned(), Value::Integer(a))],
+            ),
+            // Set the `rank` of every `:Person` with this id. `MATCH … SET` updates every match, so
+            // multiplicity > 1 sets them all to the same `val` — exactly what the shadow model mirrors.
+            WorkloadOp::SetProperty { id, val } => (
+                "MATCH (n:Person {id: $id}) SET n.rank = $val",
+                vec![
+                    ("id".to_owned(), Value::Integer(id)),
+                    ("val".to_owned(), Value::Integer(val)),
+                ],
+            ),
+            // Delete every `:Person` with this id and detach its `:KNOWS` edges (multigraph: a duplicate
+            // id deletes all of them at once, cascading every incident edge).
+            WorkloadOp::DeleteNode { id } => (
+                "MATCH (n:Person {id: $id}) DETACH DELETE n",
+                vec![("id".to_owned(), Value::Integer(id))],
             ),
         }
     }

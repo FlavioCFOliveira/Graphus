@@ -51,3 +51,22 @@ jobs:
           name: dst-replay-artifacts-${{ matrix.mode }}
           path: dst-artifacts/
           if-no-files-found: ignore
+
+  # The threaded concurrency lane (rmp #460): the named owner of the parallel-race class that the
+  # deterministic simulator cannot see (off-thread reader pool, morsel fan-out, ConcurrentBufferPool
+  # sweep, evictors, the DWB ring). Runs the real-OS-thread tests under ThreadSanitizer on the nightly
+  # toolchain. It is NON-DETERMINISTIC and SOAK-ONLY — deliberately NOT part of the byte-identical
+  # seed-replay gate (see specification/07-dst-simulator.md §5.1 / §13).
+  tsan-soak:
+    name: ThreadSanitizer threaded concurrency lane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + rust-src (ThreadSanitizer needs an instrumented std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Run the ThreadSanitizer soak lane
+        # The script sets its own RUSTFLAGS for `-Z sanitizer=thread`; halt_on_error fails fast on any
+        # detected data race. It never feeds the deterministic gate.
+        run: scripts/tsan-soak.sh

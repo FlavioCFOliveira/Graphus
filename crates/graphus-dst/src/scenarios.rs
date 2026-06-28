@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use graphus_core::Value;
 use graphus_cypher::MaterializedValue;
-use graphus_io::MemBlockDevice;
+use graphus_io::{MemBlockDevice, atomic_replace_file};
 use graphus_server::engine::LocalEngine;
 use graphus_server::engine::command::AccessMode;
 use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock};
@@ -64,8 +64,11 @@ pub type Scenario = fn(u64) -> ScenarioOutcome;
 ///   `cyclic_traversal`.
 /// - **Index / aggregation** — `indexed_point_lookup`, `aggregation_analytics`.
 /// - **Isolation / concurrency** — `contended_writes`, `concurrent_supernode`, `snapshot_isolation`.
+/// - **Property / secondary index** — `property_index_oracle` (rmp #461: SET/DELETE churn under
+///   contention cross-checked for property values + indexed-seek-vs-scan consistency).
 /// - **Atomicity / churn** — `transaction_rollback`, `churn_create_delete`.
-/// - **Durability / crash recovery** — `crash_recovery_durability`.
+/// - **Durability / crash recovery** — `crash_recovery_durability`, `backup_restore_crash` (rmp #440:
+///   a crash injected at each window of the backup → seal → file → restore → WAL/DWB-reset pipeline).
 /// - **Time / hostile clock** — `hostile_clock` (bounded skew, forward jumps, non-monotonic
 ///   regressions; the clock-fault tolerance contract of rmp #233).
 /// - **Load shapes** — `spike_load`, `ramp_load`, `sustained_high_concurrency`.
@@ -88,11 +91,14 @@ pub fn catalogue() -> Vec<(&'static str, Scenario)> {
         ("contended_writes", contended_writes),
         ("concurrent_supernode", concurrent_supernode),
         ("snapshot_isolation", snapshot_isolation),
+        // Property / secondary index (rmp #461)
+        ("property_index_oracle", property_index_oracle),
         // Atomicity / churn
         ("transaction_rollback", transaction_rollback),
         ("churn_create_delete", churn_create_delete),
         // Durability / crash recovery
         ("crash_recovery_durability", crash_recovery_durability),
+        ("backup_restore_crash", backup_restore_crash),
         // Time / hostile clock
         ("hostile_clock", hostile_clock),
         // Load shapes
@@ -164,6 +170,29 @@ fn write(eng: &mut Eng, stmt: &str, params: Vec<(String, Value)>) -> bool {
 
 /// Runs an auto-commit read, returning the number of rows produced.
 fn count_rows(eng: &mut Eng, stmt: &str, params: Vec<(String, Value)>) -> usize {
+    let Ok(ticket) = eng.begin_auto_commit(AccessMode::Read) else {
+        return usize::MAX;
+    };
+    match eng.run(ticket, stmt, params, true, None) {
+        Ok(mut reply) => {
+            let mut n = 0;
+            while let Ok(Some(_)) = reply.rows.next() {
+                n += 1;
+            }
+            n
+        }
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Runs an auto-commit read over an engine built on **any** block device (rmp #440 restore opens the
+/// restored store over a [`graphus_io::FileBlockDevice`], not the in-memory device), returning the row
+/// count. The generic mirror of [`count_rows`].
+fn count_rows_dev<D: graphus_io::BlockDevice + Send + Sync + 'static>(
+    eng: &mut LocalEngine<D, MemLogSink>,
+    stmt: &str,
+    params: Vec<(String, Value)>,
+) -> usize {
     let Ok(ticket) = eng.begin_auto_commit(AccessMode::Read) else {
         return usize::MAX;
     };
@@ -615,6 +644,65 @@ fn two_concurrent_edge_writers(eng: &mut Eng, base: i64) -> (i64, Option<i64>) {
     (committed, fanout)
 }
 
+/// One concurrency degree's outcome from a supernode degree sweep: the degree `k`, how many of the `k`
+/// concurrently-open writers committed, and the persisted hub fan-out afterwards (rmp #462).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DegreeOutcome {
+    /// The number of concurrently-open write transactions for this rung.
+    pub k: i64,
+    /// How many of them committed (the rest were SSI-aborted).
+    pub committed: i64,
+    /// The hub's persisted out-edge count after all commits (must equal `committed`, never 0).
+    pub fanout: Option<i64>,
+}
+
+/// **Reusable `#220` supernode degree sweep (rmp #462, F-DST-5).** Promotes the previously-hardcoded
+/// `K ∈ {2,3,4,6,8,12,16,24}` regression sweep into a parameterised routine: for each degree in
+/// `degrees`, opens `k` concurrently-open write transactions that each create one `:LINK` edge on the
+/// **same** hub, commits them all, and records `(k, committed, fanout)`. A fresh engine per rung keeps
+/// the rungs independent. The safety invariant a caller asserts is `fanout == committed` (every
+/// committed edge survives) at every rung — but the routine itself is policy-free, so it can drive the
+/// regression guard, an exploratory wider sweep, or a swarmed corner without duplicating the loop.
+#[must_use]
+pub fn supernode_degree_sweep(degrees: &[i64]) -> Vec<DegreeOutcome> {
+    let mut out = Vec::with_capacity(degrees.len());
+    for &k in degrees {
+        let mut eng = engine();
+        let _ = write(&mut eng, "CREATE (:Hub {id: 1})", vec![]);
+        let mut tickets = Vec::new();
+        for i in 0..k {
+            let Ok(t) = eng.begin(AccessMode::Write) else {
+                continue;
+            };
+            if let Ok(mut r) = eng.run(
+                t,
+                "MATCH (h:Hub {id: 1}) CREATE (h)-[:LINK]->(:Leaf {id: $l})",
+                vec![("l".into(), Value::Integer(100 + i))],
+                false,
+                None,
+            ) {
+                while let Ok(Some(_)) = r.rows.next() {}
+            }
+            tickets.push(t);
+        }
+        let committed: i64 = tickets
+            .into_iter()
+            .map(|t| i64::from(eng.commit(t).is_ok()))
+            .sum();
+        let fanout = read_scalar(
+            &mut eng,
+            "MATCH (h:Hub {id: 1})-[:LINK]->(x) RETURN count(x) AS c",
+            vec![],
+        );
+        out.push(DegreeOutcome {
+            k,
+            committed,
+            fanout,
+        });
+    }
+    out
+}
+
 /// Snapshot isolation: a read transaction's view must be **stable** while a concurrent writer commits
 /// new data. The reader counts a label, a second transaction inserts and commits, and the reader
 /// counts again within the *same* transaction — the two counts must match (repeatable read). After
@@ -682,6 +770,25 @@ fn snapshot_isolation(seed: u64) -> ScenarioOutcome {
             "snapshot_isolation",
             format!("first {first:?} after {after:?} (expected 1 then 2)"),
         )
+    }
+}
+
+/// Property + secondary-index oracle (rmp #461): drives a contended `CREATE`/`SET rank`/`CREATE edge`/
+/// `DETACH DELETE` workload over a declared `(Person, rank)` index and, on every commit, cross-checks
+/// the engine against the extended reference model for (a) **property values**, (b) the **indexed
+/// `rank` seek vs the model**, and (c) the **indexed seek vs a forced full scan** (index-vs-base-store
+/// consistency — the surface of rmp #313/#316). Closes the oracle's blindness to property values,
+/// secondary indexes, and delete churn. The driver lives in [`crate::vopr_property`].
+fn property_index_oracle(seed: u64) -> ScenarioOutcome {
+    let a = crate::vopr_property::run(seed);
+    let b = crate::vopr_property::run(seed);
+    if a != b {
+        return ScenarioOutcome::fail("property_index_oracle", "non-deterministic run");
+    }
+    if a.ok {
+        ScenarioOutcome::pass("property_index_oracle", a.detail)
+    } else {
+        ScenarioOutcome::fail("property_index_oracle", a.detail)
     }
 }
 
@@ -823,6 +930,344 @@ fn crash_recovery_durability(seed: u64) -> ScenarioOutcome {
             "crash_recovery_durability",
             format!("survived {survived} (want 1), leaked {leaked} (want 0)"),
         )
+    }
+}
+
+/// **Backup → seal → file → restore / key-rotation crash recovery (rmp #440).** Drives the genuine
+/// operator backup/restore pipeline against **real temp files** and injects a crash at each of its
+/// four atomicity windows, asserting that at every window the database opens to a **committed-only,
+/// consistent** state **under exactly the expected key** (and that a wrong key fails closed).
+///
+/// # Why a DST scenario, and what it exercises
+///
+/// The constituent primitives are unit-tested in isolation (`restore_chain_file_atomic` round-trips;
+/// `atomic_replace_file` leaves the original intact on an aborted fill; the crypto envelope opens only
+/// under the right key), but before rmp #440 there was **no DST-driven crash injection across the full
+/// pipeline**. This scenario reconstructs the pipeline at the **public-API level** — it cannot call the
+/// server's private `dbcatalog` orchestration, so it drives the same building blocks the orchestration
+/// composes:
+///
+/// 1. [`LocalEngine::backup`] captures a chain artifact of a store holding one **committed** node and
+///    one **rolled-back** node (so "committed-only" has teeth).
+/// 2. [`graphus_crypto::seal_backup`] seals it under the expected master key.
+/// 3. [`graphus_io::atomic_replace_file`] writes the sealed file (the backup write) and
+///    [`restore_chain_file_atomic`] writes the restored device file — both via the durable temp +
+///    `rename(2)` idiom, whose crash semantics this scenario probes.
+///
+/// # The four crash windows (each asserted)
+///
+/// * **W1 — after `seal_artifact`, before the backup-file rename.** The sealed bytes exist but the
+///   backup file's `atomic_replace_file` is interrupted mid-`fill` (the producer returns `Err` before
+///   the rename). The backup path must be **untouched** (the prior whole image, or absent).
+/// * **W2 — mid `write_file_atomic` over an existing backup.** A *second* sealed write crashes mid-fill;
+///   the **previous** backup file must survive byte-for-byte (an aborted overwrite never destroys the
+///   good backup).
+/// * **W3 — mid `restore_chain_file_atomic` temp write.** The restore's device-file `fill` is
+///   interrupted (the device open fails) before the rename. The device target must be **untouched**.
+/// * **W4 — after the device temp-rename, before the WAL + DWB reset.** The restored device file is in
+///   place (the new whole image), but the WAL/DWB reset step has not run. Because the chain restore
+///   leaves the device at a **self-sufficient consistent committed point** (needing no WAL replay),
+///   opening it with a fresh empty WAL + the consistency checker yields exactly the committed-only
+///   state — so a crash in this window is healed by simply (re-)opening, never a torn or half-applied
+///   database.
+///
+/// Deterministic and seed-swept: the committed payload, the key, and the partial-write content are all
+/// pure functions of `seed`. Real temp files are created under the system temp dir and removed on
+/// completion.
+fn backup_restore_crash(seed: u64) -> ScenarioOutcome {
+    const NAME: &str = "backup_restore_crash";
+    use graphus_storage::{ChainArtifact, Plain, RestoreTarget, restore_chain_file_atomic};
+
+    let base = (seed % 1000) as i64;
+    // The expected master key (a pure function of seed); a different key must never open the envelope.
+    let key = backup_key(seed);
+    let wrong_key = backup_key(seed ^ 0xDEAD_BEEF);
+
+    // 1. Build a store with one committed node and one rolled-back node, then capture the chain backup.
+    let plaintext = match capture_committed_backup(base) {
+        Ok(bytes) => bytes,
+        Err(detail) => return ScenarioOutcome::fail(NAME, detail),
+    };
+    // 2. Seal under the expected key (this is the artifact an operator would write to disk).
+    let Ok(sealed) = graphus_crypto::seal_backup(&plaintext, &key) else {
+        return ScenarioOutcome::fail(NAME, "sealing the backup envelope failed");
+    };
+
+    let dir = TempDir::new(&format!("backup-crash-{seed}"));
+    let backup_path = dir.path().join("graph.gba");
+    let device_path = dir.path().join("graph.blk");
+
+    // ---- W1: after seal, before the backup-file rename -------------------------------------------
+    // A crash mid backup-file write must leave the (absent) target untouched: no half-written file.
+    let crash_write = atomic_replace_file(&backup_path, |tmp| {
+        // Write a deterministic partial prefix, then "crash" before the rename.
+        let half = sealed.len() / 2;
+        std::fs::write(tmp, &sealed[..half]).map_err(|e| {
+            graphus_core::error::GraphusError::Storage(format!("partial write: {e}"))
+        })?;
+        Err(graphus_core::error::GraphusError::Storage(
+            "simulated crash before backup rename".to_owned(),
+        ))
+    });
+    if crash_write.is_ok() {
+        return ScenarioOutcome::fail(NAME, "W1: interrupted backup write unexpectedly succeeded");
+    }
+    if backup_path.exists() {
+        return ScenarioOutcome::fail(NAME, "W1: a crashed backup write left a partial file");
+    }
+    // Now complete the backup write atomically (the operator retries; the rename makes it whole).
+    if atomic_replace_file(&backup_path, |tmp| write_durable(tmp, &sealed)).is_err() {
+        return ScenarioOutcome::fail(NAME, "W1: completing the backup write failed");
+    }
+
+    // ---- W2: mid write_file_atomic over an EXISTING backup ---------------------------------------
+    // A crashed overwrite of the good backup must leave the good backup byte-for-byte intact.
+    let before = std::fs::read(&backup_path).unwrap_or_default();
+    let crash_overwrite = atomic_replace_file(&backup_path, |tmp| {
+        std::fs::write(tmp, b"GARBAGE-PARTIAL")
+            .map_err(|e| graphus_core::error::GraphusError::Storage(format!("partial: {e}")))?;
+        Err(graphus_core::error::GraphusError::Storage(
+            "simulated crash mid write_file_atomic".to_owned(),
+        ))
+    });
+    if crash_overwrite.is_ok() {
+        return ScenarioOutcome::fail(NAME, "W2: interrupted overwrite unexpectedly succeeded");
+    }
+    let after = std::fs::read(&backup_path).unwrap_or_default();
+    if before != after || before.is_empty() {
+        return ScenarioOutcome::fail(NAME, "W2: a crashed overwrite damaged the good backup");
+    }
+
+    // The good backup must open only under the expected key (key-rotation correctness).
+    let sealed_on_disk = match std::fs::read(&backup_path) {
+        Ok(b) => b,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("W2: reading backup: {e}")),
+    };
+    if graphus_crypto::open_backup(&sealed_on_disk, &wrong_key).is_ok() {
+        return ScenarioOutcome::fail(
+            NAME,
+            "W2: backup opened under the WRONG key (not fail-closed)",
+        );
+    }
+    let Ok(opened) = graphus_crypto::open_backup(&sealed_on_disk, &key) else {
+        return ScenarioOutcome::fail(NAME, "W2: backup did not open under the expected key");
+    };
+    let Ok(artifact) = ChainArtifact::decode(&opened) else {
+        return ScenarioOutcome::fail(NAME, "W2: decoding the restored chain artifact failed");
+    };
+
+    // ---- W3: mid restore_chain_file_atomic temp write --------------------------------------------
+    // A crash during the restore's device-file fill (here: the device open fails) before the rename
+    // must leave the (absent) device target untouched.
+    let crash_restore = restore_chain_file_atomic(
+        &artifact.manifest,
+        &artifact.links,
+        RestoreTarget::Latest,
+        &Plain,
+        &device_path,
+        crash_during_restore_open,
+        64,
+    );
+    if crash_restore.is_ok() {
+        return ScenarioOutcome::fail(NAME, "W3: interrupted restore unexpectedly succeeded");
+    }
+    if device_path.exists() {
+        return ScenarioOutcome::fail(NAME, "W3: a crashed restore left a partial device file");
+    }
+
+    // ---- W4: after the device temp-rename, before the WAL + DWB reset ----------------------------
+    // Complete the atomic restore to the device file (the rename lands the whole new image). The
+    // chain restore + the in-`fill` consistency check leave the device at a self-sufficient committed
+    // point; we then open it with a FRESH empty WAL (the "WAL reset" the orchestration would do) and
+    // assert the committed-only state — modelling recovery from a crash *between* the rename and the
+    // WAL/DWB reset, which simply re-opens to the consistent committed image.
+    let restored = restore_chain_file_atomic(
+        &artifact.manifest,
+        &artifact.links,
+        RestoreTarget::Latest,
+        &Plain,
+        &device_path,
+        |p| graphus_io::FileBlockDevice::open(p),
+        64,
+    );
+    if let Err(e) = restored {
+        return ScenarioOutcome::fail(NAME, format!("W4: completing the restore failed: {e}"));
+    }
+    let (survived, leaked) = match open_restored_and_count(&device_path, base) {
+        Ok(counts) => counts,
+        Err(detail) => return ScenarioOutcome::fail(NAME, detail),
+    };
+    if survived != 1 || leaked != 0 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("W4: restored state not committed-only (survived {survived}, leaked {leaked})"),
+        );
+    }
+
+    ScenarioOutcome::pass(
+        NAME,
+        "crash at every backup/restore/key-rotation window opens committed-only under the right key",
+    )
+}
+
+/// Derives the deterministic 32-byte backup master key for `seed` (a pure function of the seed, so the
+/// whole [`backup_restore_crash`] scenario replays identically).
+fn backup_key(seed: u64) -> [u8; graphus_crypto::KEY_LEN] {
+    let mut key = [0u8; graphus_crypto::KEY_LEN];
+    // SplitMix64-style fill from the seed — no external RNG, fully reproducible.
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    for chunk in key.chunks_mut(8) {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = (x >> (8 * i)) as u8;
+        }
+    }
+    key
+}
+
+/// Builds a fresh engine, commits `:Durable {id: base}`, opens-and-rolls-back `:Durable {id: base+1}`,
+/// and returns the captured **chain backup** plaintext (rmp #440 setup). The committed node must be in
+/// the backup; the rolled-back node must not — so the restore's "committed-only" assertion has teeth.
+fn capture_committed_backup(base: i64) -> std::result::Result<Vec<u8>, String> {
+    let mut eng = engine();
+    // Committed node.
+    let Ok(c) = eng.begin(AccessMode::Write) else {
+        return Err("setup: begin committed failed".to_owned());
+    };
+    if let Ok(mut r) = eng.run(
+        c,
+        "CREATE (:Durable {id: $id})",
+        vec![("id".into(), Value::Integer(base))],
+        false,
+        None,
+    ) {
+        while let Ok(Some(_)) = r.rows.next() {}
+    }
+    if eng.commit(c).is_err() {
+        return Err("setup: commit failed".to_owned());
+    }
+    // Rolled-back node (must NOT appear in the backup).
+    if let Ok(t) = eng.begin(AccessMode::Write) {
+        if let Ok(mut r) = eng.run(
+            t,
+            "CREATE (:Durable {id: $id})",
+            vec![("id".into(), Value::Integer(base + 1))],
+            false,
+            None,
+        ) {
+            while let Ok(Some(_)) = r.rows.next() {}
+        }
+        let _ = eng.rollback(t);
+    }
+    let bytes = eng
+        .backup()
+        .map_err(|e| format!("setup: backup failed: {e}"))?;
+    let _ = eng.shutdown();
+    Ok(bytes)
+}
+
+/// Opens the restored device file as a queryable engine and returns `(survived, leaked)` — the row
+/// count of the committed `:Durable {id: base}` (must be 1) and of the rolled-back `:Durable {id:
+/// base+1}` (must be 0). Opens the store over a **fresh empty WAL** (the WAL the orchestration resets
+/// to) and runs the consistency checker, so this is the "open after restore" path the W4 assertion
+/// needs.
+fn open_restored_and_count(
+    device_path: &std::path::Path,
+    base: i64,
+) -> std::result::Result<(usize, usize), String> {
+    use graphus_storage::{RecordStore, verify_on_open};
+    use graphus_wal::WalManager;
+
+    let dev = graphus_io::FileBlockDevice::open(device_path)
+        .map_err(|e| format!("W4: reopening restored device: {e}"))?;
+    let wal = WalManager::create(MemLogSink::new()).map_err(|e| format!("W4: fresh WAL: {e}"))?;
+    let mut store =
+        RecordStore::open(dev, wal, 64).map_err(|e| format!("W4: opening restored store: {e}"))?;
+    // The restored device must pass the full consistency pass (committed, internally consistent).
+    verify_on_open(&mut store, &[]).map_err(|e| format!("W4: restored store inconsistent: {e}"))?;
+
+    let mut eng = LocalEngine::new(
+        graphus_cypher::TxnCoordinator::new(store),
+        Arc::new(SharedClock::new(0)),
+    );
+    let survived = count_rows_dev(
+        &mut eng,
+        "MATCH (n:Durable {id: $id}) RETURN n",
+        vec![("id".into(), Value::Integer(base))],
+    );
+    let leaked = count_rows_dev(
+        &mut eng,
+        "MATCH (n:Durable {id: $id}) RETURN n",
+        vec![("id".into(), Value::Integer(base + 1))],
+    );
+    let _ = eng.shutdown();
+    // `count_rows_dev` returns `usize::MAX` if a read-back query itself failed (begin/run error). That
+    // is a read-back failure, NOT a "wrong count" — surface it distinctly so the W4 diagnosis isn't
+    // mislabelled as data corruption when the real fault is a query/store error.
+    if survived == usize::MAX || leaked == usize::MAX {
+        return Err("W4: read-back query against the restored store failed".to_owned());
+    }
+    Ok((survived, leaked))
+}
+
+/// The `open_device` closure for the **crashed** restore leg (rmp #440 W3): it always fails, modelling
+/// a crash the instant the restore opens its device temp file — *before* any page is written. Named
+/// (rather than an inline closure) so its concrete `MemBlockDevice` return type pins
+/// [`restore_chain_file_atomic`]'s device parameter without a higher-ranked-lifetime inference failure.
+fn crash_during_restore_open(
+    _tmp: &std::path::Path,
+) -> graphus_core::error::Result<MemBlockDevice> {
+    Err(graphus_core::error::GraphusError::Storage(
+        "simulated crash opening restore device".to_owned(),
+    ))
+}
+
+/// Writes `bytes` to `path` durably (`sync_all`) — the fill closure for the *successful* leg of an
+/// [`atomic_replace_file`] (the crashed legs write a partial then return `Err`).
+fn write_durable(path: &std::path::Path, bytes: &[u8]) -> graphus_core::error::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)
+        .map_err(|e| graphus_core::error::GraphusError::Storage(format!("create temp: {e}")))?;
+    f.write_all(bytes)
+        .map_err(|e| graphus_core::error::GraphusError::Storage(format!("write temp: {e}")))?;
+    f.sync_all()
+        .map_err(|e| graphus_core::error::GraphusError::Storage(format!("sync temp: {e}")))
+}
+
+/// A self-cleaning temporary directory under the system temp dir, unique per `(tag, pid, nanos,
+/// counter)`. Used by [`backup_restore_crash`] for the real-file backup/restore pipeline; removed on
+/// drop so a sweep leaves no residue.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "graphus-dst-{tag}-{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        Self(p)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1038,41 +1483,73 @@ mod tests {
         );
 
         // With K>=3 concurrently-open writers, SSI aborts the dangerous pivots; every edge that
-        // COMMITS must survive — fan-out equals the committed count (NOT 0). Swept across a range of
-        // concurrency degrees so the guarantee holds at every K, not just one.
-        for k in [2i64, 3, 4, 6, 8, 12, 16, 24] {
-            let mut eng = engine();
-            let _ = write(&mut eng, "CREATE (:Hub {id: 1})", vec![]);
-            let mut tickets = Vec::new();
-            for i in 0..k {
-                let t = eng.begin(AccessMode::Write).expect("begin");
-                if let Ok(mut r) = eng.run(
-                    t,
-                    "MATCH (h:Hub {id: 1}) CREATE (h)-[:LINK]->(:Leaf {id: $l})",
-                    vec![("l".into(), Value::Integer(100 + i))],
-                    false,
-                    None,
-                ) {
-                    while let Ok(Some(_)) = r.rows.next() {}
-                }
-                tickets.push(t);
-            }
-            let committed: i64 = tickets
-                .into_iter()
-                .map(|t| i64::from(eng.commit(t).is_ok()))
-                .sum();
-            let fanout = read_scalar(
-                &mut eng,
-                "MATCH (h:Hub {id: 1})-[:LINK]->(x) RETURN count(x) AS c",
-                vec![],
-            );
-            assert!(committed >= 1, "at least one writer commits at K={k}");
+        // COMMITS must survive — fan-out equals the committed count (NOT 0). Driven through the reusable
+        // degree-sweep parameter (rmp #462) so the guarantee holds at every K, not just one.
+        for o in supernode_degree_sweep(&[2, 3, 4, 6, 8, 12, 16, 24]) {
+            assert!(o.committed >= 1, "at least one writer commits at K={}", o.k);
             assert_eq!(
-                fanout,
-                Some(committed),
-                "rmp #220 (fixed): at K={k} every committed edge must survive (fan-out == committed)"
+                o.fanout,
+                Some(o.committed),
+                "rmp #220 (fixed): at K={} every committed edge must survive (fan-out == committed)",
+                o.k
             );
         }
+    }
+
+    /// **rmp #462 (F-DST-5).** The promoted, reusable [`supernode_degree_sweep`] drives an arbitrary set
+    /// of degrees and is policy-free: here a *wider* exploratory sweep (including odd corners beyond the
+    /// pinned set) still upholds `fanout == committed` at every rung, proving the parameter is genuinely
+    /// reusable for corner exploration, not just the fixed regression set.
+    #[test]
+    fn reusable_degree_sweep_holds_for_arbitrary_degrees() {
+        let outcomes = supernode_degree_sweep(&[1, 5, 7, 10, 20, 32]);
+        assert_eq!(
+            outcomes.len(),
+            6,
+            "every requested degree produced an outcome"
+        );
+        for o in outcomes {
+            assert_eq!(
+                o.fanout,
+                Some(o.committed),
+                "rmp #462: the reusable sweep upholds fan-out == committed at K={}",
+                o.k
+            );
+        }
+    }
+
+    /// **rmp #462 (F-DST-5 coverage watermark).** Proves the swarmed VOPR actually **reaches the corner
+    /// that matters**: across a bounded swarmed seed range, some seed drives **≥3 concurrently-open
+    /// writers** *and* some seed runs under **buffer-pool eviction pressure** (a working set larger than
+    /// the pool, so the pool cannot hold it and must evict/steal). The `#220` lesson — the bug only
+    /// surfaced at ≥3 concurrent writers — is why corner-reaching, not just raw seed count, must be
+    /// asserted. Without this watermark a "256-seed swarm" could silently never reach the corner.
+    #[test]
+    fn swarm_reaches_three_writers_and_eviction_pressure() {
+        use crate::vopr::{self, VoprConfig};
+
+        let mut max_open_seen = 0usize;
+        let mut eviction_pressure_seen = false;
+        // A bounded swarmed range — enough to hit the corners, fast in a debug build.
+        for seed in 1u64..=128 {
+            let cfg = VoprConfig::swarm(seed);
+            let pool_pages = cfg.pool_pages;
+            let r = vopr::run(cfg);
+            max_open_seen = max_open_seen.max(r.max_open_txns);
+            // Eviction pressure: the committed working set exceeds the buffer pool, so the pool provably
+            // could not hold it all resident — eviction/steal must have occurred during the run.
+            if (r.persisted_nodes as usize) > pool_pages {
+                eviction_pressure_seen = true;
+            }
+        }
+        assert!(
+            max_open_seen >= 3,
+            "the swarm must reach >=3 concurrently-open writers on some seed (max seen {max_open_seen})"
+        );
+        assert!(
+            eviction_pressure_seen,
+            "the swarm must reach buffer-pool eviction pressure (working set > pool) on some seed"
+        );
     }
 
     /// **rmp #233.** The hostile-clock scenario certifies the clock-fault tolerance contract: under a
@@ -1123,9 +1600,11 @@ mod tests {
             "contended_writes",
             "concurrent_supernode",
             "snapshot_isolation",
+            "property_index_oracle",
             "transaction_rollback",
             "churn_create_delete",
             "crash_recovery_durability",
+            "backup_restore_crash",
             "hostile_clock",
             "spike_load",
             "ramp_load",
@@ -1134,6 +1613,27 @@ mod tests {
             assert!(
                 names.contains(&expected),
                 "catalogue must include {expected}"
+            );
+        }
+    }
+
+    /// **rmp #440.** The backup → seal → file → restore / key-rotation crash scenario opens to a
+    /// committed-only, consistent state under exactly the expected key at every crash window, and
+    /// replays identically per seed (determinism). A real regression gate: a torn backup/device write,
+    /// a wrong-key open, or a half-applied restore makes some seed fail here.
+    #[test]
+    fn backup_restore_crash_recovers_at_every_window_across_seeds() {
+        for seed in 1u64..=6 {
+            let a = backup_restore_crash(seed);
+            let b = backup_restore_crash(seed);
+            assert_eq!(
+                a, b,
+                "backup_restore_crash must replay identically for seed {seed}"
+            );
+            assert!(
+                a.ok,
+                "backup/restore crash recovery must hold at seed {seed}: {}",
+                a.detail
             );
         }
     }
