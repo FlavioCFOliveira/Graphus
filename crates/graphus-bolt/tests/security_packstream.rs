@@ -132,6 +132,24 @@ fn deeply_nested_maps_are_rejected() {
 }
 
 #[test]
+fn deeply_nested_structural_list_via_bolt_value_is_rejected() {
+    // rmp #445 F-PS-3: the SAME depth guard must protect the *structural* decoder
+    // (`unpack_bolt_value`, which can hold graph entities), not only `unpack_value`. A RECORD's
+    // values go through `unpack_bolt_value`, so a hostile RECORD nesting lists 5000 deep would
+    // overflow the stack (remote DoS) without the guard. 5000 × 0x91 (TINY_LIST size 1) far exceeds
+    // MAX_DECODE_DEPTH (256); the structural decoder must return a clean depth error, never abort.
+    let depth = 5000;
+    let mut bytes = vec![0x91u8; depth]; // 0x91 = TINY_LIST size 1
+    bytes.push(0xC0); // innermost value: NULL
+    let err = dec_bolt(&bytes)
+        .expect_err("over-deep structural nesting must be rejected, never overflow the stack");
+    assert!(
+        format!("{err}").contains("depth"),
+        "expected a depth-limit error from unpack_bolt_value, got: {err}"
+    );
+}
+
+#[test]
 fn nesting_at_the_limit_is_accepted() {
     // A payload nested just within MAX_DECODE_DEPTH (256) must still decode — a legitimate (if deep)
     // message is never rejected. 200 levels is comfortably under the limit.
@@ -140,6 +158,11 @@ fn nesting_at_the_limit_is_accepted() {
     assert!(
         dec(&bytes).is_ok(),
         "a payload within the depth limit must decode"
+    );
+    // The structural decoder accepts the same within-limit payload.
+    assert!(
+        dec_bolt(&bytes).is_ok(),
+        "a payload within the depth limit must decode via unpack_bolt_value too"
     );
 }
 

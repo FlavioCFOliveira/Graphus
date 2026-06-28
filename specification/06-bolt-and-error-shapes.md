@@ -227,6 +227,40 @@ object's members as follows:
 This keeps a single error model (`04` §8.3, "one executor, one value model") behind both the Bolt
 `FAILURE` and the REST problem+json renderings.
 
+### 3.4 `RESET` and `GOODBYE` transaction-control semantics
+
+`RESET` and `GOODBYE` both have to leave the server's transaction state clean. Graphus's
+**single-threaded, lockstep** session loop (one request decoded, dispatched, and fully answered
+before the next is read — there is no asynchronous in-flight pipeline) shapes how it realises the
+two messages relative to the letter of the Bolt spec:
+
+- **`RESET` (serial-equivalence).** The Bolt spec describes `RESET` as a message that **jumps the
+  queue**: it interrupts work already in progress and any messages the client *pipelined* ahead of
+  it are answered `IGNORED`, after which the connection returns to a clean `READY`
+  (neo4j.com/docs/bolt/current/bolt/message/, server-state appendix `INTERRUPTED`). Graphus has no
+  queue to jump and no in-flight work to interrupt: by the time it reads `RESET`, every earlier
+  message (e.g. a pipelined `RUN` + `PULL`) has **already been processed to completion**. `RESET`
+  therefore (a) rolls back any open explicit transaction (best-effort), (b) discards any open result
+  stream and resets the per-transaction `qid` counter, (c) replies `SUCCESS`, and (d) returns to
+  `READY`. For a **lockstep client** this is **observably equivalent** to the spec's queue-jumping
+  `RESET` — the same `SUCCESS` and the same clean `READY` result. The only divergence is for a
+  client that *pipelines* `RUN` + `PULL` + `RESET` in one burst **expecting the in-flight `RUN`/`PULL`
+  to be answered `IGNORED`**: Graphus instead answers them normally (they ran before `RESET` was
+  seen) and then `SUCCESS`-es the `RESET`. The official Neo4j drivers drive `RESET` synchronously
+  (they do not depend on the in-flight-`IGNORED` ordering for correctness), so this is conformant for
+  the driver ecosystem. The `INTERRUPTED` state and pipelined-`IGNORED` ordering are **deliberately
+  not modelled** in v1; revisit if/when an asynchronous request pipeline is introduced. Pinned by the
+  `reset_after_run_pull_clears_state_serial_equivalence` regression test.
+
+- **`GOODBYE` (transaction rollback symmetry).** The Bolt spec states `GOODBYE` "interrupts the
+  server current work if there is any." An open explicit transaction is *current work*, so a
+  `GOODBYE` received mid-transaction **explicitly rolls it back** — symmetric with the abrupt-EOF
+  path, so neither a clean client close (`GOODBYE`) nor a dropped socket (EOF) can leak a transaction
+  that would pin the GC watermark and block concurrent writers. The rollback is best-effort and
+  idempotent (a no-op when nothing is open); the executor's `Drop` remains the final backstop for the
+  panic path. Pinned by `goodbye_mid_tx_rolls_back_open_transaction` (and its no-op counterpart
+  `goodbye_with_no_open_tx_does_not_roll_back`).
+
 ---
 
 ## 4. REST transactional API — read/write access mode
@@ -279,6 +313,9 @@ field (read vs write), but `04` §8.2 left the REST equivalent open. This spike 
   `crates/graphus-cypher/src/errors.rs` (§2) — closes `02` Q2 / `04` §12 item 13 for the
   compile-time surface.
 - Bolt result and failure shapes, and their REST problem+json equivalent, fixed (§3).
+- `RESET` serial-equivalence and `GOODBYE` transaction-rollback symmetry for the single-threaded
+  lockstep session loop documented (§3.4) — closes the `RESET` queue-jump / `GOODBYE` rollback
+  question for v1 (rmp #444).
 - REST transactional API **`access_mode`** field specified (§4) — closes `02` Q5 / `04` §12 item 14.
 
 **Remaining flagged (deferred, owner-visible):**
@@ -290,3 +327,6 @@ field (read vs write), but `04` §8.2 left the REST equivalent open. This spike 
   item 13).
 - **REST `access_mode` routing semantics** — revisited when clustering / read replicas arrive
   (§4.2; `D-v1-topology`).
+- **Bolt `INTERRUPTED` state / pipelined-`RESET` `IGNORED` ordering** — not modelled in v1; Graphus's
+  lockstep loop makes `RESET` serial-equivalent for the driver ecosystem (§3.4). Revisit if an
+  asynchronous request pipeline is introduced (rmp #444).

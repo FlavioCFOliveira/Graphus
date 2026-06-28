@@ -22,8 +22,9 @@
 //!
 //! - `HELLO` / `BEGIN` carry one **extra** map; `LOGON` one **auth** map.
 //! - `RUN` carries three fields in order: `query` string, `parameters` map, `extra` map.
-//! - `PULL` / `DISCARD` carry one **extra** map whose keys are `n` (fetch size, `-1` = all) and
-//!   `qid` (query id, `-1` = last).
+//! - `PULL` / `DISCARD` carry one **extra** map whose keys are `n` (fetch size, `-1` = all;
+//!   **mandatory** — "n has no default and must be present") and `qid` (query id, `-1` = last;
+//!   optional, defaults to `-1`).
 //! - `LOGOFF` / `COMMIT` / `ROLLBACK` / `RESET` / `GOODBYE` carry **no** fields.
 //! - `SUCCESS` / `FAILURE` carry one **metadata** map; `RECORD` one **values** list; `IGNORED` no
 //!   fields.
@@ -205,12 +206,12 @@ impl Request {
             }
             opcode::DISCARD => {
                 let extra = take_map(&mut fields, 0, tag, "DISCARD.extra")?;
-                let (n, qid) = pull_discard_fields(&extra);
+                let (n, qid) = pull_discard_fields(&extra, tag, "DISCARD")?;
                 Ok(Request::Discard { n, qid })
             }
             opcode::PULL => {
                 let extra = take_map(&mut fields, 0, tag, "PULL.extra")?;
-                let (n, qid) = pull_discard_fields(&extra);
+                let (n, qid) = pull_discard_fields(&extra, tag, "PULL")?;
                 Ok(Request::Pull { n, qid })
             }
             opcode::BEGIN => Ok(Request::Begin {
@@ -246,11 +247,22 @@ impl Request {
             }
             opcode::TELEMETRY => {
                 expect_arity(tag, fields.len(), 1)?;
-                // The `api` field is an integer; a non-integer is tolerated as `0` since TELEMETRY is
-                // advisory and must never fail the connection (rmp #95).
+                // The `api` field MUST be an integer. A non-integer is a malformed TELEMETRY: the
+                // Bolt spec mandates that "a TELEMETRY message [that] contains a value that is not a
+                // valid api value … responds with a FAILURE message and enters the FAILED state"
+                // (neo4j.com/docs/bolt/current/bolt/message/). A non-integer can never be a valid
+                // `api` (which is one of the integers 0..=3), so it is rejected here as a decode
+                // error → the session answers `Neo.ClientError.Request.Invalid` → FAILED. The
+                // out-of-range *integer* case (e.g. 99) is validated at dispatch, where the value is
+                // known together with the connection state. (Supersedes the earlier rmp #95 "tolerate
+                // as 0" leniency, which silently swallowed this spec-mandated FAILURE path.)
                 let api = match fields.into_iter().next() {
                     Some(Value::Integer(n)) => n,
-                    _ => 0,
+                    other => {
+                        return Err(BoltError::Decode(format!(
+                            "message {tag:#04x}: TELEMETRY api must be an integer, found {other:?}"
+                        )));
+                    }
                 };
                 Ok(Request::Telemetry { api })
             }
@@ -264,7 +276,9 @@ impl Request {
     /// Encodes this request to a message payload (used by tests and any future client-side use).
     ///
     /// # Errors
-    /// [`BoltError::Encode`] only if a structure would exceed 15 fields (never for these messages).
+    /// [`BoltError::Encode`] if a structure would exceed 15 fields, or if a `String`/`Bytes`/`List`/
+    /// `Map` length exceeds the PackStream maximum of `i32::MAX` (refused rather than emitted as an
+    /// out-of-spec header). Neither happens for the standard messages.
     pub fn encode(&self) -> BoltResult<Vec<u8>> {
         let mut p = Packer::new();
         match self {
@@ -316,6 +330,9 @@ impl Request {
                 }
             }
         }
+        // Refuse an out-of-spec collection length (> i32::MAX) instead of returning a corrupt buffer
+        // with a truncated 32-bit header (rmp #445).
+        p.check_overflow()?;
         Ok(p.into_inner())
     }
 }
@@ -335,8 +352,14 @@ impl Response {
     /// output to [`Response::encode`]. Lets the server reuse a single retained `Packer` (cleared via
     /// [`Packer::reset`]) across messages instead of allocating a fresh zero-capacity buffer per send.
     ///
+    /// This is the single chokepoint for the server's response encoding (both [`Response::encode`]
+    /// and the listener's retained-packer `send` path go through it), so the over-length collection
+    /// check lives here.
+    ///
     /// # Errors
-    /// [`BoltError::Encode`] only if a structure would exceed 15 fields (never for these messages).
+    /// [`BoltError::Encode`] if a structure would exceed 15 fields, or if a `String`/`Bytes`/`List`/
+    /// `Map` length exceeds the PackStream maximum of `i32::MAX` (refused rather than emitted as an
+    /// out-of-spec header). Neither happens for the standard messages.
     pub fn encode_into(&self, p: &mut Packer) -> BoltResult<()> {
         match self {
             Response::Success { metadata } => {
@@ -358,6 +381,10 @@ impl Response {
                 write_struct_with_map(p, opcode::FAILURE, &meta)?;
             }
         }
+        // Refuse an out-of-spec collection length (> i32::MAX) instead of framing a corrupt buffer
+        // with a truncated 32-bit header (rmp #445). Unreachable for real responses (a RECORD value
+        // never exceeds the 64 MiB inbound cap), but keeps the encoder strictly spec-faithful.
+        p.check_overflow()?;
         Ok(())
     }
 
@@ -492,12 +519,30 @@ fn expect_list(v: Option<Value>, tag: u8, what: &str) -> BoltResult<Vec<Value>> 
     }
 }
 
-/// Extracts `(n, qid)` from a `PULL`/`DISCARD` extra map. A missing `n` defaults to [`ALL`]
-/// (Bolt treats an absent fetch size as "all"); a missing `qid` stays `None` ("last query").
-fn pull_discard_fields(extra: &[(String, Value)]) -> (i64, Option<i64>) {
-    let n = map_get_int(extra, "n").unwrap_or(ALL);
+/// Extracts `(n, qid)` from a `PULL`/`DISCARD` extra map.
+///
+/// `n` (the fetch size) is **mandatory**: the Bolt message spec states verbatim that for PULL and
+/// DISCARD "`n` has no default and must be present" (neo4j.com/docs/bolt/current/bolt/message/). An
+/// extra map that omits `n` is therefore a malformed request — it is rejected as a decode error so
+/// the session answers `Neo.ClientError.Request.Invalid` → FAILED, rather than silently treating an
+/// absent fetch size as "all" (which would also let a no-`n` PULL force full materialization of the
+/// result set — a DoS-adjacent footgun). A missing `qid` stays `None` ("last query"), which the spec
+/// *does* allow (`qid` defaults to `-1`).
+///
+/// # Errors
+/// [`BoltError::Decode`] if the `n` key is absent (it has no default and must be present).
+fn pull_discard_fields(
+    extra: &[(String, Value)],
+    tag: u8,
+    what: &str,
+) -> BoltResult<(i64, Option<i64>)> {
+    let n = map_get_int(extra, "n").ok_or_else(|| {
+        BoltError::Decode(format!(
+            "message {tag:#04x}: {what} requires `n` (it has no default and must be present)"
+        ))
+    })?;
     let qid = map_get_int(extra, "qid");
-    (n, qid)
+    Ok((n, qid))
 }
 
 /// Builds the `PULL`/`DISCARD` extra map from `(n, qid)` for encoding.
@@ -586,19 +631,55 @@ mod tests {
             qid: Some(7),
         };
         assert_eq!(rt_request(&r), r);
-        // Default fetch-all when n omitted: encode ALL explicitly, decode back to ALL.
+        // `n` is always encoded (it is mandatory on the wire); ALL (-1) round-trips to ALL.
         let all = Request::Pull { n: ALL, qid: None };
         assert_eq!(rt_request(&all), all);
     }
 
     #[test]
-    fn pull_with_absent_n_defaults_to_all() {
-        // A hand-built PULL whose extra map has no `n` key must decode to n = ALL.
+    fn pull_with_absent_n_is_a_decode_error() {
+        // Bolt spec (neo4j.com/docs/bolt/current/bolt/message/): for PULL and DISCARD "n has no
+        // default and must be present." A hand-built PULL whose extra map has no `n` key (B1 3F A0:
+        // TINY_STRUCT-1, PULL opcode, empty MAP) MUST be a decode error, NOT a silent default to
+        // ALL — otherwise a no-`n` PULL would force full materialization of the result set.
         let mut p = Packer::new();
         p.write_struct_header(opcode::PULL, 1).unwrap();
         p.write_map_header(0);
         let bytes = p.into_inner();
-        match Request::decode(&bytes).unwrap() {
+        assert_eq!(bytes, [0xB1, opcode::PULL, 0xA0], "hand-framed B1 3F A0");
+        match Request::decode(&bytes) {
+            Err(BoltError::Decode(msg)) => assert!(
+                msg.contains('n') && msg.contains("must be present"),
+                "decode error must explain the missing mandatory `n`: {msg}"
+            ),
+            other => panic!("expected a Decode error for absent n, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discard_with_absent_n_is_a_decode_error() {
+        // The same mandatory-`n` rule applies to DISCARD (B1 2F A0).
+        let mut p = Packer::new();
+        p.write_struct_header(opcode::DISCARD, 1).unwrap();
+        p.write_map_header(0);
+        let bytes = p.into_inner();
+        assert_eq!(bytes, [0xB1, opcode::DISCARD, 0xA0], "hand-framed B1 2F A0");
+        assert!(
+            matches!(Request::decode(&bytes), Err(BoltError::Decode(_))),
+            "DISCARD without `n` must be a decode error"
+        );
+    }
+
+    #[test]
+    fn pull_with_present_n_still_decodes() {
+        // Regression guard: a PULL that DOES carry `n` (the normal driver case) still decodes — the
+        // mandatory-`n` rule must reject only the *absent* case, never a present one.
+        let mut p = Packer::new();
+        p.write_struct_header(opcode::PULL, 1).unwrap();
+        p.write_map_header(1);
+        p.write_string("n");
+        p.write_int(ALL);
+        match Request::decode(&p.into_inner()).unwrap() {
             Request::Pull { n, qid } => {
                 assert_eq!(n, ALL);
                 assert_eq!(qid, None);
@@ -689,15 +770,26 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tolerates_a_non_integer_api() {
-        // A non-integer api field decodes to 0 rather than failing (TELEMETRY is advisory).
+    fn telemetry_non_integer_api_is_a_decode_error() {
+        // A non-integer `api` can never be a valid api value (valid api ∈ {0,1,2,3}), so the Bolt
+        // spec's "FAILURE on an invalid api value" applies: it is rejected as a decode error (which
+        // the session turns into `Neo.ClientError.Request.Invalid` → FAILED), NOT tolerated as 0.
         let mut p = Packer::new();
         p.write_struct_header(opcode::TELEMETRY, 1).unwrap();
         p.write_string("oops");
-        match Request::decode(&p.into_inner()).unwrap() {
-            Request::Telemetry { api } => assert_eq!(api, 0),
-            other => panic!("expected TELEMETRY, got {other:?}"),
-        }
+        assert!(
+            matches!(Request::decode(&p.into_inner()), Err(BoltError::Decode(_))),
+            "a non-integer TELEMETRY api must be a decode error"
+        );
+    }
+
+    #[test]
+    fn telemetry_integer_api_decodes_even_out_of_range() {
+        // An out-of-range *integer* api (e.g. 99) still decodes at the wire layer — its validity is a
+        // semantic check the server performs at dispatch (where it knows the connection state). The
+        // codec only rejects a non-integer; a too-large integer is the dispatch layer's call.
+        let r = Request::Telemetry { api: 99 };
+        assert_eq!(rt_request(&r), r);
     }
 
     #[test]

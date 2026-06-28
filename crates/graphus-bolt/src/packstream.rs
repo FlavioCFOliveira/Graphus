@@ -91,21 +91,27 @@ pub(crate) const MAP_32: u8 = 0xDA;
 
 pub(crate) const TINY_STRUCT_BASE: u8 = 0xB0; // 0xB0..=0xBF: 0..=15 fields
 
-/// The largest collection (string/bytes/list/map) length PackStream's 32-bit size field can carry.
+/// The largest collection (string/bytes/list/map) length the PackStream **encoder** will emit.
 ///
-/// # Spec maximum vs this lenient cap (`rmp` #397 — NOT yet ratified)
+/// # Spec maximum (`rmp` #445 — ratified)
 ///
-/// The PackStream specification states the maximum collection length is **`i32::MAX`**
+/// The PackStream specification sets the maximum collection length at **`i32::MAX`**
 /// (`2_147_483_647`): the `*_32` size header is read as a *signed* 32-bit big-endian integer, so a
-/// strictly conformant decoder rejects any length above `i32::MAX`. Graphus deliberately uses the
-/// **wider `u32::MAX`** here — a *lenient* choice that accepts the full unsigned 32-bit range. This is
-/// safe by construction: a wire length never sizes an allocation directly (every collection
-/// pre-allocates at most [`MAX_PREALLOC`] and grows as real elements are decoded, and each element
-/// consumes ≥1 input byte), so an over-large header cannot exhaust memory — it simply fails at
-/// end-of-input. Tightening this cap to `i32::MAX` is a behavioural change (it would start *rejecting*
-/// inputs the decoder currently accepts), so it is **pending a ratified decision** and is intentionally
-/// not changed here; the `collection_length_cap_current_behavior` test pins the present behaviour.
-const MAX_U32_LEN: usize = u32::MAX as usize;
+/// strictly conformant decoder rejects any length above `i32::MAX`. The encoder therefore caps every
+/// `String` / `Bytes` / `List` / `Map` at this length; a value longer than this cannot be expressed
+/// by an in-spec header, so instead of silently writing a truncated/out-of-spec 32-bit header the
+/// encoder *refuses* it (the packer is poisoned and the encode boundary returns
+/// [`BoltError::Encode`] — see [`Packer::check_overflow`]). A strict driver therefore never receives
+/// an oversize header from Graphus.
+///
+/// The **decoder stays deliberately lenient**: it reads the `*_32` header as an unsigned 32-bit
+/// integer and accepts lengths up to `u32::MAX`, because a wire length never sizes an allocation
+/// directly (every collection pre-allocates at most [`MAX_PREALLOC`] and grows as real elements are
+/// decoded, and each element consumes ≥1 input byte), so an over-large inbound header cannot exhaust
+/// memory — it simply fails at end-of-input. Accepting `i32::MAX < len ≤ u32::MAX` on input (only to
+/// fail when the body runs out) is harmless and avoids rejecting a peer that, against the spec, used
+/// the full unsigned range; the cap here governs only what Graphus *emits*.
+const MAX_COLLECTION_LEN: usize = i32::MAX as usize;
 /// A structure has at most 15 fields (the tiny-struct nibble); Bolt never exceeds this.
 pub(crate) const MAX_STRUCT_FIELDS: usize = 15;
 
@@ -199,18 +205,38 @@ impl Structure {
 
 /// A cursor that appends PackStream-encoded items to an owned byte buffer.
 ///
-/// All writes are infallible (a `Vec` grows) except [`Packer::write_struct_header`], which rejects
-/// a field count above 15 (PackStream has no non-tiny structure marker; Bolt never needs one).
+/// Most writes are infallible (a `Vec` grows). Two cases are *checked* rather than silently
+/// truncated, because emitting an out-of-spec header would corrupt the stream for a strict decoder:
+///
+/// - [`Packer::write_struct_header`] rejects a field count above 15 immediately (PackStream has no
+///   non-tiny structure marker; Bolt never needs one) by returning [`BoltError::Encode`].
+/// - A string / byte-string / list / map whose length exceeds the PackStream maximum of
+///   [`MAX_COLLECTION_LEN`] (`i32::MAX`) cannot be expressed by the signed 32-bit `*_32` size header.
+///   Rather than make the dozens of infallible header-writer call sites fallible, such an
+///   over-length write *poisons* the packer (records the offending length and writes no header) and
+///   is surfaced as a single [`BoltError::Encode`] at the encode boundary — see [`Packer::overflow`]
+///   and [`Packer::check_overflow`], which [`crate::message::Request::encode`] and
+///   [`crate::message::Response::encode_into`] consult before handing the bytes back. This keeps the
+///   bytes of every in-spec message byte-for-byte unchanged while refusing to emit an oversize
+///   header (rmp #445; the inbound side is capped far lower — 64 MiB — so this is unreachable in
+///   practice and exists purely to keep the encoder spec-faithful).
 #[derive(Debug, Default)]
 pub struct Packer {
     buf: Vec<u8>,
+    /// The length of the first collection write that exceeded [`MAX_COLLECTION_LEN`], if any. Once
+    /// set, the packed bytes are incomplete (the over-length header was deliberately not written) and
+    /// [`Packer::check_overflow`] turns this into an [`BoltError::Encode`] at the encode boundary.
+    overflow: Option<usize>,
 }
 
 impl Packer {
     /// A new empty packer.
     #[must_use]
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            overflow: None,
+        }
     }
 
     /// A new packer with `cap` bytes reserved.
@@ -218,19 +244,43 @@ impl Packer {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             buf: Vec::with_capacity(cap),
+            overflow: None,
         }
     }
 
     /// Consumes the packer, returning the encoded bytes.
+    ///
+    /// Callers that may have packed an untrusted-length collection should call
+    /// [`Packer::check_overflow`] first; this accessor does not itself fail (it is used widely by
+    /// tests that pack small, known values).
     #[must_use]
     pub fn into_inner(self) -> Vec<u8> {
         self.buf
     }
 
+    /// Returns an [`BoltError::Encode`] if any collection write exceeded [`MAX_COLLECTION_LEN`]
+    /// (`i32::MAX`) and was therefore not encoded. The encode entry points
+    /// ([`crate::message::Request::encode`] / [`crate::message::Response::encode_into`]) call this
+    /// before returning the bytes, so an oversize value is refused rather than emitted as an
+    /// out-of-spec 32-bit header.
+    ///
+    /// # Errors
+    /// [`BoltError::Encode`] if the packer was poisoned by an over-length collection write.
+    pub fn check_overflow(&self) -> BoltResult<()> {
+        match self.overflow {
+            None => Ok(()),
+            Some(len) => Err(BoltError::Encode(format!(
+                "collection length {len} exceeds the PackStream maximum of {MAX_COLLECTION_LEN} (i32::MAX)"
+            ))),
+        }
+    }
+
     /// PERF (C4/C5): clears the buffer while retaining its allocated capacity, so a single `Packer`
-    /// can encode many messages back-to-back without re-allocating between them.
+    /// can encode many messages back-to-back without re-allocating between them. Also clears any
+    /// recorded overflow poison so a reused packer starts each message clean.
     pub fn reset(&mut self) {
         self.buf.clear();
+        self.overflow = None;
     }
 
     /// Borrows the encoded bytes so far.
@@ -283,6 +333,13 @@ impl Packer {
     }
 
     /// Writes a byte string with the smallest 8 / 16 / 32 marker (bytes have no tiny form).
+    ///
+    /// A byte string longer than [`MAX_COLLECTION_LEN`] (`i32::MAX`) cannot be expressed by an
+    /// in-spec `BYTES_32` header; rather than emit a truncated/out-of-spec header (which would
+    /// corrupt the stream for a strict decoder) the packer is poisoned and *nothing* is written for
+    /// this value — the over-length condition is reported at the encode boundary via
+    /// [`Packer::check_overflow`]. (Unreachable in practice: a `Value::Bytes` this large never
+    /// arises from a decoded message — inbound is capped at 64 MiB.)
     pub fn write_bytes(&mut self, b: &[u8]) {
         let len = b.len();
         if let Ok(n) = u8::try_from(len) {
@@ -291,12 +348,15 @@ impl Packer {
         } else if let Ok(n) = u16::try_from(len) {
             self.buf.push(BYTES_16);
             self.buf.extend_from_slice(&n.to_be_bytes());
+        } else if len > MAX_COLLECTION_LEN {
+            self.mark_overflow(len);
+            return;
         } else {
-            // PackStream caps bytes at u32; values longer never occur from a `Value::Bytes` that
-            // round-trips, but truncating the length silently would corrupt the stream, so clamp at
-            // the codec's documented limit by writing the 32-bit header.
-            #[expect(clippy::cast_possible_truncation, reason = "documented u32 length cap")]
-            let n = len.min(MAX_U32_LEN) as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "checked <= MAX_COLLECTION_LEN"
+            )]
+            let n = len as u32;
             self.buf.push(BYTES_32);
             self.buf.extend_from_slice(&n.to_be_bytes());
         }
@@ -333,6 +393,11 @@ impl Packer {
 
     /// Shared length-header writer for the string / list / map families, which share the
     /// tiny(0..=15) / 8 / 16 / 32 marker shape and differ only in their base marker bytes.
+    ///
+    /// A length above [`MAX_COLLECTION_LEN`] (`i32::MAX`) has no in-spec header: the packer is
+    /// poisoned and no marker is written (the resulting bytes are discarded at the encode boundary by
+    /// [`Packer::check_overflow`]). See [`Packer`] for why this is a poison-then-check rather than a
+    /// fallible call at every header site.
     fn write_collection_header(&mut self, tiny_base: u8, m8: u8, m16: u8, m32: u8, len: usize) {
         if len <= 15 {
             #[expect(clippy::cast_possible_truncation, reason = "checked <= 15 above")]
@@ -343,11 +408,25 @@ impl Packer {
         } else if let Ok(n) = u16::try_from(len) {
             self.buf.push(m16);
             self.buf.extend_from_slice(&n.to_be_bytes());
+        } else if len > MAX_COLLECTION_LEN {
+            self.mark_overflow(len);
         } else {
-            #[expect(clippy::cast_possible_truncation, reason = "documented u32 length cap")]
-            let n = len.min(MAX_U32_LEN) as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "checked <= MAX_COLLECTION_LEN"
+            )]
+            let n = len as u32;
             self.buf.push(m32);
             self.buf.extend_from_slice(&n.to_be_bytes());
+        }
+    }
+
+    /// Records the first over-length collection write so the encode boundary can refuse the whole
+    /// message via [`Packer::check_overflow`]. Idempotent: only the first offending length is kept
+    /// (it is the one reported), and writing nothing for the value keeps the in-spec part intact.
+    fn mark_overflow(&mut self, len: usize) {
+        if self.overflow.is_none() {
+            self.overflow = Some(len);
         }
     }
 }
@@ -1452,21 +1531,68 @@ mod tests {
         assert_eq!(decode(&[TINY_LIST_BASE]), Value::List(Vec::new()));
     }
 
-    /// `rmp` #397: documents the **current** collection-length cap behaviour. The PackStream spec's
-    /// maximum is `i32::MAX`, but Graphus deliberately uses the wider unsigned [`MAX_U32_LEN`]
-    /// (`u32::MAX`) as a lenient choice (see its doc comment). This test pins that current value so any
-    /// change to the cap — in either direction — is a conscious, reviewed decision (the tightening to
-    /// `i32::MAX` is not yet ratified). The cap governs only the maximum *expressible* header length; a
-    /// header never sizes an allocation directly ([`MAX_PREALLOC`] / [`prealloc_cap`]).
+    /// `rmp` #445 (ratified): the **encoder** caps collection length at the PackStream spec maximum of
+    /// `i32::MAX`. This pins the cap value so any future change is a conscious, reviewed decision.
+    /// (The decoder stays lenient — `MAX_COLLECTION_LEN` governs only what Graphus *emits*; see the
+    /// constant's doc and `non_minimal_encodings_are_accepted` for the decode side.)
     #[test]
-    fn collection_length_cap_current_behavior() {
-        // The cap is the full unsigned 32-bit range, NOT the spec's i32::MAX — the current lenient
-        // choice. (If this assertion ever needs changing, the cap was changed; that requires a
-        // ratified decision per `rmp` #397.)
-        assert_eq!(MAX_U32_LEN, u32::MAX as usize);
+    fn collection_length_cap_is_spec_i32max() {
+        assert_eq!(
+            MAX_COLLECTION_LEN,
+            i32::MAX as usize,
+            "the encoder cap must be the spec's i32::MAX maximum (rmp #445)"
+        );
+    }
+
+    /// `rmp` #445: an encode whose collection length would exceed `i32::MAX` must be **refused** with
+    /// [`BoltError::Encode`], not emitted as a truncated/out-of-spec 32-bit header that a strict
+    /// driver would reject. We cannot allocate a >2.1 GiB `String` in a unit test, so we drive the
+    /// poison path directly through the public `Packer` API (the same path `write_string` /
+    /// `write_list_header` / `write_map_header` / `write_bytes` take internally), then assert the
+    /// encode boundary surfaces it.
+    #[test]
+    fn encode_over_i32max_is_refused_not_truncated() {
+        // A list header one past the cap poisons the packer and writes NO marker byte.
+        let mut p = Packer::new();
+        let over = MAX_COLLECTION_LEN + 1; // i32::MAX + 1 == 2_147_483_648
+        p.write_list_header(over);
         assert!(
-            MAX_U32_LEN > i32::MAX as usize,
-            "the current cap is intentionally wider than the spec's i32::MAX maximum"
+            p.as_bytes().is_empty(),
+            "an over-length header must not be written (no truncated 32-bit marker)"
+        );
+        match p.check_overflow() {
+            Err(BoltError::Encode(msg)) => assert!(
+                msg.contains(&over.to_string()) && msg.contains("i32::MAX"),
+                "the encode error must name the offending length and the cap: {msg}"
+            ),
+            other => {
+                panic!("expected an Encode error for an over-length collection, got {other:?}")
+            }
+        }
+        // The boundary that real encoders use (Response::encode_into → check_overflow) refuses too:
+        // a RECORD carrying a list value whose header is over-length is rejected. We assert via the
+        // poison flag the encode methods consult, which is the contract `Request::encode` /
+        // `Response::encode_into` enforce.
+        assert!(p.check_overflow().is_err(), "poison persists until reset");
+        p.reset();
+        assert!(
+            p.check_overflow().is_ok(),
+            "reset clears the overflow poison for buffer reuse"
+        );
+
+        // A within-cap 32-bit header IS still written (the cap rejects only what exceeds it). We use
+        // a small count but assert the header-writer's branch boundary directly: u16::MAX + 1 uses a
+        // 32-bit header and must succeed.
+        let mut q = Packer::new();
+        q.write_list_header(u16::MAX as usize + 1);
+        assert_eq!(
+            q.as_bytes()[0],
+            LIST_32,
+            "a within-cap large list uses LIST_32"
+        );
+        assert!(
+            q.check_overflow().is_ok(),
+            "a within-cap length is not poisoned"
         );
     }
 
@@ -1484,8 +1610,21 @@ mod tests {
             (-128, &[INT_8, 0x80]),
             (200, &[INT_16, 0x00, 0xC8]),
             (-200, &[INT_16, 0xFF, 0x38]),
+            // 255 still does not fit i8 (max 127): INT_16 (rmp #445 boundary coverage).
+            (255, &[INT_16, 0x00, 0xFF]),
             (32_767, &[INT_16, 0x7F, 0xFF]),
             (32_768, &[INT_32, 0x00, 0x00, 0x80, 0x00]),
+            // Negative step-up boundaries (rmp #445): each value is one past the previous width's
+            // minimum (-128 / -32768 / -2147483648), forcing the next-wider marker.
+            // -129 = 0xFF7F as i16 → INT_16.
+            (-129, &[INT_16, 0xFF, 0x7F]),
+            // -32769 = 0xFFFF7FFF as i32 → INT_32.
+            (-32_769, &[INT_32, 0xFF, 0xFF, 0x7F, 0xFF]),
+            // -2147483649 = 0xFFFFFFFF7FFFFFFF as i64 → INT_64.
+            (
+                -2_147_483_649,
+                &[INT_64, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF],
+            ),
             (
                 2_147_483_648,
                 &[INT_64, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00],

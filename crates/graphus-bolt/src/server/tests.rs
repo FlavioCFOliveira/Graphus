@@ -1239,8 +1239,10 @@ fn route_db_defaults_to_null_for_the_home_database() {
 }
 
 #[test]
-fn telemetry_is_acknowledged_with_success_and_never_fails() {
-    // TELEMETRY in READY → SUCCESS, the connection stays usable for a following RUN.
+fn telemetry_with_valid_api_is_acknowledged_with_success() {
+    // TELEMETRY in READY carrying a VALID api (2 = implicit transaction) → SUCCESS, the connection
+    // stays usable for a following RUN. (An INVALID api is rejected — see
+    // `telemetry_with_invalid_api_is_rejected`.)
     let exec = MockExecutor::new().on_query(
         "RETURN 1",
         CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
@@ -1273,7 +1275,7 @@ fn telemetry_is_acknowledged_with_success_and_never_fails() {
     );
     assert!(
         !r.iter().any(|resp| matches!(resp, Response::Failure(_))),
-        "TELEMETRY must never produce a FAILURE: {r:?}"
+        "TELEMETRY with a valid api must never produce a FAILURE: {r:?}"
     );
     assert!(r.iter().any(|resp| matches!(resp, Response::Record { .. })));
 }
@@ -1310,6 +1312,221 @@ fn telemetry_in_authentication_is_rejected_as_wrong_state() {
         "LOGON after the TELEMETRY FAILURE → IGNORED"
     );
     assert_eq!(r.len(), 3);
+}
+
+// ---- rmp #443: absent-`n` PULL/DISCARD + invalid-`api` TELEMETRY rejection ---------------------
+
+#[test]
+fn pull_without_n_is_rejected() {
+    // rmp #443 / Bolt spec (neo4j.com/docs/bolt/current/bolt/message/): for PULL "n has no default
+    // and must be present." A PULL whose extra map omits `n` — the hand-framed payload B1 3F A0
+    // (TINY_STRUCT-1, PULL opcode 0x3F, empty MAP A0) — must FAILURE `Neo.ClientError.Request.Invalid`
+    // → FAILED and emit NO RECORD, instead of silently streaming the whole result. We inject the raw
+    // payload (the typed `Request::Pull` always encodes `n`, so it cannot express this malformed
+    // case). After RUN opens a stream, the no-`n` PULL is rejected at decode and the following PULL
+    // is IGNORED.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+
+    let mut input = handshake_54();
+    input.extend_from_slice(&encode_request_framed(&hello()).unwrap());
+    input.extend_from_slice(&encode_request_framed(&logon_alice()).unwrap());
+    input.extend_from_slice(
+        &encode_request_framed(&Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        })
+        .unwrap(),
+    );
+    // The hand-framed no-`n` PULL: B1 3F A0.
+    let pull_no_n = [0xB1u8, crate::message::opcode::PULL, 0xA0];
+    input.extend_from_slice(&crate::framing::chunk_message(&pull_no_n));
+    input.extend_from_slice(&encode_request_framed(&Request::Goodbye).unwrap());
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct); // GOODBYE after the FAILURE
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [0]HELLO [1]LOGON [2]RUN SUCCESS{fields} [3]FAILURE (absent n). NO RECORD must appear.
+    match &r[3] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected FAILURE for absent n, got {other:?}"),
+    }
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Record { .. })),
+        "an absent-n PULL must stream NO records: {r:?}"
+    );
+}
+
+#[test]
+fn telemetry_with_invalid_api_is_rejected() {
+    // rmp #443 / Bolt spec: a TELEMETRY whose `api` is not a valid value (valid api ∈ {0,1,2,3}) must
+    // FAILURE `Neo.ClientError.Request.Invalid` → FAILED, after which the next request is IGNORED
+    // until RESET. `api: 99` is in range as an integer (so it decodes) but out of the valid
+    // enumeration (so dispatch rejects it).
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Telemetry { api: 99 },
+        // This RUN must be IGNORED (the connection is FAILED until RESET).
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [0]HELLO [1]LOGON [2]TELEMETRY FAILURE (invalid api) [3]RUN IGNORED.
+    match &r[2] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected FAILURE for invalid TELEMETRY api, got {other:?}"),
+    }
+    assert!(
+        matches!(r[3], Response::Ignored),
+        "the request after an invalid TELEMETRY must be IGNORED (FAILED until RESET): {r:?}"
+    );
+}
+
+// ---- rmp #444: GOODBYE-mid-tx rollback + RESET serial-equivalence ------------------------------
+
+#[test]
+fn goodbye_mid_tx_rolls_back_open_transaction() {
+    // rmp #444 / Bolt spec: GOODBYE "interrupts the server current work if there is any." An open
+    // explicit transaction is current work, so GOODBYE received mid-tx must explicitly roll it back
+    // (symmetry with the EOF arm), not leave it dangling for a future executor that lacks a `Drop`
+    // backstop to leak. We drive HELLO/LOGON/BEGIN/GOODBYE and assert the executor saw the
+    // session-ended rollback hook fire.
+    let exec = MockExecutor::new();
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct); // ended by GOODBYE
+        // The open tx was rolled back via the session-ended hook, not left open.
+        assert!(
+            !session.executor().tx_open,
+            "GOODBYE mid-tx must roll the open transaction back"
+        );
+        let log = &session.executor().log;
+        assert!(
+            log.contains(&"rollback_open_tx".to_owned()),
+            "GOODBYE mid-tx must call the session-ended rollback hook: {log:?}"
+        );
+    }
+}
+
+#[test]
+fn goodbye_with_no_open_tx_does_not_roll_back() {
+    // Regression guard for the GOODBYE rollback (rmp #444): a clean GOODBYE in READY (no open tx)
+    // must NOT spuriously invoke a rollback — the hook is a no-op when nothing is open (idempotent,
+    // mirrors the EOF arm so a normal close stays cheap and side-effect-free).
+    let exec = MockExecutor::new();
+    let input = session_input(&[hello(), logon_alice(), Request::Goodbye]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+        let log = &session.executor().log;
+        assert!(
+            !log.contains(&"rollback_open_tx".to_owned()),
+            "a GOODBYE with no open tx must not roll anything back: {log:?}"
+        );
+    }
+}
+
+#[test]
+fn reset_after_run_pull_clears_state_serial_equivalence() {
+    // rmp #444 (RESET serial-equivalence, documented in specification/06-bolt-and-error-shapes.md):
+    // Graphus processes messages serially (it has no async pipeline to interrupt), so a pipelined
+    // RUN + PULL + RESET is observably equivalent to the spec's queue-jumping RESET for a lockstep
+    // client: by the time RESET is processed the RUN and PULL have already completed, the result is
+    // fully drained, and RESET returns the connection to a clean READY. This test PINS that chosen
+    // semantics: the RUN succeeds, the PULL streams its record, RESET → SUCCESS, and a fresh RUN
+    // afterwards works (the connection is cleanly READY again, no IGNORED, no leaked stream).
+    let exec = MockExecutor::new()
+        .on_query(
+            "RETURN 1",
+            CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+        )
+        .on_query(
+            "RETURN 2",
+            CannedResult::rows(&["y"], vec![vec![Value::Integer(2)]]),
+        );
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Reset,
+        // The connection must be cleanly READY again: this RUN must SUCCEED, not be IGNORED.
+        Request::Run {
+            query: "RETURN 2".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // [0]HELLO [1]LOGON [2]RUN1 SUCCESS{fields} [3]RECORD [4]SUMMARY [5]RESET SUCCESS
+    // [6]RUN2 SUCCESS{fields} [7]RECORD [8]SUMMARY.
+    assert!(
+        matches!(r[5], Response::Success { .. }),
+        "RESET → SUCCESS: {r:?}"
+    );
+    // No request after RESET is IGNORED — the connection is cleanly READY.
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Ignored)),
+        "a serial RUN+PULL+RESET must leave the connection cleanly READY (no IGNORED): {r:?}"
+    );
+    // The post-RESET RUN streamed its own record (proving a usable READY connection).
+    assert!(
+        matches!(r[7], Response::Record { .. }),
+        "the post-RESET RUN must stream normally: {r:?}"
+    );
+    assert_eq!(r.len(), 9, "exact response shape: {r:?}");
 }
 
 #[test]

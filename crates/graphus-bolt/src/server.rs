@@ -94,6 +94,16 @@ impl State {
 /// override it with a build-stamped one via [`SessionConfig`].
 pub const DEFAULT_SERVER_AGENT: &str = concat!("Graphus/", env!("CARGO_PKG_VERSION"));
 
+/// Smallest valid `TELEMETRY` `api` value (`0` = managed transaction). The Bolt 5.4+ message spec
+/// enumerates the `api` field as `0` (managed transaction), `1` (explicit transaction), `2`
+/// (implicit transaction), `3` (driver-level `execute_query()`); any value outside this inclusive
+/// range is an invalid api value the server must answer with `FAILURE` → `FAILED`
+/// (neo4j.com/docs/bolt/current/bolt/message/).
+const VALID_TELEMETRY_API_MIN: i64 = 0;
+/// Largest valid `TELEMETRY` `api` value (`3` = driver-level `execute_query()`); see
+/// [`VALID_TELEMETRY_API_MIN`].
+const VALID_TELEMETRY_API_MAX: i64 = 3;
+
 /// Per-connection metadata the listener supplies to a [`BoltSession`] (rmp #95).
 ///
 /// The protocol core is transport-agnostic, but two pieces of `HELLO`/`ROUTE` metadata are inherently
@@ -425,8 +435,17 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
 
     /// Handles one decoded request per the current state, writing the response(s).
     fn dispatch(&mut self, request: Request) -> BoltResult<Flow> {
-        // GOODBYE is honoured in every state: the client is leaving.
+        // GOODBYE is honoured in every state: the client is leaving. Per the Bolt message spec,
+        // GOODBYE "interrupts the server current work if there is any"
+        // (neo4j.com/docs/bolt/current/bolt/message/) — an open explicit transaction is "current
+        // work", so roll it back here (best-effort, idempotent) for symmetry with the EOF arm
+        // (`run`): a clean session-ended signal must not leak a tx that pins the GC watermark and
+        // blocks concurrent writers. `rollback_open_tx` is a no-op when nothing is open (RESET /
+        // ROLLBACK / COMMIT already cleared it). The executor's `Drop` remains the final backstop for
+        // the panic path; this explicit call also covers a future executor that implements
+        // `rollback_open_tx` without relying on `Drop` (rmp #444).
         if matches!(request, Request::Goodbye) {
+            self.executor.rollback_open_tx();
             self.state = State::Defunct;
             return Ok(Flow::Stop);
         }
@@ -618,7 +637,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 self.handle_route(db.as_deref())?;
                 Ok(Flow::Continue)
             }
-            (State::Ready, Request::Telemetry { .. }) => {
+            (State::Ready, Request::Telemetry { api }) => {
                 // TELEMETRY (Bolt 5.4+) is advisory: it reports which driver API the client used. The
                 // spec state machine accepts it ONLY in READY — `READY + TELEMETRY -> SUCCESS{} ->
                 // READY` (no state change). It is rejected as a wrong-state request in every other
@@ -627,6 +646,20 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 // outside READY; in READY the server must SUCCESS it even if the hint was sent.
                 // (Supersedes the earlier rmp #95 "accept in any state" leniency in favour of the
                 // inviolable 100%-Bolt-compliance mandate.)
+                //
+                // The `api` value is validated against the spec's enumeration — 0 = managed
+                // transaction, 1 = explicit transaction, 2 = implicit transaction, 3 = driver-level
+                // `execute_query()`. The Bolt message spec mandates that "a TELEMETRY message [that]
+                // contains a value that is not a valid api value … responds with a FAILURE message and
+                // enters the FAILED state" (neo4j.com/docs/bolt/current/bolt/message/). An out-of-range
+                // `api` (the codec already rejects a non-integer) is therefore a protocol error →
+                // FAILURE `Neo.ClientError.Request.Invalid` → FAILED, not a silent SUCCESS.
+                if !(VALID_TELEMETRY_API_MIN..=VALID_TELEMETRY_API_MAX).contains(&api) {
+                    self.fail_protocol(&format!(
+                        "TELEMETRY api {api} is invalid (must be 0, 1, 2, or 3)"
+                    ))?;
+                    return Ok(Flow::Continue);
+                }
                 self.send(&Response::Success { metadata: vec![] })?;
                 Ok(Flow::Continue)
             }

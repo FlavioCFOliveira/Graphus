@@ -369,6 +369,19 @@ pub(crate) mod mock {
             Ok(())
         }
 
+        /// Best-effort, infallible, idempotent rollback of an open transaction at session end
+        /// (EOF / GOODBYE). The base trait default is a no-op; the mock overrides it so the
+        /// state-machine tests can *observe* that the session called it — it records a distinct
+        /// `rollback_open_tx` log marker and clears `tx_open` only when a transaction is actually
+        /// open, so a clean session (nothing open) leaves the log untouched and a second call is a
+        /// no-op (mirrors the engine seam, whose `Drop` is the final backstop — rmp #388/#444).
+        fn rollback_open_tx(&mut self) {
+            if self.tx_open {
+                self.log.push("rollback_open_tx".to_owned());
+                self.tx_open = false;
+            }
+        }
+
         fn set_principal(&mut self, principal: Option<&str>) {
             self.log.push(format!("set_principal({principal:?})"));
             self.principal = principal.map(str::to_owned);
