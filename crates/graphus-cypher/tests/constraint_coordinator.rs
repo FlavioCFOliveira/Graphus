@@ -149,6 +149,52 @@ fn uniqueness_create_rejects_duplicate_and_allows_distinct() {
 }
 
 #[test]
+fn uniqueness_and_index_seek_are_cross_type_cypher_equal() {
+    // `rmp` #466 regression gate (end-to-end through the real coordinator + planner + index): Cypher
+    // treats `1 = 1.0`, so a UNIQUE constraint holding an Integer must reject a Cypher-equal Float (and
+    // vice versa) — the duplicate search seeks the index then re-checks with Cypher equality — and an
+    // index-accelerated `WHERE v = <other-type>` must still return the node. Before the fix, the
+    // order-preserving index key's numtag tie-break put `Integer(1)` outside the seek range for
+    // `Float(1.0)`, so the duplicate was admitted and the query missed the row.
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Item {v: 1})");
+    coord
+        .create_constraint("uniq_v", "Item", "v", ConstraintKind::Unique)
+        .expect("create unique constraint over Item.v");
+
+    // UNIQUE: Float 1.0 duplicates the existing Integer 1 → rejected, nothing created.
+    let err = try_write(&mut coord, "CREATE (:Item {v: 1.0})")
+        .expect_err("Float 1.0 duplicates Integer 1 under UNIQUE");
+    assert_constraint_violation(&err);
+
+    // The reverse direction: a Float seed rejects a Cypher-equal Integer.
+    run_write(&mut coord, "CREATE (:Item {v: 2.0})");
+    let err2 = try_write(&mut coord, "CREATE (:Item {v: 2})")
+        .expect_err("Integer 2 duplicates Float 2.0 under UNIQUE");
+    assert_constraint_violation(&err2);
+
+    // A genuinely distinct value is still admitted (the cross-type widening is not over-broad).
+    run_write(&mut coord, "CREATE (:Item {v: 5})");
+
+    // Index seek is cross-type: `WHERE v = 5.0` returns the node stored with Integer 5 (the constraint
+    // index is candidate-only; the Cypher-equality re-check confirms the cross-type match).
+    let plan = compile("MATCH (n:Item) WHERE n.v = 5.0 RETURN count(n) AS c");
+    let txn = coord.begin_serializable();
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let rows = {
+        let mut graph = coord.statement(txn).expect("statement");
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("cursor");
+        cursor.collect_all().expect("collect")
+    };
+    coord.commit(txn).expect("read commits");
+    assert_eq!(
+        rows[0].value("c"),
+        Value::Integer(1),
+        "WHERE v = 5.0 must find the node stored with v = 5"
+    );
+}
+
+#[test]
 fn uniqueness_enforced_on_set() {
     let mut coord = fresh_coord();
     run_write(&mut coord, "CREATE (:Person {email: 'a@x.com'})");

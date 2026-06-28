@@ -180,9 +180,26 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
 
     /// Equality seek: all record ids with `token`'s property equal to `value`, ascending by id.
     ///
+    /// Cypher equality is **cross-type for numbers** (`1 = 1.0`), but the order-preserving index key
+    /// appends a numtag tie-break (`INTEGER` vs `FLOAT`) after the shared magnitude, so an entry stored
+    /// as `Integer(1)` lies outside the byte-exact range for `Float(1.0)`. This seek therefore also
+    /// probes the Cypher-equal cross-type sibling and unions the matches, restoring the documented
+    /// **candidate-superset** contract the caller re-checks with Cypher equality (`rmp` #466).
+    ///
     /// # Errors
     /// See [`Self::insert`].
     pub fn seek_eq(&mut self, token: u32, value: &Value) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        for probe in numeric_equal_probes(value) {
+            out.extend(self.seek_eq_exact(token, &probe)?);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Byte-exact equality seek for a single encoded value (no cross-type widening).
+    fn seek_eq_exact(&mut self, token: u32, value: &Value) -> Result<Vec<u64>> {
         let tail = encode_or_storage_err(value)?;
         let lo = token_value_lo(token, &tail);
         let hi = token_value_hi(token, &tail);
@@ -344,14 +361,38 @@ impl<D: BlockDevice, S: LogSink> CompositeIndex<D, S> {
 
     /// Full-key equality seek (`values.len()` must equal [`Self::arity`]).
     ///
+    /// Each component also matches its Cypher-equal cross-type sibling (`1` vs `1.0`), so a composite
+    /// (NODE KEY) equality is the cross-product of `{value, sibling}` over every component — the
+    /// candidate superset the caller re-checks with Cypher equality (`rmp` #466). Arity is small, so the
+    /// at-most-`2^arity` probes are bounded.
+    ///
     /// # Errors
     /// See [`Self::insert`].
     pub fn seek_eq(&mut self, token: u32, values: &[Value]) -> Result<Vec<u64>> {
         self.check_arity(values.len())?;
-        let tail = composite_tail(values)?;
-        let lo = token_value_lo(token, &tail);
-        let hi = token_value_hi(token, &tail);
-        rids_in_range(&mut self.tree, &lo, &hi)
+        let mut combos: Vec<Vec<Value>> = vec![Vec::with_capacity(values.len())];
+        for v in values {
+            let alts = numeric_equal_probes(v);
+            let mut next = Vec::with_capacity(combos.len() * alts.len());
+            for c in &combos {
+                for a in &alts {
+                    let mut nc = c.clone();
+                    nc.push(a.clone());
+                    next.push(nc);
+                }
+            }
+            combos = next;
+        }
+        let mut out = Vec::new();
+        for combo in &combos {
+            let tail = composite_tail(combo)?;
+            let lo = token_value_lo(token, &tail);
+            let hi = token_value_hi(token, &tail);
+            out.extend(rids_in_range(&mut self.tree, &lo, &hi)?);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// Leading-prefix seek: all record ids whose first `prefix.len()` properties equal `prefix`
@@ -448,6 +489,47 @@ impl<D: BlockDevice, S: LogSink> RelPropertyIndex<D, S> {
     }
 }
 
+/// The cross-type numeric value Cypher-equal to `value` (`1` ↔ `1.0`), or [`None`] when there is no
+/// exactly-equal sibling: a non-numeric value, a non-integral/non-finite float, or a large integer not
+/// representable as `f64`. The equality seeks union this sibling's matches so an indexed equality is the
+/// same cross-type superset Cypher's `=` requires (`rmp` #466). The candidate set is re-checked by the
+/// caller with Cypher equality, and this is *precise*: it confirms the proposed sibling against the
+/// canonical equality encoder ([`keycodec::encode_equality_canonical`], which keeps a large integer
+/// distinct from its rounded `f64`), so no spurious cross-type candidate is produced.
+fn numeric_equal_sibling(value: &Value) -> Option<Value> {
+    let sibling = match value {
+        #[allow(clippy::cast_precision_loss)]
+        Value::Integer(i) => Value::Float(*i as f64),
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Float(f) if f.is_finite() && f.fract() == 0.0 => Value::Integer(*f as i64),
+        _ => return None,
+    };
+    match (
+        keycodec::encode_equality_canonical(value),
+        keycodec::encode_equality_canonical(&sibling),
+    ) {
+        (Ok(a), Ok(b)) if a == b => Some(sibling),
+        _ => None,
+    }
+}
+
+/// The full set of values whose order-preserving index key may differ from `value`'s but which are
+/// Cypher-equal to it — always including `value` itself. An equality seek probes each so the candidate
+/// set covers every byte-key in the Cypher-equal class (`rmp` #466). Two numeric subtleties force more
+/// than one key: Cypher merges `1`/`1.0` (an int↔float of the same magnitude differ only in the numtag
+/// tie-break — see [`numeric_equal_sibling`]) AND `0`/`0.0`/`-0.0` (signed zero encodes to distinct
+/// keys though all three are equal). Non-numeric values yield just themselves (their `encode_single` is
+/// already Cypher-equality-canonical).
+fn numeric_equal_probes(value: &Value) -> Vec<Value> {
+    if matches!(value, Value::Integer(0)) || matches!(value, Value::Float(f) if *f == 0.0) {
+        return vec![Value::Integer(0), Value::Float(0.0), Value::Float(-0.0)];
+    }
+    match numeric_equal_sibling(value) {
+        Some(sibling) => vec![value.clone(), sibling],
+        None => vec![value.clone()],
+    }
+}
+
 /// Decodes the record ids in the half-open B+-tree key range `[lo, hi)` into an ascending `Vec`,
 /// **without** allocating an owned `(key, value)` pair per row. This is the shared streaming body
 /// behind every `seek_eq`/`seek_prefix` (which all decode the 8-byte rid out of each value and
@@ -540,6 +622,81 @@ mod tests {
         let mut r2 = idx.seek_range(1, &Value::Integer(20), None).unwrap();
         r2.sort_unstable();
         assert_eq!(r2, vec![1002, 1003]);
+    }
+
+    #[test]
+    fn seek_eq_finds_cross_type_cypher_equal() {
+        // `rmp` #466 regression gate: Cypher treats `1 = 1.0`, so an equality seek MUST return entries
+        // stored under the OTHER numeric type (the index is a candidate superset the caller re-checks).
+        // Also asserts the fix is PRECISE: a large integer not exactly representable as f64 must NOT
+        // merge with its rounded float.
+        let mut idx = PropertyIndex::new(fresh_tree());
+        let txn = TxnId(1);
+        idx.tree_mut().with_wal(|w| w.begin(txn));
+        idx.insert(txn, 1, &Value::Integer(1), 1000).unwrap();
+        idx.insert(txn, 1, &Value::Float(1.0), 1001).unwrap();
+        idx.insert(txn, 1, &Value::Integer(0), 1002).unwrap();
+        idx.insert(txn, 1, &Value::Float(-0.0), 1003).unwrap();
+        // A large integer NOT exactly representable as f64 (2^60 + 1 rounds to 2^60), and that float.
+        let big = (1i64 << 60) + 1;
+        idx.insert(txn, 1, &Value::Integer(big), 1004).unwrap();
+        #[allow(clippy::cast_precision_loss)]
+        let big_f = big as f64;
+        idx.insert(txn, 1, &Value::Float(big_f), 1005).unwrap();
+        idx.tree_mut().with_wal(|w| w.commit(txn).unwrap());
+
+        let mut a = idx.seek_eq(1, &Value::Float(1.0)).unwrap();
+        a.sort_unstable();
+        assert_eq!(a, vec![1000, 1001], "Float(1.0) must also find Integer(1)");
+        let mut b = idx.seek_eq(1, &Value::Integer(1)).unwrap();
+        b.sort_unstable();
+        assert_eq!(b, vec![1000, 1001], "Integer(1) must also find Float(1.0)");
+        // 0 / 0.0 / -0.0 are all Cypher-equal.
+        let mut z = idx.seek_eq(1, &Value::Float(0.0)).unwrap();
+        z.sort_unstable();
+        assert_eq!(z, vec![1002, 1003], "0 / 0.0 / -0.0 are Cypher-equal");
+        // PRECISION (int side): a large integer not representable as f64 does NOT pull in its rounded
+        // float — `numeric_equal_sibling` declines the cross-type sibling via the canonical check, so
+        // the int-side seek stays exact.
+        assert_eq!(
+            idx.seek_eq(1, &Value::Integer(big)).unwrap(),
+            vec![1004],
+            "a large int must not merge with its rounded f64"
+        );
+        // The float side returns a candidate SUPERSET: the order-preserving integer encoding is lossy
+        // for large integers, so `Integer(big)` shares a key with the canonical sibling `Integer(big_f
+        // as i64)`. Exact filtering is the caller's Cypher-equality re-check (asserted end-to-end at the
+        // cypher layer); the index result must still CONTAIN the true float match.
+        assert!(
+            idx.seek_eq(1, &Value::Float(big_f))
+                .unwrap()
+                .contains(&1005),
+            "the float match must be in the candidate set"
+        );
+    }
+
+    #[test]
+    fn composite_seek_eq_finds_cross_type_cypher_equal() {
+        // `rmp` #466 for NODE KEY: a composite equality matches per-component cross-type Cypher-equal
+        // values (a key tuple stored with `1` is found by a query with `1.0`, in any mix).
+        let mut idx = CompositeIndex::new(fresh_tree(), 2);
+        let txn = TxnId(1);
+        idx.tree_mut().with_wal(|w| w.begin(txn));
+        idx.insert(txn, 1, &[Value::Integer(1), Value::Integer(2)], 2000)
+            .unwrap();
+        idx.tree_mut().with_wal(|w| w.commit(txn).unwrap());
+        assert_eq!(
+            idx.seek_eq(1, &[Value::Float(1.0), Value::Float(2.0)])
+                .unwrap(),
+            vec![2000],
+            "both components queried as floats must find the int-stored tuple"
+        );
+        assert_eq!(
+            idx.seek_eq(1, &[Value::Integer(1), Value::Float(2.0)])
+                .unwrap(),
+            vec![2000],
+            "a mixed int/float query must find the int-stored tuple"
+        );
     }
 
     #[test]
