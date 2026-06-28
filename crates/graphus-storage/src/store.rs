@@ -922,9 +922,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     // ----------------------------- record I/O ------------------------------
 
-    fn alloc_id(&mut self, kind: StoreKind) -> u64 {
+    /// Returns a reusable physical id for `kind`: a freed id from the store's free list when one is
+    /// available, otherwise a fresh high-water id.
+    ///
+    /// # Errors
+    /// Returns a storage error if the store's physical-id space is exhausted (`rmp` #452); see
+    /// [`PhysicalAllocator::alloc_fresh`].
+    fn alloc_id(&mut self, kind: StoreKind) -> Result<u64> {
         let s = self.store_mut(kind);
-        s.free.pop().unwrap_or_else(|| s.alloc.alloc_fresh())
+        match s.free.pop() {
+            Some(id) => Ok(id),
+            None => s.alloc.alloc_fresh(),
+        }
     }
 
     // The read-decode methods below delegate to the single authoritative impl in
@@ -1788,8 +1797,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the write fails.
     pub fn create_node(&mut self, txn: TxnId) -> Result<(u64, ElementId)> {
-        let id = self.alloc_id(StoreKind::Node);
-        let eid = self.element_ids.alloc();
+        let id = self.alloc_id(StoreKind::Node)?;
+        let eid = self.element_ids.alloc()?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); `commit` settles it to the
         // commit timestamp. Until then the version is visible only to its own transaction.
         let rec = NodeRecord::new(eid, VersionStamp::in_flight(txn));
@@ -2054,8 +2063,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 "start node {start} not in use"
             )));
         }
-        let id = self.alloc_id(StoreKind::Rel);
-        let eid = self.element_ids.alloc();
+        let id = self.alloc_id(StoreKind::Rel)?;
+        let eid = self.element_ids.alloc()?;
         self.note_created(txn, StoreKind::Rel, id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); settled at commit.
         let mut rel = RelRecord::new(eid, VersionStamp::in_flight(txn), type_id, start, end);
@@ -2395,7 +2404,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         corpses: &mut std::collections::BTreeSet<u64>,
     ) -> Result<()> {
         let mut cur = self.read_node(node_id)?.first_rel;
-        let guard = 2 * self.store(StoreKind::Rel).alloc.high_water() + 2;
+        // Bound a corrupt cyclic incidence chain. The guard is `2 * high_water + 2` (a chain can thread
+        // each rel from both ends, so up to `2 * high_water` link steps, plus slack); computed with
+        // `saturating_mul`/`saturating_add` so it can never WRAP. An unchecked `2 * high_water + 2`
+        // overflows for `high_water > (u64::MAX - 2) / 2` (≈ 2^63) and wraps to a tiny value — or to
+        // `0` — which would DEFEAT the very cycle protection this guard exists to provide (`rmp` #452).
+        // Saturation pins it at `u64::MAX` in that regime, keeping the bound monotone and sound.
+        let guard = self
+            .store(StoreKind::Rel)
+            .alloc
+            .high_water()
+            .saturating_mul(2)
+            .saturating_add(2);
         let mut steps = 0u64;
         let mut prev_link = NULL_ID; // the link traversed before `cur` (live or corpse)
         let mut last_live = NULL_ID; // the last LIVE link seen (an open run's `pred`)
@@ -2772,7 +2792,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
-        let pid = self.alloc_id(StoreKind::Prop);
+        let pid = self.alloc_id(StoreKind::Prop)?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp. Until then the version is visible only
         // to its own transaction.
@@ -2921,7 +2941,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              MVCC none-sentinel the #398 orphan check rejects)"
         );
         for chunk in chunks {
-            let id = self.alloc_id(StoreKind::Strings);
+            let id = self.alloc_id(StoreKind::Strings)?;
             let block = HeapBlock::new(txn.0, chunk, next);
             self.write_block(id, &block, txn)?;
             next = id;
@@ -3182,7 +3202,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
-        let pid = self.alloc_id(StoreKind::Prop);
+        let pid = self.alloc_id(StoreKind::Prop)?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
@@ -4948,5 +4968,77 @@ mod tests {
                 "scan_in_use_mvcc must only return in-use slots"
             );
         }
+    }
+
+    /// Regression (`rmp` #452): the corrupt-cyclic-chain guard in `collect_corpse_runs`
+    /// (`2 * high_water + 2`) must be computed with saturating arithmetic so that, near the
+    /// `high_water == u64::MAX` ceiling, it saturates to `u64::MAX` rather than WRAPPING to a tiny
+    /// value (or `0`) and thereby DEFEATING the very cycle protection it exists to provide. This
+    /// reproduces the exact expression at the `2 * self.store(StoreKind::Rel).alloc.high_water() + 2`
+    /// guard site and asserts the property at and around the ceiling.
+    #[test]
+    fn corpse_walk_guard_saturates_to_u64_max_near_ceiling() {
+        // The production expression (mirrors the guard site verbatim).
+        let guard = |hw: u64| hw.saturating_mul(2).saturating_add(2);
+        // What the OLD unchecked `2 * hw + 2` would compute (release: wraps silently).
+        let unchecked = |hw: u64| hw.wrapping_mul(2).wrapping_add(2);
+
+        // At the very ceiling: the fixed guard pins at u64::MAX; the unchecked form wraps to 0.
+        assert_eq!(
+            guard(u64::MAX),
+            u64::MAX,
+            "guard at high_water == u64::MAX must saturate to u64::MAX, not wrap"
+        );
+        assert_eq!(
+            unchecked(u64::MAX),
+            0,
+            "the unchecked 2*hw+2 wraps to 0 here — the bug this fixes"
+        );
+
+        // Just past the overflow threshold (hw > (u64::MAX - 2)/2): still saturates, never small.
+        let threshold = (u64::MAX - 2) / 2; // largest hw for which 2*hw+2 does NOT overflow
+        assert_eq!(guard(threshold), u64::MAX - 1); // 2*threshold+2 == u64::MAX-1, no saturation yet
+        assert_eq!(guard(threshold + 1), u64::MAX); // one past: fixed guard saturates...
+        assert!(
+            unchecked(threshold + 1) < 4,
+            "...whereas the unchecked form wraps to a tiny value, defeating the cycle guard"
+        );
+
+        // In the normal (non-overflowing) regime the guard is the plain arithmetic value — the fix is
+        // transparent for every real store.
+        assert_eq!(guard(0), 2);
+        assert_eq!(guard(125), 252);
+        assert_eq!(guard(1_000_000), 2_000_002);
+
+        // And it is strictly positive everywhere, so `steps > guard` can always eventually trip — the
+        // walk can never loop forever on a corrupt cycle.
+        for hw in [0u64, 1, 2, threshold, threshold + 1, u64::MAX] {
+            assert_ne!(
+                guard(hw),
+                NULL_ID,
+                "guard must never be 0 (would disable the bound)"
+            );
+        }
+    }
+
+    /// Regression (`rmp` #452): an `alloc_fresh` at the physical-id ceiling surfaces a clean
+    /// `Err(Storage)` all the way out through `create_node`, rather than wrapping to the reserved NULL
+    /// id. We force the Node allocator to the ceiling on a real store, then attempt a create.
+    #[test]
+    fn create_node_at_physical_id_ceiling_errors_not_wraps() {
+        let mut s = fresh();
+        // Force the Node store's allocator high-water mark to u64::MAX (the corrupt-catalog state the
+        // `Meta::decode` bound rejects on open; here we install it directly to prove the allocator
+        // itself fails closed even if such a state were ever reached in memory).
+        s.store_mut(StoreKind::Node).alloc = PhysicalAllocator::restore(u64::MAX);
+        let txn = TxnId(1);
+        s.begin(txn);
+        let r = s.create_node(txn);
+        assert!(
+            r.is_err(),
+            "create_node must fail closed at the id ceiling, never hand out the wrapped NULL id 0"
+        );
+        // No record id 0 was minted: the allocator high-water is unchanged (no silent advance).
+        assert_eq!(s.store(StoreKind::Node).alloc.high_water(), u64::MAX);
     }
 }

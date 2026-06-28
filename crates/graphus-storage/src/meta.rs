@@ -1404,7 +1404,7 @@ impl Meta {
         let element_id_next = read_u128(bytes, &mut cur)?;
         let commit_ts_hw = read_u64(bytes, &mut cur)?;
         let mut stores: [StoreMeta; STORE_COUNT] = Default::default();
-        for s in &mut stores {
+        for (idx, s) in stores.iter_mut().enumerate() {
             s.high_water = read_u64(bytes, &mut cur)?;
             let fl_len = read_u32(bytes, &mut cur)? as usize;
             let fl_end = take(bytes, &mut cur, fl_len)?;
@@ -1416,6 +1416,53 @@ impl Meta {
             s.device_pages = Vec::with_capacity(n_pages.min(bytes.len()));
             for _ in 0..n_pages {
                 s.device_pages.push(read_u64(bytes, &mut cur)?);
+            }
+            // Fail closed on an out-of-range high-water mark (`rmp` #452). `high_water` is one past the
+            // largest physical id ever allocated; real ids start at `1` (id `0` is the reserved null), so
+            // a never-used store legitimately carries `high_water == 1` with ZERO mapped pages (the next
+            // id it would hand out is `1`). Record `id` lives at store-relative page `id / rpp`, so id `i`
+            // is addressable iff `i < device_pages.len() * rpp` (= `capacity`). The largest id ever
+            // allocated is `high_water - 1`; when at least one real id has been allocated
+            // (`high_water >= 2`) that id must be addressable, i.e. `high_water - 1 < capacity`, i.e.
+            // `high_water <= capacity`. Folding in the `high_water <= 1` empty-store case yields the exact
+            // bound: reject iff `high_water > capacity.max(1)`. (Verified empirically: a recovered catalog
+            // floors every untouched store to `high_water == 1` / `0` pages — see
+            // `recovered_txn_hw_resumes_past_every_durable_id` — and the off-by-one-page corruption
+            // `high_water == capacity + 1` is still caught because a real allocation past a page boundary
+            // maps the new page in the same catalog commit.)
+            //
+            // Without this bound a corrupt-but-CRC-valid catalog page (a mis-replayed WAL frame onto the
+            // metadata page, a storage fault later flushed home, or raw file-write access) could seed the
+            // id allocator at `u64::MAX`; the next `alloc_fresh` does `+= 1`, and because the release
+            // profile leaves `overflow-checks` off, the second allocation WRAPS to `0` and hands out the
+            // reserved NULL id (id `0` aliases every "none" pointer — `first_rel`/`first_prop`/`next_prop`)
+            // as a live record id, violating the inviolable ACID/identity guarantee. (`element_id_next`
+            // has no page-based ceiling — it is a never-reused 128-bit identity, not a slot index — so its
+            // corruption blast radius is bounded downstream by the `checked_add` in
+            // `ElementIdAllocator::alloc`.)
+            let record_size = match idx {
+                0 => crate::record::NODE_RECORD_SIZE,
+                1 => crate::record::REL_RECORD_SIZE,
+                2 => crate::record::PROP_RECORD_SIZE,
+                // The fourth catalog store is the `strings.store` overflow heap (`04 §2.1`).
+                _ => crate::heap::STRINGS_RECORD_SIZE,
+            };
+            // `records_per_page` is a non-zero, page-bounded constant for every real store, so the only
+            // overflow risk is the `n_pages * rpp` product; `saturating_mul` keeps the ceiling sound (a
+            // saturated `u64::MAX` can only ever *accept*, and a forged page count is already rejected by
+            // the bounded read loop above, so this never masks a forged `high_water`).
+            let rpp = crate::paging::records_per_page(record_size) as u64;
+            let capacity = (s.device_pages.len() as u64).saturating_mul(rpp);
+            if s.high_water > capacity.max(1) {
+                return Err(GraphusError::Storage(format!(
+                    "metadata high_water {} for store {} exceeds addressable capacity {} \
+                     ({} pages x {} records/page)",
+                    s.high_water,
+                    idx,
+                    capacity,
+                    s.device_pages.len(),
+                    rpp
+                )));
             }
         }
         let tok_len = read_u32(bytes, &mut cur)? as usize;
@@ -1528,6 +1575,94 @@ mod tests {
         bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // forged n_pages = u32::MAX
         // No device-page bytes follow.
         assert!(Meta::decode(&bytes).is_err());
+    }
+
+    /// Regression (`rmp` #452): a corrupt-but-otherwise-well-formed catalog whose Node `high_water`
+    /// is forged to `u64::MAX` must be REJECTED by `Meta::decode`, not restored. Without the bound the
+    /// allocator is seeded at `u64::MAX`; the second `alloc_fresh` wraps (release: `overflow-checks`
+    /// off) to `0` and hands out the reserved NULL id as a live record id — an ACID/identity
+    /// violation. We build a valid populated image, splice `u64::MAX` over the first store's (Node's)
+    /// `high_water` field at its exact byte offset, and assert the decode fails closed.
+    #[test]
+    fn decode_rejects_node_high_water_forged_to_u64_max() {
+        // A well-formed catalog whose real Node high_water (9) is in range for its 3 mapped pages
+        // (3 * 125 records/page = 375 >= 9), so the only thing that makes the forged image illegal is
+        // the spliced `high_water`.
+        let mut m = Meta::new(1);
+        m.stores[0].high_water = 9;
+        m.stores[0].device_pages = vec![1, 4, 9];
+        let mut bytes = m.encode().unwrap();
+        // Encode layout (see `Meta::encode`): element_id_next(16) | commit_ts_hw(8) | then store 0
+        // begins with its `high_water` (u64). So Node's high_water occupies bytes [24, 32).
+        const NODE_HIGH_WATER_OFFSET: usize = 16 + 8;
+        bytes[NODE_HIGH_WATER_OFFSET..NODE_HIGH_WATER_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        // Sanity: the splice landed on the field we think it did — the unforged image decodes, and the
+        // forged one differs only in that field.
+        let err = Meta::decode(&bytes);
+        assert!(
+            err.is_err(),
+            "Meta::decode must reject a Node high_water of u64::MAX (3 pages cap 375), not restore it \
+             and let the id allocator wrap to the reserved NULL id"
+        );
+        match err {
+            Err(GraphusError::Storage(msg)) => assert!(
+                msg.contains("high_water") && msg.contains("capacity"),
+                "error must name the out-of-range high_water bound, got: {msg}"
+            ),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    /// Regression (`rmp` #452): the high-water bound's exact boundaries. `high_water` is one-past the
+    /// largest id ever allocated and real ids start at `1`, so:
+    ///   * `high_water == 1` with ZERO pages is the legitimate empty/untouched-store state (the next id
+    ///     it would hand out is `1`) and MUST be accepted — a recovered catalog floors every untouched
+    ///     store to exactly this (see `store::recovered_txn_hw_resumes_past_every_durable_id`);
+    ///   * any `high_water >= 2` with ZERO pages is unaddressable (the claimed live id has no slot) and
+    ///     MUST be rejected;
+    ///   * `high_water == capacity` is the full-store boundary (largest live id `capacity - 1` is on the
+    ///     last mapped page) and MUST be accepted;
+    ///   * `high_water == capacity + 1` is the off-by-one-page corruption (the largest claimed id needs
+    ///     a page that is not mapped) and MUST be rejected.
+    /// One Rel page (store 1) maps `8168 / 102 = 80` records.
+    #[test]
+    fn decode_high_water_bound_boundaries() {
+        // Empty store: high_water == 1, no pages → accepted (the fresh/recovered empty state).
+        let mut empty = Meta::new(1);
+        empty.stores[1].high_water = 1;
+        empty.stores[1].device_pages = Vec::new();
+        assert!(
+            Meta::decode(&empty.encode().unwrap()).is_ok(),
+            "high_water == 1 with no pages is the legitimate empty store and must be accepted"
+        );
+
+        // A claimed live id (high_water == 2) with no page to hold it → rejected.
+        let mut unbacked = Meta::new(1);
+        unbacked.stores[1].high_water = 2;
+        unbacked.stores[1].device_pages = Vec::new();
+        assert!(
+            Meta::decode(&unbacked.encode().unwrap()).is_err(),
+            "high_water >= 2 with no mapped pages (capacity 0) must be rejected"
+        );
+
+        // Full-store boundary: high_water == capacity (80) for one Rel page → accepted.
+        let mut full = Meta::new(1);
+        full.stores[1].high_water = 80;
+        full.stores[1].device_pages = vec![1];
+        assert!(
+            Meta::decode(&full.encode().unwrap()).is_ok(),
+            "high_water == capacity (80 for one Rel page) must be accepted"
+        );
+
+        // One past capacity (the off-by-one-page corruption) → rejected.
+        let mut over = Meta::new(1);
+        over.stores[1].high_water = 81;
+        over.stores[1].device_pages = vec![1];
+        assert!(
+            Meta::decode(&over.encode().unwrap()).is_err(),
+            "high_water one past capacity (81 for one Rel page) must be rejected"
+        );
     }
 
     #[test]

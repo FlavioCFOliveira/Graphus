@@ -14,7 +14,7 @@
 //! Physical id `0` is reserved as the null pointer (`04 §2.2`), so both the first real physical
 //! id and the first `ElementId` are `1`.
 
-use graphus_core::ElementId;
+use graphus_core::{ElementId, GraphusError, Result};
 
 /// The reserved null physical id: `first_rel`/`first_prop`/`next_prop` etc. use it for "none"
 /// (`04 §2.2`). Real records start at id `1`.
@@ -60,10 +60,21 @@ impl PhysicalAllocator {
     }
 
     /// Allocates the next fresh physical id by bumping the high-water mark.
-    pub fn alloc_fresh(&mut self) -> u64 {
+    ///
+    /// # Errors
+    /// Returns a storage error if the physical-id space is exhausted (`next == u64::MAX`). This is a
+    /// fail-closed bound (`rmp` #452): the release profile leaves `overflow-checks` off, so an
+    /// unchecked `self.next += 1` at the ceiling would WRAP to `0` and hand out the reserved NULL id
+    /// (id `0` is the "none" pointer for `first_rel`/`first_prop`/`next_prop`) as a live record id —
+    /// an ACID/identity violation. `checked_add` turns that overflow into a clean error instead.
+    pub fn alloc_fresh(&mut self) -> Result<u64> {
         let id = self.next;
-        self.next += 1;
-        id
+        self.next = self.next.checked_add(1).ok_or_else(|| {
+            GraphusError::Storage(
+                "physical-id space exhausted: high-water mark at u64::MAX".to_owned(),
+            )
+        })?;
+        Ok(id)
     }
 
     /// Records that `id` has been observed (e.g. when rebuilding from a scan), keeping the
@@ -200,10 +211,18 @@ impl ElementIdAllocator {
     }
 
     /// Allocates the next [`ElementId`], advancing the counter. Never reused (`04 §2.2`).
-    pub fn alloc(&mut self) -> ElementId {
+    ///
+    /// # Errors
+    /// Returns a storage error if the 128-bit identity space is exhausted (`next == u128::MAX`). As
+    /// with [`PhysicalAllocator::alloc_fresh`], the release profile leaves `overflow-checks` off, so
+    /// an unchecked `self.next += 1` at the ceiling would WRAP to `0` and hand out the reserved
+    /// "absent" `ElementId(0)` as a live identity (`rmp` #452); `checked_add` fails closed instead.
+    pub fn alloc(&mut self) -> Result<ElementId> {
         let id = ElementId(self.next);
-        self.next += 1;
-        id
+        self.next = self.next.checked_add(1).ok_or_else(|| {
+            GraphusError::Storage("element-id space exhausted: next id at u128::MAX".to_owned())
+        })?;
+        Ok(id)
     }
 
     /// Records that `id` has already been issued, so future allocations never collide with it
@@ -222,8 +241,8 @@ mod tests {
     #[test]
     fn physical_ids_start_at_one_and_are_monotonic() {
         let mut a = PhysicalAllocator::new();
-        assert_eq!(a.alloc_fresh(), 1);
-        assert_eq!(a.alloc_fresh(), 2);
+        assert_eq!(a.alloc_fresh().unwrap(), 1);
+        assert_eq!(a.alloc_fresh().unwrap(), 2);
         assert_eq!(a.high_water(), 3);
     }
 
@@ -231,7 +250,28 @@ mod tests {
     fn observe_keeps_high_water_ahead() {
         let mut a = PhysicalAllocator::new();
         a.observe(10);
-        assert_eq!(a.alloc_fresh(), 11);
+        assert_eq!(a.alloc_fresh().unwrap(), 11);
+    }
+
+    /// Regression (`rmp` #452): a `PhysicalAllocator` restored at the `u64::MAX` ceiling (e.g. from a
+    /// corrupt-but-CRC-valid catalog) must FAIL the next `alloc_fresh` rather than wrap to `0` and
+    /// hand out the reserved NULL id. Because `[profile.release]` leaves `overflow-checks` off, an
+    /// unchecked `+= 1` here would silently return `0` in a release build; `checked_add` errors.
+    #[test]
+    fn alloc_fresh_at_u64_max_ceiling_errors_instead_of_wrapping_to_null() {
+        let mut a = PhysicalAllocator::restore(u64::MAX);
+        // The id at the ceiling is itself `u64::MAX` — but advancing past it overflows, so the call
+        // must report the exhausted space and must NOT have produced (or be about to produce) `0`.
+        let err = a.alloc_fresh();
+        assert!(
+            err.is_err(),
+            "alloc_fresh at u64::MAX must fail closed, not wrap to the reserved NULL id"
+        );
+        // The high-water mark is unchanged by the failed allocation (no silent advance to `0`).
+        assert_eq!(a.high_water(), u64::MAX);
+        // And it keeps failing — it never resurrects as id `0`.
+        assert!(a.alloc_fresh().is_err());
+        assert_ne!(a.high_water(), NULL_ID);
     }
 
     #[test]
@@ -263,18 +303,34 @@ mod tests {
     #[test]
     fn element_ids_are_seedable_and_never_repeat() {
         let mut a = ElementIdAllocator::new(100);
-        assert_eq!(a.alloc(), ElementId(100));
-        assert_eq!(a.alloc(), ElementId(101));
+        assert_eq!(a.alloc().unwrap(), ElementId(100));
+        assert_eq!(a.alloc().unwrap(), ElementId(101));
         // Same seed -> same stream (reproducible).
         let mut b = ElementIdAllocator::new(100);
-        assert_eq!(b.alloc(), ElementId(100));
+        assert_eq!(b.alloc().unwrap(), ElementId(100));
     }
 
     #[test]
     fn element_id_observe_prevents_collision() {
         let mut a = ElementIdAllocator::new(1);
         a.observe(ElementId(50));
-        assert_eq!(a.alloc(), ElementId(51));
+        assert_eq!(a.alloc().unwrap(), ElementId(51));
+    }
+
+    /// Regression (`rmp` #452): an `ElementIdAllocator` seeded at the `u128::MAX` ceiling must FAIL
+    /// the next `alloc` rather than wrap to `0` and hand out the reserved "absent" `ElementId(0)`.
+    /// Same release-profile wrap hazard as the physical allocator above.
+    #[test]
+    fn element_id_alloc_at_u128_max_ceiling_errors_instead_of_wrapping_to_absent() {
+        let mut a = ElementIdAllocator::new(u128::MAX);
+        let err = a.alloc();
+        assert!(
+            err.is_err(),
+            "ElementId alloc at u128::MAX must fail closed, not wrap to the reserved absent id 0"
+        );
+        assert_eq!(a.peek(), u128::MAX);
+        assert!(a.alloc().is_err());
+        assert_ne!(a.peek(), 0);
     }
 
     #[test]
