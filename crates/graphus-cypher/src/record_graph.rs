@@ -1157,6 +1157,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // of the column (drop any prior value's bit), then if the node currently carries the covered
         // label AND holds an indexable value of the key, set its bit under that value. A node that
         // lost the label or the property ends up in no bitmap, so a seek never returns a phantom.
+        //
+        // Record the node as bitmap-dirty for this txn FIRST (`rmp` #453, F-IDX-3), before mutating the
+        // bitmap, so that even a panic struck mid-reindex (between the remove and the reinsert) leaves
+        // the node marked for the abort path to re-derive from the reverted store. A no-op unless a
+        // bitmap index is declared.
+        index.note_bitmap_dirty(self.txn, node.0);
         for (label_token, prop_key) in index.registered_bitmap() {
             index.remove_bitmap_node(label_token, prop_key, node.0);
             if label_tokens.contains(&label_token) {
@@ -1253,6 +1259,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 .collect()
         };
         let mut index = index.borrow_mut();
+        // Record the node as bitmap-dirty for this txn before mutating (`rmp` #453, F-IDX-3 — same
+        // rationale as `reindex_node`: an abort/panic must be able to re-derive it from the store).
+        index.note_bitmap_dirty(self.txn, node.0);
         for (label_token, prop_key) in index.registered_bitmap() {
             index.remove_bitmap_node(label_token, prop_key, node.0);
             if label_tokens.contains(&label_token) {
@@ -3145,6 +3154,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         self.note_predicate_write_preimage(node);
         if let Err(e) = self.store.borrow_mut().delete_node(self.txn, node.0) {
             self.capture(e);
+            return;
+        }
+        // De-index the bitmap (`rmp` #453, F-IDX-4): a committed `DELETE n` must clear n's bit from
+        // every covered value-bitmap, or the bitmap would keep a phantom membership the seek's re-check
+        // could only mask (today by id-recycle self-heal — a superset that violates membership-exactness
+        // once the seek is wired into the planner). Record the node as bitmap-dirty FIRST so an abort
+        // re-derives (re-adds) it from the reverted store, then remove it from every bitmap. A store
+        // read here would be wrong: the node is only tombstoned, so its labels/values are still present
+        // and would re-add it — hence the unconditional remove, not a `reindex_node_bitmaps`.
+        if let Some(index) = &self.index {
+            let mut index = index.borrow_mut();
+            index.note_bitmap_dirty(self.txn, node.0);
+            index.remove_node_from_all_bitmaps(node.0);
         }
     }
 

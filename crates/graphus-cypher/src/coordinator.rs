@@ -827,6 +827,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
+        // Skip a slot that is not in use (`rmp` #453, F-IDX-3): the rebuild/declare callers only pass
+        // ids from the in-use scan, but the abort re-derive (`rederive_node_bitmap`) may pass a node
+        // whose CREATE was just rolled back — a header-only create-undo (#220) clears the slot's in-use
+        // bit but PRESERVES its body, so `node_labels`/`node_property_values` below would still decode
+        // residual labels/values and wrongly RE-INSERT a phantom. Guarding on `in_use` keeps a
+        // reverted-create node out of every bitmap (correct: it no longer exists), and is a defensive
+        // no-op for the rebuild/declare callers (their nodes are always in use).
+        match store.borrow().node(id) {
+            Ok(node) if node.mvcc.in_use() => {}
+            _ => return, // not in use, or a read fault: contribute nothing (the bitmap stays cleared).
+        }
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
             Err(_) => return,
@@ -1022,8 +1033,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// value and the B+-tree (which also serves ranges) is the right structure — the declaration is the
     /// operator's assertion that the column is low-cardinality.
     ///
+    /// # Cardinality guard (`rmp` task #453, F-IDX-5)
+    ///
+    /// The build is bounded by an **exact runtime distinct-value cap**
+    /// ([`graphus_index::bitmap::MAX_DISTINCT_VALUES`]): as the store is scanned, the moment the column's
+    /// live distinct-value count exceeds the cap the half-built bitmap is **torn down** (the column is
+    /// unregistered) and the declaration is **refused** with a clear error, instead of letting one
+    /// `RoaringTreemap`-per-value structure grow unbounded on a near-unique column (the OOM footgun the
+    /// header doc warns about). The check is against the true built cardinality, so it needs no
+    /// pre-existing cost histogram and cannot be fooled by an estimate.
+    ///
     /// # Errors
-    /// Returns a storage error if interning either token (or its committing transaction) fails.
+    /// - A storage error if interning either token (or its committing transaction) fails.
+    /// - [`GraphusError::Runtime`] if the column's distinct-value count exceeds
+    ///   [`graphus_index::bitmap::MAX_DISTINCT_VALUES`] — the column is too high-cardinality for a
+    ///   bitmap index (use the B+-tree node-property index instead).
     pub fn declare_bitmap_index(&mut self, label: &str, property: &str) -> Result<()> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
@@ -1059,8 +1083,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Ok(ids) => ids,
             Err(_) => return Ok(()), // empty graph / scan fault: an empty bitmap, rebuilt later.
         };
+        // Build the bitmap, enforcing the distinct-value cap as we go (`rmp` #453, F-IDX-5). Checking
+        // after each node short-circuits a near-unique column before its bitmap blows up, bounding the
+        // transient memory too. On breach: unregister the (now-torn-down) column and refuse.
         for id in node_ids {
             Self::index_one_node_bitmap(&self.store, &self.index, id, &registered);
+            if self
+                .index
+                .borrow()
+                .bitmap_distinct(label_token, prop_key)
+                .is_some_and(|d| d > graphus_index::bitmap::MAX_DISTINCT_VALUES)
+            {
+                self.index
+                    .borrow_mut()
+                    .unregister_bitmap(label_token, prop_key);
+                return Err(GraphusError::Runtime(format!(
+                    "cannot create a bitmap index on `{label}.{property}`: the column has more than {} \
+                     distinct values (too high-cardinality for a bitmap index — use a node-property \
+                     index instead)",
+                    graphus_index::bitmap::MAX_DISTINCT_VALUES
+                )));
+            }
         }
         Ok(())
     }
@@ -2562,6 +2605,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         //    resolution until GC), release write locks, and close the transaction.
         self.ssi.borrow_mut().record_commit(txn, commit_ts);
         self.locks.borrow_mut().release_all(txn);
+        // Drop this txn's bitmap abort-repair tracking (`rmp` #453, F-IDX-3): on commit the eagerly
+        // maintained bitmap already reflects the now-committed writes, so there is nothing to re-derive
+        // — only the bookkeeping is freed (a no-op unless a bitmap index was touched).
+        self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);
         self.active.remove(&txn);
         Ok(commit_ts)
     }
@@ -2761,6 +2808,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// conflicts with the store borrow even when that borrow is being torn down by an unwind. Each step
     /// is idempotent (`forget` / `release_all` / `HashMap::remove` are no-ops for an absent txn), so a
     /// double abort cannot double-free.
+    ///
+    /// # Bitmap index repair (`rmp` #453, F-IDX-3)
+    ///
+    /// The eagerly-maintained in-memory bitmap index (`rmp` #328) reflects this transaction's
+    /// uncommitted writes (a `SET n.active = false` moved `n`'s bit), so the store undo above leaves it
+    /// out of sync — and because the bitmap is a *membership-exact candidate source*, a missing entry
+    /// cannot be resurrected by the query-time re-check. So this txn's bitmap-dirtied node set is
+    /// **drained up front** (freeing the bookkeeping unconditionally, exactly like the leak-safety of
+    /// the SSI/lock state) and, *only if the durable undo succeeded*, each dirtied node is re-derived
+    /// from the now-reverted store. If the undo failed/panicked the store is not cleanly reverted, so
+    /// re-derivation is skipped: the bitmap may be momentarily stale, but it is in-memory, has no
+    /// planner consumer yet, and is fully resynced by the next open-time rebuild — never a durability or
+    /// committed-data concern.
     fn abort(&mut self, txn: TxnId) -> Result<()> {
         /// Drop guard that frees the pure in-memory transaction state. Runs on normal return **and** on
         /// unwind, so a panicking store undo can never leak the SSI markers, locks, or `active` entry.
@@ -2780,6 +2840,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Drain this txn's bitmap-dirtied node set BEFORE the undo (`rmp` #453, F-IDX-3): this frees the
+        // per-txn bookkeeping unconditionally — like the SSI/lock leak-safety — so even a panicking undo
+        // cannot leak it. The set is complete (statement maintenance has finished by abort time) and the
+        // undo never grows it, so draining now loses nothing. Re-derivation runs AFTER a successful undo.
+        let dirty_bitmap_nodes = self.index.borrow_mut().take_dirty_bitmap_nodes(txn);
+
         let cleanup = Cleanup {
             ssi: &self.ssi, // `&Rc<RefCell<_>>` coerces to `&RefCell<_>` via deref.
             locks: &self.locks,
@@ -2791,7 +2857,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // the guard free to run its cleanup on scope exit / unwind without a borrow conflict.
         let undo = self.store.borrow_mut().rollback(txn);
         drop(cleanup); // Free the in-memory state now; on `Err`/panic above this same drop runs anyway.
+
+        // Re-derive each bitmap-dirtied node from the now-reverted store, but ONLY if the undo
+        // succeeded (a failed/panicked undo leaves the store half-reverted, so a re-derive could read
+        // inconsistent state — skip it; the bitmap resyncs on the next rebuild). A node's pre-image
+        // value is back in the store, so this restores the bitmap to its committed membership. No-op
+        // unless a bitmap index is declared (`dirty_bitmap_nodes` is then empty).
+        if undo.is_ok() {
+            for node in dirty_bitmap_nodes {
+                self.rederive_node_bitmap(node);
+            }
+        }
         undo
+    }
+
+    /// Re-derives node `id`'s bitmap membership from the **current** store state across every registered
+    /// bitmap column (`rmp` #453, F-IDX-3): removes the node from every value-bitmap, then re-inserts it
+    /// under its current store value for each covered column it still carries (via
+    /// [`index_one_node_bitmap`](Self::index_one_node_bitmap), which only inserts). Used by abort to
+    /// undo a rolled-back change's effect on the in-memory bitmap. Store and index are borrowed in
+    /// separate, non-overlapping scopes (the file's borrow discipline). A no-op if no bitmap is declared.
+    fn rederive_node_bitmap(&self, id: u64) {
+        let registered = self.index.borrow().registered_bitmap();
+        if registered.is_empty() {
+            return;
+        }
+        // Clear the node from every value-bitmap first (drop the rolled-back value's bit), then
+        // re-insert under the reverted store value for each column it still matches.
+        self.index.borrow_mut().remove_node_from_all_bitmaps(id);
+        Self::index_one_node_bitmap(&self.store, &self.index, id, &registered);
     }
 }
 

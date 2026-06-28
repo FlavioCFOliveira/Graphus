@@ -116,6 +116,22 @@ pub enum EvalError {
         /// The dotted function name.
         name: String,
     },
+    /// The right operand of the `=~` regular-expression operator (`rmp` task #446) was not a valid
+    /// regular expression, so it could not be compiled. The pattern is only known at runtime (it is an
+    /// ordinary expression, e.g. a parameter or a property), so an unparseable / unsupported pattern is
+    /// a **runtime** failure, not a compile-time one. This covers a malformed pattern (e.g. an
+    /// unbalanced `(`) and a pattern using a `java.util.regex` feature absent from the linear-time RE2
+    /// engine (backreferences `\1`, lookaround `(?=…)`) — see [`regex_full_match`]. It is a classified,
+    /// non-panicking error that maps (via `From<EvalError>`) to
+    /// [`GraphusError::Runtime`](graphus_core::GraphusError::Runtime), and thus the Bolt `ArgumentError`
+    /// class — the same class Neo4j raises for an invalid regular expression.
+    InvalidRegex {
+        /// The offending pattern (truncated for the message so a multi-megabyte pattern cannot bloat
+        /// the error), kept as an owned `String` so the error type stays `Eq`.
+        pattern: String,
+        /// The regex engine's parse-error description.
+        reason: String,
+    },
 }
 
 impl fmt::Display for EvalError {
@@ -145,6 +161,9 @@ impl fmt::Display for EvalError {
             }
             Self::ArgumentCount { name } => {
                 write!(f, "function `{name}` was called with too few arguments")
+            }
+            Self::InvalidRegex { pattern, reason } => {
+                write!(f, "invalid regular expression `{pattern}`: {reason}")
             }
         }
     }
@@ -407,10 +426,11 @@ fn eval_binary(
             Ok(ternary_value(compare(op, &a, &b)))
         }
         BinaryOp::RegexMatch => {
-            // Regex is a documented deferral (no regex engine dependency in v1).
-            Err(EvalError::UnsupportedFunction {
-                name: "=~ (regex match)".to_owned(),
-            })
+            // `string =~ pattern` (`rmp` task #446). Evaluate both operands to values, then apply the
+            // Cypher 3VL regex-match rules in `regex_match` (null → null; non-string → TypeError;
+            // whole-string `java.util.regex`-style match otherwise).
+            let (a, b) = eval_pair(lhs, rhs, row, params, graph, functions, clock)?;
+            regex_match(&a, &b)
         }
 
         // ---- arithmetic ----------------------------------------------------------------------
@@ -552,6 +572,97 @@ fn compare(op: BinaryOp, a: &Value, b: &Value) -> Ternary {
             Ternary::from_bool(truth)
         }
     }
+}
+
+/// Evaluates the `=~` regular-expression match `subject =~ pattern` under Cypher 3VL semantics
+/// (`rmp` task #446, `04 §7.6`), reproducing Neo4j's `java.util.regex` behaviour.
+///
+/// # Semantics
+///
+/// - **Null / non-string propagation.** If *either* operand is `NULL`, **or** a non-null operand is
+///   not a `STRING`, the result is `NULL`. This is the Cypher string-operator rule (Neo4j: "attempting
+///   to use [string operators] on values which are not `STRING` values will return `null`"), and it is
+///   exactly how `STARTS WITH` / `ENDS WITH` / `CONTAINS` behave here — pinned for that family by the
+///   TCK `precedence/Precedence4 [4]` scenario, where `'abc' STARTS WITH true` must be `null` (so an
+///   enclosing operator stays `null` rather than raising a runtime `TypeError`). `=~` is a member of the
+///   same family, so it follows the same rule: `123 =~ '.*'` and `'x' =~ 7` are `NULL`, not errors.
+/// - **Whole-string match.** The pattern must match the **entire** subject, not a substring: Neo4j
+///   compiles `=~` to `java.util.regex.Pattern.matcher(value).matches()`, which is fully anchored.
+///   [`regex_full_match`] reproduces this by anchoring with `\A(?:…)\z`. So `'abc' =~ 'a.*'` is `true`
+///   (`a.*` describes the whole string) but `'abc' =~ 'b.*'` is `false` (a substring match would have
+///   been `true`).
+///
+/// # Errors
+///
+/// Returns [`EvalError::InvalidRegex`] for a (string) pattern the engine cannot compile — a malformed
+/// pattern, or one using a `java.util.regex` feature absent from the linear-time engine (see
+/// [`regex_full_match`]). It never panics on user input. A non-string *operand* is **not** an error
+/// (it yields `NULL`, per the rule above); only a malformed *pattern string* is.
+fn regex_match(subject: &Value, pattern: &Value) -> EvalResult {
+    // A null or non-string subject yields NULL (the Cypher string-operator rule — see the fn docs).
+    let Value::String(subject) = subject else {
+        return Ok(RowValue::NULL);
+    };
+    // A null or non-string pattern likewise yields NULL: `'x' =~ null` and `'x' =~ 7` are both NULL.
+    // The pattern is only validated as a *regex* once we know it is a string.
+    let Value::String(pattern) = pattern else {
+        return Ok(RowValue::NULL);
+    };
+    let re = regex_full_match(pattern)?;
+    Ok(ternary_value(Ternary::from_bool(re.is_match(subject))))
+}
+
+/// Compiles `pattern` into a [`Regex`](regex::Regex) that matches **only** when the entire haystack
+/// matches — Java's `Matcher.matches()` semantics, which Neo4j's `=~` inherits (`rmp` task #446).
+///
+/// The user pattern is wrapped as `\A(?:<pattern>)\z`:
+/// - `\A` / `\z` anchor to the absolute start / end of the haystack (unlike `^` / `$`, they ignore
+///   multiline mode, so a `(?m)` flag inside the user pattern cannot accidentally un-anchor the
+///   whole-string match — matching Java, where `matches()` is whole-input regardless of `MULTILINE`).
+/// - The non-capturing group `(?:…)` preserves the user pattern's operator precedence, so a top-level
+///   alternation like `a|b` still means `\A(?:a|b)\z` (either whole-string `a` or whole-string `b`),
+///   not `(\Aa)|(b\z)`. An inline flag the user puts at the start (`(?i)foo`) sits inside the group and
+///   so scopes to the whole user pattern, exactly as the leading flag does in Java.
+///
+/// # Deliberate divergence from `java.util.regex` (documented per `rmp` #446)
+///
+/// The `regex` crate is a finite-automaton (RE2-style) engine with a **linear-time** matching
+/// guarantee, so no pattern/input pair can trigger catastrophic backtracking (ReDoS, CWE-1333) — the
+/// property the task mandates for an operator that takes untrusted patterns. The price is that the two
+/// `java.util.regex` features that *require* backtracking are unsupported: **backreferences** (`\1`)
+/// and **lookaround** (`(?=…)`, `(?<=…)`). A pattern using them fails to compile and surfaces as a
+/// classified [`EvalError::InvalidRegex`] rather than executing — never a silent wrong answer and
+/// never a panic. The common pattern syntax (literals, classes `[…]`, Perl classes `\d`/`\w`/`\s`,
+/// quantifiers, anchors, alternation, groups, and the `(?i)`/`(?s)`/`(?m)`/`(?x)` inline flags) is
+/// shared with Java and behaves identically.
+///
+/// # Errors
+///
+/// Returns [`EvalError::InvalidRegex`] if the wrapped pattern does not compile.
+fn regex_full_match(pattern: &str) -> Result<regex::Regex, EvalError> {
+    // `\A(?:…)\z` ⇒ whole-haystack anchored, precedence-preserving (see the fn docs).
+    let anchored = format!(r"\A(?:{pattern})\z");
+    regex::Regex::new(&anchored).map_err(|e| EvalError::InvalidRegex {
+        // Truncate the echoed pattern so a multi-megabyte pattern cannot bloat the error string; the
+        // engine's own message already pinpoints the offending span.
+        pattern: truncate_for_error(pattern),
+        reason: e.to_string(),
+    })
+}
+
+/// Truncates `s` to a bounded, char-boundary-safe prefix for embedding in an error message, appending
+/// an ellipsis when it was shortened (so an attacker-sized pattern cannot bloat the error string).
+fn truncate_for_error(s: &str) -> String {
+    /// The longest pattern prefix echoed in an `InvalidRegex` message.
+    const MAX: usize = 120;
+    if s.len() <= MAX {
+        return s.to_owned();
+    }
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Whether a value is a Cypher number (`INTEGER` or `FLOAT`, including `NaN`).
@@ -3348,6 +3459,107 @@ mod tests {
             evaluate("'abc' STARTS WITH null OR true"),
             Value::Boolean(true)
         );
+    }
+
+    #[test]
+    fn regex_match_operator_basic_gate() {
+        // The `rmp` #446 acceptance gate (the four mandated cases):
+        // `'abc' =~ 'a.*'` → true (the whole string matches `a.*`).
+        assert_eq!(evaluate("'abc' =~ 'a.*'"), Value::Boolean(true));
+        // `'abc' =~ 'b.*'` → false: `=~` is a WHOLE-STRING (Java `matches()`) match, so a pattern that
+        // would only match a *substring* (`b.*` matches `bc` inside `abc`) does NOT match the whole.
+        assert_eq!(evaluate("'abc' =~ 'b.*'"), Value::Boolean(false));
+        // `null =~ '.*'` → null (3VL null propagation on the subject).
+        assert_eq!(evaluate("null =~ '.*'"), Value::Null);
+    }
+
+    #[test]
+    fn regex_match_invalid_pattern_is_classified_error_not_panic() {
+        // The fourth gate case: an invalid pattern is a classified `InvalidRegex` runtime error — NOT
+        // a panic, and NOT a silent wrong answer. `'('` is an unbalanced group.
+        let g = MemGraph::new();
+        let row = Row::empty();
+        let err = eval_in(&g, &row, "'abc' =~ '('").expect_err("an unbalanced group must error");
+        assert!(
+            matches!(err, EvalError::InvalidRegex { .. }),
+            "expected InvalidRegex, got {err:?}"
+        );
+        // And it maps to the runtime error class at the boundary (Bolt `ArgumentError`), never a panic.
+        let mapped: graphus_core::GraphusError = err.into();
+        assert!(matches!(mapped, graphus_core::GraphusError::Runtime(_)));
+    }
+
+    #[test]
+    fn regex_match_whole_string_anchoring() {
+        // Whole-string semantics (Java `Matcher.matches()`): the pattern must describe the ENTIRE
+        // subject. A bare literal that equals a prefix/suffix/substring does not match the whole.
+        assert_eq!(evaluate("'abc' =~ 'abc'"), Value::Boolean(true));
+        assert_eq!(evaluate("'abc' =~ 'ab'"), Value::Boolean(false)); // prefix only
+        assert_eq!(evaluate("'abc' =~ 'bc'"), Value::Boolean(false)); // suffix only
+        assert_eq!(evaluate("'abc' =~ 'b'"), Value::Boolean(false)); // substring only
+        // `.*` on both ends spans the whole string (this is why Neo4j's own examples use `.*`).
+        assert_eq!(evaluate("'a-b-c' =~ '.*-.*'"), Value::Boolean(true));
+        // The empty pattern matches only the empty string (whole-string anchoring).
+        assert_eq!(evaluate("'' =~ ''"), Value::Boolean(true));
+        assert_eq!(evaluate("'x' =~ ''"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn regex_match_top_level_alternation_is_anchored_per_branch() {
+        // The `(?:…)` wrapper preserves alternation precedence: `a|b` means whole-string `a` OR
+        // whole-string `b`, NOT `(\Aa)|(b\z)`. So `'ab'` matches neither branch.
+        assert_eq!(evaluate("'a' =~ 'a|b'"), Value::Boolean(true));
+        assert_eq!(evaluate("'b' =~ 'a|b'"), Value::Boolean(true));
+        assert_eq!(evaluate("'ab' =~ 'a|b'"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn regex_match_inline_case_insensitive_flag() {
+        // The `(?i)` leading flag (a `java.util.regex` feature shared with RE2) makes the whole
+        // pattern case-insensitive — Neo4j's documented `=~ '(?i)…'` idiom.
+        assert_eq!(evaluate("'HELLO' =~ '(?i)hello'"), Value::Boolean(true));
+        assert_eq!(evaluate("'Hello' =~ '(?i)h.*o'"), Value::Boolean(true));
+        // Without the flag, case matters.
+        assert_eq!(evaluate("'HELLO' =~ 'hello'"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn regex_match_non_string_operands_yield_null() {
+        // `=~` is a member of the string-operator family: a non-null, non-`STRING` operand on either
+        // side yields `null`, consistent with `STARTS WITH`/`CONTAINS`/`ENDS WITH` and Neo4j's rule.
+        assert_eq!(evaluate("123 =~ '.*'"), Value::Null); // non-string subject
+        assert_eq!(evaluate("true =~ '.*'"), Value::Null);
+        assert_eq!(evaluate("'abc' =~ 7"), Value::Null); // non-string pattern
+        assert_eq!(evaluate("'abc' =~ null"), Value::Null); // null pattern
+        assert_eq!(evaluate("[1] =~ '.*'"), Value::Null);
+        // The precedence interaction (mirrors the STARTS-WITH test): a `null` result OR true is true.
+        assert_eq!(evaluate("(123 =~ '.*') OR true"), Value::Boolean(true));
+    }
+
+    #[test]
+    fn regex_full_match_helper_anchors_and_rejects_backtracking_features() {
+        // Anchoring: the helper-built regex matches only the whole haystack.
+        let re = regex_full_match("a.*").expect("valid pattern compiles");
+        assert!(re.is_match("abc"));
+        assert!(!re.is_match("xabc")); // would match unanchored, must not here
+
+        // The deliberate `java.util.regex` divergence (documented per `rmp` #446): backreferences and
+        // lookaround force super-linear matching and are absent from the linear-time RE2 engine, so a
+        // pattern using them is a classified `InvalidRegex`, never a panic and never a wrong answer.
+        // Backreference `\1` (written with a real backslash here, not a Cypher escape):
+        assert!(matches!(
+            regex_full_match(r"(a)\1"),
+            Err(EvalError::InvalidRegex { .. })
+        ));
+        // Lookahead `(?=…)`:
+        assert!(matches!(
+            regex_full_match("a(?=b)"),
+            Err(EvalError::InvalidRegex { .. })
+        ));
+        // A valid, shared-syntax pattern still compiles (Perl class `\d`, quantifiers, classes).
+        let digits = regex_full_match(r"\d+").expect("\\d+ is shared with Java and compiles");
+        assert!(digits.is_match("2026"));
+        assert!(!digits.is_match("20a6"));
     }
 
     #[test]

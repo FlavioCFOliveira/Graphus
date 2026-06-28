@@ -35,6 +35,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use unicode_normalization::UnicodeNormalization;
+
 /// The maximum length, in **bytes**, of a single analyzed term (`rmp` task #72).
 ///
 /// Matches Lucene's `StandardAnalyzer` default `maxTokenLength` (255, rounded to a clean 256). It
@@ -58,25 +60,30 @@ pub const MAX_TERM_LEN: usize = 256;
 /// a stored catalog entry decodes its analyzer from this byte, so the mapping must never change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Analyzer {
-    /// The **standard** analyzer (the default). Tokenization, normalization and stop-word removal
-    /// are documented on [`Analyzer::analyze`]:
+    /// The **standard** analyzer (the default). Unicode normalization, tokenization, lowercasing and
+    /// stop-word removal are documented on [`Analyzer::analyze`]:
     ///
-    /// 1. **Tokenize** on Unicode non-alphanumeric boundaries: a maximal run of
+    /// 1. **Normalize** the input to Unicode NFC (composed form) so canonically-equivalent encodings
+    ///    of the same text — e.g. a composed "é" (U+00E9) versus a decomposed "e" + U+0301 — fold to
+    ///    one code-point sequence before tokenization. Applied symmetrically at index and query time
+    ///    (`rmp` #454), so a document and a query in different forms still match.
+    /// 2. **Tokenize** on Unicode non-alphanumeric boundaries: a maximal run of
     ///    [`char::is_alphanumeric`] characters is one token; every other character (space,
     ///    punctuation, symbol) is a separator and is discarded. This is Unicode-aware — e.g.
     ///    `"l'été-2024"` tokenizes to `["l", "été", "2024"]` and CJK text splits per the
     ///    alphanumeric property.
-    /// 2. **Lowercase** each token with [`str::to_lowercase`] (full Unicode case folding, so
+    /// 3. **Lowercase** each token with [`str::to_lowercase`] (full Unicode case folding, so
     ///    `"Æon"` → `"æon"`, German `"ß"` is preserved as the spec defines, etc.).
-    /// 3. **Remove stop-words**: tokens equal (after lowercasing) to one of the documented English
+    /// 4. **Remove stop-words**: tokens equal (after lowercasing) to one of the documented English
     ///    stop-words ([`STANDARD_STOP_WORDS`]) are dropped. The set is intentionally small and
     ///    conservative (the most common closed-class English words), so it never silently swallows a
     ///    meaningful term.
     #[default]
     Standard,
-    /// The **keyword** (no-op) analyzer: the entire input is **one** term, lowercased, with no
-    /// tokenization and no stop-word removal. Useful for exact-but-case-insensitive matching of a
-    /// whole field (e.g. an identifier or tag). An empty / whitespace-only input yields no terms.
+    /// The **keyword** (no-op) analyzer: the entire input is **one** term — NFC-normalized (`rmp`
+    /// #454, so composed/decomposed forms of the same field still match), trimmed and lowercased,
+    /// with no tokenization and no stop-word removal. Useful for exact-but-case-insensitive matching
+    /// of a whole field (e.g. an identifier or tag). An empty / whitespace-only input yields no terms.
     Keyword,
 }
 
@@ -127,6 +134,19 @@ impl Analyzer {
     /// analyzer are documented on the [`Analyzer`] variants; this is the **single** entry point used
     /// at both index time and query time so the two can never diverge.
     ///
+    /// # Unicode normalization (`rmp` task #454)
+    ///
+    /// The input is first folded to **Unicode Normalization Form C (NFC)** — composed form — before
+    /// any tokenization. The same grapheme can be encoded as different code-point sequences: a
+    /// **composed** "é" (U+00E9) versus a **decomposed** "e" + U+0301 (a combining acute). These are
+    /// canonically equivalent but byte-different, and the decomposed form's combining mark is not
+    /// [`char::is_alphanumeric`], so without normalization "café" in NFD would tokenize as `["cafe"]`
+    /// while "café" in NFC tokenizes as `["café"]` — a document indexed in one form would silently
+    /// never match a query in the other (a common macOS-NFD vs web-NFC mismatch). Because the identical
+    /// normalization runs here — the single index-and-query entry point — both forms collapse to one
+    /// canonical sequence and therefore tokenize identically, on **both** sides. NFC (compose) is
+    /// chosen over NFD (decompose) so the stored term is the compact, web-conventional form.
+    ///
     /// # Examples
     ///
     /// ```
@@ -138,16 +158,30 @@ impl Analyzer {
     ///
     /// // Keyword: the whole input is one lowercased term.
     /// assert_eq!(Analyzer::Keyword.analyze("Hello World"), vec!["hello world"]);
+    ///
+    /// // Unicode normalization: a decomposed "café" ("e" + combining acute) and a composed "café"
+    /// // (U+00E9) analyze to the SAME term, so they cross-match (`rmp` #454).
+    /// let composed = Analyzer::Standard.analyze("caf\u{00e9}"); // café (NFC)
+    /// let decomposed = Analyzer::Standard.analyze("cafe\u{0301}"); // café (NFD)
+    /// assert_eq!(composed, decomposed);
+    /// assert_eq!(composed, vec!["caf\u{00e9}"]);
     /// ```
     #[must_use]
     pub fn analyze(self, text: &str) -> Vec<String> {
+        // Fold to NFC up front so the per-analyzer pipelines below see one canonical code-point
+        // sequence regardless of the caller's input form. This is the single index-and-query chokepoint
+        // (`rmp` #454), so applying it here keeps index and query byte-for-byte symmetric. `nfc()` is a
+        // lazy `char` iterator; we collect once into the owned `String` the pipelines tokenize. An
+        // already-NFC input (the common case) re-emits the same code points, so this is a cheap pass.
+        let normalized: String = text.nfc().collect();
         match self {
-            Self::Standard => Self::analyze_standard(text),
-            Self::Keyword => Self::analyze_keyword(text),
+            Self::Standard => Self::analyze_standard(&normalized),
+            Self::Keyword => Self::analyze_keyword(&normalized),
         }
     }
 
-    /// The standard analysis pipeline (tokenize → lowercase → drop stop-words). See [`Analyzer::Standard`].
+    /// The standard analysis pipeline (tokenize → lowercase → drop stop-words) over already-NFC text.
+    /// See [`Analyzer::Standard`] and the NFC note on [`Analyzer::analyze`].
     fn analyze_standard(text: &str) -> Vec<String> {
         let mut terms = Vec::new();
         let mut current = String::new();
@@ -614,6 +648,53 @@ mod tests {
         let indexed = a.analyze("Graph Databases Are GREAT");
         let queried = a.analyze("databases");
         assert!(queried.iter().all(|q| indexed.contains(q)));
+    }
+
+    #[test]
+    fn unicode_normalization_folds_composed_and_decomposed_forms() {
+        // `rmp` #454 regression gate: a document indexed in one Unicode normalization form and a query
+        // in the other MUST cross-match. "café" has two canonically-equivalent encodings:
+        //   - composed (NFC):   'c' 'a' 'f' U+00E9                (one pre-composed é)
+        //   - decomposed (NFD):  'c' 'a' 'f' 'e' U+0301           ('e' + combining acute)
+        // The combining mark U+0301 is NOT alphanumeric, so WITHOUT normalization the NFD form would
+        // tokenize as ["cafe"] and never match the NFC ["café"]. With the leading NFC fold in
+        // `analyze`, both forms collapse to the same term on both the index and the query side.
+        let nfc = "caf\u{00e9}"; // café, composed
+        let nfd = "cafe\u{0301}"; // café, decomposed
+        // Sanity: the two are genuinely byte-different inputs (the bug's precondition).
+        assert_ne!(nfc.as_bytes(), nfd.as_bytes());
+
+        // Analyzer level: both forms yield the SAME single canonical term.
+        let from_nfc = Analyzer::Standard.analyze(nfc);
+        let from_nfd = Analyzer::Standard.analyze(nfd);
+        assert_eq!(from_nfc, from_nfd, "NFC and NFD must analyze identically");
+        assert_eq!(from_nfc, vec!["caf\u{00e9}"], "the term folds to NFC");
+
+        // Full inverted-index level, BOTH directions (the explicit gate):
+        // (1) index NFD, query NFC -> match.
+        let mut idx = InvertedIndex::new();
+        idx.index_document(1, &Analyzer::Standard.analyze(nfd));
+        assert_eq!(
+            idx.query(&Analyzer::Standard.analyze(nfc), MatchSemantics::Or),
+            vec![1],
+            "a document indexed as NFD must be found by an NFC query"
+        );
+
+        // (2) index NFC, query NFD -> match (the reverse).
+        let mut idx2 = InvertedIndex::new();
+        idx2.index_document(2, &Analyzer::Standard.analyze(nfc));
+        assert_eq!(
+            idx2.query(&Analyzer::Standard.analyze(nfd), MatchSemantics::Or),
+            vec![2],
+            "a document indexed as NFC must be found by an NFD query"
+        );
+
+        // The Keyword analyzer must fold too (its whole-field term is also NFC-normalized).
+        assert_eq!(
+            Analyzer::Keyword.analyze(nfc),
+            Analyzer::Keyword.analyze(nfd),
+            "Keyword analyzer must also fold composed/decomposed forms"
+        );
     }
 
     #[test]

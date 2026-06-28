@@ -13,9 +13,17 @@
 //! than a seek-plus-scan. That is the entire point of this index, and the reason it is **gated
 //! strictly to low cardinality**: on a high-cardinality column (near-unique values) each bitmap holds
 //! one or a few ids, the per-value overhead dominates, and the B+-tree — which also serves *range*
-//! predicates the bitmap cannot — is the right structure. The planner / caller selects this index
-//! only when the persisted histogram reports few distinct values (see
-//! [`crate::histogram::PropertyHistogram::distinct`]).
+//! predicates the bitmap cannot — is the right structure.
+//!
+//! # Cardinality gate (`rmp` task #453, F-IDX-5)
+//!
+//! Declaration is gated by an **exact runtime distinct-value cap** ([`MAX_DISTINCT_VALUES`]). The
+//! caller (`TxnCoordinator::declare_bitmap_index`) populates the index by scanning the store and, if
+//! the live distinct-value count exceeds the cap, **refuses** the declaration (it tears the half-built
+//! bitmap down and returns a clear error) rather than letting one `RoaringTreemap`-per-value structure
+//! grow unbounded on a near-unique column — an out-of-memory footgun. The cap is checked against the
+//! true built cardinality ([`BitmapIndex::distinct`]), not an estimate, so it is exact regardless of
+//! whether a cost histogram exists for the column.
 //!
 //! # Lifecycle: derived, never persisted (the candidate contract)
 //!
@@ -42,6 +50,20 @@ use graphus_core::Value;
 use roaring::RoaringTreemap;
 
 use crate::keycodec;
+
+/// The maximum number of **distinct values** a bitmap index may hold (`rmp` task #453, F-IDX-5).
+///
+/// A bitmap index is for *low-cardinality* columns — booleans, enums, status flags: a handful of
+/// distinct values over many rows. Each distinct value costs one [`RoaringTreemap`] (a B-tree of
+/// containers), so an unbounded distinct count on a near-unique column would let the index grow to one
+/// (or more) container per row — an out-of-memory footgun, and the regime where the B+-tree property
+/// index (which also serves ranges) is the right structure. `1024` is a deliberately generous ceiling:
+/// it comfortably admits every genuine low-cardinality column (a country code, an HTTP status, an enum
+/// of a few hundred members) while still bounding a near-unique column's blow-up to a small, fixed
+/// number of bitmaps. The declaration path enforces it against the **true built** cardinality, so it
+/// is exact (not an estimate). A column above the cap is refused, not silently capped, so the operator
+/// learns the column is unsuited to a bitmap index.
+pub const MAX_DISTINCT_VALUES: usize = 1024;
 
 /// A low-cardinality Roaring-bitmap index over one node-property column: a map from each distinct
 /// **encoded value** to the [`RoaringTreemap`] of node ids that currently carry it.

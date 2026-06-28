@@ -27,6 +27,7 @@
 //! seek deliberately exploits this when a bound cannot be expressed exactly against the backing
 //! index (see [`IndexSet::seek_node_property_range`]).
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 
 use graphus_bufpool::BufferPool;
@@ -128,6 +129,19 @@ pub struct IndexSet {
     /// **candidate source** (not a read-only accelerator), it is kept membership-exact under writes by
     /// the wholesale per-node re-index in [`RecordStoreGraph::reindex_node`](crate::record_graph).
     bitmap: HashMap<(u32, u32), BitmapIndex>,
+    /// **Per-transaction set of node ids whose bitmap entry this transaction touched** (`rmp` task
+    /// #453, F-IDX-3). The bitmap is maintained *eagerly* during statement execution (remove-then-
+    /// reinsert on a property/label change), but a transaction **abort** rolls back only the durable
+    /// store — not this in-memory index. Because the bitmap is a *membership-exact candidate source*, a
+    /// node left under the rolled-back value (and missing under the committed one) cannot be resurrected
+    /// by the query-time re-check (which can only *drop* a stale candidate, never *add* a missing one):
+    /// a committed row would be silently lost once the seek is wired into the planner. So every write
+    /// path that maintains a node's bitmap records `(txn, node_id)` here; on abort the coordinator
+    /// re-derives exactly these nodes from the reverted store, and on commit it drops the txn's set.
+    /// Empty for any transaction that touched no bitmap-indexed column (the overwhelmingly common case,
+    /// since a bitmap index is opt-in), so this costs nothing unless a bitmap index is declared and a
+    /// covered node is written.
+    dirty_bitmap_nodes: HashMap<TxnId, BTreeSet<u64>>,
 }
 
 /// A declared constraint's in-memory rule (`rmp` tasks #99, #100): the covered label token, the
@@ -199,6 +213,7 @@ impl IndexSet {
             constraints: HashMap::new(),
             composite: HashMap::new(),
             bitmap: HashMap::new(),
+            dirty_bitmap_nodes: HashMap::new(),
         }
     }
 
@@ -444,6 +459,9 @@ impl IndexSet {
         for bm in self.bitmap.values_mut() {
             *bm = BitmapIndex::new();
         }
+        // A full rebuild re-derives every bitmap from the committed store, so any pending per-txn
+        // abort-repair tracking (`rmp` #453) is moot — drop it so a stale txn id can never leak.
+        self.dirty_bitmap_nodes.clear();
     }
 
     /// Records that node `node_id` carries label `label_token` (a candidate for label scans).
@@ -1002,19 +1020,73 @@ impl IndexSet {
         }
     }
 
+    /// Removes `node_id` from **every** value-bitmap of **every** registered bitmap column, with no
+    /// re-insert (`rmp` task #453, F-IDX-4). This is the delete path's de-index: a committed `DELETE n`
+    /// removes the node, so its bit must be cleared from all covered columns. Unlike the per-write
+    /// re-index ([`RecordStoreGraph::reindex_node`](crate::record_graph)) there is no re-insert — the
+    /// node is gone — and unlike re-deriving from the store this needs no read, because a deleted node's
+    /// record is only tombstoned (its labels/values are still physically present until GC reclaim), so a
+    /// store read would wrongly re-add it. A no-op if no bitmap index is declared.
+    pub fn remove_node_from_all_bitmaps(&mut self, node_id: u64) {
+        for bm in self.bitmap.values_mut() {
+            bm.remove_node_everywhere(node_id);
+        }
+    }
+
+    /// Records that transaction `txn` touched node `node_id`'s bitmap entry (`rmp` task #453, F-IDX-3),
+    /// so an abort can re-derive exactly that node from the reverted store. A no-op unless at least one
+    /// bitmap index is registered (a transaction that cannot have touched a bitmap records nothing, so
+    /// the map stays empty in the common case). Idempotent per `(txn, node_id)`.
+    pub fn note_bitmap_dirty(&mut self, txn: TxnId, node_id: u64) {
+        if self.bitmap.is_empty() {
+            return; // no bitmap index ⇒ nothing to repair on abort ⇒ record nothing.
+        }
+        self.dirty_bitmap_nodes
+            .entry(txn)
+            .or_default()
+            .insert(node_id);
+    }
+
+    /// Removes and returns the set of node ids whose bitmap `txn` touched (`rmp` task #453), draining
+    /// the entry so a later commit/abort of the same id cannot double-process it. Empty (and allocates
+    /// nothing) when `txn` touched no bitmap-indexed node. Used by the coordinator's **abort** to know
+    /// which nodes to re-derive from the reverted store.
+    #[must_use]
+    pub fn take_dirty_bitmap_nodes(&mut self, txn: TxnId) -> BTreeSet<u64> {
+        self.dirty_bitmap_nodes.remove(&txn).unwrap_or_default()
+    }
+
+    /// Drops `txn`'s dirty-bitmap-node set without acting on it (`rmp` task #453) — the **commit** path,
+    /// where the eagerly-maintained bitmap already reflects the now-committed writes, so no repair is
+    /// needed. A no-op if `txn` touched no bitmap-indexed node.
+    pub fn forget_dirty_bitmap_nodes(&mut self, txn: TxnId) {
+        self.dirty_bitmap_nodes.remove(&txn);
+    }
+
     /// Candidate node ids whose `(label_token, prop_key)` value equals `value`, ascending. `None` if
     /// no bitmap index is registered for the column; otherwise the membership-exact set (the caller
     /// still re-checks MVCC visibility + the exact predicate, per the candidate contract).
     ///
-    /// **`rmp` #410 — abort/panic-undo prerequisite before wiring this into the planner.** The bitmap is
-    /// a *membership-exact* index maintained by remove-then-reinsert on a property change
-    /// ([`remove_bitmap_node`](Self::remove_bitmap_node) + [`insert_bitmap_value`](Self::insert_bitmap_value)),
-    /// and a transaction abort (`coordinator::abort`) rolls back only the durable store, **not** this
-    /// in-memory index. So a panic/unwind struck *between* the remove and the reinsert would leave a
-    /// committed node's entry missing — and unlike the planner's insert-only candidate index, the
-    /// query-time re-check cannot resurrect a *missing* candidate. This is harmless **today only because
-    /// this seek has no planner consumer** (test-only). Wiring it into the planner first requires either
-    /// abort-undo of the in-memory bitmap on rollback or a dedicated panic-window regression test.
+    /// # Abort/delete repair (`rmp` #453, F-IDX-3/F-IDX-4 — resolved)
+    ///
+    /// The bitmap is a *membership-exact* candidate source maintained by remove-then-reinsert on a
+    /// property/label change ([`remove_bitmap_node`](Self::remove_bitmap_node) +
+    /// [`insert_bitmap_value`](Self::insert_bitmap_value)), so an omitted node would make a seek miss a
+    /// committed row (a subset — never correct), and unlike the planner's insert-only candidate index
+    /// the query-time re-check cannot resurrect a *missing* candidate. Two write paths used to break
+    /// this and are now repaired:
+    /// - **Abort.** A transaction abort rolls back the durable store but not this in-memory index, so a
+    ///   rolled-back (or panic-interrupted mid-reindex) change used to leave the bitmap out of sync.
+    ///   Every write that maintains a node's bitmap now records `(txn, node)` via
+    ///   [`note_bitmap_dirty`](Self::note_bitmap_dirty) **before** mutating it, and `coordinator::abort`
+    ///   re-derives exactly those nodes from the reverted store — so even a panic struck *between* the
+    ///   remove and the reinsert is repaired (the node was recorded before the remove).
+    /// - **Delete.** A committed `DELETE n` now clears the node from every covered bitmap via
+    ///   [`remove_node_from_all_bitmaps`](Self::remove_node_from_all_bitmaps).
+    ///
+    /// With both in place this seek is membership-exact across aborts and deletes and is safe to wire
+    /// into the planner. (The seek itself is still test/diagnostic-only — there is no `plan_physical`
+    /// consumer yet — but it no longer *blocks* one.)
     #[must_use]
     pub fn seek_bitmap_eq(
         &self,
@@ -1033,10 +1105,10 @@ impl IndexSet {
     /// bitmaps entirely inside Roaring and returns the common ids. An empty `predicates` yields `None`
     /// (no conjunction to accelerate).
     ///
-    /// **`rmp` #410 — same abort/panic-undo prerequisite as [`seek_bitmap_eq`](Self::seek_bitmap_eq)
-    /// before wiring this into the planner** (membership-exact, not abort-undone; a mid-reinsert unwind
-    /// could drop a committed node's entry that the query-time re-check cannot resurrect). Safe today
-    /// only because it has no planner consumer.
+    /// Membership-exactness across aborts and deletes is maintained the same way as
+    /// [`seek_bitmap_eq`](Self::seek_bitmap_eq) (`rmp` #453, F-IDX-3/F-IDX-4): the abort repair and the
+    /// delete de-index keep every value-bitmap in sync with the committed store, so the intersection
+    /// here is over membership-exact inputs.
     #[must_use]
     pub fn seek_bitmap_conjunction(
         &self,
@@ -1063,6 +1135,17 @@ impl IndexSet {
         self.bitmap
             .get(&(label_token, prop_key))
             .map(BitmapIndex::serialized_bytes)
+    }
+
+    /// The number of **distinct values** currently held by the `(label_token, prop_key)` bitmap index,
+    /// or `None` if none is registered (`rmp` #453, F-IDX-5). Used by the declaration's cardinality
+    /// guard to refuse a column whose true built cardinality exceeds
+    /// [`graphus_index::bitmap::MAX_DISTINCT_VALUES`].
+    #[must_use]
+    pub fn bitmap_distinct(&self, label_token: u32, prop_key: u32) -> Option<usize> {
+        self.bitmap
+            .get(&(label_token, prop_key))
+            .map(BitmapIndex::distinct)
     }
 
     /// All candidate ids for `token` in `idx`, regardless of value. Used as the correct

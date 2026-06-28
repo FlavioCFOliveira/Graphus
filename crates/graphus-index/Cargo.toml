@@ -14,6 +14,18 @@ graphus-io = { path = "../graphus-io" }
 graphus-bufpool = { path = "../graphus-bufpool" }
 graphus-wal = { path = "../graphus-wal" }
 roaring = { version = "0.11.3", default-features = false, features = ["std"] }
+# Unicode canonical normalization (NFC) for the full-text analyzer (`rmp` task #454, src/fulltext.rs).
+# The same grapheme can be stored in different code-point sequences — a composed form ("café", U+00E9)
+# versus a decomposed form ("café", "e" + U+0301) — common because macOS filesystem/text APIs emit NFD
+# while the web emits NFC. Without normalization the analyzer tokenizes the two forms differently (the
+# combining mark in NFD acts as a non-alphanumeric boundary), so a document indexed in one form never
+# matches a query in the other: a silent missing hit. NFC, applied symmetrically inside `Analyzer::analyze`
+# (the single index-and-query entry point), folds both forms to one canonical sequence so they tokenize
+# identically. NFC is defined by the Unicode canonical-decomposition + canonical-ordering + composition
+# tables, which cannot be hand-rolled correctly; `unicode-normalization` is the de-facto-standard,
+# `#![forbid(unsafe_code)]` implementation (the unicode-rs project) and its only dependency is `tinyvec`
+# (also unsafe-free). Pinned to "0.1" (semver-compatible with the current 0.1.x line).
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 graphus-sim = { path = "../graphus-sim" }

@@ -74,6 +74,15 @@ fn run_write(coord: &mut Coord, src: &str) {
     coord.commit(txn).expect("write commits");
 }
 
+/// Runs `src` as a write transaction and then **rolls it back** instead of committing — the abort
+/// path that must leave the in-memory bitmap synced with the reverted store (`rmp` #453, F-IDX-3).
+fn run_write_then_rollback(coord: &mut Coord, src: &str) {
+    let plan = compile(src);
+    let txn = coord.begin_serializable();
+    let _rows = run_plan(coord, txn, &plan);
+    coord.rollback(txn).expect("write rolls back");
+}
+
 /// The **row-path** truth: the sorted set of physical node ids the engine matches for `query`
 /// (which must `RETURN id(n) AS id`), run in its own committed read transaction.
 fn row_path_ids(coord: &mut Coord, query: &str) -> BTreeSet<u64> {
@@ -337,6 +346,243 @@ fn conjunction_declines_when_a_column_is_not_bitmap_indexed() {
         got.is_none(),
         "conjunction must decline when a column lacks a bitmap index"
     );
+}
+
+// =================================================================================================
+// Abort repair (`rmp` #453, F-IDX-3) — a rolled-back change must not desync the bitmap
+// =================================================================================================
+
+/// The F-IDX-3 gate: a write+rollback of an indexed-property change must leave the bitmap exactly as
+/// it was before the aborted statement — i.e. the bitmap seek must still equal the (unchanged,
+/// committed) row path. Without the abort repair the bitmap would keep the rolled-back value's
+/// membership (the node under `false`, missing under `true`), and the seek's re-check could not
+/// resurrect the missing member.
+#[test]
+fn aborted_set_does_not_desync_bitmap() {
+    let mut coord = fresh_coord();
+    for i in 0..40 {
+        run_write(
+            &mut coord,
+            &format!("CREATE (:User {{id: {i}, active: true}})"),
+        );
+    }
+    coord
+        .declare_bitmap_index("User", "active")
+        .expect("declare");
+
+    // Roll back a flip of half the nodes to inactive. The store reverts; the bitmap must too.
+    run_write_then_rollback(
+        &mut coord,
+        "MATCH (n:User) WHERE n.id < 20 SET n.active = false",
+    );
+
+    for v in [true, false] {
+        let bitmap = coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(v))
+            .expect("declared");
+        let row = row_path_ids(
+            &mut coord,
+            &format!("MATCH (n:User) WHERE n.active = {v} RETURN id(n) AS id"),
+        );
+        assert_eq!(
+            as_set(bitmap),
+            row,
+            "after the aborted SET, bitmap(active={v}) must equal the rolled-back row path"
+        );
+    }
+    // Concretely: every User is still active=true (nothing committed), so `false` is empty.
+    assert!(
+        coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(false))
+            .expect("declared")
+            .is_empty(),
+        "no node should be under active=false after the abort"
+    );
+}
+
+/// A rolled-back **CREATE** of a new covered node must not leave a phantom in the bitmap (the
+/// reverted-create node is no longer in use, so `index_one_node_bitmap`'s in-use guard keeps it out).
+#[test]
+fn aborted_create_leaves_no_phantom_in_bitmap() {
+    let mut coord = fresh_coord();
+    for i in 0..10 {
+        run_write(
+            &mut coord,
+            &format!("CREATE (:User {{id: {i}, active: true}})"),
+        );
+    }
+    coord
+        .declare_bitmap_index("User", "active")
+        .expect("declare");
+
+    let before = as_set(
+        coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(true))
+            .expect("declared"),
+    );
+    // Create a new active User, then roll it back.
+    run_write_then_rollback(&mut coord, "CREATE (:User {id: 999, active: true})");
+
+    let after = as_set(
+        coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(true))
+            .expect("declared"),
+    );
+    assert_eq!(
+        before, after,
+        "an aborted CREATE must leave the bitmap exactly as before (no phantom id)"
+    );
+    // And the bitmap still equals the committed row path.
+    let row = row_path_ids(
+        &mut coord,
+        "MATCH (n:User) WHERE n.active = true RETURN id(n) AS id",
+    );
+    assert_eq!(after, row, "bitmap must equal the row path after the abort");
+}
+
+/// A rolled-back **DELETE** of a covered node must restore its bitmap membership (the abort re-derives
+/// the un-deleted node from the reverted store).
+#[test]
+fn aborted_delete_restores_bitmap_membership() {
+    let mut coord = fresh_coord();
+    for i in 0..20 {
+        run_write(
+            &mut coord,
+            &format!("CREATE (:User {{id: {i}, active: true}})"),
+        );
+    }
+    coord
+        .declare_bitmap_index("User", "active")
+        .expect("declare");
+
+    let before = as_set(
+        coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(true))
+            .expect("declared"),
+    );
+    run_write_then_rollback(&mut coord, "MATCH (n:User) WHERE n.id < 5 DELETE n");
+
+    let after = as_set(
+        coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(true))
+            .expect("declared"),
+    );
+    assert_eq!(
+        before, after,
+        "an aborted DELETE must restore the deleted nodes' bitmap membership"
+    );
+}
+
+// =================================================================================================
+// Delete de-index (`rmp` #453, F-IDX-4) — a committed DELETE clears the bit
+// =================================================================================================
+
+/// The F-IDX-4 gate: after a committed `DELETE n`, the bitmap seek must equal the row path (the
+/// deleted node leaves every value-bitmap — no phantom membership the row path no longer matches).
+#[test]
+fn committed_delete_clears_node_from_bitmap() {
+    let mut coord = fresh_coord();
+    for i in 0..50 {
+        let active = i % 2 == 0;
+        run_write(
+            &mut coord,
+            &format!("CREATE (:User {{id: {i}, active: {active}}})"),
+        );
+    }
+    coord
+        .declare_bitmap_index("User", "active")
+        .expect("declare");
+
+    // Delete a band that spans both values.
+    run_write(
+        &mut coord,
+        "MATCH (n:User) WHERE n.id >= 20 AND n.id < 35 DELETE n",
+    );
+
+    for v in [true, false] {
+        let bitmap = coord
+            .bitmap_seek_eq("User", "active", &Value::Boolean(v))
+            .expect("declared");
+        let row = row_path_ids(
+            &mut coord,
+            &format!("MATCH (n:User) WHERE n.active = {v} RETURN id(n) AS id"),
+        );
+        assert_eq!(
+            as_set(bitmap),
+            row,
+            "after the committed DELETE, bitmap(active={v}) must equal the row path"
+        );
+    }
+}
+
+// =================================================================================================
+// Cardinality guard (`rmp` #453, F-IDX-5) — refuse a high-cardinality column
+// =================================================================================================
+
+/// The F-IDX-5 gate: declaring a bitmap index on a near-unique (high-distinct) column is **refused**
+/// (the cap is `graphus_index::bitmap::MAX_DISTINCT_VALUES`), the column is not left registered, and a
+/// genuinely low-cardinality column is still accepted.
+#[test]
+fn declare_refuses_high_cardinality_column() {
+    let mut coord = fresh_coord();
+    let cap = graphus_index::bitmap::MAX_DISTINCT_VALUES;
+    // A column with strictly more than `cap` distinct values: one unique `code` per node.
+    for i in 0..(cap as i64 + 50) {
+        run_write(&mut coord, &format!("CREATE (:Item {{code: {i}}})"));
+    }
+
+    let err = coord
+        .declare_bitmap_index("Item", "code")
+        .expect_err("a near-unique column must be refused");
+    // Classified, descriptive error — not a panic.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("distinct") || msg.contains("cardinality"),
+        "refusal must explain the cardinality reason, got: {msg}"
+    );
+    // The refused column is NOT left registered (the seek declines), so a later seek finds no index.
+    assert!(
+        coord
+            .bitmap_seek_eq("Item", "code", &Value::Integer(0))
+            .is_none(),
+        "a refused bitmap index must not stay registered"
+    );
+
+    // A genuinely low-cardinality column on the same store is still accepted.
+    run_write(&mut coord, "CREATE (:Flag {on: true})");
+    run_write(&mut coord, "CREATE (:Flag {on: false})");
+    coord
+        .declare_bitmap_index("Flag", "on")
+        .expect("a low-cardinality column is accepted");
+    assert!(
+        coord
+            .bitmap_seek_eq("Flag", "on", &Value::Boolean(true))
+            .is_some(),
+        "the accepted low-cardinality column must be registered"
+    );
+}
+
+/// A column exactly at the cap is accepted (the refusal is `> cap`, not `>= cap`).
+#[test]
+fn declare_accepts_column_at_the_cap() {
+    let mut coord = fresh_coord();
+    let cap = graphus_index::bitmap::MAX_DISTINCT_VALUES;
+    // Exactly `cap` distinct values (one node each) — at the boundary, still admissible.
+    for i in 0..(cap as i64) {
+        run_write(&mut coord, &format!("CREATE (:Item {{code: {i}}})"));
+    }
+    coord
+        .declare_bitmap_index("Item", "code")
+        .expect("a column exactly at the cap is accepted");
+    // Spot-check the seek equals the row path for one value.
+    let bitmap = coord
+        .bitmap_seek_eq("Item", "code", &Value::Integer(0))
+        .expect("declared");
+    let row = row_path_ids(
+        &mut coord,
+        "MATCH (n:Item) WHERE n.code = 0 RETURN id(n) AS id",
+    );
+    assert_eq!(as_set(bitmap), row, "at-cap bitmap must equal the row path");
 }
 
 // =================================================================================================

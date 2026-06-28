@@ -89,6 +89,18 @@ rayon = "1"
 # in the build graph (a direct dep of graphus-txn/graphus-bufpool), so this adds no new crate. Matches
 # the workspace pin `rustc-hash = "2"`.
 rustc-hash = "2"
+# The openCypher `=~` regular-expression operator (`rmp` task #446, src/eval.rs). Neo4j inherits
+# `java.util.regex` semantics; we use the `regex` crate, whose RE2-style finite automaton guarantees
+# **linear-time** matching — so an adversarial pattern/text can never cause catastrophic backtracking
+# (ReDoS, CWE-1333), which is exactly the property the task mandates. Java's whole-string
+# `Matcher.matches()` anchoring is reproduced by wrapping the user pattern as `\A(?:…)\z` (see
+# `regex_full_match`); the one deliberate divergence from Java is that backreferences and lookaround —
+# which force super-linear matching and are intentionally absent from RE2 — are unsupported and surface
+# as a classified `EvalError::InvalidRegex` rather than executing. Already in the build graph as a
+# transitive dependency (criterion), so this pulls in no new crate. `default-features = false` drops the
+# `unicode-case`/`unicode-script`/`unicode-bool` tables we do not need; `unicode-perl` is kept so the
+# Perl classes `\d`/`\w`/`\s` behave per Unicode, matching Java's default Unicode-aware classes.
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.
