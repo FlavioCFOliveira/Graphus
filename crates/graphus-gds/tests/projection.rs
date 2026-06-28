@@ -342,3 +342,126 @@ fn personalized_pagerank_rejects_missing_or_empty_seed() {
         Err(GdsError::InvalidArgument(_))
     ));
 }
+
+// `rmp` #455 (F-GDS-1): `personalized_pagerank` must validate weighted projections the SAME way
+// `pagerank` does. Before the fix it silently accepted a weighted projection carrying a negative
+// edge weight that `pagerank` rejects with `InvalidArgument` — an inconsistent contract between the
+// two entry points. A negative (or non-finite) weight is a malformed weighted projection regardless
+// of whether the algorithm later uses the magnitudes, so both entry points must reject it identically.
+#[test]
+fn personalized_pagerank_rejects_negative_weight_like_pagerank() {
+    use graphus_gds::algo::pagerank::{PageRankConfig, pagerank, personalized_pagerank};
+    // A WEIGHTED projection (build's third arg = true) with one negative edge weight.
+    let mut g = VecGraphSource {
+        nodes: vec![0, 1],
+        edges: vec![(0, 1, -1.0)],
+    }
+    .build(Orientation::Directed, true)
+    .unwrap();
+    g.attach_node_column_from(
+        "seed",
+        0.0,
+        |ext| if ext == 0 { Some(1.0) } else { Some(0.0) },
+    );
+
+    // `pagerank` rejects this projection today; `personalized_pagerank` must do the SAME.
+    assert!(
+        matches!(
+            pagerank(&g, PageRankConfig::default(), &Cancel::never()),
+            Err(GdsError::InvalidArgument(_))
+        ),
+        "baseline: plain pagerank must reject a negative weight"
+    );
+    assert!(
+        matches!(
+            personalized_pagerank(&g, "seed", PageRankConfig::default(), &Cancel::never()),
+            Err(GdsError::InvalidArgument(_))
+        ),
+        "personalized_pagerank must reject a negative weight exactly like pagerank (rmp #455)"
+    );
+
+    // A non-finite (NaN) weight is rejected by the same shared validity check.
+    let mut g_nan = VecGraphSource {
+        nodes: vec![0, 1],
+        edges: vec![(0, 1, f64::NAN)],
+    }
+    .build(Orientation::Directed, true)
+    .unwrap();
+    g_nan.attach_node_column_from(
+        "seed",
+        0.0,
+        |ext| if ext == 0 { Some(1.0) } else { Some(0.0) },
+    );
+    assert!(matches!(
+        personalized_pagerank(&g_nan, "seed", PageRankConfig::default(), &Cancel::never()),
+        Err(GdsError::InvalidArgument(_))
+    ));
+}
+
+// `rmp` #455 (F-GDS-1): pin the documented contract that `personalized_pagerank` IGNORES edge-weight
+// magnitudes (uniform `1/out_degree` transition) — only topology and the seed column shape the rank.
+// Two projections with the SAME topology but DIFFERENT (valid, positive) weights must yield an
+// identical rank vector; that result must also equal the unweighted projection's. This proves the
+// magnitudes are inert, distinguishing PPR from weight-normalized `pagerank` (rmp #422).
+#[test]
+fn personalized_pagerank_ignores_positive_weight_magnitudes() {
+    use graphus_gds::algo::pagerank::{PageRankConfig, personalized_pagerank};
+
+    // Same topology (a directed star 0 -> {1, 2}), seed all mass on node 0, three weightings:
+    // unweighted, uniform-weighted (all 1.0), and skewed-weighted (1.0 vs 9.0).
+    let seed = |ext: u64| if ext == 0 { Some(1.0) } else { Some(0.0) };
+    let cfg = PageRankConfig::default();
+
+    let mut g_unweighted = VecGraphSource {
+        nodes: vec![0, 1, 2],
+        edges: vec![(0, 1, 1.0), (0, 2, 1.0)],
+    }
+    .build(Orientation::Directed, false)
+    .unwrap();
+    g_unweighted.attach_node_column_from("seed", 0.0, seed);
+
+    let mut g_uniform = VecGraphSource {
+        nodes: vec![0, 1, 2],
+        edges: vec![(0, 1, 1.0), (0, 2, 1.0)],
+    }
+    .build(Orientation::Directed, true)
+    .unwrap();
+    g_uniform.attach_node_column_from("seed", 0.0, seed);
+
+    let mut g_skewed = VecGraphSource {
+        nodes: vec![0, 1, 2],
+        // Heavily skewed weights: if magnitudes mattered, node 2 would outrank node 1.
+        edges: vec![(0, 1, 1.0), (0, 2, 9.0)],
+    }
+    .build(Orientation::Directed, true)
+    .unwrap();
+    g_skewed.attach_node_column_from("seed", 0.0, seed);
+
+    let r_unweighted = personalized_pagerank(&g_unweighted, "seed", cfg, &Cancel::never()).unwrap();
+    let r_uniform = personalized_pagerank(&g_uniform, "seed", cfg, &Cancel::never()).unwrap();
+    let r_skewed = personalized_pagerank(&g_skewed, "seed", cfg, &Cancel::never()).unwrap();
+
+    // All three rank vectors are bit-comparable up to fp tolerance: weight magnitudes are ignored.
+    assert_eq!(r_unweighted.rank.len(), 3);
+    for i in 0..3 {
+        assert!(
+            (r_uniform.rank[i] - r_unweighted.rank[i]).abs() < 1e-12,
+            "uniform-weighted PPR must equal unweighted PPR at node {i}: {} vs {}",
+            r_uniform.rank[i],
+            r_unweighted.rank[i]
+        );
+        assert!(
+            (r_skewed.rank[i] - r_unweighted.rank[i]).abs() < 1e-12,
+            "skewed-weighted PPR must equal unweighted PPR at node {i} (magnitudes ignored): {} vs {}",
+            r_skewed.rank[i],
+            r_unweighted.rank[i]
+        );
+    }
+    // The two leaf targets receive an EQUAL share despite the 1.0-vs-9.0 weighting (uniform transition).
+    let i1 = g_skewed.internal_id(1).unwrap() as usize;
+    let i2 = g_skewed.internal_id(2).unwrap() as usize;
+    assert!(
+        (r_skewed.rank[i1] - r_skewed.rank[i2]).abs() < 1e-12,
+        "uniform transition: the two out-neighbours must rank equally regardless of edge weight"
+    );
+}

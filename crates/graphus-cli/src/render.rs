@@ -221,7 +221,14 @@ fn write_value(out: &mut String, value: &Value) {
     }
 }
 
-/// Writes a string in Cypher double-quoted form, escaping `\` and `"` and the common control chars.
+/// Writes a string in Cypher double-quoted form, escaping `\` and `"` and **every** control character.
+///
+/// The common control chars get their short C-style escapes (`\n`, `\r`, `\t`); any other control
+/// character — crucially `\x1b` (ESC) and the rest of the C0/C1 ranges, NUL, BEL, DEL — is emitted as
+/// a `\u{XXXX}` escape rather than verbatim. This is a security control: a stored string value can
+/// carry raw terminal escape sequences (colour codes, cursor moves, even clear-screen), and rendering
+/// them verbatim would let untrusted graph data drive the operator's terminal (escape injection).
+/// Escaping all control bytes keeps a rendered value inert text.
 fn write_quoted(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
@@ -231,6 +238,11 @@ fn write_quoted(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // Any remaining control character (ESC, NUL, BEL, the C0/C1 ranges, DEL, …) is rendered as
+            // an inert `\u{XXXX}` escape so it cannot drive the terminal. Non-control chars pass through.
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:04x}}}", c as u32);
+            }
             _ => out.push(ch),
         }
     }
@@ -250,10 +262,24 @@ fn write_float(out: &mut String, x: f64) {
     }
 }
 
+/// A bounded sentinel rendered for a temporal value whose day count is so extreme that the civil-date
+/// conversion would overflow `i64` (reachable only for a day count within `719_468` of `i64::MAX`,
+/// which the storage codec can round-trip). Rendering this inert string is preferable to wrapping
+/// (release) or panicking (debug).
+const DATE_OUT_OF_RANGE: &str = "Date(out-of-range)";
+
 /// Writes a calendar date as `YYYY-MM-DD` from days since the Unix epoch (proleptic Gregorian).
+///
+/// A day count within `719_468` of `i64::MAX` (which the storage codec can round-trip) would overflow
+/// the civil-date conversion's positive shift; that case renders the bounded [`DATE_OUT_OF_RANGE`]
+/// sentinel instead of wrapping or panicking.
 fn write_date(out: &mut String, days_since_epoch: i64) {
-    let (y, m, d) = civil_from_days(days_since_epoch);
-    let _ = write!(out, "{y:04}-{m:02}-{d:02}");
+    match civil_from_days(days_since_epoch) {
+        Some((y, m, d)) => {
+            let _ = write!(out, "{y:04}-{m:02}-{d:02}");
+        }
+        None => out.push_str(DATE_OUT_OF_RANGE),
+    }
 }
 
 /// Writes a wall-clock time `HH:MM:SS[.fraction]` from nanoseconds-of-day.
@@ -267,10 +293,18 @@ fn write_time_of_day(out: &mut String, nanos_of_day: u64) {
 }
 
 /// Writes a no-zone date-time `YYYY-MM-DDTHH:MM:SS[.fraction]` from epoch seconds + sub-second nanos.
+///
+/// As with [`write_date`], a date component so extreme that the civil-date conversion would overflow
+/// renders the bounded [`DATE_OUT_OF_RANGE`] sentinel rather than wrapping or panicking. (Dividing
+/// `epoch_seconds` by 86 400 keeps `days` well inside the safe range for any in-range `i64` seconds,
+/// so this branch is defensive; it matches `write_date`'s contract exactly.)
 fn write_local_datetime(out: &mut String, epoch_seconds: i64, nanos: u32) {
     let days = epoch_seconds.div_euclid(NANOS_PER_DAY as i64 / 1_000_000_000);
     let secs_of_day = epoch_seconds.rem_euclid(86_400);
-    let (y, mo, d) = civil_from_days(days);
+    let Some((y, mo, d)) = civil_from_days(days) else {
+        out.push_str(DATE_OUT_OF_RANGE);
+        return;
+    };
     let (h, min, s) = (
         secs_of_day / 3600,
         (secs_of_day % 3600) / 60,
@@ -303,12 +337,19 @@ fn write_offset(out: &mut String, offset_seconds: i32) {
     let _ = write!(out, "{sign}{h:02}:{m:02}");
 }
 
-/// Converts a day count since the Unix epoch to a proleptic-Gregorian `(year, month, day)`.
+/// Converts a day count since the Unix epoch to a proleptic-Gregorian `(year, month, day)`, or `None`
+/// when the conversion would overflow `i64`.
 ///
-/// Uses Howard Hinnant's well-known `civil_from_days` algorithm (public-domain), which is exact for
-/// the full `i64` day range and avoids pulling in a date-time crate just to render dates.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
+/// Uses Howard Hinnant's well-known `civil_from_days` algorithm (public-domain). The algorithm first
+/// shifts the day count by `+719_468` to anchor the era arithmetic; because the shift is positive it
+/// can only overflow at the **top** of the range — for a `z` within `719_468` of `i64::MAX` (the low
+/// end, including `i64::MIN`, never overflows the shift). Such high day counts are reachable because
+/// the storage codec round-trips the full `i64` `Date` range. Rather than wrap (release) or panic
+/// (debug), the overflowing shift returns `None`; the caller renders a bounded sentinel. For every
+/// non-overflowing `z` the remaining arithmetic stays within Hinnant's proven bounds, so the result is
+/// exact across the representable range.
+fn civil_from_days(z: i64) -> Option<(i64, u32, u32)> {
+    let z = z.checked_add(719_468)?;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
@@ -317,7 +358,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    Some((if m <= 2 { y + 1 } else { y }, m, d))
 }
 
 #[cfg(test)]
@@ -486,5 +527,90 @@ mod tests {
     fn single_row_uses_singular_footer() {
         let r = result(&["x"], vec![vec![Value::Integer(1)]]);
         assert!(render_table(&r).contains("(1 row)"));
+    }
+
+    // `rmp` #464 (F-CLI-1): a stored string can carry raw terminal control bytes (ESC, BEL, NUL, …).
+    // Rendering them verbatim is escape injection — untrusted graph data driving the operator's
+    // terminal. Every control character must be emitted ESCAPED (`\u{XXXX}`), never raw.
+    #[test]
+    fn control_bytes_are_escaped_not_emitted_raw() {
+        // A classic ANSI escape sequence: ESC [ 3 1 m (set red) embedded in a value.
+        let injected = Value::String("\u{1b}[31mRED\u{1b}[0m".to_owned());
+        let rendered = render_value(&injected);
+        // The raw ESC byte must NOT survive into the output...
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "raw ESC must not be emitted: {rendered:?}"
+        );
+        // ...it must appear as the inert `\u{001b}` escape instead.
+        assert!(
+            rendered.contains("\\u{001b}"),
+            "ESC must be escaped as \\u{{001b}}: {rendered:?}"
+        );
+        assert_eq!(rendered, "\"\\u{001b}[31mRED\\u{001b}[0m\"");
+
+        // A spread of other C0/C1/DEL control bytes, plus the explicitly-handled short escapes.
+        let controls = Value::String("\u{0}\u{7}\u{8}\u{1f}\u{7f}\u{9b}\t\n\r".to_owned());
+        let r = render_value(&controls);
+        assert_eq!(
+            r,
+            // NUL, BEL, BS, US, DEL, CSI escaped as \u{..}; TAB/LF/CR keep their short escapes.
+            "\"\\u{0000}\\u{0007}\\u{0008}\\u{001f}\\u{007f}\\u{009b}\\t\\n\\r\""
+        );
+        // No actual control byte leaks through (the strongest invariant: the rendered text is inert).
+        assert!(
+            !r.chars().any(|c| c.is_control()),
+            "no raw control char may survive escaping: {r:?}"
+        );
+        // Ordinary characters (incl. non-ASCII printable) still pass through verbatim.
+        assert_eq!(
+            render_value(&Value::String("héllo café".to_owned())),
+            "\"héllo café\""
+        );
+    }
+
+    // `rmp` #464 (F-CLI-2): a `Date` at `i64::MIN`/`MAX` (the storage codec round-trips the full
+    // range) must render a BOUNDED string with NO panic and NO silent wrap. The civil-date conversion
+    // shifts the day count by `+719_468`; that shift overflows only at the very top of the `i64` range
+    // (`> i64::MAX - 719_468`), so `i64::MAX` renders the bounded `Date(out-of-range)` sentinel via the
+    // `checked_add` guard. `i64::MIN + 719_468` does NOT overflow, so the algorithm stays valid there
+    // and yields a (correct, astronomically negative) date — which is itself a bounded, panic-free
+    // string. Both ends therefore satisfy the gate: bounded, no panic, no wrap. This test runs in the
+    // debug profile where overflow checks are ON, so a wrapping bug at either extreme would panic here.
+    #[test]
+    fn extreme_dates_render_bounded_string_without_panic() {
+        let max = render_value(&Value::Date(Date {
+            days_since_epoch: i64::MAX,
+        }));
+        let min = render_value(&Value::Date(Date {
+            days_since_epoch: i64::MIN,
+        }));
+        // The high extreme overflows the `+719_468` shift -> bounded sentinel (the bug's locus).
+        assert_eq!(
+            max, "Date(out-of-range)",
+            "i64::MAX overflows the civil shift and must render the bounded sentinel"
+        );
+        // The low extreme does NOT overflow; it renders a real (extreme) date, bounded and panic-free.
+        assert_ne!(
+            min, "Date(out-of-range)",
+            "i64::MIN does not overflow the shift; it renders a valid extreme date: {min}"
+        );
+        // Both outputs are BOUNDED and carry no raw control bytes (the gate's invariant for either end).
+        for s in [&max, &min] {
+            assert!(s.len() < 64, "rendered date must be bounded: {s:?}");
+            assert!(
+                !s.chars().any(|c| c.is_control()),
+                "rendered date must be inert text: {s:?}"
+            );
+        }
+        // The largest non-overflowing day count renders a real date, not the sentinel (the sentinel is
+        // reserved strictly for the overflowing shift, never for a merely "large" but valid date).
+        let safe = render_value(&Value::Date(Date {
+            days_since_epoch: i64::MAX - 719_468,
+        }));
+        assert_ne!(
+            safe, "Date(out-of-range)",
+            "the largest non-overflowing date must render normally: {safe}"
+        );
     }
 }

@@ -205,9 +205,23 @@ pub fn pagerank(
 /// teleport target and the dangling-mass redistribution toward it, yielding rank personalized to the
 /// seed set. With a uniform seed column this reduces exactly to [`pagerank`].
 ///
+/// # Edge weights (ignored magnitudes; same validity contract as [`pagerank`])
+/// Unlike [`pagerank`], personalized PageRank uses a **uniform** `1 / out_degree(src)` transition: a
+/// node distributes its rank **equally** to its out-neighbours, so edge-weight **magnitudes are
+/// ignored** (only the graph topology and the seed column shape the result; a self-loop or a parallel
+/// edge still contributes its own equal share, as in the unweighted [`pagerank`] path). The personal-
+/// ization enters solely through the seed distribution, never through edge weights.
+///
+/// Even though magnitudes are ignored, the **validity** contract is identical to [`pagerank`]: a
+/// weighted projection ([`CsrGraph::is_weighted`]) carrying a **negative or non-finite** edge weight
+/// is rejected with [`GdsError::InvalidArgument`] — the same data [`pagerank`] rejects. This keeps the
+/// two entry points consistent (neither silently accepts a malformed weighted projection), rather than
+/// having `personalized_pagerank` quietly accept weights that [`pagerank`] refuses.
+///
 /// # Errors
-/// - [`GdsError::InvalidArgument`] if `damping`/`tolerance` are out of range (as [`pagerank`]), if
-///   `seed_column` is not an attached column, or if the seed column has no positive mass / a negative
+/// - [`GdsError::InvalidArgument`] if `damping`/`tolerance` are out of range (as [`pagerank`]); if the
+///   projection is weighted and carries a negative or non-finite edge weight (as [`pagerank`]); if
+///   `seed_column` is not an attached column; or if the seed column has no positive mass / a negative
 ///   or non-finite entry (it cannot form a teleport distribution).
 /// - [`GdsError::Cancelled`] if `cancel` fires.
 pub fn personalized_pagerank(
@@ -223,6 +237,14 @@ pub fn personalized_pagerank(
     }
     if config.tolerance < 0.0 || config.tolerance.is_nan() {
         return Err(GdsError::InvalidArgument("tolerance must be >= 0".into()));
+    }
+    // Mirror `pagerank`'s weight-validity contract exactly. The transition below ignores weight
+    // magnitudes (uniform `1/deg`), but a weighted projection carrying a negative or non-finite weight
+    // is still a malformed projection: reject it with the same shared validator (and the same error)
+    // `pagerank` uses, so the two PageRank entry points never disagree on what weighted data they
+    // accept.
+    if graph.is_weighted() {
+        validate_weights_non_negative(graph)?;
     }
     let n = graph.node_count();
     if n == 0 {
