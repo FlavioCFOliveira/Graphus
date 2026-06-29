@@ -369,8 +369,10 @@ fn writer_reader_storm_high_n_keeps_all_committed_and_stays_live() {
                             // The real invariants hold regardless: no deadlock (the watchdog), no torn
                             // result (the `count >= 0` check inside `drain_read`), no leak (the
                             // active_txns settle-poll), and committed-edge survival (the final fan-out).
-                            let _ =
-                                drain_read(&h, "MATCH (h:Hub {id: 0})-[:LINK]->(x) RETURN count(x)");
+                            let _ = drain_read(
+                                &h,
+                                "MATCH (h:Hub {id: 0})-[:LINK]->(x) RETURN count(x)",
+                            );
                             let _ = drain_read(&h, "MATCH (l:Leaf) RETURN count(l)");
                         }
                     })
@@ -599,8 +601,10 @@ fn begin_commit_abort_with_reads_churn_no_deadlock_no_leak() {
                             // deadlock = watchdog, no torn result = the `count >= 0` check inside
                             // `drain_read`, no leak = the active_txns settle-poll, committed-edge
                             // survival = the final fan-out) hold whether or not this read is shed.
-                            let _ =
-                                drain_read(&h, "MATCH (h:Hub {id: 0})-[:LINK]->(x) RETURN count(x)");
+                            let _ = drain_read(
+                                &h,
+                                "MATCH (h:Hub {id: 0})-[:LINK]->(x) RETURN count(x)",
+                            );
                         }
                         _ => {
                             // EXPLICIT-txn read → inline engine-thread path (not the reader pool).
