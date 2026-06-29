@@ -759,6 +759,24 @@ impl InFlightInline {
     pub(super) fn txn(&self) -> graphus_core::TxnId {
         self.txn
     }
+
+    /// Delivers a **terminal error** to the consumer through the still-open egress channel (`rmp` #485
+    /// B2). When the engine loop abandons a parked statement — it panicked on a resumed batch, or was
+    /// rejected at the parked-queue capacity bound — the consumer has received rows but no terminal
+    /// item; without this it would observe a clean end-of-stream (`Ok(None)`) and report a **partial
+    /// result as success** (the CWE-393 silent-truncation class). This sends the failure in the same
+    /// terminal position [`drive_batch`] uses for a mid-stream runtime error, [`finalize_inflight`] for
+    /// a commit failure, and the off-thread `finish_reader` for an auto-commit abort — so an
+    /// abandoned-on-the-resume-path statement is reported to the client exactly as those are: a FAILURE.
+    ///
+    /// Uses the **blocking** [`RowSender::send`] like those existing terminal-error sites: the engine
+    /// only ever reaches a *resumed* batch while the consumer is actively draining (a stalled consumer
+    /// leaves the egress full, so the statement stays suspended and is never pulled — hence never
+    /// panics here), so this does not stall the engine any more than the runtime-error terminal in
+    /// `drive_batch` already can. A dropped receiver (early disconnect) makes the send a harmless no-op.
+    pub(super) fn deliver_terminal_error(&self, e: GraphusError) {
+        let _ = self.row_tx.send(Err(e));
+    }
 }
 
 /// How a single resume visit ended (`rmp` task #372): either the statement is fully done (the caller

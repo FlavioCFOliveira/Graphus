@@ -35,7 +35,7 @@ mod seam_bolt;
 mod seam_rest;
 pub mod stream;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -416,6 +416,16 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     max_transaction_age: Option<std::time::Duration>,
+    // The bound on **concurrently parked (suspended) inline statements** (`rmp` #485, finding B1).
+    // Several slow-consumer inline statements can be parked at once (writes + explicit-txn reads run
+    // inline and any can fill its bounded egress on its first visit), so a single slot is unsound: a
+    // second suspension would clobber the first (silent result truncation + leaked txn in release; a
+    // `debug_assert` engine-thread panic in debug). The true upstream bound is the admission limit
+    // (`AdmissionConfig::max_concurrent_queries`): a parked statement holds its admission permit for its
+    // whole stream lifetime, so at most `max_concurrent_queries` can be parked at once. The engine is
+    // sized with `engine_queue_capacity` (≥ `max_concurrent_queries` in any sane config), so this cap is
+    // a never-reached defense-in-depth ceiling against an admission bypass — not a routine limit.
+    max_parked_inline: usize,
 ) {
     // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
     // additively so the gauge sums across every database engine. Also folds the same delta into THIS
@@ -459,11 +469,15 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // is processed promptly even if no client command arrives. Incremented at dispatch, decremented as
     // each retirement is processed.
     let mut readers_inflight: u64 = 0;
-    // The single suspended inline statement, if any (`rmp` task #372). An inline `Run` whose bounded
-    // egress channel fills with a slow consumer draining is parked here instead of blocking this
-    // thread on `row_tx.send`; the loop resumes it one batch per tick (gated into `timed` below) until
-    // its cursor exhausts. At most one exists at a time — the engine processes one `Run` per tick.
-    let mut inflight: Option<exec::InFlightInline> = None;
+    // The suspended inline statements (`rmp` task #372; bounded-queue generalization `rmp` #485 B1). An
+    // inline `Run` whose bounded egress channel fills with a slow consumer draining is parked here
+    // instead of blocking this thread on `row_tx.send`; the loop resumes each one batch per tick
+    // (round-robin, gated into `timed` below) until its cursor exhausts. **Multiple** can be parked at
+    // once — writes and explicit-transaction reads run inline and any can suspend, and the engine keeps
+    // dispatching new commands while statements are parked (the #372 no-head-of-line-block property) —
+    // so this is a FIFO `VecDeque`, bounded by `max_parked_inline`. The historical single-`Option` slot
+    // silently clobbered the first parked statement when a second suspended (`rmp` #485 finding B1).
+    let mut parked: VecDeque<exec::InFlightInline> = VecDeque::new();
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
@@ -509,7 +523,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         maybe_reap_aged(
             &mut coordinator,
             &mut open,
-            inflight.as_ref(),
+            &parked,
             max_transaction_age,
             &clock,
             &metrics,
@@ -517,27 +531,24 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &mut active_txns,
         );
 
-        // Resume one batch of the suspended inline statement, if any (`rmp` task #372). Done each tick
-        // — before the (timed) command receive — so a draining consumer makes progress promptly even
-        // when no client command arrives. `resume_inflight` returns `false` once the statement is
-        // finalised (cursor exhausted / runtime error / disconnect), clearing the slot. Because this
-        // runs between commands, a concurrent write/command on the SAME database is serviced on the
-        // very next tick even while the consumer drains zero rows — the head-of-line block is gone.
-        if let Some(parked) = inflight.as_mut() {
-            if let Some(coord) = coordinator.as_mut() {
-                if !exec::resume_inflight(
-                    parked,
-                    coord,
-                    &mut open,
-                    &extensions,
-                    &metrics,
-                    &db_name,
-                    &clock,
-                ) {
-                    inflight = None;
-                }
-            }
-        }
+        // Resume ONE batch of EACH suspended inline statement (`rmp` task #372; round-robin over the
+        // bounded queue per `rmp` #485 B1). Done each tick — before the (timed) command receive — so
+        // every draining consumer makes progress promptly even when no client command arrives, and a
+        // concurrent write/command on the SAME database is still serviced on the very next tick (the
+        // head-of-line block stays gone for N parked statements, not just one). Each resume runs behind
+        // a panic-isolation boundary (`rmp` #485 B2): a panic on a resumed batch rolls that statement
+        // back and keeps the engine alive instead of unwinding the single engine thread.
+        resume_parked_statements(
+            &mut parked,
+            &mut coordinator,
+            &mut open,
+            &extensions,
+            &metrics,
+            &db_name,
+            &degraded,
+            &clock,
+            &mut active_txns,
+        );
 
         // A timed receive is needed when EITHER a non-blocking index build is in progress (`rmp` #91)
         // OR readers are in flight (so their retirements are polled) OR a suspended inline statement is
@@ -547,7 +558,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             .as_ref()
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .has_pending_index_builds();
-        let timed = building || readers_inflight > 0 || inflight.is_some();
+        let timed = building || readers_inflight > 0 || !parked.is_empty();
 
         if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
@@ -564,6 +575,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                     ) else {
                         continue 'engine;
                     };
+                    // A per-dispatch slot for the (at most one) statement THIS `Run` suspends; drained
+                    // into the bounded `parked` queue below so a newly-suspended statement never
+                    // overwrites an already-parked one (`rmp` #485 B1).
+                    let mut just_suspended: Option<exec::InFlightInline> = None;
                     if !dispatch_command(
                         cmd,
                         &mut coordinator,
@@ -573,7 +588,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &extensions,
                         &dispatch,
                         &mut readers_inflight,
-                        &mut inflight,
+                        &mut just_suspended,
                         result_buffer_capacity,
                         &metrics,
                         &db_name,
@@ -585,6 +600,16 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                     ) {
                         break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
+                    enqueue_suspended(
+                        &mut parked,
+                        &mut just_suspended,
+                        max_parked_inline,
+                        &mut coordinator,
+                        &mut open,
+                        &metrics,
+                        &db_name,
+                        &degraded,
+                    );
                     drive_index_build(&mut coordinator);
                     invalidate_cache_on_build_completion(
                         &coordinator,
@@ -626,6 +651,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             ) else {
                 continue 'engine;
             };
+            // A per-dispatch slot for the (at most one) statement THIS `Run` suspends; drained into the
+            // bounded `parked` queue below (`rmp` #485 B1 — never clobber an already-parked statement).
+            let mut just_suspended: Option<exec::InFlightInline> = None;
             if !dispatch_command(
                 cmd,
                 &mut coordinator,
@@ -635,7 +663,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &extensions,
                 &dispatch,
                 &mut readers_inflight,
-                &mut inflight,
+                &mut just_suspended,
                 result_buffer_capacity,
                 &metrics,
                 &db_name,
@@ -647,6 +675,16 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             ) {
                 break 'engine;
             }
+            enqueue_suspended(
+                &mut parked,
+                &mut just_suspended,
+                max_parked_inline,
+                &mut coordinator,
+                &mut open,
+                &metrics,
+                &db_name,
+                &degraded,
+            );
             // A DDL command dispatched here may have started a build; reflect that in the edge tracker
             // so its later completion invalidates the cache (the no-build blocking path never advances
             // a build itself, but the next `timed` tick will).
@@ -873,14 +911,15 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
 ///   off-thread reader** (`rmp` #336) whose retirement still merges its SIREAD buffer back — reaping it
 ///   would resurrect a forgotten reader in the conflict graph. The age cap targets *explicit*
 ///   `BEGIN … COMMIT` transactions, which are the only ones a client can hold open across statements.
-/// - **The one statement executing inline** (`inflight`) is skipped: reaping it would pull the per-
-///   statement seam out from under a live cursor. It is reaped on a later tick once idle (and is itself
-///   bounded by the per-statement timeout meanwhile).
+/// - **Every statement currently parked/executing inline** (`parked`) is skipped: reaping one would
+///   pull the per-statement seam out from under a live (suspended) cursor. Several can be parked at
+///   once (`rmp` #485 B1), so ALL of their transactions are excluded, not just one. Each is reaped on a
+///   later tick once idle (and is itself bounded by the per-statement timeout meanwhile).
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     open: &mut HashMap<u64, OpenTx>,
-    inflight: Option<&exec::InFlightInline>,
+    parked: &VecDeque<exec::InFlightInline>,
     max_transaction_age: Option<std::time::Duration>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     metrics: &Metrics,
@@ -898,12 +937,12 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     if aged.is_empty() {
         return; // the common case: nothing over-age
     }
-    // The single inline statement currently executing (if any) must not be reaped mid-statement.
-    let busy_inline = inflight.map(exec::InFlightInline::txn);
     let mut reaped = 0u64;
     for txn in aged {
-        if Some(txn) == busy_inline {
-            continue; // executing inline now — reap on a later (idle) tick
+        // Any inline statement currently parked (suspended mid-stream) must not be reaped: it holds a
+        // live cursor that resumes on a later tick. Several can be parked at once (`rmp` #485 B1).
+        if parked.iter().any(|p| p.txn() == txn) {
+            continue; // executing/parked inline now — reap on a later (idle) tick
         }
         // Reverse-map txn -> ticket and read its auto-commit flag in one immutable borrow, so the
         // subsequent `open.remove` mutable borrow is unobstructed. Reap only explicit transactions.
@@ -930,6 +969,191 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
         // The active set shrank — refresh the open-transaction gauge so observability reflects the reap.
         active_txns.publish(coord.active_count());
     }
+}
+
+/// Resumes ONE batch of EACH currently-parked inline statement (`rmp` task #372; bounded-queue
+/// round-robin generalization per `rmp` #485 B1), each behind a panic-isolation boundary (`rmp` #485 B2).
+///
+/// Only the statements parked at entry get a turn this tick (a re-suspended one is appended and waits
+/// for the next tick), so the pass is bounded and fair across N slow consumers. For each statement:
+///
+/// * `resume_inflight` → `true` (egress filled again): push it back; resume next tick.
+/// * `resume_inflight` → `false` (cursor exhausted / runtime error / disconnect): it already finalised
+///   (auto-commit/rollback); drop it (closing its egress).
+/// * `resume_inflight` **panics**: [`recover_panicked_resume`] rolls its transaction back + records the
+///   panic, then it is dropped — and the engine thread stays alive. Without this boundary the panic
+///   unwinds the single engine thread and bricks the database (the `rmp` #485 B2 finding: the
+///   first-visit boundary in [`run_statement_isolated`] never covered the resume path).
+///
+/// [`AssertUnwindSafe`] is sound for the same reason as in [`run_statement_isolated`]: on a caught
+/// panic no partially-mutated coordinator state is observed on any success path — the statement is
+/// rolled back via ARIES undo, and the per-statement seam's `RefCell` borrows are released by
+/// unwinding RAII guards before this frame regains control.
+#[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
+fn resume_parked_statements<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    parked: &mut VecDeque<exec::InFlightInline>,
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
+    metrics: &Arc<Metrics>,
+    db: &Arc<str>,
+    degraded: &EngineDegraded,
+    clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    active_txns: &mut ActiveTxnGauge,
+) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut finalized_any = false;
+    // Snapshot the count at entry: a statement that re-suspends is pushed to the back and only gets its
+    // next batch on the following tick, so this never spins on one fast-refilling consumer.
+    let mut budget = parked.len();
+    while budget > 0 {
+        budget -= 1;
+        let Some(mut stmt) = parked.pop_front() else { break };
+        let Some(coord) = coordinator.as_mut() else {
+            // Coordinator already consumed (Shutdown in progress): put it back and stop; Shutdown's
+            // `drain_inflight` rolls its transaction back and the queue drops at loop exit.
+            parked.push_front(stmt);
+            break;
+        };
+        let txn = stmt.txn();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            exec::resume_inflight(&mut stmt, coord, open, extensions, metrics, db, clock)
+        }));
+        match outcome {
+            // Re-suspended: round-robin to the back of the queue for the next tick.
+            Ok(true) => parked.push_back(stmt),
+            // Finalised (committed/rolled back inside `resume_inflight`): drop `stmt` (closes egress).
+            Ok(false) => finalized_any = true,
+            // Panicked on this resumed batch (`rmp` #485 B2): roll the txn back, deliver a terminal
+            // FAILURE to the consumer, then drop `stmt` (closing its egress). Ordering is rollback →
+            // terminal error → drop, so the client sees a clean failure rather than a partial result
+            // reported as a successful end-of-stream (the CWE-393 class). No terminal was sent before
+            // the panic (it interrupts `drive_batch` at `next_materialized`, before any terminal send),
+            // so this is the first and only terminal item. Covers a per-row execution panic AND a
+            // commit panic inside the resumed auto-commit's `finalize_inflight` — both surface here.
+            Err(panic_payload) => {
+                recover_panicked_resume(
+                    coord,
+                    open,
+                    txn,
+                    metrics,
+                    db,
+                    degraded,
+                    panic_payload.as_ref(),
+                );
+                stmt.deliver_terminal_error(GraphusError::Runtime(
+                    "internal error: statement aborted (panic during resumed execution)".to_owned(),
+                ));
+                finalized_any = true;
+            }
+        }
+    }
+    if finalized_any {
+        // A parked statement finalised/aborted — refresh the open-transaction gauge so observability
+        // reflects it promptly (the threaded loop otherwise publishes only after a dispatched command).
+        active_txns.publish(coordinator.as_ref().map_or(0, TxnCoordinator::active_count));
+    }
+}
+
+/// Recovers from a panic caught while **resuming** a parked inline statement (`rmp` #485 B2), mirroring
+/// [`rollback_panicked_statement`] for the resume path: roll the statement's transaction back (so no
+/// half-applied write buffer survives — for a write that suspended mid-statement this discards the
+/// partial buffer via ARIES undo), account the abort, and record the statement panic. The engine
+/// thread stays alive.
+///
+/// The rollback runs through [`catch_recovery`] so a rollback that *itself* double-panics flags the
+/// engine **degraded** (`rmp` #409) rather than unwinding the thread — identical to the first-visit
+/// path. A panic *inside* `resume_inflight`'s own auto-commit (`finalize_inflight`'s `commit`) is
+/// caught by the caller's boundary too and treated as a statement-level abort, exactly as the
+/// first-visit inline path treats a commit panic (only the off-thread reader path flags degraded on a
+/// commit panic).
+///
+/// This handles only the **coordinator-side** recovery (txn rollback + accounting). The caller
+/// delivers the consumer-facing terminal FAILURE via
+/// [`InFlightInline::deliver_terminal_error`](exec::InFlightInline) *after* this returns (rollback →
+/// terminal error → drop), so the consumer sees an explicit error rather than a clean end-of-stream
+/// over a partial result (`rmp` #485 B2).
+fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
+    coord: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    txn: TxnId,
+    metrics: &Metrics,
+    db: &str,
+    degraded: &EngineDegraded,
+    panic_payload: &(dyn std::any::Any + Send),
+) {
+    let detail = panic_message(panic_payload);
+    tracing::error!(
+        target: "graphus::engine",
+        panic = %detail,
+        "inline statement panicked on a RESUMED batch; rolling back its transaction and keeping the \
+         engine alive (rmp #386/#485 B2)",
+    );
+    // `InFlightInline.ticket` is private to `exec`; reverse-map txn → ticket via `open` (as
+    // `maybe_reap_aged` does) so the open-tx entry is removed exactly once.
+    if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
+        open.remove(&ticket);
+    }
+    if let Some(Ok(())) = catch_recovery(metrics, degraded, "resumed statement rollback", || {
+        coord.rollback(txn)
+    }) {
+        metrics.record_abort_for(db);
+    }
+    metrics.record_statement_panic();
+}
+
+/// Moves the statement THIS dispatch just suspended (if any) into the bounded `parked` queue (`rmp`
+/// #485 B1). A newly-suspended statement is **appended** — it never overwrites an already-parked one
+/// (the historical single-slot clobber bug). If the queue is at `max_parked` — a defense-in-depth
+/// ceiling the upstream admission limit (`max_concurrent_queries`) normally keeps far out of reach,
+/// since a parked statement holds its admission permit for its whole lifetime — the NEWCOMER (never an
+/// already-parked statement) is rolled back and dropped, preserving all existing parked work.
+#[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
+fn enqueue_suspended<D: BlockDevice, S: LogSink>(
+    parked: &mut VecDeque<exec::InFlightInline>,
+    just_suspended: &mut Option<exec::InFlightInline>,
+    max_parked: usize,
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    metrics: &Metrics,
+    db: &str,
+    degraded: &EngineDegraded,
+) {
+    let Some(stmt) = just_suspended.take() else {
+        return; // the common case: the dispatch ran to completion / off-thread, nothing to park
+    };
+    if parked.len() < max_parked.max(1) {
+        parked.push_back(stmt);
+        return;
+    }
+    // Overflow — unreachable under correct admission. Roll back the NEWCOMER (never an existing parked
+    // statement) so the bound holds without losing already-parked work, then deliver a clean retriable
+    // FAILURE to its consumer (rollback → terminal error → drop) so it is reported as busy/aborted, not
+    // a partial result over a successful end-of-stream (the CWE-393 class).
+    let txn = stmt.txn();
+    if let Some(coord) = coordinator.as_mut() {
+        if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
+            open.remove(&ticket);
+        }
+        if let Some(Ok(())) = catch_recovery(metrics, degraded, "overflow statement rollback", || {
+            coord.rollback(txn)
+        }) {
+            metrics.record_abort_for(db);
+        }
+    }
+    stmt.deliver_terminal_error(GraphusError::Runtime(
+        "server busy: in-flight statement capacity reached, retry".to_owned(),
+    ));
+    tracing::warn!(
+        target: "graphus::engine",
+        parked = parked.len(),
+        "parked-inline-statement queue at capacity; rolled back a newly-suspended statement (rmp #485 \
+         B1) — admission did not bound concurrency as expected",
+    );
+    drop(stmt);
 }
 
 /// Accounts one **failed** background maintenance checkpoint and escalates a persistent run of them
@@ -1397,14 +1621,18 @@ fn run_statement_isolated<
             // A read dispatched off-thread retires later (it is not yet finalised); track it so the
             // engine loop polls the retirement channel until it returns.
             exec::RunOutcome::OffThreadReader => *readers_inflight += 1,
-            // The egress channel filled with a slow consumer draining (`rmp` task #372): park the
-            // statement so the loop resumes it one batch per tick without head-of-line-blocking this
-            // thread. There is at most one in-flight inline statement (the engine processes one `Run`
-            // at a time), so a single slot suffices.
+            // The egress channel filled with a slow consumer draining (`rmp` task #372): hand the
+            // suspended statement back through this dispatch's `inflight` slot. `inflight` is a
+            // **per-dispatch** `Option` (a fresh `None` for each `Run`; the engine loop drains it into
+            // its bounded `parked` queue, and the `LocalEngine` inline driver never suspends), so a
+            // single `Run` parks at most one statement here — the assert holds trivially. Multiple
+            // statements CAN be parked across dispatches; that breadth lives in the loop's bounded
+            // `VecDeque`, never in this slot (`rmp` #485 B1 — the historical shared single slot here
+            // silently clobbered an already-parked statement when a second one suspended).
             exec::RunOutcome::Suspended(parked) => {
                 debug_assert!(
                     inflight.is_none(),
-                    "INVARIANT: at most one suspended inline statement at a time"
+                    "INVARIANT: a single Run dispatch suspends at most one inline statement"
                 );
                 *inflight = Some(*parked);
             }
@@ -2085,6 +2313,11 @@ where
                     clock,
                     statement_timeout,
                     max_transaction_age,
+                    // Bound on concurrently parked (suspended) inline statements (`rmp` #485 B1). The
+                    // command channel is sized `engine_queue_capacity`, which in any sane config is ≥
+                    // `max_concurrent_queries` (the admission limit that actually bounds how many
+                    // statements can be parked at once), so this is a generous never-reached ceiling.
+                    engine_queue_capacity,
                 );
             }
             Err(e) => {
@@ -2291,7 +2524,7 @@ mod max_transaction_age_tests {
         maybe_reap_aged(
             &mut coordinator,
             &mut open,
-            None, // nothing executing inline
+            &VecDeque::new(), // nothing parked inline
             Some(cap),
             &clock,
             &metrics,
@@ -2342,7 +2575,7 @@ mod max_transaction_age_tests {
         maybe_reap_aged(
             &mut coordinator,
             &mut open,
-            None,
+            &VecDeque::new(),
             None, // cap disabled
             &clock,
             &metrics,
