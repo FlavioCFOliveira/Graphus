@@ -119,20 +119,21 @@ fn list_with_real_elements_is_bounded_by_input_length() {
 ///
 /// 2. **The multiplicative (nested) pre-allocation is capped by `MAX_DECODE_DEPTH`.** The only way to
 ///    stack many capped reservations live at once is to nest collections; that is bounded at
-///    `MAX_DECODE_DEPTH` (256) levels, above which decoding is rejected. So the absolute worst-case
+///    `MAX_DECODE_DEPTH` (64) levels, above which decoding is rejected. So the absolute worst-case
 ///    transient allocation for ONE message decode is `MAX_DECODE_DEPTH × MAX_PREALLOC ×
 ///    size_of::<slot>()` — a *fixed* ceiling, independent of the claimed counts and of the (64
 ///    MiB-capped) wire message size, and freed the instant the decode returns/errors.
 ///
 /// 3. **The cap is small (`rmp` #484).** `MAX_PREALLOC` is `32` (was `1024`). With the widest slot
-///    (`(String, Value)`, 64 B) the ceiling is `256 × 32 × 64 B = 512 KiB` per in-flight decode — a
-///    32× reduction from the previous ~16 MiB. This matters because the spike scales with concurrent
-///    connections (`max_connections`, default 1024): the coordinated worst case drops from ~16 GiB to
-///    ~512 MiB. Lowering the cap costs no successful-decode correctness (the `Vec` grows lazily) and
-///    no measurable throughput (collections ≤ 32 still exact-fit; larger ones amortise).
+///    (`(String, Value)`, 64 B) the ceiling is `64 × 32 × 64 B = 128 KiB` per in-flight decode (the
+///    depth factor dropped from 256 to 64 in `rmp` #487, tightening this further). This matters
+///    because the spike scales with concurrent connections (`max_connections`, default 1024): the
+///    coordinated worst case is ~128 MiB. Lowering the caps costs no successful-decode correctness
+///    (the `Vec` grows lazily) and no measurable throughput (collections ≤ 32 still exact-fit; larger
+///    ones amortise).
 ///
 /// The measured amplification ratio is therefore bounded: from ~1.5 KiB of crafted input (the nested
-/// bomb below) the peak transient pre-allocation is `MAX_DECODE_DEPTH × MAX_PREALLOC × slot` ≤ 512 KiB
+/// bomb below) the peak transient pre-allocation is `MAX_DECODE_DEPTH × MAX_PREALLOC × slot` ≤ 128 KiB
 /// — a hard, constant ceiling — whereas an unbounded decoder would have turned the same input into a
 /// multi-GiB abort. This test asserts all three bounds against the crate's real constants.
 #[test]
@@ -173,9 +174,9 @@ fn decode_amplification_is_bounded_not_header_driven() {
     );
     let map_slot = std::mem::size_of::<(String, graphus_core::Value)>();
     let ceiling_bytes = MAX_DECODE_DEPTH * MAX_PREALLOC * map_slot;
-    // The NEW ceiling: 256 × 32 × 64 B = 512 KiB. Assert the hard upper bound (1 MiB leaves headroom
-    // only for the 64 B slot growing slightly), proving the post-#484 amplification ceiling is in the
-    // sub-MiB range, NOT the tens of MiB of the old 1024 cap.
+    // The ceiling: 64 × 32 × 64 B = 128 KiB (depth 64 after rmp #487, prealloc 32 after rmp #484).
+    // Assert the hard sub-MiB upper bound, proving the amplification ceiling is in the sub-MiB range,
+    // NOT the tens of MiB of the old 1024 prealloc cap or the 512 KiB of the old 256 depth.
     assert!(
         ceiling_bytes <= 1024 * 1024,
         "worst-case transient prealloc ceiling ({ceiling_bytes} bytes = {MAX_DECODE_DEPTH} depth × \
@@ -189,7 +190,7 @@ fn decode_amplification_is_bounded_not_header_driven() {
 #[test]
 fn deeply_nested_lists_are_rejected_not_stack_overflowed() {
     // 5000 nested single-element lists (TINY_LIST of size 1 = 0x91) far exceeds MAX_DECODE_DEPTH
-    // (256). Without the depth guard this recurses 5000 frames deep and overflows the stack (process
+    // (64). Without the depth guard this recurses 5000 frames deep and overflows the stack (process
     // abort = remote DoS). With it, it returns a clean Decode error.
     let depth = 5000;
     let mut bytes = vec![0x91u8; depth]; // 0x91 = TINY_LIST size 1
@@ -234,9 +235,10 @@ fn deeply_nested_structural_list_via_bolt_value_is_rejected() {
 
 #[test]
 fn nesting_at_the_limit_is_accepted() {
-    // A payload nested just within MAX_DECODE_DEPTH (256) must still decode — a legitimate (if deep)
-    // message is never rejected. 200 levels is comfortably under the limit.
-    let mut bytes = vec![0x91u8; 200];
+    // A payload nested just within MAX_DECODE_DEPTH (64, after rmp #487) must still decode — a
+    // legitimate (if deep) message is never rejected. 50 levels is comfortably under the limit and
+    // remains orders of magnitude beyond any real-world Bolt payload (single-digit nesting).
+    let mut bytes = vec![0x91u8; 50];
     bytes.push(0xC0);
     assert!(
         dec(&bytes).is_ok(),

@@ -141,7 +141,7 @@ pub(crate) const MAX_STRUCT_FIELDS: usize = 15;
 /// Keeping the cap small is what bounds the **transient** memory of one in-flight decode. The only
 /// way to stack many capped reservations live at once is to nest collections, which is bounded at
 /// [`MAX_DECODE_DEPTH`] levels; so the absolute worst-case transient pre-allocation for ONE message
-/// decode is `MAX_DECODE_DEPTH × MAX_PREALLOC × size_of::<slot>()` — `256 × 32 × 64 B = 512 KiB` for
+/// decode is `MAX_DECODE_DEPTH × MAX_PREALLOC × size_of::<slot>()` — `64 × 32 × 64 B = 128 KiB` for
 /// the widest (`(String, Value)` map) slot — a hard, constant ceiling independent of the claimed
 /// counts and of the 64 MiB-capped wire size, freed the instant the decode returns or errors. (Before
 /// `rmp` #484 the cap was `1024`, a 32× larger ~16 MiB ceiling per in-flight decode.)
@@ -489,13 +489,21 @@ pub struct Unpacker<'a> {
 /// nested empty lists) could otherwise exhaust the call stack and abort the process — a trivial
 /// denial-of-service from network bytes.
 ///
-/// The bound is chosen from measurement, not folklore: a debug build of [`unpack_value`] consumes
-/// roughly 2 KiB of stack per recursive frame, so ~1000 frames already overflow the default 2 MiB
-/// thread stack a Bolt session runs on. `256` levels therefore cost at most ~0.5 MiB even in the
-/// worst (debug) profile — safe with wide margin on a 1 MiB stack — while remaining orders of
-/// magnitude beyond any legitimate Bolt payload (real-world property/list nesting is single-digit).
-/// A well-formed message is never rejected; only a hostile one is.
-pub const MAX_DECODE_DEPTH: usize = 256;
+/// The bound is chosen from measurement, not folklore, and is calibrated for the **worst-case**
+/// recursive path — not the cheapest. The decode runs on the ~2 MiB stack of a `spawn_blocking` Bolt
+/// session thread (the runtime does not enlarge it the way the query engine enlarges its own, `rmp`
+/// #473). A list/map level is a single [`unpack_value`] frame, but a **structure** level on the
+/// `Point2D`/`Point3D` coordinate path threads `unpack_value → unpack_structured_value →
+/// read_float_field → unpack_value` — ~3 frames/level, measured at ~10 KiB of stack per level in a
+/// debug build. That path overflows a 2 MiB stack at ~210 levels (measured), so the historical `256`
+/// was itself unsafe for structures (and, before `rmp` #487, the struct arm bypassed this guard
+/// entirely — a `Point` whose coordinate is another `Point` recursed uncapped, a pre-auth
+/// single-packet whole-process abort). `64` levels therefore cost at most ~0.6 MiB even on the
+/// worst (debug, 3-frame) path — a ~3× margin on the 2 MiB session stack — while remaining orders of
+/// magnitude beyond any legitimate Bolt payload (real-world property/list nesting is single-digit;
+/// for comparison `serde_json` defaults to 128 with a 1-frame-per-level recursion). A well-formed
+/// message is never rejected; only a hostile one is.
+pub const MAX_DECODE_DEPTH: usize = 64;
 
 impl<'a> Unpacker<'a> {
     /// A new unpacker over `buf`, positioned at the start.
@@ -1042,7 +1050,23 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             unpacker.leave_nested();
             Ok(Value::Map(entries))
         }
-        _ if is_struct_marker(marker) => unpack_structured_value(unpacker),
+        _ if is_struct_marker(marker) => {
+            // Guard struct decoding with the same depth budget the list/map arms use (`rmp` #487,
+            // CWE-674 → CWE-400). `unpack_structured_value` decodes `Point2D`/`Point3D` coordinates
+            // via `read_float_field` → `unpack_value`, so a `Point` whose coordinate is itself a
+            // `Point` recurses straight back through the decoder. Without entering the nesting guard
+            // here that recursion never increments `depth`, bypassing [`MAX_DECODE_DEPTH`] entirely
+            // and overflowing the (~2 MiB `spawn_blocking`) Bolt-session stack — an unauthenticated,
+            // single-message whole-process abort (a stack overflow aborts the process and is not
+            // catchable by `catch_unwind`). Entering the guard caps struct nesting at
+            // [`MAX_DECODE_DEPTH`] exactly like every other recursive arm. On the error path the `?`
+            // unwinds the whole decode (the `Unpacker` is discarded), so skipping `leave_nested`
+            // there is correct — identical to the list/map arms above.
+            unpacker.enter_nested()?;
+            let v = unpack_structured_value(unpacker)?;
+            unpacker.leave_nested();
+            Ok(v)
+        }
         other => Err(BoltError::Decode(format!(
             "unknown PackStream marker {other:#04x}"
         ))),
