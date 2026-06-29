@@ -2025,9 +2025,15 @@ fn string_case(v: &Value, upper: bool, fname: &str) -> Result<Value, EvalError> 
     match v {
         Value::String(s) => {
             let out_len: usize = if upper {
-                s.chars().flat_map(char::to_uppercase).map(char::len_utf8).sum()
+                s.chars()
+                    .flat_map(char::to_uppercase)
+                    .map(char::len_utf8)
+                    .sum()
             } else {
-                s.chars().flat_map(char::to_lowercase).map(char::len_utf8).sum()
+                s.chars()
+                    .flat_map(char::to_lowercase)
+                    .map(char::len_utf8)
+                    .sum()
             };
             let limit = crate::value_size::max_value_bytes();
             if out_len > limit {

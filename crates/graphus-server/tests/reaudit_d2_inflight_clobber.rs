@@ -123,7 +123,10 @@ fn seed(handle: &EngineHandle) {
 /// the open ticket and the (un-drained) reply — the caller decides when to drain.
 fn start_explicit_wide_read(
     handle: &EngineHandle,
-) -> (graphus_server::engine::TxTicket, graphus_server::engine::command::RunReply) {
+) -> (
+    graphus_server::engine::TxTicket,
+    graphus_server::engine::command::RunReply,
+) {
     let ticket = handle
         .begin_blocking(AccessMode::Read)
         .expect("begin explicit read txn");
@@ -291,7 +294,10 @@ fn two_concurrent_suspended_inline_statements_must_not_clobber() {
 
     // Best-effort teardown. If the engine thread already died (debug), the join returns Err — we do not
     // assert on it here because the row-count assertions above are the primary teeth.
-    let Engine { handle: inner, join } = engine;
+    let Engine {
+        handle: inner,
+        join,
+    } = engine;
     drop(handle);
     drop(inner);
     let _ = join.join();

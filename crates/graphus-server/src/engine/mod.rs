@@ -1011,7 +1011,9 @@ fn resume_parked_statements<
     let mut budget = parked.len();
     while budget > 0 {
         budget -= 1;
-        let Some(mut stmt) = parked.pop_front() else { break };
+        let Some(mut stmt) = parked.pop_front() else {
+            break;
+        };
         let Some(coord) = coordinator.as_mut() else {
             // Coordinator already consumed (Shutdown in progress): put it back and stop; Shutdown's
             // `drain_inflight` rolls its transaction back and the queue drops at loop exit.
@@ -1138,9 +1140,11 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
         if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
             open.remove(&ticket);
         }
-        if let Some(Ok(())) = catch_recovery(metrics, degraded, "overflow statement rollback", || {
-            coord.rollback(txn)
-        }) {
+        if let Some(Ok(())) =
+            catch_recovery(metrics, degraded, "overflow statement rollback", || {
+                coord.rollback(txn)
+            })
+        {
             metrics.record_abort_for(db);
         }
     }

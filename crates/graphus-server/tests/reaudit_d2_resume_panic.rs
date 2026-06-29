@@ -271,7 +271,10 @@ fn engine_survives_panic_during_resumed_batch() {
     );
 
     // Best-effort teardown (the engine thread may already be dead on HEAD).
-    let Engine { handle: inner, join } = engine;
+    let Engine {
+        handle: inner,
+        join,
+    } = engine;
     drop(handle);
     drop(inner);
     let _ = join.join();

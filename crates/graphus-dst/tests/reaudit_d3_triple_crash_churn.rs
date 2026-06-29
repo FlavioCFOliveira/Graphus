@@ -349,8 +349,14 @@ fn triple_crash_recovery_is_idempotent_across_seeds() {
     assert_eq!(passed, SEEDS, "every seed must survive three crashes");
     // Non-vacuity: the soak must reach the #468 (rel) and #301 (prop) corpse-head states AND the
     // multi-loser in-flight undo regime, or it is not exercising the hard shape.
-    assert!(rel_corpse > 0, "no seed reached a rel corpse head — soak vacuous");
-    assert!(prop_corpse > 0, "no seed reached a prop corpse head — soak vacuous");
+    assert!(
+        rel_corpse > 0,
+        "no seed reached a rel corpse head — soak vacuous"
+    );
+    assert!(
+        prop_corpse > 0,
+        "no seed reached a prop corpse head — soak vacuous"
+    );
     assert!(
         multi_inflight > 0,
         "no seed left >=2 losers in flight at the crash — multi-loser undo not exercised"

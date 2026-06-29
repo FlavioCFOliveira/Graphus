@@ -77,7 +77,10 @@ fn wide_csv(fields: usize) -> String {
 }
 
 fn src_for(path: &std::path::Path) -> String {
-    format!("LOAD CSV FROM '{}' AS row RETURN row AS r", path.to_string_lossy())
+    format!(
+        "LOAD CSV FROM '{}' AS row RETURN row AS r",
+        path.to_string_lossy()
+    )
 }
 
 fn is_value_budget_rejection(outcome: &Result<Vec<Row>, String>) -> bool {

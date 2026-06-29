@@ -169,7 +169,8 @@ fn point_recursion_also_bypasses_the_structural_decoder() {
     let bytes = nested_point2d(depth);
     let err: BoltError = decode_on_big_stack(move || {
         let mut u = Unpacker::new(&bytes);
-        unpack_bolt_value(&mut u).expect_err("a 4000-deep nested Point2D must not decode via bolt_value")
+        unpack_bolt_value(&mut u)
+            .expect_err("a 4000-deep nested Point2D must not decode via bolt_value")
     });
     assert!(
         format!("{err}").contains("depth"),
@@ -197,8 +198,7 @@ fn pre_auth_hello_extra_nested_point_bypasses_depth_guard() {
 
     let err: BoltError = decode_on_big_stack(move || {
         Request::decode(&payload)
-            .err()
-            .expect("a HELLO carrying a 4000-deep nested Point2D must not decode successfully")
+            .expect_err("a HELLO carrying a 4000-deep nested Point2D must not decode successfully")
     });
 
     assert!(
@@ -304,7 +304,10 @@ fn point_recursion_overflow_victim() {
     let rejected = handle
         .join()
         .expect("victim decode thread must not panic (a depth-guarded decode returns an error)");
-    assert!(rejected, "a depth-guarded decoder must reject the deep nested point with an error");
+    assert!(
+        rejected,
+        "a depth-guarded decoder must reject the deep nested point with an error"
+    );
     // Reached only if the decode returned (i.e. the guard worked). Exit cleanly so the parent sees
     // success. On HEAD the process has already aborted before this point.
     std::process::exit(0);
