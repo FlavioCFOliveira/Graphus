@@ -116,6 +116,26 @@ fn pump(handle: &EngineHandle, tag: &str) {
     run_auto_write(handle, &format!("CREATE (:Pump {{tag: '{tag}-b'}})")).expect("pump write b");
 }
 
+/// Polls the open-transaction gauge until it reaches `expected` (up to a generous 5 s bound), then
+/// returns the final value. The gauge is published from the ENGINE thread (on reap / on commit), so
+/// after a reap the test thread can observe a transient lag — the auto-commit "settle" writes may signal
+/// end-of-stream before the engine finishes publishing the post-reap count — even though the
+/// coordinator's active set is already correct (proven separately by `touch_explicit` failing). Polling
+/// removes that cross-thread observability race WITHOUT masking a real leak: a genuinely-still-pinned
+/// transaction keeps the gauge above `expected` for the whole bound, so the caller's `assert_eq!` still
+/// fails on a true defect. (`rmp` #485 — closes a CI gauge-settle flake; the clock is deterministic but
+/// the engine-thread scheduling is not.)
+fn settle_active_txns(metrics: &Metrics, expected: u64) -> u64 {
+    for _ in 0..500 {
+        let v = metrics.active_txns();
+        if v == expected {
+            return v;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    metrics.active_txns()
+}
+
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
@@ -174,7 +194,7 @@ fn age_cap_reaps_actively_touched_explicit_txn() {
     // The watermark-pinning holder is gone, so the open-transaction gauge is back to zero.
     pump(&handle, "settle");
     assert_eq!(
-        metrics.active_txns(),
+        settle_active_txns(&metrics, 0),
         0,
         "after the reap (and the auto-commit writes settling) no transaction is open"
     );
@@ -224,7 +244,7 @@ fn age_cap_reaps_silently_held_txn_under_cotenant_writes() {
     );
     pump(&handle, "settle");
     assert_eq!(
-        metrics.active_txns(),
+        settle_active_txns(&metrics, 0),
         0,
         "the GC-watermark-pinning holder is gone — the open-transaction gauge is zero"
     );

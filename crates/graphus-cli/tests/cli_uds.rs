@@ -17,6 +17,7 @@
 //! embedded in an async host, and it keeps the blocking socket calls from starving the reactor.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use graphus_cli::client::BoltClient;
 use graphus_cli::render::render_table;
@@ -30,6 +31,7 @@ use graphus_server::{Server, ServerHandle};
 /// integration-test helper.
 struct TempStore {
     path: PathBuf,
+    sock: PathBuf,
 }
 
 impl TempStore {
@@ -44,7 +46,15 @@ impl TempStore {
             std::process::id()
         ));
         std::fs::create_dir_all(&path).unwrap();
-        Self { path }
+        // The UDS socket path must stay under the platform's `sun_path` limit (~104 bytes on macOS,
+        // where `std::env::temp_dir()` is a long `/var/folders/.../T` path that overflows it). Put the
+        // socket in a SHORT, dedicated path under `/tmp` (short on every Unix) with a short unique name,
+        // decoupled from the long store directory above — otherwise the server *correctly* rejects the
+        // over-long path with `path must be shorter than SUN_LEN`, and these tests fail on macOS/BSD only.
+        static SOCK_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let sock = PathBuf::from(format!("/tmp/gcli-{}-{seq}.sock", std::process::id()));
+        Self { path, sock }
     }
 
     fn store_dir(&self) -> PathBuf {
@@ -52,13 +62,14 @@ impl TempStore {
     }
 
     fn uds_path(&self) -> PathBuf {
-        self.path.join("graphus.sock")
+        self.sock.clone()
     }
 }
 
 impl Drop for TempStore {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        let _ = std::fs::remove_file(&self.sock);
     }
 }
 
