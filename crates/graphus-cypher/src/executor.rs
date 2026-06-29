@@ -4322,6 +4322,15 @@ pub struct Accumulator {
     extreme: Option<Value>,
     // RowValue-typed so `collect(n)` / `collect(nodes(p))` keep their structural elements.
     collected: Vec<RowValue>,
+    /// The running estimated in-memory byte size of [`collected`](Self::collected) (`SEC-191`,
+    /// CWE-770 / CWE-789). Maintained incrementally — each push adds only the appended element's
+    /// estimate, so it is amortised `O(1)` and never re-walks the accumulated list. The serial fold
+    /// rejects with [`EvalError::ResourceLimit`] the instant this crosses
+    /// [`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES); the parallel grouped tier
+    /// ([`combine`](Self::combine)) keeps it summed across merged partitions so the engine thread can
+    /// detect a merged `collect` that crossed the budget and decline to the serial path (which raises
+    /// the identical error). Non-`collect` kinds leave it at `0`.
+    collected_bytes: usize,
     // `percentileCont`/`percentileDisc`: every numeric input value, kept as `(sort_key, original)`
     // so the result can preserve the source numeric subtype (`percentileDisc` returns a real value
     // of the set) while sorting on the `f64` key. The percentile (`args[1]`) is captured and
@@ -4399,9 +4408,43 @@ impl Accumulator {
             int_sum_saturated: false,
             extreme: None,
             collected: Vec::new(),
+            collected_bytes: 0,
             numeric: Vec::new(),
             percentile: None,
         }
+    }
+
+    /// Appends `rv` to the `collect` buffer, growing the running byte estimate
+    /// ([`collected_bytes`](Self::collected_bytes)) and **rejecting before the push** if the
+    /// accumulated list would exceed the per-value budget
+    /// ([`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES)) — the `collect`-side memory-DoS guard
+    /// (`SEC-191`, CWE-770 / CWE-789). Walks only the appended element (amortised `O(1)`).
+    ///
+    /// # Errors
+    /// [`EvalError::ResourceLimit`] (as [`ExecError::Eval`]) once the buffer would cross the budget.
+    fn push_collected(&mut self, rv: RowValue) -> Result<(), ExecError> {
+        let next = self
+            .collected_bytes
+            .saturating_add(crate::value_size::estimate_rowvalue_bytes(&rv));
+        let limit = crate::value_size::max_value_bytes();
+        if next > limit {
+            return Err(ExecError::Eval(EvalError::ResourceLimit {
+                detail: format!("collected list exceeds the {limit}-byte value limit"),
+            }));
+        }
+        self.collected_bytes = next;
+        self.collected.push(rv);
+        Ok(())
+    }
+
+    /// The running estimated byte size of the `collect` buffer (`SEC-191`). The `rmp` #360 grouped
+    /// morsel tier reads this on the engine thread after merging a group's partitions: a merged
+    /// `collect` whose estimate crosses [`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES) makes
+    /// the tier decline to the serial path, which re-folds and raises the identical
+    /// [`EvalError::ResourceLimit`].
+    #[must_use]
+    pub(crate) fn collected_bytes(&self) -> usize {
+        self.collected_bytes
     }
 
     /// Saturating-adds `delta` into `int_sum`, recording in [`int_sum_saturated`](Self::int_sum_saturated)
@@ -4526,7 +4569,16 @@ impl Accumulator {
                 self.seen.push(v.clone());
                 match self.kind {
                     AggKind::Count => self.count += 1,
-                    AggKind::Collect => self.collected.push(v.clone()),
+                    AggKind::Collect => {
+                        // Track the running byte estimate (`SEC-191`) so the engine thread can detect a
+                        // merged DISTINCT `collect` that crossed the budget; `combine` is infallible, so
+                        // it accounts the bytes here and the merge site enforces the cap (declining to
+                        // serial, which re-raises the typed error).
+                        self.collected_bytes = self
+                            .collected_bytes
+                            .saturating_add(crate::value_size::estimate_rowvalue_bytes(v));
+                        self.collected.push(v.clone());
+                    }
                     // The `rmp` #360 grouped recognizer admits DISTINCT only on `count` / `collect`, so a
                     // DISTINCT merge of any other kind (sum/min/max/avg DISTINCT) never reaches here. A
                     // no-op keeps the merge total; the `debug_assert` flags a gate-widening that forgot to
@@ -4571,8 +4623,11 @@ impl Accumulator {
         }
         // `collect` (non-DISTINCT): concatenate `other`'s buffer AFTER `self`'s (`rmp` #360). The caller
         // drives the combine in ascending-source order, so the concatenation reproduces the serial
-        // scan-order encounter sequence. Structural elements are preserved (RowValue-typed).
+        // scan-order encounter sequence. Structural elements are preserved (RowValue-typed). The running
+        // byte estimate is summed too (`SEC-191`) so the engine thread can detect a merged `collect` that
+        // crossed [`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES) and decline to the serial path.
         if self.kind == AggKind::Collect {
+            self.collected_bytes = self.collected_bytes.saturating_add(other.collected_bytes);
             self.collected.extend(other.collected);
         }
     }
@@ -4697,10 +4752,11 @@ impl Accumulator {
         if self.distinct {
             self.seen.push(rv.clone());
         }
-        // `collect` keeps the full RowValue (structural elements survive into the list).
+        // `collect` keeps the full RowValue (structural elements survive into the list), bounded by
+        // the per-value memory budget (`SEC-191`): `push_collected` rejects before the buffer crosses
+        // [`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES).
         if self.kind == AggKind::Collect {
-            self.collected.push(rv.clone());
-            return Ok(());
+            return self.push_collected(rv.clone());
         }
         // A percentile accumulator must never reach here (its fold needs `args[1]`; `update` keeps it
         // inline). The grouped-tier recognizer excludes percentiles, so this is defensive only.
@@ -7535,6 +7591,48 @@ mod tests {
             a.finish(),
             serial.finish(),
             "collect merge in ascending-lo order must equal the serial encounter order"
+        );
+    }
+
+    /// `rmp` #481: the `collect` byte-accounting the per-value budget rejects on. The running estimate must
+    /// be additive across folds AND across a `combine` (the input the `rmp` #360 grouped-morsel merge-site
+    /// detector reads), so a merged `collect` that crosses the budget is detected exactly as a serial fold
+    /// of the same elements would be — even when no single partition crossed it alone.
+    #[test]
+    fn collect_byte_estimate_is_additive_over_fold_and_combine() {
+        let per = crate::value_size::estimate_rowvalue_bytes(&RowValue::Value(Value::Integer(0)));
+
+        let collect = |vals: &[i64]| -> Accumulator {
+            let mut acc = Accumulator::for_kind(AggKind::Collect);
+            for &v in vals {
+                acc.fold_rowvalue(&RowValue::Value(Value::Integer(v)))
+                    .unwrap();
+            }
+            acc
+        };
+
+        // Per-fold: N integers ⇒ N * per bytes.
+        let a = collect(&[1, 2, 3]);
+        assert_eq!(
+            a.collected_bytes(),
+            3 * per,
+            "fold estimate must be additive"
+        );
+
+        // Per-combine: the merged estimate is the sum of the partitions' — exactly what a single serial fold
+        // over the concatenation reports.
+        let mut left = collect(&[1, 2, 3]);
+        let right = collect(&[4, 5]);
+        left.combine(right);
+        assert_eq!(
+            left.collected_bytes(),
+            5 * per,
+            "combine must sum the partitions' byte estimates (the merge-site cap input)"
+        );
+        assert_eq!(
+            left.collected_bytes(),
+            collect(&[1, 2, 3, 4, 5]).collected_bytes(),
+            "merged estimate must equal the serial fold over the concatenation"
         );
     }
 

@@ -2123,6 +2123,23 @@ pub fn converge_group_aggregate_outcomes(outcomes: Vec<MorselGroupOutcome>) -> G
                     for (acc, other) in g.accs.iter_mut().zip(local.accs) {
                         acc.combine(other);
                     }
+                    // Per-value memory budget on `collect` (`SEC-191`, CWE-770 / CWE-789): each morsel's
+                    // local fold already capped its own partition, but merging partitions of the SAME group
+                    // could push the union over [`MAX_VALUE_BYTES`] while no single morsel did. If so, the
+                    // parallel result is over budget: surface a typed error so the engine thread DECLINES
+                    // the parallel path and falls back to serial, which re-folds and raises the identical
+                    // `ResourceLimit` (`collected list exceeds the N-byte value limit`) the serial path
+                    // owns — never returning the oversized value to the client.
+                    let limit = crate::value_size::max_value_bytes();
+                    if first_error.is_none() && g.accs.iter().any(|a| a.collected_bytes() > limit) {
+                        first_error = Some(eval_error_to_graphus(
+                            &crate::eval::EvalError::ResourceLimit {
+                                detail: format!(
+                                    "collected list exceeds the {limit}-byte value limit"
+                                ),
+                            },
+                        ));
+                    }
                 }
                 None => {
                     let gi = merged.len();

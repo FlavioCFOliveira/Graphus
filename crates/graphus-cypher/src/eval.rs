@@ -443,7 +443,7 @@ fn eval_binary(
             let a = eval(lhs, row, params, graph, functions, clock)?;
             let b = eval(rhs, row, params, graph, functions, clock)?;
             if let Some(out) = structural_list_add(&a, &b) {
-                return Ok(out);
+                return out;
             }
             arithmetic_add(&to_value(a), &to_value(b))
         }
@@ -674,6 +674,52 @@ fn is_nan(v: &Value) -> bool {
     matches!(v, Value::Float(f) if f.is_nan())
 }
 
+/// Rejects a string-concatenation result whose byte length would exceed
+/// [`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES) — the per-value budget every materialised
+/// value shares (`SEC-191`, CWE-770 / CWE-789). The check is `O(1)` (the operand lengths are known)
+/// and runs **before** the `format!` allocates, so a runaway `+` / coercion chain
+/// (`s + s + s + …`, each step feeding the next) is rejected the instant a single result crosses the
+/// budget rather than growing until it OOMs the engine thread.
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] if `a_len + b_len` exceeds the budget.
+fn check_concat_string_len(a_len: usize, b_len: usize) -> Result<(), EvalError> {
+    let total = a_len.saturating_add(b_len);
+    let limit = crate::value_size::max_value_bytes();
+    if total > limit {
+        return Err(EvalError::ResourceLimit {
+            detail: format!(
+                "string concatenation would produce {total} bytes (limit {limit} bytes per value)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a list-concatenation result whose element count would exceed the per-value budget
+/// ([`max_list_elements`](crate::value_size::max_list_elements), derived from
+/// [`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES) exactly as `range()` derives its element
+/// ceiling). The check is `O(1)` (only the operand element counts are read) and runs **before** the
+/// result `Vec` grows, so a runaway list `+` is rejected the instant a single result crosses the
+/// budget — the `Vec` backbone alone (`count * size_of::<Value>()`) is what the budget bounds.
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] if `a_len + b_len` exceeds the element ceiling.
+fn check_concat_list_len(a_len: usize, b_len: usize) -> Result<(), EvalError> {
+    let total = a_len.saturating_add(b_len);
+    let limit = crate::value_size::max_list_elements();
+    if total > limit {
+        return Err(EvalError::ResourceLimit {
+            detail: format!(
+                "list concatenation would produce {total} elements (limit {limit}, a {}-byte \
+                 materialisation budget)",
+                crate::value_size::max_value_bytes()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Structural list concatenation for `+` when a **structural** list (one holding a node /
 /// relationship / path) is involved. Returns `Some(result)` when at least one operand is a
 /// structural [`RowValue::List`], handling `list + list`, `list + element` and `element + list` while
@@ -682,11 +728,28 @@ fn is_nan(v: &Value) -> bool {
 ///
 /// `null + x` / `x + null` is **not** handled here (it is value-level null propagation), so a null
 /// operand makes this return `None` and the property path produces null.
-fn structural_list_add(a: &RowValue, b: &RowValue) -> Option<RowValue> {
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] (carried as `Some(Err(..))`) if the concatenated list would exceed
+/// the per-value element budget ([`check_concat_list_len`]). Checked on the operand element counts
+/// **before** the result `Vec` is grown.
+fn structural_list_add(a: &RowValue, b: &RowValue) -> Option<EvalResult> {
     let a_struct_list = matches!(a, RowValue::List(_));
     let b_struct_list = matches!(b, RowValue::List(_));
     if !a_struct_list && !b_struct_list {
         return None;
+    }
+    // The element count each operand contributes: a list-shaped operand (structural or property)
+    // contributes its length, anything else a single element (Cypher's `list + element`).
+    fn elem_count(v: &RowValue) -> usize {
+        match v {
+            RowValue::List(items) => items.len(),
+            RowValue::Value(Value::List(items)) => items.len(),
+            _ => 1,
+        }
+    }
+    if let Err(e) = check_concat_list_len(elem_count(a), elem_count(b)) {
+        return Some(Err(e));
     }
     // Borrow each operand as list elements when it is list-shaped (structural or property), else
     // treat it as a single element to append/prepend (Cypher's `list + element`).
@@ -695,7 +758,7 @@ fn structural_list_add(a: &RowValue, b: &RowValue) -> Option<RowValue> {
     }
     let mut out = elems_or_single(a);
     out.extend(elems_or_single(b));
-    Some(RowValue::list(out))
+    Some(Ok(RowValue::list(out)))
 }
 
 /// Cypher `+`: numeric addition, **or** string concatenation, **or** list concatenation, with null
@@ -715,34 +778,40 @@ fn arithmetic_add(a: &Value, b: &Value) -> EvalResult {
             .map(RowValue::Value)
             .ok_or(EvalError::IntegerOverflow),
         (Value::String(x), Value::String(y)) => {
+            check_concat_string_len(x.len(), y.len())?;
             Ok(RowValue::Value(Value::String(format!("{x}{y}"))))
         }
         (Value::List(x), Value::List(y)) => {
+            check_concat_list_len(x.len(), y.len())?;
             let mut out = x.clone();
             out.extend(y.iter().cloned());
             Ok(RowValue::Value(Value::List(out)))
         }
         // List + element / element + list (Cypher appends/prepends scalars).
         (Value::List(x), other) => {
+            check_concat_list_len(x.len(), 1)?;
             let mut out = x.clone();
             out.push(other.clone());
             Ok(RowValue::Value(Value::List(out)))
         }
         (other, Value::List(y)) => {
+            check_concat_list_len(1, y.len())?;
             let mut out = Vec::with_capacity(y.len() + 1);
             out.push(other.clone());
             out.extend(y.iter().cloned());
             Ok(RowValue::Value(Value::List(out)))
         }
         // String + number and number + string concatenate the string form (Cypher coercion).
-        (Value::String(x), other) => Ok(RowValue::Value(Value::String(format!(
-            "{x}{}",
-            stringify_scalar(other)
-        )))),
-        (other, Value::String(y)) => Ok(RowValue::Value(Value::String(format!(
-            "{}{y}",
-            stringify_scalar(other)
-        )))),
+        (Value::String(x), other) => {
+            let suffix = stringify_scalar(other);
+            check_concat_string_len(x.len(), suffix.len())?;
+            Ok(RowValue::Value(Value::String(format!("{x}{suffix}"))))
+        }
+        (other, Value::String(y)) => {
+            let prefix = stringify_scalar(other);
+            check_concat_string_len(prefix.len(), y.len())?;
+            Ok(RowValue::Value(Value::String(format!("{prefix}{y}"))))
+        }
         _ => match (numeric_f64(a), numeric_f64(b)) {
             (Some(x), Some(y)) => Ok(RowValue::Value(Value::Float(x + y))),
             _ => Err(EvalError::TypeError {
@@ -2047,6 +2116,18 @@ fn replace_fn(argv: &[Value]) -> Result<Value, EvalError> {
         arg(argv, 2, "replace")?,
     ) {
         (Value::String(s), Value::String(search), Value::String(rep)) => {
+            // `replace` is an **expanding** builder: replacing a short pattern with a long replacement
+            // grows the result without bound (e.g. `replace(s, "a", <huge>)`). Reject a result that
+            // would exceed the per-value budget BEFORE `String::replace` allocates it (`SEC-191`).
+            let bound = replace_result_len_bound(s, search, rep);
+            let limit = crate::value_size::max_value_bytes();
+            if bound > limit {
+                return Err(EvalError::ResourceLimit {
+                    detail: format!(
+                        "replace() would produce up to {bound} bytes (limit {limit} bytes per value)"
+                    ),
+                });
+            }
             Ok(Value::String(s.replace(search.as_str(), rep)))
         }
         (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
@@ -2054,6 +2135,29 @@ fn replace_fn(argv: &[Value]) -> Result<Value, EvalError> {
             context: "replace() requires string arguments".to_owned(),
         }),
     }
+}
+
+/// An `O(1)` upper bound (in bytes) on the length of `s.replace(search, rep)`, computed **without**
+/// scanning `s`, so `replace` can be rejected before it allocates an over-budget result.
+///
+/// When `rep` is no longer than `search` the result can never grow past `s.len()`. Otherwise each
+/// non-overlapping occurrence adds `rep.len() - search.len()` bytes; the count of occurrences is at
+/// most `s.len() / search.len()` (each consumes at least `search.len()` bytes), or `s.len() + 1`
+/// insertion points for the empty pattern (`"abc".replace("", x)` == `"xaxbxcx"`). Using these upper
+/// bounds keeps the estimate conservative (it can only over-count, which only tightens the budget —
+/// the safe direction) and `O(1)`.
+fn replace_result_len_bound(s: &str, search: &str, rep: &str) -> usize {
+    if rep.len() <= search.len() {
+        return s.len();
+    }
+    let per_occurrence = rep.len() - search.len();
+    let occurrences = if search.is_empty() {
+        s.len().saturating_add(1)
+    } else {
+        s.len() / search.len()
+    };
+    s.len()
+        .saturating_add(occurrences.saturating_mul(per_occurrence))
 }
 
 /// `split(s, delimiter)` (openCypher).
@@ -2126,6 +2230,7 @@ fn eval_list_comprehension(
         return Ok(RowValue::NULL);
     };
     let mut out = Vec::new();
+    let mut out_bytes: usize = 0;
     for item in items {
         let inner = row.with(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
@@ -2133,12 +2238,34 @@ fn eval_list_comprehension(
                 continue;
             }
         }
-        match &lc.projection {
-            Some(proj) => out.push(eval(proj, &inner, params, graph, functions, clock)?),
-            None => out.push(item),
-        }
+        let elem = match &lc.projection {
+            Some(proj) => eval(proj, &inner, params, graph, functions, clock)?,
+            None => item,
+        };
+        accumulate_list_bytes(&mut out_bytes, &elem, "list comprehension")?;
+        out.push(elem);
     }
     Ok(RowValue::list(out))
+}
+
+/// Adds the estimated byte cost of `elem` to a streaming list builder's running `bytes` total and
+/// rejects once the accumulated list would exceed the per-value budget
+/// ([`MAX_VALUE_BYTES`](crate::value_size::MAX_VALUE_BYTES)) — the guard a list / pattern
+/// comprehension applies as it appends each projected element (`SEC-191`, CWE-770 / CWE-789). Walks
+/// only the **new** element (amortised `O(1)`), never re-walking the accumulated list, and rejects
+/// before the over-budget element is retained.
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] once the running total exceeds the budget.
+fn accumulate_list_bytes(bytes: &mut usize, elem: &RowValue, what: &str) -> Result<(), EvalError> {
+    *bytes = bytes.saturating_add(crate::value_size::estimate_rowvalue_bytes(elem));
+    let limit = crate::value_size::max_value_bytes();
+    if *bytes > limit {
+        return Err(EvalError::ResourceLimit {
+            detail: format!("{what} exceeds the {limit}-byte value limit"),
+        });
+    }
+    Ok(())
 }
 
 /// Evaluates a comprehension/quantifier **source list** to its elements at the [`RowValue`] level,
@@ -2260,13 +2387,16 @@ fn eval_pattern_comprehension(
         path_var,
     )?;
     let mut out = Vec::new();
+    let mut out_bytes: usize = 0;
     for m in matches {
         if let Some(pred) = &pc.predicate {
             if !eval_to_ternary(pred, &m, params, graph, functions, clock)?.is_true() {
                 continue;
             }
         }
-        out.push(eval(&pc.projection, &m, params, graph, functions, clock)?);
+        let elem = eval(&pc.projection, &m, params, graph, functions, clock)?;
+        accumulate_list_bytes(&mut out_bytes, &elem, "pattern comprehension")?;
+        out.push(elem);
     }
     Ok(RowValue::list(out))
 }
