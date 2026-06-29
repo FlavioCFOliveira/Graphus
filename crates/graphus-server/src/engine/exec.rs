@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use graphus_core::Value;
 use graphus_core::capability::Clock;
@@ -19,8 +19,8 @@ use graphus_cypher::procedure_registry::{FieldSpec, FieldType, ProcedureFailure,
 use graphus_cypher::{
     AuthorizedGraph, FeatureFlags, GraphAccess, IndexCatalog, Parameters, PhysicalPlan, PlanCache,
     PlanCacheKey, PrivilegeOracle, ProcedureSignature, SchemaVersion, Statistics, TxnCoordinator,
-    analyze_with_extensions, bind_parameters, execute_with_extensions, lower, parse_tokens,
-    plan_physical_with_stats, tokenize,
+    analyze_with_extensions, bind_parameters, execute_with_extensions_cancellable, lower,
+    parse_tokens, plan_physical_with_stats, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
@@ -260,8 +260,18 @@ pub(super) fn handle_run<
     metrics: &Arc<Metrics>,
     db: &str,
     clock: &Arc<dyn Clock + Send + Sync>,
+    statement_timeout: Option<Duration>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> RunOutcome {
+    // The per-statement wall-clock **deadline** (`rmp` #476): the start of this statement's CPU budget.
+    // Captured up front so it covers compile + bind + execute (all of which run on this engine thread),
+    // and on the **monotonic** `Instant` clock so an NTP step cannot perturb it. `None` (the
+    // statement-timeout-disabled config, and the deterministic `LocalEngine`, which never sets a timeout)
+    // leaves the executor wall-clock-free — byte-identical to before. Carried into both the inline cursor
+    // and the off-thread reader's `ReadTask`, and it survives suspend/resume (the token lives on the
+    // cursor), so the same budget governs every batch of the statement.
+    let deadline: Option<Instant> = statement_timeout.map(|d| Instant::now() + d);
+
     // Resolve the open transaction.
     let Some(tx) = open.get(&ticket.0) else {
         let _ = reply.send(Err(GraphusError::Transaction(format!(
@@ -347,6 +357,9 @@ pub(super) fn handle_run<
                     inputs,
                     extensions: Arc::clone(extensions),
                     privileges,
+                    // The per-statement deadline (`rmp` #476) rides the `Send` task to the reader thread,
+                    // so an off-thread read is bounded by the same budget as an inline one.
+                    deadline,
                     row_tx,
                     row_rx: row_rx
                         .take()
@@ -413,6 +426,7 @@ pub(super) fn handle_run<
         seam_error: None,
         started_nanos: started,
         query: query.to_owned(),
+        deadline,
     };
     match start_inline(
         &mut inflight,
@@ -506,13 +520,16 @@ fn open_and_drive_first(
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> BatchStep {
     // Open the cursor and hand the consumer its receiver up front (with the column names), so it can
-    // drain the bounded channel concurrently with production.
-    let mut cursor = match execute_with_extensions(
+    // drain the bounded channel concurrently with production. The cursor carries a deadline-bearing
+    // cancellation token (`rmp` #476): the per-statement CPU budget the executor's safe points enforce.
+    // The token lives on the cursor (and survives suspend/resume), so the budget spans every batch.
+    let mut cursor = match execute_with_extensions_cancellable(
         plan,
         bound,
         graph,
         extensions.functions_dyn(),
         extensions.procedures_dyn(),
+        graphus_cypher::CancellationToken::with_deadline(inflight.deadline),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -608,18 +625,22 @@ pub(super) fn run_cursor(
     bound: &graphus_cypher::BoundParameters,
     graph: &mut dyn GraphAccess,
     extensions: &ExtensionRegistry,
+    deadline: Option<Instant>,
     row_tx: &RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> bool {
     // The **same** registry that backed `compile` must back execution (`rmp` task #75), or the
-    // compile-time function/procedure guarantees are void.
-    let mut cursor = match execute_with_extensions(
+    // compile-time function/procedure guarantees are void. The cursor carries a deadline-bearing
+    // cancellation token (`rmp` #476): the same per-statement CPU budget the inline path enforces, so an
+    // off-thread reader is bounded identically.
+    let mut cursor = match execute_with_extensions_cancellable(
         plan,
         bound,
         graph,
         extensions.functions_dyn(),
         extensions.procedures_dyn(),
+        graphus_cypher::CancellationToken::with_deadline(deadline),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -723,6 +744,12 @@ pub(super) struct InFlightInline {
     started_nanos: u64,
     /// The query string, kept for the slow-query log at finish.
     query: String,
+    /// The per-statement wall-clock deadline (`rmp` #476), or `None` when no statement timeout is
+    /// configured. Read once by [`open_and_drive_first`] to build the cursor's deadline-bearing
+    /// [`CancellationToken`](graphus_cypher::CancellationToken); the token then lives on the cursor (and
+    /// its [`SuspendedCursor`](graphus_cypher::SuspendedCursor)), so the same budget governs every resume
+    /// batch without re-reading this.
+    deadline: Option<Instant>,
 }
 
 /// How a single resume visit ended (`rmp` task #372): either the statement is fully done (the caller

@@ -40,6 +40,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use graphus_core::Value;
 
@@ -62,35 +63,100 @@ use crate::ternary::Ternary;
 
 /// A cooperative **cancellation token** shared between a caller and a running query (`04 §7.7`).
 ///
-/// The caller holds a clone and trips it (e.g. on deadline / client disconnect / `RESET`); operators
-/// poll [`is_cancelled`](Self::is_cancelled) at safe points (between rows). Cloning shares the same
+/// The caller holds a clone and trips it (e.g. on client disconnect / `RESET`); operators poll
+/// [`is_cancelled`](Self::is_cancelled) at safe points (between rows). Cloning shares the same
 /// underlying flag (an [`Arc<AtomicBool>`]), so a trip on any clone is observed by all. It is
 /// `Send + Sync`, ready for the connectivity layer's `tokio::select!` timeout/abort branches.
+///
+/// A token may additionally carry a **wall-clock deadline** ([`with_deadline`](Self::with_deadline),
+/// `rmp` #476): a per-statement CPU budget the executor's existing safe points enforce cooperatively,
+/// so a runaway query (a cartesian / variable-length-expansion bomb) aborts with
+/// [`ExecError::Cancelled`] even with no external canceller — bounding per-database-thread CPU
+/// exhaustion. The deadline is a plain `Copy` [`Instant`] fixed at construction (not shared through the
+/// `Arc`): every clone observes the same instant, so no atomic is needed. A `None` deadline (the
+/// default — and what every test / TCK / deterministic-engine path uses) preserves the prior flag-only
+/// behaviour exactly.
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct CancellationToken {
     flag: Arc<AtomicBool>,
+    deadline: Option<Instant>,
 }
 
 impl CancellationToken {
-    /// A fresh, untripped token.
+    /// A fresh, untripped token with no deadline.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Trips the token: every clone now observes [`is_cancelled`](Self::is_cancelled) as `true`.
+    /// A token that trips automatically once the monotonic clock reaches `deadline`, in addition to an
+    /// explicit [`cancel`](Self::cancel) (`rmp` #476). `None` yields a never-expiring token, identical
+    /// to [`new`](Self::new) — used by the deterministic engine and the test/TCK paths so they never
+    /// observe wall-clock-dependent behaviour.
+    pub fn with_deadline(deadline: Option<Instant>) -> Self {
+        Self {
+            flag: Arc::default(),
+            deadline,
+        }
+    }
+
+    /// The wall-clock deadline this token enforces, if any (`rmp` #476). The morsel tier reads it to
+    /// install the same cooperative budget on its off-thread workers.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Trips the explicit cancel flag: every clone now observes [`is_cancelled`](Self::is_cancelled) as
+    /// `true`.
     ///
-    /// `Release` ordering pairs with the `Acquire` load in [`is_cancelled`](Self::is_cancelled) so a
+    /// `Release` ordering pairs with the `Acquire` load in [`is_flagged`](Self::is_flagged) so a
     /// cancelling thread's prior writes are visible to the observing executor thread.
     pub fn cancel(&self) {
         self.flag.store(true, AtomicOrdering::Release);
     }
 
-    /// Whether the token has been tripped.
+    /// Whether the explicit cancel flag has been tripped (client disconnect / `RESET` / external
+    /// abort). A single cheap atomic load — it does **not** consult the wall-clock deadline, so the
+    /// hot per-row safe point can check it on every call without reading the clock.
     #[must_use]
-    pub fn is_cancelled(&self) -> bool {
+    pub fn is_flagged(&self) -> bool {
         self.flag.load(AtomicOrdering::Acquire)
     }
+
+    /// Whether the wall-clock deadline (if any) has elapsed (`rmp` #476). Reads `Instant::now()`, so
+    /// callers on a hot path should gate how often they poll it (the executor's
+    /// [`Ctx::check_cancelled`] polls it at a strided cadence; the morsel workers poll it per chunk).
+    #[must_use]
+    pub fn deadline_exceeded(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Whether the token is cancelled by **either** the explicit flag or an elapsed deadline.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.is_flagged() || self.deadline_exceeded()
+    }
+}
+
+/// How many [`Ctx::check_cancelled`] safe points pass between two wall-clock deadline polls (`rmp`
+/// #476). The explicit cancel flag is an atomic load checked on **every** safe point; the deadline,
+/// which needs an `Instant::now()`, is consulted only once per this many calls so a legitimate large
+/// result keeps its prior atomic-only hot-path cost (production always configures a finite default, so
+/// an un-gated per-row `Instant::now()` would tax every big read). A runaway query still aborts within
+/// this many safe points of the deadline — microseconds for a tight loop — so cancellation stays
+/// prompt. A power of two so the gate is a mask, not a division.
+const DEADLINE_POLL_STRIDE: u32 = 1024;
+
+thread_local! {
+    /// A per-thread, monotonic counter that strides the wall-clock deadline poll in
+    /// [`Ctx::check_cancelled`] (`rmp` #476). It is a **benign performance gate**, not semantic state:
+    /// it only decides *when* to read `Instant::now()`, never *whether* the query is cancelled, so its
+    /// value carrying across statements (the engine thread is long-lived) is harmless — it merely
+    /// phases the gate. Lives at thread scope (not on [`Ctx`]) so it persists across `Cursor::next`
+    /// calls: a streaming cartesian bomb emits one row per `next()` with only a few safe points each,
+    /// and the deadline must still be polled across that stream.
+    static DEADLINE_POLL_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// A **runtime** execution error (`04 §7.3` runtime phase; never a compile-time class).
@@ -195,12 +261,28 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// Polls the cancellation token at a safe point; `Err(Cancelled)` unwinds the pipeline.
+    ///
+    /// The explicit cancel flag (client disconnect / `RESET` / external abort) is a cheap atomic load
+    /// checked on every call. The per-statement wall-clock deadline (`rmp` #476) needs an
+    /// `Instant::now()`, so it is polled at a strided cadence ([`DEADLINE_POLL_STRIDE`]) — bounding a
+    /// runaway query within that many safe points of its deadline while keeping a legitimate large
+    /// result on the prior atomic-only hot path. When the token has no deadline (every test / TCK /
+    /// deterministic-engine path) the clock is never read, so behaviour is byte-identical to before.
     fn check_cancelled(&self) -> Result<(), ExecError> {
-        if self.token.is_cancelled() {
-            Err(ExecError::Cancelled)
-        } else {
-            Ok(())
+        if self.token.is_flagged() {
+            return Err(ExecError::Cancelled);
         }
+        if self.token.deadline().is_some() {
+            let fire = DEADLINE_POLL_COUNTER.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n & (DEADLINE_POLL_STRIDE - 1) == 0
+            });
+            if fire && self.token.deadline_exceeded() {
+                return Err(ExecError::Cancelled);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2830,12 +2912,16 @@ fn try_morsel_group_aggregate(
     // --- the engine-thread seam: capture the candidate vector + off-thread read surface (registers the
     // identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
     // serial pipeline runs verbatim. ---
-    let Some(scan) = ctx.graph.morsel_label_scan(label) else {
+    let Some(mut scan) = ctx.graph.morsel_label_scan(label) else {
         return Ok(None);
     };
+    // Install the per-statement wall-clock budget (`rmp` #476) on the parallel workers, so a runaway
+    // grouped morsel scan abandons rather than pinning every core; on elapse a worker records a timeout
+    // error and the serial fallback below surfaces a clean `Cancelled`.
+    scan.deadline = ctx.token.deadline();
 
-    // Cancellation is polled once up front (the per-morsel work is a self-contained store read + pure
-    // evaluation + local fold, bounded by the candidate count).
+    // Cancellation (flag and an already-elapsed deadline) is polled once up front; each worker then polls
+    // the deadline again at a strided cadence while it runs (`rmp` #476).
     ctx.check_cancelled()?;
 
     let spec = crate::morsel::MorselGroupSpec {
@@ -2966,12 +3052,16 @@ fn try_morsel_label_aggregate(
     // --- the engine-thread seam: capture the candidate vector + off-thread read surface (registers the
     // identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
     // fall through to the serial tiers, which run verbatim. ---
-    let Some(scan) = ctx.graph.morsel_label_scan(label) else {
+    let Some(mut scan) = ctx.graph.morsel_label_scan(label) else {
         return Ok(None);
     };
+    // Install the per-statement wall-clock budget (`rmp` #476): the bare-aggregate fan-out gates each
+    // morsel on the deadline, so a runaway scan abandons rather than pinning every core; the serial
+    // fallback below then surfaces a clean `Cancelled`.
+    scan.deadline = ctx.token.deadline();
 
-    // Cancellation is polled once up front (the per-morsel read polls nothing — it is a self-contained
-    // store read; the whole fan-out is bounded by the candidate count).
+    // Cancellation (flag and an already-elapsed deadline) is polled once up front; the fan-out then gates
+    // each morsel on the deadline as it runs (`rmp` #476).
     ctx.check_cancelled()?;
 
     // --- read the morsels concurrently on the dedicated pool (the parallelized MVCC-revalidating read) ---
@@ -3514,12 +3604,15 @@ fn try_morsel_scan_filter_project(
     // --- the engine-thread seam: capture the candidate vector + off-thread read surface (registers the
     // identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
     // fall through to the serial pipeline, which runs verbatim. ---
-    let Some(scan) = ctx.graph.morsel_label_scan(shape.label) else {
+    let Some(mut scan) = ctx.graph.morsel_label_scan(shape.label) else {
         return Ok(None);
     };
+    // Install the per-statement wall-clock budget (`rmp` #476) on the parallel workers, so a runaway
+    // scan→filter→project abandons rather than pinning every core; the serial fallback surfaces `Cancelled`.
+    scan.deadline = ctx.token.deadline();
 
-    // Cancellation is polled once up front (the per-morsel work is a self-contained store read + pure
-    // evaluation, bounded by the candidate count).
+    // Cancellation (flag and an already-elapsed deadline) is polled once up front; each worker then polls
+    // the deadline again at a strided cadence while it runs (`rmp` #476).
     ctx.check_cancelled()?;
 
     // --- read + filter + project the morsels concurrently, converging row-order-identically to serial ---
@@ -3734,12 +3827,16 @@ fn try_morsel_expand_aggregate(
     // --- the engine-thread seam: capture the anchor candidate vector + off-thread read surface (registers
     // the identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
     // serial pipeline runs verbatim (and RBAC-composes per relationship/endpoint). ---
-    let Some(scan) = ctx.graph.morsel_label_scan(shape.label) else {
+    let Some(mut scan) = ctx.graph.morsel_label_scan(shape.label) else {
         return Ok(None);
     };
+    // Install the per-statement wall-clock budget (`rmp` #476) on the parallel workers, so a runaway
+    // scan→expand (incl. a supernode's fan-out) abandons rather than pinning every core; the serial
+    // fallback surfaces a clean `Cancelled`.
+    scan.deadline = ctx.token.deadline();
 
-    // Cancellation is polled once up front (the per-anchor expand is a self-contained store read, bounded
-    // by the candidate count × per-anchor degree).
+    // Cancellation (flag and an already-elapsed deadline) is polled once up front; each worker then polls
+    // the deadline again — per anchor and within a high-degree anchor's expansion — while it runs (`rmp` #476).
     ctx.check_cancelled()?;
 
     let plan = crate::morsel::MorselExpandPlan {
@@ -3856,9 +3953,12 @@ fn try_morsel_expand_project(
     }
 
     // --- the engine-thread seam: capture the anchor candidate vector + off-thread read surface ---
-    let Some(scan) = ctx.graph.morsel_label_scan(shape.label) else {
+    let Some(mut scan) = ctx.graph.morsel_label_scan(shape.label) else {
         return Ok(None);
     };
+    // Install the per-statement wall-clock budget (`rmp` #476) on the parallel workers, so a runaway
+    // scan→expand→project abandons rather than pinning every core; the serial fallback surfaces `Cancelled`.
+    scan.deadline = ctx.token.deadline();
 
     ctx.check_cancelled()?;
 
@@ -5974,6 +6074,32 @@ pub fn execute_with_extensions<'a>(
         functions,
         procedures,
     )
+}
+
+/// [`execute_with_extensions`] driven by a **caller-supplied** [`CancellationToken`] (`rmp` #476)
+/// instead of a fresh throwaway one — so the engine can install a per-statement wall-clock deadline
+/// (and/or trip the token on client disconnect / `RESET`) and have the executor's existing safe points
+/// abort a runaway query cooperatively.
+///
+/// Build the token with [`CancellationToken::with_deadline`] for a finite per-statement budget, or with
+/// [`CancellationToken::new`] for an unbounded one. The token is moved into the returned [`Cursor`] (and
+/// survives [`Cursor::suspend`]/[`SuspendedCursor::resume`]), so the same budget governs every batch of
+/// the statement.
+///
+/// # Errors
+///
+/// As [`execute_with_extensions`]; additionally an already-elapsed deadline (or an already-tripped flag)
+/// surfaces as [`ExecError::Cancelled`] at the first safe point.
+pub fn execute_with_extensions_cancellable<'a>(
+    plan: &PhysicalPlan,
+    params: &BoundParameters,
+    graph: &'a mut dyn GraphAccess,
+    functions: &'a dyn FunctionRegistry,
+    procedures: &'a dyn ProcedureRegistry,
+    token: CancellationToken,
+) -> Result<Cursor<'a>, ExecError> {
+    Executor::new(plan.clone(), params.clone())
+        .open_with_extensions(graph, token, functions, procedures)
 }
 
 /// Whether `op` is a top-level write operator (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`).

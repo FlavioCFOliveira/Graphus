@@ -2346,6 +2346,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             snapshot: self.snapshot,
             registry: self.registry.clone(),
             txn: self.txn,
+            // The seam never knows the statement deadline (an executor-time concern); the morsel tier
+            // sets it from the cursor's `CancellationToken` before dispatch (`rmp` #476).
+            deadline: None,
         })
     }
 

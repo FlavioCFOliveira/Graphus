@@ -76,6 +76,11 @@ pub struct ReadTask<D: BlockDevice, S: LogSink> {
     pub extensions: Arc<ExtensionRegistry>,
     /// The principal's resolved RBAC for this statement (`None`/unrestricted = no filtering).
     pub privileges: Option<EffectivePrivileges>,
+    /// The per-statement wall-clock deadline (`rmp` #476), captured on the engine thread at statement
+    /// start, or `None` when no statement timeout is configured. Bounds this off-thread read's CPU to the
+    /// same budget an inline statement gets: the reader builds its cursor's deadline-bearing
+    /// cancellation token from it.
+    pub deadline: Option<std::time::Instant>,
     /// The egress channel the reader streams rows into; handed back at retirement so the engine can
     /// send a terminal auto-commit error through it (the auto-commit terminal-error contract).
     pub row_tx: RowSender,
@@ -128,6 +133,7 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
         inputs,
         extensions,
         privileges,
+        deadline,
         row_tx,
         row_rx,
         reply,
@@ -158,6 +164,7 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
                 &bound,
                 &mut authz,
                 &extensions,
+                deadline,
                 &row_tx,
                 row_rx,
                 reply,
@@ -170,6 +177,7 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
             &bound,
             &mut graph,
             &extensions,
+            deadline,
             &row_tx,
             row_rx,
             reply,

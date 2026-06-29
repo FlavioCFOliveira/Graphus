@@ -12,11 +12,13 @@
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use graphus_core::Value;
 use graphus_cypher::binding::{BindError, Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
+use graphus_cypher::executor::{CancellationToken, ExecError, Executor};
+use graphus_cypher::graph_access::MemGraph;
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
@@ -163,4 +165,136 @@ fn over_deep_parameter_is_rejected_at_bind_with_a_recoverable_error() {
         bind_parameters(&plan, &Parameters::new().with("a", ok)).is_ok(),
         "a value at exactly MAX_VALUE_DEPTH must still bind"
     );
+}
+
+// =================================================================================================
+// SEC-476: per-statement CPU budget (execution-time deadline) bounds a runaway query
+//
+// An ordinary Cypher statement used to run with NO execution-time budget: a patient client could
+// submit a cartesian-product or deep variable-length-expansion "bomb" that pins the per-database
+// engine thread unbounded, starving every co-tenant (a per-database-thread CPU-exhaustion DoS). The
+// executor polls a `CancellationToken` at dense safe points (the top of every `Operator::next`, and
+// inside the variable-length DFS / shortest-path BFS); rmp #476 drives that token from a
+// per-statement wall-clock deadline (`CancellationToken::with_deadline`) so a runaway query aborts
+// cooperatively with `ExecError::Cancelled` instead of running forever.
+//
+// These tests exercise the executor's token plumbing directly (the `graphus-server` end-to-end test
+// `tests/statement_timeout.rs` proves the engine-thread path). They build a *bomb* plan and run it
+// with an already-elapsed deadline, asserting a clean `Cancelled` (no panic, no hang) — and prove a
+// normal query under a generous deadline is unaffected.
+// =================================================================================================
+
+/// Compiles `src` to a physical plan (no index catalogue, no stats) via the full front-end pipeline.
+fn compile_plan(src: &str) -> graphus_cypher::physical::PhysicalPlan {
+    let toks = tokenize(src).expect("lex");
+    let ast = parse_tokens(&toks, src).expect("parse");
+    let validated = analyze(&ast).expect("analyze");
+    plan_physical(&lower(&validated), &IndexCatalog::empty())
+}
+
+/// Builds a [`MemGraph`] of `n` `:N` nodes, fully connected (every ordered pair, incl. self-loops)
+/// by `:R` edges — a dense substrate so both a cartesian product and a variable-length expansion
+/// blow up super-linearly.
+fn dense_graph(n: usize) -> MemGraph {
+    let mut g = MemGraph::new();
+    let ids: Vec<_> = (0..n)
+        .map(|i| g.add_node(["N"], [("v", Value::Integer(i as i64))]))
+        .collect();
+    for &a in &ids {
+        for &b in &ids {
+            g.add_rel("R", a, b, [] as [(&str, Value); 0]);
+        }
+    }
+    g
+}
+
+/// Runs `plan` over `graph` under `token`, draining the cursor; returns the terminal result so a
+/// test can assert whether it completed or was cancelled. An open-time error (a materialising
+/// aggregate folds at `open`) and a streaming error are unified here.
+fn run_under(
+    plan: &graphus_cypher::physical::PhysicalPlan,
+    graph: &mut MemGraph,
+    token: CancellationToken,
+) -> Result<usize, ExecError> {
+    let bound = bind_parameters(plan, &Parameters::new()).expect("bind");
+    Executor::new(plan.clone(), bound)
+        .open(graph, token)
+        .and_then(|mut c| c.collect_all())
+        .map(|rows| rows.len())
+}
+
+#[test]
+fn statement_deadline_aborts_cartesian_bomb() {
+    // Regression: SEC-476 — a 3-way cartesian product over 60 nodes folds 60^3 = 216_000 intermediate
+    // rows. With an already-elapsed deadline the executor's per-row safe point trips `Cancelled` within
+    // the poll stride — promptly, with no panic and no hang.
+    let mut graph = dense_graph(60);
+    let plan = compile_plan("MATCH (a:N), (b:N), (c:N) RETURN count(*) AS n");
+
+    let started = Instant::now();
+    let result = run_under(
+        &plan,
+        &mut graph,
+        CancellationToken::with_deadline(Some(Instant::now() - Duration::from_secs(1))),
+    );
+    assert!(
+        matches!(result, Err(ExecError::Cancelled)),
+        "an elapsed per-statement deadline must abort the cartesian bomb with Cancelled, got {result:?}"
+    );
+    // It aborted cooperatively at a safe point — not after folding all 216k rows.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cancellation must be prompt, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn statement_deadline_aborts_var_length_bomb() {
+    // Regression: SEC-476 — an unbounded variable-length expansion over a dense graph enumerates an
+    // explosive number of relationship-unique trails; the DFS polls the token per recursion, so an
+    // elapsed deadline aborts it cleanly (the safe point inside `expand_var_length_dfs`).
+    let mut graph = dense_graph(12);
+    let plan = compile_plan("MATCH (a:N)-[*]->(b:N) RETURN count(*) AS n");
+
+    let result = run_under(
+        &plan,
+        &mut graph,
+        CancellationToken::with_deadline(Some(Instant::now() - Duration::from_secs(1))),
+    );
+    assert!(
+        matches!(result, Err(ExecError::Cancelled)),
+        "an elapsed per-statement deadline must abort the variable-length bomb with Cancelled, got {result:?}"
+    );
+}
+
+#[test]
+fn generous_deadline_does_not_disturb_a_normal_query() {
+    // A legitimate query under a far-future deadline completes unaffected — the budget never trips, and
+    // the gated wall-clock poll keeps the result exact.
+    let mut graph = dense_graph(20);
+    let plan = compile_plan("MATCH (a:N), (b:N) RETURN count(*) AS n");
+
+    let result = run_under(
+        &plan,
+        &mut graph,
+        CancellationToken::with_deadline(Some(Instant::now() + Duration::from_secs(3600))),
+    );
+    // One aggregated row (count(*) over 20*20 = 400 pairs).
+    assert_eq!(
+        result,
+        Ok(1),
+        "a normal query under a generous deadline must complete unaffected"
+    );
+}
+
+#[test]
+fn no_deadline_token_preserves_prior_behaviour() {
+    // A `None` deadline (every test / TCK / deterministic-engine path) is byte-identical to a fresh
+    // token: the executor never reads the wall clock, and the query completes normally.
+    let mut graph = dense_graph(20);
+    let plan = compile_plan("MATCH (a:N), (b:N) RETURN count(*) AS n");
+
+    let result = run_under(&plan, &mut graph, CancellationToken::with_deadline(None));
+    assert_eq!(result, Ok(1));
 }

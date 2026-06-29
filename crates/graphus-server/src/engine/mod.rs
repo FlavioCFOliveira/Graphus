@@ -407,6 +407,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     degraded: EngineDegraded,
     maintenance_degraded: MaintenanceDegraded,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
 ) {
     // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
     // additively so the gauge sums across every database engine. Also folds the same delta into THIS
@@ -552,6 +553,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &maintenance_degraded,
                         &mut active_txns,
                         &clock,
+                        statement_timeout,
                     ) {
                         break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
@@ -613,6 +615,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &maintenance_degraded,
                 &mut active_txns,
                 &clock,
+                statement_timeout,
             ) {
                 break 'engine;
             }
@@ -1013,6 +1016,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     maintenance_degraded: &MaintenanceDegraded,
     active_txns: &mut ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
 ) -> bool {
     // `rmp` #409 / #414: once a statement-recovery double-panic has flagged **this** engine degraded,
     // the coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke).
@@ -1082,6 +1086,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 db,
                 degraded,
                 clock,
+                statement_timeout,
                 reply,
             );
             active_txns.publish(coord.active_count());
@@ -1246,6 +1251,7 @@ fn run_statement_isolated<
     db: &str,
     degraded: &EngineDegraded,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
     reply: command::Reply<std::result::Result<RunReply, GraphusError>>,
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1272,6 +1278,7 @@ fn run_statement_isolated<
             metrics,
             db,
             clock,
+            statement_timeout,
             reply,
         )
     }));
@@ -1851,6 +1858,10 @@ pub struct Engine {
 /// `db_name` is the canonical database name this engine serves; it labels the per-database metric
 /// series (`rmp` #463) so an operator can attribute transaction/latency/abort counts to a single tenant.
 ///
+/// This convenience spawns an engine with **no per-statement timeout** (the prior behaviour); the
+/// production path uses [`spawn_engine_with_timeout`] to install the configured per-statement CPU
+/// budget (`rmp` #476).
+///
 /// # Errors
 /// Returns the spawn error if the OS thread cannot be created, or the `build` error (e.g. an
 /// integrity-check failure) if the store cannot be opened/verified.
@@ -1862,6 +1873,42 @@ pub fn spawn_engine<D, S, B>(
     reader_threads: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+) -> Result<Engine>
+where
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+    B: FnOnce() -> Result<TxnCoordinator<D, S>> + Send + 'static,
+{
+    spawn_engine_with_timeout(
+        db_name,
+        build,
+        engine_queue_capacity,
+        result_buffer_capacity,
+        reader_threads,
+        metrics,
+        clock,
+        None,
+    )
+}
+
+/// [`spawn_engine`] with an explicit per-statement execution **timeout** (`rmp` #476): a finite
+/// `statement_timeout` installs a per-statement wall-clock deadline on the Cypher executor's
+/// cancellation token, so a runaway query (a cartesian / variable-length-expansion bomb) is
+/// cooperatively aborted instead of pinning the engine thread and starving co-tenants. `None` disables
+/// it (identical to [`spawn_engine`]).
+///
+/// # Errors
+/// As [`spawn_engine`].
+#[allow(clippy::too_many_arguments)] // engine sizing + clock + per-statement budget — all positional knobs
+pub fn spawn_engine_with_timeout<D, S, B>(
+    db_name: Arc<str>,
+    build: B,
+    engine_queue_capacity: usize,
+    result_buffer_capacity: usize,
+    reader_threads: usize,
+    metrics: Arc<Metrics>,
+    clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -1906,6 +1953,7 @@ where
                     loop_degraded,
                     loop_maintenance_degraded,
                     clock,
+                    statement_timeout,
                 );
             }
             Err(e) => {

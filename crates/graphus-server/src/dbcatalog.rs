@@ -116,7 +116,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
-use crate::engine::{Engine, EngineHandle, spawn_engine};
+use crate::engine::{Engine, EngineHandle, spawn_engine_with_timeout};
 use crate::metrics::Metrics;
 use crate::store_device::{MasterKey, StoreDevice, WalSink};
 
@@ -475,6 +475,14 @@ pub struct EngineParams {
     /// admin op until the process is externally `SIGKILL`ed. Sourced from
     /// [`TimingConfig::shutdown_drain_deadline`](crate::config::TimingConfig::shutdown_drain_deadline).
     pub engine_shutdown_timeout: std::time::Duration,
+    /// Per-statement execution timeout (`rmp` #476), or `None` when disabled. Threaded to the engine
+    /// thread, which turns it into a per-statement wall-clock deadline on the Cypher executor's
+    /// cancellation token so a runaway query (cartesian / variable-length bomb) is cooperatively aborted
+    /// instead of pinning the engine thread and starving co-tenants. Sourced from
+    /// [`TimingConfig::statement_timeout`](crate::config::TimingConfig::statement_timeout). The
+    /// deterministic [`crate::engine::LocalEngine`] does not go through this path and runs statements
+    /// with no timeout (so DST stays wall-clock-free).
+    pub statement_timeout: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for EngineParams {
@@ -492,6 +500,7 @@ impl std::fmt::Debug for EngineParams {
             )
             .field("clock", &"<dyn Clock>")
             .field("engine_shutdown_timeout", &self.engine_shutdown_timeout)
+            .field("statement_timeout", &self.statement_timeout)
             .finish()
     }
 }
@@ -535,6 +544,7 @@ impl EngineParams {
             master_key,
             clock: std::sync::Arc::new(crate::server::SystemClock),
             engine_shutdown_timeout: config.timing.shutdown_drain_deadline(),
+            statement_timeout: config.timing.statement_timeout(),
         })
     }
 }
@@ -799,7 +809,7 @@ fn spawn_db_engine(
     let build = move || {
         open_or_create_coordinator(&device_file, &wal_file, pool_pages, master_key.as_ref())
     };
-    spawn_engine(
+    spawn_engine_with_timeout(
         Arc::from(db_name),
         build,
         params.engine_queue_capacity,
@@ -807,6 +817,7 @@ fn spawn_db_engine(
         params.reader_threads,
         metrics,
         std::sync::Arc::clone(&params.clock),
+        params.statement_timeout,
     )
 }
 
@@ -1995,6 +2006,7 @@ mod tests {
             master_key: None,
             clock: std::sync::Arc::new(crate::server::SystemClock),
             engine_shutdown_timeout: std::time::Duration::from_secs(10),
+            statement_timeout: None,
         }
     }
 

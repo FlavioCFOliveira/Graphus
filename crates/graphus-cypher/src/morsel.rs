@@ -66,6 +66,7 @@
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value};
@@ -85,6 +86,29 @@ use crate::read_only_graph::ReadOnlyGraph;
 use crate::read_source::{self, ReadSink, ReadViewSource, VisCtx};
 use crate::runtime::{NodeRef, RelRef, Row, RowValue};
 use crate::statement_clock::StatementClock;
+
+/// How many candidates / anchors a morsel worker processes between two wall-clock **deadline** polls
+/// (`rmp` #476): the per-statement timeout's cooperative safe point inside a (potentially large) morsel.
+/// `Instant::now()` is read only once per this many rows, so it never dominates the per-row work, yet a
+/// runaway morsel still abandons within this many rows of the deadline — keeping cancellation prompt
+/// across cores. A power of two so the gate is a mask. The morsel tier is OFF in the deterministic engine
+/// (`morsel_threads <= 1`), so this wall-clock poll never perturbs DST determinism.
+const MORSEL_DEADLINE_POLL_STRIDE: u64 = 1024;
+
+/// Whether the per-statement wall-clock deadline (if any) has elapsed (`rmp` #476). A `None` deadline (no
+/// configured timeout — and every deterministic / test path) returns `false` without reading the clock.
+#[inline]
+fn deadline_exceeded(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+/// The error a morsel worker records when the per-statement deadline elapses mid-morsel (`rmp` #476).
+/// Like every other morsel error it makes the executor discard the parallel result and fall back to the
+/// serial pipeline, whose first per-row safe point re-observes the elapsed deadline and surfaces
+/// [`crate::executor::ExecError::Cancelled`] — so the user sees a clean cancellation, never this string.
+fn statement_timeout_error() -> GraphusError {
+    GraphusError::Runtime("query cancelled by statement timeout".to_owned())
+}
 
 // =================================================================================================
 // The knob — process-global effective morsel-thread count
@@ -378,6 +402,22 @@ pub struct MorselReadOutcome {
     pub error: Option<GraphusError>,
 }
 
+impl MorselReadOutcome {
+    /// An empty, **timeout-abandoned** outcome (`rmp` #476): the per-statement deadline elapsed before
+    /// this morsel started, so it carries no values and a timeout error tagged `txn`, which the executor
+    /// treats like any other morsel error — discard the parallel result and fall back to the serial
+    /// pipeline, whose first per-row safe point surfaces a clean [`ExecError::Cancelled`]. The empty
+    /// buffer is dropped (the executor never folds the buffers of an errored morsel).
+    fn cancelled(txn: TxnId) -> Self {
+        Self {
+            values: Vec::new(),
+            label_matches: 0,
+            buffer: SsiReadBuffer::new(txn),
+            error: Some(statement_timeout_error()),
+        }
+    }
+}
+
 /// The result of reading + filtering + projecting one morsel of label candidates (`rmp` task #339,
 /// Slice 3b): the surviving (visible, label-carrying, filter-`TRUE`) candidates' **projected rows** in
 /// candidate order, this morsel's accumulated SIREAD markers, and the first read / evaluation error
@@ -619,6 +659,10 @@ pub trait MorselSource: Send + Sync {
     /// run — so a morsel produces byte-identical values, three-valued filter decisions, sort keys, and
     /// SIREAD markers to the serial path. `params` supplies any `$param` the predicate / projection /
     /// sort key reads.
+    ///
+    /// `deadline` is the per-statement wall-clock budget (`rmp` #476): the worker abandons (recording a
+    /// timeout error so the executor falls back to the serial pipeline, which surfaces a clean
+    /// cancellation) if it elapses mid-morsel. `None` means no budget — the worker runs to completion.
     #[allow(clippy::too_many_arguments)] // a per-morsel read worker; the seams are positional
     fn read_filter_project_morsel(
         &self,
@@ -632,6 +676,7 @@ pub trait MorselSource: Send + Sync {
         txn: TxnId,
         snapshot: Snapshot,
         registry: &CommitRegistry,
+        deadline: Option<Instant>,
     ) -> MorselRowsOutcome;
 
     /// Filters the contiguous **anchor** candidate slice `ids` to visible, label-carrying nodes, then
@@ -652,6 +697,11 @@ pub trait MorselSource: Send + Sync {
     /// `(a, r, b)` is evaluated through the identical [`crate::eval::eval`] — so a morsel produces
     /// byte-identical rows / counts, visibility, and SIREAD markers to the serial scan→expand path.
     /// `params` supplies any `$param` the projection reads.
+    ///
+    /// `deadline` is the per-statement wall-clock budget (`rmp` #476): the traversal abandons (recording
+    /// a timeout error so the executor falls back to the serial pipeline, which surfaces a clean
+    /// cancellation) if it elapses mid-morsel — polled both per anchor and, for a high-degree anchor,
+    /// periodically within its expansion. `None` means no budget.
     #[allow(clippy::too_many_arguments)] // a per-morsel read worker; the seams are positional
     fn expand_morsel(
         &self,
@@ -662,6 +712,7 @@ pub trait MorselSource: Send + Sync {
         txn: TxnId,
         snapshot: Snapshot,
         registry: &CommitRegistry,
+        deadline: Option<Instant>,
     ) -> MorselExpandOutcome;
 
     /// Filters the contiguous candidate slice `ids` to visible, label-carrying nodes, then **groups +
@@ -689,6 +740,10 @@ pub trait MorselSource: Send + Sync {
     /// aggregate arguments read. The recognizer (engine thread) guarantees every key + aggregate-argument
     /// expression is pure per-row ([`is_pure_per_row_expr`]), so the off-thread evaluation is
     /// deterministic and cross-row-free.
+    ///
+    /// `deadline` is the per-statement wall-clock budget (`rmp` #476): the worker abandons (recording a
+    /// timeout error so the executor falls back to the serial pipeline, which surfaces a clean
+    /// cancellation) if it elapses mid-morsel. `None` means no budget.
     #[allow(clippy::too_many_arguments)] // a per-morsel read worker; the seams are positional
     fn group_aggregate_morsel(
         &self,
@@ -699,6 +754,7 @@ pub trait MorselSource: Send + Sync {
         txn: TxnId,
         snapshot: Snapshot,
         registry: &CommitRegistry,
+        deadline: Option<Instant>,
     ) -> MorselGroupOutcome;
 
     /// A **cheap** clone of this source as a fresh boxed handle (`rmp` task #339): a handful of `Arc`
@@ -789,6 +845,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         txn: TxnId,
         snapshot: Snapshot,
         registry: &CommitRegistry,
+        deadline: Option<Instant>,
     ) -> MorselRowsOutcome {
         // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
         // `Arc` bumps, no page copy). It owns a fresh `SsiReadBuffer` tagged with `txn`, so every
@@ -828,7 +885,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             Vec::with_capacity(members.len())
         };
         let mut first_error: Option<GraphusError> = None;
-        for node in members {
+        for (i, node) in members.into_iter().enumerate() {
+            // Per-statement timeout safe point (`rmp` #476): bound a large morsel's CPU under the
+            // configured deadline. Polled at a strided cadence so the wall-clock read never dominates the
+            // per-row work; on elapse the morsel abandons with a timeout error and the executor surfaces a
+            // clean `Cancelled` via the serial fallback.
+            if (i as u64) & (MORSEL_DEADLINE_POLL_STRIDE - 1) == 0 && deadline_exceeded(deadline) {
+                first_error.get_or_insert_with(statement_timeout_error);
+                break;
+            }
             // The single-binding input row the serial label scan feeds the `Filter` / `Projection`:
             // `{scan_var: Node(id)}`.
             let row =
@@ -929,6 +994,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         txn: TxnId,
         snapshot: Snapshot,
         registry: &CommitRegistry,
+        deadline: Option<Instant>,
     ) -> MorselExpandOutcome {
         // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
         // `Arc` bumps, no page copy) — the identical `GraphAccess` the `rmp` #336 Slice 3b-i reader uses.
@@ -973,7 +1039,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let mut partial_count: i64 = 0;
         let mut first_error: Option<GraphusError> = None;
 
-        'anchors: for anchor in anchors {
+        // Per-edge deadline-poll counter (`rmp` #476): a single high-degree anchor (a supernode) can
+        // expand over millions of edges, so the per-statement timeout is also polled *within* one
+        // anchor's expansion, strided so the wall-clock read never dominates the per-edge work.
+        let mut edges_seen: u64 = 0;
+        'anchors: for (anchor_i, anchor) in anchors.into_iter().enumerate() {
+            // Per-statement timeout safe point (`rmp` #476): bound a large morsel's traversal CPU under the
+            // configured deadline. Strided so the wall-clock read is amortized; on elapse the morsel
+            // abandons with a timeout error and the executor surfaces a clean `Cancelled` via serial fallback.
+            if (anchor_i as u64) & (MORSEL_DEADLINE_POLL_STRIDE - 1) == 0
+                && deadline_exceeded(deadline)
+            {
+                first_error.get_or_insert_with(statement_timeout_error);
+                break 'anchors;
+            }
             // Reproduce the serial `Operator::Expand` / `expand_into_pending` EXACTLY (`04 §2.4`):
             //   1. `expand` returns the incident sides (a self-loop is reported once PER matching
             //      direction — twice for `Both` — and the live + reader paths share the body, so the
@@ -990,6 +1069,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
             let mut seen_rel = std::collections::BTreeSet::new();
             for inc in incidents {
+                // Bound a single supernode's expansion under the deadline too (strided per edge).
+                edges_seen = edges_seen.wrapping_add(1);
+                if edges_seen & (MORSEL_DEADLINE_POLL_STRIDE - 1) == 0
+                    && deadline_exceeded(deadline)
+                {
+                    first_error.get_or_insert_with(statement_timeout_error);
+                    break 'anchors;
+                }
                 if !seen_rel.insert(inc.rel) {
                     // A self-loop's second side (same rel id) — serial emits ONE row for it. Skip the dup.
                     continue;
@@ -1061,6 +1148,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         txn: TxnId,
         snapshot: Snapshot,
         registry: &CommitRegistry,
+        deadline: Option<Instant>,
     ) -> MorselGroupOutcome {
         // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
         // `Arc` bumps, no page copy) — the identical `GraphAccess` the `rmp` #336 Slice 3b-i reader uses,
@@ -1102,6 +1190,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let mut first_error: Option<GraphusError> = None;
 
         for (rank, node) in members.into_iter().enumerate() {
+            // Per-statement timeout safe point (`rmp` #476): bound a large grouped morsel's CPU under the
+            // configured deadline (strided wall-clock poll). On elapse the morsel abandons with a timeout
+            // error and the executor surfaces a clean `Cancelled` via the serial fallback.
+            if (rank as u64) & (MORSEL_DEADLINE_POLL_STRIDE - 1) == 0 && deadline_exceeded(deadline)
+            {
+                first_error.get_or_insert_with(statement_timeout_error);
+                break;
+            }
             let row = Row::from_pairs([(
                 spec.scan_var.to_owned(),
                 RowValue::Node(NodeRef { id: node }),
@@ -1359,6 +1455,13 @@ pub struct MorselLabelScan {
     pub registry: CommitRegistry,
     /// The transaction this query runs in (every morsel's markers are tagged with it).
     pub txn: TxnId,
+    /// The per-statement wall-clock **deadline** (`rmp` #476), or `None` when no statement timeout is
+    /// configured. The seam builds this `None`; the executor's morsel tier sets it from the cursor's
+    /// [`CancellationToken::deadline`](crate::executor::CancellationToken::deadline) before dispatch, so
+    /// every morsel worker shares the same cooperative CPU budget the serial safe points enforce — a
+    /// runaway parallel scan abandons rather than pinning every core. `None` (the deterministic engine,
+    /// where the morsel tier is off anyway, and the no-timeout config) leaves the workers wall-clock-free.
+    pub deadline: Option<Instant>,
 }
 
 // `rmp` #339, Slice 3a: `MorselLabelScan` must be `Send` so the tier can move morsels onto the worker
@@ -1417,6 +1520,7 @@ impl MorselLabelScan {
             self.txn,
             self.snapshot,
             &self.registry,
+            self.deadline,
         )
     }
 
@@ -1440,6 +1544,7 @@ impl MorselLabelScan {
             self.txn,
             self.snapshot,
             &self.registry,
+            self.deadline,
         )
     }
 
@@ -1463,6 +1568,7 @@ impl MorselLabelScan {
             self.txn,
             self.snapshot,
             &self.registry,
+            self.deadline,
         )
     }
 }
@@ -1509,12 +1615,23 @@ pub fn run_morsels(
         return Vec::new();
     }
 
+    let deadline = scan.deadline;
     // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
     // order, so the returned outcomes are in ascending candidate order — the serial scan order.
     install_morsel_fanout(|| {
         bounds
             .par_iter()
-            .map(|&(lo, hi)| scan.read_morsel(lo, hi, property))
+            .map(|&(lo, hi)| {
+                // Per-statement timeout gate (`rmp` #476): a morsel whose turn comes after the deadline
+                // abandons immediately rather than reading its slice — the executor then surfaces a clean
+                // `Cancelled` via the serial fallback. The bare-aggregate worker (`read_label_morsel`) does
+                // O(1)-per-node work with no `eval`, so per-morsel granularity bounds it tightly enough
+                // without taxing the hot per-node read with a wall-clock poll.
+                if deadline_exceeded(deadline) {
+                    return MorselReadOutcome::cancelled(scan.txn);
+                }
+                scan.read_morsel(lo, hi, property)
+            })
             .collect()
     })
 }

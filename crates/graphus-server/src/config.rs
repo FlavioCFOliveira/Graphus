@@ -321,6 +321,25 @@ pub struct TimingConfig {
     /// must be `> 0`. Each `run`/`commit` refreshes the deadline, so only a genuinely abandoned
     /// transaction is reaped.
     pub transaction_idle_timeout_ms: u64,
+    /// Maximum wall-clock time a **single Cypher statement** may execute on its database engine thread
+    /// before it is cooperatively aborted with a cancellation error (`04 §7.7`; rmp #476). Without this
+    /// bound an ordinary statement runs with **no CPU budget**: a patient client can submit a
+    /// cartesian-product or deep variable-length-expansion "bomb" that pins the per-database engine
+    /// thread (and, via morsel parallelism, several cores) indefinitely, starving every co-tenant on the
+    /// same database — a CPU-exhaustion denial of service. The executor already polls a cancellation
+    /// token at dense safe points (between rows, inside the variable-length DFS / shortest-path BFS, and
+    /// inside each morsel worker); this timeout drives that token from a per-statement deadline.
+    ///
+    /// Deliberately **generous** so it never false-cancels a legitimate statement: at 2 minutes it is
+    /// ~240× the [`slow_query_threshold_ms`](Self::slow_query_threshold_ms) and far beyond any
+    /// interactive/OLTP query, while comfortably accommodating a large analytical aggregation or a bulk
+    /// `MATCH … SET` over millions of rows. Its purpose is to make the server **bounded by default** (a
+    /// runaway query is reclaimed in finite time) rather than to police normal latency. In milliseconds;
+    /// `0` **disables** the per-statement timeout (opt-out, unbounded — matching the prior behaviour).
+    /// Operators serving a pure-OLTP workload can lower it dramatically; batch-analytics deployments can
+    /// raise or disable it. GDS procedures carry their own independent (inner) deadline, so this acts as
+    /// an outer bound on the non-GDS portion of a statement.
+    pub statement_timeout_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -337,6 +356,11 @@ impl Default for TimingConfig {
             // transaction, while ensuring an abandoned one is reclaimed promptly (rmp #389). Each
             // touch refreshes the deadline, so only a genuinely idle transaction is reaped.
             transaction_idle_timeout_ms: 60_000,
+            // 2 minutes (rmp #476): bounded-by-default per-statement CPU budget. Generous enough never to
+            // false-cancel a legitimate analytical / bulk statement (~240× the slow-query threshold, far
+            // beyond any interactive/OLTP query), yet finite so a cartesian / variable-length bomb is
+            // reclaimed instead of pinning the engine thread forever. `0` disables it.
+            statement_timeout_ms: 120_000,
         }
     }
 }
@@ -379,6 +403,18 @@ impl TimingConfig {
             None
         } else {
             Some(Duration::from_millis(self.header_read_timeout_ms))
+        }
+    }
+
+    /// The per-statement execution timeout as a [`Duration`], or `None` when disabled
+    /// (`statement_timeout_ms == 0`) — rmp #476. Drives the per-statement cancellation deadline that
+    /// bounds a runaway query's CPU on the database engine thread.
+    #[must_use]
+    pub fn statement_timeout(&self) -> Option<Duration> {
+        if self.statement_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.statement_timeout_ms))
         }
     }
 
@@ -789,6 +825,13 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_STATEMENT_TIMEOUT_MS") {
+            self.timing.statement_timeout_ms = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_STATEMENT_TIMEOUT_MS is not an integer: {v:?}"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -1039,6 +1082,22 @@ mod tests {
             }
             .idle_timeout(),
             Some(Duration::from_millis(250))
+        );
+
+        // The per-statement timeout (rmp #476) is bounded-by-default and `0` disables it.
+        assert_eq!(
+            t.statement_timeout(),
+            Some(Duration::from_millis(120_000)),
+            "statement timeout is finite (bounded) by default"
+        );
+        assert_eq!(
+            TimingConfig {
+                statement_timeout_ms: 0,
+                ..TimingConfig::default()
+            }
+            .statement_timeout(),
+            None,
+            "0 ⇒ disabled (opt-out, unbounded)"
         );
 
         // A zero connection cap is rejected.

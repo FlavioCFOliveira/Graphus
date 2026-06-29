@@ -165,6 +165,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &self.maintenance_degraded,
             &mut self.active_txns,
             &self.clock,
+            // The deterministic DST driver runs statements with **no** wall-clock timeout (`rmp` #476):
+            // a per-statement deadline would read `Instant::now()` and leak non-determinism into the
+            // replay. The inline engine runs each statement atomically anyway, and the statement timeout
+            // is a production-thread CPU-exhaustion defence, not a correctness property — so disabling it
+            // here keeps the VOPR replay bit-deterministic while exercising the same dispatch code path.
+            None,
         );
         debug_assert!(
             inflight.is_none(),
