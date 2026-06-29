@@ -165,3 +165,45 @@ fn safety_cli_seed_sweep_reports_zero_violations() {
     );
     assert!(out.contains("all SAFE + deterministic"), "{out}");
 }
+
+/// **Regression — committed-data loss after an aborted boundary-crossing allocation (`rmp` #479).**
+///
+/// Seed 5043221 (safety preset: 6 clients × 24 ops, write-heavy, 8 faults + 2 crashes) used to leave a
+/// block of EARLY committed `:Person` ids absent from the recovered store while later ids survived — a
+/// silent ACID **durability** breach. Traced root cause:
+///
+/// 1. A `CREATE (a)-[:KNOWS]->(b)` allocated a relationship id that crossed a rel-store **page
+///    boundary** (`alloc_id` advanced the high-water) and then `relink_old_head` surfaced a bit-rot
+///    checksum error on the old head's page (an injected, *recoverable* disk fault) **before** the new
+///    record's page was mapped at write time. That left the catalog inconsistent: rel `high_water` one
+///    past the addressable capacity of its mapped `device_pages`.
+/// 2. A later checkpoint persisted that inconsistent catalog; a still-later rollback's `reload_catalog`
+///    then **rejected** it (`Meta::decode`, `rmp` #452).
+/// 3. Because `rollback` had already `mem::take`-n every store's `device_pages` and the `?` on the
+///    failed reload skipped the restore, the in-memory page maps were left EMPTY — so the next node
+///    create mapped a fresh BLANK device page over a store whose committed records lived on the
+///    now-orphaned original page. The early persons were silently destroyed.
+///
+/// Fixed by mapping a fresh id's page **at allocation time** (keeping `high_water <= capacity` always
+/// true) and by making `rollback` exception-safe (restore the page maps if `reload_catalog` fails).
+/// This pins the seed SAFE and, more strongly, asserts the engine queried back holds EVERY committed
+/// `:Person` row (`persisted == created`, the no-lost-create probe) — the exact invariant that broke.
+#[test]
+fn safety_seed_5043221_no_committed_node_loss_under_fault_then_rollback() {
+    let cfg = VoprConfig::safety(5043221);
+    let r = run_safety(cfg);
+    assert!(
+        r.safe,
+        "seed 5043221 must be SAFE (no committed-data loss under crash+disk-fault); violations: {:?}",
+        r.violations
+    );
+    // Strong, interleaving-robust assertion of the durability invariant that broke: the recovered
+    // store returns exactly as many `:Person` rows as were committed — none stranded/lost.
+    assert_eq!(
+        r.run.persisted_nodes, r.run.created_nodes,
+        "every committed :Person create must survive (persisted {} != created {})",
+        r.run.persisted_nodes, r.run.created_nodes
+    );
+    // Determinism: same seed ⇒ identical verdict.
+    assert_eq!(r, run_safety(cfg), "seed 5043221 must be deterministic");
+}

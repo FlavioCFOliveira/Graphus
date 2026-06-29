@@ -1019,17 +1019,53 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // ----------------------------- record I/O ------------------------------
 
     /// Returns a reusable physical id for `kind`: a freed id from the store's free list when one is
-    /// available, otherwise a fresh high-water id.
+    /// available, otherwise a fresh high-water id whose store page is **mapped before the id is
+    /// handed out**.
+    ///
+    /// # Mapping the page at allocation time (`rmp` #479)
+    ///
+    /// A fresh id's device page is mapped here — eagerly — rather than lazily at write time. This keeps
+    /// the catalog invariant **`high_water <= addressable capacity`** (every allocated physical id has a
+    /// mapped device page) true the instant the id is handed out. The durable-catalog decoder
+    /// ([`crate::meta::Meta::decode`], `rmp` #452), the rollback catalog reload
+    /// ([`reload_catalog`](Self::reload_catalog)), the orphan-page reconstruction
+    /// ([`reconstruct_orphan_store_pages`](Self::reconstruct_orphan_store_pages)) and every store scan
+    /// all rely on it.
+    ///
+    /// Previously the page was mapped lazily inside [`write_record`](Self::write_record). A transaction
+    /// that advanced the high-water here and then failed a LATER fallible step **before** writing the
+    /// record — e.g. [`create_rel`](Self::create_rel) crossing a relationship page boundary in
+    /// `alloc_id` and then surfacing a disk-fault checksum error in `relink_old_head`/`read_node` —
+    /// left the high-water one past the mapped capacity. A subsequent checkpoint persisted that
+    /// inconsistent catalog (`high_water > capacity`); a later rollback's `reload_catalog` then rejected
+    /// it, and (because rollback's page-map restore was skipped on that error) every store's
+    /// `device_pages` was emptied, blank pages were re-allocated over committed records, and committed
+    /// data was silently lost — an ACID durability violation surfaced by VOPR seed 5043221. Mapping the
+    /// page up front (and un-bumping the high-water if the mapping itself fails) closes that hole.
     ///
     /// # Errors
-    /// Returns a storage error if the store's physical-id space is exhausted (`rmp` #452); see
-    /// [`PhysicalAllocator::alloc_fresh`].
-    fn alloc_id(&mut self, kind: StoreKind) -> Result<u64> {
-        let s = self.store_mut(kind);
-        match s.free.pop() {
-            Some(id) => Ok(id),
-            None => s.alloc.alloc_fresh(),
+    /// Returns a storage error if the store's physical-id space is exhausted (`rmp` #452, see
+    /// [`PhysicalAllocator::alloc_fresh`]) or if mapping the fresh id's page fails (e.g. ENOSPC).
+    fn alloc_id(&mut self, kind: StoreKind, txn: TxnId) -> Result<u64> {
+        // A freed id is reused first: its store page already exists (the record once lived there), so
+        // no growth — and no fallibility — is needed.
+        if let Some(id) = self.store_mut(kind).free.pop() {
+            return Ok(id);
         }
+        // Fresh id: `alloc_fresh` first (it fails closed at the `u64::MAX` ceiling, `rmp` #452, so we
+        // never compute a page index for an astronomically large id), then map the page the id lands
+        // on. A within-page id finds its page already mapped (a cheap no-op); only a page-boundary
+        // crossing actually grows `device_pages` — exactly the growth `write_record` would have done,
+        // just up front.
+        let id = self.store_mut(kind).alloc.alloc_fresh()?;
+        let (rel_page, _) = paging::record_location(id, kind.record_size());
+        if let Err(e) = self.ensure_store_page(kind, rel_page, txn) {
+            // Mapping failed (e.g. ENOSPC growing the device): un-bump the high-water so it never
+            // exceeds the mapped capacity. `id` was never written, so re-handing it out is safe.
+            self.store_mut(kind).alloc = PhysicalAllocator::restore(id.max(1));
+            return Err(e);
+        }
+        Ok(id)
     }
 
     // The read-decode methods below delegate to the single authoritative impl in
@@ -1740,11 +1776,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         {
             self.pending_gc_prune = None;
         }
-        // Move out the pre-rollback page maps (no clone): `reload_catalog` reassigns each
-        // `self.stores[i]` wholesale below, so the taken Vecs are otherwise discarded. We re-extend
-        // the reloaded (shrunk) maps with only the tail entries the catalog reload dropped.
-        let device_pages: [Vec<PageId>; STORE_COUNT] =
-            std::array::from_fn(|i| std::mem::take(&mut self.stores[i].device_pages));
         // Capture the in-memory physical-id high-water marks BEFORE the catalog reload (`rmp` #220 /
         // #172). `reload_catalog` restores the allocators from the last COMMITTED metadata — but under
         // STATEMENT-granularity interleaving a CONCURRENT, still-open transaction may have advanced a
@@ -1792,7 +1823,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.pool.unpin(f);
             r?;
         }
-        self.reload_catalog()?;
+        // Move out the pre-rollback page maps (no clone) ONLY now — every fallible step above
+        // (`wal.rollback`, the compensation replay) ran with `device_pages` still INTACT, so a failure
+        // there can never strand them. `reload_catalog` (the immediate next, and now the ONLY,
+        // operation that overwrites these maps) reassigns each `self.stores[i]` wholesale from the
+        // durable catalog; we re-extend the reloaded (shrunk) maps with the tail entries it dropped.
+        //
+        // EXCEPTION SAFETY (`rmp` #479): if `reload_catalog` itself fails — e.g. a disk-faulted or an
+        // inconsistent durable catalog (`Meta::decode` rejecting `high_water > capacity`) — we MUST
+        // restore the taken maps before propagating. Leaving `device_pages` empty would make the next
+        // allocation map a FRESH BLANK device page over a store whose committed records live on the
+        // now-orphaned original pages, silently destroying committed data (the seed-5043221 durability
+        // breach). The pre-rollback maps are a safe superset, so restoring them keeps every committed
+        // record addressable.
+        let device_pages: [Vec<PageId>; STORE_COUNT] =
+            std::array::from_fn(|i| std::mem::take(&mut self.stores[i].device_pages));
+        if let Err(e) = self.reload_catalog() {
+            for (i, pages) in device_pages.into_iter().enumerate() {
+                self.stores[i].device_pages = pages;
+            }
+            return Err(e);
+        }
         self.tokens = pre_tokens;
         if pre_element_next > self.element_ids.peek() {
             self.element_ids = ElementIdAllocator::new(pre_element_next);
@@ -1893,7 +1944,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the write fails.
     pub fn create_node(&mut self, txn: TxnId) -> Result<(u64, ElementId)> {
-        let id = self.alloc_id(StoreKind::Node)?;
+        let id = self.alloc_id(StoreKind::Node, txn)?;
         let eid = self.element_ids.alloc()?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); `commit` settles it to the
         // commit timestamp. Until then the version is visible only to its own transaction.
@@ -2159,7 +2210,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 "start node {start} not in use"
             )));
         }
-        let id = self.alloc_id(StoreKind::Rel)?;
+        let id = self.alloc_id(StoreKind::Rel, txn)?;
         let eid = self.element_ids.alloc()?;
         self.note_created(txn, StoreKind::Rel, id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); settled at commit.
@@ -2888,7 +2939,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
-        let pid = self.alloc_id(StoreKind::Prop)?;
+        let pid = self.alloc_id(StoreKind::Prop, txn)?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp. Until then the version is visible only
         // to its own transaction.
@@ -3037,7 +3088,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              MVCC none-sentinel the #398 orphan check rejects)"
         );
         for chunk in chunks {
-            let id = self.alloc_id(StoreKind::Strings)?;
+            let id = self.alloc_id(StoreKind::Strings, txn)?;
             let block = HeapBlock::new(txn.0, chunk, next);
             self.write_block(id, &block, txn)?;
             next = id;
@@ -3298,7 +3349,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
-        let pid = self.alloc_id(StoreKind::Prop)?;
+        let pid = self.alloc_id(StoreKind::Prop, txn)?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
