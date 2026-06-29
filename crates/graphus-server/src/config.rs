@@ -155,6 +155,28 @@ pub struct AdmissionConfig {
     /// the budget here makes a silent under-sizing (e.g. Tokio's 512 default starving the 513th
     /// session) impossible: raise `max_connections` and the blocking budget grows with it.
     pub max_connections: usize,
+    /// Maximum number of **concurrently-open connections from a single source IP** on the *network*
+    /// listeners (Bolt-over-TCP + REST), enforced at *accept time* as an **inner** bound that composes
+    /// **with** the global [`max_connections`](Self::max_connections) cap (`rmp` #478, D1/R1). The global
+    /// cap protects the process's total file-descriptor/task budget; this caps how much of that budget any
+    /// *one* source IP may hold, so a single abusive client — or a distributed connect-then-reconnect
+    /// flood concentrated on a few sources — cannot keep the global budget saturated and shed legitimate
+    /// clients arriving from *other* IPs. The live per-IP count is decremented when the connection closes
+    /// (an RAII guard, so it never leaks on any exit path — success, timeout, error, or panic). A
+    /// connection that would exceed an IP's cap is closed at accept time, *before* any TLS/protocol work,
+    /// and counted in `graphus_connections_per_ip_rejected_total`.
+    ///
+    /// **UDS is exempt.** A Unix-domain socket has no peer IP: it is a single, kernel-protected, local
+    /// trust domain already gated by `SO_PEERCRED` (`04 §8.4`), so the per-IP cap never applies to it (a
+    /// flood there is bounded by the global cap and the peer-cred gate, not by a per-IP count).
+    ///
+    /// `0` **disables** the per-IP cap (only the global `max_connections` applies) — the correct setting
+    /// for a deployment where all clients legitimately share one source IP (behind a NAT, a load balancer,
+    /// or a reverse proxy), where a per-IP cap would otherwise shed real clients. Defaults to `256`: a
+    /// meaningful fraction of the default `max_connections` (1024) so one IP cannot dominate the budget,
+    /// yet far above what any normal single-host client opens. When set larger than `max_connections` it
+    /// simply never binds (the global cap is tighter) — a valid "effectively unlimited per IP" setting.
+    pub max_connections_per_ip: usize,
     /// Number of **off-thread reader worker threads** (`rmp` task #336): read-only auto-commit
     /// statements run on this pool concurrently with the single writer (the engine thread), so multiple
     /// `MATCH`es scale past one core. `0` (the default) selects an automatic size of
@@ -207,6 +229,10 @@ impl Default for AdmissionConfig {
             engine_queue_capacity: 1024,
             result_buffer_capacity: 256,
             max_connections: 1024,
+            // A meaningful fraction of `max_connections` so one IP cannot dominate the global budget,
+            // yet well above any normal single-host client's footprint (`rmp` #478). `0` disables it
+            // (the NAT/load-balancer/reverse-proxy setting where all clients share one source IP).
+            max_connections_per_ip: 256,
             reader_threads: 0,
             morsel_parallelism: 0,
             max_open_transactions: graphus_rest::registry::DEFAULT_MAX_OPEN_TRANSACTIONS,
@@ -764,6 +790,14 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_MAX_CONNECTIONS_PER_IP") {
+            // `0` is valid here (it disables the per-IP cap), so accept any non-negative integer.
+            self.admission.max_connections_per_ip = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_MAX_CONNECTIONS_PER_IP is not a non-negative integer (0 = disabled): {v:?}"
+                ))
+            })?;
+        }
         if let Ok(v) = var("GRAPHUS_MAX_OPEN_TRANSACTIONS") {
             self.admission.max_open_transactions = v.parse().map_err(|_| {
                 ConfigError::Parse(format!(
@@ -1070,6 +1104,9 @@ mod tests {
         // Sensible defaults (rmp #118).
         let cfg = AdmissionConfig::default();
         assert_eq!(cfg.max_connections, 1024);
+        // The per-source-IP cap (rmp #478) defaults to a fraction of `max_connections` — enabled by
+        // default, but well above any single-host client's footprint.
+        assert_eq!(cfg.max_connections_per_ip, 256);
         let t = TimingConfig::default();
         assert_eq!(t.handshake_timeout_ms, 10_000);
         assert_eq!(t.idle_timeout_ms, 0, "idle reaping is off by default");
@@ -1242,6 +1279,45 @@ mod tests {
         )
         .expect("parse");
         assert!(on.admission.csr_adjacency, "csr_adjacency = true ⇒ on");
+    }
+
+    #[test]
+    fn per_ip_cap_parses_from_toml_and_zero_is_valid() {
+        // The per-source-IP cap (rmp #478) is operator-tunable via the `[admission]` table, and `0`
+        // (disabled — the NAT/load-balancer/reverse-proxy setting) is a valid configuration.
+        let mut cfg: ServerConfig = toml::from_str(
+            r#"
+            store_path = "/x"
+            uds_path = "/run/g.sock"
+            rest_addr = ""
+            [admission]
+            max_connections = 4096
+            max_connections_per_ip = 512
+            "#,
+        )
+        .expect("parse");
+        // `normalize()` turns the blanked `rest_addr` into `None` (UDS-only), exactly as `load()` does;
+        // `toml::from_str` alone does not run it.
+        cfg.normalize();
+        assert_eq!(cfg.admission.max_connections_per_ip, 512);
+        assert!(cfg.validate().is_ok());
+
+        // A zero per-IP cap (disabled) is accepted by validation — unlike `max_connections`, which
+        // must be > 0, a zero per-IP cap simply means "global cap only".
+        let cfg = ServerConfig {
+            admission: AdmissionConfig {
+                max_connections_per_ip: 0,
+                ..AdmissionConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "a zero per-IP cap is valid (disables the per-IP bound)"
+        );
     }
 
     #[test]

@@ -54,6 +54,16 @@ pub struct AsyncToBlockingTransport<S> {
     /// (rmp #118; `None` = idle reaping disabled, the default). Held here so
     /// [`Transport::on_authenticated`] can swap it into [`read_deadline`](Self::read_deadline).
     idle_deadline: Option<std::time::Duration>,
+    /// The **cumulative** pre-authentication wall-clock deadline (rmp #478, R2): an absolute instant,
+    /// captured at construction (≈ accept / post-TLS), past which the *whole* pre-auth phase is reaped —
+    /// regardless of how recently a byte arrived. The [`read_deadline`](Self::read_deadline) above is a
+    /// *per-read* bound that every received byte resets; on its own a slow dribbler that sends one byte
+    /// just under it can extend the unauthenticated phase indefinitely. This absolute bound caps the
+    /// accept→READY span so that cannot happen: each pre-auth read is governed by the **earlier** of its
+    /// per-read deadline and this instant. It is `None` once idle (no pre-auth guard configured), and is
+    /// **cleared** on [`Transport::on_authenticated`] so a legitimate long-lived authenticated session is
+    /// never reaped by it.
+    pre_auth_absolute_deadline: Option<std::time::Instant>,
 }
 
 impl<S> AsyncToBlockingTransport<S>
@@ -85,6 +95,11 @@ where
             (Some(p), None) => Some(p),
             (None, i) => i,
         };
+        // The cumulative pre-auth bound (rmp #478, R2): an absolute instant `pre_auth_deadline` from now
+        // (construction ≈ accept / post-TLS), bounding the *whole* pre-auth phase so a dribbler that
+        // keeps the per-read deadline alive cannot extend it indefinitely. `None` when no pre-auth guard
+        // is configured (the per-read idle policy, if any, then governs alone).
+        let pre_auth_absolute_deadline = pre_auth_deadline.map(|p| std::time::Instant::now() + p);
         Self {
             stream,
             handle,
@@ -92,6 +107,7 @@ where
             write_buf: Vec::new(),
             read_deadline,
             idle_deadline,
+            pre_auth_absolute_deadline,
         }
     }
 }
@@ -109,16 +125,26 @@ where
         let stream = &mut self.stream;
         let shutdown = &self.shutdown;
         let deadline = self.read_deadline;
+        let absolute = self.pre_auth_absolute_deadline;
         self.handle.block_on(async move {
-            // Race the read against the shutdown edge (and an optional drain deadline) so a session
+            // Race the read against the shutdown edge and the effective read deadline so a session
             // idle-blocked on the socket does not stall graceful shutdown (`04 §9.4`).
+            //
+            // The effective deadline for THIS read is the **earlier** of two bounds (rmp #478, R2):
+            //   - the per-read `deadline` (the idle / pre-auth bound that every byte resets), and
+            //   - the cumulative `absolute` pre-auth instant (the wall-clock cap on the whole pre-auth
+            //     phase, which a dribbler cannot push back by sending a byte).
+            // Taking the min means a slow dribbler keeping the per-read bound alive is still reaped once
+            // the cumulative pre-auth instant passes, while a normal client (which authenticates, clearing
+            // `absolute`) is then governed only by the relaxed idle policy.
             let read_fut = stream.read(buf);
             tokio::pin!(read_fut);
-            if let Some(d) = deadline {
+            let effective = effective_deadline(deadline, absolute);
+            if let Some(when) = effective {
                 tokio::select! {
                     r = &mut read_fut => r.map_err(|e| BoltError::Transport(e.to_string())),
                     () = shutdown.wait() => Ok(0), // treat shutdown as EOF
-                    () = tokio::time::sleep(d) => Ok(0), // drain deadline: end the session
+                    () = tokio::time::sleep_until(when) => Ok(0), // deadline: end the session
                 }
             } else {
                 tokio::select! {
@@ -168,6 +194,29 @@ where
         // govern subsequent reads by the steady-state idle policy only (often `None` = no deadline),
         // so a legitimate long-lived authenticated session is not reaped (rmp #469, F-NET-1).
         self.read_deadline = self.idle_deadline;
+        // Clear the cumulative pre-auth wall-clock bound (rmp #478, R2): once authenticated, only the
+        // (relaxed) idle policy governs the session — the accept→READY cap must never reap it.
+        self.pre_auth_absolute_deadline = None;
+    }
+}
+
+/// The effective deadline instant for one pre-auth/idle read (rmp #478, R2): the **earlier** of the
+/// per-read relative `deadline` (measured from *now*, so a received byte resets it) and the cumulative
+/// pre-auth `absolute` instant (a fixed wall-clock cap on the whole pre-auth phase). `None` when neither
+/// bound applies.
+///
+/// Must be called inside the Tokio runtime context — it reads [`tokio::time::Instant::now`]; the
+/// transport's [`Transport::read`] calls it inside [`Handle::block_on`], which provides that context.
+fn effective_deadline(
+    deadline: Option<std::time::Duration>,
+    absolute: Option<std::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let per_read = deadline.map(|d| tokio::time::Instant::now() + d);
+    let cumulative = absolute.map(tokio::time::Instant::from_std);
+    match (per_read, cumulative) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
     }
 }
 
@@ -348,6 +397,75 @@ mod tests {
             still_pending,
             "an authenticated session with idle reaping disabled must NOT be reaped (the read stayed \
              pending well past the old 50ms pre-auth deadline)"
+        );
+    }
+
+    #[test]
+    fn cumulative_pre_auth_deadline_reaps_a_slow_dribbler() {
+        // R2 (rmp #478): the pre-auth read deadline is a *per-read* bound — every received byte resets
+        // it — so a slow dribbler that sends one byte just under it could otherwise extend the
+        // unauthenticated phase forever. The CUMULATIVE pre-auth wall-clock bound caps the whole
+        // accept→READY span, so such a dribbler is still reaped. Here a writer dribbles one byte every
+        // 25ms (always well within the 150ms per-read bound, so the per-read guard never fires), yet the
+        // 150ms cumulative bound reaps the pre-auth phase near 150ms — not indefinitely.
+        let rt = multi_thread_rt();
+        let handle = rt.handle().clone();
+        let shutdown = ShutdownCoordinator::new();
+        // An in-memory bidirectional pipe: the transport reads the `server` half; a task dribbles into
+        // the `client` half (the model of a slow-loris that keeps the per-read deadline alive).
+        let (client, server) = tokio::io::duplex(256);
+        rt.spawn(async move {
+            let mut client = client;
+            loop {
+                if client.write_all(b"x").await.is_err() {
+                    break; // the transport closed its end (reaped) — stop dribbling.
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let mut t = AsyncToBlockingTransport::new(
+            server,
+            handle,
+            shutdown,
+            None,                             // idle reaping disabled (the production default)
+            Some(Duration::from_millis(150)), // 150ms pre-auth bound (per-read AND cumulative)
+        );
+        let start = Instant::now();
+        let reads = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut buf = [0u8; 1];
+                let mut reads = 0u32;
+                loop {
+                    match t.read(&mut buf) {
+                        Ok(0) => return reads, // reaped (EOF) by the cumulative pre-auth bound
+                        Ok(_) => {
+                            reads += 1;
+                            if reads > 100_000 {
+                                return reads; // safety valve — never the expected path
+                            }
+                        }
+                        Err(_) => return reads,
+                    }
+                }
+            })
+            .await
+            .expect("blocking read task joins")
+        });
+        let elapsed = start.elapsed();
+        // The dribbler delivered SOME bytes (the per-read guard never fired on a 25ms-spaced drip) ...
+        assert!(
+            (1..100_000).contains(&reads),
+            "the dribbler delivered a bounded number of bytes before being reaped (got {reads})"
+        );
+        // ... and the pre-auth phase was reaped near the 150ms cumulative bound — NOT extended forever
+        // by the drip the per-read deadline alone could never stop.
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "reaped at/after the cumulative pre-auth bound, not before (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "reaped near the cumulative bound, never pinned indefinitely by the drip (elapsed {elapsed:?})"
         );
     }
 }

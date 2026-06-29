@@ -25,6 +25,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
+use super::ip_limit::{PerIpConnGuard, PerIpConnLimiter};
 use super::transport::AsyncToBlockingTransport;
 use crate::admin::AdminContext;
 use crate::audit::AuditSource;
@@ -123,6 +124,9 @@ pub async fn run_uds_accept_loop(
                     idle_timeout,
                     pre_auth_timeout,
                     permit,
+                    // UDS has no peer IP — it is a single kernel-protected local trust domain gated by
+                    // peer-cred (rmp #478), so it is exempt from the per-source-IP cap.
+                    None,
                     shutdown.clone(),
                 );
             }
@@ -155,8 +159,10 @@ fn try_admit(
 /// connection cap, TLS-wrapped under a handshake deadline, then handed to a blocking session task
 /// (native LOGON auth happens inside the session). `context` is the shared database-targeting + admin
 /// surface (rmp #84). `advertised_bolt_address` is the address routing drivers are told to reconnect
-/// to in a `ROUTE` reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore,
-/// `handshake_timeout` bounds the TLS handshake **and** doubles as the Bolt pre-authentication read
+/// to in a `ROUTE` reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore;
+/// `per_ip` is the per-source-IP connection cap (rmp #478) taken as an inner bound *after* the global
+/// permit, so one abusive IP cannot hold more than its share of the global budget. `handshake_timeout`
+/// bounds the TLS handshake **and** doubles as the Bolt pre-authentication read
 /// deadline (rmp #469, F-NET-1) reaping a client that completes TLS then withholds the Bolt
 /// handshake / `HELLO` / `LOGON`, and `idle_timeout` reaps idle *authenticated* sessions (rmp #118).
 #[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
@@ -168,6 +174,7 @@ pub async fn run_tcp_accept_loop(
     advertised_bolt_address: Option<String>,
     metrics: Arc<Metrics>,
     conn_limit: Arc<Semaphore>,
+    per_ip: Arc<PerIpConnLimiter>,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     shutdown: ShutdownCoordinator,
@@ -191,6 +198,23 @@ pub async fn run_tcp_accept_loop(
                 // connection budget. The permit is moved into the handshake task and on into the
                 // session, releasing on drop when the connection ends (success, timeout, or error).
                 let Some(permit) = try_admit(&conn_limit, &metrics, "Bolt-TCP") else {
+                    drop(conn);
+                    continue;
+                };
+
+                // Per-source-IP gate (rmp #478): an INNER bound under the global cap. A connection from an
+                // IP already at `max_connections_per_ip` is closed here, *before* the TLS handshake, so an
+                // abusive source cannot spend the budget it would otherwise tie up in handshakes. The
+                // global permit is dropped first (it is not used), freeing that slot immediately.
+                let peer_ip = conn.peer_addr().ip();
+                let Some(ip_guard) = per_ip.try_admit(peer_ip) else {
+                    metrics.record_per_ip_rejection();
+                    tracing::warn!(
+                        interface = "Bolt-TCP",
+                        peer_ip = %peer_ip,
+                        "connection rejected: source IP at its per-IP connection cap (rmp #478)"
+                    );
+                    drop(permit);
                     drop(conn);
                     continue;
                 };
@@ -226,13 +250,16 @@ pub async fn run_tcp_accept_loop(
                                 // reaped (rmp #469, F-NET-1).
                                 Some(handshake_timeout),
                                 permit,
+                                // Hand the per-IP slot guard to the session so the source IP's live count
+                                // stays held for the connection's lifetime, releasing on drop (rmp #478).
+                                Some(ip_guard),
                                 shutdown,
                             );
                         }
                         Ok(Err(e)) => {
                             metrics.record_auth_failure();
                             tracing::warn!(error = %e, "Bolt-TCP TLS handshake failed");
-                            // `permit` drops here, freeing the connection budget.
+                            // `permit` and `ip_guard` drop here, freeing the global and per-IP slots.
                         }
                         Err(_elapsed) => {
                             metrics.record_handshake_timeout();
@@ -240,7 +267,7 @@ pub async fn run_tcp_accept_loop(
                                 timeout_ms = handshake_timeout.as_millis(),
                                 "Bolt-TCP TLS handshake timed out; dropping connection"
                             );
-                            // `permit` drops here, freeing the connection budget.
+                            // `permit` and `ip_guard` drop here, freeing the global and per-IP slots.
                         }
                     }
                 });
@@ -304,7 +331,9 @@ impl PeerCredSource for FixedPeerCred {
 /// slot + blocking thread + socket indefinitely; on `LOGON` success the transport relaxes to
 /// `idle_timeout`. `permit` is the connection-admission permit (rmp #118); it is moved
 /// into the task and held for the whole session, releasing the global connection-budget slot on drop
-/// when the connection ends.
+/// when the connection ends. `ip_guard` is the per-source-IP slot guard (rmp #478): `Some` for the
+/// Bolt-TCP transport (released on drop, decrementing the source IP's live count), `None` for UDS (which
+/// has no peer IP and is exempt from the per-IP cap).
 ///
 /// The session is **blocking** (its `Transport` and engine submits block), so it runs on
 /// `spawn_blocking`, never a runtime worker (`04 §9.1`). The [`AuthProvider`] seam is shared (`Arc`);
@@ -321,14 +350,17 @@ fn spawn_session<S>(
     idle_timeout: Option<Duration>,
     pre_auth_timeout: Option<Duration>,
     permit: OwnedSemaphorePermit,
+    ip_guard: Option<PerIpConnGuard>,
     shutdown: ShutdownCoordinator,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
         // Hold the connection-admission permit for the session's lifetime; it releases on drop when
-        // this task returns (rmp #118).
+        // this task returns (rmp #118). The per-source-IP slot guard (rmp #478, `None` for UDS, which
+        // has no peer IP) is held the same way, so the IP's live count is decremented on every exit path.
         let _permit = permit;
+        let _ip_guard = ip_guard;
         let transport =
             AsyncToBlockingTransport::new(stream, handle, shutdown, idle_timeout, pre_auth_timeout);
         let executor = BoltEngineExecutor::new(context, source);

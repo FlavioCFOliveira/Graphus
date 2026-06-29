@@ -234,6 +234,11 @@ pub struct Metrics {
     /// Network connections dropped because their TLS handshake did not complete within
     /// `handshake_timeout_ms` (a slow-loris guard — rmp #118).
     handshake_timeouts: CachePad,
+    /// Connections **rejected at accept time** because the source IP was already at its per-IP
+    /// concurrent-connection cap (`max_connections_per_ip`, rmp #478). The connection was closed before
+    /// any TLS/protocol bytes; the global budget it would have consumed stays free for other sources.
+    /// Multi-writer (both network accept loops record into it), so cache-padded.
+    per_ip_rejections: CachePad,
 
     // ---- query latency ----
     latency: LatencyHistogram,
@@ -319,6 +324,7 @@ impl Metrics {
             auth_failures: CachePad::new(0),
             conn_shed: CachePad::new(0),
             handshake_timeouts: CachePad::new(0),
+            per_ip_rejections: CachePad::new(0),
             latency: LatencyHistogram::new(),
             slow_queries: AtomicU64::new(0),
             maintenance_checkpoints: AtomicU64::new(0),
@@ -493,6 +499,13 @@ impl Metrics {
         self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a connection rejected at accept time because its source IP was already at the per-IP
+    /// concurrent-connection cap (`max_connections_per_ip`, rmp #478). The connection was closed before
+    /// any TLS/protocol bytes were read.
+    pub fn record_per_ip_rejection(&self) {
+        self.per_ip_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Observes a query's execution latency into the histogram.
     pub fn observe_query_latency(&self, d: Duration) {
         self.latency.observe(d);
@@ -658,6 +671,12 @@ impl Metrics {
             "graphus_handshake_timeouts_total",
             "Network connections dropped because their TLS handshake timed out.",
             self.handshake_timeouts.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_connections_per_ip_rejected_total",
+            "Connections rejected at accept time because the source IP hit its per-IP cap (rmp #478).",
+            self.per_ip_rejections.load(Ordering::Relaxed),
         );
         counter(
             &mut out,
@@ -957,10 +976,15 @@ mod tests {
         m.record_conn_shed();
         m.record_conn_shed();
         m.record_handshake_timeout();
+        m.record_per_ip_rejection();
+        m.record_per_ip_rejection();
+        m.record_per_ip_rejection();
         let text = m.render_prometheus();
         assert!(text.contains("graphus_connections_shed_total 2"));
         assert!(text.contains("graphus_handshake_timeouts_total 1"));
+        assert!(text.contains("graphus_connections_per_ip_rejected_total 3"));
         assert!(text.contains("# TYPE graphus_connections_shed_total counter"));
+        assert!(text.contains("# TYPE graphus_connections_per_ip_rejected_total counter"));
     }
 
     #[test]
@@ -1144,6 +1168,7 @@ mod padding_tests {
             line(&m.auth_failures),
             line(&m.conn_shed),
             line(&m.handshake_timeouts),
+            line(&m.per_ip_rejections),
         ];
         for i in 0..addrs.len() {
             for j in (i + 1)..addrs.len() {
@@ -1277,8 +1302,9 @@ mod size_probe {
             64,
             "Metrics inherits 64-byte alignment from its padded multi-writer counters"
         );
-        // 10 padded counters * 64B = 640B (the 9 original + `statement_panics`, `rmp` #386 — written by
-        // both the engine thread and reader-pool workers, so genuinely multi-writer); the unpadded
+        // 11 padded counters * 64B = 704B (the 9 original + `statement_panics`, `rmp` #386 — written by
+        // both the engine thread and reader-pool workers — + `per_ip_rejections`, `rmp` #478, written by
+        // both network accept loops); the unpadded
         // engine-only fields (the latency histogram, the `maintenance_*`/reliability counters) and the
         // `rmp` #463 per-database registry (`RwLock<BTreeMap<…>>`) pack into the trailing lines. The exact
         // byte count is no longer pinned: the per-database registry's `RwLock`/`BTreeMap` have
@@ -1286,7 +1312,7 @@ mod size_probe {
         // anything meaningful. The invariants that DO matter are asserted instead — 64-byte alignment
         // (above) and a floor at the padded-counter contribution (below), which still catches any
         // accidental padding of the engine-only fields or loss of a padded counter.
-        const PADDED_COUNTERS: usize = 10;
+        const PADDED_COUNTERS: usize = 11;
         const CACHE_LINE: usize = 64;
         let size = std::mem::size_of::<Metrics>();
         assert!(

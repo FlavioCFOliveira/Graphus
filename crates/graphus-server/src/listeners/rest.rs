@@ -30,6 +30,7 @@ use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
+use super::ip_limit::PerIpConnLimiter;
 use crate::shutdown::ShutdownCoordinator;
 
 /// A [`tower::Service`] that drives the wrapped axum `Router` to completion on a blocking task, so the
@@ -90,7 +91,9 @@ impl Service<Request<Incoming>> for BlockingRouter {
 /// `conn_limit` is the process-wide connection-admission semaphore (rmp #118): a permit is taken at
 /// accept time *before* the TLS handshake, and held for the connection's lifetime (moved into the
 /// per-connection task), so a flood of REST connections cannot exhaust the process's connection budget
-/// ahead of query admission. `handshake_timeout` bounds the TLS handshake so a stalled one is dropped
+/// ahead of query admission. `per_ip` is the per-source-IP connection cap (rmp #478), taken as an inner
+/// bound *after* the global permit so one abusive IP cannot hold more than its share of the global
+/// budget. `handshake_timeout` bounds the TLS handshake so a stalled one is dropped
 /// rather than pinning the task and socket. `header_read_timeout` (SEC-181) bounds how long a client
 /// may take to send its complete request headers *after* TLS, closing the slow-loris HTTP vector that
 /// the handshake deadline alone does not cover; `None` disables it.
@@ -101,6 +104,7 @@ pub async fn run_rest_accept_loop(
     router: Router,
     metrics: Arc<crate::metrics::Metrics>,
     conn_limit: Arc<tokio::sync::Semaphore>,
+    per_ip: Arc<PerIpConnLimiter>,
     handshake_timeout: Duration,
     header_read_timeout: Option<Duration>,
     shutdown: ShutdownCoordinator,
@@ -134,6 +138,23 @@ pub async fn run_rest_accept_loop(
                     }
                 };
 
+                // Per-source-IP gate (rmp #478): an INNER bound under the global cap. A connection from an
+                // IP already at `max_connections_per_ip` is closed here, *before* any TLS/HTTP work, so an
+                // abusive source cannot tie up the budget with parked HTTP connections. The global permit
+                // is dropped first (it is not used), freeing that slot immediately.
+                let peer_ip = conn.peer_addr().ip();
+                let Some(ip_guard) = per_ip.try_admit(peer_ip) else {
+                    metrics.record_per_ip_rejection();
+                    tracing::warn!(
+                        interface = "REST",
+                        peer_ip = %peer_ip,
+                        "connection rejected: source IP at its per-IP connection cap (rmp #478)"
+                    );
+                    drop(permit);
+                    drop(conn);
+                    continue;
+                };
+
                 metrics.record_rest_request();
                 let svc = BlockingRouter {
                     router: router.clone(),
@@ -144,8 +165,10 @@ pub async fn run_rest_accept_loop(
                 let conn_metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
                     // The permit is held for the whole connection, releasing on drop when this task
-                    // returns (rmp #118).
+                    // returns (rmp #118). The per-source-IP slot guard (rmp #478) is held the same way,
+                    // decrementing the source IP's live count on every exit path.
                     let _permit = permit;
+                    let _ip_guard = ip_guard;
                     serve_connection(
                         conn,
                         tls,

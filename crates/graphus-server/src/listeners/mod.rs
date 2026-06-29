@@ -8,6 +8,7 @@
 
 mod bolt;
 mod extra_routes;
+mod ip_limit;
 mod rest;
 mod transport;
 
@@ -145,6 +146,24 @@ pub async fn start_all(
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(
         config.admission.max_connections,
     ));
+    // Per-source-IP connection cap (rmp #478): an INNER bound under the global `conn_limit`. One shared
+    // limiter spans BOTH network listeners (Bolt-TCP + REST), so a single abusive IP's connections count
+    // jointly against its cap across both — it can never hold more than its share of the global budget,
+    // and therefore can never shed legitimate clients arriving from other IPs. `0` disables it (the
+    // NAT/load-balancer/reverse-proxy setting). UDS is exempt: it has no peer IP (a kernel-protected
+    // local trust domain gated by `SO_PEERCRED`), so it never consults this limiter.
+    let per_ip_limiter = ip_limit::PerIpConnLimiter::new(config.admission.max_connections_per_ip);
+    if per_ip_limiter.is_enabled() {
+        tracing::debug!(
+            max_connections_per_ip = config.admission.max_connections_per_ip,
+            "per-source-IP connection cap enabled on the network listeners (rmp #478)"
+        );
+    } else {
+        tracing::debug!(
+            "per-source-IP connection cap disabled (max_connections_per_ip = 0); only the global \
+             max_connections cap applies"
+        );
+    }
     // The TLS-handshake deadline and optional idle/read deadline applied to network sessions.
     let handshake_timeout = config.timing.handshake_timeout();
     let idle_timeout = config.timing.idle_timeout();
@@ -211,6 +230,7 @@ pub async fn start_all(
             advertised_bolt.clone(),
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
+            Arc::clone(&per_ip_limiter),
             handshake_timeout,
             idle_timeout,
             shutdown.clone(),
@@ -250,6 +270,7 @@ pub async fn start_all(
             router,
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
+            Arc::clone(&per_ip_limiter),
             handshake_timeout,
             header_read_timeout,
             shutdown.clone(),
