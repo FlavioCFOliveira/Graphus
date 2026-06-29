@@ -31,9 +31,16 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # the raw `http`/`bytes` types directly, so they are declared explicitly (same major as axum's).
 bytes = "1"
 http = "1"
-# Async runtime. Only `rt` + `rt-multi-thread` (axum's executor) and `sync` (the `oneshot` the
-# auto-rollback sweep uses) are needed in the lib; `macros`/`rt`/`time` are dev-only for `#[tokio::test]`.
+# Async runtime. `rt` + `rt-multi-thread` (axum's executor), `sync` (the `oneshot` the auto-rollback
+# sweep uses, plus the bounded `mpsc` egress channel that backs the incrementally-streamed response
+# bodies, rmp #475). The streaming producer drains the synchronous `ResultStream` on a
+# `spawn_blocking` thread (`rt`) and `blocking_send`s serialized chunks (`sync`) into that channel.
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync"] }
+# The `Stream` trait only — to bridge the bounded `tokio::sync::mpsc::Receiver` of serialized response
+# chunks into an `axum::body::Body::from_stream` streaming body (rmp #475: bounded-memory egress). A
+# tiny, already-in-tree leaf crate (no new transitive dependencies); the `Stream` impl is hand-rolled
+# over `Receiver::poll_recv`, so no `futures-util`/`tokio-stream` adapter crate is pulled.
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
 # The middleware stack: CORS + response compression are wired as layers (`04 §8.2` HTTP niceties).
 # `tower` itself is needed for `ServiceExt`/`ServiceBuilder` when composing those layers.
 tower = { version = "0.5", default-features = false, features = ["util"] }

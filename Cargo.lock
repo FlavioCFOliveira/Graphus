@@ -1308,6 +1308,7 @@ dependencies = [
  "axum",
  "bytes",
  "ciborium",
+ "futures-core",
  "graphus-auth",
  "graphus-columnar",
  "graphus-core",

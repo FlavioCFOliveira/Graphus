@@ -980,6 +980,178 @@ async fn ndjson_streaming_of_multiple_rows() {
     assert!(summary.get("summary").is_some());
 }
 
+// =============================== incremental streaming (rmp #475) ==============================
+//
+// The single-statement JSON and NDJSON paths now stream the response body incrementally with bounded
+// server memory (rmp #475). The hard requirement is **byte-identity**: a streamed body must be
+// byte-for-byte equal to what the buffered serializer produced, so no driver/client sees any wire
+// difference. These tests pin that with the router itself as the oracle.
+
+/// BYTE-IDENTITY (auto-commit / `Finalise::Commit`): a JSON auto-commit with **no** `Idempotency-Key`
+/// now STREAMS; the **same** request WITH a key stays on the BUFFERED+cached path. The two bodies
+/// must be byte-for-byte identical. Exercises every cell class — a big int (int53 string form), a
+/// plain string, a structural node, and a null — so the streamed envelope is proven equal to the
+/// buffered `RunResponse` across the full encoding surface.
+#[tokio::test]
+async fn streamed_json_autocommit_is_byte_identical_to_buffered() {
+    let query = "RETURN mix";
+    let rows = vec![
+        vec![
+            RestValue::Value(Value::Integer((1_i64 << 53) + 1)),
+            RestValue::Value(Value::String("hi \"quoted\"".to_owned())),
+        ],
+        vec![viz_node(7, "Person", "Ada"), RestValue::Value(Value::Null)],
+    ];
+    let engine = MockEngine::new().on_query(query, canned_structural(&["a", "b"], rows));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+    let body = json!({ "statements": [{ "statement": query }] });
+
+    // Streamed (no Idempotency-Key).
+    let streamed_resp = h
+        .send(post_json("/db/neo4j/tx/commit", &token, body.clone()))
+        .await;
+    assert_eq!(content_type(&streamed_resp), "application/json");
+    let streamed = body_bytes(streamed_resp).await;
+
+    // Buffered (an Idempotency-Key routes to the buffered, cacheable path — the prior behaviour).
+    let buffered_req = Request::builder()
+        .method("POST")
+        .uri("/db/neo4j/tx/commit")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", "buffered-key-1")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let buffered = body_bytes(h.send(buffered_req).await).await;
+
+    assert_eq!(
+        streamed,
+        buffered,
+        "streamed JSON must be byte-identical to the buffered RunResponse:\n  streamed={}\n  buffered={}",
+        String::from_utf8_lossy(&streamed),
+        String::from_utf8_lossy(&buffered),
+    );
+    // The streamed body is a complete, valid envelope (not a truncated stream).
+    let doc: Json = serde_json::from_slice(&streamed).unwrap();
+    assert_eq!(doc["results"][0]["data"].as_array().unwrap().len(), 2);
+
+    // COMMIT-AFTER-DRAIN: the commit was issued by the producer only after the result fully streamed,
+    // so by the time the body is collected the engine has seen begin → run → commit (in that order).
+    let log = h.engine.log();
+    let pos = |p: &str| log.iter().position(|l| l.starts_with(p));
+    assert!(pos("begin") < pos("run") && pos("run") < pos("commit"));
+}
+
+/// BYTE-IDENTITY (`run_in_tx` / `Finalise::KeepOpen`): a single-statement JSON `run` inside an open
+/// transaction streams the `RunResponse` envelope **including** the trailing `"id"` /
+/// `"expires_at_nanos"` members. The streamed bytes must equal `serde_json::to_vec(&RunResponse{…})`
+/// built from the public structs (the buffered serializer), so the open-tx tail framing is pinned.
+#[tokio::test]
+async fn streamed_json_keepopen_is_byte_identical_to_runresponse() {
+    let query = "RETURN n";
+    let engine = MockEngine::new().on_query(
+        query,
+        Canned::rows(
+            &["x"],
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]],
+        ),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let begin = body_json(
+        h.send(post_json(
+            "/db/neo4j/tx",
+            &token,
+            json!({ "access_mode": "READ" }),
+        ))
+        .await,
+    )
+    .await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &token,
+            json!({ "statements": [{ "statement": query }] }),
+        ))
+        .await;
+    assert_eq!(content_type(&resp), "application/json");
+    let streamed = body_bytes(resp).await;
+
+    // Reconstruct the expected buffered envelope from the PUBLIC structs, using the exact id/expiry
+    // the streamed response carried (the framing — not the values — is what we are pinning).
+    let doc: Json = serde_json::from_slice(&streamed).unwrap();
+    let got_id = doc["id"].as_str().unwrap().to_owned();
+    let got_exp = doc["expires_at_nanos"].as_u64().unwrap();
+    let data: Vec<Json> = vec![
+        Json::Array(vec![crate::restvalue::restvalue_to_jolt(
+            &RestValue::Value(Value::Integer(1)),
+        )]),
+        Json::Array(vec![crate::restvalue::restvalue_to_jolt(
+            &RestValue::Value(Value::Integer(2)),
+        )]),
+    ];
+    let expected = serde_json::to_vec(&crate::protocol::RunResponse {
+        results: vec![crate::protocol::StatementResult {
+            fields: vec!["x".to_owned()],
+            data,
+            // The mock's read summary, exactly as `encode_summary` renders it.
+            summary: json!({ "type": "r", "stats": {} }),
+        }],
+        id: Some(got_id),
+        expires_at_nanos: Some(got_exp),
+    })
+    .unwrap();
+
+    assert_eq!(
+        streamed,
+        expected,
+        "streamed KeepOpen JSON must equal the buffered RunResponse byte-for-byte:\n  streamed={}\n  expected={}",
+        String::from_utf8_lossy(&streamed),
+        String::from_utf8_lossy(&expected),
+    );
+}
+
+/// An idempotency-keyed JSON commit is still BUFFERED and CACHED — streaming must not silently break
+/// the `Idempotency-Key` replay. The first keyed request runs once; a replay returns the same bytes
+/// without re-executing (exactly one `begin`/`commit` reaches the engine).
+#[tokio::test]
+async fn idempotency_keyed_json_commit_is_buffered_and_cached() {
+    let query = "CREATE (n) RETURN n";
+    let engine =
+        MockEngine::new().on_query(query, Canned::rows(&["n"], vec![vec![Value::Integer(42)]]));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let keyed = || {
+        Request::builder()
+            .method("POST")
+            .uri("/db/neo4j/tx/commit")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", "commit-key-1")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "statements": [{ "statement": query }] })).unwrap(),
+            ))
+            .unwrap()
+    };
+
+    let first = body_bytes(h.send(keyed()).await).await;
+    let second = body_bytes(h.send(keyed()).await).await; // replay
+    assert_eq!(
+        first, second,
+        "keyed commit must replay the exact first body"
+    );
+
+    // Exactly one begin and one commit reached the engine — the replay did NOT re-execute.
+    let log = h.engine.log();
+    assert_eq!(log.iter().filter(|l| l.starts_with("begin")).count(), 1);
+    assert_eq!(log.iter().filter(|l| l.starts_with("commit")).count(), 1);
+}
+
 // =============================== errors ========================================================
 
 #[tokio::test]

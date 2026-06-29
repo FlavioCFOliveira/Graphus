@@ -52,7 +52,12 @@
 //!     engine: Arc<E>,
 //!     auth: Arc<dyn AuthProvider>,
 //!     clock: Arc<dyn Clock + Send + Sync>,
-//! ) -> axum::Router {
+//! ) -> axum::Router
+//! where
+//!     // The result stream is drained on a `spawn_blocking` producer for bounded-memory egress
+//!     // (rmp #475), so it must be `Send`; the real coordinator's stream is.
+//!     E::Stream: Send,
+//! {
 //!     let registry = Arc::new(TxRegistry::new(DEFAULT_TX_TTL_NANOS));
 //!     router(AppState::new(engine, auth, registry, clock))
 //! }
@@ -68,9 +73,12 @@
 //!   (`04 §7.2`). The Jolt structural sigils (`$N`/`$R`/`$P`) and the point sigil (`@`) are therefore
 //!   not emitted yet; the codec gains them when the variants land, without changing the seam — see
 //!   [`value`].
-//! - **NDJSON streaming** frames each row as its own line from the pull-based seam; in this
-//!   in-process build the body is assembled eagerly (the engine cursor is synchronous), which a
-//!   future async cursor turns into true incremental flushing with no API change.
+//! - **Incremental streaming** (rmp #475): a single-statement NDJSON or JSON result is streamed with
+//!   **bounded server memory** — rows are drained one at a time from the pull-based seam on a
+//!   `spawn_blocking` producer and `blocking_send`-ed in bounded chunks into the response body, so the
+//!   footprint is flat regardless of result size (the Bolt `PULL` property). The COMMIT runs only
+//!   after a fully-drained successful stream; see [`router`](mod@router) for the framing and the
+//!   mid-stream-error/commit-after-drain semantics.
 #![forbid(unsafe_code)]
 
 pub mod columnar;

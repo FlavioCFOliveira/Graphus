@@ -29,29 +29,57 @@
 //!
 //! # The `Built` response intermediate
 //!
-//! Every handler produces a `Built` (`status` + `content_type` + buffered `body` bytes) rather
+//! Most handlers produce a `Built` (`status` + `content_type` + buffered `body` bytes) rather
 //! than an opaque `axum::Response` directly. This makes the **`Idempotency-Key`** cache trivial and
 //! correct — the bytes to cache *are* the response — and keeps the conversion to `axum::Response` in
-//! one place. The single exception is the NDJSON streaming path, which builds its body
-//! line-by-line and is not idempotency-cached (see below).
+//! one place. The exception is the **incremental streaming path** (rmp #475), which never
+//! materialises the whole body and is therefore not idempotency-cached (see below).
 //!
-//! # Streaming (`04 §8.2`, §7.7)
+//! # Streaming with bounded memory (`04 §8.2`, §7.7, §9.3; rmp #475)
 //!
-//! When the client `Accept`s `application/x-ndjson`, a single-statement result is framed as
-//! NDJSON — a `fields` header line, then one line per row, then a `summary` line — pulled lazily
-//! from the [`ResultStream`]. Otherwise the result is buffered into a typed-JSON or CBOR
-//! [`RunResponse`].
+//! A single-statement result whose negotiated wire is **NDJSON** or **JSON** is streamed
+//! **incrementally**: rows are pulled one at a time from the [`ResultStream`], serialized, flushed,
+//! and dropped before the next is pulled, so **server memory stays bounded regardless of the
+//! result-set size** — exactly the Bolt `PULL` property (each `RECORD` ships as produced). This
+//! closes the egress-DoS where a tiny request asking for a huge result forced the whole body into
+//! RAM (an OOM vector that also starved co-tenants on the shared process). The mechanics:
+//!
+//! - The synchronous [`ResultStream`] is drained on a `tokio::task::spawn_blocking` producer (its
+//!   `next_row` blocks the engine's bounded egress channel — never a runtime worker, `04 §9.1`).
+//! - Each serialized chunk is `blocking_send`-ed into a **bounded** [`tokio::sync::mpsc`] channel,
+//!   so a slow client throttles production (backpressure) rather than buffering the result (`04
+//!   §9.3`). The response [`Body`] is fed from the receiver via [`Body::from_stream`].
+//! - **NDJSON** frames a `fields` header line, one `row` line per row, then a `summary` line.
+//!   **JSON** streams the [`RunResponse`] envelope incrementally — the `[…]` `data` array is emitted
+//!   element-by-element — producing **byte-identical** output to the buffered serializer.
+//!
+//! **Commit-after-drain (ACID).** For an auto-commit / committing statement the COMMIT runs **only
+//! after** the result has fully streamed (mirroring Bolt, whose auto-commit finalises at the trailing
+//! `SUCCESS`). A row-production error *mid-stream* — which can only arise after the `200` status and
+//! the first bytes are already on the wire — rolls the transaction back (no partial commit) and
+//! surfaces in-band: NDJSON appends a trailing problem line (a Bolt-`FAILURE`-after-records analogue);
+//! JSON terminates the body as a transport error so the client sees an incomplete document. A
+//! statement error *before* the first byte still maps to the correct problem+json status, unchanged.
+//!
+//! CBOR, multi-statement batches, and idempotency-keyed committing requests stay on the buffered
+//! path (CBOR cannot be length-prefix-streamed byte-identically; an idempotency replay must cache the
+//! exact bytes — see [`with_idempotency`]). These are not the measured DoS vector (one huge result).
 //!
 //! # Idempotency (`04 §8.2`)
 //!
 //! The transaction-*finalising* entry points (`begin`, `commit`, `auto_commit`) honour an
 //! `Idempotency-Key`: the first `Built` response under a key is cached and a retry replays it
 //! verbatim rather than re-executing — exactly the retries that matter (a client that resends a
-//! commit must not commit twice). The NDJSON streaming path is not cached (a byte-replayable cache
-//! of an unbounded stream would defeat the bounded-memory goal); a client wanting idempotent
-//! semantics uses the buffered response by not requesting NDJSON.
+//! commit must not commit twice). The incremental streaming path is not cached — a byte-replayable
+//! cache of an unbounded stream would defeat the bounded-memory goal — so a committing request that
+//! carries an `Idempotency-Key` is served from the **buffered** path (which the cache can store)
+//! rather than streamed: NDJSON streams unconditionally (never cached, as before), JSON streams only
+//! when no key is present, and a keyed JSON commit keeps its exact prior buffered-and-cached
+//! behaviour. A client wanting idempotent replay simply sends the key (or omits `x-ndjson`).
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -374,7 +402,15 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// the listener enables it (axum's `http2` feature is on); **CORS** and **response compression** are
 /// wired here as `tower-http` layers. The request body is capped at [`MAX_REQUEST_BODY_BYTES`]
 /// (`413` past the cap) so untrusted input cannot exhaust memory.
-pub fn router<E: RestEngine + Send + Sync + 'static>(state: AppState<E>) -> Router {
+pub fn router<E: RestEngine + Send + Sync + 'static>(state: AppState<E>) -> Router
+where
+    // The incremental streaming egress (rmp #475) drains the engine's `ResultStream` on a
+    // `spawn_blocking` producer, so the stream must cross to that thread. The production
+    // `RestEngineAdapter::Stream` (a channel receiver + admission permit) and every test stream are
+    // already `Send`; the deterministic VOPR engine (`!Send`) never builds a `router` — it drives
+    // the synchronous `execute_autocommit` core directly — so this bound does not reach it.
+    E::Stream: Send,
+{
     // Take the configured CORS policy out of the state before it is moved into the router; the policy
     // is a layer-construction input, not per-request state.
     let cors_layer = state.cors.clone().into_layer();
@@ -469,12 +505,15 @@ async fn begin<E: RestEngine + 'static>(
 
 /// `POST /db/{db}/tx/{id}` → run statements in the open transaction (resets the timeout)
 /// (`04 §8.2`).
-async fn run_in_tx<E: RestEngine + 'static>(
+async fn run_in_tx<E: RestEngine + Send + Sync + 'static>(
     State(state): State<AppState<E>>,
     Path((db, id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
+) -> Response
+where
+    E::Stream: Send,
+{
     // The streaming path cannot be uniformly buffered for the idempotency cache, and `run` is not a
     // finalising endpoint, so it is handled directly (not via `with_idempotency`).
     let outcome = (|| {
@@ -512,12 +551,15 @@ async fn run_in_tx<E: RestEngine + 'static>(
 }
 
 /// `POST /db/{db}/tx/{id}/commit` → run final statements and commit (`04 §8.2`).
-async fn commit_tx<E: RestEngine + 'static>(
+async fn commit_tx<E: RestEngine + Send + Sync + 'static>(
     State(state): State<AppState<E>>,
     Path((_db, id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
+) -> Response
+where
+    E::Stream: Send,
+{
     // Authenticate BEFORE any idempotency replay (rmp #182): an anonymous caller never reaches the
     // cache, and the replay below is scoped to this principal so it can only return this user's body.
     let identity = match authenticate(&state, &headers) {
@@ -566,9 +608,10 @@ async fn commit_tx<E: RestEngine + 'static>(
                 .into_response();
         }
     };
-    if wire == Wire::Ndjson && req.statements.len() == 1 {
-        return stream_single_statement_ndjson(
+    if let Some(framing) = stream_framing(wire, &req.statements, &headers) {
+        return stream_single_statement(
             &state,
+            framing,
             handle,
             &req.statements[0],
             Finalise::Commit,
@@ -615,12 +658,15 @@ async fn rollback_tx<E: RestEngine + 'static>(
 }
 
 /// `POST /db/{db}/tx/commit` → single-statement auto-commit shortcut (`04 §8.2`, `06 §4`).
-async fn auto_commit<E: RestEngine + 'static>(
+async fn auto_commit<E: RestEngine + Send + Sync + 'static>(
     State(state): State<AppState<E>>,
     Path(db): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
+) -> Response
+where
+    E::Stream: Send,
+{
     // Authenticate BEFORE any idempotency replay (rmp #182): anonymous callers never reach the cache,
     // and the replay below is scoped to this principal.
     let identity = match authenticate(&state, &headers) {
@@ -666,9 +712,10 @@ async fn auto_commit<E: RestEngine + 'static>(
                 .into_response();
         }
     };
-    if wire == Wire::Ndjson && req.statements.len() == 1 {
-        return stream_single_statement_ndjson(
+    if let Some(framing) = stream_framing(wire, &req.statements, &headers) {
+        return stream_single_statement(
             &state,
+            framing,
             handle,
             &req.statements[0],
             Finalise::Commit,
@@ -977,14 +1024,18 @@ enum Finalise {
 }
 
 /// Dispatches a `run` to the streaming or buffered path based on the negotiated wire format, then
-/// converts to a `Response`. Used by `run_in_tx` (which does not idempotency-cache).
-fn run_statements<E: RestEngine>(
+/// converts to a `Response`. Used by `run_in_tx` (which does not idempotency-cache, so streaming is
+/// chosen for a single-statement NDJSON or JSON result with no key check needed).
+fn run_statements<E: RestEngine + Send + Sync + 'static>(
     state: &AppState<E>,
     headers: &HeaderMap,
     handle: TxHandle,
     statements: &[Statement],
     finalise: Finalise,
-) -> Response {
+) -> Response
+where
+    E::Stream: Send,
+{
     let wire = match response_wire(header_str(headers, &ACCEPT)) {
         Some(w) => w,
         None => {
@@ -992,8 +1043,8 @@ fn run_statements<E: RestEngine>(
                 .into_response();
         }
     };
-    if wire == Wire::Ndjson && statements.len() == 1 {
-        return stream_single_statement_ndjson(state, handle, &statements[0], finalise);
+    if let Some(framing) = stream_framing(wire, statements, headers) {
+        return stream_single_statement(state, framing, handle, &statements[0], finalise);
     }
     run_statements_buffered(state, headers, handle, statements, finalise, wire)
         .unwrap_or_else(Built::problem)
@@ -1122,24 +1173,218 @@ fn run_one<E: RestEngine>(
     })
 }
 
-/// Frames a single statement's result as NDJSON (`04 §8.2`): a `fields` line, one line per row, then
-/// a `summary` line. Rows are pulled lazily from the [`ResultStream`] seam.
-///
-/// The engine's [`ResultStream`] is synchronous (not `Send`-across-await), so the body is assembled
-/// here line-by-line; the **pull-based seam** is what lets a future async-cursor engine flush each
-/// line without buffering the whole result. The NDJSON framing is identical either way, and a client
-/// parses it incrementally. This path is not idempotency-cached (see the module docs).
-fn stream_single_statement_ndjson<E: RestEngine>(
+// =============================== incremental streaming egress (rmp #475) =======================
+
+/// The depth of the bounded egress channel backing a streamed body. Each slot holds one already-
+/// serialized chunk (≈ [`STREAM_FLUSH_BYTES`]); a full channel throttles the producer (backpressure,
+/// `04 §9.3`). Small on purpose — the goal is a flat footprint, not a deep buffer.
+const STREAM_CHANNEL_CAP: usize = 8;
+
+/// The producer batches serialized rows into a reusable buffer and flushes a chunk once it reaches
+/// this size (16 KiB), amortising the per-row channel overhead over many rows while keeping the
+/// in-flight bytes bounded at ≈ `(STREAM_CHANNEL_CAP + 1) * STREAM_FLUSH_BYTES` — **independent of
+/// the result-set size**.
+const STREAM_FLUSH_BYTES: usize = 16 * 1024;
+
+/// Which wire framing a streamed single-statement result uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// NDJSON: a `fields` line, one `row` line per row, then a `summary` line (`application/x-ndjson`).
+    Ndjson,
+    /// The [`RunResponse`] envelope, streamed element-by-element, **byte-identical** to the buffered
+    /// serializer (`application/json`).
+    Json,
+}
+
+/// Decides whether a `run`/commit response should be **streamed** (and in which framing) rather than
+/// buffered: only a **single-statement** NDJSON or JSON result streams. JSON additionally requires no
+/// `Idempotency-Key` (a keyed committing request keeps its exact buffered-and-cached behaviour;
+/// `run_in_tx` passes no key, so its single-statement JSON always streams). CBOR, multi-statement,
+/// and empty batches return `None` (buffered).
+fn stream_framing(wire: Wire, statements: &[Statement], headers: &HeaderMap) -> Option<Framing> {
+    if statements.len() != 1 {
+        return None;
+    }
+    match wire {
+        Wire::Ndjson => Some(Framing::Ndjson),
+        Wire::Json if headers.get(IDEMPOTENCY_KEY).is_none() => Some(Framing::Json),
+        _ => None,
+    }
+}
+
+impl Framing {
+    /// The `Content-Type` the streamed body is sent with.
+    fn content_type(self) -> &'static str {
+        match self {
+            Framing::Ndjson => "application/x-ndjson",
+            Framing::Json => "application/json",
+        }
+    }
+
+    /// Writes the leading bytes (before any row): NDJSON's `fields` line, or JSON's
+    /// `{"results":[{"fields":<fields>,"data":[` envelope opener.
+    fn prefix(self, fields: &[String], out: &mut Vec<u8>) {
+        match self {
+            Framing::Ndjson => push_ndjson_line(out, &json!({ "fields": fields })),
+            Framing::Json => {
+                out.extend_from_slice(b"{\"results\":[{\"fields\":");
+                append_json(out, fields);
+                out.extend_from_slice(b",\"data\":[");
+            }
+        }
+    }
+
+    /// Writes one row: NDJSON's `{"row":[…]}` line, or the next JSON `data` array element
+    /// (comma-separated, exactly as `serde_json` serializes a `Vec<Json>`).
+    fn row(self, cells: &[crate::restvalue::RestValue], first: bool, out: &mut Vec<u8>) {
+        let encoded: Vec<Json> = cells
+            .iter()
+            .map(crate::restvalue::restvalue_to_jolt)
+            .collect();
+        match self {
+            Framing::Ndjson => push_ndjson_line(out, &json!({ "row": encoded })),
+            Framing::Json => {
+                if !first {
+                    out.push(b',');
+                }
+                append_json(out, &Json::Array(encoded));
+            }
+        }
+    }
+
+    /// Writes the trailing bytes after a fully-drained, committed result: NDJSON's `summary` line, or
+    /// the JSON envelope close `],"summary":<summary>}]` followed by the `RunResponse` tail (`}` for a
+    /// closed transaction, or `,"id":…,"expires_at_nanos":…}` while it stays open). The bytes match
+    /// `serde_json::to_vec(&RunResponse { … })` exactly.
+    fn success_tail(self, summary: &Json, finalise: &Finalise, out: &mut Vec<u8>) {
+        match self {
+            Framing::Ndjson => push_ndjson_line(out, &json!({ "summary": summary })),
+            Framing::Json => {
+                out.extend_from_slice(b"],\"summary\":");
+                append_json(out, summary);
+                out.extend_from_slice(b"}]");
+                match finalise {
+                    Finalise::Commit => out.push(b'}'),
+                    Finalise::KeepOpen {
+                        id,
+                        expires_at_nanos,
+                    } => {
+                        out.extend_from_slice(b",\"id\":");
+                        append_json(out, &Json::String(id.clone()));
+                        out.extend_from_slice(b",\"expires_at_nanos\":");
+                        out.extend_from_slice(expires_at_nanos.to_string().as_bytes());
+                        out.push(b'}');
+                    }
+                }
+            }
+        }
+    }
+
+    /// Surfaces an error that arrives **after** the `200` status and the first bytes are on the wire
+    /// (a mid-stream row error, or a post-drain commit failure). NDJSON appends a trailing problem
+    /// line — well-formed NDJSON, the Bolt-`FAILURE`-after-records analogue — and returns `true` (the
+    /// body ends normally). JSON cannot retroactively turn a `200` array into a problem document, so
+    /// it returns `false`: the caller aborts the body as a transport error and the client observes an
+    /// incomplete JSON document (and, crucially, the transaction was rolled back — no partial commit).
+    fn mid_error(self, problem: &Problem, out: &mut Vec<u8>) -> bool {
+        match self {
+            Framing::Ndjson => {
+                push_ndjson_line(out, &serde_json::to_value(problem).unwrap_or(Json::Null));
+                true
+            }
+            Framing::Json => false,
+        }
+    }
+}
+
+/// The producer's write end: batches serialized bytes and `blocking_send`s a chunk once it reaches
+/// [`STREAM_FLUSH_BYTES`]. Every send is **blocking** — the producer runs on a `spawn_blocking`
+/// thread, so this never parks a runtime worker (`04 §9.1`). A send error means the consumer (client)
+/// dropped the body; the producer then stops and cleans up.
+struct ChunkSink {
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    buf: Vec<u8>,
+}
+
+impl ChunkSink {
+    fn new(tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(STREAM_FLUSH_BYTES + 1024),
+        }
+    }
+
+    /// Flush a chunk if the buffer has grown past the threshold. `Err(())` ⇒ the consumer is gone.
+    fn maybe_flush(&mut self) -> Result<(), ()> {
+        if self.buf.len() >= STREAM_FLUSH_BYTES {
+            self.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Send whatever is buffered as one chunk (a no-op when empty). `Err(())` ⇒ the consumer is gone.
+    fn flush(&mut self) -> Result<(), ()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        self.tx.blocking_send(Ok(chunk)).map_err(|_| ())
+    }
+
+    /// Terminate the body as a transport error — the JSON mid-stream failure signal. Flushes any
+    /// buffered bytes, then sends an `Err` so `Body::from_stream` aborts the response (the client sees
+    /// an incomplete document rather than a falsely-complete one).
+    fn abort(&mut self) {
+        let _ = self.flush();
+        let _ = self.tx.blocking_send(Err(std::io::Error::other(
+            "result stream aborted by a mid-stream error",
+        )));
+    }
+}
+
+/// The streaming response body: a [`futures_core::Stream`] over the bounded egress channel's receive
+/// end. Hyper polls it on a runtime worker (the producer feeds it from a `spawn_blocking` thread), so
+/// each chunk is written to the socket and dropped as it arrives — bounded memory, no runtime-worker
+/// blocking.
+struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl futures_core::Stream for ChannelBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // `ChannelBody`'s only field is a `Receiver`, which is `Unpin`, so projecting to `&mut self`
+        // through `Pin::get_mut` is sound.
+        self.get_mut().rx.poll_recv(cx)
+    }
+}
+
+/// Runs `stmt` and streams its single result incrementally in `framing` with **bounded server
+/// memory** (rmp #475). A statement error raised **before** the first byte (compile / immediate
+/// runtime / READ-tx rejection) still maps to the correct problem+json status and rolls back; only
+/// once rows begin streaming does an error become an in-band, post-`200` signal (see
+/// [`produce_stream`]). The COMMIT (for [`Finalise::Commit`]) runs **only after** the result has
+/// fully drained.
+fn stream_single_statement<E>(
     state: &AppState<E>,
+    framing: Framing,
     handle: TxHandle,
     stmt: &Statement,
     finalise: Finalise,
-) -> Response {
+) -> Response
+where
+    E: RestEngine + Send + Sync + 'static,
+    E::Stream: Send,
+{
     let params = match bind_parameters(stmt) {
         Ok(p) => p,
         Err(e) => return Built::from(Problem::from_codec_error(&e)).into_response(),
     };
-    let mut stream = match state.engine.run(handle, &stmt.statement, params) {
+    // The error path BEFORE the first byte keeps the exact problem+json status (e.g. a write in a
+    // READ tx → 409): the response has not begun, so it is a normal buffered error, unchanged.
+    let stream = match state.engine.run(handle, &stmt.statement, params) {
         Ok(s) => s,
         Err(e) => {
             let _ = state.engine.rollback(handle);
@@ -1147,42 +1392,124 @@ fn stream_single_statement_ndjson<E: RestEngine>(
         }
     };
 
-    let mut out = Vec::new();
-    push_ndjson_line(&mut out, &json!({ "fields": stream.fields() }));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAP);
+    let engine = Arc::clone(&state.engine);
+    // Drain the synchronous `ResultStream` OFF the runtime: `next_row` blocks the engine's bounded
+    // egress channel, which `04 §9.1` forbids on a runtime worker. The producer is bound to the
+    // response body's lifetime — when the body is fully read or dropped, the receiver drops and the
+    // producer's next `blocking_send` returns `Err`, so it stops and cleans up (no orphan task).
+    tokio::task::spawn_blocking(move || {
+        produce_stream(
+            engine.as_ref(),
+            framing,
+            handle,
+            stream,
+            finalise,
+            ChunkSink::new(tx),
+        );
+    });
+
+    streaming_response(
+        framing.content_type(),
+        Body::from_stream(ChannelBody { rx }),
+    )
+}
+
+/// The streamed-egress producer (runs on a `spawn_blocking` thread). Drains `stream` row by row,
+/// serializing each into `sink` (flushed in bounded chunks), then finalises:
+///
+/// - **clean drain** → COMMIT (for [`Finalise::Commit`]) *after* the full drain, then the trailing
+///   summary/closing bytes — the commit-after-drain ACID order (mirrors Bolt's auto-commit, which
+///   finalises at the trailing `SUCCESS`);
+/// - **row error mid-stream** → roll back (no partial commit) and surface in-band (NDJSON problem
+///   line / JSON transport-abort) — the post-`200` `06 §3.3` case;
+/// - **client disconnect** (a send fails) → drain the engine egress and, for a `Commit`, roll back
+///   the owned handle so no engine transaction leaks (a `KeepOpen` handle stays registered for the
+///   inactivity sweep — the same lifetime it would have on a buffered response);
+/// - **commit failure** after a clean drain → roll back and surface in-band (the Bolt
+///   `FAILURE`-after-records analogue).
+fn produce_stream<E: RestEngine>(
+    engine: &E,
+    framing: Framing,
+    handle: TxHandle,
+    mut stream: E::Stream,
+    finalise: Finalise,
+    mut sink: ChunkSink,
+) {
+    framing.prefix(stream.fields(), &mut sink.buf);
+    let mut first = true;
     loop {
         match stream.next_row() {
             Ok(Some(row)) => {
-                let encoded: Vec<Json> = row
-                    .iter()
-                    .map(crate::restvalue::restvalue_to_jolt)
-                    .collect();
-                push_ndjson_line(&mut out, &json!({ "row": encoded }));
+                framing.row(&row, first, &mut sink.buf);
+                first = false;
+                drop(row); // free the row before pulling the next — the memory-bounding step
+                if sink.maybe_flush().is_err() {
+                    // Client dropped the body mid-stream: drain the engine egress (so its bounded
+                    // `send` unblocks) and, for an owned committing handle, roll back to avoid a leak.
+                    drop(stream);
+                    if matches!(finalise, Finalise::Commit) {
+                        let _ = engine.rollback(handle);
+                    }
+                    return;
+                }
             }
             Ok(None) => break,
             Err(e) => {
-                // A runtime error mid-stream: emit a problem line (rows may already have streamed —
-                // `06 §3.3`), roll back, and stop. The body stays well-formed NDJSON.
-                let problem = Problem::from_graphus_error(&e);
-                push_ndjson_line(
-                    &mut out,
-                    &serde_json::to_value(&problem).unwrap_or(Json::Null),
-                );
-                let _ = state.engine.rollback(handle);
-                return Built::new(StatusCode::OK, "application/x-ndjson", out).into_response();
+                // A runtime error after some rows already streamed (`06 §3.3`): roll back (no partial
+                // commit), surface in-band, and stop.
+                let _ = engine.rollback(handle);
+                emit_terminal_error(framing, &mut sink, &Problem::from_graphus_error(&e));
+                return;
             }
         }
     }
-    push_ndjson_line(
-        &mut out,
-        &json!({ "summary": encode_summary(&stream.summary()) }),
-    );
 
-    if matches!(finalise, Finalise::Commit) {
-        if let Err(e) = state.engine.commit(handle) {
-            return Built::from(Problem::from_graphus_error(&e)).into_response();
+    // Clean drain. Commit-after-drain, then the trailing summary/closing bytes.
+    let summary = encode_summary(&stream.summary());
+    if let Finalise::Commit = finalise {
+        if let Err(e) = engine.commit(handle) {
+            // Commit failed after the rows shipped: roll back and surface in-band (the status is
+            // already `200`, so this cannot become a problem+json status — see [`Framing::mid_error`]).
+            let _ = engine.rollback(handle);
+            emit_terminal_error(framing, &mut sink, &Problem::from_graphus_error(&e));
+            return;
         }
     }
-    Built::new(StatusCode::OK, "application/x-ndjson", out).into_response()
+    framing.success_tail(&summary, &finalise, &mut sink.buf);
+    let _ = sink.flush();
+    // `sink` drops here → the sender drops → the body sees EOF.
+}
+
+/// Emits a post-`200` terminal error (mid-stream row error or commit failure) in the right framing,
+/// then flushes/aborts the body. NDJSON appends a trailing problem line and flushes; JSON aborts the
+/// body as a transport error.
+fn emit_terminal_error(framing: Framing, sink: &mut ChunkSink, problem: &Problem) {
+    if framing.mid_error(problem, &mut sink.buf) {
+        let _ = sink.flush();
+    } else {
+        sink.abort();
+    }
+}
+
+/// Builds a streamed `200 OK` response carrying `body` with `content_type` and the **same**
+/// defence-in-depth security headers [`Built::into_response`] injects (rmp #188): `nosniff`,
+/// `Cache-Control: no-store`, `Referrer-Policy: no-referrer`. Kept in lock-step with
+/// [`Built::into_response`] so a streamed result is indistinguishable from a buffered one at the
+/// header level.
+fn streaming_response(content_type: &str, body: Body) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"))
+        .header(CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .header(REFERRER_POLICY, HeaderValue::from_static("no-referrer"))
+        .body(body)
+        .unwrap_or_else(|_| {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            resp
+        })
 }
 
 // =============================== auth + decode helpers =========================================
@@ -1358,9 +1685,18 @@ fn serializable_built<T: serde::Serialize>(
 
 /// Appends a JSON object as one NDJSON line (object + `\n`) to `out`.
 fn push_ndjson_line(out: &mut Vec<u8>, value: &Json) {
-    if let Ok(mut bytes) = serde_json::to_vec(value) {
-        out.append(&mut bytes);
-        out.push(b'\n');
+    append_json(out, value);
+    out.push(b'\n');
+}
+
+/// Appends `value` as **compact** JSON to `out`, serialized directly into the buffer (no intermediate
+/// `Vec`). A serialize failure — which a well-formed `Value` / `&[String]` cannot trigger (writing to
+/// a `Vec` never does I/O) — degrades to `null` so the streaming producer keeps progressing rather
+/// than panicking. The bytes are identical to `serde_json::to_vec(value)`, which is what makes the
+/// incrementally-streamed JSON envelope byte-for-byte equal to the buffered [`RunResponse`].
+fn append_json<T: serde::Serialize + ?Sized>(out: &mut Vec<u8>, value: &T) {
+    if serde_json::to_writer(&mut *out, value).is_err() {
+        out.extend_from_slice(b"null");
     }
 }
 

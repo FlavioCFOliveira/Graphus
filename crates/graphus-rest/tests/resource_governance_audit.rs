@@ -4,14 +4,14 @@
 //! resource curves rather than guessing.
 //!
 //! These tests are measurement vehicles **and** correctness regressions: they assert that the REST
-//! path returns a *complete* large result (every row present, well-formed framing), and they PRINT
-//! the resident-set (`VmRSS`) curve so a reviewer can read off whether server memory is **bounded**
-//! (flat) or **grows with the result size** (a buffering DoS vector). The correctness assertions hold
-//! whether the body is buffered (today) or truly streamed (a future fix), so the file does not encode
-//! the bug — it documents the behaviour and guards completeness. Tagged `[AUDIT#472]` on stdout
-//! (run with `--nocapture` to read the curve).
+//! path returns a *complete* large result (every row present, well-formed framing) **and** that the
+//! server's resident memory stays **bounded** (flat) as the result grows — they PRINT the resident-set
+//! (`VmRSS`) curve so a reviewer can read it off. The completeness assertions hold whether the body is
+//! buffered or truly streamed; the bounded-RSS assertions are the regression guard for the
+//! incremental-streaming fix (rmp #475). Tagged `[AUDIT#472/rmp#475]` on stdout (run with `--nocapture`
+//! to read the curve).
 //!
-//! Probe 1 — unbounded result materialization (JSON buffered + NDJSON "stream").
+//! Probe 1 — incremental streaming keeps egress memory bounded (JSON array + NDJSON), rmp #475.
 //! Probe 2 — open-transaction cap (429) + idle-sweep reclamation end-to-end.
 
 use std::sync::Arc;
@@ -203,6 +203,15 @@ fn vmrss_kib() -> u64 {
         .unwrap_or(0)
 }
 
+/// The response `Content-Type`, for the probes' wire-format assertions.
+fn content_type(resp: &Response<Body>) -> String {
+    resp.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned()
+}
+
 fn auto_commit_req(token: &str, accept: &str, n: u64) -> Request<Body> {
     let body =
         serde_json::to_vec(&json!({ "statements": [ { "statement": format!("GEN:{n}") } ] }))
@@ -218,21 +227,33 @@ fn auto_commit_req(token: &str, accept: &str, n: u64) -> Request<Body> {
 }
 
 // ============================================================================================
-//  PROBE 1 — UNBOUNDED RESULT MATERIALIZATION (#304): JSON-buffered + NDJSON "stream"
+//  PROBE 1 — INCREMENTAL STREAMING KEEPS EGRESS MEMORY BOUNDED (rmp #475, was #304)
 // ============================================================================================
 //
-// The router builds the WHOLE response body in memory before sending: the JSON path collects a
-// `serde_json::Value` tree (`run_one` → `data: Vec<Json>`) then serializes it; the NDJSON path
-// accumulates every framed line into one `out: Vec<u8>` (`stream_single_statement_ndjson`). Neither
-// is a true incremental stream. The request body is capped at 4 MiB (`413`), but the RESPONSE is
-// uncapped — so a single small authenticated request asking for a huge result forces the server to
-// materialize the entire body in RAM (an OOM / DoS vector that also affects co-tenants on the shared
-// process). These tests MEASURE the RSS curve to quantify it.
+// The router streams a single-statement JSON or NDJSON result incrementally: a `spawn_blocking`
+// producer drains the `ResultStream` one row at a time, serializes it, and `blocking_send`s bounded
+// chunks into a bounded `tokio::sync::mpsc` channel that backs an `axum::body::Body::from_stream`
+// response. A row is serialized → flushed → dropped before the next is pulled, so server memory is
+// FLAT regardless of result size — the Bolt `PULL` property. Before the fix (#304) the router built
+// the WHOLE body in memory first (JSON: a `serde_json::Value` tree; NDJSON: one `Vec<u8>`), so a tiny
+// authenticated request asking for a huge result forced the entire body into RAM (an OOM/DoS vector
+// that also starved co-tenants). These tests MEASURE the RSS curve to prove the fix: each lazy
+// `Response` is held WITHOUT draining, so the measured `VmRSS` reflects only what the SERVER buffered.
 
-/// JSON buffered path: a single auto-commit request returns ALL `n` rows (completeness), and the
-/// server's resident memory GROWS with `n` (the printed curve is the audit evidence for #304).
+/// The maximum server-side buffering (`VmRSS` growth while a large response is *held but not yet
+/// drained*) the streamed paths may exhibit. With incremental streaming (rmp #475) the server
+/// materializes at most a few bounded egress chunks (≈ `STREAM_CHANNEL_CAP * STREAM_FLUSH_BYTES`) plus
+/// per-response task overhead — sub-MiB; the generous 32 MiB bound clearly separates that from the
+/// pre-fix behaviour, which materialized the **entire** body (≈ +585 MiB at 1M rows for JSON).
+const STREAMING_RSS_BOUND_KIB: u64 = 32 * 1024;
+
+/// JSON streaming path (rmp #475): a single auto-commit request returns ALL `n` rows (completeness),
+/// and the server's resident memory stays **FLAT** as `n` grows — the body is streamed, never
+/// materialized. The measurement holds each lazy `Response` *without draining it*: with streaming the
+/// server has buffered ~nothing at that point; the pre-fix buffered path would have already
+/// materialized the whole body inside the handler. The before/after curve is printed as evidence.
 #[tokio::test]
-async fn probe1_json_buffered_result_rss_curve() {
+async fn probe1_json_streamed_result_rss_is_bounded() {
     let h = Harness::new();
     let token = h.token();
 
@@ -247,58 +268,74 @@ async fn probe1_json_buffered_result_rss_curve() {
     // artifact.
     let _ = h
         .send(auto_commit_req(&token, "application/json", 1_000))
+        .await
+        .into_body()
+        .collect()
         .await;
 
     let baseline = vmrss_kib();
-    println!("[AUDIT#472] PROBE 1 — JSON buffered result materialization");
-    println!("[AUDIT#472]   baseline VmRSS = {baseline} KiB");
-    println!("[AUDIT#472]   rows |  body bytes | VmRSS after | Δ vs before");
+    println!("[AUDIT#472/rmp#475] PROBE 1 — JSON incremental streaming (bounded egress)");
+    println!("[AUDIT#472/rmp#475]   baseline VmRSS = {baseline} KiB");
+    println!(
+        "[AUDIT#472/rmp#475]   rows | VmRSS held (pre-drain) | Δ vs baseline (server buffering)"
+    );
 
-    let mut last_body_len = 0usize;
+    // Send each size and HOLD the lazy Response (do NOT drain) so the measured RSS reflects only what
+    // the SERVER buffered. The lazy bodies are cheap channel receivers, so all three can be held at
+    // once for a clean, cross-size comparison unconfounded by client-side `collect()` buffers.
+    let mut held = Vec::new();
     for &n in &sizes {
-        let before = vmrss_kib();
         let resp = h.send(auto_commit_req(&token, "application/json", n)).await;
         assert_eq!(resp.status(), StatusCode::OK, "n={n}: 200 OK");
-        // Measure RSS while the Response (its buffered Body) is still held in memory.
-        let after_holding = vmrss_kib();
-
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let body_len = bytes.len();
-        last_body_len = body_len;
-        let parsed: Json = serde_json::from_slice(&bytes).unwrap();
-        let data_rows = parsed["results"][0]["data"].as_array().map_or(0, Vec::len);
-        // Completeness: a single buffered response carried EVERY one of the n rows.
         assert_eq!(
-            data_rows as u64, n,
-            "n={n}: all rows present in one response"
+            content_type(&resp),
+            "application/json",
+            "n={n}: JSON content type"
         );
-
-        let delta = after_holding as i64 - before as i64;
-        println!(
-            "[AUDIT#472]   {n:>9} | {body_len:>10} | {after_holding:>9} KiB | {delta:>+8} KiB"
-        );
-        drop(bytes);
+        let after_holding = vmrss_kib();
+        let delta = after_holding as i64 - baseline as i64;
+        println!("[AUDIT#472/rmp#475]   {n:>9} | {after_holding:>9} KiB | {delta:>+8} KiB");
+        held.push((n, resp, delta));
     }
 
-    // Evidence assertion (unconfounded by cross-test allocator reuse): the server returned the ENTIRE
-    // large result as ONE materialized body — and that uncapped body DWARFS the 4 MiB request-body cap
-    // (`MAX_REQUEST_BODY_BYTES`), the very asymmetry that makes this a DoS vector. The printed VmRSS
-    // column is the resource curve; body_len is the deterministic proof of full materialization. When a
-    // true streaming fix lands the body is delivered incrementally (RSS flat) but `collect()` still
-    // yields all bytes, so this completeness assertion remains valid.
+    // BOUNDED-EGRESS ASSERTION: holding the largest result added only a bounded amount of resident
+    // memory — the server did NOT materialize the whole body. (Pre-fix this delta was the full body
+    // size, hundreds of MiB.)
+    let (largest_n, _, largest_delta) = held.last().unwrap();
+    assert!(
+        *largest_delta < STREAMING_RSS_BOUND_KIB as i64,
+        "PROBE 1 (JSON): holding the {largest_n}-row response added {largest_delta} KiB of resident \
+         memory — streaming must keep this bounded (< {STREAMING_RSS_BOUND_KIB} KiB), independent of n"
+    );
+
+    // COMPLETENESS: draining each held response still yields EVERY row in a well-formed envelope, and
+    // the largest body exceeds the 4 MiB request cap (the full result really is delivered — just
+    // incrementally rather than buffered).
+    let mut last_body_len = 0usize;
+    for (n, resp, _) in held {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        last_body_len = bytes.len();
+        let parsed: Json = serde_json::from_slice(&bytes).unwrap();
+        let data_rows = parsed["results"][0]["data"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            data_rows as u64, n,
+            "n={n}: all rows present in the streamed body"
+        );
+    }
     assert!(
         last_body_len as u64 > 4 * 1024 * 1024,
-        "PROBE 1 (JSON): the buffered response for {} rows was {last_body_len} bytes — \
-         a single request materialized a body larger than the 4 MiB request cap",
+        "PROBE 1 (JSON): the streamed body for {} rows was {last_body_len} bytes — the full result \
+         (larger than the 4 MiB request cap) is delivered incrementally, not buffered",
         sizes[2]
     );
 }
 
-/// NDJSON "streaming" path: framed `fields` + one `row` line per row + `summary` (completeness via
-/// exact line count), with the RSS curve printed. Despite the `application/x-ndjson` content type,
-/// the body is assembled whole into `out: Vec<u8>` before the first byte is sent (#304).
+/// NDJSON streaming path (rmp #475): framed `fields` + one `row` line per row + `summary`
+/// (completeness via exact line count), with server RSS held **FLAT** as `n` grows. As with the JSON
+/// probe, each lazy `Response` is held without draining so the measured RSS is the SERVER's buffering
+/// only — bounded by the egress channel, independent of result size.
 #[tokio::test]
-async fn probe1_ndjson_result_rss_curve() {
+async fn probe1_ndjson_streamed_result_rss_is_bounded() {
     let h = Harness::new();
     let token = h.token();
 
@@ -310,53 +347,57 @@ async fn probe1_ndjson_result_rss_curve() {
 
     let _ = h
         .send(auto_commit_req(&token, "application/x-ndjson", 1_000))
+        .await
+        .into_body()
+        .collect()
         .await;
 
     let baseline = vmrss_kib();
-    println!("[AUDIT#472] PROBE 1 — NDJSON 'stream' result materialization");
-    println!("[AUDIT#472]   baseline VmRSS = {baseline} KiB");
-    println!("[AUDIT#472]   rows |  body bytes | VmRSS after | Δ vs before");
+    println!("[AUDIT#472/rmp#475] PROBE 1 — NDJSON incremental streaming (bounded egress)");
+    println!("[AUDIT#472/rmp#475]   baseline VmRSS = {baseline} KiB");
+    println!(
+        "[AUDIT#472/rmp#475]   rows | VmRSS held (pre-drain) | Δ vs baseline (server buffering)"
+    );
 
-    let mut last_body_len = 0usize;
+    let mut held = Vec::new();
     for &n in &sizes {
-        let before = vmrss_kib();
         let resp = h
             .send(auto_commit_req(&token, "application/x-ndjson", n))
             .await;
         assert_eq!(resp.status(), StatusCode::OK, "n={n}: 200 OK");
         assert_eq!(
-            resp.headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("application/x-ndjson"),
+            content_type(&resp),
+            "application/x-ndjson",
             "n={n}: NDJSON content type"
         );
         let after_holding = vmrss_kib();
-
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let body_len = bytes.len();
-        last_body_len = body_len;
-        // Completeness: a `fields` line, one `row` line per row, and a `summary` line — exactly n+2
-        // newline-terminated NDJSON records, the whole result in one body.
-        let lines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
-        assert_eq!(lines, n + 2, "n={n}: fields + n rows + summary = n+2 lines");
-
-        let delta = after_holding as i64 - before as i64;
-        println!(
-            "[AUDIT#472]   {n:>9} | {body_len:>10} | {after_holding:>9} KiB | {delta:>+8} KiB"
-        );
-        drop(bytes);
+        let delta = after_holding as i64 - baseline as i64;
+        println!("[AUDIT#472/rmp#475]   {n:>9} | {after_holding:>9} KiB | {delta:>+8} KiB");
+        held.push((n, resp, delta));
     }
 
-    // The `application/x-ndjson` body is assembled WHOLE into one `out: Vec<u8>` before the first byte
-    // ships (`stream_single_statement_ndjson`) — so despite the content type it is not an incremental
-    // stream. The complete body for the largest size again exceeds the 4 MiB request cap, materialized
-    // server-side in one allocation. (The printed VmRSS Δ can read ~0 when an earlier probe in the same
-    // test process already grew the allocator arena; body_len is the unconfounded proof.)
+    // BOUNDED-EGRESS ASSERTION: holding the largest NDJSON result added only a bounded amount of
+    // resident memory — the body is streamed, not assembled whole (pre-fix it was one `Vec<u8>`).
+    let (largest_n, _, largest_delta) = held.last().unwrap();
+    assert!(
+        *largest_delta < STREAMING_RSS_BOUND_KIB as i64,
+        "PROBE 1 (NDJSON): holding the {largest_n}-row response added {largest_delta} KiB of resident \
+         memory — streaming must keep this bounded (< {STREAMING_RSS_BOUND_KIB} KiB), independent of n"
+    );
+
+    // COMPLETENESS: draining each held response yields exactly n+2 newline-terminated records (a
+    // `fields` line, one `row` line per row, a `summary` line) — the whole result, framed incrementally.
+    let mut last_body_len = 0usize;
+    for (n, resp, _) in held {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        last_body_len = bytes.len();
+        let lines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+        assert_eq!(lines, n + 2, "n={n}: fields + n rows + summary = n+2 lines");
+    }
     assert!(
         last_body_len as u64 > 4 * 1024 * 1024,
-        "PROBE 1 (NDJSON): the buffered NDJSON body for {} rows was {last_body_len} bytes — \
-         a single request materialized a body larger than the 4 MiB request cap",
+        "PROBE 1 (NDJSON): the streamed NDJSON body for {} rows was {last_body_len} bytes — the full \
+         result (larger than the 4 MiB request cap) is delivered incrementally, not buffered",
         sizes[2]
     );
 }
