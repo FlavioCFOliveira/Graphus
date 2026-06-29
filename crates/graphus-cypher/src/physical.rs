@@ -1471,11 +1471,24 @@ fn logical_op_is_correlated(op: &LogicalOp) -> bool {
 /// The maximum number of operands in a single join region the bottom-up DP will fully enumerate.
 ///
 /// Exhaustive DP over join order is `O(3^n)` in the number of operands (the classic System-R subset
-/// enumeration), so a hard cap keeps planning time bounded on pathological inputs. Above the cap the
-/// region falls back to the rule-based (already-correct) order for that region — the result bag is
-/// identical, only the (un-optimised) shape differs. `10` operands ≈ 59 049 subset visits, a
-/// comfortable ceiling for interactive planning; real queries rarely approach it.
-const MAX_JOIN_REGION_OPERANDS: usize = 10;
+/// enumeration), and each subset visit here clones candidate sub-plans and re-estimates their cost,
+/// so the real cost grows even faster than `3^n`. A hard cap is therefore the load-bearing defence
+/// against a **plan-time CPU/memory DoS**: a query with very many comma-separated patterns (a long
+/// cartesian region) would otherwise make *planning itself* blow up before execution begins.
+///
+/// Measured plan time for an `n`-operand cartesian region (in-memory statistics, release build) grows
+/// ~3.6x per added operand: `~8 ms` at `n=6`, `~30 ms` at `n=7`, `~106 ms` at `n=8`, `~380 ms` at
+/// `n=9`, `~1.3 s` at `n=10`. `8` is the knee where the DP is still comfortably bounded (≈ `10^2 ms`)
+/// while sitting far above realistic query sizes — real Cypher rarely has more than a handful of
+/// disconnected join components, so no normal query loses the optimal DP. (For comparison, PostgreSQL
+/// switches from its exhaustive join DP to a heuristic search at `geqo_threshold = 12`; this cap is
+/// deliberately more conservative because each visit here is heavier.)
+///
+/// Above the cap the region is re-planned by a **polynomial-time greedy** join order
+/// ([`greedy_join_order`]) instead of the DP: still a correct, connectivity-respecting, bag-identical
+/// plan — only optimality is traded — so planning stays bounded for pathological pattern counts while
+/// large queries still get a far better-than-rule-based shape.
+const MAX_JOIN_REGION_OPERANDS: usize = 8;
 
 /// Rewrites the rule-based physical tree `op` into a cost-minimised, bag-equivalent tree, using
 /// `catalog` for access-path alternatives and `stats` for the cost model.
@@ -1485,6 +1498,32 @@ const MAX_JOIN_REGION_OPERANDS: usize = 10;
 /// **(A)** join-region reordering + build-side selection when the node roots a reorderable join
 /// region. Operators that are neither keep their rule-based form with optimised children.
 fn optimize(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> PhysicalOp {
+    optimize_inner(op, catalog, stats, false)
+}
+
+/// The recursion behind [`optimize`]. `in_join_region` is `true` when an ancestor reorderable join
+/// (with only reorderable joins on the spine between) will re-flatten and re-plan this node as part of
+/// **its** region — in which case this node must NOT plan its own sub-region (the maximal region root
+/// plans the whole region exactly once, avoiding `O(n)` redundant re-planning that turned a long
+/// cartesian chain into an `O(n^4)` plan-time blow-up).
+///
+/// This is behaviour-preserving versus planning every sub-join bottom-up: a sub-region reorder is kept
+/// only when it is strictly cheaper, and in that case the maximal-region DP/greedy — which enumerates a
+/// superset of orders — finds an order at least as cheap, so it wins the `cheaper(..)` comparison
+/// either way. When no sub-reorder helps, the deferred and the bottom-up baselines are the identical
+/// rule-based shape.
+fn optimize_inner(
+    op: PhysicalOp,
+    catalog: &IndexCatalog,
+    stats: &dyn Statistics,
+    in_join_region: bool,
+) -> PhysicalOp {
+    // Inside an ancestor's reorderable region: optimise the leaves (so the operands the root flattens
+    // are themselves optimised) but defer this sub-region's own reordering to that root.
+    if in_join_region && is_reorderable_join(&op) {
+        return optimize_children(op, catalog, stats);
+    }
+
     // First, optimise all children (bottom-up): the cost of a parent depends on its inputs' shapes.
     let op = optimize_children(op, catalog, stats);
 
@@ -1500,14 +1539,21 @@ fn optimize(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> P
     let op = optimize_expand_direction(op, catalog, stats);
 
     // (A) Join reordering: if this node roots a maximal reorderable join region, flatten and re-plan
-    // it by bottom-up DP. (If it is not such a region root, this is a no-op returning `op`.)
+    // it by DP (small regions) or greedy (large regions). (If it is not such a region root, this is a
+    // no-op returning `op`.)
     optimize_join_region(op, stats)
 }
 
 /// Optimises every child subtree of `op` in place, leaving `op`'s own shape untouched. The single
 /// place the recursion descends, so each operator variant lists its children exactly once.
+///
+/// A reorderable join's children inherit `in_join_region = true` (they continue the same region the
+/// flattener will walk); every other operator resets it to `false` (its children are region leaves,
+/// optimised in their own right). This mirrors [`flatten_join_region`], which descends only through
+/// reorderable joins.
 fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> PhysicalOp {
-    let opt = |b: Box<PhysicalOp>| Box::new(optimize(*b, catalog, stats));
+    let child_in_region = is_reorderable_join(&op);
+    let opt = |b: Box<PhysicalOp>| Box::new(optimize_inner(*b, catalog, stats, child_in_region));
     match op {
         // Leaves: nothing to descend into.
         PhysicalOp::AllNodesScan { .. }
@@ -2148,14 +2194,20 @@ fn optimize_join_region(op: PhysicalOp, stats: &dyn Statistics) -> PhysicalOp {
     let mut operands: Vec<PhysicalOp> = Vec::new();
     flatten_join_region(op.clone(), &mut operands);
 
-    // A region must have >= 2 operands to reorder; a cap keeps the DP bounded.
-    if operands.len() < 2 || operands.len() > MAX_JOIN_REGION_OPERANDS {
-        // Too large (or degenerate): keep the rule-based region shape (already correct). Logged via the
-        // cap constant's documentation; no behavioural change beyond skipping optimisation here.
+    // A region must have >= 2 operands to reorder.
+    if operands.len() < 2 {
         return op;
     }
 
-    let replanned = dp_join_order(&operands, stats);
+    // Bound planning cost (plan-time DoS defence). Up to the cap, the exhaustive System-R DP finds the
+    // optimal order. Above it, the DP's super-exponential subset enumeration would dominate planning
+    // time, so re-plan with a polynomial greedy heuristic instead — a correct, connectivity-respecting,
+    // bag-identical order (see `MAX_JOIN_REGION_OPERANDS` and `greedy_join_order`).
+    let replanned = if operands.len() <= MAX_JOIN_REGION_OPERANDS {
+        dp_join_order(&operands, stats)
+    } else {
+        greedy_join_order(&operands, stats)
+    };
     // Keep whichever is cheaper; tie -> the original rule-based region (determinism).
     cheaper(op, replanned, stats)
 }
@@ -2394,6 +2446,152 @@ fn left_deep_fallback(operands: &[PhysicalOp]) -> PhysicalOp {
         };
     }
     acc
+}
+
+/// A polynomial-time **greedy** join order for regions too large for the exhaustive DP
+/// ([`MAX_JOIN_REGION_OPERANDS`]) — the plan-time DoS fallback.
+///
+/// This is the classic *greedy operator ordering*: maintain a working set of sub-plans (initially the
+/// region's leaf operands) and repeatedly merge the pair whose join is cheapest under the cost model,
+/// until one plan remains. At each step a **connected** pair (the two sides share a bound variable, so
+/// the join is an equi-[`HashJoin`](PhysicalOp::HashJoin)) is always preferred over a cartesian one,
+/// so the greedy never introduces a cartesian product where a connected join exists. Only when the
+/// working set is fully disconnected (every pair cartesian) does it join two operands with no shared
+/// key — and then it picks the two of smallest cardinality, which both minimises the intermediate
+/// product (Huffman-style) and is the cheapest [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin)
+/// orientation.
+///
+/// **Complexity:** `O(n^3)` merge evaluations in the worst (densely-connected) case and `O(n)` per
+/// step in the common all-cartesian case — polynomial either way, so planning time is bounded no
+/// matter how many patterns the query lists.
+///
+/// **Soundness:** identical to the DP — inner equi-join and cartesian product are commutative and
+/// associative, so any binary join tree over the same operands computes the same multiset. Greedy only
+/// trades optimality of the *shape*, never correctness of the *bag*.
+///
+/// **Determinism:** the working set is scanned in index order and ties are broken toward the
+/// lower-index pair, so the same region + statistics always yields the same plan.
+fn greedy_join_order(operands: &[PhysicalOp], stats: &dyn Statistics) -> PhysicalOp {
+    // Each working entry carries its cached cost/rows (so a parent join scores it without re-walking)
+    // and its bound-variable set (so connectivity is an O(set) check, never a subtree re-walk).
+    let mut entries: Vec<DpEntry> = Vec::with_capacity(operands.len());
+    let mut varsets: Vec<BTreeSet<String>> = Vec::with_capacity(operands.len());
+    for op in operands {
+        let est = estimate_cost(op, Some(stats));
+        entries.push(DpEntry {
+            plan: op.clone(),
+            cost: est.cost,
+            rows: est.rows,
+        });
+        varsets.push(bound_var_names(op).into_iter().collect());
+    }
+
+    // Fast path — a **fully disconnected** region (no bound variable appears in more than one operand):
+    // every join is cartesian and *stays* cartesian under merging, so the connectivity pre-filter would
+    // never fire. This is the shape produced by comma-separated patterns — exactly the plan-time DoS
+    // vector — so it gets a dedicated `O(n^2)` order (repeatedly merge the two smallest cardinalities)
+    // instead of the general path's `O(n^3)` pair scan.
+    if is_fully_disconnected(&varsets) {
+        return greedy_cartesian_order(entries, stats);
+    }
+
+    while entries.len() > 1 {
+        // Find the cheapest *connected* pair (shared bound variable ⇒ equi-join). The `is_disjoint`
+        // pre-filter agrees with `join_entries`' own `shared_keys` test (both derive from
+        // `bound_var_names`), so a non-disjoint pair is exactly the one `join_entries` realises as a
+        // `HashJoin`.
+        let mut best: Option<(usize, usize, DpEntry)> = None;
+        for i in 0..entries.len() {
+            for j in (i + 1)..entries.len() {
+                if varsets[i].is_disjoint(&varsets[j]) {
+                    continue; // cartesian — skip while any connected pair is available
+                }
+                let cand = join_entries(&entries[i], &entries[j], stats);
+                if best.as_ref().is_none_or(|(_, _, b)| cand.cost < b.cost) {
+                    best = Some((i, j, cand));
+                }
+            }
+        }
+
+        // No connected pair: the working set is fully disconnected. Join the two smallest-cardinality
+        // sub-plans (an O(n) choice, no O(n^2) scan), minimising the cartesian blow-up at this step.
+        let (i, j, joined) = best.unwrap_or_else(|| {
+            let (i, j) = two_smallest_by_rows(&entries);
+            (i, j, join_entries(&entries[i], &entries[j], stats))
+        });
+
+        debug_assert!(
+            i < j,
+            "merge indices must be ordered so removal keeps `i` valid"
+        );
+        // Merge: remove the higher index first so the lower stays valid, then push the joined entry.
+        let merged_vars: BTreeSet<String> = varsets[i].union(&varsets[j]).cloned().collect();
+        entries.remove(j);
+        entries.remove(i);
+        varsets.remove(j);
+        varsets.remove(i);
+        entries.push(joined);
+        varsets.push(merged_vars);
+    }
+
+    entries.pop().expect("a region has >= 1 operand").plan
+}
+
+/// Whether no bound variable appears in more than one operand — i.e. every pair of operands is
+/// variable-disjoint, so every possible join is a cartesian product. `O(total variables)`.
+fn is_fully_disconnected(varsets: &[BTreeSet<String>]) -> bool {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for vs in varsets {
+        for v in vs {
+            if !seen.insert(v.as_str()) {
+                return false; // a variable shared by two operands ⇒ a connected (equi-join) pair exists
+            }
+        }
+    }
+    true
+}
+
+/// Greedy join order for a fully-disconnected (all-cartesian) region: repeatedly merge the two
+/// smallest-cardinality sub-plans until one remains. For cartesian products this Huffman-style choice
+/// minimises the sum of intermediate sizes, and joining the two smallest is also the cheapest
+/// [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin) orientation. `O(n^2)` — each of `n-1` merges scans
+/// the working set once for its two smallest, with no `O(n^2)` connectivity probe.
+fn greedy_cartesian_order(mut entries: Vec<DpEntry>, stats: &dyn Statistics) -> PhysicalOp {
+    while entries.len() > 1 {
+        let (i, j) = two_smallest_by_rows(&entries);
+        let joined = join_entries(&entries[i], &entries[j], stats);
+        debug_assert!(i < j, "two_smallest_by_rows returns ordered indices");
+        // Remove the higher index first so the lower stays valid, then push the merged entry.
+        entries.remove(j);
+        entries.remove(i);
+        entries.push(joined);
+    }
+    entries.pop().expect("a region has >= 1 operand").plan
+}
+
+/// The indices of the two smallest-cardinality entries, returned ordered (`i < j`). Ties keep
+/// ascending-index order for determinism. Single pass, `O(n)`. The caller guarantees
+/// `entries.len() >= 2`.
+fn two_smallest_by_rows(entries: &[DpEntry]) -> (usize, usize) {
+    debug_assert!(entries.len() >= 2);
+    // `min1` is the smallest so far, `min2` the second smallest; both by (rows, then index) order.
+    let less = |a: usize, b: usize| -> bool {
+        entries[a].rows < entries[b].rows || (entries[a].rows == entries[b].rows && a < b)
+    };
+    let (mut min1, mut min2) = if less(0, 1) { (0, 1) } else { (1, 0) };
+    for k in 2..entries.len() {
+        if less(k, min1) {
+            min2 = min1;
+            min1 = k;
+        } else if less(k, min2) {
+            min2 = k;
+        }
+    }
+    if min1 < min2 {
+        (min1, min2)
+    } else {
+        (min2, min1)
+    }
 }
 
 /// Every subset of `{0..n}` of exactly `size` elements, in ascending lexicographic order of the sorted
