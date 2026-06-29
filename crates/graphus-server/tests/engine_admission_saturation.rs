@@ -306,6 +306,25 @@ where
 
 /// The per-test hang budget. A clean run finishes in seconds; this generous wall-clock ceiling only
 /// trips on a genuine deadlock/livelock (the budget is loose enough to absorb a heavily loaded CI box).
+/// Polls `active_txns` until it nets to 0, up to a generous bound, then returns the final value. The
+/// open-transaction gauge is decremented by off-thread reader RETIREMENTS, which settle asynchronously
+/// on the engine thread *after* the client worker threads observe their statements finish — so under
+/// extreme CPU oversubscription (e.g. many test binaries sharing the cores) an immediate read can race
+/// ahead of the last retirement. Polling removes that test-fidelity race WITHOUT masking a real leak: a
+/// genuinely leaked transaction never reaches 0 within the bound, so the caller's `assert_eq!(.., 0)`
+/// still fails on a true defect. (`rmp` #485 D4 F-D4-2 — the only fix is to the assertion's timing, not
+/// the engine, which already nets to 0.)
+fn settle_active_txns(mut sample: impl FnMut() -> u64) -> u64 {
+    for _ in 0..500 {
+        let v = sample();
+        if v == 0 {
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    sample()
+}
+
 const TEST_BUDGET: Duration = Duration::from_secs(240);
 
 // --------------------------------------------------------------------------------------------------
@@ -368,8 +387,9 @@ fn writer_reader_storm_high_n_keeps_all_committed_and_stays_live() {
             "N={n}: every committed edge must survive (fan-out {survived:?} == committed {committed})"
         );
 
-        // No transaction leaked: the open-transaction gauge nets back to zero once the storm drains.
-        let active = handle.metrics().active_txns();
+        // No transaction leaked: the open-transaction gauge nets back to zero once the storm drains
+        // (settle-polled — off-thread reader retirements decrement it asynchronously; see settle_active_txns).
+        let active = settle_active_txns(|| handle.metrics().active_txns());
         assert_eq!(
             active, 0,
             "N={n}: no transaction may leak — active_txns must net to 0, got {active}"
@@ -496,7 +516,7 @@ fn admission_load_shedding_sheds_excess_without_losing_committed_work() {
         "every admission permit was released — the in-flight gauge nets to zero"
     );
     assert_eq!(
-        base.metrics().active_txns(),
+        settle_active_txns(|| base.metrics().active_txns()),
         0,
         "no transaction leaked under load shedding"
     );
@@ -611,7 +631,7 @@ fn begin_commit_abort_with_reads_churn_no_deadlock_no_leak() {
         "only committed edges survive — every rolled-back edge is invisible (fan-out {survived:?} == committed {committed})"
     );
     assert_eq!(
-        handle.metrics().active_txns(),
+        settle_active_txns(|| handle.metrics().active_txns()),
         0,
         "no transaction leaked across begin/commit/abort churn"
     );
