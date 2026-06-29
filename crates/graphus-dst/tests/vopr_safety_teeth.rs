@@ -207,3 +207,32 @@ fn safety_seed_5043221_no_committed_node_loss_under_fault_then_rollback() {
     // Determinism: same seed ⇒ identical verdict.
     assert_eq!(r, run_safety(cfg), "seed 5043221 must be deterministic");
 }
+
+/// **Regression — committed-EDGE loss after crash × disk-fault (closed by `rmp` #468).**
+///
+/// A sibling class of the #479 node-loss seed: these safety seeds left a committed relationship
+/// absent from the recovered store (the safety oracle's reference-model-equivalence, an
+/// edge-multiset mismatch) under the COMBINED crash + injected-recoverable-disk-fault +
+/// interleaved-loser regime. They are closed by the #468 rel-chain corpse high-water floor
+/// (`RecordStore::open` → `floor_high_water_over_mapped_corpses`): a disk fault that leaves loser rel
+/// corpses materialised above the durable high-water on an already-mapped rel page would otherwise
+/// leave the recovered incidence chain unwalkable to the committed head. (The #479 investigation
+/// observed these as "open" only because its worktree baseline predated #468; on any tree carrying
+/// #468 every one is SAFE.) This pins #468's coverage of the rel-store edge case so a future change
+/// cannot silently reintroduce committed-edge loss under fault.
+#[test]
+fn safety_committed_edge_loss_seeds_are_safe_under_fault_then_crash() {
+    // A representative low-range subset of the previously-vulnerable seeds; each runs one safety
+    // scenario (6 clients × 24 ops, 8 faults + 2 crashes).
+    for seed in [489u64, 578, 2723, 5030, 8751, 10412, 15676] {
+        let cfg = VoprConfig::safety(seed);
+        let r = run_safety(cfg);
+        assert!(
+            r.safe,
+            "seed {seed} must be SAFE (no committed-edge loss under crash+disk-fault); violations: {:?}",
+            r.violations
+        );
+        // Determinism: same seed ⇒ identical verdict.
+        assert_eq!(r, run_safety(cfg), "seed {seed} must be deterministic");
+    }
+}
