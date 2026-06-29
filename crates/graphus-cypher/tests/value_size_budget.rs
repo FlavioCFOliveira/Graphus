@@ -223,12 +223,18 @@ fn list_concat_is_capped_at_the_element_ceiling() {
         "expected a typed list-concat ResourceLimit, got: {err}"
     );
 
-    // A concatenation that stays at/under the ceiling completes.
-    let lo = limit / 2;
+    // A concatenation safely under the budget completes. NB (`rmp` #491): list `+` is now bounded by
+    // BOTH the element count ([`check_concat_list_len`]) AND the materialised BYTES
+    // ([`check_concat_value_bytes`], added to catch `[$big] + [$big]` byte amplification that a
+    // count-only guard misses). Both derive from the same budget, but the byte estimate is deliberately
+    // conservative, so a concat of ~`limit` small elements (≈ the byte budget) now rejects marginally
+    // before the pure count ceiling. Use a quarter of the ceiling so the operands are unambiguously
+    // under both guards.
+    let lo = (limit / 4).max(1);
     assert_eq!(
         run_q(&format!("RETURN range(1, {lo}) + range(1, {lo}) AS r")),
         Ok(1),
-        "a list concatenation under the ceiling must complete"
+        "a list concatenation well under both the element and byte budgets must complete"
     );
 }
 

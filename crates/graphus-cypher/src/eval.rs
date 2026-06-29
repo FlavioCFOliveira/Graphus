@@ -279,9 +279,21 @@ pub fn eval(
             Ok(RowValue::list(out))
         }
         ExprKind::Map(entries) => {
-            let mut out = Vec::with_capacity(entries.len());
+            // Bound the materialised map against the per-value budget as it is built (`SEC-191`,
+            // CWE-770 / CWE-789), like the list literal: a map literal `{k0:$s, …, kN:$s}` with many
+            // keys each bound to a large value would otherwise materialise an unbounded single value.
+            // Cap the pre-allocation at the budget element ceiling so a huge literal in the (≤ 64 MiB)
+            // query text cannot force a multi-GB `Vec::with_capacity` before the per-entry check runs.
+            let cap = entries
+                .len()
+                .min(crate::value_size::max_list_elements().saturating_add(1));
+            let mut out = Vec::with_capacity(cap);
+            let mut out_bytes: usize = 0;
             for (MapKey { name, .. }, v) in entries {
-                out.push((name.clone(), eval(v, row, params, graph, functions, clock)?));
+                let val = eval(v, row, params, graph, functions, clock)?;
+                out_bytes = out_bytes.saturating_add(name.len());
+                accumulate_list_bytes(&mut out_bytes, &val, "map literal")?;
+                out.push((name.clone(), val));
             }
             // Canonical map construction: stays structural iff any value is (node/rel/path/structural
             // collection), so `{key: u}.key` recovers the node for `DELETE` (Delete5.feature).
@@ -730,6 +742,28 @@ fn check_concat_list_len(a_len: usize, b_len: usize) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// Bounds the **byte** size of a list-concatenation result against the per-value budget (`SEC-191`,
+/// CWE-770 / CWE-789). [`check_concat_list_len`] bounds the element COUNT, but a concatenation of FEW
+/// large-valued elements — `[$s] + [$s] + …` with `$s` a big string — keeps the count trivially under
+/// the ceiling while the byte footprint grows without bound, so the bytes must be bounded too (exactly
+/// as [`check_concat_string_len`] does for `+` on strings). The caller passes
+/// [`estimate_value_bytes`](crate::value_size::estimate_value_bytes)-derived sizes, which short-circuit
+/// at the budget, so once an operand alone exceeds it the check is `O(budget)`, not `O(value)`; a
+/// chained `+` stays bounded because each step re-checks the growing accumulator and rejects the first
+/// time the running result crosses the ceiling.
+fn check_concat_value_bytes(a_bytes: usize, b_bytes: usize) -> Result<(), EvalError> {
+    let total = a_bytes.saturating_add(b_bytes);
+    let limit = crate::value_size::max_value_bytes();
+    if total > limit {
+        return Err(EvalError::ResourceLimit {
+            detail: format!(
+                "list concatenation would produce {total} bytes (limit {limit} bytes per value)"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Structural list concatenation for `+` when a **structural** list (one holding a node /
 /// relationship / path) is involved. Returns `Some(result)` when at least one operand is a
 /// structural [`RowValue::List`], handling `list + list`, `list + element` and `element + list` while
@@ -758,7 +792,14 @@ fn structural_list_add(a: &RowValue, b: &RowValue) -> Option<EvalResult> {
             _ => 1,
         }
     }
-    if let Err(e) = check_concat_list_len(elem_count(a), elem_count(b)) {
+    if let Err(e) = check_concat_list_len(elem_count(a), elem_count(b)).and_then(|()| {
+        // Also bound the BYTE footprint, not just the element count (`SEC-191`): `[$big] + [$big]` has
+        // few elements but a large materialised size.
+        check_concat_value_bytes(
+            crate::value_size::estimate_rowvalue_bytes(a),
+            crate::value_size::estimate_rowvalue_bytes(b),
+        )
+    }) {
         return Some(Err(e));
     }
     // Borrow each operand as list elements when it is list-shaped (structural or property), else
@@ -793,6 +834,10 @@ fn arithmetic_add(a: &Value, b: &Value) -> EvalResult {
         }
         (Value::List(x), Value::List(y)) => {
             check_concat_list_len(x.len(), y.len())?;
+            check_concat_value_bytes(
+                crate::value_size::estimate_value_bytes(a),
+                crate::value_size::estimate_value_bytes(b),
+            )?;
             let mut out = x.clone();
             out.extend(y.iter().cloned());
             Ok(RowValue::Value(Value::List(out)))
@@ -800,12 +845,20 @@ fn arithmetic_add(a: &Value, b: &Value) -> EvalResult {
         // List + element / element + list (Cypher appends/prepends scalars).
         (Value::List(x), other) => {
             check_concat_list_len(x.len(), 1)?;
+            check_concat_value_bytes(
+                crate::value_size::estimate_value_bytes(a),
+                crate::value_size::estimate_value_bytes(other),
+            )?;
             let mut out = x.clone();
             out.push(other.clone());
             Ok(RowValue::Value(Value::List(out)))
         }
         (other, Value::List(y)) => {
             check_concat_list_len(1, y.len())?;
+            check_concat_value_bytes(
+                crate::value_size::estimate_value_bytes(other),
+                crate::value_size::estimate_value_bytes(b),
+            )?;
             let mut out = Vec::with_capacity(y.len() + 1);
             out.push(other.clone());
             out.extend(y.iter().cloned());
@@ -1455,12 +1508,12 @@ fn call_function(
         }
         "properties" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
-            return Ok(match v {
+            return match v {
                 RowValue::Node(NodeRef { id }) => map_from_props(graph.node_properties(id)),
                 RowValue::Rel(RelRef { id }) => map_from_props(graph.rel_properties(id)),
-                RowValue::Value(m @ Value::Map(_)) => RowValue::Value(m),
-                _ => RowValue::NULL,
-            });
+                RowValue::Value(m @ Value::Map(_)) => Ok(RowValue::Value(m)),
+                _ => Ok(RowValue::NULL),
+            };
         }
         "keys" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
@@ -1753,10 +1806,16 @@ fn call_function(
     Ok(RowValue::Value(result))
 }
 
-fn map_from_props(props: Option<Vec<(String, Value)>>) -> RowValue {
+fn map_from_props(props: Option<Vec<(String, Value)>>) -> Result<RowValue, EvalError> {
     match props {
-        Some(p) => RowValue::Value(Value::Map(p)),
-        None => RowValue::NULL,
+        Some(p) => {
+            // Sibling of keys(): bound the property map against the per-value budget (`SEC-191`,
+            // CWE-770 / CWE-789). Lower-severity than the parameter-driven amplifiers (bounded by
+            // already-stored data, not a cheap 1→N blow-up), guarded for consistency with keys().
+            check_list_len_budget(p.len(), "properties()")?;
+            Ok(RowValue::Value(Value::Map(p)))
+        }
+        None => Ok(RowValue::NULL),
     }
 }
 
