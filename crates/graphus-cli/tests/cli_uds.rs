@@ -93,7 +93,16 @@ fn current_uid() -> u32 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        0
+        // macOS/BSD: std exposes no `getuid()`, so read the real uid via `id -u`. The server's UDS
+        // peer-cred gate reports this same uid (via `getpeereid`), so `admin_uid` must match it for
+        // the connection to be admitted — returning 0 here would mismatch the runner's real uid.
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
     }
 }
 

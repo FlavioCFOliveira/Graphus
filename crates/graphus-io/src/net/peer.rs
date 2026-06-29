@@ -28,37 +28,31 @@ pub struct PeerCred {
 impl PeerCred {
     /// Extracts the peer credentials from an accepted Tokio [`tokio::net::UnixStream`].
     ///
-    /// Returns `Ok(Some(cred))` on platforms that support `SO_PEERCRED` (Linux), `Ok(None)` on
-    /// platforms where peer credentials are not available through this mechanism, and `Err` only
-    /// if the underlying `getsockopt` fails on a platform that does support it.
+    /// Uses Tokio's cross-platform [`tokio::net::UnixStream::peer_cred`], which wraps
+    /// `getsockopt(SO_PEERCRED)` on Linux and `getpeereid` / `LOCAL_PEERCRED` on macOS/BSD. It is
+    /// therefore available on **every** Graphus Tier-1 target (x86_64/aarch64 Linux and aarch64
+    /// macOS), so UDS peer-credential authentication (`04 §8.4`) works on Apple Silicon as well as
+    /// Linux — previously it was gated to Linux only and the listener fail-closed-refused every UDS
+    /// connection on macOS ("peer credentials unavailable on this platform"). `uid`/`gid` are always
+    /// reported; `pid` only where the platform records it (`None` on macOS/BSD, whose `getpeereid`
+    /// carries no pid — Graphus authenticates on the **uid**, so the missing pid is immaterial).
+    ///
+    /// Returns `Ok(Some(cred))` on success and `Err` only if the underlying `getsockopt` fails.
     ///
     /// # Errors
-    /// Propagates the `std::io::Error` from `UnixStream::peer_cred` on supported platforms.
-    #[cfg(target_os = "linux")]
+    /// Propagates the `std::io::Error` from [`tokio::net::UnixStream::peer_cred`].
     pub(crate) fn from_unix_stream(
         stream: &tokio::net::UnixStream,
     ) -> std::io::Result<Option<Self>> {
-        // `peer_cred()` wraps `getsockopt(SO_PEERCRED)`; it is a pure socket-metadata read, not a
-        // blocking I/O syscall, so calling it on a runtime worker does not violate the §9.1 rule.
+        // `peer_cred()` is a pure socket-metadata read (`getsockopt`), not a blocking I/O syscall, so
+        // calling it on a runtime worker does not violate the §9.1 rule. Tokio implements it for every
+        // Graphus Tier-1 platform.
         let creds = stream.peer_cred()?;
         Ok(Some(Self {
             uid: creds.uid(),
             gid: creds.gid(),
-            // `UCred::pid()` returns `Option<i32>` (the kernel may not have recorded a pid).
+            // `UCred::pid()` returns `Option<i32>` — `None` on macOS/BSD (getpeereid carries no pid).
             pid: creds.pid(),
         }))
-    }
-
-    /// Non-Linux fallback: peer credentials are not surfaced.
-    ///
-    /// macOS exposes `LOCAL_PEERCRED`/`getpeereid` with different semantics (no pid, and a
-    /// different `getsockopt` level); Graphus treats UDS peer-cred auth as a Linux capability for
-    /// now and returns `None` elsewhere so the build stays portable. The listener (rmp #20) is
-    /// expected to fall back to filesystem socket permissions where this is `None`.
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn from_unix_stream(
-        _stream: &tokio::net::UnixStream,
-    ) -> std::io::Result<Option<Self>> {
-        Ok(None)
     }
 }

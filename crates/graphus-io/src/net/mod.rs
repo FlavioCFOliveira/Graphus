@@ -72,22 +72,17 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let mut conn = acceptor.accept().await.expect("accept");
-            // On Linux SO_PEERCRED must be present and must report *our own* uid (the test process
-            // is both client and server). On non-Linux it is cleanly `None`.
-            let cred = conn.peer_cred();
-            #[cfg(target_os = "linux")]
-            {
-                let cred = cred.expect("peer cred present on Linux");
-                // SAFETY-free: `geteuid` via std is not exposed, so compare against the documented
-                // invariant that the connecting peer is this very process. We at least assert the
-                // pid, when present, is our own.
-                if let Some(pid) = cred.pid {
-                    assert_eq!(pid, std::process::id() as i32);
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                assert!(cred.is_none());
+            // Peer credentials are now available on every Tier-1 platform via Tokio's cross-platform
+            // `peer_cred()` (SO_PEERCRED on Linux, getpeereid on macOS/BSD), so they must be present
+            // here regardless of OS (the test process is both client and server). `geteuid` via std is
+            // not exposed, so we assert against the documented invariant that the connecting peer is
+            // this very process: the pid, **where the platform records it**, is our own. macOS/BSD
+            // `getpeereid` carries no pid, so `pid` is `None` there and the check is simply skipped.
+            let cred = conn
+                .peer_cred()
+                .expect("peer cred present on every Tier-1 platform (SO_PEERCRED / getpeereid)");
+            if let Some(pid) = cred.pid {
+                assert_eq!(pid, std::process::id() as i32);
             }
             let mut buf = [0u8; 4];
             conn.read_exact(&mut buf).await.expect("server read");
