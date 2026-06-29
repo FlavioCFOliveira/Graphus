@@ -7,6 +7,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # macOS's default temp dir (/var/folders/.../T) is long enough that a UDS socket path built under it
+  # overflows the platform `sun_path` limit (~104 bytes), so every integration test that binds a Unix
+  # domain socket fails to boot on macos-14 with "path must be shorter than SUN_LEN". Point the temp dir
+  # at the short /tmp (`std::env::temp_dir()` honours `$TMPDIR` on Unix) so socket paths stay under the
+  # limit on every leg; a no-op on Linux, where `temp_dir()` is already /tmp.
+  TMPDIR: /tmp
 
 jobs:
   check:
