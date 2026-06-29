@@ -31,6 +31,19 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test --all
+      # DST crash-recovery soak gate (rmp #468/#471/#480): the three large-seed crash + ARIES recovery
+      # sweeps that pin the dead-link-corpse class (#468/#172/#301) and recovery idempotency closed —
+      # interleaved self-loop incidence-chain churn (10k seeds), interleaved property-chain churn (10k
+      # seeds), and crash-during-recovery double-crash idempotency (6k seeds). They run on every OS leg
+      # in debug via `cargo test --all` above; this names them as an explicit, always-on standing gate
+      # and re-runs them in release (optimised paths) on the x86_64 Linux leg. No `#[ignore]`, no skips.
+      - name: DST crash-recovery soaks
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          cargo test --release -p graphus-dst
+          --test selfloop_churn_recovery
+          --test property_churn_recovery
+          --test double_crash_recovery
       # Deterministic Simulation Testing gate (rmp #244): a fast, bounded VOPR seed sweep asserting
       # every seed is SAFE (strict serializability + durability + atomicity + reference-model
       # equivalence under injected disk/clock/crash faults), LIVE (progress watchdog + fault-then-heal

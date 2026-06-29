@@ -82,6 +82,8 @@ pub use vopr_fuzz::{
 // The replay-artifact + deterministic shrinker tools (rmp #242). Module-qualified runners
 // (`vopr_repro::run_repro_cli` / `vopr_repro::shrink` / `vopr_repro::replay_from_file`) stay beside the
 // re-exported types.
-pub use vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
+pub use vopr_oracle::{
+    OracleError, ShadowGraph, SurfacedFault, assert_equivalent, is_surfaced_injected_latent_fault,
+};
 pub use vopr_repro::{FailurePredicate, ReplayArtifact, ReplayMode, ReplayOutcome, ShrinkOutcome};
 pub use workload::{Op, PlannedTxn, TxnOutcome, WorkloadConfig};

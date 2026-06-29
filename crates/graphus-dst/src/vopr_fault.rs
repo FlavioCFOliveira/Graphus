@@ -51,6 +51,8 @@
 //! This split is the rmp #236 honesty requirement: disk + clock are physically injected; transport is
 //! scheduled, budgeted, traced and left as a clean SimNet seam — never faked.
 
+use std::collections::BTreeSet;
+
 use graphus_core::PageId;
 use graphus_core::capability::Rng;
 use graphus_io::FaultPlan;
@@ -256,6 +258,15 @@ pub struct FaultScheduler {
     injected_transport: u32,
     /// Tally of crash + ARIES restart events fired (rmp #237).
     injected_crash: u32,
+    /// Device page ids the scheduler **actually armed** with a *latent sector error* over the run
+    /// (rmp #480) — only pages whose owning disk fault was armed on a live device (the `arm_disk` hook
+    /// returned `true`). A latent sector error makes a page permanently unreadable, so a later
+    /// read-back that hard-fails naming one of these pages is the engine *surfacing* an injected fault
+    /// ("surface, never corrupt"), NOT a durability bug. The safety oracle uses this set to positively
+    /// tie such a surfaced read-back error to a fault the harness itself injected — see
+    /// [`is_surfaced_injected_latent_fault`](crate::vopr_oracle::is_surfaced_injected_latent_fault).
+    /// Deterministic (a pure function of the seed + budget), so it never perturbs same-seed replay.
+    armed_latent_pages: BTreeSet<u64>,
 }
 
 impl FaultScheduler {
@@ -322,6 +333,7 @@ impl FaultScheduler {
             injected_clock: 0,
             injected_transport: 0,
             injected_crash: 0,
+            armed_latent_pages: BTreeSet::new(),
         }
     }
 
@@ -366,9 +378,14 @@ impl FaultScheduler {
             self.cursor += 1;
             let effect = match ev.kind {
                 VoprFaultKind::Disk => {
-                    let plan = self.build_disk_plan(ev.seed);
+                    let (plan, latent_pages) = self.build_disk_plan(ev.seed);
                     if arm_disk(plan) {
                         self.injected_disk += 1;
+                        // Record the latent-sector-error pages this fault made unreadable, so a later
+                        // read-back that hard-fails naming one of them can be positively tied to this
+                        // injected fault by the safety oracle (rmp #480). Recorded only on a successful
+                        // arm: if the engine was spent the page is not actually unreadable.
+                        self.armed_latent_pages.extend(latent_pages);
                         ev.seed
                     } else {
                         // Engine already spent — record the *attempt* so the trace still reflects the
@@ -459,9 +476,14 @@ impl FaultScheduler {
     /// corruption (bit-rot the checksum catches, a misdirected read, or a latent sector error). Capacity
     /// / write-reordering faults are deliberately omitted from the per-slot plan so the workload keeps
     /// making progress (the chaos stays recoverable, never a guaranteed wipe).
-    fn build_disk_plan(&self, seed: u64) -> FaultPlan {
+    ///
+    /// Returns the plan **and** the device pages it armed with a *latent sector error* (rmp #480), so
+    /// the caller can record which pages this fault made unreadable — a later read-back that hard-fails
+    /// naming one of them is the engine correctly surfacing an injected fault, not a durability bug.
+    fn build_disk_plan(&self, seed: u64) -> (FaultPlan, Vec<u64>) {
         let mut rng = SimRng::new(seed);
         let mut plan = FaultPlan::new(seed);
+        let mut latent_pages = Vec::new();
         let span = self.budget.disk_page_span.max(1) as u64;
         let pages = rng.range_inclusive(1, u64::from(self.budget.disk_max_pages.max(1)));
         for _ in 0..pages {
@@ -480,10 +502,21 @@ impl FaultScheduler {
                 _ => {
                     // Latent sector error: the page becomes unreadable (a hard read error to recover).
                     plan = plan.with_latent_sector_error(page);
+                    latent_pages.push(page.0);
                 }
             }
         }
-        plan
+        (plan, latent_pages)
+    }
+
+    /// The device pages the scheduler armed with a *latent sector error* over the run (rmp #480),
+    /// ascending. A read-back that hard-fails naming one of these pages is the engine surfacing an
+    /// injected unreadable sector ("surface, never corrupt"), which the safety oracle treats as
+    /// expected rather than a durability violation — see
+    /// [`is_surfaced_injected_latent_fault`](crate::vopr_oracle::is_surfaced_injected_latent_fault).
+    #[must_use]
+    pub fn armed_latent_pages(&self) -> Vec<u64> {
+        self.armed_latent_pages.iter().copied().collect()
     }
 
     /// Intensifies the active clock plan from `seed`, bounded by `clock_max_ns`. Each clock fault raises

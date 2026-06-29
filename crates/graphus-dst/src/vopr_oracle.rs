@@ -374,11 +374,107 @@ pub enum OracleError {
         scan: u64,
     },
     /// A read-back query failed against the engine (could not begin / run / drain). Carries a coarse
-    /// class so the failure is reproducible without leaking incidental wording.
+    /// class so the failure is reproducible without leaking incidental wording, plus — when the
+    /// failure was a storage/IO error the engine *surfaced* rather than a logic error — the parsed,
+    /// deterministic [`SurfacedFault`] detail (rmp #480). The safety oracle uses `surfaced` to tell an
+    /// engine-surfaced *injected* latent-sector-error (expected: "surface, never corrupt" upheld — the
+    /// engine refused to serve bytes from a page the harness deliberately made unreadable) apart from a
+    /// genuine read-back failure — see [`is_surfaced_injected_latent_fault`]. `None` for a non-storage
+    /// logic error (begin / compile / drain) or any storage error whose signature is not recognised,
+    /// neither of which is ever excused.
     ReadBack {
         /// What was being read when it failed.
         what: &'static str,
+        /// The parsed engine-surfaced storage-fault detail, if this failure carried the device's
+        /// latent-sector-error signature (a page the engine refused to read). `None` otherwise.
+        surfaced: Option<SurfacedFault>,
     },
+}
+
+/// The engine-*surfaced* detail of a read-back that hard-failed on an unreadable page (rmp #480).
+///
+/// A read-back can fail two fundamentally different ways, and the safety oracle MUST NOT conflate
+/// them:
+///
+/// * **Engine surfaced an injected fault.** The engine refused to serve bytes from a page the harness
+///   deliberately destroyed (a *latent sector error* — the page is unreadable), returning a storage
+///   error instead of silently returning wrong or missing committed data. This **upholds** the
+///   "surface, never corrupt" durability contract: an errored read of a faulted page is the engine
+///   doing exactly the right thing, not a bug.
+/// * **A genuine failure.** The read-back returned wrong/missing data (a multiset mismatch — *no*
+///   surfaced error), or failed for a reason unrelated to an injected fault.
+///
+/// This type carries the parsed detail of the first case so the classifier
+/// ([`is_surfaced_injected_latent_fault`]) can *positively* tie the failure to a fault the harness
+/// itself injected. Only the latent-sector-error signature — the one disk fault that makes a page
+/// permanently unreadable and names the exact device page — is recognised, keeping the tie
+/// conservative, exact and auditable. It is parsed from the engine error *signature*, never raw
+/// incidental wording, so the value stays a pure function of the seed (deterministic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfacedFault {
+    /// The device page id the surfaced latent-sector-error named — the `MemBlockDevice` reports the
+    /// exact unreadable page (`graphus_io` `mem.rs`: `"latent sector error: page {N} unreadable"`).
+    /// The classifier matches this against the set of pages the harness armed with a latent sector
+    /// error this run, so the tie to an injected fault is exact.
+    pub page: u64,
+}
+
+/// Recognises the **latent-sector-error** signature in an engine read-back error string and extracts
+/// the device page id it names (rmp #480).
+///
+/// The wording is the `MemBlockDevice` durability contract `"latent sector error: page {N}
+/// unreadable"` (`graphus_io` `mem.rs::read_page`) — the device hard-fails a read of a page armed with
+/// a latent sector error, which is precisely how the engine *surfaces* an unreadable sector instead of
+/// serving wrong bytes. Only this exact, page-naming signature is recognised, so the parse is
+/// deterministic and the tie to an injected fault is exact. Returns `None` for any other error (a
+/// logic error, a checksum mismatch from bit-rot/misdirected I/O, an out-of-range read), so the
+/// classifier never excuses a failure it cannot positively attribute to an injected unreadable sector.
+fn parse_surfaced_latent_fault(msg: &str) -> Option<SurfacedFault> {
+    const SIG: &str = "latent sector error: page ";
+    let tail = msg.split(SIG).nth(1)?;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    let page: u64 = digits.parse().ok()?;
+    Some(SurfacedFault { page })
+}
+
+/// Builds a [`OracleError::ReadBack`] from a failed read-back, parsing the engine error string for a
+/// surfaced latent-sector-error signature (rmp #480). The raw string is reduced to the deterministic
+/// [`SurfacedFault`] (or `None`); the incidental wording is discarded so the error stays a pure
+/// function of the seed.
+fn read_back_err<D: std::fmt::Display>(what: &'static str, err: &D) -> OracleError {
+    OracleError::ReadBack {
+        what,
+        surfaced: parse_surfaced_latent_fault(&err.to_string()),
+    }
+}
+
+/// Whether `err` is an engine-*surfaced injected latent-sector-error* read-back (rmp #480): the
+/// read-back hard-failed with the device's latent-sector-error signal for a page the harness itself
+/// armed with a latent sector error this run.
+///
+/// Such a failure is **expected**, not a durability violation: the engine refused to serve bytes from
+/// a page the harness deliberately made unreadable, upholding "surface, never corrupt". This is the
+/// **only** reason the safety oracle may drop a reference-model "failure".
+///
+/// Conservative by construction — returns `true` only when BOTH hold:
+/// 1. the read-back error carries the device's exact latent-sector-error signature naming a page
+///    ([`SurfacedFault`]), AND
+/// 2. that page is in `armed_latent_pages` — the set of pages the harness injected a latent sector
+///    error on during this run.
+///
+/// A **silent** committed-data discrepancy — a `NodeMultiset` / `EdgeMultiset` / `Count` / `Neighbor`
+/// / `Property` mismatch, none of which carries a surfaced error — can therefore never be `true`, so
+/// the teeth that catch genuine durability loss (the [`OracleError`] mismatch variants) are wholly
+/// untouched. A surfaced error on a page the harness never faulted, or any non-storage logic error,
+/// is likewise never excused.
+#[must_use]
+pub fn is_surfaced_injected_latent_fault(err: &OracleError, armed_latent_pages: &[u64]) -> bool {
+    match err {
+        OracleError::ReadBack {
+            surfaced: Some(sf), ..
+        } => armed_latent_pages.contains(&sf.page),
+        _ => false,
+    }
 }
 
 /// Reads the engine's `:Person` id multiset via Cypher: `(id, multiplicity)` ascending.
@@ -438,7 +534,10 @@ fn engine_rank_of(eng: &mut SimEngine, id: i64) -> Result<Option<i64>, OracleErr
     match rows.first().and_then(|r| r.first()) {
         Some(MaterializedValue::Value(Value::Integer(v))) => Ok(Some(*v)),
         Some(MaterializedValue::Value(Value::Null)) | None => Ok(None),
-        Some(_) => Err(OracleError::ReadBack { what: "rank" }),
+        Some(_) => Err(OracleError::ReadBack {
+            what: "rank",
+            surfaced: None,
+        }),
     }
 }
 
@@ -518,7 +617,10 @@ fn read_int_pairs(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         if row.len() < 2 {
-            return Err(OracleError::ReadBack { what });
+            return Err(OracleError::ReadBack {
+                what,
+                surfaced: None,
+            });
         }
         out.push((cell_int(&row[0], what)?, cell_int(&row[1], what)?));
     }
@@ -535,16 +637,18 @@ fn run_read(
 ) -> Result<Vec<Vec<MaterializedValue>>, OracleError> {
     let ticket = eng
         .begin_auto_commit(AccessMode::Read)
-        .map_err(|_| OracleError::ReadBack { what })?;
+        .map_err(|e| read_back_err(what, &e))?;
     let mut reply = eng
         .run(ticket, stmt, params, true, None)
-        .map_err(|_| OracleError::ReadBack { what })?;
+        .map_err(|e| read_back_err(what, &e))?;
     let mut rows = Vec::new();
     loop {
         match reply.rows.next() {
             Ok(Some(row)) => rows.push(row),
             Ok(None) => break,
-            Err(_) => return Err(OracleError::ReadBack { what }),
+            // A latent-sector-error injected by the harness surfaces here as a hard read error; the
+            // parsed [`SurfacedFault`] lets the safety oracle tell it apart from a genuine failure.
+            Err(e) => return Err(read_back_err(what, &e)),
         }
     }
     Ok(rows)
@@ -552,7 +656,10 @@ fn run_read(
 
 /// Extracts the first cell of a row as an `i64`.
 fn first_int(row: &[MaterializedValue], what: &'static str) -> Result<i64, OracleError> {
-    let cell = row.first().ok_or(OracleError::ReadBack { what })?;
+    let cell = row.first().ok_or(OracleError::ReadBack {
+        what,
+        surfaced: None,
+    })?;
     cell_int(cell, what)
 }
 
@@ -560,7 +667,10 @@ fn first_int(row: &[MaterializedValue], what: &'static str) -> Result<i64, Oracl
 fn cell_int(cell: &MaterializedValue, what: &'static str) -> Result<i64, OracleError> {
     match cell {
         MaterializedValue::Value(Value::Integer(i)) => Ok(*i),
-        _ => Err(OracleError::ReadBack { what }),
+        _ => Err(OracleError::ReadBack {
+            what,
+            surfaced: None,
+        }),
     }
 }
 
@@ -845,5 +955,108 @@ mod tests {
         assert_eq!(diff_sorted(&[(1, 2)], &[(1, 1)]), Some((1, 2, 1)));
         assert_eq!(diff_sorted(&[(1, 1), (3, 1)], &[(1, 1)]), Some((3, 1, 0)));
         assert_eq!(diff_sorted::<i64>(&[], &[(5, 4)]), Some((5, 0, 4)));
+    }
+
+    /// The parser recognises the `MemBlockDevice` latent-sector-error signature and extracts the exact
+    /// device page id, and returns `None` for every other error wording — so only an engine-surfaced
+    /// unreadable sector is ever tied to an injected fault (rmp #480).
+    #[test]
+    fn parse_surfaced_latent_fault_extracts_the_page_and_rejects_other_errors() {
+        // The exact device wording (graphus_io mem.rs::read_page).
+        assert_eq!(
+            parse_surfaced_latent_fault("latent sector error: page 3 unreadable"),
+            Some(SurfacedFault { page: 3 })
+        );
+        // Wrapped in an outer `Storage(...)` Display, as the engine surfaces it.
+        assert_eq!(
+            parse_surfaced_latent_fault("Storage(\"latent sector error: page 41 unreadable\")"),
+            Some(SurfacedFault { page: 41 })
+        );
+        // Other storage faults (checksum from bit-rot / misdirected I/O, out-of-range) are NOT tied.
+        assert_eq!(
+            parse_surfaced_latent_fault("read out of range: page 3"),
+            None
+        );
+        assert_eq!(
+            parse_surfaced_latent_fault("page checksum mismatch: page 3"),
+            None
+        );
+        // A pure logic error is never a surfaced storage fault.
+        assert_eq!(
+            parse_surfaced_latent_fault("read transaction cannot write"),
+            None
+        );
+    }
+
+    /// **Teeth survival (unit level, rmp #480).** The classifier reclassifies a reference-model
+    /// "failure" as expected **only** for an engine-surfaced injected latent-sector-error on a page the
+    /// harness actually armed — and NEVER for a silent committed-data discrepancy or an untied error.
+    /// This is the guard that the fix did not blunt the oracle's teeth.
+    #[test]
+    fn classifier_excuses_only_surfaced_injected_latent_faults() {
+        let armed = [3u64, 7u64];
+
+        // (1) Engine surfaced an injected LSE on an armed page ⇒ expected (the engine refused to serve
+        //     bytes from a page WE made unreadable: "surface, never corrupt" upheld).
+        assert!(is_surfaced_injected_latent_fault(
+            &OracleError::ReadBack {
+                what: "nodes",
+                surfaced: Some(SurfacedFault { page: 3 }),
+            },
+            &armed,
+        ));
+
+        // (2) Surfaced LSE on a page the harness NEVER armed ⇒ NOT excused (cannot positively tie it).
+        assert!(!is_surfaced_injected_latent_fault(
+            &OracleError::ReadBack {
+                what: "nodes",
+                surfaced: Some(SurfacedFault { page: 99 }),
+            },
+            &armed,
+        ));
+
+        // (3) An armed set is required: no injected fault ⇒ nothing is excused.
+        assert!(!is_surfaced_injected_latent_fault(
+            &OracleError::ReadBack {
+                what: "nodes",
+                surfaced: Some(SurfacedFault { page: 3 }),
+            },
+            &[],
+        ));
+
+        // (4) A read-back that failed for a non-storage reason (surfaced: None) ⇒ NOT excused.
+        assert!(!is_surfaced_injected_latent_fault(
+            &OracleError::ReadBack {
+                what: "nodes",
+                surfaced: None,
+            },
+            &armed,
+        ));
+
+        // (5) TEETH: a SILENT committed-data loss (the read-back SUCCEEDED but returned the wrong
+        //     multiset) is a real durability violation and is NEVER excused, even with faults armed.
+        assert!(!is_surfaced_injected_latent_fault(
+            &OracleError::NodeMultisetMismatch {
+                id: 5,
+                model: 1,
+                engine: 0,
+            },
+            &armed,
+        ));
+        assert!(!is_surfaced_injected_latent_fault(
+            &OracleError::EdgeMultisetMismatch {
+                edge: (1, 2),
+                model: 1,
+                engine: 0,
+            },
+            &armed,
+        ));
+        assert!(!is_surfaced_injected_latent_fault(
+            &OracleError::CountMismatch {
+                model: 10,
+                engine: 9,
+            },
+            &armed,
+        ));
     }
 }

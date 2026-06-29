@@ -41,7 +41,9 @@ use graphus_sim::SimRng;
 
 use crate::mix::{LoadProfile, MixProfile, WorkloadGen, WorkloadOp};
 use crate::vopr_fault::{FaultBudget, FaultScheduler};
-use crate::vopr_oracle::{OracleError, ShadowGraph, assert_equivalent};
+use crate::vopr_oracle::{
+    OracleError, ShadowGraph, assert_equivalent, is_surfaced_injected_latent_fault,
+};
 
 /// The single Elle object key the safety oracle records the `:Person` id space under. Every committed
 /// `CreateNode{id}` is an [`ElleOp::Append`] of `id` to this key; the generator's ids are monotonic +
@@ -465,6 +467,15 @@ pub struct VoprReport {
     /// into [`trace_hash`](Self::trace_hash): the oracle's read-back queries are an observer and do not
     /// perturb the canonical workload trace.
     pub oracle: Option<OracleError>,
+    /// The device pages the fault scheduler armed with a **latent sector error** over this run (rmp
+    /// #480), ascending. A latent sector error makes a page permanently unreadable, so a read-back that
+    /// hard-fails naming one of these pages is the engine *surfacing* an injected fault ("surface,
+    /// never corrupt"), not a durability bug. The safety oracle correlates a surfaced read-back error
+    /// against this set to tell an expected engine-surfaced injected fault apart from a genuine
+    /// reference-model divergence (a *silent* committed-data discrepancy, which carries no surfaced
+    /// error and is never excused). Empty for a fault-free run. Deterministic, so it never perturbs
+    /// same-seed replay.
+    pub latent_fault_pages: Vec<u64>,
 }
 
 /// The acked-vs-in-flight split captured at one **crash + ARIES restart** instant (rmp #237) — the
@@ -985,6 +996,11 @@ fn run_inner(cfg: VoprConfig, mode: RunMode) -> (VoprReport, Vec<ElleTxn>, Liven
     let _ = eng.shutdown();
 
     let (disk_faults, clock_faults, transport_faults) = faults.tally();
+    // The latent-sector-error pages armed over the run (rmp #480): the safety oracle uses these to
+    // tell an engine-surfaced injected fault apart from a genuine reference-model divergence. Read
+    // after the trailing drain so every armed fault (including any a short run swept up at the end) is
+    // accounted.
+    let latent_fault_pages = faults.armed_latent_pages();
 
     let elle_history = oracle.elle_history.take().unwrap_or_default();
 
@@ -1007,6 +1023,7 @@ fn run_inner(cfg: VoprConfig, mode: RunMode) -> (VoprReport, Vec<ElleTxn>, Liven
         crash_restarts,
         crash_splits,
         oracle: oracle_verdict,
+        latent_fault_pages,
     };
 
     let liveness = LivenessTrace {
@@ -1703,7 +1720,19 @@ fn evaluate_safety(run: &VoprReport, history: &[ElleTxn]) -> Vec<SafetyViolation
     }
 
     // 4. Reference-model equivalence: the #238 shadow model agrees with the engine cell-by-cell.
-    if let Some(err) = &run.oracle {
+    //
+    //    One read-back outcome is **expected, not a violation** (rmp #480): the read-back hard-failed
+    //    because the engine *surfaced* a latent-sector-error the harness itself injected — it refused
+    //    to serve bytes from a page we deliberately made unreadable, returning a storage error rather
+    //    than silently returning wrong/missing committed data. That UPHOLDS the "surface, never
+    //    corrupt" contract. We drop the reference-model "failure" only when the oracle error is
+    //    positively tied to such an injected fault (the surfaced error names a page in
+    //    `latent_fault_pages`). A *silent* committed-data discrepancy — any multiset/count/neighbour
+    //    mismatch, which carries NO surfaced error — is never excused and still flags the violation,
+    //    so the teeth that catch genuine durability loss are intact.
+    if let Some(err) = &run.oracle
+        && !is_surfaced_injected_latent_fault(err, &run.latent_fault_pages)
+    {
         violations.push(SafetyViolation {
             property: SafetyProperty::ReferenceModel,
             detail: format!("{err:?}"),
@@ -3147,6 +3176,7 @@ mod tests {
             crash_restarts: 0,
             crash_splits: Vec::new(),
             oracle: None,
+            latent_fault_pages: Vec::new(),
         }
     }
 
@@ -3239,6 +3269,61 @@ mod tests {
             v.iter()
                 .any(|x| x.property == SafetyProperty::ReferenceModel),
             "an oracle divergence must trip the reference-model arm: {v:?}"
+        );
+    }
+
+    /// **rmp #480 — engine-surfaced injected fault is EXPECTED, but the teeth survive.** The safety
+    /// bundle must drop the reference-model "failure" ONLY when the read-back hard-failed because the
+    /// engine surfaced a latent-sector-error the harness itself injected (a page in
+    /// `latent_fault_pages`) — and must STILL flag every silent committed-data discrepancy and every
+    /// untied error. This is the exact distinction the false-positive seed 47251 exposed.
+    #[test]
+    fn evaluate_safety_excuses_surfaced_injected_lse_only() {
+        use crate::vopr_oracle::SurfacedFault;
+
+        // (a) Engine SURFACED an injected LSE on an armed page ⇒ NOT a safety violation. The read-back
+        //     refused to serve bytes from a page WE made unreadable — "surface, never corrupt" upheld.
+        let mut surfaced = clean_report();
+        surfaced.oracle = Some(OracleError::ReadBack {
+            what: "nodes",
+            surfaced: Some(SurfacedFault { page: 3 }),
+        });
+        surfaced.latent_fault_pages = vec![3];
+        let v = evaluate_safety(&surfaced, &clean_history());
+        assert!(
+            v.is_empty(),
+            "an engine-surfaced injected latent-sector-error read-back must be SAFE: {v:?}"
+        );
+
+        // (b) TEETH: a SILENT committed-data loss (the read SUCCEEDED but returned the wrong multiset)
+        //     is a real durability violation and is STILL flagged, even with the SAME page faulted.
+        let mut silent_loss = clean_report();
+        silent_loss.oracle = Some(OracleError::NodeMultisetMismatch {
+            id: 5,
+            model: 1,
+            engine: 0,
+        });
+        silent_loss.latent_fault_pages = vec![3];
+        let v = evaluate_safety(&silent_loss, &clean_history());
+        assert!(
+            v.iter()
+                .any(|x| x.property == SafetyProperty::ReferenceModel),
+            "a SILENT committed-data loss must STILL be UNSAFE even with faults armed: {v:?}"
+        );
+
+        // (c) TEETH: a surfaced read error on a page the harness NEVER armed is not positively tied to
+        //     an injected fault, so it is STILL flagged (conservative).
+        let mut untied = clean_report();
+        untied.oracle = Some(OracleError::ReadBack {
+            what: "nodes",
+            surfaced: Some(SurfacedFault { page: 99 }),
+        });
+        untied.latent_fault_pages = vec![3]; // page 99 was never faulted
+        let v = evaluate_safety(&untied, &clean_history());
+        assert!(
+            v.iter()
+                .any(|x| x.property == SafetyProperty::ReferenceModel),
+            "a surfaced read error on an un-faulted page must STILL be UNSAFE: {v:?}"
         );
     }
 
