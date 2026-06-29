@@ -72,7 +72,8 @@ fn bytes32_huge_length_truncated_errors_without_allocating() {
 #[test]
 fn list32_giant_header_does_not_oom() {
     // LIST_32 (0xD6) announcing ~4 billion elements, but no element bytes. The decoder pre-allocates
-    // `n.min(1024)` and then loops reading elements, hitting end-of-input on the first → Decode error.
+    // `min(claimed, bytes_remaining, MAX_PREALLOC=32)` and then loops reading elements, hitting
+    // end-of-input on the first → Decode error.
     // It must NOT attempt to allocate a 4-billion-element Vec. A panic/abort here would be a remote
     // DoS; we assert a clean error instead.
     let bytes = [0xD6, 0xFF, 0xFF, 0xFF, 0xFF];
@@ -104,30 +105,39 @@ fn list_with_real_elements_is_bounded_by_input_length() {
 // ---- decode-bomb amplification quantification (rmp #469) --------------------------------------
 
 /// Quantifies the worst-case memory **amplification** of the PackStream decoder: a small adversarial
-/// input must never force an allocation sized by a *claimed* count. Two invariants are pinned, which
+/// input must never force an allocation sized by a *claimed* count. Three invariants are pinned, which
 /// together bound the absolute transient-memory ceiling of one in-flight message decode:
 ///
 /// 1. **Per-collection pre-allocation is decoupled from the header.** A `LIST_32` / `MAP_32` claiming
 ///    `u32::MAX` (~4.29e9) elements with no body errors cleanly (the decode loop fails at
-///    end-of-input) — it never reserves ~4 billion slots. The pre-allocation is capped at
-///    `MAX_PREALLOC` (1024) regardless of the claim, so the worst case for one collection is
-///    `1024 × size_of::<slot>()`, NOT `claimed × size_of::<slot>()` (the difference between a few KiB
-///    and hundreds of GiB / a process abort).
+///    end-of-input) — it never reserves ~4 billion slots. The pre-allocation is
+///    `min(claimed, bytes_remaining, MAX_PREALLOC)` (`rmp` #484), so the worst case for one collection
+///    is `MAX_PREALLOC × size_of::<slot>()`, NOT `claimed × size_of::<slot>()` (the difference between
+///    a few hundred bytes and hundreds of GiB / a process abort). The `bytes_remaining` term makes the
+///    reservation proportional to the data actually present: a short/truncated bomb reserves almost
+///    nothing.
 ///
 /// 2. **The multiplicative (nested) pre-allocation is capped by `MAX_DECODE_DEPTH`.** The only way to
 ///    stack many capped reservations live at once is to nest collections; that is bounded at
 ///    `MAX_DECODE_DEPTH` (256) levels, above which decoding is rejected. So the absolute worst-case
 ///    transient allocation for ONE message decode is `MAX_DECODE_DEPTH × MAX_PREALLOC ×
-///    size_of::<slot>()` — a *fixed* ceiling in the low tens of MiB, independent of the claimed counts
-///    and of the (64 MiB-capped) wire message size, and freed the instant the decode returns/errors.
+///    size_of::<slot>()` — a *fixed* ceiling, independent of the claimed counts and of the (64
+///    MiB-capped) wire message size, and freed the instant the decode returns/errors.
+///
+/// 3. **The cap is small (`rmp` #484).** `MAX_PREALLOC` is `32` (was `1024`). With the widest slot
+///    (`(String, Value)`, 64 B) the ceiling is `256 × 32 × 64 B = 512 KiB` per in-flight decode — a
+///    32× reduction from the previous ~16 MiB. This matters because the spike scales with concurrent
+///    connections (`max_connections`, default 1024): the coordinated worst case drops from ~16 GiB to
+///    ~512 MiB. Lowering the cap costs no successful-decode correctness (the `Vec` grows lazily) and
+///    no measurable throughput (collections ≤ 32 still exact-fit; larger ones amortise).
 ///
 /// The measured amplification ratio is therefore bounded: from ~1.5 KiB of crafted input (the nested
-/// bomb below) the peak transient is `MAX_DECODE_DEPTH × MAX_PREALLOC × slot` ≈ 10–17 MiB — a hard,
-/// constant ceiling — whereas an unbounded decoder would have turned the same input into a multi-GiB
-/// abort. This test asserts both bounds and that the ceiling stays small.
+/// bomb below) the peak transient pre-allocation is `MAX_DECODE_DEPTH × MAX_PREALLOC × slot` ≤ 512 KiB
+/// — a hard, constant ceiling — whereas an unbounded decoder would have turned the same input into a
+/// multi-GiB abort. This test asserts all three bounds against the crate's real constants.
 #[test]
 fn decode_amplification_is_bounded_not_header_driven() {
-    use graphus_bolt::packstream::MAX_DECODE_DEPTH;
+    use graphus_bolt::packstream::{MAX_DECODE_DEPTH, MAX_PREALLOC};
 
     // (1) A single max-width collection header with NO body must error, never reserve from the header.
     assert!(
@@ -153,17 +163,23 @@ fn decode_amplification_is_bounded_not_header_driven() {
         "expected a depth-limit error (the multiplicative-prealloc cap), got: {err}"
     );
 
-    // Document/verify the ceiling numerically from the real constants and the worst-case (map) slot —
-    // a regression tripwire if either the depth cap or the value layout balloons. MAX_PREALLOC is 1024
-    // (the crate's documented, `pub(crate)` cap); the map slot `(String, Value)` is the largest a
-    // collection element can be.
-    const MAX_PREALLOC: usize = 1024;
+    // (3) Compute the ceiling from the crate's REAL constants and the worst-case (map) slot — a
+    //     regression tripwire if the depth cap, the prealloc cap, or the value layout balloons. The
+    //     map slot `(String, Value)` is the largest a collection element can be.
+    assert_eq!(
+        MAX_PREALLOC, 32,
+        "rmp #484 lowered the prealloc cap to 32; a change here moves the transient ceiling and must \
+         be a conscious, reviewed decision"
+    );
     let map_slot = std::mem::size_of::<(String, graphus_core::Value)>();
     let ceiling_bytes = MAX_DECODE_DEPTH * MAX_PREALLOC * map_slot;
+    // The NEW ceiling: 256 × 32 × 64 B = 512 KiB. Assert the hard upper bound (1 MiB leaves headroom
+    // only for the 64 B slot growing slightly), proving the post-#484 amplification ceiling is in the
+    // sub-MiB range, NOT the tens of MiB of the old 1024 cap.
     assert!(
-        ceiling_bytes <= 32 * 1024 * 1024,
+        ceiling_bytes <= 1024 * 1024,
         "worst-case transient prealloc ceiling ({ceiling_bytes} bytes = {MAX_DECODE_DEPTH} depth × \
-         {MAX_PREALLOC} prealloc × {map_slot}-byte map slots) must stay in the low tens of MiB; a \
+         {MAX_PREALLOC} prealloc × {map_slot}-byte map slots) must stay sub-MiB after rmp #484; a \
          larger value means the decode-bomb amplification ceiling has regressed"
     );
 }

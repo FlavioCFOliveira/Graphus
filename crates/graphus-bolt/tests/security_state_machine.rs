@@ -310,7 +310,7 @@ fn response_decode_giant_record_header_does_not_allocate_unbounded() {
 #[test]
 fn response_decode_large_record_with_real_elements_still_succeeds() {
     // Regression: SEC-192 — capping only the *pre-allocation* must not change successful decodes.
-    // A RECORD declaring 5000 elements (≫ MAX_PREALLOC = 1024) WITH all 5000 real element bytes
+    // A RECORD declaring 5000 elements (≫ MAX_PREALLOC = 32) WITH all 5000 real element bytes
     // present must still decode to a 5000-element row: the `Vec` grows past the cap as elements are
     // read. This pins that the fix is a pure allocation-bound, not a length limit.
     let count: u32 = 5000;

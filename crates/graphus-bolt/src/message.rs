@@ -408,7 +408,7 @@ impl Response {
             // `Vec` grow as real cells are decoded. The loop is bounded by the actual input length
             // (each `unpack_bolt_value` consumes ≥1 byte and errors at end-of-input), so a genuinely
             // large record still decodes; only the unbounded pre-allocation is removed.
-            let mut values = Vec::with_capacity(prealloc_cap(count));
+            let mut values = Vec::with_capacity(prealloc_cap(count, u.remaining()));
             for _ in 0..count {
                 values.push(unpack_bolt_value(&mut u)?);
             }

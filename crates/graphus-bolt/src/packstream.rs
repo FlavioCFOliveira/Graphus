@@ -123,23 +123,54 @@ pub(crate) const MAX_STRUCT_FIELDS: usize = 15;
 /// sending only a few bytes of body. Sizing a `Vec` directly from that header would request
 /// `count * size_of::<T>()` bytes — hundreds of GiB — and abort the process via
 /// `alloc::handle_alloc_error` (CWE-789 / CWE-770). We therefore **never** trust the wire header to
-/// size an allocation: we pre-reserve at most this many slots and let the `Vec` grow as *real*
-/// elements are decoded. Every decode loop is bounded by the actual input length (each item consumes
-/// ≥1 byte and the unpacker errors at end-of-input), so a genuinely large collection still decodes
-/// correctly — it just reallocates instead of pre-sizing. This is the single source of truth for the
-/// policy; use [`prealloc_cap`] at every wire-driven `Vec::with_capacity` call site.
-pub(crate) const MAX_PREALLOC: usize = 1024;
+/// size an allocation: we pre-reserve a small, bounded number of slots and let the `Vec` grow lazily
+/// (amortised doubling) as *real* elements are decoded. Every decode loop is bounded by the actual
+/// input length (each item consumes ≥1 byte and the unpacker errors at end-of-input), so a genuinely
+/// large collection still decodes correctly — it just grows instead of pre-sizing.
+///
+/// # Value — kept deliberately small (`rmp` #484)
+///
+/// The cap is `32`, *not* the message-frame size. It is chosen as a small value that still exact-fits
+/// the overwhelming majority of real Bolt collections (RUN parameter maps, node label lists, RECORD
+/// field lists, and almost all node/relationship property maps sit well under 32 entries), so the
+/// common case sees **zero** reallocation — byte-for-byte the same `Vec` behaviour as an exact-fit
+/// `with_capacity`. Collections larger than 32 grow by amortised doubling; the extra reallocation
+/// cost is O(n) and, measured in isolation, under ~20 ns even for a 1000-element collection —
+/// negligible against the per-element parse + `String` allocation cost of the real decode path.
+///
+/// Keeping the cap small is what bounds the **transient** memory of one in-flight decode. The only
+/// way to stack many capped reservations live at once is to nest collections, which is bounded at
+/// [`MAX_DECODE_DEPTH`] levels; so the absolute worst-case transient pre-allocation for ONE message
+/// decode is `MAX_DECODE_DEPTH × MAX_PREALLOC × size_of::<slot>()` — `256 × 32 × 64 B = 512 KiB` for
+/// the widest (`(String, Value)` map) slot — a hard, constant ceiling independent of the claimed
+/// counts and of the 64 MiB-capped wire size, freed the instant the decode returns or errors. (Before
+/// `rmp` #484 the cap was `1024`, a 32× larger ~16 MiB ceiling per in-flight decode.)
+///
+/// This is the single source of truth for the policy; use [`prealloc_cap`] at every wire-driven
+/// `Vec::with_capacity` call site.
+pub const MAX_PREALLOC: usize = 32;
 
-/// Clamps a wire-supplied collection length to a safe pre-allocation capacity ([`MAX_PREALLOC`]).
+/// Clamps a wire-supplied collection length to a safe pre-allocation capacity.
 ///
 /// This is the **only** sanctioned way to turn an untrusted PackStream length into a
-/// `Vec::with_capacity` argument. Capping the pre-sizing changes no successful-decode behaviour (the
-/// `Vec` grows as elements are read); it only removes the unbounded-allocation footgun. See
-/// [`MAX_PREALLOC`] for the threat model.
+/// `Vec::with_capacity` argument. The reservation is the minimum of three quantities, so it can never
+/// be driven by the claimed count alone:
+///
+/// 1. `wire_len` — the element count the header claims;
+/// 2. `remaining` — the bytes still unread in this message ([`Unpacker::remaining`]). A collection of
+///    `k` elements needs ≥ `k` body bytes (every element is ≥1 byte), so the real element count can
+///    never exceed `remaining`; clamping here makes the reservation **proportional to the data that
+///    is actually present**, not to a crafted header — a short/truncated bomb reserves almost nothing;
+/// 3. [`MAX_PREALLOC`] — the absolute cap that bounds the per-level (and, via [`MAX_DECODE_DEPTH`],
+///    the total) transient footprint.
+///
+/// Clamping the pre-sizing changes no successful-decode behaviour (the `Vec` grows as elements are
+/// read); it only removes the unbounded-allocation footgun. See [`MAX_PREALLOC`] for the threat model
+/// and the resulting transient ceiling.
 #[inline]
 #[must_use]
-pub(crate) fn prealloc_cap(wire_len: usize) -> usize {
-    wire_len.min(MAX_PREALLOC)
+pub fn prealloc_cap(wire_len: usize, remaining: usize) -> usize {
+    wire_len.min(remaining).min(MAX_PREALLOC)
 }
 
 // ---- Structure tag bytes (Bolt 5.x; `04 §8.1`, verified 2026-06) -----------------------------
@@ -989,7 +1020,7 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
         _ if is_list_marker(marker) => {
             let n = unpacker.read_list_header()?;
             unpacker.enter_nested()?;
-            let mut items = Vec::with_capacity(prealloc_cap(n));
+            let mut items = Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
             for _ in 0..n {
                 items.push(unpack_value(unpacker)?);
             }
@@ -999,7 +1030,8 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
         _ if is_map_marker(marker) => {
             let n = unpacker.read_map_header()?;
             unpacker.enter_nested()?;
-            let mut entries: Vec<(String, Value)> = Vec::with_capacity(prealloc_cap(n));
+            let mut entries: Vec<(String, Value)> =
+                Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
             for _ in 0..n {
                 let k = unpacker.read_string()?;
                 let v = unpack_value(unpacker)?;
@@ -1162,7 +1194,7 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
     if is_list_marker(marker) {
         let n = unpacker.read_list_header()?;
         unpacker.enter_nested()?;
-        let mut items = Vec::with_capacity(prealloc_cap(n));
+        let mut items = Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
         for _ in 0..n {
             items.push(unpack_bolt_value(unpacker)?);
         }
@@ -1177,7 +1209,7 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
 fn unpack_properties(unpacker: &mut Unpacker<'_>) -> BoltResult<Vec<(String, Value)>> {
     let n = unpacker.read_map_header()?;
     unpacker.enter_nested()?;
-    let mut props: Vec<(String, Value)> = Vec::with_capacity(prealloc_cap(n));
+    let mut props: Vec<(String, Value)> = Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
     for _ in 0..n {
         let k = unpacker.read_string()?;
         let v = unpack_value(unpacker)?;
@@ -1194,10 +1226,10 @@ fn unpack_node(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltNode> {
     expect_fields(t, field_count, 4)?;
     let id = unpacker.read_int()?;
     let label_count = unpacker.read_list_header()?;
-    // Pre-allocation is capped (a node carries very few labels in practice, so 64 is a deliberately
-    // tighter bound than [`MAX_PREALLOC`]); the `Vec` still grows if a node legitimately has more.
-    // The wire `label_count` is NEVER trusted to size the allocation — see [`prealloc_cap`].
-    let mut labels = Vec::with_capacity(label_count.min(64));
+    // The wire `label_count` is NEVER trusted to size the allocation: clamp via `prealloc_cap`
+    // (≤ MAX_PREALLOC, and ≤ the bytes still present) and let the `Vec` grow if a node legitimately
+    // carries more labels than the small initial reservation. A node has very few labels in practice.
+    let mut labels = Vec::with_capacity(prealloc_cap(label_count, unpacker.remaining()));
     for _ in 0..label_count {
         labels.push(unpacker.read_string()?);
     }
@@ -1254,17 +1286,17 @@ fn unpack_path(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltPath> {
     let (t, field_count) = unpacker.read_struct_header()?;
     expect_fields(t, field_count, 3)?;
     let node_count = unpacker.read_list_header()?;
-    let mut nodes = Vec::with_capacity(prealloc_cap(node_count));
+    let mut nodes = Vec::with_capacity(prealloc_cap(node_count, unpacker.remaining()));
     for _ in 0..node_count {
         nodes.push(unpack_node(unpacker)?);
     }
     let rel_count = unpacker.read_list_header()?;
-    let mut rels = Vec::with_capacity(prealloc_cap(rel_count));
+    let mut rels = Vec::with_capacity(prealloc_cap(rel_count, unpacker.remaining()));
     for _ in 0..rel_count {
         rels.push(unpack_unbound_relationship(unpacker)?);
     }
     let idx_count = unpacker.read_list_header()?;
-    let mut indices = Vec::with_capacity(prealloc_cap(idx_count));
+    let mut indices = Vec::with_capacity(prealloc_cap(idx_count, unpacker.remaining()));
     for _ in 0..idx_count {
         indices.push(unpacker.read_int()?);
     }
