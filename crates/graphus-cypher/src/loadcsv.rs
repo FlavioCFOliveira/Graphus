@@ -57,6 +57,7 @@ use std::sync::OnceLock;
 
 use graphus_core::Value;
 
+use crate::eval::EvalError;
 use crate::executor::ExecError;
 use crate::runtime::RowValue;
 
@@ -286,8 +287,23 @@ impl LoadCsvState {
                 }
                 Value::Map(map)
             }
-            // No headers: a List of the record's string fields.
-            None => Value::List(record.iter().map(|s| Value::String(s.to_owned())).collect()),
+            // No headers: a List of the record's string fields. Bound the field count against the
+            // per-value budget before collecting one `Value::String` per field (`SEC-191`, CWE-770 /
+            // CWE-789): a hostile single wide record (millions of fields on one line, under the import
+            // policy) would otherwise materialise one `Value` slot per field with no budget. O(1) check,
+            // mirroring `split`/`keys`.
+            None => {
+                let limit = crate::value_size::max_list_elements();
+                if record.len() > limit {
+                    return Err(ExecError::Eval(EvalError::ResourceLimit {
+                        detail: format!(
+                            "LOAD CSV record has {} fields (limit {limit} per value)",
+                            record.len()
+                        ),
+                    }));
+                }
+                Value::List(record.iter().map(|s| Value::String(s.to_owned())).collect())
+            }
         };
         Ok(Some(RowValue::Value(value)))
     }

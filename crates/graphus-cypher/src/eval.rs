@@ -261,9 +261,19 @@ pub fn eval(
         }),
 
         ExprKind::List(items) => {
-            let mut out = Vec::with_capacity(items.len());
+            // Bound the materialised list against the per-value budget as it is built (`SEC-191`,
+            // CWE-770 / CWE-789), exactly like a list comprehension. Cap the pre-allocation at the
+            // budget's element ceiling so a huge list literal in the (≤ 64 MiB) query text cannot force
+            // a multi-GB `Vec::with_capacity` *before* the per-element budget check even runs.
+            let cap = items
+                .len()
+                .min(crate::value_size::max_list_elements().saturating_add(1));
+            let mut out = Vec::with_capacity(cap);
+            let mut out_bytes: usize = 0;
             for it in items {
-                out.push(eval(it, row, params, graph, functions, clock)?);
+                let elem = eval(it, row, params, graph, functions, clock)?;
+                accumulate_list_bytes(&mut out_bytes, &elem, "list literal")?;
+                out.push(elem);
             }
             // Canonical list construction: stays structural iff any element is (node/rel/path).
             Ok(RowValue::list(out))
@@ -1454,14 +1464,19 @@ fn call_function(
         }
         "keys" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
-            return Ok(match v {
+            return match v {
                 RowValue::Node(NodeRef { id }) => keys_list(graph.node_properties(id)),
                 RowValue::Rel(RelRef { id }) => keys_list(graph.rel_properties(id)),
-                RowValue::Value(Value::Map(entries)) => RowValue::Value(Value::List(
-                    entries.into_iter().map(|(k, _)| Value::String(k)).collect(),
-                )),
-                _ => RowValue::NULL,
-            });
+                // `keys($map)` materialises one `Value::String` per key — bound the key list against the
+                // per-value budget (a wide map parameter is the amplifier) before collecting (`SEC-191`).
+                RowValue::Value(Value::Map(entries)) => {
+                    check_list_len_budget(entries.len(), "keys()")?;
+                    Ok(RowValue::Value(Value::List(
+                        entries.into_iter().map(|(k, _)| Value::String(k)).collect(),
+                    )))
+                }
+                _ => Ok(RowValue::NULL),
+            };
         }
         "startnode" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
@@ -1692,8 +1707,8 @@ fn call_function(
             Value::Null => Value::Null,
             _ => return Err(num_type_error("sign")),
         },
-        "toupper" => string_unary(arg(&argv, 0, "toUpper")?, |s| s.to_uppercase(), "toUpper")?,
-        "tolower" => string_unary(arg(&argv, 0, "toLower")?, |s| s.to_lowercase(), "toLower")?,
+        "toupper" => string_case(arg(&argv, 0, "toUpper")?, true, "toUpper")?,
+        "tolower" => string_case(arg(&argv, 0, "toLower")?, false, "toLower")?,
         "trim" => string_unary(arg(&argv, 0, "trim")?, |s| s.trim().to_owned(), "trim")?,
         "ltrim" => string_unary(
             arg(&argv, 0, "ltrim")?,
@@ -1745,12 +1760,17 @@ fn map_from_props(props: Option<Vec<(String, Value)>>) -> RowValue {
     }
 }
 
-fn keys_list(props: Option<Vec<(String, Value)>>) -> RowValue {
+fn keys_list(props: Option<Vec<(String, Value)>>) -> Result<RowValue, EvalError> {
     match props {
-        Some(p) => RowValue::Value(Value::List(
-            p.into_iter().map(|(k, _)| Value::String(k)).collect(),
-        )),
-        None => RowValue::NULL,
+        Some(p) => {
+            // A node/relationship can carry an adversarially large (write-amplified) property set;
+            // bound the key list against the per-value budget before collecting (`SEC-191`).
+            check_list_len_budget(p.len(), "keys()")?;
+            Ok(RowValue::Value(Value::List(
+                p.into_iter().map(|(k, _)| Value::String(k)).collect(),
+            )))
+        }
+        None => Ok(RowValue::NULL),
     }
 }
 
@@ -1993,6 +2013,43 @@ fn string_unary(v: &Value, f: impl Fn(&str) -> String, fname: &str) -> Result<Va
     }
 }
 
+/// `toUpper`/`toLower` with a per-value budget guard (`SEC-191`, CWE-770 / CWE-789). Unlike
+/// trim/ltrim/rtrim (which can only shrink), Unicode case mapping can **expand** the byte length —
+/// e.g. `U+0390` (2 B) uppercases to three code points (6 B). An attacker can therefore amplify a
+/// near-budget string past the budget. We compute the mapped output byte length **exactly** by walking
+/// the case-mapping iterator (no allocation of the result), reject with [`EvalError::ResourceLimit`] if
+/// it would exceed the budget, and only then build the `String`. The exact walk (rather than a
+/// conservative `×3` factor) is future-proof against Unicode case-mapping changes and never
+/// false-rejects a non-expanding input.
+fn string_case(v: &Value, upper: bool, fname: &str) -> Result<Value, EvalError> {
+    match v {
+        Value::String(s) => {
+            let out_len: usize = if upper {
+                s.chars().flat_map(char::to_uppercase).map(char::len_utf8).sum()
+            } else {
+                s.chars().flat_map(char::to_lowercase).map(char::len_utf8).sum()
+            };
+            let limit = crate::value_size::max_value_bytes();
+            if out_len > limit {
+                return Err(EvalError::ResourceLimit {
+                    detail: format!(
+                        "{fname}() would produce a {out_len}-byte string (limit {limit} bytes per value)"
+                    ),
+                });
+            }
+            Ok(Value::String(if upper {
+                s.to_uppercase()
+            } else {
+                s.to_lowercase()
+            }))
+        }
+        Value::Null => Ok(Value::Null),
+        _ => Err(EvalError::TypeError {
+            context: format!("{fname}() requires a string"),
+        }),
+    }
+}
+
 /// `range(start, end[, step])` — an inclusive integer range (openCypher).
 ///
 /// The byte budget a single materialised `range()` list may occupy (`SEC-191`, CWE-770/789). The
@@ -2164,6 +2221,20 @@ fn replace_result_len_bound(s: &str, search: &str, rep: &str) -> usize {
 fn split_fn(argv: &[Value]) -> Result<Value, EvalError> {
     match (arg(argv, 0, "split")?, arg(argv, 1, "split")?) {
         (Value::String(s), Value::String(delim)) => {
+            // `split` is a list-producing builder: it materialises one `Value::String` per part, so a
+            // char-wise split (empty delimiter) or a dense single-byte delimiter amplifies a bounded
+            // input string into one `Value` slot per character — bypassing the per-value budget unless
+            // guarded (`SEC-191`, CWE-770 / CWE-789; the exact gap #481's neighbour `replace` already
+            // closes). Count the parts EXACTLY (one cheap O(|s|) pass, no allocation) and reject before
+            // `.collect()` if the result list would exceed the budget. The exact count (not a loose
+            // `|s|/|delim|` upper bound) avoids falsely rejecting a split whose delimiter is sparse or
+            // absent — that legitimately yields few parts.
+            let part_count = if delim.is_empty() {
+                s.chars().count()
+            } else {
+                s.matches(delim.as_str()).count() + 1
+            };
+            check_list_len_budget(part_count, "split()")?;
             let parts: Vec<Value> = if delim.is_empty() {
                 s.chars().map(|c| Value::String(c.to_string())).collect()
             } else {
@@ -2263,6 +2334,27 @@ fn accumulate_list_bytes(bytes: &mut usize, elem: &RowValue, what: &str) -> Resu
     if *bytes > limit {
         return Err(EvalError::ResourceLimit {
             detail: format!("{what} exceeds the {limit}-byte value limit"),
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a list-producing builtin whose element **count** alone would exceed the per-value budget
+/// (`SEC-191`, CWE-770 / CWE-789) — the `O(1)` guard the one-shot `.collect()` builders (`split`,
+/// `keys`, `LOAD CSV` records) apply *before* allocating. The backing `Vec<Value>` owns `count` slots
+/// of `size_of::<Value>()` bytes each, so a build of more than
+/// [`max_list_elements`](crate::value_size::max_list_elements) elements exceeds the budget regardless
+/// of element content. This mirrors `range()`'s element ceiling and `replace`'s pre-allocation bound:
+/// the budget the streaming builders enforce per element is enforced here on the known final count, so
+/// an amplifying builtin can no longer turn a bounded input into an unbounded materialised value.
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] when `count` exceeds the per-value element ceiling.
+fn check_list_len_budget(count: usize, what: &str) -> Result<(), EvalError> {
+    let limit = crate::value_size::max_list_elements();
+    if count > limit {
+        return Err(EvalError::ResourceLimit {
+            detail: format!("{what} would produce {count} elements (limit {limit} per value)"),
         });
     }
     Ok(())
