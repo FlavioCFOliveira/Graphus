@@ -366,6 +366,29 @@ pub struct TimingConfig {
     /// raise or disable it. GDS procedures carry their own independent (inner) deadline, so this acts as
     /// an outer bound on the non-GDS portion of a statement.
     pub statement_timeout_ms: u64,
+    /// Maximum wall-clock **lifetime** an open transaction may reach (now − begin) before the engine's
+    /// background sweep aborts it with a clean, retriable rollback (`rmp` #477). Where
+    /// [`transaction_idle_timeout_ms`](Self::transaction_idle_timeout_ms) bounds *inactivity* (refreshed
+    /// on every operation) and [`statement_timeout_ms`](Self::statement_timeout_ms) bounds a *single
+    /// statement*, this bounds the transaction's *total age* — the one window a client can hold open
+    /// indefinitely by periodically touching a read transaction so the inactivity sweep never fires (or
+    /// simply by leaving a single long-lived `BEGIN` open). Such a holder pins the MVCC GC low-water
+    /// mark forever, so dead versions can never be reclaimed and the store and RAM grow without bound
+    /// with other transactions' write rate — the classic "idle-in-transaction blocks vacuum"
+    /// denial of service (CWE-400). Reaping the over-age holder frees the watermark so reclamation
+    /// resumes. Applies on **both** Bolt and REST (it lives in the per-database engine, not a protocol
+    /// layer). Measured on the **monotonic** clock (`rmp` #395), so an NTP step cannot expire a fresh
+    /// transaction or perpetually reprieve a stale one.
+    ///
+    /// Deliberately **generous** so it never aborts a legitimate long-running transaction: at 1 hour it
+    /// comfortably accommodates a long analytical session or a multi-statement bulk load (far beyond the
+    /// 2-minute single-statement budget and 1-minute idle window), yet finite so an abandoned or
+    /// deliberately-held transaction is reclaimed in bounded time. In milliseconds; `0` **disables** the
+    /// cap (opt-out, unbounded lifetime — matching the prior behaviour). The auto-commit statements that
+    /// back a simple `RUN` are transient single-statement units already bounded by
+    /// [`statement_timeout_ms`](Self::statement_timeout_ms); this cap targets explicit
+    /// `BEGIN … COMMIT` transactions, which are the only ones a client can hold open across statements.
+    pub max_transaction_age_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -387,6 +410,12 @@ impl Default for TimingConfig {
             // beyond any interactive/OLTP query), yet finite so a cartesian / variable-length bomb is
             // reclaimed instead of pinning the engine thread forever. `0` disables it.
             statement_timeout_ms: 120_000,
+            // 1 hour (rmp #477): bounded-by-default per-transaction lifetime. Generous enough never to
+            // abort a legitimate long analytical session or multi-statement bulk load (far beyond the
+            // 2-minute single-statement budget and the 1-minute idle window), yet finite so an
+            // idle-in-transaction holder pinning the GC watermark — the classic "idle-in-transaction
+            // blocks vacuum" DoS — is reclaimed in bounded time. `0` disables it.
+            max_transaction_age_ms: 60 * 60 * 1000,
         }
     }
 }
@@ -441,6 +470,19 @@ impl TimingConfig {
             None
         } else {
             Some(Duration::from_millis(self.statement_timeout_ms))
+        }
+    }
+
+    /// The maximum transaction-age (total-lifetime) cap as a [`Duration`], or `None` when disabled
+    /// (`max_transaction_age_ms == 0`) — `rmp` #477. Drives the engine's background sweep that aborts a
+    /// transaction whose lifetime exceeds the cap, freeing the GC watermark it would otherwise pin
+    /// (the idle-in-transaction DoS).
+    #[must_use]
+    pub fn max_transaction_age(&self) -> Option<Duration> {
+        if self.max_transaction_age_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.max_transaction_age_ms))
         }
     }
 
@@ -866,6 +908,13 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_MAX_TRANSACTION_AGE_MS") {
+            self.timing.max_transaction_age_ms = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_MAX_TRANSACTION_AGE_MS is not an integer: {v:?}"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -1135,6 +1184,26 @@ mod tests {
             .statement_timeout(),
             None,
             "0 ⇒ disabled (opt-out, unbounded)"
+        );
+
+        // The max transaction-age cap (rmp #477) is bounded-by-default (1 hour) and `0` disables it.
+        assert_eq!(
+            t.max_transaction_age_ms, 3_600_000,
+            "max transaction age is finite (1 hour) by default"
+        );
+        assert_eq!(
+            t.max_transaction_age(),
+            Some(Duration::from_millis(3_600_000)),
+            "max transaction age is finite (bounded) by default"
+        );
+        assert_eq!(
+            TimingConfig {
+                max_transaction_age_ms: 0,
+                ..TimingConfig::default()
+            }
+            .max_transaction_age(),
+            None,
+            "0 ⇒ disabled (opt-out, unbounded lifetime)"
         );
 
         // A zero connection cap is rejected.

@@ -378,14 +378,21 @@ impl AccessMode {
 /// State the engine task keeps for one open transaction.
 ///
 /// Whether a transaction is auto-commit is carried per-statement on the [`EngineCommand::Run`]
-/// (and the seam opens the implicit transaction via [`EngineCommand::BeginAutoCommit`]), so it is not
-/// stored here — the engine commits/rolls-back an auto-commit transaction in the `Run` handler when
-/// its stream drains (see [`exec`]).
+/// (and the seam opens the implicit transaction via [`EngineCommand::BeginAutoCommit`]); the engine
+/// commits/rolls-back an auto-commit transaction in the `Run` handler when its stream drains (see
+/// [`exec`]). We **also** record it here so the maximum-transaction-age sweep ([`maybe_reap_aged`],
+/// `rmp` #477) can tell an explicit `BEGIN … COMMIT` transaction (which a client can hold open across
+/// statements — the idle-in-transaction DoS surface) from a transient auto-commit statement (already
+/// bounded by the per-statement timeout, and possibly mid-flight on an off-thread reader the sweep must
+/// not race).
 struct OpenTx {
     /// The coordinator's transaction id.
     txn: TxnId,
     /// The access mode (so a write statement in a `Read` transaction is rejected — `06 §4`).
     mode: AccessMode,
+    /// Whether this transaction backs a single auto-commit statement (`true`) or is an explicit
+    /// `BEGIN … COMMIT` transaction (`false`). The age sweep reaps only the latter (`rmp` #477).
+    auto_commit: bool,
 }
 
 /// Runs the engine event loop until a [`EngineCommand::Shutdown`] (or the command channel closes).
@@ -408,6 +415,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     maintenance_degraded: MaintenanceDegraded,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
+    max_transaction_age: Option<std::time::Duration>,
 ) {
     // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
     // additively so the gauge sums across every database engine. Also folds the same delta into THIS
@@ -486,6 +494,26 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &metrics,
             &db_name,
             &degraded,
+            &mut active_txns,
+        );
+
+        // Maximum-transaction-age sweep (`rmp` #477): reap any **explicit** transaction whose lifetime
+        // has exceeded the configured cap, measured on the **monotonic** clock (`rmp` #395, so an NTP
+        // step cannot mis-fire). Runs each engine tick — every command and every timed wake — which is
+        // exactly when the denial of service it guards against can manifest: a long-running reader pins
+        // the MVCC GC low-water mark, but dead versions only *accumulate* (so the pin only *costs*) under
+        // other transactions' write traffic, and that traffic is what wakes this loop. Disabled (`None`)
+        // ⇒ a cheap no-op. Skips the one statement executing inline and excludes auto-commit statements
+        // (transient, bounded by the per-statement timeout, possibly mid-flight on an off-thread reader),
+        // so a reap never races a live read.
+        maybe_reap_aged(
+            &mut coordinator,
+            &mut open,
+            inflight.as_ref(),
+            max_transaction_age,
+            &clock,
+            &metrics,
+            &db_name,
             &mut active_txns,
         );
 
@@ -823,6 +851,87 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     *wal_at_last_maintenance = coord.wal_durable_len();
 }
 
+/// The **maximum-transaction-age sweep** (`rmp` #477): aborts any open **explicit** transaction whose
+/// lifetime (now − begin, on the **monotonic** clock per `rmp` #395) has reached
+/// `max_transaction_age`, freeing the MVCC GC low-water mark it would otherwise pin indefinitely.
+///
+/// This is the engine-level half of the guard whose detection lives in
+/// [`TxnCoordinator::aged_transactions`]: a long-running reader — a single sustained `BEGIN`, or one a
+/// client keeps *active* by periodically touching it so the inactivity sweep never fires — holds
+/// [`TxnCoordinator::oldest_active_snapshot`] back forever, so dead versions can never be reclaimed and
+/// the store and RAM grow without bound (the classic "idle-in-transaction blocks vacuum" denial of
+/// service, CWE-400). Reaping the over-age holder with a clean [`TxnCoordinator::rollback`] removes it
+/// from the active set, so the watermark advances and the next maintenance pass reclaims what it had
+/// pinned. The abort is a clean rollback (no partial commit); the client sees a retriable
+/// [`GraphusError::Transaction`] on its next use of the now-closed transaction.
+///
+/// ## Exclusions (so a reap never races a live read)
+///
+/// - **Disabled** (`max_transaction_age == None`): a cheap no-op.
+/// - **Auto-commit statements** are excluded: they are transient single-statement units already bounded
+///   by the per-statement timeout (`rmp` #476), and a read-only auto-commit may be **mid-flight on an
+///   off-thread reader** (`rmp` #336) whose retirement still merges its SIREAD buffer back — reaping it
+///   would resurrect a forgotten reader in the conflict graph. The age cap targets *explicit*
+///   `BEGIN … COMMIT` transactions, which are the only ones a client can hold open across statements.
+/// - **The one statement executing inline** (`inflight`) is skipped: reaping it would pull the per-
+///   statement seam out from under a live cursor. It is reaped on a later tick once idle (and is itself
+///   bounded by the per-statement timeout meanwhile).
+#[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
+fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    inflight: Option<&exec::InFlightInline>,
+    max_transaction_age: Option<std::time::Duration>,
+    clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    metrics: &Metrics,
+    db: &str,
+    active_txns: &mut ActiveTxnGauge,
+) {
+    let Some(max_age) = max_transaction_age else {
+        return; // cap disabled — opt-out, unbounded lifetime
+    };
+    let Some(coord) = coordinator.as_mut() else {
+        return; // coordinator already consumed by Shutdown
+    };
+    let max_age_nanos = u64::try_from(max_age.as_nanos()).unwrap_or(u64::MAX);
+    let aged = coord.aged_transactions(clock.now_nanos(), max_age_nanos);
+    if aged.is_empty() {
+        return; // the common case: nothing over-age
+    }
+    // The single inline statement currently executing (if any) must not be reaped mid-statement.
+    let busy_inline = inflight.map(exec::InFlightInline::txn);
+    let mut reaped = 0u64;
+    for txn in aged {
+        if Some(txn) == busy_inline {
+            continue; // executing inline now — reap on a later (idle) tick
+        }
+        // Reverse-map txn -> ticket and read its auto-commit flag in one immutable borrow, so the
+        // subsequent `open.remove` mutable borrow is unobstructed. Reap only explicit transactions.
+        let Some((ticket, auto_commit)) = open
+            .iter()
+            .find(|(_, t)| t.txn == txn)
+            .map(|(ticket, t)| (*ticket, t.auto_commit))
+        else {
+            continue; // not engine-tracked (an internal maintenance txn) — leave it to its owner
+        };
+        if auto_commit {
+            continue; // transient single-statement unit — never the idle-holder threat
+        }
+        open.remove(&ticket);
+        // A clean rollback: discards the transaction's writes/locks/SSI footprint atomically and removes
+        // it from the active set so `oldest_active_snapshot` advances. Idempotent-safe: `rollback` only
+        // errs for an already-inactive txn, which cannot happen here (we just observed it active).
+        if coord.rollback(txn).is_ok() {
+            metrics.record_abort_for(db);
+            reaped += 1;
+        }
+    }
+    if reaped > 0 {
+        // The active set shrank — refresh the open-transaction gauge so observability reflects the reap.
+        active_txns.publish(coord.active_count());
+    }
+}
+
 /// Accounts one **failed** background maintenance checkpoint and escalates a persistent run of them
 /// (`rmp` #394). Records the failure metric, bumps the consecutive-failure streak, and — once the
 /// streak reaches [`MAINTENANCE_FAILURE_ESCALATION_THRESHOLD`] — flips the reclamation-degraded gauge
@@ -1042,12 +1151,12 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
     match cmd {
         Cmd::Begin { mode, reply } => {
-            let ticket = open_tx(coord, open, next_ticket, mode);
+            let ticket = open_tx(coord, open, next_ticket, mode, false, clock.now_nanos());
             active_txns.publish(coord.active_count());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::BeginAutoCommit { mode, reply } => {
-            let ticket = open_tx(coord, open, next_ticket, mode);
+            let ticket = open_tx(coord, open, next_ticket, mode, true, clock.now_nanos());
             active_txns.publish(coord.active_count());
             let _ = reply.send(Ok(ticket));
         }
@@ -1735,16 +1844,30 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
 }
 
 /// Opens a transaction in the coordinator, tracks it, and returns its freshly-minted ticket.
+///
+/// `begin_nanos` is the **monotonic**-clock reading at open (`rmp` #395/#477): the coordinator stamps
+/// the active entry with it so the engine's age sweep can reap a transaction whose lifetime exceeds the
+/// configured cap. `auto_commit` records whether this transaction backs a single auto-commit statement
+/// (excluded from the age sweep) or an explicit `BEGIN … COMMIT` (the sweep's target).
 fn open_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
     next_ticket: &mut u64,
     mode: AccessMode,
+    auto_commit: bool,
+    begin_nanos: u64,
 ) -> TxTicket {
-    let txn = coordinator.begin(mode.isolation());
+    let txn = coordinator.begin_at(mode.isolation(), begin_nanos);
     *next_ticket += 1;
     let ticket = *next_ticket;
-    open.insert(ticket, OpenTx { txn, mode });
+    open.insert(
+        ticket,
+        OpenTx {
+            txn,
+            mode,
+            auto_commit,
+        },
+    );
     TxTicket(ticket)
 }
 
@@ -1888,18 +2011,24 @@ where
         metrics,
         clock,
         None,
+        None,
     )
 }
 
-/// [`spawn_engine`] with an explicit per-statement execution **timeout** (`rmp` #476): a finite
-/// `statement_timeout` installs a per-statement wall-clock deadline on the Cypher executor's
+/// [`spawn_engine`] with an explicit per-statement execution **timeout** (`rmp` #476) and
+/// maximum-transaction-age cap (`rmp` #477).
+///
+/// A finite `statement_timeout` installs a per-statement wall-clock deadline on the Cypher executor's
 /// cancellation token, so a runaway query (a cartesian / variable-length-expansion bomb) is
-/// cooperatively aborted instead of pinning the engine thread and starving co-tenants. `None` disables
-/// it (identical to [`spawn_engine`]).
+/// cooperatively aborted instead of pinning the engine thread and starving co-tenants. A finite
+/// `max_transaction_age` installs a background sweep that aborts any explicit transaction whose
+/// lifetime exceeds it, freeing the MVCC GC watermark a long-running reader would otherwise pin
+/// indefinitely (the idle-in-transaction DoS). Either `None` disables the respective guard (identical
+/// to [`spawn_engine`]).
 ///
 /// # Errors
 /// As [`spawn_engine`].
-#[allow(clippy::too_many_arguments)] // engine sizing + clock + per-statement budget — all positional knobs
+#[allow(clippy::too_many_arguments)] // engine sizing + clock + per-statement/per-transaction budgets — all positional knobs
 pub fn spawn_engine_with_timeout<D, S, B>(
     db_name: Arc<str>,
     build: B,
@@ -1909,6 +2038,7 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
+    max_transaction_age: Option<std::time::Duration>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -1954,6 +2084,7 @@ where
                     loop_maintenance_degraded,
                     clock,
                     statement_timeout,
+                    max_transaction_age,
                 );
             }
             Err(e) => {
@@ -2080,6 +2211,153 @@ mod maintenance_tests {
         assert!(
             engine_a.is_degraded(),
             "engine B's checkpoint success must NOT false-clear engine A's stuck flag (the #435 bug)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod max_transaction_age_tests {
+    //! `rmp` #477: the engine-level half of the maximum-transaction-age guard. [`maybe_reap_aged`]
+    //! reaps an over-age **explicit** transaction (freeing the GC watermark), while excluding
+    //! auto-commit statements and under-age transactions, and is a no-op when the cap is disabled.
+    //!
+    //! The clock is a fixed [`graphus_sim::SimClock`] and each transaction's begin reading is supplied
+    //! explicitly to [`open_tx`], so ages — and therefore the reap decision — are fully deterministic.
+
+    use super::*;
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::RecordStore;
+    use graphus_wal::{MemLogSink, WalManager};
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("store");
+        TxnCoordinator::new(store)
+    }
+
+    fn clock_at(now_nanos: u64) -> Arc<dyn graphus_core::capability::Clock + Send + Sync> {
+        Arc::new(graphus_sim::SimClock::new(now_nanos))
+    }
+
+    /// THE GATE. With a 60s cap and the clock at 61s: an over-age **explicit** transaction is reaped
+    /// (removed from `open`, rolled back, dropping the active count and releasing the watermark), an
+    /// over-age **auto-commit** transaction is left alone (transient / possibly mid-flight), and a
+    /// **young** explicit transaction is untouched.
+    #[test]
+    fn reaps_over_age_explicit_txn_only() {
+        let mut coord = fresh_coord();
+        let mut open: HashMap<u64, OpenTx> = HashMap::new();
+        let mut next_ticket: u64 = 0;
+        let cap = std::time::Duration::from_secs(60);
+        let now = 61 * 1_000_000_000u64; // 61s in nanos — past the cap
+        let clock = clock_at(now);
+        let metrics = Arc::new(Metrics::new());
+        let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
+
+        // Over-age explicit reader (begin at t=0 ⇒ age 61s ≥ cap).
+        let aged_explicit = open_tx(
+            &mut coord,
+            &mut open,
+            &mut next_ticket,
+            AccessMode::Read,
+            false,
+            0,
+        );
+        // Over-age auto-commit statement (same age, but excluded from the sweep).
+        let aged_auto = open_tx(
+            &mut coord,
+            &mut open,
+            &mut next_ticket,
+            AccessMode::Read,
+            true,
+            0,
+        );
+        // Young explicit reader (begin just now ⇒ age 1ns ≪ cap).
+        let young_explicit = open_tx(
+            &mut coord,
+            &mut open,
+            &mut next_ticket,
+            AccessMode::Read,
+            false,
+            now - 1,
+        );
+        assert_eq!(coord.active_count(), 3);
+
+        let mut coordinator = Some(coord);
+        maybe_reap_aged(
+            &mut coordinator,
+            &mut open,
+            None, // nothing executing inline
+            Some(cap),
+            &clock,
+            &metrics,
+            "test",
+            &mut gauge,
+        );
+        let coord = coordinator
+            .as_ref()
+            .expect("coordinator survives the sweep");
+
+        // Only the over-age explicit transaction was reaped (the `open` map is keyed by ticket).
+        assert_eq!(coord.active_count(), 2, "exactly one transaction reaped");
+        assert!(
+            !open.contains_key(&aged_explicit.0),
+            "the over-age explicit transaction must be removed from the open map"
+        );
+        assert!(
+            open.contains_key(&aged_auto.0),
+            "the over-age auto-commit statement must be left alone (transient / possibly mid-flight)"
+        );
+        assert!(
+            open.contains_key(&young_explicit.0),
+            "the young explicit transaction (under the cap) must be untouched"
+        );
+    }
+
+    /// A disabled cap (`None`) is a no-op: even a transaction far past any sane cap stays open.
+    #[test]
+    fn disabled_cap_reaps_nothing() {
+        let mut coord = fresh_coord();
+        let mut open: HashMap<u64, OpenTx> = HashMap::new();
+        let mut next_ticket: u64 = 0;
+        let clock = clock_at(u64::MAX); // arbitrarily far in the future
+        let metrics = Arc::new(Metrics::new());
+        let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
+
+        let _ = open_tx(
+            &mut coord,
+            &mut open,
+            &mut next_ticket,
+            AccessMode::Read,
+            false,
+            0,
+        );
+        assert_eq!(coord.active_count(), 1);
+
+        let mut coordinator = Some(coord);
+        maybe_reap_aged(
+            &mut coordinator,
+            &mut open,
+            None,
+            None, // cap disabled
+            &clock,
+            &metrics,
+            "test",
+            &mut gauge,
+        );
+        assert_eq!(
+            coordinator.as_ref().unwrap().active_count(),
+            1,
+            "a disabled cap must never reap"
+        );
+        assert_eq!(
+            open.len(),
+            1,
+            "the open map is untouched when the cap is disabled"
         );
     }
 }

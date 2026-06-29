@@ -116,6 +116,13 @@ pub struct ConstraintInfo {
 struct ActiveTxn {
     snapshot: Snapshot,
     isolation: IsolationLevel,
+    /// The **monotonic**-clock reading (nanoseconds, `rmp` #395) captured at begin, or `None` when the
+    /// transaction was opened through the clock-agnostic [`TxnCoordinator::begin`] (the TCK / unit
+    /// tests — never age-reaped). The server's open path uses [`TxnCoordinator::begin_at`] to stamp it,
+    /// so the maximum-transaction-age sweep ([`TxnCoordinator::aged_transactions`], `rmp` #477) can
+    /// reap a transaction whose lifetime exceeds the configured cap — freeing the GC watermark
+    /// ([`TxnCoordinator::oldest_active_snapshot`]) it would otherwise pin indefinitely.
+    begin_nanos: Option<u64>,
 }
 
 /// One in-progress **non-blocking** node-property index build (`rmp` task #91).
@@ -889,6 +896,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// it sees exactly what has committed so far; it is registered with the SSI tracker so its
     /// conflicts are tracked from this begin timestamp.
     pub fn begin(&mut self, isolation: IsolationLevel) -> TxnId {
+        self.begin_inner(isolation, None)
+    }
+
+    /// Begins a transaction at `isolation`, stamping it with the **monotonic**-clock reading
+    /// `begin_nanos` (nanoseconds, `rmp` #395) so the maximum-transaction-age sweep
+    /// ([`aged_transactions`](Self::aged_transactions), `rmp` #477) can reap it once its lifetime
+    /// exceeds the configured cap.
+    ///
+    /// The server's open path uses this; pass a reading from the **same** monotonic clock later handed
+    /// to [`aged_transactions`](Self::aged_transactions), so an NTP step on the wall clock can neither
+    /// expire a fresh transaction nor perpetually reprieve a stale one. Otherwise identical to
+    /// [`begin`](Self::begin) (which leaves the transaction age-untracked, hence never reaped — the TCK
+    /// / unit-test path).
+    pub fn begin_at(&mut self, isolation: IsolationLevel, begin_nanos: u64) -> TxnId {
+        self.begin_inner(isolation, Some(begin_nanos))
+    }
+
+    /// Shared body of [`begin`](Self::begin) / [`begin_at`](Self::begin_at): mints the id, snapshots
+    /// the store's latest commit, registers SSI tracking, and inserts the active entry with its
+    /// (optional) monotonic begin reading.
+    fn begin_inner(&mut self, isolation: IsolationLevel, begin_nanos: Option<u64>) -> TxnId {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         let begin_ts = self.store.borrow().snapshot_ts();
@@ -902,6 +930,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     ts: begin_ts,
                 },
                 isolation,
+                begin_nanos,
             },
         );
         txn
@@ -2676,6 +2705,56 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.active.values().map(|a| a.snapshot.ts).min()
     }
 
+    /// The [`TxnId`]s of open transactions whose lifetime (`now_nanos − begin`) is **at least**
+    /// `max_age_nanos`, where `now_nanos` and each transaction's begin reading both come from the
+    /// engine's **monotonic** clock (`rmp` #395). The result is sorted by id (deterministic). This is
+    /// the detection half of the **maximum-transaction-age** guard (`rmp` #477).
+    ///
+    /// Only transactions opened through [`begin_at`](Self::begin_at) (the server's open path) are
+    /// age-tracked; one opened through the clock-agnostic [`begin`](Self::begin) (the TCK / unit tests)
+    /// is never reported. `max_age_nanos == 0` **disables** the cap and returns empty.
+    ///
+    /// ## Why this exists
+    ///
+    /// A long-running reader — a single sustained `BEGIN`, or one a client keeps *active* by
+    /// periodically touching it so the inactivity sweep never fires — pins
+    /// [`oldest_active_snapshot`](Self::oldest_active_snapshot), the GC low-water mark, indefinitely. No
+    /// dead version committed after its snapshot can then be reclaimed, so the store and RAM grow
+    /// without bound with other transactions' write rate (the classic "idle-in-transaction blocks
+    /// vacuum" denial of service). The age cap bounds a transaction's *total lifetime*, complementing
+    /// the inactivity timeout (which a periodically-touched holder evades).
+    ///
+    /// The cap is **wall-clock-driven**, hence non-deterministic, so the detection is kept here (pure,
+    /// clock-agnostic — the caller supplies `now_nanos`) while only the production engine drives it; the
+    /// deterministic `LocalEngine` / DST path never calls it, preserving replay determinism.
+    ///
+    /// ## Contract for the caller (the engine)
+    ///
+    /// Aborting a reported transaction is the caller's job and **must** be a clean
+    /// [`rollback`](Self::rollback): that removes it from the active set so
+    /// [`oldest_active_snapshot`](Self::oldest_active_snapshot) advances and a subsequent
+    /// [`gc`](Self::gc) reclaims what it had pinned, while its SSI / lock / store state is discarded
+    /// atomically (no partial commit). Its next use then surfaces a clean retriable
+    /// [`GraphusError::Transaction`]. The engine additionally excludes auto-commit statements (transient
+    /// single-statement units, bounded by the per-statement timeout) and the one statement currently
+    /// executing inline, so a reap never races a live read.
+    #[must_use]
+    pub fn aged_transactions(&self, now_nanos: u64, max_age_nanos: u64) -> Vec<TxnId> {
+        if max_age_nanos == 0 {
+            return Vec::new();
+        }
+        let mut aged: Vec<TxnId> = self
+            .active
+            .iter()
+            .filter_map(|(id, a)| {
+                let begin = a.begin_nanos?;
+                (now_nanos.saturating_sub(begin) >= max_age_nanos).then_some(*id)
+            })
+            .collect();
+        aged.sort_unstable();
+        aged
+    }
+
     /// The safe GC watermark **right now**: the oldest open reader's snapshot
     /// ([`oldest_active_snapshot`](Self::oldest_active_snapshot)), or — when no transaction is open —
     /// the store's current snapshot high-water ([`RecordStore::snapshot_ts`]), at which everything
@@ -3231,5 +3310,201 @@ mod abort_failure_tests {
             baseline_active,
             "coordinator must be left in a clean state after the failed abort + successful successor"
         );
+    }
+}
+
+#[cfg(test)]
+mod max_transaction_age_tests {
+    //! `rmp` #477 regression: the maximum-transaction-age guard. A long-running reader that pins the GC
+    //! low-water mark ([`TxnCoordinator::oldest_active_snapshot`]) indefinitely — the classic
+    //! "idle-in-transaction blocks vacuum" denial of service — is detected by
+    //! [`TxnCoordinator::aged_transactions`] once its lifetime exceeds the cap and reaped by a clean
+    //! [`TxnCoordinator::rollback`], so the watermark advances and dead-version retention stops growing.
+    //!
+    //! The clock is supplied explicitly (no wall clock), so the scenario is fully deterministic.
+
+    use graphus_core::{GraphusError, TxnId};
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::RecordStore;
+    use graphus_txn::IsolationLevel;
+    use graphus_wal::{MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::catalog::IndexCatalog;
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::{PhysicalPlan, plan_physical};
+    use crate::semantics::analyze;
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    fn compile(src: &str) -> PhysicalPlan {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        plan_physical(&lower(&validated), &IndexCatalog::empty())
+    }
+
+    /// Runs one statement under `txn`, asserting it captured no error.
+    fn run_stmt(coord: &Coord, txn: TxnId, src: &str) {
+        let plan = compile(src);
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(txn).expect("statement");
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect");
+        }
+        assert!(graph.take_error().is_none(), "captured error in: {src}");
+    }
+
+    /// Nanoseconds in one millisecond — the cap is expressed in ms in the server config.
+    const MS: u64 = 1_000_000;
+
+    /// THE GATE. A long reader opened via `begin_at` pins the watermark while a churn of committed
+    /// writers accumulates dead versions GC cannot reclaim. Once the reader's lifetime crosses the cap,
+    /// `aged_transactions` reports it (and a younger reader is left alone); reaping it via `rollback`
+    /// advances the watermark and a GC pass — which reclaimed **nothing** while pinned — now reclaims
+    /// the accumulated garbage. The reaped reader's next use is a clean retriable error.
+    #[test]
+    fn aged_reader_is_reaped_freeing_the_gc_watermark() {
+        let mut coord = fresh_coord();
+        // The configured cap (mirrors the server's `max_transaction_age_ms`), in monotonic nanoseconds.
+        let max_age_nanos = 60 * 60 * 1000 * MS; // 1 hour
+
+        // Seed exactly one committed node at t = 0, so there is no pre-existing garbage.
+        let seed = coord.begin_at(IsolationLevel::Serializable, 0);
+        run_stmt(&coord, seed, "CREATE (:Reg {k: 1, v: 0})");
+        coord.commit(seed).expect("seed commit");
+
+        // A long-lived reader opens its snapshot near t = 0 and reads the register, taking SSI markers.
+        let reader = coord.begin_at(IsolationLevel::Serializable, MS);
+        run_stmt(&coord, reader, "MATCH (n:Reg {k: 1}) RETURN n.v AS v");
+        let pinned = coord
+            .oldest_active_snapshot()
+            .expect("the open reader pins the GC low-water mark");
+
+        // Churn the SAME node many times AFTER the reader's snapshot: every overwrite supersedes the
+        // prior version, but each dead version committed after the reader began (xmax > the watermark),
+        // so GC cannot reclaim any of it while the reader stays open.
+        const CHURN: u64 = 25;
+        for i in 1..=CHURN {
+            let w = coord.begin_at(IsolationLevel::Serializable, MS + i);
+            run_stmt(&coord, w, &format!("MATCH (n:Reg {{k: 1}}) SET n.v = {i}"));
+            coord.commit(w).expect("churn writer commits cleanly");
+        }
+        // The reader still pins the watermark, so a GC pass reclaims (essentially) nothing.
+        assert_eq!(
+            coord.oldest_active_snapshot(),
+            Some(pinned),
+            "the long reader must still pin the watermark while it is open"
+        );
+        let reclaimed_pinned = coord.gc().expect("gc pass while pinned").reclaimed;
+        assert_eq!(
+            reclaimed_pinned, 0,
+            "while the reader pins the watermark, no dead version is reclaimable"
+        );
+
+        // Now: time has advanced one nanosecond past the cap for the reader (begin = MS), but a younger
+        // reader opened just now must NOT be disturbed.
+        let now = MS + max_age_nanos + 1;
+        let young = coord.begin_at(IsolationLevel::Serializable, now - 1); // age 1ns << cap
+        let aged = coord.aged_transactions(now, max_age_nanos);
+        assert_eq!(
+            aged,
+            vec![reader],
+            "only the over-age reader is reported — the just-opened reader is left alone"
+        );
+
+        // Reap the over-age reader with a clean rollback (the engine's contract).
+        coord
+            .rollback(reader)
+            .expect("clean rollback of the over-age reader");
+
+        // The watermark advanced: the young reader is now the oldest snapshot (the reaped reader is gone
+        // from the active set). A GC pass — which reclaimed 0 while pinned — now reclaims the garbage the
+        // reader had been holding back, proving retention stops growing.
+        assert_ne!(
+            coord.oldest_active_snapshot(),
+            Some(pinned),
+            "reaping the over-age reader must release its hold on the watermark"
+        );
+        let reclaimed_after = coord.gc().expect("gc pass after reap").reclaimed;
+        assert!(
+            reclaimed_after > reclaimed_pinned && reclaimed_after > 0,
+            "the advanced watermark must unblock reclamation of the pinned garbage: \
+             reclaimed {reclaimed_pinned} (pinned) -> {reclaimed_after} (after reap)"
+        );
+
+        // The reaped reader's next use surfaces a clean retriable error — it is no longer active.
+        // (`statement`'s `Ok` value is not `Debug`, so match rather than `expect_err`.)
+        match coord.statement(reader) {
+            Ok(_) => panic!("the reaped reader must be inactive — its next statement must error"),
+            Err(GraphusError::Transaction(_)) => {}
+            Err(other) => panic!(
+                "a reaped over-age transaction must surface a retriable Transaction error, got: {other:?}"
+            ),
+        }
+        assert!(
+            coord.commit(reader).is_err(),
+            "commit of the reaped reader errors"
+        );
+        assert!(
+            coord.rollback(reader).is_err(),
+            "rollback of the reaped reader errors (already inactive)"
+        );
+
+        // The coordinator is left clean and usable: the young reader still commits.
+        coord
+            .commit(young)
+            .expect("the untouched young reader commits cleanly");
+    }
+
+    /// `aged_transactions` is a pure, deterministic detector: a disabled cap (`0`) reports nothing, an
+    /// age-untracked transaction (opened via `begin`) is never reported, and the boundary is inclusive.
+    #[test]
+    fn aged_transactions_detection_rules() {
+        let mut coord = fresh_coord();
+
+        // Untracked (opened via the clock-agnostic `begin`): never reported, even far past any cap.
+        let untracked = coord.begin(IsolationLevel::Serializable);
+        // Tracked, opened at t = 1000ns.
+        let tracked = coord.begin_at(IsolationLevel::Serializable, 1_000);
+
+        // Disabled cap (0) reports nothing regardless of age.
+        assert!(
+            coord.aged_transactions(u64::MAX, 0).is_empty(),
+            "cap 0 disables"
+        );
+
+        // Just under the cap: nothing.
+        assert!(
+            coord.aged_transactions(1_000 + 500, 1_000).is_empty(),
+            "age 500ns < 1000ns cap — not yet aged"
+        );
+        // Exactly at the cap: inclusive — the tracked txn is reported, the untracked one never.
+        assert_eq!(
+            coord.aged_transactions(1_000 + 1_000, 1_000),
+            vec![tracked],
+            "age == cap is inclusive; the untracked transaction is never reported"
+        );
+        // `now` before begin (a monotonic clock cannot do this, but saturate rather than wrap): age 0.
+        assert!(
+            coord.aged_transactions(0, 1_000).is_empty(),
+            "saturating age computation never reports a negative age"
+        );
+
+        let _ = untracked;
+        coord.rollback(tracked).expect("rollback");
     }
 }

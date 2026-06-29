@@ -483,6 +483,14 @@ pub struct EngineParams {
     /// deterministic [`crate::engine::LocalEngine`] does not go through this path and runs statements
     /// with no timeout (so DST stays wall-clock-free).
     pub statement_timeout: Option<std::time::Duration>,
+    /// Maximum transaction-age (total-lifetime) cap (`rmp` #477), or `None` when disabled. Threaded to
+    /// the engine thread, whose background sweep aborts an open transaction whose lifetime exceeds it —
+    /// freeing the MVCC GC watermark a long-running reader would otherwise pin indefinitely (the
+    /// idle-in-transaction DoS). Sourced from
+    /// [`TimingConfig::max_transaction_age`](crate::config::TimingConfig::max_transaction_age). The
+    /// deterministic [`crate::engine::LocalEngine`] does not run the sweep (so DST stays wall-clock-free
+    /// and deterministic).
+    pub max_transaction_age: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for EngineParams {
@@ -501,6 +509,7 @@ impl std::fmt::Debug for EngineParams {
             .field("clock", &"<dyn Clock>")
             .field("engine_shutdown_timeout", &self.engine_shutdown_timeout)
             .field("statement_timeout", &self.statement_timeout)
+            .field("max_transaction_age", &self.max_transaction_age)
             .finish()
     }
 }
@@ -545,6 +554,7 @@ impl EngineParams {
             clock: std::sync::Arc::new(crate::server::SystemClock),
             engine_shutdown_timeout: config.timing.shutdown_drain_deadline(),
             statement_timeout: config.timing.statement_timeout(),
+            max_transaction_age: config.timing.max_transaction_age(),
         })
     }
 }
@@ -818,6 +828,7 @@ fn spawn_db_engine(
         metrics,
         std::sync::Arc::clone(&params.clock),
         params.statement_timeout,
+        params.max_transaction_age,
     )
 }
 
@@ -2007,6 +2018,7 @@ mod tests {
             clock: std::sync::Arc::new(crate::server::SystemClock),
             engine_shutdown_timeout: std::time::Duration::from_secs(10),
             statement_timeout: None,
+            max_transaction_age: None,
         }
     }
 

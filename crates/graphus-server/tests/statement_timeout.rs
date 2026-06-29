@@ -59,6 +59,8 @@ fn engine_with_timeout(statement_timeout: Option<Duration>) -> Engine {
         metrics,
         clock,
         statement_timeout,
+        // No max-transaction-age cap in this test (rmp #477): it exercises the per-statement timeout.
+        None,
     )
     .expect("spawn threaded engine")
 }

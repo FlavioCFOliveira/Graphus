@@ -752,6 +752,15 @@ pub(super) struct InFlightInline {
     deadline: Option<Instant>,
 }
 
+impl InFlightInline {
+    /// The transaction this suspended inline statement runs in. The engine loop reads it so the
+    /// maximum-transaction-age sweep (`rmp` #477) never reaps a transaction whose statement is currently
+    /// executing inline (a reap mid-statement would pull the seam out from under the live cursor).
+    pub(super) fn txn(&self) -> graphus_core::TxnId {
+        self.txn
+    }
+}
+
 /// How a single resume visit ended (`rmp` task #372): either the statement is fully done (the caller
 /// finalises it), or it filled the channel again and stays suspended for a later tick.
 enum BatchStep {
