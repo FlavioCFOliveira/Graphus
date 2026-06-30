@@ -1301,6 +1301,81 @@ async fn admin_grammar_is_strict_on_the_wire() {
 /// trailing PULL `SUCCESS` metadata reports the query `type` (`s` for a schema/system change, `r` for a
 /// `SHOW *` read) and the schema/system side-effect counters, exactly as a Neo4j driver reads them.
 /// Before #513 every admin summary was empty (type `null`, no `stats`) even though the change persisted.
+/// `rmp` #512 GATE: the DATA result summary over the real Bolt wire — the **engine path**, distinct
+/// from the admin path the DDL test below covers. A locally-built server, driven through `RUN`/`PULL`,
+/// must surface the side-effect counters + query type that the Neo4j driver ecosystem reads from the
+/// trailing PULL `SUCCESS`.
+#[tokio::test]
+async fn data_result_summary_on_the_bolt_wire() {
+    let temp = TempStore::new("data-result-summary");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+
+    // A read → type `r`, no stats block.
+    let m = c.run_pull_summary("RETURN 1 AS n", None).await;
+    assert_eq!(summary_type(&m), Some("r"), "a read is type r");
+    assert_eq!(
+        summary_stat(&m, "nodes-created"),
+        None,
+        "a read emits no stats"
+    );
+
+    // CREATE … RETURN → type `rw`; node + label + property counters; contains-updates.
+    let m = c
+        .run_pull_summary("CREATE (n:Widget {sku: 1}) RETURN n", None)
+        .await;
+    assert_eq!(
+        summary_type(&m),
+        Some("rw"),
+        "a write that returns rows is rw"
+    );
+    assert_eq!(summary_stat(&m, "nodes-created"), Some(Value::Integer(1)));
+    assert_eq!(summary_stat(&m, "labels-added"), Some(Value::Integer(1)));
+    assert_eq!(summary_stat(&m, "properties-set"), Some(Value::Integer(1)));
+    assert_eq!(
+        summary_stat(&m, "contains-updates"),
+        Some(Value::Boolean(true)),
+        "a data write flips contains-updates"
+    );
+
+    // A write with no RETURN → type `w`; a relationship + its property.
+    let m = c
+        .run_pull_summary(
+            "CREATE (:Widget {sku: 2})-[:LINKS {w: 1}]->(:Widget {sku: 3})",
+            None,
+        )
+        .await;
+    assert_eq!(summary_type(&m), Some("w"), "a write with no rows is w");
+    assert_eq!(summary_stat(&m, "nodes-created"), Some(Value::Integer(2)));
+    assert_eq!(
+        summary_stat(&m, "relationships-created"),
+        Some(Value::Integer(1))
+    );
+    // Two node properties (a `sku` on each Widget) + one relationship property (`w`) = 3.
+    assert_eq!(summary_stat(&m, "properties-set"), Some(Value::Integer(3)));
+
+    // SET to a new value → properties-set (type `w`).
+    let m = c
+        .run_pull_summary("MATCH (n:Widget {sku: 1}) SET n.sku = 9", None)
+        .await;
+    assert_eq!(summary_type(&m), Some("w"));
+    assert_eq!(summary_stat(&m, "properties-set"), Some(Value::Integer(1)));
+
+    // DETACH DELETE → nodes-deleted + relationships-deleted (each incident rel).
+    let m = c
+        .run_pull_summary("MATCH (n:Widget) DETACH DELETE n", None)
+        .await;
+    assert_eq!(summary_type(&m), Some("w"));
+    assert_eq!(summary_stat(&m, "nodes-deleted"), Some(Value::Integer(3)));
+    assert_eq!(
+        summary_stat(&m, "relationships-deleted"),
+        Some(Value::Integer(1))
+    );
+}
+
 #[tokio::test]
 async fn admin_and_ddl_result_summary_on_the_bolt_wire() {
     let temp = TempStore::new("result-summary");

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Query result summary (side-effect counters + query type).** Both the Bolt and REST interfaces now
+  populate the per-statement result summary that was previously always empty — every query reported
+  zero update counters and a null query type even though writes persisted, breaking conformance with
+  the Bolt/Cypher contract and the Neo4j driver ecosystem. The trailing summary now carries the query
+  `type` (`r` read, `w` write, `rw` read-write, `s` schema/admin) and the Neo4j-compatible `stats`
+  counters (`nodes-created`/`-deleted`, `relationships-created`/`-deleted`, `properties-set`,
+  `labels-added`/`-removed`, `indexes-added`/`-removed`, `constraints-added`/`-removed`,
+  `system-updates`, `contains-updates`, `contains-system-updates`), present only when non-empty.
+  Counters follow Neo4j's operation-count model and use kebab-case keys; over REST they are plain JSON
+  numbers (e.g. `"nodes-created": 1`), matching the Neo4j HTTP API. Verified end to end against a
+  locally-built server with the official Neo4j driver (Bolt) and the REST API.
+
 ## [0.0.3] - 2026-06-30
 
 ### Added
