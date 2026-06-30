@@ -143,6 +143,24 @@ pub fn value_to_jolt(value: &Value) -> Json {
     }
 }
 
+/// Encodes a **result-summary stat** value as a plain JSON scalar — NOT a strict-Jolt typed cell.
+///
+/// Summary counters follow the Neo4j HTTP API contract documented in `docs/rest-api.md`: e.g.
+/// `"nodes-created": 1` and `"contains-updates": true`, so a client reads each count/flag directly as
+/// a JSON number/boolean. (The string-encoded Jolt typing in [`value_to_jolt`] is for result-row
+/// cells, where the int53 64-bit-fidelity contract applies; summary stats are only ever small
+/// non-negative counts or booleans, so a native scalar is both correct and what the driver ecosystem
+/// expects.)
+#[must_use]
+pub fn summary_value_to_json(value: &Value) -> Json {
+    match value {
+        Value::Integer(n) => Json::from(*n),
+        Value::Boolean(b) => Json::from(*b),
+        // Summary stats only ever carry integers/booleans; fall back to the typed form defensively.
+        other => value_to_jolt(other),
+    }
+}
+
 /// Encodes a [`graphus_core::Point`] as the self-describing `@`-sigil payload object: its CRS name,
 /// SRID and coordinate list. The coordinates are plain JSON numbers (a point coordinate is a
 /// geometric quantity, not subject to the property int53 contract that strings 64-bit integers).

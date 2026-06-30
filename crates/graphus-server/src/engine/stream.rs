@@ -14,6 +14,7 @@
 //! parks a Tokio runtime worker (`04 §9.1`).
 
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use graphus_core::GraphusError;
 use graphus_cypher::MaterializedValue;
@@ -181,5 +182,63 @@ impl Drop for RowReceiver {
         // If a cursor is dropped before exhaustion (early client disconnect), drain so the engine
         // thread is not left blocked on a full bounded channel waiting for a gone consumer.
         self.drain();
+    }
+}
+
+/// A side channel carrying a finished statement's [`RunSummary`](super::command::RunSummary) from the
+/// engine thread back to the consumer seam, out of band of the row stream (`rmp` task #512).
+///
+/// The Bolt/REST result summary (`metadata.type` + `metadata.stats`) is known only **after** a
+/// statement's rows are produced: the side-effect counters are tallied as the cursor drains, and the
+/// query type is classified up front. Threading it through the row channel would entangle the delicate
+/// peek / `has_more` / suspend-resume logic [`RowReceiver`]/[`RowSender`] already implement, so instead
+/// the [`RunReply`](super::command::RunReply) carries this cheap shared cell: the engine fills it via
+/// [`set`](Self::set) **before** it drops the row sender, and the consumer reads it via
+/// [`get`](Self::get) **after** its row stream returns `None`.
+///
+/// ## Happens-before (the load-bearing ordering — `rmp` #512)
+///
+/// [`set`](Self::set) MUST run **before** the engine drops the egress [`RowSender`]. The consumer
+/// observes end-of-stream ([`RowReceiver::next`] → `Ok(None)`) only once that sender is dropped, and
+/// `std::sync::mpsc` establishes a happens-before edge from the sender's drop to the receiver observing
+/// the disconnect. So `set` (sequenced-before the drop on the engine thread) happens-before the
+/// consumer's [`get`](Self::get) (sequenced-after it observes `None`), and the consumer is guaranteed to
+/// read the filled value rather than the empty default. Filling the cell *after* the drop would race
+/// that read and surface an empty summary. The inner [`Mutex`] additionally makes the access
+/// data-race-free.
+#[derive(Clone, Debug, Default)]
+pub struct SummarySink(Arc<Mutex<Option<super::command::RunSummary>>>);
+
+impl SummarySink {
+    /// A fresh, empty sink (no summary set yet).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publishes the finished statement's summary. Called once by the engine thread, **before** it
+    /// drops the row sender (see the type's happens-before contract). A poisoned lock is recovered —
+    /// the cell holds plain data, and recovering beats cascading a panic onto the engine thread.
+    pub fn set(&self, summary: super::command::RunSummary) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(summary);
+    }
+
+    /// Reads the summary, cloning it out (idempotent — a seam's `summary()` may be called more than
+    /// once). An unfilled sink yields [`RunSummary::default`](super::command::RunSummary) (no type, no
+    /// stats), which both wire serializers render as a valid empty summary.
+    #[must_use]
+    pub fn get(&self) -> super::command::RunSummary {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Removes and returns the summary if one was set (for a consumer that takes ownership rather than
+    /// cloning). Leaves the sink empty.
+    #[must_use]
+    pub fn take(&self) -> Option<super::command::RunSummary> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 }

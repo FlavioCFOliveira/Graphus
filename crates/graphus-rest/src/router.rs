@@ -1790,7 +1790,9 @@ fn bind_parameters(stmt: &Statement) -> Result<Vec<(String, Value)>, ValueCodecE
 fn encode_summary(summary: &RunSummary) -> Json {
     let mut stats = serde_json::Map::new();
     for (k, v) in &summary.stats {
-        stats.insert(k.clone(), value::value_to_jolt(v));
+        // Summary counters are plain JSON scalars (`"nodes-created": 1`), not Jolt-typed cells — the
+        // Neo4j HTTP API / `docs/rest-api.md` contract a client reads counts from directly (`rmp` #512).
+        stats.insert(k.clone(), value::summary_value_to_json(v));
     }
     json!({
         "type": summary.query_type,

@@ -56,7 +56,7 @@ use crate::audit::{
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
 use super::privileges::EffectivePrivileges;
-use super::stream::RowReceiver;
+use super::stream::{RowReceiver, SummarySink};
 use super::{EngineHandle, RunSummary, TxTicket};
 
 /// The shared REST engine: database routing + admin statements over the per-database engines
@@ -202,7 +202,9 @@ enum RowSource {
 pub struct RestEngineStream {
     fields: Vec<String>,
     source: RowSource,
-    summary: RestRunSummary,
+    /// The result summary, read AFTER the rows drain (`rmp` #512). For an engine query this is the
+    /// shared sink the engine fills in `finalize_inflight`; for an admin result it is an empty sink.
+    summary: SummarySink,
 }
 
 impl RestEngineStream {
@@ -211,7 +213,8 @@ impl RestEngineStream {
         Self {
             fields: result.fields,
             source: RowSource::Admin(result.rows.into_iter()),
-            summary: RestRunSummary::default(),
+            // Admin results carry no engine summary yet (`rmp` #513); an empty sink is a valid summary.
+            summary: SummarySink::new(),
         }
     }
 }
@@ -237,7 +240,7 @@ impl ResultStream for RestEngineStream {
     }
 
     fn summary(&self) -> RestRunSummary {
-        self.summary.clone()
+        to_rest_summary(self.summary.get())
     }
 }
 
@@ -510,7 +513,9 @@ impl RestEngine for RestEngineAdapter {
                 rows: reply.rows,
                 _permit: permit,
             },
-            summary: RestRunSummary::default(),
+            // Read from the shared sink AFTER the rows drain; the engine fills it before `row_tx`
+            // drops (`rmp` #512).
+            summary: reply.summary,
         })
     }
 

@@ -48,7 +48,7 @@ use crate::audit::{
 use super::command::AccessMode;
 use super::handle::AdmissionPermit;
 use super::privileges::EffectivePrivileges;
-use super::stream::RowReceiver;
+use super::stream::{RowReceiver, SummarySink};
 use super::{EngineHandle, RunSummary, TxTicket};
 
 /// One Bolt connection's view of the server: the shared database-targeting/admin context, the
@@ -166,9 +166,9 @@ impl BoltEngineExecutor {
                 rows: reply.rows,
                 _permit: permit,
             },
-            // v1 summary: the query type is not yet surfaced by the executor; an empty summary is a
-            // valid `SUCCESS` body (`06 §3.1`). Richer summaries arrive with executor stats.
-            summary: QuerySummary::default(),
+            // The result summary (query type + side-effect counters) is read from this sink AFTER the
+            // rows drain: the engine fills it in `finalize_inflight` before `row_tx` drops (`rmp` #512).
+            summary: reply.summary,
         })
     }
 }
@@ -230,7 +230,9 @@ enum RowSource {
 pub struct BoltEngineStream {
     fields: Vec<String>,
     source: RowSource,
-    summary: QuerySummary,
+    /// The result summary, read AFTER the rows drain (`rmp` #512). For an engine query this is the
+    /// shared sink the engine fills in `finalize_inflight`; for an admin result it is an empty sink.
+    summary: SummarySink,
 }
 
 impl BoltEngineStream {
@@ -239,7 +241,9 @@ impl BoltEngineStream {
         Self {
             fields: result.fields,
             source: RowSource::Admin(result.rows.into_iter()),
-            summary: QuerySummary::default(),
+            // Admin results carry no engine summary yet (DDL counters + the `s` type are `rmp` #513);
+            // an empty sink renders as a valid empty `SUCCESS` body.
+            summary: SummarySink::new(),
         }
     }
 }
@@ -265,7 +269,7 @@ impl RecordStream for BoltEngineStream {
     }
 
     fn summary(&self) -> QuerySummary {
-        self.summary.clone()
+        to_bolt_summary(self.summary.get())
     }
 }
 

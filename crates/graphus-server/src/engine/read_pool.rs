@@ -50,6 +50,7 @@ use graphus_wal::LogSink;
 use super::command::Reply;
 use super::exec::run_cursor;
 use super::privileges::EffectivePrivileges;
+use super::stream::SummarySink;
 use super::stream::{RowItem, RowSender};
 use super::{RunReply, TxTicket};
 use crate::metrics::Metrics;
@@ -167,6 +168,9 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
                 deadline,
                 &row_tx,
                 row_rx,
+                // A fresh read-only summary sink; `run_cursor` fills it with the `r` query type
+                // before the caller drops `row_tx` (`rmp` #512).
+                SummarySink::new(),
                 reply,
             );
             auth_error = authz.take_auth_error();
@@ -180,6 +184,9 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
             deadline,
             &row_tx,
             row_rx,
+            // A fresh read-only summary sink; `run_cursor` fills it with the `r` query type before
+            // the caller drops `row_tx` (`rmp` #512).
+            SummarySink::new(),
             reply,
         ),
     };

@@ -28,8 +28,8 @@ use graphus_wal::LogSink;
 use super::command::{AccessMode, Reply};
 use super::privileges::EffectivePrivileges;
 use super::read_pool::{ReadDispatch, ReadTask};
-use super::stream::{RowReceiver, RowSender};
-use super::{OpenTx, RunReply, TxTicket};
+use super::stream::{RowReceiver, RowSender, SummarySink};
+use super::{OpenTx, RunReply, RunSummary, TxTicket};
 use crate::metrics::Metrics;
 
 /// The default capacity of the engine's compiled-plan cache (`rmp` task #322). A few hundred distinct
@@ -322,6 +322,12 @@ pub(super) fn handle_run<
         return RunOutcome::Done;
     }
 
+    // The Bolt/REST result-summary query type (`rmp` task #512): classified structurally from the plan
+    // (`r` / `w` / `rw`). Computed here — before the plan is moved into either dispatch path — so it is
+    // available to the inline statement's summary regardless of the suspend/resume path. The off-thread
+    // reader path is always read-only (`"r"`), set in `read_pool::run_read_task`.
+    let query_type = query_type_code(plan.query_type());
+
     // The egress channel: bounded for backpressure (`04 §9.3`), or unbounded for the inline
     // single-threaded driver (`super::stream::UNBOUNDED`, used by `super::LocalEngine`).
     let (row_tx, row_rx) = super::stream::egress(result_buffer_capacity);
@@ -427,6 +433,9 @@ pub(super) fn handle_run<
         started_nanos: started,
         query: query.to_owned(),
         deadline,
+        counters: graphus_cypher::QueryCounters::default(),
+        query_type: Some(query_type),
+        summary_sink: SummarySink::new(),
     };
     match start_inline(
         &mut inflight,
@@ -504,6 +513,12 @@ fn start_inline<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync
         }
     }
 
+    // Accumulate THIS visit's side-effect counters (`rmp` task #512). Each per-visit seam from
+    // `coordinator.statement()` starts at zero, so summing every visit's slice yields the statement's
+    // cumulative total across suspend/resume. The `AuthorizedGraph` decorator delegated its writes to
+    // this inner seam, so its counters are already included (a denied write never reached the seam).
+    inflight.counters.add(&graph.write_counters());
+
     step
 }
 
@@ -539,14 +554,23 @@ fn open_and_drive_first(
     };
     let fields: Vec<String> = cursor.columns().to_vec();
 
-    // Send the reply (fields + the consumer's receiver) before the first row.
+    // Send the reply (fields + the consumer's receiver + the result-summary sink) before the first
+    // row. The sink is shared (`rmp` #512): the consumer keeps a clone and reads it after draining,
+    // while `finalize_inflight` fills `inflight.summary_sink` (the same cell) before `row_tx` drops.
     let rows = RowReceiver::new(
         inflight
             .row_rx
             .take()
             .expect("INVARIANT: the first visit owns the egress receiver"),
     );
-    if reply.send(Ok(RunReply { fields, rows })).is_err() {
+    if reply
+        .send(Ok(RunReply {
+            fields,
+            rows,
+            summary: inflight.summary_sink.clone(),
+        }))
+        .is_err()
+    {
         // The consumer disconnected between submit and reply: nothing to stream; finalization handles
         // the orphaned auto-commit as a (drained) success, exactly as `run_cursor` does.
         return BatchStep::Done { produced_ok: true };
@@ -628,6 +652,7 @@ pub(super) fn run_cursor(
     deadline: Option<Instant>,
     row_tx: &RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
+    summary: SummarySink,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> bool {
     // The **same** registry that backed `compile` must back execution (`rmp` task #75), or the
@@ -656,6 +681,7 @@ pub(super) fn run_cursor(
         .send(Ok(RunReply {
             fields,
             rows: RowReceiver::new(row_rx),
+            summary: summary.clone(),
         }))
         .is_err()
     {
@@ -685,6 +711,15 @@ pub(super) fn run_cursor(
             }
         }
     }
+
+    // The off-thread reader path is read-only (`rmp` #336): publish an `r` summary into the sink
+    // BEFORE the caller drops `row_tx`, so the consumer's post-drain `summary()` reports the query
+    // type for reads exactly as the inline path does for writes (`rmp` #512). A read applies no
+    // mutations, so `write_counters()` is empty and `counters_to_stats` omits the `stats` block.
+    summary.set(RunSummary {
+        query_type: Some("r".to_owned()),
+        stats: counters_to_stats(&graph.write_counters()),
+    });
     true
 }
 
@@ -750,6 +785,18 @@ pub(super) struct InFlightInline {
     /// its [`SuspendedCursor`](graphus_cypher::SuspendedCursor)), so the same budget governs every resume
     /// batch without re-reading this.
     deadline: Option<Instant>,
+    /// Cumulative side-effect counters tallied across every (re)visit of this statement (`rmp` #512).
+    /// Each per-visit seam from `coordinator.statement()` starts at zero; `start_inline`/`run_batch`
+    /// add its slice here, so the running total is correct across suspend/resume. Published into
+    /// `summary_sink` at finalization.
+    counters: graphus_cypher::QueryCounters,
+    /// The Bolt/REST result-summary query-type code (`r`/`w`/`rw`), classified once from the plan in
+    /// [`handle_run`] (`rmp` #512) and carried unchanged across resumes.
+    query_type: Option<String>,
+    /// The side channel the consumer reads its result summary from; filled by [`finalize_inflight`]
+    /// (query type + counters) BEFORE `row_tx` drops (`rmp` #512 — see [`SummarySink`]'s
+    /// happens-before contract).
+    summary_sink: SummarySink,
 }
 
 impl InFlightInline {
@@ -887,6 +934,11 @@ fn run_batch<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 
         }
     }
 
+    // Accumulate THIS resume visit's counters (`rmp` task #512), exactly as the first visit in
+    // `start_inline`: the fresh per-visit seam contributes only the writes applied during this batch,
+    // so the running total in `inflight.counters` stays correct across every suspend/resume.
+    inflight.counters.add(&graph.write_counters());
+
     step
 }
 
@@ -999,6 +1051,19 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             db,
         );
     }
+
+    // Publish the finished statement's result summary (`rmp` task #512) into the side sink BEFORE
+    // `row_tx` drops. THIS ORDERING IS CRITICAL: the channel-close that follows — when `inflight`
+    // (which owns `row_tx`) drops at the caller's scope end — is the happens-before edge the consumer
+    // relies on. The consumer reads `summary()` only after its row stream returns `None` (the closed
+    // channel), and `std::sync::mpsc` orders that observation happens-after this `set`. Filling the
+    // sink AFTER the drop would race the consumer's post-drain read and surface an empty summary. The
+    // counters reflect operations *applied* during execution (Neo4j operation-count model); on a
+    // rollback the consumer sees the terminal error and never reads the summary, so it is harmless.
+    inflight.summary_sink.set(RunSummary {
+        query_type: inflight.query_type.clone(),
+        stats: counters_to_stats(&inflight.counters),
+    });
 
     // Latency + slow-query log, measured from statement start (`04 §9` / NFR-10). Emitted at finish so
     // the latency spans the whole — possibly suspended — stream, exactly as the single-visit path.
@@ -1113,6 +1178,58 @@ fn finish_failed_autocommit<D: BlockDevice, S: LogSink>(
     }
 }
 
+/// Maps the cypher [`QueryType`](graphus_cypher::QueryType) to its Bolt/REST wire code (`rmp` task
+/// #512): `r` (read), `w` (pure write — no result rows), `rw` (read-write — returns rows). The schema
+/// class `s` is not produced here: DDL is intercepted before the Cypher pipeline, so admin summaries
+/// are a separate task (#513).
+fn query_type_code(query_type: graphus_cypher::QueryType) -> String {
+    use graphus_cypher::QueryType;
+    match query_type {
+        QueryType::Read => "r",
+        QueryType::Write => "w",
+        QueryType::ReadWrite => "rw",
+    }
+    .to_owned()
+}
+
+/// Builds the Bolt/REST `stats` key/value pairs from the cypher
+/// [`QueryCounters`](graphus_cypher::QueryCounters) (`rmp` task #512), following the Neo4j
+/// `SummaryCounters` wire contract.
+///
+/// Only **non-zero** data counters are emitted (a counter that did not change is omitted), keyed in the
+/// kebab-case the official driver ecosystem expects. When any data counter is non-zero a
+/// `contains-updates = true` flag is appended (mirroring `SummaryCounters.containsUpdates()`). A
+/// fully-empty set (a read) yields an empty vec, so the wire layer emits no `stats` block at all.
+///
+/// The wire-key naming lives here in the server layer — the cypher counters stay protocol-agnostic —
+/// and **both** seams convert through this one helper, so Bolt and REST spell every key identically.
+fn counters_to_stats(counters: &graphus_cypher::QueryCounters) -> Vec<(String, Value)> {
+    let entries = [
+        ("nodes-created", counters.nodes_created),
+        ("nodes-deleted", counters.nodes_deleted),
+        ("relationships-created", counters.relationships_created),
+        ("relationships-deleted", counters.relationships_deleted),
+        ("properties-set", counters.properties_set),
+        ("labels-added", counters.labels_added),
+        ("labels-removed", counters.labels_removed),
+    ];
+    let mut stats: Vec<(String, Value)> = entries
+        .into_iter()
+        .filter(|&(_, n)| n > 0)
+        // Operation counts never approach `i64::MAX`; clamp defensively rather than wrap.
+        .map(|(key, n)| {
+            (
+                key.to_owned(),
+                Value::Integer(i64::try_from(n).unwrap_or(i64::MAX)),
+            )
+        })
+        .collect();
+    if counters.contains_updates() {
+        stats.push(("contains-updates".to_owned(), Value::Boolean(true)));
+    }
+    stats
+}
+
 /// Whether a physical plan performs writes (so a `READ` transaction can reject it — `06 §4`). A
 /// write plan's root (or a nested write op) is one of the mutating operators.
 fn plan_writes(plan: &graphus_cypher::PhysicalPlan) -> bool {
@@ -1211,5 +1328,43 @@ mod tests {
         // 2.5 ms in nanoseconds.
         let elapsed = monotonic_elapsed(1_000_000_000, 1_002_500_000);
         assert_eq!(elapsed, Duration::from_micros(2_500));
+    }
+
+    /// `rmp` #512 GATE: the wire `stats` builder emits ONLY non-zero counters, in the fixed wire
+    /// order, kebab-case, and appends `contains-updates` whenever any counter fired. A read (all
+    /// zero) yields an empty vec, so the seam omits the `stats` block entirely. This locks the wire
+    /// key spelling + ordering both seams depend on (byte-determinism for the DST clients).
+    #[test]
+    fn counters_to_stats_omits_zeros_and_flags_updates() {
+        use graphus_cypher::QueryCounters;
+        assert!(
+            counters_to_stats(&QueryCounters::default()).is_empty(),
+            "a read records no counters, so no stats block is emitted"
+        );
+        let c = QueryCounters {
+            nodes_created: 2,
+            properties_set: 3,
+            labels_added: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            counters_to_stats(&c),
+            vec![
+                ("nodes-created".to_owned(), Value::Integer(2)),
+                ("properties-set".to_owned(), Value::Integer(3)),
+                ("labels-added".to_owned(), Value::Integer(1)),
+                ("contains-updates".to_owned(), Value::Boolean(true)),
+            ],
+            "only the non-zero counters, kebab-case, fixed order, contains-updates flag last"
+        );
+    }
+
+    /// `rmp` #512 GATE: the query-type classification maps onto the Bolt/REST wire codes.
+    #[test]
+    fn query_type_code_maps_read_write_readwrite() {
+        use graphus_cypher::QueryType;
+        assert_eq!(query_type_code(QueryType::Read), "r");
+        assert_eq!(query_type_code(QueryType::Write), "w");
+        assert_eq!(query_type_code(QueryType::ReadWrite), "rw");
     }
 }

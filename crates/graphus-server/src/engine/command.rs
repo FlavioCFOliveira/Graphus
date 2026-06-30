@@ -14,7 +14,7 @@
 use graphus_core::{GraphusError, Value};
 
 use super::privileges::EffectivePrivileges;
-use super::stream::RowReceiver;
+use super::stream::{RowReceiver, SummarySink};
 use crate::engine::TxTicket;
 
 /// The engine's end of a command reply: a one-shot, capacity-1 [`std::sync::mpsc::SyncSender`].
@@ -106,6 +106,11 @@ pub struct RunReply {
     pub fields: Vec<String>,
     /// The bounded row stream; pull rows until it yields `None` (exhausted) or a row `Err`.
     pub rows: RowReceiver,
+    /// The side channel the engine fills with this statement's result summary (`metadata.type` +
+    /// `metadata.stats`) once its rows are produced (`rmp` task #512). The consumer seam reads it via
+    /// [`SummarySink::get`] **after** draining `rows` (the happens-before the sink documents); it is
+    /// empty (a default [`RunSummary`]) until the engine fills it.
+    pub summary: SummarySink,
 }
 
 /// An **index-DDL** statement routed to the engine thread (`rmp` task #91), where the
