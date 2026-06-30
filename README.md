@@ -98,19 +98,19 @@ there and your databases survive container restarts and recreation.
 ### Quick start
 
 ```sh
-# Build the multi-arch-capable image from this repository (native arch):
-docker build -t graphus:latest .
-
-# Run it with a named volume for durable persistence and both listeners published:
+# Pull and run the published multi-arch image from Docker Hub:
 docker run -d --name graphus \
   -p 7687:7687 \         # Bolt over TCP (Neo4j drivers)
   -p 7474:7474 \         # Web REST API
   -v graphus-data:/data \  # databases persist here
-  graphus:latest
+  flaviocfo/graphus:latest
 
 # Liveness check (unauthenticated; -k because the cert is self-signed):
 curl -k https://localhost:7474/health/live      # -> live
 ```
+
+To build from source instead, run `docker build -t graphus:latest .` and use
+`graphus:latest` in place of `flaviocfo/graphus:latest` above.
 
 The default credentials for the local quickstart are user **`graphus`** /
 password **`graphus-local`**.
@@ -191,7 +191,7 @@ docker run -d --name graphus \
   -e GRAPHUS_TLS_CERT_PATH=/etc/graphus/tls/fullchain.pem \
   -e GRAPHUS_TLS_KEY_PATH=/etc/graphus/tls/privkey.pem \
   -e GRAPHUS_JWT_SECRET="$(openssl rand -hex 32)" \
-  graphus:latest
+  flaviocfo/graphus:latest
 ```
 
 ### Multi-architecture builds
@@ -200,11 +200,13 @@ To build and publish a manifest covering every supported architecture:
 
 ```sh
 docker buildx build --platform linux/amd64,linux/arm64 \
-  -t ghcr.io/flaviocfoliveira/graphus:latest --push .
+  -t flaviocfo/graphus:latest --push .
 ```
 
-CI builds both architectures on every change and publishes on tags — see
-[`.github/workflows/docker.yml`](.github/workflows/docker.yml).
+CI builds both architectures and publishes the image to **Docker Hub**
+(`flaviocfo/graphus`, see [`dockerhub.yml`](.github/workflows/dockerhub.yml)) on a
+published release, and to the **GitHub Container Registry** on every change
+(see [`docker.yml`](.github/workflows/docker.yml)).
 
 ## License
 

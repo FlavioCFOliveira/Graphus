@@ -20,7 +20,7 @@ services:
       context: .
       dockerfile: Dockerfile
     # ...or pull a published multi-arch image instead (comment out `build:` above):
-    # image: ghcr.io/flaviocfoliveira/graphus:latest
+    # image: flaviocfo/graphus:latest
     container_name: graphus
     restart: unless-stopped
     ports:

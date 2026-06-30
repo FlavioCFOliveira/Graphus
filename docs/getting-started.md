@@ -14,15 +14,13 @@ This page gets you from nothing to a first authenticated query.
 ## 1. Run the server (Docker)
 
 ```sh
-# Build the image from this repository (or pull ghcr.io/flaviocfoliveira/graphus:latest):
-docker build -t graphus:latest .
-
-# Run it, publishing both network listeners and persisting data in a named volume:
+# Pull the published multi-arch image from Docker Hub
+# (to build locally instead: `docker build -t graphus:latest .`, then use graphus:latest):
 docker run -d --name graphus \
   -p 7687:7687 \           # Bolt over TCP
   -p 7474:7474 \           # REST WebAPI
   -v graphus-data:/data \  # all durable state lives under /data
-  graphus:latest
+  flaviocfo/graphus:latest
 
 # Liveness check (-k because the quickstart certificate is self-signed):
 curl -k https://localhost:7474/health/live      # -> live
