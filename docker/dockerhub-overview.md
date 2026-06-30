@@ -46,7 +46,7 @@ docker run -d --name graphus \
   -p 7687:7687 \      # Bolt over TCP (Neo4j drivers)
   -p 7474:7474 \      # Web REST API
   -v graphus-data:/data \
-  flaviocfoliveira/graphus:latest
+  flaviocfo/graphus:latest
 
 # Liveness probe (unauthenticated; -k because the default cert is self-signed):
 curl -k https://localhost:7474/health/live      # -> live
@@ -101,7 +101,7 @@ The OpenAPI document is at `https://localhost:7474/openapi.json`; `GET /health/l
 ```yaml
 services:
   graphus:
-    image: flaviocfoliveira/graphus:latest
+    image: flaviocfo/graphus:latest
     container_name: graphus
     restart: unless-stopped
     ports:
@@ -168,7 +168,7 @@ docker run -d --name graphus \
   -e GRAPHUS_TLS_CERT_PATH=/etc/graphus/tls/fullchain.pem \
   -e GRAPHUS_TLS_KEY_PATH=/etc/graphus/tls/privkey.pem \
   -e GRAPHUS_JWT_SECRET="$(openssl rand -hex 32)" \
-  flaviocfoliveira/graphus:latest
+  flaviocfo/graphus:latest
 ```
 
 Also set a strong `[auth] admin_password` in your mounted config. See
