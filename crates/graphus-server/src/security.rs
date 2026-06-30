@@ -951,6 +951,19 @@ impl AuthProvider for LiveAuth {
     fn require(&self, user: &str, wanted: &Privilege) -> std::result::Result<(), AuthError> {
         self.0.with_auth(|auth| auth.require(user, wanted))
     }
+
+    fn issue_token(
+        &self,
+        user: &str,
+        now_unix_secs: u64,
+        ttl_secs: u64,
+    ) -> std::result::Result<String, AuthError> {
+        // One brief read lock on the live model: the token is stamped with the user's *current*
+        // credential epoch, so the REST `/auth/login` endpoint (rmp #499) mints tokens that a later
+        // runtime password change immediately invalidates (SEC-180).
+        self.0
+            .with_auth(|auth| auth.issue_token(user, now_unix_secs, ttl_secs))
+    }
 }
 
 /// The persist entry point used by [`SecurityCatalog::mutate`] (a free fn so it captures only

@@ -119,6 +119,46 @@ pub struct RunResponse {
     pub expires_at_nanos: Option<u64>,
 }
 
+/// The default validity, in seconds, of a Bearer token minted by `POST /auth/login` (rmp #499):
+/// **one hour**.
+///
+/// A short-lived token bounds the blast radius of a leaked credential while staying long enough that
+/// an interactive client need not re-authenticate on every request. A client that wants a different
+/// lifetime re-authenticates when the token nears expiry (the response echoes
+/// [`LoginResponse::expires_at_unix_secs`] so the client knows when). The credential-epoch and
+/// `jti`-denylist revocation paths (SEC-180) still apply, so a password change or explicit revocation
+/// invalidates an outstanding token well before this TTL elapses.
+pub const DEFAULT_LOGIN_TOKEN_TTL_SECS: u64 = 3600;
+
+/// The request body for `POST /auth/login` (rmp #499): a username + password presented to obtain a
+/// Bearer token.
+///
+/// Both members are **required**: a body missing either (or an empty body) fails to deserialize and
+/// is rejected with a `400` problem+json, exactly like any other malformed request body. The
+/// credentials are used only to authenticate the principal and are never echoed back or logged.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoginRequest {
+    /// The principal (catalog user) to authenticate.
+    pub username: String,
+    /// The principal's password, verified against the stored Argon2 hash (constant-time).
+    pub password: String,
+}
+
+/// The response body for a successful `POST /auth/login` (rmp #499): a Bearer token the client then
+/// sends as `Authorization: Bearer <token>` on subsequent requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginResponse {
+    /// The signed HS256 JWT to present as a Bearer credential.
+    pub token: String,
+    /// The token's scheme, always `"Bearer"` (RFC 6750) — so a client can build the
+    /// `Authorization` header verbatim (`{token_type} {token}`).
+    pub token_type: String,
+    /// The token's absolute expiry as **Unix seconds** (wall-clock), equal to the server's
+    /// `now_unix_secs` at issuance plus the TTL ([`DEFAULT_LOGIN_TOKEN_TTL_SECS`]). After this instant
+    /// the token is rejected by Bearer validation and the client must log in again.
+    pub expires_at_unix_secs: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +212,38 @@ mod tests {
         let req: RunRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(req.statements.is_empty());
         assert_eq!(parse_access_mode(&req.access_mode), Ok(AccessMode::Write));
+    }
+
+    #[test]
+    fn login_request_requires_both_fields() {
+        let req: LoginRequest =
+            serde_json::from_value(serde_json::json!({ "username": "alice", "password": "pw" }))
+                .unwrap();
+        assert_eq!(req.username, "alice");
+        assert_eq!(req.password, "pw");
+        // Either field missing (or an empty body) is a deserialization error → a 400 at the boundary.
+        assert!(
+            serde_json::from_value::<LoginRequest>(serde_json::json!({ "username": "a" })).is_err()
+        );
+        assert!(
+            serde_json::from_value::<LoginRequest>(serde_json::json!({ "password": "p" })).is_err()
+        );
+        assert!(serde_json::from_value::<LoginRequest>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn login_response_serializes_with_expected_members() {
+        let resp = LoginResponse {
+            token: "jwt.token.value".to_owned(),
+            token_type: "Bearer".to_owned(),
+            expires_at_unix_secs: 1_700_003_600,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["token"], "jwt.token.value");
+        assert_eq!(json["token_type"], "Bearer");
+        assert_eq!(json["expires_at_unix_secs"], 1_700_003_600_u64);
+        // It round-trips (the member used by the CBOR response path and Go clients).
+        let back: LoginResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.expires_at_unix_secs, resp.expires_at_unix_secs);
     }
 }

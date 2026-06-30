@@ -86,7 +86,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use graphus_auth::{Action, AuthError, AuthProvider, Privilege};
+use graphus_auth::{Action, AuthError, AuthProvider, AuthThrottle, Privilege};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
@@ -99,7 +99,8 @@ use crate::engine::{AccessMode, RestEngine, ResultStream, RunSummary, TxHandle, 
 use crate::negotiate::{Decode, Wire, request_decode, response_wire};
 use crate::problem::{PROBLEM_JSON, Problem};
 use crate::protocol::{
-    BeginResponse, RunRequest, RunResponse, Statement, StatementResult, parse_access_mode,
+    BeginResponse, DEFAULT_LOGIN_TOKEN_TTL_SECS, LoginRequest, LoginResponse, RunRequest,
+    RunResponse, Statement, StatementResult, parse_access_mode,
 };
 use crate::registry::{CachedResponse, TxRegistry};
 use crate::value::{self, ValueCodecError};
@@ -310,6 +311,12 @@ pub struct AppState<E: RestEngine> {
     /// The CORS policy (rmp #186). Defaults to **fail-closed** same-origin only; the server configures
     /// an allow-list via [`with_cors`](Self::with_cors).
     cors: CorsConfig,
+    /// The per-account failed-login throttle (rmp #458) consulted by the [`login`] handler **before**
+    /// the expensive Argon2 verification. Defaults to a **disabled** throttle (every attempt allowed)
+    /// — the server enables it with configured limits via [`with_auth_throttle`](Self::with_auth_throttle).
+    /// Shared (`Arc`) because the bucket map is process-wide state, behind an internal `std::sync::Mutex`
+    /// whose critical section never spans an `.await`.
+    auth_throttle: Arc<AuthThrottle>,
 }
 
 // Manual `Clone` (deriving would wrongly require `E: Clone`; the fields are all `Arc`).
@@ -322,6 +329,7 @@ impl<E: RestEngine> Clone for AppState<E> {
             clock: Arc::clone(&self.clock),
             auth_observer: self.auth_observer.clone(),
             cors: self.cors.clone(),
+            auth_throttle: Arc::clone(&self.auth_throttle),
         }
     }
 }
@@ -344,6 +352,10 @@ impl<E: RestEngine + 'static> AppState<E> {
             auth_observer: None,
             // Fail-closed by default (rmp #186): no cross-origin sharing unless the server opts in.
             cors: CorsConfig::default(),
+            // Disabled by default: the login throttle's limits are a deployment policy, so the server
+            // enables it via `with_auth_throttle`. A disabled throttle allows every attempt (the
+            // tests, and any in-process embedding that does not configure one, are unaffected).
+            auth_throttle: Arc::new(AuthThrottle::disabled()),
         }
     }
 
@@ -361,6 +373,15 @@ impl<E: RestEngine + 'static> AppState<E> {
     #[must_use]
     pub fn with_cors(mut self, cors: CorsConfig) -> Self {
         self.cors = cors;
+        self
+    }
+
+    /// Wires the per-account failed-login throttle (rmp #458) the [`login`] handler consults before
+    /// Argon2. The default is a **disabled** throttle (every attempt allowed); the server passes a
+    /// configured, enabled [`AuthThrottle`] here. Returns `self` for chaining at construction.
+    #[must_use]
+    pub fn with_auth_throttle(mut self, throttle: Arc<AuthThrottle>) -> Self {
+        self.auth_throttle = throttle;
         self
     }
 }
@@ -416,6 +437,9 @@ where
     let cors_layer = state.cors.clone().into_layer();
     Router::new()
         .route("/openapi.json", get(openapi_doc))
+        // The authentication entry point (rmp #499): UNAUTHENTICATED by design — it mints the very
+        // Bearer token the other routes require, so it does not (and must not) go through `authenticate`.
+        .route("/auth/login", post(login::<E>))
         .route("/db/{db}/tx", post(begin::<E>))
         .route("/db/{db}/tx/commit", post(auto_commit::<E>))
         .route("/db/{db}/graph", post(graph_viz::<E>))
@@ -442,6 +466,102 @@ where
 /// description).
 async fn openapi_doc() -> Response {
     Built::json(StatusCode::OK, &crate::openapi::document()).into_response()
+}
+
+/// `POST /auth/login` → exchange a username + password for a short-lived Bearer JWT (rmp #499).
+///
+/// This is the REST **authentication entry point**, so it is the one route that is **not** itself
+/// Bearer-authenticated and does **not** participate in the idempotency cache: an honest client (curl,
+/// a Go `net/http` program, …) presents its credentials and receives a token to use on every other
+/// route, without ever needing the server's JWT signing secret. The token is minted through the
+/// [`AuthProvider`] seam ([`AuthProvider::issue_token`]), so the router stays free of any token/crypto
+/// logic — the live server backs the seam with its read-locked security catalog.
+///
+/// # Flow (the order is security-load-bearing)
+///
+/// 1. **Decode** the [`LoginRequest`] (JSON or CBOR, content-negotiated). A malformed body, a missing
+///    field, or an undecodable `Content-Type` is a `400`/`415` problem+json *before* any auth work.
+/// 2. **Throttle gate** (rmp #458): the per-account failed-login bucket is consulted **before** the
+///    expensive Argon2 verification, keyed by the submitted `username`. An exhausted bucket is a
+///    retriable **`429`** (and an audited failure) — this blunts targeted online password-guessing and
+///    the per-account Argon2 CPU-exhaustion vector. (Cross-account flooding is independently bounded by
+///    the listener's per-source-IP connection cap + pre-auth deadline, rmp #478; the router layer has no
+///    peer IP, so the throttle keys by account only — see the type docs for [`AuthThrottle`].)
+/// 3. **Verify** the password ([`AuthProvider::authenticate_password`], constant-time Argon2). On
+///    failure → debit the throttle, audit the failure, and return a **uniform `401`**
+///    ([`Problem::invalid_credentials`]): the *same* message for a wrong password and an unknown user,
+///    so the endpoint is never a user-existence oracle (CWE-204). On success the throttle is **not**
+///    debited (a correct credential never counts against a legitimate client's rate).
+/// 4. **Issue** the token for the resolved principal, valid for [`DEFAULT_LOGIN_TOKEN_TTL_SECS`] from
+///    the server's `now_unix_secs`, audit the success, and return `200` with a [`LoginResponse`].
+async fn login<E: RestEngine + 'static>(
+    State(state): State<AppState<E>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // (1) Decode before any auth/throttle work, so a bad body is a clean 400/415.
+    let req: LoginRequest = match decode_body(&headers, &body) {
+        Ok(r) => r,
+        Err(p) => return Built::from(p).into_response(),
+    };
+
+    // (2) Throttle gate BEFORE Argon2 (rmp #458), keyed by the submitted account. The injected clock
+    // (monotonic timeline) drives the token bucket — never the wall clock — so the window is
+    // deterministic in tests. The lock inside `permit_attempt` is a tiny, non-`await` critical section.
+    if !state
+        .auth_throttle
+        .permit_attempt(&req.username, state.clock.as_ref())
+    {
+        notify_auth_failure(&state, "login attempt throttled");
+        return Built::from(Problem::too_many_login_attempts(
+            "too many failed login attempts for this account; retry after the throttle window refills",
+        ))
+        .into_response();
+    }
+
+    // (3) Verify the credential. Any failure is a UNIFORM 401 with no user-exists oracle.
+    match state
+        .auth
+        .authenticate_password(&req.username, &req.password)
+    {
+        Ok(user) => {
+            // (4) Success: do NOT debit the throttle. Mint a token for the resolved principal.
+            let now = state.now_unix_secs();
+            let token = match state
+                .auth
+                .issue_token(&user, now, DEFAULT_LOGIN_TOKEN_TTL_SECS)
+            {
+                Ok(t) => t,
+                // Post-authentication, this is essentially unreachable (the user just authenticated and
+                // the signing secret was validated at startup); a token-issue failure here can only be a
+                // race where the user was dropped between verify and issue, or an encoding fault. Surface
+                // it through the same auth-error mapping the rest of the surface uses.
+                Err(e) => return Built::from(Problem::from_auth_error(&e)).into_response(),
+            };
+            if let Some(observer) = &state.auth_observer {
+                observer.on_auth_success(&user);
+            }
+            serializable_built(
+                &headers,
+                StatusCode::OK,
+                &LoginResponse {
+                    token,
+                    token_type: "Bearer".to_owned(),
+                    expires_at_unix_secs: now + DEFAULT_LOGIN_TOKEN_TTL_SECS,
+                },
+            )
+            .into_response()
+        }
+        Err(_e) => {
+            // Failure: debit the per-account bucket (this attempt counts toward the throttle), audit
+            // it, and return the uniform 401 — identical for a wrong password and an unknown user.
+            state
+                .auth_throttle
+                .note_failure(&req.username, state.clock.as_ref());
+            notify_auth_failure(&state, "login authentication failed");
+            Built::from(Problem::invalid_credentials()).into_response()
+        }
+    }
 }
 
 /// `POST /db/{db}/tx` → open an explicit transaction (`04 §8.2`, `06 §4`).
@@ -1595,17 +1715,22 @@ fn authorize_mode<E: RestEngine>(
         .map_err(|e| Problem::from_auth_error(&e))
 }
 
-/// Decodes the request body into a [`RunRequest`], honouring `Content-Type` (`415` for an
-/// undecodable type) (`04 §8.2`). An empty body is an empty request.
-fn decode_request(headers: &HeaderMap, body: &Bytes) -> Result<RunRequest, Problem> {
+/// Decodes a request body into any deserializable `T`, honouring `Content-Type` (`415` for an
+/// undecodable type) and the recursion-bounded CBOR limit (`04 §8.2`). The shared decode core behind
+/// [`decode_request`] (the statement batch) and [`login`] (the [`LoginRequest`]).
+///
+/// Unlike [`decode_request`], an **empty body is not special-cased**: it is fed to the decoder and so
+/// fails for a `T` with required fields (e.g. [`LoginRequest`]) — a missing-field `400`, not a silent
+/// default. `decode_request` layers its empty-body-means-default behaviour on top of this.
+fn decode_body<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<T, Problem> {
     let decode = request_decode(header_str(headers, &CONTENT_TYPE)).ok_or_else(|| {
         Problem::unsupported_media_type("Content-Type must be application/json or application/cbor")
     })?;
-    if body.is_empty() {
-        return Ok(RunRequest::default());
-    }
     match decode {
-        Decode::Json => serde_json::from_slice::<RunRequest>(body).map_err(|e| {
+        Decode::Json => serde_json::from_slice::<T>(body).map_err(|e| {
             Problem::from_codec_error(&ValueCodecError::Malformed {
                 detail: e.to_string(),
             })
@@ -1614,7 +1739,7 @@ fn decode_request(headers: &HeaderMap, body: &Bytes) -> Result<RunRequest, Probl
         // can still nest CBOR arrays/maps deeply enough to overflow the stack, and ciborium's own
         // default limit is implicit. Cap at the same audited depth the typed-value codec enforces
         // (`value::MAX_CBOR_DEPTH`); over-deep input becomes a controlled `Malformed`, never a panic.
-        Decode::Cbor => ciborium::de::from_reader_with_recursion_limit::<RunRequest, _>(
+        Decode::Cbor => ciborium::de::from_reader_with_recursion_limit::<T, _>(
             body.as_ref(),
             value::MAX_CBOR_DEPTH,
         )
@@ -1624,6 +1749,22 @@ fn decode_request(headers: &HeaderMap, body: &Bytes) -> Result<RunRequest, Probl
             })
         }),
     }
+}
+
+/// Decodes the request body into a [`RunRequest`], honouring `Content-Type` (`415` for an
+/// undecodable type) (`04 §8.2`). An empty body is an empty (default) request.
+fn decode_request(headers: &HeaderMap, body: &Bytes) -> Result<RunRequest, Problem> {
+    if body.is_empty() {
+        // An empty body is a valid empty request (every `RunRequest` field defaults), but an
+        // undecodable `Content-Type` is still a `415` — validate it before short-circuiting.
+        request_decode(header_str(headers, &CONTENT_TYPE)).ok_or_else(|| {
+            Problem::unsupported_media_type(
+                "Content-Type must be application/json or application/cbor",
+            )
+        })?;
+        return Ok(RunRequest::default());
+    }
+    decode_body(headers, body)
 }
 
 /// Binds a statement's `parameters` (raw JSON) into `(name, Value)` pairs via the typed-value codec.

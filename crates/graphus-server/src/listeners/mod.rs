@@ -297,6 +297,19 @@ pub async fn start_all(
 ///
 /// Authentication is LIVE everywhere (rmp #94): the transactional API holds the `AuthProvider`
 /// (`auth`, a `LiveAuth` over the catalog), and the server's own `/admin/*` routes hold the
+/// The per-account failed-login **burst** tolerated before the REST `/auth/login` throttle (rmp #458)
+/// engages: a legitimate user fat-fingering a password gets this many tries; an attacker gets no more
+/// per account before being slowed. A modest value — the protection is the *refill*, not the burst.
+const LOGIN_THROTTLE_MAX_FAILURES: u32 = 5;
+
+/// The per-account failed-login **refill** rate for the REST `/auth/login` throttle (rmp #458): one
+/// failed-attempt slot per second — the finest the token bucket exposes (its constructor requires an
+/// integer rate ≥ 1/s). After the burst is spent, this bounds *sustained* failed logins for one
+/// account — and so its Argon2 CPU cost — to ~1/s, layered under the per-source-IP connection cap
+/// (rmp #478) and the global connection cap. A *correct* credential never debits, so a legitimate
+/// client is never throttled by its own success.
+const LOGIN_THROTTLE_REFILL_PER_SEC: u32 = 1;
+
 /// `SecurityCatalog` directly (`security`) and resolve each Bearer check through it.
 #[allow(clippy::too_many_arguments)] // The router legitimately aggregates all the shared services.
 fn build_rest_router(
@@ -342,8 +355,18 @@ fn build_rest_router(
     // `Rest` source. The observer is a tiny server-side adapter over the shared `AuditLog`.
     let observer: Arc<dyn graphus_rest::router::AuthObserver> =
         Arc::new(crate::engine::RestAuthObserver::new(Arc::clone(&audit)));
+    // Enable the per-account failed-login throttle (rmp #458) on the `POST /auth/login` endpoint
+    // (rmp #499): the bucket is consulted before the expensive Argon2 verification, blunting targeted
+    // online password-guessing and the per-account Argon2 CPU-exhaustion vector. The limits are
+    // compile-time non-zero, so construction cannot fail.
+    let auth_throttle = Arc::new(
+        graphus_auth::AuthThrottle::new(LOGIN_THROTTLE_MAX_FAILURES, LOGIN_THROTTLE_REFILL_PER_SEC)
+            .expect("INVARIANT: login throttle limits are compile-time non-zero"),
+    );
     let api = router(
-        AppState::new(rest_engine, auth, registry, Arc::clone(&clock)).with_auth_observer(observer),
+        AppState::new(rest_engine, auth, registry, Arc::clone(&clock))
+            .with_auth_observer(observer)
+            .with_auth_throttle(auth_throttle),
     );
 
     let extra = extra_routes::routes(

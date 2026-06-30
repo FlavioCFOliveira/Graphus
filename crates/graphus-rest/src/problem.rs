@@ -251,6 +251,45 @@ impl Problem {
         .with_code(CODE_TXN_TERMINATED)
     }
 
+    /// A **401 Unauthorized** for a failed `POST /auth/login` (rmp #499): a wrong password **or** an
+    /// unknown user, deliberately **indistinguishable**.
+    ///
+    /// The `detail` is a fixed, generic `"invalid username or password"` for *both* causes, so the
+    /// login endpoint is never a user-existence oracle (CWE-204): an attacker learns nothing about
+    /// whether a given username exists. It reuses the same `unauthorized` kind/title/code as a failed
+    /// Bearer validation, so a client sees one consistent authentication-failure shape.
+    #[must_use]
+    pub fn invalid_credentials() -> Self {
+        Problem::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication failed",
+            "invalid username or password",
+        )
+        .with_code(CODE_UNAUTHORIZED)
+    }
+
+    /// A **429 Too Many Requests** when the per-account login throttle (rmp #458) rejects an attempt
+    /// **before** the expensive Argon2 verification: the account has exhausted its failed-login budget
+    /// within the window.
+    ///
+    /// It is a **retriable** load-shed (the bucket refills over time), so it carries the
+    /// authentication-rate-limit code rather than a permanent client-fault code — the client should
+    /// back off and retry once the throttle window refills, exactly as for
+    /// [`too_many_transactions`](Self::too_many_transactions). A *successful* login is never throttled
+    /// (a correct credential does not debit the bucket), so a legitimate client is unaffected by its
+    /// own attempt rate.
+    #[must_use]
+    pub fn too_many_login_attempts(detail: impl Into<String>) -> Self {
+        Problem::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too-many-login-attempts",
+            "too many login attempts",
+            detail,
+        )
+        .with_code(CODE_AUTH_RATE_LIMIT)
+    }
+
     /// A **404 Not Found** for an unknown transaction id (`04 §8.2`).
     #[must_use]
     pub fn unknown_transaction(id: &str) -> Self {
@@ -298,6 +337,9 @@ const CODE_DB_UNKNOWN: &str = "Neo.DatabaseError.General.UnknownError";
 const CODE_REQUEST_INVALID: &str = "Neo.ClientError.Request.Invalid";
 const CODE_UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
 const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
+/// The auth-rate-limit code for a throttled login (rmp #458/#499): the same best-effort `Neo.*`-shaped
+/// rendering the rest of the surface uses (`06 §2.4`), matching Neo4j's authentication-rate-limit class.
+const CODE_AUTH_RATE_LIMIT: &str = "Neo.ClientError.Security.AuthenticationRateLimit";
 
 /// Removes the `GraphusError::Display` layer prefix (`"<layer> error: "`) so the problem `detail`
 /// is the bare human description — mirrors `graphus_bolt::error`'s `strip_layer_prefix`.
@@ -405,5 +447,25 @@ mod tests {
     fn status_code_round_trips() {
         let p = Problem::unknown_transaction("tx-7");
         assert_eq!(p.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn invalid_credentials_is_uniform_401_with_no_oracle() {
+        // rmp #499 (CWE-204): the wrong-password and unknown-user 401s must be byte-identical, so the
+        // login endpoint never reveals whether a username exists.
+        let p = Problem::invalid_credentials();
+        assert_eq!(p.status, 401);
+        assert_eq!(p.detail.as_deref(), Some("invalid username or password"));
+        assert_eq!(p.code.as_deref(), Some(CODE_UNAUTHORIZED));
+        // Calling it again yields the same object (the fixed, cause-independent shape).
+        assert_eq!(Problem::invalid_credentials(), p);
+    }
+
+    #[test]
+    fn too_many_login_attempts_is_retriable_429() {
+        let p = Problem::too_many_login_attempts("account login throttled");
+        assert_eq!(p.status, 429);
+        assert_eq!(p.code.as_deref(), Some(CODE_AUTH_RATE_LIMIT));
+        assert_eq!(p.type_uri, "urn:graphus:error:too-many-login-attempts");
     }
 }

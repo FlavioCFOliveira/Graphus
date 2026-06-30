@@ -102,7 +102,8 @@ pub use engine::{AccessMode, RestEngine, ResultStream, Row, RunSummary, TxHandle
 pub use negotiate::{Decode, Wire};
 pub use problem::{PROBLEM_JSON, Problem};
 pub use protocol::{
-    BeginResponse, RunRequest, RunResponse, Statement, StatementResult, parse_access_mode,
+    BeginResponse, DEFAULT_LOGIN_TOKEN_TTL_SECS, LoginRequest, LoginResponse, RunRequest,
+    RunResponse, Statement, StatementResult, parse_access_mode,
 };
 pub use registry::{CachedResponse, TxRegistry};
 pub use restvalue::{

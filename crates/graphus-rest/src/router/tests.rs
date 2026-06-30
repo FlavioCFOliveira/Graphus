@@ -16,11 +16,12 @@ use http_body_util::BodyExt;
 use serde_json::{Value as Json, json};
 use tower::ServiceExt;
 
-use graphus_auth::{AuthProvider, Authenticator, Privilege};
+use graphus_auth::{AuthProvider, AuthThrottle, Authenticator, Privilege};
 use graphus_core::Value;
 use graphus_core::capability::Clock;
 
 use crate::engine::{Row, RunSummary, mock::Canned, mock::MockEngine};
+use crate::protocol::{DEFAULT_LOGIN_TOKEN_TTL_SECS, LoginResponse};
 use crate::registry::TxRegistry;
 use crate::restvalue::{RestNode, RestPath, RestRelationship, RestValue};
 use crate::router::{AppState, router};
@@ -50,8 +51,14 @@ impl Clock for TestClock {
 const JWT_SECRET: &[u8] = b"a-test-jwt-signing-secret-at-least-32b!!";
 const TTL: u64 = 1_000_000_000; // 1s, in clock nanos
 
+/// Passwords for the `POST /auth/login` (password-auth) tests, each ≥ `MIN_PASSWORD_LEN` (8) so
+/// `set_password` accepts them. The Bearer-only lifecycle tests are unaffected — see `fixture_auth`.
+const ALICE_PASSWORD: &str = "alice-strong-pw";
+const BOB_PASSWORD: &str = "bob-strong-pw-2";
+
 /// An authenticator with `alice` (DB Read + Write) and `bob` (DB Read only), so tests can exercise
-/// both authorized and forbidden access modes. No passwords needed (REST uses Bearer).
+/// both authorized and forbidden access modes. `alice`/`bob` also get a password (rmp #499) so the
+/// `POST /auth/login` tests can authenticate them; `carol` stays password-less.
 ///
 /// It also seeds `carol`, a **per-tenant** (graph-scoped) principal granted `READ`/`WRITE` on
 /// `GRAPH neo4j` **only** (not server-wide `Resource::Database`). She is the regression fixture for
@@ -91,6 +98,11 @@ fn fixture_auth() -> Authenticator {
     a.catalog_mut().grant_role("alice", "rw").unwrap();
     a.catalog_mut().grant_role("bob", "ro").unwrap();
     a.catalog_mut().grant_role("carol", "tenant_neo4j").unwrap();
+    // rmp #499: `/auth/login` authenticates by password. Setting an INITIAL password keeps each user's
+    // credential epoch at its baseline (0), so the Bearer tokens the other tests mint via `issue_token`
+    // (also epoch 0) stay valid — the credentials are additive, not a perturbation of those tests.
+    a.set_password("alice", ALICE_PASSWORD).unwrap();
+    a.set_password("bob", BOB_PASSWORD).unwrap();
     a
 }
 
@@ -112,8 +124,20 @@ impl Harness {
     }
 
     /// Builds a harness whose registry caps the number of concurrently-open transactions at `cap`
-    /// (rmp #448), so the open-transaction-cap gate can exhaust it with a handful of `BEGIN`s.
+    /// (rmp #448), so the open-transaction-cap gate can exhaust it with a handful of `BEGIN`s. The
+    /// login throttle is **disabled** (the lifecycle/cap tests do not exercise `/auth/login`).
     fn with_engine_and_cap(engine: MockEngine, cap: usize) -> Self {
+        Self::with_engine_cap_throttle(engine, cap, Arc::new(AuthThrottle::disabled()))
+    }
+
+    /// Builds a harness with an explicit login throttle (rmp #458/#499), so the `/auth/login`
+    /// throttle test can drive an enabled bucket against the deterministic clock. `cap` is the
+    /// open-transaction cap as in [`with_engine_and_cap`](Self::with_engine_and_cap).
+    fn with_engine_cap_throttle(
+        engine: MockEngine,
+        cap: usize,
+        throttle: Arc<AuthThrottle>,
+    ) -> Self {
         let engine = Arc::new(engine);
         let auth = Arc::new(fixture_auth());
         let registry = Arc::new(TxRegistry::new(TTL).with_max_open_transactions(cap));
@@ -127,7 +151,8 @@ impl Harness {
             Arc::clone(&auth) as Arc<dyn AuthProvider>,
             Arc::clone(&registry),
             Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>,
-        );
+        )
+        .with_auth_throttle(throttle);
         Self {
             router: router(state),
             engine,
@@ -1923,4 +1948,220 @@ async fn columnar_endpoint_does_not_affect_the_json_path() {
     let doc = body_json(resp).await;
     assert_eq!(doc["results"][0]["fields"][0], "x");
     assert_eq!(doc["results"][0]["data"][0][0], json!({ "Z": "1" }));
+}
+
+// =============================== POST /auth/login (rmp #499) ====================================
+
+/// A `POST /auth/login` with a JSON credential body and **no** `Authorization` header (the route is
+/// the unauthenticated entry point).
+fn post_login_json(username: &str, password: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "username": username, "password": password })).unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn login_returns_a_bearer_token_with_expiry() {
+    let h = Harness::new();
+    let resp = h.send(post_login_json("alice", ALICE_PASSWORD)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(content_type(&resp), "application/json");
+    let body = body_json(resp).await;
+    assert!(
+        body["token"].as_str().is_some_and(|t| !t.is_empty()),
+        "a non-empty token is returned"
+    );
+    assert_eq!(body["token_type"], "Bearer");
+    // `expires_at_unix_secs == now_unix_secs + TTL`. The fixture clock starts at t=1s (1e9 ns), so
+    // `now_unix_secs` is 1 and the expiry is `1 + DEFAULT_LOGIN_TOKEN_TTL_SECS`.
+    assert_eq!(
+        body["expires_at_unix_secs"].as_u64().unwrap(),
+        1 + DEFAULT_LOGIN_TOKEN_TTL_SECS
+    );
+}
+
+#[tokio::test]
+async fn login_token_is_accepted_by_a_transactional_route() {
+    // The whole point of the endpoint: a token minted from credentials authorises a real request.
+    let engine = MockEngine::new().on_query(
+        "RETURN 1 AS x",
+        Canned::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let h = Harness::with_engine(engine);
+
+    let login = body_json(h.send(post_login_json("alice", ALICE_PASSWORD)).await).await;
+    let token = login["token"].as_str().unwrap().to_owned();
+
+    // Use the minted Bearer on an auto-commit query — it must be accepted (not 401) and run.
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({ "statements": [{ "statement": "RETURN 1 AS x" }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    assert_eq!(doc["results"][0]["data"][0][0], json!({ "Z": "1" }));
+}
+
+#[tokio::test]
+async fn login_wrong_password_and_unknown_user_are_the_same_uniform_401() {
+    // rmp #499 (CWE-204): a wrong password and an unknown user must be INDISTINGUISHABLE — same
+    // status and byte-identical body — so the endpoint is never a user-existence oracle.
+    let h = Harness::new();
+
+    let wrong_pw = h
+        .send(post_login_json("alice", "not-alices-password"))
+        .await;
+    assert_eq!(wrong_pw.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(content_type(&wrong_pw), "application/problem+json");
+    let wrong_pw_bytes = body_bytes(wrong_pw).await;
+
+    let unknown = h.send(post_login_json("ghost", "any-password-here")).await;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    let unknown_bytes = body_bytes(unknown).await;
+
+    assert_eq!(
+        wrong_pw_bytes, unknown_bytes,
+        "the wrong-password and unknown-user 401 bodies must be byte-identical (no oracle)"
+    );
+    let problem: Json = serde_json::from_slice(&wrong_pw_bytes).unwrap();
+    assert_eq!(problem["detail"], "invalid username or password");
+    assert_eq!(problem["status"], 401);
+}
+
+#[tokio::test]
+async fn login_throttle_returns_429_then_refills() {
+    // rmp #458/#499: after `max_failures` failed attempts for one account, the next attempt is
+    // rejected with a retriable 429 BEFORE Argon2; the bucket refills over the injected clock.
+    let throttle = Arc::new(AuthThrottle::new(2, 1).expect("non-zero throttle limits"));
+    let h = Harness::with_engine_cap_throttle(
+        MockEngine::new(),
+        crate::registry::DEFAULT_MAX_OPEN_TRANSACTIONS,
+        throttle,
+    );
+
+    // Two wrong-password attempts: each reaches Argon2 and fails with the uniform 401 (and debits).
+    for _ in 0..2 {
+        let resp = h.send(post_login_json("alice", "wrong-password")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // The third attempt is rejected up front — the bucket is empty — with a retriable 429.
+    let throttled = h.send(post_login_json("alice", "wrong-password")).await;
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(content_type(&throttled), "application/problem+json");
+    let problem = body_json(throttled).await;
+    assert_eq!(
+        problem["code"],
+        "Neo.ClientError.Security.AuthenticationRateLimit"
+    );
+
+    // Advance the injected clock by one second: the bucket refills one slot (rate = 1/s), so the
+    // next attempt is permitted through to the (failing) credential check again — proving the refill.
+    h.clock.set(2_000_000_000); // t = 2s
+    let after_refill = h.send(post_login_json("alice", "wrong-password")).await;
+    assert_eq!(
+        after_refill.status(),
+        StatusCode::UNAUTHORIZED,
+        "after the throttle window refills, the attempt reaches the credential check again (401, not 429)"
+    );
+
+    // A throttle keyed on `alice` must not bleed onto another account: `bob` is never throttled here.
+    let bob = h.send(post_login_json("bob", BOB_PASSWORD)).await;
+    assert_eq!(bob.status(), StatusCode::OK, "the throttle is per-account");
+}
+
+#[tokio::test]
+async fn login_throttle_never_blocks_a_correct_credential() {
+    // A successful login must NOT debit the bucket — a legitimate client is never throttled by its
+    // own (correct) attempt rate, even repeated many times within the window.
+    let throttle = Arc::new(AuthThrottle::new(2, 1).expect("non-zero throttle limits"));
+    let h = Harness::with_engine_cap_throttle(
+        MockEngine::new(),
+        crate::registry::DEFAULT_MAX_OPEN_TRANSACTIONS,
+        throttle,
+    );
+    for _ in 0..5 {
+        let resp = h.send(post_login_json("alice", ALICE_PASSWORD)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a correct credential is never throttled (success does not debit the bucket)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn login_malformed_body_is_400() {
+    let h = Harness::new();
+
+    // Missing required fields → a 400 problem (serde rejects the body at the decode boundary).
+    let missing = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+        .unwrap();
+    let resp = h.send(missing).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(content_type(&resp), "application/problem+json");
+
+    // An empty body is likewise a 400 (unlike a statement batch, login has no valid empty form).
+    let empty = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.send(empty).await.status(), StatusCode::BAD_REQUEST);
+
+    // An undecodable Content-Type is a 415.
+    let bad_ct = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from("username=alice".as_bytes().to_vec()))
+        .unwrap();
+    assert_eq!(
+        h.send(bad_ct).await.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+}
+
+#[tokio::test]
+async fn login_cbor_request_and_response_round_trip() {
+    let h = Harness::new();
+
+    // Encode the credentials as a CBOR map and ask for a CBOR response.
+    let mut body = Vec::new();
+    ciborium::into_writer(
+        &json!({ "username": "alice", "password": ALICE_PASSWORD }),
+        &mut body,
+    )
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/auth/login")
+        .header(header::CONTENT_TYPE, "application/cbor")
+        .header(header::ACCEPT, "application/cbor")
+        .body(Body::from(body))
+        .unwrap();
+
+    let resp = h.send(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(content_type(&resp), "application/cbor");
+    let bytes = body_bytes(resp).await;
+    let decoded: LoginResponse = ciborium::from_reader(bytes.as_slice()).unwrap();
+    assert_eq!(decoded.token_type, "Bearer");
+    assert!(!decoded.token.is_empty());
+    assert_eq!(
+        decoded.expires_at_unix_secs,
+        1 + DEFAULT_LOGIN_TOKEN_TTL_SECS
+    );
 }

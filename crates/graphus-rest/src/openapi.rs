@@ -5,8 +5,9 @@
 //! published OpenAPI 3.1 description makes that surface machine-discoverable. The document is
 //! **hand-written** (a single source-of-truth [`serde_json::Value`]) rather than derived, so it can
 //! describe the Jolt typed-value schema and the RFC 9457 error shape precisely and stays valid
-//! independent of any code-generation macro. It declares `"openapi": "3.1.0"`, the five transaction
-//! paths, the typed-value/`Statement`/`Problem` component schemas, and the Bearer security scheme.
+//! independent of any code-generation macro. It declares `"openapi": "3.1.0"`, the unauthenticated
+//! `POST /auth/login` token-minting path (rmp #499), the transaction paths, the
+//! typed-value/`Statement`/`Problem`/`Login*` component schemas, and the Bearer security scheme.
 //!
 //! It is intentionally a *description*, not a contract enforced at runtime: the handlers validate
 //! their own inputs (`06 §4` access_mode, [`crate::value`] decoding) and the document mirrors that
@@ -36,10 +37,47 @@ pub fn document() -> Json {
         "servers": [ { "url": "/", "description": "This Graphus server (TLS-terminated by the listener)." } ],
         "security": [ { "bearerAuth": [] } ],
         "tags": [
+            { "name": "auth", "description": "Authentication: obtain a Bearer token from credentials." },
             { "name": "transaction", "description": "The Cypher transaction lifecycle." },
             { "name": "graph", "description": "Graph projection for visualisation front-ends." }
         ],
         "paths": {
+            "/auth/login": {
+                "post": {
+                    "tags": ["auth"],
+                    "summary": "Exchange a username and password for a Bearer token.",
+                    "description": "Authenticates a username + password and returns a short-lived \
+                        Bearer JWT to use as `Authorization: Bearer <token>` on every other route. \
+                        This is the one UNAUTHENTICATED route (it mints the token the others require) \
+                        — hence `security: []`. A wrong password and an unknown user return the same \
+                        401 (no user-existence oracle); repeated failures for one account are \
+                        throttled with a retriable 429 (rmp #458). See \
+                        specification/04-technical-design.md §8.4.",
+                    "operationId": "login",
+                    "security": [],
+                    "requestBody": {
+                        "required": true,
+                        "description": "The credentials to authenticate.",
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } },
+                            "application/cbor": { "schema": { "$ref": "#/components/schemas/LoginRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Authenticated; a Bearer token is returned.",
+                            "content": {
+                                "application/json": { "schema": { "$ref": "#/components/schemas/LoginResponse" } },
+                                "application/cbor": { "schema": { "$ref": "#/components/schemas/LoginResponse" } }
+                            }
+                        },
+                        "400": { "$ref": "#/components/responses/Problem" },
+                        "401": { "$ref": "#/components/responses/Problem" },
+                        "415": { "$ref": "#/components/responses/Problem" },
+                        "429": { "$ref": "#/components/responses/Problem" }
+                    }
+                }
+            },
             "/db/{db}/tx": {
                 "post": {
                     "tags": ["transaction"],
@@ -218,6 +256,25 @@ pub fn document() -> Json {
                 }
             },
             "schemas": {
+                "LoginRequest": {
+                    "type": "object",
+                    "description": "Credentials presented to `POST /auth/login` (rmp #499).",
+                    "required": ["username", "password"],
+                    "properties": {
+                        "username": { "type": "string", "description": "The catalog user to authenticate." },
+                        "password": { "type": "string", "description": "The user's password (verified against a stored Argon2 hash, constant-time)." }
+                    }
+                },
+                "LoginResponse": {
+                    "type": "object",
+                    "description": "A minted Bearer token and its expiry (rmp #499).",
+                    "required": ["token", "token_type", "expires_at_unix_secs"],
+                    "properties": {
+                        "token": { "type": "string", "description": "The signed HS256 JWT to send as a Bearer credential." },
+                        "token_type": { "type": "string", "enum": ["Bearer"], "description": "Always \"Bearer\" (RFC 6750)." },
+                        "expires_at_unix_secs": { "type": "integer", "description": "Absolute token expiry in Unix seconds (now + TTL; default TTL 3600s)." }
+                    }
+                },
                 "TypedValue": {
                     "description": "A Jolt-style typed value (specification/04 §8.2). 64-bit integers \
                         are string-encoded for int53 safety.",
@@ -404,5 +461,22 @@ mod tests {
         let scheme = &doc["components"]["securitySchemes"]["bearerAuth"];
         assert_eq!(scheme["type"], "http");
         assert_eq!(scheme["scheme"], "bearer");
+    }
+
+    #[test]
+    fn document_declares_the_unauthenticated_login_path_and_schemas() {
+        // rmp #499: the login route is declared, marked UNAUTHENTICATED (`security: []` overriding the
+        // global bearerAuth), and references the Login request/response schemas.
+        let doc = document();
+        let op = &doc["paths"]["/auth/login"]["post"];
+        assert_eq!(op["operationId"], "login");
+        // An empty `security` array opts this one route out of the global Bearer requirement.
+        assert_eq!(op["security"], json!([]));
+        let schemas = &doc["components"]["schemas"];
+        assert!(schemas.get("LoginRequest").is_some());
+        assert!(schemas.get("LoginResponse").is_some());
+        // The 401 (uniform failure) and 429 (throttle) outcomes are documented.
+        assert!(op["responses"].get("401").is_some());
+        assert!(op["responses"].get("429").is_some());
     }
 }

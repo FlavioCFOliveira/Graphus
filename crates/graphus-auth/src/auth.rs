@@ -69,6 +69,20 @@ pub trait AuthProvider: Send + Sync {
     /// # Errors
     /// [`AuthError::Unauthorized`] if `user` lacks `wanted`.
     fn require(&self, user: &str, wanted: &Privilege) -> Result<()>;
+
+    /// Issues a Bearer token for `user`, valid for `ttl_secs` from `now_unix_secs`, stamped with the
+    /// user's current credential epoch (SEC-180) so a later password change invalidates it.
+    ///
+    /// This is the **token-minting** counterpart to [`authenticate_bearer`](Self::authenticate_bearer):
+    /// it lets a connectivity seam (the REST `POST /auth/login` endpoint, rmp #499) hand a
+    /// freshly-authenticated principal a Bearer token **without** holding the server's JWT signing
+    /// secret. The live `graphus-server` implementation resolves the current credential epoch through
+    /// its read-locked catalog, exactly as [`Authenticator::issue_token`] does for a snapshot.
+    ///
+    /// # Errors
+    /// - [`AuthError::NotFound`] if `user` does not exist (only known users get tokens).
+    /// - [`AuthError::BadToken`] if encoding fails.
+    fn issue_token(&self, user: &str, now_unix_secs: u64, ttl_secs: u64) -> Result<String>;
 }
 
 /// The shared authentication + authorization service for all listeners.
@@ -398,6 +412,10 @@ impl AuthProvider for Authenticator {
 
     fn require(&self, user: &str, wanted: &Privilege) -> Result<()> {
         Authenticator::require(self, user, wanted)
+    }
+
+    fn issue_token(&self, user: &str, now_unix_secs: u64, ttl_secs: u64) -> Result<String> {
+        Authenticator::issue_token(self, user, now_unix_secs, ttl_secs)
     }
 }
 
