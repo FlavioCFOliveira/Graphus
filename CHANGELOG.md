@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-06-30
+
 ### Fixed
 
 - **Query result summary (side-effect counters + query type).** Both the Bolt and REST interfaces now
@@ -227,6 +229,8 @@ to build, run, and evaluate the server.
   Supply a CA-issued certificate, a strong admin password, and a real JWT secret before
   any non-sandbox use. See the README "Production / TLS" section.
 
-[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/FlavioCFOliveira/Graphus/releases/tag/v0.0.1
