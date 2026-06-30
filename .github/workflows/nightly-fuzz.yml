@@ -31,7 +31,7 @@ jobs:
       matrix:
         mode: [safety, liveness, standard]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build fuzzer (release)
         run: cargo build --release -p graphus-dst --bin graphus-dst
@@ -46,7 +46,7 @@ jobs:
             --write-artifacts dst-artifacts
       - name: Upload replay artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dst-replay-artifacts-${{ matrix.mode }}
           path: dst-artifacts/
@@ -61,7 +61,7 @@ jobs:
     name: ThreadSanitizer threaded concurrency lane
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install nightly + rust-src (ThreadSanitizer needs an instrumented std)
         uses: dtolnay/rust-toolchain@nightly
         with:
