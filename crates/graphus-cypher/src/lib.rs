@@ -116,6 +116,7 @@ pub mod column_cache;
 pub mod constraint;
 pub mod coordinator;
 pub mod cost;
+pub mod counters;
 pub mod csr_adjacency;
 pub mod equality;
 pub mod equivalence;
@@ -168,6 +169,7 @@ pub use catalog::{
 pub use constraint::{CONSTRAINT_VIOLATION_PREFIX, ConstraintViolation};
 pub use coordinator::{ConstraintInfo, CoordinatorStatistics, ReadTaskInputs, TxnCoordinator};
 pub use cost::{CostEstimate, estimate_cost};
+pub use counters::QueryCounters;
 pub use equality::{equals, is_in, not_equals};
 pub use equivalence::equivalent;
 pub use errors::{
@@ -200,7 +202,9 @@ pub use logical::{
 pub use lower::lower;
 pub use ordering::{cmp_values, compare_values};
 pub use parser::{MAX_EXPR_DEPTH, SyntaxError, SyntaxErrorKind, parse, parse_tokens};
-pub use physical::{PhysicalOp, PhysicalPlan, RangeBound, plan_physical, plan_physical_with_stats};
+pub use physical::{
+    PhysicalOp, PhysicalPlan, QueryType, RangeBound, plan_physical, plan_physical_with_stats,
+};
 pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,

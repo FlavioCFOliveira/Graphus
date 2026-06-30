@@ -530,6 +530,26 @@ pub trait GraphAccess {
     fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
         None
     }
+
+    // ---- counters -----------------------------------------------------------------------------
+
+    /// The exact side-effect [`QueryCounters`](crate::counters::QueryCounters) this seam accumulated
+    /// over the statement it ran — the Bolt / Neo4j operation-count model (`rmp` task #510).
+    ///
+    /// A statement's writes are tallied at the lowest shared chokepoints (so `CREATE` / `SET` /
+    /// `MERGE` / `REMOVE` / `DELETE` all count through one path), following the Neo4j
+    /// `SummaryCounters` rules documented on [`QueryCounters`](crate::counters). The result is read
+    /// **after** the cursor is drained, before commit, by the orchestration layer that builds the
+    /// result summary.
+    ///
+    /// The **default** is an empty [`QueryCounters`] — correct for every read-only / mock seam (which
+    /// applies no writes) and for any backend that does not track counters. The write-applying
+    /// backends ([`MemGraph`] and the live `RecordStoreGraph`) override it to return their exact
+    /// tally; the [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator delegates to
+    /// its inner seam (a denied write never reaches inner, so it correctly counts zero).
+    fn write_counters(&self) -> crate::counters::QueryCounters {
+        crate::counters::QueryCounters::default()
+    }
 }
 
 // =================================================================================================
@@ -594,6 +614,12 @@ pub struct MemGraph {
     /// the real grid index from the executor's perspective: a geometric superset re-checked exactly by
     /// the residual `distance` filter above the seek.
     spatial: std::collections::BTreeSet<(String, String)>,
+    /// The exact side-effect tally for the statement run against this graph (`rmp` task #510),
+    /// surfaced by [`write_counters`](GraphAccess::write_counters). Incremented at the same logical
+    /// chokepoints (and following the same Neo4j operation-count rules) as the live
+    /// `RecordStoreGraph`, so the two backends report byte-identical counters for the same statement.
+    /// A plain field suffices — every write method takes `&mut self`.
+    counters: crate::counters::QueryCounters,
 }
 
 /// A declared full-text index in [`MemGraph`] (`rmp` task #72): the covered label, properties and
@@ -881,17 +907,27 @@ impl GraphAccess for MemGraph {
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
         let id = NodeId(self.next_node);
         self.next_node += 1;
+        // `rmp` #510: a node creation always counts. Labels/properties are counted below as they are
+        // actually applied (this backend inlines the loops rather than routing through
+        // `add_labels`/`set_node_property`, so the increments live here — matching the live store,
+        // which counts the same logical events through those sub-calls).
+        self.counters.nodes_created += 1;
         let mut node = MemNode::default();
         for l in labels {
             if !node.labels.iter().any(|existing| existing == l) {
                 node.labels.push(l.clone());
+                // A label bit not already set counts (`rmp` #510); a repeat in the same clause (`:A:A`)
+                // hits the dedup guard and counts once.
+                self.counters.labels_added += 1;
             }
         }
         node.labels.sort();
         for (k, v) in properties {
-            // A null property value is not stored (Cypher does not persist null properties).
+            // A null property value is not stored (Cypher does not persist null properties) and does
+            // not count; a non-null write counts (`rmp` #510).
             if !v.is_null() {
                 node.props.insert(k.clone(), v.clone());
+                self.counters.properties_set += 1;
             }
         }
         self.nodes.insert(id, node);
@@ -907,10 +943,13 @@ impl GraphAccess for MemGraph {
     ) -> RelId {
         let id = RelId(self.next_rel);
         self.next_rel += 1;
+        // `rmp` #510: a relationship creation always counts; non-null properties count below.
+        self.counters.relationships_created += 1;
         let mut props = BTreeMap::new();
         for (k, v) in properties {
             if !v.is_null() {
                 props.insert(k.clone(), v.clone());
+                self.counters.properties_set += 1;
             }
         }
         self.rels.insert(
@@ -928,9 +967,12 @@ impl GraphAccess for MemGraph {
     fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
         if let Some(n) = self.nodes.get_mut(&node) {
             if value.is_null() {
+                // `SET n.p = null` is a removal, not a set: it does not count (`rmp` #510).
                 n.props.remove(key);
             } else {
+                // A non-null set counts even when the value is unchanged (Neo4j semantics, `rmp` #510).
                 n.props.insert(key.to_owned(), value);
+                self.counters.properties_set += 1;
             }
         }
     }
@@ -941,6 +983,7 @@ impl GraphAccess for MemGraph {
                 r.props.remove(key);
             } else {
                 r.props.insert(key.to_owned(), value);
+                self.counters.properties_set += 1;
             }
         }
     }
@@ -950,6 +993,8 @@ impl GraphAccess for MemGraph {
             for l in labels {
                 if !n.labels.iter().any(|existing| existing == l) {
                     n.labels.push(l.clone());
+                    // Only a newly-set bit counts; re-adding a present label counts 0 (`rmp` #510).
+                    self.counters.labels_added += 1;
                 }
             }
             n.labels.sort();
@@ -958,7 +1003,10 @@ impl GraphAccess for MemGraph {
 
     fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
         if let Some(n) = self.nodes.get_mut(&node) {
+            let before = n.labels.len();
             n.labels.retain(|l| !labels.iter().any(|r| r == l));
+            // Only labels actually present-and-removed count; an absent label counts 0 (`rmp` #510).
+            self.counters.labels_removed += (before - n.labels.len()) as u64;
         }
     }
 
@@ -976,10 +1024,12 @@ impl GraphAccess for MemGraph {
 
     fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
         if let Some(n) = self.nodes.get_mut(&node) {
+            // The clear is a bulk removal and does not count; each non-null re-set counts (`rmp` #510).
             n.props.clear();
             for (k, v) in properties {
                 if !v.is_null() {
                     n.props.insert(k.clone(), v.clone());
+                    self.counters.properties_set += 1;
                 }
             }
         }
@@ -992,6 +1042,7 @@ impl GraphAccess for MemGraph {
                     n.props.remove(k);
                 } else {
                     n.props.insert(k.clone(), v.clone());
+                    self.counters.properties_set += 1;
                 }
             }
         }
@@ -1003,6 +1054,7 @@ impl GraphAccess for MemGraph {
             for (k, v) in properties {
                 if !v.is_null() {
                     r.props.insert(k.clone(), v.clone());
+                    self.counters.properties_set += 1;
                 }
             }
         }
@@ -1015,6 +1067,7 @@ impl GraphAccess for MemGraph {
                     r.props.remove(k);
                 } else {
                     r.props.insert(k.clone(), v.clone());
+                    self.counters.properties_set += 1;
                 }
             }
         }
@@ -1029,16 +1082,27 @@ impl GraphAccess for MemGraph {
     }
 
     fn delete_rel(&mut self, rel: RelId) {
-        self.rels.remove(&rel);
+        // Count only an actually-removed relationship; a second delete of an already-gone rel in the
+        // same statement is a no-op and counts 0 (`rmp` #510).
+        if self.rels.remove(&rel).is_some() {
+            self.counters.relationships_deleted += 1;
+        }
     }
 
     fn delete_node(&mut self, node: NodeId) {
-        self.nodes.remove(&node);
+        // Count only an actually-removed node; an idempotent double-delete counts once (`rmp` #510).
+        if self.nodes.remove(&node).is_some() {
+            self.counters.nodes_deleted += 1;
+        }
     }
 
     fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
         // MemGraph knows its full contents, so it always provides exact counts.
         Some(self)
+    }
+
+    fn write_counters(&self) -> crate::counters::QueryCounters {
+        self.counters.clone()
     }
 }
 

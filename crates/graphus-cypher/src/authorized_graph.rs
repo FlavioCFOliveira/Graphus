@@ -843,6 +843,14 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         // cardinality-estimation one.
         self.inner.statistics()
     }
+
+    fn write_counters(&self) -> crate::counters::QueryCounters {
+        // `rmp` #510: side effects are counted at the inner seam's write chokepoints. This decorator
+        // is deny-by-default: a forbidden write returns via `deny()` WITHOUT calling inner, so it
+        // never reaches a chokepoint and is correctly counted as zero. An authorized write forwards to
+        // inner and is counted there. So delegating verbatim yields the exact applied-side-effect tally.
+        self.inner.write_counters()
+    }
 }
 
 impl<O: PrivilegeOracle> AuthorizedGraph<'_, O> {

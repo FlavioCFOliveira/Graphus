@@ -19,10 +19,11 @@
 //! distinct label) is the documented overflow deferral (#39's token-list block) and errors.
 
 use graphus_core::{TxnId, Value};
+use graphus_cypher::QueryCounters;
 use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::executor::execute;
-use graphus_cypher::graph_access::MemGraph;
+use graphus_cypher::graph_access::{GraphAccess, MemGraph};
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
@@ -1210,4 +1211,194 @@ fn uncommitted_relationship_property_is_rolled_back_after_a_crash() {
         vec![i(2000)],
         "the committed inline value stands; the uncommitted overwrite was undone"
     );
+}
+
+// =================================================================================================
+// Side-effect QueryCounters equivalence (`rmp` task #510)
+// =================================================================================================
+//
+// The Bolt operation-count counters MemGraph accumulates MUST match the live `RecordStoreGraph`
+// event-for-event (the executor proves correctness on MemGraph; the wire summary reads the real
+// store). These tests run the SAME statement on both backends and assert the counters are identical
+// AND equal to the documented Neo4j count. They cover every counting rule the seam implements.
+
+/// Compiles and runs `src` against `graph` (MemGraph), draining the cursor so all writes apply.
+fn mem_run(src: &str, graph: &mut MemGraph) {
+    let plan = compile(src);
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    execute(&plan, &bound, graph)
+        .expect("open cursor")
+        .collect_all()
+        .expect("collect rows");
+}
+
+/// Field-wise `a - b` of two counter tallies (`a >= b` field-wise by construction here).
+fn counter_sub(a: &QueryCounters, b: &QueryCounters) -> QueryCounters {
+    QueryCounters {
+        nodes_created: a.nodes_created - b.nodes_created,
+        nodes_deleted: a.nodes_deleted - b.nodes_deleted,
+        relationships_created: a.relationships_created - b.relationships_created,
+        relationships_deleted: a.relationships_deleted - b.relationships_deleted,
+        properties_set: a.properties_set - b.properties_set,
+        labels_added: a.labels_added - b.labels_added,
+        labels_removed: a.labels_removed - b.labels_removed,
+    }
+}
+
+/// The counters `op` contributes on a fresh MemGraph seeded by `setup` (the delta, isolating `op`).
+fn mem_op_counters(setup: &str, op: &str) -> QueryCounters {
+    let mut g = MemGraph::new();
+    if !setup.is_empty() {
+        mem_run(setup, &mut g);
+    }
+    let before = g.write_counters();
+    mem_run(op, &mut g);
+    counter_sub(&g.write_counters(), &before)
+}
+
+/// The counters `op` contributes on the real store: `setup` is committed in one transaction, then
+/// `op` runs in a FRESH `RecordStoreGraph` (whose per-statement tally starts at zero), so the read
+/// counters are exactly `op`'s side effects with no setup leakage.
+fn rsg_op_counters(setup: &str, op: &str) -> QueryCounters {
+    let mut store = fresh_store();
+    let op_txn = if setup.is_empty() {
+        1
+    } else {
+        let (_, committed) = run_commit(setup, store, 1);
+        store = committed;
+        2
+    };
+    let plan = compile(op);
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let mut graph = RecordStoreGraph::begin(store, TxnId(op_txn));
+    {
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+        cursor.collect_all().expect("collect rows");
+    }
+    assert!(
+        !graph.has_error(),
+        "unexpected captured error running `{op}`: {:?}",
+        graph.take_error()
+    );
+    let counters = graph.write_counters();
+    let _ = graph.commit().expect("commit");
+    counters
+}
+
+#[test]
+fn counters_match_memgraph_and_neo4j_semantics_across_backends() {
+    // (setup, op, expected operation-count). Setup is committed first; `op`'s counters are isolated.
+    let cases: &[(&str, &str, QueryCounters)] = &[
+        // CREATE: node + labels + property.
+        (
+            "",
+            "CREATE (n:A:B {x:1})",
+            QueryCounters {
+                nodes_created: 1,
+                labels_added: 2,
+                properties_set: 1,
+                ..QueryCounters::default()
+            },
+        ),
+        // CREATE relationship: two endpoints + one rel + one rel property.
+        (
+            "",
+            "CREATE (a)-[:R {w:1}]->(b)",
+            QueryCounters {
+                nodes_created: 2,
+                relationships_created: 1,
+                properties_set: 1,
+                ..QueryCounters::default()
+            },
+        ),
+        // Re-setting a property to its current value still counts, once per matched node.
+        (
+            "CREATE (:N {x:1}), (:N {x:2}), (:N {x:3})",
+            "MATCH (n) SET n.x = n.x",
+            QueryCounters {
+                properties_set: 3,
+                ..QueryCounters::default()
+            },
+        ),
+        // SET ... = null and REMOVE are removals: no properties_set.
+        (
+            "CREATE (:N {x:1})",
+            "MATCH (n) SET n.x = null",
+            QueryCounters::default(),
+        ),
+        (
+            "CREATE (:N {x:1})",
+            "MATCH (n) REMOVE n.x",
+            QueryCounters::default(),
+        ),
+        // Idempotent label add / absent label remove count zero.
+        ("CREATE (:A)", "MATCH (n) SET n:A", QueryCounters::default()),
+        (
+            "CREATE (:A)",
+            "MATCH (n) REMOVE n:B",
+            QueryCounters::default(),
+        ),
+        // Removing a present label counts; an absent one in the same clause does not.
+        (
+            "CREATE (:A:B)",
+            "MATCH (n) REMOVE n:A:C",
+            QueryCounters {
+                labels_removed: 1,
+                ..QueryCounters::default()
+            },
+        ),
+        // MERGE that matches creates nothing; MERGE that creates counts the create.
+        (
+            "CREATE (:Person {name:'Ada'})",
+            "MERGE (n:Person {name:'Ada'})",
+            QueryCounters::default(),
+        ),
+        (
+            "",
+            "MERGE (n:Person {name:'Bob'})",
+            QueryCounters {
+                nodes_created: 1,
+                labels_added: 1,
+                properties_set: 1,
+                ..QueryCounters::default()
+            },
+        ),
+        // DETACH DELETE: the shared node counts once; each incident relationship counts.
+        (
+            "CREATE (a:A), (b1:B), (b2:B), (a)-[:R]->(b1), (a)-[:R]->(b2)",
+            "MATCH (a)-[r]->(b) DETACH DELETE a",
+            QueryCounters {
+                nodes_deleted: 1,
+                relationships_deleted: 2,
+                ..QueryCounters::default()
+            },
+        ),
+        // Operation-count model: create-then-delete in one statement is two operations.
+        (
+            "",
+            "CREATE (n) DELETE n",
+            QueryCounters {
+                nodes_created: 1,
+                nodes_deleted: 1,
+                ..QueryCounters::default()
+            },
+        ),
+    ];
+
+    for (setup, op, expected) in cases {
+        let mem = mem_op_counters(setup, op);
+        let rsg = rsg_op_counters(setup, op);
+        assert_eq!(
+            &mem, expected,
+            "MemGraph counters for `{op}` (setup `{setup}`)"
+        );
+        assert_eq!(
+            &rsg, expected,
+            "RecordStoreGraph counters for `{op}` (setup `{setup}`)"
+        );
+        assert_eq!(
+            mem, rsg,
+            "backends disagree on counters for `{op}` (setup `{setup}`)"
+        );
+    }
 }

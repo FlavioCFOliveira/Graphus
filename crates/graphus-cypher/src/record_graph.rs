@@ -350,6 +350,13 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// chain walk — always store-faithful — takes over until the next rebuild-on-open. `None` on the
     /// standalone path or when the knob is off (zero extra RAM).
     csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
+    /// The exact side-effect tally for the statement this seam runs (`rmp` task #510), surfaced by
+    /// [`write_counters`](GraphAccess::write_counters). Behind a `Cell`-style `RefCell` because the
+    /// lowest shared label chokepoint ([`apply_add_labels`](Self::apply_add_labels)) is `&self`; the
+    /// increments live at the same logical events as [`MemGraph`](crate::graph_access::MemGraph), so
+    /// both backends report byte-identical counters. Reset to zero per seam (each statement begins a
+    /// fresh tally), and read after the cursor is drained, before commit.
+    counters: RefCell<crate::counters::QueryCounters>,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
@@ -399,6 +406,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Standalone path: no CSR accelerator (it lives in the coordinator); typed expand always
             // walks the live chain (`rmp` #324).
             csr: None,
+            // A fresh per-statement side-effect tally (`rmp` #510).
+            counters: RefCell::new(crate::counters::QueryCounters::default()),
         }
     }
 
@@ -451,6 +460,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Coordinated path: the opt-in CSR accelerator is present only when the knob enabled it at
             // coordinator construction (`rmp` #324, Win 2); `None` otherwise (zero extra RAM).
             csr,
+            // A fresh per-statement side-effect tally (`rmp` #510).
+            counters: RefCell::new(crate::counters::QueryCounters::default()),
         }
     }
 
@@ -654,6 +665,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             zones: None,
             // Standalone snapshot path: no CSR accelerator (it lives in the coordinator).
             csr: None,
+            // A fresh per-statement side-effect tally (`rmp` #510).
+            counters: RefCell::new(crate::counters::QueryCounters::default()),
         }
     }
 
@@ -758,6 +771,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     #[must_use]
     pub fn has_error(&self) -> bool {
         self.error.borrow().is_some()
+    }
+
+    /// Mutates this statement's side-effect tally (`rmp` task #510). Takes `&self` because the lowest
+    /// shared label chokepoint ([`apply_add_labels`](Self::apply_add_labels)) is `&self`; the borrow
+    /// is momentary (no graph access happens inside `f`), so it can never overlap another borrow of
+    /// the counters cell.
+    fn bump(&self, f: impl FnOnce(&mut crate::counters::QueryCounters)) {
+        f(&mut self.counters.borrow_mut());
     }
 
     /// Commits the query's transaction, making its writes durable, and returns the wrapped store.
@@ -869,6 +890,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let Some(token_id) = self.label_id_intern(name) else {
                 return; // storage error already captured (token-namespace exhaustion)
             };
+            // `rmp` #510: count a label only when this add flips a not-yet-set bit. The store's
+            // `add_label` is a no-op when the bit is already set (`next == node.labels`); pre-reading
+            // the SAME latest-record bitmap via `node_has_label` (which `add_label` itself reads) makes
+            // the count exactly track whether a write happens — re-adding a present label, or the
+            // second `A` in `:A:A` (own-write now sets it), counts 0. A read error is not a newly-set
+            // bit (and the `add_label` below will capture it).
+            let newly_set = {
+                let store = self.store.borrow();
+                matches!(store.node_has_label(node.0, token_id), Ok(false))
+            };
             if let Err(e) = self
                 .store
                 .borrow_mut()
@@ -876,6 +907,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             {
                 self.capture(e);
                 return;
+            }
+            if newly_set {
+                self.bump(|c| c.labels_added += 1);
             }
         }
     }
@@ -2881,6 +2915,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         };
         let node = NodeId(id);
+        // `rmp` #510: a node creation counts. Labels are counted inside `apply_add_labels` and
+        // properties inside `set_node_property` (the shared chokepoints both `create_node` and
+        // `add_labels`/`SET` route through), so they are NOT counted again here — no double count.
+        self.bump(|c| c.nodes_created += 1);
         self.note_write(node_ssi_key(id));
         // Apply labels via the inline label bitmap (`05 §9`, `rmp` task #42). An overflowing label
         // (token id `≥ 63`) captures the documented deferred error rather than dropping it silently.
@@ -2941,6 +2979,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         };
         let rel = RelId(id);
+        // `rmp` #510: a relationship creation counts. Its non-null properties are counted inside
+        // `set_rel_property` below (the shared chokepoint), so they are not counted again here.
+        self.bump(|c| c.relationships_created += 1);
         // `rmp` #324, Win 2: a new edge changes incidence, so invalidate the CSR snapshot — it now
         // declines and `expand` walks the live chain until the next rebuild-on-open. No-op when off.
         self.mark_csr_dirty();
@@ -3010,6 +3051,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.capture(e);
             return;
         }
+        // `rmp` #510: the store accepted a non-null property write — count it (the `null` branch above
+        // returned early as a removal, which does not count). A property re-set to its current value
+        // still reaches here and still counts (Neo4j semantics).
+        self.bump(|c| c.properties_set += 1);
         // Enforce constraints on the now-current value (`rmp` task #99) before indexing: a `SET` that
         // makes the node's covered property duplicate another node's of the same label (uniqueness) is
         // captured as a runtime error, so the statement aborts and rolls back before commit. (The
@@ -3055,6 +3100,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .set_rel_property_value(self.txn, rel.0, key_id, &value)
         {
             self.capture(e);
+        } else {
+            // `rmp` #510: a non-null relationship property write counts (the `null` branch above is a
+            // removal and returned early); count only on store success.
+            self.bump(|c| c.properties_set += 1);
         }
     }
 
@@ -3094,6 +3143,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let Some(token_id) = self.label_id_existing(name) else {
                 continue;
             };
+            // `rmp` #510: count a label only when this remove actually clears a present bit. Symmetric
+            // to `apply_add_labels`: the store's `remove_label` is a no-op when the bit is absent, so
+            // pre-reading the same latest-record bitmap tells us whether a write happens (removing an
+            // absent label counts 0).
+            let was_present = {
+                let store = self.store.borrow();
+                matches!(store.node_has_label(node.0, token_id), Ok(true))
+            };
             if let Err(e) = self
                 .store
                 .borrow_mut()
@@ -3101,6 +3158,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             {
                 self.capture(e);
                 return;
+            }
+            if was_present {
+                self.bump(|c| c.labels_removed += 1);
             }
         }
         // Keep the bitmap candidate source membership-exact after a label loss (`rmp` #328): a node
@@ -3280,6 +3340,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         self.note_rel_predicate_write(type_id);
         if let Err(e) = self.store.borrow_mut().delete_rel(self.txn, rel.0) {
             self.capture(e);
+        } else {
+            // `rmp` #510: the relationship was visible (gated above) and the tombstone was written —
+            // count it. A second delete in the same statement fails the `visible(mvcc)` guard above
+            // (it sees its own tombstone) and returns early, so it counts 0 (idempotent).
+            self.bump(|c| c.relationships_deleted += 1);
         }
     }
 
@@ -3301,6 +3366,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.capture(e);
             return;
         }
+        // `rmp` #510: the node was visible (gated above) and its tombstone was written — count it. An
+        // idempotent double-delete in the same statement fails the `visible(mvcc)` guard above and
+        // returns early, so it counts once.
+        self.bump(|c| c.nodes_deleted += 1);
         // De-index the bitmap (`rmp` #453, F-IDX-4): a committed `DELETE n` must clear n's bit from
         // every covered value-bitmap, or the bitmap would keep a phantom membership the seek's re-check
         // could only mask (today by id-recycle self-heal — a superset that violates membership-exactness
@@ -3323,5 +3392,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// so the planner gets real selectivities here exactly as it does over [`MemGraph`](crate::graph_access::MemGraph).
     fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
         Some(self)
+    }
+
+    fn write_counters(&self) -> crate::counters::QueryCounters {
+        // `rmp` #510: the exact side-effect tally accumulated at the write chokepoints above. Cloned
+        // out so the caller can read it after the cursor is drained, before commit.
+        self.counters.borrow().clone()
     }
 }

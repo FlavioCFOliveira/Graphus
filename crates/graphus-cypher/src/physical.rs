@@ -168,6 +168,32 @@ pub struct PhysicalPlan {
     estimated_rows: f64,
 }
 
+/// The read/write classification of a compiled [`PhysicalPlan`] (`rmp` task #511).
+///
+/// This is the Bolt `RUN` summary's **query type** (`metadata.type`): the official driver ecosystem
+/// reports `"r"` / `"w"` / `"rw"` / `"s"` for read / write / read-write / schema statements. Graphus
+/// computes the data-statement classes here; the schema (`"s"`) class is **not** represented because
+/// DDL is intercepted before the Cypher pipeline (a later task), so a `PhysicalPlan` is only ever
+/// `Read`, `Write`, or `ReadWrite`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum QueryType {
+    /// A read-only statement: no write operator anywhere in the plan (Bolt `"r"`).
+    ///
+    /// E.g. `MATCH (n) RETURN n`.
+    Read,
+    /// A pure write: the plan contains a write operator **and** its root is a write (so it yields no
+    /// result rows — no `RETURN`, Bolt `"w"`).
+    ///
+    /// E.g. `CREATE (n)`, `MATCH (n) SET n.x = 1`, `MATCH (a)-[r]->(b) DETACH DELETE a`.
+    Write,
+    /// A read-write statement: the plan contains a write operator but its root is **not** a write —
+    /// a projection sits above the write, so the statement returns rows (Bolt `"rw"`).
+    ///
+    /// E.g. `CREATE (n) RETURN n`, `MATCH (n) SET n.x = 1 RETURN n`.
+    ReadWrite,
+}
+
 impl PhysicalPlan {
     /// The catalog [`IndexId`]s this plan depends on, ascending (`04 §6.6`).
     ///
@@ -175,6 +201,30 @@ impl PhysicalPlan {
     /// plan ([`crate::plan_cache`]).
     pub fn index_dependencies(&self) -> impl Iterator<Item = IndexId> + '_ {
         self.index_dependencies.iter().copied()
+    }
+
+    /// The read/write [`QueryType`] of this plan — the Bolt `RUN` summary's `metadata.type`
+    /// (`rmp` task #511).
+    ///
+    /// Classification is structural and exact, reusing the same write-operator predicates the planner
+    /// and executor already rely on (so it can never drift from how the plan actually behaves):
+    ///
+    /// - **No** write operator anywhere ⇒ [`QueryType::Read`].
+    /// - A write operator **at the root** ⇒ [`QueryType::Write`]: a write root has no `RETURN` above
+    ///   it (a `RETURN` would put a projection at the root), so the statement yields zero rows.
+    /// - A write operator present but **not** at the root ⇒ [`QueryType::ReadWrite`]: a projection (or
+    ///   other row-emitting operator) sits above the write, so the statement returns rows.
+    ///
+    /// The schema (`"s"`) class is not produced here: DDL is intercepted ahead of the Cypher pipeline,
+    /// so a compiled plan is only ever read, write, or read-write.
+    pub fn query_type(&self) -> QueryType {
+        if !contains_write(&self.root) {
+            QueryType::Read
+        } else if root_is_write(&self.root) {
+            QueryType::Write
+        } else {
+            QueryType::ReadWrite
+        }
     }
 
     /// Whether this plan depends on `id`.
@@ -1374,6 +1424,29 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
     }
+}
+
+/// Whether `op` is a **top-level** write operator (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`/
+/// `Foreach`).
+///
+/// A query whose physical-plan **root** is such an operator has no `RETURN` and therefore yields zero
+/// result rows (openCypher: a write's effect is a summary-only side effect). When a `RETURN` follows
+/// the write, the plan root is the projection above it, not the write, so this is `false`.
+///
+/// The single source of truth for the write-root test: the executor uses it to set the cursor's
+/// `emits_rows` flag, and [`PhysicalPlan::query_type`] uses it to tell [`QueryType::Write`] apart from
+/// [`QueryType::ReadWrite`]. Co-located with [`contains_write`] so the two predicates share one
+/// authoritative write-variant list and cannot drift.
+pub(crate) fn root_is_write(op: &PhysicalOp) -> bool {
+    matches!(
+        op,
+        PhysicalOp::Create { .. }
+            | PhysicalOp::Merge { .. }
+            | PhysicalOp::SetClause { .. }
+            | PhysicalOp::Delete { .. }
+            | PhysicalOp::Remove { .. }
+            | PhysicalOp::Foreach { .. }
+    )
 }
 
 /// Chooses the physical join for a logical [`Apply`](LogicalOp::Apply): hash join for an equi-join,
@@ -3656,6 +3729,49 @@ mod tests {
         let ast = parse_tokens(&toks, src).expect("parse");
         let validated = analyze(&ast).expect("analyze");
         lower(&validated)
+    }
+
+    // ---- QueryType classification (`rmp` task #511) -------------------------------------------
+
+    /// The [`QueryType`] of `src` compiled against the empty catalog.
+    fn query_type_of(src: &str) -> QueryType {
+        physical(src, &IndexCatalog::empty()).query_type()
+    }
+
+    #[test]
+    fn query_type_read_has_no_write_operator() {
+        assert_eq!(query_type_of("MATCH (n) RETURN n"), QueryType::Read);
+        // A read with aggregation / ordering is still a read.
+        assert_eq!(
+            query_type_of("MATCH (n) RETURN count(n) ORDER BY count(n)"),
+            QueryType::Read
+        );
+    }
+
+    #[test]
+    fn query_type_write_root_emits_no_rows() {
+        // A bare CREATE: the plan root IS the write operator (no RETURN above it).
+        assert_eq!(query_type_of("CREATE (n)"), QueryType::Write);
+        // MATCH then SET, no RETURN: the SetClause is the root.
+        assert_eq!(query_type_of("MATCH (n) SET n.x = 1"), QueryType::Write);
+        // DETACH DELETE with no RETURN: the Delete is the root.
+        assert_eq!(
+            query_type_of("MATCH (a)-[r]->(b) DETACH DELETE a"),
+            QueryType::Write
+        );
+        // REMOVE with no RETURN.
+        assert_eq!(query_type_of("MATCH (n) REMOVE n.x"), QueryType::Write);
+    }
+
+    #[test]
+    fn query_type_read_write_when_a_return_sits_above_the_write() {
+        // CREATE ... RETURN: a projection sits above the Create, so the statement returns rows.
+        assert_eq!(query_type_of("CREATE (n) RETURN n"), QueryType::ReadWrite);
+        // SET ... RETURN.
+        assert_eq!(
+            query_type_of("MATCH (n) SET n.x = 1 RETURN n"),
+            QueryType::ReadWrite
+        );
     }
 
     #[test]

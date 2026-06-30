@@ -52,7 +52,7 @@ use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId};
 use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
 use crate::ordering::cmp_values;
-use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound};
+use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound, root_is_write};
 use crate::procedure_registry::{self, ProcedureFailure, ProcedureRegistry};
 use crate::runtime::{
     NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cmp_row_values, hash_row_value,
@@ -6156,22 +6156,6 @@ pub fn execute_with_extensions_cancellable<'a>(
 ) -> Result<Cursor<'a>, ExecError> {
     Executor::new(plan.clone(), params.clone())
         .open_with_extensions(graph, token, functions, procedures)
-}
-
-/// Whether `op` is a top-level write operator (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`).
-/// A query whose physical-plan **root** is such an operator has no `RETURN` and therefore yields
-/// zero result rows (openCypher: a write's effect is a summary-only side effect). When a `RETURN`
-/// follows the write, the plan root is the projection above it, not the write, so this is false.
-fn root_is_write(op: &PhysicalOp) -> bool {
-    matches!(
-        op,
-        PhysicalOp::Create { .. }
-            | PhysicalOp::Merge { .. }
-            | PhysicalOp::SetClause { .. }
-            | PhysicalOp::Delete { .. }
-            | PhysicalOp::Remove { .. }
-            | PhysicalOp::Foreach { .. }
-    )
 }
 
 /// The result column names a plan produces, derived from its root operator's output schema.
