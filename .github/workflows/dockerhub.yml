@@ -86,14 +86,14 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}
-          # On a release the git ref is the tag (refs/tags/vX.Y.Z), so the semver
-          # patterns produce X.Y.Z and X.Y. `latest` moves only for a final
-          # (non-prerelease) release. A manual dispatch additionally honours the
-          # optional `tag` input and always stamps a `sha-<sha>` tag, so a build
-          # off a branch is never left untagged.
+          # On a release the git ref is the tag (refs/tags/vX.Y.Z); pattern=v{{version}}
+          # mirrors that git tag verbatim, so a v0.0.3 release publishes the `:v0.0.3`
+          # tag (the leading `v` is kept on purpose). `latest` moves only for a final
+          # (non-prerelease) release. A manual dispatch additionally honours the optional
+          # `tag` input and always stamps a `sha-<sha>` tag, so a build off a branch is
+          # never left untagged.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=v{{version}}
             type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
             type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
             type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
