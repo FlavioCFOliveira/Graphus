@@ -549,3 +549,83 @@ async fn fast_profile_rest_discovery_matches_reference_with_ndjson_and_cbor() {
         jbody.len()
     );
 }
+
+/// Runs one statement auto-commit and returns its `results[0].summary` object (`{ "type", "stats" }`).
+async fn statement_summary(app: &Router, token: &str, statement: &str) -> Json {
+    let (st, body) = auto_commit(app, token, serde_json::json!([{ "statement": statement }])).await;
+    assert_eq!(st, StatusCode::OK, "statement failed: {statement}");
+    let resp: Json = serde_json::from_slice(&body).expect("parse RunResponse");
+    resp.get("results")
+        .and_then(Json::as_array)
+        .and_then(|r| r.first())
+        .and_then(|r0| r0.get("summary"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no results[0].summary for {statement}: {resp}"))
+}
+
+/// `rmp` #513: every admin/DDL statement carries a populated result summary in the REST response —
+/// `results[i].summary` reports the query `type` (`s` for a schema/system change, `r` for a `SHOW *`
+/// read) and the schema/system side-effect counters as plain JSON scalars (the Neo4j HTTP-API shape:
+/// `"indexes-added": 1`, `"contains-updates": true`). Before #513 the admin summary was always empty
+/// (`type` null, `stats {}`) even though the change persisted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_and_ddl_result_summary_over_rest() {
+    let temp = TempStore::new();
+    let (app, token) = boot_router(&temp).await;
+
+    // ---- Index DDL → type `s`, indexes-added / indexes-removed (+ contains-updates) ----
+    let s = statement_summary(&app, &token, "CREATE INDEX FOR (n:Person) ON (n.name)").await;
+    assert_eq!(s["type"], Json::from("s"), "CREATE INDEX is a schema write");
+    assert_eq!(s["stats"]["indexes-added"], Json::from(1));
+    assert_eq!(s["stats"]["contains-updates"], Json::from(true));
+
+    let s = statement_summary(&app, &token, "DROP INDEX FOR (n:Person) ON (n.name)").await;
+    assert_eq!(s["type"], Json::from("s"));
+    assert_eq!(s["stats"]["indexes-removed"], Json::from(1));
+
+    // ---- Constraint DDL → type `s`, constraints-added / constraints-removed ----
+    let s = statement_summary(
+        &app,
+        &token,
+        "CREATE CONSTRAINT uniq_email FOR (n:Person) REQUIRE n.email IS UNIQUE",
+    )
+    .await;
+    assert_eq!(s["type"], Json::from("s"));
+    assert_eq!(s["stats"]["constraints-added"], Json::from(1));
+    assert!(
+        s["stats"].get("indexes-added").is_none(),
+        "a uniqueness constraint's backing index is NOT separately counted (Neo4j parity, rmp #513)"
+    );
+
+    let s = statement_summary(&app, &token, "DROP CONSTRAINT uniq_email").await;
+    assert_eq!(s["type"], Json::from("s"));
+    assert_eq!(s["stats"]["constraints-removed"], Json::from(1));
+
+    // ---- System commands → type `s`, system-updates >= 1 (+ contains-system-updates) ----
+    let s = statement_summary(&app, &token, "CREATE DATABASE sales").await;
+    assert_eq!(
+        s["type"],
+        Json::from("s"),
+        "CREATE DATABASE is a system write"
+    );
+    assert!(
+        matches!(s["stats"]["system-updates"].as_i64(), Some(n) if n >= 1),
+        "system-updates >= 1: {s}"
+    );
+    assert_eq!(s["stats"]["contains-system-updates"], Json::from(true));
+
+    let s = statement_summary(&app, &token, "CREATE USER dave SET PASSWORD 'dave-pw88'").await;
+    assert_eq!(s["type"], Json::from("s"));
+    assert!(matches!(s["stats"]["system-updates"].as_i64(), Some(n) if n >= 1));
+
+    // ---- Reads (`SHOW *`) → type `r`, empty stats object ----
+    for show in ["SHOW INDEXES", "SHOW CONSTRAINTS", "SHOW DATABASES"] {
+        let s = statement_summary(&app, &token, show).await;
+        assert_eq!(s["type"], Json::from("r"), "{show} is a read");
+        assert_eq!(
+            s["stats"],
+            serde_json::json!({}),
+            "{show} reports an empty stats object"
+        );
+    }
+}

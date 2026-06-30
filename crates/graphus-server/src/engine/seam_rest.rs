@@ -53,7 +53,7 @@ use crate::audit::{
     redact_constraint_detail, redact_index_detail,
 };
 
-use super::command::AccessMode;
+use super::command::{AccessMode, constraint_ddl_summary, index_ddl_summary};
 use super::handle::AdmissionPermit;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
@@ -208,13 +208,18 @@ pub struct RestEngineStream {
 }
 
 impl RestEngineStream {
-    /// Wraps a buffered administrative result.
+    /// Wraps a buffered administrative result, carrying its result summary (`rmp` #513): the query
+    /// type (`s` for a schema/system change, `r` for a `SHOW *` read) and any schema/system counters,
+    /// published into a fresh sink so [`Self::summary`] surfaces it exactly as an engine query's sink
+    /// does (admin rows are produced synchronously, so the sink is filled here before any row drains —
+    /// no cross-thread ordering to observe).
     fn admin(result: AdminResult) -> Self {
+        let summary = SummarySink::new();
+        summary.set(result.summary);
         Self {
             fields: result.fields,
             source: RowSource::Admin(result.rows.into_iter()),
-            // Admin results carry no engine summary yet (`rmp` #513); an empty sink is a valid summary.
-            summary: SummarySink::new(),
+            summary,
         }
     }
 }
@@ -390,6 +395,11 @@ impl RestEngine for RestEngineAdapter {
                         | crate::engine::IndexCommand::ShowPointIndexes
                 );
                 let detail = redact_index_detail(&cmd);
+                // The result summary (`rmp` #513): query type `s` + `indexes-added`/`indexes-removed`
+                // for a CREATE/DROP, or type `r` for a `SHOW`. Built before the command is moved into
+                // the engine; only the success path reaches the stream (a failure returns via
+                // `outcome?`), so `ok = true`.
+                let summary = index_ddl_summary(&cmd, true);
                 let outcome = open.handle.index_ddl_blocking(cmd);
                 if mutating {
                     self.context.audit().record(
@@ -411,6 +421,7 @@ impl RestEngine for RestEngineAdapter {
                 return Ok(RestEngineStream::admin(AdminResult {
                     fields: reply.fields,
                     rows: reply.rows,
+                    summary,
                 }));
             }
             // A constraint-DDL statement (`rmp` task #99): routed identically to an index command.
@@ -440,6 +451,11 @@ impl RestEngine for RestEngineAdapter {
                 // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
                 let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
                 let detail = redact_constraint_detail(&cmd);
+                // The result summary (`rmp` #513): query type `s` +
+                // `constraints-added`/`constraints-removed` for a CREATE/DROP, or type `r` for a
+                // `SHOW`. Built before the command is moved into the engine; only the success path
+                // reaches the stream (a failure returns via `outcome?`), so `ok = true`.
+                let summary = constraint_ddl_summary(&cmd, true);
                 let outcome = open.handle.constraint_ddl_blocking(cmd);
                 if mutating {
                     self.context.audit().record(
@@ -461,6 +477,7 @@ impl RestEngine for RestEngineAdapter {
                 return Ok(RestEngineStream::admin(AdminResult {
                     fields: reply.fields,
                     rows: reply.rows,
+                    summary,
                 }));
             }
             AdminParse::Invalid(msg) => return Err(GraphusError::Compile(msg)),

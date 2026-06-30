@@ -423,3 +423,211 @@ pub struct RunSummary {
     /// Side-effect counters (e.g. `nodes-created`), in order.
     pub stats: Vec<(String, Value)>,
 }
+
+/// Builds a **schema-mutation** result summary for DDL (`rmp` #513): query type `"s"` (SCHEMA_WRITE)
+/// plus, on success, the single fired counter `key: 1` and the Neo4j `contains-updates` flag — index
+/// and constraint counters both feed `SummaryCounters.containsUpdates()`, mirroring how the data path
+/// appends `contains-updates` (see `exec::counters_to_stats`). A failed mutation (`ok == false`)
+/// carries the `"s"` type with no counters; in practice the seam returns the engine error before it
+/// ever builds a result stream, so only the success shape reaches the wire.
+fn schema_mutation_summary(key: &str, ok: bool) -> RunSummary {
+    let stats = if ok {
+        vec![
+            (key.to_owned(), Value::Integer(1)),
+            ("contains-updates".to_owned(), Value::Boolean(true)),
+        ]
+    } else {
+        Vec::new()
+    };
+    RunSummary {
+        query_type: Some("s".to_owned()),
+        stats,
+    }
+}
+
+/// The result summary for an [`IndexCommand`] (`rmp` #513), following the Neo4j `SummaryCounters`
+/// wire contract: a `CREATE … INDEX` reports query type `"s"` with `indexes-added: 1`; a `DROP …
+/// INDEX` reports `indexes-removed: 1`; the read-only `SHOW … INDEXES` listings report query type
+/// `"r"` with no counters. `ok` is whether the DDL succeeded (a failure carries no counters — see
+/// [`schema_mutation_summary`]).
+///
+/// Shared by both connectivity seams ([`crate::engine::BoltEngineExecutor`] /
+/// [`crate::engine::RestEngineAdapter`]) so Bolt and REST spell every key identically: the wire-key
+/// naming lives here in the server layer while the engine's [`IndexCommand`] stays protocol-agnostic.
+#[must_use]
+pub fn index_ddl_summary(command: &IndexCommand, ok: bool) -> RunSummary {
+    match command {
+        IndexCommand::ShowIndexes
+        | IndexCommand::ShowFulltextIndexes
+        | IndexCommand::ShowPointIndexes => RunSummary {
+            query_type: Some("r".to_owned()),
+            stats: Vec::new(),
+        },
+        IndexCommand::CreateNodePropertyIndex { .. }
+        | IndexCommand::CreateFulltextIndex { .. }
+        | IndexCommand::CreatePointIndex { .. } => schema_mutation_summary("indexes-added", ok),
+        IndexCommand::DropNodePropertyIndex { .. }
+        | IndexCommand::DropFulltextIndex { .. }
+        | IndexCommand::DropPointIndex { .. } => schema_mutation_summary("indexes-removed", ok),
+    }
+}
+
+/// The result summary for a [`ConstraintCommand`] (`rmp` #513), following the Neo4j `SummaryCounters`
+/// wire contract: a `CREATE CONSTRAINT` reports query type `"s"` with `constraints-added: 1`; a `DROP
+/// CONSTRAINT` reports `constraints-removed: 1`; the read-only `SHOW CONSTRAINTS` reports query type
+/// `"r"` with no counters. `ok` is whether the DDL succeeded (see [`schema_mutation_summary`]).
+///
+/// A uniqueness / node-key constraint is enforced by an implicit backing index, but — matching Neo4j,
+/// whose `CREATE CONSTRAINT` result summary reports `constraintsAdded` **without** an accompanying
+/// `indexesAdded` for that backing index — only `constraints-added` is reported here (`rmp` #513's
+/// empirical decision). Shared by both seams for identical wire keys.
+#[must_use]
+pub fn constraint_ddl_summary(command: &ConstraintCommand, ok: bool) -> RunSummary {
+    match command {
+        ConstraintCommand::Show => RunSummary {
+            query_type: Some("r".to_owned()),
+            stats: Vec::new(),
+        },
+        ConstraintCommand::CreateUnique { .. }
+        | ConstraintCommand::CreateExistence { .. }
+        | ConstraintCommand::CreateNodeKey { .. }
+        | ConstraintCommand::CreatePropertyType { .. } => {
+            schema_mutation_summary("constraints-added", ok)
+        }
+        ConstraintCommand::Drop { .. } => schema_mutation_summary("constraints-removed", ok),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `rmp` #513 GATE: an index `CREATE` reports query type `s` with `indexes-added: 1` +
+    /// `contains-updates`; a `DROP` reports `indexes-removed: 1`; the full-text / point CREATE/DROP
+    /// share that shape; every `SHOW … INDEXES` is a read (`r`, no counters).
+    #[test]
+    fn index_ddl_summary_create_drop_show() {
+        let create = index_ddl_summary(
+            &IndexCommand::CreateNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "name".to_owned(),
+            },
+            true,
+        );
+        assert_eq!(create.query_type.as_deref(), Some("s"));
+        assert_eq!(
+            create.stats,
+            vec![
+                ("indexes-added".to_owned(), Value::Integer(1)),
+                ("contains-updates".to_owned(), Value::Boolean(true)),
+            ],
+            "CREATE INDEX: type s, indexes-added 1, contains-updates flag last"
+        );
+
+        let drop = index_ddl_summary(
+            &IndexCommand::DropNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "name".to_owned(),
+            },
+            true,
+        );
+        assert_eq!(drop.query_type.as_deref(), Some("s"));
+        assert_eq!(
+            drop.stats[0],
+            ("indexes-removed".to_owned(), Value::Integer(1))
+        );
+
+        // Full-text and point CREATE/DROP follow the same indexes-added/removed shape.
+        assert_eq!(
+            index_ddl_summary(
+                &IndexCommand::CreateFulltextIndex {
+                    name: "ft".to_owned(),
+                    label: "Doc".to_owned(),
+                    properties: vec!["body".to_owned()],
+                    analyzer: "standard".to_owned(),
+                },
+                true,
+            )
+            .stats[0],
+            ("indexes-added".to_owned(), Value::Integer(1)),
+        );
+        assert_eq!(
+            index_ddl_summary(
+                &IndexCommand::DropPointIndex {
+                    name: "p".to_owned()
+                },
+                true
+            )
+            .stats[0],
+            ("indexes-removed".to_owned(), Value::Integer(1)),
+        );
+
+        for show in [
+            IndexCommand::ShowIndexes,
+            IndexCommand::ShowFulltextIndexes,
+            IndexCommand::ShowPointIndexes,
+        ] {
+            let s = index_ddl_summary(&show, true);
+            assert_eq!(s.query_type.as_deref(), Some("r"), "{show:?} is a read");
+            assert!(s.stats.is_empty(), "a SHOW reports no counters: {show:?}");
+        }
+    }
+
+    /// `rmp` #513: a failed schema mutation keeps the `s` type but reports no counters (in practice the
+    /// seam returns the engine error before building a stream, so only the success shape is wired).
+    #[test]
+    fn index_ddl_summary_failure_has_no_counters() {
+        let s = index_ddl_summary(
+            &IndexCommand::CreateNodePropertyIndex {
+                label: "Person".to_owned(),
+                property: "name".to_owned(),
+            },
+            false,
+        );
+        assert_eq!(s.query_type.as_deref(), Some("s"));
+        assert!(s.stats.is_empty());
+    }
+
+    /// `rmp` #513 GATE: a constraint `CREATE` reports query type `s` with `constraints-added: 1` +
+    /// `contains-updates` (and **no** `indexes-added` for the implicit backing index, matching Neo4j);
+    /// a `DROP` reports `constraints-removed: 1`; `SHOW CONSTRAINTS` is a read (`r`, no counters).
+    #[test]
+    fn constraint_ddl_summary_create_drop_show() {
+        let create = constraint_ddl_summary(
+            &ConstraintCommand::CreateUnique {
+                name: "u".to_owned(),
+                label: "Person".to_owned(),
+                property: "email".to_owned(),
+            },
+            true,
+        );
+        assert_eq!(create.query_type.as_deref(), Some("s"));
+        assert_eq!(
+            create.stats,
+            vec![
+                ("constraints-added".to_owned(), Value::Integer(1)),
+                ("contains-updates".to_owned(), Value::Boolean(true)),
+            ]
+        );
+        assert!(
+            !create.stats.iter().any(|(k, _)| k == "indexes-added"),
+            "a uniqueness constraint reports constraints-added only, not a backing-index counter"
+        );
+
+        let drop = constraint_ddl_summary(
+            &ConstraintCommand::Drop {
+                name: "u".to_owned(),
+            },
+            true,
+        );
+        assert_eq!(drop.query_type.as_deref(), Some("s"));
+        assert_eq!(
+            drop.stats[0],
+            ("constraints-removed".to_owned(), Value::Integer(1))
+        );
+
+        let show = constraint_ddl_summary(&ConstraintCommand::Show, true);
+        assert_eq!(show.query_type.as_deref(), Some("r"));
+        assert!(show.stats.is_empty());
+    }
+}

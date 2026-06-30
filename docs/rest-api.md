@@ -156,7 +156,10 @@ hold open is bounded (excess `begin`s get a retriable `429`).
 | `expires_at_nanos` | number (optional)                     | refreshed expiry on the engine clock, while open |
 
 Each result: `fields` is the ordered column names; `data` is the rows (each a list of cell
-values in `fields` order); `summary` carries `type` (`r`/`w`/`rw`/…) and `stats`.
+values in `fields` order); `summary` carries the query `type` (`r` read, `w` write, `rw`
+read-write, `s` schema/admin) and `stats` — the side-effect counters as **plain JSON numbers**
+(e.g. `"nodes-created": 1`, not Jolt-typed), present only when non-empty. The full counter-key list
+is the Bolt result-summary contract in `specification/06-bolt-and-error-shapes.md` §3.1.
 
 ### 4.1 Value encoding (Jolt typed JSON)
 

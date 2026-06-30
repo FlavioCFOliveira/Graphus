@@ -57,6 +57,25 @@ fn bolt_to_scalar(v: BoltValue) -> Value {
     }
 }
 
+/// The `type` (query-type code) from a Bolt result-summary metadata map (`rmp` #513) — the trailing
+/// PULL `SUCCESS` `type` field a Neo4j driver exposes as `ResultSummary.query_type`.
+fn summary_type(meta: &[(String, Value)]) -> Option<&str> {
+    meta.iter().find_map(|(k, v)| match v {
+        Value::String(s) if k == "type" => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// One `stats` counter/flag by key from a Bolt result-summary metadata map, or `None` when the `stats`
+/// block is absent (a read) or that key did not fire (`rmp` #513).
+fn summary_stat(meta: &[(String, Value)], key: &str) -> Option<Value> {
+    let stats = meta.iter().find_map(|(k, v)| match v {
+        Value::Map(m) if k == "stats" => Some(m),
+        _ => None,
+    })?;
+    stats.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
 /// The JWT secret shared between the test config and the token-minting helper.
 const JWT_SECRET: &str = "dbadmin-itest-jwt-secret-32-bytes!!!";
 
@@ -310,6 +329,34 @@ impl BoltClient {
         match self.run_on_db(query, db).await {
             Ok(rows) => rows,
             Err(f) => panic!("query {query:?} on {db:?} failed: {f:?}"),
+        }
+    }
+
+    /// `RUN` + `PULL -1` for an admin/DDL statement, discarding any rows and returning the **trailing
+    /// PULL `SUCCESS` metadata** — the result summary (`type` + `stats`) the Neo4j driver ecosystem
+    /// reads (`rmp` #513). Asserts both RUN and PULL succeed.
+    async fn run_pull_summary(&mut self, query: &str, db: Option<&str>) -> Vec<(String, Value)> {
+        let extra = match db {
+            Some(name) => vec![("db".to_owned(), Value::String(name.to_owned()))],
+            None => vec![],
+        };
+        self.send(&Request::Run {
+            query: query.to_owned(),
+            parameters: vec![],
+            extra,
+        })
+        .await;
+        match self.recv().await {
+            Response::Success { .. } => {}
+            other => panic!("RUN {query:?} expected SUCCESS, got {other:?}"),
+        }
+        self.send(&Request::Pull { n: -1, qid: None }).await;
+        loop {
+            match self.recv().await {
+                Response::Record { .. } => {} // discard rows (e.g. SHOW listings)
+                Response::Success { metadata } => return metadata,
+                other => panic!("unexpected PULL response for {query:?}: {other:?}"),
+            }
         }
     }
 
@@ -1245,6 +1292,106 @@ async fn admin_grammar_is_strict_on_the_wire() {
         1,
         "the Cypher statement executed as Cypher"
     );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// `rmp` #513: every admin/DDL statement carries a populated result summary on the Bolt wire — the
+/// trailing PULL `SUCCESS` metadata reports the query `type` (`s` for a schema/system change, `r` for a
+/// `SHOW *` read) and the schema/system side-effect counters, exactly as a Neo4j driver reads them.
+/// Before #513 every admin summary was empty (type `null`, no `stats`) even though the change persisted.
+#[tokio::test]
+async fn admin_and_ddl_result_summary_on_the_bolt_wire() {
+    let temp = TempStore::new("result-summary");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+
+    // ---- Index DDL → type `s`, indexes-added / indexes-removed (+ contains-updates) ----
+    let m = c
+        .run_pull_summary("CREATE INDEX FOR (n:Person) ON (n.name)", None)
+        .await;
+    assert_eq!(
+        summary_type(&m),
+        Some("s"),
+        "CREATE INDEX is a schema write"
+    );
+    assert_eq!(summary_stat(&m, "indexes-added"), Some(Value::Integer(1)));
+    assert_eq!(
+        summary_stat(&m, "contains-updates"),
+        Some(Value::Boolean(true)),
+        "schema DDL flips contains-updates (not contains-system-updates)"
+    );
+
+    let m = c
+        .run_pull_summary("DROP INDEX FOR (n:Person) ON (n.name)", None)
+        .await;
+    assert_eq!(summary_type(&m), Some("s"));
+    assert_eq!(summary_stat(&m, "indexes-removed"), Some(Value::Integer(1)));
+
+    // ---- Constraint DDL → type `s`, constraints-added / constraints-removed ----
+    let m = c
+        .run_pull_summary(
+            "CREATE CONSTRAINT uniq_email FOR (n:Person) REQUIRE n.email IS UNIQUE",
+            None,
+        )
+        .await;
+    assert_eq!(summary_type(&m), Some("s"));
+    assert_eq!(
+        summary_stat(&m, "constraints-added"),
+        Some(Value::Integer(1))
+    );
+    assert_eq!(
+        summary_stat(&m, "indexes-added"),
+        None,
+        "a uniqueness constraint's backing index is NOT separately counted (Neo4j parity, rmp #513)"
+    );
+
+    let m = c.run_pull_summary("DROP CONSTRAINT uniq_email", None).await;
+    assert_eq!(summary_type(&m), Some("s"));
+    assert_eq!(
+        summary_stat(&m, "constraints-removed"),
+        Some(Value::Integer(1))
+    );
+
+    // ---- System commands → type `s`, system-updates >= 1 (+ contains-system-updates) ----
+    let m = c.run_pull_summary("CREATE DATABASE sales", None).await;
+    assert_eq!(
+        summary_type(&m),
+        Some("s"),
+        "CREATE DATABASE is a system write"
+    );
+    match summary_stat(&m, "system-updates") {
+        Some(Value::Integer(n)) => assert!(n >= 1, "system-updates >= 1, got {n}"),
+        other => panic!("expected a system-updates integer, got {other:?}"),
+    }
+    assert_eq!(
+        summary_stat(&m, "contains-system-updates"),
+        Some(Value::Boolean(true)),
+        "an administration command flips contains-system-updates (not contains-updates)"
+    );
+
+    let m = c
+        .run_pull_summary("CREATE USER dave SET PASSWORD 'dave-pw88'", None)
+        .await;
+    assert_eq!(summary_type(&m), Some("s"));
+    assert!(
+        matches!(summary_stat(&m, "system-updates"), Some(Value::Integer(n)) if n >= 1),
+        "CREATE USER reports system-updates >= 1"
+    );
+
+    // ---- Reads (`SHOW *`) → type `r`, no stats block ----
+    for show in ["SHOW INDEXES", "SHOW CONSTRAINTS", "SHOW DATABASES"] {
+        let m = c.run_pull_summary(show, None).await;
+        assert_eq!(summary_type(&m), Some("r"), "{show} is a read");
+        assert!(
+            !m.iter().any(|(k, _)| k == "stats"),
+            "{show} emits no stats block (a read has empty counters)"
+        );
+    }
 
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");

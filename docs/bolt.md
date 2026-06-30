@@ -122,6 +122,14 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
 - **Errors.** A server-side problem arrives as a Bolt `FAILURE` carrying a Neo4j-style
   `code` and a human-readable `message`, after which the connection is `FAILED` until a
   `RESET`.
+- **Result summary.** After a query's records, the trailing `SUCCESS` carries the summary:
+  `type` — the query type (`r` read, `w` write, `rw` read-write, `s` schema/admin) — and
+  `stats`, the side-effect counters (`nodes-created`/`-deleted`, `relationships-created`/`-deleted`,
+  `properties-set`, `labels-added`/`-removed`, `indexes-added`/`-removed`,
+  `constraints-added`/`-removed`, `system-updates`, `contains-updates`, and
+  `contains-system-updates`), present only when non-empty. The official driver surfaces these as `summary().query_type` and
+  `summary().counters.*`. The counters use Neo4j's operation-count model; the full contract is
+  `specification/06-bolt-and-error-shapes.md` §3.1.
 
 For the exact wire encoding, the authoritative reference is the `graphus-bolt` crate
 (`handshake.rs`, `framing.rs`, `message.rs`, `packstream.rs`) — and the Go UDS example,

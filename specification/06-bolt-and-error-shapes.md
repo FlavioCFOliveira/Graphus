@@ -181,11 +181,36 @@ A successful query over Bolt produces this sequence of server messages (`04` §8
 2. A stream of **`RECORD`** messages, one per result row, each a PackStream list whose entries are
    the row's `Value`s in the order declared by the fields metadata. Records are produced lazily and
    pushed in response to the client's `PULL n` demand (flow control; `04` §7.7).
-3. A trailing **`SUCCESS`** carrying the **result summary** (e.g. type of query, statistics /
-   side-effect counters, and a `has_more` indicator when the client `PULL`ed a bounded batch).
+3. A trailing **`SUCCESS`** carrying the **result summary** — the query `type`, the side-effect
+   `stats` (present only when non-empty), and a `has_more` indicator when the client `PULL`ed a
+   bounded batch.
 
 `DISCARD` consumes (and discards) the remaining rows and yields the trailing `SUCCESS` summary
 without emitting `RECORD`s.
+
+**Query `type`** is exactly one of: `r` (read-only), `w` (writes, returns no rows), `rw` (writes and
+returns rows), or `s` (schema/administrative — index/constraint DDL and database/user/role commands).
+
+**`stats`** is the map of the statement's side-effect counters, included only when non-empty (a
+read-only statement carries no `stats`). Keys are kebab-case and only non-zero counters appear:
+
+| Key | Counts |
+| --- | ------ |
+| `nodes-created` / `nodes-deleted` | nodes created / actually deleted |
+| `relationships-created` / `relationships-deleted` | relationships created / actually deleted |
+| `properties-set` | property assignments — re-setting an equal value counts; `SET null`/`REMOVE` do not |
+| `labels-added` / `labels-removed` | labels actually added / removed (an idempotent add/remove counts 0) |
+| `indexes-added` / `indexes-removed` | indexes created / dropped |
+| `constraints-added` / `constraints-removed` | constraints created / dropped |
+| `system-updates` | system-database changes (database/user/role commands) |
+| `contains-updates` | `true` whenever any data or schema counter is non-zero |
+| `contains-system-updates` | `true` whenever a system-database change occurred |
+
+The counters follow Neo4j's **operation-count** model (operations *applied* by the statement),
+which deliberately differs from the openCypher **TCK observability** model: `CREATE (n) DELETE n`
+reports `nodes-created: 1, nodes-deleted: 1` here, whereas the TCK observes no net side effect. The
+two models are kept separate by design — the TCK conformance runner uses the observability model and
+is never repointed at these wire counters.
 
 ### 3.2 Failure shape (FAILURE)
 

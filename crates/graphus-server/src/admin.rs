@@ -100,7 +100,7 @@ use crate::audit::{
     classify_admin, is_mutating_admin, redact_admin_detail,
 };
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
-use crate::engine::{ConstraintCommand, EngineHandle, IndexCommand};
+use crate::engine::{ConstraintCommand, EngineHandle, IndexCommand, RunSummary};
 use crate::security::{SecurityCatalog, SecurityError};
 
 // ------------------------------------------------------------------------------------------------
@@ -1842,14 +1842,23 @@ pub struct AdminResult {
     pub fields: Vec<String>,
     /// The result rows (e.g. one per database for `SHOW DATABASES`).
     pub rows: Vec<Vec<Value>>,
+    /// The result summary — query type + schema/system counters — for this administrative statement
+    /// (`rmp` #513). Empty (a default [`RunSummary`]) for the rows-only constructors; the
+    /// [`AdminContext::execute`] funnel fills it for a system command (`type s` + `system-updates`),
+    /// and the connectivity seams fill it for index / constraint DDL via
+    /// [`crate::engine::command::index_ddl_summary`] /
+    /// [`crate::engine::command::constraint_ddl_summary`].
+    pub summary: RunSummary,
 }
 
 impl AdminResult {
-    /// The empty result the lifecycle commands return.
+    /// The empty result the lifecycle commands return (the [`AdminContext::execute`] funnel sets the
+    /// `summary` afterwards — `rmp` #513).
     fn empty() -> Self {
         Self {
             fields: Vec::new(),
             rows: Vec::new(),
+            summary: RunSummary::default(),
         }
     }
 }
@@ -2097,7 +2106,14 @@ impl AdminContext {
                     .detail(redact_admin_detail(cmd)),
             );
         }
-        result
+        // Populate the result summary on success (`rmp` #513): a system/catalog mutation reports query
+        // type `s` + `system-updates`, a read-only `SHOW *` reports type `r` with no counters. A
+        // failure returns `Err` here and carries no summary. This is the single funnel for **all**
+        // database/security/operator commands, so neither connectivity seam duplicates the logic.
+        result.map(|mut admin_result| {
+            admin_result.summary = admin_command_summary(cmd);
+            admin_result
+        })
     }
 
     /// Executes an already-authorized administrative command (the mutation itself), without any
@@ -2356,6 +2372,64 @@ impl std::fmt::Debug for AdminContext {
     }
 }
 
+/// The result summary for a **successful** administrative command (`rmp` #513), following the Neo4j
+/// `SummaryCounters` contract:
+///
+/// - the system / catalog and security **mutations** (CREATE/DROP/START/STOP DATABASE,
+///   CREATE/DROP USER/ROLE, GRANT/REVOKE ROLE/PRIVILEGE) report query type `"s"` (SCHEMA_WRITE) with
+///   `system-updates` and the `contains-system-updates` flag — administration commands feed
+///   `containsSystemUpdates`, **not** `containsUpdates`, so this is the system-side analogue of the
+///   data path's `contains-updates`;
+/// - the read-only `SHOW *` listings report query type `"r"` with no counters;
+/// - the operator commands (`BACKUP`/`RESTORE`/`CHECKPOINT DATABASE`, which have no Neo4j-Cypher
+///   equivalent) are administrative operations with no countable system-catalog change, so they report
+///   `"s"` with no counters.
+///
+/// `system-updates` is reported as `1` for every successful mutation: the exact affected count is not
+/// distinguishable at this funnel (an `IF [NOT] EXISTS` / `IF EXISTS` no-op also returns a successful
+/// empty result), and `execute_authorized` returns a uniform empty [`AdminResult`] for both the real
+/// change and the no-op. The acceptance contract (`rmp` #513) is `system-updates >= 1`.
+fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
+    use AdminCommand as A;
+    match cmd {
+        // Read-only listings → query type "r", no counters.
+        A::ShowDatabases
+        | A::ShowDatabase { .. }
+        | A::ShowUsers
+        | A::ShowRoles
+        | A::ShowPrivileges => RunSummary {
+            query_type: Some("r".to_owned()),
+            stats: Vec::new(),
+        },
+        // Catalog + security mutations → query type "s" + system-updates + contains-system-updates.
+        A::CreateDatabase { .. }
+        | A::DropDatabase { .. }
+        | A::StartDatabase { .. }
+        | A::StopDatabase { .. }
+        | A::CreateUser { .. }
+        | A::DropUser { .. }
+        | A::CreateRole { .. }
+        | A::DropRole { .. }
+        | A::GrantRole { .. }
+        | A::RevokeRole { .. }
+        | A::GrantPrivilege { .. }
+        | A::RevokePrivilege { .. } => RunSummary {
+            query_type: Some("s".to_owned()),
+            stats: vec![
+                ("system-updates".to_owned(), Value::Integer(1)),
+                ("contains-system-updates".to_owned(), Value::Boolean(true)),
+            ],
+        },
+        // Operator commands: administrative operations, not countable system-catalog updates.
+        A::BackupDatabase { .. } | A::RestoreDatabase { .. } | A::CheckpointDatabase { .. } => {
+            RunSummary {
+                query_type: Some("s".to_owned()),
+                stats: Vec::new(),
+            }
+        }
+    }
+}
+
 /// Builds the `SHOW DATABASE(S)` result from catalog listings: `name`, `state`
 /// (`"online"`/`"offline"`, the actual state), `default` (bool), `error` (string/null).
 fn show_result(infos: Vec<crate::dbcatalog::DbInfo>) -> AdminResult {
@@ -2382,7 +2456,11 @@ fn show_result(infos: Vec<crate::dbcatalog::DbInfo>) -> AdminResult {
             ]
         })
         .collect();
-    AdminResult { fields, rows }
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
 }
 
 /// Builds the `SHOW USERS` result: `user` (string), `roles` (comma-joined string), `passwordSet`
@@ -2403,7 +2481,11 @@ fn show_users(users: &[crate::security::UserListing]) -> AdminResult {
             ]
         })
         .collect();
-    AdminResult { fields, rows }
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
 }
 
 /// Builds the `SHOW ROLES` result: `role` (string), `privilegeCount` (integer).
@@ -2418,7 +2500,11 @@ fn show_roles(roles: &[crate::security::RoleListing]) -> AdminResult {
             ]
         })
         .collect();
-    AdminResult { fields, rows }
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
 }
 
 /// Builds the `SHOW PRIVILEGES` result: `role` (string), `action` (string), `scope` (string).
@@ -2434,7 +2520,11 @@ fn show_privileges(privs: &[crate::security::PrivilegeListing]) -> AdminResult {
             ]
         })
         .collect();
-    AdminResult { fields, rows }
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
 }
 
 /// Maps a [`SecurityError`] onto the engine error model with the same client/server fault split as
@@ -2513,6 +2603,67 @@ mod tests {
             parse_admin_statement(query),
             AdminParse::NotAdmin,
             "{query:?} must pass through to Cypher"
+        );
+    }
+
+    /// `rmp` #513 GATE: the admin-command result summary classification. A system / catalog or security
+    /// mutation reports query type `s` with `system-updates: 1` + `contains-system-updates`; the
+    /// read-only `SHOW *` listings report type `r` with no counters; the operator commands
+    /// (`BACKUP`/`RESTORE`/`CHECKPOINT DATABASE`) report `s` with no countable system-catalog change.
+    #[test]
+    fn admin_command_summary_classifies_type_and_system_updates() {
+        let system_mutations = [
+            cmd("CREATE DATABASE sales"),
+            cmd("DROP DATABASE sales"),
+            cmd("CREATE USER carol SET PASSWORD 'carol-pw8'"),
+            // Constructed directly: covers the security GRANT-role and GRANT-privilege arms without a
+            // dependency on the grant grammar's parse path (tested elsewhere).
+            AdminCommand::GrantRole {
+                role: "reader".to_owned(),
+                user: "carol".to_owned(),
+            },
+            AdminCommand::GrantPrivilege {
+                action: PrivAction::Read,
+                scope: PrivScope::Database,
+                role: "reader".to_owned(),
+            },
+        ];
+        for c in &system_mutations {
+            let s = admin_command_summary(c);
+            assert_eq!(
+                s.query_type.as_deref(),
+                Some("s"),
+                "{c:?} is a schema/system write"
+            );
+            assert_eq!(
+                s.stats,
+                vec![
+                    ("system-updates".to_owned(), Value::Integer(1)),
+                    ("contains-system-updates".to_owned(), Value::Boolean(true)),
+                ],
+                "{c:?}: type s, system-updates 1, contains-system-updates flag"
+            );
+        }
+
+        for q in [
+            "SHOW DATABASES",
+            "SHOW USERS",
+            "SHOW ROLES",
+            "SHOW PRIVILEGES",
+        ] {
+            let s = admin_command_summary(&cmd(q));
+            assert_eq!(s.query_type.as_deref(), Some("r"), "{q} is a read");
+            assert!(s.stats.is_empty(), "{q} reports no counters");
+        }
+
+        // An operator command: administrative, but no countable system-catalog change.
+        let s = admin_command_summary(&AdminCommand::CheckpointDatabase {
+            name: "sales".to_owned(),
+        });
+        assert_eq!(s.query_type.as_deref(), Some("s"));
+        assert!(
+            s.stats.is_empty(),
+            "CHECKPOINT reports no system-updates counter"
         );
     }
 
