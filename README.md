@@ -10,10 +10,29 @@ aarch64 (including Apple Silicon and Raspberry Pi 5+).
 
 ## Status
 
-Early development. The **specification** is complete (see [`specification/`](specification/)):
-a global needs survey, 24 ratified design decisions, the technical design, and the pinned
-openCypher `2024.3` TCK target. Phase 1 (the single-node correctness core) is planned in the
-`rmp` roadmap `graphus`; the workspace is scaffolded below.
+Released — **v0.0.2** (see the [CHANGELOG](CHANGELOG.md) and
+[releases](https://github.com/FlavioCFOliveira/Graphus/releases)). The single-node
+correctness core is complete and production-hardened: the four inviolable guarantees —
+**100% ACID**, **100% openCypher TCK** (pinned `2024.3`), **100% Bolt protocol**, and
+**100% PackStream** — hold, validated by an extensive test suite including a deterministic
+simulation tester (DST/VOPR). A production-grade, multi-architecture Docker image is
+published. The complete **specification** lives in [`specification/`](specification/).
+
+## Documentation
+
+Usage documentation is in **[`docs/`](docs/)** — start with
+[`docs/getting-started.md`](docs/getting-started.md):
+
+| Guide | Covers |
+| --- | --- |
+| [getting-started](docs/getting-started.md) | Install with Docker, credentials, first query per interface |
+| [rest-api](docs/rest-api.md) | REST WebAPI: login/JWT, queries, transactions, errors, health |
+| [bolt](docs/bolt.md) | Bolt over TCP (Neo4j drivers) and UDS (local IPC) |
+| [security](docs/security.md) | Credentials, users, roles, and access control (RBAC) |
+| [configuration](docs/configuration.md) | Every config key and `GRAPHUS_*` environment variable |
+
+Runnable **Go client examples** for all three interfaces are in
+[`examples/clients-go/`](examples/clients-go).
 
 ## Repository layout
 
