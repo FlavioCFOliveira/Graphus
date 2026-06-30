@@ -6,8 +6,12 @@ name: Docker Hub
 # Triggers are INTENTIONALLY restricted to two — this workflow never runs on
 # ordinary pushes or pull requests:
 #
-#   * workflow_dispatch    → manual, on-demand publish (with an optional extra tag)
+#   * workflow_dispatch    → manual, on-demand publish of a specific version (required input)
 #   * release: published   → automatic publish when a GitHub Release is published
+#
+# Either way the image is published with CONFORMANT tags ONLY — `:latest` plus a
+# `:vX.Y.Z` version tag. There is no sha/edge/branch fallback: a publish that would
+# not carry a version tag is treated as a configuration error and fails fast.
 #
 # The companion `docker.yml` workflow keeps the Dockerfile green on every change
 # and publishes to the GitHub Container Registry (GHCR); this one targets Docker Hub.
@@ -20,9 +24,9 @@ name: Docker Hub
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Optional extra tag to publish (e.g. 'edge'). Leave empty to publish only the tags derived from the git ref."
-        required: false
+      version:
+        description: "Version to publish, e.g. 0.0.3 (semver, no leading 'v'). Publishes :vX.Y.Z and :latest."
+        required: true
         type: string
   release:
     types: [published]
@@ -51,6 +55,19 @@ jobs:
     name: Build and publish to Docker Hub
     runs-on: ubuntu-latest
     steps:
+      # A dispatch must name a concrete semver version up front, so Docker Hub can
+      # never receive a non-conformant (sha/branch) tag via the manual path.
+      - name: Validate the dispatch version is semver
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::The 'version' input must be semver like 0.0.3 (no leading v); got '$VERSION'."
+            exit 1
+          fi
+          echo "Publishing version v$VERSION."
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -86,17 +103,17 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}
-          # On a release the git ref is the tag (refs/tags/vX.Y.Z); pattern=v{{version}}
-          # mirrors that git tag verbatim, so a v0.0.3 release publishes the `:v0.0.3`
-          # tag (the leading `v` is kept on purpose). `latest` moves only for a final
-          # (non-prerelease) release. A manual dispatch additionally honours the optional
-          # `tag` input and always stamps a `sha-<sha>` tag, so a build off a branch is
-          # never left untagged.
+          # CONFORMANT TAGS ONLY — every publish carries :vX.Y.Z + :latest, never a
+          # sha or branch tag:
+          #   * release  → the git tag (refs/tags/vX.Y.Z) feeds pattern=v{{version}};
+          #                `latest` moves for a final (non-prerelease) release.
+          #   * dispatch → the required, semver-validated `version` input feeds
+          #                :v<version>, and `latest` moves too (an operator publishing
+          #                a version on purpose).
           tags: |
-            type=semver,pattern=v{{version}}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
-            type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern=v{{version}},enable=${{ github.event_name == 'release' }}
+            type=raw,value=v${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push (multi-arch)
         id: build
