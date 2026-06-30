@@ -66,12 +66,22 @@ struct TempStore {
 }
 impl TempStore {
     fn new() -> Self {
+        // A monotonic per-process counter makes the path unique even when two parallel
+        // tests read the *same* coarse `SystemTime` — macOS clocks can repeat an
+        // `as_nanos()` value, which previously let both tests resolve the same temp dir
+        // and race on the atomic `security.toml` publish (the loser saw ENOENT on
+        // `rename` because the winner had already moved the shared `.tmp`).
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
-        path.push(format!("graphus-rest-login-{nanos}-{}", std::process::id()));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        path.push(format!(
+            "graphus-rest-login-{nanos}-{}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
     }
