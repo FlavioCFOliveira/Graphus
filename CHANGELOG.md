@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /auth/login` REST endpoint.** Exchange a username + password for a short-lived
+  HS256 Bearer JWT, so the authenticated REST WebAPI is usable from any HTTP client without
+  distributing the server's `jwt_secret`. The credential is verified with Argon2 (the same
+  path as Bolt `LOGON`); failed attempts are rate-limited per account, and unknown-user and
+  wrong-password failures return an identical `401`.
+- **Usage documentation** under [`docs/`](docs/) (getting started, REST WebAPI, Bolt
+  over TCP/UDS, security and RBAC, configuration) and **Go client examples** under
+  [`examples/clients-go/`](examples/clients-go) for all three interfaces (REST, Bolt-over-TCP
+  via the official Neo4j Go driver, and Bolt-over-UDS via a dependency-free raw client).
+
 ## [0.0.2] - 2026-06-29
 
 A **hardening, performance, and production-readiness** release. Graphus matured across
