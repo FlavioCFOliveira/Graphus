@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over TCP/UDS, security and RBAC, configuration) and **Go client examples** under
   [`examples/clients-go/`](examples/clients-go) for all three interfaces (REST, Bolt-over-TCP
   via the official Neo4j Go driver, and Bolt-over-UDS via a dependency-free raw client).
+- **Docker Hub image publishing.** A new GitHub Actions workflow
+  (`.github/workflows/dockerhub.yml`) builds the multi-architecture (`linux/amd64` +
+  `linux/arm64`) image and publishes it to Docker Hub, alongside the existing GitHub
+  Container Registry (GHCR) workflow. It runs only on a manual dispatch or when a GitHub
+  Release is published, authenticating with the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+  repository secrets.
 
 ## [0.0.2] - 2026-06-29
 

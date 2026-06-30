@@ -1,0 +1,128 @@
+name: Docker Hub
+
+# Build and publish the multi-architecture Graphus container image
+# (linux/amd64 + linux/arm64) to Docker Hub.
+#
+# Triggers are INTENTIONALLY restricted to two — this workflow never runs on
+# ordinary pushes or pull requests:
+#
+#   * workflow_dispatch    → manual, on-demand publish (with an optional extra tag)
+#   * release: published   → automatic publish when a GitHub Release is published
+#
+# The companion `docker.yml` workflow keeps the Dockerfile green on every change
+# and publishes to the GitHub Container Registry (GHCR); this one targets Docker Hub.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   * DOCKERHUB_USERNAME — Docker Hub account/namespace and login username
+#   * DOCKERHUB_TOKEN    — a Docker Hub Access Token (create one under your Docker
+#                          Hub account settings; do NOT use the account password)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional extra tag to publish (e.g. 'edge'). Leave empty to publish only the tags derived from the git ref."
+        required: false
+        type: string
+  release:
+    types: [published]
+
+# Never cancel an in-flight publish — a half-pushed multi-arch manifest is worse
+# than waiting. Serialise per ref instead.
+concurrency:
+  group: dockerhub-${{ github.ref }}
+  cancel-in-progress: false
+
+# Docker Hub auth uses the secrets below, so no elevated GITHUB_TOKEN scope is
+# needed; read-only access to the repository contents is enough to check it out.
+permissions:
+  contents: read
+
+env:
+  # The published reference is docker.io/<DOCKERHUB_USERNAME>/<IMAGE_REPO>. The
+  # namespace is taken from the secret at run time; only the repository name is
+  # set here. If you publish under a Docker Hub organisation whose name differs
+  # from the login user, change the `images:` value in the metadata step below.
+  IMAGE_REPO: graphus
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  publish:
+    name: Build and publish to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Fail fast with a clear message if run on a fork or before the secrets are
+      # configured, instead of erroring opaquely deep inside the login step.
+      - name: Verify Docker Hub credentials are configured
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::The DOCKERHUB_USERNAME and/or DOCKERHUB_TOKEN repository secrets are not set. Configure them under Settings -> Secrets and variables -> Actions before running this workflow."
+            exit 1
+          fi
+          echo "Docker Hub credentials are present."
+
+      # QEMU lets the runner build the non-native (arm64) image under emulation.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          # registry defaults to docker.io (Docker Hub) when omitted.
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}
+          # On a release the git ref is the tag (refs/tags/vX.Y.Z), so the semver
+          # patterns produce X.Y.Z and X.Y. `latest` moves only for a final
+          # (non-prerelease) release. A manual dispatch additionally honours the
+          # optional `tag` input and always stamps a `sha-<sha>` tag, so a build
+          # off a branch is never left untagged.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+            type=sha,enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Build and push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Supply-chain attestations, matching the GHCR workflow.
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish summary
+        run: |
+          {
+            echo "### Published to Docker Hub"
+            echo ""
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "**Tags:**"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
