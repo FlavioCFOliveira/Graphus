@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-06-30
+
 ### Added
 
 - **`POST /auth/login` REST endpoint.** Exchange a username + password for a short-lived
@@ -23,7 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `linux/arm64`) image and publishes it to Docker Hub, alongside the existing GitHub
   Container Registry (GHCR) workflow. It runs only on a manual dispatch or when a GitHub
   Release is published, authenticating with the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
-  repository secrets.
+  repository secrets, and always publishes conformant tags — `:latest` plus a `:vX.Y.Z`
+  version (never a commit-sha or branch tag). A community-standard repository overview
+  ships in [`docker/dockerhub-overview.md`](docker/dockerhub-overview.md).
+
+### Changed
+
+- **CI GitHub Actions updated to their latest major versions** across `ci.yml`,
+  `docker.yml`, and `nightly-fuzz.yml` (`actions/checkout` v7, `actions/upload-artifact`
+  v7, and the Docker `setup-qemu`/`setup-buildx`/`login`/`metadata`/`build-push` actions),
+  keeping the pipeline on maintained, Node 24-based action runtimes.
 
 ## [0.0.2] - 2026-06-29
 
