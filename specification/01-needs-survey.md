@@ -254,8 +254,22 @@ format: **Bolt over UDS**, **Bolt over TCP**, and the **Web REST API**.
 - **FR-BK-2** [CORE] **Offline bulk importer** for high-throughput initial load into an empty DB.
 - **FR-BK-3** [CORE] **Bulk export / dump** of the whole graph (CSV/JSON/native).
 - **FR-BK-4** [CORE] **Measured initial-load performance** (empirical, per the project rules).
-- **FR-BK-5** [ADV] **Incremental/resumable import.**
-- **FR-BK-6** [ADV] **Parquet/JSON import; streaming ingestion.**
+- **FR-BK-5** [ADV] **Incremental/resumable import.** For the network case (`FR-BK-7`), this is a
+  required property, not merely advanced: `08-network-bulk-import.md` §7.1 specifies
+  session-checkpoint resumability, required in both of `FR-BK-7`'s modes.
+- **FR-BK-6** [ADV] **Parquet/JSON import; streaming ingestion.** The streaming-ingestion half of
+  this need is concretely specified by `FR-BK-7` (CSV/`.gcol` over a streamed HTTP body); Parquet
+  and JSON as additional accepted formats remain open and unspecified.
+- **FR-BK-7** [ADV] **Network bulk import.** Load a large dataset (millions of nodes, hundreds of
+  millions of relationships) into an already-running Graphus server (local or remote) over the
+  network, without requiring the operator to have local filesystem access to the server host.
+  Ratified with **two** required modes (`D-bulk-import-network`, ratified 2026-07-01): **Mode A**
+  — a fresh/empty target database, loaded exclusively (the server process stays up, but the
+  target database is not open to ordinary traffic during the session); and **Mode B** — an
+  already-live, already-serving target database, loaded fully concurrently with ordinary client
+  reads and writes, with every import batch participating in the same MVCC/SSI machinery as any
+  other transaction so serializability is never violated. Fully specified in
+  `08-network-bulk-import.md`.
 
 ## 10. Backup & Restore (BR)
 

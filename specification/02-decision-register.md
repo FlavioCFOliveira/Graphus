@@ -114,6 +114,51 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 >    the source is already an in-memory `Vec`; the benefit is negligible. Accept-as-is.
 > **Status:** accepted-as-is for production; tracked as rmp #159.
 
+## Ratified decision (2026-07-01) — `D-bulk-import-network`
+
+> **`D-bulk-import-network` — Network bulk import (remote streaming bulk load).** Unlike the two
+> sprint-19 entries above, this decision was **not** dispositioned by an internal audit against an
+> already-ratified requirement — it was a genuinely new capability, proposed after an empirical
+> load test (2026-06-30, host `pi516`) established that no existing mechanism can load a
+> large-scale dataset (order of 1,000,000 nodes, hundreds of millions of relationships) into an
+> already-running Graphus server, local or remote (`08-network-bulk-import.md` §1). It was
+> presented with options and a recommendation on six facets, and the two highest-impact,
+> least-reversible facets were flagged for sequential owner ratification. **The project owner
+> ratified this decision on 2026-07-01**, confirming the recommended RBAC option and — on the
+> target-database-scope facet — selecting the **non-recommended, higher-risk option**: network
+> bulk import must support an already-live, already-serving database, not only a fresh/empty one.
+> Full rationale, the resulting concurrency-safe design, and its independent validation
+> (`storage-systems-auditor`, 2026-07-01) are in `08-network-bulk-import.md`; this entry is the
+> register's summary of that document.
+>
+> **Status: ratified.**
+>
+> | Facet | Options | Ratified choice |
+> | --- | --- | --- |
+> | Transport | (a) new Bolt message type; (b) Bolt, bounded chunks over standard `RUN`/`PULL` only; ★(c) dedicated REST streaming-upload endpoint, exempt from the general 4 MiB body limit | **(c), as recommended.** Option (a) is a genuine Bolt-spec compliance violation (no reserved extension range in the spec) and PackStream's `BYTES_32` size tier is capped at ~2 GiB by the specification itself, ruling out a single large payload value regardless. Option (b) is spec-conformant but pays a full RUN/PULL/PackStream round trip per chunk for what is, at that point, opaque bytes. HTTP chunked transfer-encoding (RFC 9112/9113) has no such ceiling and is the standards-native fit; `graphus-rest` already established the symmetric egress-streaming pattern (rmp #475). See `08` §3. |
+> | Payload format | (a) reuse the existing local CSV / `.gcol` formats `graphus-bulk` already parses; (b) a new network-specific binary format | **(a), as recommended.** Reuses already-certified (sprint 7) parsing/import logic unmodified; only the byte source changes. See `08` §4. |
+> | Target-database scope | (a) fresh, empty database only (matches today's offline-importer precondition); **(b) — RATIFIED, the non-recommended option** — support incremental load into an already-live, already-serving database, in addition to (a) | **Both (a) and (b) — the owner chose to add (b) on top of, not instead of, (a).** (b) requires the low-level import path to participate in MVCC/SSI conflict detection and inline index maintenance against concurrent transactions — flagged as being in the same risk family as the already-deferred `D-read-parallelism` (rmp #146). Unlike that deferral, this was ratified: `08` §7.2 is the resulting concurrency-safe design (every batch is a first-class, SSI-participating `TxnCoordinator` transaction, never a raw low-level store bypass), independently validated against the actual concurrency-control code before being written into the spec. Named **Mode A** ((a), exclusive, `08` §5.1–§5.2) and **Mode B** ((b), concurrent, `08` §5.3) in the spec. |
+> | Exclusivity mechanism | Mode A: ★a new `Loading` database lifecycle state (engine running, ordinary client traffic rejected) alongside the existing `Online`/`Offline`; Mode B: no exclusivity mechanism, correctness from MVCC/SSI alone | **Both, one per mode — as designed.** Mode A mirrors the existing `RESTORE DATABASE` precedent (stopped first, started explicitly after) while keeping the engine alive to receive the stream; scoped to one database, every other database unaffected (`D-multi-db`). Mode B stays `Online` throughout and relies entirely on the same SSI machinery that already protects ordinary concurrent Cypher transactions. See `08` §5.2/§5.3. |
+> | RBAC privilege | ★(a) the existing global `Admin` privilege (same gate as `BACKUP`/`RESTORE`/`CREATE DATABASE`), for both modes; (b) a new, narrower graph-scoped privilege | **(a), as recommended — confirmed by the owner, no change, applies to both Mode A and Mode B.** The operation can take exclusive control of a database (Mode A) or write at import scale against live traffic while bypassing the ordinary Cypher write path's fine-grained RBAC checks (Mode B), so it should not be reachable by a data-level `Write` grant alone. A narrower privilege remains a possible follow-up once the core capability is in production. See `08` §6. |
+> | Atomicity / resumability | ★(a) extend the already-ratified `D-bulk-import-non-atomic` (per-batch commit, whole session non-atomic) and add mandatory, crash-consistent session-checkpoint resumability; (b) require the whole import to be all-or-nothing | **(a), as recommended, both modes.** Does not weaken the inviolable ACID requirement: every committed batch is a fully durable, consistent transaction; only the *session as a whole* is non-atomic, exactly as already ratified for the offline case. Resumability is the correct response to network unreliability, not a workaround for it. **Mode B additionally requires** a prerequisite fix in `graphus-bulk` (the `id_map` staging bug, `08` §7.2.2) before its automatic batch retry can be enabled safely — see the note below. See `08` §7. |
+>
+> **Prerequisite fix required before Mode B ships.** The independent validation
+> (`storage-systems-auditor`, 2026-07-01) surfaced a **pre-existing, must-fix correctness bug** in
+> `graphus-bulk::BulkImporter`: its external-id→physical-id map is mutated eagerly during row
+> ingestion, before the enclosing transaction commits, and is never reverted on rollback. This is
+> harmless for today's offline, no-retry, empty-database path, but Mode B's batch-retry-on-abort
+> requirement (an expected, ordinary event under live-database concurrency, `08` §7.2.1) would
+> turn it into a live data-corruption risk (spurious duplicate-id failures, or silently orphaned
+> nodes and corrupted relationship-pass joins under `DuplicatePolicy::SkipDuplicate`). Registered
+> as KG Finding `bulk-idmap-not-abort-safe` (severity high, status open). **This fix is a
+> precondition of Mode B's acceptance criteria** (`08` §11), not a follow-up.
+>
+> DoS/resource-limit requirements (byte quotas, disk-space preflight, session timeouts,
+> backpressure, engine-thread-yielding fairness for Mode B) and the two required new DST scenarios
+> (`network_bulk_ingest_mode_a`, `network_bulk_ingest_mode_b`) are specified in
+> `08-network-bulk-import.md` §8 and §10 respectively; they are implementation requirements of the
+> ratified design, not separate decisions.
+
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 
 The "100% Cypher TCK" target is pinned to the **openCypher `2024.3`** tag (commit `677cbaf`,
@@ -198,3 +243,11 @@ SPIKE #9 (`06-bolt-and-error-shapes.md` §2–§3; resolves open question 2 and 
    REST transactional API declares access mode through an `access_mode` request member with values
    `"READ"` / `"WRITE"`, defaulting to `"WRITE"` when absent, validated as a client error otherwise,
    matching the Bolt `BEGIN` semantics.
+6. Ratify `D-bulk-import-network` (see the "Ratified decision (2026-07-01)" section above and
+   `08-network-bulk-import.md`). **Resolved (2026-07-01).** The owner confirmed the recommended
+   REST-streaming transport and the global `Admin` RBAC gate, and selected the non-recommended
+   option on database scope: both a fresh/empty database (Mode A) and an already-live database
+   under concurrent traffic (Mode B) are in scope. Mode B's concurrency-safe design (`08` §7.2)
+   was independently validated by `storage-systems-auditor` before being finalized; that audit
+   also surfaced a prerequisite `graphus-bulk` correctness fix (`08` §7.2.2, KG Finding
+   `bulk-idmap-not-abort-safe`) that must land before Mode B's automatic batch retry ships.
