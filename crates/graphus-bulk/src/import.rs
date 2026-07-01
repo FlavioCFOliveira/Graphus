@@ -110,7 +110,24 @@ pub enum DuplicatePolicy {
 pub struct BulkImporter<D: BlockDevice, S: LogSink> {
     store: RecordStore<D, S>,
     /// External `:ID` → physical node id, populated by the node pass and read by the rel pass.
+    ///
+    /// Only holds bindings from **committed** batches (`rmp` #517) — see [`Self::pending_id_map`].
     id_map: HashMap<String, u64>,
+    /// External `:ID` → physical node id bindings staged by the *current, not-yet-committed* batch
+    /// (`rmp` #517: `bulk-idmap-not-abort-safe`).
+    ///
+    /// A batch's rows are written to the store speculatively and only become durable when the batch's
+    /// transaction commits; the physical ids created by a rolled-back batch cease to exist in the
+    /// store. Staging id-map bindings here (instead of directly in `id_map`) and merging them only on
+    /// a successful [`Self::commit_batch`] keeps the two in lock-step: a batch that aborts leaves
+    /// `id_map` exactly as if it had never run, so a *retried* batch (a future network bulk-import
+    /// retry, or simply calling the node pass again over the same rows) never resolves an external id
+    /// to a ghost physical id that the store has already rolled back.
+    pending_id_map: HashMap<String, u64>,
+    /// `stats` as of the start of the in-flight batch (`rmp` #517), restored verbatim on rollback (or
+    /// a failed commit) so per-row counters (`nodes`, `relationships`, `properties`,
+    /// `skipped_duplicate_ids`) never count rows from a batch that did not durably commit.
+    batch_start_stats: ImportStats,
     /// The next transaction id to use (monotonic; bulk load is single-threaded).
     next_txn: u64,
     /// Rows per committed transaction.
@@ -133,6 +150,8 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         Self {
             store,
             id_map: HashMap::new(),
+            pending_id_map: HashMap::new(),
+            batch_start_stats: ImportStats::default(),
             next_txn: 1,
             batch_size: batch_size.max(1),
             delimiter,
@@ -230,13 +249,13 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             }
             in_batch += 1;
             if in_batch >= self.batch_size {
-                self.store.commit(txn)?;
+                self.commit_batch(txn)?;
                 txn = self.begin_batch();
                 in_batch = 0;
             }
         }
         // Commit the final (possibly partial) batch.
-        self.store.commit(txn)?;
+        self.commit_batch(txn)?;
         self.stats.node_seconds += start.elapsed().as_secs_f64();
         Ok(())
     }
@@ -308,15 +327,21 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             self.store.set_node_labels(txn, node_id, &label_tokens)?;
         }
 
-        // Bind the external id last (after a successful write). SEC-196 (CWE-694): a duplicate
-        // *non-empty* external id must not silently overwrite an earlier binding — that would
-        // re-point every relationship referencing it onto the wrong node. Detect the collision and,
-        // per the configured policy, either reject the import (strict, default) or keep the first
-        // binding and count the skip. An *empty* id is the anonymous-node convention (no relationship
-        // can reference it), so multiple anonymous nodes are allowed to share the empty key.
+        // Bind the external id last (after a successful write), staging it in `pending_id_map` rather
+        // than `id_map` directly (`rmp` #517): the binding only becomes visible to the relationship
+        // pass once this row's batch durably commits (see `commit_batch`), so a batch that later
+        // aborts never leaves a stale binding behind for a retry to trip over.
+        //
+        // SEC-196 (CWE-694): a duplicate *non-empty* external id must not silently overwrite an
+        // earlier binding — that would re-point every relationship referencing it onto the wrong
+        // node. Detect the collision (against both the confirmed `id_map` and this batch's own
+        // `pending_id_map`) and, per the configured policy, either reject the import (strict, default)
+        // or keep the first binding and count the skip. An *empty* id is the anonymous-node convention
+        // (no relationship can reference it), so multiple anonymous nodes are allowed to share the
+        // empty key.
         if external_id.is_empty() {
-            self.id_map.insert(external_id, node_id);
-        } else if let Some(&existing) = self.id_map.get(&external_id) {
+            self.pending_id_map.insert(external_id, node_id);
+        } else if let Some(existing) = self.bound_id(&external_id) {
             match self.duplicate_policy {
                 DuplicatePolicy::Strict => {
                     return Err(graphus_core::GraphusError::Storage(format!(
@@ -333,7 +358,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
                 }
             }
         } else {
-            self.id_map.insert(external_id, node_id);
+            self.pending_id_map.insert(external_id, node_id);
         }
         self.stats.nodes += 1;
         Ok(())
@@ -387,12 +412,12 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             }
             in_batch += 1;
             if in_batch >= self.batch_size {
-                self.store.commit(txn)?;
+                self.commit_batch(txn)?;
                 txn = self.begin_batch();
                 in_batch = 0;
             }
         }
-        self.store.commit(txn)?;
+        self.commit_batch(txn)?;
         self.stats.rel_seconds += start.elapsed().as_secs_f64();
         Ok(())
     }
@@ -475,17 +500,64 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         Ok(out)
     }
 
+    /// The physical id currently bound to `external_id`, checking both the confirmed `id_map` and the
+    /// in-flight batch's `pending_id_map` (`rmp` #517) — a duplicate within the *same* uncommitted
+    /// batch must be caught just as reliably as one against an already-committed batch.
+    fn bound_id(&self, external_id: &str) -> Option<u64> {
+        self.pending_id_map
+            .get(external_id)
+            .or_else(|| self.id_map.get(external_id))
+            .copied()
+    }
+
     /// Begins the next batch transaction and returns its id.
     fn begin_batch(&mut self) -> TxnId {
         let txn = TxnId(self.next_txn);
         self.next_txn += 1;
         self.store.begin(txn);
+        self.batch_start_stats = self.stats;
+        debug_assert!(
+            self.pending_id_map.is_empty(),
+            "INVARIANT: pending_id_map is always drained (on commit) or cleared (on rollback) \
+             before the next batch begins (#517)"
+        );
         txn
     }
 
+    /// Commits the batch transaction `txn` and, only once that succeeds, confirms the batch's staged
+    /// work: merges `pending_id_map` into the visible `id_map` (`rmp` #517).
+    ///
+    /// If the commit itself fails, the batch's writes never became durable, so its staged id-map
+    /// bindings and stats deltas are discarded exactly as an explicit [`Self::rollback`] would — the
+    /// importer's visible state always matches "this batch either fully happened or never happened".
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying [`RecordStore::commit`] failure.
+    fn commit_batch(&mut self, txn: TxnId) -> Result<()> {
+        match self.store.commit(txn) {
+            Ok(()) => {
+                self.id_map.extend(self.pending_id_map.drain());
+                Ok(())
+            }
+            Err(e) => {
+                self.pending_id_map.clear();
+                self.stats = self.batch_start_stats;
+                Err(e)
+            }
+        }
+    }
+
     /// Best-effort rollback of a failed batch (the error being returned is the primary failure).
+    ///
+    /// Also discards this batch's staged `pending_id_map` bindings and restores `stats` to its
+    /// pre-batch snapshot (`rmp` #517): the store already undid the batch's writes, so retaining
+    /// either would let a retried batch resolve relationships against physical ids the store no
+    /// longer has, or double-count rows the store never durably kept.
     fn rollback(&mut self, txn: TxnId) {
         let _ = self.store.rollback(txn);
+        self.pending_id_map.clear();
+        self.stats = self.batch_start_stats;
     }
 
     /// Finishes the import, returning the populated store and the cumulative [`ImportStats`].
