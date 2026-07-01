@@ -71,8 +71,10 @@
 //!   outside the surrounding engine transaction.
 //! - `IF NOT EXISTS` / `IF EXISTS` turn the duplicate/missing cases into no-op successes
 //!   (`CREATE DATABASE <default> IF NOT EXISTS` is also a no-op: the default always exists).
-//! - `SHOW DATABASES` returns one row per database — `name`, `state` (`"online"`/`"offline"`,
-//!   the **actual** state), `default` (bool), `error` (string or null) — exactly what
+//! - `SHOW DATABASES` returns one row per database — `name`, `state`
+//!   (`"online"`/`"offline"`/`"loading"`, the **actual** state — `"loading"` is a Mode A network
+//!   bulk-import session in progress, `rmp` #519), `default` (bool), `error` (string or null) —
+//!   exactly what
 //!   [`DatabaseCatalog::list`] exposes. `SHOW DATABASE <name>` returns that database's row, or
 //!   zero rows when no such database exists.
 //! - `DROP` requires the database to be stopped first (the catalog enforces it; the error is
@@ -2431,7 +2433,8 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
 }
 
 /// Builds the `SHOW DATABASE(S)` result from catalog listings: `name`, `state`
-/// (`"online"`/`"offline"`, the actual state), `default` (bool), `error` (string/null).
+/// (`"online"`/`"offline"`/`"loading"`, the actual state — `"loading"` is a Mode A network
+/// bulk-import session in progress, `rmp` #519), `default` (bool), `error` (string/null).
 fn show_result(infos: Vec<crate::dbcatalog::DbInfo>) -> AdminResult {
     let fields = vec![
         "name".to_owned(),
@@ -2448,6 +2451,7 @@ fn show_result(infos: Vec<crate::dbcatalog::DbInfo>) -> AdminResult {
                     match info.state {
                         DbState::Online => "online",
                         DbState::Offline => "offline",
+                        DbState::Loading => "loading",
                     }
                     .to_owned(),
                 ),
@@ -2553,6 +2557,7 @@ fn graphus_error_from_catalog(e: &CatalogError) -> GraphusError {
         | CatalogError::AlreadyExists(_)
         | CatalogError::UnknownDatabase(_)
         | CatalogError::NotOffline(_)
+        | CatalogError::NotLoadable(_)
         | CatalogError::Backup(_)
         | CatalogError::DefaultDatabase { .. } => GraphusError::Runtime(e.to_string()),
         CatalogError::Io { .. }

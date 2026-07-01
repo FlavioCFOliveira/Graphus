@@ -2908,6 +2908,42 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         f(&mut store)
     }
 
+    /// Mints one fresh, coordinator-issued [`TxnId`] from [`Self::next_txn_id`](Self#structfield.next_txn_id)
+    /// and hands `f` mutable store access under it — **without** registering the id in
+    /// [`active`](Self#structfield.active), the SSI tracker, or the lock table (`rmp` #519, network
+    /// bulk-import Mode A).
+    ///
+    /// This is the raw, transaction-agnostic sibling of [`with_store_mut`](Self::with_store_mut) (used
+    /// by backup/checkpoint, which need no transaction at all): it exists for a caller that must issue
+    /// its own low-level `RecordStore::begin`/`create_node`/.../`commit` sequence — exactly what
+    /// `graphus_bulk`'s free ingestion functions (`ingest_node_row`/`ingest_rel_row`) do — while
+    /// guaranteeing the id can never collide with one this coordinator already issued or will issue
+    /// later, on this same store, via its ordinary `begin`/`begin_serializable`/etc. methods. Unlike
+    /// those methods this performs **no** SSI/lock/`record_graph` bookkeeping: the caller is fully
+    /// responsible for `store.begin(txn)`/`store.commit(txn)`/`store.rollback(txn)` and for ensuring no
+    /// concurrent access requires conflict detection over this write (true by construction for Mode A:
+    /// the target database is `Loading`, exclusive to this session, `08 §5.2`).
+    ///
+    /// Because the id still comes from the coordinator's own WAL-seeded counter
+    /// ([`new`](Self::new) reseeds it past [`RecordStore::recovered_txn_hw`] on every open), a
+    /// transaction begun+committed through this seam recovers identically to an ordinary
+    /// coordinator-driven one — `graphus_wal`/`graphus_storage::recovery` redo/undo keys off each WAL
+    /// record's own `TxnId` tag, never coordinator in-memory state.
+    ///
+    /// The store is borrowed for exactly the duration of `f`; do not call back into the coordinator
+    /// from within `f` (the same `RefCell` re-entrancy hazard [`with_store_mut`](Self::with_store_mut)
+    /// documents).
+    ///
+    /// # Panics
+    /// Panics if the store is already borrowed (a live statement seam, or `f` re-enters the
+    /// coordinator).
+    pub fn raw_txn<R>(&mut self, f: impl FnOnce(TxnId, &mut RecordStore<D, S>) -> R) -> R {
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        let mut store = self.store.borrow_mut();
+        f(txn, &mut store)
+    }
+
     /// Aborts `txn`: store undo, SSI forget, lock release, and removal from the open set.
     ///
     /// # Why the in-memory cleanup is unconditional (`rmp` #415)

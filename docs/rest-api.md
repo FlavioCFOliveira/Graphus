@@ -228,12 +228,13 @@ Errors use `Content-Type: application/problem+json`:
 
 | HTTP  | When |
 | ----- | ---- |
-| `400` | Cypher syntax/argument error; malformed body; invalid `access_mode` |
+| `400` | Cypher syntax/argument error; malformed body; invalid `access_mode`; `/admin/db/{db}/bulk-import`: neither `phase` nor `end=true` given, an invalid `phase` value, or an invalid `{db}` name |
 | `401` | missing / invalid / expired Bearer token (and failed `/auth/login`) |
 | `403` | valid token but the principal lacks the required privilege |
 | `404` | unknown / expired transaction id (or one owned by another principal) |
-| `406` / `415` | unacceptable `Accept` / unsupported `Content-Type` |
-| `409` | serialization conflict (retriable) |
+| `406` / `415` | unacceptable `Accept` / unsupported `Content-Type` (`/admin/db/{db}/bulk-import`: an unrecognized `Content-Type` on a `phase=...` call) |
+| `408` | `/admin/db/{db}/bulk-import` only: the session timeout (`bulk_import.session_timeout_ms`) elapsed |
+| `409` | serialization conflict (retriable); `/admin/db/{db}/bulk-import`: the target database is already `Loading` (a concurrent session), not `Online`, or not empty (Mode A's precondition — see §8.1) |
 | `413` | request body over 4 MiB (over the configured quota for `/admin/db/{db}/bulk-import`) |
 | `429` | too many open transactions, or `/auth/login` rate-limited (retriable) |
 | `500` | internal fault (detail redacted; logged server-side) |
@@ -260,27 +261,108 @@ database over the network, for scale that ordinary parameterized Cypher cannot r
 (millions of nodes, hundreds of millions of relationships) — see
 `specification/08-network-bulk-import.md` for the full design.
 
+This endpoint implements **Mode A**: loading a **fresh, empty** database that is not yet
+serving ordinary traffic. **Mode B** — bulk-importing into an already-live, already-serving,
+non-empty database under concurrent Bolt/REST traffic — is `rmp` #520 and is **not yet
+implemented**; this endpoint `409`s cleanly (see the status table below) if attempted
+against a non-empty database rather than attempting it.
+
 - **Auth:** the global `Admin` privilege — the same gate as `BACKUP`/`RESTORE`/
   `CREATE DATABASE`. Missing/invalid Bearer → `401`; valid Bearer without `Admin` → `403`.
-- **`Content-Type`:** `text/csv` or `application/vnd.graphus.gcol` (a `;charset=...`
-  parameter is ignored; matching is case-insensitive). Anything else → `415`.
+- **Wire protocol — one session, several calls.** A bulk-import session is one or more
+  `POST` calls against the same `{db}`, distinguished by a query parameter:
+  - `?phase=nodes` / `?phase=relationships` — this call's body is **one** CSV (or `.gcol`)
+    file. The **first** such call against a given `{db}` implicitly **begins** the session
+    (moving the database to the `Loading` state, `08` §5.2); every subsequent call against
+    the same, already-`Loading` database **continues** it. Response: `200 OK`,
+    `Content-Type: application/json`, body `{"nodes":N,"relationships":M,"properties":P}` —
+    the session's **cumulative** stats — once this call's whole file has been durably
+    ingested (batch-by-batch, so the engine thread is never blocked for the whole upload).
+  - `?end=true` — ends the session: durably deletes the internal checkpoint sentinel node,
+    moves the database from `Loading` to `Offline` (never straight back to `Online` — the
+    operator issues `START DATABASE` once satisfied with the load), and returns the same
+    JSON shape with the final cumulative stats. Empty body, no `Content-Type` required.
+    **Idempotent:** calling it when no session is active (never begun, or already ended) is
+    a `200` no-op reporting `{"nodes":0,"relationships":0,"properties":0}`, never an error.
+  - A request naming neither a recognized `phase` nor `end=true` → `400`.
+- **`Content-Type`** (on `phase=...` calls): `text/csv` or `application/vnd.graphus.gcol` (a
+  `;charset=...` parameter is ignored; matching is case-insensitive). Anything else → `415`.
+  Node and relationship files are sent as **separate calls** — nodes must fully land before
+  relationships that reference them.
+- **Empty-database precondition:** checked only on the call that begins the session (the
+  first call against a not-yet-`Loading` database): the database must contain zero nodes, or
+  the call is rejected with `409` (pointing at Mode B, `rmp` #520, as the option for a
+  non-empty database). A subsequent call against an already-`Loading` database skips this
+  check (the database is by then non-empty by design).
 - **Streaming, not buffered:** the body is read incrementally and is exempt from the
   general 4 MiB `DefaultBodyLimit` — it has its own configurable byte quota
-  (`bulk_import.max_bytes_per_session`, default 8 GiB), enforced as bytes arrive. Exceeding
-  it aborts the upload with `413` without ever holding the excess in memory.
-- **Disk-space guard:** before accepting the upload, and periodically while streaming, the
-  server checks free space on the target database's volume against
-  `bulk_import.min_free_disk_bytes` (default 1 GiB). Insufficient space → `507`.
-  `0` disables the check.
-- **Session timeout:** `bulk_import.session_timeout_ms` (default 2 hours) bounds the whole
-  upload's wall-clock duration; exceeding it aborts with `408`.
+  (`bulk_import.max_bytes_per_session`, default 8 GiB), enforced **per call** as bytes
+  arrive. Exceeding it aborts the upload with `413` without ever holding the excess in
+  memory. (`.gcol`'s CRC-framing makes it structurally impossible to decode incrementally,
+  so a `.gcol` body is buffered whole — still byte-quota-bounded — before being transcoded
+  to the same CSV shape the streaming path uses.)
+- **Disk-space guard:** before accepting each call's upload, and periodically while
+  streaming, the server checks free space on the target database's volume against
+  `bulk_import.min_free_disk_bytes` (default 1 GiB). Insufficient space → `507`. `0`
+  disables the check.
+- **Session timeout:** `bulk_import.session_timeout_ms` (default 2 hours) bounds each
+  individual call's wall-clock duration; exceeding it aborts that call with `408`.
 - **Target database:** the `{db}` path segment; an unknown database → `404`.
-- `202 Accepted` on success: `{ "accepted_bytes": N, "format": "csv" | "gcol" }`.
+- **Dropped-connection / retry contract:** if the connection drops mid-file, the in-flight
+  batch is rolled back and the database **stays `Loading`** — a mid-file failure never
+  forecloses resuming. Retry with the **same** `phase=...` call, resending the header plus
+  every row not yet reflected in the last successful response's cumulative counts (rows from
+  earlier, already-committed batches of the same call are safe and must not be resent, as
+  long as the server process itself has not restarted). A client resuming after a **full
+  server restart** must resume from the last **fully durable file boundary** (never
+  mid-file) — this endpoint does not track byte offsets beyond the per-file resume above.
+- **Status codes:**
 
-This is the scaffolding milestone (`rmp` #518): the endpoint validates, streams, and
-enforces the resource limits above, but does not yet hand the ingested bytes to the bulk
-importer — that lands in a follow-up. Every session's admission decision and outcome is
+  | HTTP | When |
+  | ---- | ---- |
+  | `200` | a `phase=...` batch was durably ingested, or `?end=true` completed (or was a no-op) — cumulative stats in the body |
+  | `400` | neither `phase` nor `end=true` given; invalid `phase` value; invalid `{db}` name |
+  | `401` | missing/invalid/expired Bearer token |
+  | `403` | valid Bearer without the `Admin` privilege |
+  | `404` | unknown database |
+  | `409` | the database is not empty (Mode A's precondition — see Mode B, `rmp` #520), or is not currently online (offline, or another session is already `Loading` it) |
+  | `413` | this call's upload crossed `bulk_import.max_bytes_per_session` |
+  | `415` | unrecognized `Content-Type` on a `phase=...` call |
+  | `408` | this call exceeded `bulk_import.session_timeout_ms` |
+  | `507` | insufficient free disk space on the target database's volume |
+  | `500` | a header/value-parse/storage error, or an internal fault (detail redacted where sensitive; logged server-side) |
+
+Every session-lifecycle event (begin, each accepted batch, end, and every rejection) is
 recorded in the security audit log (`security.md`).
+
+```sh
+# 1. Create an empty database for the load.
+curl -sk -X POST $BASE/db/graphus/tx/commit \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"statements":[{"statement":"CREATE DATABASE loadtest"}]}'
+
+# 2. Stream the node file (begins the session; the database moves to Loading).
+curl -sk -X POST "$BASE/admin/db/loadtest/bulk-import?phase=nodes" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: text/csv" \
+  --data-binary @nodes.csv
+
+# 3. Stream the relationship file (nodes must already be fully landed).
+curl -sk -X POST "$BASE/admin/db/loadtest/bulk-import?phase=relationships" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: text/csv" \
+  --data-binary @rels.csv
+
+# 4. End the session (Loading -> Offline) and start the database for ordinary traffic.
+curl -sk -X POST "$BASE/admin/db/loadtest/bulk-import?end=true" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -sk -X POST $BASE/db/graphus/tx/commit \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"statements":[{"statement":"START DATABASE loadtest"}]}'
+
+# 5. The loaded data is now visible to ordinary queries.
+curl -sk -X POST $BASE/db/loadtest/tx/commit \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"statements":[{"statement":"MATCH (n) RETURN count(n) AS c"}]}'
+```
 
 User, role, and database administration is done by sending the administrative statements
 (`CREATE USER`, `GRANT`, `CREATE DATABASE`, …) to the transactional endpoint as an

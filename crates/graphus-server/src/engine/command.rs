@@ -13,6 +13,7 @@
 
 use graphus_core::{GraphusError, Value};
 
+use super::bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
 use crate::engine::TxTicket;
@@ -384,6 +385,23 @@ pub enum EngineCommand {
         /// Reply channel: a [`CheckpointReply`] summary, or a storage error from the GC pass / flush /
         /// reclaim.
         reply: Reply<Result<CheckpointReply, GraphusError>>,
+    },
+    /// Ingests one batch of a **network bulk-import Mode A session** (`08-network-bulk-import.md`
+    /// §5.1/§7.1, `rmp` #519): creates/updates rows directly through the low-level store API
+    /// (mirroring the offline `graphus-bulk` importer), committing through the coordinator's own
+    /// transaction id source ([`graphus_cypher::TxnCoordinator::raw_txn`]) so it recovers identically
+    /// to any other transaction. Session-local state (the external-id map, per-file token caches,
+    /// cumulative stats, the durable checkpoint sentinel node) lives on the engine thread across many
+    /// dispatches of this command — see `crate::engine::bulk_load`. Like the DDL/backup/checkpoint
+    /// commands this takes **no admission permit**; the caller (the REST bulk-import handler) is
+    /// responsible for the `Loading`-state precondition and the admin-privilege gate beforehand.
+    BulkImportBatch {
+        /// The batch to ingest, or the session-ending sentinel cleanup.
+        batch: BulkImportBatchInput,
+        /// Reply channel: the session's cumulative stats after this batch, or a storage/value-parse
+        /// error (the batch's transaction is rolled back on any error — no partial batch is ever
+        /// visible).
+        reply: Reply<Result<BulkImportBatchOutcome, GraphusError>>,
     },
     /// **Test-only** (`rmp` #435, opt-in `internal-test-udf`): deterministically drives this engine's
     /// **background maintenance escalation** path so the per-engine reclamation-degraded flag is set

@@ -62,5 +62,8 @@ pub mod value_parse;
 pub use columnar::{ColumnarError, csv_to_gcol, gcol_to_csv};
 pub use dump::{dump_nodes, dump_relationships};
 pub use header::{ColumnRole, HeaderError, NodeHeader, PropertyType, RelHeader, ScalarType};
-pub use import::{BulkImporter, DEFAULT_BATCH_SIZE, DuplicatePolicy, ImportStats};
+pub use import::{
+    BulkImporter, DEFAULT_BATCH_SIZE, DuplicatePolicy, ImportStats, ingest_node_row,
+    ingest_rel_row, intern_property_key_tokens,
+};
 pub use value_parse::ValueParseError;

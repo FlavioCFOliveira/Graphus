@@ -51,6 +51,17 @@ graphus-crypto = { path = "../graphus-crypto" }
 # Builds/parses the REST JSON request body for the transport-fault harness (rmp #234), modelling a
 # truncated/reset HTTP body before it reaches the request core. Already a transitive dep via graphus-rest.
 serde_json = "1"
+# The network-bulk-import Mode A header/row types (`NodeHeader`/`RelHeader`/`ColumnRole`/
+# `PropertyType`/`ScalarType`) so `network_bulk_ingest_mode_a` (rmp #519, `08` §10.1) can build
+# batches for `LocalEngine::bulk_import_batch` exactly as `crates/graphus-server/src/engine/
+# bulk_load.rs`'s own tests do. Already a transitive dep via graphus-server; named here so the
+# scenario can construct the header/row types directly. Acyclic: graphus-bulk depends only on
+# core/io/wal/storage/columnar/csv, never on graphus-dst.
+graphus-bulk = { path = "../graphus-bulk" }
+# `csv::StringRecord` is the row type `BulkImportBatchInput::{Nodes,Relationships}` carries; the
+# scenario constructs records directly (mirroring `bulk_load.rs`'s own `#[cfg(test)]` pattern), so
+# this is a direct dependency, not just a transitive one via graphus-bulk.
+csv = "1.4"
 # Derive `Serialize`/`Deserialize` for `VoprConfig` (+ `MixProfile`/`LoadProfile`/`FaultBudget`) so a
 # failing run round-trips to/from a JSON reproducer artifact (rmp #242). Test/CLI-only persistence — the
 # production server crates do not depend on graphus-dst, so this never reaches a production build.

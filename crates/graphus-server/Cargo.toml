@@ -64,6 +64,11 @@ graphus-auth = { path = "../graphus-auth" }
 # when `encryption.key_path` is configured. Absent that config, the plaintext `FileBlockDevice` path
 # is byte-identical to today.
 graphus-crypto = { path = "../graphus-crypto" }
+# The offline bulk-import free functions (`intern_property_key_tokens`/`ingest_node_row`/
+# `ingest_rel_row`, rmp #517/#519) reused byte-for-byte by the network bulk-import Mode A engine
+# command (`crates/graphus-server/src/engine/bulk_load.rs`), so the low-level store-mutation logic is
+# shared, unmodified code between the offline tool and the network endpoint (`08` §4.2).
+graphus-bulk = { path = "../graphus-bulk" }
 
 # The async runtime. `full` is intentional: the server is the top-level binary that drives every
 # Tokio facility (multi-thread runtime, net, time, signal, sync, macros). The library crates keep a
@@ -114,6 +119,15 @@ http-body-util = "0.1"
 # crate's `#![forbid(unsafe_code)]`) `statvfs` wrapper. `default-features = false` drops the
 # file-locking ("sync") feature this crate does not use; only `available_space` is called.
 fs4 = { version = "1", default-features = false }
+# The CSV record type the network bulk-import Mode A engine command carries between the REST handler
+# (parsing off the engine thread) and the engine's low-level ingestion (`rmp` #519). Same `1.4` line
+# `graphus-bulk` pins, so no duplicate tree enters the build.
+csv = "1.4"
+# `Bytes` is the network bulk-import endpoint's zero-copy channel payload (`rmp` #519): each
+# `BodyExt::frame` chunk is cloned (Arc-refcounted, not copied) into a bounded `tokio::sync::mpsc`
+# channel that bridges the async body-poll loop into the blocking CSV-parsing task. Same `1` line
+# `axum`/`http-body-util` already pin, so no duplicate tree enters the build.
+bytes = "1"
 
 [dev-dependencies]
 # In-test self-signed certificate generation for the TLS listener paths (`04 §8.4`; same crate

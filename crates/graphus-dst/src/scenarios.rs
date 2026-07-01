@@ -10,11 +10,12 @@
 
 use std::sync::Arc;
 
+use graphus_bulk::{ColumnRole, ImportStats, NodeHeader, PropertyType, RelHeader, ScalarType};
 use graphus_core::Value;
 use graphus_cypher::MaterializedValue;
 use graphus_io::{MemBlockDevice, atomic_replace_file};
-use graphus_server::engine::LocalEngine;
 use graphus_server::engine::command::AccessMode;
+use graphus_server::engine::{BulkImportBatchInput, BulkImportBatchOutcome, LocalEngine};
 use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock};
 use graphus_wal::MemLogSink;
 
@@ -69,6 +70,9 @@ pub type Scenario = fn(u64) -> ScenarioOutcome;
 /// - **Atomicity / churn** — `transaction_rollback`, `churn_create_delete`.
 /// - **Durability / crash recovery** — `crash_recovery_durability`, `backup_restore_crash` (rmp #440:
 ///   a crash injected at each window of the backup → seal → file → restore → WAL/DWB-reset pipeline).
+/// - **Network bulk import** — `network_bulk_ingest_mode_a` (rmp #519: per-batch cumulative-stats
+///   correctness, an aborted-batch idempotent retry, and crash-mid-session durability of both the
+///   ingested data and the checkpoint sentinel node, for `08-network-bulk-import.md` Mode A).
 /// - **Time / hostile clock** — `hostile_clock` (bounded skew, forward jumps, non-monotonic
 ///   regressions; the clock-fault tolerance contract of rmp #233).
 /// - **Load shapes** — `spike_load`, `ramp_load`, `sustained_high_concurrency`.
@@ -99,6 +103,8 @@ pub fn catalogue() -> Vec<(&'static str, Scenario)> {
         // Durability / crash recovery
         ("crash_recovery_durability", crash_recovery_durability),
         ("backup_restore_crash", backup_restore_crash),
+        // Network bulk import (rmp #519)
+        ("network_bulk_ingest_mode_a", network_bulk_ingest_mode_a),
         // Time / hostile clock
         ("hostile_clock", hostile_clock),
         // Load shapes
@@ -1271,6 +1277,502 @@ impl Drop for TempDir {
     }
 }
 
+/// **Network bulk import Mode A (rmp #519, `08-network-bulk-import.md` §10.1).** Drives
+/// [`LocalEngine::bulk_import_batch`] — the same low-level, per-batch-commit ingestion dispatch the
+/// REST `POST /admin/db/{db}/bulk-import` endpoint
+/// (`crates/graphus-server/src/listeners/extra_routes/bulk_import.rs`) drives through the engine
+/// command channel — against a fresh database, proving the storage/engine-level substance of `08`
+/// §7.1's resumability and crash-durability guarantees.
+///
+/// # Scope: what this scenario does **not** cover, and why (a deliberate, already-made split)
+///
+/// `08` §10.1's bullet list mixes three architectural layers that this project's *other* test suites
+/// already cover more appropriately than DST can, because DST structurally never touches HTTP/axum
+/// (`grep -r "axum\|hyper" crates/graphus-dst/src` returns nothing outside doc comments) and never
+/// instantiates a `DatabaseCatalog` (the same precedent [`backup_restore_crash`] already established:
+/// it reconstructs its pipeline at the *public-API* level precisely because the server's `dbcatalog`
+/// orchestration is private):
+///
+/// - **`Loading`-state catalog crash-recovery, and "ordinary traffic rejected while `Loading`, other
+///   databases unaffected"** are `DatabaseCatalog`-level concerns, already covered by
+///   `crates/graphus-server/src/dbcatalog.rs`'s `mod tests` (`begin_loading_transitions_online_to_loading_and_moves_the_handle`
+///   and siblings) and by `crates/graphus-server/tests/bulk_import_endpoint.rs`'s
+///   `loading_database_rejects_queries_while_an_unrelated_database_keeps_serving` (a real end-to-end
+///   REST test proving exactly this). **Not re-tested here.**
+/// - **HTTP-transport-level fault injection (mid-stream disconnect, partial-chunk delivery)** would
+///   need a new async-Stream-over-`SimEndpoint` adapter driving axum's chunked `Body`/`frame()`
+///   machinery, plus a hand-rolled executor, without a real tokio reactor — a materially separate,
+///   large undertaking, out of scope for this stage. That layer's own resumability/dropped-connection
+///   contract is instead covered by `bulk_import_endpoint.rs`'s real streamed-upload tests
+///   (`start_paused_upload`, `oversized_streamed_upload`) and its module doc's explicit
+///   dropped-connection contract.
+/// - **What this scenario DOES cover**, and it is the correct, non-redundant DST contribution: the
+///   storage/engine-level substance of resumability and crash-durability that
+///   `LocalEngine`/`raw_txn`/the checkpoint sentinel actually implement — byte-for-byte deterministic
+///   outcomes across a seed sweep, an aborted-batch retry proven idempotent (mirroring
+///   `crates/graphus-bulk/tests/idmap_abort_retry.rs`'s already-proven pattern, now exercised through
+///   the coordinator's `raw_txn` seam via [`LocalEngine::bulk_import_batch`] instead of
+///   `BulkImporter`'s own counter), and a crash mid-session proving the checkpoint sentinel + all
+///   previously committed data survive ARIES recovery intact — squarely what
+///   `crash_recovery_durability`/`backup_restore_crash` already prove for *other* durability-critical
+///   paths in this codebase, applied to this new one.
+///
+/// # `End` on a freshly-recovered engine cleans up the orphaned sentinel
+///
+/// `crates/graphus-server/src/engine/bulk_load.rs`'s own module doc states the resumability contract
+/// precisely: after [`LocalEngine::crash_restart`], the rebuilt engine's in-memory `LoadingSession` is
+/// unconditionally `None` (a fresh process has no way to recover the abandoned session's `id_map` from
+/// the sentinel node's properties — that residual gap stands, see the module doc). But
+/// `BulkImportBatchInput::End` dispatched on a freshly-recovered engine is **not** a silent no-op:
+/// `handle_bulk_import_batch`'s `End` arm takes `session.take()`, finds `None`, and falls back to
+/// `recover_and_delete_orphaned_sentinel` — a full store scan for the reserved sentinel label, reading
+/// back its last-recorded `nodes`/`relationships`/`properties` counters (an accurate final summary,
+/// even without the in-memory `id_map`) before deleting it. An operator who decides to **abandon**
+/// (rather than resume) a crashed session therefore still ends up with a database holding exactly the
+/// imported graph data and nothing else — no permanent orphaned bookkeeping node. This scenario asserts
+/// that recovered-`End` contract as a positive, regression-guarding assertion (the recovered stats must
+/// equal the pre-crash committed totals, the sentinel must be gone afterward, and a second `End` is a
+/// genuine, harmless no-op) — and separately proves the **uninterrupted-session** `End`/sentinel-deletion
+/// contract (never crashed), which is the more common case.
+fn network_bulk_ingest_mode_a(seed: u64) -> ScenarioOutcome {
+    const NAME: &str = "network_bulk_ingest_mode_a";
+
+    let node_header = bulk_node_header();
+    let rel_header = bulk_rel_header();
+
+    let (mut eng, clock) = engine_with_clock(256);
+
+    // Seed-derived batch shape (1..=3 batches per phase, 2..=5 rows per node batch, 1..=3 rows per
+    // relationship batch) — mirrors how `deep_traversal`/`supernode_fanout` derive a seed-scoped
+    // `base` from `seed % N` rather than pulling in a new RNG dependency.
+    let n_node_batches = 1 + (seed % 3); // 1..=3
+    let n_rel_batches = 1 + ((seed / 3) % 3); // 1..=3
+
+    let mut node_ext_ids: Vec<String> = Vec::new();
+    let mut expect = ImportStats::default();
+    let mut committed_batches: u64 = 0;
+
+    // ---- node batches: cumulative-stats correctness (§10.1 bullet 1) -----------------------------
+    for b in 0..n_node_batches {
+        let rows = 2 + ((seed + b) % 4); // 2..=5
+        let mut records = Vec::with_capacity(rows as usize);
+        for _ in 0..rows {
+            let ext = format!("n{}", node_ext_ids.len());
+            records.push(bulk_node_row(&ext, "Ada"));
+            node_ext_ids.push(ext);
+        }
+        let out = match eng.bulk_import_batch(BulkImportBatchInput::Nodes {
+            header: Arc::clone(&node_header),
+            records,
+        }) {
+            Ok(o) => o,
+            Err(e) => return ScenarioOutcome::fail(NAME, format!("node batch {b} failed: {e}")),
+        };
+        expect.nodes += rows;
+        expect.properties += rows; // one `name` property per row
+        committed_batches += 1;
+        if let Some(mismatch) = stats_mismatch(NAME, "node batch", b, &out, &expect) {
+            return mismatch;
+        }
+    }
+
+    // ---- relationship batches: cumulative-stats correctness (§10.1 bullet 1) ---------------------
+    let mut rel_cursor: u64 = 0;
+    for b in 0..n_rel_batches {
+        let rows = 1 + ((seed + b * 7) % 3); // 1..=3
+        let mut records = Vec::with_capacity(rows as usize);
+        for r in 0..rows {
+            let idx = (rel_cursor + r) as usize;
+            let a = &node_ext_ids[idx % node_ext_ids.len()];
+            let bnode = &node_ext_ids[(idx + 1) % node_ext_ids.len()];
+            records.push(bulk_rel_row(a, bnode));
+        }
+        rel_cursor += rows;
+        let out = match eng.bulk_import_batch(BulkImportBatchInput::Relationships {
+            header: Arc::clone(&rel_header),
+            records,
+        }) {
+            Ok(o) => o,
+            Err(e) => return ScenarioOutcome::fail(NAME, format!("rel batch {b} failed: {e}")),
+        };
+        expect.relationships += rows;
+        expect.properties += rows; // one `since` property per row
+        committed_batches += 1;
+        if let Some(mismatch) = stats_mismatch(NAME, "rel batch", b, &out, &expect) {
+            return mismatch;
+        }
+    }
+
+    // ---- idempotent-retry: an aborted batch leaves no trace (§10.1 bullet 1, the §7.2.2-style proof)
+    // A batch with a duplicate `:ID` under the default Strict policy must fail WHOLE (not just the
+    // offending row): `graphus_bulk::ingest_node_row`'s doc (SEC-196) — reject a duplicate non-empty
+    // external `:ID` — and `LoadingSession::ingest_nodes`'s abort-safety contract (`stats` reverted to
+    // its pre-batch snapshot on any row error) together mean this batch must leave `expect` untouched.
+    let stats_before_failure = expect;
+    let dup_id = node_ext_ids[0].clone();
+    let doomed = vec![
+        bulk_node_row("n-should-not-land", "Eve"),
+        bulk_node_row(&dup_id, "Duplicate"),
+    ];
+    let doomed_result = eng.bulk_import_batch(BulkImportBatchInput::Nodes {
+        header: Arc::clone(&node_header),
+        records: doomed,
+    });
+    if doomed_result.is_ok() {
+        return ScenarioOutcome::fail(
+            NAME,
+            "a batch containing a duplicate :ID under the Strict policy unexpectedly succeeded",
+        );
+    }
+    // Retry with the SAME shape corrected (the duplicate row replaced by a fresh id) — this must
+    // succeed and the cumulative stats must advance by EXACTLY this retry's own rows, proving the
+    // doomed attempt (including its otherwise-valid first row) left no trace to trip up the retry.
+    let retry_id = format!("n{}", node_ext_ids.len());
+    let retry = vec![bulk_node_row(&retry_id, "Eve")];
+    let retry_out = match eng.bulk_import_batch(BulkImportBatchInput::Nodes {
+        header: Arc::clone(&node_header),
+        records: retry,
+    }) {
+        Ok(o) => o,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("retry batch failed: {e}")),
+    };
+    node_ext_ids.push(retry_id);
+    expect.nodes = stats_before_failure.nodes + 1;
+    expect.properties = stats_before_failure.properties + 1;
+    committed_batches += 1;
+    if let Some(mismatch) = stats_mismatch(NAME, "retry batch", 0, &retry_out, &expect) {
+        return mismatch;
+    }
+
+    // One more committed relationship batch after the retry episode, so the crash point below covers
+    // both node and relationship data committed *after* an aborted attempt, not just before it.
+    let a = node_ext_ids[0].clone();
+    let bnode = node_ext_ids[node_ext_ids.len() - 1].clone();
+    let post_retry_rel_out = match eng.bulk_import_batch(BulkImportBatchInput::Relationships {
+        header: Arc::clone(&rel_header),
+        records: vec![bulk_rel_row(&a, &bnode)],
+    }) {
+        Ok(o) => o,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("post-retry rel batch failed: {e}")),
+    };
+    expect.relationships += 1;
+    expect.properties += 1;
+    committed_batches += 1;
+    if let Some(mismatch) = stats_mismatch(
+        NAME,
+        "post-retry rel batch",
+        0,
+        &post_retry_rel_out,
+        &expect,
+    ) {
+        return mismatch;
+    }
+
+    // ---- crash mid-session: data + checkpoint sentinel survive ARIES recovery intact (§10.1 bullet 2)
+    let mut recovered = match eng.crash_restart(clock.clone(), 256) {
+        Ok(e) => e,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("crash_restart failed: {e}")),
+    };
+
+    let survived_nodes = read_scalar(
+        &mut recovered,
+        "MATCH (n:Person) RETURN count(n) AS c",
+        vec![],
+    );
+    if survived_nodes != Some(expect.nodes as i64) {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "post-crash node count {survived_nodes:?} != expected {}",
+                expect.nodes
+            ),
+        );
+    }
+    let survived_rels = read_scalar(
+        &mut recovered,
+        "MATCH ()-[r:KNOWS]->() RETURN count(r) AS c",
+        vec![],
+    );
+    if survived_rels != Some(expect.relationships as i64) {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "post-crash relationship count {survived_rels:?} != expected {}",
+                expect.relationships
+            ),
+        );
+    }
+
+    // The durable checkpoint sentinel: exactly one node, its counters matching the last committed
+    // batch's cumulative stats and its `batch_seq` matching the number of batches that actually
+    // committed (the doomed batch never advanced it).
+    let sentinel_rows = count_rows(
+        &mut recovered,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n",
+        vec![],
+    );
+    if sentinel_rows != 1 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("post-crash sentinel node count {sentinel_rows} != 1"),
+        );
+    }
+    let sentinel_batch_seq = read_scalar(
+        &mut recovered,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n.batch_seq AS c",
+        vec![],
+    );
+    let sentinel_nodes = read_scalar(
+        &mut recovered,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n.nodes AS c",
+        vec![],
+    );
+    let sentinel_rels = read_scalar(
+        &mut recovered,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n.relationships AS c",
+        vec![],
+    );
+    let sentinel_props = read_scalar(
+        &mut recovered,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n.properties AS c",
+        vec![],
+    );
+    if sentinel_batch_seq != Some(committed_batches as i64)
+        || sentinel_nodes != Some(expect.nodes as i64)
+        || sentinel_rels != Some(expect.relationships as i64)
+        || sentinel_props != Some(expect.properties as i64)
+    {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "post-crash sentinel (batch_seq={sentinel_batch_seq:?} nodes={sentinel_nodes:?} \
+                 relationships={sentinel_rels:?} properties={sentinel_props:?}) != expected \
+                 (batch_seq={committed_batches} nodes={} relationships={} properties={})",
+                expect.nodes, expect.relationships, expect.properties
+            ),
+        );
+    }
+
+    // ---- `End` on a freshly-recovered engine (no in-memory `LoadingSession` — the crash-restart
+    // case) is NOT a silent no-op: `bulk_load::recover_and_delete_orphaned_sentinel` scans for the
+    // durable checkpoint sentinel by its reserved label, reports the last-recorded
+    // `nodes`/`relationships`/`properties` counters (== `expect`, the pre-crash committed total —
+    // an accurate final summary even though the in-memory `id_map` is gone), and deletes it, so an
+    // operator abandoning a crashed session still ends up with a database holding exactly the
+    // imported graph data and nothing else. Asserted as a positive regression guard.
+    let recovered_end = match recovered.bulk_import_batch(BulkImportBatchInput::End) {
+        Ok(o) => o,
+        Err(e) => {
+            return ScenarioOutcome::fail(
+                NAME,
+                format!("End on the recovered engine errored: {e}"),
+            );
+        }
+    };
+    if recovered_end.stats.nodes != expect.nodes
+        || recovered_end.stats.relationships != expect.relationships
+        || recovered_end.stats.properties != expect.properties
+    {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "End on a freshly-recovered engine reported stats {:?}, expected the pre-crash \
+                 committed totals (nodes={} relationships={} properties={})",
+                recovered_end.stats, expect.nodes, expect.relationships, expect.properties
+            ),
+        );
+    }
+    let sentinel_after_recovered_end = count_rows(
+        &mut recovered,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n",
+        vec![],
+    );
+    if sentinel_after_recovered_end != 0 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "sentinel count after the crash-recovered End is {sentinel_after_recovered_end} \
+                 != 0 (End must clean up an orphaned sentinel even after a crash restart)"
+            ),
+        );
+    }
+    // Idempotent: a second `End` on the same (now sentinel-free) recovered engine is a genuine,
+    // harmless no-op.
+    let second_end = match recovered.bulk_import_batch(BulkImportBatchInput::End) {
+        Ok(o) => o,
+        Err(e) => {
+            return ScenarioOutcome::fail(
+                NAME,
+                format!("second End on the recovered engine errored: {e}"),
+            );
+        }
+    };
+    if second_end.stats.nodes != 0 || second_end.stats.relationships != 0 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "a second End (nothing left to clean up) reported non-zero stats {:?}",
+                second_end.stats
+            ),
+        );
+    }
+
+    // ---- clean session lifecycle: End on an UNINTERRUPTED session deletes the sentinel and reports
+    // the final cumulative stats (§10.1's `End` contract, on the case it actually covers today).
+    let mut clean_eng = engine();
+    let clean_out = match clean_eng.bulk_import_batch(BulkImportBatchInput::Nodes {
+        header: Arc::clone(&node_header),
+        records: vec![bulk_node_row("c0", "Fin"), bulk_node_row("c1", "Fon")],
+    }) {
+        Ok(o) => o,
+        Err(e) => {
+            return ScenarioOutcome::fail(NAME, format!("clean-lifecycle node batch failed: {e}"));
+        }
+    };
+    if clean_out.stats.nodes != 2 || clean_out.stats.properties != 2 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "clean-lifecycle node batch stats {:?} != expected 2/2",
+                clean_out.stats
+            ),
+        );
+    }
+    let clean_rel_out = match clean_eng.bulk_import_batch(BulkImportBatchInput::Relationships {
+        header: Arc::clone(&rel_header),
+        records: vec![bulk_rel_row("c0", "c1")],
+    }) {
+        Ok(o) => o,
+        Err(e) => {
+            return ScenarioOutcome::fail(NAME, format!("clean-lifecycle rel batch failed: {e}"));
+        }
+    };
+    if clean_rel_out.stats.nodes != 2
+        || clean_rel_out.stats.relationships != 1
+        || clean_rel_out.stats.properties != 3
+    {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "clean-lifecycle rel batch stats {:?} != expected 2/1/3",
+                clean_rel_out.stats
+            ),
+        );
+    }
+    let clean_end_out = match clean_eng.bulk_import_batch(BulkImportBatchInput::End) {
+        Ok(o) => o,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("clean-lifecycle End failed: {e}")),
+    };
+    if clean_end_out.stats.nodes != 2
+        || clean_end_out.stats.relationships != 1
+        || clean_end_out.stats.properties != 3
+    {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "clean-lifecycle End stats {:?} != expected 2/1/3 (final cumulative stats)",
+                clean_end_out.stats
+            ),
+        );
+    }
+    let clean_sentinel_after_end = count_rows(
+        &mut clean_eng,
+        "MATCH (n:__graphus_bulk_import_session__) RETURN n",
+        vec![],
+    );
+    if clean_sentinel_after_end != 0 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "clean-lifecycle sentinel count after End is {clean_sentinel_after_end} != 0 \
+                 (End must delete the sentinel on an uninterrupted session)"
+            ),
+        );
+    }
+
+    ScenarioOutcome::pass(
+        NAME,
+        format!(
+            "{committed_batches} batches committed ({} nodes, {} relationships), 1 aborted batch \
+             left no trace, checkpoint sentinel + data survived a crash, clean End cleaned up",
+            expect.nodes, expect.relationships
+        ),
+    )
+}
+
+/// Builds the fixed `NodeHeader` used by [`network_bulk_ingest_mode_a`]: `:ID`, `:LABEL`, and one
+/// `name` string property — mirrors `crates/graphus-server/src/engine/bulk_load.rs`'s own
+/// `#[cfg(test)]` fixture exactly.
+fn bulk_node_header() -> Arc<NodeHeader> {
+    Arc::new(NodeHeader {
+        columns: vec![
+            ColumnRole::Id,
+            ColumnRole::Label,
+            ColumnRole::Property {
+                key: "name".to_owned(),
+                ty: PropertyType::Scalar(ScalarType::String),
+            },
+        ],
+        id_index: 0,
+    })
+}
+
+/// Builds the fixed `RelHeader` used by [`network_bulk_ingest_mode_a`]: `:START_ID`, `:END_ID`,
+/// `:TYPE`, and one `since` integer property — mirrors `bulk_load.rs`'s own test fixture.
+fn bulk_rel_header() -> Arc<RelHeader> {
+    Arc::new(RelHeader {
+        columns: vec![
+            ColumnRole::StartId,
+            ColumnRole::EndId,
+            ColumnRole::Type,
+            ColumnRole::Property {
+                key: "since".to_owned(),
+                ty: PropertyType::Scalar(ScalarType::Integer),
+            },
+        ],
+        start_index: 0,
+        end_index: 1,
+        type_index: 2,
+    })
+}
+
+/// One `Person` node row matching [`bulk_node_header`]'s column order.
+fn bulk_node_row(external_id: &str, name: &str) -> csv::StringRecord {
+    csv::StringRecord::from(vec![external_id, "Person", name])
+}
+
+/// One `KNOWS` relationship row matching [`bulk_rel_header`]'s column order.
+fn bulk_rel_row(start_external_id: &str, end_external_id: &str) -> csv::StringRecord {
+    csv::StringRecord::from(vec![start_external_id, end_external_id, "KNOWS", "2020"])
+}
+
+/// Compares `out`'s cumulative stats against `expect`'s `nodes`/`relationships`/`properties`
+/// (`ImportStats` derives no `PartialEq`, so this is a field-by-field check), returning `Some` of a
+/// failing [`ScenarioOutcome`] naming `phase`/`index` on a mismatch, `None` on a match.
+fn stats_mismatch(
+    name: &'static str,
+    phase: &str,
+    index: u64,
+    out: &BulkImportBatchOutcome,
+    expect: &ImportStats,
+) -> Option<ScenarioOutcome> {
+    if out.stats.nodes != expect.nodes
+        || out.stats.relationships != expect.relationships
+        || out.stats.properties != expect.properties
+    {
+        Some(ScenarioOutcome::fail(
+            name,
+            format!(
+                "{phase} {index}: cumulative stats {:?} != expected nodes={} relationships={} \
+                 properties={}",
+                out.stats, expect.nodes, expect.relationships, expect.properties
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
 /// **Hostile clock (rmp #233).** Drives the real engine under a seed-driven [`FaultyClock`] — bounded
 /// skew, forward jumps, and **non-monotonic regressions** — while advancing logical time, and asserts
 /// the engine's documented tolerance contract holds end to end:
@@ -1605,6 +2107,7 @@ mod tests {
             "churn_create_delete",
             "crash_recovery_durability",
             "backup_restore_crash",
+            "network_bulk_ingest_mode_a",
             "hostile_clock",
             "spike_load",
             "ramp_load",
@@ -1633,6 +2136,27 @@ mod tests {
             assert!(
                 a.ok,
                 "backup/restore crash recovery must hold at seed {seed}: {}",
+                a.detail
+            );
+        }
+    }
+
+    /// **rmp #519.** The network-bulk-import Mode A scenario replays identically and holds across a
+    /// wider seed range than the catalogue's own quick 1..=3 sweep, so a regression in JUST this
+    /// scenario (batching stats, the idempotent-retry proof, or crash-mid-session sentinel/data
+    /// durability) fails clearly and fast without needing the whole-catalogue sweep.
+    #[test]
+    fn network_bulk_ingest_mode_a_holds_across_seeds() {
+        for seed in 1u64..=20 {
+            let a = network_bulk_ingest_mode_a(seed);
+            let b = network_bulk_ingest_mode_a(seed);
+            assert_eq!(
+                a, b,
+                "network_bulk_ingest_mode_a must replay identically for seed {seed}"
+            );
+            assert!(
+                a.ok,
+                "network_bulk_ingest_mode_a must hold at seed {seed}: {}",
                 a.detail
             );
         }

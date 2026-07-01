@@ -193,6 +193,11 @@ pub enum CatalogError {
     },
     /// `drop` of a database that is not stopped (drop requires desired + actual state offline).
     NotOffline(String),
+    /// [`DatabaseCatalog::begin_loading`] (`rmp` #519, `08 §5.2`) of a database that is not
+    /// `Online` (offline, unknown, already `Loading`, or `Online`-desired but not yet running) — a
+    /// Mode A network bulk-import session requires a running, ordinary-traffic-serving database to
+    /// take exclusive control of.
+    NotLoadable(String),
     /// A backup capture or a restore failed (`rmp` task #149): a storage/crypto fault, a malformed
     /// or wrong-key backup file, or a target-state precondition (e.g. restore requires the database
     /// stopped). The message is the operator-facing reason.
@@ -227,6 +232,11 @@ impl std::fmt::Display for CatalogError {
             Self::NotOffline(name) => write!(
                 f,
                 "database {name:?} must be stopped (offline) before it can be dropped"
+            ),
+            Self::NotLoadable(name) => write!(
+                f,
+                "database {name:?} must be online and not already loading (or offline/unknown) to \
+                 begin a network bulk-import session"
             ),
             Self::Backup(m) => write!(f, "backup/restore failed: {m}"),
             Self::Engine(e) => write!(f, "database engine error: {e}"),
@@ -284,6 +294,13 @@ pub enum DbState {
     Online,
     /// The database is stopped (desired: leave it stopped at boot).
     Offline,
+    /// A Mode A network bulk-import session is in progress (`rmp` #519, `08 §5.2`): the engine is
+    /// running (so it can accept low-level bulk writes and commit through the normal WAL path) but
+    /// the database is not open to ordinary Bolt/REST client traffic. Persisted so a crash mid-import
+    /// recovers back to `Loading` (never silently `Online`/`Offline`) — the operator must explicitly
+    /// resume or abandon the session. `Loading` only ever transitions to `Offline` (never directly to
+    /// `Online`) — mirrors `RESTORE DATABASE`'s "stopped first, started explicitly after" precedent.
+    Loading,
 }
 
 /// The serialized shape of `databases.toml`. Unknown fields are rejected (a format change must
@@ -998,7 +1015,9 @@ fn reset_wal(wal_dir: &Path, keyring: Option<&Keyring>) -> Result<(), GraphusErr
 pub struct DbInfo {
     /// The (lowercase) database name.
     pub name: String,
-    /// The **actual** state: `Online` iff the engine is running right now.
+    /// The **actual** state: `Loading` iff the engine is running but restricted to a Mode A network
+    /// bulk-import session (`rmp` #519), `Online` iff the engine is running and open to ordinary
+    /// traffic, `Offline` otherwise.
     pub state: DbState,
     /// The durable **desired** state (always `Online` for the default database). `desired ==
     /// Online` with `state == Offline` means the engine failed to start (see [`DbInfo::error`]).
@@ -1047,8 +1066,18 @@ pub struct DatabaseCatalog {
     /// drain under the guard.
     admin: Mutex<AdminState>,
     /// The concurrent lookup view: name → admission-limited [`EngineHandle`] for **running**
-    /// databases. Written only inside admin-locked sections; read lock-briefly by lookups.
+    /// databases that are open to **ordinary Bolt/REST client traffic**. Written only inside
+    /// admin-locked sections; read lock-briefly by lookups. A `Loading` database's engine is running
+    /// but its handle lives in [`loading_handles`](Self::loading_handles) instead — never here — so
+    /// [`handle`](Self::handle) correctly reports it as not servable to ordinary traffic.
     handles: RwLock<HashMap<String, EngineHandle>>,
+    /// The concurrent lookup view for databases whose desired state is `Loading` (`rmp` #519,
+    /// `08 §5.2`): name → admission-limited [`EngineHandle`] for a running engine that is
+    /// *deliberately* excluded from [`handles`](Self::handles), so it is reachable only by the
+    /// network bulk-import session machinery ([`loading_handle`](Self::loading_handle)) and never by
+    /// an ordinary Bolt/REST query. Same locking discipline as `handles`: written only inside
+    /// admin-locked sections, read lock-briefly, never held across an `.await`.
+    loading_handles: RwLock<HashMap<String, EngineHandle>>,
     /// Count of **non-default** databases whose desired state is `online` but whose engine **failed to
     /// open/start** (`rmp` #430). Maintained alongside the admin-locked `failed` map, but as a
     /// lock-free atomic so `/health/ready` can read it without taking the async admin mutex. A non-zero
@@ -1110,6 +1139,7 @@ impl DatabaseCatalog {
                 failed: BTreeMap::new(),
             }),
             handles: RwLock::new(HashMap::new()),
+            loading_handles: RwLock::new(HashMap::new()),
             failed_open_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             persist_faults: std::sync::atomic::AtomicU32::new(0),
@@ -1169,6 +1199,21 @@ impl DatabaseCatalog {
             return None;
         };
         self.read_handles().get(&name).cloned()
+    }
+
+    /// Looks up the running engine handle for a database currently in the `Loading` state (`rmp`
+    /// #519, `08 §5.2`), case-insensitive. `None` when the database does not exist, is not
+    /// `Loading`, or (mirroring [`handle`](Self::handle)) the name is invalid. Used by the network
+    /// bulk-import session machinery to re-fetch the engine handle for an in-progress or
+    /// crash-recovered `Loading` session (e.g. a resumed upload after a server restart, where the
+    /// in-process HTTP session state is gone but the catalog + engine are not). Cheap and concurrent:
+    /// a brief read lock + a handle clone, never held across an `.await`.
+    #[must_use]
+    pub fn loading_handle(&self, name: &str) -> Option<EngineHandle> {
+        let Ok(name) = normalize_db_name(name) else {
+            return None;
+        };
+        self.read_loading_handles().get(&name).cloned()
     }
 
     /// The default database's engine handle, when it is running (it always is while the server
@@ -1278,19 +1323,26 @@ impl DatabaseCatalog {
             is_default: true,
             error: None,
         });
+        // A brief, separate lock on `loading_handles` (never nested the other way — module docs: the
+        // lock order is always admin → handles). Not held across an `.await`.
+        let loading = self.read_loading_handles();
         for (name, desired) in &state.entries {
+            let actual = if loading.contains_key(name) {
+                DbState::Loading
+            } else if state.running.contains_key(name) {
+                DbState::Online
+            } else {
+                DbState::Offline
+            };
             out.push(DbInfo {
                 name: name.clone(),
-                state: if state.running.contains_key(name) {
-                    DbState::Online
-                } else {
-                    DbState::Offline
-                },
+                state: actual,
                 desired: *desired,
                 is_default: false,
                 error: state.failed.get(name).cloned(),
             });
         }
+        drop(loading);
         out
     }
 
@@ -1317,21 +1369,40 @@ impl DatabaseCatalog {
     /// memory — its durable desired state is **not** flipped, and the failure never prevents the
     /// server or the other databases from starting (module docs: lifecycle state model). Call
     /// after [`start_default`](Self::start_default).
+    ///
+    /// A database whose desired state is `Loading` (`rmp` #519, `08 §5.2`: a crash mid network
+    /// bulk-import session) is likewise started — the whole point of persisting `Loading` is that
+    /// recovery replays its WAL like any other database and stays `Loading`, never silently
+    /// `Online`/`Offline` — but its engine is registered into the loading-only handle registry,
+    /// **never** the ordinary one: a freshly-booted `Loading` database must never become
+    /// ordinary-traffic-resolvable without an explicit operator action (`08 §7.1`).
     pub async fn start_catalog_databases(&self) {
         let mut state = self.admin.lock().await;
         let to_start: Vec<String> = state
             .entries
             .iter()
             .filter(|(name, desired)| {
-                **desired == DbState::Online && !state.running.contains_key(*name)
+                (**desired == DbState::Online || **desired == DbState::Loading)
+                    && !state.running.contains_key(*name)
             })
             .map(|(name, _)| name.clone())
             .collect();
         for name in to_start {
+            let loading = state.entries.get(&name).copied() == Some(DbState::Loading);
             match self.spawn_in(&name, self.db_dir(&name)).await {
                 Ok(engine) => {
-                    let _ = self.register(&mut state, &name, engine);
-                    tracing::info!(db = %name, "database online");
+                    if loading {
+                        let _ = self.register_loading(&mut state, &name, engine);
+                        tracing::info!(
+                            db = %name,
+                            "database recovered into the Loading state (a network bulk-import \
+                             session was in progress at the last crash/shutdown); an operator must \
+                             explicitly resume or abandon it",
+                        );
+                    } else {
+                        let _ = self.register(&mut state, &name, engine);
+                        tracing::info!(db = %name, "database online");
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1560,6 +1631,78 @@ impl DatabaseCatalog {
         run_blocking(move || remove_dir(&dir)).await
     }
 
+    /// Begins a **Mode A network bulk-import session** against database `name` (`rmp` #519,
+    /// `08 §5.1/§5.2`): moves it from `Online` to the durable `Loading` state and returns its running
+    /// engine handle so the caller (the REST bulk-import handler) can drive
+    /// [`EngineHandle::bulk_import_batch`](crate::engine::EngineHandle::bulk_import_batch) directly.
+    ///
+    /// The database must already be `Online` (running, serving ordinary traffic) — exactly one Mode A
+    /// session may be in progress per database at a time, enforced by the `Loading` state itself
+    /// (`08 §5.2`): a second `begin_loading` against the same database, or one against an offline,
+    /// unknown, or already-`Loading` database, is rejected. Desired-state-first ordering (module
+    /// docs): the durable state is persisted `Loading` **before** the handle is moved out of the
+    /// ordinary handle registry, so a crash between the persist and the move recovers to `Loading`
+    /// via [`start_catalog_databases`](Self::start_catalog_databases) on the next boot — never a
+    /// database that silently stayed ordinary-traffic-resolvable while its durable state claimed
+    /// otherwise.
+    ///
+    /// The default database can never be loaded (it is always online and server-lifecycle-managed).
+    ///
+    /// # Errors
+    /// [`CatalogError::DefaultDatabase`] for the default database, [`CatalogError::NotLoadable`] when
+    /// the database is not currently `Online`, or [`CatalogError::Io`] on persist failure.
+    pub async fn begin_loading(&self, name: &str) -> Result<EngineHandle, CatalogError> {
+        let name = normalize_db_name(name)?;
+        if name == self.default_name {
+            return Err(CatalogError::DefaultDatabase {
+                name,
+                operation: "bulk-import",
+            });
+        }
+        let mut state = self.admin.lock().await;
+        if state.entries.get(&name) != Some(&DbState::Online) || !state.running.contains_key(&name)
+        {
+            return Err(CatalogError::NotLoadable(name));
+        }
+
+        // Persist the durable intent BEFORE the handle moves (module docs: desired-state-first).
+        let fallback = state.entries.clone();
+        state.entries.insert(name.clone(), DbState::Loading);
+        self.persist_or_resync(&mut state, fallback).await?;
+
+        let handle = state
+            .running
+            .get(&name)
+            .expect("INVARIANT: checked running above, still under the same admin lock")
+            .handle
+            .clone();
+        // Move the handle out of ordinary-traffic resolution and into the loading-only registry.
+        // Order matters: the durable `Loading` state is already published above, so there is never a
+        // window where a query could resolve a handle for a database whose desired state already
+        // claims `Loading`.
+        self.write_handles().remove(&name);
+        self.write_loading_handles()
+            .insert(name.clone(), handle.clone());
+        Ok(handle)
+    }
+
+    /// Ends a **Mode A network bulk-import session** against database `name` (`rmp` #519,
+    /// `08 §5.2`): unpublishes the loading-only handle (best-effort — a crash-recovered session may
+    /// never have populated it in this process, since the engine registry is rebuilt empty on every
+    /// boot) and delegates to [`stop`](Self::stop), which drains + hardens + joins the engine and
+    /// persists the durable desired state `Offline` — `Loading` only ever transitions to `Offline`
+    /// (`08 §5.2`), never directly back to `Online`; the operator restarts it explicitly
+    /// (`START DATABASE`) once satisfied with the freshly-loaded data.
+    ///
+    /// # Errors
+    /// As [`stop`](Self::stop): [`CatalogError::UnknownDatabase`], [`CatalogError::DefaultDatabase`],
+    /// or [`CatalogError::Io`] on persist failure.
+    pub async fn end_loading(&self, name: &str) -> Result<(), CatalogError> {
+        let name = normalize_db_name(name)?;
+        self.write_loading_handles().remove(&name);
+        self.stop(&name).await
+    }
+
     /// The store directory of database `name`: the data root for the default database, or
     /// `<root>/databases/<name>` for an additional one (mirrors [`spawn_in`](Self::spawn_in)'s
     /// targets). `name` must already be normalized.
@@ -1739,6 +1882,30 @@ impl DatabaseCatalog {
         handle
     }
 
+    /// Registers a freshly-spawned engine under `name` **as a `Loading` database** (admin lock held
+    /// by the caller; `rmp` #519, `08 §5.2`): identical to [`register`](Self::register) except the
+    /// lookup handle is published into [`loading_handles`](Self::loading_handles) instead of
+    /// [`handles`](Self::handles), so the database is never resolvable to ordinary Bolt/REST traffic.
+    /// Used by [`start_catalog_databases`](Self::start_catalog_databases) when a crash-recovered
+    /// entry's durable desired state is `Loading`.
+    fn register_loading(&self, state: &mut AdminState, name: &str, engine: Engine) -> EngineHandle {
+        let handle = engine
+            .handle
+            .with_admission_limit(self.params.max_concurrent_queries);
+        state.running.insert(
+            name.to_owned(),
+            RunningEngine {
+                handle: handle.clone(),
+                join: engine.join,
+            },
+        );
+        state.failed.remove(name);
+        self.sync_failed_count(state);
+        self.write_loading_handles()
+            .insert(name.to_owned(), handle.clone());
+        handle
+    }
+
     /// Stops one engine (admin lock held by the caller): unpublishes the lookup handle **first**
     /// (no new consumer obtains a handle to a draining engine), drains + hardens via the engine's
     /// `Shutdown` command, then joins its thread off the runtime. Errors are logged — at this
@@ -1759,6 +1926,13 @@ impl DatabaseCatalog {
     /// deadlines.
     async fn stop_engine(&self, name: &str, engine: RunningEngine) {
         self.write_handles().remove(name);
+        // Also unpublish the loading-only registry (`rmp` #519): `stop()` is reachable directly on a
+        // `Loading` database (an operator issuing a plain `STOP DATABASE` against one, bypassing the
+        // network bulk-import session's own `end_loading`), whose handle lives here instead of
+        // `handles`. Removing from both is always safe (a database is registered in at most one) and
+        // closes the gap where a directly-stopped `Loading` database would leave a stale handle to a
+        // now-dead engine in `loading_handles`.
+        self.write_loading_handles().remove(name);
         let deadline = self.params.engine_shutdown_timeout;
         match tokio::time::timeout(deadline, engine.handle.shutdown()).await {
             // Drain round-trip completed within the deadline (cleanly or with a flush error).
@@ -1897,6 +2071,26 @@ impl DatabaseCatalog {
     /// The handles map's write guard (same poisoning recovery as [`Self::read_handles`]).
     fn write_handles(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, EngineHandle>> {
         self.handles.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The `Loading`-databases handles map's read guard (same poisoning-recovery rationale as
+    /// [`Self::read_handles`]).
+    fn read_loading_handles(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<String, EngineHandle>> {
+        self.loading_handles
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The `Loading`-databases handles map's write guard (same poisoning-recovery rationale as
+    /// [`Self::read_handles`]).
+    fn write_loading_handles(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<String, EngineHandle>> {
+        self.loading_handles
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -2995,5 +3189,225 @@ mod tests {
 
         let _ = bg.await;
         crate::engine::arm_shutdown_hang(0);
+    }
+
+    // ---- `Loading` lifecycle state (`rmp` #519, `08 §5.2`) -----------------------------------------
+
+    /// `begin_loading` moves an `Online` database to the durable `Loading` state: the durable file
+    /// reflects it immediately, and the engine handle moves from the ordinary [`handle`] registry to
+    /// the loading-only [`loading_handle`] registry (never both, never neither).
+    #[tokio::test]
+    async fn begin_loading_transitions_online_to_loading_and_moves_the_handle() {
+        let root = TempRoot::new("begin-loading");
+        let catalog = open_catalog(&root);
+        let _ = catalog.create("alpha").await.expect("create");
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Online));
+        assert!(catalog.handle("alpha").is_some());
+        assert!(catalog.loading_handle("alpha").is_none());
+
+        let handle = catalog.begin_loading("alpha").await.expect("begin_loading");
+        drop(handle);
+
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Loading));
+        assert!(
+            catalog.handle("alpha").is_none(),
+            "a Loading database is not resolvable to ordinary traffic"
+        );
+        assert!(
+            catalog.loading_handle("alpha").is_some(),
+            "the handle moved to the loading-only registry"
+        );
+        // Case-insensitive, mirroring `handle`.
+        assert!(catalog.loading_handle("ALPHA").is_some());
+
+        let infos = catalog.list().await;
+        let alpha = infos.iter().find(|i| i.name == "alpha").expect("listed");
+        assert_eq!(alpha.state, DbState::Loading, "actual state is Loading");
+        assert_eq!(alpha.desired, DbState::Loading, "desired state is Loading");
+
+        catalog.shutdown_all().await;
+    }
+
+    /// `begin_loading` is rejected against every database that is not currently `Online`: unknown,
+    /// offline (stopped), and already-`Loading` (exactly one Mode A session per database, `08 §5.2`).
+    #[tokio::test]
+    async fn begin_loading_rejects_non_online_databases() {
+        let root = TempRoot::new("begin-loading-rejects");
+        let catalog = open_catalog(&root);
+
+        // Unknown (folded into `NotLoadable` per the design: "online and not already loading (or
+        // offline/unknown)" — a single precondition check covers every non-`Online` case).
+        assert!(matches!(
+            catalog.begin_loading("nope").await,
+            Err(CatalogError::NotLoadable(_))
+        ));
+
+        // Offline (created then stopped).
+        let _ = catalog.create("beta").await.expect("create beta");
+        catalog.stop("beta").await.expect("stop beta");
+        assert!(matches!(
+            catalog.begin_loading("beta").await,
+            Err(CatalogError::NotLoadable(_))
+        ));
+
+        // Already Loading: a second session against the same database is rejected.
+        let _ = catalog.create("alpha").await.expect("create alpha");
+        let handle = catalog.begin_loading("alpha").await.expect("begin_loading");
+        drop(handle);
+        assert!(matches!(
+            catalog.begin_loading("alpha").await,
+            Err(CatalogError::NotLoadable(_))
+        ));
+        // ALPHA's already-Loading rejection must not disturb BETA's independent (offline) state —
+        // the `D-multi-db` per-database isolation claim.
+        assert_eq!(durable_states(&root).get("beta"), Some(&DbState::Offline));
+
+        catalog.shutdown_all().await;
+    }
+
+    /// `begin_loading` never accepts the default database (always online, server-lifecycle-managed —
+    /// the same protection `create`/`stop`/`drop` already carry).
+    #[tokio::test]
+    async fn begin_loading_rejects_the_default_database() {
+        let root = TempRoot::new("begin-loading-default");
+        let catalog = open_catalog(&root);
+        let _ = catalog.start_default().await.expect("start default");
+
+        assert!(matches!(
+            catalog.begin_loading(DEFAULT_DATABASE_NAME).await,
+            Err(CatalogError::DefaultDatabase {
+                operation: "bulk-import",
+                ..
+            })
+        ));
+
+        catalog.shutdown_all().await;
+    }
+
+    /// `end_loading` transitions `Loading` back to `Offline`: the engine is genuinely stopped (both
+    /// registries lose the handle), and the durable state persists `Offline` — mirroring
+    /// `RESTORE DATABASE`'s "stopped first, resumed explicitly" precedent (`Loading` never goes
+    /// straight back to `Online`).
+    #[tokio::test]
+    async fn end_loading_transitions_loading_to_offline_and_stops_the_engine() {
+        let root = TempRoot::new("end-loading");
+        let catalog = open_catalog(&root);
+        let _ = catalog.create("alpha").await.expect("create");
+        let handle = catalog.begin_loading("alpha").await.expect("begin_loading");
+        drop(handle);
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Loading));
+
+        catalog.end_loading("alpha").await.expect("end_loading");
+
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Offline));
+        assert!(
+            catalog.handle("alpha").is_none(),
+            "the database is offline, not ordinary-traffic-resolvable"
+        );
+        assert!(
+            catalog.loading_handle("alpha").is_none(),
+            "the loading-only registry no longer holds a (now-dead) handle"
+        );
+        let infos = catalog.list().await;
+        let alpha = infos.iter().find(|i| i.name == "alpha").expect("listed");
+        assert_eq!(alpha.state, DbState::Offline);
+        assert_eq!(alpha.desired, DbState::Offline);
+
+        // The database can be restarted explicitly afterwards (never auto-resumed to Online).
+        let handle = catalog
+            .start("alpha")
+            .await
+            .expect("start after end_loading");
+        drop(handle);
+        assert!(catalog.handle("alpha").is_some());
+
+        catalog.shutdown_all().await;
+    }
+
+    /// Crash recovery of a `Loading` database (`08 §7.1`): a durable entry left `Loading` at the last
+    /// shutdown/crash comes back `Loading` on the next boot — never silently `Online`/`Offline` — and
+    /// its engine is registered into the loading-only registry, never the ordinary one, so it stays
+    /// unreachable to client traffic until an operator explicitly resumes ([`end_loading`]) it.
+    #[tokio::test]
+    async fn boot_reconciliation_recovers_a_loading_database_into_the_loading_registry() {
+        let root = TempRoot::new("boot-loading");
+        {
+            let catalog = open_catalog(&root);
+            let _ = catalog.start_default().await.expect("start default");
+            let _ = catalog.create("alpha").await.expect("create alpha");
+            let handle = catalog.begin_loading("alpha").await.expect("begin_loading");
+            drop(handle);
+            assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Loading));
+            // Process teardown while a Mode A session was in progress — durable desired state must
+            // survive untouched (mirrors `boot_reconciliation_starts_online_databases_...`).
+            catalog.shutdown_all().await;
+        }
+
+        // "Next boot": alpha's engine comes back up, but ONLY in the loading-only registry.
+        let catalog = open_catalog(&root);
+        let _ = catalog.start_default().await.expect("start default");
+        catalog.start_catalog_databases().await;
+
+        assert!(
+            catalog.handle("alpha").is_none(),
+            "a recovered Loading database must never be ordinary-traffic-resolvable"
+        );
+        assert!(
+            catalog.loading_handle("alpha").is_some(),
+            "the engine is running, registered in the loading-only registry"
+        );
+        let infos = catalog.list().await;
+        let alpha = infos.iter().find(|i| i.name == "alpha").expect("listed");
+        assert_eq!(alpha.state, DbState::Loading);
+        assert_eq!(alpha.desired, DbState::Loading);
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Loading));
+
+        // The operator can still explicitly end the recovered session.
+        catalog
+            .end_loading("alpha")
+            .await
+            .expect("end_loading after recovery");
+        assert_eq!(durable_states(&root).get("alpha"), Some(&DbState::Offline));
+
+        catalog.shutdown_all().await;
+    }
+
+    /// `list()` reports `Loading` correctly alongside `Online`/`Offline` siblings with no
+    /// cross-database leakage — the `D-multi-db` isolation claim at the catalog layer (`08 §5.2`,
+    /// `10.1`'s "traffic against every OTHER database is completely unaffected" requirement).
+    #[tokio::test]
+    async fn list_reports_loading_alongside_online_and_offline_with_no_leakage() {
+        let root = TempRoot::new("list-loading");
+        let catalog = open_catalog(&root);
+        let _ = catalog.start_default().await.expect("start default");
+
+        let _ = catalog.create("alpha").await.expect("create alpha");
+        let handle = catalog
+            .begin_loading("alpha")
+            .await
+            .expect("begin_loading alpha");
+        drop(handle);
+
+        let _ = catalog.create("beta").await.expect("create beta"); // stays Online
+
+        let _ = catalog.create("gamma").await.expect("create gamma");
+        catalog.stop("gamma").await.expect("stop gamma"); // Offline
+
+        let infos = catalog.list().await;
+        let find = |n: &str| infos.iter().find(|i| i.name == n).expect("listed");
+        assert_eq!(find("alpha").state, DbState::Loading);
+        assert_eq!(find("beta").state, DbState::Online);
+        assert_eq!(find("gamma").state, DbState::Offline);
+        assert_eq!(find(DEFAULT_DATABASE_NAME).state, DbState::Online);
+
+        // Independently resolvable/unaffected.
+        assert!(catalog.handle("alpha").is_none());
+        assert!(catalog.loading_handle("alpha").is_some());
+        assert!(catalog.handle("beta").is_some());
+        assert!(catalog.loading_handle("beta").is_none());
+        assert!(catalog.handle("gamma").is_none());
+        assert!(catalog.loading_handle("gamma").is_none());
+
+        catalog.shutdown_all().await;
     }
 }

@@ -24,6 +24,7 @@
 //! (§9.1).
 
 pub mod bolt_values;
+pub(crate) mod bulk_load;
 pub mod command;
 mod exec;
 mod handle;
@@ -46,6 +47,7 @@ use graphus_storage::RecordStore;
 use graphus_txn::IsolationLevel;
 use graphus_wal::LogSink;
 
+pub use bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 pub use command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
     RunReply, RunSummary,
@@ -494,6 +496,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // ticks; once it reaches `MAINTENANCE_FAILURE_ESCALATION_THRESHOLD` the reclamation-degraded gauge
     // is set (driving `/health/ready` to 503). Reset to 0 by any successful checkpoint.
     let mut maintenance_consecutive_failures: u32 = 0;
+    // Network bulk-import Mode A session state (`rmp` #519, `08 §5.1/§7.1`): `None` until the first
+    // `BulkImportBatch` dispatch, `Some` for the session's lifetime, reset to `None` by
+    // `BulkImportBatchInput::End`. Lives here (not inside `dispatch_command`) because it must persist
+    // across many command dispatches within one session — see `crate::engine::bulk_load`'s module docs.
+    let mut loading_session: Option<bulk_load::LoadingSession> = None;
 
     'engine: loop {
         // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
@@ -597,6 +604,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut active_txns,
                         &clock,
                         statement_timeout,
+                        &mut loading_session,
                     ) {
                         break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
                     }
@@ -672,6 +680,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &mut active_txns,
                 &clock,
                 statement_timeout,
+                &mut loading_session,
             ) {
                 break 'engine;
             }
@@ -1327,6 +1336,10 @@ fn reply_engine_degraded(cmd: EngineCommand) -> Option<EngineCommand> {
             let _ = reply.send(Err(engine_degraded_error()));
             None
         }
+        Cmd::BulkImportBatch { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
     }
 }
 
@@ -1354,6 +1367,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     active_txns: &mut ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
+    loading_session: &mut Option<bulk_load::LoadingSession>,
 ) -> bool {
     // `rmp` #409 / #414: once a statement-recovery double-panic has flagged **this** engine degraded,
     // the coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke).
@@ -1484,6 +1498,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             if out.is_ok() {
                 maintenance_degraded.clear();
             }
+            let _ = reply.send(out);
+        }
+        Cmd::BulkImportBatch { batch, reply } => {
+            let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
             let _ = reply.send(out);
         }
         // Test-only (`rmp` #435): the threaded engine loop intercepts this before dispatch, so it only

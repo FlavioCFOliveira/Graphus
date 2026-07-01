@@ -19,6 +19,7 @@ use tokio::sync::Semaphore;
 use super::EngineDegraded;
 use super::MaintenanceDegraded;
 use super::TxTicket;
+use super::bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 use super::command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
     ReplyReceiver, RunReply, RunSummary, reply_channel,
@@ -317,6 +318,27 @@ impl EngineHandle {
     pub async fn checkpoint(&self) -> Result<CheckpointReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit(EngineCommand::Checkpoint { reply }).await?;
+        recv_async(rx).await?
+    }
+
+    /// Ingests one batch of a **network bulk-import Mode A session** (`08-network-bulk-import.md`
+    /// §5.1/§7.1, `rmp` #519): low-level store writes committed through the coordinator's own
+    /// transaction id source, with the durable checkpoint sentinel updated in the same commit. Like
+    /// the DDL/backup/checkpoint commands this takes **no admission permit**; the caller (the REST
+    /// bulk-import handler) is responsible for the `Loading`-state precondition
+    /// ([`crate::dbcatalog::DatabaseCatalog::begin_loading`]) and the admin-privilege gate
+    /// beforehand.
+    ///
+    /// # Errors
+    /// A header/value-parse/storage error from the batch (its transaction is rolled back on any
+    /// error — no partial batch is ever visible), or if the engine is shut down.
+    pub async fn bulk_import_batch(
+        &self,
+        batch: BulkImportBatchInput,
+    ) -> Result<BulkImportBatchOutcome, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::BulkImportBatch { batch, reply })
+            .await?;
         recv_async(rx).await?
     }
 

@@ -1,29 +1,29 @@
-//! End-to-end tests for the network bulk-import streaming upload endpoint
-//! (`POST /admin/db/{db}/bulk-import`, `specification/08-network-bulk-import.md`, `rmp` #518),
+//! End-to-end tests for the network bulk-import streaming upload endpoint, **Mode A**
+//! (`POST /admin/db/{db}/bulk-import`, `specification/08-network-bulk-import.md`, `rmp` #518/#519),
 //! driven through a REAL booted [`graphus_server::Server`] over a raw HTTP/1.1 client (the same
 //! no-framework socket style `db_admin_surface.rs`/`server_integration.rs` already use).
 //!
-//! This is the **scaffolding** milestone (RBAC, streaming ingestion, quota, disk-space preflight,
-//! session timeout, format detection, target-database validation) — it does not yet drive a real
-//! `BulkImporter`/`TxnCoordinator` import, so these tests assert the admission/rejection surface,
-//! not data actually landing in the graph.
-//!
-//! Covered: an authenticated `Admin` upload of a valid, small CSV payload succeeds (`202`); no
-//! `Authorization` header is `401`; an authenticated but non-admin principal is `403`; an unknown
-//! `Content-Type` is `415`; an unknown target database is `404`; and an upload streamed past a
-//! (deliberately tiny, test-only) byte quota is rejected (`413`) **before** the client finishes
-//! sending it — proving the server never buffers the whole oversized body (`08` §8) — using a
-//! synthetic, chunked-transfer-encoded payload generated from a small reused buffer, never a real
-//! file on disk.
+//! Covers both the scaffolding-era admission/rejection surface (RBAC, format detection, byte quota,
+//! now exercised through the real `?phase=nodes`/`?phase=relationships`/`?end=true` wire protocol) and
+//! the real Mode A ingestion added in `rmp` #519: a full happy-path session (nodes file → relationships
+//! file → end → the data is actually there and queryable, the checkpoint sentinel is gone), the
+//! `Loading`-state exclusivity (a concurrent query against a loading database is rejected while an
+//! unrelated database keeps serving normally), the empty-database precondition (`409` on a non-empty
+//! target), and a byte-for-byte stats parity check against the offline `graphus_bulk::BulkImporter` on
+//! the same dataset.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
+use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE};
+use graphus_io::MemBlockDevice;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, BulkImportConfig, ServerConfig, TimingConfig, TlsConfig,
     UserBootstrap,
 };
 use graphus_server::{Server, ServerHandle};
+use graphus_storage::RecordStore;
+use graphus_wal::{MemLogSink, WalManager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -131,17 +131,106 @@ fn mint_token(user: &str) -> String {
 // A tiny raw HTTP/1.1 client (no TLS, loopback only), as in `db_admin_surface.rs`.
 // ----------------------------------------------------------------------------------------------
 
-/// One small (`Content-Length`-framed) `POST /admin/db/{db}/bulk-import` request.
-async fn small_upload(
+/// Parses a raw HTTP/1.1 response into `(status, body)`.
+fn parse_response(raw: &[u8]) -> (u16, String) {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+async fn http_request(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body_json: Option<&str>,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect REST");
+    let body = body_json.unwrap_or("");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if let Some(token) = bearer {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if body_json.is_some() {
+        req.push_str("Content-Type: application/json\r\n");
+    }
+    req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    req.push_str(body);
+
+    stream.write_all(req.as_bytes()).await.expect("write req");
+    stream.flush().await.expect("flush req");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read resp");
+    parse_response(&raw)
+}
+
+/// `POST /db/{db}/tx/commit` with one statement; returns `(status, body)`.
+async fn rest_statement(
+    addr: std::net::SocketAddr,
+    token: &str,
+    db: &str,
+    statement: &str,
+) -> (u16, String) {
+    let body = format!(r#"{{"statements":[{{"statement":"{statement}"}}]}}"#);
+    http_request(
+        addr,
+        "POST",
+        &format!("/db/{db}/tx/commit"),
+        Some(token),
+        Some(&body),
+    )
+    .await
+}
+
+/// Extracts the integer from the first Jolt `{"Z":"<n>"}` cell in `body` — sufficient for these
+/// tests' single-scalar-result queries (`RETURN count(...)`).
+fn extract_jolt_int(body: &str) -> Option<i64> {
+    let idx = body.find("\"Z\":\"")?;
+    let rest = &body[idx + 5..];
+    let end = rest.find('"')?;
+    rest[..end].parse().ok()
+}
+
+/// Extracts a top-level JSON integer field's value by key from the bulk-import endpoint's own plain
+/// (non-Jolt) `{"nodes":N,"relationships":M,"properties":P}` response body.
+fn extract_json_number(body: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\":");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// One `POST /admin/db/{db}/bulk-import?{query}` call with a `Content-Length`-framed body.
+async fn bulk_call(
     addr: std::net::SocketAddr,
     bearer: Option<&str>,
     db: &str,
+    query: &str,
     content_type: Option<&str>,
     body: &[u8],
 ) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect REST");
+    let path = if query.is_empty() {
+        format!("/admin/db/{db}/bulk-import")
+    } else {
+        format!("/admin/db/{db}/bulk-import?{query}")
+    };
     let mut req = format!(
-        "POST /admin/db/{db}/bulk-import HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n"
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n"
     );
     if let Some(token) = bearer {
         req.push_str(&format!("Authorization: Bearer {token}\r\n"));
@@ -178,7 +267,7 @@ async fn oversized_streamed_upload(
     let (mut rd, mut wr) = tokio::io::split(stream);
 
     let header = format!(
-        "POST /admin/db/{db}/bulk-import HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\nAuthorization: Bearer {bearer}\r\nContent-Type: text/csv\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "POST /admin/db/{db}/bulk-import?phase=nodes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\nAuthorization: Bearer {bearer}\r\nContent-Type: text/csv\r\nTransfer-Encoding: chunked\r\n\r\n"
     );
 
     // Willing to stream up to this many bytes before giving up — comfortably past any reasonable
@@ -222,38 +311,95 @@ async fn oversized_streamed_upload(
     (status, body, sent)
 }
 
-/// Parses a raw HTTP/1.1 response into `(status, body)`.
-fn parse_response(raw: &[u8]) -> (u16, String) {
-    let text = String::from_utf8_lossy(raw).into_owned();
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_owned())
-        .unwrap_or_default();
-    (status, body)
+/// A `phase=nodes` upload whose chunked body is deliberately left **unterminated** after
+/// `first_chunk`, so the connection (and the server-side `Loading` claim it already made before
+/// touching any body byte — see `bulk_import.rs`'s module docs) stays open until [`Self::finish`] is
+/// called. Used to give a test a reliable window in which the target database is guaranteed
+/// `Loading`.
+struct PausedUpload {
+    stream: TcpStream,
+}
+
+async fn start_paused_upload(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    db: &str,
+    first_chunk: &[u8],
+) -> PausedUpload {
+    let mut stream = TcpStream::connect(addr).await.expect("connect REST");
+    let header = format!(
+        "POST /admin/db/{db}/bulk-import?phase=nodes HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\nAuthorization: Bearer {bearer}\r\nContent-Type: text/csv\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    stream
+        .write_all(header.as_bytes())
+        .await
+        .expect("write header");
+    let framing = format!("{:X}\r\n", first_chunk.len());
+    stream
+        .write_all(framing.as_bytes())
+        .await
+        .expect("write chunk framing");
+    stream
+        .write_all(first_chunk)
+        .await
+        .expect("write chunk data");
+    stream
+        .write_all(b"\r\n")
+        .await
+        .expect("write chunk terminator");
+    stream.flush().await.expect("flush");
+    PausedUpload { stream }
+}
+
+impl PausedUpload {
+    /// Sends the terminating zero-length chunk and reads the (now-complete) response.
+    async fn finish(mut self) -> (u16, String) {
+        self.stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("write terminating chunk");
+        self.stream.flush().await.expect("flush");
+        let mut raw = Vec::new();
+        self.stream.read_to_end(&mut raw).await.expect("read resp");
+        parse_response(&raw)
+    }
+}
+
+/// Retries `attempt` (a closure returning a fresh future each call, e.g. a `rest_statement` call)
+/// until it observes the expected `status`, or gives up after `tries` attempts — absorbing the
+/// inherent client/server scheduling race between two independent raw-socket connections. Returns
+/// the last `(status, body)` observed either way.
+async fn poll_until_status<F, Fut>(mut attempt: F, expected: u16, tries: u32) -> (u16, String)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = (u16, String)>,
+{
+    let mut last = (0u16, String::new());
+    for _ in 0..tries {
+        last = attempt().await;
+        if last.0 == expected {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    last
 }
 
 // ----------------------------------------------------------------------------------------------
-// Tests
+// Tests: scaffolding-era admission/rejection surface, now exercised through the real wire protocol.
 // ----------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_with_valid_csv_upload_is_accepted() {
-    let temp = TempStore::new("happy");
+async fn missing_query_parameter_is_400() {
+    let temp = TempStore::new("noquery");
     let server = boot(base_config(&temp, BulkImportConfig::default())).await;
     let rest = server.rest_addr.expect("REST enabled");
     let token = mint_token(ADMIN_USER);
 
-    let (status, body) =
-        small_upload(rest, Some(&token), DB, Some("text/csv"), b":ID\n1\n2\n").await;
+    let (status, body) = bulk_call(rest, Some(&token), DB, "", Some("text/csv"), b":ID\n1\n").await;
 
-    assert_eq!(status, 202, "body: {body}");
-    assert!(body.contains("\"accepted_bytes\":8"), "body: {body}");
-    assert!(body.contains("\"format\":\"csv\""), "body: {body}");
+    assert_eq!(status, 400, "body: {body}");
+    assert!(body.contains("phase=nodes"), "body: {body}");
 
     server.shutdown().await.expect("clean shutdown");
 }
@@ -264,7 +410,8 @@ async fn missing_authorization_header_is_401() {
     let server = boot(base_config(&temp, BulkImportConfig::default())).await;
     let rest = server.rest_addr.expect("REST enabled");
 
-    let (status, body) = small_upload(rest, None, DB, Some("text/csv"), b":ID\n1\n").await;
+    let (status, body) =
+        bulk_call(rest, None, DB, "phase=nodes", Some("text/csv"), b":ID\n1\n").await;
 
     assert_eq!(status, 401, "body: {body}");
 
@@ -278,7 +425,15 @@ async fn authenticated_non_admin_is_403() {
     let rest = server.rest_addr.expect("REST enabled");
     let token = mint_token(NON_ADMIN_USER);
 
-    let (status, body) = small_upload(rest, Some(&token), DB, Some("text/csv"), b":ID\n1\n").await;
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        DB,
+        "phase=nodes",
+        Some("text/csv"),
+        b":ID\n1\n",
+    )
+    .await;
 
     assert_eq!(status, 403, "body: {body}");
 
@@ -292,8 +447,15 @@ async fn unknown_content_type_is_415_with_a_clear_message() {
     let rest = server.rest_addr.expect("REST enabled");
     let token = mint_token(ADMIN_USER);
 
-    let (status, body) =
-        small_upload(rest, Some(&token), DB, Some("application/json"), b"{}").await;
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        DB,
+        "phase=nodes",
+        Some("application/json"),
+        b"{}",
+    )
+    .await;
 
     assert_eq!(status, 415, "body: {body}");
     assert!(body.contains("application/json"), "body: {body}");
@@ -309,10 +471,11 @@ async fn unknown_database_is_404_with_a_clear_message() {
     let rest = server.rest_addr.expect("REST enabled");
     let token = mint_token(ADMIN_USER);
 
-    let (status, body) = small_upload(
+    let (status, body) = bulk_call(
         rest,
         Some(&token),
         "does-not-exist",
+        "phase=nodes",
         Some("text/csv"),
         b":ID\n1\n",
     )
@@ -320,6 +483,29 @@ async fn unknown_database_is_404_with_a_clear_message() {
 
     assert_eq!(status, 404, "body: {body}");
     assert!(body.contains("does-not-exist"), "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_database_cannot_be_bulk_imported_into() {
+    let temp = TempStore::new("defaultdb");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        DB,
+        "phase=nodes",
+        Some("text/csv"),
+        b"id:ID\n1\n",
+    )
+    .await;
+
+    assert_eq!(status, 400, "body: {body}");
+    assert!(body.contains("default"), "body: {body}");
 
     server.shutdown().await.expect("clean shutdown");
 }
@@ -338,7 +524,10 @@ async fn upload_past_the_quota_is_rejected_without_buffering_the_whole_body() {
     let rest = server.rest_addr.expect("REST enabled");
     let token = mint_token(ADMIN_USER);
 
-    let (status, body, sent) = oversized_streamed_upload(rest, &token, DB).await;
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE quotadb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    let (status, body, sent) = oversized_streamed_upload(rest, &token, "quotadb").await;
 
     assert_eq!(status, 413, "body: {body}");
     assert!(body.contains("quota"), "body: {body}");
@@ -347,6 +536,271 @@ async fn upload_past_the_quota_is_rejected_without_buffering_the_whole_body() {
     assert!(
         sent < 32 * 1024 * 1024,
         "client sent {sent} bytes before the server aborted; expected an early, mid-stream abort"
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+// ----------------------------------------------------------------------------------------------
+// Tests: real Mode A ingestion (`rmp` #519).
+// ----------------------------------------------------------------------------------------------
+
+/// A small, deterministic node file: 3 people, 2 typed properties each (6 properties).
+const NODES_CSV: &str =
+    "id:ID,:LABEL,name:string,age:int\n1,Person,Ada,30\n2,Person,Bob,25\n3,Person,Cy,40\n";
+/// A small, deterministic relationship file joining the nodes above: 2 `KNOWS` edges, 1 typed
+/// property each (2 properties).
+const RELS_CSV: &str = ":START_ID,:END_ID,:TYPE,since:int\n1,2,KNOWS,2010\n2,3,KNOWS,2015\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_a_happy_path_end_to_end() {
+    let temp = TempStore::new("happy");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE happydb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "happydb",
+        "phase=nodes",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "nodes phase: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+    assert_eq!(
+        extract_json_number(&body, "relationships"),
+        Some(0),
+        "body: {body}"
+    );
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "happydb",
+        "phase=relationships",
+        Some("text/csv"),
+        RELS_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "relationships phase: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+    assert_eq!(
+        extract_json_number(&body, "relationships"),
+        Some(2),
+        "body: {body}"
+    );
+    assert_eq!(
+        extract_json_number(&body, "properties"),
+        Some(8),
+        "body: {body}"
+    );
+
+    let (status, body) = bulk_call(rest, Some(&token), "happydb", "end=true", None, b"").await;
+    assert_eq!(status, 200, "end: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+    assert_eq!(
+        extract_json_number(&body, "relationships"),
+        Some(2),
+        "body: {body}"
+    );
+
+    // `end_loading` leaves the database `Offline`, never straight back to `Online` (`08` §5.2) — the
+    // operator must explicitly bring it back.
+    let (status, body) = rest_statement(rest, &token, DB, "START DATABASE happydb").await;
+    assert_eq!(status, 200, "start database: {body}");
+
+    // The data is actually there and queryable...
+    let (status, body) = rest_statement(rest, &token, "happydb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        extract_jolt_int(&body),
+        Some(3),
+        "exactly the imported node count — the checkpoint sentinel must be gone: {body}"
+    );
+    let (status, body) =
+        rest_statement(rest, &token, "happydb", "MATCH ()-[r]->() RETURN count(r)").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(extract_jolt_int(&body), Some(2), "{body}");
+
+    // ...and the checkpoint sentinel label itself is entirely gone (not just outnumbered).
+    let (status, body) = rest_statement(
+        rest,
+        &token,
+        "happydb",
+        "MATCH (n:__graphus_bulk_import_session__) RETURN count(n)",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(extract_jolt_int(&body), Some(0), "{body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loading_database_rejects_queries_while_an_unrelated_database_keeps_serving() {
+    let temp = TempStore::new("concurrent");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE loadingdb").await;
+    assert_eq!(status, 200, "create loadingdb: {body}");
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE otherdb").await;
+    assert_eq!(status, 200, "create otherdb: {body}");
+    let (status, body) = rest_statement(rest, &token, "otherdb", "CREATE (:Seed {v: 1})").await;
+    assert_eq!(status, 200, "seed otherdb: {body}");
+
+    // Start (but do not finish) a `phase=nodes` upload against `loadingdb`. By the time the header
+    // is on the wire, the server has already run the empty-database precondition check and flipped
+    // `loadingdb` to `Loading` — BEFORE it ever reads a body byte (`bulk_import.rs` module docs) — so
+    // a query against it while this upload is paused is guaranteed to observe the `Loading` state.
+    let paused = start_paused_upload(rest, &token, "loadingdb", NODES_CSV.as_bytes()).await;
+
+    // The loading database rejects an ordinary query with a clear "not online" class of error —
+    // never a panic, a hang, or a silently-empty result. Poll briefly to absorb the inherent
+    // raw-socket scheduling race between the two independent connections.
+    let (status, body) = poll_until_status(
+        || rest_statement(rest, &token, "loadingdb", "MATCH (n) RETURN count(n)"),
+        400,
+        50,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a Loading database must reject ordinary queries: {body}"
+    );
+    assert!(
+        body.contains("not currently online"),
+        "expected a clear not-online error: {body}"
+    );
+
+    // The unrelated database is fully unaffected throughout.
+    let (status, body) = rest_statement(rest, &token, "otherdb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "otherdb must keep serving: {body}");
+    assert_eq!(extract_jolt_int(&body), Some(1), "body: {body}");
+
+    // Finish the paused upload cleanly and end the session (good citizenship — not the assertion).
+    let (status, body) = paused.finish().await;
+    assert_eq!(status, 200, "finish paused upload: {body}");
+    let (status, body) = bulk_call(rest, Some(&token), "loadingdb", "end=true", None, b"").await;
+    assert_eq!(status, 200, "end loadingdb: {body}");
+
+    // The unrelated database is STILL fully unaffected after the loading session ends.
+    let (status, body) = rest_statement(rest, &token, "otherdb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "otherdb must keep serving: {body}");
+    assert_eq!(extract_jolt_int(&body), Some(1), "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_empty_database_is_rejected_with_409() {
+    let temp = TempStore::new("nonempty");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE fulldb").await;
+    assert_eq!(status, 200, "create database: {body}");
+    let (status, body) = rest_statement(rest, &token, "fulldb", "CREATE (n) RETURN n").await;
+    assert_eq!(status, 200, "seed one node: {body}");
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "fulldb",
+        "phase=nodes",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+
+    assert_eq!(status, 409, "body: {body}");
+    assert!(
+        body.contains("empty database"),
+        "message must explain Mode A requires an empty database: {body}"
+    );
+    assert!(
+        body.contains("Mode B") || body.contains("#520"),
+        "message should point at Mode B for a live database: {body}"
+    );
+
+    // The database is untouched: no session was ever begun (it stays `Online`, still resolvable
+    // through the ordinary handle, still holding exactly the one seeded node).
+    let (status, body) = rest_statement(rest, &token, "fulldb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "fulldb must still be online: {body}");
+    assert_eq!(extract_jolt_int(&body), Some(1), "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_a_matches_the_offline_importer_stats() {
+    // (a) Offline import of the SAME dataset via `graphus_bulk::BulkImporter`.
+    let device = MemBlockDevice::new(0);
+    let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+    let store = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let mut importer = BulkImporter::new(store, DEFAULT_BATCH_SIZE, b',');
+    importer
+        .import_nodes(NODES_CSV.as_bytes())
+        .expect("offline import_nodes");
+    importer
+        .import_relationships(RELS_CSV.as_bytes())
+        .expect("offline import_relationships");
+    let (_store, offline_stats) = importer.finish();
+
+    // (b) The SAME dataset via the network Mode A endpoint.
+    let temp = TempStore::new("parity");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE paritydb").await;
+    assert_eq!(status, 200, "create database: {body}");
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "paritydb",
+        "phase=nodes",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "nodes phase: {body}");
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "paritydb",
+        "phase=relationships",
+        Some("text/csv"),
+        RELS_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "relationships phase: {body}");
+    let (status, end_body) = bulk_call(rest, Some(&token), "paritydb", "end=true", None, b"").await;
+    assert_eq!(status, 200, "end: {end_body}");
+
+    // (c) Byte-for-byte (well, field-for-field) parity between the two.
+    assert_eq!(
+        extract_json_number(&end_body, "nodes"),
+        Some(offline_stats.nodes),
+        "node count parity: network={end_body} offline={offline_stats:?}"
+    );
+    assert_eq!(
+        extract_json_number(&end_body, "relationships"),
+        Some(offline_stats.relationships),
+        "relationship count parity: network={end_body} offline={offline_stats:?}"
+    );
+    assert_eq!(
+        extract_json_number(&end_body, "properties"),
+        Some(offline_stats.properties),
+        "property count parity: network={end_body} offline={offline_stats:?}"
     );
 
     server.shutdown().await.expect("clean shutdown");

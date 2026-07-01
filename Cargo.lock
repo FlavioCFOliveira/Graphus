@@ -1188,9 +1188,11 @@ dependencies = [
 name = "graphus-dst"
 version = "0.0.4"
 dependencies = [
+ "csv",
  "graphus-auth",
  "graphus-bolt",
  "graphus-bufpool",
+ "graphus-bulk",
  "graphus-core",
  "graphus-crypto",
  "graphus-cypher",
@@ -1351,10 +1353,13 @@ name = "graphus-server"
 version = "0.0.4"
 dependencies = [
  "axum",
+ "bytes",
  "ciborium",
+ "csv",
  "fs4",
  "graphus-auth",
  "graphus-bolt",
+ "graphus-bulk",
  "graphus-cli",
  "graphus-core",
  "graphus-crypto",

@@ -40,6 +40,7 @@ use graphus_io::{BlockDevice, MemBlockDevice};
 use graphus_storage::RecordStore;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
+use super::bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome, LoadingSession};
 use super::command::{
     AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply,
     RunSummary, reply_channel,
@@ -106,6 +107,10 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     db_name: Arc<str>,
     /// The injected (simulated) clock; threaded into execution so latency/timing is deterministic.
     clock: Arc<dyn Clock + Send + Sync>,
+    /// Network bulk-import Mode A session state (`rmp` #519), mirroring the threaded loop's
+    /// `loading_session` local — see [`super::bulk_load`]'s module docs. `None` until the first
+    /// `BulkImportBatch` dispatch; DST scenarios drive this via [`Self::bulk_import_batch`].
+    loading_session: Option<LoadingSession>,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> LocalEngine<D, S> {
@@ -131,6 +136,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             db_name,
             metrics,
             clock,
+            loading_session: None,
         }
     }
 
@@ -171,6 +177,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // is a production-thread CPU-exhaustion defence, not a correctness property — so disabling it
             // here keeps the VOPR replay bit-deterministic while exercising the same dispatch code path.
             None,
+            &mut self.loading_session,
         );
         debug_assert!(
             inflight.is_none(),
@@ -306,6 +313,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     pub fn backup(&mut self) -> Result<Vec<u8>> {
         let (reply, rx) = reply_channel();
         self.dispatch(EngineCommand::Backup { reply });
+        rx.recv().map_err(|_| gone())?
+    }
+
+    /// Ingests one batch of a network bulk-import Mode A session (`rmp` #519), driving the same
+    /// `bulk_load::handle_bulk_import_batch` dispatch the production engine loop uses — the DST/VOPR
+    /// seam for `network_bulk_ingest_mode_a` (`07-dst-simulator.md`).
+    ///
+    /// # Errors
+    /// A header/value-parse/storage error from the batch (the batch's transaction is rolled back on
+    /// any error), or [`GraphusError`] if the engine has been shut down.
+    pub fn bulk_import_batch(
+        &mut self,
+        batch: BulkImportBatchInput,
+    ) -> Result<BulkImportBatchOutcome> {
+        let (reply, rx) = reply_channel();
+        self.dispatch(EngineCommand::BulkImportBatch { batch, reply });
         rx.recv().map_err(|_| gone())?
     }
 

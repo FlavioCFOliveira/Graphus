@@ -266,6 +266,11 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// `prop_key_tokens[i]` carries the pre-interned `PropKey` token for column `i` (`Some` iff that
     /// column is a `Property`), interned once per file rather than per cell (`rmp` task #321).
     /// `label_memo` memoises label-name → token across rows so a repeated label is interned once.
+    ///
+    /// Thin forwarding wrapper over [`ingest_node_row`] (`rmp` #519): the store-mutation logic lives
+    /// there as a free function so `graphus-server`'s network bulk-import Mode A batch handler (which
+    /// drives a store it *borrows* from a live engine's `TxnCoordinator`, never one it owns) reuses it
+    /// byte-for-byte instead of duplicating it.
     fn ingest_node_record(
         &mut self,
         txn: TxnId,
@@ -274,94 +279,18 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         label_memo: &mut HashMap<String, u32>,
         record: &csv::StringRecord,
     ) -> Result<()> {
-        let (node_id, _eid) = self.store.create_node(txn)?;
-
-        // External id (the join key for relationships).
-        let external_id = record.get(header.id_index).unwrap_or("").to_owned();
-
-        // Collect labels first (a single `set_node_labels` write), then properties.
-        // PERF (C18): dedup via a `HashSet` (O(1) membership) instead of `Vec::contains` (O(n) per
-        // probe, O(n^2) per row). `set_node_labels` treats labels as a set, so order is irrelevant.
-        let mut label_set: HashSet<u32> = HashSet::new();
-        for (i, role) in header.columns.iter().enumerate() {
-            let cell = record.get(i).unwrap_or("");
-            match role {
-                ColumnRole::Label => {
-                    for label in cell.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        // Memoise label-name → token: intern once per distinct name, not per cell.
-                        let token = match label_memo.get(label) {
-                            Some(&t) => t,
-                            None => {
-                                let t = self.store.intern_token(Namespace::Label, label)?;
-                                label_memo.insert(label.to_owned(), t);
-                                t
-                            }
-                        };
-                        label_set.insert(token);
-                    }
-                }
-                ColumnRole::Property { key, ty } => {
-                    if let Some(value) =
-                        parse_cell(cell, *ty, key).map_err(graphus_core::GraphusError::from)?
-                    {
-                        // Reuse the per-column pre-interned key token (`rmp` task #321).
-                        let key_token = prop_key_tokens[i].expect(
-                            "INVARIANT: a Property column has a pre-interned PropKey token (#321)",
-                        );
-                        self.store
-                            .set_node_property_value(txn, node_id, key_token, &value)?;
-                        self.stats.properties += 1;
-                    }
-                }
-                // `:ID` is consumed via `header.id_index`; reserved rel roles never appear in a node
-                // header; `Ignore` columns are skipped.
-                ColumnRole::Id
-                | ColumnRole::StartId
-                | ColumnRole::EndId
-                | ColumnRole::Type
-                | ColumnRole::Ignore => {}
-            }
-        }
-        if !label_set.is_empty() {
-            let label_tokens: Vec<u32> = label_set.into_iter().collect();
-            self.store.set_node_labels(txn, node_id, &label_tokens)?;
-        }
-
-        // Bind the external id last (after a successful write), staging it in `pending_id_map` rather
-        // than `id_map` directly (`rmp` #517): the binding only becomes visible to the relationship
-        // pass once this row's batch durably commits (see `commit_batch`), so a batch that later
-        // aborts never leaves a stale binding behind for a retry to trip over.
-        //
-        // SEC-196 (CWE-694): a duplicate *non-empty* external id must not silently overwrite an
-        // earlier binding — that would re-point every relationship referencing it onto the wrong
-        // node. Detect the collision (against both the confirmed `id_map` and this batch's own
-        // `pending_id_map`) and, per the configured policy, either reject the import (strict, default)
-        // or keep the first binding and count the skip. An *empty* id is the anonymous-node convention
-        // (no relationship can reference it), so multiple anonymous nodes are allowed to share the
-        // empty key.
-        if external_id.is_empty() {
-            self.pending_id_map.insert(external_id, node_id);
-        } else if let Some(existing) = self.bound_id(&external_id) {
-            match self.duplicate_policy {
-                DuplicatePolicy::Strict => {
-                    return Err(graphus_core::GraphusError::Storage(format!(
-                        "bulk-import: duplicate :ID {external_id:?} (first bound to node {existing}, \
-                         row {} would rebind to node {node_id}); relationships would join the wrong \
-                         node. Deduplicate the input or use a skip-duplicate policy.",
-                        self.stats.nodes + 1
-                    )));
-                }
-                DuplicatePolicy::SkipDuplicate => {
-                    // Keep the first binding; the duplicate's node exists but stays unreferenceable
-                    // by external id. Count the skip for the operator.
-                    self.stats.skipped_duplicate_ids += 1;
-                }
-            }
-        } else {
-            self.pending_id_map.insert(external_id, node_id);
-        }
-        self.stats.nodes += 1;
-        Ok(())
+        ingest_node_row(
+            &mut self.store,
+            txn,
+            header,
+            prop_key_tokens,
+            label_memo,
+            record,
+            &self.id_map,
+            &mut self.pending_id_map,
+            self.duplicate_policy,
+            &mut self.stats,
+        )
     }
 
     /// Imports one relationship CSV file from `reader`, joining `:START_ID`/`:END_ID` against the id
@@ -424,6 +353,9 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
 
     /// Ingests one relationship record under `txn`: resolve endpoints, create the relationship, set
     /// its typed properties.
+    ///
+    /// Thin forwarding wrapper over [`ingest_rel_row`] (`rmp` #519) — see [`ingest_node_record`]'s
+    /// doc for why the logic is a free function.
     fn ingest_rel_record(
         &mut self,
         txn: TxnId,
@@ -432,49 +364,16 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         type_memo: &mut HashMap<String, u32>,
         record: &csv::StringRecord,
     ) -> Result<()> {
-        let start_ext = record.get(header.start_index).unwrap_or("");
-        let end_ext = record.get(header.end_index).unwrap_or("");
-        let type_name = record.get(header.type_index).unwrap_or("");
-
-        let start_id = *self.id_map.get(start_ext).ok_or_else(|| {
-            graphus_core::GraphusError::Storage(format!(
-                "relationship references unknown :START_ID `{start_ext}` (no such node)"
-            ))
-        })?;
-        let end_id = *self.id_map.get(end_ext).ok_or_else(|| {
-            graphus_core::GraphusError::Storage(format!(
-                "relationship references unknown :END_ID `{end_ext}` (no such node)"
-            ))
-        })?;
-        // Memoise rel-type-name → token: intern once per distinct type, not per row (`rmp` task #321).
-        let type_token = match type_memo.get(type_name) {
-            Some(&t) => t,
-            None => {
-                let t = self.store.intern_token(Namespace::RelType, type_name)?;
-                type_memo.insert(type_name.to_owned(), t);
-                t
-            }
-        };
-        let (rel_id, _eid) = self.store.create_rel(txn, type_token, start_id, end_id)?;
-
-        for (i, role) in header.columns.iter().enumerate() {
-            if let ColumnRole::Property { key, ty } = role {
-                let cell = record.get(i).unwrap_or("");
-                if let Some(value) =
-                    parse_cell(cell, *ty, key).map_err(graphus_core::GraphusError::from)?
-                {
-                    // Reuse the per-column pre-interned key token (`rmp` task #321).
-                    let key_token = prop_key_tokens[i].expect(
-                        "INVARIANT: a Property column has a pre-interned PropKey token (#321)",
-                    );
-                    self.store
-                        .set_rel_property_value(txn, rel_id, key_token, &value)?;
-                    self.stats.properties += 1;
-                }
-            }
-        }
-        self.stats.relationships += 1;
-        Ok(())
+        ingest_rel_row(
+            &mut self.store,
+            txn,
+            header,
+            prop_key_tokens,
+            type_memo,
+            record,
+            &self.id_map,
+            &mut self.stats,
+        )
     }
 
     /// Interns every `Property` column's key token once and returns a vector aligned with `columns`:
@@ -487,27 +386,11 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// # Errors
     ///
     /// Propagates a store write failure from interning a new property-key token.
+    ///
+    /// Thin forwarding wrapper over [`intern_property_key_tokens`] (`rmp` #519) — see
+    /// [`ingest_node_record`]'s doc for why the logic is a free function.
     fn resolve_property_key_tokens(&mut self, columns: &[ColumnRole]) -> Result<Vec<Option<u32>>> {
-        let mut out = Vec::with_capacity(columns.len());
-        for role in columns {
-            match role {
-                ColumnRole::Property { key, .. } => {
-                    out.push(Some(self.store.intern_token(Namespace::PropKey, key)?));
-                }
-                _ => out.push(None),
-            }
-        }
-        Ok(out)
-    }
-
-    /// The physical id currently bound to `external_id`, checking both the confirmed `id_map` and the
-    /// in-flight batch's `pending_id_map` (`rmp` #517) — a duplicate within the *same* uncommitted
-    /// batch must be caught just as reliably as one against an already-committed batch.
-    fn bound_id(&self, external_id: &str) -> Option<u64> {
-        self.pending_id_map
-            .get(external_id)
-            .or_else(|| self.id_map.get(external_id))
-            .copied()
+        intern_property_key_tokens(&mut self.store, columns)
     }
 
     /// Begins the next batch transaction and returns its id.
@@ -576,4 +459,226 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
 /// Converts a `csv` crate error into a [`graphus_core::GraphusError`].
 fn csv_err(e: csv::Error) -> graphus_core::GraphusError {
     graphus_core::GraphusError::Storage(format!("bulk-import CSV read: {e}"))
+}
+
+// ------------------------------------------------------------------------------------------------
+// Free functions (rmp #519): the exact low-level per-record store-mutation logic `BulkImporter`
+// uses internally, extracted so it can be driven against a store this crate does not own.
+//
+// `BulkImporter` (above) is the **offline** path: it owns its `RecordStore` outright (constructed
+// fresh by the CLI) and allocates its own monotonic `TxnId`s, safe only because that store has
+// never had a transaction run against it. The **network** bulk-import Mode A path (`08 §5.1`,
+// `graphus-server`) is different: it writes into a store a *live, already-running* database engine
+// already owns (`graphus_cypher::TxnCoordinator`), so it must borrow that store for the scope of one
+// engine command and use a `TxnId` the coordinator's own counter allocated (never a private
+// from-1 counter, which could collide with ids the coordinator already issued). Extracting the
+// per-record body into free functions taking `&mut RecordStore` + an externally-supplied `TxnId`
+// lets both callers share byte-identical store-mutation logic — "shared, unmodified code between
+// the offline tool and the network endpoint" per `08 §4.2` — while each owns its transaction/id
+// lifecycle appropriately for its own environment.
+// ------------------------------------------------------------------------------------------------
+
+/// Interns every `Property` column's key token once against `store` and returns a vector aligned
+/// with `columns`: `out[i]` is `Some(token)` iff column `i` is a [`ColumnRole::Property`], else
+/// `None` (`rmp` task #321). Token interning is idempotent by name, so calling this once per file
+/// (rather than once per cell) is content-identical to a per-cell intern.
+///
+/// # Errors
+/// Propagates a store write failure from interning a new property-key token.
+pub fn intern_property_key_tokens<D: BlockDevice, S: LogSink>(
+    store: &mut RecordStore<D, S>,
+    columns: &[ColumnRole],
+) -> Result<Vec<Option<u32>>> {
+    let mut out = Vec::with_capacity(columns.len());
+    for role in columns {
+        match role {
+            ColumnRole::Property { key, .. } => {
+                out.push(Some(store.intern_token(Namespace::PropKey, key)?));
+            }
+            _ => out.push(None),
+        }
+    }
+    Ok(out)
+}
+
+/// Ingests one node record into `store` under `txn`: creates the node, sets its `:LABEL` set and
+/// typed properties, and stages its external-id binding into `pending_id_map` — never directly into
+/// `id_map` (`rmp` #517's abort-safety invariant: a binding becomes visible to relationship
+/// resolution only once the caller's transaction durably commits and merges `pending_id_map` in).
+///
+/// `prop_key_tokens[i]` is the token [`intern_property_key_tokens`] resolved for column `i`;
+/// `label_memo` memoises label-name → token across rows within one caller-chosen scope (a whole
+/// file for the offline path, one batch for the network path — both are correct, since interning is
+/// idempotent by name and a memo only saves redundant `intern_token` calls, never changes the
+/// result).
+///
+/// SEC-196 (CWE-694): a duplicate non-empty external `:ID` is rejected under
+/// [`DuplicatePolicy::Strict`] (checked against both `id_map` and `pending_id_map`, so a collision
+/// within the very same in-flight batch is caught too) or counted and kept-first under
+/// [`DuplicatePolicy::SkipDuplicate`] — silently overwriting the binding would re-point every
+/// relationship referencing it onto the wrong node.
+///
+/// # Errors
+/// A header/value-parse/storage error, or [`DuplicatePolicy::Strict`]'s duplicate-`:ID` rejection.
+/// The caller is responsible for rolling back `txn` on `Err` (this function never does, since it
+/// does not own the transaction's lifecycle).
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_node_row<D: BlockDevice, S: LogSink>(
+    store: &mut RecordStore<D, S>,
+    txn: TxnId,
+    header: &NodeHeader,
+    prop_key_tokens: &[Option<u32>],
+    label_memo: &mut HashMap<String, u32>,
+    record: &csv::StringRecord,
+    id_map: &HashMap<String, u64>,
+    pending_id_map: &mut HashMap<String, u64>,
+    duplicate_policy: DuplicatePolicy,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let (node_id, _eid) = store.create_node(txn)?;
+
+    // External id (the join key for relationships).
+    let external_id = record.get(header.id_index).unwrap_or("").to_owned();
+
+    // Collect labels first (a single `set_node_labels` write), then properties.
+    // PERF (C18): dedup via a `HashSet` (O(1) membership) instead of `Vec::contains` (O(n) per
+    // probe, O(n^2) per row). `set_node_labels` treats labels as a set, so order is irrelevant.
+    let mut label_set: HashSet<u32> = HashSet::new();
+    for (i, role) in header.columns.iter().enumerate() {
+        let cell = record.get(i).unwrap_or("");
+        match role {
+            ColumnRole::Label => {
+                for label in cell.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    // Memoise label-name → token: intern once per distinct name, not per cell.
+                    let token = match label_memo.get(label) {
+                        Some(&t) => t,
+                        None => {
+                            let t = store.intern_token(Namespace::Label, label)?;
+                            label_memo.insert(label.to_owned(), t);
+                            t
+                        }
+                    };
+                    label_set.insert(token);
+                }
+            }
+            ColumnRole::Property { key, ty } => {
+                if let Some(value) =
+                    parse_cell(cell, *ty, key).map_err(graphus_core::GraphusError::from)?
+                {
+                    // Reuse the per-column pre-interned key token (`rmp` task #321).
+                    let key_token = prop_key_tokens[i].expect(
+                        "INVARIANT: a Property column has a pre-interned PropKey token (#321)",
+                    );
+                    store.set_node_property_value(txn, node_id, key_token, &value)?;
+                    stats.properties += 1;
+                }
+            }
+            // `:ID` is consumed via `header.id_index`; reserved rel roles never appear in a node
+            // header; `Ignore` columns are skipped.
+            ColumnRole::Id
+            | ColumnRole::StartId
+            | ColumnRole::EndId
+            | ColumnRole::Type
+            | ColumnRole::Ignore => {}
+        }
+    }
+    if !label_set.is_empty() {
+        let label_tokens: Vec<u32> = label_set.into_iter().collect();
+        store.set_node_labels(txn, node_id, &label_tokens)?;
+    }
+
+    // Bind the external id last (after a successful write) — see the doc comment above for why
+    // this stages into `pending_id_map` rather than `id_map` directly, and the duplicate-id policy.
+    if external_id.is_empty() {
+        pending_id_map.insert(external_id, node_id);
+    } else if let Some(existing) = pending_id_map
+        .get(&external_id)
+        .or_else(|| id_map.get(&external_id))
+        .copied()
+    {
+        match duplicate_policy {
+            DuplicatePolicy::Strict => {
+                return Err(graphus_core::GraphusError::Storage(format!(
+                    "bulk-import: duplicate :ID {external_id:?} (first bound to node {existing}, \
+                     row {} would rebind to node {node_id}); relationships would join the wrong \
+                     node. Deduplicate the input or use a skip-duplicate policy.",
+                    stats.nodes + 1
+                )));
+            }
+            DuplicatePolicy::SkipDuplicate => {
+                // Keep the first binding; the duplicate's node exists but stays unreferenceable
+                // by external id. Count the skip for the operator.
+                stats.skipped_duplicate_ids += 1;
+            }
+        }
+    } else {
+        pending_id_map.insert(external_id, node_id);
+    }
+    stats.nodes += 1;
+    Ok(())
+}
+
+/// Ingests one relationship record into `store` under `txn`: resolves `:START_ID`/`:END_ID` against
+/// the **confirmed** `id_map` (never `pending_id_map` — a relationship must join to an already
+/// durably-committed node, not one still in-flight in the current batch), creates the relationship,
+/// and sets its typed properties.
+///
+/// `type_memo` memoises `:TYPE` name → token across rows within one caller-chosen scope (mirrors
+/// `label_memo` in [`ingest_node_row`]).
+///
+/// # Errors
+/// A header/value-parse/storage error, or an unknown `:START_ID`/`:END_ID` (no node bound to that
+/// external id in `id_map`). The caller is responsible for rolling back `txn` on `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_rel_row<D: BlockDevice, S: LogSink>(
+    store: &mut RecordStore<D, S>,
+    txn: TxnId,
+    header: &RelHeader,
+    prop_key_tokens: &[Option<u32>],
+    type_memo: &mut HashMap<String, u32>,
+    record: &csv::StringRecord,
+    id_map: &HashMap<String, u64>,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let start_ext = record.get(header.start_index).unwrap_or("");
+    let end_ext = record.get(header.end_index).unwrap_or("");
+    let type_name = record.get(header.type_index).unwrap_or("");
+
+    let start_id = *id_map.get(start_ext).ok_or_else(|| {
+        graphus_core::GraphusError::Storage(format!(
+            "relationship references unknown :START_ID `{start_ext}` (no such node)"
+        ))
+    })?;
+    let end_id = *id_map.get(end_ext).ok_or_else(|| {
+        graphus_core::GraphusError::Storage(format!(
+            "relationship references unknown :END_ID `{end_ext}` (no such node)"
+        ))
+    })?;
+    // Memoise rel-type-name → token: intern once per distinct type, not per row (`rmp` task #321).
+    let type_token = match type_memo.get(type_name) {
+        Some(&t) => t,
+        None => {
+            let t = store.intern_token(Namespace::RelType, type_name)?;
+            type_memo.insert(type_name.to_owned(), t);
+            t
+        }
+    };
+    let (rel_id, _eid) = store.create_rel(txn, type_token, start_id, end_id)?;
+
+    for (i, role) in header.columns.iter().enumerate() {
+        if let ColumnRole::Property { key, ty } = role {
+            let cell = record.get(i).unwrap_or("");
+            if let Some(value) =
+                parse_cell(cell, *ty, key).map_err(graphus_core::GraphusError::from)?
+            {
+                // Reuse the per-column pre-interned key token (`rmp` task #321).
+                let key_token = prop_key_tokens[i]
+                    .expect("INVARIANT: a Property column has a pre-interned PropKey token (#321)");
+                store.set_rel_property_value(txn, rel_id, key_token, &value)?;
+                stats.properties += 1;
+            }
+        }
+    }
+    stats.relationships += 1;
+    Ok(())
 }

@@ -369,7 +369,7 @@ ones drive a `LocalEngine` directly. `run_sweep(seeds)` runs every scenario acro
 the CI-friendly entry point. The in-crate battery is deliberately sized to stay fast in a debug build;
 raw scale is delegated to the `vopr` CLI seed-sweep.
 
-The catalogue holds **20 scenarios**, grouped by the production-readiness dimensions a graph database
+The catalogue holds **21 scenarios**, grouped by the production-readiness dimensions a graph database
 must satisfy under extreme concurrency and load. Each entry below names the scenario, the production
 concern it certifies, and its oracle.
 
@@ -440,6 +440,22 @@ concern it certifies, and its oracle.
   (`LocalEngine::backup`, `graphus_crypto::seal_backup`/`open_backup`, `atomic_replace_file`,
   `restore_chain_file_atomic`, `verify_on_open`), since the server's `dbcatalog` orchestration is
   private.
+
+### Network bulk import
+
+- `network_bulk_ingest_mode_a` (rmp #519) — drives `LocalEngine::bulk_import_batch` against a fresh
+  database: seed-varying node/relationship batches with cumulative-stats assertions, an
+  aborted-batch (duplicate `:ID` under the Strict policy) retry proven idempotent, and a crash
+  mid-session. *Oracle:* every committed batch's cumulative stats are exact; the doomed batch leaves
+  no trace; after `crash_restart`, all previously committed nodes/relationships and the durable
+  checkpoint sentinel node (`batch_seq`/`nodes`/`relationships`/`properties`) survive intact; `End`
+  deletes the sentinel and reports the final stats on an uninterrupted session (the documented no-op
+  behavior of `End` immediately after a crash-restart, before the `LoadingSession` is re-established,
+  is asserted explicitly — see `crates/graphus-server/src/engine/bulk_load.rs`'s module doc on the
+  resumability contract). Reconstructs the ingestion path at the public-API level (`LocalEngine`),
+  the same convention `backup_restore_crash` established, since `08-network-bulk-import.md`'s
+  HTTP-transport and `DatabaseCatalog`/`Loading`-state layers are DST's structural non-goals
+  (covered instead by `dbcatalog.rs`'s `mod tests` and `graphus-server/tests/bulk_import_endpoint.rs`).
 
 ### Load shapes
 
