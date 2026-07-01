@@ -99,6 +99,7 @@ fn config(temp: &TempStore) -> ServerConfig {
         encryption: EncryptionConfig::default(),
         audit: AuditConfig::default(),
         allow_insecure_network: false,
+        bulk_import: graphus_server::config::BulkImportConfig::default(),
         metrics_scrape_token: None,
     }
 }

@@ -103,6 +103,17 @@ toml = "0.9"
 # Hold the loaded master key (encryption at rest, rmp #85) in zeroizing memory so it is wiped on
 # drop. Same crate (and version line) `graphus-crypto` uses for its keyring.
 zeroize = { version = "1", features = ["derive"] }
+# Polls the network bulk-import upload body (`08-network-bulk-import.md` §8, rmp #518) one frame at
+# a time via `BodyExt::frame`, so the request body is never buffered whole — the ingress-side mirror
+# of the `Body::from_stream` egress pattern rmp #475 already established. Same `0.1` line
+# `graphus-rest` already pins (previously only a dev-dependency here), so no duplicate tree enters
+# the build.
+http-body-util = "0.1"
+# The bulk-import endpoint's disk-space preflight/ongoing check (`08` §8): a small, pure-Rust
+# (`rustix`-backed on Unix, no raw `libc`/`unsafe` at this crate's boundary — required by this
+# crate's `#![forbid(unsafe_code)]`) `statvfs` wrapper. `default-features = false` drops the
+# file-locking ("sync") feature this crate does not use; only `available_space` is called.
+fs4 = { version = "1", default-features = false }
 
 [dev-dependencies]
 # In-test self-signed certificate generation for the TLS listener paths (`04 §8.4`; same crate
@@ -162,10 +173,10 @@ graphus-kg-gen = { path = "../graphus-kg-gen" }
 graphus-security-gen = { path = "../graphus-security-gen" }
 # The HTTP request/response types + body collector to drive the REST `axum::Router` via
 # `tower::ServiceExt::oneshot` in the hermetic mirror (the same no-socket pattern `graphus-rest`'s
-# own router tests use). `http`/`http-body-util` track the `1`/`0.1` lines `graphus-rest` already
-# pins, so no duplicate trees enter the build.
+# own router tests use). `http` tracks the `1` line `graphus-rest` already pins, so no duplicate
+# tree enters the build (`http-body-util` moved to `[dependencies]`: the bulk-import handler now
+# uses it in production code too, rmp #518).
 http = "1"
-http-body-util = "0.1"
 # The CBOR codec (RFC 8949) so the mirror can decode the `application/cbor` response body and assert
 # it is logically identical to the JSON body — the content-negotiation proof. Same `0.2` line
 # `graphus-rest` pins.

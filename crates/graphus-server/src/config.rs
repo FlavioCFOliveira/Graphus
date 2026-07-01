@@ -494,6 +494,54 @@ impl TimingConfig {
     }
 }
 
+/// Network bulk-import endpoint configuration (`08-network-bulk-import.md` §8; `rmp` #518): the
+/// resource limits guarding `POST /admin/db/{db}/bulk-import` — a deliberately oversized-body-
+/// tolerant route (exempt from [`graphus_rest::router::MAX_REQUEST_BODY_BYTES`]) that therefore
+/// needs its own, purpose-built ceiling instead.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BulkImportConfig {
+    /// Maximum total bytes a single bulk-import session may upload, enforced **as bytes are
+    /// consumed** from the request body (never after the fact — `08` §8): a session whose running
+    /// total crosses this ceiling is aborted mid-stream without ever materializing the excess in
+    /// memory. Must be `> 0`. Default: 8 GiB — a sensible ceiling for one streamed session; raise it
+    /// for a deployment that routinely loads larger datasets.
+    pub max_bytes_per_session: u64,
+    /// The minimum free space (bytes) that must remain on the **target database's** filesystem,
+    /// checked before the upload is accepted (the `08` §8 disk-space preflight) and re-checked
+    /// periodically as bytes are consumed (the ongoing check). An upload that would leave free space
+    /// below this reserve is refused up front, or aborted mid-stream, rather than running the device
+    /// out of space. `0` **disables** the check (not recommended in production). Default: 1 GiB.
+    pub min_free_disk_bytes: u64,
+    /// Maximum wall-clock duration a bulk-import session may stay open, from the first request byte
+    /// to the last (`08` §8's per-session timeout — guards an abandoned or deliberately slow-loris'd
+    /// upload). Measured on the real (wall-clock) timer, the same as
+    /// [`TimingConfig::handshake_timeout_ms`] and
+    /// [`TimingConfig::header_read_timeout_ms`] (network-level connection guards, not domain logic
+    /// gated on the injected [`graphus_core::capability::Clock`]). In milliseconds; must be `> 0`.
+    /// Default: 2 hours — generous enough for a multi-hundred-GB transfer over a modest link, yet
+    /// finite so an abandoned session is reclaimed.
+    pub session_timeout_ms: u64,
+}
+
+impl Default for BulkImportConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_session: 8 * 1024 * 1024 * 1024,
+            min_free_disk_bytes: 1024 * 1024 * 1024,
+            session_timeout_ms: 2 * 60 * 60 * 1000,
+        }
+    }
+}
+
+impl BulkImportConfig {
+    /// The per-session upload timeout as a [`Duration`].
+    #[must_use]
+    pub fn session_timeout(&self) -> Duration {
+        Duration::from_millis(self.session_timeout_ms)
+    }
+}
+
 /// One additional (non-admin) bootstrap user: a name and a password.
 ///
 /// Bootstrap users are granted database **read + write** (but **not** admin), so a deployment can
@@ -637,6 +685,11 @@ pub struct ServerConfig {
     /// the configured override). Security-critical deployments enable it — see [`AuditConfig`].
     pub audit: AuditConfig,
 
+    /// Network bulk-import endpoint resource limits (`08-network-bulk-import.md` §8; `rmp` #518):
+    /// the byte quota, disk-space reserve and session timeout guarding
+    /// `POST /admin/db/{db}/bulk-import`.
+    pub bulk_import: BulkImportConfig,
+
     /// **Escape hatch (default `false`):** allow a network listener (Bolt-TCP / REST) to run
     /// **without TLS**. Off by default so production is TLS-mandatory (`04 §8.4`); intended for
     /// loopback test harnesses and trusted-network/dev setups. The name is deliberately alarming so
@@ -674,6 +727,7 @@ impl Default for ServerConfig {
             auth: AuthBootstrap::default(),
             encryption: EncryptionConfig::default(),
             audit: AuditConfig::default(),
+            bulk_import: BulkImportConfig::default(),
             allow_insecure_network: false,
             metrics_scrape_token: None,
         }
@@ -980,6 +1034,20 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "timing.transaction_idle_timeout_ms must be > 0 (a zero idle timeout would reap \
                  every REST transaction the instant it is opened)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.max_bytes_per_session == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.max_bytes_per_session must be > 0 (a zero quota would reject every \
+                 bulk-import upload)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.session_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.session_timeout_ms must be > 0 (a zero session timeout would abort \
+                 every bulk-import upload immediately)"
                     .to_owned(),
             ));
         }

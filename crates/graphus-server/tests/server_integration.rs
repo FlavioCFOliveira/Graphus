@@ -107,6 +107,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         // The REST test client speaks plaintext HTTP on loopback; opt into the non-TLS network path
         // (production keeps this off — `ServerConfig::validate`).
         allow_insecure_network: true,
+        bulk_import: graphus_server::config::BulkImportConfig::default(),
         metrics_scrape_token: None,
     }
 }

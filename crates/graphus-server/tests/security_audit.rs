@@ -116,6 +116,7 @@ fn uds_only_config(temp: &TempStore) -> ServerConfig {
         encryption: EncryptionConfig::default(),
         audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: true,
+        bulk_import: graphus_server::config::BulkImportConfig::default(),
         metrics_scrape_token: None,
     }
 }

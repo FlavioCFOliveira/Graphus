@@ -103,6 +103,7 @@ fn config_for(dir: &TempDir, cert_path: PathBuf, key_path: PathBuf) -> ServerCon
         encryption: graphus_server::config::EncryptionConfig::default(),
         audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: false,
+        bulk_import: graphus_server::config::BulkImportConfig::default(),
         metrics_scrape_token: None,
     }
 }

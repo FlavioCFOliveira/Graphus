@@ -104,6 +104,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         encryption: graphus_server::config::EncryptionConfig::default(),
         audit: graphus_server::AuditConfig::default(),
         allow_insecure_network: true,
+        bulk_import: graphus_server::config::BulkImportConfig::default(),
         metrics_scrape_token: Some(SCRAPE_TOKEN.to_owned()),
     }
 }

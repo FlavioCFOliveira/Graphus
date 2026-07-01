@@ -96,6 +96,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         allow_insecure_network: true,
         // A scrape token so the `/metrics` reads below authenticate (rmp #149: /metrics is
         // fail-closed — an unauthenticated scrape is now 401).
+        bulk_import: graphus_server::config::BulkImportConfig::default(),
         metrics_scrape_token: Some(METRICS_TOKEN.to_owned()),
     }
 }

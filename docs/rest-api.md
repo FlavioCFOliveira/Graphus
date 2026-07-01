@@ -31,6 +31,7 @@ certificate, so clients pass `curl -k` / disable verification). The default data
 | `GET`    | `/admin/status`               | Bearer (admin)| Server status + open-transaction count |
 | `GET`    | `/admin/users/{name}`         | Bearer (admin)| Inspect a user's roles + password presence |
 | `POST`   | `/admin/shutdown`             | Bearer (admin)| Begin a graceful shutdown |
+| `POST`   | `/admin/db/{db}/bulk-import`  | Bearer (admin)| Streaming network bulk-import upload (§8.1) |
 
 ---
 
@@ -233,9 +234,10 @@ Errors use `Content-Type: application/problem+json`:
 | `404` | unknown / expired transaction id (or one owned by another principal) |
 | `406` / `415` | unacceptable `Accept` / unsupported `Content-Type` |
 | `409` | serialization conflict (retriable) |
-| `413` | request body over 4 MiB |
+| `413` | request body over 4 MiB (over the configured quota for `/admin/db/{db}/bulk-import`) |
 | `429` | too many open transactions, or `/auth/login` rate-limited (retriable) |
 | `500` | internal fault (detail redacted; logged server-side) |
+| `507` | insufficient free disk space (`/admin/db/{db}/bulk-import` only) |
 
 ---
 
@@ -250,6 +252,35 @@ Errors use `Content-Type: application/problem+json`:
 - `GET /admin/users/{name}` → `{ "user": "...", "roles": [...], "has_password": true }`
   (admin), or `404`.
 - `POST /admin/shutdown` → `202 Accepted`, drain proceeds in the background (admin).
+
+### 8.1 Network bulk import — `POST /admin/db/{db}/bulk-import`
+
+Streams a large CSV (`neo4j-admin import` flavour) or `.gcol` (columnar) dataset into a
+database over the network, for scale that ordinary parameterized Cypher cannot reach
+(millions of nodes, hundreds of millions of relationships) — see
+`specification/08-network-bulk-import.md` for the full design.
+
+- **Auth:** the global `Admin` privilege — the same gate as `BACKUP`/`RESTORE`/
+  `CREATE DATABASE`. Missing/invalid Bearer → `401`; valid Bearer without `Admin` → `403`.
+- **`Content-Type`:** `text/csv` or `application/vnd.graphus.gcol` (a `;charset=...`
+  parameter is ignored; matching is case-insensitive). Anything else → `415`.
+- **Streaming, not buffered:** the body is read incrementally and is exempt from the
+  general 4 MiB `DefaultBodyLimit` — it has its own configurable byte quota
+  (`bulk_import.max_bytes_per_session`, default 8 GiB), enforced as bytes arrive. Exceeding
+  it aborts the upload with `413` without ever holding the excess in memory.
+- **Disk-space guard:** before accepting the upload, and periodically while streaming, the
+  server checks free space on the target database's volume against
+  `bulk_import.min_free_disk_bytes` (default 1 GiB). Insufficient space → `507`.
+  `0` disables the check.
+- **Session timeout:** `bulk_import.session_timeout_ms` (default 2 hours) bounds the whole
+  upload's wall-clock duration; exceeding it aborts with `408`.
+- **Target database:** the `{db}` path segment; an unknown database → `404`.
+- `202 Accepted` on success: `{ "accepted_bytes": N, "format": "csv" | "gcol" }`.
+
+This is the scaffolding milestone (`rmp` #518): the endpoint validates, streams, and
+enforces the resource limits above, but does not yet hand the ingested bytes to the bulk
+importer — that lands in a follow-up. Every session's admission decision and outcome is
+recorded in the security audit log (`security.md`).
 
 User, role, and database administration is done by sending the administrative statements
 (`CREATE USER`, `GRANT`, `CREATE DATABASE`, …) to the transactional endpoint as an

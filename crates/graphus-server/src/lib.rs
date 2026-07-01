@@ -39,6 +39,6 @@ pub mod shutdown;
 pub mod store_device;
 
 pub use audit::{AuditClass, AuditConfig, AuditEvent, AuditLog, AuditOutcome, AuditSource};
-pub use config::{ConfigError, ServerConfig};
+pub use config::{BulkImportConfig, ConfigError, ServerConfig};
 pub use dbcatalog::{CatalogError, DatabaseCatalog, DbInfo, DbState};
 pub use server::{Server, ServerError, ServerHandle};

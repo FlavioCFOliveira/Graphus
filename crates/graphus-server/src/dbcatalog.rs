@@ -1128,6 +1128,38 @@ impl DatabaseCatalog {
         self.root.join(DATABASES_DIR_NAME).join(name)
     }
 
+    /// The directory holding `name`'s store, whether it is the **default** database (directly in
+    /// the root) or an **additional** one (`<root>/databases/<name>`) — module docs, "On-disk
+    /// layout". Resolves the default/additional split so a caller that just needs a database's
+    /// on-disk location (e.g. the network bulk-import endpoint's disk-space preflight, `rmp` #518)
+    /// need not duplicate it. `name` is normalized first (case-insensitive, like every other catalog
+    /// lookup); an invalid name falls back to the root, matching [`handle`](Self::handle)'s
+    /// fail-safe style — callers that must distinguish "invalid name" from "a real path" should
+    /// validate with [`normalize_db_name`] (or [`exists`](Self::exists)) first.
+    #[must_use]
+    pub fn database_dir(&self, name: &str) -> PathBuf {
+        match normalize_db_name(name) {
+            Ok(n) if n != self.default_name => self.db_dir(&n),
+            _ => self.root.clone(),
+        }
+    }
+
+    /// Whether a database named `name` exists in the catalog — **default or additional, online or
+    /// offline** (unlike [`handle`](Self::handle), which only reports *running* databases). `name`
+    /// is normalized first (case-insensitive, like every other catalog lookup); an invalid name is
+    /// simply reported as not existing rather than an error, since "invalid" and "absent" are the
+    /// same answer to "can I target this database".
+    #[must_use]
+    pub async fn exists(&self, name: &str) -> bool {
+        let Ok(name) = normalize_db_name(name) else {
+            return false;
+        };
+        if name == self.default_name {
+            return true;
+        }
+        self.admin.lock().await.entries.contains_key(&name)
+    }
+
     /// Looks up the running engine handle for `name` (case-insensitive). `None` when the database
     /// does not exist or is not online. Cheap and concurrent: a brief read lock + a handle clone,
     /// never held across an `.await` (module docs: locking design).

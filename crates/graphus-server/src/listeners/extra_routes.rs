@@ -17,6 +17,8 @@
 //! - `GET  /admin/status` — server status (open transactions, readiness).
 //! - `GET  /admin/users/{name}` — inspect a named user's roles (RBAC inspection).
 //! - `POST /admin/shutdown` — trigger graceful shutdown (`04 §9.4`).
+//! - `POST /admin/db/{db}/bulk-import` — streaming network bulk-import upload
+//!   (`08-network-bulk-import.md`, `rmp` #518; see the [`bulk_import`] submodule).
 //!
 //! All `/admin/*` routes require an authenticated principal with the global `Admin` privilege.
 //!
@@ -25,6 +27,8 @@
 //! ([`crate::admin`], rmp #92): `CREATE USER`, `GRANT`, … run over Bolt/UDS/REST and persist to
 //! `security.toml`, and — since these routes read the live catalog — take effect for this surface's
 //! authentication immediately.
+
+mod bulk_import;
 
 use std::sync::Arc;
 
@@ -35,6 +39,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use graphus_auth::Privilege;
 
+use crate::audit::AuditLog;
+use crate::config::BulkImportConfig;
 use crate::dbcatalog::DatabaseCatalog;
 use crate::engine::EngineHandle;
 use crate::metrics::Metrics;
@@ -47,7 +53,8 @@ struct ExtraState {
     metrics: Arc<Metrics>,
     engine: EngineHandle,
     /// The database catalog, for **per-database** readiness aggregation (`rmp` #414/#430): which
-    /// running databases are engine-degraded, and how many configured databases failed to open.
+    /// running databases are engine-degraded, and how many configured databases failed to open; and
+    /// for resolving a bulk-import target database's existence + on-disk directory (`rmp` #518).
     catalog: Arc<DatabaseCatalog>,
     /// The LIVE security catalog (rmp #94): every `/admin/*` Bearer check + RBAC read resolves
     /// through it under a brief read lock, so runtime user/role mutations are visible at once.
@@ -58,6 +65,13 @@ struct ExtraState {
     /// Optional Prometheus scrape token (rmp #149). `None` ⇒ `/metrics` requires an **admin Bearer**;
     /// `Some(token)` ⇒ `/metrics` also accepts `Authorization: Bearer <token>` (constant-time match).
     metrics_scrape_token: Option<Arc<str>>,
+    /// The audit log (rmp #70): every bulk-import session's admission decision and outcome is
+    /// recorded here (`08` §6) — the other `/admin/*` routes above predate rmp #70's REST wiring and
+    /// do not yet audit; only the new bulk-import route does, per its own specification.
+    audit: Arc<AuditLog>,
+    /// Bulk-import resource limits (`08` §8; `rmp` #518): byte quota, disk-space reserve, session
+    /// timeout.
+    bulk_import: Arc<BulkImportConfig>,
 }
 
 /// Builds the observability + admin routes as a standalone `Router` to be merged onto the REST API
@@ -72,6 +86,8 @@ pub fn routes(
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
     metrics_scrape_token: Option<Arc<str>>,
+    audit: Arc<AuditLog>,
+    bulk_import: BulkImportConfig,
 ) -> Router {
     let state = ExtraState {
         metrics,
@@ -82,6 +98,8 @@ pub fn routes(
         shutdown,
         readiness,
         metrics_scrape_token,
+        audit,
+        bulk_import: Arc::new(bulk_import),
     };
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -90,6 +108,10 @@ pub fn routes(
         .route("/admin/status", get(admin_status))
         .route("/admin/users/{name}", get(admin_user))
         .route("/admin/shutdown", post(admin_shutdown))
+        .route(
+            "/admin/db/{db}/bulk-import",
+            post(bulk_import::admin_bulk_import),
+        )
         .with_state(state)
 }
 

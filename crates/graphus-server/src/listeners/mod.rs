@@ -263,6 +263,7 @@ pub async fn start_all(
             config.metrics_scrape_token.as_deref().map(Arc::from),
             config.timing.transaction_idle_timeout(),
             config.admission.max_open_transactions,
+            config.bulk_import.clone(),
         );
         tokio::spawn(rest::run_rest_accept_loop(
             acceptor,
@@ -326,6 +327,7 @@ fn build_rest_router(
     metrics_scrape_token: Option<Arc<str>>,
     transaction_idle_timeout: std::time::Duration,
     max_open_transactions: usize,
+    bulk_import: crate::config::BulkImportConfig,
 ) -> axum::Router {
     use graphus_rest::registry::TxRegistry;
     use graphus_rest::router::{AppState, router};
@@ -378,6 +380,8 @@ fn build_rest_router(
         shutdown,
         readiness,
         metrics_scrape_token,
+        audit,
+        bulk_import,
     );
     api.merge(extra)
 }
