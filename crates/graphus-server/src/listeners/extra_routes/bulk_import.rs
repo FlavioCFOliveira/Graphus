@@ -1,11 +1,13 @@
 //! `POST /admin/db/{db}/bulk-import` — the network bulk-import streaming upload endpoint, **Mode A**
-//! (`08-network-bulk-import.md`, decision `D-bulk-import-network`, `rmp` #518/#519).
+//! and **Mode B** (`08-network-bulk-import.md`, decision `D-bulk-import-network`, `rmp` #518/#519/#520).
 //!
 //! Mode A drives [`graphus_bulk`]'s low-level, offline-importer-equivalent ingestion (via
 //! [`crate::engine::bulk_load`]) against an **empty** database taken over exclusively (the `Loading`
-//! state, `08` §5.2) for the duration of the session. A non-empty, live-serving database is out of
-//! scope here — that is Mode B (`rmp` #520, not yet implemented), and this endpoint `409`s cleanly
-//! rather than attempting it.
+//! state, `08` §5.2) for the duration of the session. Mode B (`?mode=live`, `rmp` #520; see
+//! [`handle_phase_mode_b`]/[`crate::bulk_import_mode_b`]) drives the same streaming/CSV/`.gcol`/
+//! quota/disk-space/timeout machinery against an already-**live**, non-empty, still-serving database,
+//! with every row applied through the ordinary transactional (SSI-checked) write path instead of Mode
+//! A's raw low-level one — see [`BatchSink`] for the one branch point between the two.
 //!
 //! ## Wire protocol
 //!
@@ -151,6 +153,7 @@ use graphus_cypher::MaterializedValue;
 use http_body_util::BodyExt;
 
 use crate::audit::{AuditClass, AuditEvent, AuditOutcome, AuditSource};
+use crate::bulk_import_mode_b::{ModeBCapacityReached, ModeBSession};
 use crate::dbcatalog::CatalogError;
 use crate::engine::{AccessMode, BulkImportBatchInput, EngineHandle};
 
@@ -227,20 +230,60 @@ enum Op {
     End,
 }
 
-/// Parses `raw_query` (the request's raw query string, `None` if absent) into an [`Op`].
+/// The bulk-import mode a call declares (`08` §5: "a bulk-import session declares its mode explicitly
+/// when it opens — it is never inferred"), decoded from `?mode=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportMode {
+    /// Mode A (`08` §5.1/§5.2): a fresh/empty database taken over exclusively (`Loading`).
+    Fresh,
+    /// Mode B (`08` §5.3, `rmp` #520): an already-live database, no exclusivity.
+    Live,
+}
+
+impl ImportMode {
+    /// Case-insensitive: matches this endpoint's other query-value conventions loosely enough for
+    /// `curl`-friendly scripting without inviting ambiguity (only the two literal spellings match).
+    fn parse(v: &str) -> Option<Self> {
+        match v.to_ascii_lowercase().as_str() {
+            "fresh" => Some(Self::Fresh),
+            "live" => Some(Self::Live),
+            _ => None,
+        }
+    }
+}
+
+/// The fully-decoded query string: which operation, which mode, and (Mode B only) which session.
+#[derive(Debug)]
+struct ParsedQuery {
+    op: Op,
+    /// Whether this call operates in Mode B. `true` iff `mode=live` was explicit, or `mode` was
+    /// omitted while `session=<uuid>` was present (`08` §5: the natural shorthand for "continue my
+    /// already-open Mode B session" — still an explicit declaration via the presence of `session`,
+    /// never a guess from unrelated request shape).
+    live: bool,
+    /// The Mode B session id, if `session=<uuid>` was present and well-formed.
+    session: Option<uuid::Uuid>,
+}
+
+/// Parses `raw_query` (the request's raw query string, `None` if absent) into a [`ParsedQuery`].
 ///
-/// Recognized parameters: `phase` (`"nodes"` or `"relationships"`) and `end` (`"true"`; any other
-/// value, or its absence, means "not ending"). `end=true` takes precedence if somehow both are
-/// present (defensive — a well-behaved client never sends both). Every other query parameter is
-/// ignored. Values are compared verbatim (no percent-decoding): the three accepted literals never
-/// need it, and a client that needlessly encodes them gets a clear `400` rather than a silent
-/// misparse.
+/// Recognized parameters: `phase` (`"nodes"` or `"relationships"`), `end` (`"true"`; any other value,
+/// or its absence, means "not ending"), `mode` (`"fresh"` or `"live"`, case-insensitive), and
+/// `session` (a UUID). `end=true` takes precedence over `phase` if somehow both are present
+/// (defensive — a well-behaved client never sends both). Every other query parameter is ignored.
+/// Values are compared verbatim (no percent-decoding): none of the accepted literals need it, and a
+/// client that needlessly encodes them gets a clear `400` rather than a silent misparse.
 ///
 /// # Errors
-/// A short, client-facing message when neither a recognized `phase` nor `end=true` is present.
-fn parse_op(raw_query: Option<&str>) -> Result<Op, String> {
+/// A short, client-facing message when: neither a recognized `phase` nor `end=true` is present; `mode`
+/// is present but not `"fresh"`/`"live"`; `session` is present but not a well-formed UUID; or `mode`
+/// is explicitly `"fresh"` while `session` is also present (a session id is a Mode B concept only —
+/// Mode A has no session, `08` §5.2's exclusivity is per-database, not per-session).
+fn parse_query(raw_query: Option<&str>) -> Result<ParsedQuery, String> {
     let mut phase: Option<&str> = None;
     let mut end = false;
+    let mut mode_raw: Option<&str> = None;
+    let mut session_raw: Option<&str> = None;
     for pair in raw_query.unwrap_or_default().split('&') {
         if pair.is_empty() {
             continue;
@@ -249,23 +292,56 @@ fn parse_op(raw_query: Option<&str>) -> Result<Op, String> {
         match key {
             "phase" => phase = Some(value),
             "end" => end = value == "true",
+            "mode" => mode_raw = Some(value),
+            "session" => session_raw = Some(value),
             _ => {}
         }
     }
-    if end {
-        return Ok(Op::End);
-    }
-    match phase {
-        Some("nodes") => Ok(Op::Phase(Phase::Nodes)),
-        Some("relationships") => Ok(Op::Phase(Phase::Relationships)),
-        Some(other) => Err(format!(
-            "invalid phase={other:?}: expected \"nodes\" or \"relationships\""
-        )),
-        None => Err(
-            "missing query parameter: specify ?phase=nodes, ?phase=relationships, or ?end=true"
-                .to_owned(),
+
+    let mode = match mode_raw {
+        Some(v) => Some(
+            ImportMode::parse(v)
+                .ok_or_else(|| format!("invalid mode={v:?}: expected \"fresh\" or \"live\""))?,
         ),
+        None => None,
+    };
+    let session = match session_raw {
+        Some(v) => Some(
+            uuid::Uuid::parse_str(v)
+                .map_err(|_| format!("invalid session={v:?}: expected a UUID"))?,
+        ),
+        None => None,
+    };
+    if mode == Some(ImportMode::Fresh) && session.is_some() {
+        return Err(
+            "session=... is only meaningful with mode=live: Mode A (mode=fresh) has no session id, \
+             its exclusivity is per-database (the Loading state), not per-session"
+                .to_owned(),
+        );
     }
+    let live = mode == Some(ImportMode::Live) || (mode.is_none() && session.is_some());
+
+    let op = if end {
+        Op::End
+    } else {
+        match phase {
+            Some("nodes") => Op::Phase(Phase::Nodes),
+            Some("relationships") => Op::Phase(Phase::Relationships),
+            Some(other) => {
+                return Err(format!(
+                    "invalid phase={other:?}: expected \"nodes\" or \"relationships\""
+                ));
+            }
+            None => {
+                return Err(
+                    "missing query parameter: specify ?phase=nodes, ?phase=relationships, or \
+                     ?end=true"
+                        .to_owned(),
+                );
+            }
+        }
+    };
+    Ok(ParsedQuery { op, live, session })
 }
 
 /// `POST /admin/db/{db}/bulk-import` — see the module docs for the wire protocol.
@@ -292,8 +368,8 @@ pub(super) async fn admin_bulk_import(
         }
     };
 
-    let op = match parse_op(raw_query.as_deref()) {
-        Ok(op) => op,
+    let parsed = match parse_query(raw_query.as_deref()) {
+        Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
 
@@ -312,14 +388,33 @@ pub(super) async fn admin_bulk_import(
             .into_response();
     }
 
-    match op {
-        Op::End => handle_end(&state, &who, &db_name).await,
-        Op::Phase(phase) => {
+    match (parsed.op, parsed.live) {
+        (Op::End, false) => handle_end(&state, &who, &db_name).await,
+        (Op::End, true) => {
+            let Some(session) = parsed.session else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "?end=true&mode=live requires ?session=<uuid>: a Mode B session id is required \
+                     to know which session to end"
+                        .to_owned(),
+                )
+                    .into_response();
+            };
+            handle_end_mode_b(&state, &who, &db_name, session).await
+        }
+        (Op::Phase(phase), false) => {
             let format = match BulkImportFormat::from_headers(&headers) {
                 Ok(f) => f,
                 Err(msg) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg).into_response(),
             };
             handle_phase(&state, &who, &db_name, phase, format, body).await
+        }
+        (Op::Phase(phase), true) => {
+            let format = match BulkImportFormat::from_headers(&headers) {
+                Ok(f) => f,
+                Err(msg) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg).into_response(),
+            };
+            handle_phase_mode_b(&state, &who, &db_name, phase, parsed.session, format, body).await
         }
     }
 }
@@ -409,8 +504,8 @@ async fn begin_session(
             StatusCode::CONFLICT,
             format!(
                 "database {db_name:?} is not empty ({count} node(s) found); Mode A network \
-                 bulk-import requires an empty database. For a live, non-empty database, Mode B \
-                 (`rmp` #520) is the option — not yet implemented."
+                 bulk-import requires an empty database. For a live, non-empty database, use Mode B \
+                 (`rmp` #520): add ?mode=live to the request."
             ),
         ));
     }
@@ -638,12 +733,106 @@ impl Read for ChunkReader {
     }
 }
 
+/// Where a materialized batch of parsed rows goes — the ONE branch point [`run_batch_loop`]'s shared
+/// streaming/CSV/quota/disk-space/timeout machinery needs between **Mode A** (`08` §5.1: the raw,
+/// low-level, no-SSI engine ingest) and **Mode B** (`08` §5.3, `rmp` #520: the ordinary transactional
+/// batch driver). Owns whatever state must survive across a call's many batches: Mode A's cumulative
+/// [`ImportStats`] reply, Mode B's checked-out [`ModeBSession`] (moved in and handed back — see
+/// [`BatchSink::into_mode_b_session`] — because [`tokio::task::spawn_blocking`] requires a `'static`,
+/// owned closure, so a borrowed `&mut ModeBSession` cannot cross that boundary).
+enum BatchSink {
+    /// Mode A: every batch is one direct [`EngineHandle::bulk_import_batch`] call.
+    ModeA {
+        engine: EngineHandle,
+        stats: ImportStats,
+    },
+    /// Mode B: every batch is one [`crate::bulk_import_mode_b::drive_mode_b_batch`] call against the
+    /// checked-out `session`.
+    ModeB {
+        engine: EngineHandle,
+        session: ModeBSession,
+        cfg: Arc<crate::config::BulkImportConfig>,
+    },
+}
+
+impl BatchSink {
+    /// The batch size this sink's caller should accumulate rows to before calling
+    /// [`ingest`](Self::ingest): Mode A's fixed [`DEFAULT_BATCH_SIZE`], or Mode B's configured
+    /// [`BulkImportConfig::mode_b_batch_rows`](crate::config::BulkImportConfig::mode_b_batch_rows).
+    fn batch_rows(&self) -> usize {
+        match self {
+            Self::ModeA { .. } => DEFAULT_BATCH_SIZE,
+            Self::ModeB { cfg, .. } => {
+                usize::try_from(cfg.mode_b_batch_rows.max(1)).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    /// Ingests one batch, off the async runtime (`rt.block_on` — the sanctioned off-worker pattern
+    /// this module already documents elsewhere).
+    ///
+    /// # Errors
+    /// [`BulkIngestError::Engine`] for a row/storage/commit/conflict failure.
+    fn ingest(
+        &mut self,
+        rt: &tokio::runtime::Handle,
+        batch: crate::bulk_import_mode_b::BatchRows,
+    ) -> Result<(), BulkIngestError> {
+        match self {
+            Self::ModeA { engine, stats } => {
+                let input = match batch {
+                    crate::bulk_import_mode_b::BatchRows::Nodes { header, records } => {
+                        BulkImportBatchInput::Nodes { header, records }
+                    }
+                    crate::bulk_import_mode_b::BatchRows::Relationships { header, records } => {
+                        BulkImportBatchInput::Relationships { header, records }
+                    }
+                };
+                let outcome = rt
+                    .block_on(engine.bulk_import_batch(input))
+                    .map_err(BulkIngestError::Engine)?;
+                *stats = outcome.stats;
+                Ok(())
+            }
+            Self::ModeB {
+                engine,
+                session,
+                cfg,
+            } => rt
+                .block_on(crate::bulk_import_mode_b::drive_mode_b_batch(
+                    engine, session, &batch, cfg,
+                ))
+                .map_err(BulkIngestError::Engine),
+        }
+    }
+
+    /// The cumulative stats to report after the whole call: Mode A's last batch reply, or Mode B's
+    /// session-cumulative stats.
+    fn stats(&self) -> ImportStats {
+        match self {
+            Self::ModeA { stats, .. } => *stats,
+            Self::ModeB { session, .. } => session.stats,
+        }
+    }
+
+    /// Reclaims the checked-out [`ModeBSession`] (Mode A yields `None`) so the caller can check it
+    /// back into [`crate::bulk_import_mode_b::ModeBSessionRegistry`] — regardless of whether the call
+    /// ultimately succeeded or failed (an earlier batch within this same call may have already
+    /// committed real progress that must not be lost by discarding the session).
+    fn into_mode_b_session(self) -> Option<ModeBSession> {
+        match self {
+            Self::ModeA { .. } => None,
+            Self::ModeB { session, .. } => Some(session),
+        }
+    }
+}
+
 /// The shared batch-ingestion core: parses `reader`'s header, then streams+batches its data rows into
-/// [`crate::engine::EngineHandle::bulk_import_batch`] calls of up to
-/// [`graphus_bulk::DEFAULT_BATCH_SIZE`] rows. Generic over [`Read`] so the SAME loop backs both the
-/// streaming-CSV [`ChunkReader`] and the `.gcol` path's in-memory [`Cursor`] (module docs' "`.gcol`
-/// handling"). Runs entirely off the async runtime (called from inside `spawn_blocking`); `rt.block_on`
-/// is the sanctioned off-worker pattern this codebase already documents elsewhere (module docs).
+/// [`BatchSink::ingest`] calls of up to [`BatchSink::batch_rows`] rows. Generic over [`Read`] so the
+/// SAME loop backs both the streaming-CSV [`ChunkReader`] and the `.gcol` path's in-memory [`Cursor`]
+/// (module docs' "`.gcol` handling"). Runs entirely off the async runtime (called from inside
+/// `spawn_blocking`); `rt.block_on` is the sanctioned off-worker pattern this codebase already
+/// documents elsewhere (module docs).
 ///
 /// Always submits at least one (possibly empty) final batch, so the caller learns the session's
 /// current cumulative stats even when this call's file had a header but zero remaining data rows.
@@ -651,11 +840,11 @@ impl Read for ChunkReader {
 /// # Errors
 /// [`BulkIngestError::EmptyFile`] if the reader yields no header row at all,
 /// [`BulkIngestError::Header`]/[`BulkIngestError::Csv`] for a malformed header/record, or
-/// [`BulkIngestError::Engine`] for a row/storage/commit failure from the engine.
+/// [`BulkIngestError::Engine`] for a row/storage/commit failure from the sink.
 fn run_batch_loop<R: Read>(
     reader: R,
     phase: Phase,
-    engine: &EngineHandle,
+    sink: &mut BatchSink,
     rt: &tokio::runtime::Handle,
 ) -> Result<ImportStats, BulkIngestError> {
     let mut csv_reader = csv::ReaderBuilder::new()
@@ -672,30 +861,34 @@ fn run_batch_loop<R: Read>(
         return Err(BulkIngestError::EmptyFile);
     }
 
-    let make_batch: Box<dyn Fn(Vec<csv::StringRecord>) -> BulkImportBatchInput> = match phase {
-        Phase::Nodes => {
-            let header = Arc::new(
-                NodeHeader::parse(header_record.iter())
-                    .map_err(|e| BulkIngestError::Header(e.to_string()))?,
-            );
-            Box::new(move |records| BulkImportBatchInput::Nodes {
-                header: Arc::clone(&header),
-                records,
-            })
-        }
-        Phase::Relationships => {
-            let header = Arc::new(
-                RelHeader::parse(header_record.iter())
-                    .map_err(|e| BulkIngestError::Header(e.to_string()))?,
-            );
-            Box::new(move |records| BulkImportBatchInput::Relationships {
-                header: Arc::clone(&header),
-                records,
-            })
-        }
-    };
+    let make_batch: Box<dyn Fn(Vec<csv::StringRecord>) -> crate::bulk_import_mode_b::BatchRows> =
+        match phase {
+            Phase::Nodes => {
+                let header = Arc::new(
+                    NodeHeader::parse(header_record.iter())
+                        .map_err(|e| BulkIngestError::Header(e.to_string()))?,
+                );
+                Box::new(move |records| crate::bulk_import_mode_b::BatchRows::Nodes {
+                    header: Arc::clone(&header),
+                    records,
+                })
+            }
+            Phase::Relationships => {
+                let header = Arc::new(
+                    RelHeader::parse(header_record.iter())
+                        .map_err(|e| BulkIngestError::Header(e.to_string()))?,
+                );
+                Box::new(
+                    move |records| crate::bulk_import_mode_b::BatchRows::Relationships {
+                        header: Arc::clone(&header),
+                        records,
+                    },
+                )
+            }
+        };
 
-    let mut batch: Vec<csv::StringRecord> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+    let batch_rows = sink.batch_rows();
+    let mut batch: Vec<csv::StringRecord> = Vec::with_capacity(batch_rows.min(DEFAULT_BATCH_SIZE));
     let mut record = csv::StringRecord::new();
     loop {
         let more = csv_reader
@@ -705,23 +898,20 @@ fn run_batch_loop<R: Read>(
             break;
         }
         batch.push(record.clone());
-        if batch.len() >= DEFAULT_BATCH_SIZE {
+        if batch.len() >= batch_rows {
             let input = make_batch(std::mem::take(&mut batch));
             // Full intermediate batches are committed for throughput (so the engine thread is never
             // blocked on the whole file); only the FINAL flush's stats are reported below, so an
             // intermediate outcome is intentionally discarded here.
-            rt.block_on(engine.bulk_import_batch(input))
-                .map_err(BulkIngestError::Engine)?;
+            sink.ingest(rt, input)?;
         }
     }
     // Always flush the final (possibly empty) batch: mirrors `BulkImporter::import_nodes`'s
     // unconditional final commit (see the doc comment above). Its outcome carries the session's
     // cumulative stats.
-    let outcome = rt
-        .block_on(engine.bulk_import_batch(make_batch(batch)))
-        .map_err(BulkIngestError::Engine)?;
+    sink.ingest(rt, make_batch(batch))?;
 
-    Ok(outcome.stats)
+    Ok(sink.stats())
 }
 
 /// The chunk channel's bound: small enough that a stalled batch (e.g. mid-commit) throttles the
@@ -731,18 +921,25 @@ const CHUNK_CHANNEL_CAPACITY: usize = 8;
 
 /// Streams `body` as one CSV file, batching + ingesting it via [`run_batch_loop`] on a blocking task
 /// bridged by a bounded chunk channel (module docs' "Streaming and batching").
+///
+/// `sink` is moved into the blocking task (required for `'static` `spawn_blocking`) and handed back in
+/// the returned tuple's first element — `None` only if the blocking task itself **panicked** (the
+/// `sink`, and for Mode B the checked-out [`ModeBSession`] within it, is unrecoverably lost in that one
+/// rare case; the caller must not pretend to check a lost session back in).
 async fn ingest_csv_stream(
-    engine: EngineHandle,
+    sink: BatchSink,
     phase: Phase,
     mut body: Body,
     quota: u64,
     min_free: u64,
     target_dir: PathBuf,
-) -> Result<ImportStats, BulkIngestError> {
+) -> (Option<BatchSink>, Result<ImportStats, BulkIngestError>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<ChunkMsg>(CHUNK_CHANNEL_CAPACITY);
     let rt = tokio::runtime::Handle::current();
     let blocking = tokio::task::spawn_blocking(move || {
-        run_batch_loop(ChunkReader::new(rx), phase, &engine, &rt)
+        let mut sink = sink;
+        let result = run_batch_loop(ChunkReader::new(rx), phase, &mut sink, &rt);
+        (sink, result)
     });
 
     let mut guard = QuotaGuard::new(quota, min_free, target_dir);
@@ -775,53 +972,71 @@ async fn ingest_csv_stream(
     }
     drop(tx); // signals clean EOF to `ChunkReader` when the loop ended without an abort.
 
-    let joined = blocking.await;
-    if let Some(err) = abort {
-        // Prefer our own precise transport/quota/disk-space diagnosis over whatever csv::Reader
-        // derived from the resulting broken pipe.
-        return Err(err);
-    }
-    match joined {
-        Err(join_err) => Err(BulkIngestError::JoinPanicked(join_err.to_string())),
-        Ok(inner) => inner,
+    match blocking.await {
+        Err(join_err) => (
+            None,
+            Err(BulkIngestError::JoinPanicked(join_err.to_string())),
+        ),
+        Ok((sink, inner)) => {
+            if let Some(err) = abort {
+                // Prefer our own precise transport/quota/disk-space diagnosis over whatever
+                // csv::Reader derived from the resulting broken pipe — but still hand `sink` back.
+                (Some(sink), Err(err))
+            } else {
+                (Some(sink), inner)
+            }
+        }
     }
 }
 
 /// Buffers `body` whole (still quota-bounded), transcodes it from `.gcol` to CSV, then runs the SAME
-/// [`run_batch_loop`] the streaming path uses (module docs' "`.gcol` handling").
+/// [`run_batch_loop`] the streaming path uses (module docs' "`.gcol` handling"). See
+/// [`ingest_csv_stream`] for the `sink` round-tripping contract.
 async fn ingest_gcol_buffered(
-    engine: EngineHandle,
+    sink: BatchSink,
     phase: Phase,
     mut body: Body,
     quota: u64,
     min_free: u64,
     target_dir: PathBuf,
-) -> Result<ImportStats, BulkIngestError> {
+) -> (Option<BatchSink>, Result<ImportStats, BulkIngestError>) {
     let mut guard = QuotaGuard::new(quota, min_free, target_dir);
     let mut buf: Vec<u8> = Vec::new();
     loop {
         match body.frame().await {
             None => break,
-            Some(Err(e)) => return Err(BulkIngestError::Transport(e.to_string())),
+            Some(Err(e)) => return (Some(sink), Err(BulkIngestError::Transport(e.to_string()))),
             Some(Ok(frame)) => {
                 let Some(data) = frame.data_ref() else {
                     continue;
                 };
-                guard.observe(data.len() as u64).await?;
+                if let Err(err) = guard.observe(data.len() as u64).await {
+                    return (Some(sink), Err(err));
+                }
                 buf.extend_from_slice(data);
             }
         }
     }
 
     let rt = tokio::runtime::Handle::current();
-    let joined = tokio::task::spawn_blocking(move || -> Result<ImportStats, BulkIngestError> {
-        let csv_bytes = gcol_to_csv(&buf).map_err(|e| BulkIngestError::Gcol(e.to_string()))?;
-        run_batch_loop(Cursor::new(csv_bytes), phase, &engine, &rt)
-    })
+    let joined = tokio::task::spawn_blocking(
+        move || -> (BatchSink, Result<ImportStats, BulkIngestError>) {
+            let mut sink = sink;
+            let result = (|| {
+                let csv_bytes =
+                    gcol_to_csv(&buf).map_err(|e| BulkIngestError::Gcol(e.to_string()))?;
+                run_batch_loop(Cursor::new(csv_bytes), phase, &mut sink, &rt)
+            })();
+            (sink, result)
+        },
+    )
     .await;
     match joined {
-        Err(join_err) => Err(BulkIngestError::JoinPanicked(join_err.to_string())),
-        Ok(inner) => inner,
+        Err(join_err) => (
+            None,
+            Err(BulkIngestError::JoinPanicked(join_err.to_string())),
+        ),
+        Ok((sink, inner)) => (Some(sink), inner),
     }
 }
 
@@ -896,21 +1111,26 @@ async fn handle_phase(
 
     let quota = state.bulk_import.max_bytes_per_session;
     let session_timeout = state.bulk_import.session_timeout();
+    let sink = BatchSink::ModeA {
+        engine,
+        stats: ImportStats::default(),
+    };
+    // Mode A never needs the sink back (it carries no cross-call state — `LoadingSession` lives on
+    // the engine thread instead, see `crate::engine::bulk_load`), so the returned `Option<BatchSink>`
+    // is intentionally discarded here; only Mode B's caller (`handle_phase_mode_b`) uses it.
     let outcome = match format {
-        BulkImportFormat::Csv => {
-            tokio::time::timeout(
-                session_timeout,
-                ingest_csv_stream(engine, phase, body, quota, min_free, target_dir),
-            )
-            .await
-        }
-        BulkImportFormat::Gcol => {
-            tokio::time::timeout(
-                session_timeout,
-                ingest_gcol_buffered(engine, phase, body, quota, min_free, target_dir),
-            )
-            .await
-        }
+        BulkImportFormat::Csv => tokio::time::timeout(
+            session_timeout,
+            ingest_csv_stream(sink, phase, body, quota, min_free, target_dir),
+        )
+        .await
+        .map(|(_sink, result)| result),
+        BulkImportFormat::Gcol => tokio::time::timeout(
+            session_timeout,
+            ingest_gcol_buffered(sink, phase, body, quota, min_free, target_dir),
+        )
+        .await
+        .map(|(_sink, result)| result),
     };
 
     match outcome {
@@ -983,6 +1203,341 @@ async fn handle_phase(
                 .into_response()
         }
     }
+}
+
+/// Renders `stats` as the endpoint's JSON response body, plus a `"session"` field carrying `id` — the
+/// Mode B response shape (`08` §5.3, `rmp` #520). A body field (rather than a response header) is used
+/// for the session id: it is simpler for `curl`-based operator scripting and matches this endpoint's
+/// existing plain-JSON, non-Jolt response style (no reason to introduce a header for one new field).
+/// Only present in Mode B responses — Mode A's [`stats_json`] is untouched, so its response shape
+/// stays byte-for-byte identical to before this change.
+fn stats_json_mode_b(stats: &ImportStats, session: uuid::Uuid) -> String {
+    format!(
+        "{{\"nodes\":{},\"relationships\":{},\"properties\":{},\"session\":\"{session}\"}}",
+        stats.nodes, stats.relationships, stats.properties
+    )
+}
+
+/// Handles one Mode B `?mode=live&phase=...` call (`08` §5.3, `rmp` #520): resolves (continuing or
+/// beginning) the session, runs the disk-space preflight, then streams + ingests the body under the
+/// call's own quota/timeout budget — reusing the exact same [`ChunkReader`]/CSV/`.gcol`/[`QuotaGuard`]/
+/// timeout machinery [`handle_phase`] (Mode A) uses, branching only at [`BatchSink`] (module docs'
+/// "Streaming and batching").
+///
+/// ## Session check-out / check-in discipline
+///
+/// The session is **checked out** of [`crate::bulk_import_mode_b::ModeBSessionRegistry`] for the
+/// duration of this call (so a second concurrent call against the same session id cleanly `409`s —
+/// "a Mode B session is driven by one call at a time") and checked back in on every exit path that
+/// still has it: success, a terminal ingest error, a disk-space/preflight rejection discovered after
+/// checkout, and even a database-went-offline race. The **one** exception is a genuine request
+/// timeout or a blocking-task panic (see [`ingest_csv_stream`]'s doc): in both cases the session's
+/// ownership is unrecoverably stuck inside an orphaned `spawn_blocking` task and is **not** checked
+/// back in — a narrow, documented, accepted residual gap (mirrors the "Known, accepted race" already
+/// documented in this module for Mode A's empty-database precondition check), not silently swallowed:
+/// the session slot is simply gone until the server restarts or an operator notices via `08`'s
+/// concurrent-session-cap symptom and investigates.
+async fn handle_phase_mode_b(
+    state: &ExtraState,
+    who: &str,
+    db_name: &str,
+    phase: Phase,
+    session_id: Option<uuid::Uuid>,
+    format: BulkImportFormat,
+    body: Body,
+) -> Response {
+    let audit_fail = |detail: String| {
+        state.audit.record(
+            AuditEvent::new(
+                AuditClass::AdminChange,
+                AuditOutcome::Failure,
+                AuditSource::Rest,
+            )
+            .actor(Some(who))
+            .database(Some(db_name))
+            .detail(detail),
+        );
+    };
+
+    let (session_id, session, began_session) = match session_id {
+        Some(id) => {
+            let Some(sess) = state.mode_b.checkout(id).await else {
+                audit_fail(format!(
+                    "bulk-import Mode B phase={} refused: session {id} unavailable (unknown, \
+                     expired, or currently busy)",
+                    phase.as_str()
+                ));
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "no Mode B session {id} is available: it was never opened, has already \
+                         ended, was idle-reaped, or is currently busy (driven by another call) — a \
+                         Mode B session is driven by one call at a time"
+                    ),
+                )
+                    .into_response();
+            };
+            // A session is bound to the database it was opened against; a client naming the wrong
+            // `{db}` path segment for an existing session id is a client error, not a silent
+            // cross-database continuation (which would be a real containment breach — `D-multi-db`).
+            if sess.db != db_name {
+                let sess_db = sess.db.clone();
+                state.mode_b.checkin(id, sess).await;
+                audit_fail(format!(
+                    "bulk-import Mode B phase={} refused: session {id} belongs to database \
+                     {sess_db:?}, not {db_name:?}",
+                    phase.as_str()
+                ));
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "session {id} belongs to database {sess_db:?}, not {db_name:?}: continue it \
+                         against its own database"
+                    ),
+                )
+                    .into_response();
+            }
+            (id, sess, false)
+        }
+        None => {
+            // Mode B's precondition is "the database exists and is Online" (`08` §5.3) — NOT the
+            // empty-database check Mode A's `begin_session` performs; Mode B is explicitly designed
+            // for incremental load into a populated, already-serving graph.
+            if state.catalog.handle(db_name).is_none() {
+                audit_fail(format!(
+                    "bulk-import Mode B session could not begin (phase={}): database {db_name:?} \
+                     is not online",
+                    phase.as_str()
+                ));
+                return (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "database {db_name:?} is not online; Mode B requires an already-live \
+                         (Online) database (it is offline, or does not exist)"
+                    ),
+                )
+                    .into_response();
+            }
+            match state.mode_b.create(db_name.to_owned()).await {
+                Ok(id) => {
+                    let sess = state.mode_b.checkout(id).await.unwrap_or_else(|| {
+                        // INVARIANT: `create` just checked this session in and no other call can
+                        // have raced a checkout for an id this function has not returned yet.
+                        unreachable!(
+                            "a freshly created Mode B session must be immediately checkoutable"
+                        )
+                    });
+                    (id, sess, true)
+                }
+                Err(ModeBCapacityReached { max }) => {
+                    audit_fail(format!(
+                        "bulk-import Mode B session could not begin (phase={}): concurrent-session \
+                         cap reached ({max})",
+                        phase.as_str()
+                    ));
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "server-wide Mode B concurrent-session cap reached ({max} sessions \
+                             already open); retry once another session ends"
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    let Some(engine) = state.catalog.handle(db_name) else {
+        // The database went offline between resolving/creating the session and here (a narrow,
+        // accepted race — mirrors Mode A's own documented precondition-check race). Check the
+        // session back in unchanged (no progress lost) and report a clean conflict.
+        state.mode_b.checkin(session_id, session).await;
+        audit_fail(format!(
+            "bulk-import Mode B phase={} aborted: database {db_name:?} went offline mid-call",
+            phase.as_str()
+        ));
+        return (
+            StatusCode::CONFLICT,
+            format!("database {db_name:?} is no longer online"),
+        )
+            .into_response();
+    };
+
+    let target_dir = state.catalog.database_dir(db_name);
+    let min_free = state.bulk_import.min_free_disk_bytes;
+    if min_free > 0 {
+        match check_free_space(&target_dir).await {
+            Ok(free) if free < min_free => {
+                state.mode_b.checkin(session_id, session).await;
+                audit_fail(format!(
+                    "bulk-import Mode B phase={} refused: disk-space preflight failed",
+                    phase.as_str()
+                ));
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    format!(
+                        "insufficient free disk space on database {db_name:?}'s volume: {free} \
+                         bytes available, {min_free} required"
+                    ),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(msg) => {
+                state.mode_b.checkin(session_id, session).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+            }
+        }
+    }
+
+    let quota = state.bulk_import.max_bytes_per_session;
+    let session_timeout = state.bulk_import.session_timeout();
+    let sink = BatchSink::ModeB {
+        engine,
+        session,
+        cfg: Arc::clone(&state.bulk_import),
+    };
+
+    let (sink_back, outcome) = match format {
+        BulkImportFormat::Csv => {
+            match tokio::time::timeout(
+                session_timeout,
+                ingest_csv_stream(sink, phase, body, quota, min_free, target_dir),
+            )
+            .await
+            {
+                Ok((s, r)) => (s, Ok(r)),
+                Err(elapsed) => (None, Err(elapsed)),
+            }
+        }
+        BulkImportFormat::Gcol => {
+            match tokio::time::timeout(
+                session_timeout,
+                ingest_gcol_buffered(sink, phase, body, quota, min_free, target_dir),
+            )
+            .await
+            {
+                Ok((s, r)) => (s, Ok(r)),
+                Err(elapsed) => (None, Err(elapsed)),
+            }
+        }
+    };
+
+    // Check the session back in on every path that still has it (see the doc comment above for the
+    // one exception: `sink_back` is `None` on a request timeout or a blocking-task panic).
+    if let Some(sink) = sink_back {
+        if let Some(session) = sink.into_mode_b_session() {
+            state.mode_b.checkin(session_id, session).await;
+        }
+    }
+
+    match outcome {
+        Ok(Ok(stats)) => {
+            state.audit.record(
+                AuditEvent::new(
+                    AuditClass::AdminChange,
+                    AuditOutcome::Success,
+                    AuditSource::Rest,
+                )
+                .actor(Some(who))
+                .database(Some(db_name))
+                .detail(format!(
+                    "bulk-import Mode B session {session_id} phase={} batch accepted{}: {} nodes, \
+                     {} relationships, {} properties (format {})",
+                    phase.as_str(),
+                    if began_session {
+                        " (session begun)"
+                    } else {
+                        ""
+                    },
+                    stats.nodes,
+                    stats.relationships,
+                    stats.properties,
+                    format.as_str()
+                )),
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                stats_json_mode_b(&stats, session_id),
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => {
+            let (status, msg) = err.into_response_parts();
+            audit_fail(format!(
+                "bulk-import Mode B session {session_id} phase={} aborted: {msg}",
+                phase.as_str()
+            ));
+            (status, msg).into_response()
+        }
+        Err(_elapsed) => {
+            audit_fail(format!(
+                "bulk-import Mode B session {session_id} phase={} aborted: call timeout exceeded \
+                 (the session slot is not recoverable — see the handler's doc comment)",
+                phase.as_str()
+            ));
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                "bulk-import call exceeded its configured timeout",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Handles Mode B's `?end=true&mode=live&session=<uuid>` (`08` §5.3, `rmp` #520): idempotently ends
+/// `session` — removing it from the registry and reporting its final cumulative stats — mirroring Mode
+/// A's `End` idempotency contract exactly (an unknown/already-ended session id is a `200` no-op zero
+/// stats, never an error).
+async fn handle_end_mode_b(
+    state: &ExtraState,
+    who: &str,
+    db_name: &str,
+    session_id: uuid::Uuid,
+) -> Response {
+    // `checkout` (not `end`) first, so a wrong-database session id can be restored rather than lost:
+    // idempotent no-op for "unknown/expired/busy" AND for "exists, but belongs to a different
+    // database" — both are indistinguishable from the caller's point of view ("there is no such Mode
+    // B session for *this* database"), mirroring Mode A's End idempotency contract exactly.
+    let Some(session) = state.mode_b.checkout(session_id).await else {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            stats_json_mode_b(&ImportStats::default(), session_id),
+        )
+            .into_response();
+    };
+    if session.db != db_name {
+        state.mode_b.checkin(session_id, session).await;
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            stats_json_mode_b(&ImportStats::default(), session_id),
+        )
+            .into_response();
+    }
+    state.audit.record(
+        AuditEvent::new(
+            AuditClass::AdminChange,
+            AuditOutcome::Success,
+            AuditSource::Rest,
+        )
+        .actor(Some(who))
+        .database(Some(db_name))
+        .detail(format!(
+            "bulk-import Mode B session {session_id} ended: {} nodes, {} relationships, {} \
+             properties",
+            session.stats.nodes, session.stats.relationships, session.stats.properties
+        )),
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        stats_json_mode_b(&session.stats, session_id),
+    )
+        .into_response()
 }
 
 /// Handles `?end=true`: idempotently ends the session (module docs).
@@ -1137,64 +1692,130 @@ mod tests {
 
     #[test]
     fn parse_op_recognizes_phase_nodes() {
-        assert!(matches!(
-            parse_op(Some("phase=nodes")),
-            Ok(Op::Phase(Phase::Nodes))
-        ));
+        let q = parse_query(Some("phase=nodes")).unwrap();
+        assert!(matches!(q.op, Op::Phase(Phase::Nodes)));
+        assert!(
+            !q.live,
+            "no mode/session ⇒ Mode A, byte-identical to pre-#520 behavior"
+        );
+        assert!(q.session.is_none());
     }
 
     #[test]
     fn parse_op_recognizes_phase_relationships() {
-        assert!(matches!(
-            parse_op(Some("phase=relationships")),
-            Ok(Op::Phase(Phase::Relationships))
-        ));
+        let q = parse_query(Some("phase=relationships")).unwrap();
+        assert!(matches!(q.op, Op::Phase(Phase::Relationships)));
+        assert!(!q.live);
     }
 
     #[test]
     fn parse_op_recognizes_end_true() {
-        assert!(matches!(parse_op(Some("end=true")), Ok(Op::End)));
+        let q = parse_query(Some("end=true")).unwrap();
+        assert!(matches!(q.op, Op::End));
+        assert!(!q.live);
     }
 
     #[test]
     fn parse_op_end_true_takes_precedence_over_phase() {
-        assert!(matches!(
-            parse_op(Some("phase=nodes&end=true")),
-            Ok(Op::End)
-        ));
+        let q = parse_query(Some("phase=nodes&end=true")).unwrap();
+        assert!(matches!(q.op, Op::End));
     }
 
     #[test]
     fn parse_op_rejects_missing_query() {
-        let err = parse_op(None).unwrap_err();
+        let err = parse_query(None).unwrap_err();
         assert!(err.contains("phase=nodes"), "message: {err}");
         assert!(err.contains("end=true"), "message: {err}");
     }
 
     #[test]
     fn parse_op_rejects_empty_query() {
-        assert!(parse_op(Some("")).is_err());
+        assert!(parse_query(Some("")).is_err());
     }
 
     #[test]
     fn parse_op_rejects_invalid_phase_value() {
-        let err = parse_op(Some("phase=bogus")).unwrap_err();
+        let err = parse_query(Some("phase=bogus")).unwrap_err();
         assert!(err.contains("bogus"), "message: {err}");
     }
 
     #[test]
     fn parse_op_end_false_falls_back_to_phase() {
-        assert!(matches!(
-            parse_op(Some("end=false&phase=nodes")),
-            Ok(Op::Phase(Phase::Nodes))
-        ));
+        let q = parse_query(Some("end=false&phase=nodes")).unwrap();
+        assert!(matches!(q.op, Op::Phase(Phase::Nodes)));
     }
 
     #[test]
     fn parse_op_ignores_unknown_parameters() {
-        assert!(matches!(
-            parse_op(Some("foo=bar&phase=relationships&baz=qux")),
-            Ok(Op::Phase(Phase::Relationships))
-        ));
+        let q = parse_query(Some("foo=bar&phase=relationships&baz=qux")).unwrap();
+        assert!(matches!(q.op, Op::Phase(Phase::Relationships)));
+    }
+
+    // ---- Mode B query parsing (`rmp` #520) ----------------------------------------------------
+
+    #[test]
+    fn mode_live_marks_the_call_as_mode_b() {
+        let q = parse_query(Some("phase=nodes&mode=live")).unwrap();
+        assert!(q.live);
+        assert!(q.session.is_none());
+    }
+
+    #[test]
+    fn mode_fresh_is_mode_a_explicitly() {
+        let q = parse_query(Some("phase=nodes&mode=fresh")).unwrap();
+        assert!(!q.live);
+    }
+
+    #[test]
+    fn mode_is_case_insensitive() {
+        assert!(parse_query(Some("phase=nodes&mode=LIVE")).unwrap().live);
+        assert!(!parse_query(Some("phase=nodes&mode=Fresh")).unwrap().live);
+    }
+
+    #[test]
+    fn invalid_mode_value_is_rejected() {
+        let err = parse_query(Some("phase=nodes&mode=bogus")).unwrap_err();
+        assert!(err.contains("bogus"), "message: {err}");
+    }
+
+    #[test]
+    fn a_present_session_with_omitted_mode_is_treated_as_live() {
+        let id = uuid::Uuid::new_v4();
+        let q = parse_query(Some(&format!("phase=nodes&session={id}"))).unwrap();
+        assert!(
+            q.live,
+            "a present session implies Mode B even without an explicit mode=live"
+        );
+        assert_eq!(q.session, Some(id));
+    }
+
+    #[test]
+    fn mode_live_with_a_session_continues_it() {
+        let id = uuid::Uuid::new_v4();
+        let q = parse_query(Some(&format!("phase=relationships&mode=live&session={id}"))).unwrap();
+        assert!(q.live);
+        assert_eq!(q.session, Some(id));
+    }
+
+    #[test]
+    fn invalid_session_uuid_is_rejected() {
+        let err = parse_query(Some("phase=nodes&mode=live&session=not-a-uuid")).unwrap_err();
+        assert!(err.contains("not-a-uuid"), "message: {err}");
+    }
+
+    #[test]
+    fn mode_fresh_with_a_session_is_rejected() {
+        let id = uuid::Uuid::new_v4();
+        let err = parse_query(Some(&format!("phase=nodes&mode=fresh&session={id}"))).unwrap_err();
+        assert!(err.contains("mode=live"), "message: {err}");
+    }
+
+    #[test]
+    fn end_true_with_mode_live_and_session_is_recognized() {
+        let id = uuid::Uuid::new_v4();
+        let q = parse_query(Some(&format!("end=true&mode=live&session={id}"))).unwrap();
+        assert!(matches!(q.op, Op::End));
+        assert!(q.live);
+        assert_eq!(q.session, Some(id));
     }
 }

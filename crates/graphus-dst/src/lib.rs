@@ -44,6 +44,7 @@ pub mod harness;
 pub mod isolation;
 pub mod misbehave;
 pub mod mix;
+pub mod mode_b_batch_size_measurement;
 pub mod model;
 pub mod rng;
 pub mod scenarios;

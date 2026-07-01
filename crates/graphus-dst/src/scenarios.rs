@@ -8,14 +8,18 @@
 //! scenarios reuse [`crate::vopr`] + [`crate::mix`]; the structural ones drive a [`LocalEngine`]
 //! directly. Everything is a pure function of the seed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use graphus_bulk::{ColumnRole, ImportStats, NodeHeader, PropertyType, RelHeader, ScalarType};
-use graphus_core::Value;
+use graphus_core::{GraphusError, Value};
 use graphus_cypher::MaterializedValue;
+use graphus_elle::{Op, Transaction, check};
 use graphus_io::{MemBlockDevice, atomic_replace_file};
 use graphus_server::engine::command::AccessMode;
-use graphus_server::engine::{BulkImportBatchInput, BulkImportBatchOutcome, LocalEngine};
+use graphus_server::engine::{
+    BulkImportBatchInput, BulkImportBatchOutcome, BulkImportModeBChunkInput, LocalEngine, TxTicket,
+};
 use graphus_sim::{ClockFaultPlan, FaultyClock, SharedClock};
 use graphus_wal::MemLogSink;
 
@@ -72,7 +76,12 @@ pub type Scenario = fn(u64) -> ScenarioOutcome;
 ///   a crash injected at each window of the backup → seal → file → restore → WAL/DWB-reset pipeline).
 /// - **Network bulk import** — `network_bulk_ingest_mode_a` (rmp #519: per-batch cumulative-stats
 ///   correctness, an aborted-batch idempotent retry, and crash-mid-session durability of both the
-///   ingested data and the checkpoint sentinel node, for `08-network-bulk-import.md` Mode A).
+///   ingested data and the checkpoint sentinel node, for `08-network-bulk-import.md` Mode A);
+///   `network_bulk_ingest_mode_b` (rmp #520: Mode A's concurrent, higher-risk sibling — joint
+///   serializability with ordinary concurrent traffic (Elle-checked), a seeded genuine SSI pivot
+///   abort + idempotent retry, exact snapshot-visibility, a dense/hot pre-existing node targeted by
+///   both the import and concurrent traffic, the chunking-bounds-a-dispatch mechanism, and crash
+///   recovery mid-batch interleaved with other committing transactions).
 /// - **Time / hostile clock** — `hostile_clock` (bounded skew, forward jumps, non-monotonic
 ///   regressions; the clock-fault tolerance contract of rmp #233).
 /// - **Load shapes** — `spike_load`, `ramp_load`, `sustained_high_concurrency`.
@@ -103,8 +112,9 @@ pub fn catalogue() -> Vec<(&'static str, Scenario)> {
         // Durability / crash recovery
         ("crash_recovery_durability", crash_recovery_durability),
         ("backup_restore_crash", backup_restore_crash),
-        // Network bulk import (rmp #519)
+        // Network bulk import (rmp #519/#520)
         ("network_bulk_ingest_mode_a", network_bulk_ingest_mode_a),
+        ("network_bulk_ingest_mode_b", network_bulk_ingest_mode_b),
         // Time / hostile clock
         ("hostile_clock", hostile_clock),
         // Load shapes
@@ -1700,6 +1710,708 @@ fn network_bulk_ingest_mode_a(seed: u64) -> ScenarioOutcome {
     )
 }
 
+// ------------------------------------------------------------------------------------------------
+// network_bulk_ingest_mode_b (`08` §10.2, `rmp` #520): the higher-priority scenario — Mode B
+// (already-live database, concurrent, no exclusivity) must be jointly serializable against ordinary
+// concurrent traffic, its batch-retry must be idempotent under a genuine seeded pivot abort, its
+// visibility must be exactly "everything committed before my snapshot began", it must not lose edges
+// on a dense/hot pre-existing node under concurrent writers, its chunking must genuinely bound a
+// single engine dispatch (the `08` §7.2.6 fairness requirement — DST asserts the MECHANISM; real
+// wall-clock latency is proven separately by `crates/graphus-server/tests/bulk_import_mode_b_fairness.rs`,
+// per the SAME DST/integration split `network_bulk_ingest_mode_a`'s own doc cites for HTTP-transport
+// concerns: "`08-network-bulk-import.md`'s HTTP-transport and `DatabaseCatalog`/`Loading`-state layers
+// are DST's structural non-goals... covered instead by... `graphus-server/tests/bulk_import_endpoint.rs`"),
+// and it must recover correctly from a crash mid-batch interleaved with other committing transactions.
+//
+// `drive_mode_b_batch` (the real async retry-loop driver, `graphus_server::bulk_import_mode_b`) cannot
+// run inline against a synchronous `LocalEngine` (it is written against the async `EngineHandle`, and
+// this DST harness's whole determinism model is "no real async scheduler, no real clock"). Per this
+// task's own guidance this scenario instead reimplements the retry loop's SHAPE synchronously
+// ([`drive_mode_b_batch_sync`], below) over `LocalEngine::begin`/`bulk_import_mode_b_chunk`/`commit`/
+// `rollback` — the exact same primitives the real driver calls, just sequenced inline. The scenario's
+// job is to prove the STATE-MACHINE/data outcome is correct, not to re-exercise the async wrapper
+// (which has its own real-engine, real-tokio tests in `graphus-server`'s own `bulk_import_mode_b.rs`).
+// ------------------------------------------------------------------------------------------------
+
+/// Which kind of rows a [`drive_mode_b_batch_sync`] call ingests.
+enum ModeBRowsSync {
+    Nodes(Arc<NodeHeader>),
+    Relationships(Arc<RelHeader>, Arc<HashMap<String, u64>>),
+}
+
+/// The outcome of a successful [`drive_mode_b_batch_sync`] call: new `(external_id, physical_id)`
+/// node bindings plus the `(nodes, relationships, properties)` cumulative deltas.
+type ModeBBatchOk = (Vec<(String, u64)>, u64, u64, u64);
+
+/// A synchronous, DST-local mirror of `graphus_server::bulk_import_mode_b::drive_mode_b_batch`'s
+/// retry-loop SHAPE (see this section's module doc for why the real async driver cannot run here):
+/// dispatches `records` in `chunk_rows`-sized [`BulkImportModeBChunkInput`] chunks under ONE
+/// transaction, retrying up to `max_retries` times on a [`GraphusError::Transaction`] (the same
+/// structural-match retriability rule the real driver uses), exactly reproducing the `08` §7.2.2
+/// `id_map`-staging invariant: a failed attempt's bindings/deltas are discarded, never merged.
+///
+/// `first_ticket`, when `Some`, is used as the FIRST attempt's transaction instead of an ordinary
+/// `eng.begin()` — a small testability seam (mirrors
+/// `graphus_server::bulk_import_mode_b::drive_mode_b_batch_from`'s identical one, for the identical
+/// reason): it lets a caller open a ticket, seed a genuine SSI conflict against it (in program order,
+/// no race), and hand it in, so the doomed first attempt's timing is deterministic. Every retry after
+/// the first still opens its own fresh ticket via the ordinary path.
+///
+/// # Errors
+/// The terminal error once retries are exhausted, or a non-retriable row/storage error.
+fn drive_mode_b_batch_sync(
+    eng: &mut Eng,
+    kind: &ModeBRowsSync,
+    records: &[csv::StringRecord],
+    chunk_rows: usize,
+    max_retries: u32,
+    first_ticket: Option<TxTicket>,
+) -> Result<ModeBBatchOk, GraphusError> {
+    let mut attempt = 0u32;
+    let mut pending_first_ticket = first_ticket;
+    loop {
+        let ticket = match pending_first_ticket.take() {
+            Some(t) => t,
+            None => eng.begin(AccessMode::Write)?,
+        };
+        let mut bindings = Vec::new();
+        let (mut nodes, mut rels, mut props) = (0u64, 0u64, 0u64);
+        let mut failure: Option<GraphusError> = None;
+        for chunk in records.chunks(chunk_rows.max(1)) {
+            let input = match kind {
+                ModeBRowsSync::Nodes(header) => BulkImportModeBChunkInput::Nodes {
+                    header: Arc::clone(header),
+                    records: chunk.to_vec(),
+                },
+                ModeBRowsSync::Relationships(header, id_map) => {
+                    BulkImportModeBChunkInput::Relationships {
+                        header: Arc::clone(header),
+                        records: chunk.to_vec(),
+                        id_map: Arc::clone(id_map),
+                    }
+                }
+            };
+            match eng.bulk_import_mode_b_chunk(ticket, input) {
+                Ok(out) => {
+                    bindings.extend(out.new_node_bindings);
+                    nodes += out.nodes;
+                    rels += out.relationships;
+                    props += out.properties;
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        let commit_result = match failure {
+            Some(e) => {
+                let _ = eng.rollback(ticket);
+                Err(e)
+            }
+            None => eng.commit(ticket).map(|_| ()),
+        };
+        match commit_result {
+            Ok(()) => return Ok((bindings, nodes, rels, props)),
+            Err(e) => {
+                if matches!(e, GraphusError::Transaction(_)) && attempt < max_retries {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// The node-file header [`network_bulk_ingest_mode_b`] uses: `:ID`, `:LABEL` (fixed `Entity`), and a
+/// per-row-unique `seq` integer property — the same "distinct-per-row property" shape
+/// `crate::mode_b_batch_size_measurement` empirically found necessary for a concurrent reader to
+/// register a genuine `Equality` predicate marker against a *specific*, not-yet-created row (an
+/// unlabeled node registers no `Equality` marker at all — `reindex_node`'s footprint loop is nested
+/// inside "for each label the node carries").
+fn mode_b_node_header() -> Arc<NodeHeader> {
+    Arc::new(NodeHeader {
+        columns: vec![
+            ColumnRole::Id,
+            ColumnRole::Label,
+            ColumnRole::Property {
+                key: "seq".to_owned(),
+                ty: PropertyType::Scalar(ScalarType::Integer),
+            },
+        ],
+        id_index: 0,
+    })
+}
+
+fn mode_b_node_row(external_id: &str, seq: i64) -> csv::StringRecord {
+    csv::StringRecord::from(vec![external_id, "Entity", &seq.to_string()])
+}
+
+fn mode_b_rel_header() -> Arc<RelHeader> {
+    Arc::new(RelHeader {
+        columns: vec![ColumnRole::StartId, ColumnRole::EndId, ColumnRole::Type],
+        start_index: 0,
+        end_index: 1,
+        type_index: 2,
+    })
+}
+
+fn mode_b_rel_row(start: &str, end: &str, rel_type: &str) -> csv::StringRecord {
+    csv::StringRecord::from(vec![start, end, rel_type])
+}
+
+/// Seeds a genuine SSI pivot abort against whichever transaction next creates the `Entity` node whose
+/// `seq` property equals `target_seq` — the exact rw-edge sequence
+/// `graphus_txn::ssi::SsiTracker::add_edge`'s eager committed-pivot-break rule dooms (proven against a
+/// real `EngineHandle` in `graphus_server::bulk_import_mode_b`'s own tests, and against `LocalEngine`
+/// in `crate::mode_b_batch_size_measurement`): `trdr` (caller-owned, already open, reading an unrelated
+/// marker predicate — kept open by the caller so `forget()`'s edge-cleanup never erases the edge it
+/// contributes) plus a fresh `r` that reads the specific not-yet-created `seq=target_seq` node (a
+/// realistic "does entity X exist yet" probe), writes the marker predicate `trdr` already read
+/// (closing `trdr --rw--> r`), and commits — becoming a genuine committed pivot. The caller's next
+/// chunk creating that exact `seq` value closes `r --rw--> target` and dooms it.
+fn seed_mode_b_pivot_abort(eng: &mut Eng, trdr: TxTicket, target_seq: i64) {
+    let Ok(r) = eng.begin(AccessMode::Write) else {
+        return;
+    };
+    let read_ok = eng
+        .run(
+            r,
+            "MATCH (n:Entity {seq: $s}) RETURN n",
+            vec![("s".to_owned(), Value::Integer(target_seq))],
+            false,
+            None,
+        )
+        .is_ok_and(|mut reply| {
+            while let Ok(Some(_)) = reply.rows.next() {}
+            true
+        });
+    let write_ok = read_ok
+        && eng
+            .run(r, "CREATE (:Marker)", vec![], false, None)
+            .is_ok_and(|mut reply| {
+                while let Ok(Some(_)) = reply.rows.next() {}
+                true
+            });
+    if write_ok {
+        let _ = eng.commit(r);
+    } else {
+        let _ = eng.rollback(r);
+    }
+    let _ = trdr;
+}
+
+/// Reads `key`'s append-list in `ticket`, returning the observed values in order — the Elle
+/// list-append model's read primitive (mirrors `isolation.rs`'s identical test-only helper, redefined
+/// here since that one is private to that module's `#[cfg(test)]`).
+fn read_list(eng: &mut Eng, ticket: TxTicket, key: &str) -> Vec<i64> {
+    let mut reply = match eng.run(
+        ticket,
+        "MATCH (e:Entry {key: $k}) RETURN e.val AS val ORDER BY e.val",
+        vec![("k".to_owned(), Value::String(key.to_owned()))],
+        false,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(row)) = reply.rows.next() {
+        if let Some(MaterializedValue::Value(Value::Integer(n))) = row.first() {
+            out.push(*n);
+        }
+    }
+    out
+}
+
+/// Appends `val` to `key`'s list in `ticket` — the Elle list-append model's write primitive (mirrors
+/// `isolation.rs`'s identical test-only helper).
+fn append(eng: &mut Eng, ticket: TxTicket, key: &str, val: i64) {
+    if let Ok(mut reply) = eng.run(
+        ticket,
+        "CREATE (:Entry {key: $k, val: $v})",
+        vec![
+            ("k".to_owned(), Value::String(key.to_owned())),
+            ("v".to_owned(), Value::Integer(val)),
+        ],
+        false,
+        None,
+    ) {
+        while let Ok(Some(_)) = reply.rows.next() {}
+    }
+}
+
+/// **`network_bulk_ingest_mode_b`** (`08` §10.2, `rmp` #520). See the section doc comment above for
+/// the DST/integration split and the synchronous retry-loop mirror this scenario drives through.
+#[allow(clippy::too_many_lines)]
+fn network_bulk_ingest_mode_b(seed: u64) -> ScenarioOutcome {
+    const NAME: &str = "network_bulk_ingest_mode_b";
+    let (mut eng, clock) = engine_with_clock(256);
+    let node_header = mode_b_node_header();
+    let rel_header = mode_b_rel_header();
+
+    // ---- bullet 4 prep: a dense/hot pre-existing node, seeded before anything else ----------------
+    if !write(&mut eng, "CREATE (:Hub {id: 0})", vec![]) {
+        return ScenarioOutcome::fail(NAME, "seed hub node failed");
+    }
+
+    // ============================================================================================
+    // Bullet 1: joint serializability (Elle, list-append model) — a Mode B node batch interleaved
+    // with an ordinary concurrent Cypher read-then-append transaction over the SAME shared key.
+    // ============================================================================================
+    let key = "shared";
+    let t_ordinary = match eng.begin(AccessMode::Write) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("begin ordinary txn: {e}")),
+    };
+    let ordinary_read = read_list(&mut eng, t_ordinary, key);
+
+    // The Mode B batch commits BEFORE the ordinary txn (both were concurrent: the ordinary txn began
+    // first but has not yet committed its own append).
+    let modeb_ext = format!("e-modeb-{seed}");
+    let modeb_records = vec![mode_b_node_row(&modeb_ext, 1)];
+    let modeb_result = drive_mode_b_batch_sync(
+        &mut eng,
+        &ModeBRowsSync::Nodes(Arc::clone(&node_header)),
+        &modeb_records,
+        10,
+        3,
+        None,
+    );
+    let modeb_committed = modeb_result.is_ok();
+    if !modeb_committed {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("bullet 1: unconflicted mode-b batch unexpectedly failed: {modeb_result:?}"),
+        );
+    }
+    // Model the Mode B batch's committed row as a list-append on `key` (mirroring `isolation.rs`'s
+    // convention): its "value" is a fixed sentinel distinguishing it from the ordinary txn's append.
+    append(&mut eng, t_ordinary, key, 999);
+    let c_ordinary = eng.commit(t_ordinary).is_ok();
+
+    let history = vec![
+        Transaction {
+            id: 1,
+            ops: vec![
+                Op::Read {
+                    key: key.to_owned(),
+                    observed: ordinary_read,
+                },
+                Op::Append {
+                    key: key.to_owned(),
+                    val: 999,
+                },
+            ],
+            committed: c_ordinary,
+        },
+        Transaction {
+            id: 2,
+            ops: vec![Op::Append {
+                key: "modeb-nodes".to_owned(),
+                val: 1,
+            }],
+            committed: modeb_committed,
+        },
+    ];
+    let elle = check(&history);
+    if !elle.serializable {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("bullet 1: committed history is not serializable: {elle:?}"),
+        );
+    }
+
+    // ============================================================================================
+    // Bullet 2: a seeded pivot abort of an in-progress batch, and idempotent-retry convergence.
+    // A long-lived `trdr` anchors the doom (see `seed_mode_b_pivot_abort`'s doc for why it must stay
+    // open — `forget()`'s edge-cleanup otherwise erases the edge it contributes). `trdr` is reused for
+    // BOTH sub-phases below (2a, 2b): it only needs to stay open reading the Marker predicate; each
+    // seed targets a DIFFERENT, not-yet-created row, so the two phases do not interfere.
+    // ============================================================================================
+    let trdr = match eng.begin(AccessMode::Write) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("begin trdr anchor: {e}")),
+    };
+    let _ = eng.run(
+        trdr,
+        "MATCH (:Marker) RETURN count(*) AS c",
+        vec![],
+        false,
+        None,
+    );
+
+    // ---- 2a: 0 retries — the seeded conflict must surface immediately, terminally, atomically. ----
+    // The ticket is opened FIRST (before seeding), matching the ordering
+    // `seed_mode_b_pivot_abort`'s doc requires (the target must begin before `r` commits).
+    let ticket_a = match eng.begin(AccessMode::Write) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("bullet 2a: begin ticket_a: {e}")),
+    };
+    seed_mode_b_pivot_abort(&mut eng, trdr, 1000);
+    let doomed_records = vec![mode_b_node_row(&format!("e-doomed-{seed}"), 1000)];
+    let doomed_result = drive_mode_b_batch_sync(
+        &mut eng,
+        &ModeBRowsSync::Nodes(Arc::clone(&node_header)),
+        &doomed_records,
+        10,
+        0,
+        Some(ticket_a),
+    );
+    if doomed_result.is_ok() {
+        return ScenarioOutcome::fail(
+            NAME,
+            "bullet 2a: the seeded pivot conflict unexpectedly did not abort the 0-retry batch",
+        );
+    }
+    let doomed_err = doomed_result.unwrap_err();
+    if !matches!(doomed_err, GraphusError::Transaction(_)) {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 2a: the seeded abort was not classified Transaction/retriable: {doomed_err}"
+            ),
+        );
+    }
+    let doomed_visible = count_rows(
+        &mut eng,
+        "MATCH (n:Entity {seq: $s}) RETURN n",
+        vec![("s".to_owned(), Value::Integer(1000))],
+    );
+    if doomed_visible != 0 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("bullet 2a: the doomed row is visible ({doomed_visible} rows) — not atomic"),
+        );
+    }
+
+    // ---- 2b: retries enabled — the SAME real retry loop must converge to exactly the retry's own
+    // contribution, no duplication, no stale bindings from the aborted first attempt. ----
+    let ticket_b = match eng.begin(AccessMode::Write) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("bullet 2b: begin ticket_b: {e}")),
+    };
+    seed_mode_b_pivot_abort(&mut eng, trdr, 1001);
+    let retry_records = vec![mode_b_node_row(&format!("e-retry-{seed}"), 1001)];
+    let retry_result = drive_mode_b_batch_sync(
+        &mut eng,
+        &ModeBRowsSync::Nodes(Arc::clone(&node_header)),
+        &retry_records,
+        10,
+        3,
+        Some(ticket_b),
+    );
+    let (retry_bindings, retry_nodes, ..) = match retry_result {
+        Ok(o) => o,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("bullet 2b: retry failed: {e}")),
+    };
+    if retry_nodes != 1 || retry_bindings.len() != 1 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 2b: retry outcome != exactly 1 new node: nodes={retry_nodes} bindings={retry_bindings:?}"
+            ),
+        );
+    }
+    let final_visible = count_rows(
+        &mut eng,
+        "MATCH (n:Entity {seq: $s}) RETURN n",
+        vec![("s".to_owned(), Value::Integer(1001))],
+    );
+    if final_visible != 1 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 2b: post-retry seq=1001 row count {final_visible} != 1 (no duplicate, no orphan)"
+            ),
+        );
+    }
+
+    // ============================================================================================
+    // Bullet 3: concurrent readers at various snapshot begin timestamps observe exactly "everything
+    // committed strictly before my snapshot began" — never a partial/torn batch.
+    // ============================================================================================
+    let reader_before = match eng.begin(AccessMode::Read) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("begin reader_before: {e}")),
+    };
+    let before_count = scalar_in(
+        &mut eng,
+        reader_before,
+        "MATCH (n:Entity) RETURN count(n) AS c",
+        vec![],
+    )
+    .unwrap_or(-1);
+    let expected_before_count = 2i64; // e-modeb-{seed} (bullet 1) + e-doomed-{seed} retry (bullet 2)
+    if before_count != expected_before_count {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 3: reader_before saw {before_count} Entity nodes, expected {expected_before_count}"
+            ),
+        );
+    }
+    let more_ext = format!("e-more-{seed}");
+    let more_records = vec![mode_b_node_row(&more_ext, 2)];
+    if drive_mode_b_batch_sync(
+        &mut eng,
+        &ModeBRowsSync::Nodes(Arc::clone(&node_header)),
+        &more_records,
+        10,
+        0,
+        None,
+    )
+    .is_err()
+    {
+        return ScenarioOutcome::fail(NAME, "bullet 3: unconflicted batch unexpectedly failed");
+    }
+    // `reader_before`'s snapshot must NOT see the just-committed row (it began strictly earlier).
+    let before_count_after = scalar_in(
+        &mut eng,
+        reader_before,
+        "MATCH (n:Entity) RETURN count(n) AS c",
+        vec![],
+    )
+    .unwrap_or(-1);
+    if before_count_after != expected_before_count {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 3: reader_before's view changed after a LATER commit ({before_count} -> \
+                 {before_count_after}) — snapshot isolation violated"
+            ),
+        );
+    }
+    let _ = eng.commit(reader_before);
+    let reader_after = match eng.begin(AccessMode::Read) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("begin reader_after: {e}")),
+    };
+    let after_count =
+        read_scalar(&mut eng, "MATCH (n:Entity) RETURN count(n) AS c", vec![]).unwrap_or(-1);
+    let _ = eng.rollback(reader_after);
+    if after_count != expected_before_count + 1 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 3: reader_after saw {after_count}, expected {}",
+                expected_before_count + 1
+            ),
+        );
+    }
+
+    // ============================================================================================
+    // Bullet 4: dense/hot pre-existing node targeted by BOTH the import and concurrent live traffic
+    // — every edge that commits must persist (the #220 invariant `concurrent_supernode` already pins,
+    // reused here with Mode B as one of the two concurrent writers).
+    // ============================================================================================
+    let ordinary_writer = match eng.begin(AccessMode::Write) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("begin hub ordinary writer: {e}")),
+    };
+    let mut ordinary_reply = match eng.run(
+        ordinary_writer,
+        "MATCH (h:Hub {id: 0}) CREATE (h)-[:LINK]->(:Leaf {tag: 'ordinary'})",
+        vec![],
+        false,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("bullet 4: ordinary hub write: {e}")),
+    };
+    while let Ok(Some(_)) = ordinary_reply.rows.next() {}
+
+    // Mode B's own batch adds an edge to the SAME hub, via an existing-node relationship row (start
+    // id resolves through a durable id_map entry seeded via a tiny prior node batch naming the hub).
+    let hub_ext = "hub-anchor";
+    let leaf_ext = format!("leaf-modeb-{seed}");
+    let mut anchor_id_map: HashMap<String, u64> = HashMap::new();
+    let hub_physical = read_scalar(&mut eng, "MATCH (h:Hub {id: 0}) RETURN id(h) AS i", vec![]);
+    let Some(hub_physical) = hub_physical else {
+        return ScenarioOutcome::fail(NAME, "bullet 4: could not resolve the hub's physical id");
+    };
+    anchor_id_map.insert(hub_ext.to_owned(), hub_physical as u64);
+    let leaf_batch = drive_mode_b_batch_sync(
+        &mut eng,
+        &ModeBRowsSync::Nodes(Arc::clone(&node_header)),
+        &[mode_b_node_row(&leaf_ext, 3)],
+        10,
+        0,
+        None,
+    );
+    let leaf_physical = match leaf_batch {
+        Ok((bindings, ..)) => bindings.first().map(|(_, id)| *id),
+        Err(e) => {
+            return ScenarioOutcome::fail(NAME, format!("bullet 4: mode-b leaf node batch: {e}"));
+        }
+    };
+    let Some(leaf_physical) = leaf_physical else {
+        return ScenarioOutcome::fail(NAME, "bullet 4: mode-b leaf node batch produced no binding");
+    };
+    anchor_id_map.insert(leaf_ext.clone(), leaf_physical);
+    let rel_id_map = Arc::new(anchor_id_map);
+    let hub_edge_result = drive_mode_b_batch_sync(
+        &mut eng,
+        &ModeBRowsSync::Relationships(Arc::clone(&rel_header), Arc::clone(&rel_id_map)),
+        &[mode_b_rel_row(hub_ext, &leaf_ext, "LINK")],
+        10,
+        3,
+        None,
+    );
+    let modeb_hub_committed = hub_edge_result.is_ok();
+    let ordinary_hub_committed = eng.commit(ordinary_writer).is_ok();
+    if !modeb_hub_committed && !ordinary_hub_committed {
+        return ScenarioOutcome::fail(NAME, "bullet 4: BOTH concurrent hub writers were lost");
+    }
+    let expected_hub_fanout = i64::from(modeb_hub_committed) + i64::from(ordinary_hub_committed);
+    let hub_fanout = read_scalar(
+        &mut eng,
+        "MATCH (h:Hub {id: 0})-[:LINK]->(x) RETURN count(x) AS c",
+        vec![],
+    )
+    .unwrap_or(-1);
+    if hub_fanout != expected_hub_fanout {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 4: hub fan-out {hub_fanout} != expected {expected_hub_fanout} \
+                 (modeb_committed={modeb_hub_committed} ordinary_committed={ordinary_hub_committed}) \
+                 — a committed edge was lost"
+            ),
+        );
+    }
+
+    // ============================================================================================
+    // Bullet 5 (mechanism only — real wall-clock latency is `bulk_import_mode_b_fairness.rs`'s job,
+    // per this section's doc comment): the chunking genuinely bounds a single dispatch's row count.
+    // ============================================================================================
+    let chunk_rows = 7usize;
+    let fairness_records: Vec<_> = (0..25i64)
+        .map(|i| mode_b_node_row(&format!("e-fair-{seed}-{i}"), 10_000 + i))
+        .collect();
+    let mut max_dispatched = 0usize;
+    {
+        let ticket = match eng.begin(AccessMode::Write) {
+            Ok(t) => t,
+            Err(e) => return ScenarioOutcome::fail(NAME, format!("bullet 5: begin: {e}")),
+        };
+        for chunk in fairness_records.chunks(chunk_rows) {
+            max_dispatched = max_dispatched.max(chunk.len());
+            let out = eng.bulk_import_mode_b_chunk(
+                ticket,
+                BulkImportModeBChunkInput::Nodes {
+                    header: Arc::clone(&node_header),
+                    records: chunk.to_vec(),
+                },
+            );
+            if out.is_err() {
+                return ScenarioOutcome::fail(NAME, "bullet 5: fairness chunk dispatch failed");
+            }
+        }
+        if eng.commit(ticket).is_err() {
+            return ScenarioOutcome::fail(NAME, "bullet 5: fairness batch commit failed");
+        }
+    }
+    if max_dispatched > chunk_rows {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!("bullet 5: a chunk dispatched {max_dispatched} rows > configured {chunk_rows}"),
+        );
+    }
+
+    // ============================================================================================
+    // Bullet 6: a crash mid-batch while other, unrelated transactions are concurrently committing —
+    // recovery must reconcile the interleaved WAL correctly (nothing torn, nothing lost).
+    // ============================================================================================
+    let pre_crash_entities =
+        read_scalar(&mut eng, "MATCH (n:Entity) RETURN count(n) AS c", vec![]).unwrap_or(-1);
+    // An unrelated ordinary transaction commits.
+    if !write(&mut eng, "CREATE (:Unrelated {tag: 1})", vec![]) {
+        return ScenarioOutcome::fail(NAME, "bullet 6: unrelated pre-crash write failed");
+    }
+    // A Mode B batch is left DELIBERATELY UNCOMMITTED (mid-flight) at the moment of the crash.
+    let crash_ticket = match eng.begin(AccessMode::Write) {
+        Ok(t) => t,
+        Err(e) => return ScenarioOutcome::fail(NAME, format!("bullet 6: begin in-flight: {e}")),
+    };
+    let inflight_records = vec![mode_b_node_row(&format!("e-inflight-{seed}"), 20_000)];
+    let inflight_out = eng.bulk_import_mode_b_chunk(
+        crash_ticket,
+        BulkImportModeBChunkInput::Nodes {
+            header: Arc::clone(&node_header),
+            records: inflight_records,
+        },
+    );
+    if inflight_out.is_err() {
+        return ScenarioOutcome::fail(NAME, "bullet 6: in-flight chunk dispatch failed");
+    }
+    // Another unrelated ordinary transaction ALSO commits, interleaved with the still-open ticket.
+    if !write(&mut eng, "CREATE (:Unrelated {tag: 2})", vec![]) {
+        return ScenarioOutcome::fail(NAME, "bullet 6: second unrelated pre-crash write failed");
+    }
+
+    let mut recovered = match eng.crash_restart(clock.clone(), 256) {
+        Ok(e) => e,
+        Err(e) => {
+            return ScenarioOutcome::fail(NAME, format!("bullet 6: crash_restart failed: {e}"));
+        }
+    };
+    let recovered_entities = read_scalar(
+        &mut recovered,
+        "MATCH (n:Entity) RETURN count(n) AS c",
+        vec![],
+    )
+    .unwrap_or(-1);
+    if recovered_entities != pre_crash_entities {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 6: post-crash Entity count {recovered_entities} != pre-crash committed \
+                 count {pre_crash_entities} (the in-flight, never-committed batch must NOT survive)"
+            ),
+        );
+    }
+    let recovered_unrelated = read_scalar(
+        &mut recovered,
+        "MATCH (n:Unrelated) RETURN count(n) AS c",
+        vec![],
+    )
+    .unwrap_or(-1);
+    if recovered_unrelated != 2 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 6: post-crash Unrelated count {recovered_unrelated} != 2 (both committed \
+                 concurrent transactions must survive, interleaved correctly around the crash)"
+            ),
+        );
+    }
+    let inflight_visible = count_rows(
+        &mut recovered,
+        "MATCH (n:Entity {seq: 20000}) RETURN n",
+        vec![],
+    );
+    if inflight_visible != 0 {
+        return ScenarioOutcome::fail(
+            NAME,
+            format!(
+                "bullet 6: the never-committed in-flight row is visible after recovery ({inflight_visible})"
+            ),
+        );
+    }
+
+    ScenarioOutcome::pass(
+        NAME,
+        format!(
+            "Elle-serializable, seeded-abort retry converged, snapshot visibility exact, hub \
+             fan-out {hub_fanout} preserved, chunking bounded to {max_dispatched}<={chunk_rows}, \
+             crash mid-batch reconciled ({recovered_unrelated} unrelated + {recovered_entities} \
+             entities survived, in-flight row correctly absent)"
+        ),
+    )
+}
+
 /// Builds the fixed `NodeHeader` used by [`network_bulk_ingest_mode_a`]: `:ID`, `:LABEL`, and one
 /// `name` string property — mirrors `crates/graphus-server/src/engine/bulk_load.rs`'s own
 /// `#[cfg(test)]` fixture exactly.
@@ -2157,6 +2869,28 @@ mod tests {
             assert!(
                 a.ok,
                 "network_bulk_ingest_mode_a must hold at seed {seed}: {}",
+                a.detail
+            );
+        }
+    }
+
+    /// **rmp #520.** The network-bulk-import Mode B scenario replays identically and holds across a
+    /// wider seed range than the catalogue's own quick 1..=3 sweep, so a regression in JUST this
+    /// scenario (joint serializability, the seeded-abort idempotent-retry proof, snapshot visibility,
+    /// dense-node fan-out, chunking bounds, or crash-mid-batch reconciliation) fails clearly and fast
+    /// without needing the whole-catalogue sweep.
+    #[test]
+    fn network_bulk_ingest_mode_b_holds_across_seeds() {
+        for seed in 1u64..=20 {
+            let a = network_bulk_ingest_mode_b(seed);
+            let b = network_bulk_ingest_mode_b(seed);
+            assert_eq!(
+                a, b,
+                "network_bulk_ingest_mode_b must replay identically for seed {seed}"
+            );
+            assert!(
+                a.ok,
+                "network_bulk_ingest_mode_b must hold at seed {seed}: {}",
                 a.detail
             );
         }

@@ -214,6 +214,15 @@ fn extract_json_number(body: &str, key: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Extracts a top-level JSON **string** field's value by key (e.g. Mode B's `"session":"<uuid>"`).
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_owned())
+}
+
 /// One `POST /admin/db/{db}/bulk-import?{query}` call with a `Content-Length`-framed body.
 async fn bulk_call(
     addr: std::net::SocketAddr,
@@ -802,6 +811,351 @@ async fn network_mode_a_matches_the_offline_importer_stats() {
         Some(offline_stats.properties),
         "property count parity: network={end_body} offline={offline_stats:?}"
     );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+// ------------------------------------------------------------------------------------------------
+// Mode B (`08` §5.3, `rmp` #520): an already-live database, concurrent, no exclusivity.
+// ------------------------------------------------------------------------------------------------
+
+/// Full Mode B session lifecycle: open against an already-**non-empty**, `Online` database (proving
+/// Mode B has no empty-database precondition, unlike Mode A), nodes then relationships in the SAME
+/// session (continued via `?session=<uuid>`), `end`, and the data is durably queryable — all while an
+/// ordinary Cypher write against the SAME database succeeds mid-session (the core "still live" proof
+/// at the REST layer, `08` §5.3's defining property).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_b_session_lifecycle_happy_path_stays_live() {
+    let temp = TempStore::new("modeb-happy");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE livedb").await;
+    assert_eq!(status, 200, "create database: {body}");
+    // Seed a pre-existing node BEFORE the Mode B session opens — proves Mode B has no empty-database
+    // precondition (`08` §5.3: "Mode B does not require the database to be empty").
+    let (status, body) = rest_statement(rest, &token, "livedb", "CREATE (:Seed {x:1})").await;
+    assert_eq!(status, 200, "seed pre-existing data: {body}");
+
+    // Open a NEW Mode B session (mode=live, no session param): a fresh id is minted.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "livedb",
+        "phase=nodes&mode=live",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "mode=live nodes phase (open): {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+    let session = extract_json_string(&body, "session").expect("a session id is returned");
+
+    // Concurrent ordinary traffic against the SAME database succeeds WHILE the Mode B session is
+    // conceptually "open" (between calls) — the defining "still live" property of Mode B.
+    let (status, body) = rest_statement(rest, &token, "livedb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "ordinary concurrent read: {body}");
+    assert_eq!(
+        extract_jolt_int(&body),
+        Some(4),
+        "ordinary read sees the seed node + the 3 just-imported nodes: {body}"
+    );
+    let (status, body) = rest_statement(rest, &token, "livedb", "CREATE (:Other {y:2})").await;
+    assert_eq!(status, 200, "ordinary concurrent write: {body}");
+
+    // Continue the SAME session for the relationship file, naming it explicitly.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "livedb",
+        &format!("phase=relationships&mode=live&session={session}"),
+        Some("text/csv"),
+        RELS_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "mode=live relationships phase (continue): {body}"
+    );
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+    assert_eq!(
+        extract_json_number(&body, "relationships"),
+        Some(2),
+        "body: {body}"
+    );
+    assert_eq!(
+        extract_json_string(&body, "session").as_deref(),
+        Some(session.as_str()),
+        "the SAME session id is echoed back on continuation: {body}"
+    );
+
+    // End the session.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "livedb",
+        &format!("end=true&mode=live&session={session}"),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200, "mode=live end: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+    assert_eq!(
+        extract_json_number(&body, "relationships"),
+        Some(2),
+        "body: {body}"
+    );
+
+    // The database was NEVER taken offline (unlike Mode A) — still Online, still queryable, holding
+    // exactly: 1 seed + 3 imported + 1 ordinary-concurrent-write = 5 nodes, 2 imported relationships.
+    let (status, body) = rest_statement(rest, &token, "livedb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "post-end read: {body}");
+    assert_eq!(extract_jolt_int(&body), Some(5), "body: {body}");
+    let (status, body) = rest_statement(
+        rest,
+        &token,
+        "livedb",
+        "MATCH ()-[r:KNOWS]->() RETURN count(r)",
+    )
+    .await;
+    assert_eq!(status, 200, "post-end rel read: {body}");
+    assert_eq!(extract_jolt_int(&body), Some(2), "body: {body}");
+
+    // Ending again is an idempotent no-op (mirrors Mode A's `End` contract).
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "livedb",
+        &format!("end=true&mode=live&session={session}"),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(status, 200, "second end is a no-op: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(0), "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// RBAC: a Mode B call is denied to an authenticated but non-admin principal, exactly like Mode A.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_b_authenticated_non_admin_is_403() {
+    let temp = TempStore::new("modeb-rbac");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let admin = mint_token(ADMIN_USER);
+    let non_admin = mint_token(NON_ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &admin, DB, "CREATE DATABASE rbacdb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&non_admin),
+        "rbacdb",
+        "phase=nodes&mode=live",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 403, "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// An unknown/never-opened Mode B session id is a clean `409`, and the target database is
+/// completely untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_b_unknown_session_is_409() {
+    let temp = TempStore::new("modeb-unknown-session");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE unkdb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    let bogus = uuid::Uuid::new_v4();
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "unkdb",
+        &format!("phase=nodes&mode=live&session={bogus}"),
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 409, "body: {body}");
+    assert!(
+        body.contains(&bogus.to_string()),
+        "message should name the unknown session: {body}"
+    );
+
+    let (status, body) = rest_statement(rest, &token, "unkdb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(
+        status, 200,
+        "unkdb must still be online and untouched: {body}"
+    );
+    assert_eq!(extract_jolt_int(&body), Some(0), "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The server-wide Mode B concurrent-session cap (`08` §8) is enforced: opening one more session past
+/// the configured cap is a clean `503`, and the already-open sessions are unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_b_concurrent_session_cap_is_503() {
+    let temp = TempStore::new("modeb-cap");
+    let server = boot(base_config(
+        &temp,
+        BulkImportConfig {
+            mode_b_max_concurrent_sessions: 1,
+            ..BulkImportConfig::default()
+        },
+    ))
+    .await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE capdb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    // The first session opens fine (cap == 1).
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "capdb",
+        "phase=nodes&mode=live",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "first session opens under the cap: {body}");
+    let first_session = extract_json_string(&body, "session").expect("session id");
+
+    // A second, DISTINCT session (no `session=` param — a genuinely new session) is refused: the cap
+    // is already saturated by the still-open first session.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "capdb",
+        "phase=nodes&mode=live",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 503, "body: {body}");
+
+    // The first session is unaffected: it can still be continued and ended normally.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "capdb",
+        &format!("end=true&mode=live&session={first_session}"),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "first session still usable after the cap rejection: {body}"
+    );
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// Mode B requires the target database to be `Online`; a non-existent database is `404` (unchanged,
+/// checked before mode/session parsing even runs), and an `Offline` database is `409`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_b_non_online_database_is_rejected() {
+    let temp = TempStore::new("modeb-offline");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE offdb").await;
+    assert_eq!(status, 200, "create database: {body}");
+    let (status, body) = rest_statement(rest, &token, DB, "STOP DATABASE offdb").await;
+    assert_eq!(status, 200, "stop database: {body}");
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "offdb",
+        "phase=nodes&mode=live",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 409, "body: {body}");
+    assert!(
+        body.contains("not online"),
+        "message should explain the database is not online: {body}"
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// A Mode B session opened against database `A` cannot be continued via a request path naming
+/// database `B` — cross-database continuation is refused (`D-multi-db` containment), and the session
+/// remains usable against its own database afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_b_session_is_bound_to_its_own_database() {
+    let temp = TempStore::new("modeb-crossdb");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE dba").await;
+    assert_eq!(status, 200, "create dba: {body}");
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE dbb").await;
+    assert_eq!(status, 200, "create dbb: {body}");
+
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "dba",
+        "phase=nodes&mode=live",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "open against dba: {body}");
+    let session = extract_json_string(&body, "session").expect("session id");
+
+    // Continuing against `dbb` (wrong database) is refused.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "dbb",
+        &format!("phase=relationships&mode=live&session={session}"),
+        Some("text/csv"),
+        RELS_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "cross-database continuation must be refused: {body}"
+    );
+
+    // The session is unaffected and still usable against its OWN database.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "dba",
+        &format!("end=true&mode=live&session={session}"),
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "session still usable against its own db: {body}"
+    );
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
 
     server.shutdown().await.expect("clean shutdown");
 }

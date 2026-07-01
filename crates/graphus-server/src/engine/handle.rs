@@ -20,6 +20,7 @@ use super::EngineDegraded;
 use super::MaintenanceDegraded;
 use super::TxTicket;
 use super::bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
+use super::bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 use super::command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
     ReplyReceiver, RunReply, RunSummary, reply_channel,
@@ -339,6 +340,34 @@ impl EngineHandle {
         let (reply, rx) = reply_channel();
         self.submit(EngineCommand::BulkImportBatch { batch, reply })
             .await?;
+        recv_async(rx).await?
+    }
+
+    /// Ingests one chunk of a **network bulk-import Mode B batch** (`08-network-bulk-import.md`
+    /// §5.3/§7.2, `rmp` #520): loading into an already-**live** database, concurrent with ordinary
+    /// traffic. `ticket` must already be an open transaction (opened via [`begin`](Self::begin)); this
+    /// call does **not** commit — the caller drives the surrounding `Begin`/`Commit`/`Rollback` itself
+    /// (`crate::bulk_import_mode_b`'s batch driver). Takes **no admission permit**, mirroring
+    /// [`bulk_import_batch`](Self::bulk_import_batch); Mode B's own server-wide concurrent-session cap
+    /// (`08` §8) is the resource-bounding mechanism instead.
+    ///
+    /// # Errors
+    /// [`GraphusError::Transaction`] is the **retriable** case (a write-write lock conflict or an SSI
+    /// predicate conflict registered mid-statement, or an unknown/inactive `ticket`); every other
+    /// variant is terminal (a malformed row, an unknown relationship endpoint), or if the engine is
+    /// shut down.
+    pub async fn bulk_import_mode_b_chunk(
+        &self,
+        ticket: TxTicket,
+        chunk: BulkImportModeBChunkInput,
+    ) -> Result<BulkImportModeBChunkOutcome, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit(EngineCommand::BulkImportModeBChunk {
+            ticket,
+            chunk,
+            reply,
+        })
+        .await?;
         recv_async(rx).await?
     }
 

@@ -69,9 +69,13 @@ struct ExtraState {
     /// recorded here (`08` §6) — the other `/admin/*` routes above predate rmp #70's REST wiring and
     /// do not yet audit; only the new bulk-import route does, per its own specification.
     audit: Arc<AuditLog>,
-    /// Bulk-import resource limits (`08` §8; `rmp` #518): byte quota, disk-space reserve, session
-    /// timeout.
+    /// Bulk-import resource limits (`08` §8; `rmp` #518/#520): byte quota, disk-space reserve, session
+    /// timeout, and the Mode B batch/chunk/retry/concurrency knobs.
     bulk_import: Arc<BulkImportConfig>,
+    /// The server-wide registry of open **Mode B** sessions (`08` §5.3/§8, `rmp` #520) — a live
+    /// database's network bulk-import sessions, checked out for the duration of one HTTP call at a
+    /// time. Built once, from `bulk_import`, at server startup.
+    mode_b: Arc<crate::bulk_import_mode_b::ModeBSessionRegistry>,
 }
 
 /// Builds the observability + admin routes as a standalone `Router` to be merged onto the REST API
@@ -89,6 +93,8 @@ pub fn routes(
     audit: Arc<AuditLog>,
     bulk_import: BulkImportConfig,
 ) -> Router {
+    let mode_b =
+        Arc::new(crate::bulk_import_mode_b::ModeBSessionRegistry::from_config(&bulk_import));
     let state = ExtraState {
         metrics,
         engine,
@@ -100,6 +106,7 @@ pub fn routes(
         metrics_scrape_token,
         audit,
         bulk_import: Arc::new(bulk_import),
+        mode_b,
     };
     Router::new()
         .route("/metrics", get(metrics_handler))

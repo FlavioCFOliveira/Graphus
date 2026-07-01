@@ -128,6 +128,13 @@ csv = "1.4"
 # channel that bridges the async body-poll loop into the blocking CSV-parsing task. Same `1` line
 # `axum`/`http-body-util` already pin, so no duplicate tree enters the build.
 bytes = "1"
+# Network bulk-import Mode B session ids (`08-network-bulk-import.md` §5.3, `rmp` #520): an opaque,
+# server-minted identifier a REST client presents on every continuation call against an in-flight
+# Mode B session. `v4` (random) is the only feature needed — no MAC-address/timestamp-based variants,
+# no `serde` (a session id round-trips as a plain string in the JSON response body, not a typed
+# field). Mature, minimal-dependency (`getrandom` only), 1.x-stable crate; no other workspace member
+# depends on it yet, so this is a new, small addition, not a version-conflict risk.
+uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [dev-dependencies]
 # In-test self-signed certificate generation for the TLS listener paths (`04 §8.4`; same crate
@@ -195,3 +202,7 @@ http = "1"
 # it is logically identical to the JSON body — the content-negotiation proof. Same `0.2` line
 # `graphus-rest` pins.
 ciborium = "0.2"
+# Mints an intentionally-unknown Mode B session id (`rmp` #520) for the
+# `network_mode_b_unknown_session_is_409` integration test. Same `1`/`v4` line the production
+# `[dependencies]` entry above already pins, so no duplicate tree enters the build.
+uuid = { version = "1", default-features = false, features = ["v4"] }

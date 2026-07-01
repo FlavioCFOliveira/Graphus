@@ -25,6 +25,7 @@
 
 pub mod bolt_values;
 pub(crate) mod bulk_load;
+pub(crate) mod bulk_load_b;
 pub mod command;
 mod exec;
 mod handle;
@@ -48,6 +49,7 @@ use graphus_txn::IsolationLevel;
 use graphus_wal::LogSink;
 
 pub use bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
+pub use bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 pub use command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
     RunReply, RunSummary,
@@ -1340,6 +1342,10 @@ fn reply_engine_degraded(cmd: EngineCommand) -> Option<EngineCommand> {
             let _ = reply.send(Err(engine_degraded_error()));
             None
         }
+        Cmd::BulkImportModeBChunk { reply, .. } => {
+            let _ = reply.send(Err(engine_degraded_error()));
+            None
+        }
     }
 }
 
@@ -1503,6 +1509,13 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         Cmd::BulkImportBatch { batch, reply } => {
             let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
             let _ = reply.send(out);
+        }
+        Cmd::BulkImportModeBChunk {
+            ticket,
+            chunk,
+            reply,
+        } => {
+            run_mode_b_chunk_isolated(coord, open, ticket, chunk, metrics, db, degraded, reply);
         }
         // Test-only (`rmp` #435): the threaded engine loop intercepts this before dispatch, so it only
         // reaches here on the `LocalEngine` inline path — drive the same real per-engine escalation.
@@ -1672,6 +1685,69 @@ fn run_statement_isolated<
                 &fallback,
                 &panic_payload,
             );
+        }
+    }
+}
+
+/// Runs one [`bulk_load_b::ingest_mode_b_chunk`] dispatch behind the **same panic-isolation
+/// boundary** [`run_statement_isolated`] uses (`rmp` #386, reproduced here for `rmp` #520's Mode B
+/// chunk command): a panic during row ingestion (a malformed value, an unexpected internal-state
+/// corner case) becomes a clean terminal [`GraphusError`] instead of unwinding the single engine
+/// thread. Unlike a `Run` statement's own auto-commit bookkeeping, a Mode B chunk never commits or
+/// closes its ticket itself (see [`bulk_load_b`]'s module docs) — a caught panic therefore rolls the
+/// **whole batch's transaction** back and removes its ticket from `open`, exactly mirroring what the
+/// driver's own error path would have done via an explicit `Rollback`, so a panicked chunk can never
+/// leave `ticket` open (leaking an SSI/lock/SIREAD footprint) or silently hang the waiting HTTP call.
+#[allow(clippy::too_many_arguments)]
+fn run_mode_b_chunk_isolated<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    coord: &mut TxnCoordinator<D, S>,
+    open: &mut HashMap<u64, OpenTx>,
+    ticket: TxTicket,
+    chunk: bulk_load_b::BulkImportModeBChunkInput,
+    metrics: &Metrics,
+    db: &str,
+    degraded: &EngineDegraded,
+    reply: command::Reply<
+        std::result::Result<bulk_load_b::BulkImportModeBChunkOutcome, GraphusError>,
+    >,
+) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let fallback = reply.fallback();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        bulk_load_b::ingest_mode_b_chunk(coord, open, ticket, chunk)
+    }));
+
+    match result {
+        Ok(out) => {
+            let _ = reply.send(out);
+        }
+        Err(panic_payload) => {
+            let detail = panic_message(&*panic_payload);
+            tracing::error!(
+                target: "graphus::engine",
+                ticket = ticket.0,
+                panic = %detail,
+                "bulk-import Mode B chunk panicked; rolling back its transaction and keeping the \
+                 engine alive (rmp #386/#520)",
+            );
+            if let Some(tx) = open.remove(&ticket.0) {
+                let txn = tx.txn;
+                if let Some(Ok(())) =
+                    catch_recovery(metrics, degraded, "mode-b chunk rollback", || {
+                        coord.rollback(txn)
+                    })
+                {
+                    metrics.record_abort_for(db);
+                }
+            }
+            metrics.record_statement_panic();
+            let _ = fallback.try_send_fallback(Err(GraphusError::Runtime(format!(
+                "internal error: bulk-import Mode B chunk aborted ({detail})"
+            ))));
         }
     }
 }

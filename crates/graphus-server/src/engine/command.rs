@@ -14,6 +14,7 @@
 use graphus_core::{GraphusError, Value};
 
 use super::bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
+use super::bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
 use crate::engine::TxTicket;
@@ -402,6 +403,29 @@ pub enum EngineCommand {
         /// error (the batch's transaction is rolled back on any error — no partial batch is ever
         /// visible).
         reply: Reply<Result<BulkImportBatchOutcome, GraphusError>>,
+    },
+    /// Ingests one chunk of a **network bulk-import Mode B batch** (`08-network-bulk-import.md`
+    /// §5.3/§7.2, `rmp` #520): loading into an already-**live** database, concurrent with ordinary
+    /// traffic. Unlike [`EngineCommand::BulkImportBatch`] (Mode A's raw, no-SSI store write), every
+    /// row is applied through the ordinary [`graphus_cypher::GraphAccess`] write seam
+    /// (`create_node`/`create_rel`) inside the **already-open** transaction `ticket` (opened via the
+    /// ordinary [`EngineCommand::Begin`]) — full SIREAD/predicate-marker registration and
+    /// write-locking, so it participates in MVCC/SSI exactly like a concurrent Cypher `CREATE`. Does
+    /// **not** commit: the caller (`crate::bulk_import_mode_b`'s batch driver) commits/rolls back the
+    /// whole batch itself via the ordinary [`EngineCommand::Commit`]/[`EngineCommand::Rollback`].
+    /// Takes **no admission permit** (mirrors [`EngineCommand::BulkImportBatch`]) — Mode B's own
+    /// server-wide concurrent-session cap (`08` §8) is the resource-bounding mechanism instead.
+    BulkImportModeBChunk {
+        /// The already-open transaction (opened via `Begin`) this chunk's rows are applied into.
+        ticket: TxTicket,
+        /// The rows to ingest.
+        chunk: BulkImportModeBChunkInput,
+        /// Reply channel: this chunk's outcome (new external-id bindings + row-count deltas), or the
+        /// captured/parse/commit-adjacent error. [`GraphusError::Transaction`] is the retriable case
+        /// (a write-write lock conflict or an SSI predicate conflict registered mid-statement);
+        /// every other variant is terminal (a malformed row, an unknown transaction ticket, an
+        /// unknown relationship endpoint).
+        reply: Reply<Result<BulkImportModeBChunkOutcome, GraphusError>>,
     },
     /// **Test-only** (`rmp` #435, opt-in `internal-test-udf`): deterministically drives this engine's
     /// **background maintenance escalation** path so the per-engine reclamation-degraded flag is set

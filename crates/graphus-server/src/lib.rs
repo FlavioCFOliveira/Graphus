@@ -26,6 +26,7 @@
 
 pub mod admin;
 pub mod audit;
+pub mod bulk_import_mode_b;
 pub mod config;
 pub mod dbcatalog;
 pub mod engine;

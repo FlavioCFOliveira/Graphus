@@ -41,6 +41,7 @@ use graphus_storage::RecordStore;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 use super::bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome, LoadingSession};
+use super::bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 use super::command::{
     AccessMode, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply, RunReply,
     RunSummary, reply_channel,
@@ -329,6 +330,28 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ) -> Result<BulkImportBatchOutcome> {
         let (reply, rx) = reply_channel();
         self.dispatch(EngineCommand::BulkImportBatch { batch, reply });
+        rx.recv().map_err(|_| gone())?
+    }
+
+    /// Ingests one chunk of a network bulk-import **Mode B** batch (`rmp` #520), driving the same
+    /// `bulk_load_b::ingest_mode_b_chunk` dispatch the production engine loop uses — the DST/VOPR seam
+    /// for `network_bulk_ingest_mode_b` (`07-dst-simulator.md`). `ticket` must already be an open
+    /// transaction (see [`Self::begin`]); does not commit.
+    ///
+    /// # Errors
+    /// [`GraphusError::Transaction`] (retriable) on a write-write/SSI conflict or an unknown ticket; a
+    /// terminal error for a malformed row / unknown endpoint; or if the engine has been shut down.
+    pub fn bulk_import_mode_b_chunk(
+        &mut self,
+        ticket: TxTicket,
+        chunk: BulkImportModeBChunkInput,
+    ) -> Result<BulkImportModeBChunkOutcome> {
+        let (reply, rx) = reply_channel();
+        self.dispatch(EngineCommand::BulkImportModeBChunk {
+            ticket,
+            chunk,
+            reply,
+        });
         rx.recv().map_err(|_| gone())?
     }
 

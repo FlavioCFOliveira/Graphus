@@ -522,6 +522,78 @@ pub struct BulkImportConfig {
     /// Default: 2 hours — generous enough for a multi-hundred-GB transfer over a modest link, yet
     /// finite so an abandoned session is reclaimed.
     pub session_timeout_ms: u64,
+    /// **Mode B** (`08` §5.3/§7.2, `rmp` #520): rows per Mode B commit/transaction — the SSI-footprint
+    /// / retry-blast-radius knob (`08` §7.2.1). A larger in-flight batch holds a larger SIREAD/write-
+    /// lock footprint open for longer, raising both the probability of a pivot abort against
+    /// concurrent traffic that happens to probe/scan the exact rows/predicates the batch is populating
+    /// (the dominant, correct source of Mode B contention — `08` §7.2.1) and the wasted work of a
+    /// whole-batch retry when one occurs; too small a batch fails to amortize the fixed per-commit cost
+    /// (WAL group commit, SSI/index-maintenance bookkeeping), defeating the point of batching.
+    /// **Measured** (`rmp` #520, `crates/graphus-dst/src/mode_b_batch_size_measurement.rs`, a
+    /// deterministic `LocalEngine` sweep driving a REAL Mode B batch — `begin`/
+    /// `bulk_import_mode_b_chunk`/`commit` — against a fixed-probability concurrent reader that probes
+    /// each about-to-be-created row's own unique property value, reproducing a genuine, per-chunk
+    /// SSI pivot-abort mechanism traced against the actual `graphus_txn::ssi::SsiTracker`, not a
+    /// guessed one — see that module's doc comment for the empirically-derived mechanism, which turned
+    /// out to be node-property-equality-driven rather than the originally-assumed relationship-type
+    /// predicate): batch size → abort rate — 100 → 0%, 500 → 0%, 2,000 → 5%, 5,000 → 25%, 10,000 → 10%
+    /// (20 trials/candidate; the 5,000/10,000 gap reflects genuine run-to-run noise at this trial count,
+    /// not a real non-monotonicity — both are well above the 2,000 candidate). `2,000` keeps the
+    /// measured abort rate low (~5%, comfortably under the ~20-25% ceiling this default is chosen
+    /// against) while still amortizing per-commit overhead ~2,000× over the row-at-a-time floor, and is
+    /// a full order of magnitude below Mode A's contention-free `DEFAULT_BATCH_SIZE = 10,000` (`08`
+    /// §7.2.1: "Mode B batch size is expected to differ from Mode A's default"). Must be `> 0`.
+    pub mode_b_batch_rows: u64,
+    /// **Mode B**: rows per engine-thread dispatch within one open batch — the `08` §7.2.6 fairness/
+    /// yielding granularity ("the batch driver must yield the engine thread at small sub-batch...
+    /// granularity, never submit an entire...batch as one uninterruptible engine command"). Chosen as
+    /// a small, low-double-digit row count: each row's `GraphAccess::create_node`/`create_rel` call is
+    /// itself sub-millisecond (a handful of B-tree/bitmap writes), so a chunk of a few dozen rows keeps
+    /// any single [`EngineCommand`](crate::engine::EngineCommand) dispatch's uninterruptible engine-
+    /// thread occupancy in the tens-of-microseconds range — far below the latency an ordinary
+    /// concurrent client would notice — while still amortizing the fixed per-dispatch channel
+    /// round-trip cost (a `std::sync::mpsc` send + reply) over more than one row. Verified
+    /// mechanistically (chunk size genuinely bounds one dispatch) by the
+    /// `network_bulk_ingest_mode_b` DST scenario, and against **real wall-clock latency** under
+    /// genuine concurrent tokio tasks by
+    /// `crates/graphus-server/tests/bulk_import_mode_b_fairness.rs` (DST has no real clock — see that
+    /// scenario's module docs for the split). Must be `> 0` and `<= mode_b_batch_rows`.
+    pub mode_b_chunk_rows: u64,
+    /// **Mode B**: the bounded automatic retry count for a batch that aborts on an SSI pivot (`08`
+    /// §7.2.3: "The server automatically retries an aborted batch, bounded by a configurable retry
+    /// count... If a batch keeps aborting past the retry bound... the session surfaces a retriable
+    /// error to the client rather than looping forever"). `0` is a valid value (no automatic retry —
+    /// every abort surfaces immediately, e.g. for a client that prefers to control its own retry
+    /// policy). Default: `5` — generous enough to ride out a handful of pivot aborts against transient
+    /// concurrent contention (per the measurement above, most batch sizes in the sane range abort well
+    /// under 5 times in a row even under sustained contention) without looping indefinitely against a
+    /// persistently hot relationship type.
+    pub mode_b_max_batch_retries: u32,
+    /// **Mode B**: the base backoff (milliseconds) between automatic batch retries, doubling per
+    /// attempt up to a fixed ceiling (exponential backoff with a cap — `crate::bulk_import_mode_b`).
+    /// Must be `> 0`: a zero base with exponential doubling stays zero forever, defeating backoff's own
+    /// purpose (immediately hammering a hot contended predicate on every retry, worsening the exact
+    /// abort storm `08` §7.2.1 describes). Default: `20` ms — brief enough not to meaningfully slow a
+    /// multi-batch import's overall throughput, long enough to let a transient conflicting transaction
+    /// clear before the retry re-contends.
+    pub mode_b_retry_backoff_ms: u64,
+    /// **Mode B**: server-wide cap on concurrently open Mode B sessions, across all databases (`08`
+    /// §8: "a server-wide cap on concurrently open Mode B sessions..., since Mode B has no exclusivity
+    /// mechanism to naturally bound concurrency... purely to bound aggregate resource consumption").
+    /// Must be `> 0`. Default: `8` — bounds the aggregate in-flight-batch/id-map/SSI-footprint memory a
+    /// multi-tenant server exposes to this capability, while comfortably covering the realistic
+    /// "several concurrent imports against different label sets/databases" scenario `08` §5.3
+    /// describes as supported.
+    pub mode_b_max_concurrent_sessions: usize,
+    /// **Mode B**: idle-session reap window (milliseconds) — a Mode B session with no chunk/end
+    /// activity for longer than this is opportunistically reclaimed on the next registry access (`08`
+    /// §8's abandoned/slow-loris session guard, applied to Mode B's own session registry rather than
+    /// the streaming-call-level guards [`session_timeout_ms`](Self::session_timeout_ms) already
+    /// provides for Mode A / the per-call streaming path). Must be `> 0`. Default: 30 minutes —
+    /// generous for a legitimate pause between batches (e.g. an operator-side ETL step between files),
+    /// yet finite so an abandoned session's `id_map`/stats memory and its held session slot are
+    /// eventually reclaimed.
+    pub mode_b_session_idle_timeout_ms: u64,
 }
 
 impl Default for BulkImportConfig {
@@ -530,6 +602,12 @@ impl Default for BulkImportConfig {
             max_bytes_per_session: 8 * 1024 * 1024 * 1024,
             min_free_disk_bytes: 1024 * 1024 * 1024,
             session_timeout_ms: 2 * 60 * 60 * 1000,
+            mode_b_batch_rows: 2_000,
+            mode_b_chunk_rows: 25,
+            mode_b_max_batch_retries: 5,
+            mode_b_retry_backoff_ms: 20,
+            mode_b_max_concurrent_sessions: 8,
+            mode_b_session_idle_timeout_ms: 30 * 60 * 1000,
         }
     }
 }
@@ -539,6 +617,18 @@ impl BulkImportConfig {
     #[must_use]
     pub fn session_timeout(&self) -> Duration {
         Duration::from_millis(self.session_timeout_ms)
+    }
+
+    /// The Mode B base retry backoff as a [`Duration`].
+    #[must_use]
+    pub fn mode_b_retry_backoff(&self) -> Duration {
+        Duration::from_millis(self.mode_b_retry_backoff_ms)
+    }
+
+    /// The Mode B idle-session reap window as a [`Duration`].
+    #[must_use]
+    pub fn mode_b_session_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.mode_b_session_idle_timeout_ms)
     }
 }
 
@@ -1051,6 +1141,48 @@ impl ServerConfig {
                     .to_owned(),
             ));
         }
+        if self.bulk_import.mode_b_batch_rows == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.mode_b_batch_rows must be > 0 (a zero batch size can never commit a \
+                 Mode B row)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.mode_b_chunk_rows == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.mode_b_chunk_rows must be > 0 (a zero chunk size can never dispatch a \
+                 Mode B row)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.mode_b_chunk_rows > self.bulk_import.mode_b_batch_rows {
+            return Err(ConfigError::Invalid(format!(
+                "bulk_import.mode_b_chunk_rows ({}) must be <= bulk_import.mode_b_batch_rows ({}): \
+                 a chunk larger than its own batch cannot be dispatched within it",
+                self.bulk_import.mode_b_chunk_rows, self.bulk_import.mode_b_batch_rows
+            )));
+        }
+        if self.bulk_import.mode_b_retry_backoff_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.mode_b_retry_backoff_ms must be > 0 (a zero base backoff never grows \
+                 under exponential doubling, defeating its own purpose)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.mode_b_max_concurrent_sessions == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.mode_b_max_concurrent_sessions must be > 0 (a zero cap would reject \
+                 every Mode B session)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.mode_b_session_idle_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.mode_b_session_idle_timeout_ms must be > 0 (a zero idle timeout would \
+                 reap every Mode B session the instant it is opened)"
+                    .to_owned(),
+            ));
+        }
 
         for user in &self.auth.users {
             if user.name.trim().is_empty() {
@@ -1215,6 +1347,141 @@ mod tests {
         };
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
     }
+
+    #[test]
+    fn bulk_import_mode_b_defaults_and_accessors() {
+        let cfg = BulkImportConfig::default();
+        assert_eq!(cfg.mode_b_batch_rows, 2_000);
+        assert_eq!(cfg.mode_b_chunk_rows, 25);
+        assert_eq!(cfg.mode_b_max_batch_retries, 5);
+        assert_eq!(cfg.mode_b_retry_backoff_ms, 20);
+        assert_eq!(cfg.mode_b_max_concurrent_sessions, 8);
+        assert_eq!(cfg.mode_b_session_idle_timeout_ms, 30 * 60 * 1000);
+        assert_eq!(cfg.mode_b_retry_backoff(), Duration::from_millis(20));
+        assert_eq!(
+            cfg.mode_b_session_idle_timeout(),
+            Duration::from_millis(30 * 60 * 1000)
+        );
+        // The defaults themselves must validate cleanly.
+        let server = ServerConfig {
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(server.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_mode_b_batch_rows_is_rejected() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_batch_rows: 0,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn zero_mode_b_chunk_rows_is_rejected() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_chunk_rows: 0,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn mode_b_chunk_rows_exceeding_batch_rows_is_rejected() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_batch_rows: 10,
+                mode_b_chunk_rows: 11,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn mode_b_chunk_rows_equal_to_batch_rows_is_accepted() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_batch_rows: 10,
+                mode_b_chunk_rows: 10,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_mode_b_retry_backoff_is_rejected() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_retry_backoff_ms: 0,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn zero_mode_b_max_concurrent_sessions_is_rejected() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_max_concurrent_sessions: 0,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn zero_mode_b_session_idle_timeout_is_rejected() {
+        let cfg = ServerConfig {
+            bulk_import: BulkImportConfig {
+                mode_b_session_idle_timeout_ms: 0,
+                ..BulkImportConfig::default()
+            },
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    // `mode_b_max_batch_retries` has no zero-rejection rule: `0` is documented as a valid "no
+    // automatic retry" value (`08` §7.2.3), so there is no invalid value to test here beyond the
+    // type's own range — covered implicitly by the defaults test above.
 
     #[test]
     fn connection_admission_defaults_and_validation() {

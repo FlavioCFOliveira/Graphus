@@ -456,6 +456,32 @@ concern it certifies, and its oracle.
   the same convention `backup_restore_crash` established, since `08-network-bulk-import.md`'s
   HTTP-transport and `DatabaseCatalog`/`Loading`-state layers are DST's structural non-goals
   (covered instead by `dbcatalog.rs`'s `mod tests` and `graphus-server/tests/bulk_import_endpoint.rs`).
+- `network_bulk_ingest_mode_b` (rmp #520) — Mode A's concurrent, higher-risk sibling: drives
+  `LocalEngine::begin`/`bulk_import_mode_b_chunk`/`commit` against an already-**live** database (no
+  `Loading` exclusivity), through a synchronous, DST-local mirror of
+  `graphus_server::bulk_import_mode_b::drive_mode_b_batch`'s retry-loop shape (`drive_mode_b_batch_sync`
+  — the real async driver cannot run against a synchronous `LocalEngine`; its own real-`EngineHandle`
+  tests live in `graphus-server/src/bulk_import_mode_b.rs`). Covers, in order: (1) **joint
+  serializability** — a Mode B node batch interleaved with an ordinary concurrent read-then-append
+  Cypher transaction on a shared key, checked via the Elle list-append model (`graphus_elle::check`),
+  the same convention `isolation.rs` establishes; (2) a **seeded, genuine SSI pivot abort** (the exact
+  `graphus_txn::ssi::SsiTracker::add_edge` eager committed-pivot-break rw-edge sequence, not a mock) of
+  an in-progress batch under `max_retries=0` (surfaces immediately, atomically, `GraphusError::
+  Transaction`-classified) and again under retries enabled (the real retry loop converges to exactly
+  the retry's own contribution — no duplication, no stale bindings); (3) **concurrent readers at
+  different snapshot begin timestamps** observe exactly "everything committed strictly before my
+  snapshot began," proven precisely (exact counts), never inferred; (4) a **dense/hot pre-existing
+  node** targeted by both a concurrent ordinary writer and a Mode B batch — fan-out exactly matches
+  what committed (the #220 invariant, Mode B as one of the two writers); (5) the **chunking mechanism**
+  genuinely bounds a single `bulk_import_mode_b_chunk` dispatch's row count (a direct assertion on
+  dispatched chunk sizes — real wall-clock engine-thread-yielding latency is DST's structural
+  non-goal here, covered instead by `graphus-server/tests/bulk_import_mode_b_fairness.rs`, the same
+  DST/integration split this section already uses for Mode A's transport layer); (6) a **crash
+  mid-batch** while unrelated ordinary transactions concurrently commit — recovery reconciles the
+  interleaved WAL exactly (every actually-committed row present, the never-committed in-flight batch
+  absent, nothing torn). *Oracle:* every bullet above is asserted precisely (exact counts/classes),
+  not just "no crash"; `network_bulk_ingest_mode_b_holds_across_seeds` (`scenarios.rs`) pins a 20-seed
+  deterministic-replay + always-holds gate independent of the whole-catalogue sweep.
 
 ### Load shapes
 

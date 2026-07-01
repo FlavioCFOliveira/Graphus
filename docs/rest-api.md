@@ -31,7 +31,7 @@ certificate, so clients pass `curl -k` / disable verification). The default data
 | `GET`    | `/admin/status`               | Bearer (admin)| Server status + open-transaction count |
 | `GET`    | `/admin/users/{name}`         | Bearer (admin)| Inspect a user's roles + password presence |
 | `POST`   | `/admin/shutdown`             | Bearer (admin)| Begin a graceful shutdown |
-| `POST`   | `/admin/db/{db}/bulk-import`  | Bearer (admin)| Streaming network bulk-import upload (§8.1) |
+| `POST`   | `/admin/db/{db}/bulk-import`  | Bearer (admin)| Streaming network bulk-import upload — Mode A §8.1.1, Mode B §8.1.2 |
 
 ---
 
@@ -228,16 +228,17 @@ Errors use `Content-Type: application/problem+json`:
 
 | HTTP  | When |
 | ----- | ---- |
-| `400` | Cypher syntax/argument error; malformed body; invalid `access_mode`; `/admin/db/{db}/bulk-import`: neither `phase` nor `end=true` given, an invalid `phase` value, or an invalid `{db}` name |
+| `400` | Cypher syntax/argument error; malformed body; invalid `access_mode`; `/admin/db/{db}/bulk-import`: neither `phase` nor `end=true` given, an invalid `phase` value, an invalid `{db}` name, an invalid `mode`/`session` value, `mode=fresh` combined with `session=...`, or Mode B's `end=true` with no `session` |
 | `401` | missing / invalid / expired Bearer token (and failed `/auth/login`) |
 | `403` | valid token but the principal lacks the required privilege |
-| `404` | unknown / expired transaction id (or one owned by another principal) |
+| `404` | unknown / expired transaction id (or one owned by another principal); `/admin/db/{db}/bulk-import`: unknown database |
 | `406` / `415` | unacceptable `Accept` / unsupported `Content-Type` (`/admin/db/{db}/bulk-import`: an unrecognized `Content-Type` on a `phase=...` call) |
 | `408` | `/admin/db/{db}/bulk-import` only: the session timeout (`bulk_import.session_timeout_ms`) elapsed |
-| `409` | serialization conflict (retriable); `/admin/db/{db}/bulk-import`: the target database is already `Loading` (a concurrent session), not `Online`, or not empty (Mode A's precondition — see §8.1) |
+| `409` | serialization conflict (retriable); `/admin/db/{db}/bulk-import` Mode A: the target database is already `Loading` (a concurrent session), not `Online`, or not empty; Mode B: the database is not `Online`, the named `session` is unknown/expired/busy/belongs to a different database, or a batch exhausted all automatic retries on a persistent SSI conflict |
 | `413` | request body over 4 MiB (over the configured quota for `/admin/db/{db}/bulk-import`) |
 | `429` | too many open transactions, or `/auth/login` rate-limited (retriable) |
 | `500` | internal fault (detail redacted; logged server-side) |
+| `503` | `/admin/db/{db}/bulk-import` Mode B only: the server-wide `mode_b_max_concurrent_sessions` cap is saturated |
 | `507` | insufficient free disk space (`/admin/db/{db}/bulk-import` only) |
 
 ---
@@ -261,14 +262,26 @@ database over the network, for scale that ordinary parameterized Cypher cannot r
 (millions of nodes, hundreds of millions of relationships) — see
 `specification/08-network-bulk-import.md` for the full design.
 
-This endpoint implements **Mode A**: loading a **fresh, empty** database that is not yet
-serving ordinary traffic. **Mode B** — bulk-importing into an already-live, already-serving,
-non-empty database under concurrent Bolt/REST traffic — is `rmp` #520 and is **not yet
-implemented**; this endpoint `409`s cleanly (see the status table below) if attempted
-against a non-empty database rather than attempting it.
+This endpoint supports **two modes**, declared explicitly via `?mode=` (never inferred, `08` §5):
+
+- **Mode A** (default, `mode=fresh` or `mode` omitted): loading a **fresh, empty** database
+  that is not yet serving ordinary traffic. The database is taken over exclusively (`Loading`
+  state) for the session's duration.
+- **Mode B** (`mode=live`, `rmp` #520): loading into an **already-live, already-serving**
+  database, under ordinary concurrent Bolt/REST traffic, with **zero exclusivity** — the
+  database is never taken offline. Every row is applied through the same transactional
+  (SSI-checked) write path an equivalent Cypher `CREATE` would use, so it is fully
+  serializable against concurrent traffic. See §8.1.2 below.
+
+Mode A's own wire protocol, response shape, and every documented behavior below are
+**unchanged** by Mode B's addition — a call with no `mode`/`session` parameter behaves
+byte-for-byte as it always has.
+
+#### 8.1.1 Mode A (default) — fresh, empty database
 
 - **Auth:** the global `Admin` privilege — the same gate as `BACKUP`/`RESTORE`/
   `CREATE DATABASE`. Missing/invalid Bearer → `401`; valid Bearer without `Admin` → `403`.
+  (Applies identically to Mode B, §8.1.2.)
 - **Wire protocol — one session, several calls.** A bulk-import session is one or more
   `POST` calls against the same `{db}`, distinguished by a query parameter:
   - `?phase=nodes` / `?phase=relationships` — this call's body is **one** CSV (or `.gcol`)
@@ -362,6 +375,130 @@ curl -sk -X POST $BASE/db/graphus/tx/commit \
 curl -sk -X POST $BASE/db/loadtest/tx/commit \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"statements":[{"statement":"MATCH (n) RETURN count(n) AS c"}]}'
+```
+
+#### 8.1.2 Mode B (`mode=live`) — already-live database, concurrent, no exclusivity
+
+`rmp` #520. Loads into a database that is **already `Online` and stays `Online`** for the
+whole session — it is never taken offline, never moved to `Loading`, and continues serving
+ordinary Bolt/REST reads and writes from other clients throughout the import. Every row is
+applied through the same transactional (SSI-checked) write path an equivalent Cypher
+`CREATE` would use, so the import is fully serializable against concurrent traffic (`08`
+§7.2) — this is *why* it is safe to run without exclusivity, not a shortcut around safety.
+
+- **Precondition:** the target database exists and is `Online`. Unlike Mode A, Mode B does
+  **not** require the database to be empty — it is explicitly designed for incremental load
+  into an already-populated, live graph. A database that is offline, `Loading`, or does not
+  exist → `409` (offline/not-found cases already covered by the `404`/`409` rows in §8.1.1's
+  status table — a non-existent database is still `404`, checked before `mode`/`session`
+  parsing even runs).
+- **Wire protocol — mode + session.** Every call adds two optional query parameters on top
+  of Mode A's `phase=...`/`end=true`:
+  - `?mode=live` — declares this call Mode B (required explicitly, or see the shorthand
+    below — never inferred from anything else about the request). `?mode=fresh` (or
+    omitting `mode` entirely) is Mode A, unchanged.
+  - `?session=<uuid>` — the Mode B session id. **Omitted** on the call that **opens** a new
+    session; **present** on every call that **continues** or **ends** an existing one. A
+    present `session` with `mode` omitted is treated as `mode=live` (a convenience
+    shorthand for "continue my session" — still an explicit declaration via `session`'s
+    presence, never an inferred one). `mode=fresh` together with a `session` parameter is
+    rejected with `400` (a session id is a Mode B concept only).
+  - `phase=nodes` / `phase=relationships` with `mode=live` and **no** `session` → opens a
+    **new** Mode B session against `{db}` (subject to the concurrent-session cap below) and
+    streams this call's file into it. Response adds one field to the usual JSON body:
+    `{"nodes":N,"relationships":M,"properties":P,"session":"<uuid>"}` — the newly-minted
+    session id, to be reused on every subsequent call.
+  - `phase=...` with `mode=live` (or the shorthand above) and a `session=<uuid>` naming a
+    still-open session → continues it, streaming this call's file into it. Same response
+    shape, echoing the same `session` id.
+  - `?end=true&mode=live&session=<uuid>` → ends the session: removes it from the server's
+    open-session registry and returns its final cumulative stats. **Idempotent**, mirroring
+    Mode A's `End` contract exactly: an unknown, already-ended, or idle-reaped session id is
+    a `200` no-op reporting zero stats, never an error. `?end=true&mode=live` **without** a
+    `session` → `400` (a session id is required to know which session to end — Mode A's
+    `end=true` has no such requirement since it is per-database, not per-session).
+  - A `session=<uuid>` naming a session that is unknown, expired (idle-reaped), or currently
+    busy (already driven by another in-flight call — a Mode B session is driven by **one**
+    call at a time) → `409`. A `session=<uuid>` naming a session that exists but belongs to a
+    **different** database than `{db}` → `409` (cross-database continuation is refused; the
+    session remains usable against its own database).
+- **No empty-database check, no `Loading` transition.** Everything else about the file
+  format, `Content-Type` detection, streaming/quota/disk-space/timeout guards, and the
+  target-database resolution is **identical** to Mode A (§8.1.1) — Mode B reuses the exact
+  same streaming/CSV/`.gcol`/quota/disk-space/timeout machinery, branching only in how each
+  batch is committed.
+- **Server-wide concurrent-session cap** (`bulk_import.mode_b_max_concurrent_sessions`,
+  default `8`, across *all* databases): opening a new session past the cap → `503`
+  (`Retry-After`-style: "retry once another session ends"). Already-open sessions are
+  unaffected by a rejected open attempt.
+- **Batch size, chunking, and automatic retry** (server-side, not client-visible beyond the
+  eventual response): each call's rows are grouped into **batches**
+  (`bulk_import.mode_b_batch_rows`, default `2,000` — measured empirically, see the
+  field's doc comment in `config.rs` for the abort-rate-vs-batch-size table this default is
+  chosen from) and each batch into **chunks** (`bulk_import.mode_b_chunk_rows`, default
+  `25`) dispatched as separate engine commands so the single engine thread is never
+  monopolized by one Mode B session for more than a chunk's worth of work at a time (`08`
+  §7.2.6/§8 — the fairness/DoS requirement). A batch that aborts on a genuine SSI conflict
+  (the dominant, *correct* source of Mode B contention: a concurrent transaction that scans
+  or counts the exact relationship type/rows being imported — `08` §7.2.1) is retried
+  automatically up to `bulk_import.mode_b_max_batch_retries` times (default `5`, exponential
+  backoff starting at `bulk_import.mode_b_retry_backoff_ms` = 20 ms, capped at 2 s); once
+  exhausted, the call fails with `409` naming the exceeded retry count.
+- **Crash / process-restart behavior — read this before relying on Mode B across a restart.**
+  Every batch that committed before a crash is durable via ordinary WAL/ARIES recovery (`08`
+  §7.2.5: no special mechanism is needed). An **in-process** HTTP reconnect (the server
+  process itself never restarted) resumes a session for free — it is still parked, live, in
+  the server's session registry. A full **server process restart** loses **every** in-memory
+  Mode B session (there is no durable checkpoint sentinel for Mode B, unlike Mode A — see
+  `crates/graphus-server/src/bulk_import_mode_b.rs`'s module doc for the full reasoning: a
+  bookkeeping node would be visible to ordinary Cypher queries on a *live* database, an
+  acceptable trade-off for Mode A's offline `Loading` database but not for Mode B's). The
+  operator must open a **new** Mode B session after a restart and re-supply data from the
+  last file boundary they tracked client-side. **This has a real, honest consequence:**
+  Mode B does **not** deduplicate against external ids — a re-sent, already-committed row
+  after a restart simply creates a **second** node/relationship with the same properties,
+  exactly as an ordinary Cypher client re-running a `CREATE` after a crash would. This is not
+  a defect; it is the correct consequence of "no exclusivity, ordinary transactional
+  semantics" (`08` §5.3).
+- **Status codes** (in addition to Mode A's table in §8.1.1, which still applies unchanged
+  for `mode=fresh`/omitted):
+
+  | HTTP | When |
+  | ---- | ---- |
+  | `200` | a `phase=...` batch was durably ingested, or `?end=true` completed (or was an idempotent no-op) — cumulative stats + `session` in the body |
+  | `400` | `mode=fresh` combined with `session=...`; `?end=true&mode=live` with no `session`; an invalid `mode` value (anything other than absent/`fresh`/`live`); an invalid `session` value (not a UUID) |
+  | `404` | unknown database (checked before `mode`/`session` parsing) |
+  | `409` | the database is not `Online` (offline, or does not exist as `Online`); the named `session` is unknown/expired/busy; the named `session` belongs to a different database; a batch exhausted all automatic retries on a persistent SSI conflict |
+  | `503` | the server-wide `mode_b_max_concurrent_sessions` cap is already saturated |
+
+Every session-lifecycle event (open, continue, end, and every rejection) is recorded in the
+security audit log (`security.md`), naming the mode and session id.
+
+```sh
+# 1. The target database is ALREADY live and serving traffic — no CREATE/STOP needed.
+#    (Seed a little existing data to make the point concrete.)
+curl -sk -X POST $BASE/db/livedb/tx/commit \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"statements":[{"statement":"CREATE (:Seed {x: 1})"}]}'
+
+# 2. Open a Mode B session (no `session` param — a new one is minted) and stream the node file.
+SESSION=$(curl -sk -X POST "$BASE/admin/db/livedb/bulk-import?phase=nodes&mode=live" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: text/csv" \
+  --data-binary @nodes.csv | jq -r '.session')
+
+# 3. The database is STILL live: an ordinary concurrent read succeeds right now.
+curl -sk -X POST $BASE/db/livedb/tx/commit \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"statements":[{"statement":"MATCH (n) RETURN count(n) AS c"}]}'
+
+# 4. Continue the SAME session for the relationship file, naming it explicitly.
+curl -sk -X POST "$BASE/admin/db/livedb/bulk-import?phase=relationships&mode=live&session=$SESSION" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: text/csv" \
+  --data-binary @rels.csv
+
+# 5. End the session — the database was NEVER taken offline; no START DATABASE step needed.
+curl -sk -X POST "$BASE/admin/db/livedb/bulk-import?end=true&mode=live&session=$SESSION" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 User, role, and database administration is done by sending the administrative statements

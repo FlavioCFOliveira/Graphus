@@ -57,6 +57,7 @@ pub mod columnar;
 pub mod dump;
 pub mod header;
 pub mod import;
+pub mod row_parse;
 pub mod value_parse;
 
 pub use columnar::{ColumnarError, csv_to_gcol, gcol_to_csv};
@@ -66,4 +67,19 @@ pub use import::{
     BulkImporter, DEFAULT_BATCH_SIZE, DuplicatePolicy, ImportStats, ingest_node_row,
     ingest_rel_row, intern_property_key_tokens,
 };
+// `row_parse` (`rmp` #520): the store-independent CSV row-parsing helpers network bulk-import Mode B
+// drives directly (never `ingest_node_row`/`ingest_rel_row`, which write through a raw `RecordStore`).
+pub use row_parse::{
+    ParsedNodeRow, ParsedRelRow, RowParseError, parse_node_row, parse_node_row_with_limits,
+    parse_rel_row, parse_rel_row_with_limits,
+};
+// Pre-existing re-export gap (found while implementing `rmp` #520, fixed on the spot per CLAUDE.md's
+// self-contained-development policy): `value_parse::parse_cell`/`parse_cell_with_limits`/`ParseLimits`
+// were already `pub` in `value_parse.rs` but never re-exported at the crate root, forcing an external
+// caller through the internal `graphus_bulk::value_parse::` path instead of the crate's normal
+// re-export surface (every other public item in this module is re-exported this way).
 pub use value_parse::ValueParseError;
+pub use value_parse::{
+    DEFAULT_MAX_ARRAY_ELEMS, DEFAULT_MAX_CELL_BYTES, ParseLimits, parse_cell,
+    parse_cell_with_limits,
+};
