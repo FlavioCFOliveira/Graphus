@@ -148,6 +148,20 @@ pub const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
 /// only reserved address space (lazily paged, a handful of threads per database).
 pub const QUERY_ENGINE_STACK_SIZE: usize = 64 * 1024 * 1024;
 
+/// The maximum number of write commits coalesced into a single group-commit `fdatasync` (`rmp` #528,
+/// `04 §4.2`).
+///
+/// The engine batches only commits **already queued** on its command channel: the drain stops the
+/// instant `try_recv` reports the channel momentarily empty, so under low load a lone committer still
+/// hardens immediately (a batch of one). This cap bounds the pathological case where commits arrive
+/// faster than one `fdatasync` completes — it caps how many are PREPAREd (a handful of microseconds of
+/// in-memory work + one WAL append each) before the batch is forced to harden, so a committer's added
+/// latency is at most `MAX_COMMIT_BATCH − 1` cheap prepares plus one shared sync, never unbounded.
+/// 128 is comfortably above the number of writer connections a single-writer engine services between
+/// two `fdatasync`s on any realistic durable device, so in practice the natural channel-drain bound
+/// (not this cap) ends every batch.
+const MAX_COMMIT_BATCH: usize = 128;
+
 /// A **test-only fault-injection seam** (`rmp` #409): the count of upcoming statement-recovery
 /// rollbacks/commits that should *themselves* panic, simulating the historical `RefCell`-double-borrow
 /// in `store.rs` (or the #359 buffer-pool replay panic class) striking inside the recovery path. Lets
@@ -418,6 +432,23 @@ struct OpenTx {
     auto_commit: bool,
 }
 
+/// A write commit that has been group-commit **PREPAREd** (SSI-validated + `COMMIT` record appended,
+/// `fdatasync` deferred) and is awaiting the batch harden before its client is acknowledged (`rmp`
+/// #528, `04 §4.2`).
+///
+/// The `reply` is answered `Ok` only after [`flush_commit_batch`] has issued a `harden_wal` that made
+/// `commit_lsn` durable — the ACID-inviolable **ack-after-fsync** rule: a committer is told its commit
+/// succeeded only once an `fdatasync` covering its commit record has completed. If the batch harden
+/// PANICS (fsyncgate, `04 §4.9`) the whole batch fails together and NONE of these replies is sent, so
+/// no committer is ever acked for an un-hardened commit.
+struct PendingCommit {
+    /// The one-shot reply the committer's connection is blocked on.
+    reply: command::Reply<Result<RunSummary>>,
+    /// The LSN of this transaction's `COMMIT` record; the batch harden must advance the durable
+    /// watermark past it before this reply is sent (asserted in `flush_commit_batch`).
+    commit_lsn: graphus_core::Lsn,
+}
+
 /// Runs the engine event loop until a [`EngineCommand::Shutdown`] (or the command channel closes).
 ///
 /// Owns `coordinator` and the result-egress bound (`result_buffer_capacity`). Each command is
@@ -522,6 +553,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // `BulkImportBatchInput::End`. Lives here (not inside `dispatch_command`) because it must persist
     // across many command dispatches within one session — see `crate::engine::bulk_load`'s module docs.
     let mut loading_session: Option<bulk_load::LoadingSession> = None;
+    // A command a group-commit batch drain pulled off the channel but did NOT batch (the first
+    // non-`Commit` command, which ends the drain — `rmp` #528). It is processed on the NEXT loop
+    // iteration, IN ORDER, after the batch it followed has been hardened + acked — never reordered ahead
+    // of the batch, and never dropped.
+    let mut pending_cmd: Option<EngineCommand> = None;
 
     'engine: loop {
         // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
@@ -578,6 +614,49 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &mut active_txns,
         );
 
+        // Prefer a command a group-commit batch drain stashed (a non-`Commit` command that ended the
+        // batch, `rmp` #528): process it NOW — in channel order, after its preceding batch was hardened
+        // + acked — without a fresh receive.
+        if let Some(cmd) = pending_cmd.take() {
+            let Some(cmd) = intercept_simulate_maintenance(
+                cmd,
+                &mut maintenance_consecutive_failures,
+                &metrics,
+                &maintenance_degraded,
+            ) else {
+                continue 'engine;
+            };
+            if !process_command(ProcessCtx {
+                cmd,
+                rx: &rx,
+                coordinator: &mut coordinator,
+                open: &mut open,
+                next_ticket: &mut next_ticket,
+                plan_cache: &mut plan_cache,
+                extensions: &extensions,
+                dispatch: &dispatch,
+                readers_inflight: &mut readers_inflight,
+                parked: &mut parked,
+                max_parked_inline,
+                result_buffer_capacity,
+                metrics: &metrics,
+                db: &db_name,
+                degraded: &degraded,
+                maintenance_degraded: &maintenance_degraded,
+                active_txns: &mut active_txns,
+                clock: &clock,
+                statement_timeout,
+                loading_session: &mut loading_session,
+                wal_at_last_maintenance: &mut wal_at_last_maintenance,
+                maintenance_consecutive_failures: &mut maintenance_consecutive_failures,
+                builds_were_pending: &mut builds_were_pending,
+                pending_cmd: &mut pending_cmd,
+            }) {
+                break 'engine;
+            }
+            continue 'engine;
+        }
+
         // A timed receive is needed when EITHER a non-blocking index build is in progress (`rmp` #91)
         // OR readers are in flight (so their retirements are polled) OR a suspended inline statement is
         // parked (so it is resumed each tick even with no command). Otherwise block plainly (no idle
@@ -588,72 +667,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             .has_pending_index_builds();
         let timed = building || readers_inflight > 0 || !parked.is_empty();
 
-        if timed {
+        let cmd = if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
-                Ok(cmd) => {
-                    // Test-only (`rmp` #435): intercept the simulated-maintenance driver here in the
-                    // loop, where the per-engine flag + the consecutive-failure streak live, so it
-                    // exercises the REAL escalation path confined to this engine. Returns the original
-                    // command if it was not a `SimulateMaintenance` (production builds: identity).
-                    let Some(cmd) = intercept_simulate_maintenance(
-                        cmd,
-                        &mut maintenance_consecutive_failures,
-                        &metrics,
-                        &maintenance_degraded,
-                    ) else {
-                        continue 'engine;
-                    };
-                    // A per-dispatch slot for the (at most one) statement THIS `Run` suspends; drained
-                    // into the bounded `parked` queue below so a newly-suspended statement never
-                    // overwrites an already-parked one (`rmp` #485 B1).
-                    let mut just_suspended: Option<exec::InFlightInline> = None;
-                    if !dispatch_command(
-                        cmd,
-                        &mut coordinator,
-                        &mut open,
-                        &mut next_ticket,
-                        &mut plan_cache,
-                        &extensions,
-                        &dispatch,
-                        &mut readers_inflight,
-                        &mut just_suspended,
-                        result_buffer_capacity,
-                        &metrics,
-                        &db_name,
-                        &degraded,
-                        &maintenance_degraded,
-                        &mut active_txns,
-                        &clock,
-                        statement_timeout,
-                        &mut loading_session,
-                    ) {
-                        break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
-                    }
-                    enqueue_suspended(
-                        &mut parked,
-                        &mut just_suspended,
-                        max_parked_inline,
-                        &mut coordinator,
-                        &mut open,
-                        &metrics,
-                        &db_name,
-                        &degraded,
-                    );
-                    drive_index_build(&mut coordinator);
-                    invalidate_cache_on_build_completion(
-                        &coordinator,
-                        &mut plan_cache,
-                        &mut builds_were_pending,
-                    );
-                    maybe_run_maintenance(
-                        &mut coordinator,
-                        &mut wal_at_last_maintenance,
-                        &mut maintenance_consecutive_failures,
-                        &metrics,
-                        &maintenance_degraded,
-                        loading_session.is_some(),
-                    );
-                }
+                Ok(cmd) => cmd,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
                     drive_index_build(&mut coordinator);
@@ -662,6 +678,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut plan_cache,
                         &mut builds_were_pending,
                     );
+                    continue 'engine;
                 }
                 // Channel closed (all client senders dropped): the engine is being torn down without a
                 // graceful `Shutdown`. Stop serving.
@@ -671,67 +688,46 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             // No build pending and no readers in flight: a plain blocking receive (the original
             // behaviour). `Err` is the closed-channel EOF the old `while let Ok(..)` terminated on.
             let Ok(cmd) = rx.recv() else { break 'engine };
-            // Test-only (`rmp` #435): intercept the simulated-maintenance driver (identity in
-            // production). See the `timed` branch for the rationale.
-            let Some(cmd) = intercept_simulate_maintenance(
-                cmd,
-                &mut maintenance_consecutive_failures,
-                &metrics,
-                &maintenance_degraded,
-            ) else {
-                continue 'engine;
-            };
-            // A per-dispatch slot for the (at most one) statement THIS `Run` suspends; drained into the
-            // bounded `parked` queue below (`rmp` #485 B1 — never clobber an already-parked statement).
-            let mut just_suspended: Option<exec::InFlightInline> = None;
-            if !dispatch_command(
-                cmd,
-                &mut coordinator,
-                &mut open,
-                &mut next_ticket,
-                &mut plan_cache,
-                &extensions,
-                &dispatch,
-                &mut readers_inflight,
-                &mut just_suspended,
-                result_buffer_capacity,
-                &metrics,
-                &db_name,
-                &degraded,
-                &maintenance_degraded,
-                &mut active_txns,
-                &clock,
-                statement_timeout,
-                &mut loading_session,
-            ) {
-                break 'engine;
-            }
-            enqueue_suspended(
-                &mut parked,
-                &mut just_suspended,
-                max_parked_inline,
-                &mut coordinator,
-                &mut open,
-                &metrics,
-                &db_name,
-                &degraded,
-            );
-            // A DDL command dispatched here may have started a build; reflect that in the edge tracker
-            // so its later completion invalidates the cache (the no-build blocking path never advances
-            // a build itself, but the next `timed` tick will).
-            invalidate_cache_on_build_completion(
-                &coordinator,
-                &mut plan_cache,
-                &mut builds_were_pending,
-            );
-            maybe_run_maintenance(
-                &mut coordinator,
-                &mut wal_at_last_maintenance,
-                &mut maintenance_consecutive_failures,
-                &metrics,
-                &maintenance_degraded,
-                loading_session.is_some(),
-            );
+            cmd
+        };
+        // Test-only (`rmp` #435): intercept the simulated-maintenance driver here in the loop, where the
+        // per-engine flag + the consecutive-failure streak live, so it exercises the REAL escalation
+        // path confined to this engine. Returns the original command in production builds (identity).
+        let Some(cmd) = intercept_simulate_maintenance(
+            cmd,
+            &mut maintenance_consecutive_failures,
+            &metrics,
+            &maintenance_degraded,
+        ) else {
+            continue 'engine;
+        };
+        if !process_command(ProcessCtx {
+            cmd,
+            rx: &rx,
+            coordinator: &mut coordinator,
+            open: &mut open,
+            next_ticket: &mut next_ticket,
+            plan_cache: &mut plan_cache,
+            extensions: &extensions,
+            dispatch: &dispatch,
+            readers_inflight: &mut readers_inflight,
+            parked: &mut parked,
+            max_parked_inline,
+            result_buffer_capacity,
+            metrics: &metrics,
+            db: &db_name,
+            degraded: &degraded,
+            maintenance_degraded: &maintenance_degraded,
+            active_txns: &mut active_txns,
+            clock: &clock,
+            statement_timeout,
+            loading_session: &mut loading_session,
+            wal_at_last_maintenance: &mut wal_at_last_maintenance,
+            maintenance_consecutive_failures: &mut maintenance_consecutive_failures,
+            builds_were_pending: &mut builds_were_pending,
+            pending_cmd: &mut pending_cmd,
+        }) {
+            break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
     }
 
@@ -1384,6 +1380,165 @@ fn reply_engine_degraded(cmd: EngineCommand) -> Option<EngineCommand> {
     }
 }
 
+/// The whole mutable execution context [`process_command`] threads through per command (`rmp` #528).
+///
+/// Bundled into one struct rather than ~24 positional `&mut` arguments: the engine loop owns every
+/// field and hands the whole context to `process_command`, which dispatches the command, coalesces any
+/// group-commit batch, and runs the post-command maintenance/cache steps.
+struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> {
+    cmd: EngineCommand,
+    /// The command channel, so a group-commit batch can non-blockingly drain further queued commits.
+    rx: &'a std::sync::mpsc::Receiver<EngineCommand>,
+    coordinator: &'a mut Option<TxnCoordinator<D, S>>,
+    open: &'a mut HashMap<u64, OpenTx>,
+    next_ticket: &'a mut u64,
+    plan_cache: &'a mut exec::EnginePlanCache,
+    extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
+    dispatch: &'a read_pool::ReadDispatch<D, S>,
+    readers_inflight: &'a mut u64,
+    parked: &'a mut VecDeque<exec::InFlightInline>,
+    max_parked_inline: usize,
+    result_buffer_capacity: usize,
+    metrics: &'a Arc<Metrics>,
+    db: &'a Arc<str>,
+    degraded: &'a EngineDegraded,
+    maintenance_degraded: &'a MaintenanceDegraded,
+    active_txns: &'a mut ActiveTxnGauge,
+    clock: &'a Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
+    loading_session: &'a mut Option<bulk_load::LoadingSession>,
+    wal_at_last_maintenance: &'a mut u64,
+    maintenance_consecutive_failures: &'a mut u32,
+    builds_were_pending: &'a mut bool,
+    /// A command a group-commit batch drain pulled but did not batch, stashed for the loop's next tick.
+    pending_cmd: &'a mut Option<EngineCommand>,
+}
+
+/// Processes one received [`EngineCommand`] end-to-end (`rmp` #528): dispatches it, coalesces a
+/// group-commit batch if it PREPAREd a durable write commit, and runs the post-command maintenance /
+/// plan-cache steps. Returns `false` once a [`EngineCommand::Shutdown`] has drained + hardened the
+/// store (the loop then exits), `true` otherwise.
+///
+/// **Group commit (`04 §4.2`).** A `Cmd::Commit` for a durable write transaction is PREPAREd (SSI +
+/// `COMMIT` record appended, no `fdatasync`) into a fresh `commit_batch` by [`dispatch_command`]. When
+/// that happens, [`drain_commit_batch`] non-blockingly pulls further consecutive queued commits into the
+/// same batch, and [`flush_commit_batch`] issues ONE `harden_wal` for all of them before acking — so `K`
+/// concurrent committers pay one `fdatasync`, not `K`. The redo-bounding checkpoint is taken once, after
+/// the acks ([`checkpoint_after_batch`]). Crucially, the maintenance sweep ([`maybe_run_maintenance`],
+/// which can *reclaim* the WAL) runs only AFTER the batch is hardened + acked, so no durability watermark
+/// is ever advanced over an un-`fdatasync`'d commit record.
+fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
+    ctx: ProcessCtx<'_, D, S>,
+) -> bool {
+    let ProcessCtx {
+        cmd,
+        rx,
+        coordinator,
+        open,
+        next_ticket,
+        plan_cache,
+        extensions,
+        dispatch,
+        readers_inflight,
+        parked,
+        max_parked_inline,
+        result_buffer_capacity,
+        metrics,
+        db,
+        degraded,
+        maintenance_degraded,
+        active_txns,
+        clock,
+        statement_timeout,
+        loading_session,
+        wal_at_last_maintenance,
+        maintenance_consecutive_failures,
+        builds_were_pending,
+        pending_cmd,
+    } = ctx;
+
+    // A per-dispatch slot for the (at most one) statement THIS command suspends; drained into the bounded
+    // `parked` queue below (`rmp` #485 B1). And a fresh, empty group-commit batch (`rmp` #528).
+    let mut just_suspended: Option<exec::InFlightInline> = None;
+    let mut commit_batch: Vec<PendingCommit> = Vec::new();
+    if !dispatch_command(
+        cmd,
+        coordinator,
+        open,
+        next_ticket,
+        plan_cache,
+        extensions,
+        dispatch,
+        readers_inflight,
+        &mut just_suspended,
+        result_buffer_capacity,
+        metrics,
+        db,
+        degraded,
+        maintenance_degraded,
+        active_txns,
+        clock,
+        statement_timeout,
+        loading_session,
+        &mut commit_batch,
+    ) {
+        return false; // Shutdown handled (drained + hardened) inside the dispatch.
+    }
+
+    // Group commit (`rmp` #528): if this command PREPAREd a durable write commit, coalesce further queued
+    // commits into the SAME batch and harden them all with ONE `fdatasync` before acking. The drain
+    // stashes the first non-commit command it pulls into `pending_cmd` (processed next tick, in order).
+    if !commit_batch.is_empty() {
+        drain_commit_batch(
+            rx,
+            coordinator,
+            open,
+            next_ticket,
+            plan_cache,
+            extensions,
+            dispatch,
+            readers_inflight,
+            &mut commit_batch,
+            pending_cmd,
+            result_buffer_capacity,
+            metrics,
+            db,
+            degraded,
+            maintenance_degraded,
+            active_txns,
+            clock,
+            statement_timeout,
+            loading_session,
+        );
+        // ONE fdatasync for the whole batch, then ack every committer (ack-after-fsync).
+        flush_commit_batch(coordinator, &mut commit_batch, metrics, db);
+        // The redo-bounding checkpoint, once, AFTER the acks (the commits are already durable).
+        checkpoint_after_batch(coordinator);
+    }
+
+    enqueue_suspended(
+        parked,
+        &mut just_suspended,
+        max_parked_inline,
+        coordinator,
+        open,
+        metrics,
+        db,
+        degraded,
+    );
+    drive_index_build(coordinator);
+    invalidate_cache_on_build_completion(coordinator, plan_cache, builds_were_pending);
+    maybe_run_maintenance(
+        coordinator,
+        wal_at_last_maintenance,
+        maintenance_consecutive_failures,
+        metrics,
+        maintenance_degraded,
+        loading_session.is_some(),
+    );
+    true
+}
+
 /// Dispatches one [`EngineCommand`] against the coordinator. Returns `true` to keep the loop running,
 /// `false` once a [`EngineCommand::Shutdown`] has drained + hardened the store (the loop then exits).
 ///
@@ -1409,6 +1564,12 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
+    // Group commit (`rmp` #528): a `Cmd::Commit` for a durable write transaction is PREPAREd (SSI +
+    // `COMMIT` record appended, no `fdatasync`) and its deferred `(reply, commit_lsn)` pushed here
+    // instead of replied inline; the caller drains more queued commits into the same batch and issues
+    // ONE `harden_wal` for all of them (see `flush_commit_batch`). Read-only and SSI-aborted commits are
+    // still answered immediately and never join the batch.
+    commit_batch: &mut Vec<PendingCommit>,
 ) -> bool {
     // `rmp` #409 / #414: once a statement-recovery double-panic has flagged **this** engine degraded,
     // the coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke).
@@ -1484,9 +1645,11 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             active_txns.publish(coord.active_count());
         }
         Cmd::Commit { ticket, reply } => {
-            let out = commit_tx(coord, open, ticket, metrics, db);
+            // Group commit (`rmp` #528): PREPARE the commit (SSI + append `COMMIT`, no `fdatasync`) and
+            // DEFER the ack into `commit_batch`; the caller hardens the whole batch with one sync and
+            // then replies. A read-only or SSI-aborted commit is answered here and never batched.
+            commit_prepare_tx(coord, open, ticket, reply, commit_batch, metrics, db);
             active_txns.publish(coord.active_count());
-            let _ = reply.send(out);
         }
         Cmd::Rollback { ticket, reply } => {
             let out = rollback_tx(coord, open, ticket, metrics, db);
@@ -2232,30 +2395,198 @@ fn open_tx<D: BlockDevice, S: LogSink>(
     TxTicket(ticket)
 }
 
-/// Commits the explicit transaction `ticket`. Translates a coordinator commit into a [`RunSummary`]
-/// and bumps the commit/abort metrics (a serialization-failure abort counts as an abort).
-fn commit_tx<D: BlockDevice, S: LogSink>(
+/// Group-commit PREPARE of the explicit transaction `ticket` (`rmp` #528, `04 §4.2`): runs SSI
+/// validation and appends the `COMMIT` record WITHOUT the `fdatasync`, then either answers the
+/// committer immediately or defers its ack into `commit_batch` for the batch harden:
+///
+/// * **unknown/inactive ticket** → immediate `Err` (nothing was prepared).
+/// * **SSI serialization abort** → the coordinator already rolled the pivot back; the committer gets
+///   the retriable error immediately (an aborted pivot appended no record, so it NEVER joins a batch —
+///   the inviolable invariant that an aborted transaction contributes no COMMIT record).
+/// * **read-only commit** (`rmp` #529, nothing durable to harden) → immediate `Ok` (no `fdatasync`
+///   needed, so no reason to make the client wait for the batch).
+/// * **durable write commit** → `(reply, commit_lsn)` is pushed onto `commit_batch`; the reply is held
+///   until [`flush_commit_batch`] has hardened a covering `fdatasync` (ack-after-fsync).
+fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
     ticket: TxTicket,
+    reply: command::Reply<Result<RunSummary>>,
+    commit_batch: &mut Vec<PendingCommit>,
     metrics: &Metrics,
     db: &str,
-) -> Result<RunSummary> {
+) {
     let Some(tx) = open.remove(&ticket.0) else {
-        return Err(GraphusError::Transaction(format!(
+        let _ = reply.send(Err(GraphusError::Transaction(format!(
             "commit of unknown transaction {}",
             ticket.0
-        )));
+        ))));
+        return;
     };
-    match coordinator.commit(tx.txn) {
-        Ok(_commit_ts) => {
-            metrics.record_commit_for(db);
-            Ok(RunSummary::default())
+    match coordinator.commit_prepare(tx.txn) {
+        // A durable write commit: defer the ack until the batch `fdatasync` covers `commit_lsn`.
+        Ok((_commit_ts, Some(commit_lsn))) => {
+            commit_batch.push(PendingCommit { reply, commit_lsn })
         }
+        // A read-only commit (`rmp` #529): nothing was appended, so no sync is needed — ack now.
+        Ok((_commit_ts, None)) => {
+            metrics.record_commit_for(db);
+            let _ = reply.send(Ok(RunSummary::default()));
+        }
+        // An SSI serialization abort (or an inactive txn): the coordinator already rolled it back.
         Err(e) => {
-            // The coordinator already rolled the victim back on a serialization failure; count it.
             metrics.record_abort_for(db);
-            Err(e)
+            let _ = reply.send(Err(e));
+        }
+    }
+}
+
+/// Group-commit HARDEN + ACK (`rmp` #528, `04 §4.2`): issues ONE `harden_wal` (`fdatasync`) covering
+/// every PREPAREd write commit in `batch`, then acknowledges each committer `Ok` — the ack-after-fsync
+/// durability rule. Called when the command channel momentarily drains, when the batch reaches
+/// [`MAX_COMMIT_BATCH`], or before the loop processes a non-commit command.
+///
+/// The single `harden_wal` `fdatasync`s the WAL's whole pending buffer — every batched `COMMIT` record
+/// plus the data/catalog records that preceded them — so `K` concurrent committers are hardened by ONE
+/// sync instead of `K`. A `harden_wal` **failure PANICS** (fsyncgate, `04 §4.9`): the whole batch fails
+/// together and NONE of its members is acked, which is correct — recovery undoes any un-`fdatasync`'d
+/// record, so there is no partial commit and no committer was ever told its (lost) commit succeeded.
+///
+/// The redo-bounding auto-checkpoint is deliberately NOT taken here (see
+/// [`checkpoint_after_batch`]); it runs after the acks, because the commits are already durable and a
+/// checkpoint only bounds later recovery redo.
+fn flush_commit_batch<D: BlockDevice, S: LogSink>(
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    batch: &mut Vec<PendingCommit>,
+    metrics: &Metrics,
+    db: &str,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let Some(coord) = coordinator.as_mut() else {
+        // The coordinator was consumed (Shutdown). Unreachable in practice: `Shutdown` drains before
+        // consuming and a commit batch is always flushed within the same loop iteration that filled it,
+        // before any `Shutdown` is dispatched. Drop the deferred replies (their connections error out
+        // cleanly on the dropped one-shot) rather than panic.
+        batch.clear();
+        return;
+    };
+    // ONE fdatasync hardens the whole pending buffer, making every batched COMMIT record durable. A
+    // failure here PANICS (fsyncgate) — no committer below is acked, and recovery undoes the un-synced
+    // tail, so the batch is lost WHOLE (never partially applied), matching what each committer was (not)
+    // told.
+    coord.harden_wal();
+    let durable = coord.wal_durable_len();
+    for pending in batch.drain(..) {
+        debug_assert!(
+            pending.commit_lsn.0 < durable,
+            "INVARIANT (rmp #528 ack-after-fsync): the group-commit harden must advance the durable \
+             watermark ({durable}) past every batched commit LSN ({})",
+            pending.commit_lsn.0
+        );
+        metrics.record_commit_for(db);
+        let _ = pending.reply.send(Ok(RunSummary::default()));
+    }
+}
+
+/// Non-blocking drain of consecutive queued `Cmd::Commit` commands into the current group-commit batch
+/// (`rmp` #528): each is PREPAREd (SSI + append, no `fdatasync`) via [`dispatch_command`], so ONE later
+/// [`flush_commit_batch`] hardens them all. Stops at [`MAX_COMMIT_BATCH`], at the first NON-commit
+/// command (stashed into `pending_cmd` for the loop to process next — IN ORDER, only after the batch is
+/// hardened and acked), or when `try_recv` reports the channel momentarily empty / disconnected.
+///
+/// **Causal safety under Bolt pipelining.** Draining only *consecutive* `Cmd::Commit`s is safe: for a
+/// commit to be immediately available here, that transaction's earlier `Begin`/`Run` commands sit
+/// EARLIER in the channel and are therefore already processed — so the transaction is fully executed and
+/// genuinely ready to commit. A non-commit command ends the drain and is NEVER reordered ahead of the
+/// batch (the batch's commits were already ahead of it in channel order), so command order is preserved.
+#[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
+fn drain_commit_batch<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    rx: &std::sync::mpsc::Receiver<EngineCommand>,
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    next_ticket: &mut u64,
+    plan_cache: &mut exec::EnginePlanCache,
+    extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
+    dispatch: &read_pool::ReadDispatch<D, S>,
+    readers_inflight: &mut u64,
+    commit_batch: &mut Vec<PendingCommit>,
+    pending_cmd: &mut Option<EngineCommand>,
+    result_buffer_capacity: usize,
+    metrics: &Arc<Metrics>,
+    db: &str,
+    degraded: &EngineDegraded,
+    maintenance_degraded: &MaintenanceDegraded,
+    active_txns: &mut ActiveTxnGauge,
+    clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
+    loading_session: &mut Option<bulk_load::LoadingSession>,
+) {
+    while commit_batch.len() < MAX_COMMIT_BATCH {
+        match rx.try_recv() {
+            Ok(cmd @ Cmd::Commit { .. }) => {
+                // PREPARE this commit into the SAME batch. A `Commit` never suspends a cursor and never
+                // starts an index build, so the throwaway `just_suspended` slot stays `None`.
+                let mut just_suspended: Option<exec::InFlightInline> = None;
+                let _keep_running = dispatch_command(
+                    cmd,
+                    coordinator,
+                    open,
+                    next_ticket,
+                    plan_cache,
+                    extensions,
+                    dispatch,
+                    readers_inflight,
+                    &mut just_suspended,
+                    result_buffer_capacity,
+                    metrics,
+                    db,
+                    degraded,
+                    maintenance_degraded,
+                    active_txns,
+                    clock,
+                    statement_timeout,
+                    loading_session,
+                    commit_batch,
+                );
+                debug_assert!(
+                    just_suspended.is_none(),
+                    "INVARIANT: a Cmd::Commit never suspends an inline statement"
+                );
+            }
+            // A non-commit command ends the drain: stash it so the loop processes it next, in order,
+            // AFTER the batch is hardened + acked (never reordered ahead of the batch).
+            Ok(other) => {
+                *pending_cmd = Some(other);
+                break;
+            }
+            // Channel momentarily empty, or all senders dropped (teardown): flush what we have.
+            Err(_) => break,
+        }
+    }
+}
+
+/// Takes the redo-bounding auto-checkpoint once per drained group-commit batch (`rmp` #528), AFTER its
+/// committers have been acknowledged by [`flush_commit_batch`]. The commits are already durable (the
+/// batch `fdatasync` completed), so a checkpoint here only bounds later crash-recovery redo — it can
+/// never affect the durability of the just-acked commits. A checkpoint failure is therefore
+/// **non-fatal**: it is logged and retried on the next batch (or by the background maintenance cadence),
+/// never turned into a spurious commit failure over already-durable data.
+fn checkpoint_after_batch<D: BlockDevice, S: LogSink>(
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+) {
+    if let Some(coord) = coordinator.as_mut() {
+        if let Err(e) = coord.checkpoint_if_due() {
+            tracing::warn!(
+                target: "graphus::engine",
+                error = %e,
+                "deferred group-commit checkpoint failed; the batch's commits are already durable, so \
+                 this only defers redo bounding — will retry on a later batch (rmp #528)",
+            );
         }
     }
 }

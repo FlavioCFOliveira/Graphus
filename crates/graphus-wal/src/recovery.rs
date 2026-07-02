@@ -461,8 +461,13 @@ mod tests {
         // the pre-fix `read_durable(Lsn(0)/HEADER_LEN, ..)` code because those reads still returned the
         // *correct* bytes, only a lifetime-sized buffer). See the counter assertion below.
         let counter = Arc::new(AtomicU64::new(0));
-        let mut wal =
-            WalManager::create(CountingSink::new(MemLogSink::new(), Arc::clone(&counter))).unwrap();
+        let syncs = Arc::new(AtomicU64::new(0));
+        let mut wal = WalManager::create(CountingSink::new(
+            MemLogSink::new(),
+            Arc::clone(&counter),
+            Arc::clone(&syncs),
+        ))
+        .unwrap();
 
         const CHURN_CYCLES: u64 = 500;
         const RETAINED_TXNS: u64 = 5;
@@ -613,10 +618,15 @@ mod tests {
         // --- Reopen phase: fresh FileLogSink over the same directory (the real crash-recovery boot
         // --- path), wrapped so we can observe the recovery reads.
         let counter = Arc::new(AtomicU64::new(0));
+        let syncs = Arc::new(AtomicU64::new(0));
         let backing =
             FileLogSink::open_with_segment_target(&dir, 512).expect("reopen file backing");
-        let mut wal = WalManager::open(CountingSink::new(backing, Arc::clone(&counter)))
-            .expect("reopen wal manager");
+        let mut wal = WalManager::open(CountingSink::new(
+            backing,
+            Arc::clone(&counter),
+            Arc::clone(&syncs),
+        ))
+        .expect("reopen wal manager");
 
         let lifetime_len = wal.sink().durable_len();
         let floor = wal.sink().reclaimed_floor();

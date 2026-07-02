@@ -155,6 +155,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // suspends — `handle_run` always returns `Done`/`OffThreadReader`. A never-populated slot
         // preserves the inline driver's bit-determinism (asserted below).
         let mut inflight = None;
+        // The inline driver processes exactly ONE command per dispatch (there is no command channel to
+        // drain), so a `Cmd::Commit` PREPAREs into this batch and is hardened + acked immediately below —
+        // a group-commit batch of one, byte-for-byte identical to the pre-`rmp`-#528 inline commit. This
+        // keeps the DST/VOPR replay deterministic (no channel-drain non-determinism ever forms a batch >1).
+        let mut commit_batch: Vec<super::PendingCommit> = Vec::new();
         let live = dispatch_command(
             cmd,
             &mut self.coordinator,
@@ -179,7 +184,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // here keeps the VOPR replay bit-deterministic while exercising the same dispatch code path.
             None,
             &mut self.loading_session,
+            &mut commit_batch,
         );
+        // Harden + ack the (at most one) PREPAREd commit immediately: one command in, one durable commit
+        // out, exactly as before group commit (`rmp` #528). A no-op when the command was not a durable
+        // write commit. The redo-bounding checkpoint runs identically to the pre-split path.
+        super::flush_commit_batch(
+            &mut self.coordinator,
+            &mut commit_batch,
+            &self.metrics,
+            &self.db_name,
+        );
+        super::checkpoint_after_batch(&mut self.coordinator);
         debug_assert!(
             inflight.is_none(),
             "INVARIANT: the unbounded inline DST driver never suspends a cursor (rmp #372)"

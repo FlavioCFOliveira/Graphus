@@ -43,7 +43,7 @@ use std::rc::Rc;
 
 use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{Timestamp, TxnId};
+use graphus_core::{Lsn, Timestamp, TxnId};
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
@@ -2682,6 +2682,87 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);
         self.active.remove(&txn);
         Ok(commit_ts)
+    }
+
+    /// Commit-**PREPARE** (cross-transaction group commit, phase 1, `04 §4.2` / `rmp` #528): runs SSI
+    /// validation and the FULL in-memory commit publish of `txn` (assign commit timestamp, publish the
+    /// SSI outcome + full-text/spatial marker, release locks, retire the transaction) EXCEPT the WAL
+    /// group-commit `fdatasync`. Every observable effect is identical to [`commit`](Self::commit); only
+    /// the durability sync is deferred, so the engine can PREPARE many committers and then issue ONE
+    /// [`harden_wal`](Self::harden_wal) covering the whole batch.
+    ///
+    /// Returns `(commit_ts, commit_lsn)` where `commit_lsn` is `Some` iff a durable `COMMIT` record was
+    /// appended (a real write commit the batch `fdatasync` must cover) or `None` for the read-only fast
+    /// path (`rmp` #529 — nothing appended, nothing to harden). The caller MUST
+    /// [`harden_wal`](Self::harden_wal) (advancing the durable watermark past `commit_lsn`) **before**
+    /// acknowledging `txn` to its client — the ack-after-fsync durability rule.
+    ///
+    /// # Errors
+    /// - [`GraphusError::Transaction`] if `txn` is not open.
+    /// - [`GraphusError::Transaction`] (retriable serialization failure) if `txn` is the SSI abort
+    ///   victim — it is rolled back and its client should retry. **An aborted pivot never joins a
+    ///   batch** (it appended no `COMMIT` record), so the caller answers it the error immediately.
+    /// - A storage error if the store PREPARE fails.
+    pub fn commit_prepare(&mut self, txn: TxnId) -> Result<(Timestamp, Option<Lsn>)> {
+        let isolation = self.active.get(&txn).map(|a| a.isolation).ok_or_else(|| {
+            GraphusError::Transaction(format!("commit of inactive txn {}", txn.0))
+        })?;
+
+        // 1) SSI validation (SERIALIZABLE only): abort a pivot on a dangerous structure (`04 §5.4`) —
+        //    identical to `commit`. An aborted pivot never reaches the WAL PREPARE below.
+        if isolation.runs_ssi() {
+            let victim = self.ssi.borrow().detect_pivot_abort(txn);
+            if let Some(victim) = victim {
+                if victim == txn {
+                    self.abort(txn)?;
+                    return Err(GraphusError::Transaction(format!(
+                        "serialization failure: transaction {} aborted to preserve serializability \
+                         (SSI dangerous structure); retry",
+                        txn.0
+                    )));
+                }
+                self.abort(victim)?;
+            }
+        }
+
+        // 2) Store PREPARE: assign the commit timestamp, publish the outcome and append the `COMMIT`
+        //    record WITHOUT hardening (`rmp` #528). The store is the timestamp oracle.
+        let commit_lsn = self.store.borrow_mut().commit_prepare(txn)?;
+        let commit_ts = self.store.borrow().snapshot_ts();
+
+        // 3) Publish the outcome — byte-identical to `commit` (the WAL harden is the only deferred step).
+        self.index
+            .borrow_mut()
+            .commit_ft_spatial_marker(txn, commit_ts);
+        self.ssi.borrow_mut().record_commit(txn, commit_ts);
+        self.locks.borrow_mut().release_all(txn);
+        self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);
+        self.active.remove(&txn);
+        Ok((commit_ts, commit_lsn))
+    }
+
+    /// Group-commit **HARDEN** (phase 2, `04 §4.2` / `rmp` #528): `fdatasync`s the WAL, making every
+    /// record appended by the [`commit_prepare`](Self::commit_prepare)s since the last harden durable in
+    /// ONE sync — the whole batch of concurrent committers. Call after the last PREPARE and **before**
+    /// acknowledging any committer (the ack-after-fsync rule). A no-op syscall when nothing is pending
+    /// (a batch of only read-only commits).
+    ///
+    /// # Panics
+    /// Panics (controlled abort) if the durability `fdatasync` fails (`04 §4.9`, fsyncgate) — the WHOLE
+    /// batch fails together (none of its members are acked), which is correct.
+    pub fn harden_wal(&mut self) {
+        self.store.borrow_mut().harden_wal();
+    }
+
+    /// Runs the redo-bounding auto-checkpoint if enough WAL has accumulated (`rmp` storage audit F3),
+    /// a no-op otherwise. The engine's group-commit path calls this **once per drained batch**, after
+    /// its committers are acknowledged (their commits are already durable via
+    /// [`harden_wal`](Self::harden_wal); a checkpoint only bounds later recovery redo).
+    ///
+    /// # Errors
+    /// Returns a storage error if flushing the dirty pages or syncing the device fails.
+    pub fn checkpoint_if_due(&mut self) -> Result<()> {
+        self.store.borrow_mut().checkpoint_if_due()
     }
 
     /// The **oldest** read snapshot timestamp among the coordinator's open transactions — the

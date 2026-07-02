@@ -32,7 +32,7 @@
 //! therefore adds **exactly one** new [`EngineCommand`](super::command::EngineCommand) variant
 //! (chunk ingestion); the surrounding `Begin`/`Commit`/`Rollback` verbs are the **existing** ones
 //! (`crate::engine::command::EngineCommand::{Begin,Commit,Rollback}`), which already thread a
-//! [`super::TxTicket`] through `super::open_tx`/`commit_tx`/`rollback_tx`. The `graphus-server`
+//! [`super::TxTicket`] through `super::open_tx`/`commit_prepare_tx`/`rollback_tx`. The `graphus-server`
 //! driver (`crate::bulk_import_mode_b`) calls `EngineHandle::begin`/`bulk_import_mode_b_chunk` (N
 //! times)/`commit`/`rollback` — an ordinary, first-class transaction from the coordinator's point of
 //! view, indistinguishable from a client's own `BEGIN … COMMIT` except that its writes happen to come
@@ -123,8 +123,8 @@ pub struct BulkImportModeBChunkOutcome {
 /// itself).
 ///
 /// # Errors
-/// - [`GraphusError::Transaction`] if `ticket` is unknown/inactive (mirrors `commit_tx`'s error
-///   shape).
+/// - [`GraphusError::Transaction`] if `ticket` is unknown/inactive (mirrors `commit_prepare_tx`'s
+///   error shape).
 /// - A row-parse error (terminal — a malformed row will not fix itself on retry).
 /// - [`GraphusError::Storage`]/[`GraphusError::Runtime`] for an unknown `:START_ID`/`:END_ID` (a
 ///   relationship referencing a node that was never committed — terminal, the same clean-error

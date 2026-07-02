@@ -378,6 +378,27 @@ impl<S: LogSink> WalManager<S> {
         Ok(self.finish_commit(txn, &mut r))
     }
 
+    /// Commit-**PREPARE** (cross-transaction group commit, phase 1, `§4.2` / `rmp` #528): appends
+    /// `txn`'s MVCC `commit_ts`-bearing `COMMIT` record and retires it from the active table, but does
+    /// **NOT** `fdatasync` — the record sits in the sink's pending buffer until a later
+    /// [`flush`](Self::flush) hardens the whole batch.
+    ///
+    /// The produced durable bytes and returned LSN are **byte-for-byte identical** to
+    /// [`commit_at`](Self::commit_at); only the sync is deferred, so a batch of concurrent committers is
+    /// hardened by ONE `fdatasync` instead of one each. The commit is committed-**visible** the instant
+    /// its store publishes the timestamp, but only committed-**durable** once a covering `flush` returns
+    /// — so the caller MUST `flush()` (past the returned LSN) **before** acknowledging `txn` to its
+    /// client (the ack-after-fsync rule). A crash before that `flush` loses this record (a torn tail
+    /// recovery truncates), which is correct precisely because the client was never acked.
+    ///
+    /// # Errors
+    /// Returns an error if `txn` is not active.
+    pub fn commit_at_no_sync(&mut self, txn: TxnId, commit_ts: Timestamp) -> Result<Lsn> {
+        let prev = self.commit_prev_lsn(txn)?;
+        let mut r = LogRecord::commit(txn, prev, commit_ts);
+        Ok(self.append_commit_record(txn, &mut r))
+    }
+
     /// The `prev_lsn` to thread into `txn`'s commit record (its last logged action).
     fn commit_prev_lsn(&self, txn: TxnId) -> Result<Lsn> {
         Ok(self
@@ -387,13 +408,27 @@ impl<S: LogSink> WalManager<S> {
             .last_lsn)
     }
 
+    /// Appends `txn`'s prepared commit record and retires `txn` from the active table, but does **not**
+    /// harden — the group-commit PREPARE step (`§4.2`, `rmp` #528). Shared by the deferred
+    /// [`commit_at_no_sync`](Self::commit_at_no_sync) and the eager [`finish_commit`](Self::finish_commit).
+    ///
+    /// Removing `txn` from the active table before the (deferred) harden is sound: nothing runs between
+    /// this and the batch `flush` that reads the active table (the single writer appends the rest of the
+    /// batch and then hardens), and once the `COMMIT` record is durable `txn` is a recovery *winner* whose
+    /// undo back-chain is no longer needed. A crash before the `flush` loses this un-synced record, so
+    /// `txn` reverts to a loser whose still-durable earlier records (if any) recovery undoes normally.
+    fn append_commit_record(&mut self, txn: TxnId, r: &mut LogRecord) -> Lsn {
+        let lsn = self.append(r);
+        self.active.remove(&txn);
+        lsn
+    }
+
     /// Appends `txn`'s prepared commit record, hardens the log (group commit, `§4.2`), and retires
     /// `txn` from the active table. Shared by [`commit`](Self::commit) and
     /// [`commit_at`](Self::commit_at).
     fn finish_commit(&mut self, txn: TxnId, r: &mut LogRecord) -> Lsn {
-        let lsn = self.append(r);
+        let lsn = self.append_commit_record(txn, r);
         self.harden();
-        self.active.remove(&txn);
         lsn
     }
 
@@ -719,6 +754,166 @@ mod tests {
         let d = wal.durable_len();
         wal.ensure_durable(Lsn(0)); // already durable -> no-op
         assert_eq!(wal.durable_len(), d);
+    }
+
+    /// `rmp` #528 group commit: `commit_at_no_sync` produces the **byte-for-byte identical** durable
+    /// log to `commit_at` — same LSN, same `COMMIT` record — once a `flush` hardens it. Deferring the
+    /// `fdatasync` must not change the wire format recovery depends on.
+    #[test]
+    fn commit_at_no_sync_is_byte_identical_to_commit_at_after_flush() {
+        let drive = |defer: bool| -> (Vec<u8>, u64) {
+            let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+            wal.begin(TxnId(1));
+            wal.log_update(TxnId(1), PageId(0), b"r".to_vec(), b"u".to_vec());
+            let lsn = if defer {
+                let lsn = wal.commit_at_no_sync(TxnId(1), Timestamp(7)).unwrap();
+                wal.flush();
+                lsn
+            } else {
+                wal.commit_at(TxnId(1), Timestamp(7)).unwrap()
+            };
+            (wal.sink().durable_bytes(), lsn.0)
+        };
+        let (eager_bytes, eager_lsn) = drive(false);
+        let (deferred_bytes, deferred_lsn) = drive(true);
+        assert_eq!(
+            eager_bytes, deferred_bytes,
+            "deferring the fdatasync must not change the durable WAL bytes"
+        );
+        assert_eq!(
+            eager_lsn, deferred_lsn,
+            "the COMMIT record LSN is unchanged"
+        );
+    }
+
+    /// `rmp` #528 group commit — the core coalescing proof: `K` committers that PREPARE
+    /// (`commit_at_no_sync`, no sync) and then issue ONE `flush` are hardened by exactly ONE
+    /// `fdatasync`, not `K`. A `CountingSink` counts every `sync`. This is the strace-free evidence
+    /// that concurrent committers no longer each pay a durability sync.
+    #[test]
+    fn group_commit_coalesces_k_commits_into_one_fdatasync() {
+        use crate::test_support::CountingSink;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let max_read = Arc::new(AtomicU64::new(0));
+        let syncs = Arc::new(AtomicU64::new(0));
+        let mut wal = WalManager::create(CountingSink::new(
+            MemLogSink::new(),
+            max_read,
+            Arc::clone(&syncs),
+        ))
+        .unwrap();
+        // The create wrote+hardened the header (one sync); reset so we count only the batch.
+        syncs.store(0, Ordering::SeqCst);
+
+        const K: u64 = 32;
+        let mut last_lsn = Lsn(0);
+        for i in 1..=K {
+            let txn = TxnId(i);
+            wal.begin(txn);
+            wal.log_update(txn, PageId(0), b"redo".to_vec(), b"undo".to_vec());
+            // PREPARE: append the COMMIT record with NO fdatasync (the group-commit deferral).
+            last_lsn = wal.commit_at_no_sync(txn, Timestamp(i)).unwrap();
+        }
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            0,
+            "PREPARE must issue ZERO fdatasyncs — all {K} commit records sit un-synced in the buffer"
+        );
+
+        // HARDEN the whole batch with ONE flush.
+        wal.flush();
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            1,
+            "the whole batch of {K} committers is hardened by exactly ONE fdatasync"
+        );
+        // The single sync covers every committer's LSN (durable watermark past the last COMMIT).
+        assert!(
+            wal.durable_len() > last_lsn.0,
+            "the batch fdatasync hardens the durable watermark past every batched commit LSN"
+        );
+
+        // Every committed transaction is recoverable from the hardened log.
+        let committed = wal.committed_transactions().unwrap();
+        assert_eq!(
+            committed.len() as u64,
+            K,
+            "all {K} batched commits are durable and recoverable after the single fdatasync"
+        );
+    }
+
+    /// `rmp` #528 group commit — an ISOLATED single commit still hardens exactly once (no regression):
+    /// `commit_at` is one append + one `fdatasync`, exactly as before the batching split.
+    #[test]
+    fn isolated_single_commit_still_hardens_exactly_once() {
+        use crate::test_support::CountingSink;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let max_read = Arc::new(AtomicU64::new(0));
+        let syncs = Arc::new(AtomicU64::new(0));
+        let mut wal = WalManager::create(CountingSink::new(
+            MemLogSink::new(),
+            max_read,
+            Arc::clone(&syncs),
+        ))
+        .unwrap();
+        syncs.store(0, Ordering::SeqCst);
+
+        wal.begin(TxnId(1));
+        wal.log_update(TxnId(1), PageId(0), b"r".to_vec(), b"u".to_vec());
+        wal.commit_at(TxnId(1), Timestamp(1)).unwrap();
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            1,
+            "an isolated commit_at issues exactly one fdatasync"
+        );
+    }
+
+    /// `rmp` #528 group commit — **crash mid-batch**: only committers whose `COMMIT` record was covered
+    /// by a completed `fdatasync` survive; a batch PREPAREd but not yet hardened is lost WHOLE (none of
+    /// its members), never partially. Modelled deterministically with [`MemLogSink::crash`] (drops the
+    /// un-synced tail), the exact DST power-loss model. This is the ACID-inviolable ack-after-fsync
+    /// contract: the un-hardened batch's committers were never acked, so losing them is correct, and no
+    /// partial batch is ever applied.
+    #[test]
+    fn crash_mid_batch_recovers_only_the_hardened_prefix() {
+        let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+
+        // Batch A: two committers PREPAREd then HARDENED (durable, acked).
+        for i in 1..=2u64 {
+            wal.begin(TxnId(i));
+            wal.log_update(TxnId(i), PageId(0), b"r".to_vec(), b"u".to_vec());
+            wal.commit_at_no_sync(TxnId(i), Timestamp(i)).unwrap();
+        }
+        wal.flush(); // ONE fdatasync hardens batch A
+
+        // Batch B: two more committers PREPAREd but the fdatasync NEVER completes (crash).
+        for i in 3..=4u64 {
+            wal.begin(TxnId(i));
+            wal.log_update(TxnId(i), PageId(0), b"r".to_vec(), b"u".to_vec());
+            wal.commit_at_no_sync(TxnId(i), Timestamp(i)).unwrap();
+        }
+        // Power loss BEFORE batch B's flush: the un-synced tail is dropped whole.
+        wal.sink_mut_for_test().crash();
+
+        // Reopen the durable image and read back the committed set.
+        let sink = wal.sink().clone();
+        let reopened = WalManager::open(sink).unwrap();
+        let committed: Vec<u64> = reopened
+            .committed_transactions()
+            .unwrap()
+            .into_iter()
+            .map(|(t, _, _)| t.0)
+            .collect();
+        assert_eq!(
+            committed,
+            vec![1, 2],
+            "only the hardened batch (txns 1,2) survives; the un-synced batch (3,4) is lost WHOLE — \
+             never a partial application"
+        );
     }
 
     #[test]

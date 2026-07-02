@@ -1214,6 +1214,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Commits `txn`: persists the catalog under `txn`, then group-commits the WAL so all of
     /// `txn`'s work (records, catalog growth, token creation) is durable (`04 §4.2`).
     ///
+    /// This is the eager single-commit path: [`commit_prepare`](Self::commit_prepare) (assign the
+    /// commit timestamp, publish the outcome, append the `COMMIT` record) immediately followed by the
+    /// group-commit `fdatasync` ([`harden_wal`](Self::harden_wal)) and the redo-bounding auto-checkpoint
+    /// (`maybe_checkpoint`) — byte-for-byte and behaviourally identical to the
+    /// pre-split path. The engine's cross-transaction group-commit path (`rmp` #528) instead calls
+    /// `commit_prepare` for **many** transactions and then a **single** [`harden_wal`](Self::harden_wal),
+    /// coalescing their `fdatasync`s.
+    ///
     /// **Read-only fast path (`rmp` #529):** a transaction that logged nothing durable (a read-only
     /// transaction — see [`begin`](Self::begin)'s lazy `BEGIN`) has nothing to persist, so it performs
     /// **zero** WAL appends and **zero** `fdatasync`: the catalog checkpoint, the WAL `COMMIT` record
@@ -1227,6 +1235,47 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Panics
     /// Panics if the commit `fdatasync` fails (`04 §4.9`) — for a read-only commit no sync is issued.
     pub fn commit(&mut self, txn: TxnId) -> Result<()> {
+        match self.commit_prepare(txn)? {
+            // Read-only fast path (`rmp` #529): nothing was appended, so there is nothing to harden and
+            // no checkpoint to take.
+            None => Ok(()),
+            // A durable write commit: harden the just-appended records (the group-commit `fdatasync`)
+            // and take the redo-bounding auto-checkpoint. Identical to the pre-#528 inline path (same
+            // durable bytes, same fsync placement observationally, same checkpoint cadence).
+            Some(_commit_lsn) => {
+                self.harden_wal();
+                self.maybe_checkpoint()
+            }
+        }
+    }
+
+    /// Commit-**PREPARE** (cross-transaction group commit, phase 1, `04 §4.2` / `rmp` #528): runs the
+    /// entire in-memory commit of `txn` EXCEPT the group-commit `fdatasync` and the redo-bounding
+    /// auto-checkpoint. It assigns the commit timestamp, records the commit in the Active/Recent
+    /// Transaction Table (so `txn` is committed-**visible** to new readers the instant this returns),
+    /// persists any catalog delta, and appends the WAL `COMMIT` record — but leaves that record
+    /// **un-hardened** in the sink's pending buffer for a later batch [`harden_wal`](Self::harden_wal).
+    ///
+    /// Returns `Some(commit_lsn)` when a durable `COMMIT` record was appended (a real write commit the
+    /// batch `fdatasync` must cover), or `None` when the read-only fast path applied (`rmp` #529 —
+    /// nothing appended, nothing to harden). The caller MUST issue a [`harden_wal`](Self::harden_wal)
+    /// (which advances the durable watermark past the returned LSN) **before** acknowledging `txn` to
+    /// its client — the ack-after-fsync durability rule. A crash before that harden loses this record
+    /// (recovery truncates the un-synced tail), which is correct precisely because the client was never
+    /// acked.
+    ///
+    /// **Ordering note (`rmp` #528):** the post-append bookkeeping below (`catalog_dirty = false`, the
+    /// `unfrozen_commit_lsn` insert, the GC-prune) runs here — *before* the deferred harden — rather
+    /// than after an inline `fdatasync` as the pre-split path did. This is sound because the only failure
+    /// mode of the deferred harden is a PANIC (`04 §4.9`, fsyncgate) that aborts the process, after which
+    /// this in-memory state is irrelevant (recovery rebuilds from the durable WAL); on a *successful*
+    /// harden the resulting state is exactly what the pre-split ordering produced. No watermark is
+    /// advanced here (the `unfrozen_commit_lsn` floor only ever *lowers* what reclaim may drop, and
+    /// reclaim itself runs only in `maybe_checkpoint`, after the batch harden).
+    ///
+    /// # Errors
+    /// Returns a storage error if the catalog cannot be persisted or `txn` is not active.
+    pub fn commit_prepare(&mut self, txn: TxnId) -> Result<Option<Lsn>> {
         // Assign this transaction's commit timestamp (`04 §5.2`). **Lazy GC-time freezing**
         // (`04 §5.5`, hint-bit style, `rmp` task #49): do NOT settle each version's header from the
         // in-flight `TxnId` to the commit timestamp here — that was O(records touched) WAL-logged
@@ -1236,7 +1285,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // visibility layer via [`commit_registry`](Self::commit_registry)); the GC-time header
         // freeze (`rmp` task #59) later settles the stamps and prunes the entries, bounding the
         // table. What makes a committed insert/delete survive a crash is now the WAL commit record
-        // carrying `commit_ts` (`commit_at`): recovery rebuilds the table from it
+        // carrying `commit_ts` (`commit_at_no_sync`): recovery rebuilds the table from it
         // ([`open`](Self::open)). Commit is now O(1) in header writes.
         // Did `txn` change anything durable? Two independent signals (`rmp` #529):
         //   * `wrote_durable` — it logged a WAL data record. Because `BEGIN` is lazy and every record
@@ -1271,26 +1320,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .as_ref()
             .is_some_and(|p| p.gc_txn == txn);
         if !wrote_durable && !self.catalog_dirty && !is_gc_prune {
-            return Ok(());
+            return Ok(None);
         }
 
         self.commit_registry.record_commit(txn, commit_ts);
         self.checkpoint_meta(txn, false)?;
-        let commit_lsn = self.wal.with(|w| w.commit_at(txn, commit_ts))?;
-        // The catalog (any pending token intern / index / histogram / constraint change) is now
-        // persisted AND hardened (the `checkpoint_meta` writes above are made durable by this commit
-        // record's `fdatasync`), so the next read-only commit may safely take its fast path (`rmp`
-        // #529). Cleared strictly AFTER the commit hardens so a mid-commit failure leaves the flag set.
+        // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
+        // #528). The caller hardens the whole batch with a single `harden_wal`.
+        let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
+        // The catalog (any pending token intern / index / histogram / constraint change) will be durable
+        // once this commit record's `fdatasync` (the deferred `harden_wal`) completes, so the next
+        // read-only commit may safely take its fast path (`rmp` #529). Cleared here (before the deferred
+        // harden) is sound: the only harden failure is a PANIC (fsyncgate), after which this flag is moot.
         self.catalog_dirty = false;
         // Remember this commit record's LSN until a GC freeze settles `txn`'s versions: WAL
         // reclamation must keep it readable so a crash can still resolve an unfrozen in-flight stamp
-        // (`rmp` #114 / the lazy freeze of #49/#59).
+        // (`rmp` #114 / the lazy freeze of #49/#59). This only ever LOWERS the reclaim floor, and reclaim
+        // runs only in the post-harden `maybe_checkpoint`, so setting it pre-harden advances no watermark.
         self.unfrozen_commit_lsn.insert(txn, commit_lsn);
-        // If `txn` was a GC pass, its header freeze is durable from here on (`rmp` task #59): every
-        // writer the pass scheduled is no longer referenced by any on-disk in-flight stamp, so the
-        // Active/Recent Transaction Table entries can be forgotten — this, after the freeze, is what
-        // bounds the table. Pruning strictly AFTER the commit hardens means a crash or rollback
-        // before this point leaves the table intact for the restored in-flight stamps.
+        // If `txn` was a GC pass, its header freeze is durable once the deferred harden completes (`rmp`
+        // task #59): every writer the pass scheduled is no longer referenced by any on-disk in-flight
+        // stamp, so the Active/Recent Transaction Table entries can be forgotten — this bounds the table.
+        // A crash before the harden loses this GC commit record, and recovery rebuilds the table from the
+        // still-durable writer commit records, so pruning here (pre-harden) cannot lose a needed entry.
         if is_gc_prune {
             let pending = self
                 .pending_gc_prune
@@ -1303,11 +1355,33 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.unfrozen_commit_lsn.remove(&writer);
             }
         }
-        // Bound crash-recovery redo: take a checkpoint once enough WAL has accumulated since the last
-        // one (`rmp` storage audit F3). The commit above is already durable, so a checkpoint here only
-        // adds a flush + marker — never affecting this transaction's durability.
-        self.maybe_checkpoint()?;
-        Ok(())
+        Ok(Some(commit_lsn))
+    }
+
+    /// Group-commit **HARDEN** (phase 2, `04 §4.2` / `rmp` #528): `fdatasync`s the WAL, making every
+    /// record appended by the [`commit_prepare`](Self::commit_prepare)s since the last harden durable in
+    /// ONE sync — the whole batch of concurrent committers. Call after the last PREPARE and **before**
+    /// acknowledging any of the batch's committers (the ack-after-fsync rule).
+    ///
+    /// A no-op syscall when the sink's pending buffer is empty (e.g. a batch of only read-only commits
+    /// appended nothing — the production [`FileLogSink`](graphus_wal::FileLogSink) skips the real
+    /// `fdatasync`), so a read-only batch costs zero real syncs.
+    ///
+    /// # Panics
+    /// Panics (controlled abort) if the durability `fdatasync` fails (`04 §4.9`, fsyncgate).
+    pub fn harden_wal(&mut self) {
+        self.wal.with(|w| w.flush());
+    }
+
+    /// Runs the redo-bounding auto-checkpoint if enough WAL has accumulated since the last one (`rmp`
+    /// storage audit F3), a no-op otherwise. Exposed so the engine's group-commit path can take it
+    /// **once per drained batch**, after the batch's committers have been acknowledged (their commits
+    /// are already durable — a checkpoint only bounds later recovery redo, never their durability).
+    ///
+    /// # Errors
+    /// Returns a storage error if flushing the dirty pages or syncing the device fails.
+    pub fn checkpoint_if_due(&mut self) -> Result<()> {
+        self.maybe_checkpoint()
     }
 
     /// Overrides the automatic-checkpoint cadence (WAL bytes between checkpoints). `0` disables it
@@ -4792,6 +4866,59 @@ mod tests {
         );
     }
 
+    /// **`rmp` #528 group-commit crash-mid-batch recovery (store layer).** A crash that lands after one
+    /// group-commit batch's `fdatasync` but during a SECOND, un-hardened batch recovers ONLY the hardened
+    /// batch's committed nodes — the un-`fdatasync`'d batch is lost WHOLE, never partially applied. This
+    /// is the store-level ACID proof of the ack-after-fsync rule: a committer whose batch `fdatasync`
+    /// never completed was never acked, so losing it (all of it) is correct. Deterministic (MemLogSink
+    /// power-loss model + the real ARIES `recover_device` path), the DST/VOPR discipline.
+    #[test]
+    fn group_commit_crash_mid_batch_recovers_only_the_hardened_batch() {
+        use crate::recovery::recover_device;
+
+        let mut s = fresh();
+
+        // --- Batch A: two write commits PREPAREd, then HARDENED by one fdatasync (durable, "acked"). ---
+        for i in 1..=2u64 {
+            s.begin(TxnId(i));
+            s.create_node(TxnId(i)).unwrap();
+            assert!(s.commit_prepare(TxnId(i)).unwrap().is_some());
+        }
+        s.harden_wal(); // ONE group-commit fdatasync hardens batch A
+
+        // --- Batch B: two more write commits PREPAREd, but the batch fdatasync NEVER completes. ---
+        for i in 3..=4u64 {
+            s.begin(TxnId(i));
+            s.create_node(TxnId(i)).unwrap();
+            assert!(s.commit_prepare(TxnId(i)).unwrap().is_some());
+        }
+        // Power loss BEFORE batch B's `harden_wal`: the un-synced tail is dropped whole. Capture the
+        // DURABLE prefix (what survived) — it holds batch A but not batch B (never fdatasync'd).
+        let log = s.wal.with(|w| {
+            let mut b = Vec::new();
+            w.read_durable(Lsn(0), &mut b).unwrap();
+            b
+        });
+
+        // Recover a fresh device purely from the durable WAL prefix, exactly as a reopen does.
+        let mut sink = MemLogSink::new();
+        sink.append(&log);
+        sink.sync().unwrap();
+        let mut device = MemBlockDevice::new(0);
+        let mut wal = WalManager::open(sink).unwrap();
+        recover_device(&mut wal, &mut device).unwrap();
+        let reopened = RecordStore::open(device, wal, 64).unwrap();
+
+        // Only batch A's two committed nodes survive; batch B's two are gone (never a partial batch).
+        let live = reopened.scan_node_ids().unwrap();
+        assert_eq!(
+            live.len(),
+            2,
+            "only the hardened batch's committed nodes survive a mid-batch crash; the un-fdatasync'd \
+             batch is lost WHOLE (live nodes: {live:?})"
+        );
+    }
+
     #[test]
     fn label_set_get_add_remove_round_trip() {
         let mut s = fresh();
@@ -5462,6 +5589,78 @@ mod tests {
                 "reload_catalog on rollback must never roll the commit-ts oracle backwards \
                  (was {after_ro}, now {})",
                 s.snapshot_ts().0
+            );
+        }
+
+        /// **The `rmp` #528 group-commit acceptance proof (store layer).** `K` write transactions
+        /// PREPAREd (`commit_prepare`, no `fdatasync`) and then hardened by a SINGLE `harden_wal`
+        /// perform exactly ONE group-commit `fdatasync`, not `K` — while every one of them is
+        /// committed-durable afterwards. This is the storage-layer half of the cross-transaction
+        /// group-commit (`§4.2`); the engine layer wires the batch drain that feeds it.
+        #[test]
+        fn group_commit_prepares_k_writes_then_one_harden_issues_one_fdatasync() {
+            let (mut s, appended, syncs) = fresh_counting();
+
+            const K: u64 = 16;
+            // PREPARE K write transactions: each appends a data record + a COMMIT record, but NO sync.
+            for i in 1..=K {
+                let txn = TxnId(i);
+                s.begin(txn);
+                s.create_node(txn).unwrap();
+                let lsn = s.commit_prepare(txn).unwrap();
+                assert!(
+                    lsn.is_some(),
+                    "a write commit_prepare must append a durable COMMIT record"
+                );
+            }
+            assert!(
+                appended.load(Ordering::SeqCst) > 0,
+                "the batch appended WAL bytes (K data + K commit records)"
+            );
+            assert_eq!(
+                syncs.load(Ordering::SeqCst),
+                0,
+                "PREPARE issues ZERO fdatasyncs — all {K} commits sit un-synced in the WAL buffer"
+            );
+
+            // HARDEN the whole batch with ONE fdatasync.
+            s.harden_wal();
+            assert_eq!(
+                syncs.load(Ordering::SeqCst),
+                1,
+                "the whole batch of {K} committers is hardened by exactly ONE group-commit fdatasync"
+            );
+
+            // Every prepared commit is now committed-visible and durable: the snapshot oracle advanced
+            // to the last commit timestamp, and the WAL holds K committed transactions.
+            assert_eq!(
+                s.snapshot_ts().0,
+                K,
+                "the commit-ts oracle advanced once per batched commit"
+            );
+            let committed: std::collections::BTreeSet<u64> = s
+                .with_wal(|w| w.committed_transactions().unwrap())
+                .into_iter()
+                .map(|(t, _, _)| t.0)
+                .collect();
+            for i in 1..=K {
+                assert!(
+                    committed.contains(&i),
+                    "batched write commit txn {i} must be durable after the single fdatasync \
+                     (committed set: {committed:?})"
+                );
+            }
+
+            // A subsequent isolated single commit still hardens exactly once (no regression).
+            syncs.store(0, Ordering::SeqCst);
+            let solo = TxnId(K + 1);
+            s.begin(solo);
+            s.create_node(solo).unwrap();
+            s.commit(solo).unwrap();
+            assert_eq!(
+                syncs.load(Ordering::SeqCst),
+                1,
+                "an isolated commit still performs exactly one fdatasync"
             );
         }
     }
