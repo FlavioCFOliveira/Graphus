@@ -186,8 +186,8 @@ pub fn rotate_master_key(
     // Read the old WAL's LOGICAL durable bytes (decrypting old frames) and re-seal them under the
     // new key. Logical bytes (hence LSNs) are preserved exactly, so the recovered device's
     // `page_lsn`s still reference valid WAL offsets.
-    let logical_wal_bytes = read_old_wal_logical_bytes(wal_file, &old_keyring)?;
-    reencrypt_wal(&logical_wal_bytes, &new_keyring, &wal_temp)?;
+    let old_wal_logical = read_old_wal_logical_bytes(wal_file, &old_keyring)?;
+    reencrypt_wal(&old_wal_logical, &new_keyring, &wal_temp)?;
 
     // ---- 4b) Harden the temps' DIRECTORY ENTRIES before the marker becomes the commit point. -----
     // `reencrypt_*` fsync the temp files' *contents* (`sync_all`/`sync`), but an `fsync` of a file
@@ -232,48 +232,113 @@ fn reencrypt_device(
     Ok(())
 }
 
-/// Reads the old WAL's **logical** durable bytes (the plaintext the WAL manager sees), decrypting the
-/// old encrypted frames under `old_keyring`. Returns the logical stream `[0, durable_len)`.
-fn read_old_wal_logical_bytes(wal_file: &Path, old_keyring: &Keyring) -> Result<Vec<u8>> {
+/// The old WAL's retained **logical** durable bytes, in a shape [`reencrypt_wal`] can rebuild from.
+enum OldWalLogical {
+    /// Nothing was reclaimed above the header (the common case, and always the case today): the whole
+    /// offset-`0` logical image `[0, durable_len)`. Re-encrypted byte-identically to before `rmp` #525.
+    Whole(Vec<u8>),
+    /// A reclaimed prefix was dropped (`rmp` #525): the header bytes `[0, HEADER_LEN)` plus the
+    /// retained records `[records_base, durable_len)`, so the rebuild can place the records at their
+    /// ORIGINAL offset after a compact header frame — preserving LSNs without materialising (or reading)
+    /// the already-reclaimed prefix.
+    Compact {
+        header: Vec<u8>,
+        records_base: u64,
+        records: Vec<u8>,
+    },
+}
+
+/// Reads the old WAL's retained **logical** durable bytes (the plaintext the WAL manager sees),
+/// decrypting the old encrypted frames under `old_keyring`.
+///
+/// Reads from the old sink's [`reclaimed_floor`](graphus_wal::LogSink::reclaimed_floor), never a bare
+/// `0` (`rmp` #525): on a long-lived, heavily-reclaimed WAL `read_durable(0, ..)` would allocate a
+/// buffer sized by the whole logical LIFETIME (the reclaimed prefix reads back as a huge zero gap) — the
+/// same OOM this task eliminates on the reopen path. When nothing is reclaimed (`floor <= HEADER_LEN`,
+/// the common case — and always the case for today's segmented WAL) the whole image is read exactly as
+/// before, as [`OldWalLogical::Whole`]; otherwise the header and the retained records are read
+/// separately (bounded) as [`OldWalLogical::Compact`], preserving offsets on rebuild.
+fn read_old_wal_logical_bytes(wal_file: &Path, old_keyring: &Keyring) -> Result<OldWalLogical> {
     let backing = FileLogSink::open(wal_file).map_err(|e| {
         GraphusError::Storage(format!("opening old WAL backing for re-encrypt: {e}"))
     })?;
     let sink = EncryptedFileLogSink::open(backing, old_keyring)?;
-    let mut logical = Vec::new();
-    sink.read_durable(0, &mut logical)?;
-    Ok(logical)
+    let floor = sink.reclaimed_floor();
+    if floor <= HEADER_LEN {
+        // Nothing reclaimed above the header: read the whole image from 0 (behaviour identical to
+        // before `rmp` #525). `reclaimed_floor()` is 0 here, so this is not the unbounded-read hazard.
+        let mut logical = Vec::new();
+        sink.read_durable(0, &mut logical)?;
+        return Ok(OldWalLogical::Whole(logical));
+    }
+    // Reclaimed: read the tiny header and the retained records separately, both bounded to what is
+    // actually retained — never the reclaimed prefix.
+    let mut header = Vec::new();
+    sink.read_bounded(0, HEADER_LEN, &mut header)?;
+    let mut records = Vec::new();
+    sink.read_durable(floor, &mut records)?;
+    Ok(OldWalLogical::Compact {
+        header,
+        records_base: floor,
+        records,
+    })
 }
 
-/// Writes `logical_bytes` as a fresh encrypted WAL at `dest` under `new_keyring`. The WAL header
-/// (`[0, HEADER_LEN)`) is sealed as its **own** first frame and the remaining records as a second
-/// frame, exactly mirroring a freshly created WAL (`WalManager::create` syncs the header alone before
-/// any record). This keeps the rotated WAL's reclamation granularity intact (`rmp` #116): the tiny
-/// header frame stays protected while the records frame and everything appended after it can later be
-/// reclaimed — without the split, a single giant header-bearing frame would be pinned forever. An
-/// empty/header-only old WAL yields just the header frame (or a bare header). Created clean and
-/// `sync`'d before returning.
-fn reencrypt_wal(logical_bytes: &[u8], new_keyring: &Keyring, dest: &Path) -> Result<()> {
+/// Writes `old` as a fresh, compact encrypted WAL at `dest` under `new_keyring`. The WAL header
+/// (`[0, HEADER_LEN)`) is sealed as its **own** first frame and the retained records as a second frame,
+/// exactly mirroring a freshly created WAL (`WalManager::create` syncs the header alone before any
+/// record). This keeps the rotated WAL's reclamation granularity intact (`rmp` #116): the tiny header
+/// frame stays protected while the records frame and everything appended after it can later be
+/// reclaimed — without the split, a single giant header-bearing frame would be pinned forever.
+///
+/// For a [`OldWalLogical::Compact`] old WAL (an already-reclaimed prefix was dropped, `rmp` #525) the
+/// records frame is stamped at its ORIGINAL logical offset via
+/// [`advance_reclaimed_gap`](graphus_crypto::EncryptedLogSink::advance_reclaimed_gap), so LSNs are
+/// preserved (the recovered device's `page_lsn`s still reference valid WAL offsets) while the reclaimed
+/// prefix is never written — the new WAL is compact. An empty/header-only old WAL yields just the header
+/// frame (or a bare header). Created clean and `sync`'d before returning.
+fn reencrypt_wal(old: &OldWalLogical, new_keyring: &Keyring, dest: &Path) -> Result<()> {
     // The WAL is a segmented directory (`rmp` #116); clear any leftover temp directory wholesale.
     remove_path_if_exists(dest)?;
     let backing = FileLogSink::open(dest)
         .map_err(|e| GraphusError::Storage(format!("creating new WAL backing: {e}")))?;
     let mut sink = EncryptedFileLogSink::create(backing, new_keyring)?;
     let header_len = HEADER_LEN as usize;
-    if logical_bytes.is_empty() {
-        // No logical bytes: still harden the fresh sink header (create already synced it, but a
-        // uniform sync keeps the contract explicit and costs nothing for an empty WAL).
-        sink.sync()?;
-    } else if logical_bytes.len() <= header_len {
-        // Header-only WAL: one frame carrying exactly the header bytes.
-        sink.append(logical_bytes);
-        sink.sync()?;
-    } else {
-        // Header frame, then a records frame — matching a fresh WAL's frame structure so the header
-        // frame (logical `[0, HEADER_LEN)`) is protected and the records frame remains reclaimable.
-        sink.append(&logical_bytes[..header_len]);
-        sink.sync()?;
-        sink.append(&logical_bytes[header_len..]);
-        sink.sync()?;
+    match old {
+        OldWalLogical::Whole(logical_bytes) => {
+            if logical_bytes.is_empty() {
+                // No logical bytes: still harden the fresh sink header (create already synced it, but a
+                // uniform sync keeps the contract explicit and costs nothing for an empty WAL).
+                sink.sync()?;
+            } else if logical_bytes.len() <= header_len {
+                // Header-only WAL: one frame carrying exactly the header bytes.
+                sink.append(logical_bytes);
+                sink.sync()?;
+            } else {
+                // Header frame, then a records frame — matching a fresh WAL's frame structure so the
+                // header frame (logical `[0, HEADER_LEN)`) is protected and the records reclaimable.
+                sink.append(&logical_bytes[..header_len]);
+                sink.sync()?;
+                sink.append(&logical_bytes[header_len..]);
+                sink.sync()?;
+            }
+        }
+        OldWalLogical::Compact {
+            header,
+            records_base,
+            records,
+        } => {
+            // Header frame first (logical `[0, HEADER_LEN)`).
+            sink.append(header);
+            sink.sync()?;
+            if !records.is_empty() {
+                // Place the retained records at their ORIGINAL offset by opening a reclaimed gap for the
+                // dropped prefix (not writing it) — LSNs preserved, the new WAL compact (`rmp` #525).
+                sink.advance_reclaimed_gap(*records_base)?;
+                sink.append(records);
+                sink.sync()?;
+            }
+        }
     }
     Ok(())
 }
@@ -865,5 +930,71 @@ mod tests {
         let (a, b, r, _l, rt) = create_store_with_graph(&dir, &MASTER_A);
         recover_pending_rotation(&dir.path, &dir.device(), &dir.wal()).expect("recover noop");
         assert_graph_intact(&dir, &MASTER_A, a, b, r, rt);
+    }
+
+    /// **`rmp` #525.** The offset-preserving compact re-encryption path: an already-reclaimed old WAL
+    /// (its retained records sit above a dropped prefix) is re-encrypted so the records keep their
+    /// ORIGINAL logical offsets (LSNs preserved — the recovered device's `page_lsn`s stay valid) while
+    /// the reclaimed prefix is never written, yielding a physically compact new WAL. This directly
+    /// exercises the [`OldWalLogical::Compact`] rebuild that `read_old_wal_logical_bytes` selects for a
+    /// heavily-reclaimed WAL, proving the bounded read did not shift offsets.
+    #[test]
+    fn reencrypt_wal_compact_preserves_offsets_and_drops_the_reclaimed_prefix() {
+        let dir = TempDir::new("reencrypt-compact");
+        let salt = random_salt();
+        let kr = Keyring::from_master_key(MASTER_B, &salt);
+
+        let header = vec![0xEEu8; HEADER_LEN as usize];
+        let records_base = 8192u64; // the old WAL's reclaimed floor: everything below it was dropped
+        let records = b"retained-records-above-a-dropped-reclaimed-prefix".to_vec();
+        let compact = OldWalLogical::Compact {
+            header: header.clone(),
+            records_base,
+            records: records.clone(),
+        };
+
+        let dest = dir.wal();
+        reencrypt_wal(&compact, &kr, &dest).expect("reencrypt the compact old WAL");
+
+        // Reopen the rebuilt WAL and assert the logical image: header at [0, HEADER_LEN), a zero gap,
+        // then the records at their ORIGINAL base offset.
+        let backing = FileLogSink::open(&dest).expect("reopen backing");
+        let sink = EncryptedFileLogSink::open(backing, &kr).expect("reopen encrypted");
+        let total = records_base + records.len() as u64;
+        assert_eq!(
+            sink.durable_len(),
+            total,
+            "durable length spans to the records' original end"
+        );
+        let mut logical = Vec::new();
+        sink.read_durable(0, &mut logical).expect("read logical");
+        assert_eq!(
+            &logical[0..HEADER_LEN as usize],
+            &header[..],
+            "the header is preserved at offset 0"
+        );
+        assert!(
+            logical[HEADER_LEN as usize..records_base as usize]
+                .iter()
+                .all(|&b| b == 0),
+            "the dropped reclaimed prefix reads back as zeros"
+        );
+        assert_eq!(
+            &logical[records_base as usize..],
+            &records[..],
+            "the records are preserved at their ORIGINAL offset (LSNs unchanged)"
+        );
+        assert_eq!(
+            sink.reclaimed_floor(),
+            records_base,
+            "the rebuilt WAL's reclaimed floor is the records base"
+        );
+        // Compact: the dropped prefix was never written, so the new WAL is physically tiny — NOT sized
+        // by the (8 KiB) logical lifetime.
+        assert!(
+            sink.backing().durable_len() < 4096,
+            "the rebuilt WAL must be physically compact ({} bytes), not lifetime-sized",
+            sink.backing().durable_len()
+        );
     }
 }

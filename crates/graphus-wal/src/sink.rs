@@ -67,6 +67,31 @@ pub trait LogSink {
     /// Reads durable bytes `[from, durable_len)` into `into` (which is cleared first).
     fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()>;
 
+    /// Reads durable bytes `[from, to.min(durable_len))` into `into` (cleared first) — like
+    /// [`read_durable`](LogSink::read_durable), but bounded at `to` instead of implicitly reading all
+    /// the way to `durable_len` (`rmp` #525).
+    ///
+    /// **Why this exists, distinct from [`read_durable`](LogSink::read_durable):** a caller that only
+    /// needs a small, fixed-size prefix — the canonical case is [`WalManager::open`](crate::WalManager::open)
+    /// validating the 8-byte header — has no way to say so with `read_durable`, which *always* builds a
+    /// buffer spanning to `durable_len` regardless of how few bytes the caller actually wants. On a
+    /// long-lived, heavily-reclaimed log, `durable_len` (the log's lifetime byte offset) can vastly
+    /// exceed both the retained window *and* whatever tiny slice the caller asked for — reproducing the
+    /// exact ~61 GiB allocation this task's regression test guards against, this time from a header
+    /// check that only ever wanted 8 bytes. The default implementation is a safe (not
+    /// necessarily-cheap) fallback via `read_durable` + `truncate` — correct for a sink that cannot
+    /// reproduce the unbounded-read pathology (e.g. one with no reclamation, or whose durable image is
+    /// already a bounded in-memory slice); [`FileLogSink`], [`MemLogSink`], and
+    /// `graphus_crypto::EncryptedLogSink` override it with a real bound.
+    ///
+    /// # Errors
+    /// Returns a storage error if the underlying read fails.
+    fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+        self.read_durable(from, into)?;
+        into.truncate((to.saturating_sub(from)) as usize);
+        Ok(())
+    }
+
     /// Physically reclaims the storage backing the durable byte range `[from, up_to)` — bytes that
     /// recovery no longer needs (below the checkpoint / oldest-active-transaction floor, `rmp` #114).
     ///
@@ -86,6 +111,36 @@ pub trait LogSink {
     /// Returns a storage error if the underlying reclaim operation fails.
     fn reclaim(&mut self, _from: u64, _up_to: u64) -> Result<()> {
         Ok(())
+    }
+
+    /// The smallest LSN a caller can pass to [`read_durable`](LogSink::read_durable) without
+    /// [`read_durable`](LogSink::read_durable) having to zero-fill a **reclaimed** (already physically
+    /// freed) gap it doesn't need — i.e. the start of the earliest byte range this sink still actually
+    /// retains real bytes for, at or below which everything is either genuine data or a gap so small it
+    /// is cheap to materialise. `0` (the default, correct for a sink that never reclaims — the header
+    /// is always at offset `0`) never zero-fills anything it shouldn't; a reclaiming sink narrows this
+    /// upward once its retained window no longer starts at `0` (`rmp` #525).
+    ///
+    /// **Why this exists (`rmp` #525):** `read_durable(from, ..)` always builds one contiguous
+    /// `[from, durable_len)` buffer, zero-padding whatever is reclaimed inside that range — correct and
+    /// cheap when `from` sits near the retained window, but `durable_len` is the log's **absolute
+    /// lifetime byte offset** (never reset by reclamation) and is *not* bounded by how much data is
+    /// currently retained. A caller that always reads from `0` (or from a fixed floor like the header
+    /// length) on a long-lived, heavily-reclaimed log ends up allocating and zero-filling a buffer sized
+    /// by the log's **entire history**, not by what is actually on disk — which can vastly exceed
+    /// available memory even when the *retained* WAL is small (the exact mechanism behind a real crash:
+    /// a ~3.5 GiB retained WAL with enough reclaimed history demanded a ~61 GiB allocation on reopen).
+    /// Every caller of `read_durable` that does not have a more specific, narrower start in hand (e.g. a
+    /// backup chain's own `base_lsn`) should read from `start.max(self.reclaimed_floor())` instead of a
+    /// bare `0`/header-floor constant.
+    ///
+    /// This is provably safe to skip past: [`WalManager::reclaim`](crate::WalManager::reclaim) only
+    /// ever advances the reclaim floor to an LSN it has already established is "provably unneeded by
+    /// recovery" (its own doc comment) — the exact same guarantee the leading-zero-skip in
+    /// [`crate::recover_from`] already relies on. This accessor does not weaken that guarantee; it only
+    /// avoids *materialising* a gap that was already safe to skip.
+    fn reclaimed_floor(&self) -> u64 {
+        0
     }
 }
 
@@ -223,6 +278,30 @@ impl LogSink for MemLogSink {
         Ok(())
     }
 
+    fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+        into.clear();
+        // Identical to `read_durable` except capped at `to` (`rmp` #525) — see `FileLogSink`'s
+        // `read_bounded` / `LogSink::read_bounded`'s doc comment for the rationale.
+        let end = to.min(self.durable_end());
+        if from >= end {
+            return Ok(());
+        }
+        into.resize((end - from) as usize, 0);
+        let head_end = self.head.len() as u64;
+        if from < head_end {
+            let len = (head_end.min(end) - from) as usize;
+            into[..len].copy_from_slice(&self.head[from as usize..from as usize + len]);
+        }
+        let tail_start = self.base.max(from);
+        if tail_start < end {
+            let out_off = (tail_start - from) as usize;
+            let tail_off = (tail_start - self.base) as usize;
+            let len = (end - tail_start) as usize;
+            into[out_off..out_off + len].copy_from_slice(&self.tail[tail_off..tail_off + len]);
+        }
+        Ok(())
+    }
+
     fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
         // Physically free the retained tail bytes in `[from, up_to)` (memory is RELEASED, not
         // zero-filled), while the logical length and all offsets are preserved: the freed gap reads
@@ -231,15 +310,17 @@ impl LogSink for MemLogSink {
         let from = from.min(self.durable_end());
         let up_to = up_to.min(self.durable_end()).max(from);
 
-        // Promote the never-reclaimed prefix `[0, from)` into `head` if it is not already there (the
-        // header lives in `tail` until the first reclaim). `from` is the constant header floor, so
-        // `head` stabilises at the 8-byte header after the first pass.
-        if (self.head.len() as u64) < from {
-            debug_assert_eq!(
-                self.base,
-                self.head.len() as u64,
-                "no gap below the floor yet"
-            );
+        // Promote the never-reclaimed prefix `[0, from)` into `head` on the FIRST reclaim only, while
+        // no gap exists yet (`base == head.len()`). A plaintext WAL passes a constant `from` (the
+        // header floor), so `head` stabilises at the 8-byte header after this single pass. A wrapping
+        // sink (e.g. the encrypted `EncryptedLogSink`) legitimately passes a *rising* `from` to protect
+        // a growing pinned prefix (its header frame): once a gap already exists (`base > head.len()`),
+        // that rising `from` moves the floor further into the already-freed/about-to-be-freed region,
+        // so there is nothing new to promote — the header is already safely in `head` and the bytes in
+        // `[base, from)` are below the floor and fall to the drain below (`rmp` #525). Guarding the
+        // promotion on `base == head.len()` keeps `head` a contiguous `[0, head.len())` prefix (the
+        // model cannot represent a non-contiguous head) instead of mis-absorbing the gap.
+        if self.base == self.head.len() as u64 && (self.head.len() as u64) < from {
             let promote = (from - self.base) as usize;
             self.head.extend_from_slice(&self.tail[..promote]);
             self.tail.drain(..promote);
@@ -257,6 +338,15 @@ impl LogSink for MemLogSink {
         self.tail.shrink_to_fit();
         self.base = up_to;
         Ok(())
+    }
+
+    /// `0` if nothing has been reclaimed past the retained `head` yet (reading from `0` is already
+    /// cheap — `head` is small and fixed), else `self.base` (the start of the retained `tail`), which
+    /// skips the zero-filled gap `[head.len(), base)` a reclaim has opened above the header (`rmp`
+    /// #525) — mirrors [`FileLogSink::reclaimed_floor`].
+    fn reclaimed_floor(&self) -> u64 {
+        let head_end = self.head.len() as u64;
+        if self.base > head_end { self.base } else { 0 }
     }
 }
 
@@ -630,6 +720,49 @@ impl LogSink for FileLogSink {
         Ok(())
     }
 
+    fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+        use graphus_core::GraphusError;
+        use std::os::unix::fs::FileExt;
+        into.clear();
+        // Identical to `read_durable` except every span is additionally capped at `to` (`rmp` #525) —
+        // so a caller that only wants a small prefix (the header check) never allocates a buffer sized
+        // by the log's full lifetime length.
+        let end = to.min(self.durable_len);
+        if from >= end {
+            return Ok(());
+        }
+        let total = (end - from) as usize;
+        into.resize(total, 0);
+
+        if from < self.anchor_len {
+            let anchor_path = self.dir.join(ANCHOR_NAME);
+            let anchor_end = self.anchor_len.min(end);
+            let len = (anchor_end - from) as usize;
+            let f = File::open(&anchor_path)
+                .map_err(|e| GraphusError::Storage(format!("open wal anchor to read: {e}")))?;
+            f.read_exact_at(&mut into[..len], from)
+                .map_err(|e| GraphusError::Storage(format!("wal anchor read: {e}")))?;
+        }
+
+        for seg in self.segments.values() {
+            if seg.base >= end || seg.len == 0 {
+                continue;
+            }
+            let seg_end = (seg.base + seg.len).min(end);
+            if seg_end <= from {
+                continue;
+            }
+            let read_from = seg.base.max(from);
+            let out_off = (read_from - from) as usize;
+            let file_off = read_from - seg.base;
+            let len = (seg_end - read_from) as usize;
+            seg.file
+                .read_exact_at(&mut into[out_off..out_off + len], file_off)
+                .map_err(|e| GraphusError::Storage(format!("wal segment read: {e}")))?;
+        }
+        Ok(())
+    }
+
     fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
         // Delete the maximal **prefix** of segments whose whole range lies below `up_to` — never the
         // anchor (offsets `< from`, the header), never the active (last) segment (it takes appends).
@@ -662,6 +795,19 @@ impl LogSink for FileLogSink {
         // leading-zero-prefix assumption).
         self.sync_dir()?;
         Ok(())
+    }
+
+    /// `0` if no segment has been reclaimed away yet (the earliest segment, if any, still starts right
+    /// at `anchor_len` — reading from `0` is already cheap, the anchor is small and fixed), else the
+    /// earliest **surviving** segment's `base`, which skips the zero-filled gap `[anchor_len, base)` a
+    /// reclaim has opened above the anchor (`rmp` #525) — this is the fix for the crash this task's
+    /// regression test reproduces: `read_durable(0, ..)` on a log whose lifetime byte offset vastly
+    /// exceeds its currently-retained window otherwise allocates a buffer sized by that whole lifetime.
+    fn reclaimed_floor(&self) -> u64 {
+        match self.segments.keys().next() {
+            Some(&first_base) if first_base > self.anchor_len => first_base,
+            _ => 0,
+        }
     }
 }
 
@@ -786,6 +932,49 @@ mod tests {
         let mut buf = Vec::new();
         s.read_durable(8, &mut buf).unwrap();
         assert_eq!(buf, b"CCCC");
+    }
+
+    #[test]
+    fn reclaim_tolerates_a_rising_from_across_repeated_calls() {
+        // `rmp` #525 regression: a *wrapping* sink (e.g. `EncryptedLogSink`) protects a GROWING pinned
+        // prefix — its own header frame — by passing a **rising** `from` to the backing on every
+        // reclaim. Once a reclaimed gap already exists (`base > head.len()`), that rising `from` moves
+        // the floor further into the already-freed region. The previous implementation asserted `from`
+        // was constant (`base == head.len()`) and PANICKED here in debug / mis-promoted the head into a
+        // non-contiguous state in release, corrupting the logical image. This asserts repeated reclaim
+        // with a rising `from` is a well-behaved, offset-preserving no-op past the gap.
+        let mut s = MemLogSink::new();
+        s.append(&[0xAB; 8]); // a "header" prefix at [0, 8), always retained
+        for i in 0..40u32 {
+            s.append(&i.to_le_bytes()); // 4-byte chunks: [8, 168)
+        }
+        s.sync().unwrap();
+        let full = s.durable_bytes();
+        let durable = s.durable_len();
+        assert_eq!(durable, 168);
+
+        // Repeatedly reclaim with a RISING `from` (and `up_to`), simulating the growing pinned prefix.
+        let mut from = 8u64;
+        let mut up_to = 16u64;
+        while up_to <= durable {
+            s.reclaim(from, up_to).unwrap(); // must NOT panic
+            let img = s.durable_bytes();
+            // Offsets are never shifted, the retained tail is byte-exact, the header survives, and the
+            // reclaimed span reads as zeros — the exact offset-preserving contract recovery relies on.
+            assert_eq!(img.len() as u64, durable, "reclaim never shifts offsets");
+            assert_eq!(&img[0..8], &full[0..8], "the pinned header prefix survives");
+            assert_eq!(
+                &img[up_to as usize..],
+                &full[up_to as usize..],
+                "the retained tail beyond up_to is byte-exact"
+            );
+            assert!(
+                img[8..up_to as usize].iter().all(|&b| b == 0),
+                "the reclaimed span [8, up_to) reads back as zeros"
+            );
+            from += 4; // RISING from — the pattern that used to panic/corrupt
+            up_to += 4;
+        }
     }
 
     // miri has filesystem isolation enabled by default, so the real `open`/`remove_dir_all`

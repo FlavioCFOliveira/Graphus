@@ -92,8 +92,13 @@ impl<S: LogSink> WalManager<S> {
                 "WAL too short to contain a header".to_owned(),
             ));
         }
+        // Bounded to exactly the header (`rmp` #525): `read_durable(0, ..)` would allocate and
+        // zero-fill a buffer sized by the log's entire lifetime byte offset on a long-lived,
+        // heavily-reclaimed WAL, for a check that only ever wants 8 bytes — this is called on every
+        // reopen, so it must not scale with the log's history. See `LogSink::read_bounded`'s doc
+        // comment for the full rationale (the exact mechanism behind a real crash).
         let mut hdr = Vec::new();
-        sink.read_durable(0, &mut hdr)?;
+        sink.read_bounded(0, HEADER_LEN, &mut hdr)?;
         let magic = u32::from_le_bytes(hdr[0..4].try_into().expect("4-byte slice"));
         let version = u32::from_le_bytes(hdr[4..8].try_into().expect("4-byte slice"));
         if magic != WAL_MAGIC {
@@ -161,10 +166,17 @@ impl<S: LogSink> WalManager<S> {
     /// # Errors
     /// Propagates a sink read error, or returns a storage error on interior WAL corruption.
     pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp, Lsn)>> {
+        // Bound the read to the sink's `reclaimed_floor()` (`rmp` #525): reading unconditionally from
+        // `HEADER_LEN` makes `read_durable` allocate and zero-fill a buffer sized by the log's entire
+        // lifetime byte offset once enough has been reclaimed, not by what is actually retained — see
+        // `LogSink::reclaimed_floor`'s doc comment for the full rationale (this is the exact mechanism
+        // behind a real OOM-abort crash on reopen).
+        let base = HEADER_LEN.max(self.sink.reclaimed_floor());
         let mut log = Vec::new();
-        self.read_durable(Lsn(0), &mut log)?;
+        self.read_durable(Lsn(base), &mut log)?;
         let mut out = Vec::new();
-        let mut cursor = HEADER_LEN as usize;
+        // `log[0]` corresponds to absolute LSN `base`, so the scan starts at the buffer's beginning.
+        let mut cursor = 0usize;
         // Skip a reclaimed (zero) prefix to the first surviving record (`rmp` #114; see
         // `recover_from`). A real record never begins with a zero byte.
         while cursor < log.len() && log[cursor] == 0 {
@@ -183,16 +195,19 @@ impl<S: LogSink> WalManager<S> {
                     }
                 }
                 // Same interior-corruption guard as `recover_from`: only truncate on a genuine torn
-                // tail; fail loud if real committed data follows the undecodable spot.
+                // tail; fail loud if real committed data follows the undecodable spot. Diagnostics
+                // report absolute LSNs (`base + cursor`), not the buffer-relative index.
                 Err(_) => {
-                    if let Some(off) =
-                        crate::recovery::next_self_consistent_record(&log, cursor + 1)
+                    let abs_cursor = base + cursor as u64;
+                    if let Some(abs_off) =
+                        crate::recovery::next_self_consistent_record(&log, cursor + 1, base)
                     {
                         return Err(GraphusError::Storage(format!(
-                            "WAL interior log corruption: an undecodable record at offset {cursor} \
-                             is followed by a valid record at offset {off}; refusing to rebuild the \
-                             transaction table, because stopping here would silently drop the \
-                             committed transactions logged after offset {cursor}"
+                            "WAL interior log corruption: an undecodable record at offset \
+                             {abs_cursor} is followed by a valid record at offset {abs_off}; \
+                             refusing to rebuild the transaction table, because stopping here would \
+                             silently drop the committed transactions logged after offset \
+                             {abs_cursor}"
                         )));
                     }
                     break;
@@ -226,10 +241,14 @@ impl<S: LogSink> WalManager<S> {
     /// corruption is rejected by the recovery path that runs alongside this, so this scan simply stops
     /// at the first undecodable record and never reads past it.)
     pub fn max_recovered_txn_id(&self) -> Result<u64> {
+        // Bound the read to `reclaimed_floor()`, exactly like `committed_transactions` (`rmp` #525) —
+        // see that method's comment and `LogSink::reclaimed_floor`'s doc comment for the rationale.
+        let base = HEADER_LEN.max(self.sink.reclaimed_floor());
         let mut log = Vec::new();
-        self.read_durable(Lsn(0), &mut log)?;
+        self.read_durable(Lsn(base), &mut log)?;
         let mut max_id = 0u64;
-        let mut cursor = HEADER_LEN as usize;
+        // `log[0]` corresponds to absolute LSN `base`, so the scan starts at the buffer's beginning.
+        let mut cursor = 0usize;
         // Skip a reclaimed (zero) prefix to the first surviving record (`rmp` #114; see
         // `recover_from`). A real record never begins with a zero byte.
         while cursor < log.len() && log[cursor] == 0 {

@@ -102,8 +102,21 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
     target: &mut T,
     scan_start: Lsn,
 ) -> Result<RecoveryReport> {
+    // The scan begins at `scan_start` for a logical/chain WAL, or at `HEADER_LEN` for a normal log.
+    // Clamp to at least `HEADER_LEN` (offset 0 is the null LSN; the header is never a record) and to
+    // at least the sink's own `reclaimed_floor()` (`rmp` #525): reading from any lower LSN would make
+    // `read_durable` allocate and zero-fill a buffer sized by the log's entire lifetime byte offset,
+    // not by what is actually retained — the exact mechanism behind a real crash (a ~3.5 GiB retained
+    // WAL demanding a ~61 GiB allocation on reopen, because `durable_len` had grown far larger than
+    // the retained window over the database's lifetime). `reclaimed_floor()` is provably safe to read
+    // from: it never exceeds an LSN `WalManager::reclaim` has already established is unneeded by
+    // recovery — the same guarantee the leading-zero-skip below already relies on.
+    let base = scan_start
+        .0
+        .max(HEADER_LEN)
+        .max(wal.sink().reclaimed_floor());
     let mut log = Vec::new();
-    wal.read_durable(Lsn(0), &mut log)?;
+    wal.read_durable(Lsn(base), &mut log)?;
 
     // --- Phase 1: analysis ---
     let mut ordered: Vec<LogRecord> = Vec::new();
@@ -114,10 +127,9 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
     let mut last_checkpoint_lsn: Option<Lsn> = None;
     let mut tail_truncated = false;
 
-    // The scan begins at `scan_start` for a logical/chain WAL, or at `HEADER_LEN` for a normal log.
-    // Clamp to at least `HEADER_LEN` (offset 0 is the null LSN; the header is never a record) and to
-    // within the log so a degenerate input can never index out of bounds.
-    let mut cursor = (scan_start.0.max(HEADER_LEN) as usize).min(log.len());
+    // `log[0]` corresponds to absolute LSN `base` (read_durable was bounded to start there), so the
+    // scan cursor starts at the beginning of the buffer, not at `base` itself.
+    let mut cursor = 0usize;
     // Skip a leading run of zero bytes: a **reclaimed WAL prefix** (deleted segments / punched holes
     // below the recovery floor, `rmp` #114) reads back as zeros, and a real record never begins with
     // a zero byte (its leading `total_len` is `>= MIN_RECORD_LEN`). This advances the scan to the
@@ -168,12 +180,15 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
             // fail-closed (the operator investigates; no bytes are discarded) is the correct ACID
             // choice versus silently dropping possibly-committed data.
             Err(DecodeError::Incomplete | DecodeError::BadCrc | DecodeError::Corrupt) => {
-                if let Some(off) = next_self_consistent_record(&log, cursor + 1) {
+                // Diagnostics report absolute LSNs (`base + cursor`), not the buffer-relative index,
+                // now that the buffer may start at a nonzero `base` (`rmp` #525).
+                let abs_cursor = base + cursor as u64;
+                if let Some(abs_off) = next_self_consistent_record(&log, cursor + 1, base) {
                     return Err(GraphusError::Storage(format!(
-                        "WAL interior log corruption: an undecodable record at offset {cursor} is \
-                         followed by a valid record at offset {off}; refusing to recover, because \
+                        "WAL interior log corruption: an undecodable record at offset {abs_cursor} is \
+                         followed by a valid record at offset {abs_off}; refusing to recover, because \
                          truncating here would silently drop the committed transactions logged \
-                         after offset {cursor}"
+                         after offset {abs_cursor}"
                     )));
                 }
                 tail_truncated = true;
@@ -283,23 +298,27 @@ pub fn recover_from<S: LogSink, T: ApplyTarget>(
 }
 
 /// Scans `log[from..]` for the first offset that decodes to a **self-consistent** record — one whose
-/// stamped LSN equals its own byte offset (`record.lsn == offset`). A record's LSN is its byte offset
-/// (`§4.1`) and is covered by the record's CRC32C, so a self-consistent decode is a record genuinely
-/// written at that position, not a chance CRC match (a stray CRC32C hit would additionally have to
-/// carry exactly the right 8-byte offset — astronomically unlikely).
+/// stamped LSN equals its own **absolute** byte offset (`record.lsn == base + offset`). A record's LSN
+/// is its byte offset (`§4.1`) and is covered by the record's CRC32C, so a self-consistent decode is a
+/// record genuinely written at that position, not a chance CRC match (a stray CRC32C hit would
+/// additionally have to carry exactly the right 8-byte offset — astronomically unlikely).
+///
+/// `base` is the absolute LSN of `log[0]` (`rmp` #525: the caller may have read `log` starting at a
+/// nonzero floor, not true LSN `0`, to avoid materialising an already-reclaimed gap) — `0` recovers the
+/// original "index is the absolute offset" behaviour.
 ///
 /// Used by [`recover_from`] to tell interior log corruption (a valid record follows an undecodable
 /// one ⇒ committed data exists beyond the failure ⇒ fail loud) from a benign torn tail (no genuine
-/// record follows ⇒ truncate). Returns the offset of the first such record, or `None` if none
+/// record follows ⇒ truncate). Returns the **absolute** LSN of the first such record, or `None` if none
 /// remains in the durable range.
-pub(crate) fn next_self_consistent_record(log: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn next_self_consistent_record(log: &[u8], from: usize, base: u64) -> Option<u64> {
     let mut off = from;
     while off + MIN_RECORD_LEN <= log.len() {
-        // Probes only the self-consistency of the header (`lsn == off`), never redo/undo, so decode
-        // in place without allocating — this runs once per byte across the corrupt region.
+        // Probes only the self-consistency of the header (`lsn == base + off`), never redo/undo, so
+        // decode in place without allocating — this runs once per byte across the corrupt region.
         if let Ok((rec, _)) = LogRecordRef::decode(&log[off..]) {
-            if rec.lsn.0 == off as u64 {
-                return Some(off);
+            if rec.lsn.0 == base + off as u64 {
+                return Some(rec.lsn.0);
             }
         }
         off += 1;
@@ -311,6 +330,9 @@ pub(crate) fn next_self_consistent_record(log: &[u8], from: usize) -> Option<usi
 mod tests {
     use super::*;
     use crate::sink::MemLogSink;
+    use crate::test_support::CountingSink;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A page-per-counter store whose redo/undo images are 8-byte little-endian **deltas**
     /// (physiological redo + logical undo, as `§4.1` requires for interleaving soundness).
@@ -413,5 +435,229 @@ mod tests {
         store.pages.insert(0, (Lsn(0), 100));
         recover(&mut wal2, &mut store).unwrap();
         assert_eq!(store.value(0), 70); // 100 - 30 (committed); the loser's -20 is undone
+    }
+
+    /// **`rmp` #525 regression gate.** Reproduces the exact production crash — a WAL whose *lifetime*
+    /// byte offset (`durable_len`) has grown far larger than its *currently retained* window, because
+    /// many commit+reclaim cycles ran over the database's life (exactly what a long bulk-import session
+    /// with the widened maintenance-checkpoint interval, or simply a long-lived busy database, produces)
+    /// — then reopens it (the real crash-recovery boot path: `recover`/`committed_transactions`/
+    /// `max_recovered_txn_id`, all of which used to call `read_durable(Lsn(0), ..)` unconditionally) and
+    /// asserts BOTH halves of the fix:
+    ///
+    /// 1. **The read is actually bounded** — `read_durable` from `reclaimed_floor()` returns a buffer
+    ///    close to the retained window's size, not the log's entire lifetime length (this is the direct,
+    ///    measurable effect of the fix; before it, this same read would have been `lifetime_len` bytes,
+    ///    which is exactly what turned into the ~61 GiB allocation in production).
+    /// 2. **Nothing needed for recovery is silently skipped by the new boundary** — every one of the
+    ///    still-retained committed transactions is correctly recovered (`committed_transactions`,
+    ///    `max_recovered_txn_id`, and a full `recover` redo/undo pass all agree), which is the primary
+    ///    correctness concern for narrowing a crash-recovery read boundary.
+    #[test]
+    fn reopen_after_heavy_reclaim_churn_bounds_the_read_and_recovers_every_retained_commit() {
+        // Wrap the backing so we can OBSERVE the largest buffer the recovery methods
+        // (`committed_transactions` / `max_recovered_txn_id` / `recover`) actually allocate — the part
+        // the earlier version of this test never asserted, which left it non-gating (it passed even on
+        // the pre-fix `read_durable(Lsn(0)/HEADER_LEN, ..)` code because those reads still returned the
+        // *correct* bytes, only a lifetime-sized buffer). See the counter assertion below.
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut wal =
+            WalManager::create(CountingSink::new(MemLogSink::new(), Arc::clone(&counter))).unwrap();
+
+        const CHURN_CYCLES: u64 = 500;
+        const RETAINED_TXNS: u64 = 5;
+
+        for i in 1..=CHURN_CYCLES {
+            let txn = TxnId(i);
+            wal.begin(txn);
+            wal.log_update(txn, PageId(0), d(1), d(-1));
+            wal.commit(txn).unwrap();
+            // Reclaim everything durable so far behind every commit except the last few, so the WAL
+            // ends with a LARGE lifetime offset (500 commits' worth of LSN space issued) but a SMALL
+            // retained window (only the last `RETAINED_TXNS` commits' bytes still on "disk").
+            if i <= CHURN_CYCLES - RETAINED_TXNS {
+                wal.reclaim(Lsn(wal.sink().durable_len())).unwrap();
+            }
+        }
+
+        let lifetime_len = wal.sink().durable_len();
+        let floor = wal.sink().reclaimed_floor();
+        assert!(
+            floor > 0,
+            "many commit+reclaim cycles must have advanced the floor well past LSN 0 \
+             (floor={floor}, lifetime_len={lifetime_len})"
+        );
+        let retained_span = lifetime_len - floor;
+        // The reproduction is only meaningful if the retained window is genuinely small relative to
+        // the lifetime length — assert the scenario itself, not just the fix.
+        assert!(
+            retained_span * 20 < lifetime_len,
+            "test setup did not reproduce a small-retention/high-lifetime-offset WAL: \
+             retained_span={retained_span} lifetime_len={lifetime_len}"
+        );
+
+        // --- 1. The fix's direct, measurable effect: the bounded read stays small. ---
+        let mut bounded = Vec::new();
+        wal.sink().read_durable(floor, &mut bounded).unwrap();
+        assert_eq!(bounded.len() as u64, retained_span);
+        assert!(
+            (bounded.len() as u64) * 20 < lifetime_len,
+            "a read bounded to reclaimed_floor() must stay close to the retained window, not scale \
+             with the log's lifetime length (bounded={} lifetime_len={lifetime_len})",
+            bounded.len()
+        );
+
+        // --- 2. Reopen (the real crash-recovery boot path) must succeed and recover EXACTLY the
+        // --- retained commits — none silently dropped, none phantom.
+        let sink = wal.sink().clone();
+        // Reset the counter so it measures ONLY the reopen + recovery reads that follow.
+        counter.store(0, Ordering::SeqCst);
+        let mut wal2 = WalManager::open(sink).unwrap();
+
+        let committed = wal2.committed_transactions().unwrap();
+        assert_eq!(
+            committed.len(),
+            RETAINED_TXNS as usize,
+            "must recover exactly the retained commits"
+        );
+        let mut recovered_ids: Vec<u64> = committed.iter().map(|(t, _, _)| t.0).collect();
+        recovered_ids.sort_unstable();
+        let expected_ids: Vec<u64> = ((CHURN_CYCLES - RETAINED_TXNS + 1)..=CHURN_CYCLES).collect();
+        assert_eq!(
+            recovered_ids, expected_ids,
+            "recovered exactly the still-retained transaction ids, none skipped, none phantom"
+        );
+
+        assert_eq!(
+            wal2.max_recovered_txn_id().unwrap(),
+            CHURN_CYCLES,
+            "the id high-water mark must still be seeded from the last retained commit"
+        );
+
+        let mut store = DeltaStore::default();
+        let report = recover(&mut wal2, &mut store).unwrap();
+        assert_eq!(
+            report.losers, 0,
+            "every retained transaction committed; no losers to undo"
+        );
+        assert_eq!(
+            report.redo_applied, RETAINED_TXNS as usize,
+            "every retained commit's single update must be redone"
+        );
+        assert_eq!(
+            store.value(0),
+            RETAINED_TXNS as i64,
+            "each retained commit added +1 to page 0; the reclaimed-away commits' effects predate \
+             this store (a fresh redo target, modelling a no-force page that was never flushed) so \
+             they correctly do not appear here — this asserts the RETAINED commits are complete, not \
+             that reclaimed history is (impossibly) still redoable"
+        );
+
+        // --- 3. GATING: the recovery methods above must have read only the RETAINED window, never a
+        // --- buffer sized by the log's lifetime. This is what makes the test fail on the pre-fix code:
+        // --- reverting the recovery-path `.max(reclaimed_floor())` makes these reads start at
+        // --- `HEADER_LEN`, spiking the observed allocation to ~`lifetime_len`.
+        let max_recovery_read = counter.load(Ordering::SeqCst);
+        assert!(
+            max_recovery_read <= retained_span + HEADER_LEN,
+            "recovery allocated {max_recovery_read} bytes — it must stay bounded by the retained \
+             window {retained_span}, not scale with the lifetime length {lifetime_len}"
+        );
+        assert!(
+            max_recovery_read * 20 < lifetime_len,
+            "recovery read {max_recovery_read} must be well below the lifetime length {lifetime_len} \
+             (bounded to the retained window, not the whole history)"
+        );
+    }
+
+    /// **`rmp` #525** — the same gate over a **real segmented [`FileLogSink`]** (not the in-memory
+    /// sink): after many commit+reclaim cycles the WAL directory has physically deleted its below-floor
+    /// segments, so `durable_len` (the lifetime byte offset) far exceeds the retained window. Reopening
+    /// from disk and recovering must read only the retained window — reverting the recovery-path
+    /// `.max(reclaimed_floor())` makes the read scale with the lifetime and fails the gate — while still
+    /// recovering every retained commit (the last commit is always retained).
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn file_backed_reopen_after_heavy_reclaim_bounds_the_recovery_read() {
+        use crate::sink::FileLogSink;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("graphus-wal-recl-{nanos}-{}", std::process::id()));
+
+        const CHURN_CYCLES: u64 = 400;
+
+        // --- Build phase: churn commits + reclaim, on a REAL file backing with tiny segments so the
+        // --- reclaim frees whole segments at a fine granularity. Then drop the manager (close files).
+        {
+            let backing =
+                FileLogSink::open_with_segment_target(&dir, 512).expect("open file backing");
+            let mut wal = WalManager::create(backing).expect("create wal on file backing");
+            for i in 1..=CHURN_CYCLES {
+                let txn = TxnId(i);
+                wal.begin(txn);
+                wal.log_update(txn, PageId(0), d(1), d(-1));
+                wal.commit(txn).expect("commit");
+                // Reclaim everything durable so far; the active segment is always kept, so the retained
+                // window stays a small suffix while the lifetime offset grows with every commit.
+                wal.reclaim(Lsn(wal.sink().durable_len())).expect("reclaim");
+            }
+        }
+
+        // --- Reopen phase: fresh FileLogSink over the same directory (the real crash-recovery boot
+        // --- path), wrapped so we can observe the recovery reads.
+        let counter = Arc::new(AtomicU64::new(0));
+        let backing =
+            FileLogSink::open_with_segment_target(&dir, 512).expect("reopen file backing");
+        let mut wal = WalManager::open(CountingSink::new(backing, Arc::clone(&counter)))
+            .expect("reopen wal manager");
+
+        let lifetime_len = wal.sink().durable_len();
+        let floor = wal.sink().reclaimed_floor();
+        assert!(
+            floor > 0,
+            "the segmented file reclaim must have advanced the floor past LSN 0 \
+             (floor={floor}, lifetime_len={lifetime_len})"
+        );
+        let retained_span = lifetime_len - floor;
+        assert!(
+            retained_span * 10 < lifetime_len,
+            "test setup did not reproduce a small-retention/high-lifetime WAL on disk: \
+             retained_span={retained_span} lifetime_len={lifetime_len}"
+        );
+
+        // Recovery must succeed and see the last (always-retained) commit.
+        let committed = wal.committed_transactions().expect("committed txns");
+        assert!(
+            !committed.is_empty() && committed.iter().any(|(t, _, _)| t.0 == CHURN_CYCLES),
+            "the last committed transaction must be among the recovered retained set"
+        );
+        assert_eq!(
+            wal.max_recovered_txn_id().expect("max id"),
+            CHURN_CYCLES,
+            "the id high-water mark is seeded from the last retained commit"
+        );
+        let mut store = DeltaStore::default();
+        recover(&mut wal, &mut store).expect("recover from the reopened file WAL");
+
+        // GATING: the recovery reads stayed bounded by the retained window.
+        let max_recovery_read = counter.load(Ordering::SeqCst);
+        assert!(
+            max_recovery_read <= retained_span + HEADER_LEN,
+            "recovery allocated {max_recovery_read} bytes from the file WAL — it must stay bounded by \
+             the retained window {retained_span}, not scale with the lifetime length {lifetime_len}"
+        );
+        assert!(
+            max_recovery_read * 10 < lifetime_len,
+            "recovery read {max_recovery_read} must be well below the lifetime length {lifetime_len}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

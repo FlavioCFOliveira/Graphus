@@ -3224,8 +3224,14 @@ mod abort_failure_tests {
         fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
             self.inner.read_durable(from, into)
         }
+        fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+            self.inner.read_bounded(from, to, into)
+        }
         fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
             self.inner.reclaim(from, up_to)
+        }
+        fn reclaimed_floor(&self) -> u64 {
+            self.inner.reclaimed_floor()
         }
     }
 

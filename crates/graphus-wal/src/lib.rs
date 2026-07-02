@@ -30,6 +30,8 @@ pub mod manager;
 pub mod record;
 pub mod recovery;
 pub mod sink;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use checkpoint::CheckpointSnapshot;
 pub use manager::{HEADER_LEN, WAL_MAGIC, WAL_VERSION, WalManager};

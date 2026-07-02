@@ -258,6 +258,16 @@ impl LogSink for WalSink {
         }
     }
 
+    fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+        // Forward for the same reason `read_durable`/`reclaimed_floor` are forwarded (`rmp` #525):
+        // without this, `WalSink` would inherit the trait's default (`read_durable` + truncate), which
+        // does not avoid the unbounded allocation this method exists to prevent.
+        match self {
+            Self::Plain(s) => s.read_bounded(from, to, into),
+            Self::Encrypted(s) => s.read_bounded(from, to, into),
+        }
+    }
+
     fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
         // Forward to the concrete sink so production WAL disk is actually bounded (`rmp` #116):
         // without this, `WalSink` would inherit the trait's NO-OP `reclaim` and the segmented
@@ -265,6 +275,17 @@ impl LogSink for WalSink {
         match self {
             Self::Plain(s) => s.reclaim(from, up_to),
             Self::Encrypted(s) => s.reclaim(from, up_to),
+        }
+    }
+
+    fn reclaimed_floor(&self) -> u64 {
+        // Forward to the concrete sink for the same reason `reclaim` is forwarded above (`rmp` #525):
+        // without this, `WalSink` — the actual type `graphus-server` opens every database with —
+        // would silently inherit the trait's default `0` and every reopen would read from true LSN
+        // `0`, exactly reproducing the crash this method exists to prevent.
+        match self {
+            Self::Plain(s) => s.reclaimed_floor(),
+            Self::Encrypted(s) => s.reclaimed_floor(),
         }
     }
 }

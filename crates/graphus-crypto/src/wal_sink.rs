@@ -51,6 +51,8 @@
 //! bytes inside a synced (hence whole, authenticated) frame as durable, dropping a torn tail can
 //! never lose committed work: a group commit's frame is fully durable before `commit` returns.
 
+use std::borrow::Cow;
+
 use aes_gcm::aead::{Aead, AeadInPlace};
 use aes_gcm::{Aes256Gcm, Nonce};
 use graphus_core::error::{GraphusError, Result};
@@ -129,6 +131,15 @@ const FRAME_MAGIC: [u8; 4] = *b"GWFR";
 /// `logical_len`, `write_count`), the nonce, and the trailing tag. The on-disk frame length is
 /// `FRAME_OVERHEAD + logical_len`.
 const FRAME_OVERHEAD: usize = 4 + 8 + 8 + 8 + 8 + NONCE_LEN + TAG_LEN;
+
+/// A defensive upper bound on the physical size of the **WAL-manager header frame** (frame 0, logical
+/// `[0, HEADER_LEN)`), used only by [`EncryptedLogSink::read_header_frame`] to cap the bounded read
+/// that recovers frame 0 after a reclaim opened a gap above it (`rmp` #525). Frame 0 seals the WAL
+/// manager's fixed 8-byte header, so its real physical length is `FRAME_OVERHEAD + 8`; the generous 1
+/// MiB logical allowance still bounds the allocation even if a forged/corrupt `phys_len` claims a huge
+/// frame (a claim beyond this cap is rejected as corruption, failing closed rather than allocating by
+/// the log's whole lifetime — the very pathology this task eliminates).
+const HEADER_FRAME_MAX_PHYS: u64 = FRAME_OVERHEAD as u64 + (1 << 20);
 
 /// One frame's physical layout: where its plaintext begins logically, and where it sits physically.
 #[derive(Debug, Clone, Copy)]
@@ -234,18 +245,52 @@ impl<S: LogSink> EncryptedLogSink<S> {
     /// the key is wrong (WAL KCV mismatch); [`GraphusError::Storage`] on an unsupported
     /// version/cipher, a corrupt header, or a backing read failure.
     pub fn open(backing: S, keyring: &Keyring) -> Result<Self> {
-        // Read the whole durable backing once (recovery's hot read is `from = 0` anyway). The header
-        // is validated before any frame byte is interpreted.
-        let mut physical = Vec::new();
-        backing.read_durable(0, &mut physical)?;
-        let header_len = parse_and_verify_sink_header(&physical, keyring)?;
+        // 1. Validate the sink header via a BOUNDED read, never `read_durable(0, ..)` (`rmp` #525).
+        //    On a long-lived, heavily-reclaimed WAL the backing's `durable_len` is the whole physical
+        //    LIFETIME (never lowered by reclamation), so `read_durable(0, ..)` would allocate a buffer
+        //    sized by the entire history — the exact ~61 GiB OOM this task eliminates — merely to read
+        //    the small fixed-shape sink header at physical offset 0. The header's length is the fixed
+        //    prefix plus the KCV, whose length lives inside the prefix: read the prefix, learn the KCV
+        //    length, then read the whole header. The KCV is verified constant-time (wrong/missing key →
+        //    fail closed) before any frame byte is interpreted.
+        let header_phys_len = read_sink_header_len(&backing)?;
+        let mut header = Vec::new();
+        backing.read_bounded(0, header_phys_len, &mut header)?;
+        let header_len = parse_and_verify_sink_header(&header, keyring)?;
+        debug_assert_eq!(header_len as u64, header_phys_len);
 
         let cipher = keyring.wal_cipher();
         let mut frames: Vec<FrameLoc> = Vec::new();
         let mut logical_durable_len: u64 = 0;
-        let mut cursor = header_len;
 
-        // Forward scan: step frame-to-frame. Each frame stores its own logical offset (v3) and begins
+        // 2. Read only the RETAINED frame body — from the backing's reclaimed floor, never from 0
+        //    (`rmp` #525). `base` is the absolute physical offset of `physical[0]`, so a frame's
+        //    ABSOLUTE `phys_offset` indexes the buffer as `phys_offset - base`. When nothing has been
+        //    reclaimed above the sink header (`backing.reclaimed_floor() <= header_phys_len`, e.g. a
+        //    never-reclaimed log or a segmented backing that could not free frame 0's segment) `base`
+        //    is exactly `header_phys_len` and the scan below is byte-identical to reading from the
+        //    header end as before — only now bounded to `[header_phys_len, durable_len)` rather than
+        //    materialising the reclaimed prefix.
+        let base = header_phys_len.max(backing.reclaimed_floor());
+
+        // 2a. Frame 0 (the WAL-manager header frame, logical `[0, HEADER_LEN)`) is NEVER reclaimed, but
+        //     on a backing that frees exact byte ranges the retained tail can start ABOVE it, past the
+        //     reclaimed gap — so `base > header_phys_len` would exclude frame 0 from the tail buffer and
+        //     lose the WAL header. Recover it here with its own tiny, capped bounded read so the header
+        //     survives the narrowed tail read. When `base == header_phys_len` (nothing reclaimed above
+        //     the sink header) frame 0 is simply the first frame of the tail buffer, so this separate
+        //     read is skipped (no duplication).
+        if base > header_phys_len {
+            if let Some(loc0) = Self::read_header_frame(&backing, header_phys_len, &cipher)? {
+                logical_durable_len = loc0.logical_offset + loc0.logical_len;
+                frames.push(loc0);
+            }
+        }
+
+        let mut physical = Vec::new();
+        backing.read_durable(base, &mut physical)?;
+
+        // Forward scan of the retained tail. Each frame stores its own logical offset (v3) and begins
         // with an all-non-zero magic, so a **reclaimed gap** — a run of zero bytes left by deleted
         // backing segments below the recovery floor (`rmp` #116) — is skipped to the next surviving
         // frame: the first non-zero byte after the gap is always that frame's magic (never a `phys_len`
@@ -253,8 +298,10 @@ impl<S: LogSink> EncryptedLogSink<S> {
         // The frame then resumes from its stored offset. The first frame that is short, fails the
         // magic, claims an impossible length, fails AEAD, or claims an offset before where we are (a
         // relocated/corrupt frame) is a torn/garbage tail — stop there, dropping it and everything after.
+        // `cursor` is a buffer-relative index; a frame's ABSOLUTE `phys_offset` is `base + cursor`.
+        let mut cursor = 0usize;
         loop {
-            // Skip a reclaimed zero gap (between the header and the first surviving frame, or between
+            // Skip a reclaimed zero gap (before the first surviving frame in the buffer, or between
             // surviving frames after an interior run was freed).
             while cursor < physical.len() && physical[cursor] == 0 {
                 cursor += 1;
@@ -263,7 +310,7 @@ impl<S: LogSink> EncryptedLogSink<S> {
                 break;
             }
             let Some((loc, plaintext_ok)) =
-                decode_and_authenticate_frame(&physical, cursor, &cipher)
+                decode_and_authenticate_frame(&physical, cursor, base, &cipher)
             else {
                 break;
             };
@@ -273,10 +320,12 @@ impl<S: LogSink> EncryptedLogSink<S> {
             // The stored logical offset must not move backwards (frames are appended in increasing
             // logical order; a reclaim gap only ever *increases* it). A backwards offset is a relocated
             // or corrupt frame — treat as a torn tail and stop, never re-ordering the logical stream.
+            // (Frame 0, recovered in step 2a, seeds `logical_durable_len` to `HEADER_LEN`, so the first
+            // tail frame — whose logical offset is the reclaimed floor, always `>= HEADER_LEN` — passes.)
             if loc.logical_offset < logical_durable_len {
                 break;
             }
-            cursor = (loc.phys_offset + loc.phys_len) as usize;
+            cursor = (loc.phys_offset - base + loc.phys_len) as usize;
             logical_durable_len = loc.logical_offset + loc.logical_len;
             frames.push(loc);
         }
@@ -303,6 +352,35 @@ impl<S: LogSink> EncryptedLogSink<S> {
     #[must_use]
     pub fn into_backing(self) -> S {
         self.backing
+    }
+
+    /// Opens a **reclaimed (zero-reading) logical gap** by advancing the logical durable length to
+    /// `to` without sealing a frame, so the next [`sync`](LogSink::sync) stamps its frame at logical
+    /// offset `to` — preserving the LSN == byte-offset invariant across an offline re-encryption that
+    /// *drops* an already-reclaimed prefix instead of materialising it (`rmp` #525, key rotation).
+    ///
+    /// The gap `[current durable length, to)` reads back as zeros (no frame covers it — exactly a
+    /// reclaimed prefix), and `to` becomes the sink's [`reclaimed_floor`](LogSink::reclaimed_floor).
+    /// Callers use this to rebuild a compact WAL whose retained records keep their original offsets
+    /// while the reclaimed prefix is never written.
+    ///
+    /// # Errors
+    /// [`GraphusError::Storage`] if there are unsealed pending bytes (a gap can only be opened at a
+    /// frame boundary) or if `to` would move the durable length backwards.
+    pub fn advance_reclaimed_gap(&mut self, to: u64) -> Result<()> {
+        if !self.pending.is_empty() {
+            return Err(GraphusError::Storage(
+                "advance_reclaimed_gap requires an empty pending buffer (frame boundary)"
+                    .to_owned(),
+            ));
+        }
+        if to < self.logical_durable_len {
+            return Err(GraphusError::Storage(
+                "advance_reclaimed_gap cannot move the durable length backwards".to_owned(),
+            ));
+        }
+        self.logical_durable_len = to;
+        Ok(())
     }
 
     /// Borrows the backing sink (test/inspection helper).
@@ -450,11 +528,17 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
         if from >= self.logical_durable_len {
             return Ok(());
         }
-        // Read the whole physical backing once; slice + decrypt the frames covering
-        // `[from, logical_durable_len)`. The common case is `from = 0` (recovery reads the whole
-        // log), so this is the same single bulk read the plaintext sink does.
+        // Read only the RETAINED physical body — from the backing's reclaimed floor, never from 0
+        // (`rmp` #525). `read_durable(0, ..)` on a heavily-reclaimed backing would allocate a buffer
+        // sized by the backing's whole physical LIFETIME (its `durable_len`, never lowered by
+        // reclamation), reproducing the ~61 GiB OOM this task eliminates. `base` is the absolute
+        // physical offset of `physical[0]`; a frame's ABSOLUTE `phys_offset` indexes it as
+        // `phys_offset - base`. A frame that sits BELOW `base` (only the never-reclaimed header frame
+        // 0, after a reclaim opened a gap above it) is fetched by `decrypt_frame_at` via its own tiny
+        // bounded read, so no requested range ever needs the whole backing materialised.
+        let base = self.retained_base();
         let mut physical = Vec::new();
-        self.backing.read_durable(0, &mut physical)?;
+        self.backing.read_durable(base, &mut physical)?;
 
         // Build the logical range zero-filled, then place each surviving frame's plaintext at its
         // logical position. A **reclaimed gap** (frames dropped from the index, `rmp` #116) has no
@@ -468,7 +552,7 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
             if frame_end <= from {
                 continue; // entirely before the requested range
             }
-            let plaintext = self.decrypt_frame_at(&physical, loc)?;
+            let plaintext = self.decrypt_frame_at(&physical, base, loc)?;
             // Skip any prefix before `from` (only ever the first overlapping frame).
             let skip = from.saturating_sub(loc.logical_offset) as usize;
             if skip >= plaintext.len() {
@@ -476,6 +560,46 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
             }
             let out_off = (loc.logical_offset + skip as u64 - from) as usize;
             let slice = &plaintext[skip..];
+            into[out_off..out_off + slice.len()].copy_from_slice(slice);
+        }
+        Ok(())
+    }
+
+    fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+        into.clear();
+        // Identical to `read_durable` except capped at `to` (`rmp` #525) — see
+        // `graphus_wal::LogSink::read_bounded`'s doc comment for the rationale (the canonical caller is
+        // `WalManager::open`'s header check, which only ever wants 8 bytes but would otherwise trigger
+        // the same unbounded-allocation crash `read_durable` was fixed against).
+        let end = to.min(self.logical_durable_len);
+        if from >= end {
+            return Ok(());
+        }
+        // Bounded PHYSICAL read from the retained floor (see `read_durable` above): the backing itself
+        // is not indexed by logical range, but reading from `base` instead of 0 keeps the allocation
+        // proportional to the retained window, not the log's lifetime.
+        let base = self.retained_base();
+        let mut physical = Vec::new();
+        self.backing.read_durable(base, &mut physical)?;
+
+        let total = (end - from) as usize;
+        into.resize(total, 0);
+        for loc in &self.frames {
+            if loc.logical_offset >= end {
+                break; // frames are stored in logical order; nothing further overlaps [from, end)
+            }
+            let frame_end = (loc.logical_offset + loc.logical_len).min(end);
+            if frame_end <= from {
+                continue;
+            }
+            let plaintext = self.decrypt_frame_at(&physical, base, loc)?;
+            let skip = from.saturating_sub(loc.logical_offset) as usize;
+            let take = (frame_end - loc.logical_offset.max(from)) as usize;
+            if skip >= plaintext.len() {
+                continue;
+            }
+            let out_off = (loc.logical_offset + skip as u64 - from) as usize;
+            let slice = &plaintext[skip..skip + take];
             into[out_off..out_off + slice.len()].copy_from_slice(slice);
         }
         Ok(())
@@ -518,28 +642,74 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
         self.frames.drain(protect_end..cut);
         Ok(())
     }
+
+    /// `0` if nothing has been reclaimed past the protected header frame yet, else the next surviving
+    /// frame's `logical_offset` — skips the zero-filled logical gap a reclaim has opened above the
+    /// header frame (`rmp` #525; mirrors `graphus_wal`'s `FileLogSink`/`MemLogSink` fix for the same
+    /// bug — see [`graphus_wal::LogSink::reclaimed_floor`]'s doc comment for the full rationale). Frame
+    /// 0 (the WAL header) is never reclaimed (see [`reclaim`](LogSink::reclaim)), so `frames[0]` always
+    /// exists once anything has been synced; a gap exists exactly when `frames[1]`'s logical start is
+    /// past frame 0's logical end.
+    fn reclaimed_floor(&self) -> u64 {
+        let Some(header) = self.frames.first() else {
+            return 0;
+        };
+        let header_end = header.logical_offset + header.logical_len;
+        match self.frames.get(1) {
+            Some(next) if next.logical_offset > header_end => next.logical_offset,
+            _ => 0,
+        }
+    }
 }
 
 impl<S: LogSink> EncryptedLogSink<S> {
-    /// Decrypts and authenticates the frame described by `loc` from the physical bytes, returning
-    /// its plaintext. Used by [`read_durable`](LogSink::read_durable) (the frame index was already
+    /// The absolute physical offset the retained-body reads start from (`rmp` #525): the larger of the
+    /// sink-header length (frames never begin below it) and the backing's own reclaimed floor. Reading
+    /// from here — rather than 0 — bounds a read's allocation to the retained window instead of the
+    /// backing's whole physical lifetime.
+    fn retained_base(&self) -> u64 {
+        self.header_phys_len.max(self.backing.reclaimed_floor())
+    }
+
+    /// Decrypts and authenticates the frame described by `loc`, returning its plaintext. The frame's
+    /// physical bytes come from `physical` (which covers `[base, backing.durable_len)`) when the frame
+    /// lies within it; a frame BELOW `base` — only ever the never-reclaimed header frame 0 after a
+    /// reclaim opened a gap above it (`rmp` #525) — is fetched by a small, targeted bounded read of
+    /// exactly its own physical extent, so a request that spans frame 0 never forces the whole backing
+    /// to be materialised. Used by [`read_durable`](LogSink::read_durable) (the frame index was already
     /// validated at open, so a failure here is genuine on-disk corruption discovered late).
     ///
     /// # Errors
     /// [`GraphusError::Storage`] if the physical bytes are too short for the frame, or
     /// [`GraphusError::Security`] if AEAD authentication fails (tamper/corruption after open).
-    fn decrypt_frame_at(&self, physical: &[u8], loc: &FrameLoc) -> Result<Vec<u8>> {
-        let phys_offset = loc.phys_offset as usize;
+    fn decrypt_frame_at(&self, physical: &[u8], base: u64, loc: &FrameLoc) -> Result<Vec<u8>> {
         let phys_len = loc.phys_len as usize;
-        let end = phys_offset
-            .checked_add(phys_len)
-            .ok_or_else(|| GraphusError::Storage("WAL frame offset overflow".to_owned()))?;
-        if end > physical.len() {
-            return Err(GraphusError::Storage(
-                "WAL frame runs past the durable backing (truncated after open)".to_owned(),
-            ));
-        }
-        let frame = &physical[phys_offset..end];
+        let frame: Cow<'_, [u8]> = if loc.phys_offset >= base {
+            let start = (loc.phys_offset - base) as usize;
+            let end = start
+                .checked_add(phys_len)
+                .ok_or_else(|| GraphusError::Storage("WAL frame offset overflow".to_owned()))?;
+            if end > physical.len() {
+                return Err(GraphusError::Storage(
+                    "WAL frame runs past the durable backing (truncated after open)".to_owned(),
+                ));
+            }
+            Cow::Borrowed(&physical[start..end])
+        } else {
+            // The header frame 0 sits below the retained tail base — fetch just its bytes.
+            let end = loc
+                .phys_offset
+                .checked_add(loc.phys_len)
+                .ok_or_else(|| GraphusError::Storage("WAL frame offset overflow".to_owned()))?;
+            let mut buf = Vec::new();
+            self.backing.read_bounded(loc.phys_offset, end, &mut buf)?;
+            if (buf.len() as u64) < loc.phys_len {
+                return Err(GraphusError::Storage(
+                    "WAL frame runs past the durable backing (truncated after open)".to_owned(),
+                ));
+            }
+            Cow::Owned(buf)
+        };
         let nonce_bytes: [u8; NONCE_LEN] = frame[FR_OFF_NONCE..FR_OFF_NONCE + NONCE_LEN]
             .try_into()
             .expect("INVARIANT: nonce region is exactly NONCE_LEN bytes by frame construction");
@@ -572,6 +742,45 @@ impl<S: LogSink> EncryptedLogSink<S> {
         }
         Ok(plaintext)
     }
+
+    /// Reads, decodes, and authenticates the **header frame** (frame 0, logical `[0, HEADER_LEN)`) that
+    /// immediately follows the sink header, via small **bounded** reads capped at [`HEADER_FRAME_MAX_PHYS`]
+    /// (`rmp` #525). Frame 0 is never reclaimed, so after a reclaim opens a gap above it the tail read
+    /// starts past it — this recovers it without materialising the reclaimed prefix. Returns `None` when
+    /// there is no header frame (an empty log) or the region is short/garbage/AEAD-failing (a corrupt or
+    /// forged frame is rejected, failing closed rather than allocating by a bogus `phys_len`).
+    fn read_header_frame(
+        backing: &S,
+        header_phys_len: u64,
+        cipher: &Aes256Gcm,
+    ) -> Result<Option<FrameLoc>> {
+        // Read the fixed frame preamble (through the nonce) to learn the claimed physical length.
+        let mut fh = Vec::new();
+        backing.read_bounded(
+            header_phys_len,
+            header_phys_len + FR_OFF_CIPHERTEXT as u64,
+            &mut fh,
+        )?;
+        if fh.len() < FR_OFF_CIPHERTEXT {
+            return Ok(None); // no header frame (empty log) or a truncated preamble
+        }
+        if fh[FR_OFF_MAGIC..FR_OFF_MAGIC + 4] != FRAME_MAGIC {
+            return Ok(None);
+        }
+        let phys_len = u64::from_le_bytes(read8(&fh, FR_OFF_PHYS_LEN));
+        // Reject an inconsistent or implausibly large claimed length BEFORE allocating, so a corrupt
+        // header cannot make this read the whole backing. The header frame is tiny (`FRAME_OVERHEAD +
+        // HEADER_LEN`), so the generous cap never rejects a legitimate frame.
+        if phys_len < FRAME_OVERHEAD as u64 || phys_len > HEADER_FRAME_MAX_PHYS {
+            return Ok(None);
+        }
+        let mut full = Vec::new();
+        backing.read_bounded(header_phys_len, header_phys_len + phys_len, &mut full)?;
+        match decode_and_authenticate_frame(&full, 0, header_phys_len, cipher) {
+            Some((loc, true)) => Ok(Some(loc)),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Encodes the sink header (magic, version, cipher, KCV) into a single fixed-shape byte block.
@@ -584,6 +793,28 @@ fn encode_sink_header(kcv: &[u8]) -> Vec<u8> {
     hdr.extend_from_slice(kcv); // HDR_OFF_KCV
     debug_assert_eq!(hdr.len(), HDR_PREFIX_LEN + kcv.len());
     hdr
+}
+
+/// Reads *only* the sink header's length from `backing` via a bounded read of the fixed prefix
+/// (`rmp` #525): the header is `magic(8) || version(4) || cipher(4) || kcv_len(4) || kcv(kcv_len)`, so
+/// its total length is `HDR_OFF_KCV + kcv_len`, and `kcv_len` lives inside the fixed prefix. This lets
+/// [`EncryptedLogSink::open`] size its full-header read exactly, never reading the whole backing.
+///
+/// # Errors
+/// [`GraphusError::Storage`] if the backing is too short for the prefix or the KCV length overflows.
+fn read_sink_header_len<S: LogSink>(backing: &S) -> Result<u64> {
+    let mut prefix = Vec::new();
+    backing.read_bounded(0, HDR_PREFIX_LEN as u64, &mut prefix)?;
+    if prefix.len() < HDR_PREFIX_LEN {
+        return Err(GraphusError::Storage(
+            "encrypted WAL is too short to contain a sink header".to_owned(),
+        ));
+    }
+    let kcv_len = u32::from_le_bytes(read4(&prefix, HDR_OFF_KCV_LEN)) as usize;
+    let header_len = HDR_OFF_KCV.checked_add(kcv_len).ok_or_else(|| {
+        GraphusError::Storage("corrupt encrypted-WAL header: KCV length".to_owned())
+    })?;
+    Ok(header_len as u64)
 }
 
 /// Parses and validates the sink header at the start of `physical`, verifying the WAL KCV against
@@ -635,13 +866,16 @@ fn parse_and_verify_sink_header(physical: &[u8], keyring: &Keyring) -> Result<us
     Ok(kcv_end)
 }
 
-/// Decodes the frame starting at physical offset `cursor` and authenticates it against its **stored**
+/// Decodes the frame starting at buffer index `cursor` and authenticates it against its **stored**
 /// logical offset (v3: the offset is on disk and is the AAD, so a frame is self-locating after a
-/// reclaimed prefix). Returns `Some((loc, true))` on a fully valid frame, or `None`/`(_, false)` when
+/// reclaimed prefix). `base` is the ABSOLUTE physical offset of `physical[0]` (`rmp` #525: the buffer
+/// may start at a nonzero reclaimed floor, not physical 0), so the returned [`FrameLoc::phys_offset`]
+/// is `base + cursor`. Returns `Some((loc, true))` on a fully valid frame, or `None`/`(_, false)` when
 /// the frame is short, claims an impossible length, or fails AEAD — signalling a torn tail to drop.
 fn decode_and_authenticate_frame(
     physical: &[u8],
     cursor: usize,
+    base: u64,
     cipher: &Aes256Gcm,
 ) -> Option<(FrameLoc, bool)> {
     // Need at least the magic + three header fields to read the claimed lengths and offset.
@@ -686,7 +920,7 @@ fn decode_and_authenticate_frame(
             FrameLoc {
                 logical_offset,
                 logical_len,
-                phys_offset: cursor as u64,
+                phys_offset: base + cursor as u64,
                 phys_len,
                 write_count,
             },
@@ -716,7 +950,9 @@ pub type EncryptedFileLogSink = EncryptedLogSink<graphus_wal::FileLogSink>;
 mod tests {
     use super::*;
     use crate::keyring::{KEY_LEN, SALT_LEN};
-    use graphus_wal::MemLogSink;
+    use graphus_wal::{HEADER_LEN, MemLogSink};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const SALT: [u8; SALT_LEN] = [0x3C; SALT_LEN];
 
@@ -727,6 +963,57 @@ mod tests {
     /// A fresh encrypted sink over an empty in-memory backing.
     fn fresh(kr: &Keyring) -> EncryptedLogSink<MemLogSink> {
         EncryptedLogSink::create(MemLogSink::new(), kr).expect("create encrypted sink")
+    }
+
+    /// A [`LogSink`] wrapper that records the **largest single physical read** any `read_durable` /
+    /// `read_bounded` produced (`into.len()`), so a test can prove the encrypted sink's recovery reads
+    /// stay bounded by the RETAINED window and never allocate by the backing's whole lifetime
+    /// (`rmp` #525). Reverting the `retained_base()` (`max(reclaimed_floor())`) bound makes `open` /
+    /// `read_durable` read from physical 0, spiking this counter to the lifetime length and failing the
+    /// gating assertion.
+    struct CountingSink<S: LogSink> {
+        inner: S,
+        max_read: Arc<AtomicU64>,
+    }
+
+    impl<S: LogSink> CountingSink<S> {
+        fn new(inner: S, max_read: Arc<AtomicU64>) -> Self {
+            Self { inner, max_read }
+        }
+        fn record(&self, n: usize) {
+            self.max_read.fetch_max(n as u64, Ordering::SeqCst);
+        }
+    }
+
+    impl<S: LogSink> LogSink for CountingSink<S> {
+        fn append(&mut self, bytes: &[u8]) {
+            self.inner.append(bytes);
+        }
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn durable_len(&self) -> u64 {
+            self.inner.durable_len()
+        }
+        fn buffered_len(&self) -> u64 {
+            self.inner.buffered_len()
+        }
+        fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
+            self.inner.read_durable(from, into)?;
+            self.record(into.len());
+            Ok(())
+        }
+        fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+            self.inner.read_bounded(from, to, into)?;
+            self.record(into.len());
+            Ok(())
+        }
+        fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
+            self.inner.reclaim(from, up_to)
+        }
+        fn reclaimed_floor(&self) -> u64 {
+            self.inner.reclaimed_floor()
+        }
     }
 
     #[test]
@@ -1208,5 +1495,172 @@ mod tests {
         assert_eq!(&out[(f2_logical as usize)..], b"SURVIVOR");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **`rmp` #525 encrypted-path regression gate.** Reproduces the production OOM on the encrypted
+    /// reopen path: a WAL whose backing's physical *lifetime* (`durable_len`, never lowered by
+    /// reclamation) has grown far larger than its currently *retained* window, then reopens it (the
+    /// real crash-recovery boot path — `EncryptedLogSink::open`) and asserts BOTH halves of the fix:
+    ///
+    /// 1. **The physical read is actually bounded** — `open` reads the retained tail from the backing's
+    ///    reclaimed floor, so the largest buffer it allocates stays near the retained window, not the
+    ///    physical lifetime. Before the fix (`backing.read_durable(0, ..)`) this same read allocated a
+    ///    `lifetime`-sized buffer — the ~61 GiB OOM. Observed via [`CountingSink`]; reverting the
+    ///    `retained_base()` bound spikes it to `lifetime` and fails the bound.
+    /// 2. **Nothing needed for recovery is silently dropped** — the reopened logical stream is
+    ///    byte-identical to the live one (the never-reclaimed WAL header frame 0, recovered by its own
+    ///    tiny bounded read past the reclaimed gap, plus every retained record), which is the primary
+    ///    correctness concern for narrowing a crash-recovery read boundary.
+    ///
+    /// The scenario runs **many commit+reclaim cycles** with a rising `from` (the exact pattern that a
+    /// long-lived busy database drives, and that used to corrupt the `MemLogSink` backing before its
+    /// own `rmp` #525 fix), then reopens.
+    #[test]
+    fn encrypted_reopen_after_heavy_reclaim_bounds_the_read_and_recovers_every_retained_frame() {
+        let kr = keyring(0xB1);
+        let counter = Arc::new(AtomicU64::new(0));
+        let backing = CountingSink::new(MemLogSink::new(), Arc::clone(&counter));
+        let mut enc = EncryptedLogSink::create(backing, &kr).expect("create");
+
+        // Frame 0: the WAL-manager header (stand-in), logical [0, HEADER_LEN). Never reclaimed.
+        enc.append(b"WALHDR01");
+        enc.sync().expect("sync header frame");
+        assert_eq!(enc.durable_len(), HEADER_LEN);
+
+        const CYCLES: u64 = 400;
+        const FRAME_LEN: u64 = 8;
+        const RETAIN_FRAMES: u64 = 6;
+
+        for i in 1..=CYCLES {
+            // Each data frame carries its own index (LE) so a retained frame is self-identifying.
+            enc.append(&i.to_le_bytes());
+            enc.sync().expect("sync data frame");
+            // Reclaim everything below the last few data frames (frame 0 stays; the active frame is
+            // always kept by reclaim). This drives a RISING `from` on every cycle.
+            let durable = enc.durable_len();
+            let keep_span = (RETAIN_FRAMES + 1) * FRAME_LEN;
+            let floor = durable.saturating_sub(keep_span).max(HEADER_LEN);
+            enc.reclaim(HEADER_LEN, floor).expect("reclaim");
+        }
+
+        // --- Assert the scenario itself: a small retained window over a huge physical lifetime. ---
+        let lifetime_phys = enc.backing().durable_len();
+        let phys_floor = enc.backing().reclaimed_floor();
+        let retained_phys = lifetime_phys - phys_floor; // the retained physical tail
+        assert!(
+            phys_floor > 0 && retained_phys * 10 < lifetime_phys,
+            "test setup did not reproduce a small-retention/high-lifetime WAL: \
+             phys_floor={phys_floor} retained_phys={retained_phys} lifetime_phys={lifetime_phys}"
+        );
+        let logical_floor = enc.reclaimed_floor();
+        assert!(
+            logical_floor > HEADER_LEN,
+            "reclaim must have advanced the logical floor past the header frame"
+        );
+
+        // Capture the live logical image (full, and from the floor) for an exact equivalence check.
+        let live_durable = enc.durable_len();
+        let mut live_full = Vec::new();
+        enc.read_durable(0, &mut live_full).expect("live full read");
+        let mut live_from_floor = Vec::new();
+        enc.read_durable(logical_floor, &mut live_from_floor)
+            .expect("live floor read");
+
+        // --- Reopen (the crash-recovery boot path) with the physical-read counter reset. ---
+        let backing = enc.into_backing();
+        counter.store(0, Ordering::SeqCst);
+        let reopened = EncryptedLogSink::open(backing, &kr).expect("reopen across a reclaim gap");
+        let open_max_read = counter.load(Ordering::SeqCst);
+
+        // 1. GATING: `open` must not have materialised the physical lifetime. Its largest read is the
+        //    retained tail (plus a tiny, capped header-frame read); a revert to `read_durable(0, ..)`
+        //    makes this `== lifetime_phys` and fails the bound.
+        assert!(
+            open_max_read <= retained_phys + HEADER_FRAME_MAX_PHYS,
+            "open() physical read {open_max_read} must stay near the retained window {retained_phys}, \
+             not the physical lifetime {lifetime_phys}"
+        );
+        assert!(
+            open_max_read * 4 < lifetime_phys,
+            "open() physical read {open_max_read} must be well below the physical lifetime \
+             {lifetime_phys} (bounded to the retained window, not the whole history)"
+        );
+
+        // 2. Correctness: the reopened logical image is byte-identical to the live one.
+        assert_eq!(reopened.durable_len(), live_durable);
+        let mut re_full = Vec::new();
+        reopened
+            .read_durable(0, &mut re_full)
+            .expect("reopened full read");
+        assert_eq!(
+            re_full, live_full,
+            "reopen reconstructs the identical logical stream across the reclaim gap"
+        );
+        assert_eq!(
+            &re_full[0..8],
+            b"WALHDR01",
+            "the never-reclaimed header frame 0 survived (recovered past the reclaimed gap)"
+        );
+        let mut re_from_floor = Vec::new();
+        reopened
+            .read_durable(logical_floor, &mut re_from_floor)
+            .expect("reopened floor read");
+        assert_eq!(re_from_floor, live_from_floor);
+
+        // The last retained data frame decodes to the last cycle's index (self-identifying content).
+        let tail = &re_full[(live_durable - FRAME_LEN) as usize..];
+        assert_eq!(
+            u64::from_le_bytes(tail.try_into().unwrap()),
+            CYCLES,
+            "the active (last) data frame recovered its exact payload"
+        );
+    }
+
+    /// **`rmp` #525.** The offline-re-encryption offset preservation primitive: `advance_reclaimed_gap`
+    /// lets a compact rebuild place the retained records at their ORIGINAL logical offsets after a tiny
+    /// header frame, dropping the (already-reclaimed) prefix instead of materialising it — so LSNs are
+    /// preserved without the giant zero gap. Proven end-to-end: build such a WAL, reopen it, and assert
+    /// the header + retained records land at the right offsets with the gap reading as zeros.
+    #[test]
+    fn advance_reclaimed_gap_preserves_offsets_across_reopen() {
+        let kr = keyring(0xB2);
+        let mut enc = fresh(&kr);
+
+        // Header frame at logical [0, HEADER_LEN).
+        enc.append(b"WALHDR01");
+        enc.sync().expect("sync header");
+        // Drop an already-reclaimed prefix: jump the logical length forward WITHOUT writing it.
+        let records_base = 4096u64;
+        enc.advance_reclaimed_gap(records_base)
+            .expect("open reclaimed gap");
+        assert_eq!(enc.durable_len(), records_base);
+        // The retained records frame, stamped at its original offset.
+        enc.append(b"RETAINED-RECORDS");
+        enc.sync().expect("sync records");
+        let total = records_base + b"RETAINED-RECORDS".len() as u64;
+        assert_eq!(enc.durable_len(), total);
+        assert_eq!(
+            enc.reclaimed_floor(),
+            records_base,
+            "the retained records sit above a reclaimed gap opened by advance_reclaimed_gap"
+        );
+
+        // The live logical image: header, then a zero gap, then the records at `records_base`.
+        let mut live = Vec::new();
+        enc.read_durable(0, &mut live).expect("live read");
+        assert_eq!(&live[0..8], b"WALHDR01");
+        assert_eq!(
+            &live[8..records_base as usize],
+            &vec![0u8; (records_base - 8) as usize][..]
+        );
+        assert_eq!(&live[records_base as usize..], b"RETAINED-RECORDS");
+
+        // Reopen: the compact backing (no gap physically written) reconstructs the identical image.
+        let backing = enc.into_backing();
+        let reopened = EncryptedLogSink::open(backing, &kr).expect("reopen");
+        assert_eq!(reopened.durable_len(), total);
+        let mut re = Vec::new();
+        reopened.read_durable(0, &mut re).expect("reopened read");
+        assert_eq!(re, live, "offsets preserved across reopen");
     }
 }
