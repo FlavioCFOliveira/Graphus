@@ -307,8 +307,10 @@ fn reencrypt_wal(old: &OldWalLogical, new_keyring: &Keyring, dest: &Path) -> Res
     match old {
         OldWalLogical::Whole(logical_bytes) => {
             if logical_bytes.is_empty() {
-                // No logical bytes: still harden the fresh sink header (create already synced it, but a
-                // uniform sync keeps the contract explicit and costs nothing for an empty WAL).
+                // No logical bytes and no frame 0: harden the fresh sink header alone into the anchor.
+                // Since `rmp` #533 `create` no longer syncs the sink header itself, THIS sync is what
+                // makes it durable; an empty WAL has no frame 0 to accompany it (and no segments to
+                // reclaim), so a header-only anchor is correct here.
                 sink.sync()?;
             } else if logical_bytes.len() <= header_len {
                 // Header-only WAL: one frame carrying exactly the header bytes.

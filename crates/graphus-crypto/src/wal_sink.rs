@@ -12,20 +12,36 @@
 //! plaintext sink for the same logical writes — while storing larger **authenticated frames** in
 //! the backing sink. Above the seam nothing changes: the same WAL records, the same LSNs.
 //!
-//! ## Physical layout in the backing sink
+//! ## Physical layout in the backing sink (`rmp` #533)
 //!
 //! ```text
-//!   [sink header]  [frame 0]  [frame 1]  ...  [frame N]
+//!   ├─────────── backing anchor ──────────┤├─────────── backing segments ──────────┤
+//!   [sink header]  [frame 0 = WAL header]    [frame 1]  [frame 2]  ...  [frame N]
+//!   └──────────── never reclaimed ─────────┘└──────────── reclaimable prefix ───────┘
 //! ```
 //!
-//! - **Sink header** (at physical offset 0, written once at create, never rewritten): magic
-//!   (`"GRAPHUSW"`), version, cipher id, and a WAL **Key-Check-Value** (a GCM seal of a fixed
-//!   constant under the WAL subkey). On open the magic is checked (wrong magic → fail closed) and
-//!   the KCV verified constant-time against the keyring (wrong/missing key → fail closed) **before
-//!   any frame is read**. There is **no salt** in this header: the WAL subkey is derived from the
-//!   master key + the *store's* salt (passed in by the caller), so the WAL and store share one
-//!   salt source. The header logically maps physical offset `0` to logical offset `0` (the WAL
-//!   manager's own header sits at logical `0`, inside the first frame).
+//! The **sink header and frame 0 both live in the backing's never-reclaimed *anchor*** — over a
+//! segmented [`graphus_wal::FileLogSink`] the anchor is a file that reclamation never deletes —
+//! exactly mirroring the plaintext WAL, whose 8-byte header also lives in the anchor. This is what
+//! lets [`reclaim`](LogSink::reclaim) actually free disk on the encrypted path: the pinned prefix
+//! (the sink header + the WAL-manager header frame 0, logical `[0, HEADER_LEN)`) is out of the record
+//! segments, so the first record segment holds **only** reclaimable frames and segment
+//! prefix-deletion can free it. Before `rmp` #533 the sink header was `sync`d **alone** into the
+//! anchor and frame 0 landed in the first *segment*; because a pinned frame 0 was co-located there,
+//! that segment — always the head of the deletion prefix — could never be freed
+//! (`FileLogSink::reclaim` requires `seg.base >= from` and stops at the first non-qualifying segment),
+//! so an encrypted WAL grew without bound and reopen still read the whole lifetime (the `rmp` #525
+//! OOM). The plaintext path was unaffected because its header lives in the anchor already.
+//!
+//! - **Sink header** (at physical offset 0, buffered at create and hardened into the anchor
+//!   **together with frame 0** by the first sync, never rewritten): magic (`"GRAPHUSW"`), version,
+//!   cipher id, and a WAL **Key-Check-Value** (a GCM seal of a fixed constant under the WAL subkey).
+//!   On open the magic is checked (wrong magic → fail closed) and the KCV verified constant-time
+//!   against the keyring (wrong/missing key → fail closed) **before any frame is read**. There is
+//!   **no salt** in this header: the WAL subkey is derived from the master key + the *store's* salt
+//!   (passed in by the caller), so the WAL and store share one salt source. The header maps physical
+//!   offset `0` to logical offset `0` (the WAL manager's own header sits at logical `0`, inside frame
+//!   0).
 //! - **Frame** (one per [`sync`](LogSink::sync) that has pending bytes, v3 — `rmp` #116):
 //!   ```text
 //!     magic(4) || phys_len(8) || logical_offset(8) || logical_len(8) || nonce(12) || ciphertext(logical_len) || tag(16)
@@ -89,7 +105,17 @@ pub const WAL_SINK_MAGIC: [u8; 8] = *b"GRAPHUSW";
 ///   count, so the GCM random-nonce birthday cap
 ///   ([`crate::nonce_budget::MAX_WRITES_PER_SUBKEY`]) is enforced across reopens. Changes the frame
 ///   layout; a v3 sink fails closed at open on the version check. No migration needed (pre-1.0).
-pub const WAL_SINK_VERSION: u32 = 4;
+/// - **v5** (rmp #533): the sink header is no longer `sync`d **alone** at create; it is buffered and
+///   hardened into the backing **anchor together with frame 0** (the WAL-manager header frame,
+///   logical `[0, HEADER_LEN)`) by the first sync. This moves the pinned prefix out of the first
+///   record *segment* so that over a segmented [`graphus_wal::FileLogSink`] backing
+///   [`reclaim`](LogSink::reclaim) can physically delete leading segments — before v5 a pinned frame
+///   0 sat in the first segment and poisoned segment prefix-deletion, so an encrypted WAL grew
+///   without bound and reopen read the whole lifetime (the `rmp` #525 OOM). Nothing in the
+///   header/frame *bytes* changes, but a v4 sink (frame 0 in the first segment) is rejected
+///   fail-closed at open on the version check rather than silently reopened with the reclaim bug
+///   intact. No migration needed (pre-1.0, no committed-stable encrypted WAL).
+pub const WAL_SINK_VERSION: u32 = 5;
 
 /// Cipher identifier for AES-256-GCM with a 96-bit nonce and 128-bit tag (matches the store).
 pub const WAL_CIPHER_AES_256_GCM: u32 = 1;
@@ -174,8 +200,10 @@ pub struct EncryptedLogSink<S: LogSink> {
     /// The logical durable length (the end of the last frame). Unchanged by reclamation — the freed
     /// frames become a zero gap, never a shift (logical byte-offset == LSN).
     logical_durable_len: u64,
-    /// The physical length of the sink header in the backing (where frame 0 begins). The backing's
-    /// reclaim floor is never set below this, so the header (the backing's anchor) is never freed.
+    /// The physical length of the sink header in the backing = the physical offset where frame 0
+    /// begins. Frame 0 (the WAL-manager header) sits immediately after it, both inside the backing's
+    /// never-reclaimed anchor (`rmp` #533). The backing's reclaim floor is never set below this, so
+    /// the sink header (physical `[0, header_phys_len)`) is never freed.
     header_phys_len: u64,
     /// Buffered plaintext appended but not yet sealed into a frame (mirrors the backing sinks'
     /// `pending`).
@@ -202,15 +230,25 @@ impl<S: LogSink> std::fmt::Debug for EncryptedLogSink<S> {
 }
 
 impl<S: LogSink> EncryptedLogSink<S> {
-    /// Creates a **fresh** encrypted WAL sink on an empty backing: writes the sink header (magic,
-    /// version, cipher, WAL KCV) and hardens it, leaving zero logical bytes durable.
+    /// Creates a **fresh** encrypted WAL sink on an empty backing: buffers the sink header (magic,
+    /// version, cipher, WAL KCV) for the anchor, leaving zero logical bytes durable.
+    ///
+    /// The sink header is **not** hardened on its own here (`rmp` #533). It is flushed into the
+    /// backing's never-reclaimed *anchor* **together with frame 0** (the WAL-manager header frame) on
+    /// the first [`sync`](LogSink::sync) that carries pending bytes — the caller's
+    /// [`WalManager::create`](graphus_wal::WalManager::create) appends the WAL header and hardens
+    /// immediately, so both land in the anchor as one write + fsync. This keeps the pinned prefix out
+    /// of the first record segment so [`reclaim`](LogSink::reclaim) can free leading segments (see the
+    /// module docs). No committed data exists before that first frame, so the durability contract is
+    /// preserved: a crash in the window (entirely inside the caller's `create`) simply leaves an empty
+    /// backing that is re-created, never a lost commit.
     ///
     /// The keyring's WAL subkey is assumed to have been derived from the store's salt (the caller
     /// shares one salt source between the store device and the WAL — see the module docs).
     ///
     /// # Errors
-    /// [`GraphusError::Storage`] if the backing is non-empty or a backing write/sync fails;
-    /// [`GraphusError::Security`] if the WAL KCV cannot be computed.
+    /// [`GraphusError::Storage`] if the backing is non-empty; [`GraphusError::Security`] if the WAL
+    /// KCV cannot be computed.
     pub fn create(mut backing: S, keyring: &Keyring) -> Result<Self> {
         if backing.buffered_len() != 0 {
             return Err(GraphusError::Storage(
@@ -220,8 +258,13 @@ impl<S: LogSink> EncryptedLogSink<S> {
         let kcv = keyring.compute_wal_kcv()?;
         let header = encode_sink_header(&kcv);
         let header_phys_len = header.len() as u64;
+        // Buffer the sink header into the backing but do NOT `sync` it alone (`rmp` #533): the first
+        // real `sync` — the WAL manager's header write, which appends frame 0 then hardens — flushes
+        // `[sink header][frame 0]` in ONE write + fsync, so BOTH land in the backing's never-reclaimed
+        // anchor. Hardening the header alone here would close the anchor at the sink header and force
+        // frame 0 into the first record *segment*, where a pinned frame 0 poisons segment
+        // prefix-deletion (the unbounded-growth / reopen-OOM bug this fix eliminates).
         backing.append(&header);
-        backing.sync()?;
         Ok(Self {
             backing,
             cipher: keyring.wal_cipher(),
@@ -478,9 +521,25 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
     fn sync(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             // Forward the sync so the backing's fsync still runs (a no-op `sync` must still harden
-            // anything the backing buffered, and keeps the group-commit contract uniform).
+            // anything the backing buffered, and keeps the group-commit contract uniform). This is
+            // also the one path that hardens a still-buffered sink header alone (`rmp` #533) — the
+            // genuinely-empty encrypted WAL (an empty re-encryption source), which has no frame 0 to
+            // accompany it; every real WAL writes frame 0 first, so the header lands in the anchor
+            // together with it.
             return self.backing.sync();
         }
+        // `rmp` #533 load-bearing invariant: **frame 0 must be sealed BEFORE the backing is ever
+        // synced**, so `[sink header][frame 0]` are flushed together into the `FileLogSink` **anchor**
+        // (which reclaim never deletes). A bare `sync()` that hardened the sink header ALONE would set
+        // `anchor_len = sink_header_len`, pushing frame 0 into `seg0` — silently reintroducing the
+        // "encrypted WAL never reclaims a segment" bug this task fixed. No production caller does that
+        // (`WalManager::create` and `key_rotation::reencrypt_wal` always append frame 0 first); guard it
+        // loudly so a future regression fails here instead of leaking WAL disk forever.
+        debug_assert!(
+            !self.frames.is_empty() || self.backing.durable_len() == 0,
+            "rmp #533: frame 0 sealed after the backing was already synced — the sink header would \
+             land in the anchor alone and frame 0 in seg0, breaking segment reclaim",
+        );
         // Reserve nonce budget BEFORE sealing (rmp #175): once the GCM birthday ceiling for the WAL
         // subkey is reached, fail closed here rather than risk a (key, nonce) collision. The reserved
         // count is stamped into the frame as its durable high-water mark. Pending is untouched, so the
@@ -1662,5 +1721,195 @@ mod tests {
         let mut re = Vec::new();
         reopened.read_durable(0, &mut re).expect("reopened read");
         assert_eq!(re, live, "offsets preserved across reopen");
+    }
+
+    /// **`rmp` #533 GATING regression.** Over a REAL segmented [`graphus_wal::FileLogSink`] backing,
+    /// many commit+reclaim cycles must:
+    ///
+    /// - (a) advance the backing's `reclaimed_floor()` past `0` — leading segment files are actually
+    ///   DELETED;
+    /// - (b) keep the physical WAL disk footprint tracking the RETAINED window (the segment-file count
+    ///   and bytes do not grow with the log's lifetime); and
+    /// - (c) recover every retained commit on reopen with a BOUNDED read.
+    ///
+    /// This FAILS on the pre-fix code: frame 0 (the pinned WAL header frame) lived in the first record
+    /// *segment*, so `FileLogSink::reclaim`'s prefix-deletion — which needs `seg.base >= from` and
+    /// stops at the first non-qualifying segment — could never free that first segment.
+    /// `reclaimed_floor()` stayed `0` and the encrypted WAL grew without bound (assertions (a)/(b)
+    /// fail; the read-from-0 reopen then materialises the whole lifetime, failing (c)). After the fix
+    /// frame 0 lives in the anchor, so the record segments hold only reclaimable frames.
+    ///
+    /// Uses a real `FileLogSink` (not the `MemLogSink`, which frees exact byte ranges from its tail
+    /// and so does not exhibit the segment-granularity bug at all).
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn encrypted_reclaim_over_file_backing_actually_frees_segments() {
+        use graphus_wal::FileLogSink;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("graphus-enc-533-{nanos}-{}", std::process::id()));
+        let kr = keyring(0x88);
+
+        // A tiny segment target puts each ~72-byte data frame in its own segment file, so reclaim has
+        // a long prefix of segments to free — the shape a long-lived busy database drives.
+        const SEG_TARGET: u64 = 64;
+        const CYCLES: u64 = 300;
+        const RETAIN_FRAMES: u64 = 4; // logical bytes kept live = RETAIN_FRAMES * 8
+
+        // Count `seg.*` files and their total bytes currently on disk.
+        let segment_stats = |d: &std::path::Path| -> (usize, u64) {
+            let mut count = 0usize;
+            let mut bytes = 0u64;
+            for e in std::fs::read_dir(d).expect("read dir").flatten() {
+                if e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("seg."))
+                {
+                    count += 1;
+                    bytes += e.metadata().expect("seg meta").len();
+                }
+            }
+            (count, bytes)
+        };
+
+        let logical_floor;
+        {
+            let backing =
+                FileLogSink::open_with_segment_target(&dir, SEG_TARGET).expect("open backing");
+            let mut enc = EncryptedLogSink::create(backing, &kr).expect("create");
+
+            // Frame 0: the WAL-manager header stand-in (logical [0, HEADER_LEN)); flushed into the
+            // anchor together with the sink header by this first sync.
+            enc.append(b"WALHDR01");
+            enc.sync().expect("sync header frame");
+            assert_eq!(enc.durable_len(), HEADER_LEN);
+
+            for i in 1..=CYCLES {
+                // Each data frame is its own segment (8-byte self-identifying payload).
+                enc.append(&i.to_le_bytes());
+                enc.sync().expect("sync data frame");
+                let durable = enc.durable_len();
+                let floor = durable.saturating_sub(RETAIN_FRAMES * 8).max(HEADER_LEN);
+                enc.reclaim(HEADER_LEN, floor).expect("reclaim");
+            }
+
+            // (a) The backing physically freed leading segments: its reclaim floor advanced past 0.
+            let phys_floor = enc.backing().reclaimed_floor();
+            assert!(
+                phys_floor > 0,
+                "FileLogSink reclaimed_floor stayed 0 — no segment was ever freed (the rmp #533 bug: \
+                 a pinned frame 0 in the first segment blocks prefix-deletion)"
+            );
+
+            // The encrypted sink's own LOGICAL floor also advanced past the header frame.
+            logical_floor = enc.reclaimed_floor();
+            assert!(
+                logical_floor > HEADER_LEN,
+                "the encrypted sink's logical reclaimed floor must advance past the header frame"
+            );
+
+            // (b) The on-disk record segments track the RETAINED window, not the lifetime. A full
+            // lifetime would be ~CYCLES segment files (~CYCLES * 72 bytes); the retained window is a
+            // handful of frames.
+            let (seg_count, seg_bytes) = segment_stats(&dir);
+            assert!(
+                seg_count <= RETAIN_FRAMES as usize + 4,
+                "segment files were not freed: {seg_count} on disk after {CYCLES} cycles \
+                 (pre-fix this is ~{CYCLES})"
+            );
+            assert!(
+                seg_bytes < (RETAIN_FRAMES + 6) * 128,
+                "the encrypted WAL's physical segment bytes ({seg_bytes}) must track the retained \
+                 window, not the {CYCLES}-frame lifetime"
+            );
+        }
+
+        // (c) Reopen (the crash-recovery boot path) over a fresh backing that reads the surviving
+        // files from disk, wrapped so we can prove the read stays bounded to the retained window.
+        let counter = Arc::new(AtomicU64::new(0));
+        let backing = CountingSink::new(
+            FileLogSink::open_with_segment_target(&dir, SEG_TARGET).expect("reopen backing"),
+            Arc::clone(&counter),
+        );
+        let lifetime_phys = backing.durable_len();
+        let reopened = EncryptedLogSink::open(backing, &kr).expect("reopen across reclaim gap");
+        let open_max_read = counter.load(Ordering::SeqCst);
+
+        // The largest physical read stays well below the whole physical lifetime (which a read-from-0
+        // reopen would materialise) — bounded to the retained window plus the tiny capped
+        // header-frame read.
+        assert!(
+            open_max_read < lifetime_phys / 2,
+            "open() physical read {open_max_read} must be well below the physical lifetime \
+             {lifetime_phys} (bounded to the retained window)"
+        );
+
+        // Every retained commit is recovered: the header frame survived and the last data frame
+        // decodes to CYCLES.
+        assert_eq!(reopened.durable_len(), HEADER_LEN + CYCLES * 8);
+        let mut re = Vec::new();
+        reopened.read_durable(0, &mut re).expect("read reopened");
+        assert_eq!(
+            &re[0..8],
+            b"WALHDR01",
+            "the never-reclaimed header frame survived (recovered past the reclaimed gap)"
+        );
+        let tail = &re[(HEADER_LEN + CYCLES * 8 - 8) as usize..];
+        assert_eq!(
+            u64::from_le_bytes(tail.try_into().expect("8-byte tail")),
+            CYCLES,
+            "the active (last) data frame recovered its exact payload"
+        );
+        // The retained records above the logical floor are byte-identical to the same slice of the
+        // full read.
+        let mut re_from_floor = Vec::new();
+        reopened
+            .read_durable(logical_floor, &mut re_from_floor)
+            .expect("read reopened from floor");
+        assert_eq!(re_from_floor, re[logical_floor as usize..].to_vec());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn old_format_encrypted_wal_is_rejected_fail_closed() {
+        // A v4 (pre-`rmp` #533) encrypted WAL has frame 0 in the first record segment; opening it with
+        // the current build must FAIL CLOSED on the version check, not silently reopen it with the
+        // reclaim bug intact. Forge an old-version header by writing a valid current-format WAL and
+        // patching the version field down (the version is not part of the KCV/AEAD, and
+        // `parse_and_verify_sink_header` checks it BEFORE the KCV, so this is the pure version gate).
+        let kr = keyring(0x89);
+        let mut enc = fresh(&kr);
+        enc.append(b"WALHDR01");
+        enc.sync().expect("sync");
+        let backing = enc.into_backing();
+        let mut bytes = backing.durable_bytes();
+        assert_eq!(
+            u32::from_le_bytes(read4(&bytes, HDR_OFF_VERSION)),
+            WAL_SINK_VERSION,
+            "sanity: the current version is stamped at HDR_OFF_VERSION"
+        );
+        // Patch the version to the previous format (4).
+        bytes[HDR_OFF_VERSION..HDR_OFF_VERSION + 4].copy_from_slice(&4u32.to_le_bytes());
+        let mut forged = MemLogSink::new();
+        forged.append(&bytes);
+        forged.sync().expect("sync forged");
+
+        let err = EncryptedLogSink::open(forged, &kr)
+            .expect_err("an old-format encrypted WAL must be rejected");
+        match err {
+            GraphusError::Storage(msg) => assert!(
+                msg.contains("unsupported encrypted-WAL format version"),
+                "expected an unsupported-version error, got: {msg}"
+            ),
+            other => panic!("expected a fail-closed Storage version error, got {other:?}"),
+        }
     }
 }
