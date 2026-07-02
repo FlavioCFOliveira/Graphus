@@ -400,15 +400,24 @@ impl<S: LogSink> WalManager<S> {
     /// Rolls `txn` back: undoes its actions newest-first, writing a CLR per action and applying
     /// the compensating change to `target`, then logs `ABORT` and hardens.
     ///
+    /// A transaction that logged **nothing** — a read-only transaction, now that `BEGIN` is lazy
+    /// (`rmp` #529): the WAL active-table entry is created only by the first data record, so a
+    /// transaction that never called [`log_update`](Self::log_update) has no entry — has nothing to
+    /// undo, so its rollback is a **no-op**: no CLRs, no `ABORT` record, and no `fdatasync`. This is
+    /// exactly what makes a read-only abort (e.g. an SSI pivot victim, `04 §5.4`) cost zero WAL bytes
+    /// and zero syncs. It is also idempotent for a genuinely absent id (a double rollback), which the
+    /// old error return forbade; the store layer never rolls back an id it did not open, so relaxing
+    /// this cannot mask a real bug.
+    ///
     /// # Errors
-    /// Returns an error if `txn` is not active or a compensating apply fails.
+    /// Returns an error if a compensating apply fails.
     ///
     /// # Panics
     /// Panics if the final `fdatasync` fails (`§4.9`).
     pub fn rollback<T: ApplyTarget>(&mut self, txn: TxnId, target: &mut T) -> Result<()> {
-        let st = self.active.remove(&txn).ok_or_else(|| {
-            GraphusError::Transaction(format!("rollback of inactive txn {}", txn.0))
-        })?;
+        let Some(st) = self.active.remove(&txn) else {
+            return Ok(());
+        };
         for entry in st.undo.iter().rev() {
             let clr_lsn =
                 self.write_clr(txn, entry.page_id, entry.lsn, &entry.undo, entry.prev_lsn);
@@ -476,6 +485,21 @@ impl<S: LogSink> WalManager<S> {
     #[must_use]
     pub fn oldest_active_first_lsn(&self) -> Option<Lsn> {
         self.active.values().map(|s| s.first_lsn).min()
+    }
+
+    /// Whether `txn` currently has an Active-Transaction-Table entry — i.e. it has logged at least
+    /// one record. Since `BEGIN` is lazy (`rmp` #529, [`begin`](Self::begin) is no longer emitted by
+    /// the store's `begin`), the entry is created on demand by the first
+    /// [`log_update`](Self::log_update); so a transaction that has logged **nothing** — a read-only
+    /// transaction — has no entry.
+    ///
+    /// This is the signal [`RecordStore::commit`](../../graphus_storage) uses to decide a transaction
+    /// wrote nothing durable and so may skip its WAL `COMMIT` record, its catalog checkpoint, and the
+    /// group-commit `fdatasync` entirely: a read-only transaction has no version, no on-disk in-flight
+    /// stamp, and no catalog delta a crash could need.
+    #[must_use]
+    pub fn is_active(&self, txn: TxnId) -> bool {
+        self.active.contains_key(&txn)
     }
 
     /// The buffer-pool **WAL rule** (`§4` / `graphus_bufpool::WalRule`): before a dirty page
