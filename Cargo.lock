@@ -1328,8 +1328,10 @@ dependencies = [
 name = "graphus-reco-gen"
 version = "0.0.4"
 dependencies = [
+ "graphus-bolt",
  "graphus-bulk",
  "graphus-core",
+ "graphus-examples-harness",
  "graphus-io",
  "graphus-storage",
  "graphus-wal",

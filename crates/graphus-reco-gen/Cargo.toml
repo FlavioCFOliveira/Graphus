@@ -19,10 +19,22 @@ path = "src/lib.rs"
 
 [dependencies]
 # The generator is HERMETIC: it emits the graph as `neo4j-admin import`-flavoured CSV and its config /
-# summary as serde values. Serde only — no engine, no server, no network — so the determinism test
-# stays light and CI-runnable with no heavy engine build. serde pins match the rest of the workspace.
+# summary as serde values. serde pins match the rest of the workspace.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# --- Example client tooling (the `reco_bench` concurrent read driver + the evidence emitter) ---------
+# These are the CLIENT-side crates the wire driver reuses; NONE of them is the engine/server, so the
+# generator + `reco_gen` stay light and this crate stays a leaf `graphus-server` never depends on.
+# The shared value model packed/unpacked on the Bolt wire (the "one value model").
+graphus-core = { path = "../graphus-core" }
+# The transport-agnostic Bolt 5.x codec. `reco_bench` is a *client*: it reuses the symmetric wire
+# codec (handshake, framing, message, packstream) exactly as `graphus-cli` does and only owns the
+# socket I/O — no wire format is reinvented here.
+graphus-bolt = { path = "../graphus-bolt" }
+# The shared, schema-versioned evidence harness (`EvidenceReport` + `EvidenceCollector`) every example
+# emits its CPU/RAM/storage/throughput evidence through. A dev-only leaf crate, never in the server.
+graphus-examples-harness = { path = "../graphus-examples-harness" }
 
 # The deterministic generator binary: streams the generated recommendation-graph CSV file set + a
 # summary for a profile. Usage:
@@ -30,6 +42,29 @@ serde_json = "1"
 [[bin]]
 name = "reco_gen"
 path = "src/bin/reco_gen.rs"
+
+# The network bulk-import (Mode A) loader + schema DDL + correctness asserts. REST-only (raw HTTP/1.1
+# over `std::net::TcpStream`): CREATE DATABASE -> streaming bulk upload -> START DATABASE -> CREATE
+# INDEX -> shape + recommendation-query asserts. Usage:
+#   cargo run -p graphus-reco-gen --bin reco_load -- --rest 127.0.0.1:PORT --db recodb --data-dir <dir>
+[[bin]]
+name = "reco_load"
+path = "src/bin/reco_load.rs"
+
+# The concurrent UDS-Bolt read driver: sweeps a concurrency ladder of many simultaneous connections
+# issuing the recommendation read battery, samples the server's CPU/RSS/IO, and emits standardized
+# evidence. Usage:
+#   cargo run -p graphus-reco-gen --bin reco_bench -- --socket <s> --db recodb --server-pid <pid>
+[[bin]]
+name = "reco_bench"
+path = "src/bin/reco_bench.rs"
+
+# The evidence regression gate: compares a fresh `reco_bench` report against the committed baseline
+# using ONLY stable STRUCTURAL metrics (realised node/relationship + per-label counts). Needs only the
+# harness + serde. Usage: `cargo run -p graphus-reco-gen --bin reco_baseline_cmp -- <baseline> <cand>`
+[[bin]]
+name = "reco_baseline_cmp"
+path = "src/bin/reco_baseline_cmp.rs"
 
 [dev-dependencies]
 # The offline high-throughput CSV bulk importer (FR-BK) — the PRODUCTION ingest path. Used ONLY by
@@ -40,6 +75,5 @@ path = "src/bin/reco_gen.rs"
 # acyclic and adds nothing to the shipped binary.
 graphus-bulk = { path = "../graphus-bulk" }
 graphus-storage = { path = "../graphus-storage" }
-graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
 graphus-wal = { path = "../graphus-wal" }

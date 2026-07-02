@@ -76,6 +76,20 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
+/// The canonical **recommendation read battery** — the parameterised Cypher the wire clients run
+/// (`reco_load`'s correctness asserts and `reco_bench`'s concurrent load). Defined once so the loader
+/// and the driver exercise byte-identical queries.
+pub mod queries;
+
+/// A synchronous **Bolt client over a Unix domain socket** (with `db` selection + parameters), reused
+/// by the `reco_bench` concurrent read driver. Reuses the [`graphus_bolt`] symmetric wire codec.
+pub mod client;
+
+/// Pure, hermetic helpers for the `reco_bench` concurrent read driver: latency-percentile
+/// summarisation, the `/proc/<pid>` field parsers, the concurrency-ladder CSV parser, and the
+/// read-battery family-index lookup — all unit-testable without a running server.
+pub mod bench;
+
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it
 /// is a *pure* integer mixing function: identical output for identical seeds on every platform, with
 /// no global state, no float, and no allocation. We never use the standard library's `HashMap`-based
