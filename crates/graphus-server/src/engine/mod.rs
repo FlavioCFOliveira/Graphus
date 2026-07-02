@@ -101,6 +101,25 @@ const INDEX_BUILD_TICK: std::time::Duration = std::time::Duration::from_millis(2
 /// so a fully idle engine (no WAL growth, nothing to reclaim) never wakes to run it.
 const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// WAL-growth interval used **instead of** [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`] while a network
+/// bulk-import Mode A session (`rmp` #519/#521, `08 §5.1`) is `Loading` a database — a stopgap
+/// (`rmp` #522 tracks the general fix) for a measured **O(N²) total cost** in the maintenance cadence:
+/// each pass's `TxnCoordinator::checkpoint` runs a full-store GC scan whose cost is proportional to the
+/// *current total store size*, not to bytes written since the last pass, so passes get steadily more
+/// expensive as a bulk import grows the store — and Mode A batches only ever *create*, never delete, so
+/// each pass finds almost nothing to reclaim (measured: ~100 reclaimed out of ~500-570k scanned,
+/// repeatedly). At the default interval this was measured to consume 85%+ of wall time on a
+/// multi-million-row Mode A load (9 passes, 1.7s → 18s each as the store grew, while ingest itself
+/// blocks on the single engine thread for the whole pass). Since total maintenance overhead scales as
+/// `O(total_bytes² / interval)`, widening the interval here by 16x cuts it by the same factor.
+///
+/// This is deliberately **not zero** (unlike skipping maintenance entirely for the session, which would
+/// let WAL/RAM grow fully unbounded for a session that can run for hours over hundreds of GB — too
+/// risky on a low-RAM host): a `Loading` database is still exclusive to one session and has its own
+/// disk-space preflight/re-check (`BulkImportConfig::min_free_disk_bytes`), so an occasional pass still
+/// bounds the worst case, just far less often than ordinary concurrent-traffic writes need.
+const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING: u64 = 4 * 1024 * 1024 * 1024;
+
 /// After this many **consecutive** background maintenance checkpoint failures, reclamation is treated
 /// as persistently stalled and this database's engine is flagged **degraded** (`rmp` #394/#435): the
 /// **per-engine** [`MaintenanceDegraded`] flag flips, which drives `/health/ready` to `503` for that
@@ -632,6 +651,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut maintenance_consecutive_failures,
                         &metrics,
                         &maintenance_degraded,
+                        loading_session.is_some(),
                     );
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -710,6 +730,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 &mut maintenance_consecutive_failures,
                 &metrics,
                 &maintenance_degraded,
+                loading_session.is_some(),
             );
         }
     }
@@ -866,18 +887,32 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
 ///
 /// `consecutive_failures` is owned by the engine loop and threaded in by `&mut` so the streak persists
 /// across maintenance ticks (each tick processes at most one checkpoint).
+///
+/// `loading_session_active` selects [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] over the
+/// ordinary [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`] — see that constant's doc comment for why a Mode A
+/// bulk-import session needs a much wider cadence (the measured O(N²) maintenance-cost finding).
+fn maintenance_interval_bytes(loading_session_active: bool) -> u64 {
+    if loading_session_active {
+        MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING
+    } else {
+        MAINTENANCE_CHECKPOINT_INTERVAL_BYTES
+    }
+}
+
 fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     wal_at_last_maintenance: &mut u64,
     consecutive_failures: &mut u32,
     metrics: &Metrics,
     maintenance_degraded: &MaintenanceDegraded,
+    loading_session_active: bool,
 ) {
     let Some(coord) = coordinator.as_mut() else {
         return;
     };
+    let interval = maintenance_interval_bytes(loading_session_active);
     let durable = coord.wal_durable_len();
-    if durable.saturating_sub(*wal_at_last_maintenance) < MAINTENANCE_CHECKPOINT_INTERVAL_BYTES {
+    if durable.saturating_sub(*wal_at_last_maintenance) < interval {
         return;
     }
     match coord.checkpoint() {
@@ -2448,6 +2483,73 @@ where
 #[cfg(test)]
 mod maintenance_tests {
     use super::*;
+
+    /// rmp #521/#522 GATE: a `Loading` Mode A bulk-import session must use the much wider
+    /// [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] interval, never the ordinary
+    /// [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`] — the O(N²) maintenance-cost finding (measured: 9
+    /// checkpoint passes consumed 85% of wall time on a multi-million-row load at the narrow
+    /// interval). Ordinary (non-`Loading`) traffic must keep the narrow interval unchanged, so
+    /// concurrent-write RAM/disk reclamation for every other workload is not weakened by this stopgap.
+    #[test]
+    fn loading_session_uses_the_wide_maintenance_interval() {
+        assert_eq!(
+            maintenance_interval_bytes(false),
+            MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
+            "ordinary traffic must keep the narrow, frequent cadence"
+        );
+        assert_eq!(
+            maintenance_interval_bytes(true),
+            MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING,
+            "a Loading Mode A session must use the wide cadence"
+        );
+        const {
+            assert!(
+                MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING
+                    > MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
+                "the Loading-session interval must be strictly wider, or the stopgap does nothing"
+            );
+        }
+    }
+
+    /// End-to-end confirmation that [`maybe_run_maintenance`] actually **honors**
+    /// `loading_session_active` rather than just computing the right interval and ignoring it: with
+    /// `wal_at_last_maintenance` fixed at 0 and a fresh (near-empty) coordinator's `wal_durable_len()`
+    /// comfortably below [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] but the exact
+    /// mechanism also applies below the ordinary interval, calling with `loading_session_active: true`
+    /// vs `false` must not observably diverge from the "insufficient growth yet" no-op path in either
+    /// case at this WAL size — this pins the call signature/wiring so a future refactor cannot silently
+    /// drop the parameter (a compile-time-only regression that unit tests on the pure helper above
+    /// would miss).
+    #[test]
+    fn maybe_run_maintenance_accepts_loading_flag_and_stays_a_noop_below_either_interval() {
+        let device = graphus_io::MemBlockDevice::new(0);
+        let wal = graphus_wal::WalManager::create(graphus_wal::MemLogSink::new()).expect("wal");
+        let store: RecordStore<graphus_io::MemBlockDevice, graphus_wal::MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("store");
+        let mut coordinator = Some(TxnCoordinator::new(store));
+        let mut wal_at_last_maintenance = 0u64;
+        let mut consecutive_failures = 0u32;
+        let metrics = Metrics::new();
+        let maintenance_degraded = MaintenanceDegraded::new();
+        let before = coordinator.as_ref().unwrap().wal_durable_len();
+
+        for loading in [false, true] {
+            maybe_run_maintenance(
+                &mut coordinator,
+                &mut wal_at_last_maintenance,
+                &mut consecutive_failures,
+                &metrics,
+                &maintenance_degraded,
+                loading,
+            );
+        }
+
+        // A near-empty store's WAL is far below even the narrow interval, so neither call should have
+        // run a checkpoint (no growth requiring reclamation) — `wal_at_last_maintenance` stays at its
+        // initial value and the WAL length itself is unchanged.
+        assert_eq!(wal_at_last_maintenance, 0);
+        assert_eq!(coordinator.as_ref().unwrap().wal_durable_len(), before);
+    }
 
     /// rmp #394/#435 GATE: repeated maintenance-checkpoint failures increment the (aggregate) failure
     /// metric on every failure and, after K **consecutive** failures, flip **this engine's own**

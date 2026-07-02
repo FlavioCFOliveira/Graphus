@@ -501,6 +501,27 @@ curl -sk -X POST "$BASE/admin/db/livedb/bulk-import?end=true&mode=live&session=$
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
+#### 8.1.3 Performance notes (Mode A)
+
+Empirically measured (`rmp` #521, a ~65,000-user/~37.7M-relationship social-graph dataset with
+the `huge` profile's friend-degree density, streamed over loopback HTTPS on an x86_64
+workstation — see the project memory for the full write-up and numbers): the **node** phase is
+very fast (a single hash-map insertion per row, no lookups); **relationship**-phase throughput
+is markedly lower and dominated by the per-batch commit/dispatch cost over the network and the
+single engine thread, not by raw store-write speed — expect low-thousands to low-tens-of-
+thousands of relationship rows per second rather than the offline `graphus-bulk` importer's
+`O(E)` in-process rate, and budget accordingly for very large transfers against
+`bulk_import.session_timeout_ms`.
+
+A background maintenance cadence (`rmp` #305) periodically pauses ingest for a full-store GC
+pass. Its cost scales with the *current total store size*, not with bytes written since the
+last pass — an insert-only workload like Mode A reclaims almost nothing on each pass, so a
+naive fixed interval makes total maintenance overhead grow roughly quadratically with dataset
+size over a long session. To keep this practical, a `Loading` database uses a **much wider**
+maintenance interval than ordinary online traffic (`rmp` #521/#522) — a stopgap that
+substantially reduces, but does not eliminate, this cost; a general fix (skip the reclaim scan
+entirely when nothing has died since the last pass) is tracked as a follow-up (`rmp` #522).
+
 User, role, and database administration is done by sending the administrative statements
 (`CREATE USER`, `GRANT`, `CREATE DATABASE`, …) to the transactional endpoint as an
 administrator — see [security.md](security.md).

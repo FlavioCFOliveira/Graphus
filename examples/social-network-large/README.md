@@ -78,6 +78,19 @@ proves the **same Cypher model** round-trips over the real **Bolt-over-UDS wire*
 > endpoint ⇒ `O(E)` total), which is the correct, production way to load a large graph and lets this
 > example actually reach scale.
 
+> **Loading this dataset into a REMOTE, already-running server** (rather than the in-process
+> demonstration above) is a separate scenario this example's generator also supports: `social_gen
+> --format csv --profile <fast|large|huge> --out-dir <dir> [--users N] [...]` writes the same
+> deterministic graph as `users.csv`/`articles.csv`/`friends.csv`/`likes.csv` (the
+> `neo4j-admin import` shape `graphus-bulk`/the network bulk-import endpoint consume — see
+> `--help`), instead of the single `graph.cypher` file. Stream those files into a live server with
+> `POST /admin/db/{db}/bulk-import` (`docs/rest-api.md` §8.1) to reach scale over the network, not
+> just in-process. This is what `rmp` #521 used to validate the network bulk-import capability
+> end-to-end against a real dataset at the `huge` profile's density (scaled down in user count for
+> a disk-safe run — see the project memory for the full write-up); the `--users`/`--articles`/
+> `--friend-min`/`--friend-max`/`--avg-likes`/`--seed` flags let a caller request a custom scale
+> while keeping a named profile's density/shape.
+
 ## Running it
 
 ```bash
