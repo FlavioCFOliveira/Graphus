@@ -80,6 +80,55 @@ pub fn init_logging() {
     let _ = fmt().with_env_filter(filter).with_target(true).try_init();
 }
 
+/// The application name reported in the startup banner (the Cargo package name of this binary crate,
+/// resolved at compile time — no build script needed).
+pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The current server version reported in the startup banner (the workspace version, resolved at
+/// compile time from `Cargo.toml`).
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The build's data-model pointer width in bits (64 on 64-bit targets, 32 on 32-bit) — the "bits"
+/// figure a database server traditionally reports at startup (cf. Redis's `64 bit` banner line).
+const POINTER_WIDTH_BITS: u32 = usize::BITS;
+
+/// Builds the human-readable platform descriptor for the startup banner, e.g. `linux/x86_64 (64-bit)`.
+///
+/// Every component is resolved from the standard library (`std::env::consts` + `usize::BITS`), so it
+/// reflects the *build target* faithfully with no build-time git/rustc plumbing to keep in sync.
+#[must_use]
+pub fn platform_descriptor() -> String {
+    format!(
+        "{}/{} ({}-bit)",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        POINTER_WIDTH_BITS,
+    )
+}
+
+/// Emits the traditional database-server startup banner: one structured `info` log line naming the
+/// application, its version and the runtime platform, plus the process id (`04 §9` / NFR-10).
+///
+/// This mirrors the convention every mature database server follows — PostgreSQL's
+/// `starting PostgreSQL <v> on <platform>`, Redis's version/bits/PID banner — so an operator can, at
+/// a glance (or with a single `grep`), confirm exactly which build is running and on what hardware.
+/// The facts come only from compile-time (`CARGO_PKG_*`, target consts) and runtime (`pid`) sources,
+/// so the banner can never drift from the actual binary. Call it once, at the very start of the boot
+/// sequence, right after [`init_logging`]; the matching end-of-boot line is `"graphus-server ready"`.
+pub fn log_startup_banner() {
+    tracing::info!(
+        app = APP_NAME,
+        version = APP_VERSION,
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        pointer_width = POINTER_WIDTH_BITS,
+        pid = std::process::id(),
+        "starting {APP_NAME} {APP_VERSION} on {} — pid {}",
+        platform_descriptor(),
+        std::process::id(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +156,40 @@ mod tests {
         // Without a prior `set` in this isolated assertion, the default is positive. (Other tests in
         // the process may have set it; either way it is a sane positive duration.)
         assert!(slow_query_threshold() > Duration::ZERO);
+    }
+
+    #[test]
+    fn banner_identifies_this_build() {
+        // The banner must never drift from the actual binary: name comes from Cargo, version is the
+        // workspace version (`X.Y.Z`), and both are non-empty.
+        assert_eq!(APP_NAME, "graphus-server");
+        assert!(!APP_VERSION.is_empty(), "version must be present");
+        assert_eq!(
+            APP_VERSION.split('.').count(),
+            3,
+            "workspace version is semver `major.minor.patch`, got {APP_VERSION:?}",
+        );
+    }
+
+    #[test]
+    fn platform_descriptor_reports_target() {
+        let p = platform_descriptor();
+        // e.g. `linux/x86_64 (64-bit)` — carries the runtime OS, arch and pointer width.
+        assert!(p.contains(std::env::consts::OS), "must name the OS: {p:?}");
+        assert!(
+            p.contains(std::env::consts::ARCH),
+            "must name the arch: {p:?}"
+        );
+        assert!(
+            p.contains(&format!("{POINTER_WIDTH_BITS}-bit")),
+            "must report pointer width: {p:?}",
+        );
+    }
+
+    #[test]
+    fn startup_banner_does_not_panic() {
+        // Logging without a global subscriber installed is a no-op, not a panic; this guards the
+        // banner call site (formatting + field capture) against regressions.
+        log_startup_banner();
     }
 }

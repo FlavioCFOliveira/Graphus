@@ -220,6 +220,11 @@ impl Server {
     pub async fn start(self) -> Result<ServerHandle, ServerError> {
         self.config.validate().map_err(ServerError::Config)?;
         observability::init_logging();
+        // The traditional database-server startup banner (app name, version, platform, pid) — emitted
+        // as the first line of the boot sequence, matched by the `"graphus-server ready"` line once
+        // every listener is bound (rmp #363 keeps `main` sync; this is the first thing an operator
+        // sees confirming *which* build is coming up).
+        observability::log_startup_banner();
         observability::set_slow_query_threshold(self.config.timing.slow_query_threshold());
 
         let config = self.config;
