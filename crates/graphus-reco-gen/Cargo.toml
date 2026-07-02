@@ -1,0 +1,45 @@
+[package]
+name = "graphus-reco-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Deterministic, seeded product-recommendation graph generator (configuration-model FRIEND multigraph + popularity-skewed PURCHASED edges) for the product-recommendation performance-evaluation example (dev-only leaf crate)."
+# UNPUBLISHED dev/example leaf crate, in the same spirit as `graphus-social-gen`, `graphus-iot-gen`
+# and `graphus-fraud-gen`: it exists only to support the `examples/product-recommendation`
+# performance-evaluation demonstration and is depended upon by NOTHING in the production build. In
+# particular, `graphus-server` MUST NOT depend on it, so it adds ZERO overhead to the shipped binary.
+publish = false
+
+[lib]
+name = "graphus_reco_gen"
+path = "src/lib.rs"
+
+[dependencies]
+# The generator is HERMETIC: it emits the graph as `neo4j-admin import`-flavoured CSV and its config /
+# summary as serde values. Serde only — no engine, no server, no network — so the determinism test
+# stays light and CI-runnable with no heavy engine build. serde pins match the rest of the workspace.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The deterministic generator binary: streams the generated recommendation-graph CSV file set + a
+# summary for a profile. Usage:
+#   cargo run -p graphus-reco-gen --bin reco_gen -- --profile fast --out-dir <dir>
+[[bin]]
+name = "reco_gen"
+path = "src/bin/reco_gen.rs"
+
+[dev-dependencies]
+# The offline high-throughput CSV bulk importer (FR-BK) — the PRODUCTION ingest path. Used ONLY by
+# `tests/bulk_import_validity.rs`, which proves the generated CSV file set is a valid bulk-import
+# artifact (it round-trips through `BulkImporter` into a fresh in-memory `RecordStore` with matching
+# node/relationship counts). These are the real engine crates, pulled in as dev-deps only — the
+# library itself never touches them, and `graphus-server` does not depend on this crate, so this stays
+# acyclic and adds nothing to the shipped binary.
+graphus-bulk = { path = "../graphus-bulk" }
+graphus-storage = { path = "../graphus-storage" }
+graphus-core = { path = "../graphus-core" }
+graphus-io = { path = "../graphus-io" }
+graphus-wal = { path = "../graphus-wal" }

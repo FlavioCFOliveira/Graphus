@@ -1325,6 +1325,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-reco-gen"
+version = "0.0.4"
+dependencies = [
+ "graphus-bulk",
+ "graphus-core",
+ "graphus-io",
+ "graphus-storage",
+ "graphus-wal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "graphus-rest"
 version = "0.0.4"
 dependencies = [
