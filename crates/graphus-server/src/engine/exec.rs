@@ -42,10 +42,18 @@ const PLAN_CACHE_CAPACITY: usize = 512;
 /// (`rmp` task #322; `04 §7.5`).
 ///
 /// The server's RUN path used to re-run the *entire* compile pipeline
-/// (tokenize→parse→analyze→lower→physical-plan) on **every** `Run` — a measured ~7–9 µs of pure CPU
+/// (tokenize→parse→analyze→lower→physical-plan) on **every** `Run` — a measured ~2.4–8.6 µs of pure CPU
 /// per statement that a looped concurrency workload pays on every iteration. This cache reuses the
-/// compiled [`PhysicalPlan`] for an identical query text, turning a repeated `Run` into a ~0.1 µs
-/// hash lookup + a cheap plan clone.
+/// compiled [`PhysicalPlan`] for an identical query text, turning a repeated `Run` into a ~50 ns hash
+/// lookup + an `Arc::clone` (an atomic refcount bump) of the shared plan.
+///
+/// **Shared plans (`rmp` task #531).** The cache value is an `Arc<PhysicalPlan>`, not an owned plan, so
+/// a cache hit hands out an `Arc::clone` (a few nanoseconds) instead of the ~0.2–0.7 µs deep clone of
+/// the operator tree the engine used to pay per statement. The same shared `Arc` is threaded all the
+/// way into [`graphus_cypher::execute_with_extensions_cancellable`], so the executor no longer deep
+/// clones the plan into itself either — a cache-hit statement performs **zero** deep plan clones on the
+/// engine thread. The `Arc<PhysicalPlan>` is `Send + Sync` (the plan is pure data), so the off-thread
+/// reader (`rmp` #336/#527) still receives a correct `Send` plan.
 ///
 /// **Keying & correctness.** The key is the **verbatim query text** paired with the current
 /// [`SchemaVersion`] (and an empty [`FeatureFlags`] set — the engine compiles one feature line).
@@ -71,7 +79,7 @@ const PLAN_CACHE_CAPACITY: usize = 512;
 /// This lives on the **single engine thread** and is borrowed `&mut` per `Run`, so the underlying
 /// [`PlanCache`]'s documented single-threaded contract holds with no synchronisation.
 pub(super) struct EnginePlanCache {
-    cache: PlanCache<PhysicalPlan>,
+    cache: PlanCache<Arc<PhysicalPlan>>,
     schema_version: SchemaVersion,
     feature_flags: FeatureFlags,
 }
@@ -289,12 +297,15 @@ pub(super) fn handle_run<
     // coordinator's statistics seam activates the cost-based optimiser (`rmp` tasks #65/#82; each
     // statistics call borrows the store briefly, never across the compile).
     //
-    // Plan-reuse policy (`rmp` task #322): the server consults the engine's [`EnginePlanCache`] keyed
-    // on `(query text, schema_version)`. A hit reuses the compiled [`PhysicalPlan`] (a ~0.1 µs lookup
-    // + a cheap plan clone) instead of re-running the ~7–9 µs compile pipeline; a miss compiles and
-    // inserts. A cached plan keeps the statistics it was compiled against — acceptable because every
-    // cost-based rewrite is bag-preserving (`04 §7.5`), and any schema change that *could* alter
-    // results bumps the version (invalidating the cache) via [`EnginePlanCache::bump_schema`].
+    // Plan-reuse policy (`rmp` tasks #322/#531): the server consults the engine's [`EnginePlanCache`]
+    // keyed on `(query text, schema_version)`. A hit reuses the compiled plan as a shared
+    // `Arc<PhysicalPlan>` (a ~50 ns lookup + an `Arc::clone` refcount bump — no operator-tree deep
+    // clone) instead of re-running the ~2.4–8.6 µs compile pipeline; a miss compiles and inserts. The
+    // same `Arc` is threaded into the executor, so a cache-hit statement performs zero deep plan clones
+    // on the engine thread. A cached plan keeps the statistics it was compiled against — acceptable
+    // because every cost-based rewrite is bag-preserving (`04 §7.5`), and any schema change that
+    // *could* alter results bumps the version (invalidating the cache) via
+    // [`EnginePlanCache::bump_schema`].
     let plan = match compile_cached(plan_cache, query, coordinator, extensions.as_ref()) {
         Ok(p) => p,
         Err(e) => {
@@ -474,7 +485,7 @@ pub(super) fn handle_run<
 fn start_inline<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     inflight: &mut InFlightInline,
     coordinator: &mut TxnCoordinator<D, S>,
-    plan: &graphus_cypher::PhysicalPlan,
+    plan: &Arc<graphus_cypher::PhysicalPlan>,
     bound: &graphus_cypher::BoundParameters,
     extensions: &ExtensionRegistry,
     reply: Reply<Result<RunReply, GraphusError>>,
@@ -528,7 +539,7 @@ fn start_inline<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync
 /// the cursor, or a consumer that disconnected before receiving the reply, is handled here.
 fn open_and_drive_first(
     inflight: &mut InFlightInline,
-    plan: &graphus_cypher::PhysicalPlan,
+    plan: &Arc<graphus_cypher::PhysicalPlan>,
     bound: &graphus_cypher::BoundParameters,
     graph: &mut dyn GraphAccess,
     extensions: &ExtensionRegistry,
@@ -539,7 +550,8 @@ fn open_and_drive_first(
     // cancellation token (`rmp` #476): the per-statement CPU budget the executor's safe points enforce.
     // The token lives on the cursor (and survives suspend/resume), so the budget spans every batch.
     let mut cursor = match execute_with_extensions_cancellable(
-        plan,
+        // `Arc::clone` (a refcount bump) — the executor holds the shared plan, no deep clone (`rmp` #531).
+        Arc::clone(plan),
         bound,
         graph,
         extensions.functions_dyn(),
@@ -590,27 +602,30 @@ fn open_and_drive_first(
 /// Returns the compiled [`PhysicalPlan`] for `query`, consulting the engine's [`EnginePlanCache`]
 /// (`rmp` task #322).
 ///
-/// On a **hit** the cached plan is cloned and returned without touching the store — no parse, no
-/// analyse, no planning, and crucially no `catalog()`/`statistics()` borrow (those are taken only to
-/// *compile* a fresh plan). On a **miss** the full [`compile`] pipeline runs against the coordinator's
-/// current catalog + statistics, and the result is inserted under the exact-text key before being
-/// returned. Reuse is sound because the key pairs the verbatim text with the current schema version
-/// (see [`EnginePlanCache`]); a compile error is never cached (only a successful plan is inserted).
+/// On a **hit** the cached [`Arc<PhysicalPlan>`](std::sync::Arc) is `Arc::clone`d (an atomic refcount
+/// bump — no operator-tree deep clone) and returned without touching the store — no parse, no analyse,
+/// no planning, and crucially no `catalog()`/`statistics()` borrow (those are taken only to *compile* a
+/// fresh plan). On a **miss** the full [`compile`] pipeline runs against the coordinator's current
+/// catalog + statistics, the fresh plan is wrapped in an `Arc` inserted under the exact-text key, and a
+/// clone of that `Arc` is returned (again no deep clone). Reuse is sound because the key pairs the
+/// verbatim text with the current schema version (see [`EnginePlanCache`]); a compile error is never
+/// cached (only a successful plan is inserted).
 fn compile_cached<D: BlockDevice, S: LogSink>(
     plan_cache: &mut EnginePlanCache,
     query: &str,
     coordinator: &TxnCoordinator<D, S>,
     extensions: &ExtensionRegistry,
-) -> Result<PhysicalPlan, GraphusError> {
+) -> Result<Arc<PhysicalPlan>, GraphusError> {
     let key = plan_cache.key(query);
     if let Some(plan) = plan_cache.cache.get(&key) {
-        return Ok(plan.clone());
+        return Ok(Arc::clone(plan));
     }
-    // Miss: compile against the current catalog + statistics, then cache.
+    // Miss: compile against the current catalog + statistics, wrap in an `Arc`, then cache. Inserting a
+    // clone of the `Arc` (not a deep clone of the plan) keeps the insert-and-return path clone-free too.
     let catalog = coordinator.catalog();
     let stats = coordinator.statistics();
-    let plan = compile(query, &catalog, Some(&stats), extensions)?;
-    plan_cache.cache.insert(key, plan.clone());
+    let plan = Arc::new(compile(query, &catalog, Some(&stats), extensions)?);
+    plan_cache.cache.insert(key, Arc::clone(&plan));
     Ok(plan)
 }
 
@@ -645,7 +660,7 @@ fn compile(
 /// `graph`/wrapper, not in the runtime error channel).
 #[allow(clippy::too_many_arguments)] // Threads the seam + extension registry + egress channel.
 pub(super) fn run_cursor(
-    plan: &graphus_cypher::PhysicalPlan,
+    plan: &Arc<graphus_cypher::PhysicalPlan>,
     bound: &graphus_cypher::BoundParameters,
     graph: &mut dyn GraphAccess,
     extensions: &ExtensionRegistry,
@@ -660,7 +675,8 @@ pub(super) fn run_cursor(
     // cancellation token (`rmp` #476): the same per-statement CPU budget the inline path enforces, so an
     // off-thread reader is bounded identically.
     let mut cursor = match execute_with_extensions_cancellable(
-        plan,
+        // `Arc::clone` (a refcount bump) — the executor holds the shared plan, no deep clone (`rmp` #531).
+        Arc::clone(plan),
         bound,
         graph,
         extensions.functions_dyn(),

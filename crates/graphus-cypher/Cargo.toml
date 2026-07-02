@@ -124,3 +124,10 @@ criterion = { version = "0.5", default-features = false, features = [
 [[bench]]
 name = "snapshot_parallel"
 harness = false
+
+# The per-statement engine-thread cost breakdown (`rmp` task #531): compile-miss vs plan deep-clone vs
+# parameter-bind vs key-build+probe, quantifying what is worth moving off the single engine thread.
+# `cargo bench -p graphus-cypher --bench compile_bind`.
+[[bench]]
+name = "compile_bind"
+harness = false

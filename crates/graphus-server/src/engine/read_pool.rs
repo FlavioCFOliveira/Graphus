@@ -66,8 +66,10 @@ pub struct ReadTask<D: BlockDevice, S: LogSink> {
     pub txn: TxnId,
     /// The open-transaction ticket, echoed back at retirement so the engine finalises the right entry.
     pub ticket: TxTicket,
-    /// The compiled physical plan (a plain `Send` plan tree — no `Rc`).
-    pub plan: graphus_cypher::PhysicalPlan,
+    /// The compiled physical plan, shared from the engine's `Arc`-valued plan cache (`rmp` task #531).
+    /// `Arc<PhysicalPlan>` is `Send + Sync` (the plan is pure data — no `Rc`), so it moves cleanly to
+    /// the reader thread; capturing it on the engine thread is an `Arc::clone`, not a deep tree clone.
+    pub plan: Arc<graphus_cypher::PhysicalPlan>,
     /// The bound parameters for this execution.
     pub bound: graphus_cypher::BoundParameters,
     /// The owned, engine-thread-captured store read view + token snapshot + read snapshot + commit

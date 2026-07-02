@@ -5874,13 +5874,31 @@ impl SuspendedCursor {
 /// borrow scoped to the cursor.
 #[must_use]
 pub struct Executor {
-    plan: PhysicalPlan,
+    plan: Arc<PhysicalPlan>,
     params: BoundParameters,
 }
 
 impl Executor {
     /// Builds an executor for `plan` bound with `params`.
+    ///
+    /// The plan is moved into a fresh [`Arc`] (the executor holds it shared internally so a caller that
+    /// already has an `Arc<PhysicalPlan>` can avoid an extra deep clone via [`Executor::from_arc`]).
     pub fn new(plan: PhysicalPlan, params: BoundParameters) -> Self {
+        Self {
+            plan: Arc::new(plan),
+            params,
+        }
+    }
+
+    /// Builds an executor for an **already-shared** `plan` (`rmp` task #531).
+    ///
+    /// This is the server's plan-cache hot path: the engine's [`PlanCache`](crate::plan_cache::PlanCache)
+    /// hands out `Arc<PhysicalPlan>` clones (an atomic refcount bump), so a cache-hit statement reaches
+    /// execution with **zero** deep plan clones — the plan is read (never mutated) through the shared
+    /// `Arc` during [`open`](Self::open) and the resulting [`Cursor`] owns its built operators
+    /// independently of the plan. Behaviourally identical to [`Executor::new`]; it only avoids the
+    /// per-statement deep clone [`Executor::new`] would perform on an owned plan.
+    pub fn from_arc(plan: Arc<PhysicalPlan>, params: BoundParameters) -> Self {
         Self { plan, params }
     }
 
@@ -6146,15 +6164,24 @@ pub fn execute_with_extensions<'a>(
 ///
 /// As [`execute_with_extensions`]; additionally an already-elapsed deadline (or an already-tripped flag)
 /// surfaces as [`ExecError::Cancelled`] at the first safe point.
+///
+/// # Plan sharing (`rmp` task #531)
+///
+/// Takes the plan as a shared `Arc<PhysicalPlan>` (moved in) rather than a `&PhysicalPlan` it would deep
+/// clone: the server's engine keeps compiled plans in an `Arc`-valued [`PlanCache`](crate::plan_cache::PlanCache),
+/// so a cache-hit statement reaches execution with **no** deep plan clone (the `Arc` refcount bump is a
+/// few nanoseconds versus the hundreds of nanoseconds a plan-tree clone costs). The plan is only read
+/// during [`open_with_extensions`], and the returned [`Cursor`] owns its built operators, so the shared
+/// plan can be dropped the moment the cursor is built.
 pub fn execute_with_extensions_cancellable<'a>(
-    plan: &PhysicalPlan,
+    plan: Arc<PhysicalPlan>,
     params: &BoundParameters,
     graph: &'a mut dyn GraphAccess,
     functions: &'a dyn FunctionRegistry,
     procedures: &'a dyn ProcedureRegistry,
     token: CancellationToken,
 ) -> Result<Cursor<'a>, ExecError> {
-    Executor::new(plan.clone(), params.clone())
+    Executor::from_arc(plan, params.clone())
         .open_with_extensions(graph, token, functions, procedures)
 }
 
