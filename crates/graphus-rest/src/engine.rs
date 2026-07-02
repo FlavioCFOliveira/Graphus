@@ -201,6 +201,37 @@ pub trait RestEngine {
         parameters: Vec<(String, Value)>,
     ) -> Result<Self::Stream, GraphusError>;
 
+    /// Runs `query` with `parameters` as a **single-statement auto-commit** against `db` in `mode` on
+    /// behalf of `origin`, returning a lazy result stream (rmp #527).
+    ///
+    /// Unlike [`begin`](RestEngine::begin) + [`run`](RestEngine::run) + [`commit`](RestEngine::commit),
+    /// this opens the transaction **as a true engine auto-commit**: the engine commits when the
+    /// returned stream drains (and rolls back on a runtime error or a dropped receiver), so the caller
+    /// issues **no** separate `commit`. This is what lets the engine dispatch a read to its off-thread
+    /// reader pool — the pool is engaged only for a `Read` **auto-commit** statement — so REST reads
+    /// scale across the reader threads instead of serialising on the single engine thread. It mirrors
+    /// the Bolt bare auto-commit path.
+    ///
+    /// A serialization conflict at the (engine-internal) commit surfaces as the stream's **terminal
+    /// error** — a draining consumer observes it via [`ResultStream::next_row`] returning `Err`, never a
+    /// silent success over rolled-back writes. Administrative statements (which are not transactional)
+    /// are executed outside any engine transaction, exactly as [`run`](RestEngine::run) handles them;
+    /// `origin.explicit` is `false` for this shortcut, so an admin statement is permitted here.
+    ///
+    /// # Errors
+    /// [`GraphusError::Compile`] for a compile-time error (before any row — `06 §2.1`),
+    /// [`GraphusError::Runtime`] for an immediate runtime error, [`GraphusError::Transaction`] if a
+    /// **write statement runs in a `READ`** auto-commit (`06 §4`) or the engine cannot begin/admit the
+    /// statement, or [`GraphusError::Protocol`] if `db` names no servable database.
+    fn run_autocommit(
+        &self,
+        db: &str,
+        mode: AccessMode,
+        origin: TxOrigin<'_>,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError>;
+
     /// Commits the transaction identified by `tx`.
     ///
     /// # Errors
@@ -412,6 +443,43 @@ pub(crate) mod mock {
             })
         }
 
+        fn run_autocommit(
+            &self,
+            db: &str,
+            mode: AccessMode,
+            origin: TxOrigin<'_>,
+            query: &str,
+            _parameters: Vec<(String, Value)>,
+        ) -> Result<Self::Stream, GraphusError> {
+            {
+                let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
+                inner.log.push(format!(
+                    "run_autocommit(db={db}, mode={mode:?}, principal={}, q={query})",
+                    origin.principal
+                ));
+            }
+            // `06 §4`: a READ auto-commit rejects any write statement — the engine's auto-commit path
+            // enforces this identically to an explicit READ transaction.
+            if mode == AccessMode::Read && Self::is_write(query) {
+                return Err(GraphusError::Transaction(
+                    "writing in read-only transaction is not allowed".to_owned(),
+                ));
+            }
+            if let Some(err) = self.errors.get(query) {
+                return Err(clone_error(err));
+            }
+            let canned = self
+                .results
+                .get(query)
+                .cloned()
+                .unwrap_or_else(|| Canned::rows(&[], vec![]));
+            Ok(MockStream {
+                fields: canned.fields,
+                rows: canned.rows.into_iter(),
+                summary: canned.summary,
+            })
+        }
+
         fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError> {
             let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
             inner.log.push(format!("commit(tx={})", tx.0));
@@ -495,6 +563,39 @@ mod tests {
             .begin("neo4j", AccessMode::Read, TEST_ORIGIN)
             .unwrap();
         let err = engine.run(tx, "CREATE (n)", vec![]).unwrap_err();
+        assert!(matches!(err, GraphusError::Transaction(_)));
+    }
+
+    #[test]
+    fn mock_run_autocommit_streams_canned_rows_without_a_handle() {
+        // rmp #527: the auto-commit shortcut opens no client-facing `TxHandle` — it runs one statement
+        // as a true engine auto-commit and streams the result directly.
+        let engine = MockEngine::new().on_query(
+            "RETURN 1",
+            Canned::rows(&["x"], vec![vec![Value::Integer(1)]]),
+        );
+        let mut stream = engine
+            .run_autocommit("neo4j", AccessMode::Write, TEST_ORIGIN, "RETURN 1", vec![])
+            .unwrap();
+        assert_eq!(stream.fields(), &["x".to_owned()]);
+        assert_eq!(
+            stream.next_row().unwrap(),
+            Some(vec![RestValue::Value(Value::Integer(1))])
+        );
+        assert_eq!(stream.next_row().unwrap(), None);
+        // No `begin`/`commit` lifecycle calls — only the one auto-commit run.
+        let log = engine.log();
+        assert_eq!(log.len(), 1);
+        assert!(log[0].starts_with("run_autocommit"));
+    }
+
+    #[test]
+    fn mock_run_autocommit_read_rejects_write_statement() {
+        // `06 §4`: a write in a READ auto-commit is rejected, exactly as in an explicit READ tx.
+        let engine = MockEngine::new();
+        let err = engine
+            .run_autocommit("neo4j", AccessMode::Read, TEST_ORIGIN, "CREATE (n)", vec![])
+            .unwrap_err();
         assert!(matches!(err, GraphusError::Transaction(_)));
     }
 

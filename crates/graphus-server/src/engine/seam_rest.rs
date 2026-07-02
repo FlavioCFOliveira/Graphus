@@ -25,11 +25,13 @@
 //!
 //! ## Administrative statements (rmp #84)
 //!
-//! [`RestEngine::run`] matches the statement against the strict admin grammar before the engine
-//! sees it (see [`crate::admin`]). Admin statements require the global `Admin` privilege, are
-//! rejected inside an explicit (client-managed) transaction, and on the auto-commit shortcut they
-//! execute immediately — outside the surrounding engine transaction (they are not transactional;
-//! the engine transaction the router opened simply commits empty afterwards).
+//! Both [`RestEngine::run`] and [`RestEngine::run_autocommit`] match the statement against the strict
+//! admin grammar before the engine sees it, through the shared [`RestEngineAdapter::dispatch_admin`]
+//! (see [`crate::admin`]). Admin statements require the global `Admin` privilege, are rejected inside
+//! an explicit (client-managed) transaction, and execute immediately — outside any engine transaction
+//! (they are not transactional). The single-statement auto-commit shortcut (rmp #527) runs through
+//! `run_autocommit`, which never opens an engine transaction for an admin statement; a multi-statement
+//! batch still opens one, and an admin statement inside it commits that transaction empty afterwards.
 //!
 //! The router's row-pull (`ResultStream::next_row`) and the `run`/`commit`/`rollback` calls are
 //! synchronous; the server drives each REST connection's router future to completion on a
@@ -150,6 +152,159 @@ impl RestEngineAdapter {
                 .database(Some(db))
                 .detail(data_change_detail(query, None)),
         );
+    }
+
+    /// Intercepts an administrative / index-DDL / constraint-DDL statement BEFORE Cypher compilation
+    /// (rmp #84/#91), shared by [`RestEngine::run`] (explicit + auto-commit shortcut) and
+    /// [`RestEngine::run_autocommit`] (rmp #527) so both surfaces handle admin identically.
+    ///
+    /// Returns `Some(result)` when the statement was claimed by the admin grammar (executed, or an
+    /// error), and `None` when it is ordinary Cypher (the caller runs it through the engine). Admin
+    /// statements are not transactional: they are rejected inside an `explicit` transaction, authorized
+    /// against `principal`/`db`, audited at the single funnel (rmp #70), and their result is streamed as
+    /// buffered admin rows carrying the `rmp` #513 summary.
+    fn dispatch_admin(
+        &self,
+        query: &str,
+        principal: &str,
+        db: &str,
+        handle: &EngineHandle,
+        explicit: bool,
+    ) -> Option<Result<RestEngineStream, GraphusError>> {
+        match crate::admin::parse_admin_statement(query) {
+            AdminParse::Command(cmd) => {
+                if explicit {
+                    return Some(Err(admin_in_explicit_tx()));
+                }
+                // `execute` audits the change/denial at the single admin funnel (rmp #70) with the
+                // REST source.
+                Some(
+                    self.context
+                        .execute(Some(principal), AuditSource::Rest, &cmd)
+                        .map(RestEngineStream::admin),
+                )
+            }
+            // An index-DDL statement (rmp #91): authorize like a database command, then route it to
+            // the engine the transaction was opened against (the index catalog lives on the
+            // coordinator). Rejected inside an explicit transaction, behind the admin-privilege gate.
+            AdminParse::Index(cmd) => {
+                if explicit {
+                    return Some(Err(admin_in_explicit_tx()));
+                }
+                // Authorization first — no side effects on denial. Index DDL requires the SCHEMA
+                // privilege on the transaction's pinned database (`Admin` still satisfies it via RBAC
+                // containment), so `GRANT SCHEMA ON GRAPH x` can delegate DDL without full Admin (rmp
+                // #457). The seam audits the index-DDL denial / schema change itself (rmp #70).
+                if let Err(e) = self.context.authorize_schema(Some(principal), db) {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::AuthzDenied,
+                            AuditOutcome::Failure,
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(principal))
+                        .database(Some(db))
+                        .detail(redact_index_detail(&cmd)),
+                    );
+                    return Some(Err(e));
+                }
+                // `SHOW (FULLTEXT|POINT) INDEXES` is read-only — only the mutating CREATE/DROP are
+                // schema changes (`rmp` task #72/#98 add the full-text / point SHOW to the read-only
+                // set).
+                let mutating = !matches!(
+                    cmd,
+                    crate::engine::IndexCommand::ShowIndexes
+                        | crate::engine::IndexCommand::ShowFulltextIndexes
+                        | crate::engine::IndexCommand::ShowPointIndexes
+                );
+                let detail = redact_index_detail(&cmd);
+                // The result summary (`rmp` #513): query type `s` + `indexes-added`/`indexes-removed`
+                // for a CREATE/DROP, or type `r` for a `SHOW`. Built before the command is moved into
+                // the engine; only the success path reaches the stream (a failure returns via
+                // `outcome?`), so `ok = true`.
+                let summary = index_ddl_summary(&cmd, true);
+                let outcome = handle.index_ddl_blocking(cmd);
+                if mutating {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::SchemaChange,
+                            if outcome.is_ok() {
+                                AuditOutcome::Success
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(principal))
+                        .database(Some(db))
+                        .detail(detail),
+                    );
+                }
+                Some(outcome.map(|reply| {
+                    RestEngineStream::admin(AdminResult {
+                        fields: reply.fields,
+                        rows: reply.rows,
+                        summary,
+                    })
+                }))
+            }
+            // A constraint-DDL statement (`rmp` task #99): routed identically to an index command.
+            AdminParse::Constraint(cmd) => {
+                if explicit {
+                    return Some(Err(admin_in_explicit_tx()));
+                }
+                // Authorization first — no side effects on denial. Constraint DDL requires SCHEMA on
+                // the transaction's pinned database (`Admin` still satisfies it via RBAC containment;
+                // rmp #457).
+                if let Err(e) = self.context.authorize_schema(Some(principal), db) {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::AuthzDenied,
+                            AuditOutcome::Failure,
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(principal))
+                        .database(Some(db))
+                        .detail(redact_constraint_detail(&cmd)),
+                    );
+                    return Some(Err(e));
+                }
+                // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
+                let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
+                let detail = redact_constraint_detail(&cmd);
+                // The result summary (`rmp` #513): query type `s` +
+                // `constraints-added`/`constraints-removed` for a CREATE/DROP, or type `r` for a
+                // `SHOW`. Built before the command is moved into the engine; only the success path
+                // reaches the stream (a failure returns via `outcome?`), so `ok = true`.
+                let summary = constraint_ddl_summary(&cmd, true);
+                let outcome = handle.constraint_ddl_blocking(cmd);
+                if mutating {
+                    self.context.audit().record(
+                        AuditEvent::new(
+                            AuditClass::SchemaChange,
+                            if outcome.is_ok() {
+                                AuditOutcome::Success
+                            } else {
+                                AuditOutcome::Failure
+                            },
+                            AuditSource::Rest,
+                        )
+                        .actor(Some(principal))
+                        .database(Some(db))
+                        .detail(detail),
+                    );
+                }
+                Some(outcome.map(|reply| {
+                    RestEngineStream::admin(AdminResult {
+                        fields: reply.fields,
+                        rows: reply.rows,
+                        summary,
+                    })
+                }))
+            }
+            AdminParse::Invalid(msg) => Some(Err(GraphusError::Compile(msg))),
+            AdminParse::NotAdmin => None,
+        }
     }
 }
 
@@ -345,143 +500,15 @@ impl RestEngine for RestEngineAdapter {
         let open = self.lookup(tx)?;
 
         // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84/#91); see the
-        // module docs for the explicit-vs-auto-commit rule.
-        match crate::admin::parse_admin_statement(query) {
-            AdminParse::Command(cmd) => {
-                if open.explicit {
-                    return Err(admin_in_explicit_tx());
-                }
-                // `execute` audits the change/denial at the single admin funnel (rmp #70) with the
-                // REST source.
-                let result =
-                    self.context
-                        .execute(Some(&open.principal), AuditSource::Rest, &cmd)?;
-                return Ok(RestEngineStream::admin(result));
-            }
-            // An index-DDL statement (rmp #91): authorize like a database command, then route it to
-            // the engine the transaction was opened against (the index catalog lives on the
-            // coordinator). Rejected inside an explicit transaction, behind the admin-privilege gate.
-            AdminParse::Index(cmd) => {
-                if open.explicit {
-                    return Err(admin_in_explicit_tx());
-                }
-                // Authorization first — no side effects on denial. Index DDL requires the SCHEMA
-                // privilege on the transaction's pinned database (`Admin` still satisfies it via RBAC
-                // containment), so `GRANT SCHEMA ON GRAPH x` can delegate DDL without full Admin (rmp
-                // #457). The seam audits the index-DDL denial / schema change itself (rmp #70).
-                if let Err(e) = self
-                    .context
-                    .authorize_schema(Some(&open.principal), &open.db)
-                {
-                    self.context.audit().record(
-                        AuditEvent::new(
-                            AuditClass::AuthzDenied,
-                            AuditOutcome::Failure,
-                            AuditSource::Rest,
-                        )
-                        .actor(Some(&open.principal))
-                        .database(Some(&open.db))
-                        .detail(redact_index_detail(&cmd)),
-                    );
-                    return Err(e);
-                }
-                // `SHOW (FULLTEXT|POINT) INDEXES` is read-only — only the mutating CREATE/DROP are
-                // schema changes (`rmp` task #72/#98 add the full-text / point SHOW to the read-only
-                // set).
-                let mutating = !matches!(
-                    cmd,
-                    crate::engine::IndexCommand::ShowIndexes
-                        | crate::engine::IndexCommand::ShowFulltextIndexes
-                        | crate::engine::IndexCommand::ShowPointIndexes
-                );
-                let detail = redact_index_detail(&cmd);
-                // The result summary (`rmp` #513): query type `s` + `indexes-added`/`indexes-removed`
-                // for a CREATE/DROP, or type `r` for a `SHOW`. Built before the command is moved into
-                // the engine; only the success path reaches the stream (a failure returns via
-                // `outcome?`), so `ok = true`.
-                let summary = index_ddl_summary(&cmd, true);
-                let outcome = open.handle.index_ddl_blocking(cmd);
-                if mutating {
-                    self.context.audit().record(
-                        AuditEvent::new(
-                            AuditClass::SchemaChange,
-                            if outcome.is_ok() {
-                                AuditOutcome::Success
-                            } else {
-                                AuditOutcome::Failure
-                            },
-                            AuditSource::Rest,
-                        )
-                        .actor(Some(&open.principal))
-                        .database(Some(&open.db))
-                        .detail(detail),
-                    );
-                }
-                let reply = outcome?;
-                return Ok(RestEngineStream::admin(AdminResult {
-                    fields: reply.fields,
-                    rows: reply.rows,
-                    summary,
-                }));
-            }
-            // A constraint-DDL statement (`rmp` task #99): routed identically to an index command.
-            AdminParse::Constraint(cmd) => {
-                if open.explicit {
-                    return Err(admin_in_explicit_tx());
-                }
-                // Authorization first — no side effects on denial. Constraint DDL requires SCHEMA on
-                // the transaction's pinned database (`Admin` still satisfies it via RBAC containment;
-                // rmp #457).
-                if let Err(e) = self
-                    .context
-                    .authorize_schema(Some(&open.principal), &open.db)
-                {
-                    self.context.audit().record(
-                        AuditEvent::new(
-                            AuditClass::AuthzDenied,
-                            AuditOutcome::Failure,
-                            AuditSource::Rest,
-                        )
-                        .actor(Some(&open.principal))
-                        .database(Some(&open.db))
-                        .detail(redact_constraint_detail(&cmd)),
-                    );
-                    return Err(e);
-                }
-                // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
-                let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
-                let detail = redact_constraint_detail(&cmd);
-                // The result summary (`rmp` #513): query type `s` +
-                // `constraints-added`/`constraints-removed` for a CREATE/DROP, or type `r` for a
-                // `SHOW`. Built before the command is moved into the engine; only the success path
-                // reaches the stream (a failure returns via `outcome?`), so `ok = true`.
-                let summary = constraint_ddl_summary(&cmd, true);
-                let outcome = open.handle.constraint_ddl_blocking(cmd);
-                if mutating {
-                    self.context.audit().record(
-                        AuditEvent::new(
-                            AuditClass::SchemaChange,
-                            if outcome.is_ok() {
-                                AuditOutcome::Success
-                            } else {
-                                AuditOutcome::Failure
-                            },
-                            AuditSource::Rest,
-                        )
-                        .actor(Some(&open.principal))
-                        .database(Some(&open.db))
-                        .detail(detail),
-                    );
-                }
-                let reply = outcome?;
-                return Ok(RestEngineStream::admin(AdminResult {
-                    fields: reply.fields,
-                    rows: reply.rows,
-                    summary,
-                }));
-            }
-            AdminParse::Invalid(msg) => return Err(GraphusError::Compile(msg)),
-            AdminParse::NotAdmin => {}
+        // module docs for the explicit-vs-auto-commit rule. Shared with `run_autocommit` (rmp #527).
+        if let Some(result) = self.dispatch_admin(
+            query,
+            &open.principal,
+            &open.db,
+            &open.handle,
+            open.explicit,
+        ) {
+            return result;
         }
 
         // Admission control on the TARGET database's handle (per-db limits, `04 §9.3`); the
@@ -532,6 +559,88 @@ impl RestEngine for RestEngineAdapter {
             },
             // Read from the shared sink AFTER the rows drain; the engine fills it before `row_tx`
             // drops (`rmp` #512).
+            summary: reply.summary,
+        })
+    }
+
+    fn run_autocommit(
+        &self,
+        db: &str,
+        mode: RestAccessMode,
+        origin: TxOrigin<'_>,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError> {
+        // Resolve the `{db}` segment (rmp #84), exactly as `begin` does: the configured default name
+        // is the default database; anything else goes through the catalog. Unknown/offline → a clear
+        // error, and no transaction is opened. The canonical `name` scopes the privileges below.
+        let (name, handle) = self.context.resolve(Some(db))?;
+        let engine_mode = from_rest_mode(mode);
+
+        // Admin / index-DDL / constraint-DDL statements run OUTSIDE any engine transaction (rmp
+        // #84/#91), exactly as `run` handles them — shared through `dispatch_admin`. `origin.explicit`
+        // is `false` for the auto-commit shortcut, so an admin statement is permitted here (never the
+        // "cannot run inside an explicit transaction" rejection).
+        if let Some(result) =
+            self.dispatch_admin(query, origin.principal, &name, &handle, origin.explicit)
+        {
+            return result;
+        }
+
+        // A regular query: run it as a TRUE engine auto-commit (rmp #527) — `run_blocking` with
+        // `auto_commit = true`. The engine's Run handler dispatches a `Read` to the off-thread reader
+        // pool (`exec.rs` gate: `mode == Read && auto_commit`) and finalises (commits on success, rolls
+        // back on error) when the result stream drains, so this seam issues NO separate commit. A
+        // commit-time serialization abort is surfaced as the stream's terminal error (never swallowed —
+        // rmp #238), so the router observes it via `next_row`.
+        //
+        // Admission is acquired BEFORE the begin so a saturated engine sheds the statement without
+        // opening (and having to finalise) a transaction; the permit rides the returned stream for its
+        // whole lifetime (`04 §9.3`). `begin_auto_commit_blocking` is followed by the infallible
+        // privilege resolution and then `run_blocking`, so there is no error gap that could leak an
+        // opened auto-commit transaction (a `run_blocking` error is finalised by the engine itself).
+        let permit = handle
+            .try_admit()
+            .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
+        let ticket = handle.begin_auto_commit_blocking(engine_mode)?;
+        // Resolve the principal's effective privileges for the pinned database once, against the LIVE
+        // security catalog (rmp #93) — a runtime grant/revoke is in effect on this very statement. No
+        // principal / admin ⇒ an unrestricted pass-through.
+        let privileges = Some(EffectivePrivileges::resolve(
+            std::sync::Arc::clone(self.context.security()),
+            Some(origin.principal),
+            &name,
+        ));
+        let outcome = handle.run_blocking(
+            ticket,
+            query.to_owned(),
+            parameters,
+            /* auto_commit */ true,
+            privileges,
+        );
+        // Data-change audit (rmp #70, config-gated): a write that the engine ACCEPTED is audited at
+        // this seam (the row stream is lazy; acceptance is the cheap, correct point). Full query text is
+        // NEVER logged — only the category. Read auto-commits are not data changes.
+        self.audit_data_change_if_enabled(
+            origin.principal,
+            &name,
+            query,
+            engine_mode,
+            if outcome.is_ok() {
+                AuditOutcome::Success
+            } else {
+                AuditOutcome::Failure
+            },
+        );
+        let reply = outcome?;
+        Ok(RestEngineStream {
+            fields: reply.fields,
+            source: RowSource::Engine {
+                rows: reply.rows,
+                _permit: permit,
+            },
+            // Read from the shared sink AFTER the rows drain; the engine fills it (with the committed
+            // side-effect counters) before `row_tx` drops (`rmp` #512).
             summary: reply.summary,
         })
     }

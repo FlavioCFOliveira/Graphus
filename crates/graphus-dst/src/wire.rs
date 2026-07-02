@@ -626,6 +626,26 @@ impl RestEngine for SimRestEngine {
         })
     }
 
+    fn run_autocommit(
+        &self,
+        _db: &str,
+        mode: RestAccessMode,
+        _origin: TxOrigin<'_>,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError> {
+        // A TRUE engine auto-commit (rmp #527): the engine commits when the returned stream drains and
+        // rolls back on a runtime/commit error, so no separate commit is issued. Mirrors the real
+        // `RestEngineAdapter::run_autocommit`.
+        let mut engine = self.engine.borrow_mut();
+        let ticket = engine.begin_auto_commit(map_rest_mode(mode))?;
+        let reply = engine.run(ticket, query, parameters, true, None)?;
+        Ok(SimRestStream {
+            reply,
+            summary: RestRunSummary::default(),
+        })
+    }
+
     fn commit(&self, tx: TxHandle) -> Result<RestRunSummary, GraphusError> {
         self.engine.borrow_mut().commit(TxTicket(tx.0))?;
         Ok(RestRunSummary::default())

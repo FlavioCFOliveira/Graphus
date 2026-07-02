@@ -104,6 +104,22 @@ impl RestEngine for LeakTrackingEngine {
         })
     }
 
+    fn run_autocommit(
+        &self,
+        _db: &str,
+        _mode: AccessMode,
+        _origin: TxOrigin<'_>,
+        _query: &str,
+        _params: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError> {
+        // rmp #527: a true engine auto-commit opens AND finalises its transaction internally, so it
+        // never hands the router a `TxHandle` to leak (net-zero on the live count). Not exercised by
+        // this test (it drives the EXPLICIT-transaction open cap), but the trait requires it.
+        Ok(EmptyStream {
+            fields: vec!["n".to_owned()],
+        })
+    }
+
     fn commit(&self, _tx: TxHandle) -> Result<RunSummary, GraphusError> {
         self.live.fetch_sub(1, Ordering::Relaxed);
         Ok(RunSummary::default())

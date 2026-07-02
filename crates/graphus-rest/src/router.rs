@@ -797,7 +797,9 @@ where
         return replay.into_response();
     }
 
-    let outcome: Result<(RunRequest, TxHandle), Problem> = (|| {
+    // Decode + validate access_mode + authorize the coarse mode gate — WITHOUT opening a transaction
+    // yet (rmp #527): a single statement runs through the engine's OWN auto-commit path, below.
+    let outcome: Result<(RunRequest, AccessMode), Problem> = (|| {
         let req = decode_request(&headers, &body)?;
         let mode = parse_access_mode(&req.access_mode).map_err(|bad| {
             Problem::bad_request(format!(
@@ -805,21 +807,10 @@ where
             ))
         })?;
         authorize_mode(&state, &identity, &db, mode)?;
-        let handle = state
-            .engine
-            .begin(
-                &db,
-                mode,
-                TxOrigin {
-                    principal: &identity,
-                    explicit: false,
-                },
-            )
-            .map_err(|e| Problem::from_graphus_error(&e))?;
-        Ok((req, handle))
+        Ok((req, mode))
     })();
 
-    let (req, handle) = match outcome {
+    let (req, mode) = match outcome {
         Ok(v) => v,
         Err(p) => return Built::from(p).into_response(),
     };
@@ -827,10 +818,50 @@ where
     let wire = match response_wire(header_str(&headers, &ACCEPT)) {
         Some(w) => w,
         None => {
-            let _ = state.engine.rollback(handle);
             return Built::from(Problem::not_acceptable("no acceptable representation"))
                 .into_response();
         }
+    };
+
+    // rmp #527: a SINGLE-statement **READ** runs through the engine's own auto-commit path
+    // (`begin_auto_commit` + `run(auto_commit = true)`; the engine commits at retirement), so it
+    // dispatches to the off-thread reader pool and REST reads scale across the reader threads. The
+    // result is byte-identical to the previous `begin` + `run` + `commit` decomposition (same rows,
+    // same summary, same error status).
+    //
+    // **Restricted to reads deliberately** (ACID-conservative): the engine finalises an auto-commit at
+    // stream drain, and a client disconnect mid-stream on a WRITE would let the engine COMMIT (it sees
+    // the produced rows as complete) where the old REST path did an explicit `engine.rollback(handle)`
+    // on disconnect — an observable durability-on-disconnect change. A READ has no durable effect, so
+    // commit-vs-rollback-on-disconnect is moot, which eliminates the concern entirely. Single-statement
+    // WRITES therefore keep the unchanged begin + run + commit path below.
+    if req.statements.len() == 1 && mode == AccessMode::Read {
+        return auto_commit_single_statement(
+            &state,
+            &headers,
+            &db,
+            &identity,
+            mode,
+            &req.statements[0],
+            wire,
+        );
+    }
+
+    // Everything else — a multi-statement batch, the empty batch, or a single-statement WRITE — shares
+    // ONE explicit transaction, exactly as before (unchanged begin + run… + commit). This is the
+    // pre-#527 auto-commit path verbatim: a single-statement WRITE still STREAMS when NDJSON/keyless-JSON
+    // is negotiated (`stream_framing`), and — crucially — its `produce_stream` keeps the explicit
+    // `engine.rollback(handle)` on a client disconnect (no durability-on-disconnect change for writes).
+    let handle = match state.engine.begin(
+        &db,
+        mode,
+        TxOrigin {
+            principal: &identity,
+            explicit: false,
+        },
+    ) {
+        Ok(h) => h,
+        Err(e) => return Built::from(Problem::from_graphus_error(&e)).into_response(),
     };
     if let Some(framing) = stream_framing(wire, &req.statements, &headers) {
         return stream_single_statement(
@@ -851,6 +882,79 @@ where
     )
     .unwrap_or_else(Built::problem);
     cache_and_respond(&state, &headers, &identity, built)
+}
+
+/// The single-statement **READ** `POST /db/{db}/tx/commit` fast path (rmp #527): runs the one statement
+/// through the engine's OWN auto-commit ([`RestEngine::run_autocommit`]) so it **engages the off-thread
+/// reader pool**, then streams or buffers the result. The engine commits at drain, so no separate commit
+/// is issued; a pre-first-byte error (compile / a write statement in the READ auto-commit → 409 /
+/// admission busy / admin) surfaces as problem+json with the engine having already finalised the
+/// auto-commit transaction. Only ever called with `mode == AccessMode::Read` — the gate in
+/// [`auto_commit`] keeps single-statement WRITES on the explicit-transaction path, so the auto-commit's
+/// commit-at-drain never changes write durability on a client disconnect.
+fn auto_commit_single_statement<E: RestEngine + Send + Sync + 'static>(
+    state: &AppState<E>,
+    headers: &HeaderMap,
+    db: &str,
+    identity: &str,
+    mode: AccessMode,
+    stmt: &Statement,
+    wire: Wire,
+) -> Response
+where
+    E::Stream: Send,
+{
+    let params = match bind_parameters(stmt) {
+        Ok(p) => p,
+        Err(e) => return Built::from(Problem::from_codec_error(&e)).into_response(),
+    };
+    // Obtain the auto-commit result stream. An error raised BEFORE the first byte (compile / immediate
+    // runtime / a write in a READ auto-commit → 409 / admission busy / an admin failure) keeps its
+    // exact problem+json status; the engine has already finalised the auto-commit transaction, so there
+    // is nothing to roll back here.
+    let stream = match state.engine.run_autocommit(
+        db,
+        mode,
+        TxOrigin {
+            principal: identity,
+            explicit: false,
+        },
+        &stmt.statement,
+        params,
+    ) {
+        Ok(s) => s,
+        Err(e) => return Built::from(Problem::from_graphus_error(&e)).into_response(),
+    };
+
+    // Same negotiation as the handle path: a single-statement NDJSON or keyless-JSON result STREAMS
+    // (bounded memory, rmp #475); CBOR or a keyed JSON BUFFERS (and a keyed JSON stays idempotency-
+    // cached). `stream_framing` sees exactly this one statement.
+    if let Some(framing) = stream_framing(wire, std::slice::from_ref(stmt), headers) {
+        return stream_autocommit(framing, stream);
+    }
+    let built = buffer_autocommit(headers, stream).unwrap_or_else(Built::problem);
+    cache_and_respond(state, headers, identity, built)
+}
+
+/// Buffers a single-statement engine auto-commit result stream (rmp #527) into a committed
+/// [`RunResponse`] — the `id`/`expires_at_nanos` are absent, the closed-transaction shape identical to
+/// `Finalise::Commit`. The engine commits at drain (the summary is filled before the last row — `rmp`
+/// #512), so no separate commit is issued; a drain error means the engine already rolled back and is
+/// surfaced as a problem+json (no partial result — `06 §3.3`).
+fn buffer_autocommit<S: ResultStream>(
+    headers: &HeaderMap,
+    mut stream: S,
+) -> Result<Built, Problem> {
+    let result = serialize_stream(&mut stream).map_err(|e| Problem::from_graphus_error(&e))?;
+    Ok(serializable_built(
+        headers,
+        StatusCode::OK,
+        &RunResponse {
+            results: vec![result],
+            id: None,
+            expires_at_nanos: None,
+        },
+    ))
 }
 
 /// `POST /db/{db}/graph` → run a read query and return a **deduplicated graph projection** of its
@@ -1219,15 +1323,21 @@ fn run_statements_buffered<E: RestEngine>(
 }
 
 /// **Deterministic synchronous entry** for the VOPR simulator (rmp #164): runs an auto-commit
-/// statement batch through the **same** request core the axum `auto_commit` handler uses
-/// (`run_statements_buffered`), returning the serialized response as a [`CachedResponse`]
-/// (status + content-type + body bytes).
+/// statement batch through the **same** request core the axum `auto_commit` handler uses, returning the
+/// serialized response as a [`CachedResponse`] (status + content-type + body bytes).
 ///
 /// This bypasses only the axum/tower/hyper HTTP transport (generic plumbing, covered by the
 /// integration tests) and the auth/idempotency layers — everything Graphus-specific about a REST
 /// request (statement binding, the engine tx lifecycle, result serialization in `accept`'s wire
 /// format, and RFC 9457 problem mapping on error) runs verbatim. It needs no `Send`/async, so the
 /// single-threaded deterministic engine (rmp #160) drives it reproducibly.
+///
+/// It mirrors the production router's gating (rmp #527): a **single-statement READ** runs through the
+/// engine's own auto-commit ([`RestEngine::run_autocommit`], buffered — this synchronous core never
+/// streams), so the commit-at-retirement read path gets deterministic DST coverage (under the
+/// `LocalEngine` the reader dispatch is inline, so `run_autocommit` stays bit-deterministic).
+/// Everything else — multi-statement, the empty batch, or a single-statement WRITE — keeps the
+/// begin + run… + commit decomposition, matching the router.
 ///
 /// `mode` is the transaction access mode; on a begin error a problem+json response is returned.
 pub fn execute_autocommit<E: RestEngine>(
@@ -1238,6 +1348,38 @@ pub fn execute_autocommit<E: RestEngine>(
     accept: Wire,
     statements: &[Statement],
 ) -> CachedResponse {
+    // `serializable_built`/`buffer_autocommit` re-derive the wire format from the `Accept` header, so
+    // synthesise one carrying the requested format.
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(accept.content_type()) {
+        headers.insert(ACCEPT, v);
+    }
+
+    // rmp #527: a single-statement READ runs through the engine auto-commit path (same gating as the
+    // async router), giving the commit-at-retirement read path deterministic simulator coverage.
+    if statements.len() == 1 && mode == AccessMode::Read {
+        let stmt = &statements[0];
+        let params = match bind_parameters(stmt) {
+            Ok(p) => p,
+            Err(e) => return Built::problem(Problem::from_codec_error(&e)).cached(),
+        };
+        let built = match state.engine.run_autocommit(
+            db,
+            mode,
+            TxOrigin {
+                principal,
+                explicit: false,
+            },
+            &stmt.statement,
+            params,
+        ) {
+            Ok(stream) => buffer_autocommit(&headers, stream).unwrap_or_else(Built::problem),
+            Err(e) => Built::problem(Problem::from_graphus_error(&e)),
+        };
+        return built.cached();
+    }
+
+    // Multi-statement / empty / single-statement WRITE: the unchanged begin + run… + commit path.
     let handle = match state.engine.begin(
         db,
         mode,
@@ -1249,12 +1391,6 @@ pub fn execute_autocommit<E: RestEngine>(
         Ok(h) => h,
         Err(e) => return Built::problem(Problem::from_graphus_error(&e)).cached(),
     };
-    // `serializable_built` re-derives the wire format from the `Accept` header, so synthesise one
-    // carrying the requested format.
-    let mut headers = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str(accept.content_type()) {
-        headers.insert(ACCEPT, v);
-    }
     run_statements_buffered(
         state,
         &headers,
@@ -1276,6 +1412,14 @@ fn run_one<E: RestEngine>(
 ) -> Result<StatementResult, GraphusError> {
     let params = bind_parameters(stmt).map_err(|e| GraphusError::Runtime(e.to_string()))?;
     let mut stream = state.engine.run(handle, &stmt.statement, params)?;
+    serialize_stream(&mut stream)
+}
+
+/// Drains a [`ResultStream`] into a buffered [`StatementResult`] (fields + Jolt-encoded rows +
+/// summary). Shared by the handle-based buffered path ([`run_one`]) and the single-statement
+/// auto-commit buffered path ([`buffer_autocommit`], rmp #527). The summary is read AFTER the rows
+/// drain, so an engine auto-commit's committed side-effect counters are already published (`rmp` #512).
+fn serialize_stream<S: ResultStream>(stream: &mut S) -> Result<StatementResult, GraphusError> {
     let fields = stream.fields().to_vec();
     let mut data = Vec::new();
     while let Some(row) = stream.next_row()? {
@@ -1597,6 +1741,76 @@ fn produce_stream<E: RestEngine>(
         }
     }
     framing.success_tail(&summary, &finalise, &mut sink.buf);
+    let _ = sink.flush();
+    // `sink` drops here → the sender drops → the body sees EOF.
+}
+
+/// Streams a single-statement **engine auto-commit** result incrementally (rmp #527/#475) with bounded
+/// server memory. The engine owns finalisation (it commits at drain, and rolls back on a mid-stream
+/// error or a dropped receiver), so — unlike [`stream_single_statement`] — no transaction handle is
+/// threaded and no commit/rollback is issued here. The NDJSON/JSON framing is identical to the handle
+/// path, so a streamed body stays byte-for-byte equal to the buffered one.
+fn stream_autocommit<S: ResultStream + Send + 'static>(framing: Framing, stream: S) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_CAP);
+    // Drain the synchronous `ResultStream` OFF the runtime (`next_row` blocks the engine egress, which
+    // `04 §9.1` forbids on a runtime worker). Bound to the body's lifetime: if the client drops the
+    // body, the receiver drops; dropping `stream` drops the engine egress receiver, and the engine
+    // rolls back the auto-commit — no orphan task, no leaked transaction.
+    tokio::task::spawn_blocking(move || {
+        produce_stream_autocommit(framing, stream, ChunkSink::new(tx));
+    });
+    streaming_response(
+        framing.content_type(),
+        Body::from_stream(ChannelBody { rx }),
+    )
+}
+
+/// The engine-auto-commit streamed-egress producer (rmp #527), the analogue of [`produce_stream`] for a
+/// stream the **engine** finalises. Drains `stream` row by row into `sink`:
+///
+/// - **clean drain** → the engine has already committed and filled the summary sink (`rmp` #512); emit
+///   the trailing summary/closing bytes (the closed-transaction `Finalise::Commit` tail);
+/// - **error mid-stream** (a runtime error, or a commit-time serialization abort surfaced as the
+///   stream's terminal item — rmp #238) → the engine has already rolled back; surface it in-band
+///   (NDJSON problem line / JSON transport-abort), the post-`200` `06 §3.3` case;
+/// - **client disconnect** (a send fails) → dropping `stream` drops the engine egress receiver, so the
+///   engine rolls back the auto-commit; just stop (no leak).
+///
+/// It issues NO commit/rollback itself — that is the engine's job on the auto-commit path.
+fn produce_stream_autocommit<S: ResultStream>(
+    framing: Framing,
+    mut stream: S,
+    mut sink: ChunkSink,
+) {
+    framing.prefix(stream.fields(), &mut sink.buf);
+    let mut first = true;
+    loop {
+        match stream.next_row() {
+            Ok(Some(row)) => {
+                framing.row(&row, first, &mut sink.buf);
+                first = false;
+                drop(row); // free the row before pulling the next — the memory-bounding step
+                if sink.maybe_flush().is_err() {
+                    // Client dropped the body mid-stream: dropping `stream` drops the engine egress
+                    // receiver, so the engine rolls back the auto-commit (no separate rollback, no leak).
+                    drop(stream);
+                    return;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // A runtime error, or a commit-time SSI abort surfaced as the terminal item (rmp #238):
+                // the engine has already rolled back. Surface it in-band (`06 §3.3`) and stop.
+                emit_terminal_error(framing, &mut sink, &Problem::from_graphus_error(&e));
+                return;
+            }
+        }
+    }
+
+    // Clean drain: the engine has already committed and published the summary sink (`rmp` #512). Emit
+    // the trailing summary/closing bytes with the closed-transaction (`Finalise::Commit`) framing.
+    let summary = encode_summary(&stream.summary());
+    framing.success_tail(&summary, &Finalise::Commit, &mut sink.buf);
     let _ = sink.flush();
     // `sink` drops here → the sender drops → the body sees EOF.
 }

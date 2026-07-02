@@ -115,6 +115,26 @@ impl RestEngine for GenEngine {
         })
     }
 
+    fn run_autocommit(
+        &self,
+        _db: &str,
+        _mode: AccessMode,
+        _origin: TxOrigin<'_>,
+        query: &str,
+        _params: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError> {
+        // rmp #527: the single-statement auto-commit fast path — yields the SAME lazy stream as `run`,
+        // so the router-buffering probe still attributes any RSS growth to the router, not the engine.
+        Ok(GenStream {
+            fields: vec!["n".to_owned()],
+            remaining: Self::parse_gen(query).unwrap_or(0),
+            summary: RunSummary {
+                query_type: Some("r".to_owned()),
+                stats: Vec::new(),
+            },
+        })
+    }
+
     fn commit(&self, _tx: TxHandle) -> Result<RunSummary, GraphusError> {
         Ok(RunSummary::default())
     }

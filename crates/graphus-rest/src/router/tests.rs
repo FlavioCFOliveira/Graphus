@@ -552,6 +552,10 @@ async fn idle_transaction_is_reaped_by_the_inactivity_sweep() {
     );
 }
 
+/// A single-statement auto-commit WRITE runs and commits. rmp #527 deliberately keeps single-statement
+/// WRITES on the explicit `begin` + `run` + `commit` path (only single-statement READS take the engine
+/// auto-commit fast path — see [`auto_commit_single_read_returns_rows_and_summary`]), so a write must
+/// NOT use `run_autocommit`; the durability-on-disconnect behaviour is therefore unchanged for writes.
 #[tokio::test]
 async fn auto_commit_shortcut_runs_and_commits() {
     let engine = MockEngine::new().on_query(
@@ -575,9 +579,124 @@ async fn auto_commit_shortcut_runs_and_commits() {
     assert!(run.get("id").is_none() || run["id"].is_null());
     assert_eq!(h.registry.open_count(), 0);
 
+    // A WRITE uses the explicit begin + run + commit path (NOT the read-only auto-commit fast path).
     let log = h.engine.log();
     assert!(log.iter().any(|l| l.starts_with("begin")));
     assert!(log.iter().any(|l| l.starts_with("commit")));
+    assert!(
+        !log.iter().any(|l| l.starts_with("run_autocommit")),
+        "a single-statement WRITE must stay on the explicit path (rmp #527): {log:?}"
+    );
+}
+
+/// rmp #527: a single-statement auto-commit READ returns its rows and summary correctly through the
+/// engine auto-commit path (the read is what the off-thread reader pool serves). Buffered here (CBOR is
+/// not exercised; this asserts the JSON stream body decodes to the right rows + summary).
+#[tokio::test]
+async fn auto_commit_single_read_returns_rows_and_summary() {
+    let engine = MockEngine::new().on_query(
+        "MATCH (n) RETURN n.age AS age",
+        Canned::rows(
+            &["age"],
+            vec![vec![Value::Integer(30)], vec![Value::Integer(40)]],
+        ),
+    );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({
+                "access_mode": "READ",
+                "statements": [{ "statement": "MATCH (n) RETURN n.age AS age" }],
+            }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let run = body_json(resp).await;
+    assert_eq!(run["results"][0]["fields"][0], "age");
+    assert_eq!(run["results"][0]["data"][0][0], json!({ "Z": "30" }));
+    assert_eq!(run["results"][0]["data"][1][0], json!({ "Z": "40" }));
+    // The result summary (rmp #512/#509) is present and carries the query type.
+    assert_eq!(run["results"][0]["summary"]["type"], "r");
+    assert_eq!(h.registry.open_count(), 0);
+    // Ran as a READ auto-commit — the mode the reader-pool gate keys on.
+    let log = h.engine.log();
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("run_autocommit") && l.contains("mode=Read"))
+    );
+}
+
+/// rmp #527 / `06 §4`: a single-statement auto-commit READ still rejects a write statement, surfaced as
+/// the same `409 Conflict` problem+json the explicit READ transaction produces — the engine enforces it
+/// on the auto-commit path identically.
+#[tokio::test]
+async fn auto_commit_single_read_rejects_write_statement() {
+    let h = Harness::new();
+    let token = h.token("alice"); // alice may write; the READ auto-commit still rejects the statement.
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({
+                "access_mode": "READ",
+                "statements": [{ "statement": "CREATE (n)" }],
+            }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT); // transaction error → 409
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+    let problem = body_json(resp).await;
+    assert!(problem["detail"].as_str().unwrap().contains("read-only"));
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+/// rmp #527: a MULTI-statement auto-commit still shares ONE explicit transaction (unchanged path) —
+/// the seam sees `begin` → `run` → `run` → `commit`, never `run_autocommit`. Both statements' results
+/// are returned in one buffered envelope.
+#[tokio::test]
+async fn auto_commit_multi_statement_shares_one_transaction_unchanged() {
+    let engine = MockEngine::new()
+        .on_query(
+            "RETURN 1 AS a",
+            Canned::rows(&["a"], vec![vec![Value::Integer(1)]]),
+        )
+        .on_query(
+            "RETURN 2 AS b",
+            Canned::rows(&["b"], vec![vec![Value::Integer(2)]]),
+        );
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({ "statements": [
+                { "statement": "RETURN 1 AS a" },
+                { "statement": "RETURN 2 AS b" },
+            ] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let run = body_json(resp).await;
+    assert_eq!(run["results"][0]["data"][0][0], json!({ "Z": "1" }));
+    assert_eq!(run["results"][1]["data"][0][0], json!({ "Z": "2" }));
+    assert_eq!(h.registry.open_count(), 0);
+
+    // The multi-statement batch used the unchanged begin + run… + commit path (one shared tx).
+    let log = h.engine.log();
+    assert!(
+        !log.iter().any(|l| l.starts_with("run_autocommit")),
+        "multi-statement must NOT use the auto-commit fast path: {log:?}"
+    );
+    assert_eq!(log.iter().filter(|l| l.starts_with("begin")).count(), 1);
+    assert_eq!(log.iter().filter(|l| l.starts_with("run(")).count(), 2);
+    assert_eq!(log.iter().filter(|l| l.starts_with("commit")).count(), 1);
 }
 
 // =============================== inactivity auto-rollback =======================================
@@ -1061,11 +1180,16 @@ async fn streamed_json_autocommit_is_byte_identical_to_buffered() {
     let doc: Json = serde_json::from_slice(&streamed).unwrap();
     assert_eq!(doc["results"][0]["data"].as_array().unwrap().len(), 2);
 
-    // COMMIT-AFTER-DRAIN: the commit was issued by the producer only after the result fully streamed,
-    // so by the time the body is collected the engine has seen begin → run → commit (in that order).
+    // This request carries no `access_mode`, so it is a WRITE auto-commit — rmp #527 keeps writes on
+    // the explicit path. COMMIT-AFTER-DRAIN: the commit is issued by the producer only after the result
+    // fully streams, so by the time the body is collected the engine has seen begin → run → commit.
     let log = h.engine.log();
     let pos = |p: &str| log.iter().position(|l| l.starts_with(p));
     assert!(pos("begin") < pos("run") && pos("run") < pos("commit"));
+    assert!(
+        !log.iter().any(|l| l.starts_with("run_autocommit")),
+        "a WRITE auto-commit must not use the read-only auto-commit fast path (rmp #527): {log:?}"
+    );
 }
 
 /// BYTE-IDENTITY (`run_in_tx` / `Finalise::KeepOpen`): a single-statement JSON `run` inside an open
@@ -1171,7 +1295,8 @@ async fn idempotency_keyed_json_commit_is_buffered_and_cached() {
         "keyed commit must replay the exact first body"
     );
 
-    // Exactly one begin and one commit reached the engine — the replay did NOT re-execute.
+    // This is a WRITE commit (rmp #527 keeps writes on the explicit path). Exactly one begin and one
+    // commit reached the engine — the replay did NOT re-execute.
     let log = h.engine.log();
     assert_eq!(log.iter().filter(|l| l.starts_with("begin")).count(), 1);
     assert_eq!(log.iter().filter(|l| l.starts_with("commit")).count(), 1);

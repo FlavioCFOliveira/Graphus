@@ -135,6 +135,39 @@ impl RestEngine for MockEngine {
         })
     }
 
+    fn run_autocommit(
+        &self,
+        _db: &str,
+        mode: AccessMode,
+        _origin: TxOrigin<'_>,
+        query: &str,
+        _params: Vec<(String, Value)>,
+    ) -> Result<Self::Stream, GraphusError> {
+        // rmp #527: the single-statement auto-commit fast path — mirrors `run` (echoes `ran:{query}` so
+        // an idempotency-replay leak stays observable in the body), including the READ-rejects-write rule.
+        if mode == AccessMode::Read && Self::is_write(query) {
+            return Err(GraphusError::Transaction(
+                "writing in read-only transaction is not allowed".to_owned(),
+            ));
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .log
+            .push(format!("run_autocommit(q={query})"));
+        Ok(MockStream {
+            fields: vec!["x".to_owned()],
+            rows: vec![vec![RestValue::Value(Value::String(format!(
+                "ran:{query}"
+            )))]]
+            .into_iter(),
+            summary: RunSummary {
+                query_type: Some("r".to_owned()),
+                stats: Vec::new(),
+            },
+        })
+    }
+
     fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError> {
         self.inner
             .lock()
@@ -633,6 +666,20 @@ async fn sec5_storage_error_detail_is_redacted_from_client() {
             _q: &str,
             _p: Vec<(String, Value)>,
         ) -> Result<Self::Stream, GraphusError> {
+            Err(GraphusError::Storage(
+                "page fault at /var/lib/graphus/data/store.0001 offset 0xDEADBEEF".to_owned(),
+            ))
+        }
+        fn run_autocommit(
+            &self,
+            _db: &str,
+            _mode: AccessMode,
+            _o: TxOrigin<'_>,
+            _q: &str,
+            _p: Vec<(String, Value)>,
+        ) -> Result<Self::Stream, GraphusError> {
+            // rmp #527: the single-statement auto-commit path must surface the SAME storage error so the
+            // detail-redaction guard still exercises the 5xx path.
             Err(GraphusError::Storage(
                 "page fault at /var/lib/graphus/data/store.0001 offset 0xDEADBEEF".to_owned(),
             ))
