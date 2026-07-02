@@ -88,6 +88,46 @@ fn run(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> (bool, Option<i64
     }
 }
 
+/// Runs a read aggregate inside an **explicit** transaction (`auto_commit = false`), so it executes
+/// **inline on the engine thread** — explicit-transaction reads are never dispatched off-thread
+/// (`rmp` task #543 widened off-thread dispatch to *auto-commit* structurally-read-only statements
+/// only). Used as the morsel-suppression control: the engine thread holds no reader-pool guard, so the
+/// morsel tier engages, proving the path is reachable for this shape. (After #543 a Write-mode
+/// *auto-commit* read is no longer a valid engine-thread control — it too runs off-thread.)
+fn run_explicit_read(handle: &EngineHandle, stmt: &str) -> (bool, Option<i64>) {
+    let Ok(ticket) = handle.begin_blocking(AccessMode::Read) else {
+        return (false, None);
+    };
+    let mut first: Option<i64> = None;
+    let stream_ok = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None) {
+        Ok(mut reply) => loop {
+            match reply.rows.next() {
+                Ok(Some(cells)) => {
+                    if first.is_none() {
+                        if let Some(graphus_cypher::MaterializedValue::Value(Value::Integer(n))) =
+                            cells.first()
+                        {
+                            first = Some(*n);
+                        }
+                    }
+                }
+                Ok(None) => break true,
+                Err(_) => break false,
+            }
+        },
+        Err(_) => false,
+    };
+    if stream_ok {
+        match handle.commit_blocking(ticket) {
+            Ok(_) => (true, first),
+            Err(_) => (false, first),
+        }
+    } else {
+        let _ = handle.rollback_blocking(ticket);
+        (false, first)
+    }
+}
+
 /// Preloads `n` `:Person {age}` nodes in batches (one auto-commit statement per batch via `UNWIND`),
 /// returning the expected `sum(age)`.
 fn preload_people(handle: &EngineHandle, n: i64) -> i64 {
@@ -111,6 +151,87 @@ fn preload_people(handle: &EngineHandle, n: i64) -> i64 {
     expected_sum
 }
 
+/// Serializes the two tests that mutate the **process-global** morsel knobs (`set_morsel_threads` /
+/// `set_morsel_min_rows`) and read the **process-global** `morsel_fanout_count()`. They share one test
+/// binary, so cargo runs them on parallel threads by default; without this lock their deltas + knob
+/// resets would interleave and make both flaky. Each test measures its counter delta inside the lock.
+static MORSEL_GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `rmp` task #543 (regression, deterministic): a structurally read-only **auto-commit** statement is
+/// dispatched to the off-thread reader pool **regardless of the client-declared access mode** — in
+/// particular when the mode defaults to `Write` (a bare `MATCH` arrives without a read/routing hint).
+/// Before #543 the off-thread gate keyed on `AccessMode::Read`, so a default-`Write` read stayed pinned
+/// to the single engine thread (the measured ~1-core read ceiling). The fix keys the gate on the
+/// **structural** query type (`QueryType::Read`) instead.
+///
+/// We assert dispatch **deterministically** via the same morsel-suppression oracle the sibling test
+/// uses (`#377`): an off-thread read runs under a `ReaderPoolWorkerGuard`, so its morsel tier is
+/// suppressed (fan-out count does NOT advance); an inline engine-thread read of the same shape DOES
+/// advance it. So "counter unchanged for a `Write`-mode auto-commit read" ⇒ "it ran on the reader pool".
+#[test]
+fn write_mode_autocommit_read_dispatches_off_thread() {
+    use graphus_cypher::morsel::{morsel_fanout_count, set_morsel_min_rows, set_morsel_threads};
+
+    let _serial = MORSEL_GLOBALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Enable the morsel tier and open its cardinality gate so it WOULD engage on this aggregate shape.
+    set_morsel_threads(4);
+    set_morsel_min_rows(0);
+
+    let people: i64 = 5_000;
+    let eng = engine(4);
+    let handle = eng.handle.clone();
+    let expected = preload_people(&handle, people);
+
+    // SANITY control: the identical aggregate inline on the engine thread (explicit txn) DOES engage the
+    // morsel tier — so the `Write`-mode zero below is dispatch off-thread, not a morsel decline.
+    let before_inline = morsel_fanout_count();
+    let (ok, got) = run_explicit_read(&handle, "MATCH (n:Person) RETURN sum(n.age)");
+    assert!(
+        ok && got == Some(expected),
+        "inline control aggregate is exact"
+    );
+    assert!(
+        morsel_fanout_count() > before_inline,
+        "inline (explicit-txn) read engages the morsel tier — the oracle is armed"
+    );
+
+    // SUBJECT (#543): a **Write**-mode AUTO-COMMIT read of the identical shape. Post-#543 it dispatches
+    // off-thread, so morsel suppression holds and the fan-out counter must NOT advance.
+    let before_write = morsel_fanout_count();
+    let (ok, got) = run(
+        &handle,
+        AccessMode::Write,
+        "MATCH (n:Person) RETURN sum(n.age)",
+    );
+    assert!(ok, "Write-mode auto-commit read commits");
+    assert_eq!(
+        got,
+        Some(expected),
+        "off-thread aggregate is exact (serial-equivalent)"
+    );
+    assert_eq!(
+        morsel_fanout_count(),
+        before_write,
+        "rmp #543: a default-Write-mode auto-commit read MUST dispatch off-thread (morsel suppressed) — \
+         not run inline on the engine thread"
+    );
+
+    // Restore the process-global knobs so sibling tests see the defaults.
+    set_morsel_min_rows(u64::MAX);
+    set_morsel_threads(1);
+
+    let Engine {
+        handle: inner,
+        join,
+    } = eng;
+    drop(handle);
+    drop(inner);
+    join.join().expect("engine joins");
+}
+
 /// `rmp` task #377 (deterministic correctness gate, not a measurement): the reader-pool morsel
 /// suppression — `K` concurrent large reads dispatched to the reader pool engage the morsel tier **zero**
 /// times (no pool-on-pool oversubscription), while the identical aggregate on the engine thread *does*
@@ -124,6 +245,10 @@ fn preload_people(handle: &EngineHandle, n: i64) -> i64 {
 #[test]
 fn reader_pool_suppresses_morsel_no_oversubscription() {
     use graphus_cypher::morsel::{morsel_fanout_count, set_morsel_min_rows, set_morsel_threads};
+
+    let _serial = MORSEL_GLOBALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Enable the morsel tier and open its cardinality gate (min-rows = 0) so it WOULD engage on any
     // aggregate shape — the suppression, not a too-small input, must be what keeps it off the reader path.
@@ -139,17 +264,14 @@ fn reader_pool_suppresses_morsel_no_oversubscription() {
     let handle = eng.handle.clone();
     let expected = preload_people(&handle, people);
 
-    // CONTROL: the identical aggregate on the ENGINE thread (Write-mode auto-commit is not dispatched to
-    // the reader pool — it runs inline on the engine thread, which holds no reader-pool guard). With the
-    // gate open it MUST engage the morsel tier, so the fan-out counter advances. This proves the morsel
-    // path is genuinely reachable for this shape/corpus — so a zero count on the reader path below is the
-    // suppression at work, not an unrelated decline.
+    // CONTROL: the identical aggregate on the ENGINE thread. It runs inside an EXPLICIT transaction
+    // (`run_explicit_read`), which is never dispatched off-thread (`rmp` #543 routes only *auto-commit*
+    // structurally-read-only reads to the pool), so it executes inline on the engine thread, which holds
+    // no reader-pool guard. With the gate open it MUST engage the morsel tier, so the fan-out counter
+    // advances. This proves the morsel path is genuinely reachable for this shape/corpus — so a zero
+    // count on the reader path below is the suppression at work, not an unrelated decline.
     let before_control = morsel_fanout_count();
-    let (ok, got) = run(
-        &handle,
-        AccessMode::Write,
-        "MATCH (n:Person) RETURN sum(n.age)",
-    );
+    let (ok, got) = run_explicit_read(&handle, "MATCH (n:Person) RETURN sum(n.age)");
     assert!(ok, "engine-thread aggregate commits");
     assert_eq!(got, Some(expected), "engine-thread aggregate is exact");
     assert!(

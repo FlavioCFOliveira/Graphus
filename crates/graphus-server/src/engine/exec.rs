@@ -336,25 +336,62 @@ pub(super) fn handle_run<
     // The Bolt/REST result-summary query type (`rmp` task #512): classified structurally from the plan
     // (`r` / `w` / `rw`). Computed here — before the plan is moved into either dispatch path — so it is
     // available to the inline statement's summary regardless of the suspend/resume path. The off-thread
-    // reader path is always read-only (`"r"`), set in `read_pool::run_read_task`.
-    let query_type = query_type_code(plan.query_type());
+    // reader path is always read-only (`"r"`), set in `read_pool::run_read_task`. The enum is also the
+    // authoritative **structural** read-only signal for off-thread dispatch (`rmp` task #543).
+    let plan_query_type = plan.query_type();
+    let query_type = query_type_code(plan_query_type);
+
+    // Snapshot-Isolation demotion for a standalone read (`rmp` task #545): a read-only **auto-commit**
+    // statement is not a serializable transaction — it is a MySQL / MariaDB / SQL-Server style SI
+    // snapshot read. Demote it BEFORE it runs (and before either dispatch path), so its SIREAD markers
+    // are dropped unmerged and its commit skips `detect_pivot_abort`: a read takes no serializability
+    // overhead and can never cause a writer to abort. Applied uniformly to the off-thread and inline
+    // paths, so the isolation is identical however the read is dispatched. Writes and explicit
+    // (`BEGIN … COMMIT`) transactions are untouched — they keep full Serializable SSI. The transaction
+    // keeps its snapshot reservation (GC-watermark pin), so the read still sees a consistent MVCC
+    // snapshot with no premature reclamation.
+    if auto_commit && plan_query_type == graphus_cypher::QueryType::Read {
+        coordinator.demote_read_to_snapshot(txn);
+    }
 
     // The egress channel: bounded for backpressure (`04 §9.3`), or unbounded for the inline
     // single-threaded driver (`super::stream::UNBOUNDED`, used by `super::LocalEngine`).
     let (row_tx, row_rx) = super::stream::egress(result_buffer_capacity);
 
-    // Off-thread read dispatch (`rmp` task #336, Slice 3b-ii): a **read-only auto-commit** statement is
-    // a candidate to run on a reader thread concurrently with this engine thread. We capture the owned
-    // `Send` read inputs **here on the engine thread** (so the reader never touches the live store's
-    // `Rc`/`RefCell` state), package a `ReadTask`, and submit it to the reader pool. The reader streams
-    // its rows and retires via the command channel — the engine then merges its SIREAD buffer (M1) and
-    // auto-commits. `begin` (TxnId mint + `ssi.register` + `active.insert`) already ran on this thread
-    // (the seam opened the auto-commit txn before this `Run`), so the reader's txn is in the conflict
-    // graph + active set *before* dispatch — the no-lost-edge + GC-watermark invariants.
+    // Off-thread read dispatch (`rmp` task #336, Slice 3b-ii; widened by `rmp` task #543): a
+    // **structurally read-only auto-commit** statement is a candidate to run on a reader thread
+    // concurrently with this engine thread. We capture the owned `Send` read inputs **here on the engine
+    // thread** (so the reader never touches the live store's `Rc`/`RefCell` state), package a `ReadTask`,
+    // and submit it to the reader pool. The reader streams its rows and retires via the command channel —
+    // the engine then merges its SIREAD buffer (M1) and auto-commits. `begin` (TxnId mint +
+    // `ssi.register` + `active.insert`) already ran on this thread (the seam opened the auto-commit txn
+    // before this `Run`), so the reader's txn is in the conflict graph + active set *before* dispatch —
+    // the no-lost-edge + GC-watermark invariants.
     //
-    // Only auto-commit Reads dispatch off-thread in this slice (explicit `BEGIN…MATCH…COMMIT` reads
-    // stay inline). A non-threaded dispatcher (DST `LocalEngine`) or a full reader queue falls through
-    // to the inline path below — always correct, just serial.
+    // Eligibility (`rmp` task #543): the gate keys on the **structural** query type (`plan_query_type ==
+    // QueryType::Read`, i.e. no write operator anywhere in the plan) — NOT the client-declared Bolt/REST
+    // access mode. The declared mode defaults to Write (a bare `MATCH` sent without a read/routing hint
+    // arrives as `AccessMode::Write`), so keying on it left the overwhelmingly common read — a plain
+    // auto-commit `MATCH` — pinned to the single engine thread (the measured ~1-core read ceiling). A
+    // structurally read-only graph read runs identically off-thread: `ReadOnlyGraph` implements the full
+    // `GraphAccess` trait, degrades any (impossible-for-a-read-plan) write attempt to a captured error +
+    // rollback, and gracefully degrades a *declined* accelerator seam (index / full-text / spatial /
+    // columnar) to a correct full scan — so routing it to a reader is fail-safe. Writes still run inline;
+    // a write submitted in a declared READ transaction is already rejected above (`plan_writes`).
+    //
+    // Exception (`rmp` task #543): a plan that CALLS A PROCEDURE stays inline (`plan_calls_procedure`).
+    // A procedure can reach a derived-accelerator seam that has **no scan fallback** — e.g.
+    // `db.index.fulltext.queryNodes` needs the full-text index, which lives on the coordinator and
+    // declines on the reader's owned read view, surfacing as a hard "no such index" error rather than a
+    // slower-but-correct scan. Such procedures keep their full coordinator access on the engine thread
+    // (exactly how they ran under the default Write mode before #543). Re-enabling off-thread execution
+    // for reader-safe procedures (GDS, `db.*` introspection) + capturing full-text/spatial state in the
+    // read view is the documented follow-up (`rmp` task #546).
+    //
+    // Only **auto-commit** reads dispatch off-thread (explicit `BEGIN…MATCH…COMMIT` reads stay inline —
+    // they carry ongoing transaction state on the engine thread). A non-threaded dispatcher (DST
+    // `LocalEngine`) or a full reader queue falls through to the inline path below — always correct,
+    // just serial.
     // Captured here so the queue-full fallback (below) can re-bind the locals the `ReadTask` consumes;
     // `Some(..)` only on the off-thread path, reduced back to the inline locals if submission fails.
     let mut plan = plan;
@@ -363,7 +400,11 @@ pub(super) fn handle_run<
     let mut row_rx = Some(row_rx);
     let mut reply = Some(reply);
     let mut privileges = privileges;
-    if mode == AccessMode::Read && auto_commit && dispatch.is_threaded() {
+    if plan_query_type == graphus_cypher::QueryType::Read
+        && !plan_calls_procedure(&plan)
+        && auto_commit
+        && dispatch.is_threaded()
+    {
         match coordinator.read_task_inputs(txn) {
             Ok(inputs) => {
                 let task = ReadTask {
@@ -1250,6 +1291,45 @@ fn counters_to_stats(counters: &graphus_cypher::QueryCounters) -> Vec<(String, V
 /// write plan's root (or a nested write op) is one of the mutating operators.
 fn plan_writes(plan: &graphus_cypher::PhysicalPlan) -> bool {
     op_writes(&plan.root)
+}
+
+/// Whether a physical plan contains a **procedure call** anywhere in its operator tree (`rmp` task
+/// #543). Such a plan is kept on the inline engine-thread path even when it is structurally read-only,
+/// because a procedure may reach a *derived accelerator* seam — full-text / spatial / columnar / the
+/// statistics catalogue — that lives on the coordinator (engine thread) and **declines** on the
+/// off-thread reader's owned read view ([`graphus_cypher::ReadOnlyGraph`], see its seam-decline note).
+/// A plain graph read (scan / expand / property lookup / aggregation) degrades a declined *accelerator*
+/// to a correct full scan, so it runs correctly off-thread; but a procedure like
+/// `db.index.fulltext.queryNodes` has **no scan fallback** — the declined full-text seam surfaces as a
+/// hard "no such index" error. Keeping procedure plans inline preserves their full coordinator access
+/// (exactly how they already ran when submitted in the default `Write` access mode before #543).
+fn plan_calls_procedure(plan: &graphus_cypher::PhysicalPlan) -> bool {
+    op_calls_procedure(&plan.root)
+}
+
+/// Recursively checks whether `op` (or any input) is a [`PhysicalOp::ProcedureCall`].
+fn op_calls_procedure(op: &graphus_cypher::PhysicalOp) -> bool {
+    use graphus_cypher::PhysicalOp as P;
+    match op {
+        P::ProcedureCall { .. } => true,
+        // Recurse through the single-input operators.
+        P::Filter { input, .. }
+        | P::Projection { input, .. }
+        | P::Skip { input, .. }
+        | P::Limit { input, .. }
+        | P::Sort { input, .. }
+        | P::TopN { input, .. }
+        | P::Optional { input, .. }
+        | P::Unwind { input, .. }
+        | P::Aggregation { input, .. } => op_calls_procedure(input),
+        // Binary operators.
+        P::NestedLoopJoin { left, right, .. }
+        | P::HashJoin { left, right, .. }
+        | P::Union { left, right, .. } => op_calls_procedure(left) || op_calls_procedure(right),
+        // Leaves (incl. non-recursive write ops, which never reach the off-thread gate) never call a
+        // procedure.
+        _ => false,
+    }
 }
 
 /// Recursively checks whether `op` (or any input) is a mutating operator.

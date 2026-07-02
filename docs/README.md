@@ -6,6 +6,7 @@ into the guide for the interface you need.
 | Guide | What it covers |
 | ----- | -------------- |
 | **[getting-started.md](getting-started.md)** | Install with Docker, default credentials, and a first authenticated query over each interface. |
+| **[transactions.md](transactions.md)** | The transaction model: autocommit by default (MySQL/MariaDB/SQL-Server semantics), explicit transactions, lock-free reads, and the per-work isolation levels (Snapshot for standalone reads, Serializable for writes and explicit transactions). |
 | **[rest-api.md](rest-api.md)** | The REST WebAPI: `POST /auth/login`, running queries and transactions, result and error shapes, health and metrics, with `curl` examples. |
 | **[bolt.md](bolt.md)** | The Bolt interfaces over TCP (Neo4j drivers) and UDS (local IPC): addresses, TLS, URI schemes, and authentication. |
 | **[security.md](security.md)** | Credentials, creating users, roles and privileges (RBAC), per-interface authentication, and multi-database scoping. |

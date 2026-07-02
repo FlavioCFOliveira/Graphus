@@ -2592,6 +2592,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns [`GraphusError::Transaction`] if `txn` is not an open transaction.
+    /// Demotes a standalone auto-commit read-only transaction to **Snapshot Isolation** (`rmp` task
+    /// #545): it stops participating in SSI serializability tracking — [`merge_read_buffer`] drops its
+    /// SIREAD markers unmerged and [`commit`](Self::commit) skips `detect_pivot_abort` (via
+    /// [`IsolationLevel::runs_ssi`] returning `false`) — so a read carries no serializability overhead
+    /// and can never cause a writer to abort. This is the MySQL / MariaDB / SQL-Server model: a
+    /// standalone read is an SI snapshot read, not a serializable transaction.
+    ///
+    /// The transaction KEEPS its active-set snapshot reservation, so it still pins the GC watermark
+    /// ([`oldest_active_snapshot`](Self::oldest_active_snapshot)) for the versions it reads (the InnoDB
+    /// read-view analogue) — reads remain lock-free and observe a consistent MVCC snapshot with no
+    /// premature reclamation (the #220 invariant).
+    ///
+    /// A no-op if `txn` is not open. The engine applies it ONLY to auto-commit read-only statements
+    /// (both the off-thread reader path and the inline fallback), so the isolation is identical however
+    /// the read is dispatched; explicit user transactions (`BEGIN … COMMIT`) and every write keep full
+    /// Serializable SSI.
+    pub fn demote_read_to_snapshot(&mut self, txn: TxnId) {
+        if let Some(active) = self.active.get_mut(&txn) {
+            active.isolation = IsolationLevel::Snapshot;
+            self.ssi.borrow_mut().mark_snapshot(txn);
+        }
+    }
+
     pub fn read_task_inputs(&self, txn: TxnId) -> Result<ReadTaskInputs<D, S>> {
         let snapshot = self.active.get(&txn).map(|a| a.snapshot).ok_or_else(|| {
             GraphusError::Transaction(format!("read dispatch for inactive txn {}", txn.0))

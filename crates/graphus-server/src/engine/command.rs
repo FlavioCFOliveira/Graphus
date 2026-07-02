@@ -8,8 +8,11 @@
 //! **bounded** channel. Each connection submits a command carrying its authenticated identity +
 //! access mode and a [`tokio::sync::oneshot`] reply sender, then awaits the reply.
 //!
-//! Reads serialize through the engine too in v1; lock-free concurrent reads against committed
-//! versions are the documented follow-up (`04 §9.1`).
+//! Writes serialize through the engine thread (the single-writer ACID path). **Reads do not:** a
+//! structurally read-only auto-commit statement is captured on the engine thread and then executed
+//! **off-thread** on the reader pool against a cloned MVCC read view, concurrently with the writer and
+//! with other readers (`rmp` tasks #336 + #543, `super::read_pool`). Reads take no locks and never
+//! block a writer (`graphus_txn` — `note_read` never touches the `LockTable`).
 
 use graphus_core::{GraphusError, Value};
 

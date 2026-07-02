@@ -194,6 +194,15 @@ pub struct SsiTracker {
     /// the eager counterpart of the commit-time [`detect_pivot_abort`](Self::detect_pivot_abort),
     /// which alone cannot catch a pivot whose two rw-edges form only after it commits (`rmp` audit F9).
     doomed: HashSet<TxnId>,
+    /// Transactions running at **Snapshot Isolation** whose SIREAD markers must NOT enter the conflict
+    /// graph (`rmp` task #545): a standalone auto-commit read-only statement is demoted to SI (MySQL /
+    /// MariaDB / SQL-Server semantics — a read participates in no serializability tracking), so
+    /// [`merge_read_buffer`](Self::merge_read_buffer) drops its buffer unmerged. Because the reader
+    /// contributes no `readers_of` entry, a concurrent writer's [`record_write`](Self::record_write)
+    /// never forms an rw-edge to it, so an SI read can never make a writer an SSI pivot — reads never
+    /// cause writer aborts. Populated by [`mark_snapshot`](Self::mark_snapshot); purged in
+    /// [`forget`](Self::forget) (the single termination site for abort + GC-prune).
+    snapshot_txns: HashSet<TxnId>,
 }
 
 /// A per-reader, append-only, thread-local SIREAD marker buffer (`rmp` #341).
@@ -305,6 +314,21 @@ impl SsiTracker {
             begin_ts,
             ..TxnConflict::default()
         });
+    }
+
+    /// Marks `txn` as a **Snapshot-Isolation** transaction (`rmp` task #545): its SIREAD markers are
+    /// dropped unmerged by [`merge_read_buffer`](Self::merge_read_buffer), so it contributes no rw-edge
+    /// and can never cause a writer to abort. Used for a standalone auto-commit read-only statement
+    /// demoted to MySQL-style SI. Idempotent; the mark is cleared when the transaction is
+    /// [`forget`](Self::forget)ten. Does not affect the write path (writers stay Serializable).
+    pub fn mark_snapshot(&mut self, txn: TxnId) {
+        self.snapshot_txns.insert(txn);
+    }
+
+    /// Whether `txn` was [`mark_snapshot`](Self::mark_snapshot)-demoted to Snapshot Isolation.
+    #[must_use]
+    pub fn is_snapshot(&self, txn: TxnId) -> bool {
+        self.snapshot_txns.contains(&txn)
     }
 
     /// Records a non-blocking SIREAD marker: `reader` read `key` (`04 §5.4`).
@@ -467,6 +491,14 @@ impl SsiTracker {
             mut keys,
             mut predicates,
         } = buf;
+        // Snapshot-Isolation reader (`rmp` task #545): a standalone auto-commit read-only statement
+        // demoted to SI contributes NO rw-edges — its markers are dropped unmerged, so no concurrent
+        // writer forms an edge to it and it can never be part of a dangerous structure. This is the
+        // single choke point every read (off-thread `TxnCoordinator::merge_read_buffer` and inline
+        // `ReadBufferGuard` flush) funnels through, so gating it here covers both dispatch paths.
+        if self.snapshot_txns.contains(&reader) {
+            return;
+        }
         keys.sort_unstable();
         keys.dedup();
         predicates.sort_unstable();
@@ -602,6 +634,10 @@ impl SsiTracker {
     /// Forgets `txn` entirely (aborted, or GC'd after no live snapshot can observe it).
     pub fn forget(&mut self, txn: TxnId) {
         self.doomed.remove(&txn);
+        // Clear any Snapshot-Isolation demotion mark (`rmp` task #545). `forget` is the single
+        // termination site (abort + GC-prune both funnel here), so this bounds `snapshot_txns` to the
+        // set of live-or-recently-committed transactions, exactly like `txns` itself.
+        self.snapshot_txns.remove(&txn);
         if let Some(t) = self.txns.remove(&txn) {
             for key in t.reads {
                 if let Some(set) = self.readers_of.get_mut(&key) {
@@ -1378,6 +1414,56 @@ mod tests {
         assert!(b.is_empty());
         s.merge_read_buffer(b);
         assert_eq!(before, graph_fingerprint(&s));
+    }
+
+    #[test]
+    fn snapshot_reader_merge_forms_no_edge_and_cannot_abort_a_writer() {
+        // `rmp` task #545: a standalone auto-commit read demoted to Snapshot Isolation contributes NO
+        // rw-edge. This is the mechanism by which an SI read never causes a writer to abort.
+
+        // BASELINE (serializable): the same scenario as `merge_read_buffer_case_i…` — a writer wrote key
+        // 100, then a reader that read 100 merges its buffer — DOES form the rw-OUT edge.
+        let mut serializable = SsiTracker::new();
+        serializable.register(TxnId(1), ts(1));
+        serializable.register(TxnId(2), ts(1));
+        serializable.record_write(TxnId(2), 100);
+        let mut b = SsiReadBuffer::new(TxnId(1));
+        b.record_read(100);
+        serializable.merge_read_buffer(b);
+        assert!(
+            serializable.txns.get(&TxnId(1)).unwrap().out_conflict,
+            "baseline: a serializable reader forms the rw-OUT edge against the concurrent writer"
+        );
+        assert!(serializable.txns.get(&TxnId(2)).unwrap().in_conflict);
+
+        // SUBJECT (Snapshot Isolation): mark the reader snapshot BEFORE merging — the merge is dropped.
+        let mut si = SsiTracker::new();
+        si.register(TxnId(1), ts(1));
+        si.register(TxnId(2), ts(1));
+        si.record_write(TxnId(2), 100);
+        si.mark_snapshot(TxnId(1));
+        assert!(si.is_snapshot(TxnId(1)));
+        let mut b = SsiReadBuffer::new(TxnId(1));
+        b.record_read(100);
+        si.merge_read_buffer(b); // dropped unmerged (rmp #545)
+
+        assert!(
+            !si.txns.get(&TxnId(1)).unwrap().out_conflict,
+            "an SI reader forms NO rw-OUT edge (its markers were dropped unmerged)"
+        );
+        assert!(
+            !si.txns.get(&TxnId(2)).unwrap().in_conflict,
+            "the writer gains NO rw-IN edge from an SI reader"
+        );
+        assert_eq!(
+            si.detect_pivot_abort(TxnId(2)),
+            None,
+            "an SI read can never make a concurrent writer an SSI pivot → reads never abort writers"
+        );
+
+        // `forget` (abort / GC-prune) clears the snapshot mark, so `snapshot_txns` stays bounded.
+        si.forget(TxnId(1));
+        assert!(!si.is_snapshot(TxnId(1)));
     }
 
     // --- `rmp` #361: reverse write-index (writers_of / predicate_writers_of) -----------------------
