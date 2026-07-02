@@ -233,9 +233,15 @@ fn content_type(resp: &Response<Body>) -> String {
 }
 
 fn auto_commit_req(token: &str, accept: &str, n: u64) -> Request<Body> {
-    let body =
-        serde_json::to_vec(&json!({ "statements": [ { "statement": format!("GEN:{n}") } ] }))
-            .unwrap();
+    // rmp #530: incremental streaming (bounded egress) is a READ path — single-statement WRITES now
+    // buffer (so a commit-time serialization conflict returns a clean 409 rather than dropping the body),
+    // and `GEN:<n>` is a pure generative READ. Marking it `READ` keeps the streaming probe exercising the
+    // streamed egress path it measures.
+    let body = serde_json::to_vec(&json!({
+        "access_mode": "READ",
+        "statements": [ { "statement": format!("GEN:{n}") } ],
+    }))
+    .unwrap();
     Request::builder()
         .method("POST")
         .uri("/db/neo4j/tx/commit")

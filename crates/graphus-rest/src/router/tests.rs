@@ -17,8 +17,8 @@ use serde_json::{Value as Json, json};
 use tower::ServiceExt;
 
 use graphus_auth::{AuthProvider, AuthThrottle, Authenticator, Privilege};
-use graphus_core::Value;
 use graphus_core::capability::Clock;
+use graphus_core::{GraphusError, Value};
 
 use crate::engine::{Row, RunSummary, mock::Canned, mock::MockEngine};
 use crate::protocol::{DEFAULT_LOGIN_TOKEN_TTL_SECS, LoginResponse};
@@ -699,6 +699,134 @@ async fn auto_commit_multi_statement_shares_one_transaction_unchanged() {
     assert_eq!(log.iter().filter(|l| l.starts_with("commit")).count(), 1);
 }
 
+/// rmp #530 REGRESSION GATE: a single-statement WRITE auto-commit whose COMMIT hits a retriable
+/// serialization conflict (`GraphusError::Transaction` — write-write first-updater-wins, or an SSI pivot
+/// abort) returns a clean `409 Conflict` problem+json with the **connection kept alive** — NOT a
+/// dropped/aborted body.
+///
+/// Before the fix a single-statement WRITE STREAMED: the router shipped the `200` status + rows BEFORE
+/// the producer committed, so a commit-time abort could only be signalled in-band — for JSON, an aborted
+/// document the client observes as a dropped connection (the concurrent-conflict repro: 16 ×
+/// `SET n.v = n.v + 1` on the same node → every connection dropped, zero retriable `4xx`). The fix
+/// BUFFERS a WRITE (run + commit fully, THEN build the response), so the abort maps to `409`.
+///
+/// The mock's `run` SUCCEEDS and its `commit` FAILS — the conflict surfaces at commit, exactly the case
+/// the old streaming path could not turn into a `409`. Collecting the full body is itself the assertion
+/// that the connection was kept alive: the streaming path would have yielded an `Err` body item (a
+/// transport abort) that `body_bytes` cannot collect.
+#[tokio::test]
+async fn auto_commit_single_write_commit_conflict_returns_409() {
+    const WRITE: &str = "MATCH (n:Hot {id:100}) SET n.v = n.v + 1";
+    let engine = MockEngine::new()
+        .on_query(WRITE, Canned::rows(&[], vec![]))
+        .fail_commit_with(GraphusError::Transaction(
+            "write-write conflict: first-updater-wins abort (retriable)".to_owned(),
+        ));
+    let h = Harness::with_engine(engine);
+    let token = h.token("alice"); // alice may write; the conflict is at COMMIT, not authz.
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({ "statements": [{ "statement": WRITE }] }),
+        ))
+        .await;
+
+    // A retriable `409` problem+json — the status is known BEFORE any byte ships (buffered), so it is a
+    // real HTTP status, not a mid-stream in-band signal.
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
+
+    // CONNECTION KEPT ALIVE: the body collects cleanly into a COMPLETE problem+json document. (The old
+    // streaming path aborted the body with an uncollectable `Err` item — `body_json` would panic.)
+    let problem = body_json(resp).await;
+    assert_eq!(problem["status"], 409);
+    assert_eq!(
+        problem["code"], "Neo.TransientError.Transaction.Terminated",
+        "the transaction-error code marks the failure retriable"
+    );
+
+    // SEAM TRACE: the WRITE took the buffered explicit path (begin → run → commit), NOT the read-only
+    // streaming auto-commit path. A failed COMMIT needs NO explicit rollback: the real engine spends the
+    // handle (removes it) and the coordinator self-aborts an SSI/first-updater conflict at commit
+    // (`seam_rest.rs` commit → `commit_prepare_tx`: "the coordinator already rolled it back"), so the
+    // buffered path surfaces the `409` directly — no partial commit, no leaked transaction.
+    let log = h.engine.log();
+    assert!(
+        !log.iter().any(|l| l.starts_with("run_autocommit")),
+        "a WRITE must not use the read-only auto-commit fast path: {log:?}"
+    );
+    assert_eq!(log.iter().filter(|l| l.starts_with("begin")).count(), 1);
+    assert_eq!(log.iter().filter(|l| l.starts_with("run(")).count(), 1);
+    assert_eq!(log.iter().filter(|l| l.starts_with("commit")).count(), 1);
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+/// rmp #530: a NON-conflicting single-statement WRITE auto-commit still returns `200 OK` with the SAME
+/// body — rows + the write result summary (side-effect counters, rmp #512/#509) — just BUFFERED rather
+/// than streamed. Buffering a single write's tiny result has no meaningful memory cost, and it is what
+/// lets a commit-time conflict become a `409` (see [`auto_commit_single_write_commit_conflict_returns_409`]).
+#[tokio::test]
+async fn auto_commit_single_write_buffered_returns_200_with_summary() {
+    const WRITE: &str = "CREATE (n:Person {name:'Ada'}) RETURN n.name AS name";
+    // A write result: one row, and a `w`-typed summary carrying the created-node counter.
+    let canned = Canned {
+        fields: vec!["name".to_owned()],
+        rows: vec![vec![RestValue::Value(Value::String("Ada".to_owned()))]],
+        summary: RunSummary {
+            query_type: Some("w".to_owned()),
+            stats: vec![
+                ("nodes-created".to_owned(), Value::Integer(1)),
+                ("properties-set".to_owned(), Value::Integer(1)),
+            ],
+        },
+    };
+    let h = Harness::with_engine(MockEngine::new().on_query(WRITE, canned));
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json(
+            "/db/neo4j/tx/commit",
+            &token,
+            json!({ "statements": [{ "statement": WRITE }] }),
+        ))
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // A WRITE buffers to the JSON envelope (NDJSON degrades to JSON when buffered — it is a streaming-
+    // only framing).
+    assert_eq!(content_type(&resp), "application/json");
+    let run = body_json(resp).await;
+
+    // The row is returned unchanged.
+    assert_eq!(run["results"][0]["fields"][0], "name");
+    assert_eq!(run["results"][0]["data"][0][0], json!({ "U": "Ada" }));
+    // The write summary (rmp #512/#509) is present and correct: type `w`, with the side-effect counters.
+    let summary = &run["results"][0]["summary"];
+    assert_eq!(summary["type"], "w");
+    assert_eq!(summary["stats"]["nodes-created"], 1);
+    assert_eq!(summary["stats"]["properties-set"], 1);
+    // Auto-commit closed the transaction — no open handle, and no `id` echoed.
+    assert!(run.get("id").is_none() || run["id"].is_null());
+    assert_eq!(h.registry.open_count(), 0);
+
+    // SEAM TRACE: the buffered explicit path (begin → run → commit), never the read-only auto-commit
+    // fast path.
+    let log = h.engine.log();
+    assert!(
+        !log.iter().any(|l| l.starts_with("run_autocommit")),
+        "a WRITE must not use the read-only auto-commit fast path: {log:?}"
+    );
+    assert_eq!(log.iter().filter(|l| l.starts_with("begin")).count(), 1);
+    assert_eq!(log.iter().filter(|l| l.starts_with("run(")).count(), 1);
+    assert_eq!(log.iter().filter(|l| l.starts_with("commit")).count(), 1);
+    assert!(
+        !log.iter().any(|l| l.starts_with("rollback")),
+        "a clean commit does not roll back: {log:?}"
+    );
+}
+
 // =============================== inactivity auto-rollback =======================================
 
 #[tokio::test]
@@ -1071,8 +1199,13 @@ async fn cbor_negotiation_round_trip() {
     );
 }
 
+/// rmp #530: NDJSON streaming is a **READ** path. A single-statement READ auto-commit still STREAMS its
+/// result incrementally (`fields` line + one `row` line per row + `summary` line, `application/x-ndjson`)
+/// — the framing and the seam trace are unchanged. (Writes no longer stream — rmp #530 buffers them so a
+/// commit-time serialization conflict can become a clean `409` rather than a dropped body; NDJSON
+/// streaming keeps a large READ result-set's egress memory bounded, rmp #475.)
 #[tokio::test]
-async fn ndjson_streaming_of_multiple_rows() {
+async fn ndjson_streaming_of_multiple_rows_is_a_read_path() {
     let engine = MockEngine::new().on_query(
         "UNWIND [1,2,3] AS n RETURN n",
         Canned::rows(
@@ -1094,9 +1227,10 @@ async fn ndjson_streaming_of_multiple_rows() {
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/x-ndjson")
         .body(Body::from(
-            serde_json::to_vec(
-                &json!({ "statements": [{ "statement": "UNWIND [1,2,3] AS n RETURN n" }] }),
-            )
+            serde_json::to_vec(&json!({
+                "access_mode": "READ",
+                "statements": [{ "statement": "UNWIND [1,2,3] AS n RETURN n" }],
+            }))
             .unwrap(),
         ))
         .unwrap();
@@ -1122,6 +1256,26 @@ async fn ndjson_streaming_of_multiple_rows() {
     }
     let summary: Json = serde_json::from_str(lines[4]).unwrap();
     assert!(summary.get("summary").is_some());
+
+    // SEAM TRACE (unchanged): a streamed READ takes the engine auto-commit fast path — exactly ONE
+    // `run_autocommit(mode=Read)`, no `begin`/`run(`/`commit` handle lifecycle.
+    let log = h.engine.log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.starts_with("run_autocommit"))
+            .count(),
+        1,
+        "a streamed READ uses the engine auto-commit path exactly once: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.contains("mode=Read")),
+        "the streamed auto-commit ran as a READ: {log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|l| l.starts_with("begin") || l.starts_with("commit")),
+        "a streamed READ never opens a handle transaction: {log:?}"
+    );
 }
 
 // =============================== incremental streaming (rmp #475) ==============================
@@ -1131,14 +1285,19 @@ async fn ndjson_streaming_of_multiple_rows() {
 // byte-for-byte equal to what the buffered serializer produced, so no driver/client sees any wire
 // difference. These tests pin that with the router itself as the oracle.
 
-/// BYTE-IDENTITY (auto-commit / `Finalise::Commit`): a JSON auto-commit with **no** `Idempotency-Key`
-/// now STREAMS; the **same** request WITH a key stays on the BUFFERED+cached path. The two bodies
-/// must be byte-for-byte identical. Exercises every cell class — a big int (int53 string form), a
-/// plain string, a structural node, and a null — so the streamed envelope is proven equal to the
-/// buffered `RunResponse` across the full encoding surface.
+/// BYTE-IDENTITY (READ auto-commit): a JSON **READ** auto-commit with **no** `Idempotency-Key` STREAMS;
+/// the **same** READ WITH a key stays on the BUFFERED+cached path. The two bodies must be byte-for-byte
+/// identical. Exercises every cell class — a big int (int53 string form), a plain string, a structural
+/// node, and a null — so the streamed envelope is proven equal to the buffered `RunResponse` across the
+/// full encoding surface.
+///
+/// rmp #530: streamed-vs-buffered byte-identity is now proven on the **READ** path. Single-statement
+/// WRITES no longer stream (they buffer so a commit-time serialization conflict becomes a clean `409`
+/// rather than a dropped body — see [`auto_commit_single_write_commit_conflict_returns_409`]), so the
+/// streaming byte-identity guarantee (rmp #475) lives where streaming still happens: reads.
 #[tokio::test]
-async fn streamed_json_autocommit_is_byte_identical_to_buffered() {
-    let query = "RETURN mix";
+async fn streamed_json_read_autocommit_is_byte_identical_to_buffered() {
+    let query = "MATCH (n) RETURN mix";
     let rows = vec![
         vec![
             RestValue::Value(Value::Integer((1_i64 << 53) + 1)),
@@ -1149,16 +1308,16 @@ async fn streamed_json_autocommit_is_byte_identical_to_buffered() {
     let engine = MockEngine::new().on_query(query, canned_structural(&["a", "b"], rows));
     let h = Harness::with_engine(engine);
     let token = h.token("alice");
-    let body = json!({ "statements": [{ "statement": query }] });
+    let body = json!({ "access_mode": "READ", "statements": [{ "statement": query }] });
 
-    // Streamed (no Idempotency-Key).
+    // Streamed (READ, no Idempotency-Key) — the engine auto-commit streaming read path.
     let streamed_resp = h
         .send(post_json("/db/neo4j/tx/commit", &token, body.clone()))
         .await;
     assert_eq!(content_type(&streamed_resp), "application/json");
     let streamed = body_bytes(streamed_resp).await;
 
-    // Buffered (an Idempotency-Key routes to the buffered, cacheable path — the prior behaviour).
+    // Buffered (READ + an Idempotency-Key routes to the buffered, cacheable auto-commit path).
     let buffered_req = Request::builder()
         .method("POST")
         .uri("/db/neo4j/tx/commit")
@@ -1172,7 +1331,7 @@ async fn streamed_json_autocommit_is_byte_identical_to_buffered() {
     assert_eq!(
         streamed,
         buffered,
-        "streamed JSON must be byte-identical to the buffered RunResponse:\n  streamed={}\n  buffered={}",
+        "streamed READ JSON must be byte-identical to the buffered RunResponse:\n  streamed={}\n  buffered={}",
         String::from_utf8_lossy(&streamed),
         String::from_utf8_lossy(&buffered),
     );
@@ -1180,15 +1339,20 @@ async fn streamed_json_autocommit_is_byte_identical_to_buffered() {
     let doc: Json = serde_json::from_slice(&streamed).unwrap();
     assert_eq!(doc["results"][0]["data"].as_array().unwrap().len(), 2);
 
-    // This request carries no `access_mode`, so it is a WRITE auto-commit — rmp #527 keeps writes on
-    // the explicit path. COMMIT-AFTER-DRAIN: the commit is issued by the producer only after the result
-    // fully streams, so by the time the body is collected the engine has seen begin → run → commit.
+    // Both requests are READ auto-commits — they take the engine auto-commit path (`run_autocommit`),
+    // never a `begin`/`run(`/`commit` handle lifecycle. Exactly two `run_autocommit` calls (streamed +
+    // buffered), no handle transaction.
     let log = h.engine.log();
-    let pos = |p: &str| log.iter().position(|l| l.starts_with(p));
-    assert!(pos("begin") < pos("run") && pos("run") < pos("commit"));
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.starts_with("run_autocommit"))
+            .count(),
+        2,
+        "each READ auto-commit runs through the engine auto-commit path: {log:?}"
+    );
     assert!(
-        !log.iter().any(|l| l.starts_with("run_autocommit")),
-        "a WRITE auto-commit must not use the read-only auto-commit fast path (rmp #527): {log:?}"
+        log.iter().all(|l| l.starts_with("run_autocommit")),
+        "a READ auto-commit never opens a handle transaction (no begin/run/commit): {log:?}"
     );
 }
 

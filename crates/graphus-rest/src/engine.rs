@@ -308,6 +308,10 @@ pub(crate) mod mock {
     pub struct MockEngine {
         results: HashMap<String, Canned>,
         errors: HashMap<String, GraphusError>,
+        /// If set, every `commit` fails with a reproduction of this error (rmp #530): scripts a
+        /// commit-time serialization conflict so the buffered auto-commit path can be proven to return
+        /// a clean `409` instead of dropping the response mid-stream.
+        commit_error: Option<GraphusError>,
         inner: Mutex<Inner>,
     }
 
@@ -336,6 +340,16 @@ pub(crate) mod mock {
         #[must_use]
         pub fn on_query_error(mut self, query: &str, err: GraphusError) -> Self {
             self.errors.insert(query.to_owned(), err);
+            self
+        }
+
+        /// Makes every `commit` fail with a reproduction of `err` (rmp #530): scripts a commit-time
+        /// serialization conflict (`run` succeeds, `commit` fails) so a test can prove the buffered
+        /// auto-commit path returns a retriable `409` problem+json with the connection kept alive,
+        /// rather than the streaming path's dropped/aborted body.
+        #[must_use]
+        pub fn fail_commit_with(mut self, err: GraphusError) -> Self {
+            self.commit_error = Some(err);
             self
         }
 
@@ -483,6 +497,13 @@ pub(crate) mod mock {
         fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError> {
             let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
             inner.log.push(format!("commit(tx={})", tx.0));
+            // rmp #530: a scripted commit-time serialization conflict — `run` already succeeded and
+            // `commit` aborts (retriable). The buffered auto-commit path surfaces this directly as a
+            // `409`; the real engine self-aborts such a conflict at commit (the coordinator rolls it back,
+            // so no explicit rollback follows), which the router relies on.
+            if let Some(err) = &self.commit_error {
+                return Err(clone_error(err));
+            }
             match inner.txns.get_mut(&tx.0) {
                 Some(state) => {
                     state.committed = true;

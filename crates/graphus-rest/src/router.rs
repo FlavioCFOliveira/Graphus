@@ -848,10 +848,22 @@ where
     }
 
     // Everything else — a multi-statement batch, the empty batch, or a single-statement WRITE — shares
-    // ONE explicit transaction, exactly as before (unchanged begin + run… + commit). This is the
-    // pre-#527 auto-commit path verbatim: a single-statement WRITE still STREAMS when NDJSON/keyless-JSON
-    // is negotiated (`stream_framing`), and — crucially — its `produce_stream` keeps the explicit
-    // `engine.rollback(handle)` on a client disconnect (no durability-on-disconnect change for writes).
+    // ONE explicit transaction (begin + run… + commit).
+    //
+    // rmp #530: a single-statement WRITE is now **BUFFERED, never streamed**. A WRITE's HTTP status
+    // depends on the COMMIT outcome, which is only known once the statement has run AND committed: a
+    // retriable serialization conflict (write-write first-updater-wins, or an SSI pivot abort — both
+    // `GraphusError::Transaction` → `409`) can surface at run OR at commit. The streaming path sends the
+    // `200` status + prefix BEFORE `produce_stream` commits, so a commit-time conflict can only be
+    // signalled in-band — for JSON, an aborted/incomplete document, which the client observes as a
+    // DROPPED connection rather than a retriable `409`. Buffering runs + commits FULLY first, so such a
+    // conflict becomes a clean `409` problem+json with the connection kept alive. Single-statement READS
+    // still STREAM (they were diverted to the engine-auto-commit fast path above): a read has no
+    // commit-time serialization conflict, and NDJSON/keyless-JSON streaming keeps a large read
+    // result-set's egress memory bounded (rmp #475). Hence the `mode == AccessMode::Read` gate on the
+    // streaming decision below — in this post-divert path it admits nothing (single-statement reads never
+    // reach here), so every request here BUFFERS; the gate documents the invariant and keeps streaming
+    // correct should the divert above ever change.
     let handle = match state.engine.begin(
         &db,
         mode,
@@ -863,7 +875,9 @@ where
         Ok(h) => h,
         Err(e) => return Built::from(Problem::from_graphus_error(&e)).into_response(),
     };
-    if let Some(framing) = stream_framing(wire, &req.statements, &headers) {
+    if mode == AccessMode::Read
+        && let Some(framing) = stream_framing(wire, &req.statements, &headers)
+    {
         return stream_single_statement(
             &state,
             framing,
@@ -1338,6 +1352,12 @@ fn run_statements_buffered<E: RestEngine>(
 /// `LocalEngine` the reader dispatch is inline, so `run_autocommit` stays bit-deterministic).
 /// Everything else — multi-statement, the empty batch, or a single-statement WRITE — keeps the
 /// begin + run… + commit decomposition, matching the router.
+///
+/// This synchronous core has **always** buffered single-statement WRITES (it never streams), so it is
+/// already consistent with the router's rmp #530 fix, which stopped the async `auto_commit` handler
+/// from streaming a WRITE: buffering runs + commits fully before building the response, so a
+/// run/commit-time serialization conflict (`GraphusError::Transaction`) becomes a clean `409`
+/// problem+json rather than a dropped mid-stream body.
 ///
 /// `mode` is the transaction access mode; on a begin error a problem+json response is returned.
 pub fn execute_autocommit<E: RestEngine>(

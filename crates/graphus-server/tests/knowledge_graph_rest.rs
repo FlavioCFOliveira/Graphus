@@ -471,7 +471,11 @@ async fn fast_profile_rest_discovery_matches_reference_with_ndjson_and_cbor() {
     );
 
     // ---- 4) NDJSON streaming — one JSON object per line, with the (fields, rows…, summary) frame -
+    // rmp #530: NDJSON streaming is a READ path (single-statement WRITES now buffer so a commit-time
+    // serialization conflict becomes a clean 409, not a dropped body). This MATCH is a read, so it runs
+    // as an explicit READ auto-commit and streams.
     let ndjson_body = serde_json::json!({
+        "access_mode": "READ",
         "statements": [{ "statement": "MATCH (d:Document) RETURN d.id AS id, d.year AS year" }]
     });
     let (st, bytes, ctype) = send(
