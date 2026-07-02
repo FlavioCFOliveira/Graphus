@@ -1373,6 +1373,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.wal.with(|w| w.flush());
     }
 
+    /// Group-commit **HARDEN — PREPARE half** of a *pipelined* commit (`rmp` #532): writes every
+    /// PREPAREd record to the WAL backing store (advancing its write frontier) and returns the
+    /// deferred [`FsyncJob`](graphus_wal::FsyncJob), WITHOUT `fdatasync`ing. The engine hands the job
+    /// to a dedicated fsync thread, overlaps the sync with preparing the next batch, then calls
+    /// [`complete_harden_wal`](Self::complete_harden_wal) with the job's `target_len` after the job
+    /// runs — the two-phase split of [`harden_wal`](Self::harden_wal).
+    ///
+    /// # WAL-before-data
+    /// Between this call and its paired `complete_harden_wal`, the WAL has `durable_len < written_len`.
+    /// The buffer pool shares **the same** [`WalManager`] via [`SharedWal`](crate::SharedWal) (the
+    /// pool's `WalRule` and this store are clones over one `Arc<Mutex<WalManager>>`), so an eviction's
+    /// `ensure_durable` during the overlap re-enters that manager under the same lock and hardens the
+    /// written-but-un-synced range inline — a home page is never written over an un-synced WAL record.
+    ///
+    /// # Panics
+    /// Panics (controlled abort, fsyncgate `04 §4.9`) if writing the records to the backing store
+    /// fails — an unrecoverable I/O error, exactly like a failed `fdatasync`.
+    pub fn begin_harden_wal(&mut self) -> graphus_wal::FsyncJob {
+        self.wal.with(|w| {
+            w.begin_harden().unwrap_or_else(|e| {
+                panic!(
+                    "WAL begin_harden write failed; aborting to avoid silent data loss (fsyncgate): {e}"
+                )
+            })
+        })
+    }
+
+    /// Group-commit **HARDEN — COMPLETE half** of a pipelined commit (`rmp` #532): advances the WAL
+    /// durable watermark to `target_len` (the `FsyncJob::target_len` of the job returned by
+    /// [`begin_harden_wal`](Self::begin_harden_wal)) after that job's `fdatasync` has run. Monotonic,
+    /// so it composes with an eviction's inline hardening during the overlap. Call **before**
+    /// acknowledging any committer whose record the job covered (ack-after-fsync).
+    pub fn complete_harden_wal(&mut self, target_len: u64) {
+        self.wal.with(|w| w.complete_harden(target_len));
+    }
+
     /// Runs the redo-bounding auto-checkpoint if enough WAL has accumulated since the last one (`rmp`
     /// storage audit F3), a no-op otherwise. Exposed so the engine's group-commit path can take it
     /// **once per drained batch**, after the batch's committers have been acknowledged (their commits

@@ -558,6 +558,39 @@ impl<S: LogSink> WalManager<S> {
         self.harden();
     }
 
+    /// **PREPARE** half of a pipelined harden (`rmp` #532, commit pipelining): writes every appended
+    /// record to the backing store (advancing the sink's write frontier) and returns the deferred
+    /// [`FsyncJob`], WITHOUT `fdatasync`ing. The engine hands the job to a dedicated fsync thread,
+    /// overlaps the sync with preparing the next batch, then — after the job runs successfully — calls
+    /// [`complete_harden`](Self::complete_harden) with the job's
+    /// [`target_len`](crate::FsyncJob::target_len) to advance the durable watermark.
+    ///
+    /// The produced durable bytes are byte-for-byte identical to [`flush`](Self::flush); only the
+    /// `fdatasync` is deferred. The commit is committed-**durable** only once the job has run *and*
+    /// `complete_harden` returned, so the caller MUST NOT acknowledge any committer before then (the
+    /// ack-after-fsync rule). A crash in the overlap loses the un-synced batch WHOLE (a torn-tail
+    /// recovery truncates), which is correct precisely because no committer was acked.
+    ///
+    /// # Errors
+    /// Returns a storage error if writing the records to the backing store fails (treated as
+    /// unrecoverable by the caller — the fsyncgate PANIC policy of `§4.9`).
+    pub fn begin_harden(&mut self) -> Result<crate::FsyncJob> {
+        self.sink.begin_harden()
+    }
+
+    /// **COMPLETE** half of a pipelined harden (`rmp` #532): advances the durable watermark to
+    /// `target_len` (the [`FsyncJob::target_len`](crate::FsyncJob::target_len) of a job returned by
+    /// [`begin_harden`](Self::begin_harden)) after that job's `fdatasync` has run. Monotonic — it
+    /// never regresses `durable_len` — so it composes safely with an inline [`ensure_durable`]
+    /// / [`flush`] (e.g. a buffer-pool eviction) that hardened the same or a longer range during the
+    /// pipeline overlap.
+    ///
+    /// [`ensure_durable`]: Self::ensure_durable
+    /// [`flush`]: Self::flush
+    pub fn complete_harden(&mut self, target_len: u64) {
+        self.sink.complete_harden(target_len);
+    }
+
     /// Appends a Compensation Log Record (redo-only) during undo, recording the compensating
     /// image and the next LSN still to undo. Public for the recovery driver.
     pub fn write_clr(
@@ -924,5 +957,124 @@ mod tests {
         wal.log_update(TxnId(1), PageId(0), b"r".to_vec(), b"u".to_vec());
         wal.sink_mut_for_test().arm_sync_error();
         let _ = wal.commit(TxnId(1)); // group-commit fdatasync fails -> controlled abort
+    }
+
+    /// `rmp` #532 commit pipelining: the two-phase `begin_harden` → run job → `complete_harden` path
+    /// produces a durable log **byte-for-byte identical** to the single-shot `flush`, and the same
+    /// `durable_len`. Deferring the `fdatasync` must not change the wire format recovery depends on.
+    /// (Over `MemLogSink`, whose default `begin_harden` hardens inline — the DST/replay path.)
+    #[test]
+    fn pipelined_harden_is_byte_identical_to_flush() {
+        let drive = |pipelined: bool| -> (Vec<u8>, u64) {
+            let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+            wal.begin(TxnId(1));
+            wal.log_update(TxnId(1), PageId(0), b"r".to_vec(), b"u".to_vec());
+            wal.commit_at_no_sync(TxnId(1), Timestamp(7)).unwrap();
+            if pipelined {
+                let job = wal.begin_harden().unwrap();
+                let target = job.target_len();
+                job.run().unwrap();
+                wal.complete_harden(target);
+            } else {
+                wal.flush();
+            }
+            (wal.sink().durable_bytes(), wal.durable_len())
+        };
+        let (flush_bytes, flush_len) = drive(false);
+        let (pipe_bytes, pipe_len) = drive(true);
+        assert_eq!(
+            flush_bytes, pipe_bytes,
+            "the pipelined harden must produce byte-identical durable bytes to flush"
+        );
+        assert_eq!(
+            flush_len, pipe_len,
+            "the durable watermark must match flush"
+        );
+    }
+
+    /// A unique temp WAL directory for a `FileLogSink`-backed manager test, removed on drop.
+    struct TempWalDir {
+        path: std::path::PathBuf,
+    }
+    impl TempWalDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "graphus-wal-mgr-{tag}-{nanos}-{}",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+    impl Drop for TempWalDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// `rmp` #532 **Defect-B gate (WAL-before-data)**: models a buffer-pool eviction whose
+    /// `ensure_durable` fires DURING a pipelined harden's overlap — after `begin_harden` wrote a
+    /// batch's records to the file but BEFORE the offloaded `fdatasync` ran, so
+    /// `durable_len < written_len`. The WAL rule MUST harden the already-written range: after
+    /// `ensure_durable(page_lsn)` the log must be durable through that LSN, so the evicted home page is
+    /// never written over an un-synced WAL record.
+    ///
+    /// This FAILS on the defective (no-op) `sync`, which returned `Ok` without `fdatasync`ing merely
+    /// because the pending tail was empty (the records were already in the file), leaving
+    /// `durable_len` behind the page's LSN — the silent atomicity hole this task closes. Uses the real
+    /// `FileLogSink` (the only sink whose `begin_harden` defers the `fdatasync`).
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn ensure_durable_during_pipeline_overlap_hardens_the_written_range() {
+        use crate::sink::FileLogSink;
+        let dir = TempWalDir::new("defectb");
+        let mut wal = WalManager::create(FileLogSink::open(&dir.path).unwrap()).unwrap();
+
+        wal.begin(TxnId(1));
+        // The page's `page_lsn` is this update record's LSN — the LSN the buffer-pool WAL rule must be
+        // durable through before the page is written home.
+        let page_lsn = wal.log_update(TxnId(1), PageId(5), b"redo".to_vec(), b"undo".to_vec());
+        wal.commit_at_no_sync(TxnId(1), Timestamp(1)).unwrap();
+
+        // PREPARE half of the pipelined harden: the records are WRITTEN to the file but the
+        // `fdatasync` is deferred to `job` (still un-run — the pipeline-overlap window).
+        let job = wal.begin_harden().unwrap();
+        assert!(
+            wal.durable_len() <= page_lsn.0,
+            "before the deferred fdatasync the page's LSN is written-but-not-durable"
+        );
+
+        // An eviction of the dirty page fires the WAL rule mid-overlap. THIS must actually harden the
+        // written range (the Defect-B fix); on the no-op-sync version it silently does nothing.
+        wal.ensure_durable(page_lsn);
+        assert!(
+            wal.durable_len() > page_lsn.0,
+            "WAL-before-data (rmp #532): ensure_durable during the pipeline overlap MUST harden the \
+             written-but-un-synced range so a home page is never flushed over an un-synced WAL record"
+        );
+
+        // The offloaded job then runs (now redundant) and completes; `complete_harden` is monotonic,
+        // so it never regresses the watermark the inline eviction already advanced.
+        let target = job.target_len();
+        job.run().unwrap();
+        wal.complete_harden(target);
+        assert!(wal.durable_len() > page_lsn.0);
+
+        // The commit is durable and recoverable from a freshly reopened log over the same directory
+        // (the bytes are on disk and fdatasync'd, so a reopen scans them back).
+        drop(wal);
+        let reopened = WalManager::open(FileLogSink::open(&dir.path).unwrap()).unwrap();
+        let committed = reopened.committed_transactions().unwrap();
+        assert_eq!(
+            committed.len(),
+            1,
+            "the committed txn survives the crash-safe overlap"
+        );
     }
 }

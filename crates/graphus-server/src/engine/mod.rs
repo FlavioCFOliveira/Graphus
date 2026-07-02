@@ -162,6 +162,117 @@ pub const QUERY_ENGINE_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// (not this cap) ends every batch.
 const MAX_COMMIT_BATCH: usize = 128;
 
+/// A dedicated blocking thread that runs the offloaded WAL `fdatasync` of the **pipelined**
+/// group-commit harden (`rmp` #532, commit pipelining / fsync offload).
+///
+/// # What it buys
+///
+/// [`WalManager::begin_harden`](graphus_wal::WalManager::begin_harden) writes a commit batch's
+/// records to the log file *without* `fdatasync`ing and hands back a [`FsyncJob`]. The engine
+/// [`submit`](WalSyncThread::submit)s that job here and, while the `fdatasync` runs on this thread,
+/// PREPAREs the **next** consecutive commit batch (and retires reads) on the engine thread; it then
+/// [`wait`](WalSyncThread::wait)s and completes the harden. So the durability sync of batch *K*
+/// overlaps the CPU work of batch *K+1*, instead of the engine thread blocking on every `fdatasync`.
+///
+/// # Strict depth-1
+///
+/// The job channel is bounded at **1** and the engine always `wait`s for the outstanding job before
+/// `submit`ting the next, so at most **one** batch is ever written-but-un-synced. The on-disk crash
+/// state is therefore the same *category* as inline group commit (a torn tail of one un-synced batch,
+/// which recovery truncates whole), so crash recovery is unchanged.
+///
+/// # Why a bare `std::thread`, not `graphus_io::FsyncPool`
+///
+/// The async runtime is Tokio, but this engine loop is a plain, `!Send` blocking thread that must
+/// `submit`/`wait` synchronously. `graphus_io::FsyncPool` is Tokio-only (its handles are futures),
+/// unusable from here — so this is a `std::thread` with std channels.
+///
+/// # fsyncgate (`04 §4.9`)
+///
+/// A failed `fdatasync` is unrecoverable: [`wait`](WalSyncThread::wait) PANICs (a controlled abort)
+/// **before** any committer of that batch is acked, so a lost batch is never acknowledged — the
+/// ack-after-fsync rule, identical in effect to the inline `harden`'s panic policy.
+struct WalSyncThread {
+    /// Submits a job to the fsync thread. Bounded at 1 (depth-1): a job is submitted, then always
+    /// `wait`ed on before the next submit, so `send` never blocks. `Option` so [`Drop`] can close it
+    /// (ending the thread's loop) before joining. `None` only transiently during drop.
+    job_tx: Option<std::sync::mpsc::SyncSender<graphus_wal::FsyncJob>>,
+    /// The FIFO outcome of each submitted job: `Ok(target_len)` (the write frontier the `fdatasync`
+    /// made durable, passed to `complete_harden`) or the storage error (→ fsyncgate PANIC).
+    result_rx: std::sync::mpsc::Receiver<Result<u64>>,
+    /// Joined on drop so the fsync thread never outlives the engine.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WalSyncThread {
+    /// Spawns the dedicated fsync thread for the database `db_name`.
+    fn spawn(db_name: &str) -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<graphus_wal::FsyncJob>(1);
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<u64>>();
+        let handle = std::thread::Builder::new()
+            .name(format!("graphus-walsync-{db_name}"))
+            .spawn(move || {
+                // Run each submitted `fdatasync` in order, forwarding its outcome. The loop ends (and
+                // the thread exits cleanly) when the engine drops `job_tx` at shutdown, or if the
+                // result channel is gone (engine already torn down).
+                for job in job_rx.iter() {
+                    let target = job.target_len();
+                    let outcome = job.run().map(|()| target);
+                    if result_tx.send(outcome).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("INVARIANT: spawning the WAL fsync thread must succeed");
+        Self {
+            job_tx: Some(job_tx),
+            result_rx,
+            handle: Some(handle),
+        }
+    }
+
+    /// Submits `job`'s `fdatasync` to run on the dedicated thread. Never blocks under the depth-1
+    /// discipline (the previous job was always [`wait`](WalSyncThread::wait)ed on first).
+    fn submit(&self, job: graphus_wal::FsyncJob) {
+        self.job_tx
+            .as_ref()
+            .expect("INVARIANT: job_tx present for the engine's lifetime")
+            .send(job)
+            .expect("INVARIANT: the WAL fsync thread is alive for the engine's lifetime");
+    }
+
+    /// Waits for the in-flight `fdatasync` and returns the write frontier it hardened (for
+    /// `complete_harden`).
+    ///
+    /// # Panics
+    /// Panics (fsyncgate, `04 §4.9`) if the `fdatasync` failed — deliberately BEFORE any committer is
+    /// acked, so a lost batch is never acknowledged.
+    fn wait(&self) -> u64 {
+        match self
+            .result_rx
+            .recv()
+            .expect("INVARIANT: the WAL fsync thread is alive for the engine's lifetime")
+        {
+            Ok(target) => target,
+            Err(e) => {
+                panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}")
+            }
+        }
+    }
+}
+
+impl Drop for WalSyncThread {
+    fn drop(&mut self) {
+        // Close the job channel first (ends the thread's `iter()`), THEN join — so the fsync thread
+        // never outlives the engine and any final in-flight `fdatasync` completes. Under depth-1 the
+        // engine always waits before dropping, so no job is ever in flight at drop time.
+        drop(self.job_tx.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// A **test-only fault-injection seam** (`rmp` #409): the count of upcoming statement-recovery
 /// rollbacks/commits that should *themselves* panic, simulating the historical `RefCell`-double-borrow
 /// in `store.rs` (or the #359 buffer-pool replay panic class) striking inside the recovery path. Lets
@@ -558,6 +669,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // iteration, IN ORDER, after the batch it followed has been hardened + acked — never reordered ahead
     // of the batch, and never dropped.
     let mut pending_cmd: Option<EngineCommand> = None;
+    // The dedicated WAL fsync thread (`rmp` #532): the pipelined group-commit harden offloads each
+    // batch's `fdatasync` here so it overlaps the CPU work of PREPAREing the next batch. Depth-1 (a
+    // capacity-1 job channel), so at most one batch is ever written-but-un-synced — the on-disk crash
+    // state stays the same category as inline group commit. Joined when this loop returns (its `Drop`).
+    let wal_sync = WalSyncThread::spawn(&db_name);
 
     'engine: loop {
         // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
@@ -651,6 +767,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 maintenance_consecutive_failures: &mut maintenance_consecutive_failures,
                 builds_were_pending: &mut builds_were_pending,
                 pending_cmd: &mut pending_cmd,
+                wal_sync: &wal_sync,
             }) {
                 break 'engine;
             }
@@ -726,6 +843,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             maintenance_consecutive_failures: &mut maintenance_consecutive_failures,
             builds_were_pending: &mut builds_were_pending,
             pending_cmd: &mut pending_cmd,
+            wal_sync: &wal_sync,
         }) {
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
@@ -1412,6 +1530,9 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     builds_were_pending: &'a mut bool,
     /// A command a group-commit batch drain pulled but did not batch, stashed for the loop's next tick.
     pending_cmd: &'a mut Option<EngineCommand>,
+    /// The dedicated WAL fsync thread the pipelined group-commit harden offloads each batch's
+    /// `fdatasync` to (`rmp` #532). Lives for the engine's lifetime.
+    wal_sync: &'a WalSyncThread,
 }
 
 /// Processes one received [`EngineCommand`] end-to-end (`rmp` #528): dispatches it, coalesces a
@@ -1455,6 +1576,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         maintenance_consecutive_failures,
         builds_were_pending,
         pending_cmd,
+        wal_sync,
     } = ctx;
 
     // A per-dispatch slot for the (at most one) statement THIS command suspends; drained into the bounded
@@ -1485,11 +1607,15 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         return false; // Shutdown handled (drained + hardened) inside the dispatch.
     }
 
-    // Group commit (`rmp` #528): if this command PREPAREd a durable write commit, coalesce further queued
-    // commits into the SAME batch and harden them all with ONE `fdatasync` before acking. The drain
-    // stashes the first non-commit command it pulls into `pending_cmd` (processed next tick, in order).
+    // Group commit + **pipelining** (`rmp` #528 + #532): if this command PREPAREd a durable write
+    // commit, coalesce further queued commits into the SAME batch, then harden the batch with the
+    // pipelined split — `begin_harden` writes its records to the file and the `fdatasync` is offloaded
+    // to `wal_sync` while the engine PREPAREs the NEXT consecutive batch (depth-1), then wait + complete
+    // + ack (ack-after-fsync). The drain stashes the first non-commit command into `pending_cmd`
+    // (processed next tick, in order).
     if !commit_batch.is_empty() {
-        drain_commit_batch(
+        pipelined_group_commit(
+            wal_sync,
             rx,
             coordinator,
             open,
@@ -1510,9 +1636,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             statement_timeout,
             loading_session,
         );
-        // ONE fdatasync for the whole batch, then ack every committer (ack-after-fsync).
-        flush_commit_batch(coordinator, &mut commit_batch, metrics, db);
-        // The redo-bounding checkpoint, once, AFTER the acks (the commits are already durable).
+        // The redo-bounding checkpoint, once, AFTER every batch is acked (the commits are all durable).
         checkpoint_after_batch(coordinator);
     }
 
@@ -2477,12 +2601,148 @@ fn flush_commit_batch<D: BlockDevice, S: LogSink>(
     // tail, so the batch is lost WHOLE (never partially applied), matching what each committer was (not)
     // told.
     coord.harden_wal();
-    let durable = coord.wal_durable_len();
+    ack_prepared_commits(coord.wal_durable_len(), batch, metrics, db);
+}
+
+/// **Pipelined** group-commit harden + ack (`rmp` #532, commit pipelining), the async-engine
+/// counterpart of the inline [`flush_commit_batch`] (which the DST/`LocalEngine` driver keeps, for a
+/// bit-identical synchronous replay). Depth-1: the `fdatasync` of the current batch is offloaded to
+/// `wal_sync` while this thread PREPAREs the **next** consecutive commit batch, then it waits +
+/// completes + acks.
+///
+/// # Per-batch phases
+/// 1. **begin_harden** — [`TxnCoordinator::begin_harden_wal`] writes the batch's records to the log
+///    file (advancing the WAL write frontier) WITHOUT `fdatasync`ing, returning the deferred job.
+/// 2. **submit** — hand the job to `wal_sync` (the fsync runs off the engine thread).
+/// 3. **overlap** — PREPARE the next consecutive commit batch ([`drain_commit_batch`], append-only,
+///    so the WAL write frontier does NOT advance — preserving depth-1). Skipped once a non-commit
+///    command has been stashed in `pending_cmd` (it must be processed before any later command).
+/// 4. **wait** — [`WalSyncThread::wait`] blocks for the `fdatasync`; a failure PANICs (fsyncgate)
+///    BEFORE any ack.
+/// 5. **complete_harden** — [`TxnCoordinator::complete_harden_wal`] advances the durable watermark
+///    (monotonic — race-free with an eviction's inline harden during the overlap, which shares the
+///    same WAL manager lock).
+/// 6. **ack** — acknowledge every committer of the just-hardened batch (ack-after-fsync).
+///
+/// # WAL-before-data during the overlap
+/// Between phases 1 and 5 the WAL has `durable_len < written_len`. The buffer pool shares the same
+/// [`WalManager`](graphus_wal::WalManager) via `SharedWal`, so an eviction that must write a data page
+/// home whose `page_lsn` is in that window re-enters `ensure_durable` under the same lock and hardens
+/// the written range inline — no home page is ever written over an un-synced WAL record.
+#[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
+fn pipelined_group_commit<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    wal_sync: &WalSyncThread,
+    rx: &std::sync::mpsc::Receiver<EngineCommand>,
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    open: &mut HashMap<u64, OpenTx>,
+    next_ticket: &mut u64,
+    plan_cache: &mut exec::EnginePlanCache,
+    extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
+    dispatch: &read_pool::ReadDispatch<D, S>,
+    readers_inflight: &mut u64,
+    commit_batch: &mut Vec<PendingCommit>,
+    pending_cmd: &mut Option<EngineCommand>,
+    result_buffer_capacity: usize,
+    metrics: &Arc<Metrics>,
+    db: &str,
+    degraded: &EngineDegraded,
+    maintenance_degraded: &MaintenanceDegraded,
+    active_txns: &mut ActiveTxnGauge,
+    clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    statement_timeout: Option<std::time::Duration>,
+    loading_session: &mut Option<bulk_load::LoadingSession>,
+) {
+    // The current PREPAREd batch (batch K). First coalesce further queued commits into it, exactly as
+    // the inline path did before hardening — so a burst that is all already-queued still forms ONE
+    // batch. Skipped when a non-commit command was already stashed (ordering).
+    let mut batch = std::mem::take(commit_batch);
+    if pending_cmd.is_none() {
+        drain_commit_batch(
+            rx,
+            coordinator,
+            open,
+            next_ticket,
+            plan_cache,
+            extensions,
+            dispatch,
+            readers_inflight,
+            &mut batch,
+            pending_cmd,
+            result_buffer_capacity,
+            metrics,
+            db,
+            degraded,
+            maintenance_degraded,
+            active_txns,
+            clock,
+            statement_timeout,
+            loading_session,
+        );
+    }
+
+    while !batch.is_empty() {
+        // If the coordinator was consumed (Shutdown) — unreachable here, a `Cmd::Commit` never
+        // consumes it — drop the deferred replies rather than panic.
+        let Some(coord) = coordinator.as_mut() else {
+            batch.clear();
+            return;
+        };
+        // (1) begin_harden + (2) submit: write the batch's records to the file, offload the fdatasync.
+        let job = coord.begin_harden_wal();
+        wal_sync.submit(job);
+
+        // (3) OVERLAP: PREPARE the next consecutive commit batch while the fdatasync is in flight.
+        // Only if the prior drain didn't stash a non-commit command (which must be processed first).
+        let mut next_batch: Vec<PendingCommit> = Vec::new();
+        if pending_cmd.is_none() {
+            drain_commit_batch(
+                rx,
+                coordinator,
+                open,
+                next_ticket,
+                plan_cache,
+                extensions,
+                dispatch,
+                readers_inflight,
+                &mut next_batch,
+                pending_cmd,
+                result_buffer_capacity,
+                metrics,
+                db,
+                degraded,
+                maintenance_degraded,
+                active_txns,
+                clock,
+                statement_timeout,
+                loading_session,
+            );
+        }
+
+        // (4) WAIT for the in-flight fdatasync (depth-1). PANICs on failure (fsyncgate) BEFORE any ack.
+        let target = wal_sync.wait();
+        // (5) complete_harden: advance the durable watermark (monotonic / race-free). (6) ack the batch.
+        if let Some(coord) = coordinator.as_mut() {
+            coord.complete_harden_wal(target);
+            ack_prepared_commits(coord.wal_durable_len(), &mut batch, metrics, db);
+        } else {
+            batch.clear();
+        }
+        batch = next_batch;
+    }
+}
+
+/// Acknowledges every PREPAREd committer in `batch` `Ok` once the group-commit harden has advanced the
+/// durable watermark to `durable` past their `COMMIT` records — the ack-after-fsync durability rule,
+/// shared by the inline [`flush_commit_batch`] and the [`pipelined_group_commit`] paths.
+fn ack_prepared_commits(durable: u64, batch: &mut Vec<PendingCommit>, metrics: &Metrics, db: &str) {
     for pending in batch.drain(..) {
         debug_assert!(
             pending.commit_lsn.0 < durable,
-            "INVARIANT (rmp #528 ack-after-fsync): the group-commit harden must advance the durable \
-             watermark ({durable}) past every batched commit LSN ({})",
+            "INVARIANT (ack-after-fsync, rmp #528/#532): the group-commit harden must advance the \
+             durable watermark ({durable}) past every batched commit LSN ({})",
             pending.commit_lsn.0
         );
         metrics.record_commit_for(db);

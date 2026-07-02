@@ -48,6 +48,80 @@ use std::path::{Path, PathBuf};
 
 use graphus_core::error::Result;
 
+/// The deferred `fdatasync` half of a **pipelined harden** (`rmp` #532, commit pipelining).
+///
+/// A [`LogSink::begin_harden`] writes a batch's records to the backing store (advancing the write
+/// frontier) but does **not** `fdatasync` them; it returns this job, which carries the actual
+/// `fdatasync` so the engine can hand it to a dedicated blocking thread and overlap the sync with
+/// useful work (preparing the next batch). The job is [`Send`] precisely so it can cross to that
+/// thread. After it [`run`](FsyncJob::run)s successfully, the caller MUST call
+/// [`LogSink::complete_harden`] with [`target_len`](FsyncJob::target_len) to advance the sink's
+/// durable watermark — the two-phase split of what [`LogSink::sync`] does atomically.
+///
+/// **Durability contract.** Until this job runs *and* `complete_harden` advances `durable_len`, the
+/// bytes it covers are **not** durable ([`LogSink::durable_len`] does not include them), so a crash
+/// loses them whole — which is correct only because no committer is acked until after both steps
+/// (ack-after-fsync). A sink that does not offload (the default) returns an
+/// [`already_durable`](FsyncJob::already_durable) job whose `run` is a no-op, because
+/// `begin_harden`'s default already hardened inline.
+pub struct FsyncJob {
+    /// The `fdatasync` work (segment `full_sync_data`s + an optional directory fsync). A boxed
+    /// `FnOnce` so each sink supplies whatever syscalls its backing store needs; `Send` so the job
+    /// can run on a dedicated fsync thread.
+    run: Box<dyn FnOnce() -> Result<()> + Send + 'static>,
+    /// The write frontier this job makes durable — passed to [`LogSink::complete_harden`] after the
+    /// job runs, to advance `durable_len` (monotonically).
+    target_len: u64,
+}
+
+impl std::fmt::Debug for FsyncJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsyncJob")
+            .field("target_len", &self.target_len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FsyncJob {
+    /// A deferred job that will run `run` (the `fdatasync`) and, on success, hardens the sink up to
+    /// `target_len` (the caller passes it to [`LogSink::complete_harden`]).
+    #[must_use]
+    pub fn deferred(run: impl FnOnce() -> Result<()> + Send + 'static, target_len: u64) -> Self {
+        Self {
+            run: Box::new(run),
+            target_len,
+        }
+    }
+
+    /// A no-op job for a sink that already hardened inline in `begin_harden` (the default,
+    /// non-pipelined path): `run` succeeds immediately and `target_len` is the already-durable
+    /// length, so the paired `complete_harden` is a no-op.
+    #[must_use]
+    pub fn already_durable(target_len: u64) -> Self {
+        Self {
+            run: Box::new(|| Ok(())),
+            target_len,
+        }
+    }
+
+    /// Runs the deferred `fdatasync`. Consumes the job (it runs exactly once).
+    ///
+    /// # Errors
+    /// Propagates the `fdatasync` failure. The caller treats this as unrecoverable (PANIC, the
+    /// fsyncgate policy of `§4.9`) and MUST NOT acknowledge any committer whose record this job
+    /// covered.
+    pub fn run(self) -> Result<()> {
+        (self.run)()
+    }
+
+    /// The write frontier this job hardens — pass to [`LogSink::complete_harden`] after
+    /// [`run`](FsyncJob::run) returns `Ok`.
+    #[must_use]
+    pub fn target_len(&self) -> u64 {
+        self.target_len
+    }
+}
+
 /// An append-only byte log with an explicit durability boundary.
 pub trait LogSink {
     /// Appends `bytes` to the write buffer. They become durable only on a successful
@@ -56,7 +130,61 @@ pub trait LogSink {
 
     /// Hardens every appended byte durably (the `fdatasync` of group commit). A returned error
     /// is treated as unrecoverable by [`crate::WalManager`] (PANIC on fsync failure, `§4.9`).
+    ///
+    /// After this returns `Ok`, [`durable_len`](LogSink::durable_len) equals
+    /// [`buffered_len`](LogSink::buffered_len): every appended byte is durable. A correct sync MUST
+    /// harden the **whole** written-but-un-synced range, not just any not-yet-written tail — see the
+    /// note on [`begin_harden`](LogSink::begin_harden) for why (the pipelined-harden WAL-before-data
+    /// rule, `rmp` #532).
     fn sync(&mut self) -> Result<()>;
+
+    /// **PREPARE** half of a pipelined harden (`rmp` #532): writes every appended-but-unwritten byte
+    /// to the backing store — advancing the *write* frontier so the bytes physically reach the log
+    /// file — but does **not** `fdatasync`. Returns an [`FsyncJob`] carrying the deferred
+    /// `fdatasync`; the caller runs it (typically on a dedicated blocking thread, overlapping the
+    /// sync with other work) and then calls [`complete_harden`](LogSink::complete_harden) with the
+    /// job's [`target_len`](FsyncJob::target_len) to advance [`durable_len`](LogSink::durable_len).
+    ///
+    /// # WAL-before-data safety (the critical invariant)
+    ///
+    /// Between `begin_harden` and its paired `complete_harden`, the sink has
+    /// `durable_len < buffered_len`: a batch's bytes are in the file but not yet durable. If a
+    /// buffer-pool eviction must write a data page home whose `page_lsn` falls in that
+    /// **written-but-un-synced** window, the WAL rule ([`crate::WalManager::ensure_durable`]) calls
+    /// [`sync`](LogSink::sync). That `sync` MUST actually `fdatasync` the written range up to the
+    /// write frontier (the bytes are already in the file) and advance `durable_len` — it must **not**
+    /// no-op merely because there is no *unwritten* pending tail. Otherwise the home page is written
+    /// over an un-synced WAL record and a crash before the deferred `fdatasync` leaves an
+    /// uncommitted, un-undoable change on disk (an atomicity/ACID violation).
+    ///
+    /// # Default (non-pipelined) implementation
+    ///
+    /// Performs a full inline [`sync`](LogSink::sync) — writing **and** `fdatasync`ing, advancing
+    /// `durable_len` immediately — and returns an [`FsyncJob::already_durable`] whose `run` is a
+    /// no-op. This keeps every sink correct with no code change; only a sink that can cheaply defer
+    /// just the `fdatasync` (the production [`FileLogSink`]) overrides it. The in-memory
+    /// [`MemLogSink`] deliberately keeps this default so Deterministic-Simulation-Testing replays the
+    /// exact synchronous inline path (bit-identical).
+    ///
+    /// # Errors
+    /// Returns a storage error if writing the bytes to the backing store fails (treated as
+    /// unrecoverable, like a sync failure).
+    fn begin_harden(&mut self) -> Result<FsyncJob> {
+        self.sync()?;
+        Ok(FsyncJob::already_durable(self.durable_len()))
+    }
+
+    /// **COMPLETE** half of a pipelined harden (`rmp` #532): advances the durable watermark to
+    /// `target_len` (the [`FsyncJob::target_len`] of a job returned by
+    /// [`begin_harden`](LogSink::begin_harden)) **after** that job's `fdatasync` has run. The advance
+    /// is monotonic — `durable_len = max(durable_len, target_len)` — so it composes with an inline
+    /// [`sync`](LogSink::sync) that may have hardened the same (or a longer) range concurrently
+    /// during the pipeline overlap (e.g. a buffer-pool eviction), and a stale/duplicate completion can
+    /// never regress `durable_len`.
+    ///
+    /// The default is a no-op: the default [`begin_harden`](LogSink::begin_harden) already advanced
+    /// `durable_len` inline.
+    fn complete_harden(&mut self, _target_len: u64) {}
 
     /// The number of bytes that are durable (would survive a crash now).
     fn durable_len(&self) -> u64;
@@ -475,10 +603,23 @@ pub struct FileLogSink {
     /// Present segments, keyed by base offset (ascending). A reclaimed prefix is absent; the gap it
     /// leaves reads back as zeros.
     segments: BTreeMap<u64, Segment>,
-    /// Total logical length = end of the last segment (or `anchor_len` if none). Byte offset == LSN,
-    /// so this is unchanged by reclamation (the freed prefix becomes a zero gap, not a shift).
+    /// Bytes that are **durable** (fdatasync'd) — the length that survives a crash and what
+    /// [`durable_len`](LogSink::durable_len) reports. `<= written_len`. Byte offset == LSN, so this is
+    /// unchanged by reclamation (the freed prefix becomes a zero gap, not a shift).
     durable_len: u64,
-    /// Bytes appended since the last sync (durable only once `sync` returns `Ok`).
+    /// Bytes **written** to the backing files but not necessarily fdatasync'd (`rmp` #532, commit
+    /// pipelining). `durable_len <= written_len`. A [`begin_harden`](LogSink::begin_harden) advances
+    /// this (writes the batch to the file) without advancing `durable_len` (the fdatasync is
+    /// deferred to the returned [`FsyncJob`]); `sync` / `complete_harden` then advance `durable_len`
+    /// to meet it. In the non-pipelined steady state `written_len == durable_len`.
+    written_len: u64,
+    /// A segment/anchor **file was created** by a write whose directory entry is not yet fsync'd.
+    /// The dir fsync (which makes the new file's *name* durable, so a crash cannot lose the segment
+    /// and the records in it) is issued by the next `sync`/`begin_harden`-job **after** the data
+    /// fdatasync — so it must persist across a `begin_harden` whose fdatasync is still deferred, and
+    /// an eviction's inline `sync` during that overlap must honour it too (`rmp` #532).
+    dir_sync_pending: bool,
+    /// Bytes appended since the last write-to-file (`begin_harden`/`sync`), not yet in any file.
     pending: Vec<u8>,
     /// The active segment rolls to a fresh one once it reaches this size.
     segment_target: u64,
@@ -572,6 +713,11 @@ impl FileLogSink {
             anchor_len,
             segments,
             durable_len,
+            // On open, every byte on disk was fdatasync'd before this process started (recovery only
+            // trusts durable bytes), so the write frontier equals the durable frontier and no
+            // directory entry is unhardened.
+            written_len: durable_len,
+            dir_sync_pending: false,
             pending: Vec::new(),
             segment_target: segment_target.max(1),
         })
@@ -586,29 +732,28 @@ impl FileLogSink {
     /// `fdatasync`s the WAL directory, hardening a created/deleted file's *name* (POSIX requires a
     /// directory fsync to make a new/removed directory entry durable, independent of file contents).
     fn sync_dir(&self) -> Result<()> {
-        use graphus_core::GraphusError;
-        let f = File::open(&self.dir).map_err(|e| {
-            GraphusError::Storage(format!("open wal dir to fsync {}: {e}", self.dir.display()))
-        })?;
-        f.sync_data()
-            .map_err(|e| GraphusError::Storage(format!("fsync wal dir: {e}")))
-    }
-}
-
-impl LogSink for FileLogSink {
-    fn append(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
+        sync_dir_path(&self.dir)
     }
 
-    fn sync(&mut self) -> Result<()> {
+    /// Writes the whole `pending` buffer to the backing files — the **WRITE half** shared by
+    /// [`sync`](LogSink::sync) and [`begin_harden`](LogSink::begin_harden) (`rmp` #532) so both
+    /// produce byte-for-byte identical on-disk layout. Advances `written_len`, clears `pending`, and
+    /// sets `dir_sync_pending` when it creates a new anchor/segment file — but does **not**
+    /// `fdatasync` and does **not** advance `durable_len`. A no-op when `pending` is empty.
+    ///
+    /// The very first write on a fresh sink hardens the header into the `anchor` file; every later
+    /// write appends the whole batch to the active segment (never splitting a batch across segments),
+    /// rolling to a fresh segment first when the active one has reached the target size — exactly the
+    /// segmentation the previous monolithic `sync` performed.
+    fn write_pending(&mut self) -> Result<()> {
         use graphus_core::GraphusError;
         use std::os::unix::fs::FileExt;
         if self.pending.is_empty() {
             return Ok(());
         }
 
-        // The very first sync on a fresh sink hardens the header into the anchor file.
-        if self.anchor_len == 0 && self.segments.is_empty() && self.durable_len == 0 {
+        // The very first write on a fresh sink hardens the header into the anchor file.
+        if self.anchor_len == 0 && self.segments.is_empty() && self.written_len == 0 {
             let anchor_path = self.dir.join(ANCHOR_NAME);
             let f = std::fs::OpenOptions::new()
                 .read(true)
@@ -619,27 +764,22 @@ impl LogSink for FileLogSink {
                 .map_err(|e| GraphusError::Storage(format!("create wal anchor: {e}")))?;
             f.write_all_at(&self.pending, 0)
                 .map_err(|e| GraphusError::Storage(format!("wal anchor write: {e}")))?;
-            // True stable-storage barrier (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere): a bare
-            // `fdatasync` on APFS/HFS+ does not flush the drive's volatile write cache, so an
-            // acknowledged commit could be lost on power failure. See `crate::fullsync`.
-            crate::fullsync::full_sync_data(&f, "wal anchor fdatasync")?;
-            self.sync_dir()?; // harden the anchor's directory entry
             self.anchor_len = self.pending.len() as u64;
-            self.durable_len = self.anchor_len;
+            self.written_len = self.anchor_len;
+            self.dir_sync_pending = true; // the anchor's directory entry must be hardened
             self.pending.clear();
             return Ok(());
         }
 
         // Append the whole pending batch to the active segment, creating the first/next segment if
-        // there is none or the active one has reached the roll size. A sync's bytes never split
-        // across segments (the new segment starts at the current durable end).
+        // there is none or the active one has reached the roll size. A write's bytes never split
+        // across segments (the new segment starts at the current write end).
         let need_new_segment = match self.segments.values().next_back() {
             None => true,
             Some(active) => active.len >= self.segment_target,
         };
-        let created_segment = need_new_segment;
         if need_new_segment {
-            let base = self.durable_len;
+            let base = self.written_len;
             let path = self.segment_path(base);
             let file = std::fs::OpenOptions::new()
                 .read(true)
@@ -649,6 +789,7 @@ impl LogSink for FileLogSink {
                 .open(&path)
                 .map_err(|e| GraphusError::Storage(format!("create wal segment: {e}")))?;
             self.segments.insert(base, Segment { base, len: 0, file });
+            self.dir_sync_pending = true; // the new segment's directory entry must be hardened
         }
 
         let active = self
@@ -661,17 +802,155 @@ impl LogSink for FileLogSink {
             .file
             .write_all_at(&self.pending, write_at)
             .map_err(|e| GraphusError::Storage(format!("wal segment write: {e}")))?;
-        // True stable-storage barrier (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere) — see the
-        // anchor path above and `crate::fullsync`.
-        crate::fullsync::full_sync_data(&active.file, "wal segment fdatasync")?;
         let n = self.pending.len() as u64;
         active.len += n;
-        self.durable_len += n;
-        if created_segment {
-            self.sync_dir()?; // harden the new segment's directory entry after its data is durable
-        }
+        self.written_len += n;
         self.pending.clear();
         Ok(())
+    }
+
+    /// `full_sync_data`s every anchor/segment file backing the byte range `[from, to)`, making those
+    /// already-written bytes durable. Used inline by [`sync`](LogSink::sync); the offloaded
+    /// [`FsyncJob`] does the equivalent over cloned handles.
+    fn fdatasync_range(&self, from: u64, to: u64) -> Result<()> {
+        if from < self.anchor_len {
+            let anchor_path = self.dir.join(ANCHOR_NAME);
+            let f = File::open(&anchor_path).map_err(|e| {
+                graphus_core::GraphusError::Storage(format!("open wal anchor to fdatasync: {e}"))
+            })?;
+            crate::fullsync::full_sync_data(&f, "wal anchor fdatasync")?;
+        }
+        for seg in self.segments.values() {
+            let seg_end = seg.base + seg.len;
+            if seg_end <= from || seg.base >= to || seg.len == 0 {
+                continue;
+            }
+            crate::fullsync::full_sync_data(&seg.file, "wal segment fdatasync")?;
+        }
+        Ok(())
+    }
+
+    /// Clones (`try_clone`, sharing the open file description) every anchor/segment file backing
+    /// `[from, to)`, so the returned handles can be `fdatasync`'d from an offloaded [`FsyncJob`] on
+    /// another thread without touching this sink's mutable state (`rmp` #532). A `begin_harden`
+    /// writes exactly one segment, so this is normally a single handle.
+    fn clone_files_over(&self, from: u64, to: u64) -> Result<Vec<File>> {
+        use graphus_core::GraphusError;
+        let mut files = Vec::new();
+        if from < self.anchor_len {
+            let anchor_path = self.dir.join(ANCHOR_NAME);
+            let f = File::open(&anchor_path)
+                .map_err(|e| GraphusError::Storage(format!("open wal anchor to fdatasync: {e}")))?;
+            files.push(f);
+        }
+        for seg in self.segments.values() {
+            let seg_end = seg.base + seg.len;
+            if seg_end <= from || seg.base >= to || seg.len == 0 {
+                continue;
+            }
+            let clone = seg
+                .file
+                .try_clone()
+                .map_err(|e| GraphusError::Storage(format!("clone wal segment handle: {e}")))?;
+            files.push(clone);
+        }
+        Ok(files)
+    }
+}
+
+/// `fdatasync`s a WAL directory by path, hardening a created/deleted file's *name* (POSIX requires a
+/// directory fsync to make a new/removed directory entry durable, independent of file contents). A
+/// free function so the offloaded [`FsyncJob`] can harden the directory on another thread with only
+/// the (cloned) path, holding no reference to the sink.
+fn sync_dir_path(dir: &Path) -> Result<()> {
+    use graphus_core::GraphusError;
+    let f = File::open(dir).map_err(|e| {
+        GraphusError::Storage(format!("open wal dir to fsync {}: {e}", dir.display()))
+    })?;
+    f.sync_data()
+        .map_err(|e| GraphusError::Storage(format!("fsync wal dir: {e}")))
+}
+
+impl LogSink for FileLogSink {
+    fn append(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        // WRITE half: flush any not-yet-written pending bytes into the files (advancing
+        // `written_len`, possibly creating a segment). Shared verbatim with `begin_harden`.
+        self.write_pending()?;
+        // FSYNC half: harden the whole **written-but-un-synced** range `[durable_len, written_len)`.
+        //
+        // This is the WAL-before-data fix (`rmp` #532): during a pipelined harden's overlap the
+        // bytes of a batch are already in the file (`begin_harden` wrote them) with `durable_len <
+        // written_len`, while its `fdatasync` is still deferred. A buffer-pool eviction that must
+        // write a data page home whose `page_lsn` is in that window calls this `sync` via the WAL
+        // rule — and it MUST actually `fdatasync` the already-written bytes (not no-op merely because
+        // there is no *unwritten* pending tail), or the home page is written over an un-synced WAL
+        // record and a crash before the deferred `fdatasync` leaves an un-undoable uncommitted change.
+        if self.durable_len < self.written_len {
+            // True stable-storage barrier (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere): a bare
+            // `fdatasync` on APFS/HFS+ does not flush the drive's volatile write cache. See
+            // `crate::fullsync`.
+            self.fdatasync_range(self.durable_len, self.written_len)?;
+            self.durable_len = self.written_len;
+        }
+        // Harden any created anchor/segment directory entry AFTER its data is durable (so a crash
+        // cannot leave a named-but-empty/torn segment). Persisted across a `begin_harden` whose
+        // fdatasync is still deferred, so an eviction's inline `sync` here closes that gap too.
+        if self.dir_sync_pending {
+            self.sync_dir()?;
+            self.dir_sync_pending = false;
+        }
+        Ok(())
+    }
+
+    fn begin_harden(&mut self) -> Result<FsyncJob> {
+        // WRITE half only: flush pending into the files, advancing `written_len` WITHOUT
+        // `fdatasync`ing (deferred to the returned job) and WITHOUT advancing `durable_len`.
+        self.write_pending()?;
+        // Nothing to harden (an empty batch, or an eviction's inline `sync` during a prior overlap
+        // already hardened this range): return a no-op job at the current write frontier.
+        if self.durable_len >= self.written_len && !self.dir_sync_pending {
+            return Ok(FsyncJob::already_durable(self.written_len));
+        }
+        // Capture cloned handles for the written-but-un-synced range and (if a file was just created)
+        // the directory, so the job hardens exactly the bytes `begin_harden` wrote, from another
+        // thread, touching none of this sink's mutable state. `dir_sync_pending` is intentionally NOT
+        // cleared here: an eviction's inline `sync` during the overlap must still be able to harden
+        // the directory entry before it writes a home page (it clears the flag); `complete_harden`
+        // clears it once this job has hardened it.
+        let target = self.written_len;
+        let files = self.clone_files_over(self.durable_len, self.written_len)?;
+        let dir = if self.dir_sync_pending {
+            Some(self.dir.clone())
+        } else {
+            None
+        };
+        Ok(FsyncJob::deferred(
+            move || {
+                for f in &files {
+                    crate::fullsync::full_sync_data(f, "wal pipelined fdatasync")?;
+                }
+                if let Some(dir) = dir {
+                    sync_dir_path(&dir)?;
+                }
+                Ok(())
+            },
+            target,
+        ))
+    }
+
+    fn complete_harden(&mut self, target_len: u64) {
+        // Monotonic advance: an eviction's inline `sync` during the overlap may already have hardened
+        // this (or a longer) range and advanced `durable_len` past `target_len`, so never regress.
+        self.durable_len = self.durable_len.max(target_len);
+        // The job (or an inline `sync`) has now hardened the created directory entry through
+        // `target_len`; if `durable_len` has reached the write frontier, no un-hardened entry remains.
+        if self.durable_len >= self.written_len {
+            self.dir_sync_pending = false;
+        }
     }
 
     fn durable_len(&self) -> u64 {
@@ -679,7 +958,7 @@ impl LogSink for FileLogSink {
     }
 
     fn buffered_len(&self) -> u64 {
-        self.durable_len + self.pending.len() as u64
+        self.written_len + self.pending.len() as u64
     }
 
     fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {

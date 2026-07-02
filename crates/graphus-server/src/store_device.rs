@@ -237,6 +237,30 @@ impl LogSink for WalSink {
         }
     }
 
+    fn begin_harden(&mut self) -> Result<graphus_wal::FsyncJob> {
+        // Forward through to the concrete sink so the pipelined commit harden (`rmp` #532) actually
+        // offloads the `fdatasync` in production — WITHOUT this, `WalSink` (the real type
+        // `graphus-server` opens every database with) would inherit the trait's DEFAULT `begin_harden`
+        // (a full inline `sync` + no-op job), so the fdatasync would stay on the engine thread and the
+        // whole offload would be inert (the reverted prototype's Defect A). The plaintext
+        // `FileLogSink` does the real deferred-fdatasync offload; the encrypted sink deliberately keeps
+        // the inline default (each synced batch is one AES-GCM frame, so it does not pipeline), which
+        // forwarding here preserves.
+        match self {
+            Self::Plain(s) => s.begin_harden(),
+            Self::Encrypted(s) => s.begin_harden(),
+        }
+    }
+
+    fn complete_harden(&mut self, target_len: u64) {
+        // Forward the COMPLETE half so the durable watermark advances on the concrete sink after the
+        // offloaded `fdatasync` runs (`rmp` #532); pairs with `begin_harden` above.
+        match self {
+            Self::Plain(s) => s.complete_harden(target_len),
+            Self::Encrypted(s) => s.complete_harden(target_len),
+        }
+    }
+
     fn durable_len(&self) -> u64 {
         match self {
             Self::Plain(s) => s.durable_len(),
@@ -287,5 +311,126 @@ impl LogSink for WalSink {
             Self::Plain(s) => s.reclaimed_floor(),
             Self::Encrypted(s) => s.reclaimed_floor(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp WAL directory, removed on drop.
+    struct TempWalDir {
+        path: std::path::PathBuf,
+    }
+    impl TempWalDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "graphus-walsink-{tag}-{nanos}-{}",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+    impl Drop for TempWalDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// `rmp` #532 **Defect-A gate (offload is wired THROUGH `WalSink`, not just `FileLogSink`)**: a
+    /// `WalSink::Plain` `begin_harden` must return a genuinely **deferred** fsync job — the records are
+    /// written to the file but `durable_len` is NOT advanced until the offloaded job runs and
+    /// `complete_harden` is called.
+    ///
+    /// The reverted prototype's Defect A was that `WalSink` did NOT forward `begin_harden`, so it
+    /// inherited the trait's DEFAULT (a full inline `sync` + no-op job): the fdatasync stayed on the
+    /// engine thread and the offload was inert in production while unit tests (driving `FileLogSink`
+    /// directly) still passed. This asserts the forwarding: on the defective version `begin_harden`
+    /// would advance `durable_len` immediately and `assert_eq!(sink.durable_len(), d0)` FAILS.
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn walsink_plain_begin_harden_defers_the_fdatasync() {
+        let dir = TempWalDir::new("defecta");
+        let mut sink = WalSink::Plain(FileLogSink::open(&dir.path).unwrap());
+        // The first sync writes + hardens the header into the anchor (advances durable_len).
+        sink.append(b"GWAL0001");
+        sink.sync().unwrap();
+        let d0 = sink.durable_len();
+        assert_eq!(d0, 8, "the header is durable after the anchor sync");
+
+        // Append a batch's records and PREPARE-harden them via `WalSink::begin_harden`.
+        sink.append(b"a-batch-of-commit-records");
+        let job = sink.begin_harden().unwrap();
+        assert_eq!(
+            sink.durable_len(),
+            d0,
+            "Defect A: WalSink::Plain begin_harden must NOT advance durable_len — the fdatasync is \
+             deferred to the returned job (if WalSink fell back to the inline default, durable_len \
+             would already have jumped here)"
+        );
+        assert!(
+            sink.buffered_len() > sink.durable_len(),
+            "the records are written to the file but not yet durable"
+        );
+
+        // Run the offloaded fdatasync, then complete the harden — only NOW is the batch durable.
+        let target = job.target_len();
+        job.run().unwrap();
+        sink.complete_harden(target);
+        assert!(
+            sink.durable_len() > d0,
+            "complete_harden (after the offloaded fdatasync) advances the durable watermark"
+        );
+        assert_eq!(sink.durable_len(), sink.buffered_len());
+
+        // And the bytes survive a reopen (they were genuinely fdatasync'd by the offloaded job).
+        drop(sink);
+        let reopened = WalSink::Plain(FileLogSink::open(&dir.path).unwrap());
+        assert_eq!(reopened.durable_len(), d0 + 25);
+    }
+
+    /// The encrypted arm keeps the inline default (no pipelining — each synced batch is one AES-GCM
+    /// frame): `begin_harden` hardens inline, so `durable_len` advances immediately. This documents
+    /// and pins that deliberate asymmetry (`rmp` #532/#533).
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn walsink_encrypted_begin_harden_is_inline() {
+        use graphus_crypto::{EncryptedFileLogSink, Keyring};
+        let dir = TempWalDir::new("defecta-enc");
+        let keyring = Keyring::from_master_key(
+            [7u8; graphus_crypto::KEY_LEN],
+            &[3u8; graphus_crypto::SALT_LEN],
+        );
+        let backing = FileLogSink::open(dir.path.join("wal")).unwrap();
+        let inner = EncryptedFileLogSink::create(backing, &keyring).unwrap();
+        let mut sink = WalSink::Encrypted(Box::new(inner));
+        // The first sync flushes the sink header + frame 0 and hardens it.
+        sink.append(b"first-frame");
+        sink.sync().unwrap();
+        let d0 = sink.durable_len();
+        assert!(d0 > 0, "the first frame is durable after sync");
+
+        sink.append(b"an-encrypted-batch");
+        let job = sink.begin_harden().unwrap();
+        // Inline default (the encrypted sink does NOT override begin_harden): the fdatasync already
+        // happened, so durable_len advanced in begin_harden.
+        assert!(
+            sink.durable_len() > d0,
+            "the encrypted sink hardens inline (no pipelining), so begin_harden advances durable_len"
+        );
+        let target = job.target_len();
+        job.run().unwrap(); // a no-op job
+        sink.complete_harden(target); // monotonic no-op
+        assert!(sink.durable_len() >= target);
     }
 }

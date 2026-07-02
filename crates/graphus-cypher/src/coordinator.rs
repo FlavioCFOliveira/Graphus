@@ -2754,6 +2754,33 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().harden_wal();
     }
 
+    /// Group-commit **HARDEN — PREPARE half** of a *pipelined* commit (`rmp` #532): writes every
+    /// [`commit_prepare`](Self::commit_prepare)d record to the WAL backing store (advancing its write
+    /// frontier) and returns the deferred [`FsyncJob`](graphus_wal::FsyncJob), WITHOUT `fdatasync`ing.
+    /// The engine offloads the job to a dedicated fsync thread and overlaps the sync with preparing
+    /// the next batch, then calls [`complete_harden_wal`](Self::complete_harden_wal) with the job's
+    /// `target_len` once the job has run — the two-phase split of [`harden_wal`](Self::harden_wal).
+    ///
+    /// The commit is committed-**durable** only after the job runs *and* `complete_harden_wal`
+    /// returns, so the caller MUST NOT acknowledge any committer before then (ack-after-fsync). A
+    /// crash in the overlap loses the un-synced batch WHOLE (torn-tail recovery truncates), which is
+    /// correct precisely because no committer was acked.
+    ///
+    /// # Panics
+    /// Panics (fsyncgate, `04 §4.9`) if writing the records to the backing store fails.
+    pub fn begin_harden_wal(&mut self) -> graphus_wal::FsyncJob {
+        self.store.borrow_mut().begin_harden_wal()
+    }
+
+    /// Group-commit **HARDEN — COMPLETE half** of a pipelined commit (`rmp` #532): advances the WAL
+    /// durable watermark to `target_len` (the `FsyncJob::target_len` of the job returned by
+    /// [`begin_harden_wal`](Self::begin_harden_wal)) after that job's `fdatasync` has run. Monotonic
+    /// (composes with an eviction's inline hardening during the overlap). Call **before** acking any
+    /// committer whose record the job covered.
+    pub fn complete_harden_wal(&mut self, target_len: u64) {
+        self.store.borrow_mut().complete_harden_wal(target_len);
+    }
+
     /// Runs the redo-bounding auto-checkpoint if enough WAL has accumulated (`rmp` storage audit F3),
     /// a no-op otherwise. The engine's group-commit path calls this **once per drained batch**, after
     /// its committers are acknowledged (their commits are already durable via
@@ -3295,6 +3322,17 @@ mod abort_failure_tests {
                 ));
             }
             self.inner.sync()
+        }
+        fn begin_harden(&mut self) -> Result<graphus_wal::FsyncJob> {
+            // Forward to the inner sink (mirroring `read_bounded`/`reclaimed_floor`), so `FaultSink`
+            // stays a faithful `LogSink` wrapper under the pipelined-harden path (`rmp` #532). The
+            // rollback fsync-failure fault this double injects fires on the inline `sync`/harden path
+            // these tests drive (`RecordStore::rollback` → `WalManager::rollback` → `harden` → `sync`),
+            // which is unchanged; `MemLogSink`'s default `begin_harden` hardens inline.
+            self.inner.begin_harden()
+        }
+        fn complete_harden(&mut self, target_len: u64) {
+            self.inner.complete_harden(target_len);
         }
         fn durable_len(&self) -> u64 {
             self.inner.durable_len()
