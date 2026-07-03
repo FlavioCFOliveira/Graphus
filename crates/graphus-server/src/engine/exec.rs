@@ -323,23 +323,26 @@ pub(super) fn handle_run<
         }
     };
 
-    // Reject a write in a read-only transaction (`06 §4`). The physical plan carries whether it
-    // mutates; we detect it structurally via the plan's writes flag.
-    if mode == AccessMode::Read && plan_writes(&plan) {
+    // The Bolt/REST result-summary query type (`rmp` task #512): classified structurally from the plan
+    // (`r` / `w` / `rw`) by the exhaustive `contains_write` walk. Computed here — before the plan is
+    // moved into either dispatch path — so it is available to the inline statement's summary regardless
+    // of the suspend/resume path. The off-thread reader path is always read-only (`"r"`), set in
+    // `read_pool::run_read_task`. The enum is also the authoritative **structural** read-only signal for
+    // off-thread dispatch (`rmp` task #543) AND the write-in-READ-transaction rejection below.
+    let plan_query_type = plan.query_type();
+    let query_type = query_type_code(plan_query_type);
+
+    // Reject a write in a read-only transaction (`06 §4`). Detected structurally via the plan's query
+    // type — a write operator anywhere makes it `Write`/`ReadWrite`, never `Read` (`rmp` #548: reuse the
+    // single exhaustive `query_type()` classifier instead of a hand-maintained operator list that could
+    // miss a child-bearing operator and let a nested write escape the READ-mode gate).
+    if mode == AccessMode::Read && plan_query_type != graphus_cypher::QueryType::Read {
         finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics, db);
         let _ = reply.send(Err(GraphusError::Transaction(
             "write statement attempted in a READ transaction".to_owned(),
         )));
         return RunOutcome::Done;
     }
-
-    // The Bolt/REST result-summary query type (`rmp` task #512): classified structurally from the plan
-    // (`r` / `w` / `rw`). Computed here — before the plan is moved into either dispatch path — so it is
-    // available to the inline statement's summary regardless of the suspend/resume path. The off-thread
-    // reader path is always read-only (`"r"`), set in `read_pool::run_read_task`. The enum is also the
-    // authoritative **structural** read-only signal for off-thread dispatch (`rmp` task #543).
-    let plan_query_type = plan.query_type();
-    let query_type = query_type_code(plan_query_type);
 
     // Snapshot-Isolation demotion for a standalone read (`rmp` task #545): a read-only **auto-commit**
     // statement is not a serializable transaction — it is a MySQL / MariaDB / SQL-Server style SI
@@ -350,7 +353,15 @@ pub(super) fn handle_run<
     // (`BEGIN … COMMIT`) transactions are untouched — they keep full Serializable SSI. The transaction
     // keeps its snapshot reservation (GC-watermark pin), so the read still sees a consistent MVCC
     // snapshot with no premature reclamation.
-    if auto_commit && plan_query_type == graphus_cypher::QueryType::Read {
+    //
+    // A procedure-calling plan is EXCLUDED from the demotion (`rmp` #548, symmetric with the off-thread
+    // gate below): `query_type()` classifies a `ProcedureCall` as read-only unless its *input* subtree
+    // writes — it cannot see a mutation inside a procedure's Rust body. Keeping a procedure-calling read
+    // at full Serializable SSI closes the latent trap where a future write-capable procedure would be
+    // classified `Read`, demoted to Snapshot, and silently skip pivot detection. Read-only procedures are
+    // unaffected in practice (SI vs Serializable is indistinguishable for a pure read).
+    if auto_commit && plan_query_type == graphus_cypher::QueryType::Read && !plan.calls_procedure()
+    {
         coordinator.demote_read_to_snapshot(txn);
     }
 
@@ -377,9 +388,10 @@ pub(super) fn handle_run<
     // `GraphAccess` trait, degrades any (impossible-for-a-read-plan) write attempt to a captured error +
     // rollback, and gracefully degrades a *declined* accelerator seam (index / full-text / spatial /
     // columnar) to a correct full scan — so routing it to a reader is fail-safe. Writes still run inline;
-    // a write submitted in a declared READ transaction is already rejected above (`plan_writes`).
+    // a write submitted in a declared READ transaction is already rejected above (via `query_type()`).
     //
-    // Exception (`rmp` task #543): a plan that CALLS A PROCEDURE stays inline (`plan_calls_procedure`).
+    // Exception (`rmp` task #543): a plan that CALLS A PROCEDURE stays inline (`plan.calls_procedure()`,
+    // an exhaustive structural walk — `rmp` #548).
     // A procedure can reach a derived-accelerator seam that has **no scan fallback** — e.g.
     // `db.index.fulltext.queryNodes` needs the full-text index, which lives on the coordinator and
     // declines on the reader's owned read view, surfacing as a hard "no such index" error rather than a
@@ -401,7 +413,7 @@ pub(super) fn handle_run<
     let mut reply = Some(reply);
     let mut privileges = privileges;
     if plan_query_type == graphus_cypher::QueryType::Read
-        && !plan_calls_procedure(&plan)
+        && !plan.calls_procedure()
         && auto_commit
         && dispatch.is_threaded()
     {
@@ -691,6 +703,70 @@ fn compile(
     Ok(plan_physical_with_stats(&logical, catalog, stats))
 }
 
+/// The outcome of streaming one row through the deadline-aware egress send ([`send_row_with_backpressure`]).
+enum EgressStep {
+    /// The row was delivered to the bounded egress channel.
+    Sent,
+    /// The consumer dropped its receiver (client disconnect / session end): stop streaming, not an error.
+    ConsumerGone,
+    /// The per-statement deadline (or an explicit cancel) tripped while the channel was full: abort the read.
+    Cancelled,
+}
+
+/// Backoff escalation for the off-thread reader's egress-backpressure wait (`rmp` #551): a short
+/// `spin_loop` burst (near-zero latency when a fast consumer momentarily fills the bounded channel),
+/// then `yield_now`, then brief sleeps (no CPU spin while a genuinely stalled consumer is not draining).
+/// The step counts are small so the statement deadline is re-checked promptly (sub-millisecond) once the
+/// wait escalates to sleeping.
+const EGRESS_PARK_SPINS: u32 = 8;
+const EGRESS_PARK_YIELDS: u32 = 16;
+const EGRESS_PARK_SLEEP: Duration = Duration::from_micros(200);
+
+/// Delivers one `item` to the bounded egress channel, honouring the reader's per-statement deadline
+/// while the channel is full (`rmp` #551).
+///
+/// The off-thread reader (`run_cursor`, called only from the reader pool) runs on its own worker
+/// thread — it cannot "suspend and yield the engine thread" the way the inline path does. A bare
+/// blocking [`RowSender::send`] would therefore park this reader **forever** if the consumer stops
+/// draining (TCP zero-window / a slow-loris on the result stream), which pins this read's MVCC snapshot
+/// (the GC watermark, so nothing it read is ever reclaimed → unbounded RAM + disk growth) and wedges a
+/// finite reader-pool slot (a few such reads exhaust the pool = read-service DoS). Instead we
+/// [`RowSender::try_send`] and, while the channel is full, back off and re-check the same
+/// [`CancellationToken`](graphus_cypher::CancellationToken) the CPU path already enforces. This closes
+/// exactly the gap the aged-transaction reaper's auto-commit exclusion (`engine::maybe_reap_aged`)
+/// already ASSUMES is closed — that an auto-commit read is "bounded by the per-statement timeout"
+/// (`rmp` #476) — which held on the CPU path but not while blocked on egress.
+fn send_row_with_backpressure(
+    row_tx: &RowSender,
+    cancel: &graphus_cypher::CancellationToken,
+    item: super::stream::RowItem,
+) -> EgressStep {
+    let mut item = item;
+    let mut waited: u32 = 0;
+    loop {
+        match row_tx.try_send(item) {
+            super::stream::TrySend::Sent => return EgressStep::Sent,
+            super::stream::TrySend::Disconnected(_) => return EgressStep::ConsumerGone,
+            super::stream::TrySend::Full(returned) => {
+                // Re-check the deadline/cancel BEFORE backing off, so a stalled consumer releases this
+                // reader (and its snapshot + slot) within the statement budget.
+                if cancel.is_cancelled() {
+                    return EgressStep::Cancelled;
+                }
+                item = returned;
+                if waited < EGRESS_PARK_SPINS {
+                    std::hint::spin_loop();
+                } else if waited < EGRESS_PARK_SPINS + EGRESS_PARK_YIELDS {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(EGRESS_PARK_SLEEP);
+                }
+                waited = waited.saturating_add(1);
+            }
+        }
+    }
+}
+
 /// Opens the cursor for `plan` over `graph` (the bare seam or an [`AuthorizedGraph`] wrapper), sends
 /// the [`RunReply`] before the first row, then streams each row into `row_tx`.
 ///
@@ -714,7 +790,11 @@ pub(super) fn run_cursor(
     // The **same** registry that backed `compile` must back execution (`rmp` task #75), or the
     // compile-time function/procedure guarantees are void. The cursor carries a deadline-bearing
     // cancellation token (`rmp` #476): the same per-statement CPU budget the inline path enforces, so an
-    // off-thread reader is bounded identically.
+    // off-thread reader is bounded identically. Built ONCE and cloned (`rmp` #551): the executor enforces
+    // the deadline on the CPU/compute path, and the SAME token bounds the egress-backpressure wait in the
+    // streaming loop below, so a stalled consumer cannot pin this reader (its MVCC snapshot / the GC
+    // watermark) or its pool slot past the statement deadline.
+    let cancel = graphus_cypher::CancellationToken::with_deadline(deadline);
     let mut cursor = match execute_with_extensions_cancellable(
         // `Arc::clone` (a refcount bump) — the executor holds the shared plan, no deep clone (`rmp` #531).
         Arc::clone(plan),
@@ -722,7 +802,7 @@ pub(super) fn run_cursor(
         graph,
         extensions.functions_dyn(),
         extensions.procedures_dyn(),
-        graphus_cypher::CancellationToken::with_deadline(deadline),
+        cancel.clone(),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -755,12 +835,23 @@ pub(super) fn run_cursor(
         // `AuthorizedGraph` decorator (rmp #93) — RBAC filtering and MVCC visibility compose
         // automatically: a hidden property is already `None`, an invisible entity already filtered.
         match cursor.next_materialized() {
-            Ok(Some(cells)) => {
+            Ok(Some(cells)) => match send_row_with_backpressure(row_tx, &cancel, Ok(cells)) {
+                EgressStep::Sent => {}
                 // A closed channel (consumer gone) ends streaming early; not an error.
-                if row_tx.send(Ok(cells)).is_err() {
-                    return true;
+                EgressStep::ConsumerGone => return true,
+                EgressStep::Cancelled => {
+                    // The per-statement deadline (`rmp` #476) tripped (or an explicit cancel) WHILE this
+                    // reader was backpressured by a consumer that stopped draining (`rmp` #551). End the
+                    // read so it retires and releases its MVCC snapshot (advancing the GC watermark) and
+                    // its reader-pool slot. Best-effort deliver a clear timeout error; if the channel is
+                    // still full it is dropped and the consumer observes the disconnect at retirement.
+                    let _ = row_tx.try_send(Err(GraphusError::Runtime(
+                        "statement timed out while streaming results to a slow or stalled consumer"
+                            .to_owned(),
+                    )));
+                    return false;
                 }
-            }
+            },
             Ok(None) => break,
             Err(e) => {
                 let _ = row_tx.send(Err(GraphusError::Runtime(e.to_string())));
@@ -1285,81 +1376,6 @@ fn counters_to_stats(counters: &graphus_cypher::QueryCounters) -> Vec<(String, V
         stats.push(("contains-updates".to_owned(), Value::Boolean(true)));
     }
     stats
-}
-
-/// Whether a physical plan performs writes (so a `READ` transaction can reject it — `06 §4`). A
-/// write plan's root (or a nested write op) is one of the mutating operators.
-fn plan_writes(plan: &graphus_cypher::PhysicalPlan) -> bool {
-    op_writes(&plan.root)
-}
-
-/// Whether a physical plan contains a **procedure call** anywhere in its operator tree (`rmp` task
-/// #543). Such a plan is kept on the inline engine-thread path even when it is structurally read-only,
-/// because a procedure may reach a *derived accelerator* seam — full-text / spatial / columnar / the
-/// statistics catalogue — that lives on the coordinator (engine thread) and **declines** on the
-/// off-thread reader's owned read view ([`graphus_cypher::ReadOnlyGraph`], see its seam-decline note).
-/// A plain graph read (scan / expand / property lookup / aggregation) degrades a declined *accelerator*
-/// to a correct full scan, so it runs correctly off-thread; but a procedure like
-/// `db.index.fulltext.queryNodes` has **no scan fallback** — the declined full-text seam surfaces as a
-/// hard "no such index" error. Keeping procedure plans inline preserves their full coordinator access
-/// (exactly how they already ran when submitted in the default `Write` access mode before #543).
-fn plan_calls_procedure(plan: &graphus_cypher::PhysicalPlan) -> bool {
-    op_calls_procedure(&plan.root)
-}
-
-/// Recursively checks whether `op` (or any input) is a [`PhysicalOp::ProcedureCall`].
-fn op_calls_procedure(op: &graphus_cypher::PhysicalOp) -> bool {
-    use graphus_cypher::PhysicalOp as P;
-    match op {
-        P::ProcedureCall { .. } => true,
-        // Recurse through the single-input operators.
-        P::Filter { input, .. }
-        | P::Projection { input, .. }
-        | P::Skip { input, .. }
-        | P::Limit { input, .. }
-        | P::Sort { input, .. }
-        | P::TopN { input, .. }
-        | P::Optional { input, .. }
-        | P::Unwind { input, .. }
-        | P::Aggregation { input, .. } => op_calls_procedure(input),
-        // Binary operators.
-        P::NestedLoopJoin { left, right, .. }
-        | P::HashJoin { left, right, .. }
-        | P::Union { left, right, .. } => op_calls_procedure(left) || op_calls_procedure(right),
-        // Leaves (incl. non-recursive write ops, which never reach the off-thread gate) never call a
-        // procedure.
-        _ => false,
-    }
-}
-
-/// Recursively checks whether `op` (or any input) is a mutating operator.
-fn op_writes(op: &graphus_cypher::PhysicalOp) -> bool {
-    use graphus_cypher::PhysicalOp as P;
-    match op {
-        P::Create { .. }
-        | P::Merge { .. }
-        | P::SetClause { .. }
-        | P::Delete { .. }
-        | P::Remove { .. } => true,
-        // Recurse through the single-input operators.
-        P::Filter { input, .. }
-        | P::Projection { input, .. }
-        | P::Skip { input, .. }
-        | P::Limit { input, .. }
-        | P::Sort { input, .. }
-        | P::TopN { input, .. }
-        | P::Optional { input, .. }
-        | P::Unwind { input, .. }
-        | P::Aggregation { input, .. } => op_writes(input),
-        // The procedure-call operator may have an optional input.
-        P::ProcedureCall { input, .. } => input.as_deref().is_some_and(op_writes),
-        // Binary operators.
-        P::NestedLoopJoin { left, right, .. }
-        | P::HashJoin { left, right, .. }
-        | P::Union { left, right, .. } => op_writes(left) || op_writes(right),
-        // Leaves never write.
-        _ => false,
-    }
 }
 
 /// The slow-query threshold, read from the process-wide cell the server sets at startup. Falls back

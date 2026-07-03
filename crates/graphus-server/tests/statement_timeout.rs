@@ -237,6 +237,83 @@ fn generous_timeout_does_not_disturb_normal_queries() {
     shutdown(eng, handle);
 }
 
+/// Off-thread reader path (`rmp` #551): a **stalled consumer** must not wedge the reader. An
+/// auto-commit read dispatched to the reader pool whose client stops draining rows used to park FOREVER
+/// in the blocking egress send — pinning the reader's MVCC snapshot (the GC watermark, so nothing it
+/// read is ever reclaimed) and holding its reader-pool slot indefinitely. The deadline-aware egress send
+/// must bound that wait by the same per-statement timeout the CPU path enforces (`rmp` #476): the read
+/// aborts, its stream terminates, and the reader pool + engine recover.
+#[test]
+fn statement_timeout_bounds_a_stalled_offthread_reader() {
+    let eng = engine_with_timeout(Some(SHORT_TIMEOUT));
+    let handle = eng.handle.clone();
+
+    // Seed far more than the egress buffer (256) so a fully-buffered stream still has rows queued — the
+    // reader must block on the full channel once the consumer stops reading.
+    seed_nodes(&handle, 1_000);
+
+    // Dispatch an auto-commit read OFF-THREAD (Read + auto-commit + threaded pool), take the reply, and
+    // DO NOT drain it — the classic stalled/slow-loris consumer.
+    let ticket = handle
+        .begin_auto_commit_blocking(AccessMode::Read)
+        .expect("begin read");
+    let reply = handle
+        .run_blocking(
+            ticket,
+            "MATCH (n:N) RETURN n".to_owned(),
+            vec![],
+            true,
+            None,
+        )
+        .expect("off-thread read dispatched");
+
+    // Give the reader time to fill the egress buffer, park on the full channel, and hit the deadline.
+    std::thread::sleep(SHORT_TIMEOUT * 4);
+
+    // Drain on a separate thread so a REGRESSION (the reader wedged in a blocking send that never
+    // returns) FAILS this test via the wall-clock guard below instead of hanging it forever. With the
+    // fix the reader has already aborted at its deadline and dropped its sender, so the drain terminates
+    // promptly after delivering only the buffered prefix.
+    let drain = std::thread::spawn(move || {
+        let mut rows = reply.rows;
+        let mut delivered = 0usize;
+        // Runs until the stream ends: `Ok(None)` (clean end) or `Err(_)` (terminal timeout error /
+        // disconnect) both fall out of the `while let`.
+        while let Ok(Some(_)) = rows.next() {
+            delivered += 1;
+        }
+        delivered
+    });
+
+    let deadline = Instant::now() + PROMPT_CEILING;
+    while !drain.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the stalled off-thread read did not terminate within {PROMPT_CEILING:?} — the reader is \
+             wedged in a blocking egress send (rmp #551 regression)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let delivered = drain.join().expect("drain thread joins");
+    assert!(
+        delivered < 1_000,
+        "the reader aborted before streaming the whole result (delivered {delivered} of 1000)"
+    );
+
+    // The reader-pool slot + engine recovered: a fresh read returns the full result.
+    assert!(
+        run_auto(
+            &handle,
+            AccessMode::Read,
+            "MATCH (n:N) RETURN count(n) AS c"
+        )
+        .is_ok(),
+        "the engine + reader pool must keep serving after a stalled read is reaped"
+    );
+
+    shutdown(eng, handle);
+}
+
 /// A disabled timeout (`None`) preserves the prior unbounded behaviour for legitimate work: a normal
 /// query still completes (this is the opt-out / `statement_timeout_ms = 0` config).
 #[test]

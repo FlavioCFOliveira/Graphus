@@ -410,6 +410,9 @@ impl Response {
             // large record still decodes; only the unbounded pre-allocation is removed.
             let mut values = Vec::with_capacity(prealloc_cap(count, u.remaining()));
             for _ in 0..count {
+                // Per-element breadth budget (`rmp` #550): a hostile server cannot amplify a small
+                // RECORD `LIST_32` header into a multi-GiB client-side allocation.
+                u.charge_element()?;
                 values.push(unpack_bolt_value(&mut u)?);
             }
             return Ok(Response::Record { values });
@@ -461,6 +464,10 @@ fn read_fields(u: &mut Unpacker<'_>, count: usize) -> BoltResult<Vec<Value>> {
     debug_assert!(count <= MAX_STRUCT_FIELDS);
     let mut fields = Vec::with_capacity(count);
     for _ in 0..count {
+        // Charge each struct field against the per-message breadth budget (`rmp` #550). The field
+        // count is already ≤ 15, but charging here keeps the budget accounting complete and uniform
+        // across every collection arm.
+        u.charge_element()?;
         fields.push(unpack_value(u)?);
     }
     Ok(fields)

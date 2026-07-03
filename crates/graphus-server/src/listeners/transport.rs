@@ -22,6 +22,20 @@ use tokio::runtime::Handle;
 
 use crate::shutdown::ShutdownCoordinator;
 
+/// Maximum bytes the outbound [`write_buf`](AsyncToBlockingTransport::write_buf) may accumulate before
+/// [`Transport::write_all`] forces an intermediate flush to the socket (`rmp` #547).
+///
+/// Without this cap, the `rmp` #317 "buffer-until-the-next-read" discipline lets a single `PULL {n:-1}`
+/// (fetch-all) over a large/cheap result — `UNWIND range(1, 1e9) RETURN x`, or `MATCH (n) RETURN n` over
+/// a big graph — accumulate the **entire** serialized result here before one byte is flushed, so peak
+/// unflushed RAM equals the whole result set. With `max_connections` peers each issuing one cheap
+/// request that is an OOM DoS. Flushing once the buffer crosses this threshold bounds peak per-connection
+/// unflushed memory to ≈ this many bytes (plus at most one in-flight framed message), while **preserving**
+/// the #317 syscall-batching win: a huge `PULL` still flushes once per ~256 KiB (thousands of `RECORD`s),
+/// not once per row. A single oversized *value* is separately bounded by the PackStream value-budget
+/// guards (`rmp` #489/#491); this cap governs the *aggregate* of many rows.
+const WRITE_BUF_FLUSH_THRESHOLD: usize = 256 * 1024;
+
 /// A blocking [`Transport`] over an async byte stream `S`, driven via the runtime `Handle`.
 ///
 /// `S` is the accepted connection (`UdsConn`, or `tokio_rustls::server::TlsStream<TcpConn>`). The
@@ -162,6 +176,15 @@ where
         // `flush` (driven before the next read). The bytes appended are exactly the framed PackStream
         // the caller passed, so the wire output is unchanged.
         self.write_buf.extend_from_slice(bytes);
+        // Bound peak unflushed memory (rmp #547): a fetch-all `PULL {n:-1}` over a large result would
+        // otherwise buffer the whole serialized result here before the pre-next-read flush, an
+        // unbounded per-connection RAM amplification driven by one cheap request. Flush once the buffer
+        // crosses the threshold so per-connection memory is capped while keeping the #317 batching (one
+        // flush per ~threshold, not per `RECORD`). Partial mid-`PULL` flushes are transparent to the
+        // client: each framed message is already complete in the buffer and the socket is a byte stream.
+        if self.write_buf.len() >= WRITE_BUF_FLUSH_THRESHOLD {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -466,6 +489,105 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "reaped near the cumulative bound, never pinned indefinitely by the drip (elapsed {elapsed:?})"
+        );
+    }
+
+    /// A sink that swallows every write and records the running total of bytes actually delivered to
+    /// the socket (i.e. flushed out of the transport's `write_buf`). `poll_flush`/`poll_shutdown`
+    /// succeed; reads are immediate EOF. The shared counter lets the test measure how many bytes have
+    /// left the buffer at any moment, so it can bound the *unflushed* remainder.
+    struct CountingSink {
+        delivered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(())) // immediate EOF
+        }
+    }
+
+    impl AsyncWrite for CountingSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.delivered
+                .fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn write_buffer_is_bounded_under_a_large_fetch_all_pull() {
+        // rmp #547 regression: a `PULL {n:-1}` over a large result streams many `RECORD` frames through
+        // `write_all` back-to-back with no intervening client read. Before the fix, the #317
+        // buffer-until-next-read discipline let the WHOLE serialized result accumulate in `write_buf`
+        // (peak unflushed RAM == total result size) — a one-cheap-request OOM DoS. The threshold flush
+        // must cap peak unflushed memory regardless of total result size.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rt = multi_thread_rt();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let mut t = AsyncToBlockingTransport::new(
+            CountingSink {
+                delivered: Arc::clone(&delivered),
+            },
+            rt.handle().clone(),
+            ShutdownCoordinator::new(),
+            None,
+            None,
+        );
+
+        // One framed `RECORD` ≈ 4 KiB; 20 000 rows ≈ 80 MiB total — dwarfing the 256 KiB threshold.
+        let chunk = vec![0xABu8; 4096];
+        let chunk_len = chunk.len();
+        let n_rows = 20_000usize;
+        let total = chunk_len * n_rows;
+
+        let (peak_unflushed, delivered_after_flush) = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut peak = 0usize;
+                for i in 0..n_rows {
+                    t.write_all(&chunk).expect("buffered write_all succeeds");
+                    let written = (i + 1) * chunk_len;
+                    let out = delivered.load(Ordering::Relaxed);
+                    peak = peak.max(written - out);
+                }
+                // The final trailing SUCCESS / next-read flush drains the tail.
+                t.flush().expect("final flush succeeds");
+                (peak, delivered.load(Ordering::Relaxed))
+            })
+            .await
+            .expect("blocking write task joins")
+        });
+
+        // Peak unflushed memory is bounded by the threshold plus at most one in-flight framed chunk —
+        // NOT the whole 80 MiB result. This is the OOM-DoS guarantee.
+        assert!(
+            peak_unflushed <= WRITE_BUF_FLUSH_THRESHOLD + chunk_len,
+            "peak unflushed bytes ({peak_unflushed}) must stay within the threshold \
+             ({WRITE_BUF_FLUSH_THRESHOLD}) + one chunk ({chunk_len}), not grow to the {total}-byte result",
+        );
+        assert!(
+            peak_unflushed < total / 10,
+            "peak unflushed ({peak_unflushed}) must be a tiny fraction of the {total}-byte result"
+        );
+        // Every byte still reached the socket — the fix bounds memory without dropping output.
+        assert_eq!(
+            delivered_after_flush, total,
+            "all {total} bytes were delivered to the socket across the batched flushes"
         );
     }
 }

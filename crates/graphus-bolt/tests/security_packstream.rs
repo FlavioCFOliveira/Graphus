@@ -185,6 +185,90 @@ fn decode_amplification_is_bounded_not_header_driven() {
     );
 }
 
+// ---- breadth budget: decoded-element cap (rmp #550, CWE-770 amplification) ---------------------
+
+/// Regression (`rmp` #550, HIGH): the decoder caps the **total** number of decoded elements per
+/// message at `MAX_DECODE_ELEMENTS`, so a breadth bomb — a `LIST_32`/`MAP_32` header declaring far
+/// more elements than the input's byte budget would otherwise allow to amplify — is rejected with a
+/// clean `Decode` error instead of growing a multi-GiB `Vec` (up to 40×/64× the wire bytes,
+/// reachable pre-auth on `HELLO.extra`).
+///
+/// This drives the budget the **memory-light** way: a `MAP_32` whose every entry repeats the SAME
+/// key. The per-entry breadth charge still fires for every entry (it is charged *before* dedup), so
+/// the budget trips at entry `MAX_DECODE_ELEMENTS + 1`, yet the deduplicated map holds a single entry
+/// — the test asserts the cap without allocating gigabytes.
+#[test]
+fn breadth_bomb_map_is_rejected_by_element_budget() {
+    use graphus_bolt::packstream::MAX_DECODE_ELEMENTS;
+
+    // MAP_32 header claiming u32::MAX entries, then (MAX_DECODE_ELEMENTS + 1) copies of
+    // (empty-string key 0x80, null value 0xC0). All-same-key ⇒ the decoded map stays O(1) in memory,
+    // but each entry charges the shared breadth budget.
+    let over = MAX_DECODE_ELEMENTS + 1;
+    let mut bytes = Vec::with_capacity(5 + over * 2);
+    bytes.push(0xDA); // MAP_32
+    bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+    for _ in 0..over {
+        bytes.push(0x80); // TINY_STRING length 0 (empty key)
+        bytes.push(0xC0); // NULL value
+    }
+
+    let err = dec(&bytes).expect_err("a breadth bomb must be rejected by the element budget");
+    assert!(
+        format!("{err}").contains("element count"),
+        "expected a decoded-element-budget error, got: {err}"
+    );
+}
+
+/// The element-budget constant is pinned, and the worst-case decoded memory it implies is asserted to
+/// stay a small multiple of the 64 MiB message cap — a regression tripwire if the cap or the `Value`
+/// layout balloons (mirrors `decode_amplification_is_bounded_not_header_driven` for breadth).
+#[test]
+fn element_budget_bounds_decoded_memory_to_a_small_multiple_of_the_message_cap() {
+    use graphus_bolt::packstream::MAX_DECODE_ELEMENTS;
+
+    assert_eq!(
+        MAX_DECODE_ELEMENTS,
+        4 * 1024 * 1024,
+        "rmp #550 set the breadth budget to 2^22 elements; a change here moves the decoded-memory \
+         ceiling and must be a conscious, reviewed decision"
+    );
+
+    // Worst-case decoded heap = MAX_DECODE_ELEMENTS × widest slot. The map slot (String, Value) is the
+    // largest a decoded element can be.
+    let map_slot = std::mem::size_of::<(String, graphus_core::Value)>();
+    let ceiling = MAX_DECODE_ELEMENTS * map_slot;
+    let message_cap = 64 * 1024 * 1024; // framing::DEFAULT_MAX_MESSAGE_SIZE
+    // 4.19M × 64 B = 256 MiB = 4× the 64 MiB message cap — a small, bounded multiple (vs the ~2.5 GiB
+    // an unbounded decoder produced from a 64 MiB message of null markers).
+    assert!(
+        ceiling <= 4 * message_cap,
+        "worst-case decoded heap ({ceiling} bytes = {MAX_DECODE_ELEMENTS} elements × {map_slot}-byte \
+         map slots) must stay within a small multiple of the {message_cap}-byte message cap"
+    );
+}
+
+/// A legitimately large — but in-budget — collection must still decode without error, proving the
+/// budget does not reject well-formed messages (the amplification cap only bites pathological input).
+#[test]
+fn large_in_budget_collection_still_decodes() {
+    use graphus_bolt::packstream::MAX_DECODE_ELEMENTS;
+
+    // 100k NULL elements: comfortably under the 4.19M budget and a realistic upper end for a bulk
+    // parameter list. Must decode to a full 100k-element list.
+    let n = 100_000usize;
+    assert!(n < MAX_DECODE_ELEMENTS);
+    let mut bytes = Vec::with_capacity(5 + n);
+    bytes.push(0xD6); // LIST_32
+    #[allow(clippy::cast_possible_truncation)]
+    bytes.extend_from_slice(&(n as u32).to_be_bytes());
+    bytes.extend(std::iter::repeat_n(0xC0u8, n)); // n NULLs
+    match dec(&bytes).expect("an in-budget large list must decode") {
+        graphus_core::Value::List(items) => assert_eq!(items.len(), n),
+        other => panic!("expected a list, got {other:?}"),
+    }
+}
+
 // ---- deep nesting / stack overflow ------------------------------------------------------------
 
 #[test]

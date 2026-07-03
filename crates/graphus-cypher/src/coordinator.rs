@@ -2951,6 +2951,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// 2. **[`RecordStore::checkpoint`]** then flushes every dirty page home (enforcing WAL-before-data
     ///    per page), writes the clean checkpoint marker, and physically reclaims the WAL prefix below
     ///    the now-lowered floor.
+    /// 3. **[`SsiTracker::prune_committed`]** finally reclaims the in-memory SSI conflict records of
+    ///    committed transactions no live transaction can still conflict with (`rmp` #552). The server
+    ///    engine drives every transaction through this coordinator, whose `SsiTracker` was otherwise
+    ///    never pruned (its only prior caller was `TxnManager::prune`, which the server never uses), so
+    ///    every committed write **and** every committed auto-commit read (`rmp` #545) accumulated a
+    ///    permanent `txns`/reverse-index entry — an unbounded RAM leak and an O(N)-per-commit
+    ///    `detect_pivot_abort` scan. Pruning here bounds the tracker to live-plus-recently-committed on
+    ///    the same maintenance cadence as every other reclaimed resource.
     ///
     /// Durability is preserved throughout: the GC pass commits its frozen headers before the
     /// checkpoint reads the floor, the checkpoint flush makes everything prior durable on its data
@@ -2965,6 +2973,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     pub fn checkpoint(&mut self) -> Result<GcPassReport> {
         let report = self.gc()?;
         self.store.borrow_mut().checkpoint()?;
+
+        // Reclaim the SSI tracker's retained committed records (`rmp` #552). The watermark is the
+        // oldest active read snapshot — the oldest *begin* timestamp among open transactions, or `None`
+        // when none are open — which is precisely `SsiTracker::prune_committed`'s `low_water` contract
+        // (identical to the one `TxnManager::run_gc` passes). A committed transaction whose commit is
+        // `<= low_water` committed before every open transaction began, so it is concurrent with no live
+        // transaction: `are_concurrent` gates every rw-edge on concurrency, so no live transaction holds
+        // (or can newly form) an edge to or from it, and forgetting it can never hide a dangerous
+        // structure `detect_pivot_abort` would catch (the documented no-false-negative retention rule,
+        // the same PostgreSQL applies to its committed-SSI summary). `gc()` above opens its maintenance
+        // transaction on the *store* only (never `self.active`/`self.ssi`), so it does not perturb this
+        // watermark. Serializability for live transactions is untouched: only committed records strictly
+        // below the live low-water are forgotten.
+        let low_water = self.oldest_active_snapshot();
+        self.ssi.borrow_mut().prune_committed(low_water);
+
         Ok(report)
     }
 
@@ -3006,6 +3030,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     #[must_use]
     pub(crate) fn ssi_tracks(&self, txn: TxnId) -> bool {
         self.ssi.borrow().tracks(txn)
+    }
+
+    /// Test-only witness of the SSI tracker's retained-conflict-record count (`rmp` #552): the direct
+    /// witness that [`checkpoint`](Self::checkpoint)'s `prune_committed` actually shrank the tracker
+    /// after a burst of committed transactions and auto-commit reads.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn ssi_tracked_len(&self) -> usize {
+        self.ssi.borrow().tracked_len()
     }
 
     /// Reclaims the underlying store once no transaction is open and no statement seam is live
@@ -3690,5 +3723,196 @@ mod max_transaction_age_tests {
 
         let _ = untracked;
         coord.rollback(tracked).expect("rollback");
+    }
+}
+
+#[cfg(test)]
+mod ssi_prune_tests {
+    //! `rmp` #552 regression: the maintenance checkpoint MUST prune the coordinator's `SsiTracker`.
+    //!
+    //! The server engine drives every transaction through this coordinator, whose `SsiTracker` was
+    //! never pruned in production (its only prior caller, `TxnManager::prune`, is unused by the server).
+    //! `record_commit` retains a committed transaction's record for later conflict resolution, so every
+    //! committed write — and, since `rmp` #545, every committed auto-commit read demoted to Snapshot
+    //! Isolation — accumulated a permanent `txns` entry: an unbounded RAM leak and an O(N)-per-commit
+    //! `detect_pivot_abort` scan. `TxnCoordinator::checkpoint` now drains it at the reader-safe
+    //! `oldest_active_snapshot` watermark. These tests prove the tracker GROWS without a prune and
+    //! SHRINKS with one, and that pruning at the live watermark preserves serializability (it retains
+    //! every record a live transaction could still conflict with).
+
+    use graphus_core::TxnId;
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::RecordStore;
+    use graphus_wal::{MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::catalog::IndexCatalog;
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::{PhysicalPlan, plan_physical};
+    use crate::semantics::analyze;
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    fn compile(src: &str) -> PhysicalPlan {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        plan_physical(&lower(&validated), &IndexCatalog::empty())
+    }
+
+    /// Runs one statement under `txn`, asserting it captured no error.
+    fn run_stmt(coord: &Coord, txn: TxnId, src: &str) {
+        let plan = compile(src);
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(txn).expect("statement");
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect");
+        }
+        assert!(graph.take_error().is_none(), "captured error in: {src}");
+    }
+
+    /// THE LEAK GATE. A burst of committed writers AND committed auto-commit reads (SI-demoted, the
+    /// `rmp` #545 path) each retains an SSI conflict record; with no transaction open, the maintenance
+    /// checkpoint must prune every one of them. Proves the tracker GROWS to `WRITERS + READS` without a
+    /// prune and SHRINKS to zero with one.
+    ///
+    /// Fails before the `rmp` #552 fix (`checkpoint` never pruned the tracker → `after == grown`) and
+    /// passes after (`after == 0`).
+    #[test]
+    fn checkpoint_prunes_accumulated_committed_ssi_records() {
+        let mut coord = fresh_coord();
+        assert_eq!(
+            coord.ssi_tracked_len(),
+            0,
+            "a fresh coordinator's SSI tracker retains nothing"
+        );
+
+        // A burst of committed writers — each `commit` retains its record (`record_commit`).
+        const WRITERS: usize = 8;
+        for i in 0..WRITERS {
+            let w = coord.begin_serializable();
+            run_stmt(&coord, w, &format!("CREATE (:N {{id: {i}}})"));
+            coord.commit(w).expect("writer commits");
+        }
+
+        // A burst of committed auto-commit READS demoted to Snapshot Isolation (`rmp` #545). A clean
+        // read is finalized through `commit` → `record_commit`, which retains its record too — the leak
+        // this fix closes for the read-heavy workload.
+        const READS: usize = 8;
+        for _ in 0..READS {
+            let r = coord.begin_serializable();
+            coord.demote_read_to_snapshot(r);
+            run_stmt(&coord, r, "MATCH (n:N) RETURN n.id AS id");
+            coord.commit(r).expect("auto-commit read commits");
+        }
+
+        let grown = coord.ssi_tracked_len();
+        assert_eq!(
+            grown,
+            WRITERS + READS,
+            "every committed write AND every committed auto-commit read retains an SSI record"
+        );
+        assert_eq!(coord.active_count(), 0, "no transaction is open");
+
+        // The maintenance checkpoint (`rmp` #305 / #552) prunes the tracker at `oldest_active_snapshot`
+        // = None (no open transaction), so every settled committed record is forgotten.
+        coord.checkpoint().expect("maintenance checkpoint");
+
+        let after = coord.ssi_tracked_len();
+        assert!(
+            after < grown,
+            "the checkpoint must SHRINK the SSI tracker (before {grown} -> after {after})"
+        );
+        assert_eq!(
+            after, 0,
+            "with no open transaction every committed record is settled and pruned"
+        );
+
+        // The coordinator remains fully usable after the prune.
+        let w = coord.begin_serializable();
+        run_stmt(&coord, w, "CREATE (:N {id: 999})");
+        coord.commit(w).expect("post-prune writer commits cleanly");
+    }
+
+    /// THE WATERMARK GATE (ACID-serializability safety). Pruning must forget ONLY committed records
+    /// strictly at/below the live low-water mark. With a long reader open, a checkpoint prunes the
+    /// records older than the reader's snapshot but RETAINS both the reader (still in flight) and a
+    /// writer that committed concurrently with it — a record that could still contribute an
+    /// rw-antidependency and so must not be dropped.
+    #[test]
+    fn checkpoint_retains_records_a_live_reader_still_needs() {
+        let mut coord = fresh_coord();
+
+        // Two writers that commit BEFORE the long reader opens its snapshot.
+        let pre1 = coord.begin_serializable();
+        run_stmt(&coord, pre1, "CREATE (:N {id: 1})");
+        coord.commit(pre1).expect("pre1 commits");
+        let pre2 = coord.begin_serializable();
+        run_stmt(&coord, pre2, "CREATE (:N {id: 2})");
+        coord.commit(pre2).expect("pre2 commits");
+
+        // A long-lived reader opens its snapshot and pins the GC / prune low-water mark at its begin.
+        let reader = coord.begin_serializable();
+        run_stmt(&coord, reader, "MATCH (n:N) RETURN n.id AS id");
+        let pinned = coord
+            .oldest_active_snapshot()
+            .expect("the open reader pins the watermark");
+
+        // A writer that begins AFTER the reader and commits: concurrent with the reader, its commit
+        // timestamp is strictly above `pinned`, so it must survive the prune.
+        let after_w = coord.begin_serializable();
+        run_stmt(&coord, after_w, "CREATE (:N {id: 3})");
+        coord.commit(after_w).expect("after_w commits");
+
+        // Pre-prune: every record is present.
+        assert!(coord.ssi_tracks(pre1) && coord.ssi_tracks(pre2));
+        assert!(coord.ssi_tracks(reader) && coord.ssi_tracks(after_w));
+        assert_eq!(
+            coord.oldest_active_snapshot(),
+            Some(pinned),
+            "the reader still pins the low-water mark"
+        );
+
+        // Checkpoint prunes at `oldest_active_snapshot` = the reader's snapshot.
+        coord
+            .checkpoint()
+            .expect("maintenance checkpoint with a live reader open");
+
+        // The pre-reader writers (committed <= the watermark) are forgotten; the still-open reader and
+        // the concurrent writer (committed > the watermark) are RETAINED — the serializability contract.
+        assert!(
+            !coord.ssi_tracks(pre1),
+            "a writer committed before the live watermark is pruned"
+        );
+        assert!(
+            !coord.ssi_tracks(pre2),
+            "a writer committed at the live watermark is pruned (commit_ts <= low_water)"
+        );
+        assert!(
+            coord.ssi_tracks(reader),
+            "the still-open reader must be retained (it has no commit timestamp)"
+        );
+        assert!(
+            coord.ssi_tracks(after_w),
+            "a writer concurrent with the open reader must be retained — it could still form an rw-edge"
+        );
+
+        // The reader still commits cleanly after the prune (no serializability regression).
+        coord
+            .commit(reader)
+            .expect("the pinned reader commits cleanly after the prune");
     }
 }

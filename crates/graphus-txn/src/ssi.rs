@@ -760,6 +760,22 @@ impl SsiTracker {
     pub fn tracks(&self, txn: TxnId) -> bool {
         self.txns.contains_key(&txn) || self.doomed.contains(&txn)
     }
+
+    /// The number of transactions with a **retained conflict record** — i.e. the size of the `txns`
+    /// table, the single unbounded-growth vector this tracker exposes. Observability / test seam (the
+    /// `SsiTracker` analogue of `TxnManager::registry_len`).
+    ///
+    /// [`record_commit`](Self::record_commit) deliberately *retains* a committed transaction's record
+    /// (it only stamps `commit_ts`) so a *later* concurrent reader can still discover an
+    /// rw-antidependency against it. That retained set is bounded only by
+    /// [`prune_committed`](Self::prune_committed): without a caller draining it on a maintenance
+    /// cadence, every committed write **and** every committed auto-commit read accumulates here for the
+    /// process lifetime (`rmp` #552). This accessor is the direct witness that a prune actually shrank
+    /// the table.
+    #[must_use]
+    pub fn tracked_len(&self) -> usize {
+        self.txns.len()
+    }
 }
 
 #[cfg(test)]
@@ -957,6 +973,82 @@ mod tests {
         assert_eq!(s.prune_committed(None), 1);
         assert!(!s.txns.contains_key(&TxnId(2)));
         assert!(s.txns.contains_key(&TxnId(3)));
+    }
+
+    #[test]
+    fn tracked_len_grows_with_commits_and_shrinks_on_prune() {
+        // `rmp` #552: the leak witness. `record_commit` RETAINS every committed transaction's record,
+        // so a burst of committed transactions (writes and read-only alike) grows `txns` monotonically;
+        // only `prune_committed` reclaims it. Prove it GROWS without a prune and SHRINKS with one.
+        let mut s = SsiTracker::new();
+        assert_eq!(s.tracked_len(), 0, "an empty tracker retains nothing");
+
+        // A burst of committed transactions. Each `record_commit` only stamps `commit_ts` and keeps the
+        // record (the retention that lets a later concurrent reader still find the rw-edge).
+        for i in 1..=10u64 {
+            s.register(TxnId(i), ts(i));
+            s.record_write(TxnId(i), i as Key);
+            s.record_commit(TxnId(i), ts(100 + i));
+        }
+        assert_eq!(
+            s.tracked_len(),
+            10,
+            "committed entries accumulate (the unbounded-growth leak) until pruned"
+        );
+
+        // With no active transactions, every committed entry is settled and pruned (`low_water = None`).
+        assert_eq!(s.prune_committed(None), 10);
+        assert_eq!(
+            s.tracked_len(),
+            0,
+            "prune_committed(None) reclaims all settled committed entries"
+        );
+    }
+
+    #[test]
+    fn prune_does_not_suppress_a_live_write_skew() {
+        // `rmp` #552 isolation guard: pruning committed entries strictly older than the safe watermark
+        // must NOT suppress a real anomaly among transactions that begin AFTER the prune. This is the
+        // no-false-negative contract in action end-to-end: a prune runs, then a fresh concurrent
+        // write-skew among live transactions must still be detected and aborted.
+        let mut s = SsiTracker::new();
+        // Two old committed transactions that will be pruned.
+        s.register(TxnId(1), ts(1));
+        s.record_write(TxnId(1), 100);
+        s.record_commit(TxnId(1), ts(5));
+        s.register(TxnId(2), ts(2));
+        s.record_read(TxnId(2), 100);
+        s.record_commit(TxnId(2), ts(6));
+        assert_eq!(s.tracked_len(), 2);
+
+        // A fresh pair of LIVE concurrent transactions begins after both old commits.
+        s.register(TxnId(10), ts(20));
+        s.register(TxnId(11), ts(20));
+
+        // Prune at the oldest active begin timestamp (ts(20)): both old commits (ts 5, 6 <= 20) are
+        // forgotten; the two live transactions (no commit_ts) are retained. This is exactly the
+        // watermark `TxnCoordinator::checkpoint` passes (`oldest_active_snapshot`).
+        assert_eq!(s.prune_committed(Some(ts(20))), 2);
+        assert_eq!(
+            s.tracked_len(),
+            2,
+            "only the two live transactions remain after the prune"
+        );
+
+        // The live pair now performs a classic write-skew (T10 reads x/writes y; T11 reads y/writes x).
+        s.record_read(TxnId(10), 300); // x
+        s.record_read(TxnId(11), 400); // y
+        s.record_write(TxnId(10), 400); // T11 --rw--> T10
+        s.record_write(TxnId(11), 300); // T10 --rw--> T11
+        assert!(s.is_pivot(TxnId(10)) && s.is_pivot(TxnId(11)));
+
+        // The anomaly is STILL detected after a prune ran — the prune suppressed nothing among the
+        // live transactions (their edges never touched the forgotten committed entries).
+        assert_eq!(
+            s.detect_pivot_abort(TxnId(10)),
+            Some(TxnId(10)),
+            "a real write-skew among live transactions must still abort after a prune"
+        );
     }
 
     fn label_pred(label: u32) -> PredicateRead {

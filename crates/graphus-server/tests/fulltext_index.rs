@@ -350,3 +350,60 @@ async fn drop_index_then_query_errors() {
 
     handle.shutdown().await.expect("shutdown");
 }
+
+/// rmp #548 regression (production-readiness cert, Cypher-correctness dimension). A full-text
+/// procedure whose result feeds an **expansion** — `CALL db.index.fulltext.queryNodes(...) YIELD node
+/// MATCH (node)-[r]->(m) RETURN m` — plans as `Projection -> ExpandAll -> ProcedureCall`. The #543
+/// off-thread-read gate mis-classified it as *not* calling a procedure (the old `op_calls_procedure`
+/// did not recurse `ExpandAll`), dispatched it to the off-thread reader, where the full-text seam has
+/// no scan fallback on the reader's owned read view and failed with a spurious "no such index" error.
+/// After the exhaustive `calls_procedure()` fix the plan stays inline and serves the query correctly.
+#[tokio::test]
+async fn fulltext_procedure_feeding_an_expand_is_served_inline_not_misrouted() {
+    let temp = TempStore::new("proc-expand");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // An Article that matches the full-text query, with an outgoing edge to a Ref node the query expands to.
+    run(
+        &engine,
+        "CREATE (a:Article {title: 'graph databases', name: 'a1'})-[:CITES]->(:Ref {name: 'r1'})",
+    )
+    .await;
+    engine
+        .index_ddl(create_articles_index(&["title"], "standard"))
+        .await
+        .expect("create fulltext index");
+
+    // The escape pattern: the ProcedureCall's `node` output drives an ExpandAll. Dispatched as an
+    // auto-commit read, this is exactly the plan the #543 gate would have mis-routed off-thread.
+    let rows = run(
+        &engine,
+        "CALL db.index.fulltext.queryNodes('articles', 'graph') YIELD node \
+         MATCH (node)-[r]->(m) RETURN m",
+    )
+    .await;
+
+    // It must return the expanded Ref node — NOT error with "no such index" and NOT be empty.
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(MaterializedValue::Node(n)) => n
+                .properties
+                .iter()
+                .find(|(k, _)| k == "name")
+                .and_then(|(_, v)| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["r1".to_owned()],
+        "the full-text-procedure-feeding-expand query must run inline and return the expanded node"
+    );
+
+    handle.shutdown().await.expect("graceful shutdown");
+}

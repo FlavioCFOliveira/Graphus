@@ -227,6 +227,22 @@ impl PhysicalPlan {
         }
     }
 
+    /// Whether this plan invokes a stored/user/GDS/`db.*` procedure (`CALL …`) anywhere in the tree
+    /// (`rmp` task #548).
+    ///
+    /// The server uses this to keep a procedure-calling read **inline** on the engine thread rather
+    /// than dispatching it to the off-thread reader pool (`rmp` task #543): a procedure can reach a
+    /// derived-accelerator seam (full-text / spatial) that has no scan fallback and declines on the
+    /// reader's owned read view, surfacing as a spurious "no such index" error. The predicate is an
+    /// **exhaustive** structural walk — like the sibling [`contains_write`] it matches every
+    /// [`PhysicalOp`] variant with no `_` wildcard, so a newly-added operator with children fails to
+    /// compile until it is explicitly classified here, rather than silently letting a nested
+    /// `ProcedureCall` escape detection and be mis-dispatched off-thread.
+    #[must_use]
+    pub fn calls_procedure(&self) -> bool {
+        contains_procedure_call(&self.root)
+    }
+
     /// Whether this plan depends on `id`.
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
@@ -1413,6 +1429,64 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => contains_write(left) || contains_write(right),
         PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_write),
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => false,
+    }
+}
+
+/// Whether the physical (sub)plan invokes a procedure (`CALL …` ⇒ a [`PhysicalOp::ProcedureCall`])
+/// anywhere — the structural predicate behind [`PhysicalPlan::calls_procedure`] (`rmp` task #548).
+///
+/// **Exhaustive by construction**: every [`PhysicalOp`] variant is matched with no `_` wildcard, so a
+/// new operator variant is a compile error until it is classified here. This is the whole point of the
+/// rewrite — the previous server-side `op_calls_procedure` used a `_ => false` catch-all that only
+/// recursed a *subset* of child-bearing operators (it missed `ExpandAll`/`ExpandInto`/`NamedPath`/
+/// `ShortestPath`/`Eager`/`LoadCsv`), so a `ProcedureCall` nested under one of them escaped detection
+/// and a full-text/spatial read (e.g. `CALL db.index.fulltext.queryNodes(…) YIELD node MATCH (node)-->…`)
+/// was mis-dispatched off-thread and failed with a spurious "no such index" error.
+fn contains_procedure_call(op: &PhysicalOp) -> bool {
+    match op {
+        PhysicalOp::ProcedureCall { .. } => true,
+        // Single-input operators: recurse into the one child.
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. }
+        | PhysicalOp::Optional { input, .. } => contains_procedure_call(input),
+        // `Foreach` has two children — the driving `input` and the `body` clause; check both.
+        PhysicalOp::Foreach { input, body, .. } => {
+            contains_procedure_call(input) || contains_procedure_call(body)
+        }
+        // Binary operators: recurse into both branches.
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => {
+            contains_procedure_call(left) || contains_procedure_call(right)
+        }
+        // Leaves (scans / index seeks / `Argument` / `Empty`) never call a procedure.
         PhysicalOp::AllNodesScan { .. }
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
@@ -3772,6 +3846,52 @@ mod tests {
             query_type_of("MATCH (n) SET n.x = 1 RETURN n"),
             QueryType::ReadWrite
         );
+    }
+
+    // ---- procedure-call detection for off-thread dispatch (`rmp` task #548) -------------------
+
+    /// Whether `src`, planned against the empty catalog, is detected as invoking a procedure.
+    fn calls_procedure_of(src: &str) -> bool {
+        physical(src, &IndexCatalog::empty()).calls_procedure()
+    }
+
+    #[test]
+    fn calls_procedure_is_false_for_a_plain_read() {
+        assert!(!calls_procedure_of("MATCH (n) RETURN n"));
+        assert!(!calls_procedure_of("MATCH (a)-[r]->(b) RETURN b"));
+        assert!(!calls_procedure_of(
+            "MATCH (n) WHERE n.x > 1 RETURN count(n) ORDER BY count(n)"
+        ));
+    }
+
+    #[test]
+    fn calls_procedure_detects_a_procedure_nested_under_a_previously_missed_operator() {
+        // rmp #548 regression. `CALL db.index.fulltext.queryNodes(...) YIELD node MATCH (node)-->(m)`
+        // plans as `Projection -> ExpandAll(from node) -> ProcedureCall`. The old server-side
+        // `op_calls_procedure` did NOT recurse `ExpandAll` (its `_ => false` catch-all), so this
+        // escaped detection and was mis-dispatched to the off-thread reader, where the declined
+        // full-text seam surfaced as a spurious "no such index" error. The exhaustive
+        // `contains_procedure_call` behind `calls_procedure()` must catch it.
+        assert!(
+            calls_procedure_of(
+                "CALL db.index.fulltext.queryNodes('idx','term') YIELD node \
+                 MATCH (node)-[r]->(m) RETURN m"
+            ),
+            "a ProcedureCall under an ExpandAll must be detected (the #543 off-thread escape)"
+        );
+        // A named path above the expand (`NamedPath`, another operator the old walk missed).
+        assert!(
+            calls_procedure_of(
+                "CALL db.index.fulltext.queryNodes('idx','term') YIELD node \
+                 MATCH p = (node)-[r]->(m) RETURN p"
+            ),
+            "a ProcedureCall under a NamedPath must be detected"
+        );
+        // The simple case (procedure at/near the root) was always detected — keep it covered so a
+        // future refactor cannot silently regress it.
+        assert!(calls_procedure_of(
+            "CALL db.labels() YIELD label RETURN label"
+        ));
     }
 
     #[test]

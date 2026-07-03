@@ -41,6 +41,8 @@
 //! that was the pre-5.0 layout). [`Date`] is *days* since the epoch, [`LocalTime`] / `Time` are
 //! nanoseconds-of-day, and [`Duration`] is `(months, days, seconds, nanos)`.
 
+use std::collections::HashMap;
+
 use graphus_core::Value;
 use graphus_core::value::spatial::{Crs, Point};
 use graphus_core::value::temporal::{
@@ -481,6 +483,12 @@ pub struct Unpacker<'a> {
     /// Current nesting depth of the in-progress decode (lists/maps/structures). Guarded against
     /// [`MAX_DECODE_DEPTH`] so a maliciously deep payload cannot overflow the stack (DoS hardening).
     depth: usize,
+    /// Remaining **breadth** budget for this decode: the number of collection elements still allowed
+    /// across the whole message before the decoder rejects it (`rmp` #550). Initialised to
+    /// [`MAX_DECODE_ELEMENTS`] in [`Unpacker::new`] and decremented once per decoded element by
+    /// [`Unpacker::charge_element`]. Bounds the total decoded `Value` memory independently of the
+    /// per-collection wire headers; see [`MAX_DECODE_ELEMENTS`].
+    elements_remaining: usize,
 }
 
 /// Maximum nesting depth accepted when decoding a PackStream value (lists, maps, and structures).
@@ -505,14 +513,70 @@ pub struct Unpacker<'a> {
 /// message is never rejected; only a hostile one is.
 pub const MAX_DECODE_DEPTH: usize = 64;
 
+/// Maximum number of decoded **elements** (list items, map entries, node labels, path
+/// nodes/rels/indices, struct fields) accepted across a single message decode — the **breadth**
+/// budget that mirrors [`MAX_DECODE_DEPTH`]'s depth budget (`rmp` #550, CWE-770 memory amplification).
+///
+/// # Why a depth guard is not enough
+///
+/// [`MAX_DECODE_DEPTH`] caps how *deeply* collections nest, and [`prealloc_cap`] caps the *initial*
+/// reservation of each collection — but neither caps how *wide* a single collection grows. A
+/// `LIST_32`/`MAP_32` header can declare up to `u32::MAX` elements; the decode loop reads real
+/// elements (each ≥1 wire byte, so bounded by the [`framing`](crate::framing) 64 MiB message cap) and
+/// the `Vec` grows lazily to hold them. Because `size_of::<Value>()` is 40 bytes (and a
+/// `(String, Value)` map slot 64 bytes) while the cheapest element (`null`, a tiny int) is **1 wire
+/// byte**, decoding amplifies input to heap by up to **40×** (list) / **64×** (map): a 64 MiB message
+/// of `null` markers decodes to a ~2.5 GiB transient `Vec` — per message, per connection, and
+/// reachable **pre-authentication** on `HELLO.extra`. A handful of such messages exhaust server RAM.
+///
+/// # The chosen value — `4_194_304` (`2^22`)
+///
+/// This caps the **total** decoded element count for one message, so the worst-case decoded memory is
+/// a small, bounded multiple of the 64 MiB message cap rather than a header-driven 2.5 GiB:
+///
+/// - list of `Value` (40 B/slot): `4_194_304 × 40 B = 160 MiB`;
+/// - map of `(String, Value)` (64 B/slot): `4_194_304 × 64 B = 256 MiB` — i.e. **≤ 4×** the 64 MiB
+///   framing cap. Freed the instant the decode returns or errors.
+///
+/// It composes with the other two bounds: framing caps the *input* at 64 MiB, [`MAX_DECODE_DEPTH`]
+/// caps *nesting*, and this caps *breadth*; together they pin one in-flight decode's transient
+/// footprint to a fixed ceiling independent of the wire-supplied counts.
+///
+/// The value is chosen well **above** any legitimate single-message element count so a well-formed
+/// message is never rejected. The largest realistic Bolt message is a batched `UNWIND $rows` /
+/// parameter list; recommended driver batch sizes are 10k–50k rows of a few properties each
+/// (~10²–10⁵ elements), and even an aggressive 200k-row batch of ~10-element maps is ~2M elements —
+/// comfortably under 4.19M. A message that *does* exceed 4.19M elements is either a decode bomb or a
+/// workload that must be chunked into several messages anyway; rejecting it with a clean
+/// [`BoltError::Decode`] is correct and does not violate PackStream conformance (the spec sets no
+/// element-count minimum a decoder must accept and, like Neo4j itself, an implementation may impose
+/// resource limits). It is far **below** the ~64M elements a 64 MiB message of 1-byte markers could
+/// otherwise carry, so the amplification bomb is rejected long before it allocates gigabytes.
+pub const MAX_DECODE_ELEMENTS: usize = 4 * 1024 * 1024;
+
+/// Map size at or below which duplicate-key dedup uses an **alloc-free linear scan**; above it the
+/// decoder switches to a `HashMap` index so decode stays O(n) instead of O(n²) (`rmp` #549). See
+/// [`MapAccumulator`].
+///
+/// The overwhelming majority of real Bolt maps are tiny (`HELLO.extra` ~5 keys, RUN parameter maps,
+/// node/relationship property maps, RECORD maps), so keeping the small-map path a plain linear scan
+/// avoids a `HashMap` allocation and hashing cost on the hot path — at 32 entries the worst-case scan
+/// is `32²/2 ≈ 512` cheap `str` comparisons, negligible. Only genuinely large maps (which is where
+/// O(n²) becomes a pre-auth CPU DoS) pay for the hash index.
+const HASH_DEDUP_THRESHOLD: usize = 32;
+
 impl<'a> Unpacker<'a> {
     /// A new unpacker over `buf`, positioned at the start.
+    ///
+    /// One `Unpacker` decodes exactly one top-level message, so the per-message breadth budget
+    /// ([`MAX_DECODE_ELEMENTS`]) is (re)initialised here — it resets for every message.
     #[must_use]
     pub fn new(buf: &'a [u8]) -> Self {
         Self {
             buf,
             pos: 0,
             depth: 0,
+            elements_remaining: MAX_DECODE_ELEMENTS,
         }
     }
 
@@ -534,6 +598,28 @@ impl<'a> Unpacker<'a> {
     /// Leaves one level of recursive decoding previously entered via [`Unpacker::enter_nested`].
     fn leave_nested(&mut self) {
         self.depth -= 1;
+    }
+
+    /// Charges **one** decoded element against the per-message breadth budget, rejecting the input
+    /// once [`MAX_DECODE_ELEMENTS`] elements have been decoded across the whole message (`rmp` #550).
+    ///
+    /// This is the breadth analogue of [`Unpacker::enter_nested`]: call it exactly once per element
+    /// appended to any collection (list item, map entry, node label, path node/rel/index, struct
+    /// field) *before* decoding that element. Because every element consumes at least one budget unit,
+    /// the total number of decoded `Value`s — hence the total decoded heap — is bounded regardless of
+    /// the (untrusted) collection headers. Called once per loop iteration so it adds a single
+    /// decrement-and-compare to the per-element cost.
+    ///
+    /// # Errors
+    /// [`BoltError::Decode`] once the message's decoded-element budget is exhausted.
+    pub(crate) fn charge_element(&mut self) -> BoltResult<()> {
+        if self.elements_remaining == 0 {
+            return Err(BoltError::Decode(format!(
+                "PackStream decoded element count exceeds the maximum of {MAX_DECODE_ELEMENTS}"
+            )));
+        }
+        self.elements_remaining -= 1;
+        Ok(())
     }
 
     /// Bytes not yet consumed.
@@ -978,14 +1064,83 @@ pub fn pack_point_3d(packer: &mut Packer, srid: i64, x: f64, y: f64, z: f64) {
     packer.write_float(z);
 }
 
-/// Inserts `(key, value)` into a decoded dictionary with PackStream "last seen value wins"
-/// semantics (`04 §7.1`): if `key` is already present, its value is replaced in place; otherwise the
-/// pair is appended (preserving first-seen ordering for distinct keys).
-fn map_insert_last_wins(entries: &mut Vec<(String, Value)>, key: String, value: Value) {
-    if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
-        slot.1 = value;
-    } else {
-        entries.push((key, value));
+/// Accumulates decoded dictionary `(key, value)` entries with PackStream **"last seen value wins"**
+/// semantics (`04 §7.1`): distinct keys keep **first-seen insertion order**, and a repeated key
+/// **overwrites its value in place** (its position is unchanged).
+///
+/// # Why this exists (`rmp` #549 — pre-auth CPU DoS)
+///
+/// The naive dedup — a linear `entries.iter().find(key)` on every insert — is O(n) per key, so
+/// decoding an n-distinct-key map is **O(n²)**. Measured: a 200k-distinct-key map (only ~1.2 MB on
+/// the wire) took ~minutes to decode, pinning a Bolt-session blocking thread. This is reachable
+/// **before authentication** on `HELLO.extra`, so one small message is a CPU denial-of-service.
+///
+/// `MapAccumulator` keeps the ordered `Vec<(String, Value)>` (the return shape) **plus** a lazily
+/// built `HashMap<String, usize>` index (key → position in the vec). Insert is then O(1): look the
+/// key up, overwrite in place on a hit, or push and record the index on a miss. Total decode is O(n).
+///
+/// The index is only built once the map grows past [`HASH_DEDUP_THRESHOLD`], so the common tiny-map
+/// case (the vast majority of real Bolt maps) stays an **alloc-free linear scan** with zero hashing
+/// overhead. The index is **never** sized from the wire header (a hostile `MAP_32` may claim
+/// `u32::MAX` entries with almost no body); it is built from the entries actually decoded and grows
+/// lazily, exactly like the entries `Vec`.
+///
+/// The index uses the standard-library `HashMap` (randomly-seeded SipHash), which is deliberately
+/// **hash-flooding resistant** — the keys here are attacker-controlled, so a faster but
+/// collision-predictable hasher (e.g. FxHash) would reintroduce a CPU-DoS via crafted colliding keys.
+struct MapAccumulator {
+    /// Distinct entries in first-seen order — the value returned to callers.
+    entries: Vec<(String, Value)>,
+    /// Lazily built once `entries.len()` exceeds [`HASH_DEDUP_THRESHOLD`]: key → index into
+    /// `entries`. `None` for small maps (they use the linear scan and never allocate this).
+    index: Option<HashMap<String, usize>>,
+}
+
+impl MapAccumulator {
+    /// A new accumulator, reserving `cap` entry slots (already clamped via [`prealloc_cap`] by the
+    /// caller — never the raw wire count).
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(cap),
+            index: None,
+        }
+    }
+
+    /// Inserts one `(key, value)` with last-seen-value-wins dedup (see the type docs).
+    fn insert(&mut self, key: String, value: Value) {
+        if let Some(index) = self.index.as_mut() {
+            // Hash path (large map): O(1) dedup.
+            match index.get(&key) {
+                Some(&i) => self.entries[i].1 = value,
+                None => {
+                    let i = self.entries.len();
+                    index.insert(key.clone(), i);
+                    self.entries.push((key, value));
+                }
+            }
+            return;
+        }
+
+        // Linear path (small map): alloc-free scan.
+        if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = value;
+            return;
+        }
+        self.entries.push((key, value));
+        // Crossing the threshold: build the index from the (already-distinct) entries so far and
+        // switch to the O(1) path for the rest of this map.
+        if self.entries.len() > HASH_DEDUP_THRESHOLD {
+            let mut index = HashMap::with_capacity(self.entries.len());
+            for (i, (k, _)) in self.entries.iter().enumerate() {
+                index.insert(k.clone(), i);
+            }
+            self.index = Some(index);
+        }
+    }
+
+    /// Consumes the accumulator, returning the ordered, deduplicated entries.
+    fn into_entries(self) -> Vec<(String, Value)> {
+        self.entries
     }
 }
 
@@ -1030,6 +1185,9 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             unpacker.enter_nested()?;
             let mut items = Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
             for _ in 0..n {
+                // Charge the breadth budget once per element (`rmp` #550) so a `LIST_32` claiming
+                // millions of 1-byte elements is rejected before it grows a multi-GiB `Vec`.
+                unpacker.charge_element()?;
                 items.push(unpack_value(unpacker)?);
             }
             unpacker.leave_nested();
@@ -1038,17 +1196,18 @@ pub fn unpack_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
         _ if is_map_marker(marker) => {
             let n = unpacker.read_map_header()?;
             unpacker.enter_nested()?;
-            let mut entries: Vec<(String, Value)> =
-                Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
+            let mut acc = MapAccumulator::with_capacity(prealloc_cap(n, unpacker.remaining()));
             for _ in 0..n {
+                unpacker.charge_element()?;
                 let k = unpacker.read_string()?;
                 let v = unpack_value(unpacker)?;
-                // PackStream dictionaries are "last seen value wins" for duplicate keys (`04 §7.1`):
-                // overwrite an existing entry rather than retaining a duplicate pair.
-                map_insert_last_wins(&mut entries, k, v);
+                // PackStream dictionaries are "last seen value wins" for duplicate keys (`04 §7.1`);
+                // `MapAccumulator` dedups in O(1) (hash-indexed above `HASH_DEDUP_THRESHOLD`) so the
+                // decode is O(n), not the old O(n²) linear-scan-per-key (`rmp` #549).
+                acc.insert(k, v);
             }
             unpacker.leave_nested();
-            Ok(Value::Map(entries))
+            Ok(Value::Map(acc.into_entries()))
         }
         _ if is_struct_marker(marker) => {
             // Guard struct decoding with the same depth budget the list/map arms use (`rmp` #487,
@@ -1220,6 +1379,9 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
         unpacker.enter_nested()?;
         let mut items = Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
         for _ in 0..n {
+            // Same per-element breadth budget as the `Value` list arm (`rmp` #550): a structural
+            // RECORD list cannot amplify a small header into a gigabyte `Vec`.
+            unpacker.charge_element()?;
             items.push(unpack_bolt_value(unpacker)?);
         }
         unpacker.leave_nested();
@@ -1233,15 +1395,18 @@ pub fn unpack_bolt_value(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltValue> {
 fn unpack_properties(unpacker: &mut Unpacker<'_>) -> BoltResult<Vec<(String, Value)>> {
     let n = unpacker.read_map_header()?;
     unpacker.enter_nested()?;
-    let mut props: Vec<(String, Value)> = Vec::with_capacity(prealloc_cap(n, unpacker.remaining()));
+    let mut acc = MapAccumulator::with_capacity(prealloc_cap(n, unpacker.remaining()));
     for _ in 0..n {
+        unpacker.charge_element()?;
         let k = unpacker.read_string()?;
         let v = unpack_value(unpacker)?;
-        // "Last seen value wins" for duplicate keys, exactly as a top-level dictionary (`04 §7.1`).
-        map_insert_last_wins(&mut props, k, v);
+        // "Last seen value wins" for duplicate keys, exactly as a top-level dictionary (`04 §7.1`);
+        // O(1) hash-indexed dedup above `HASH_DEDUP_THRESHOLD` keeps a big property map O(n)
+        // (`rmp` #549), and the per-entry breadth charge bounds it (`rmp` #550).
+        acc.insert(k, v);
     }
     unpacker.leave_nested();
-    Ok(props)
+    Ok(acc.into_entries())
 }
 
 /// Decodes a Bolt 5.x `Node` (tag `0x4E`, 4 fields: id, labels, properties, element_id).
@@ -1255,6 +1420,7 @@ fn unpack_node(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltNode> {
     // carries more labels than the small initial reservation. A node has very few labels in practice.
     let mut labels = Vec::with_capacity(prealloc_cap(label_count, unpacker.remaining()));
     for _ in 0..label_count {
+        unpacker.charge_element()?; // breadth budget (`rmp` #550)
         labels.push(unpacker.read_string()?);
     }
     let properties = unpack_properties(unpacker)?;
@@ -1312,16 +1478,19 @@ fn unpack_path(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltPath> {
     let node_count = unpacker.read_list_header()?;
     let mut nodes = Vec::with_capacity(prealloc_cap(node_count, unpacker.remaining()));
     for _ in 0..node_count {
+        unpacker.charge_element()?; // breadth budget (`rmp` #550)
         nodes.push(unpack_node(unpacker)?);
     }
     let rel_count = unpacker.read_list_header()?;
     let mut rels = Vec::with_capacity(prealloc_cap(rel_count, unpacker.remaining()));
     for _ in 0..rel_count {
+        unpacker.charge_element()?; // breadth budget (`rmp` #550)
         rels.push(unpack_unbound_relationship(unpacker)?);
     }
     let idx_count = unpacker.read_list_header()?;
     let mut indices = Vec::with_capacity(prealloc_cap(idx_count, unpacker.remaining()));
     for _ in 0..idx_count {
+        unpacker.charge_element()?; // breadth budget (`rmp` #550)
         indices.push(unpacker.read_int()?);
     }
     Ok(BoltPath {
@@ -1970,6 +2139,114 @@ mod tests {
             vec![("p".to_owned(), Value::Integer(20))],
             "duplicate property key must collapse to the last-seen value"
         );
+    }
+
+    /// Builds a `MAP_32` with `n` DISTINCT 4-byte string keys, each mapped to a tiny-int value equal
+    /// to its index. Distinct keys defeat the last-wins dedup, so a linear-scan-per-key decoder is
+    /// O(n²); the hash-indexed [`MapAccumulator`] must keep it O(n).
+    fn distinct_key_map_bytes(n: u32) -> Vec<u8> {
+        // 32-symbol alphabet ⇒ 32^4 = 1_048_576 distinct 4-byte keys available.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut b = Vec::with_capacity(5 + (n as usize) * 6);
+        b.push(MAP_32);
+        b.extend_from_slice(&n.to_be_bytes());
+        for i in 0..n {
+            b.push(TINY_STRING_BASE + 4); // 4-byte key
+            b.push(ALPHABET[(i & 0x1F) as usize]);
+            b.push(ALPHABET[((i >> 5) & 0x1F) as usize]);
+            b.push(ALPHABET[((i >> 10) & 0x1F) as usize]);
+            b.push(ALPHABET[((i >> 15) & 0x1F) as usize]);
+            // value = tiny-int (i mod 128), a single byte — keeps the input compact.
+            b.push((i & 0x7F) as u8);
+        }
+        b
+    }
+
+    /// Regression (`rmp` #549, CRITICAL): decoding an n-distinct-key map must be **O(n)**, not the
+    /// old O(n²) linear-scan-per-key. Before the fix this exact input took minutes (measured:
+    /// 200k keys ≈ 210 s debug / ~60 s release) — a pre-auth CPU denial-of-service on `HELLO.extra`.
+    /// After the fix it is a fraction of a second. The bound below is deliberately generous (it must
+    /// never flake on the O(n) path) yet is ~1–2 orders of magnitude under the broken O(n²) time, so a
+    /// regression to the linear-scan dedup would blow straight through it.
+    #[test]
+    fn large_distinct_key_map_decodes_in_linear_time_not_quadratic() {
+        let n = 200_000u32;
+        let bytes = distinct_key_map_bytes(n);
+        let start = std::time::Instant::now();
+        let mut u = Unpacker::new(&bytes);
+        let v = unpack_value(&mut u).expect("large distinct-key map decodes");
+        let elapsed = start.elapsed();
+        let entries = match v {
+            Value::Map(m) => m,
+            other => panic!("expected a map, got {other:?}"),
+        };
+        assert_eq!(
+            entries.len(),
+            n as usize,
+            "all distinct keys must be retained"
+        );
+        // First-seen insertion order is preserved: entry i carries key index i and value i%128.
+        assert_eq!(entries[0].0, "AAAA");
+        assert_eq!(entries[0].1, Value::Integer(0));
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "decoding {n} distinct keys took {elapsed:?}; the O(n²) scan-per-key took minutes — a \
+             regression to linear-scan dedup is the likely cause"
+        );
+    }
+
+    /// Regression (`rmp` #549): the last-seen-value-wins dedup (`04 §7.1`) must hold on the
+    /// **hash-indexed** path too (maps larger than [`HASH_DEDUP_THRESHOLD`]), not only the small
+    /// linear-scan path covered by `duplicate_map_keys_keep_last_value`. Build a map with more than
+    /// the threshold of distinct keys, then repeat an *early* key with a new value: the survivor must
+    /// be the last value, kept at the early key's ORIGINAL first-seen position, with the entry count
+    /// reduced by exactly one (the duplicate collapses).
+    #[test]
+    fn duplicate_key_last_wins_and_keeps_position_on_hash_path() {
+        let distinct = (HASH_DEDUP_THRESHOLD + 8) as u32; // safely past the hash threshold
+        let mut p = Packer::new();
+        // total header count = distinct keys + 1 duplicate of key #0.
+        p.write_map_header(distinct as usize + 1);
+        for i in 0..distinct {
+            p.write_string(&format!("k{i:05}"));
+            p.write_int(i64::from(i));
+        }
+        // Re-emit key #0 ("k00000") with a new value; last-wins must apply and position must hold.
+        p.write_string("k00000");
+        p.write_int(999);
+        let bytes = p.into_inner();
+
+        let mut u = Unpacker::new(&bytes);
+        let entries = match unpack_value(&mut u).expect("decode") {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(
+            entries.len(),
+            distinct as usize,
+            "the duplicate key must collapse (count = distinct keys, not +1)"
+        );
+        // First-seen position preserved: key #0 is still index 0, but now carries the LAST value.
+        assert_eq!(entries[0].0, "k00000");
+        assert_eq!(
+            entries[0].1,
+            Value::Integer(999),
+            "duplicate key on the hash path must keep the LAST value at its first-seen position"
+        );
+        // A middle key is untouched and in order.
+        assert_eq!(entries[5].0, "k00005");
+        assert_eq!(entries[5].1, Value::Integer(5));
+    }
+
+    /// A map that straddles the linear→hash crossover must still round-trip every distinct key in
+    /// order (exercises the index-build step in [`MapAccumulator::insert`] at the threshold).
+    #[test]
+    fn map_across_hash_threshold_round_trips_in_order() {
+        let entries: Vec<(String, Value)> = (0..(HASH_DEDUP_THRESHOLD + 20))
+            .map(|i| (format!("key{i:04}"), Value::Integer(i as i64)))
+            .collect();
+        let v = Value::Map(entries.clone());
+        assert_eq!(round_trip(&v), Value::Map(entries));
     }
 
     #[test]
