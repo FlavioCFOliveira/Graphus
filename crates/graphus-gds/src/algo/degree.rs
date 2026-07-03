@@ -22,6 +22,19 @@
 use crate::csr::{CsrGraph, InternalId, Orientation};
 use crate::execution::Execution;
 
+/// Node-count floor above which out-degree may run in parallel (`rmp` #580).
+///
+/// Degree is `O(n)` with a one-subtraction-per-node kernel — pure memory streaming, negligible compute
+/// — so it is memory-bandwidth bound. Measured on the 8-core reference box (`tests/perf_probe.rs`),
+/// the parallel path is *unreliable*: it regresses badly on small graphs (0.1x at 1k), gives a modest
+/// 2x only around 1M nodes, then **regresses again at 4M** as the single memory bus saturates. Because
+/// the crate contract is "never ship a parallel path slower than serial", and no single floor makes it
+/// reliably faster across the size range on this hardware class, out-degree is kept **sequential in
+/// production** — the same treatment the directed in-degree histogram already gets. `usize::MAX` gates
+/// the parallel path off for every real graph while an explicit `parallel_with_threshold(0)` still
+/// exercises it (so its trivial determinism is regression-tested).
+const DEGREE_MIN_PARALLEL_NODES: usize = usize::MAX;
+
 /// The direction a degree is measured in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -58,8 +71,17 @@ pub fn degree_centrality_with(graph: &CsrGraph, direction: Direction, exec: Exec
     let n = graph.node_count();
     let mut out = vec![0u64; n];
 
-    // Out-degree from offsets: per-node independent, so parallel when large enough.
-    exec.map_into(&mut out, |i| {
+    // Out-degree from offsets: per-node independent, so parallel — but only above a high floor. A
+    // single offset subtraction per node is memory-bandwidth bound with negligible compute, so the
+    // `rayon` fan-out only pays off on very large graphs; below the floor it *regresses* (measured in
+    // `tests/perf_probe.rs`, e.g. 0.1x at 1k nodes). Gate it so realistic sizes stay sequential
+    // (`rmp` #580). A forced `parallel_with_threshold(0)` still takes the parallel path.
+    let out_exec = if exec.is_parallel_floor(n, DEGREE_MIN_PARALLEL_NODES) {
+        exec
+    } else {
+        Execution::sequential()
+    };
+    out_exec.map_into(&mut out, |i| {
         graph.out_degree(i as InternalId).unwrap_or(0) as u64
     });
 

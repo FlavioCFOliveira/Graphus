@@ -174,12 +174,23 @@ pub fn weakly_connected_components_with(
     cancel: &Cancel<'_>,
 ) -> Result<WccResult> {
     let n = graph.node_count();
-    if exec.is_parallel(n) {
+    // `rmp` #580: gate on **edge** count (WCC's cost is `O(m·α)`, dominated by the `m` union
+    // operations) against a floor, because the lock-free atomic union-find + `rayon` fan-out has a
+    // fixed overhead that a small/sparse graph cannot amortise — below the floor the parallel engine
+    // *regresses* vs the trivial sequential union-find (measured in `tests/perf_probe.rs`).
+    if exec.is_parallel_floor(graph.edge_count(), WCC_MIN_PARALLEL_EDGES) {
         weakly_connected_components_parallel(graph, n, exec, cancel)
     } else {
         weakly_connected_components_sequential(graph, n, cancel)
     }
 }
+
+/// Minimum edge count for the lock-free parallel WCC engine to beat the sequential union-find
+/// (`rmp` #580). Below this the atomic-CAS + `rayon` overhead dominates the near-linear serial cost.
+/// Measured on the 8-core reference box (`tests/perf_probe.rs`): `~40k` edges is still marginal
+/// (`≈0.9–1.2x`, noisy), while `~400k` edges is a clean `≈2x`; this conservative floor sits above the
+/// marginal zone so the parallel engine is only chosen where it reliably wins.
+const WCC_MIN_PARALLEL_EDGES: usize = 1 << 17;
 
 /// Sequential union-find (the classic path-halving + union-by-size engine).
 fn weakly_connected_components_sequential(

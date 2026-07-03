@@ -121,6 +121,31 @@ impl Execution {
         matches!(self.mode, ExecMode::Parallel) && work >= self.min_parallel_work
     }
 
+    /// Like [`Execution::is_parallel`], but the `work` must additionally clear an **algorithm-specific
+    /// `floor`** (`rmp` #580).
+    ///
+    /// The crate-wide [`Execution::DEFAULT_MIN_PARALLEL_WORK`] is calibrated for algorithms whose
+    /// per-element work is non-trivial. A few algorithms need a higher bar before parallelism pays off:
+    /// **degree centrality** does a single offset subtraction per node (so it is memory-bandwidth bound
+    /// and only profits at very large `n`), and the **lock-free WCC** union-find pays fixed
+    /// atomic/`rayon` overhead that a small graph cannot amortise. Empirically (see
+    /// `tests/perf_probe.rs`) both *regress* — parallel slower than sequential — below their floor, so
+    /// they gate on it here rather than on the generic threshold.
+    ///
+    /// An explicit [`Execution::parallel_with_threshold`]`(0)` — the test "force parallel" knob —
+    /// bypasses the floor, so the parallel code path is still exercised on small test graphs.
+    #[must_use]
+    pub const fn is_parallel_floor(self, work: usize, floor: usize) -> bool {
+        if !matches!(self.mode, ExecMode::Parallel) {
+            return false;
+        }
+        // `parallel_with_threshold(0)` is an explicit "force parallel even when tiny" request.
+        if self.min_parallel_work == 0 {
+            return work > 0;
+        }
+        work >= self.min_parallel_work && work >= floor
+    }
+
     /// Maps `0..len` into a `Vec<T>` with `f`, serially or in parallel per the knob, propagating the
     /// first error — the cooperative-cancellation idiom the per-source / per-node algorithms use.
     ///
@@ -172,6 +197,56 @@ impl Execution {
             (0..len).into_par_iter().try_for_each(f)
         } else {
             (0..len).try_for_each(f)
+        }
+    }
+
+    /// The fixed reduction block size for [`Execution::det_reduce`]. Chosen large enough that the
+    /// per-chunk serial sum amortises the parallel task overhead, and small enough that a many-core
+    /// pool still gets plenty of chunks to balance. It is a **constant** (never a function of the pool
+    /// width), which is exactly what makes the reduction bit-identical across widths.
+    const REDUCE_CHUNK: usize = 8192;
+
+    /// A **deterministic** floating-point reduction of `f(0)..f(len)` into a sum, run serially or in
+    /// parallel per the knob.
+    ///
+    /// Determinism across pool widths is the whole point: the range is split into **fixed-size** blocks
+    /// of [`Execution::REDUCE_CHUNK`] elements; each block is summed **serially in ascending index
+    /// order**, and the per-block partials are then combined **serially in ascending block order**.
+    /// Because the block boundaries depend only on `len` — never on how `rayon` happened to split the
+    /// work — the result is **bit-identical in [`ExecMode::Sequential`] and [`ExecMode::Parallel`] and
+    /// across every pool width**. Only *whether the blocks are evaluated concurrently* differs. This is
+    /// the sanctioned alternative to a `rayon` tree-reduce, whose association order (and therefore
+    /// floating-point result) would depend on the pool width.
+    pub(crate) fn det_reduce<F>(self, len: usize, f: F) -> f64
+    where
+        F: Fn(usize) -> f64 + Sync + Send,
+    {
+        if len == 0 {
+            return 0.0;
+        }
+        let chunk = Self::REDUCE_CHUNK;
+        let n_chunks = len.div_ceil(chunk);
+        // The serial sum of block `c` (ascending index order within the block).
+        let block_sum = |c: usize| -> f64 {
+            let start = c * chunk;
+            let end = (start + chunk).min(len);
+            let mut acc = 0.0f64;
+            for i in start..end {
+                acc += f(i);
+            }
+            acc
+        };
+        if self.is_parallel(len) {
+            // Per-block partials computed across cores; `collect` preserves block (index) order, so the
+            // final serial fold is over `partials[0], partials[1], ...` in ascending block order.
+            let partials: Vec<f64> = (0..n_chunks).into_par_iter().map(block_sum).collect();
+            partials.iter().sum()
+        } else {
+            let mut acc = 0.0f64;
+            for c in 0..n_chunks {
+                acc += block_sum(c);
+            }
+            acc
         }
     }
 }

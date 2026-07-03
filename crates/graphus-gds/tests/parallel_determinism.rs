@@ -130,6 +130,47 @@ fn pagerank_bit_identical_across_pool_widths() {
     }
 }
 
+/// `rmp` #580: with the per-iteration L1 delta now computed by the fixed-block deterministic
+/// reduction ([`Execution::det_reduce`], 8192-element blocks) and the dangling mass summed over a
+/// pre-built ascending index list, the result must remain bit-identical across pool widths **on a
+/// graph large enough to span several reduction blocks** (`n > 8192`) — the 1500-node case above uses
+/// a single block, so it would not catch a block-boundary determinism bug. The graph also has a few
+/// dangling nodes (isolated ids), exercising the ascending dangling-index fold.
+#[test]
+fn pagerank_bit_identical_across_pool_widths_multiblock() {
+    // 20k nodes => the delta reduction splits into 3 fixed blocks; the parallel reduction combines
+    // per-block partials in ascending block order regardless of how rayon split the work.
+    let mut src = VecGraphSource {
+        nodes: (0..20_000u64).collect(),
+        edges: Vec::new(),
+    };
+    let mut rng = Lcg::new(20250580);
+    for _ in 0..120_000 {
+        // Leave the top ~500 ids without out-edges so they are dangling (tests the index-list fold).
+        let a = rng.below(19_500);
+        let b = rng.below(20_000);
+        src.edges.push((a, b, 1.0));
+    }
+    let g = src.build(Orientation::Directed, false).unwrap();
+    let cfg = PageRankConfig::default();
+    let baseline = pagerank_with(&g, cfg, PAR, &Cancel::never()).unwrap().rank;
+    // Sequential must match the parallel baseline bit-for-bit.
+    let seq = pagerank_with(&g, cfg, SEQ, &Cancel::never()).unwrap().rank;
+    assert_eq!(
+        seq, baseline,
+        "pagerank seq vs par bit-identical (multi-block)"
+    );
+    for threads in [1usize, 2, 4, 8, 16] {
+        let scores = on_pool(threads, || {
+            pagerank_with(&g, cfg, PAR, &Cancel::never()).unwrap().rank
+        });
+        assert_eq!(
+            scores, baseline,
+            "multi-block pagerank must be bit-identical on a {threads}-thread pool"
+        );
+    }
+}
+
 #[test]
 fn personalized_pagerank_parallel_equals_sequential() {
     let mut g = gen_graph(1200, 5, 99, Orientation::Directed, false);
@@ -215,6 +256,24 @@ fn wcc_lockfree_is_correct_under_contention() {
         );
         assert_eq!(got.count, expected.count, "component count on run {run}");
     }
+}
+
+/// `rmp` #580: the *production* default execution ([`Execution::parallel`], the 128 threshold) must
+/// take the lock-free engine above the WCC edge floor and still equal the sequential partition. The
+/// other WCC tests force parallelism with a `0` threshold (bypassing the floor); this one drives the
+/// real gating path a server would use on a large-enough graph.
+#[test]
+fn wcc_default_execution_above_floor_equals_sequential() {
+    // ~60k nodes * avg-deg 4 = ~240k edges, comfortably above the parallel edge floor (1<<17).
+    let g = gen_graph(60_000, 4, 909, Orientation::Directed, false);
+    let seq = weakly_connected_components_with(&g, SEQ, &Cancel::never()).unwrap();
+    let def =
+        weakly_connected_components_with(&g, Execution::parallel(), &Cancel::never()).unwrap();
+    assert_eq!(
+        seq.component, def.component,
+        "wcc default-parallel vs sequential"
+    );
+    assert_eq!(seq.count, def.count, "wcc default-parallel count");
 }
 
 #[test]
