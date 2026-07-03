@@ -1578,6 +1578,56 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.write_region(dev, off + field_off, &word.to_le_bytes(), txn)
     }
 
+    /// Stamps the 8-byte MVCC header word at `field_off` of record `id` in `kind`'s store to
+    /// `new_word` (redo = a plain post-image patch, so recovery redo repeats history byte-for-byte),
+    /// but logs a **compare-and-set logical undo** (`rmp` #301, mirroring [`write_chain_head`] and the
+    /// `rmp` #239 chain-pointer fix): the undo restores the pre-image `old_word` **only if the word is
+    /// still `new_word`** — i.e. only if this transaction's write is still the one on the page. If a
+    /// concurrently-interleaved transaction has since re-stamped the same header word, the undo
+    /// no-ops, so a **non-LIFO** abort of this transaction never clobbers the newer stamp.
+    ///
+    /// This is the header-word twin of the free-list / high-water monotonic restores (`rmp` #578 /
+    /// #220): a plain pre-image undo of a **shared** header word is unsafe under statement-granularity
+    /// interleaving because a later writer can legitimately own the word by abort time; a plain undo
+    /// would then resurrect a stale stamp (a lost-update / visibility breach). Used for the MVCC
+    /// **tombstone** (`xmax = in_flight(txn)`) writes of [`delete_node`](Self::delete_node),
+    /// [`delete_rel`](Self::delete_rel) and [`tombstone_props_for_key`](Self::tombstone_props_for_key).
+    /// The GC-time freeze ([`freeze_store_headers`](Self::freeze_store_headers)) keeps the plain
+    /// [`patch_header_word`](Self::patch_header_word): it runs only inside a GC pass that holds the
+    /// store exclusively (no interleaving mutator), so its undo can never race a concurrent writer.
+    fn patch_header_word_cas(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        field_off: usize,
+        new_word: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let abs = off + field_off;
+        let f = self.pool.fetch(dev)?;
+        // Capture the pre-image (`old_word`) under a read latch before the overwrite — the frame stays
+        // pinned across the two sequential latches (`rmp` #337, Slice 1), exactly as `write_region` /
+        // `write_chain_head` do.
+        let old_word = self
+            .pool
+            .with_page(f, |p| u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice")));
+        // Redo is a plain, unconditional post-image (byte-identical to `patch_header_word`'s redo, so
+        // recovery redo is unchanged). Undo is the compare-and-set: reset to `old_word` iff the word is
+        // still `new_word` (this txn's own stamp). Redo lent by borrow; undo retained by value.
+        let redo = paging::encode_patch(abs, &new_word.to_le_bytes());
+        let undo = paging::encode_cas_patch(abs, new_word, old_word).into_vec();
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[abs..abs + 8].copy_from_slice(&new_word.to_le_bytes());
+        });
+        self.pool.unpin(f);
+        Ok(())
+    }
+
     // ------------- chain-safe writes (logical-undo discipline, `rmp` #220 / #172) -------------
     //
     // Three writes participate in a graph chain and must NOT log a plain whole-record pre-image undo,
@@ -2355,7 +2405,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Reclamation at GC ([`reclaim_node`]) must NOT decrement again; rollback restores it via
         // `reload_catalog`.
         self.statistics.dec_node();
-        self.patch_header_word(
+        // `rmp` #301: compare-and-set undo for the tombstone stamp, so a non-LIFO abort never clobbers
+        // a header word a concurrently-interleaved transaction has since re-stamped.
+        self.patch_header_word_cas(
             StoreKind::Node,
             id,
             MVCC_OFF_EXPIRED_TS,
@@ -2720,7 +2772,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {id} is not in use")));
         }
-        self.patch_header_word(
+        // `rmp` #301: compare-and-set undo for the tombstone stamp (non-LIFO-safe, see
+        // [`patch_header_word_cas`](Self::patch_header_word_cas)).
+        self.patch_header_word_cas(
             StoreKind::Rel,
             id,
             MVCC_OFF_EXPIRED_TS,
@@ -3348,7 +3402,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let prop = self.read_prop(cur)?;
             let next = prop.next_prop;
             if Self::is_live_version(prop.mvcc) && key_filter.is_none_or(|key| prop.key == key) {
-                self.patch_header_word(
+                // `rmp` #301: compare-and-set undo for the property tombstone stamp — the finding this
+                // task fixes. A plain pre-image undo of a shared `xmax` word under a non-LIFO abort
+                // resurrects a stale stamp (a lost-update / visibility breach); the CAS undo reverts
+                // only if this txn's stamp is still on the word (see `patch_header_word_cas`).
+                self.patch_header_word_cas(
                     StoreKind::Prop,
                     cur,
                     MVCC_OFF_EXPIRED_TS,
@@ -5345,6 +5403,132 @@ mod tests {
         assert_eq!(
             post.mvcc.expired_ts, 0,
             "the live version carries no tombstone"
+        );
+    }
+
+    /// `rmp` #301 regression: the MVCC **tombstone** (`xmax`) header write uses a **compare-and-set
+    /// logical undo** ([`RecordStore::patch_header_word_cas`]), so a **non-LIFO** abort never clobbers
+    /// an `xmax` word that a concurrently-interleaved transaction has since re-stamped. A plain
+    /// pre-image undo (the pre-#301 behaviour) would restore the aborting transaction's stale
+    /// pre-image over the newer stamp — a lost-update / visibility breach mirroring the `rmp` #239
+    /// non-LIFO relationship-recovery defect and the `rmp` #578 free-list-restore hazard.
+    ///
+    /// Reachability: the public delete/tombstone API is guarded by
+    /// [`is_live_version`](RecordStore::is_live_version), which — with the single-threaded engine and
+    /// SSI — currently serialises `xmax` writes so two live transactions cannot stamp the same word.
+    /// This is therefore a **defense-in-depth** hardening of the storage undo primitive (the `rmp`
+    /// #220/#239 discipline: a shared-field undo must be intrinsically non-LIFO-safe, never rely on a
+    /// higher layer). The test drives the primitive directly to model exactly the two-writer
+    /// interleaving the guard elides. Swapping `patch_header_word_cas` back to the plain
+    /// `patch_header_word` makes the final assertion fail (T1's abort restores `0`, clobbering T2).
+    #[test]
+    fn tombstone_xmax_undo_is_non_lifo_safe_301() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+
+        // Committed node H with a live property V0 (xmax == 0).
+        let setup = TxnId(1);
+        s.begin(setup);
+        let (h, _) = s.create_node(setup).unwrap();
+        let v0 = s
+            .set_node_property_value(setup, h, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(setup).unwrap();
+        assert_eq!(s.property(v0).unwrap().mvcc.expired_ts, 0, "V0 starts live");
+
+        // Two concurrently-open transactions BOTH stamp V0's xmax. T1 stamps first, T2 second — the
+        // interleaving the `is_live_version` guard elides, modelled directly on the storage primitive.
+        let t1 = TxnId(2);
+        let t2 = TxnId(3);
+        s.begin(t1);
+        s.begin(t2);
+        s.patch_header_word_cas(
+            StoreKind::Prop,
+            v0,
+            MVCC_OFF_EXPIRED_TS,
+            VersionStamp::in_flight(t1),
+            t1,
+        )
+        .unwrap();
+        s.patch_header_word_cas(
+            StoreKind::Prop,
+            v0,
+            MVCC_OFF_EXPIRED_TS,
+            VersionStamp::in_flight(t2),
+            t2,
+        )
+        .unwrap();
+        assert_eq!(
+            VersionStamp::from_raw(s.property(v0).unwrap().mvcc.expired_ts),
+            VersionStamp::InFlight(t2),
+            "T2's stamp is the current xmax before the non-LIFO abort"
+        );
+
+        // NON-LIFO abort: the EARLIER writer (T1) rolls back while the LATER writer (T2) still owns the
+        // word. The CAS undo reverts only if xmax is still T1's stamp — it is not (T2 overwrote it), so
+        // it no-ops and T2's stamp is PRESERVED. A plain pre-image undo would restore 0 (a clobber).
+        s.rollback(t1).unwrap();
+        assert_eq!(
+            VersionStamp::from_raw(s.property(v0).unwrap().mvcc.expired_ts),
+            VersionStamp::InFlight(t2),
+            "rmp #301: T1's non-LIFO abort must NOT clobber T2's concurrent xmax stamp"
+        );
+
+        // T2 commits: its tombstone stands (no lost update). Then GC + consistency check.
+        s.commit(t2).unwrap();
+        assert!(
+            s.commit_registry()
+                .resolve_commit_ts(s.property(v0).unwrap().mvcc.expired_ts)
+                .is_some(),
+            "V0's tombstone resolves to T2's commit ts — the delete survived"
+        );
+        let watermark = s.snapshot_ts();
+        s.begin(TxnId(4));
+        s.gc(TxnId(4), watermark).unwrap();
+        s.commit(TxnId(4)).unwrap();
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after #301 non-LIFO abort: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #301 (companion): the CAS tombstone undo is a strict superset of the old plain undo for
+    /// the common **LIFO single-transaction** abort — a property delete that rolls back alone must
+    /// restore the record to live (`xmax == 0`), exactly as before. Guards against the CAS undo
+    /// regressing the ordinary abort path.
+    #[test]
+    fn tombstone_xmax_lifo_single_txn_abort_restores_live_301() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let setup = TxnId(1);
+        s.begin(setup);
+        let (h, _) = s.create_node(setup).unwrap();
+        let v0 = s
+            .set_node_property_value(setup, h, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(setup).unwrap();
+
+        // A real delete via the public API, then a single-transaction abort.
+        let t1 = TxnId(2);
+        s.begin(t1);
+        s.remove_node_property_value(t1, h, key).unwrap();
+        assert_ne!(
+            s.property(v0).unwrap().mvcc.expired_ts,
+            0,
+            "V0 is tombstoned in-flight before the abort"
+        );
+        s.rollback(t1).unwrap();
+        assert_eq!(
+            s.property(v0).unwrap().mvcc.expired_ts,
+            0,
+            "a LIFO single-txn abort restores V0 to live (CAS undo reverts its own stamp)"
+        );
+        assert_eq!(
+            s.node_property_values(h).unwrap(),
+            vec![(v0, key, Value::Integer(1))],
+            "the property is readable again after the abort"
         );
     }
 
