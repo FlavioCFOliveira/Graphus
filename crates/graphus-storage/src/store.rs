@@ -4028,6 +4028,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         pages
     }
 
+    /// The count of durable device pages this store maps — the meta page, the catalog continuation
+    /// chain, and every record store's data pages — **without** allocating the `Vec` that
+    /// [`mapped_pages`](Self::mapped_pages) builds. `O(number of record stores)`, a small constant.
+    ///
+    /// The engine's adaptive maintenance cadence (`rmp` #556) reads this on every mutating command to
+    /// size the WAL reclaim interval proportionally to the live store size, so it must stay cheap.
+    #[must_use]
+    pub fn store_page_count(&self) -> u64 {
+        let mut n = 1u64; // META_PAGE
+        n += self.meta_chain.len() as u64;
+        for s in &self.stores {
+            n += s.device_pages.len() as u64;
+        }
+        n
+    }
+
     /// The next [`ElementId`] this store would allocate (one past the largest issued so far,
     /// `04 §2.2`). Read-only; embedded as the creation marker of an offline backup
     /// ([`crate::backup`]).

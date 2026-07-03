@@ -3001,6 +3001,20 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow().with_wal(|w| w.durable_len())
     }
 
+    /// The live store size in bytes (mapped durable device pages × [`graphus_io::PAGE_SIZE`]).
+    ///
+    /// The engine's adaptive maintenance cadence (`rmp` #556) reads this alongside
+    /// [`wal_durable_len`](Self::wal_durable_len) to size the WAL reclaim interval proportionally to the
+    /// store, so a small OLTP store is not left with a WAL tens of times its size. Backed by the cheap,
+    /// non-allocating [`RecordStore::store_page_count`], so it is safe to call on every mutating command.
+    #[must_use]
+    pub fn store_byte_len(&self) -> u64 {
+        self.store
+            .borrow()
+            .store_page_count()
+            .saturating_mul(graphus_io::PAGE_SIZE as u64)
+    }
+
     /// Rolls `txn` back: undoes its writes on the store, forgets its SSI markers, and releases its
     /// locks.
     ///
