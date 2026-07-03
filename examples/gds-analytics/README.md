@@ -3,8 +3,9 @@
 A realistic, end-to-end demonstration of **graph data science (GDS) analytics** on Graphus: load a
 seeded **academic influence / citation network**, run the full `gds.*` algorithm suite over the
 in-memory CSR projection through the **procedure surface**, assert the results against an
-**analytically-known reference subgraph**, and characterise how the single-threaded GDS engine scales
-with graph size (per-algorithm time + CSR footprint).
+**analytically-known reference subgraph**, and characterise how the **multi-threaded** GDS engine
+scales — both with graph size (per-algorithm time + CSR footprint) and, at a fixed size, with **core
+count** (a real sequential-vs-parallel speedup that is deterministic across thread widths).
 
 The official **Neo4j driver** (Node.js, `bolt+ssc://`) drives the live workload, exactly as the
 driver ecosystem would. A **hermetic cargo mirror** (`crates/graphus-server/tests/gds_analytics.rs`)
@@ -20,9 +21,10 @@ Node/network.
   detection, and weighted shortest paths (Dijkstra / Bellman-Ford).
 - **Correctness against ground truth** — a small reference subgraph with hand-derived outputs the
   workload asserts EXACTLY (within a documented float tolerance).
-- **Honest performance characterisation** — a scalability + CSR-footprint sweep that reports what is
-  *actually* measurable for a single-threaded engine, never a fabricated speedup curve, captured into
-  a standardized, schema-versioned evidence report.
+- **Honest performance characterisation** — a scalability + CSR-footprint + parallelism sweep that
+  reports only what is *actually* measured on the run: per-algorithm scaling with graph size, and a
+  **real sequential-vs-parallel speedup** across thread widths (proven bit-identical across widths) —
+  never a fabricated curve — captured into a standardized, schema-versioned evidence report.
 
 ## Algorithms covered (and the honest notes)
 
@@ -41,11 +43,18 @@ The example exercises the complete `gds.*.stream` surface Graphus registers:
 | `gds.dijkstra.stream`        | single-source weighted shortest path | |
 | `gds.bellmanFord.stream`     | single-source shortest path (handles negative-ish weights) | |
 
-**Honest note 1 — GDS is single-threaded.** `graphus-gds` is a zero-runtime-dependency,
-**single-threaded** crate: there is **no rayon, no thread pool, and no core-count knob** anywhere in
-the algorithm library or the `gds.*` surface, and the server drives `Run` single-threaded. A
-speedup-vs-cores curve would therefore be a fabrication, so the scalability sweep varies the one
-dimension that *is* meaningful — **graph size** (see below).
+**Honest note 1 — GDS is multi-threaded, with a deterministic core knob.** As of `rmp` #342/#559
+`graphus-gds` fans each parallelisable algorithm across cores with `rayon`, driven by a deterministic
+[`Execution`](../../crates/graphus-gds/src/execution.rs) knob (`Sequential` / `Parallel` +
+`min_parallel_work` threshold). **Parallel today:** PageRank, Brandes betweenness, closeness, WCC
+(lock-free union-find), triangle counting, out-degree, Label Propagation (a distinct *synchronous*
+parallel variant) and multi-source Dijkstra. **Sequential by construction (documented):** SCC (Tarjan
+DFS) and single-source Dijkstra / Bellman-Ford. Crucially, the knob's only axis is *how many cores* —
+**never whether the answer is stable**: every parallel result is **bit-identical across pool widths**
+(exact for the integer algorithms, matching the sequential result to a documented `f64` tolerance for
+PageRank / centrality), which the DST simulator relies on. So the sweep varies **two** meaningful
+dimensions: **graph size** (see below) *and* **core count** — measuring the real speedup and proving
+determinism, never fabricating a curve.
 
 **Honest note 2 — no Louvain / node-similarity.** The original brief mentioned *Louvain* and *node
 similarity*; **neither procedure exists in Graphus** (verified: the engine returns "there is no
@@ -131,7 +140,9 @@ GRAPHUS_BIN_DIR=target/release examples/gds-analytics/run.sh
 The script:
 
 1. generates the deterministic graph + `reference.json` (and proves byte-identical regeneration);
-2. runs the hermetic single-threaded scalability + CSR-footprint sweep (`evidence/sweep.json`);
+2. runs the hermetic multi-threaded scalability + CSR-footprint + parallelism sweep
+   (`evidence/sweep.json`), asserting a real, non-fabricated multi-core speedup that is deterministic
+   across thread widths;
 3. (opt-in) boots a real `graphus-server` over Bolt-TCP + TLS, loads + analyses over Bolt via the
    official `neo4j-driver`, asserting the reference ground truth and recovering the planted
    communities;
@@ -154,10 +165,14 @@ planted-field community recovery). It runs in the default `cargo test` — no No
 cargo test -p graphus-server --test gds_analytics
 ```
 
-## Scalability & footprint — what we measure (and why)
+## Scalability, footprint & parallelism — what we measure (and why)
 
-`gds_sweep` (a hermetic, deterministic binary) varies **graph size** — the only meaningful dimension
-for a single-threaded engine — and reports, per size:
+`gds_sweep` (a hermetic, deterministic binary) emits **two** honest measurements.
+
+### 1. The graph-SIZE sweep
+
+Varies **graph size** and reports, per size, with the library's **default** execution (parallel above
+its threshold — exactly how the server runs the algorithms):
 
 - the **wall time** of every algorithm (so PageRank's near-linear `O(k·(n+m))` and betweenness's
   `O(n·m)` cost are visible as the graph grows), and
@@ -168,12 +183,33 @@ Measured CSR footprint is **~110–120 bytes/node and ~5.5–6.0 bytes/edge**, s
 is a linear structure); betweenness time scales near-quadratically with size while PageRank stays
 near-linear, exactly as the complexity bounds predict.
 
+### 2. The parallelism demonstration (varies CORE COUNT)
+
+At a single fixed graph size the sweep times each apples-to-apples parallel algorithm — PageRank,
+betweenness, closeness, WCC, triangle counting, out-degree — under `Execution::sequential()` and under
+`Execution::parallel_with_threshold(0)` inside **fixed-width `rayon` thread pools** (1, 2 and all
+cores), and reports, into `sweep.json`'s `parallelism` object:
+
+- per algorithm: `seq_ms`, `par_ms_by_width`, the `best_width`, `best_par_ms`, the real measured
+  `speedup` (`seq_ms / best_par_ms`), and whether it was `deterministic` across widths;
+- `max_speedup` — the headline speedup — and `deterministic_across_widths`.
+
+Every number is measured **on the run** — the example never hardcodes a curve. On the reference
+machine (linux/x86_64, 16 cores) the heavy per-source centralities show the clearest gains — e.g.
+**closeness ~6.9× and Brandes betweenness ~6.7×** at the fast demo size — while the cheap,
+memory-bandwidth-bound algorithms (out-degree, PageRank on a tiny graph) honestly show ~1× or below,
+because at that size the `rayon` fan-out cost is not amortised. The magnitude varies with the host and
+its load (which is why the gate only asserts a *real* speedup `> 1.0` on a multi-core host, never a
+fixed figure); the **determinism is invariant** — the parallel result is identical to the sequential
+one across every thread width, on every run.
+
 ## Evidence collected — how to read it
 
 `evidence/` (git-ignored) holds:
 
 - **`sweep.json`** — the raw per-size sweep (per-algorithm `timings_ms` + `csr_bytes`,
-  `bytes_per_node`, `bytes_per_edge`).
+  `bytes_per_node`, `bytes_per_edge`) **plus** the `parallelism` object (the sequential-vs-parallel
+  speedup across thread widths + the `deterministic_across_widths` verdict).
 - **`report.json` / `report.md`** — the **standardized, schema-versioned** evidence report (the same
   `graphus-examples-harness` schema every `examples/*` emits).
 

@@ -31,6 +31,13 @@ serde_json = "1"
 # build is untouched.
 graphus-gds = { path = "../graphus-gds" }
 
+# ONLY the `gds_sweep` binary uses rayon — and ONLY to build FIXED-WIDTH thread pools so the
+# parallelism demonstration can measure the real sequential-vs-parallel speedup across 1/2/all cores
+# and prove the results are bit-identical across pool widths (the GDS `Execution` knob, rmp #342/#559).
+# `graphus-gds` already depends on rayon; this dev-only leaf crate is in NOTHING's production build, so
+# the shipped `graphus-server` binary is untouched. Pin matches `graphus-gds`.
+rayon = "1"
+
 # The shared evidence harness, for the `gds_evidence` + `gds_baseline_cmp` binaries: the former turns
 # the hermetic sweep (plus optional live-server CPU/RAM/storage) into the standardized, schema-
 # versioned report.json + report.md; the latter is the committed-baseline regression gate. The sweep
@@ -46,8 +53,12 @@ path = "src/bin/gds_gen.rs"
 
 # The hermetic scalability + CSR-footprint sweep: projects CSR graphs of increasing size in-process
 # and reports per-algorithm wall time + CSR bytes-per-node / bytes-per-edge as machine-readable JSON.
-# betweenness & closeness are rayon-parallel across cores (rmp #318); the other algorithms are
-# single-threaded. The sweep varies GRAPH SIZE, not core count.
+# It ALSO runs a parallelism demonstration at a fixed graph size: the GDS algorithm library is
+# multi-threaded (rmp #342/#559 — pageRank, betweenness, closeness, wcc, triangleCount, degree, label
+# propagation + multi-source dijkstra are rayon-parallel via a deterministic `Execution` knob; scc +
+# single-source dijkstra stay sequential), so the demo measures the real sequential-vs-parallel speedup
+# across thread-pool widths and proves the results are bit-identical across widths. The size sweep
+# varies GRAPH SIZE; the parallelism demo varies CORE COUNT.
 # Usage: `cargo run -p graphus-gds-gen --bin gds_sweep -- --out <file.json>`
 [[bin]]
 name = "gds_sweep"

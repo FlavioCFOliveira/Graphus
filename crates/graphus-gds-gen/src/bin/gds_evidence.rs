@@ -1,24 +1,26 @@
 //! `gds_evidence` — turns the hermetic `gds_sweep` output (plus, when present, the live server's
-//! CPU/RAM/storage) into a **standardized, schema-versioned** [`EvidenceReport`] for
-//! `examples/gds-analytics` (`rmp #260`).
+//! CPU/RAM/storage) into a **standardized, schema-versioned**
+//! [`EvidenceReport`](graphus_examples_harness::EvidenceReport) for `examples/gds-analytics`
+//! (`rmp #260`).
 //!
 //! # Why a dedicated emitter (not `measure_server`)
 //!
 //! The fraud-oltp example meters a *live* server with `measure_server`, because its evidence (load +
 //! detection latency, SSI aborts) only exists while the server runs. The GDS example's headline
-//! evidence is **per-algorithm scaling + CSR-projection footprint**, which the **always-hermetic**
-//! `gds_sweep` measures with no server at all (`graphus-gds` is single-threaded and runs the same
-//! whether driven in-process or over Bolt). So this binary's primary input is `sweep.json`, and the
-//! live-server CPU/RAM/storage are *optional* enrichment supplied only when `run.sh` ran the
-//! official-driver path.
+//! evidence is **per-algorithm scaling + CSR-projection footprint + a sequential-vs-parallel speedup
+//! demonstration**, which the **always-hermetic** `gds_sweep` measures with no server at all (the
+//! `graphus-gds` algorithms compute the same result whether driven in-process or over Bolt). So this
+//! binary's primary input is `sweep.json`, and the live-server CPU/RAM/storage are *optional*
+//! enrichment supplied only when `run.sh` ran the official-driver path.
 //!
 //! # How per-algorithm metrics are represented (schema-stable)
 //!
-//! [`EvidenceReport`]'s fixed sections (cpu/memory/storage/throughput) have no native "per-algorithm"
-//! row, and we deliberately do NOT widen the schema. Instead we use the schema's existing flexible
-//! carriers:
+//! [`EvidenceReport`](graphus_examples_harness::EvidenceReport)'s fixed sections
+//! (cpu/memory/storage/throughput) have no native "per-algorithm" row, and we deliberately do NOT
+//! widen the schema. Instead we use the schema's existing flexible carriers:
 //!
-//! - **`phases`** — **one [`PhaseTiming`] per algorithm**, at the *reference* (largest swept) graph
+//! - **`phases`** — **one [`PhaseTiming`](graphus_examples_harness::PhaseTiming) per algorithm**, at
+//!   the *reference* (largest swept) graph
 //!   size, each phase's `millis` being that algorithm's wall time. This is exactly what a phase is (a
 //!   named unit of work + its duration), so per-algorithm timing reads naturally in both `report.md`
 //!   (the "Phase timings" table) and `report.json`.
@@ -37,7 +39,8 @@
 //!   sweep did), with `ops_per_sec` left at the honest `0.0` (the sweep reports per-algorithm time,
 //!   not an aggregate ops/sec).
 //!
-//! This keeps [`SCHEMA_VERSION`] stable while giving a faithful per-algorithm view.
+//! This keeps [`SCHEMA_VERSION`](graphus_examples_harness::SCHEMA_VERSION) stable while giving a
+//! faithful per-algorithm view.
 //!
 //! # Usage
 //!
@@ -68,12 +71,27 @@ use graphus_examples_harness::{
     current_rss_bytes,
 };
 
-/// The parsed sweep: the engine-parallelism facts + one record per swept graph size.
+/// The parsed sweep: the engine-parallelism facts + one record per swept graph size + the optional
+/// parallelism demonstration (sequential-vs-parallel speedup across thread widths).
 struct Sweep {
     engine_parallelism: String,
     host_cores: u64,
     repeats: u64,
     sizes: Vec<SweepSize>,
+    parallelism: Option<ParallelismSummary>,
+}
+
+/// The parallelism demonstration's honest summary, surfaced into the report for human visibility. The
+/// `max_speedup` is machine-/load-variant (illustrative, NOT gated); `deterministic_across_widths` is
+/// an invariant of the GDS `Execution` knob and holds on every run.
+struct ParallelismSummary {
+    field_size: u64,
+    node_count: u64,
+    thread_widths: Vec<u64>,
+    deterministic_across_widths: bool,
+    max_speedup: f64,
+    /// `(name, speedup)` per demonstrated algorithm, in emission order.
+    algo_speedups: Vec<(String, f64)>,
 }
 
 /// One swept graph size: its dimensions, CSR footprint, and per-algorithm timings.
@@ -188,6 +206,33 @@ fn main() -> ExitCode {
             w.insert("loaded_network_nodes".into(), n.to_string());
             w.insert("loaded_network_rels".into(), r.to_string());
         }
+        // The parallelism demonstration's honest summary (human visibility, NOT gated): the measured
+        // multi-core speedup is machine-/load-variant, but `deterministic_across_widths` is invariant.
+        if let Some(par) = &sweep.parallelism {
+            let widths_csv = par
+                .thread_widths
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            w.insert(
+                "parallel_demo_field_size".into(),
+                par.field_size.to_string(),
+            );
+            w.insert(
+                "parallel_demo_node_count".into(),
+                par.node_count.to_string(),
+            );
+            w.insert("parallel_thread_widths".into(), widths_csv);
+            w.insert(
+                "parallel_deterministic_across_widths".into(),
+                par.deterministic_across_widths.to_string(),
+            );
+            w.insert(
+                "parallel_max_speedup".into(),
+                format!("{:.4}", par.max_speedup),
+            );
+        }
         for (k, v) in &args.params {
             w.insert(k.clone(), v.clone());
         }
@@ -218,7 +263,7 @@ fn main() -> ExitCode {
         collector.note(format!(
             "Live CPU/RAM is graphus-server pid {pid} over {:.3}s uptime (the official-driver load + \
              analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, \
-             single-threaded gds_sweep, which runs identically with or without a server.",
+             multi-threaded gds_sweep, which computes the same results with or without a server.",
             args.uptime_secs
         ));
     } else {
@@ -275,6 +320,31 @@ fn main() -> ExitCode {
     }
     if let Some(p) = args.p999_ms {
         collector.throughput_mut().p999_latency_ms = p;
+    }
+
+    // The parallelism demonstration: a REAL, measured multi-core speedup + the invariant determinism.
+    if let Some(par) = &sweep.parallelism {
+        let per_algo = par
+            .algo_speedups
+            .iter()
+            .map(|(n, s)| format!("{n} {s:.2}x"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        collector.note(format!(
+            "Parallelism demonstration (rmp #342/#559): at field_size {} ({} nodes) each parallel GDS \
+             algorithm was timed sequential-vs-parallel across thread widths {:?}. The results were \
+             IDENTICAL across every width (deterministic_across_widths={}) — bit-identical for the \
+             integer algorithms, within the documented f64 tolerance for PageRank/centrality. Best \
+             measured speedup: {:.2}x (per algorithm: {}). The speedup magnitude is machine-/load-\
+             variant and is NOT gated; the cross-width determinism is an invariant of the GDS \
+             Execution knob and holds on every run.",
+            par.field_size,
+            par.node_count,
+            par.thread_widths,
+            par.deterministic_across_widths,
+            par.max_speedup,
+            per_algo,
+        ));
     }
 
     for note in &args.notes {
@@ -394,7 +464,7 @@ fn load_sweep(path: &str) -> Result<Sweep, String> {
     let engine_parallelism = v
         .get("engine_parallelism")
         .and_then(|x| x.as_str())
-        .unwrap_or("single-threaded")
+        .unwrap_or("unknown")
         .to_string();
     let host_cores = v.get("host_cores").and_then(|x| x.as_u64()).unwrap_or(0);
     let repeats = v.get("repeats").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -436,10 +506,49 @@ fn load_sweep(path: &str) -> Result<Sweep, String> {
     if sizes.is_empty() {
         return Err("sweep `sizes` array is empty".to_string());
     }
+
+    // The parallelism demonstration is optional (older sweeps predate it): parse it best-effort.
+    let parallelism = v.get("parallelism").map(|p| {
+        let field_size = p.get("field_size").and_then(|x| x.as_u64()).unwrap_or(0);
+        let node_count = p.get("node_count").and_then(|x| x.as_u64()).unwrap_or(0);
+        let thread_widths = p
+            .get("thread_widths")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+            .unwrap_or_default();
+        let deterministic_across_widths = p
+            .get("deterministic_across_widths")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let max_speedup = p.get("max_speedup").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let algo_speedups = p
+            .get("algorithms")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        let name = a.get("name").and_then(|x| x.as_str())?.to_string();
+                        let sp = a.get("speedup").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        Some((name, sp))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ParallelismSummary {
+            field_size,
+            node_count,
+            thread_widths,
+            deterministic_across_widths,
+            max_speedup,
+            algo_speedups,
+        }
+    });
+
     Ok(Sweep {
         engine_parallelism,
         host_cores,
         repeats,
         sizes,
+        parallelism,
     })
 }

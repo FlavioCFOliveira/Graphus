@@ -1274,6 +1274,7 @@ version = "0.0.5"
 dependencies = [
  "graphus-examples-harness",
  "graphus-gds",
+ "rayon",
  "serde",
  "serde_json",
 ]

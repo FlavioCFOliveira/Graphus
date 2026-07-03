@@ -2,7 +2,7 @@
   "version": 1,
   "metadata": {
     "scenario": "gds-analytics",
-    "description": "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, run the full gds.* suite over the CSR projection, assert the analytically-known reference outputs, and characterise single-threaded per-algorithm scaling + CSR footprint.",
+    "description": "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, run the full gds.* suite over the CSR projection, assert the analytically-known reference outputs, and characterise multi-threaded per-algorithm scaling (real sequential-vs-parallel speedup, deterministic across thread widths) + CSR footprint.",
     "dataset": {
       "nodes": 4320,
       "relationships": 86336
@@ -11,7 +11,7 @@
       "algorithm_count": "9",
       "connection": "bolt-tcp-tls",
       "driver": "official neo4j-driver",
-      "engine_parallelism": "single-threaded",
+      "engine_parallelism": "multi-threaded: pageRank, betweenness, closeness, wcc, triangleCount, degree, labelPropagation + multi-source dijkstra are rayon-parallel via a deterministic Execution knob (rmp #342/#559); scc + single-source dijkstra are sequential",
       "host_cores": "16",
       "loaded_network_nodes": "166",
       "loaded_network_rels": "1102",
@@ -103,7 +103,7 @@
     "abort_rate": 0.0
   },
   "notes": [
-    "Live CPU/RAM is graphus-server pid 1252958 over 5.000s uptime (the official-driver load + analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, single-threaded gds_sweep, which runs identically with or without a server.",
+    "Live CPU/RAM is graphus-server pid 1252958 over 5.000s uptime (the official-driver load + analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, multi-threaded gds_sweep, which runs identically with or without a server. Note: the phase timings here are from the ORIGINAL reference run (linux/x86_64 'ROG', 16 cores) — they are illustrative, machine-variant and NOT gated; the sweep's default-execution algorithms are now parallel above threshold, and the sweep additionally measures a real sequential-vs-parallel speedup that is deterministic across thread widths.",
     "storage.store_bytes is the reference CSR-projection footprint (CsrGraph::memory_bytes at the largest swept size); storage.space_amplification = CSR bytes-per-node and storage.write_amplification = CSR bytes-per-edge. These DETERMINISTIC structural metrics are what the baseline gate holds to a tight band \u2014 they are identical with or without a live server. CPU/RAM/wall-time and the live server's on-disk store/WAL footprint (workload params server_store_bytes / server_wal_bytes) are machine-/path-variant and are NOT gated.",
     "COMMITTED BASELINE (rmp #263): the fast-profile reference run for the regression gate. Only STABLE STRUCTURAL metrics are gated by gds_baseline_cmp \u2014 the reference graph size (dataset.nodes/relationships, the largest swept size), the algorithm_count, and the DETERMINISTIC CSR-projection footprint (storage.store_bytes = CSR bytes, storage.space_amplification = CSR bytes-per-node, storage.write_amplification = CSR bytes-per-edge), each within a 15% band. CPU/RAM/wall-time/latency and the live server's on-disk store/WAL are machine-/path-variant and are NOT gated. Recorded on linux/x86_64."
   ]

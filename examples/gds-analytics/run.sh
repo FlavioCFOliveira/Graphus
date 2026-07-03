@@ -9,11 +9,14 @@
 #      inter-field :CROSS edges, and a small :Ref/:LINKS reference subgraph whose PageRank /
 #      centrality / connected-component / shortest-path / community results are ANALYTICALLY KNOWN —
 #      emitted as reference.json;
-#   2. runs the HERMETIC scalability + CSR-footprint sweep (`gds_sweep`): betweenness & closeness are
-#      rayon-parallel across cores (rmp #318; the other algorithms are single-threaded), so the sweep
-#      varies GRAPH SIZE, reporting per-algorithm time vs size and the CSR footprint in bytes-per-node
-#      / bytes-per-edge. Its JSON lands in evidence/ for the report. (Run first so the evidence step
-#      can read it while the server is still alive.)
+#   2. runs the HERMETIC scalability + CSR-footprint + parallelism sweep (`gds_sweep`): the GDS
+#      algorithm library is MULTI-THREADED (rmp #342/#559 — a deterministic Execution knob fans each
+#      parallelisable algorithm across cores with rayon). The sweep (a) varies GRAPH SIZE, reporting
+#      per-algorithm time vs size and the CSR footprint in bytes-per-node / bytes-per-edge, and (b)
+#      DEMONSTRATES the multi-core capability at a fixed size — timing each algorithm sequential vs
+#      parallel across 1/2/all cores, reporting the REAL measured speedup and proving the result is
+#      bit-identical across every thread width. Its JSON lands in evidence/ for the report. (Run first
+#      so the evidence step can read it while the server is still alive.)
 #   3. (opt-in) boots the REAL `graphus-server` (Bolt-over-TCP + self-signed TLS) and loads the graph
 #      over Bolt via the OFFICIAL `neo4j-driver` npm package (`bolt+ssc://`), then projects the CSR
 #      (`CALL gds.graph.project`) and runs the FULL algorithm suite through the `CALL gds.*.stream`
@@ -201,22 +204,41 @@ else
 fi
 
 # --------------------------------------------------------------------------------------------------
-# Step 2 — hermetic single-threaded scalability + CSR-footprint sweep (always runs)
+# Step 2 — hermetic multi-threaded scalability + CSR-footprint + parallelism sweep (always runs)
 # --------------------------------------------------------------------------------------------------
 # Run the hermetic sweep FIRST so its JSON exists before the (optional) driver path: this lets the
 # evidence step (below) emit the standardized report while the server is still alive, harvesting the
 # server's live CPU/RAM/storage alongside the sweep's per-algorithm timings + CSR footprint. The sweep
 # is order-independent (no server, deterministic), so running it early changes nothing it measures.
-section "Step 2 — scalability + CSR-footprint sweep (single-threaded, hermetic)"
-info "graphus-gds is single-threaded (no rayon / thread pool / core knob) — the sweep varies GRAPH SIZE"
+section "Step 2 — scalability + CSR-footprint + parallelism sweep (multi-threaded, hermetic)"
+info "graphus-gds is MULTI-THREADED via a deterministic Execution knob (rmp #342/#559) — the sweep varies GRAPH SIZE *and* CORE COUNT"
 "$SWEEP" --out "$SWEEP_JSON" --sizes "$SWEEP_SIZES" --repeats 3 2>&1 | sed 's/^/  /'
 assert "sweep JSON was produced" "yes" "$([ -s "$SWEEP_JSON" ] && echo yes || echo no)"
-assert "sweep honestly reports single-threaded engine" "yes" \
-  "$(grep -q '"engine_parallelism": "single-threaded"' "$SWEEP_JSON" && echo yes || echo no)"
-assert "sweep reports a core_knob=false (no core sweep to fabricate)" "yes" \
-  "$(grep -q '"core_knob": false' "$SWEEP_JSON" && echo yes || echo no)"
+assert "sweep honestly reports a multi-threaded engine" "yes" \
+  "$(grep -q '"engine_parallelism": "multi-threaded' "$SWEEP_JSON" && echo yes || echo no)"
+assert "sweep exposes a deterministic core knob (core_knob=true)" "yes" \
+  "$(grep -q '"core_knob": true' "$SWEEP_JSON" && echo yes || echo no)"
 assert "sweep reports CSR bytes-per-node / bytes-per-edge" "yes" \
   "$(grep -q 'bytes_per_node' "$SWEEP_JSON" && grep -q 'bytes_per_edge' "$SWEEP_JSON" && echo yes || echo no)"
+
+# The parallelism DEMONSTRATION (the point of a GDS example post-#342/#559): the sweep measured, on
+# THIS run, the sequential-vs-parallel wall time of each algorithm across thread widths. Assert the
+# HONEST facts it recorded — never a fabricated curve:
+#   (a) the parallel results were IDENTICAL across every thread width (bit-identical for the integer
+#       algorithms, within the documented f64 tolerance for PageRank / centrality); and
+#   (b) a REAL, non-fabricated multi-core speedup was measured (only meaningful where cores > 1).
+assert "parallelism demo results are deterministic across thread widths" "yes" \
+  "$(grep -q '"deterministic_across_widths": true' "$SWEEP_JSON" && echo yes || echo no)"
+SWEEP_BLOB="$(cat "$SWEEP_JSON")"
+HOST_CORES="$(json_field "$SWEEP_BLOB" host_cores)"
+MAX_SPEEDUP="$(json_field "$SWEEP_BLOB" max_speedup)"
+info "parallelism demo: host_cores=${HOST_CORES:-?}, best measured speedup=${MAX_SPEEDUP:-?}x"
+if [ "${HOST_CORES:-0}" -gt 1 ] 2>/dev/null; then
+  assert "a real (non-fabricated) multi-core speedup was measured (>1.0x)" "yes" \
+    "$(awk -v s="${MAX_SPEEDUP:-0}" 'BEGIN { exit !(s > 1.0) }' && echo yes || echo no)"
+else
+  info "single-core host — speedup assertion skipped (parallelism cannot beat sequential on 1 core)"
+fi
 
 # --------------------------------------------------------------------------------------------------
 # Step 3 — decide whether to run the official-driver step
@@ -256,7 +278,7 @@ emit_evidence() {
     --evidence-dir "$EVIDENCE_DIR"
     --sweep "$SWEEP_JSON"
     --scenario "gds-analytics"
-    --description "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, run the full gds.* suite over the CSR projection, assert the analytically-known reference outputs, and characterise single-threaded per-algorithm scaling + CSR footprint."
+    --description "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, run the full gds.* suite over the CSR projection, assert the analytically-known reference outputs, and characterise multi-threaded per-algorithm scaling (real sequential-vs-parallel speedup, deterministic across thread widths) + CSR footprint."
     --param "profile=$PROFILE"
     --param "connection=bolt-tcp-tls"
   )
@@ -416,13 +438,15 @@ if [ "$FAILURES" -eq 0 ]; then
     printf '%s%sGDS-ANALYTICS DEMONSTRATION PASSED%s — Graphus loaded a seeded influence network over\n' "$BOLD" "$GREEN" "$RESET"
     printf 'Bolt/TLS via the official Neo4j driver, ran the FULL gds.* algorithm suite over the CSR\n'
     printf 'projection, matched the analytically-known reference outputs EXACTLY, recovered the planted\n'
-    printf 'field communities, released the projections cleanly, and produced a single-threaded\n'
-    printf 'scalability + CSR-footprint sweep.\n'
+    printf 'field communities, released the projections cleanly, and produced a multi-threaded\n'
+    printf 'scalability + CSR-footprint sweep with a REAL measured multi-core speedup that is\n'
+    printf 'deterministic across thread widths.\n'
   else
     printf '%s%sGDS-ANALYTICS DEMONSTRATION PASSED%s — the hermetic generator produced a byte-identical\n' "$BOLD" "$GREEN" "$RESET"
-    printf 'seeded influence network + reference subgraph and the single-threaded scalability sweep held\n'
-    printf 'its invariants. (Official-driver load/analyze was skipped: RUN_DRIVER=0 or node/npm absent.\n'
-    printf 'Run with node/npm present for the full Bolt/TLS GDS demonstration.)\n'
+    printf 'seeded influence network + reference subgraph and the multi-threaded scalability sweep held\n'
+    printf 'its invariants — a REAL sequential-vs-parallel speedup, deterministic across thread widths.\n'
+    printf '(Official-driver load/analyze was skipped: RUN_DRIVER=0 or node/npm absent. Run with\n'
+    printf 'node/npm present for the full Bolt/TLS GDS demonstration.)\n'
   fi
   exit 0
 else
