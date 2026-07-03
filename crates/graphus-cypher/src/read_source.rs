@@ -44,8 +44,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::collections::{BTreeSet, HashMap};
+
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value, VersionStamp};
+use graphus_index::fulltext::Analyzer;
 use graphus_index::keycodec::encode_equality_canonical;
 use graphus_io::BlockDevice;
 use graphus_storage::record::{NodeRecord, PropRecord, RelRecord};
@@ -1044,6 +1047,201 @@ pub fn node_property<S: StoreReadSource, K: ReadSink>(
         return None;
     }
     read_node_prop_one(src, ctx, sink, node, key)
+}
+
+// =================================================================================================
+// Full-text off-thread support (`rmp` task #546)
+// =================================================================================================
+
+/// The covered target of one declared full-text index: the label token, the covered property-key
+/// tokens (in declared order), and the analyzer (`rmp` task #546). Mirrors the tuple
+/// `IndexSet::fulltext_target` returns, but owned + `Send + Sync` so it can be captured into the
+/// off-thread [`ReadTaskInputs`](crate::coordinator::ReadTaskInputs).
+#[derive(Debug, Clone)]
+pub struct FulltextTarget {
+    /// The `Label`-namespace token the index covers.
+    pub label_token: u32,
+    /// The covered `PropKey`-namespace tokens, in the index's declared property order.
+    pub prop_keys: Vec<u32>,
+    /// The analyzer applied at index and query time.
+    pub analyzer: Analyzer,
+}
+
+/// An owned, `Send + Sync` snapshot of the coordinator's declared full-text indexes (`rmp` task #546),
+/// keyed by index name — captured on the engine thread and moved into an off-thread read so a
+/// `CALL db.index.fulltext.queryNodes(name, …)` resolves the index by name without touching the
+/// coordinator's `!Send` [`IndexSet`](crate::index_set::IndexSet).
+///
+/// It carries the index **catalogue** (name → covered `(label, props, analyzer)`), **not** the
+/// inverted-index postings: the off-thread full-text query recomputes its matches directly from the
+/// reader's MVCC snapshot (a snapshot-correct full scan — [`fulltext_scan_fallback`]), so it never
+/// depends on the ephemeral postings and is immune to the cross-snapshot staleness `rmp` #467 guards
+/// against. The catalogue is small (one entry per declared index) and usually empty, so capturing it
+/// per read is negligible.
+#[derive(Debug, Clone, Default)]
+pub struct FulltextReadSnapshot {
+    targets: HashMap<String, FulltextTarget>,
+}
+
+impl FulltextReadSnapshot {
+    /// Builds a snapshot from `(name, (label_token, prop_keys, analyzer))` tuples — exactly what
+    /// `IndexSet::fulltext_target` yields per registered index name.
+    #[must_use]
+    pub fn from_targets(
+        entries: impl IntoIterator<Item = (String, (u32, Vec<u32>, Analyzer))>,
+    ) -> Self {
+        Self {
+            targets: entries
+                .into_iter()
+                .map(|(name, (label_token, prop_keys, analyzer))| {
+                    (
+                        name,
+                        FulltextTarget {
+                            label_token,
+                            prop_keys,
+                            analyzer,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The covered target of the full-text index named `name`, or `None` if no such index is declared
+    /// (the caller turns `None` into the "no such full-text index" procedure error — identical to the
+    /// inline `IndexSet::fulltext_target(name).is_none()` outcome).
+    #[must_use]
+    pub fn target(&self, name: &str) -> Option<&FulltextTarget> {
+        self.targets.get(name)
+    }
+
+    /// Whether no full-text index is declared (the common case — capture is then free).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+/// The **snapshot-correct full-text scan fallback**, lifted over a [`StoreReadSource`] (`rmp` task
+/// #546) so an off-thread [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph) computes the same
+/// full-text match set as the live inline path — **without** the coordinator's inverted index.
+///
+/// It reproduces `RecordStoreGraph::fulltext_scan_fallback` exactly (the `rmp` #467 stale-reader
+/// repair path the inline seam already runs when a reader's snapshot predates a full-text mutation),
+/// over this reader's captured view:
+///
+/// 1. **SSI footprint** — [`mark_all_live_nodes`] + the per-candidate [`filter_label_candidates`]
+///    markers, byte-identical to the inline fast path (whose `mark_all_live_nodes` already dominates
+///    its candidate-only markers, so both routes' *deduped* marker sets are `{all live node keys}`).
+/// 2. **Match rule** — for each snapshot-visible node carrying the covered label, the covered STRING
+///    properties are read at this snapshot ([`node_property`], MVCC-correct) and analyzed in the
+///    index's declared property order with the index's analyzer; the node matches under `Or` iff its
+///    analyzed term set shares at least one term with the analyzed `search` term set (an empty search
+///    or an empty document matches nothing).
+///
+/// The result equals what the inline fast index path returns on a current snapshot (the inverted
+/// index is built by analyzing the same covered properties with the same analyzer), so the off-thread
+/// and inline full-text queries are byte-identical (results **and** SIREAD markers).
+pub fn fulltext_scan_fallback<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    target: &FulltextTarget,
+    search: &str,
+) -> Vec<NodeId> {
+    // SSI: mark every live node, exactly as the inline fast path does (`04 §5.4`).
+    mark_all_live_nodes(src, sink);
+
+    // Enumerate every live node id, then narrow to snapshot-visible nodes carrying the covered label
+    // via the SAME shared re-check the inline path uses — registering the per-candidate SIREAD markers
+    // identically.
+    let all_ids = match src.scan_node_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(e);
+            return Vec::new();
+        }
+    };
+    let labelled = filter_label_candidates(src, ctx, sink, target.label_token, all_ids);
+
+    // Resolve the covered prop-key tokens to names once. A token without a name was never interned and
+    // cannot occur on any node, so it is skipped (contributes no terms).
+    let prop_names: Vec<String> = target
+        .prop_keys
+        .iter()
+        .filter_map(|pk| src.token_name(Namespace::PropKey, *pk))
+        .collect();
+
+    // The analyzed search terms (the query side). An empty set matches nothing.
+    let search_terms: BTreeSet<String> = target.analyzer.analyze(search).into_iter().collect();
+    if search_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<NodeId> = Vec::new();
+    for node in labelled {
+        let mut matched = false;
+        'props: for name in &prop_names {
+            // Read at THIS snapshot via MVCC `node_property`, so the value is this reader's visible
+            // value (and the read is SIREAD-marked, subsumed by `mark_all_live_nodes` above).
+            let Some(Value::String(text)) = node_property(src, ctx, sink, node, name) else {
+                continue;
+            };
+            for term in target.analyzer.analyze(&text) {
+                if search_terms.contains(&term) {
+                    matched = true;
+                    break 'props;
+                }
+            }
+        }
+        if matched {
+            out.push(node);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The off-thread twin of `IndexSet::fulltext_score` (`rmp` task #546): the best-effort relevance of
+/// `node` for `search` under `target`, recomputed from the node's snapshot-visible covered properties
+/// instead of the inverted index's forward map.
+///
+/// Mirrors `InvertedIndex::score`: it is the count of **distinct** analyzed `search` terms that appear
+/// among the node's document terms (the union of its covered STRING properties analyzed in declared
+/// order with the index analyzer). On a current snapshot this equals the inline score exactly (both
+/// analyze the same covered properties with the same analyzer). The node's read is SIREAD-marked (the
+/// marker is subsumed by the preceding [`fulltext_scan_fallback`]'s `mark_all_live_nodes`, so the
+/// merged conflict graph is unchanged).
+#[must_use]
+pub fn fulltext_score_recompute<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    target: &FulltextTarget,
+    node: NodeId,
+    search: &str,
+) -> u64 {
+    // The node's document term set: analyze each covered STRING property at this snapshot.
+    let mut doc_terms: BTreeSet<String> = BTreeSet::new();
+    for pk in &target.prop_keys {
+        let Some(name) = src.token_name(Namespace::PropKey, *pk) else {
+            continue;
+        };
+        if let Some(Value::String(text)) = node_property(src, ctx, sink, node, &name) {
+            doc_terms.extend(target.analyzer.analyze(&text));
+        }
+    }
+    // Count each DISTINCT query term at most once, and only if the document has it (the
+    // `InvertedIndex::score` contract).
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut score = 0u64;
+    for term in target.analyzer.analyze(search) {
+        if seen.insert(term.clone()) && doc_terms.contains(&term) {
+            score += 1;
+        }
+    }
+    score
 }
 
 /// The body of `RecordStoreGraph::rel_property` (`GraphAccess::rel_property`).

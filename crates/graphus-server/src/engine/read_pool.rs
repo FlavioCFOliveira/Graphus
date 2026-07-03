@@ -147,12 +147,16 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
         snapshot,
         registry,
         buffer,
+        fulltext,
     } = inputs;
 
     // Build the off-thread read-only seam over the captured view. It accumulates this reader's SIREAD
     // markers into `buffer` (handed back below) and captures any storage / deferral / write-degrade
-    // error into its own cell (surfaced as the outcome).
-    let mut graph = ReadOnlyGraph::new(view, tokens, snapshot, registry, txn, buffer);
+    // error into its own cell (surfaced as the outcome). The captured full-text catalogue (`rmp` #546)
+    // lets an off-thread `CALL db.index.fulltext.queryNodes` resolve the index by name and recompute
+    // its matches from this reader's snapshot.
+    let mut graph =
+        ReadOnlyGraph::new(view, tokens, snapshot, registry, txn, buffer).with_fulltext(fulltext);
 
     // RBAC (rmp #93) composes exactly as the inline path: a restricted principal wraps the seam in an
     // `AuthorizedGraph` so reads are filtered uniformly; `None`/admin runs the bare seam (zero cost).

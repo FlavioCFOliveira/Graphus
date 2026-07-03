@@ -243,6 +243,28 @@ impl PhysicalPlan {
         contains_procedure_call(&self.root)
     }
 
+    /// Whether **every** procedure this plan invokes is **reader-safe** (`rmp` task #546) — i.e. the
+    /// plan calls no procedure at all, or every `CALL` targets a procedure the `registry` classifies
+    /// reader-safe ([`ProcedureRegistry::is_reader_safe`](crate::procedure_registry::ProcedureRegistry::is_reader_safe)).
+    ///
+    /// The server uses this — instead of the blanket [`calls_procedure`](Self::calls_procedure) — as
+    /// the off-thread reader-pool eligibility gate: a read-only auto-commit statement whose procedures
+    /// are all reader-safe (GDS algorithms, `db.*` introspection, `db.index.fulltext.queryNodes`) runs
+    /// correctly on a reader thread over the captured read view, so it scales across cores instead of
+    /// being pinned to the single engine thread. A plan that calls even one non-reader-safe procedure
+    /// (a UDP that may write, or one whose side effects are not thread-safe) stays inline.
+    ///
+    /// Like [`calls_procedure`](Self::calls_procedure) this is an **exhaustive** structural walk (no
+    /// `_` wildcard), so a newly-added child-bearing operator fails to compile until it is classified,
+    /// rather than silently letting a nested `ProcedureCall` escape the reader-safety check.
+    #[must_use]
+    pub fn calls_only_reader_safe_procedures(
+        &self,
+        registry: &dyn crate::procedure_registry::ProcedureRegistry,
+    ) -> bool {
+        all_procedure_calls_reader_safe(&self.root, registry)
+    }
+
     /// Whether this plan depends on `id`.
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
@@ -1497,6 +1519,74 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
+    }
+}
+
+/// Whether **every** [`PhysicalOp::ProcedureCall`] in the (sub)plan targets a procedure the `registry`
+/// classifies **reader-safe** (`rmp` task #546) — the structural predicate behind
+/// [`PhysicalPlan::calls_only_reader_safe_procedures`]. Returns `true` for a subtree with no procedure
+/// call (vacuously all-safe).
+///
+/// **Exhaustive by construction** (mirrors [`contains_procedure_call`]): every [`PhysicalOp`] variant
+/// is matched with no `_` wildcard, so a new child-bearing operator is a compile error until it is
+/// classified here — a `ProcedureCall` nested under a newly-added operator can never silently escape
+/// the reader-safety check and be mis-dispatched off-thread (the `rmp` #548 lesson).
+fn all_procedure_calls_reader_safe(
+    op: &PhysicalOp,
+    registry: &dyn crate::procedure_registry::ProcedureRegistry,
+) -> bool {
+    match op {
+        // The call itself must be reader-safe, AND any correlated input subtree must also be all-safe.
+        PhysicalOp::ProcedureCall { input, name, .. } => {
+            registry.is_reader_safe(&name.join("."))
+                && input
+                    .as_deref()
+                    .is_none_or(|i| all_procedure_calls_reader_safe(i, registry))
+        }
+        // Single-input operators: recurse into the one child.
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. }
+        | PhysicalOp::Optional { input, .. } => all_procedure_calls_reader_safe(input, registry),
+        // `Foreach` has two children — the driving `input` and the `body` clause; check both.
+        PhysicalOp::Foreach { input, body, .. } => {
+            all_procedure_calls_reader_safe(input, registry)
+                && all_procedure_calls_reader_safe(body, registry)
+        }
+        // Binary operators: recurse into both branches.
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => {
+            all_procedure_calls_reader_safe(left, registry)
+                && all_procedure_calls_reader_safe(right, registry)
+        }
+        // Leaves (scans / index seeks / `Argument` / `Empty`) never call a procedure — vacuously safe.
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => true,
     }
 }
 
@@ -3892,6 +3982,102 @@ mod tests {
         assert!(calls_procedure_of(
             "CALL db.labels() YIELD label RETURN label"
         ));
+    }
+
+    // ---- reader-safe procedure classification for off-thread dispatch (`rmp` task #546) ---------
+
+    #[test]
+    fn reader_safe_gate_admits_a_read_that_calls_no_procedure() {
+        use crate::procedure_registry::{ProcedureSet, builtins};
+        // A plain read (no procedure) is vacuously all-reader-safe against ANY registry — including an
+        // empty one — so it dispatches off-thread exactly as before this task.
+        let empty = ProcedureSet::new();
+        for src in [
+            "MATCH (n) RETURN n",
+            "MATCH (a)-[r]->(b) RETURN b",
+            "MATCH (n) RETURN count(n) ORDER BY count(n)",
+        ] {
+            let plan = physical(src, &IndexCatalog::empty());
+            assert!(plan.calls_only_reader_safe_procedures(builtins()));
+            assert!(plan.calls_only_reader_safe_procedures(&empty));
+        }
+    }
+
+    #[test]
+    fn reader_safe_gate_admits_reader_safe_builtins_and_rejects_unclassified() {
+        use crate::procedure_registry::{ProcedureSet, builtins};
+        // `db.*` introspection + `db.index.fulltext.queryNodes` are registered reader-safe in the
+        // engine's builtins, so a plan calling them (even nested under an `ExpandAll`) is admitted.
+        for src in [
+            "CALL db.labels() YIELD label RETURN label",
+            "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey",
+            "CALL db.index.fulltext.queryNodes('idx','term') YIELD node \
+             MATCH (node)-[r]->(m) RETURN m",
+        ] {
+            let plan = physical(src, &IndexCatalog::empty());
+            assert!(
+                plan.calls_only_reader_safe_procedures(builtins()),
+                "reader-safe builtin plan must be admitted off-thread: {src}"
+            );
+            // The SAME plan is REJECTED against a registry that does not classify the procedure
+            // reader-safe (an empty registry ⇒ `is_reader_safe` conservatively `false`), so an
+            // unknown/unclassified — potentially writing — procedure keeps the read inline.
+            let empty = ProcedureSet::new();
+            assert!(
+                !plan.calls_only_reader_safe_procedures(&empty),
+                "an unclassified procedure must keep the read inline: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn reader_safe_gate_rejects_a_plan_mixing_safe_and_unsafe_procedures() {
+        use crate::procedure_registry::{
+            FieldSpec, FieldType, ProcedureRegistry, ProcedureSet, ProcedureSignature, ValueClass,
+        };
+        // A plan calling two procedures, classified against a registry where one is reader-safe and the
+        // other is NOT — even one non-reader-safe call must pin the whole read inline. (Two builtins are
+        // used so the plan compiles; the CLASSIFICATION registry is independent of the compile registry,
+        // which is exactly how the server passes its live `ExtensionRegistry` in.)
+        let string_out = |name: &str| {
+            ProcedureSignature::new(
+                name,
+                Vec::new(),
+                vec![FieldSpec::new(
+                    "v",
+                    FieldType {
+                        class: ValueClass::String,
+                        nullable: false,
+                    },
+                )],
+            )
+        };
+        let mut reg = ProcedureSet::new();
+        reg.register_reader_safe(string_out("db.labels"), Box::new(|_a, _g| Ok(Vec::new())));
+        // `db.propertyKeys` registered with the conservative (non-reader-safe) `register`.
+        reg.register(
+            string_out("db.propertyKeys"),
+            Box::new(|_a, _g| Ok(Vec::new())),
+        );
+        assert!(reg.is_reader_safe("db.labels"));
+        assert!(!reg.is_reader_safe("db.propertyKeys"));
+
+        // `CALL db.labels() YIELD label CALL db.propertyKeys() YIELD propertyKey RETURN …` — both
+        // present; compiles against the builtins, classified against `reg`.
+        let plan = physical(
+            "CALL db.labels() YIELD label \
+             CALL db.propertyKeys() YIELD propertyKey RETURN label, propertyKey",
+            &IndexCatalog::empty(),
+        );
+        assert!(
+            !plan.calls_only_reader_safe_procedures(&reg),
+            "a plan calling even one non-reader-safe procedure must stay inline"
+        );
+        // Against the builtins (BOTH reader-safe) the same plan is admitted.
+        assert!(
+            plan.calls_only_reader_safe_procedures(crate::procedure_registry::builtins()),
+            "a plan whose procedures are all reader-safe is admitted off-thread"
+        );
     }
 
     #[test]

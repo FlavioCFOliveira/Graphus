@@ -265,6 +265,18 @@ pub trait ProcedureRegistry {
         args: &[Value],
         graph: &mut dyn GraphAccess,
     ) -> Result<Vec<Vec<Value>>, ProcedureFailure>;
+
+    /// Whether the named procedure is **reader-safe** (`rmp` task #546): its body performs no
+    /// graph-store write and no non-thread-safe side effect, so a read-only auto-commit statement
+    /// that calls only reader-safe procedures may be dispatched to the off-thread reader pool
+    /// (`ReadOnlyGraph` over the captured read view serves it identically to inline).
+    ///
+    /// Defaults to `false` — conservative: an unknown or unclassified procedure keeps a plan on the
+    /// engine thread. A registry that does not track reader-safety therefore never moves a
+    /// procedure-calling read off-thread, exactly as before this task.
+    fn is_reader_safe(&self, _dotted_name: &str) -> bool {
+        false
+    }
 }
 
 // =================================================================================================
@@ -279,10 +291,23 @@ type ProcedureHandler = Box<
         + Sync,
 >;
 
-/// One registered procedure: its signature and its body.
+/// One registered procedure: its signature, its body, and whether it is **reader-safe**.
 struct Procedure {
     signature: ProcedureSignature,
     handler: ProcedureHandler,
+    /// Whether this procedure is **reader-safe** (`rmp` task #546): its body performs **no**
+    /// graph-store write and no non-thread-safe side effect, so a read-only auto-commit statement
+    /// that calls only reader-safe procedures may be dispatched to the off-thread reader pool
+    /// (running concurrently with the single writer) instead of being pinned to the engine thread.
+    ///
+    /// The default for a plainly-[`register`](ProcedureSet::register)ed procedure is **`false`**
+    /// (conservative: a deployment UDP receives a `&mut dyn GraphAccess` and *could* write, so it
+    /// stays inline unless it opts in via [`register_reader_safe`](ProcedureSet::register_reader_safe)).
+    /// The engine built-ins (`db.*` introspection + `db.index.fulltext.queryNodes`) and the whole
+    /// GDS (`gds.*`) surface are registered reader-safe: they only *read* the graph through the
+    /// `GraphAccess` seam (GDS additionally mutates only its own `Arc<Mutex<GraphCatalog>>`, never the
+    /// transactional store), so the off-thread read view serves them identically to inline.
+    reader_safe: bool,
 }
 
 /// The concrete, mutable [`ProcedureRegistry`]: a name-indexed set of procedures.
@@ -319,7 +344,7 @@ impl ProcedureSet {
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut set = Self::new();
-        set.register(
+        set.register_reader_safe(
             ProcedureSignature::new(
                 "db.labels",
                 Vec::new(),
@@ -333,7 +358,7 @@ impl ProcedureSet {
             ),
             Box::new(|_args, graph| Ok(string_rows(distinct_node_labels(graph)))),
         );
-        set.register(
+        set.register_reader_safe(
             ProcedureSignature::new(
                 "db.relationshipTypes",
                 Vec::new(),
@@ -347,7 +372,7 @@ impl ProcedureSet {
             ),
             Box::new(|_args, graph| Ok(string_rows(distinct_rel_types(graph)))),
         );
-        set.register(
+        set.register_reader_safe(
             ProcedureSignature::new(
                 "db.propertyKeys",
                 Vec::new(),
@@ -365,7 +390,7 @@ impl ProcedureSet {
         // search procedure (`rmp` task #72), Neo4j-compatible. `node` is a **structural NODE** result
         // (rmp #96 materialization composes MVCC + RBAC at egress); `score` is the best-effort
         // term-overlap relevance count (a FLOAT, as Neo4j returns).
-        set.register(
+        set.register_reader_safe(
             ProcedureSignature::new(
                 "db.index.fulltext.queryNodes",
                 vec![
@@ -407,10 +432,44 @@ impl ProcedureSet {
     }
 
     /// Registers (or replaces) a handler-backed procedure under its signature's canonical name.
+    ///
+    /// The procedure is registered **not** reader-safe (the conservative default): a read plan that
+    /// calls it stays on the engine thread. Use [`register_reader_safe`](Self::register_reader_safe)
+    /// for a side-effect-free procedure that may be dispatched off-thread (`rmp` task #546).
     pub fn register(&mut self, signature: ProcedureSignature, handler: ProcedureHandler) {
+        self.register_with_safety(signature, handler, false);
+    }
+
+    /// Registers (or replaces) a **reader-safe** handler-backed procedure (`rmp` task #546): its body
+    /// performs no graph-store write and no non-thread-safe side effect, so a read-only auto-commit
+    /// statement calling only reader-safe procedures may run on the off-thread reader pool. The engine
+    /// registers its built-ins and the GDS surface through this; a deployment may register a read-only
+    /// UDP here to let it parallelize too.
+    pub fn register_reader_safe(
+        &mut self,
+        signature: ProcedureSignature,
+        handler: ProcedureHandler,
+    ) {
+        self.register_with_safety(signature, handler, true);
+    }
+
+    /// The shared registration body: inserts the procedure keyed by its canonical name, tagged with
+    /// its `reader_safe` capability (`rmp` task #546).
+    fn register_with_safety(
+        &mut self,
+        signature: ProcedureSignature,
+        handler: ProcedureHandler,
+        reader_safe: bool,
+    ) {
         let key = signature.name.clone();
-        self.procedures
-            .insert(key, Procedure { signature, handler });
+        self.procedures.insert(
+            key,
+            Procedure {
+                signature,
+                handler,
+                reader_safe,
+            },
+        );
     }
 
     /// Registers a **fixture-table** procedure (the openCypher TCK's
@@ -507,6 +566,12 @@ impl ProcedureRegistry for ProcedureSet {
             ));
         }
         (proc.handler)(args, graph)
+    }
+
+    fn is_reader_safe(&self, dotted_name: &str) -> bool {
+        self.procedures
+            .get(dotted_name.to_ascii_lowercase().as_str())
+            .is_some_and(|p| p.reader_safe)
     }
 }
 
@@ -895,5 +960,35 @@ mod tests {
         assert!(number.accepts(&Value::Integer(1)));
         assert!(number.accepts(&Value::Float(1.5)));
         assert!(!number.accepts(&Value::String("x".into())));
+    }
+
+    #[test]
+    fn builtins_are_reader_safe_and_register_default_is_not() {
+        // `rmp` task #546: every built-in procedure is registered reader-safe (they only read the
+        // graph), so a read plan calling them may dispatch off-thread.
+        let set = ProcedureSet::with_builtins();
+        for name in [
+            "db.labels",
+            "db.relationshipTypes",
+            "db.propertyKeys",
+            "db.index.fulltext.queryNodes",
+        ] {
+            assert!(
+                set.is_reader_safe(name),
+                "built-in `{name}` must be reader-safe"
+            );
+            // Case-insensitive, like every other name lookup.
+            assert!(set.is_reader_safe(&name.to_ascii_uppercase()));
+        }
+        // An unknown name is conservatively NOT reader-safe (keeps a caller inline).
+        assert!(!set.is_reader_safe("no.such.procedure"));
+
+        // The plain `register` default is NOT reader-safe; `register_reader_safe` opts in.
+        let mut set = ProcedureSet::new();
+        let sig = |name: &str| ProcedureSignature::new(name, Vec::new(), Vec::new());
+        set.register(sig("ext.maybeWrites"), Box::new(|_a, _g| Ok(Vec::new())));
+        set.register_reader_safe(sig("ext.pureRead"), Box::new(|_a, _g| Ok(Vec::new())));
+        assert!(!set.is_reader_safe("ext.maybeWrites"));
+        assert!(set.is_reader_safe("ext.pureRead"));
     }
 }

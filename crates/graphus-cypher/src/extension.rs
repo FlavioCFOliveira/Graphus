@@ -130,6 +130,21 @@ impl ExtensionRegistry {
         self.procedures.register(signature, handler);
     }
 
+    /// Registers a **reader-safe** user-defined procedure (`rmp` task #546): the deployment asserts the
+    /// procedure body performs no graph-store write and no non-thread-safe side effect, so a read-only
+    /// auto-commit statement calling it may be dispatched to the off-thread reader pool (running
+    /// concurrently with the single writer) instead of being pinned to the engine thread.
+    ///
+    /// Use plain [`register_procedure`](Self::register_procedure) (the conservative default) for a UDP
+    /// that may write or whose side effects are not thread-safe — it stays inline.
+    pub fn register_procedure_reader_safe(
+        &mut self,
+        signature: ProcedureSignature,
+        handler: ProcedureHandler,
+    ) {
+        self.procedures.register_reader_safe(signature, handler);
+    }
+
     /// Registers the **Graph Data Science (`gds.*`) procedure surface** (`rmp` task #133) into this
     /// registry's procedure set, all sharing the one `catalog` handle.
     ///

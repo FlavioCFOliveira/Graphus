@@ -431,6 +431,13 @@ fn out(name: &str, class: ValueClass) -> FieldSpec {
 ///   `gds.triangleCount.stream`.
 /// - **Pathfinding (stream):** `gds.dijkstra.stream`, `gds.bellmanFord.stream` (single-source from a
 ///   `sourceNode` config key, yielding `nodeId, distance`).
+///
+/// Every `gds.*` procedure is registered **reader-safe** (`rmp` task #546): its body only *reads* the
+/// graph through the [`GraphAccess`](crate::graph_access::GraphAccess) seam
+/// (`scan_nodes`/`scan_nodes_by_label`/`expand`/`rel_property`) and mutates only the shared
+/// `Arc<Mutex<GraphCatalog>>` — never the transactional store — so a read-only auto-commit `CALL gds.*`
+/// may run on the off-thread reader pool (where the algorithm's own `rmp` #342 rayon parallelism then
+/// nests). The `Mutex` makes concurrent projections/streams across reader threads safe.
 pub fn register_gds_procedures(set: &mut ProcedureSet, catalog: GdsCatalogHandle) {
     register_lifecycle(set, &catalog);
     register_centrality(set, &catalog);
@@ -442,7 +449,7 @@ pub fn register_gds_procedures(set: &mut ProcedureSet, catalog: GdsCatalogHandle
 fn register_lifecycle(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
     // gds.graph.project(name, nodeFilter?, relFilter?, config?) :: (graphName, nodeCount, relationshipCount)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.graph.project",
             vec![
@@ -501,7 +508,7 @@ fn register_lifecycle(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.graph.list() :: (graphName, nodeCount, relationshipCount)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.graph.list",
             Vec::new(),
@@ -532,7 +539,7 @@ fn register_lifecycle(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.graph.exists(name) :: (graphName, exists)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.graph.exists",
             vec![string_in("graphName")],
@@ -554,7 +561,7 @@ fn register_lifecycle(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.graph.drop(name) :: (graphName, nodeCount, relationshipCount)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.graph.drop",
             vec![string_in("graphName")],
@@ -652,7 +659,7 @@ fn id_component_rows(graph: &CsrGraph, component: &[u32]) -> Vec<Vec<Value>> {
 fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
     // gds.pageRank.stream(name, config?) :: (nodeId, score)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.pageRank.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -692,7 +699,7 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.degree.stream(name) :: (nodeId, score)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.degree.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -714,7 +721,7 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.closeness.stream(name) :: (nodeId, score)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.closeness.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -748,7 +755,7 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
     // is the raw accumulation divided by two. `undirected_scale` applies exactly that (and is a no-op
     // for a directed projection), so the streamed score matches Neo4j's undirected betweenness.
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.betweenness.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -778,7 +785,7 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
     // gds.wcc.stream(name) :: (nodeId, componentId)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.wcc.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -802,7 +809,7 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.scc.stream(name) :: (nodeId, componentId)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.scc.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -823,7 +830,7 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.labelPropagation.stream(name, config?) :: (nodeId, communityId)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.labelPropagation.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -852,7 +859,7 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.triangleCount.stream(name) :: (nodeId, triangleCount)
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.triangleCount.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -889,7 +896,7 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 fn register_pathfinding(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
     // gds.dijkstra.stream(name, config) :: (nodeId, distance) — single-source from config.sourceNode.
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.dijkstra.stream",
             vec![string_in("graphName"), any_in("config")],
@@ -906,7 +913,7 @@ fn register_pathfinding(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
 
     // gds.bellmanFord.stream(name, config) :: (nodeId, distance) — single-source, handles negatives.
     let cat = Arc::clone(catalog);
-    set.register(
+    set.register_reader_safe(
         ProcedureSignature::new(
             "gds.bellmanFord.stream",
             vec![string_in("graphName"), any_in("config")],

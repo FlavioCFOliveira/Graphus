@@ -768,6 +768,28 @@ impl IndexSet {
             .map(|ft| (ft.label_token, ft.prop_keys.clone(), ft.analyzer))
     }
 
+    /// An owned, `Send + Sync` snapshot of every declared full-text index's covered target, keyed by
+    /// index name (`rmp` task #546) — captured on the engine thread into an off-thread read's
+    /// [`ReadTaskInputs`](crate::coordinator::ReadTaskInputs) so `db.index.fulltext.queryNodes`
+    /// resolves the index by name on a reader thread without touching this `!Send` [`IndexSet`].
+    ///
+    /// Includes **every** registered index (in any build state), matching the no-state-gate resolution
+    /// [`fulltext_target`](Self::fulltext_target) gives the inline fast path — so the off-thread
+    /// "does this index exist?" determination is identical to inline. It carries only the catalogue
+    /// (name → covered `(label, props, analyzer)`), **not** the inverted-index postings: the reader
+    /// recomputes matches from its MVCC snapshot (`read_source::fulltext_scan_fallback`).
+    #[must_use]
+    pub fn fulltext_snapshot(&self) -> crate::read_source::FulltextReadSnapshot {
+        crate::read_source::FulltextReadSnapshot::from_targets(self.fulltext.iter().map(
+            |(name, ft)| {
+                (
+                    name.clone(),
+                    (ft.label_token, ft.prop_keys.clone(), ft.analyzer),
+                )
+            },
+        ))
+    }
+
     /// The registered full-text index names (in any state), ascending. Used by the coordinator's
     /// rebuild to know which indexes to repopulate and by `SHOW FULLTEXT INDEXES`.
     #[must_use]

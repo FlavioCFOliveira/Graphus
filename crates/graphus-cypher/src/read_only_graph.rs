@@ -85,6 +85,12 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
     /// untrustworthy and the statement should be rolled back. `RefCell` because reads capture through
     /// `&self` (mirrors `RecordStoreGraph::error`).
     error: RefCell<Option<GraphusError>>,
+    /// The declared full-text index catalogue captured on the engine thread (`rmp` task #546), so an
+    /// off-thread `CALL db.index.fulltext.queryNodes(name, …)` resolves the index by name and
+    /// recomputes matches from this reader's snapshot. Empty (the [`new`](Self::new) default) unless a
+    /// full-text-capable read supplies it via [`with_fulltext`](Self::with_fulltext) — the morsel
+    /// readers (`rmp` #339) never call procedures, so they keep the free empty catalogue.
+    fulltext: read_source::FulltextReadSnapshot,
 }
 
 impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
@@ -121,7 +127,17 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
             txn,
             buffer: RefCell::new(Some(buffer)),
             error: RefCell::new(None),
+            fulltext: read_source::FulltextReadSnapshot::default(),
         }
+    }
+
+    /// Attaches the captured full-text index catalogue (`rmp` task #546), enabling this reader to serve
+    /// `CALL db.index.fulltext.queryNodes(name, …)` off-thread. A builder so [`new`](Self::new) keeps
+    /// its (churn-free) signature and the morsel readers, which never call procedures, keep the free
+    /// empty catalogue. Consumes and returns `self` for chaining at the dispatch site.
+    pub fn with_fulltext(mut self, fulltext: read_source::FulltextReadSnapshot) -> Self {
+        self.fulltext = fulltext;
+        self
     }
 
     /// The transaction id this read runs in.
@@ -310,13 +326,47 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for ReadOnlyGraph<D, S> {
         read_source::incident_rels(&self.source(), &self.ctx(), self, node)
     }
 
-    // The optional index / full-text / spatial / columnar seams all DECLINE on the reader (first-cut
-    // scan-fallback): the derived accelerators live in the coordinator, not in this owned read view. The
-    // executor then uses the ordinary Volcano scan, which the reads above answer correctly. Each falls
-    // back to the `GraphAccess` default (`None`), so they are deliberately not overridden here.
-    //
-    // `statistics()` likewise defaults to `None`: the reader does not carry the durable statistics
-    // catalogue (cost-based planning happens on the engine thread before dispatch).
+    // The optional property-index / spatial / columnar / statistics seams DECLINE on the reader
+    // (first-cut scan-fallback): the derived accelerators live in the coordinator, not in this owned
+    // read view. The executor then uses the ordinary Volcano scan / label-scan fallback, which the
+    // reads above answer correctly and which registers the identical SSI footprint — so a
+    // `SpatialIndexSeek` off-thread returns `None` here and the executor's label-scan + residual
+    // `distance(...)` filter serves it correctly. Each falls back to the `GraphAccess` default
+    // (`None`), so they are deliberately not overridden. `statistics()` likewise defaults to `None`
+    // (cost-based planning happens on the engine thread before dispatch).
+
+    // Full-text is the exception (`rmp` task #546): unlike a declined *index seek* (which the executor
+    // turns into a correct scan), a declined `fulltext_query` surfaces as a hard "no such index"
+    // procedure error — so a `CALL db.index.fulltext.queryNodes` could not run off-thread at all. We
+    // serve it from the captured catalogue (`with_fulltext`) via the snapshot-correct full-text scan
+    // fallback: it recomputes the match set + score directly from this reader's MVCC snapshot (never
+    // the coordinator's inverted-index postings), so the result + SIREAD markers are byte-identical to
+    // the inline fast path (whose `mark_all_live_nodes` dominates its candidate-only markers) AND immune
+    // to the cross-snapshot staleness `rmp` #467 guards against. An index the catalogue does not know
+    // yields `None`, exactly as the inline `IndexSet::fulltext_target(name).is_none()` path does.
+
+    fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {
+        let target = self.fulltext.target(name)?;
+        Some(read_source::fulltext_scan_fallback(
+            &self.source(),
+            &self.ctx(),
+            self,
+            target,
+            search,
+        ))
+    }
+
+    fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {
+        let target = self.fulltext.target(name)?;
+        Some(read_source::fulltext_score_recompute(
+            &self.source(),
+            &self.ctx(),
+            self,
+            target,
+            node,
+            search,
+        ))
+    }
 
     // ---- writes: statically unreachable on the reader path → capture-degrade ------------------
 

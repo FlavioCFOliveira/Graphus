@@ -198,6 +198,11 @@ pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
     pub registry: CommitRegistry,
     /// A fresh, empty SIREAD-marker buffer tagged with the reader's txn.
     pub buffer: SsiReadBuffer,
+    /// A `Send + Sync` snapshot of the declared full-text index catalogue (`rmp` task #546), so an
+    /// off-thread `CALL db.index.fulltext.queryNodes(name, …)` resolves the index by name and
+    /// recomputes its matches from this reader's MVCC snapshot — without the coordinator's `!Send`
+    /// [`IndexSet`](crate::index_set::IndexSet). Usually empty (no full-text index declared).
+    pub fulltext: crate::read_source::FulltextReadSnapshot,
 }
 
 // `rmp` #336 Slice 3b-ii: `ReadTaskInputs` is captured on the engine thread and MOVED into the
@@ -2626,6 +2631,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             snapshot,
             registry: store.commit_registry().clone(),
             buffer: SsiReadBuffer::new(txn),
+            // `rmp` #546: capture the full-text catalogue so an off-thread `db.index.fulltext.
+            // queryNodes` resolves the index by name and recomputes matches from this snapshot. Small
+            // (one entry per declared index) and usually empty, so a per-read `Arc`-free clone is
+            // negligible.
+            fulltext: self.index.borrow().fulltext_snapshot(),
         })
     }
 

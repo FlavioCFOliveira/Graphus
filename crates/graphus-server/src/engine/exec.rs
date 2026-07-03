@@ -240,6 +240,48 @@ fn register_builtin_extensions(reg: &mut ExtensionRegistry) {
         }),
     )
     .expect("INVARIANT: test UDF `ext.panic` registers into a fresh registry");
+
+    // Test-only dispatch oracle (`rmp` task #546): `ext.readerPoolWorker() YIELD onPool` yields a
+    // single Boolean row = whether the procedure BODY is executing on an off-thread reader-pool worker
+    // ([`graphus_cypher::morsel::is_reader_pool_worker`], the thread-local a `ReaderPoolWorkerGuard`
+    // sets). Registered **reader-safe**, so a `CALL ext.readerPoolWorker()` auto-commit read is
+    // dispatched to the reader pool and yields `true`; the same call in an explicit transaction (or via
+    // the inline DST driver) runs on the engine thread and yields `false`. The `…Inline` sibling is
+    // registered **not** reader-safe, so it stays inline even in an auto-commit read (yielding
+    // `false`) — the deterministic negative gate for the reader-safe classification. Gated on the
+    // opt-in `internal-test-udf` feature (OFF in production) exactly like `ext.panic`.
+    #[cfg(feature = "internal-test-udf")]
+    {
+        fn reader_pool_probe_signature(name: &str) -> ProcedureSignature {
+            ProcedureSignature::new(
+                name,
+                Vec::new(),
+                vec![FieldSpec::new(
+                    "onPool",
+                    FieldType {
+                        class: ValueClass::Boolean,
+                        nullable: false,
+                    },
+                )],
+            )
+        }
+        reg.register_procedure_reader_safe(
+            reader_pool_probe_signature("ext.readerPoolWorker"),
+            Box::new(|_args: &[Value], _graph: &mut dyn GraphAccess| {
+                Ok(vec![vec![Value::Boolean(
+                    graphus_cypher::morsel::is_reader_pool_worker(),
+                )]])
+            }),
+        );
+        reg.register_procedure(
+            reader_pool_probe_signature("ext.readerPoolWorkerInline"),
+            Box::new(|_args: &[Value], _graph: &mut dyn GraphAccess| {
+                Ok(vec![vec![Value::Boolean(
+                    graphus_cypher::morsel::is_reader_pool_worker(),
+                )]])
+            }),
+        );
+    }
 }
 
 /// Handles a [`super::EngineCommand::Run`]: resolves the transaction, compiles + binds the query,
@@ -396,15 +438,20 @@ pub(super) fn handle_run<
     // columnar) to a correct full scan — so routing it to a reader is fail-safe. Writes still run inline;
     // a write submitted in a declared READ transaction is already rejected above (via `query_type()`).
     //
-    // Exception (`rmp` task #543): a plan that CALLS A PROCEDURE stays inline (`plan.calls_procedure()`,
-    // an exhaustive structural walk — `rmp` #548).
-    // A procedure can reach a derived-accelerator seam that has **no scan fallback** — e.g.
-    // `db.index.fulltext.queryNodes` needs the full-text index, which lives on the coordinator and
-    // declines on the reader's owned read view, surfacing as a hard "no such index" error rather than a
-    // slower-but-correct scan. Such procedures keep their full coordinator access on the engine thread
-    // (exactly how they ran under the default Write mode before #543). Re-enabling off-thread execution
-    // for reader-safe procedures (GDS, `db.*` introspection) + capturing full-text/spatial state in the
-    // read view is the documented follow-up (`rmp` task #546).
+    // Procedures (`rmp` task #546, re-enabling the #543 deferral): a plan may now dispatch off-thread
+    // when **every** procedure it calls is reader-safe
+    // (`plan.calls_only_reader_safe_procedures(...)` — the exhaustive structural walk of `rmp` #548,
+    // now consulting the registry's `is_reader_safe` capability). Reader-safe = the body performs no
+    // graph-store write and no non-thread-safe side effect: GDS algorithms (which additionally nest
+    // their own `rmp` #342 rayon parallelism on the reader thread), `db.*` introspection, and
+    // `db.index.fulltext.queryNodes` — the last served off-thread from the full-text catalogue captured
+    // into `inputs.fulltext`, recomputing its matches from this reader's snapshot (a snapshot-correct
+    // scan whose results + SIREAD markers are byte-identical to inline). A plan calling even one
+    // non-reader-safe procedure (a UDP that may write, or one whose side effects are not thread-safe)
+    // still stays inline — as does every write. NOTE: the Snapshot-Isolation demotion above deliberately
+    // still excludes *all* procedure-calling reads (`!plan.calls_procedure()`), so a reader-safe
+    // procedure read keeps full Serializable SSI; its markers are merged at retirement and are proven
+    // byte-identical to the inline path, so isolation is unchanged — only the thread it runs on differs.
     //
     // Only **auto-commit** reads dispatch off-thread (explicit `BEGIN…MATCH…COMMIT` reads stay inline —
     // they carry ongoing transaction state on the engine thread). A non-threaded dispatcher (DST
@@ -419,7 +466,7 @@ pub(super) fn handle_run<
     let mut reply = Some(reply);
     let mut privileges = privileges;
     if plan_query_type == graphus_cypher::QueryType::Read
-        && !plan.calls_procedure()
+        && plan.calls_only_reader_safe_procedures(extensions.procedures_dyn())
         && auto_commit
         && dispatch.is_threaded()
     {

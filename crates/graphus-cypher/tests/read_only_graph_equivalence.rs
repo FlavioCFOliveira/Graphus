@@ -42,7 +42,7 @@ use graphus_cypher::index_set::IndexSet;
 use graphus_cypher::read_only_graph::ReadOnlyGraph;
 use graphus_cypher::record_graph::RecordStoreGraph;
 use graphus_io::MemBlockDevice;
-use graphus_storage::{BLOCK_PAYLOAD, Namespace, RecordStore};
+use graphus_storage::{BLOCK_PAYLOAD, IndexState, Namespace, RecordStore};
 use graphus_txn::{LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -609,5 +609,167 @@ fn writes_on_the_reader_path_capture_a_degrade_error() {
     assert!(
         err.to_string().contains("read-only reader path"),
         "the degrade error names the read-only reader path: {err}"
+    );
+}
+
+/// Off-thread **full-text** equivalence (`rmp` task #546): a `db.index.fulltext.queryNodes` served on
+/// the off-thread reader — which has no inverted index and recomputes matches from its MVCC snapshot
+/// (`read_source::fulltext_scan_fallback`) via the catalogue captured in `ReadTaskInputs.fulltext` —
+/// is **byte-identical** to the inline fast index path: same candidate set, same per-candidate score,
+/// same "no such index" outcome, AND the same canonical SIREAD markers.
+///
+/// The live seam takes the **fast index arm** (an `IndexSet` with a populated full-text index, a fresh
+/// `effective_ft_spatial_marker`), while the reader takes the **scan-fallback arm** — so this proves
+/// index-arm == scan-fallback for full-text, the same "index-present == index-absent" guarantee the
+/// seam gives every other read (and the reason moving a full-text procedure off-thread is safe).
+#[test]
+fn fulltext_query_off_thread_is_byte_identical_to_inline() {
+    // A discriminating fixture: four `Person` nodes with a `bio` STRING property (overlapping terms),
+    // plus a NON-`Person` node whose bio also contains "graph" — it must be excluded by BOTH routes
+    // (the index is label-scoped; the scan fallback filters by label), proving the label scoping.
+    let bios = [
+        "graph database engineer",
+        "rust systems programmer",
+        "database and graph theory",
+        "marketing lead",
+    ];
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let l_company = s.intern_token(Namespace::Label, "Company").unwrap();
+    let k_bio = s.intern_token(Namespace::PropKey, "bio").unwrap();
+    let mut person_ids = Vec::new();
+    for bio in bios {
+        let (n, _) = s.create_node(txn).unwrap();
+        s.add_label(txn, n, l_person).unwrap();
+        s.set_node_property_value(txn, n, k_bio, &Value::String(bio.to_owned()))
+            .unwrap();
+        person_ids.push(n);
+    }
+    let (company, _) = s.create_node(txn).unwrap();
+    s.add_label(txn, company, l_company).unwrap();
+    s.set_node_property_value(
+        txn,
+        company,
+        k_bio,
+        &Value::String("graph analytics company".to_owned()),
+    )
+    .unwrap();
+    s.commit(txn).unwrap();
+    let ts = s.snapshot_ts();
+
+    // Coordinated env; register + populate a full-text index over `(Person, bio)` in the shared
+    // `IndexSet` so the live seam's fast index path is live. `clear_ft_spatial_dirty` mirrors the
+    // coordinator's rebuild path: the populate reflects committed state, not an open transaction, so it
+    // must not leak an in-flight-mutator marker (which would force the live seam onto its OWN
+    // scan-fallback and make the fast-vs-fallback comparison vacuous).
+    let coord = Coordinated::new(s);
+    {
+        let mut idx = coord.index.borrow_mut();
+        idx.register_fulltext(
+            "people_bio",
+            l_person,
+            vec![k_bio],
+            graphus_index::fulltext::Analyzer::Standard,
+            IndexState::Online,
+        );
+        for (i, bio) in bios.iter().enumerate() {
+            idx.reindex_fulltext_node(person_ids[i], &[l_person], &[(k_bio, (*bio).to_owned())]);
+        }
+        idx.clear_ft_spatial_dirty();
+    }
+
+    // Every search exercises a distinct shape: single-term matches, a multi-term OR, a term ONLY on the
+    // excluded non-Person node, a miss, and the empty (all-stop-word) query.
+    for search in [
+        "graph",
+        "database",
+        "rust",
+        "graph database",
+        "analytics",
+        "nonexistentterm",
+        "",
+    ] {
+        let live = coord.live_at(TxnId(100), ts);
+        let ro = coord
+            .reader_at(TxnId(100), ts)
+            .with_fulltext(coord.index.borrow().fulltext_snapshot());
+
+        // (1) candidate set: index arm == scan-fallback arm (byte-identical, order included).
+        let live_q = live.fulltext_query("people_bio", search);
+        let ro_q = ro.fulltext_query("people_bio", search);
+        assert_eq!(
+            live_q, ro_q,
+            "fulltext_query({search:?}): off-thread candidate set differs from inline"
+        );
+
+        // (2) per-candidate score: recomputed-from-snapshot == inverted-index score.
+        if let Some(cands) = &live_q {
+            for &c in cands {
+                assert_eq!(
+                    live.fulltext_score("people_bio", c, search),
+                    ro.fulltext_score("people_bio", c, search),
+                    "fulltext_score({search:?}, {c:?}): off-thread score differs from inline"
+                );
+            }
+        }
+
+        // (3) an unknown index name is `None` on BOTH routes (a clear procedure error, not empty rows).
+        assert_eq!(
+            live.fulltext_query("no_such_index", search),
+            ro.fulltext_query("no_such_index", search),
+            "fulltext_query on an unknown index must agree (both None)"
+        );
+        assert!(
+            live.fulltext_query("no_such_index", search).is_none(),
+            "unknown full-text index must resolve to None"
+        );
+
+        // (4) SIREAD markers byte-identical (the load-bearing ACID assertion): the live fast path's
+        // `mark_all_live_nodes` dominates its candidate-only markers, and the reader's scan-fallback
+        // marks every live node — so both deduped key sets are `{all live node keys}`, and neither
+        // records a predicate marker. Take the live buffer BEFORE it drops (unmerged).
+        let live_buf = live
+            .take_read_buffer()
+            .expect("coordinated live seam holds a SIREAD buffer");
+        let ro_buf = ro.take_buffer();
+        let (live_reader, live_keys, live_preds) = canonical(live_buf);
+        let (ro_reader, ro_keys, ro_preds) = canonical(ro_buf);
+        assert_eq!(
+            live_reader, ro_reader,
+            "{search:?}: SIREAD reader id differs"
+        );
+        assert_eq!(
+            live_keys, ro_keys,
+            "{search:?}: per-record SIREAD key markers differ (sorted+deduped)"
+        );
+        assert_eq!(
+            live_preds, ro_preds,
+            "{search:?}: predicate SIREAD markers differ (sorted+deduped)"
+        );
+        assert!(
+            !live_keys.is_empty(),
+            "{search:?}: expected non-empty SIREAD key markers (assertion would be vacuous)"
+        );
+
+        // No storage/degrade error on either route.
+        assert_eq!(
+            live.take_error().map(|e| e.to_string()),
+            ro.take_error().map(|e| e.to_string()),
+            "{search:?}: captured-error Display differs between the seams"
+        );
+    }
+
+    // Cross-check the actual match sets are what we expect (so a bug that makes BOTH routes wrong the
+    // same way cannot pass): "graph" hits the two Person bios containing it, never the Company node.
+    let live = coord.live_at(TxnId(101), ts);
+    let graph_hits = live
+        .fulltext_query("people_bio", "graph")
+        .expect("index exists");
+    assert_eq!(
+        graph_hits,
+        vec![NodeId(person_ids[0]), NodeId(person_ids[2])],
+        "\"graph\" must match exactly the two Person bios that contain it (not the Company node)"
     );
 }
