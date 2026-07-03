@@ -40,6 +40,7 @@ pub mod checker;
 pub mod cli;
 pub mod fault;
 pub mod faults;
+pub mod freelist_reuse;
 pub mod harness;
 pub mod isolation;
 pub mod misbehave;
@@ -61,6 +62,10 @@ pub mod workload;
 pub use checker::{CheckFailure, CheckResult, verify};
 pub use cli::{CliConfig, run, summarize};
 pub use fault::{DeferredFault, FaultKind};
+pub use freelist_reuse::{
+    FreelistReuseCrashReport, FreelistReuseReport, Target as FreelistReuseTarget,
+    run_freelist_reuse_after_rollback, run_freelist_reuse_crash,
+};
 pub use harness::{ScenarioReport, run_crash_scenario, run_scenario, run_with_fault};
 pub use model::{AckLedger, Model};
 pub use rng::DetRng;

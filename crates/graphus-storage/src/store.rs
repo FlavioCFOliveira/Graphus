@@ -183,6 +183,15 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 struct ActiveTxn {
     created: Vec<(StoreKind, u64)>,
     expired: Vec<(StoreKind, u64)>,
+    /// Physical ids this transaction pushed onto a store's free list (`rmp` #578). Only the
+    /// GC/reclaim paths free ids, and they route every push through
+    /// [`free_push`](RecordStore::free_push), which records it here. On a **live** rollback these
+    /// pushes must be withdrawn from the in-memory free list the catalog reload restores: the WAL
+    /// undo has just restored each reclaimed record's `in_use` bit, so leaving its id on the free
+    /// list would hand out a still-live slot (the free-list twin of the #220/#172 monotonic
+    /// high-water floor). A normal write transaction pushes nothing here (it only *pops* ids via
+    /// [`alloc_id`](RecordStore::alloc_id)), so this stays empty for it.
+    freed_ids: Vec<(StoreKind, u64)>,
 }
 
 /// What one [`RecordStore::gc`] pass did (observability, NFR-10; `rmp` task #59).
@@ -1701,6 +1710,33 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
+    /// Returns physical id `id` to `kind`'s in-memory free list AND records the push under `txn`
+    /// (`rmp` #578). **Every** GC/reclaim free-list push must go through this — never
+    /// `store_mut(kind).free.push(id)` directly — so a **live** rollback of the freeing transaction
+    /// can withdraw its own pushes.
+    ///
+    /// The hazard it closes is the free-list twin of the `rmp` #220/#172 monotonic high-water floor:
+    /// [`reload_catalog`](Self::reload_catalog) restores the free list to the last *durably committed*
+    /// image, but under statement-granularity interleaving a still-open **concurrent** transaction may
+    /// have already **popped** a freed id (via [`alloc_id`](Self::alloc_id)). Re-listing the committed
+    /// image would hand that id out **again** — two live records sharing one physical slot, whose
+    /// property/incidence chains then self-cycle (`P.next_prop = P` / `P.start_next = P`). [`rollback`]
+    /// (Self::rollback) instead restores the *pre-rollback* in-memory list (which already reflects every
+    /// concurrent pop) and removes exactly the ids recorded here, so an aborted GC pass — whose WAL undo
+    /// restores each reclaimed record's `in_use` bit — leaves no freed id whose slot is once again live.
+    /// Mirrors [`note_created`](Self::note_created) / [`note_expired`](Self::note_expired), including the
+    /// `SYSTEM_TXN` guard (the system transaction never frees records and is never rolled back).
+    fn free_push(&mut self, kind: StoreKind, id: u64, txn: TxnId) {
+        self.store_mut(kind).free.push(id);
+        if txn != SYSTEM_TXN {
+            self.active
+                .entry(txn)
+                .or_default()
+                .freed_ids
+                .push((kind, id));
+        }
+    }
+
     /// Whether `mvcc` is a **live version**: its slot is in use and it carries no expiry tombstone
     /// (`xmax == 0`). A tombstoned record keeps its `in_use` slot (it survives for older snapshots
     /// until GC) but is no longer the live version, so it must not be re-deleted or re-stamped.
@@ -1996,8 +2032,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
         // Drop the version-stamp bookkeeping: every stamp this txn wrote (in-flight `xmin`/`xmax`)
         // is reverted by the WAL undo below, and the commit timestamp was never issued (only
-        // `commit` advances it), so nothing of this txn remains visible or durable.
-        self.active.remove(&txn);
+        // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
+        // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
+        // GC pass populates `freed_ids`; a normal write transaction's is empty.
+        let aborted_freed_ids = self
+            .active
+            .remove(&txn)
+            .map(|a| a.freed_ids)
+            .unwrap_or_default();
+        // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
+        // the SAME monotonicity hazard as the high-water / token / device-page state restored below,
+        // but — unlike them — is NOT monotonic (ids are popped as well as pushed), so it cannot use a
+        // simple floor. `reload_catalog` resets it to the last DURABLY-COMMITTED image, yet under
+        // STATEMENT-granularity interleaving a still-open CONCURRENT transaction may already have
+        // POPPED a freed id (via `alloc_id`): re-listing the committed image would hand that id out
+        // AGAIN, so two live records would share one physical slot and their property / incidence
+        // chains self-cycle (the #578 "malformed (cycle?)"). This pre-rollback snapshot already
+        // reflects every concurrent pop (and this txn's own pushes), so restoring IT — minus this
+        // txn's own pushes — is the free-list twin of the #220/#172 high-water floor.
+        let pre_free: [FreeList; STORE_COUNT] =
+            std::array::from_fn(|i| self.stores[i].free.clone());
         // Any catalog-only change this txn made is discarded by the `reload_catalog` below (`rmp`
         // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
         // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
@@ -2106,6 +2160,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if hw > self.stores[i].alloc.high_water() {
                 self.stores[i].alloc.observe(hw - 1);
             }
+        }
+        // Restore the free lists to their pre-rollback in-memory image, then withdraw exactly this
+        // transaction's own pushes (`rmp` #578). Restoring `pre_free` (not the committed
+        // `reload_catalog` image) preserves every CONCURRENT open transaction's pops, so a popped id
+        // stays OUT of the free list and is never double-allocated. Withdrawing `aborted_freed_ids`
+        // undoes a GC pass's reclamations: the WAL undo above just restored each reclaimed record's
+        // `in_use` bit, so its slot must NOT remain free. A normal write transaction pushes nothing,
+        // so its `pre_free` is restored verbatim and its own POPS are left as leaked corpses —
+        // exactly the #220 corpse model (a rolled-back creation never re-frees its slot; GC's corpse
+        // reclamation collects it later). Ordering is irrelevant: `aborted_freed_ids` and the
+        // concurrent pops are disjoint id sets (a popped id is off the list; a freed id was in use).
+        for (i, pf) in pre_free.into_iter().enumerate() {
+            self.stores[i].free = pf;
+        }
+        for (kind, id) in aborted_freed_ids {
+            self.stores[kind as usize].free.remove_id(id);
         }
         Ok(())
     }
@@ -2311,7 +2381,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         dead.first_prop = NULL_ID;
         dead.mvcc = MvccHeader::default(); // clears in_use
         self.write_node(id, &dead, txn)?;
-        self.store_mut(StoreKind::Node).free.push(id);
+        self.free_push(StoreKind::Node, id, txn);
         Ok(())
     }
 
@@ -2697,7 +2767,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         dead.first_prop = NULL_ID; // the chain is freed; drop the now-dangling head pointer
         dead.mvcc = MvccHeader::default();
         self.write_rel(id, &dead, txn)?;
-        self.store_mut(StoreKind::Rel).free.push(id);
+        self.free_push(StoreKind::Rel, id, txn);
         Ok(())
     }
 
@@ -2788,7 +2858,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let mut dead = RelRecord::new(element_id, 0, 0, 0, 0);
             dead.mvcc = MvccHeader::default(); // in_use stays clear
             self.write_rel(corpse_id, &dead, txn)?;
-            self.store_mut(StoreKind::Rel).free.push(corpse_id);
+            self.free_push(StoreKind::Rel, corpse_id, txn);
         }
         Ok(corpses.len())
     }
@@ -2978,7 +3048,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 dead.mvcc = MvccHeader::default(); // clears in_use
                 dead.next_prop = NULL_ID;
                 self.write_prop(cur, &dead, txn)?;
-                self.store_mut(StoreKind::Prop).free.push(cur);
+                self.free_push(StoreKind::Prop, cur, txn);
                 freed += 1;
             }
             cur = next;
@@ -3050,7 +3120,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 dead.mvcc = MvccHeader::default(); // clears in_use (no-op for a corpse, already clear)
                 dead.next_prop = NULL_ID;
                 self.write_prop(cur, &dead, txn)?;
-                self.store_mut(StoreKind::Prop).free.push(cur);
+                self.free_push(StoreKind::Prop, cur, txn);
                 if prev == NULL_ID {
                     first_prop = next;
                     self.set_owner_first_prop(owner_kind, owner_id, first_prop, txn)?;
@@ -3387,7 +3457,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if block.mvcc.in_use() {
                 block.mvcc = MvccHeader::default(); // clears in_use
                 self.write_block(cur, &block, txn)?;
-                self.store_mut(StoreKind::Strings).free.push(cur);
+                self.free_push(StoreKind::Strings, cur, txn);
             }
             cur = next;
         }
