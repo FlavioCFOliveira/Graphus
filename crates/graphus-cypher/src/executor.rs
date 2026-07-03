@@ -2008,6 +2008,22 @@ fn build_operator(
             if let Some(rows) = try_morsel_expand_aggregate(input, group_keys, aggregates, ctx)? {
                 return Ok(Operator::Buffered { rows });
             }
+            // Morsel-driven parallel GROUPED aggregation OVER AN EXPAND (`rmp` #558 / #340 — the `top_liked`
+            // class, the dominant social-analytics query): for a *large*
+            // `MATCH (a:Label)-[r]->(b) [WHERE <pure>] WITH <bare keys>, <bare mergeable aggs>` (e.g.
+            // `MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*)`), partition the ANCHORS into contiguous
+            // morsels, expand + filter + group + aggregate each concurrently on the dedicated pool (each
+            // over a `Send` `ReadOnlyGraph`), then merge the partial group tables deterministically (serial
+            // first-seen order, the #360 merge reused verbatim). Fuses the Slice-3c per-anchor expand with
+            // the #360 grouped merge to cover the shape both decline (an interposed `Filter`/`Expand`).
+            // Byte-identical to serial; declines (falls through) for any non-conforming shape, impure
+            // filter/key, float/avg/overflow sum, below-threshold, knob<=1, RBAC restriction, standalone /
+            // historical read, or a morsel error.
+            if let Some(rows) =
+                try_morsel_expand_group_aggregate(input, group_keys, aggregates, ctx)?
+            {
+                return Ok(Operator::Buffered { rows });
+            }
             // Morsel-driven parallel GROUPED aggregation (`rmp` #360 — the actual LDBC-BI bottleneck): for
             // a *large* bare `MATCH (n:Label) RETURN <bare group keys>, <bare mergeable aggregates>`, split
             // the candidate-id vector into contiguous morsels, build a LOCAL group table per morsel
@@ -2723,6 +2739,16 @@ fn is_exact_parallel_agg(spec: &VecAgg) -> bool {
 /// - any composite column (`sum(x) + 1`, `size(collect(x))`), a non-aggregate column, or a second
 ///   argument — the serial `aggregate_rows` `AggPlan` covers all of those correctly.
 fn recognize_mergeable_bare_agg(expr: &Expr, scan_var: &str) -> Option<bool> {
+    recognize_mergeable_bare_agg_vars(expr, &[scan_var])
+}
+
+/// The multi-variable form of [`recognize_mergeable_bare_agg`] (`rmp` task #558 / #340): whether `expr`
+/// is a **bare, mergeable** aggregate whose single argument is pure per-row and references **at least one**
+/// of `vars`. The grouped-over-expand tier passes the three expansion-row variables (`from`/`relationship`
+/// /`to`), so an aggregate over any of them (e.g. `sum(l.weight)`, `count(b)`) is admitted, while a
+/// constant-/param-only argument is still left to serial. The single-var
+/// [`recognize_mergeable_bare_agg`] delegates here with a one-element slice, so its callers are unchanged.
+fn recognize_mergeable_bare_agg_vars(expr: &Expr, vars: &[&str]) -> Option<bool> {
     match &expr.kind {
         // `count(*)`: pure i64 increment, always mergeable, no integer gate.
         ExprKind::CountStar => Some(false),
@@ -2732,14 +2758,14 @@ fn recognize_mergeable_bare_agg(expr: &Expr, scan_var: &str) -> Option<bool> {
             args,
         } => {
             let fname = name.join(".").to_ascii_lowercase();
-            // Exactly one argument referencing the scan var (`count`/`sum`/`min`/`max`/`collect` are
+            // Exactly one argument referencing one of `vars` (`count`/`sum`/`min`/`max`/`collect` are
             // single-argument); the argument must be pure per-row so the off-thread eval is deterministic
-            // and cross-row-free, AND must reference the scan var (a constant-/param-only aggregate
+            // and cross-row-free, AND must reference a row variable (a constant-/param-only aggregate
             // argument is unusual and left to serial).
             let [arg] = args.as_slice() else {
                 return None;
             };
-            if !crate::morsel::is_pure_per_row_expr(arg) || !expr_references_var(arg, scan_var) {
+            if !crate::morsel::is_pure_per_row_expr(arg) || !expr_references_any_var(arg, vars) {
                 return None;
             }
             match fname.as_str() {
@@ -2755,6 +2781,13 @@ fn recognize_mergeable_bare_agg(expr: &Expr, scan_var: &str) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// Whether `expr` syntactically references **any** of `vars` (its property, or the bare variable) — the
+/// multi-variable form of [`expr_references_var`] used by the grouped-over-expand recognizer to confirm a
+/// group key / aggregate argument is anchored on one of the expansion-row variables (`rmp` task #558).
+fn expr_references_any_var(expr: &Expr, vars: &[&str]) -> bool {
+    vars.iter().any(|v| expr_references_var(expr, v))
 }
 
 /// Whether `expr` syntactically references the variable `var` (its property, or the bare variable) —
@@ -2970,6 +3003,216 @@ fn try_morsel_group_aggregate(
     // group key value IS the column value and each aggregate value IS `acc.finish()` — there is no outer
     // expression to evaluate (the recognizer guaranteed bare columns), exactly as the keyless morsel tier
     // builds its single row.
+    let mut out = VecDeque::with_capacity(converged.groups.len());
+    for group in converged.groups {
+        let mut row = Row::empty();
+        for (col, kv) in group_keys.iter().zip(group.key) {
+            row.set(col.alias.clone(), kv);
+        }
+        for (col, acc) in aggregates.iter().zip(group.accs) {
+            row.set(col.alias.clone(), acc.finish());
+        }
+        out.push_back(row);
+    }
+    Ok(Some(out))
+}
+
+/// If `(input, group_keys, aggregates)` is the **morsel-parallel-eligible grouped-aggregation-over-expand
+/// shape** — a large `MATCH (a:Label)-[r(:T…)?]->(b) [WHERE <pure residual>] WITH <bare pure group keys>,
+/// <bare mergeable aggregates>` (`rmp` task #558 / #340, the `top_liked` class:
+/// `MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*) AS likes …`) — partitions the **anchors** into
+/// contiguous morsels, expands + filters + groups + aggregates each anchor's single hop **concurrently**
+/// on the dedicated morsel pool (each over a `Send` [`ReadOnlyGraph`]), merges the partial group tables
+/// deterministically on the engine thread (serial first-seen order), and returns the grouped rows.
+/// Otherwise returns `None` so the caller falls through to the bare-scan grouped / keyless tiers and then
+/// the serial [`aggregate_rows`], all of which run **verbatim**.
+///
+/// This is the fusion of the Slice-3c per-anchor `ExpandAll` (parallelizing the traversal) and the #360
+/// grouped merge (parallelizing the group-by), which together cover the shape both those tiers **decline**:
+/// #360 requires a bare scan directly under the `Aggregation` (an interposed `Filter` / `Expand` declines),
+/// and Slice-3c only handles a single-group `count(*)` over the expand. The planner shapes the class as
+/// `Aggregation → [Filter →] ExpandAll → NodeByLabelScan` (empirically confirmed: the far-endpoint label
+/// `(a:ARTICLE)` lowers to an interposed `Filter(a:ARTICLE)`), which this tier peels.
+///
+/// # Byte-identical to serial, by construction
+///
+/// * **Same rows** — each morsel expands a *contiguous* anchor slice through the **same** lifted
+///   `read_source::expand` body the serial `Operator::Expand` runs (self-loops deduplicated per anchor by
+///   relationship id), applies the residual filter under the **same** three-valued logic, and folds the
+///   surviving `(a, r, b)` rows — so the multiset of grouped rows is identical;
+/// * **Same grouping** — each morsel keys its local table on the SAME SipHash digest ([`group_key_hash`])
+///   plus the [`row_values_equivalent`] resolution serial's `aggregate_rows` uses (the engine-thread merge
+///   re-keys identically);
+/// * **Same values / visibility / SSI markers** — each morsel reads through the identical MVCC read body
+///   and evaluates the filter / keys / aggregate arguments with the identical [`eval`]; the coarse
+///   `PredicateRead::Label` + all-live-nodes footprint is registered on the engine thread by the seam, and
+///   each morsel's per-anchor label-scan + per-edge + per-row property/label markers fold back via
+///   `merge_morsel_buffer` (union = the serial scan→expand→filter marker set);
+/// * **Same arithmetic** — every morsel folds into the SAME [`Accumulator`] the serial path uses; the
+///   merge combines via [`Accumulator::combine`] (associative for `count`/`sum`/`min`/`max`,
+///   order-preserving ascending-`lo` for `collect`/`DISTINCT`); `sum` is gated to a **no-overflow integer**
+///   column; `avg` / percentile decline;
+/// * **Same output order** — the merge emits groups sorted by global first-seen rank (over the SURVIVING
+///   post-filter expansion rows — the serial first-seen rank space), **independent of the worker count**.
+///
+/// # Eligibility (ALL required, else `None`)
+/// - the morsel knob is enabled: [`Ctx::morsel_threads`] `> 1`;
+/// - `input` is a fixed-length fresh single-hop `ExpandAll` over a bare label scan, optionally wrapped in a
+///   **single** `Filter` whose predicate is **pure per-row** ([`crate::morsel::is_pure_per_row_expr`]);
+/// - there is **at least one** group key (the keyless single-`count` case is [`try_morsel_expand_aggregate`]
+///   above), every group key is pure per-row and references an expansion-row variable
+///   (`from`/`relationship`/`to`);
+/// - every aggregate column is a **bare mergeable** aggregate over the expansion-row variables
+///   ([`recognize_mergeable_bare_agg_vars`]);
+/// - the estimated anchor-label cardinality is at least
+///   [`MORSEL_MIN_ROWS`](crate::morsel::MORSEL_MIN_ROWS) (via `statistics().nodes_with_label`; no
+///   statistics ⇒ decline);
+/// - if any `sum` is requested, the merged column is provably **no-overflow integer** (checked after the
+///   read, as #360);
+/// - the seam returns `Some` from [`GraphAccess::morsel_label_scan`] (it declines for a restricted
+///   principal — so per-relationship/endpoint RBAC is never bypassed by the off-thread expand — a
+///   standalone / historical read, and `MemGraph`).
+///
+/// On any per-morsel error the tier discards every morsel's groups + buffers and returns `None`; the serial
+/// fallback re-runs the pipeline, re-registering the markers and re-raising the identical error.
+fn try_morsel_expand_group_aggregate(
+    input: &PhysicalOp,
+    group_keys: &[ProjectionColumn],
+    aggregates: &[ProjectionColumn],
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    // --- cheap gate first (no seam work): the morsel knob must be enabled (>= 2 workers) ---
+    if ctx.morsel_threads <= 1 {
+        return Ok(None);
+    }
+
+    // --- recognize the GROUPED-over-expand shape: >= 1 group key, >= 1 aggregate ---
+    if group_keys.is_empty() || aggregates.is_empty() {
+        return Ok(None);
+    }
+
+    // Peel an optional interposed `Filter` (the far-endpoint label predicate `(b:Label)` lowers here, e.g.
+    // `Filter(a:ARTICLE)`), then recognize the fixed-length fresh single-hop `ExpandAll` over a bare scan.
+    let (filter, expand_op): (Option<&Expr>, &PhysicalOp) = match input {
+        PhysicalOp::Filter { input, predicate } => (Some(predicate), input.as_ref()),
+        other => (None, other),
+    };
+    let Some(shape) = recognize_morsel_expand(expand_op) else {
+        return Ok(None);
+    };
+
+    // The expansion-row variables the residual filter / group keys / aggregate arguments may reference.
+    let vars = [
+        shape.from.name.as_str(),
+        shape.relationship.name.as_str(),
+        shape.to.name.as_str(),
+    ];
+
+    // The residual filter (if any) must be pure per-row so the off-thread eval is deterministic + cross-row
+    // -free (a function call / subquery / comprehension in the WHERE declines to serial).
+    if let Some(pred) = filter {
+        if !crate::morsel::is_pure_per_row_expr(pred) {
+            return Ok(None);
+        }
+    }
+
+    // Every group key must be PURE per-row and reference an expansion-row variable (a constant group key is
+    // degenerate and left to serial).
+    for col in group_keys {
+        if !crate::morsel::is_pure_per_row_expr(&col.expr)
+            || !expr_references_any_var(&col.expr, &vars)
+        {
+            return Ok(None);
+        }
+    }
+
+    // Every aggregate column must be a BARE MERGEABLE aggregate over an expansion-row variable; collect
+    // whether any requires the no-overflow integer gate (i.e. is a `sum`).
+    let mut any_sum = false;
+    for col in aggregates {
+        match recognize_mergeable_bare_agg_vars(&col.expr, &vars) {
+            Some(needs_integer_gate) => any_sum |= needs_integer_gate,
+            None => return Ok(None),
+        }
+    }
+
+    // --- the size gate: the anchor label scan's estimated cardinality (the fan-out being parallelized) ---
+    let estimated_input = match ctx
+        .graph
+        .statistics()
+        .and_then(|s| s.nodes_with_label(shape.label))
+    {
+        Some(count) => count as f64,
+        None => return Ok(None),
+    };
+    if !estimated_input.is_finite() || estimated_input < crate::morsel::morsel_min_rows() {
+        return Ok(None);
+    }
+
+    // --- the engine-thread seam: capture the anchor candidate vector + off-thread read surface (registers
+    // the identical coarse SSI markers). `None` ⇒ standalone / historical / restricted-RBAC / MemGraph ⇒
+    // serial pipeline runs verbatim (and RBAC-composes per relationship/endpoint). ---
+    let Some(mut scan) = ctx.graph.morsel_label_scan(shape.label) else {
+        return Ok(None);
+    };
+    // Install the per-statement wall-clock budget (`rmp` #476) on the parallel workers, so a runaway
+    // scan→expand (incl. a supernode's fan-out) abandons rather than pinning every core.
+    scan.deadline = ctx.token.deadline();
+
+    // Cancellation (flag and an already-elapsed deadline) is polled once up front; each worker then polls
+    // the deadline again — per anchor and within a high-degree anchor's expansion — while it runs.
+    ctx.check_cancelled()?;
+
+    let spec = crate::morsel::MorselExpandGroupSpec {
+        from: shape.from,
+        relationship: shape.relationship,
+        to: shape.to,
+        direction: shape.direction,
+        types: shape.types,
+        filter,
+        group_keys,
+        aggregates,
+    };
+
+    // --- expand + group + aggregate the anchors concurrently, merging deterministically (serial first-seen
+    // order — the #360 merge, reused verbatim over the surviving-expansion-row rank space) ---
+    let converged = crate::morsel::run_expand_group_aggregate_morsels(
+        &scan,
+        &spec,
+        ctx.params,
+        ctx.morsel_threads,
+    );
+
+    // If any morsel hit a storage / evaluation error, the parallel result is untrustworthy: decline WITHOUT
+    // folding the buffers (dropped here). The serial fallback re-reads + re-expands through the live seam,
+    // re-registering the identical markers AND re-raising the identical error.
+    if converged.error.is_some() {
+        return Ok(None);
+    }
+
+    // --- the no-overflow integer gate for `sum` (`rmp` #360, finding C): `saturating_add` is NOT
+    // associative once any partition subtree clamps to the i64 rail, so a parallel `sum` is bit-identical to
+    // serial ONLY when no sub-sum saturates. Checked on the merged accumulators; a pathological near-rail
+    // column falls back to serial. ---
+    if any_sum
+        && converged
+            .groups
+            .iter()
+            .any(|g| g.accs.iter().any(Accumulator::sum_is_parallel_unsafe))
+    {
+        return Ok(None);
+    }
+
+    // Every gate passed and the read succeeded: record the engagement (observability), then converge the
+    // per-morsel SSI buffers. From here we are committed to the parallel result.
+    ctx.graph.note_parallel_aggregate();
+    for buffer in converged.buffers {
+        ctx.graph.merge_morsel_buffer(buffer);
+    }
+
+    // Finish each merged group into its output row, in serial first-seen order — the bare group key value
+    // IS the column value and each aggregate value IS `acc.finish()` (the recognizer guaranteed bare
+    // columns), exactly as the #360 grouped tier builds its rows.
     let mut out = VecDeque::with_capacity(converged.groups.len());
     for group in converged.groups {
         let mut row = Row::empty();

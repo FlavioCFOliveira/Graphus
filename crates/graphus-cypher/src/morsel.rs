@@ -553,6 +553,46 @@ pub struct MorselGroupSpec<'p> {
     pub aggregates: &'p [ProjectionColumn],
 }
 
+/// The recognized **grouped-aggregation-over-expand** shape the `rmp` #558 / #340 morsel tier reproduces
+/// per anchor-morsel: `MATCH (a:Label)-[r(:T…)?]->(b) [WHERE <pure residual>] WITH <bare group keys>,
+/// <bare aggregates>` — the `top_liked` class (`MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*) …`).
+/// It **fuses** the Slice-3c per-anchor `ExpandAll` (parallelizing the traversal) with the #360 grouped
+/// merge (parallelizing the group-by), so a single heavy expand-then-group-by-target query runs across
+/// all cores. Borrows the plan columns (no AST clone) so the morsel evaluates the *identical* expressions
+/// the serial `Filter` / `aggregate_rows` would.
+///
+/// The recognizer (engine thread) guarantees: the anchor input is a bare label scan whose scanned
+/// variable IS the expand's `from`; the hop is a **fixed-length, fresh** single `ExpandAll` (`range`
+/// `None`, no prior / bound relationship, no inline rel-prop map — [`crate::executor`]'s
+/// `recognize_morsel_expand`); the optional residual `filter` and every `group_keys[i].expr` are **pure
+/// per-row** ([`is_pure_per_row_expr`]) over the expansion-row variables (`from`/`relationship`/`to`);
+/// and every aggregate is a *bare* **mergeable** aggregate (`count(*)`/`count`/`sum`/`min`/`max`/
+/// `collect`, `DISTINCT` only on `count`/`collect`) over those variables — `avg` / percentiles / composite
+/// columns decline to the serial path.
+pub struct MorselExpandGroupSpec<'p> {
+    /// The anchor (scanned-node) variable bound by the label scan — the `from` of the expand.
+    pub from: &'p Var,
+    /// The relationship variable the traversal binds.
+    pub relationship: &'p Var,
+    /// The far-endpoint variable the traversal binds (typically the group key, e.g. `a`).
+    pub to: &'p Var,
+    /// The traversal direction relative to the anchor.
+    pub direction: RelDirection,
+    /// The relationship-type alternatives; empty means "any type".
+    pub types: &'p [RelType],
+    /// The optional residual per-expansion-row predicate (the interposed `Filter`, e.g. `a:ARTICLE`),
+    /// evaluated under three-valued logic exactly as the serial `Operator::Filter`; `None` when the
+    /// far-endpoint carries no label / property predicate. Guaranteed pure per-row by the recognizer.
+    pub filter: Option<&'p Expr>,
+    /// The GROUP BY key columns (bare, pure per-row over the expansion-row variables — typically the far
+    /// node `to` or `to.<prop>`), in the serial `group_keys` order, so the key tuple is built identically.
+    pub group_keys: &'p [ProjectionColumn],
+    /// The aggregate columns (each a bare, mergeable aggregate over the expansion-row variables), in the
+    /// serial `aggregates` order, so each morsel builds one local
+    /// [`Accumulator`](crate::executor::Accumulator) per column in the same slot.
+    pub aggregates: &'p [ProjectionColumn],
+}
+
 /// One local group a morsel accumulated for the `rmp` #360 grouped tier: its group-key tuple (the
 /// merge key), its per-aggregate-column partial accumulators (one slot per `spec.aggregates`), and the
 /// **local survivor rank** of the first survivor in this morsel that created the group. The engine
@@ -750,6 +790,48 @@ pub trait MorselSource: Send + Sync {
         ids: &[u64],
         label_token: u32,
         spec: &MorselGroupSpec<'_>,
+        params: &BoundParameters,
+        txn: TxnId,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+        deadline: Option<Instant>,
+    ) -> MorselGroupOutcome;
+
+    /// Filters the contiguous **anchor** candidate slice `ids` to visible, label-carrying nodes, then for
+    /// each surviving anchor performs the single-hop `ExpandAll` described by `spec` and **groups +
+    /// aggregates the surviving expansion rows** locally per the recognized grouped-over-expand shape
+    /// (`rmp` task #558 / #340, the `top_liked` class — `MATCH (a:L)-[r]->(b) [WHERE …] WITH <keys>,
+    /// <aggs>`, e.g. `MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*)`). It **fuses** the Slice-3c
+    /// per-anchor traversal (`expand_morsel`) with the #360 grouped fold (`group_aggregate_morsel`):
+    ///
+    /// * builds the serial expansion-row binding `{from: a, relationship: r, to: b}` for every produced
+    ///   incidence side (self-loops reported once per matching direction are deduplicated per anchor by
+    ///   relationship id, byte-identical to `Operator::Expand`);
+    /// * applies the optional residual `spec.filter` (the interposed `Operator::Filter`, e.g. `b:ARTICLE`)
+    ///   under three-valued logic — keeping the row iff the predicate is `TRUE` (NULL / FALSE drop it),
+    ///   exactly as [`read_filter_project_morsel`](Self::read_filter_project_morsel);
+    /// * for each **surviving** row, evaluates the group-key tuple + folds every aggregate column into that
+    ///   group's local [`Accumulator`](crate::executor::Accumulator)s, keyed on the same SipHash digest +
+    ///   [`row_values_equivalent`](crate::runtime::row_values_equivalent) resolution serial uses.
+    ///
+    /// The per-group `first_seen_local` rank and the morsel's `survivors` count are over the **surviving
+    /// expansion rows** (post-filter, the rows that reach the group-by) — the same first-seen rank space
+    /// the serial `aggregate_rows` observes — so the engine-thread [`converge_group_aggregate_outcomes`]
+    /// merge reproduces serial first-seen output order byte-for-byte, independent of the worker count. The
+    /// returned [`MorselGroupOutcome`] is the **identical** type the #360 grouped tier converges, so the
+    /// merge is reused verbatim.
+    ///
+    /// Records the per-anchor label-scan markers, the per-anchor `expand`'s relationship-pattern predicate
+    /// and per-edge markers, AND every per-row property / label read the filter / keys / aggregate
+    /// arguments perform, into a fresh [`SsiReadBuffer`] tagged with `txn` — byte-identical to the serial
+    /// scan→expand→filter→aggregate marker set. `deadline` is the per-statement wall-clock budget
+    /// (`rmp` #476), polled per anchor and, for a high-degree anchor, per stride of edges.
+    #[allow(clippy::too_many_arguments)] // a per-morsel read worker; the seams are positional
+    fn expand_group_aggregate_morsel(
+        &self,
+        ids: &[u64],
+        label_token: u32,
+        spec: &MorselExpandGroupSpec<'_>,
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
@@ -1281,6 +1363,228 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // a per-morsel read worker; the seams are positional
+    fn expand_group_aggregate_morsel(
+        &self,
+        ids: &[u64],
+        label_token: u32,
+        spec: &MorselExpandGroupSpec<'_>,
+        params: &BoundParameters,
+        txn: TxnId,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+        deadline: Option<Instant>,
+    ) -> MorselGroupOutcome {
+        // Off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (the `rmp` #336 Slice-3b-i
+        // reader): its `expand` routes through the SAME lifted `read_source::expand` body serial's
+        // `Operator::Expand` runs, and `eval` over it produces byte-identical filter decisions + key /
+        // aggregate-argument values. Its own fresh `SsiReadBuffer` (tagged `txn`) catches every per-anchor
+        // label-scan marker, every per-edge marker, AND every per-row property / label read the filter /
+        // keys / aggregate arguments perform — taken back below and folded at convergence.
+        let graph = ReadOnlyGraph::new(
+            self.view.clone(),
+            self.tokens.clone(),
+            snapshot,
+            registry.clone(),
+            txn,
+            SsiReadBuffer::new(txn),
+        );
+
+        // The SAME visible-label-carrying ANCHOR set the serial `scan_nodes_by_label` index arm produces,
+        // in serial anchor order (the slice is contiguous) — so the surviving-row rank below is monotone in
+        // global scan→expand position, which is what makes the merge's global first-seen order = serial's.
+        let anchors = graph.filter_label_candidates(label_token, ids.to_vec());
+
+        // Resolve the expand pieces ONCE (shared across every anchor) — identical incidents to serial.
+        let dir = ExpandDirection::from_pattern(spec.direction);
+        let type_names: Vec<String> = spec.types.iter().map(|t| t.name.clone()).collect();
+
+        // The per-row evaluator state: the empty UDF set + a captured clock, both provably never consulted
+        // (the recognizer's purity gate rejects every filter / key / aggregate-argument expression
+        // containing a function call — and an *aggregate* is recognized structurally, not via `eval`). They
+        // exist only to satisfy `eval`'s signature, exactly as the sibling morsel workers.
+        let functions = empty_function_set();
+        let clock = StatementClock::capture();
+
+        // The local group table, mirroring serial `aggregate_rows` EXACTLY: a SipHash digest of the key
+        // tuple (DoS-resistant per SEC-210 — group keys are client-derived property values) → the indices
+        // of local groups whose key hashes there; a collision falls back to the same `row_values_equivalent`
+        // resolution, so grouping semantics are identical.
+        let mut groups: Vec<MorselLocalGroup> = Vec::new();
+        // `rmp` #371: keyed on the already-DoS-resistant `group_key_hash` `u64` digest (the digest stays
+        // SipHash); the outer index buckets it with `FxHasher`. Byte-identical grouping, no wasted re-hash.
+        let mut index: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
+        let mut first_error: Option<GraphusError> = None;
+
+        // The post-filter surviving-expansion-row counter — the LOCAL first-seen rank space (0-based),
+        // incremented once per expansion row that passes the residual filter and reaches the group-by. It is
+        // exactly the first-seen rank space the serial `aggregate_rows` observes (filtered-out rows never
+        // reach the aggregation, so they must not advance the rank). `survivors` (the engine-thread
+        // prefix-sum increment) is its final value; the ascending-`lo` prefix + the local ranks together
+        // reproduce the serial surviving-row first-seen order, independent of the worker count.
+        let mut produced: u64 = 0;
+
+        // Per-edge deadline-poll counter (`rmp` #476): a single high-degree anchor can expand over millions
+        // of edges, so the per-statement timeout is polled *within* one anchor's expansion, strided.
+        let mut edges_seen: u64 = 0;
+        'anchors: for (anchor_i, anchor) in anchors.into_iter().enumerate() {
+            // Per-statement timeout safe point (`rmp` #476), strided per anchor.
+            if (anchor_i as u64) & (MORSEL_DEADLINE_POLL_STRIDE - 1) == 0
+                && deadline_exceeded(deadline)
+            {
+                first_error.get_or_insert_with(statement_timeout_error);
+                break 'anchors;
+            }
+            // Reproduce serial `Operator::Expand` / `expand_into_pending` EXACTLY: `expand` returns the
+            // incident sides (a self-loop reported once per matching direction — twice for `Both`); a
+            // self-loop is collapsed to ONE produced row by deduplicating relationship ids per anchor.
+            let incidents = graph.expand(anchor, dir, &type_names);
+            if graph.has_error() {
+                break 'anchors;
+            }
+            let mut seen_rel = std::collections::BTreeSet::new();
+            for inc in incidents {
+                // Bound a single supernode's expansion under the deadline too (strided per edge).
+                edges_seen = edges_seen.wrapping_add(1);
+                if edges_seen & (MORSEL_DEADLINE_POLL_STRIDE - 1) == 0
+                    && deadline_exceeded(deadline)
+                {
+                    first_error.get_or_insert_with(statement_timeout_error);
+                    break 'anchors;
+                }
+                if !seen_rel.insert(inc.rel) {
+                    // A self-loop's second side (same rel id) — serial emits ONE row for it. Skip the dup.
+                    continue;
+                }
+
+                // The serial expansion-row binding `{from: a, relationship: r, to: b}` — the row the serial
+                // `Filter` / `Aggregation` see. `eval` resolves any `a`/`r`/`b` property or label against
+                // this same `graph` (registering its own SIREAD markers, exactly as serial's reads do).
+                let row = Row::from_pairs([
+                    (
+                        spec.from.name.clone(),
+                        RowValue::Node(NodeRef { id: anchor }),
+                    ),
+                    (
+                        spec.relationship.name.clone(),
+                        RowValue::Rel(RelRef { id: inc.rel }),
+                    ),
+                    (
+                        spec.to.name.clone(),
+                        RowValue::Node(NodeRef { id: inc.neighbour }),
+                    ),
+                ]);
+
+                // The residual filter (the interposed `Operator::Filter`, e.g. `b:ARTICLE`): keep the row
+                // iff the predicate is `TRUE` under three-valued logic (NULL / FALSE drop it), byte-identical
+                // to serial `read_filter_project_morsel` / `Operator::Filter`. Filtered-out rows are skipped
+                // WITHOUT advancing `produced` (they never reach the serial aggregation).
+                if let Some(pred) = spec.filter {
+                    match eval(pred, &row, params, &graph, functions, &clock) {
+                        Ok(RowValue::Value(Value::Boolean(true))) => {}
+                        Ok(
+                            RowValue::Value(Value::Boolean(false)) | RowValue::Value(Value::Null),
+                        ) => {
+                            continue;
+                        }
+                        Ok(_) => {
+                            // A non-boolean, non-null predicate is a runtime type error — the serial path
+                            // raises the identical error on fallback; this only signals "abandon".
+                            first_error.get_or_insert(GraphusError::Runtime(
+                                "WHERE/predicate must be a boolean".to_owned(),
+                            ));
+                            break 'anchors;
+                        }
+                        Err(e) => {
+                            first_error.get_or_insert_with(|| eval_error_to_graphus(&e));
+                            break 'anchors;
+                        }
+                    }
+                }
+
+                // A SURVIVING row: build the group-key tuple (serial `aggregate_rows`: evaluate each key
+                // column against the row).
+                let mut key_vals = Vec::with_capacity(spec.group_keys.len());
+                for col in spec.group_keys {
+                    match eval(&col.expr, &row, params, &graph, functions, &clock) {
+                        Ok(v) => key_vals.push(v),
+                        Err(e) => {
+                            first_error.get_or_insert_with(|| eval_error_to_graphus(&e));
+                            break;
+                        }
+                    }
+                }
+                if first_error.is_some() {
+                    break 'anchors;
+                }
+
+                // Hash the whole key tuple, then resolve within the (normally singleton) bucket by exact
+                // equivalence — byte-identical to serial `aggregate_rows`' index (the SAME SipHash digest).
+                let key_hash = crate::executor::group_key_hash(&key_vals);
+                let bucket = index.entry(key_hash).or_default();
+                let found = bucket.iter().copied().find(|&gi| {
+                    let g: &MorselLocalGroup = &groups[gi];
+                    g.key.len() == key_vals.len()
+                        && g.key
+                            .iter()
+                            .zip(&key_vals)
+                            .all(|(x, y)| crate::runtime::row_values_equivalent(x, y))
+                });
+                let gi = match found {
+                    Some(i) => i,
+                    None => {
+                        let gi = groups.len();
+                        groups.push(MorselLocalGroup {
+                            key: key_vals,
+                            accs: spec
+                                .aggregates
+                                .iter()
+                                .map(|c| crate::executor::Accumulator::new(&c.expr))
+                                .collect(),
+                            // The surviving-row rank at which this group was first created (pre-increment).
+                            first_seen_local: produced,
+                        });
+                        bucket.push(gi);
+                        gi
+                    }
+                };
+
+                // Fold this surviving row into the group's per-column accumulators — identical to serial
+                // `Accumulator::update` (via the shared `fold_bare`: `count(*)` increments; every other
+                // admitted kind evaluates its single argument against the row and folds it).
+                for (col, acc) in spec.aggregates.iter().zip(groups[gi].accs.iter_mut()) {
+                    if let Err(e) =
+                        acc.fold_bare(&col.expr, &row, params, &graph, functions, &clock)
+                    {
+                        first_error.get_or_insert_with(|| GraphusError::Runtime(e.to_string()));
+                        break;
+                    }
+                }
+                if first_error.is_some() {
+                    break 'anchors;
+                }
+
+                // This row reached the group-by: advance the surviving-row rank.
+                produced = produced.saturating_add(1);
+            }
+        }
+
+        // A storage fault captured by any read (the per-anchor `expand`, or a filter / key / aggregate
+        // property read) makes the whole morsel untrustworthy — surface it so the executor abandons.
+        let read_error = graph.take_error();
+        let error = first_error.or(read_error);
+        let buffer = graph.take_buffer();
+
+        MorselGroupOutcome {
+            groups,
+            // The prefix-sum increment is the count of SURVIVING (post-filter) expansion rows, so the
+            // ascending-`lo` merge maps this morsel's local ranks into the global surviving-row rank space.
+            survivors: produced,
+            buffer,
+            error,
+        }
+    }
+
     fn clone_box(&self) -> Box<dyn MorselSource> {
         // Cheap: `StoreReadView::clone` is a few `Arc` bumps and `TokenSnapshot::clone` is one. No page
         // or id-vector copy.
@@ -1561,6 +1865,31 @@ impl MorselLabelScan {
     ) -> MorselGroupOutcome {
         let slice = &self.candidates[lo..hi];
         self.source.clone_box().group_aggregate_morsel(
+            slice,
+            self.label_token,
+            spec,
+            params,
+            self.txn,
+            self.snapshot,
+            &self.registry,
+            self.deadline,
+        )
+    }
+
+    /// Expands + groups + aggregates `candidates[lo..hi]` (the anchors) as one morsel on the **current**
+    /// thread (`rmp` task #558 / #340): cheap-clones the source and drives
+    /// [`MorselSource::expand_group_aggregate_morsel`] over the slice with the recognized `spec` +
+    /// `params`. Called by [`run_expand_group_aggregate_morsels`] inside the dedicated worker pool, once
+    /// per morsel.
+    pub fn expand_group_aggregate_morsel(
+        &self,
+        lo: usize,
+        hi: usize,
+        spec: &MorselExpandGroupSpec<'_>,
+        params: &BoundParameters,
+    ) -> MorselGroupOutcome {
+        let slice = &self.candidates[lo..hi];
+        self.source.clone_box().expand_group_aggregate_morsel(
             slice,
             self.label_token,
             spec,
@@ -2050,6 +2379,54 @@ pub fn run_group_aggregate_morsels(
             .collect()
     });
 
+    converge_group_aggregate_outcomes(outcomes)
+}
+
+/// Runs `scan`'s **grouped aggregation over an expand** across contiguous ANCHOR morsels on the dedicated
+/// worker pool (`rmp` task #558 / #340 — the `top_liked` class), then **merges** them into one group
+/// stream **byte-identical to the serial scan→expand→filter→aggregate**:
+///
+/// * each morsel expands a *contiguous* anchor slice through the same lifted `read_source::expand` body
+///   serial runs (over a [`ReadOnlyGraph`]), applies the optional residual filter, and folds each
+///   surviving `(a, r, b)` row into a LOCAL group table (same SipHash digest + `row_values_equivalent`
+///   resolution serial uses) — its `first_seen_local` rank + `survivors` count are over the SURVIVING
+///   (post-filter) expansion rows, the serial first-seen rank space;
+/// * the engine thread reuses the #360 [`converge_group_aggregate_outcomes`] **verbatim** — the
+///   per-morsel outcome is the identical [`MorselGroupOutcome`] type — combining accumulators
+///   (associative for `count`/`sum`/`min`/`max`; order-preserving ascending-`lo` for `collect`/`DISTINCT`)
+///   and reducing the global first-seen rank to the MIN across morsels of
+///   `survivor_prefix(morsel) + first_seen_local`, emitting groups **sorted by global first-seen rank**
+///   (= serial first-seen output order, independent of the worker count).
+///
+/// Returns the merged groups, the concatenation of every morsel's SIREAD buffer (the executor folds them
+/// back via `merge_morsel_buffer`, whose sort+dedup yields the union = the serial marker set), and the
+/// first morsel error (if any — the executor then discards everything and runs serial). `threads` is the
+/// effective worker count (`>= 2` when called).
+pub fn run_expand_group_aggregate_morsels(
+    scan: &MorselLabelScan,
+    spec: &MorselExpandGroupSpec<'_>,
+    params: &BoundParameters,
+    threads: usize,
+) -> GroupAggConverged {
+    use rayon::prelude::*;
+
+    let bounds = morsel_bounds(scan.candidates.len(), threads);
+    if bounds.is_empty() {
+        return GroupAggConverged::default();
+    }
+
+    // Fan out on the DEDICATED pool (never the global rayon pool). `map` preserves input (ascending-lo)
+    // order, so the outcomes are in ascending anchor order — the serial scan→expand order, which the merge
+    // relies on for the surviving-row prefix-sum and the order-sensitive `collect` / `DISTINCT` combine.
+    let outcomes: Vec<MorselGroupOutcome> = install_morsel_fanout(|| {
+        bounds
+            .par_iter()
+            .map(|&(lo, hi)| scan.expand_group_aggregate_morsel(lo, hi, spec, params))
+            .collect()
+    });
+
+    // The #360 grouped merge is shape-agnostic — it needs only that `survivors` maps local first-seen ranks
+    // into the global rank space, which the surviving-row counts satisfy — so it is reused verbatim.
     converge_group_aggregate_outcomes(outcomes)
 }
 
