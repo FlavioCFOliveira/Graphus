@@ -269,6 +269,12 @@ pub(super) fn handle_run<
     db: &str,
     clock: &Arc<dyn Clock + Send + Sync>,
     statement_timeout: Option<Duration>,
+    // Group commit (`rmp` #566): when this statement finishes within its visit as a durable auto-commit
+    // WRITE, [`finalize_inflight`] PREPAREs it and defers its ack into this batch (a clone of its egress
+    // sender held open until the batch harden), instead of an inline `fdatasync` per statement — so
+    // concurrent auto-commit writers coalesce onto one sync. Unused on the off-thread-read / early-error
+    // paths (which never commit here); the DST `LocalEngine` passes a batch it hardens inline (batch-of-one).
+    commit_batch: &mut Vec<super::PendingCommit>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> RunOutcome {
     // The per-statement wall-clock **deadline** (`rmp` #476): the start of this statement's CPU budget.
@@ -522,8 +528,14 @@ pub(super) fn handle_run<
                 metrics,
                 db,
                 clock,
+                // Defer a durable auto-commit WRITE's ack into the group-commit batch (`rmp` #566): a
+                // clone of `row_tx` is held open in the batch until the batch harden makes it durable.
+                Some(commit_batch),
             );
-            // The egress channel closes when `inflight` (owning `row_tx`) drops at end of scope.
+            // For a NON-deferred outcome (read / rollback / read-only / SSI-abort) the egress channel
+            // closes when `inflight` (owning `row_tx`) drops at end of scope. For a DEFERRED auto-commit
+            // write, `inflight`'s sender drops here but the batch holds a live clone, so the channel stays
+            // open until [`super::ack_prepared_commits`] drops it after the `fdatasync` (ack-after-fsync).
             RunOutcome::Done
         }
     }
@@ -1008,7 +1020,20 @@ pub(super) fn resume_inflight<
     match step {
         BatchStep::Suspended => true,
         BatchStep::Done { produced_ok } => {
-            finalize_inflight(inflight, coordinator, open, produced_ok, metrics, db, clock);
+            // The parked-statement resume path runs OUTSIDE a group-commit batch drain, so a durable
+            // auto-commit write finalised here commits INLINE (`None`, its own `fdatasync`), unchanged by
+            // #566 — the (rare) slow-consumer statement pays one sync, never coalesced. The common
+            // single-visit write coalesces via the `Some(batch)` path in [`handle_run`].
+            finalize_inflight(
+                inflight,
+                coordinator,
+                open,
+                produced_ok,
+                metrics,
+                db,
+                clock,
+                None,
+            );
             false
         }
     }
@@ -1165,6 +1190,7 @@ fn unwrap_row(item: super::stream::RowItem) -> Vec<graphus_cypher::MaterializedV
 /// called at the same point relative to the still-open `row_tx`, so the terminal-error / auto-commit /
 /// explicit-txn contracts are preserved. An explicit (non-auto-commit) statement is not committed here
 /// — its `BEGIN…COMMIT` does that — exactly as before.
+#[allow(clippy::too_many_arguments)] // execution context + the #566 group-commit batch, all positional
 fn finalize_inflight<D: BlockDevice, S: LogSink>(
     inflight: &mut InFlightInline,
     coordinator: &mut TxnCoordinator<D, S>,
@@ -1173,6 +1199,10 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
     metrics: &Metrics,
     db: &str,
     clock: &Arc<dyn Clock + Send + Sync>,
+    // Group commit (`rmp` #566): `Some(batch)` (the single-visit / `dispatch_command` path) DEFERS a
+    // durable auto-commit WRITE's ack into `batch` — coalescing its `fdatasync` with the rest of the
+    // batch. `None` (the parked-statement resume path) commits INLINE (its own `fdatasync`), unchanged.
+    commit_batch: Option<&mut Vec<super::PendingCommit>>,
 ) {
     // A seam-captured deferral error (the load-bearing `RecordStoreGraph` invariant) is the terminal
     // item, sent after every row — and it flips the statement to a failure so the auto-commit rolls
@@ -1197,6 +1227,7 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             &inflight.row_tx,
             metrics,
             db,
+            commit_batch,
         );
     }
 
@@ -1269,14 +1300,30 @@ fn to_parameters(params: Vec<(String, graphus_core::Value)>) -> Parameters {
 /// Finalises an auto-commit transaction after its single statement streamed: commit on success,
 /// roll back on a runtime error (`04 §1.3` step 6). Removes the ticket from the open set either way.
 ///
-/// A commit failure (an SSI serialization abort, or any [`TxnCoordinator::commit`] error) is **not**
-/// swallowed: it is sent as a **terminal error** through the still-open egress channel `row_tx`, so
-/// the consumer observes the auto-commit statement as failed and retriable. Reporting success for a
-/// transaction the engine rolled back would be an atomicity/durability violation — the client would
-/// believe a write is committed (and durable) when it was undone (`04 §1.3` step 6, ACID mandate).
-/// This was the seed-4 VOPR `EdgeMultisetMismatch` divergence (rmp #238): an auto-commit
-/// `CREATE (a)-[:KNOWS]->(b)` whose post-stream COMMIT lost the SSI dangerous-structure check was
-/// acknowledged as committed, so the model recorded the edge the engine had rolled back.
+/// A commit failure (an SSI serialization abort, or any commit error) is **not** swallowed: it is sent
+/// as a **terminal error** through the still-open egress channel `row_tx`, so the consumer observes the
+/// auto-commit statement as failed and retriable. Reporting success for a transaction the engine rolled
+/// back would be an atomicity/durability violation — the client would believe a write is committed (and
+/// durable) when it was undone (`04 §1.3` step 6, ACID mandate). This was the seed-4 VOPR
+/// `EdgeMultisetMismatch` divergence (rmp #238): an auto-commit `CREATE (a)-[:KNOWS]->(b)` whose
+/// post-stream COMMIT lost the SSI dangerous-structure check was acknowledged as committed, so the
+/// model recorded the edge the engine had rolled back.
+///
+/// # Group commit (`rmp` #566)
+/// A durable auto-commit **write** takes one of two commit shapes, chosen by `commit_batch`:
+/// * `Some(batch)` — the common single-visit path: PREPARE the commit ([`TxnCoordinator::commit_prepare`]
+///   — SSI validation + `COMMIT` record appended, **no `fdatasync`**) and DEFER the ack by pushing a
+///   [`super::PendingCommit::Autocommit`] holding a *clone* of `row_tx` onto the batch. The batch harden
+///   issues ONE `fdatasync` covering every batched committer, and only then drops the held-open clone —
+///   closing the egress channel, the client's ack-after-fsync end-of-stream. This coalesces concurrent
+///   auto-commit writers onto one sync (the T1 win); it no longer does an inline per-statement sync on
+///   the engine thread. `record_commit` is deferred to the batch ack.
+/// * `None` — the parked-statement resume path: commit INLINE ([`TxnCoordinator::commit`], its own
+///   `fdatasync`), exactly as before #566. Rare (a slow-consumer statement), so left un-coalesced.
+///
+/// In BOTH shapes the SSI validation runs at commit time in channel order, so serializability and the
+/// abort victim are byte-identical to the pre-#566 inline commit — only the `fdatasync` is coalesced.
+#[allow(clippy::too_many_arguments)] // commit bookkeeping + the #566 group-commit batch, all positional
 fn finish_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
@@ -1285,25 +1332,51 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
     row_tx: &RowSender,
     metrics: &Metrics,
     db: &str,
+    commit_batch: Option<&mut Vec<super::PendingCommit>>,
 ) {
     let Some(tx) = open.remove(&ticket.0) else {
         return;
     };
-    if produced_ok {
-        match coordinator.commit(tx.txn) {
-            Ok(_) => metrics.record_commit_for(db),
+    if !produced_ok {
+        // A runtime/deferral error terminated the stream: roll back (no commit, nothing durable).
+        let _ = coordinator.rollback(tx.txn);
+        metrics.record_abort_for(db);
+        return;
+    }
+    match commit_batch {
+        // Group-commit batch available (`rmp` #566): PREPARE the write and DEFER its durability ack.
+        Some(batch) => match coordinator.commit_prepare(tx.txn) {
+            // A durable write commit: hold a clone of the egress sender open in the batch so the channel
+            // stays open until the shared batch `fdatasync` covers `commit_lsn`; the client is acked
+            // (channel close) only then — the ack-after-fsync rule, coalesced across the batch. The
+            // statement's own `row_tx` drops when its `handle_run` returns, leaving this clone the last
+            // sender, so the close happens precisely at the batch ack. `record_commit` is deferred there.
+            Ok((_commit_ts, Some(commit_lsn))) => {
+                batch.push(super::PendingCommit::Autocommit {
+                    row_tx: row_tx.clone(),
+                    commit_lsn,
+                });
+            }
+            // Wrote nothing durable (`rmp` #529): nothing to harden, so no deferral — ack now. The
+            // statement's `row_tx` drop (at `handle_run` scope end) closes the channel with no sync.
+            Ok((_commit_ts, None)) => metrics.record_commit_for(db),
+            // SSI serialization abort (or inactive txn): already rolled back — surface the retriable
+            // failure as a terminal stream error, never a silent success over rolled-back writes
+            // (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence).
             Err(e) => {
-                // The COMMIT failed (e.g. SSI serialization abort): the transaction has been rolled
-                // back. Surface the failure to the consumer as a terminal stream error so the
-                // statement is reported as failed/retriable — never a silent success over rolled-back
-                // writes (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence).
                 let _ = row_tx.send(Err(e));
                 metrics.record_abort_for(db);
             }
-        }
-    } else {
-        let _ = coordinator.rollback(tx.txn);
-        metrics.record_abort_for(db);
+        },
+        // No batch (the parked-statement resume path): commit INLINE with its own `fdatasync`, exactly
+        // as before #566.
+        None => match coordinator.commit(tx.txn) {
+            Ok(_) => metrics.record_commit_for(db),
+            Err(e) => {
+                let _ = row_tx.send(Err(e));
+                metrics.record_abort_for(db);
+            }
+        },
     }
 }
 

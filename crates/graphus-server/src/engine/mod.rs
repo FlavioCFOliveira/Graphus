@@ -583,19 +583,70 @@ struct OpenTx {
 
 /// A write commit that has been group-commit **PREPAREd** (SSI-validated + `COMMIT` record appended,
 /// `fdatasync` deferred) and is awaiting the batch harden before its client is acknowledged (`rmp`
-/// #528, `04 §4.2`).
+/// #528/#532/#566, `04 §4.2`).
 ///
-/// The `reply` is answered `Ok` only after [`flush_commit_batch`] has issued a `harden_wal` that made
-/// `commit_lsn` durable — the ACID-inviolable **ack-after-fsync** rule: a committer is told its commit
-/// succeeded only once an `fdatasync` covering its commit record has completed. If the batch harden
-/// PANICS (fsyncgate, `04 §4.9`) the whole batch fails together and NONE of these replies is sent, so
-/// no committer is ever acked for an un-hardened commit.
-struct PendingCommit {
-    /// The one-shot reply the committer's connection is blocked on.
-    reply: command::Reply<Result<RunSummary>>,
-    /// The LSN of this transaction's `COMMIT` record; the batch harden must advance the durable
-    /// watermark past it before this reply is sent (asserted in `flush_commit_batch`).
-    commit_lsn: graphus_core::Lsn,
+/// The committer is acknowledged only after [`flush_commit_batch`] / [`pipelined_group_commit`] has
+/// hardened an `fdatasync` that made `commit_lsn` durable — the ACID-inviolable **ack-after-fsync**
+/// rule: a committer is told its commit succeeded only once an `fdatasync` covering its commit record
+/// has completed. If the batch harden PANICS (fsyncgate, `04 §4.9`) the whole batch fails together and
+/// NONE of its members is acked, so no committer is ever acked for an un-hardened commit.
+///
+/// Two shapes of committer share the one batch (`rmp` #566): an **explicit** `BEGIN…COMMIT` blocked on
+/// a one-shot reply, and an **auto-commit** single write statement whose acknowledgement is the close
+/// of its still-open result-egress channel. Both are hardened by the SAME `fdatasync`, so concurrent
+/// auto-commit writers coalesce exactly as explicit committers already did — the T1 fix that stops
+/// auto-commit writes bypassing the group-commit machinery (they previously did an inline `fdatasync`
+/// per statement on the engine thread).
+enum PendingCommit {
+    /// An explicit `BEGIN…COMMIT` committer blocked on a one-shot reply (`rmp` #528).
+    Explicit {
+        /// The one-shot reply the committer's connection is blocked on.
+        reply: command::Reply<Result<RunSummary>>,
+        /// The LSN of this transaction's `COMMIT` record; the batch harden must advance the durable
+        /// watermark past it before this reply is sent (asserted in [`ack_prepared_commits`]).
+        commit_lsn: graphus_core::Lsn,
+    },
+    /// An **auto-commit** single write statement (`rmp` #566): its client is acknowledged by the
+    /// **close of the result-egress channel**, not a one-shot reply. `row_tx` is a *clone* of the
+    /// statement's egress sender, held open across the batch so the channel stays open until the
+    /// harden makes `commit_lsn` durable; the statement's own sender drops when its `handle_run`
+    /// returns, so this clone is the LAST sender — dropping it at ack time closes the channel, which is
+    /// the consumer's end-of-stream (the ack-after-fsync signal for auto-commit). The result summary
+    /// was already published into the shared `SummarySink` before the statement returned, and the
+    /// consumer reads it only after observing the close, so the summary ordering still holds.
+    Autocommit {
+        /// The held-open clone of the statement's egress sender (see the variant docs). Dropped by
+        /// [`ack_prepared_commits`] after the harden — the client's ack-after-fsync end-of-stream.
+        row_tx: stream::RowSender,
+        /// The LSN of this transaction's `COMMIT` record; the batch harden must advance the durable
+        /// watermark past it before the egress channel is closed (asserted in [`ack_prepared_commits`]).
+        commit_lsn: graphus_core::Lsn,
+    },
+}
+
+impl PendingCommit {
+    /// The LSN of this committer's `COMMIT` record — the watermark the batch harden must make durable
+    /// before this committer is acked (the ack-after-fsync assertion in [`ack_prepared_commits`]).
+    fn commit_lsn(&self) -> graphus_core::Lsn {
+        match self {
+            PendingCommit::Explicit { commit_lsn, .. }
+            | PendingCommit::Autocommit { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+
+    /// Acknowledges this committer AFTER its `COMMIT` record is `fdatasync`-durable (the ack-after-fsync
+    /// rule). Explicit: send the one-shot `Ok` the connection is blocked on. Auto-commit: drop the
+    /// held-open egress sender, closing the channel — the consumer's end-of-stream.
+    fn ack(self) {
+        match self {
+            PendingCommit::Explicit { reply, .. } => {
+                let _ = reply.send(Ok(RunSummary::default()));
+            }
+            // Dropping the last egress sender closes the channel — the auto-commit statement's
+            // ack-after-fsync end-of-stream (the summary was already published into the shared sink).
+            PendingCommit::Autocommit { row_tx, .. } => drop(row_tx),
+        }
+    }
 }
 
 /// Runs the engine event loop until a [`EngineCommand::Shutdown`] (or the command channel closes).
@@ -1692,6 +1743,8 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             readers_inflight,
             &mut commit_batch,
             pending_cmd,
+            parked,
+            max_parked_inline,
             result_buffer_capacity,
             metrics,
             db,
@@ -1836,6 +1889,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 degraded,
                 clock,
                 statement_timeout,
+                commit_batch,
                 reply,
             );
             active_txns.publish(coord.active_count());
@@ -2017,6 +2071,11 @@ fn run_statement_isolated<
     degraded: &EngineDegraded,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
+    // Group commit (`rmp` #566): a durable auto-commit WRITE that finishes within its visit PREPAREs +
+    // defers its ack into this batch (a clone of its egress sender held open until the batch harden),
+    // instead of the pre-#566 inline `fdatasync` per statement — so concurrent auto-commit writers
+    // coalesce onto one sync exactly as explicit committers do. `exec::finalize_inflight` pushes into it.
+    commit_batch: &mut Vec<PendingCommit>,
     reply: command::Reply<std::result::Result<RunReply, GraphusError>>,
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2044,6 +2103,7 @@ fn run_statement_isolated<
             db,
             clock,
             statement_timeout,
+            commit_batch,
             reply,
         )
     }));
@@ -2625,7 +2685,7 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     match coordinator.commit_prepare(tx.txn) {
         // A durable write commit: defer the ack until the batch `fdatasync` covers `commit_lsn`.
         Ok((_commit_ts, Some(commit_lsn))) => {
-            commit_batch.push(PendingCommit { reply, commit_lsn })
+            commit_batch.push(PendingCommit::Explicit { reply, commit_lsn })
         }
         // A read-only commit (`rmp` #529): nothing was appended, so no sync is needed — ack now.
         Ok((_commit_ts, None)) => {
@@ -2720,6 +2780,8 @@ fn pipelined_group_commit<
     readers_inflight: &mut u64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
+    parked: &mut VecDeque<exec::InFlightInline>,
+    max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     db: &str,
@@ -2746,6 +2808,8 @@ fn pipelined_group_commit<
             readers_inflight,
             &mut batch,
             pending_cmd,
+            parked,
+            max_parked_inline,
             result_buffer_capacity,
             metrics,
             db,
@@ -2784,6 +2848,8 @@ fn pipelined_group_commit<
                 readers_inflight,
                 &mut next_batch,
                 pending_cmd,
+                parked,
+                max_parked_inline,
                 result_buffer_capacity,
                 metrics,
                 db,
@@ -2815,27 +2881,43 @@ fn pipelined_group_commit<
 fn ack_prepared_commits(durable: u64, batch: &mut Vec<PendingCommit>, metrics: &Metrics, db: &str) {
     for pending in batch.drain(..) {
         debug_assert!(
-            pending.commit_lsn.0 < durable,
-            "INVARIANT (ack-after-fsync, rmp #528/#532): the group-commit harden must advance the \
+            pending.commit_lsn().0 < durable,
+            "INVARIANT (ack-after-fsync, rmp #528/#532/#566): the group-commit harden must advance the \
              durable watermark ({durable}) past every batched commit LSN ({})",
-            pending.commit_lsn.0
+            pending.commit_lsn().0
         );
         metrics.record_commit_for(db);
-        let _ = pending.reply.send(Ok(RunSummary::default()));
+        // Explicit: send the one-shot `Ok`. Auto-commit (`rmp` #566): drop the held-open egress sender,
+        // closing the channel — the consumer's ack-after-fsync end-of-stream. Both only now, after the
+        // `fdatasync` above made `commit_lsn` durable.
+        pending.ack();
     }
 }
 
-/// Non-blocking drain of consecutive queued `Cmd::Commit` commands into the current group-commit batch
-/// (`rmp` #528): each is PREPAREd (SSI + append, no `fdatasync`) via [`dispatch_command`], so ONE later
-/// [`flush_commit_batch`] hardens them all. Stops at [`MAX_COMMIT_BATCH`], at the first NON-commit
-/// command (stashed into `pending_cmd` for the loop to process next — IN ORDER, only after the batch is
-/// hardened and acked), or when `try_recv` reports the channel momentarily empty / disconnected.
+/// Non-blocking drain of consecutive queued **batchable** commands into the current group-commit batch:
+/// explicit `Cmd::Commit`s (`rmp` #528) AND auto-commit `Cmd::Run`s (`rmp` #566). Each is dispatched via
+/// [`dispatch_command`] into the SAME batch, so ONE later harden's `fdatasync` covers them all — the
+/// coalescing that makes `K` concurrent committers pay one sync, not `K`. Stops at [`MAX_COMMIT_BATCH`],
+/// at the first NON-batchable command (stashed into `pending_cmd` for the loop to process next — IN
+/// ORDER, only after the batch is hardened and acked), or when `try_recv` reports the channel momentarily
+/// empty / disconnected.
 ///
-/// **Causal safety under Bolt pipelining.** Draining only *consecutive* `Cmd::Commit`s is safe: for a
-/// commit to be immediately available here, that transaction's earlier `Begin`/`Run` commands sit
-/// EARLIER in the channel and are therefore already processed — so the transaction is fully executed and
-/// genuinely ready to commit. A non-commit command ends the drain and is NEVER reordered ahead of the
-/// batch (the batch's commits were already ahead of it in channel order), so command order is preserved.
+/// **Why auto-commit `Run`s are drained here (`rmp` #566).** An auto-commit write's execution and its
+/// commit are the SAME command (a `Cmd::Run { auto_commit: true }`), unlike an explicit transaction whose
+/// writes ran in earlier `Run`s and whose commit is a cheap standalone `Cmd::Commit`. So to coalesce
+/// concurrent auto-commit writers the drain must EXECUTE each queued auto-commit `Run` (which, for a
+/// durable write, PREPAREs + defers its ack into the batch via [`exec::finish_autocommit`]); accumulating
+/// several before ONE harden is durability-equivalent to a single multi-write explicit transaction (many
+/// un-synced writes then one `fdatasync`), a path the buffer pool's WAL-before-data eviction rule already
+/// covers. A drained auto-commit read dispatches off-thread (it never joins the batch); a drained write
+/// whose slow consumer fills its bounded egress **suspends** — it is parked (it has NOT committed, so it
+/// never joined the batch) and finalised later on resume. Explicit (`auto_commit = false`) `Run`s are
+/// NOT drained (they carry ongoing-transaction state) — they end the drain like any other command.
+///
+/// **Causal safety under Bolt pipelining.** Draining only *consecutive* batchable commands is safe: for
+/// one to be immediately available here, that transaction's earlier commands sit EARLIER in the channel
+/// and are therefore already processed. A non-batchable command ends the drain and is NEVER reordered
+/// ahead of the batch (its predecessors were already ahead of it in channel order), so order is preserved.
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn drain_commit_batch<
     D: BlockDevice + Send + Sync + 'static,
@@ -2851,6 +2933,8 @@ fn drain_commit_batch<
     readers_inflight: &mut u64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
+    parked: &mut VecDeque<exec::InFlightInline>,
+    max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     db: &str,
@@ -2863,9 +2947,17 @@ fn drain_commit_batch<
 ) {
     while commit_batch.len() < MAX_COMMIT_BATCH {
         match rx.try_recv() {
-            Ok(cmd @ Cmd::Commit { .. }) => {
-                // PREPARE this commit into the SAME batch. A `Commit` never suspends a cursor and never
-                // starts an index build, so the throwaway `just_suspended` slot stays `None`.
+            // An explicit COMMIT (`rmp` #528) OR an auto-commit statement (`rmp` #566): dispatch it into
+            // the SAME batch. An explicit `Commit` PREPAREs (cheap, never suspends). An auto-commit `Run`
+            // EXECUTES then — if it is a durable write — PREPAREs + defers its ack into the batch; an
+            // auto-commit read dispatches off-thread (never joins the batch); a write whose slow consumer
+            // filled its bounded egress suspends and is parked below.
+            Ok(
+                cmd @ (Cmd::Commit { .. }
+                | Cmd::Run {
+                    auto_commit: true, ..
+                }),
+            ) => {
                 let mut just_suspended: Option<exec::InFlightInline> = None;
                 let _keep_running = dispatch_command(
                     cmd,
@@ -2888,12 +2980,21 @@ fn drain_commit_batch<
                     loading_session,
                     commit_batch,
                 );
-                debug_assert!(
-                    just_suspended.is_none(),
-                    "INVARIANT: a Cmd::Commit never suspends an inline statement"
+                // Park a suspended auto-commit `Run` (slow consumer, `rmp` #372/#485) so the loop resumes
+                // it — it has NOT committed (mid-stream), so it never joined the batch; its later resume
+                // finalises it inline. A `Commit` never suspends, so this is a no-op for that arm.
+                enqueue_suspended(
+                    parked,
+                    &mut just_suspended,
+                    max_parked_inline,
+                    coordinator,
+                    open,
+                    metrics,
+                    db,
+                    degraded,
                 );
             }
-            // A non-commit command ends the drain: stash it so the loop processes it next, in order,
+            // A non-batchable command ends the drain: stash it so the loop processes it next, in order,
             // AFTER the batch is hardened + acked (never reordered ahead of the batch).
             Ok(other) => {
                 *pending_cmd = Some(other);
