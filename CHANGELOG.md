@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-07-03
+
+This release makes Graphus **scale reads and writes across cores**, adds a **network
+bulk-import** path for loading data over the wire, and closes a **certification pass** that
+fixed a critical encrypted-at-rest disk leak and several pre-authentication denial-of-service
+vectors. It is a **drop-in upgrade** from v0.0.4: no public Cypher, Bolt, or REST contract
+changed. The four inviolable guarantees held throughout — **100% ACID**, **100% openCypher
+TCK (3914 / 3914)**, **100% Bolt protocol**, and **100% PackStream**.
+
+### Added
+
+- **Network bulk-import over REST.** A new `POST /admin/db/{db}/bulk-import` endpoint streams
+  CSV / `.gcol` data straight into a database without buffering the payload, gated by the same
+  Admin RBAC check as `BACKUP` / `RESTORE` / `CREATE DATABASE` and protected by a per-byte
+  quota, an ongoing free-disk-space check, and a session timeout (all configurable). Two
+  ingestion modes are supported: **Mode A** loads a new or empty database through the
+  low-level bulk-write path with a crash-durable per-batch checkpoint sentinel, and **Mode B**
+  loads an already-live, serving database concurrently with ordinary Bolt/REST traffic —
+  correctness coming entirely from participating in the same MVCC/SSI machinery every ordinary
+  Cypher transaction uses, with automatic bounded retry of a batch that loses a serialization
+  conflict. Ratified as decision `D-bulk-import-network` and specified in
+  `specification/08-network-bulk-import.md`.
+- **Product-recommendations example.** A self-contained, runnable end-to-end example
+  (`examples/product-recommendations`) that boots a real server, network-bulk-loads a
+  recommendation multigraph over the wire, and drives a concurrency ladder of many
+  simultaneous Bolt-over-UDS clients running a realistic read battery (direct-friend,
+  second- and third-level, and collaborative-filtering "similar consumption profile"
+  traversals) plus a few concurrent writes, while sampling the server's CPU, RSS, and I/O to
+  expose read-path bottlenecks. Backed by a new deterministic recommendation-graph generator
+  and client tooling (`graphus-reco-gen`).
+- **Server startup banner.** The server now logs a single structured startup line naming the
+  application, its version, the build platform (OS / architecture / pointer width), and the
+  pid — mirroring the PostgreSQL / Redis convention — so operators can confirm exactly which
+  binary is running.
+- **`docs/transactions.md`.** New documentation of the transaction model: autocommit by
+  default, explicit `BEGIN … COMMIT` transactions, lock-free reads, the per-work isolation
+  table, and how to opt a read back into serializable isolation.
+
+### Changed
+
+- **Reads are now lock-free and scale across cores.** A standalone auto-commit read is treated
+  as what it is — a read — and dispatched across the off-thread reader pool by the query's
+  structural type rather than the client-declared access mode, so a bare `MATCH` sent without
+  a routing hint is no longer pinned to the single engine thread. Every read is a lock-free
+  Snapshot-Isolation snapshot read that takes **no serializability overhead and can never
+  cause a writer to abort**, matching the MySQL / MariaDB / SQL-Server autocommit model, while
+  still pinning the GC watermark for the versions it reads (a consistent MVCC snapshot with no
+  premature reclamation). **Writes and explicit `BEGIN … COMMIT` transactions are unchanged —
+  full Serializable SSI**; a read that needs serializable isolation can opt in by running
+  inside an explicit transaction.
+- **Read throughput scales with concurrency.** The off-thread reader pool is now engaged for
+  single-statement REST reads as well (previously every REST read ran inline on the engine
+  thread), and a read-only transaction performs **zero WAL append and zero `fdatasync`** across
+  its whole lifecycle (it has nothing durable to persist). Together these lift server CPU on a
+  concurrent REST read workload from roughly one core to nearly five, and trivial reads from a
+  ~450 requests/s fsync-bound ceiling to tens of thousands per second, with heavy scans now
+  bounded by the reader pool rather than a serial per-read fsync.
+- **Write throughput scales with concurrency.** Explicit-transaction commits now use
+  **cross-transaction group commit** — pending commit records are batched into a single
+  `write()` + single `fdatasync` — and the batch fsync is **pipelined off the engine thread**
+  so the engine overlaps it with preparing the next batch and retiring off-thread reads. Under
+  concurrency this scales committed-write throughput several-fold on durable storage (the
+  larger the fsync latency, the larger the gain), with every durability invariant preserved: a
+  committer is acknowledged only after the fsync covering its commit record completes.
+- **Lower per-statement engine cost.** Compiled query plans are now `Arc`-shared through the
+  plan cache and executor, so a plan-cache hit ships a reference-count bump instead of a deep
+  tree clone (a ~64–233× reduction in the per-statement clone cost that dominates the
+  parameterized-repeated production case).
+- **Cheaper bulk loading.** During a Mode A bulk-import session the background
+  maintenance-checkpoint interval is widened 16× (a bulk load only ever creates rows, so each
+  full-store GC pass reclaims almost nothing yet grows more expensive as the store grows),
+  cutting maintenance overhead by the same factor; every other workload keeps the unchanged,
+  frequent reclamation cadence.
+
+### Fixed
+
+- **Encrypted write-ahead-log disk leak (critical).** On an encryption-at-rest database the
+  encrypted WAL stored its sink header in the first backing segment, which the prefix-only
+  segment reclaimer could never free — so the encrypted WAL grew on disk **without bound**, and
+  a heavily-reclaimed log could not be reopened after a crash. The header is relocated into the
+  never-deleted anchor (matching the plaintext layout) so segment reclamation frees leading
+  segments again; the on-disk sink version is bumped and an old-layout encrypted WAL is rejected
+  fail-closed at open. AEAD framing, nonce-budget resume, and key-check fail-closed are
+  preserved exactly.
+- **Crash-recovery out-of-memory on a long-lived WAL.** Several crash-recovery scans read the
+  WAL from offset zero, sizing their buffer by the log's absolute lifetime rather than the small
+  retained window — so a long-lived, heavily-reclaimed log demanded many times its retained size
+  on reopen and could abort with an out-of-memory error, leaving the database unable to reopen (a
+  direct ACID violation). Recovery now reads only from the reclaimed floor, so its allocation
+  tracks the retained window; behaviour is byte-identical when nothing has been reclaimed.
+- **Pre-authentication denial-of-service vectors (PackStream).** Decoding an attacker-supplied
+  message before authentication could burn minutes of CPU (a many-key map decoded in O(N²);
+  now an order-preserving O(N) accumulator, ~780× faster) or amplify a few megabytes into
+  gigabytes of heap (a deeply-sized collection with no breadth budget; now a per-message
+  decoded-element budget caps decoded heap at a small multiple of the framing limit).
+- **Availability and correctness hardening (certification pass).** A Bolt `PULL` of a full
+  result no longer buffers the entire result in the per-connection write buffer before
+  flushing (now bounded, buffered-writer semantics); an off-thread reader whose consumer stops
+  draining now aborts at its statement deadline instead of blocking forever and pinning the GC
+  watermark; the coordinator's serialization-conflict tracker is now pruned from the
+  maintenance checkpoint instead of leaking an entry per committed transaction and per read;
+  and a full-text/spatial procedure feeding an expansion is no longer mis-dispatched off-thread
+  into a spurious "no such index" error.
+- **REST conflict handling.** A conflicting single-statement write auto-commit now returns a
+  retriable `409` with the connection kept alive, instead of dropping the HTTP connection
+  mid-stream — a single-statement write is buffered and its status decided from its commit
+  outcome, while single-statement reads still stream. The buffered write result is bounded
+  (16 MiB) so a large authenticated write cannot exhaust memory; it never commits half-way and
+  never silently truncates.
+- **Bulk-import retry safety.** The offline bulk importer now stages each batch's external-id
+  bindings and row-count statistics separately and merges them only after the batch durably
+  commits, so an aborted batch can be retried without falsely rejecting a duplicate id or
+  resolving relationships against rolled-back physical ids — the invariant the network
+  bulk-import's automatic per-batch retry relies on.
+
 ## [0.0.4] - 2026-06-30
 
 ### Fixed
@@ -229,7 +344,8 @@ to build, run, and evaluate the server.
   Supply a CA-issued certificate, a strong admin password, and a real JWT secret before
   any non-sandbox use. See the README "Production / TLS" section.
 
-[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.1...v0.0.2
