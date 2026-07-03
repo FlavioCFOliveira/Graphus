@@ -77,6 +77,14 @@ pub struct EngineHandle {
     /// blanket-503s the node, and one engine's checkpoint success never false-clears another's stall
     /// (the residual cross-tenant breach #435 closes after #414).
     maintenance_degraded: MaintenanceDegraded,
+    /// The engine's monotonic **drain-progress beacon** (`rmp` #563): the engine thread bumps it as its
+    /// long-running operations (the O(N) maintenance GC scan, the shutdown flush) make forward progress.
+    /// `stop_engine` polls [`drain_progress`](Self::drain_progress) while draining this engine, so it can
+    /// distinguish a **healthy-but-slow** engine (beacon still advancing) from a genuinely **wedged** one
+    /// (beacon frozen) and force-detach only the latter — never a healthy engine that is simply flushing
+    /// a large store or running a long GC pass. Shared (cloned `Arc`) with the engine thread, which
+    /// installs the same beacon into the store at startup.
+    drain_progress: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EngineHandle {
@@ -89,6 +97,7 @@ impl EngineHandle {
         metrics: Arc<Metrics>,
         degraded: EngineDegraded,
         maintenance_degraded: MaintenanceDegraded,
+        drain_progress: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             tx,
@@ -96,7 +105,18 @@ impl EngineHandle {
             metrics,
             degraded,
             maintenance_degraded,
+            drain_progress,
         }
+    }
+
+    /// The current value of this engine's **drain-progress beacon** (`rmp` #563). Monotonically
+    /// non-decreasing while the engine is alive; a change between two polls means the engine made
+    /// forward progress on a long operation (a GC scan step, a flush chunk) in between. `stop_engine`
+    /// uses it to keep waiting on a slow-but-progressing drain instead of force-detaching it.
+    #[must_use]
+    pub fn drain_progress(&self) -> u64 {
+        self.drain_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sets the global admission limit (max concurrently-executing queries, `04 §9.3`).
@@ -111,6 +131,7 @@ impl EngineHandle {
             metrics: Arc::clone(&self.metrics),
             degraded: self.degraded.clone(),
             maintenance_degraded: self.maintenance_degraded.clone(),
+            drain_progress: Arc::clone(&self.drain_progress),
         }
     }
 

@@ -63,6 +63,13 @@ libc = { version = "0.2", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Safe, `unsafe`-free `flock(2)` wrapper for the exclusive store-open lock (`rmp` #563,
+# `src/store_lock.rs`). Using `rustix::fs::flock` (rather than `std::fs::File::try_lock`, which is only
+# stable since Rust 1.89) keeps this crate `#![forbid(unsafe_code)]` **and** within the workspace MSRV
+# (`rust-version = 1.85`; rustix's MSRV is far lower). `rustix` is already in the dependency tree, so no
+# new third-party crate enters the build. `fs` = the filesystem syscalls (`flock`); no default features.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
 [dev-dependencies]
 # `macros` + `time` enable `#[tokio::test]` and timeouts in the loopback round-trip tests; `net` is
 # already on for the lib. Tests bind `127.0.0.1:0` and a temp UDS path in-process (`04 §9.1`, the

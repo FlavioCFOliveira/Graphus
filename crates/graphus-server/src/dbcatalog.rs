@@ -589,6 +589,22 @@ fn open_or_create_coordinator(
     pool_pages: usize,
     master_key: Option<&MasterKey>,
 ) -> Result<TxnCoordinator<StoreDevice, WalSink>, GraphusError> {
+    // Exclusive store-open lock FIRST (`rmp` #563), before touching the device / WAL at all: if a
+    // previous engine for this store is still alive — the motivating case is a `STOP DATABASE` that
+    // force-detached (abandoned, did not join) a still-flushing engine, followed by a `START DATABASE`
+    // that reaches here in the SAME process — this fails fast with a clear, retriable error instead of
+    // opening the same files for a second concurrent writer and tearing the on-disk image. The guard is
+    // installed into the store below so it is held for the store's whole lifetime and released only
+    // after its final flush (see [`RecordStore::hold_open_guard`]). Every open path — the initial
+    // server open and every `START DATABASE` — funnels through here, so all of them are covered.
+    let store_dir = device_file.parent().ok_or_else(|| {
+        GraphusError::Storage(format!(
+            "store device path {} has no parent directory to lock",
+            device_file.display()
+        ))
+    })?;
+    let open_lock = graphus_io::StoreOpenLock::acquire(store_dir)?;
+
     let device_existing = device_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
 
     let mut store = if device_existing {
@@ -662,6 +678,11 @@ fn open_or_create_coordinator(
     // path", so divergence is structurally impossible today. The
     // `secondary_indexes_are_rebuilt_not_verified_on_open` test pins this contract.
     verify_on_open(&mut store, &[])?;
+
+    // Hand the exclusive open-lock to the store so it is held for the store's entire lifetime and
+    // released only when the store is fully closed (after the final flush), including a force-detached
+    // zombie's in-progress flush (`rmp` #563).
+    store.hold_open_guard(Box::new(open_lock));
 
     Ok(TxnCoordinator::new(store))
 }
@@ -1911,19 +1932,31 @@ impl DatabaseCatalog {
     /// `Shutdown` command, then joins its thread off the runtime. Errors are logged — at this
     /// point the engine is going away regardless.
     ///
-    /// ## Bounded drain (`rmp` #450)
+    /// ## Progress-aware bounded drain (`rmp` #450 + #563)
     ///
-    /// Both the `Shutdown` round-trip **and** the subsequent thread `join` are wrapped in a
-    /// [`tokio::time::timeout`] of [`EngineParams::engine_shutdown_timeout`]. A *wedged* engine thread
-    /// (a hung storage syscall, a buffer-pool livelock) would otherwise make `shutdown().await` —
-    /// `recv_async` on the reply — block forever, and because `shutdown_all` holds the admin lock for the
-    /// whole teardown, every **other** tenant's `CREATE/DROP/START/STOP DATABASE` would block until the
-    /// process is externally `SIGKILL`ed. On elapse we **force-detach**: log the wedged engine, abandon
-    /// its (detached) thread, and return so teardown proceeds to the next database. Durability is **not**
-    /// compromised — every acked commit is already in the WAL by the group-commit rule, so a forcibly
-    /// abandoned engine recovers cleanly on next open; only the *graceful* clean-checkpoint optimisation
-    /// is skipped for that one wedged database. The healthy engines still drain within their own
-    /// deadlines.
+    /// The `Shutdown` round-trip is bounded, but **not** by a flat wall-clock deadline: a healthy engine
+    /// draining a large store legitimately takes many seconds (a multi-GB final flush, or a long O(N)
+    /// maintenance GC pass that a `STOP` right after a bulk import races), and a flat 10 s cap
+    /// force-detached those *healthy* engines — the root cause of the `rmp` #555 corruption. Instead we
+    /// watch the engine's **drain-progress beacon** ([`EngineHandle::drain_progress`], `rmp` #563), a
+    /// monotonic counter the engine bumps as its long operations flush chunks / step the GC scan. We wait
+    /// in [`EngineParams::engine_shutdown_timeout`]-sized windows: as long as the beacon **advanced**
+    /// during a window the engine is healthy-but-slow, so we reset the window and keep waiting; only when
+    /// a **whole window passes with no progress** — a genuinely *wedged* thread (a hung storage syscall,
+    /// a buffer-pool livelock) — do we **force-detach** (abandon the detached thread and return so
+    /// `shutdown_all` releases the admin lock for other tenants).
+    ///
+    /// ## Why force-detach is now safe (`rmp` #563)
+    ///
+    /// Force-detach abandons a thread that may still be writing the store files, and on the
+    /// STOP→START path (process stays alive) a following `START DATABASE` would otherwise reopen the SAME
+    /// files and race the zombie's writes → torn image → durable corruption. That is now closed by the
+    /// **exclusive store-open lock**: the abandoned engine still holds its `flock` on `store.lock` (via
+    /// the store's last-dropped guard) until it finishes and drops the store, so a concurrent reopen
+    /// fails fast rather than racing (see [`open_or_create_coordinator`] / [`graphus_io::StoreOpenLock`]).
+    /// Durability is intact regardless: every acked commit is already in the WAL by the group-commit
+    /// rule, so an abandoned engine recovers cleanly on next open; only the graceful clean-checkpoint
+    /// optimisation is skipped for that one wedged database.
     async fn stop_engine(&self, name: &str, engine: RunningEngine) {
         self.write_handles().remove(name);
         // Also unpublish the loading-only registry (`rmp` #519): `stop()` is reachable directly on a
@@ -1933,41 +1966,71 @@ impl DatabaseCatalog {
         // closes the gap where a directly-stopped `Loading` database would leave a stale handle to a
         // now-dead engine in `loading_handles`.
         self.write_loading_handles().remove(name);
-        let deadline = self.params.engine_shutdown_timeout;
-        match tokio::time::timeout(deadline, engine.handle.shutdown()).await {
-            // Drain round-trip completed within the deadline (cleanly or with a flush error).
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::error!(db = %name, error = %e, "error hardening the store on stop");
-            }
-            // The engine did not even acknowledge `Shutdown` within the deadline: it is wedged. Do NOT
-            // wait on the join (it would block just as long). Force-detach and proceed — the admin lock
-            // is released for the next database / other tenants' admin ops.
-            Err(_elapsed) => {
-                tracing::error!(
-                    db = %name,
-                    timeout_ms = deadline.as_millis() as u64,
-                    "engine did not drain within the shutdown deadline; force-detaching the wedged \
-                     engine and proceeding (durability is preserved — acked commits are already in the \
-                     WAL; the store recovers cleanly on next open)",
-                );
-                // Drop the join handle WITHOUT joining: the OS thread is detached and torn down with the
-                // process. Joining a wedged thread is the very hang this fix exists to prevent.
-                drop(engine.join);
-                return;
+        let no_progress = self.params.engine_shutdown_timeout;
+        let RunningEngine { handle, join } = engine;
+
+        // Progress-aware drain (`rmp` #563). Re-poll the SAME `shutdown()` future across no-progress
+        // windows; between windows compare the drain-progress beacon to decide "healthy-but-slow" vs
+        // "wedged". `tokio::pin!` makes the future re-pollable by `&mut` (`Pin<&mut _>: Future`), and a
+        // timeout leaves it intact for the next poll.
+        let shutdown_fut = handle.shutdown();
+        tokio::pin!(shutdown_fut);
+        let mut last_progress = handle.drain_progress();
+        loop {
+            match tokio::time::timeout(no_progress, &mut shutdown_fut).await {
+                // Drain round-trip completed within a window (cleanly or with a flush error).
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => {
+                    tracing::error!(db = %name, error = %e, "error hardening the store on stop");
+                    break;
+                }
+                Err(_elapsed) => {
+                    let now = handle.drain_progress();
+                    if now != last_progress {
+                        // The engine advanced its drain (a flush chunk / GC scan step) during this
+                        // window: it is healthy, just slow. Reset the window and keep waiting.
+                        tracing::debug!(
+                            db = %name,
+                            progress = now,
+                            "engine still draining (progress observed); extending the deadline",
+                        );
+                        last_progress = now;
+                        continue;
+                    }
+                    // A whole window elapsed with NO progress: genuinely wedged. Force-detach and
+                    // proceed — safe now that the abandoned thread still holds the exclusive store-open
+                    // lock until it stops writing, so a concurrent reopen cannot race it (`rmp` #563).
+                    tracing::error!(
+                        db = %name,
+                        no_progress_ms = no_progress.as_millis() as u64,
+                        "engine made no drain progress within the deadline; force-detaching the wedged \
+                         engine and proceeding (durability preserved — acked commits are already in the \
+                         WAL; the exclusive store-open lock prevents a concurrent reopen from racing the \
+                         abandoned thread's writes, rmp #563)",
+                    );
+                    // Drop the join handle WITHOUT joining: joining a wedged thread is the very hang this
+                    // guard exists to prevent.
+                    drop(join);
+                    return;
+                }
             }
         }
-        // The drain completed; join the (now-exiting) thread, but still bounded so a thread that
-        // acknowledged `Shutdown` yet wedged during its final flush cannot hang teardown either.
-        let join = engine.join;
-        match tokio::time::timeout(deadline, tokio::task::spawn_blocking(move || join.join())).await
+        // The drain acked; join the (now-exiting) thread, bounded so a thread that acked `Shutdown` yet
+        // wedged while dropping its store cannot hang teardown either. This is post-flush teardown (only
+        // fd closes + the lock release), so a flat bound suffices; a timeout here still detaches safely
+        // (the store-open lock is released only when the thread finishes, so no reopen can race).
+        match tokio::time::timeout(
+            no_progress,
+            tokio::task::spawn_blocking(move || join.join()),
+        )
+        .await
         {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(_panic))) => tracing::error!(db = %name, "engine thread panicked"),
             Ok(Err(e)) => tracing::error!(db = %name, error = %e, "joining engine thread"),
             Err(_elapsed) => tracing::error!(
                 db = %name,
-                timeout_ms = deadline.as_millis() as u64,
+                timeout_ms = no_progress.as_millis() as u64,
                 "engine thread did not exit within the shutdown deadline after draining; detaching it",
             ),
         }
@@ -2393,6 +2456,52 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{tag}: reopen failed: {e}"));
             drop(reopened);
         }
+    }
+
+    /// `rmp` #563 REGRESSION GATE (the corruption stopper): the production open path holds an
+    /// **exclusive store-open lock** for the store's whole lifetime, so a **second** open of the SAME
+    /// store directory while the first is still live FAILS FAST instead of opening a second concurrent
+    /// writer. This is the invariant that makes the force-detach → concurrent-`START DATABASE` reopen
+    /// race (a zombie engine still flushing while a new engine reopens the same files) impossible:
+    /// whichever holds the lock keeps it until its store is fully closed, and the racer is denied.
+    ///
+    /// Directly exercises `open_or_create_coordinator`'s lock: open a coordinator (holding the lock via
+    /// the store's last-dropped guard), assert a concurrent second open of the same directory errors,
+    /// then drop the first and prove the lock is released (the reopen now succeeds). Deterministic and
+    /// in-process — the exact same-process, two-open-file-description conflict the real bug hits.
+    #[test]
+    fn concurrent_second_open_of_same_store_is_refused_by_the_open_lock() {
+        let root = TempRoot::new("store-open-lock");
+        let dir = root.path.join("db");
+        std::fs::create_dir_all(&dir).expect("create db dir");
+        let device_file = dir.join(STORE_FILE_NAME);
+        let wal_file = dir.join(WAL_FILE_NAME);
+
+        // First open: succeeds and holds the exclusive store-open lock for its lifetime.
+        let first = open_or_create_coordinator(&device_file, &wal_file, 64, None)
+            .expect("first open of a fresh store succeeds");
+
+        // Second open of the SAME directory WHILE the first is live: must be refused (the lock is held).
+        // Without the lock, this would open a second writer onto the same files and race the first — the
+        // exact torn-image corruption `rmp` #555/#563 fixes.
+        let second = open_or_create_coordinator(&device_file, &wal_file, 64, None);
+        assert!(
+            second.is_err(),
+            "a concurrent second open of the same store directory must be refused while the first \
+             engine still holds the store — got Ok, meaning two writers could race the files"
+        );
+        let msg = format!("{}", second.err().unwrap());
+        assert!(
+            msg.contains("already open") || msg.to_lowercase().contains("lock"),
+            "the refusal must be the clear store-open-lock error, got: {msg}"
+        );
+
+        // Drop the first (closes its store, releasing the lock — the clean STOP→START ordering). The
+        // reopen now succeeds, proving the lock is not leaked and normal restart is unaffected.
+        drop(first);
+        let reopened = open_or_create_coordinator(&device_file, &wal_file, 64, None)
+            .expect("reopen after the first store is fully closed must succeed (lock released)");
+        drop(reopened);
     }
 
     /// `rmp` #384 — the doublewrite buffer is wired into the **production** open/checkpoint path: a
@@ -3135,6 +3244,60 @@ mod tests {
 
         // Disarm so a sibling test in this binary is never affected by a residual armed hang.
         crate::engine::arm_shutdown_hang(0);
+    }
+
+    /// `rmp` #563 REGRESSION GATE (the complement of `wedged_engine_does_not_hang_shutdown_all`): a
+    /// **healthy-but-slow** engine — one that takes far longer than the flat drain deadline to drain but
+    /// keeps making forward progress (a multi-GB final flush, or the long O(N) maintenance GC pass a
+    /// `STOP` right after a bulk import races) — must **NOT** be force-detached. The flat 10 s deadline
+    /// force-detached exactly these healthy engines, and the resulting zombie racing the reopen was the
+    /// #555 corruption. The progress-aware drain must instead observe the advancing drain-progress beacon
+    /// and wait for the engine to finish.
+    ///
+    /// The engine is armed to drain slowly (8 heartbeats, 100 ms apart = ~800 ms) while the per-engine
+    /// no-progress window is a short 250 ms. A broken (flat-deadline) `stop_engine` would force-detach at
+    /// ~250 ms; the progress-aware one waits the full ~800 ms because the beacon advances every 100 ms
+    /// (well within each window). We assert `shutdown_all` took **substantially longer than one window**
+    /// — proof it waited for the progressing drain rather than force-detaching it — yet stayed bounded.
+    #[cfg(feature = "internal-test-udf")]
+    #[tokio::test]
+    async fn progressing_engine_is_not_force_detached() {
+        use std::time::{Duration, Instant};
+
+        let root = TempRoot::new("progressing-drain");
+        let mut params = test_params();
+        params.engine_shutdown_timeout = Duration::from_millis(250);
+        let catalog = DatabaseCatalog::open(
+            root.path.clone(),
+            DEFAULT_DATABASE_NAME,
+            params,
+            Arc::new(Metrics::new()),
+        )
+        .expect("open catalog");
+        catalog.start_default().await.expect("start default");
+
+        // Arm a slow-but-PROGRESSING drain: 8 beacon heartbeats, 100 ms apart (~800 ms total), each far
+        // inside the 250 ms no-progress window — so the drain never goes a whole window without progress.
+        crate::engine::arm_shutdown_progress(8, 100);
+
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), catalog.shutdown_all())
+            .await
+            .expect("shutdown_all must still return (bounded) for a progressing engine");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "shutdown_all returned in {elapsed:?} — that is ~one no-progress window, meaning the \
+             healthy progressing engine was force-detached instead of waited for (rmp #563 regression)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown_all took {elapsed:?} — the progressing drain must still be bounded"
+        );
+
+        // Disarm to keep sibling tests in this binary unaffected.
+        crate::engine::arm_shutdown_progress(0, 0);
     }
 
     /// `rmp` #450: while one engine is wedged, the admin lock `shutdown_all` holds is released within the

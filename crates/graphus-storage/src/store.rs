@@ -319,6 +319,27 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// owner and serialises their staging (one DWB-device writer at a time); the `Arc` lets the
     /// pool's stager hold a second handle to the same DWB.
     dwb: Option<Arc<std::sync::Mutex<crate::dwb::Dwb<D>>>>,
+    /// A monotonic **drain-progress beacon** (`rmp` #563): the store bumps it as its long-running
+    /// engine-thread operations make forward progress — every doublewrite flush chunk written home
+    /// ([`flush_protected_with_attached_dwb`](Self::flush_protected_with_attached_dwb)) and every step of
+    /// the O(N) GC scan ([`gc`](Self::gc), [`freeze_store_headers`](Self::freeze_store_headers)). The
+    /// server's `stop_engine` polls this same [`AtomicU64`] (a clone shared via the engine handle) while
+    /// draining an engine, so it can tell a **healthy-but-slow** engine (this counter still advancing)
+    /// from a genuinely **wedged** one (a hung syscall / livelock — the counter frozen) and force-detach
+    /// only the latter. `None` for a store with no beacon installed (an in-memory DST/scratch store).
+    drain_progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// An opaque RAII guard held for the store's **entire lifetime** and dropped when the store closes
+    /// — declared **last** so it drops *after* every other field (the device, the pool and the WAL),
+    /// i.e. after the final flush has run and the file handles are closed. Its sole purpose is
+    /// drop-ordering: the server installs the exclusive store-open advisory lock
+    /// ([`graphus_io::StoreOpenLock`], an `flock` on `store.lock`) here so that lock is released only
+    /// once this store — including a force-detached zombie's in-progress flush — is fully done writing
+    /// (`rmp` #563: the force-detach → concurrent-reopen corruption). The storage layer never inspects
+    /// the guard; it only guarantees it outlives all store I/O. `None` for a store with no such lock
+    /// (an in-memory DST/scratch store, or any store opened without the server's file-lock wiring).
+    /// `Send + Sync` so [`RecordStore`] stays `Send + Sync` (the `record_store_is_send_and_sync` gate);
+    /// the installed [`graphus_io::StoreOpenLock`] (a `File` + `PathBuf`) satisfies both.
+    open_guard: Option<Box<dyn Send + Sync>>,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -375,6 +396,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // No doublewrite buffer until one is attached ([`attach_dwb`]); the fresh-create flush
             // below therefore runs unprotected, which is correct — there is no committed data yet.
             dwb: None,
+            // No drain-progress beacon until the engine installs one ([`set_drain_progress`], #563).
+            drain_progress: None,
+            // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
+            open_guard: None,
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -460,6 +485,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `open`, so the store opens onto an already-repaired device; the attached DWB then
             // protects subsequent checkpoint/flush home writes.
             dwb: None,
+            // No drain-progress beacon until the engine installs one ([`set_drain_progress`], #563).
+            drain_progress: None,
+            // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
+            open_guard: None,
         })
     }
 
@@ -1764,11 +1793,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // takes the per-record write latch via its WAL-logged patches — the read is batched, the
         // write is not (no latch downgrade). `is_reclaimable` is decided on the header read here,
         // exactly as the per-id loop did.
+        // `rmp` #563: heartbeat the drain-progress beacon across every phase of this O(N) full-store GC
+        // pass (each `scan_in_use_mvcc` is O(total records); the largest measured pass took ~18 s). The
+        // per-phase bump plus a bump every few thousand reclaim iterations keeps the beacon advancing far
+        // faster than any drain deadline, so a `STOP DATABASE` that races this pass sees a *progressing*
+        // engine and waits for it rather than force-detaching a healthy one.
+        self.bump_drain_progress();
         let rel_in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
-        for &(id, mvcc) in &rel_in_use {
+        for (i, &(id, mvcc)) in rel_in_use.iter().enumerate() {
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry) {
                 self.reclaim_rel(txn, id)?;
                 reclaimed += 1;
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
             }
         }
 
@@ -1782,13 +1820,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // re-read after the rel sweep + corpse splice (a corpse splice never grows the node store, so
         // it is stable, but read it where the per-id loop did). `has_live_incident_rels` is a
         // per-node chain walk that needs `&mut self`, so it stays outside the batched read closure.
+        self.bump_drain_progress();
         let node_in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
-        for &(id, mvcc) in &node_in_use {
+        for (i, &(id, mvcc)) in node_in_use.iter().enumerate() {
             if Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
                 && !self.has_live_incident_rels(id)?
             {
                 self.reclaim_node(txn, id)?;
                 reclaimed += 1;
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
             }
         }
 
@@ -1797,16 +1839,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // liveness here (after the sweeps) keeps each chain reclaimed exactly once. Re-scan the
         // headers (page-batched) AFTER the reclamation sweeps so a just-reclaimed slot is no longer
         // `in_use` and is skipped — same observation point as the former per-id `read_node`/`read_rel`.
+        self.bump_drain_progress();
         let node_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
-        for &(id, mvcc) in &node_live {
+        for (i, &(id, mvcc)) in node_live.iter().enumerate() {
             if Self::is_live_version(mvcc) {
                 reclaimed += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
             }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
+            }
         }
+        self.bump_drain_progress();
         let rel_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
-        for &(id, mvcc) in &rel_live {
+        for (i, &(id, mvcc)) in rel_live.iter().enumerate() {
             if Self::is_live_version(mvcc) {
                 reclaimed += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
             }
         }
 
@@ -1817,8 +1867,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reclamation sweeps could not reach (e.g. the property chain of a tombstoned-but-retained
         // owner) are frozen.
         let mut frozen = 0usize;
+        self.bump_drain_progress();
         frozen += self.freeze_store_headers(txn, StoreKind::Rel)?;
+        self.bump_drain_progress();
         frozen += self.freeze_store_headers(txn, StoreKind::Node)?;
+        self.bump_drain_progress();
         frozen += self.freeze_store_headers(txn, StoreKind::Prop)?;
 
         // Schedule the table prune: every writer recorded as committed at this point had ALL of its
@@ -1909,7 +1962,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // read is batched, the mutating write is not (no latch downgrade).
         let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?;
         let mut frozen = 0usize;
-        for &(id, mvcc) in &in_use {
+        for (i, &(id, mvcc)) in in_use.iter().enumerate() {
             if let Some(word) = self.frozen_word(mvcc.created_ts) {
                 self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
                 frozen += 1;
@@ -1917,6 +1970,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if let Some(word) = self.frozen_word(mvcc.expired_ts) {
                 self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
                 frozen += 1;
+            }
+            // Heartbeat the drain-progress beacon across this O(N) freeze sweep (`rmp` #563).
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
             }
         }
         Ok(frozen)
@@ -3820,6 +3877,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.dwb.is_some()
     }
 
+    /// Installs an opaque RAII guard tied to this store's lifetime (`rmp` #563). The guard is held in
+    /// the store's **last-dropped** field, so it is released only when the store is fully closed —
+    /// after the final [`flush`](Self::flush) and after the device / WAL file handles are dropped. The
+    /// store never inspects it.
+    ///
+    /// The server passes the **exclusive store-open advisory lock** ([`graphus_io::StoreOpenLock`], an
+    /// `flock` on `store.lock`) here so a concurrent reopen of the same store — a `START DATABASE`
+    /// racing a force-detached zombie engine that is still flushing these files — is denied until this
+    /// store (including that zombie's in-progress flush) has stopped writing. Panics-safe: on an engine
+    /// thread unwind the guard drops during unwinding, after the store's writes have ceased, so the
+    /// lock is never released while a writer is still live.
+    pub fn hold_open_guard(&mut self, guard: Box<dyn Send + Sync>) {
+        self.open_guard = Some(guard);
+    }
+
+    /// Installs the shared **drain-progress beacon** (`rmp` #563). The engine hands the same
+    /// [`AtomicU64`](std::sync::atomic::AtomicU64) it exposes on its handle so the store's long
+    /// operations ([`gc`](Self::gc), [`flush`](Self::flush)) heartbeat it and the server's `stop_engine`
+    /// can distinguish a slow-but-progressing drain from a wedged one. Idempotent; overwrites any prior
+    /// beacon.
+    pub fn set_drain_progress(&mut self, beacon: Arc<std::sync::atomic::AtomicU64>) {
+        self.drain_progress = Some(beacon);
+    }
+
+    /// Bumps the drain-progress beacon by one, if installed (`rmp` #563). A single **relaxed** atomic
+    /// increment — negligible in the hot loops that call it, and correct for a liveness signal: a poller
+    /// only ever asks "did this value change since I last looked?", which needs no ordering with other
+    /// memory. Cheap no-op when no beacon is installed. Public so the engine's drain-progress test seam
+    /// can drive it deterministically through the coordinator.
+    #[inline]
+    pub fn bump_drain_progress(&self) {
+        if let Some(beacon) = &self.drain_progress {
+            beacon.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Flushes every dirty home page under doublewrite protection using the **attached** shared DWB
     /// — via the [`crate::dwb::DwbPageStager`] installed into the buffer pool by
     /// [`attach_dwb`](Self::attach_dwb) (`rmp` #407). Only called when `self.dwb.is_some()`.
@@ -3846,6 +3939,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let pages = self.mapped_pages();
         for chunk in pages.chunks(crate::dwb::DWB_MAX_BATCH) {
             self.pool.flush_pages(chunk)?;
+            // Heartbeat the drain-progress beacon per flushed chunk (`rmp` #563) so a large but healthy
+            // final flush at shutdown is observed as *progressing* and is never force-detached.
+            self.bump_drain_progress();
         }
         // After every home page is durable the current DWB batch is no longer needed; clear it
         // (best-effort hygiene — a stale-but-valid batch is still safe, recovery only restores a page

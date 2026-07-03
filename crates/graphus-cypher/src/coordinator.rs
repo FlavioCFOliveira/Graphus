@@ -3055,6 +3055,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
+    /// Installs the shared **drain-progress beacon** into the underlying store (`rmp` #563). The engine
+    /// calls this once at startup with the same [`AtomicU64`](std::sync::atomic::AtomicU64) it exposes on
+    /// its handle, so the store's long GC/flush loops heartbeat it and the server's `stop_engine` can
+    /// distinguish a slow-but-progressing drain from a wedged one.
+    pub fn set_drain_progress(&self, beacon: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.store.borrow_mut().set_drain_progress(beacon);
+    }
+
     /// Runs `f` with **mutable** access to the underlying store, without consuming the coordinator.
     ///
     /// This is the lending counterpart to [`into_store`](Self::into_store): it gives storage-level

@@ -327,6 +327,44 @@ fn shutdown_hang_check() {
 #[inline]
 fn shutdown_hang_check() {}
 
+/// A **test-only fault-injection seam** (`rmp` #563): a *slow-but-progressing* `Shutdown` — the engine
+/// takes a long time to drain but keeps making forward progress (bumping its drain-progress beacon), as
+/// a healthy large-store flush / long GC pass does. Packs `cycles` into the high 32 bits and the
+/// per-cycle `interval_ms` into the low 32 bits of one atomic. Used to prove
+/// [`crate::DatabaseCatalog::stop_engine`]'s progress-aware drain does **not** force-detach such an
+/// engine (the #563 regression), the complement of the `arm_shutdown_hang` (no-progress → force-detach)
+/// seam. Compiled in only under `internal-test-udf`.
+#[cfg(feature = "internal-test-udf")]
+static SHUTDOWN_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Arms the slow-but-progressing shutdown seam: the next engine `Shutdown` heartbeats its drain-progress
+/// beacon `cycles` times, `interval_ms` apart, before draining (`rmp` #563, test-only). `(0, _)` disarms.
+#[cfg(feature = "internal-test-udf")]
+pub fn arm_shutdown_progress(cycles: u32, interval_ms: u32) {
+    let packed = (u64::from(cycles) << 32) | u64::from(interval_ms);
+    SHUTDOWN_PROGRESS.store(packed, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Simulates a slow-but-progressing drain at the start of the engine's `Shutdown` handler: bumps the
+/// store's drain-progress beacon `cycles` times, sleeping `interval_ms` between bumps (`rmp` #563,
+/// test-only). A no-op (zero-cost) in production.
+#[cfg(feature = "internal-test-udf")]
+#[inline]
+fn shutdown_progress_check<D: BlockDevice, S: LogSink>(coord: &TxnCoordinator<D, S>) {
+    use std::sync::atomic::Ordering;
+    let packed = SHUTDOWN_PROGRESS.swap(0, Ordering::SeqCst);
+    let cycles = (packed >> 32) as u32;
+    let interval_ms = u64::from(packed as u32);
+    for _ in 0..cycles {
+        coord.with_store_mut(|s| s.bump_drain_progress());
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(not(feature = "internal-test-udf"))]
+#[inline]
+fn shutdown_progress_check<D: BlockDevice, S: LogSink>(_coord: &TxnCoordinator<D, S>) {}
+
 /// Panics if the recovery fault seam is armed, decrementing the armed count (`rmp` #409, test-only).
 /// Called at the start of each recovery rollback/commit so an armed fault makes the recovery itself
 /// panic. A no-op (and near-zero-cost) in production, where the feature is off (the function body
@@ -1020,10 +1058,33 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     metrics: &Metrics,
     maintenance_degraded: &MaintenanceDegraded,
     loading_session_active: bool,
+    loading_just_ended: bool,
 ) {
     let Some(coord) = coordinator.as_mut() else {
         return;
     };
+    // `rmp` #565 — do NOT fire a maintenance GC pass on the loading→not-loading edge. When a Mode A
+    // network bulk-import session ends (`End`), the maintenance interval flips from the wide loading
+    // cadence ([`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`], 4 GiB) back to the ordinary
+    // 256 MiB one, and a freshly-loaded multi-GB store has far more than 256 MiB of un-reclaimed WAL —
+    // so this tick would otherwise run `coord.checkpoint()`'s **O(total store size) full-store GC scan**
+    // (measured 1.7 s → 18 s as the store grows). That scan runs synchronously on the engine thread as
+    // the tail of the `End` command, *ahead of the `Shutdown` that a `STOP DATABASE` — which normally
+    // follows `End` — has already queued*; because the engine is single-threaded it cannot acknowledge
+    // `Shutdown` until the scan finishes, so `stop_engine`'s drain deadline elapses and it force-detaches
+    // a perfectly healthy engine (the root cause of the `rmp` #555 force-detach → concurrent-reopen
+    // corruption). Instead we re-anchor the maintenance watermark to the current WAL length and skip the
+    // pass: the backlog of unfrozen commits is reclaimed by the (now-running-again) engine's ordinary
+    // background cadence after the next `START DATABASE`, on the live database — never on the drain path.
+    // Durability is untouched: recovery redo stays bounded because the store's per-commit auto-checkpoint
+    // (`DEFAULT_CHECKPOINT_INTERVAL_BYTES`, 64 MiB) flushed every dirty page home throughout the load, so
+    // the unreclaimed WAL below the redo floor is skipped by recovery, not replayed. The progress-aware
+    // drain (`rmp` #563) is the general safety net for any *other* long maintenance pass that a `STOP`
+    // may still race; this removes the specific, reproducible bulk-import trigger.
+    if loading_just_ended {
+        *wal_at_last_maintenance = coord.wal_durable_len();
+        return;
+    }
     let interval = maintenance_interval_bytes(loading_session_active);
     let durable = coord.wal_durable_len();
     if durable.saturating_sub(*wal_at_last_maintenance) < interval {
@@ -1579,6 +1640,11 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         wal_sync,
     } = ctx;
 
+    // Whether a Mode A bulk-import loading session is active **before** this command is dispatched, so
+    // the loading→not-loading edge (an `End` command) can be detected after dispatch to suppress the
+    // maintenance GC pass that would otherwise block the following `Shutdown` (`rmp` #565, see
+    // [`maybe_run_maintenance`]).
+    let was_loading = loading_session.is_some();
     // A per-dispatch slot for the (at most one) statement THIS command suspends; drained into the bounded
     // `parked` queue below (`rmp` #485 B1). And a fresh, empty group-commit batch (`rmp` #528).
     let mut just_suspended: Option<exec::InFlightInline> = None;
@@ -1652,6 +1718,11 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     );
     drive_index_build(coordinator);
     invalidate_cache_on_build_completion(coordinator, plan_cache, builds_were_pending);
+    // The loading→not-loading edge (`rmp` #565): a bulk-import session that was active before this
+    // command is now gone — this command was the `End`. On that edge `maybe_run_maintenance` re-anchors
+    // its watermark and skips the O(N) GC pass so it cannot block the `Shutdown` a `STOP DATABASE` queues
+    // right after `End` (the force-detach trigger).
+    let loading_just_ended = was_loading && loading_session.is_none();
     maybe_run_maintenance(
         coordinator,
         wal_at_last_maintenance,
@@ -1659,6 +1730,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         metrics,
         maintenance_degraded,
         loading_session.is_some(),
+        loading_just_ended,
     );
     true
 }
@@ -1855,6 +1927,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // graceful-shutdown timeout gate can prove `stop_engine` force-detaches within its deadline.
             // Identity (zero-cost) in production.
             shutdown_hang_check();
+            // Test-only (`rmp` #563): simulate a slow-but-*progressing* drain (heartbeating the beacon),
+            // so the complementary gate can prove `stop_engine` does NOT force-detach a healthy engine.
+            shutdown_progress_check(coord);
             // Drain stragglers through `&mut`, then consume the coordinator for the final flush. An
             // in-flight index build is left durably `Populating`: it resumes and completes on the
             // next open via `TxnCoordinator::new`'s crash-recovery path (no force-drain needed —
@@ -3014,6 +3089,11 @@ where
     // checkpoint success never false-clears another's stall.
     let maintenance_degraded = MaintenanceDegraded::new();
     let loop_maintenance_degraded = maintenance_degraded.clone();
+    // The drain-progress beacon (`rmp` #563): created here so BOTH the engine thread (which installs it
+    // into the store and lets its long GC/flush loops heartbeat it) and the returned `EngineHandle`
+    // (which `stop_engine` polls) share the SAME `AtomicU64`.
+    let drain_progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let loop_drain_progress = Arc::clone(&drain_progress);
     let join = std::thread::Builder::new()
         .name("graphus-engine".to_owned())
         // A large stack: query compile/execute recurses on AST depth (`rmp` #473). See
@@ -3022,6 +3102,9 @@ where
         .stack_size(QUERY_ENGINE_STACK_SIZE)
         .spawn(move || match build() {
             Ok(coordinator) => {
+                // Install the shared drain-progress beacon into the store (`rmp` #563) so its long GC
+                // and flush loops heartbeat the SAME `AtomicU64` the handle exposes to `stop_engine`.
+                coordinator.set_drain_progress(loop_drain_progress);
                 // Startup succeeded: signal readiness, then run the loop until Shutdown. The loop
                 // spawns the off-thread reader pool internally (`rmp` task #336, Slice 3b-ii).
                 let _ = init_tx.send(Ok(()));
@@ -3054,7 +3137,7 @@ where
     // Wait for the thread's startup result before returning a usable handle.
     match init_rx.recv() {
         Ok(Ok(())) => Ok(Engine {
-            handle: EngineHandle::new(tx, metrics, degraded, maintenance_degraded),
+            handle: EngineHandle::new(tx, metrics, degraded, maintenance_degraded, drain_progress),
             join,
         }),
         Ok(Err(e)) => {
@@ -3132,6 +3215,7 @@ mod maintenance_tests {
                 &metrics,
                 &maintenance_degraded,
                 loading,
+                false,
             );
         }
 
@@ -3140,6 +3224,46 @@ mod maintenance_tests {
         // initial value and the WAL length itself is unchanged.
         assert_eq!(wal_at_last_maintenance, 0);
         assert_eq!(coordinator.as_ref().unwrap().wal_durable_len(), before);
+    }
+
+    /// `rmp` #565 GATE: on the loading→not-loading edge (`loading_just_ended == true`)
+    /// [`maybe_run_maintenance`] must **re-anchor its watermark to the current WAL length and skip the
+    /// GC pass**, even when the WAL has grown far past the ordinary interval — so the O(N) full-store
+    /// scan can never run synchronously as the tail of `End` and block the `Shutdown` a `STOP DATABASE`
+    /// queues right after it (the force-detach trigger this fix removes). We simulate "a large loaded
+    /// store" by pinning `wal_at_last_maintenance` far below the live WAL length: without the edge guard
+    /// this delta would exceed the 256 MiB interval and fire a checkpoint; with it, the pass is skipped
+    /// and the watermark jumps to the current length (never firing on the drain path).
+    #[test]
+    fn loading_just_ended_skips_the_gc_pass_and_reanchors_the_watermark() {
+        let device = graphus_io::MemBlockDevice::new(0);
+        let wal = graphus_wal::WalManager::create(graphus_wal::MemLogSink::new()).expect("wal");
+        let store: RecordStore<graphus_io::MemBlockDevice, graphus_wal::MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("store");
+        let mut coordinator = Some(TxnCoordinator::new(store));
+        // Pretend the WAL has grown a full interval past the last maintenance (a freshly loaded store),
+        // so the ordinary path WOULD fire a checkpoint. The edge guard must override that.
+        let mut wal_at_last_maintenance = 0u64;
+        let mut consecutive_failures = 0u32;
+        let metrics = Metrics::new();
+        let maintenance_degraded = MaintenanceDegraded::new();
+        let live = coordinator.as_ref().unwrap().wal_durable_len();
+
+        maybe_run_maintenance(
+            &mut coordinator,
+            &mut wal_at_last_maintenance,
+            &mut consecutive_failures,
+            &metrics,
+            &maintenance_degraded,
+            false, // session already cleared by the `End` handler
+            true,  // ...but it JUST ended: this is the edge
+        );
+
+        // Watermark re-anchored to the live WAL length (the pass was skipped, not run).
+        assert_eq!(
+            wal_at_last_maintenance, live,
+            "the loading-ended edge must re-anchor the maintenance watermark to the live WAL length"
+        );
     }
 
     /// rmp #394/#435 GATE: repeated maintenance-checkpoint failures increment the (aggregate) failure

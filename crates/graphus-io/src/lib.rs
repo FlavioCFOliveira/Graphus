@@ -51,6 +51,7 @@ mod file;
 mod fullsync;
 mod mem;
 mod replace;
+mod store_lock;
 
 // The async/network half is built on Tokio. Tokio's own `net`/runtime modules are
 // `#![cfg(not(loom))]`, so under `--cfg loom` `tokio::net` does not exist and these modules cannot
@@ -76,6 +77,7 @@ pub use file::FileBlockDevice;
 pub use fullsync::{full_sync_all, full_sync_data};
 pub use mem::{FaultPlan, MemBlockDevice, TORN_SECTOR_SIZE, sector_torn_image};
 pub use replace::{atomic_replace_file, sync_dir};
+pub use store_lock::{STORE_LOCK_FILE, StoreOpenLock};
 
 #[cfg(not(loom))]
 pub use backend::{IoBackend, probe_io_uring, select_backend};
