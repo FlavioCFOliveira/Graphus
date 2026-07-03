@@ -460,11 +460,111 @@ pub(crate) fn handle_bulk_import_batch<D: BlockDevice, S: LogSink>(
             // survived via ordinary WAL recovery. Without the fallback below, case (b) would silently
             // leave the sentinel node behind forever — `End` is meant to be a deliberate, explicit
             // session-close action, not something that only works when the process never crashed.
+            let session_was_active = session.is_some();
             let stats = match session.take() {
                 Some(sess) => sess.finish(coordinator)?,
                 None => recover_and_delete_orphaned_sentinel(coordinator)?,
             };
+            // `rmp` #579: drain the WAL backlog this Mode A load accumulated NOW, before the `End`
+            // reply is acked (and therefore before a following `STOP DATABASE`/`end_loading` can queue
+            // a `Shutdown`), so the next `START DATABASE` reopen does not materialise the whole
+            // un-reclaimed WAL into the ARIES recovery heap. Skipped for a genuine no-op `End` (no
+            // session was active and no orphaned sentinel carrying real counts was found) — there is
+            // nothing to reclaim and no reason to pay a full-store scan on an idle database. See
+            // [`reclaim_after_bulk_load`].
+            let loaded_something = session_was_active
+                || stats.nodes != 0
+                || stats.relationships != 0
+                || stats.properties != 0;
+            if loaded_something {
+                reclaim_after_bulk_load(coordinator);
+            }
             Ok(BulkImportBatchOutcome { stats })
+        }
+    }
+}
+
+/// Forces a one-shot **reclaiming checkpoint** at the end of a Mode A bulk-import session (`rmp` #579)
+/// so the WAL backlog the load accumulated is drained *before* the database is stopped — collapsing the
+/// ARIES recovery heap the next `START DATABASE` reopen would otherwise pay.
+///
+/// ## The bug this fixes
+///
+/// A Mode A load only ever *creates* rows, and `rmp` #556 deliberately widens the background
+/// maintenance cadence during a `Loading` session (to dodge its `O(N²)` full-store-GC cost), so the WAL
+/// reclaim floor — drained only by a GC **freeze** sweep — never advances during the load: the WAL grows
+/// to `O(edges)` (measured ≈ 1270 B/edge; ≈ 1.2 GB for 1 M edges, ≈ 9 GB for 7.2 M). At the subsequent
+/// `START DATABASE`, `graphus-wal` recovery materialises that whole un-reclaimed WAL into heap 2–3×
+/// (`recovery.rs`'s `log: Vec<u8>` + `ordered: Vec<LogRecord>`, plus `store.rs`'s
+/// `committed_transactions`), driving the reopen to ≈ 25 GB RSS on a 30 GB host — a near-OOM
+/// (`rmp` #579 / storage audit F3). This runs one GC freeze + checkpoint at session close, which lowers
+/// the reclaim floor and physically frees the WAL prefix below it, so the reopen reads almost nothing:
+/// the recovery heap drops from `O(edges)` toward `O(1)`. It also fixes the on-disk WAL amplification of
+/// the loaded database.
+///
+/// ## Why running it here does *not* re-introduce the `rmp` #565 force-detach hazard
+///
+/// This is called from inside the `End` command's synchronous handling, **before**
+/// [`handle_bulk_import_batch`] returns and therefore before the engine acks the `End` reply. The REST
+/// `?end=true` handler (`listeners::extra_routes::bulk_import::handle_end`) blocks on that reply and only
+/// *then* calls `end_loading`, which is what queues the engine's `Shutdown`. So on the ordinary,
+/// single-client `End`→`STOP` path the `Shutdown` cannot even be *queued* until this checkpoint has
+/// already completed — the engine is back parked on `recv` when it arrives and `stop_engine`'s drain
+/// deadline never races an in-flight checkpoint. This is the opposite ordering from the post-command
+/// `maybe_run_maintenance` sweep `rmp` #565 had to *skip* on the loading→not-loading edge: that sweep ran
+/// the checkpoint *after* the reply, while a `STOP DATABASE` could already have queued the `Shutdown`
+/// behind it, blocking the ack past the drain deadline and force-detaching a healthy engine (the
+/// `rmp` #555 corruption trigger). That skip stays; this replaces its deferred "reclaim on the ordinary
+/// cadence after the next `START`" — which never runs in time to stop the reopen itself from OOMing —
+/// with an eager, race-free reclaim *before* the stop.
+///
+/// One reachable *concurrent* window remains, and is safe for a different reason worth stating: because
+/// `handle_end` drives the `End` through the `loading_handle` **without** holding the catalog admin lock,
+/// another actor can take that lock and issue a plain `STOP DATABASE` on the `Loading` database — or a
+/// process-wide `shutdown_all` (SIGTERM) — *while* this checkpoint is in flight, queuing a `Shutdown`
+/// behind the in-flight `End` with `stop_engine`'s drain deadline already armed. This still does not
+/// reintroduce `rmp` #555: the reclaim is *not* an opaque stall — its GC freeze bumps the `rmp` #563
+/// drain-progress beacon every few thousand records and its checkpoint flush bumps it per double-write
+/// chunk, so `stop_engine`'s progress-aware drain classifies the engine as healthy-but-slow and never
+/// force-detaches it; and even in a pathological worst case the `store.lock` `flock` (also `rmp` #563) is
+/// the ultimate anti-corruption backstop — a force-detached thread holds it until it fully closes the
+/// store, so a concurrent reopen fails fast instead of racing (the actual #555 corruption mechanism).
+///
+/// ## Cost and failure handling
+///
+/// One-shot: a single `O(total store)` GC freeze + checkpoint, run once at session close — never the
+/// per-batch `O(N²)` cadence `rmp` #522/#556 guard against. The freeze is *required*, not optional: it
+/// is what drains the store's `unfrozen_commit_lsn` map and lowers the WAL reclaim floor; a reclaim that
+/// skipped it would free nothing.
+///
+/// Best-effort: a checkpoint failure leaves the store fully durable and consistent (the reclaim floor is
+/// always respected — [`TxnCoordinator::checkpoint`]'s contract), only the WAL un-reclaimed, i.e. the
+/// pre-fix reopen cost. It must therefore **never** fail the `End` response (the data landed and the
+/// session closed successfully); it is logged and swallowed, mirroring the background maintenance
+/// cadence's own non-fatal treatment of a checkpoint error (`crate::engine::maybe_run_maintenance`).
+fn reclaim_after_bulk_load<D: BlockDevice, S: LogSink>(coordinator: &mut TxnCoordinator<D, S>) {
+    match coordinator.checkpoint() {
+        Ok(report) => {
+            // `report.frozen` is the load-bearing signal: the freeze sweep settled that many committed
+            // MVCC stamps, draining the store's `unfrozen_commit_lsn` map and so lowering the WAL reclaim
+            // floor — which is what let the checkpoint physically free the WAL prefix below it. (The
+            // absolute retained-WAL shrink is not logged because the coordinator's `wal_durable_len` is a
+            // monotonic lifetime offset that reclamation never lowers, so it would read as growth, not a
+            // shrink; the drop is instead observed on disk / in RSS by the `rmp` #579 verification.)
+            tracing::info!(
+                reclaimed_versions = report.reclaimed,
+                frozen = report.frozen,
+                "bulk-import Mode A session end: reclaimed the WAL before the database is stopped, so \
+                 the next START DATABASE reopen does not replay it (rmp #579)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "bulk-import Mode A session end: the end-of-load reclaim checkpoint failed; the \
+                 database is fully durable but its WAL was not reclaimed, so the next START DATABASE \
+                 reopen will replay the full WAL (rmp #579, best-effort — never fatal)"
+            );
         }
     }
 }
@@ -709,6 +809,126 @@ mod tests {
         )
         .expect("retry batch");
         assert_eq!(out.stats.nodes, 2);
+    }
+
+    /// A [`LogSink`] over [`MemLogSink`] that records the highest `up_to` floor ever passed to
+    /// [`LogSink::reclaim`] (`rmp` #579), so a test can prove the end-of-load reclaiming checkpoint
+    /// actually ran and advanced the WAL reclaim floor. The coordinator surfaces no after-the-fact
+    /// "was the WAL reclaimed, and to where" hook, so a recording sink is the idiomatic observable
+    /// (mirrors `graphus_storage`'s own `SyncCountingSink` test pattern).
+    struct ReclaimSpySink {
+        inner: MemLogSink,
+        max_reclaim_up_to: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl LogSink for ReclaimSpySink {
+        fn append(&mut self, bytes: &[u8]) {
+            self.inner.append(bytes);
+        }
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn durable_len(&self) -> u64 {
+            self.inner.durable_len()
+        }
+        fn buffered_len(&self) -> u64 {
+            self.inner.buffered_len()
+        }
+        fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
+            self.inner.read_durable(from, into)
+        }
+        fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
+            self.inner.read_bounded(from, to, into)
+        }
+        fn reclaim(&mut self, from: u64, up_to: u64) -> Result<()> {
+            self.max_reclaim_up_to
+                .fetch_max(up_to, std::sync::atomic::Ordering::SeqCst);
+            self.inner.reclaim(from, up_to)
+        }
+        fn reclaimed_floor(&self) -> u64 {
+            self.inner.reclaimed_floor()
+        }
+    }
+
+    /// A coordinator over a [`ReclaimSpySink`] with the store's own auto-checkpoint cadence **disabled**
+    /// (`set_checkpoint_interval_bytes(0)`), so nothing reclaims during the load and any recorded reclaim
+    /// is provably attributable to the `End`-time checkpoint under test.
+    fn spy_coordinator() -> (
+        TxnCoordinator<MemBlockDevice, ReclaimSpySink>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let max_reclaim = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(ReclaimSpySink {
+            inner: MemLogSink::new(),
+            max_reclaim_up_to: Arc::clone(&max_reclaim),
+        })
+        .expect("create WAL");
+        let mut store = RecordStore::create(device, wal, 64, 1).expect("create store");
+        store.set_checkpoint_interval_bytes(0);
+        (TxnCoordinator::new(store), max_reclaim)
+    }
+
+    /// `rmp` #579: ending a Mode A session that ingested data must force a reclaiming checkpoint that
+    /// advances the WAL reclaim floor above the header — the mechanism that collapses the next
+    /// `START DATABASE` reopen's ARIES recovery heap from `O(edges)` toward `O(1)`.
+    #[test]
+    fn end_forces_a_reclaiming_checkpoint_that_advances_the_wal_floor() {
+        use std::sync::atomic::Ordering;
+        let (mut coord, max_reclaim) = spy_coordinator();
+        let mut session: Option<LoadingSession> = None;
+        let nh = node_header();
+
+        // Load many small node batches so the WAL grows well past the 8-byte header.
+        for i in 0..64u32 {
+            handle_bulk_import_batch(
+                &mut coord,
+                &mut session,
+                BulkImportBatchInput::Nodes {
+                    header: Arc::clone(&nh),
+                    records: vec![record(&[&i.to_string(), "Person", &format!("name{i}")])],
+                },
+            )
+            .expect("node batch");
+        }
+
+        // No reclaim has happened yet: the auto-checkpoint cadence is disabled and Mode A batches never
+        // reclaim on their own (the whole reason the WAL grew to O(edges) in the first place).
+        assert_eq!(
+            max_reclaim.load(Ordering::SeqCst),
+            0,
+            "nothing must reclaim the WAL during the load itself"
+        );
+
+        handle_bulk_import_batch(&mut coord, &mut session, BulkImportBatchInput::End).expect("end");
+
+        let floor = max_reclaim.load(Ordering::SeqCst);
+        assert!(
+            floor > 8,
+            "End must drive a reclaiming checkpoint that advances the WAL reclaim floor past \
+             HEADER_LEN (=8), got {floor}"
+        );
+        assert!(session.is_none(), "End clears the session");
+    }
+
+    /// `rmp` #579: a genuine no-op `End` (no session was ever active and no orphaned sentinel exists)
+    /// must NOT pay a reclaiming checkpoint — there is nothing loaded to reclaim, so no full-store GC
+    /// scan should run on an idle database.
+    #[test]
+    fn end_with_no_session_and_no_data_does_not_reclaim() {
+        use std::sync::atomic::Ordering;
+        let (mut coord, max_reclaim) = spy_coordinator();
+        let mut session: Option<LoadingSession> = None;
+
+        let out = handle_bulk_import_batch(&mut coord, &mut session, BulkImportBatchInput::End)
+            .expect("no-op end");
+        assert_eq!(out.stats.nodes, 0);
+        assert_eq!(
+            max_reclaim.load(Ordering::SeqCst),
+            0,
+            "a no-op End must not drive a reclaiming checkpoint"
+        );
+        assert!(session.is_none());
     }
 
     #[test]
