@@ -677,9 +677,14 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
             if let Some(t) = config_f64(args, 1, "tolerance") {
                 config.tolerance = t;
             }
-            // SEC-201: a real deadline-backed Cancel aborts a runaway run.
+            // SEC-201: a real deadline-backed Cancel aborts a runaway run. `rmp` #342/#559: PageRank is
+            // now data-parallel; route it onto the SHARED analytics pool (as centrality is, `rmp` #376)
+            // so the morsel + GDS thread budget stays bounded. Determinism is unaffected — the gather is
+            // bit-identical across pool widths.
             let result = with_deadline(|cancel| {
-                pagerank(&g, config, cancel).map_err(|e| gds_failure(NAME, e))
+                crate::morsel::run_on_analytics_pool(|| {
+                    pagerank(&g, config, cancel).map_err(|e| gds_failure(NAME, e))
+                })
             })?;
             Ok(id_score_rows(&g, &result.rank))
         }),
@@ -699,7 +704,9 @@ fn register_centrality(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.degree.stream";
             let g = get_projected(NAME, &cat, args)?;
-            let degrees = degree_centrality(&g, Direction::Out);
+            // `rmp` #342/#559: out-degree is now data-parallel; run it on the shared analytics pool.
+            let degrees =
+                crate::morsel::run_on_analytics_pool(|| degree_centrality(&g, Direction::Out));
             let scores: Vec<f64> = degrees.iter().map(|&d| d as f64).collect();
             Ok(id_score_rows(&g, &scores))
         }),
@@ -783,8 +790,11 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.wcc.stream";
             let g = get_projected(NAME, &cat, args)?;
+            // `rmp` #342/#559: WCC uses a lock-free parallel union-find; run it on the analytics pool.
             let result = with_deadline(|cancel| {
-                weakly_connected_components(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                crate::morsel::run_on_analytics_pool(|| {
+                    weakly_connected_components(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                })
             })?;
             Ok(id_component_rows(&g, &result.component))
         }),
@@ -830,8 +840,11 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
                 // SEC-202: validate, clamp to the policy ceiling, and keep >= 1 (LPA requires it).
                 config.max_iter = clamp_max_iter(NAME, m)?.max(1);
             }
+            // `rmp` #342/#559: the parallel synchronous LPA variant runs on the analytics pool.
             let result = with_deadline(|cancel| {
-                label_propagation(&g, config, cancel).map_err(|e| gds_failure(NAME, e))
+                crate::morsel::run_on_analytics_pool(|| {
+                    label_propagation(&g, config, cancel).map_err(|e| gds_failure(NAME, e))
+                })
             })?;
             Ok(id_component_rows(&g, &result.label))
         }),
@@ -851,8 +864,11 @@ fn register_community(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
         Box::new(move |args, _graph| {
             const NAME: &str = "gds.triangleCount.stream";
             let g = get_projected(NAME, &cat, args)?;
+            // `rmp` #342/#559: triangle counting is now node-parallel; run it on the analytics pool.
             let result = with_deadline(|cancel| {
-                triangle_count(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                crate::morsel::run_on_analytics_pool(|| {
+                    triangle_count(&g, cancel).map_err(|e| gds_failure(NAME, e))
+                })
             })?;
             let externals = g.external_ids();
             let mut rows = Vec::with_capacity(result.triangles.len());

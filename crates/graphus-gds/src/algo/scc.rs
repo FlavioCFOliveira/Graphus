@@ -4,6 +4,18 @@
 //! stack. This implementation drives the DFS with an **explicit heap-allocated work stack**, so its
 //! memory use is bounded by the heap, not the OS thread stack — the project mandate forbids any
 //! recursion whose depth scales with graph size.
+//!
+//! # Why this stays sequential (`rmp` #342 / #559)
+//!
+//! Tarjan's algorithm is a **single depth-first traversal** carrying running `index`/`lowlink` state:
+//! visiting a node depends on the exact order earlier nodes were entered and left, so the DFS cannot
+//! be split across cores without changing the algorithm. The genuinely parallel SCC algorithms
+//! (Forward-Backward / colour-propagation, e.g. Hong et al.) are a *different* algorithm class — a
+//! substantial rewrite with its own determinism and worst-case-behaviour considerations — deferred as
+//! out of scope here. The component ids this sequential Tarjan assigns (in finalization order) are
+//! already deterministic, so a caller needing reproducibility gets it today; only multi-core
+//! acceleration is deferred. Contrast **weakly** connected components, whose union-find *is*
+//! parallelised lock-free (see [`crate::algo::wcc`]).
 
 use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId};

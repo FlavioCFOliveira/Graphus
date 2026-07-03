@@ -3,10 +3,25 @@
 //! Both honour the projection's orientation (they traverse the stored out-edges, which for an
 //! undirected projection are already symmetric) and use the projection's weights when present;
 //! an unweighted projection is treated as uniform weight `1.0`.
+//!
+//! # Parallelism (`rmp` #342 / #559)
+//!
+//! A **single-source** Dijkstra is inherently sequential: its priority-queue frontier is a strict
+//! data dependency — each settled node can relax edges that change which node is settled next, so the
+//! order cannot be predetermined and split across cores. Bellman-Ford is likewise sequential across
+//! its relaxation rounds (round `r+1` depends on round `r`), and its per-round edge scan is a racing
+//! scatter. Both are therefore left **sequential** in their classic single-source form.
+//!
+//! The parallelism instead lives one level up, where it is embarrassingly parallel and deterministic:
+//! [`dijkstra_multi_source`] runs an **independent** Dijkstra **per source** across all cores (each
+//! source writes its own result), the same shape as
+//! [`closeness_centrality`](crate::algo::centrality::closeness_centrality). Weights are validated
+//! **once** up front so the per-source core skips the rescan.
 
 use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId};
 use crate::error::{GdsError, Result};
+use crate::execution::Execution;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -163,6 +178,41 @@ pub fn dijkstra_validated(
     }
 
     Ok(ShortestPaths { dist, predecessor })
+}
+
+/// **Multi-source** Dijkstra: computes the single-source shortest paths from **each** node in
+/// `sources`, in parallel across cores when the [`Execution`] knob and the source count allow
+/// (`rmp` #342 / #559).
+///
+/// This is the parallel entry point for weighted shortest paths (single-source Dijkstra is inherently
+/// sequential — see the module docs). Each source is an **independent** Dijkstra over the immutable
+/// projection writing its own `ShortestPaths`, so the loop fans across all cores with no shared mutable
+/// state, mirroring [`closeness_centrality`](crate::algo::centrality::closeness_centrality). The result
+/// is returned in the **same order** as `sources`, so it is deterministic regardless of pool width.
+///
+/// The non-negativity precondition is validated **once** for the whole graph (`SEC-209`), then each
+/// per-source Dijkstra uses the validated fast path — the validation is not re-paid per source.
+///
+/// # Complexity
+/// Time `O(|sources| · (n + m) · log n)` total work, divided across cores; space `O(n)` per active
+/// source plus the returned vector.
+///
+/// # Errors
+/// - [`GdsError::InvalidArgument`] if any weight is negative/non-finite, or any source is out of range.
+/// - [`GdsError::Cancelled`] if `cancel` fires (checked per source).
+pub fn dijkstra_multi_source(
+    graph: &CsrGraph,
+    sources: &[InternalId],
+    exec: Execution,
+    cancel: &Cancel<'_>,
+) -> Result<Vec<ShortestPaths>> {
+    // Validate the non-negativity precondition ONCE for the whole graph, not per source.
+    validate_weights_non_negative(graph)?;
+
+    exec.try_map(sources.len(), |i| {
+        cancel.check()?;
+        dijkstra_validated(graph, sources[i], cancel)
+    })
 }
 
 /// Bellman-Ford single-source shortest paths, with negative-cycle detection.

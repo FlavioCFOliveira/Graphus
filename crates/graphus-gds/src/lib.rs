@@ -35,6 +35,7 @@ pub mod cancel;
 pub mod catalog;
 pub mod csr;
 pub mod error;
+pub mod execution;
 
 pub use cancel::Cancel;
 pub use catalog::GraphCatalog;
@@ -42,6 +43,7 @@ pub use csr::{
     CsrBuilder, CsrGraph, ExternalId, GraphSource, InternalId, Orientation, SimpleUndirectedCsr,
 };
 pub use error::{GdsError, Result};
+pub use execution::{ExecMode, Execution};
 
 /// A tiny in-memory [`GraphSource`] backed by owned vectors, primarily for tests and examples.
 ///

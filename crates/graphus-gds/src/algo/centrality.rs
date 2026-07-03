@@ -29,70 +29,96 @@
 //! and parallel edges or self-loops never shorten a distance (they only add redundant relaxations of
 //! an already-discovered node), so it needs no de-duplication and is left to traverse the raw
 //! adjacency.
+//!
+//! ## Parallelism and determinism (`rmp` #342 / #376 / #421 / #559)
+//!
+//! Both centralities are **per-source data-parallel** over the immutable projection: each source's
+//! contribution is independent, so `rayon` fans the sources across all cores. The [`Execution`] knob
+//! selects sequential vs parallel; the default (via [`closeness_centrality`] / [`betweenness_centrality`])
+//! parallelises unconditionally, as before this refactor. Determinism is **bit-identical across pool
+//! widths**: closeness writes each source's score into its own result slot (order-preserving `map`),
+//! and betweenness folds the per-source dependency vectors in a fixed ascending source-id order (see
+//! `run_source` / `rmp` #421), so the answer never depends on how the work was split.
 
 use crate::cancel::Cancel;
 use crate::csr::{CsrGraph, InternalId, Orientation, SimpleUndirectedCsr};
 use crate::error::{GdsError, Result};
+use crate::execution::Execution;
 use rayon::prelude::*;
 use std::collections::VecDeque;
 
 use super::shortest_path::{dijkstra_validated, validate_weights_non_negative};
 
-/// Closeness centrality, indexed by internal id.
+/// Closeness centrality with the default [`Execution`] (unconditional parallelism), indexed by
+/// internal id.
+///
+/// A thin wrapper over [`closeness_centrality_with`].
 ///
 /// # Complexity
 /// Unweighted: `O(n · (n + m))` (a BFS per node). Weighted: `O(n · (n + m) log n)` (a Dijkstra per
 /// node). Space `O(n)` per source plus the result vector.
 ///
 /// # Errors
+/// See [`closeness_centrality_with`].
+pub fn closeness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec<f64>> {
+    // Threshold `0` = unconditional parallelism, preserving the pre-`#342` behaviour exactly (the
+    // pool-determinism tests rely on the small fixture genuinely running through `rayon`).
+    closeness_centrality_with(graph, Execution::parallel_with_threshold(0), cancel)
+}
+
+/// Closeness centrality with an explicit [`Execution`] knob, indexed by internal id.
+///
+/// # Determinism
+/// Bit-identical across [`Execution`] modes and `rayon` pool widths: each source writes its own result
+/// slot exactly once, so the vector never depends on the split.
+///
+/// # Errors
 /// - [`crate::error::GdsError::Cancelled`] if `cancel` fires (checked per source).
 /// - Propagates Dijkstra precondition errors (negative weights) for weighted graphs.
-pub fn closeness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec<f64>> {
+pub fn closeness_centrality_with(
+    graph: &CsrGraph,
+    exec: Execution,
+    cancel: &Cancel<'_>,
+) -> Result<Vec<f64>> {
     let n = graph.node_count();
     if n <= 1 {
         return Ok(vec![0.0f64; n]);
     }
     let nf = (n - 1) as f64;
 
-    // SEC-209: validate the non-negativity precondition ONCE, not once per source. Previously the
-    // per-source Dijkstra re-scanned all `m` edges on every call, making the validation alone
-    // `O(n·m)` on a weighted graph. With the single up-front scan the per-source path uses
-    // `dijkstra_validated`, which skips the rescan.
+    // SEC-209: validate the non-negativity precondition ONCE, not once per source, so the per-source
+    // path can use `dijkstra_validated` (which skips the rescan).
     if graph.is_weighted() {
         validate_weights_non_negative(graph)?;
     }
 
     // Each source's closeness is computed independently over the immutable CSR and lands in its own
-    // result slot, so the per-source loop is data-parallel (rayon) with no shared mutable state and
-    // a deterministic, order-independent result (each slot is written exactly once).
-    (0..n)
-        .into_par_iter()
-        .map(|s| -> Result<f64> {
-            cancel.check()?;
-            // distances from s
-            let (sum, reachable) = if graph.is_weighted() {
-                let sp = dijkstra_validated(graph, s as InternalId, cancel)?;
-                let mut sum = 0.0f64;
-                let mut reachable = 0usize;
-                for d in sp.dist.into_iter().flatten() {
-                    sum += d;
-                    reachable += 1;
-                }
-                (sum, reachable)
-            } else {
-                bfs_distance_sum(graph, s as InternalId)
-            };
+    // result slot, so the per-source loop is data-parallel with no shared mutable state and a
+    // deterministic, order-independent result (each slot is written exactly once).
+    exec.try_map(n, |s| -> Result<f64> {
+        cancel.check()?;
+        let (sum, reachable) = if graph.is_weighted() {
+            let sp = dijkstra_validated(graph, s as InternalId, cancel)?;
+            let mut sum = 0.0f64;
+            let mut reachable = 0usize;
+            for d in sp.dist.into_iter().flatten() {
+                sum += d;
+                reachable += 1;
+            }
+            (sum, reachable)
+        } else {
+            bfs_distance_sum(graph, s as InternalId)
+        };
 
-            // reachable includes s itself (distance 0). Need at least one other reachable node.
-            Ok(if reachable > 1 && sum > 0.0 {
-                let r_minus_1 = (reachable - 1) as f64;
-                // Wasserman-Faust: (r-1)/(n-1) * (r-1)/sum
-                (r_minus_1 / nf) * (r_minus_1 / sum)
-            } else {
-                0.0
-            })
+        // reachable includes s itself (distance 0). Need at least one other reachable node.
+        Ok(if reachable > 1 && sum > 0.0 {
+            let r_minus_1 = (reachable - 1) as f64;
+            // Wasserman-Faust: (r-1)/(n-1) * (r-1)/sum
+            (r_minus_1 / nf) * (r_minus_1 / sum)
+        } else {
+            0.0
         })
-        .collect()
+    })
 }
 
 /// BFS from `source`; returns `(sum_of_distances, reachable_node_count_including_source)`.
@@ -120,58 +146,81 @@ fn bfs_distance_sum(graph: &CsrGraph, source: InternalId) -> (f64, usize) {
     (sum, reachable)
 }
 
-/// Raw betweenness centrality via Brandes' algorithm (unweighted, BFS-based).
+/// Raw betweenness centrality via Brandes' algorithm, with the default [`Execution`] (unconditional
+/// parallelism).
+///
+/// A thin wrapper over [`betweenness_centrality_with`].
 ///
 /// The returned scores are *raw* (un-normalized) betweenness: for directed graphs they sum over all
 /// ordered `(s, t)` pairs; for an undirected projection each unordered pair is implicitly counted in
-/// both directions, so the conventional undirected score is `raw / 2` (the tests divide accordingly
-/// and document the choice).
+/// both directions, so the conventional undirected score is `raw / 2` ([`undirected_scale`]).
 ///
 /// # Complexity
-/// Time `O(n · m)`, space `O(n + m)` per source (BFS layers, sigma, delta, predecessor lists). This
-/// is the classic Brandes bound; no all-pairs distance matrix is materialized.
+/// Time `O(n · m)`, space `O(n + m)` per source. This is the classic Brandes bound.
 ///
 /// # Errors
-/// [`crate::error::GdsError::Cancelled`] if `cancel` fires (checked per source).
+/// See [`betweenness_centrality_with`].
 pub fn betweenness_centrality(graph: &CsrGraph, cancel: &Cancel<'_>) -> Result<Vec<f64>> {
+    betweenness_centrality_with(graph, Execution::parallel_with_threshold(0), cancel)
+}
+
+/// Raw betweenness centrality via Brandes' algorithm, with an explicit [`Execution`] knob.
+///
+/// # Determinism (`rmp` #421)
+/// **Bit-identical across pool widths.** The per-source dependency vectors are collected in input
+/// (source-id) order and folded serially in that fixed order; f64 addition is non-associative, so
+/// fixing the fold order makes the betweenness identical regardless of thread count. The expensive
+/// per-source BFS + dependency accumulation stays fully parallel; only the final `O(n²)` accumulation
+/// is serialized into a deterministic order.
+///
+/// # Errors
+/// - [`crate::error::GdsError::Cancelled`] if `cancel` fires (checked per source).
+/// - [`GdsError::Overflow`] if a source's shortest-path count exceeds f64 range.
+pub fn betweenness_centrality_with(
+    graph: &CsrGraph,
+    exec: Execution,
+    cancel: &Cancel<'_>,
+) -> Result<Vec<f64>> {
     let n = graph.node_count();
     if n == 0 {
         return Ok(Vec::new());
     }
 
-    // `rmp` #416: σ counts *distinct* shortest paths over a *simple* graph, so the BFS must traverse
-    // the de-duplicated (parallel-edge-free, self-loop-free) adjacency that honours the projection's
-    // orientation — not the raw multigraph CSR.
+    // `rmp` #416: σ counts *distinct* shortest paths over a *simple* graph, so the BFS traverses the
+    // de-duplicated adjacency that honours the projection's orientation — not the raw multigraph CSR.
     let adj: &SimpleUndirectedCsr = match graph.orientation() {
         Orientation::Undirected => graph.simple_undirected_csr(),
         Orientation::Directed => graph.simple_directed_csr(),
     };
 
-    // Brandes accumulates an independent single-source dependency per source `s`; the sources are
-    // data-parallel over the immutable adjacency. Each rayon task carries private scratch buffers
-    // (`BrandesScratch`) and produces that source's *own* dependency contribution as a private
-    // `Vec<f64>`.
-    //
-    // `rmp` #421 — determinism: the per-source contributions are summed in a **fixed (ascending
-    // source-id) order**, independent of how rayon splits the work. We collect the per-source delta
-    // vectors into a source-indexed `Vec` (`into_par_iter().map(...).collect()` preserves input
-    // order) and fold them serially in id order. f64 addition is non-associative, so a
-    // split-dependent reduction order (the previous `try_reduce`) made the result thread-count
-    // dependent; fixing the fold order makes the betweenness **bit-identical** across pool widths.
-    // The expensive per-source BFS + dependency accumulation stays fully parallel; only the final
-    // O(n²) accumulation is serialized into a deterministic order.
-    let per_source: Vec<Vec<f64>> = (0..n)
-        .into_par_iter()
-        .map_init(
-            || BrandesScratch::new(n),
-            |scratch, s| -> Result<Vec<f64>> {
+    // Each source produces its own private dependency contribution (`BrandesScratch::acc`), collected
+    // in source-id order. The sources are data-parallel; each rayon task carries private scratch.
+    let per_source: Vec<Vec<f64>> = if exec.is_parallel(n) {
+        (0..n)
+            .into_par_iter()
+            .map_init(
+                || BrandesScratch::new(n),
+                |scratch, s| -> Result<Vec<f64>> {
+                    cancel.check()?;
+                    scratch.run_source(adj, s)?;
+                    Ok(scratch.acc.clone())
+                },
+            )
+            .collect::<Result<Vec<Vec<f64>>>>()?
+    } else {
+        // Sequential: reuse a single scratch across all sources.
+        let mut scratch = BrandesScratch::new(n);
+        (0..n)
+            .map(|s| -> Result<Vec<f64>> {
                 cancel.check()?;
                 scratch.run_source(adj, s)?;
                 Ok(scratch.acc.clone())
-            },
-        )
-        .collect::<Result<Vec<Vec<f64>>>>()?;
+            })
+            .collect::<Result<Vec<Vec<f64>>>>()?
+    };
 
+    // `rmp` #421: fold the per-source contributions in a fixed ascending source-id order so the sum is
+    // bit-identical regardless of how rayon split the source loop.
     let mut acc = vec![0.0f64; n];
     for contribution in &per_source {
         for (x, y) in acc.iter_mut().zip(contribution.iter()) {
