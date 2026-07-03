@@ -192,6 +192,24 @@ struct ActiveTxn {
     /// high-water floor). A normal write transaction pushes nothing here (it only *pops* ids via
     /// [`alloc_id`](RecordStore::alloc_id)), so this stays empty for it.
     freed_ids: Vec<(StoreKind, u64)>,
+    /// Physical ids this transaction **popped** (reused) from a store's free list via
+    /// [`alloc_id`](RecordStore::alloc_id) (`rmp` #581). On a **live** rollback each such reused id was
+    /// never actually consumed (the transaction aborted), so its slot should return to the free list —
+    /// but ONLY when it did not become a live-referenced **corpse** (a concurrently-committed writer
+    /// prepended onto it, the `rmp` #220/#172 pattern, which the GC corpse splice owns). The rollback
+    /// re-pushes exactly the genuinely-UNREFERENCED pops
+    /// ([`reclaim_aborted_pops`](RecordStore::reclaim_aborted_pops)); the rest are left for GC, never
+    /// double-freed. Empty for a GC pass (which only frees, never pops). This is the symmetric
+    /// reclaim that closes the bounded space leak the #578 fix documented.
+    popped_ids: Vec<(StoreKind, u64)>,
+    /// The `(owner_kind, owner_id)` a popped **property** id was prepended onto (`rmp` #581). A prop
+    /// record carries no back-pointer to its owner, so — unlike a relationship (whose endpoints live
+    /// in its own body) — the rollback needs the owner to walk the chain and decide whether the popped
+    /// prop became a live-referenced corpse. Recorded by [`add_node_property`](RecordStore::add_node_property)
+    /// / [`add_rel_property`](RecordStore::add_rel_property) only for ids that were pops (a subset of
+    /// `popped_ids`, so bounded by the free list size at begin). A popped prop with no recorded owner
+    /// is conservatively **not** re-pushed (a safe leak, never a double-free).
+    popped_prop_owners: Vec<(u64, StoreKind, u64)>,
 }
 
 /// What one [`RecordStore::gc`] pass did (observability, NFR-10; `rmp` task #59).
@@ -1102,6 +1120,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // A freed id is reused first: its store page already exists (the record once lived there), so
         // no growth — and no fallibility — is needed.
         if let Some(id) = self.store_mut(kind).free.pop() {
+            // Record the pop so a live rollback can return this reused id to the free list if the
+            // transaction aborts without the slot becoming a live-referenced corpse (`rmp` #581).
+            // Mirrors the `SYSTEM_TXN` guard of `note_created`/`free_push`: the system transaction
+            // never pops-then-aborts and is never rolled back.
+            if txn != SYSTEM_TXN {
+                self.active
+                    .entry(txn)
+                    .or_default()
+                    .popped_ids
+                    .push((kind, id));
+            }
             return Ok(id);
         }
         // Fresh id: `alloc_fresh` first (it fails closed at the `u64::MAX` ceiling, `rmp` #452, so we
@@ -1610,9 +1639,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Capture the pre-image (`old_word`) under a read latch before the overwrite — the frame stays
         // pinned across the two sequential latches (`rmp` #337, Slice 1), exactly as `write_region` /
         // `write_chain_head` do.
-        let old_word = self
-            .pool
-            .with_page(f, |p| u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice")));
+        let old_word = self.pool.with_page(f, |p| {
+            u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+        });
         // Redo is a plain, unconditional post-image (byte-identical to `patch_header_word`'s redo, so
         // recovery redo is unchanged). Undo is the compare-and-set: reset to `old_word` iff the word is
         // still `new_word` (this txn's own stamp). Redo lent by borrow; undo retained by value.
@@ -1784,6 +1813,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .or_default()
                 .freed_ids
                 .push((kind, id));
+        }
+    }
+
+    /// Records that property `pid` was prepended onto `(owner_kind, owner_id)` — but only if `pid` was
+    /// a **popped** (reused) id of `txn` (`rmp` #581). A prop carries no owner back-pointer, so the
+    /// rollback needs this to walk the owner's chain and decide whether an aborted pop became a live
+    /// corpse. Recorded lazily (only for pops), so a transaction that never reuses a freed prop id
+    /// stores nothing. Mirrors the `SYSTEM_TXN` guard of [`free_push`](Self::free_push).
+    fn note_popped_prop_owner(
+        &mut self,
+        txn: TxnId,
+        pid: u64,
+        owner_kind: StoreKind,
+        owner_id: u64,
+    ) {
+        if txn == SYSTEM_TXN {
+            return;
+        }
+        if let Some(a) = self.active.get_mut(&txn)
+            && a.popped_ids
+                .iter()
+                .any(|&(k, id)| k == StoreKind::Prop && id == pid)
+        {
+            a.popped_prop_owners.push((pid, owner_kind, owner_id));
         }
     }
 
@@ -2084,12 +2137,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is reverted by the WAL undo below, and the commit timestamp was never issued (only
         // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
         // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
-        // GC pass populates `freed_ids`; a normal write transaction's is empty.
-        let aborted_freed_ids = self
-            .active
-            .remove(&txn)
-            .map(|a| a.freed_ids)
-            .unwrap_or_default();
+        // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
+        // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
+        // own reused-id pops can be RECLAIMED to the free list after the restore below.
+        let ActiveTxn {
+            freed_ids: aborted_freed_ids,
+            popped_ids: aborted_popped_ids,
+            popped_prop_owners: aborted_prop_owners,
+            ..
+        } = self.active.remove(&txn).unwrap_or_default();
         // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
         // the SAME monotonicity hazard as the high-water / token / device-page state restored below,
         // but — unlike them — is NOT monotonic (ids are popped as well as pushed), so it cannot use a
@@ -2217,9 +2273,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // stays OUT of the free list and is never double-allocated. Withdrawing `aborted_freed_ids`
         // undoes a GC pass's reclamations: the WAL undo above just restored each reclaimed record's
         // `in_use` bit, so its slot must NOT remain free. A normal write transaction pushes nothing,
-        // so its `pre_free` is restored verbatim and its own POPS are left as leaked corpses —
-        // exactly the #220 corpse model (a rolled-back creation never re-frees its slot; GC's corpse
-        // reclamation collects it later). Ordering is irrelevant: `aborted_freed_ids` and the
+        // so its `pre_free` is restored verbatim. Ordering is irrelevant: `aborted_freed_ids` and the
         // concurrent pops are disjoint id sets (a popped id is off the list; a freed id was in use).
         for (i, pf) in pre_free.into_iter().enumerate() {
             self.stores[i].free = pf;
@@ -2227,7 +2281,166 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for (kind, id) in aborted_freed_ids {
             self.stores[kind as usize].free.remove_id(id);
         }
+        // `rmp` #581: RECLAIM this transaction's own reused-id pops. Every pop the abort left as a
+        // genuinely-unreferenced dead slot returns to the free list (bounded by the pops the txn made);
+        // pops that a concurrently-committed writer turned into a live corpse are left for the #220/#172
+        // GC splice, never double-freed. Runs AFTER the free-list restore above so a re-push cannot be
+        // undone by it, and after the WAL undo (which reverted each pop's slot to `!in_use`).
+        self.reclaim_aborted_pops(&aborted_popped_ids, &aborted_prop_owners);
         Ok(())
+    }
+
+    /// Returns this aborting transaction's genuinely-**unused** reused-id pops to the free list
+    /// (`rmp` #581) — the symmetric reclaim the #578 fix left as a documented bounded leak.
+    ///
+    /// A physical id this transaction popped from the free list (`popped_ids`) and then aborted was
+    /// never actually consumed, so its slot ought to be free again. The WAL undo has already reverted
+    /// each such slot to `!in_use`. It is safe to re-push **only** when the slot is not part of any
+    /// live chain: if a concurrently-committed writer prepended onto it (the `rmp` #220/#172 pattern),
+    /// the slot is a **live-referenced corpse** the GC splice owns, and re-pushing it would hand a
+    /// still-threaded slot back to the allocator — the exact `rmp` #578 double-allocation, in reverse.
+    /// So each pop is re-pushed only after a per-kind **referenced** check:
+    ///
+    /// * **Node** — a node is a chain *anchor*, never a chain member, and a committed relationship
+    ///   cannot reference an uncommitted-then-aborted node (MVCC hides it). Safe once `!in_use`.
+    /// * **Strings** — overflow-heap blocks are built into a property's *private* chain that is never
+    ///   shared or prepended onto by another transaction, so an aborted pop is never referenced. Safe
+    ///   once `!in_use`.
+    /// * **Rel** — walk the two endpoint incidence chains (the endpoints live in the corpse's own
+    ///   preserved body); re-push only if the slot is not threaded into either.
+    /// * **Prop** — walk the recorded owner's property chain; re-push only if the slot is not threaded
+    ///   into it. A popped prop with no recorded owner is conservatively NOT re-pushed (a safe leak).
+    ///
+    /// Best-effort and never fatal: any read/walk error skips that id (leaving it leaked, the pre-#581
+    /// behaviour) rather than failing the rollback — the reclaim is a space optimisation, never a
+    /// durability obligation.
+    fn reclaim_aborted_pops(
+        &mut self,
+        popped_ids: &[(StoreKind, u64)],
+        prop_owners: &[(u64, StoreKind, u64)],
+    ) {
+        for &(kind, id) in popped_ids {
+            // Never create a duplicate free-list entry (a re-pushed id must be unique).
+            if self.store(kind).free.ids().contains(&id) {
+                continue;
+            }
+            let safe = match kind {
+                // Anchors / private heap blocks: unreferenced once their slot is reverted to `!in_use`.
+                StoreKind::Node => matches!(self.read_node(id), Ok(n) if !n.mvcc.in_use()),
+                StoreKind::Strings => matches!(self.read_block(id), Ok(b) if !b.mvcc.in_use()),
+                StoreKind::Rel => match self.read_rel(id) {
+                    Ok(r) if !r.mvcc.in_use() => {
+                        // Endpoints come from the corpse's own preserved body (`rmp` #220): a
+                        // header-only creation undo keeps the record body intact.
+                        !self.rel_slot_referenced(id, &r).unwrap_or(true)
+                    }
+                    _ => false,
+                },
+                StoreKind::Prop => match self.read_prop(id) {
+                    Ok(p) if !p.mvcc.in_use() => {
+                        match prop_owners.iter().find(|&&(pid, _, _)| pid == id) {
+                            Some(&(_, owner_kind, owner_id)) => !self
+                                .prop_chain_visits(owner_kind, owner_id, id)
+                                .unwrap_or(true),
+                            // Owner unknown ⇒ cannot prove it is unreferenced ⇒ leave it (safe leak).
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                },
+            };
+            if safe {
+                self.store_mut(kind).free.push(id);
+            }
+        }
+    }
+
+    /// Whether relationship slot `id` (whose current image is `rel`) is still threaded into either of
+    /// its endpoints' incidence chains (`rmp` #581 corpse check). Walks each endpoint chain from the
+    /// node's `first_rel`, so it is robust to the corpse's own possibly-stale link pointers — exactly
+    /// the walk-driven discipline [`gc_splice_corpses`](Self::gc_splice_corpses) uses.
+    fn rel_slot_referenced(&mut self, id: u64, rel: &RelRecord) -> Result<bool> {
+        if rel.start_node != NULL_ID && self.chain_visits_rel(rel.start_node, id)? {
+            return Ok(true);
+        }
+        if rel.end_node != NULL_ID
+            && rel.end_node != rel.start_node
+            && self.chain_visits_rel(rel.end_node, id)?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether `target` appears as a link in node `node_id`'s incidence chain (`rmp` #581). Mirrors
+    /// [`read_view::incident_rels`](crate::read_view)'s walk exactly (same self-loop side selection,
+    /// same threading through `!in_use` corpse links, same `2 * high_water + 2` cycle guard), but
+    /// returns as soon as it reaches `target` rather than collecting live rels.
+    fn chain_visits_rel(&mut self, node_id: u64, target: u64) -> Result<bool> {
+        let mut cur = self.read_node(node_id)?.first_rel;
+        let guard = self
+            .store(StoreKind::Rel)
+            .alloc
+            .high_water()
+            .saturating_mul(2)
+            .saturating_add(2);
+        let mut steps = 0u64;
+        let mut prev_link = NULL_ID;
+        while cur != NULL_ID {
+            if cur == target {
+                return Ok(true);
+            }
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "incidence chain of node {node_id} is malformed (cycle?)"
+                )));
+            }
+            let r = self.read_rel(cur)?;
+            let is_loop = r.start_node == node_id && r.end_node == node_id;
+            let next = if is_loop {
+                let (end_prev, end_next) = r.chain_pointers(ChainSide::End);
+                if end_prev == prev_link || prev_link == NULL_ID {
+                    end_next
+                } else {
+                    r.chain_pointers(ChainSide::Start).1
+                }
+            } else if r.start_node == node_id {
+                r.start_next_rel
+            } else {
+                r.end_next_rel
+            };
+            prev_link = cur;
+            cur = next;
+        }
+        Ok(false)
+    }
+
+    /// Whether `target` appears in the property chain of `(owner_kind, owner_id)` (`rmp` #581). A
+    /// singly-linked walk from the owner's `first_prop` following `next_prop`, cycle-guarded by the
+    /// `Prop` high-water, mirroring [`gc_property_chain`](Self::gc_property_chain)'s traversal.
+    fn prop_chain_visits(
+        &mut self,
+        owner_kind: StoreKind,
+        owner_id: u64,
+        target: u64,
+    ) -> Result<bool> {
+        let mut cur = self.owner_first_prop(owner_kind, owner_id)?;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            if cur == target {
+                return Ok(true);
+            }
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of {owner_kind:?} {owner_id} is malformed (cycle?)"
+                )));
+            }
+            cur = self.read_prop(cur)?.next_prop;
+        }
+        Ok(false)
     }
 
     /// Rebuilds the in-memory catalog from the durable metadata page.
@@ -3319,6 +3532,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop, txn)?;
+        // `rmp` #581: if `pid` reused a freed slot, remember its owner so a live rollback can decide
+        // whether the popped id became a live-referenced corpse (walk this node's prop chain) or a
+        // reclaimable dead slot.
+        self.note_popped_prop_owner(txn, pid, StoreKind::Node, node_id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp. Until then the version is visible only
         // to its own transaction.
@@ -3733,6 +3950,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop, txn)?;
+        // `rmp` #581: remember the owner of a reused prop slot for the rollback corpse check.
+        self.note_popped_prop_owner(txn, pid, StoreKind::Rel, rel_id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
@@ -5530,6 +5749,164 @@ mod tests {
             vec![(v0, key, Value::Integer(1))],
             "the property is readable again after the abort"
         );
+    }
+
+    /// Commits a node H with one property, then deletes that property and GCs, so its physical id `P`
+    /// is freed and the durably-committed `Prop` free list is exactly `[P]`. Returns `(h, key, P)`.
+    fn setup_freed_prop_slot(s: &mut Store) -> (u64, u32, u64) {
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (h, _) = s.create_node(t0).unwrap();
+        let p = s.add_node_property(t0, h, key, 1, 0x10).unwrap();
+        s.commit(t0).unwrap();
+        let t_del = TxnId(2);
+        s.begin(t_del);
+        s.remove_node_property_value(t_del, h, key).unwrap();
+        s.commit(t_del).unwrap();
+        let wm = s.snapshot_ts();
+        s.begin(TxnId(3));
+        s.gc(TxnId(3), wm).unwrap();
+        s.commit(TxnId(3)).unwrap();
+        assert_eq!(
+            s.store(StoreKind::Prop).free.ids(),
+            &[p],
+            "setup: the deleted property's slot P is on the free list after GC"
+        );
+        (h, key, p)
+    }
+
+    /// `rmp` #581: an aborting transaction's OWN reused-id pop that ends up UNREFERENCED is returned to
+    /// the free list (reclaimed), closing the reuse-then-abort bounded space leak the #578 fix
+    /// documented. Deterministic RecordStore repro (the #578 DST-harness style).
+    #[test]
+    fn aborted_unreferenced_pop_is_reclaimed_to_the_free_list_581() {
+        let mut s = fresh();
+        let (h, key, p) = setup_freed_prop_slot(&mut s);
+
+        // T1 pops P (reuses the freed slot) as a new property head, then aborts with NO concurrent
+        // prepend, so the chain-head CAS undo unlinks P and it ends up unreferenced.
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
+        assert_eq!(
+            reused, p,
+            "T1 popped the freed slot P (precondition reached)"
+        );
+        assert!(
+            s.store(StoreKind::Prop).free.is_empty(),
+            "P is off the free list while T1 holds it"
+        );
+        s.rollback(t1).unwrap();
+
+        // #581: P was never consumed (T1 aborted) and is unreferenced, so it is BACK on the free list.
+        assert_eq!(
+            s.store(StoreKind::Prop).free.ids(),
+            &[p],
+            "rmp #581: the aborted unreferenced pop is reclaimed to the free list"
+        );
+        // Observable end-to-end: the next allocation reuses P (pre-#581 it leaked and allocated fresh).
+        let t2 = TxnId(5);
+        s.begin(t2);
+        let again = s.add_node_property(t2, h, key, 1, 0x30).unwrap();
+        assert_eq!(
+            again, p,
+            "the reclaimed slot P is reused by the next allocation"
+        );
+        s.commit(t2).unwrap();
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after #581 reclaim + reuse: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #581 (safety boundary): an aborting transaction's own reused-id pop that a
+    /// concurrently-committed writer prepended onto is a LIVE-REFERENCED corpse (the #220/#172
+    /// pattern) and MUST NOT be re-pushed — re-freeing a still-threaded slot would be the #578
+    /// double-allocation in reverse. It stays a corpse the GC property-chain splice reclaims, and the
+    /// storage consistency checker stays green throughout.
+    #[test]
+    fn aborted_pop_that_became_a_live_corpse_is_not_reclaimed_581() {
+        let mut s = fresh();
+        let (h, key, p) = setup_freed_prop_slot(&mut s);
+
+        // T1 pops P and links it as H's property head, staying OPEN.
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
+        assert_eq!(reused, p, "T1 popped the freed slot P");
+
+        // A concurrent committed writer C prepends a NEW property Q on TOP of P (so P becomes
+        // referenced by Q.next_prop). C allocates fresh — T1's pop emptied the free list.
+        let c = TxnId(5);
+        s.begin(c);
+        let q = s.add_node_property(c, h, key + 1, 1, 0x30).unwrap();
+        assert_ne!(q, p, "C allocates a fresh slot (T1 emptied the free list)");
+        s.commit(c).unwrap();
+
+        // T1 aborts (non-LIFO relative to C): P is now a live-referenced corpse (H -> Q -> P -> NULL).
+        s.rollback(t1).unwrap();
+        assert!(
+            s.store(StoreKind::Prop).free.is_empty(),
+            "rmp #581: a referenced-corpse pop must NOT be reclaimed (no double-free of a threaded slot)"
+        );
+        assert!(
+            !s.property(p).unwrap().mvcc.in_use(),
+            "P is a not-in-use corpse threaded below the committed prepend"
+        );
+        // The checker tolerates the corpse threaded in the live chain (no StillInUse / ReferencedByLiveChain).
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "corpse-threaded chain is consistent: {:?}",
+            report.violations
+        );
+        // A subsequent allocation does NOT hand out the still-referenced corpse slot P.
+        let t2 = TxnId(6);
+        s.begin(t2);
+        let fresh_id = s.add_node_property(t2, h, key + 2, 1, 0x40).unwrap();
+        assert_ne!(
+            fresh_id, p,
+            "the corpse slot P is not handed out (still referenced)"
+        );
+        s.commit(t2).unwrap();
+
+        // GC reclaims the corpse P via the property-chain splice; the checker stays green.
+        let wm2 = s.snapshot_ts();
+        s.begin(TxnId(7));
+        s.gc(TxnId(7), wm2).unwrap();
+        s.commit(TxnId(7)).unwrap();
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after GC reclaims the corpse: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #581: a reused-id pop that a transaction COMMITS is untouched — the pop reclaim fires only
+    /// on rollback, and a committed reuse is a live record, never returned to the free list.
+    #[test]
+    fn committed_pop_is_not_reclaimed_581() {
+        let mut s = fresh();
+        let (h, key, p) = setup_freed_prop_slot(&mut s);
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
+        assert_eq!(reused, p);
+        s.commit(t1).unwrap();
+        assert!(
+            s.store(StoreKind::Prop).free.is_empty(),
+            "a committed reuse leaves nothing on the free list"
+        );
+        assert!(
+            s.property(p).unwrap().mvcc.in_use(),
+            "the committed reused slot holds a live record"
+        );
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(report.is_consistent(), "{:?}", report.violations);
     }
 
     #[test]
