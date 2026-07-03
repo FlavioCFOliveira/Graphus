@@ -23,6 +23,8 @@ The server implements, in an exemplary manner, all official software-development
 
 The Graphus server is developed with a focus on maximizing performance without leaving out any functionality, taking advantage of the available hardware capabilities (from the most basic to the most advanced).
 
+**Parallelism is a foundational design principle.** Graphus is engineered, from its very foundations, to exploit the multi-core / multi-thread architectures of modern processors, with the explicit objective of maximizing performance. Concurrency is designed into the system from the component level upward rather than bolted on afterwards: **both the write path and the read path are highly optimized to execute in parallel**, and the server is built to scale its work across **all available CPU cores** so that it extracts the fullest possible throughput from the hardware it runs on.
+
 ### Connections
 
 Three types of connection are available to access and use the server. Two of them speak the **Bolt** protocol (with **PackStream** serialization), and one speaks HTTP:
@@ -93,6 +95,20 @@ Whenever you find pre-existing bugs, you MUST fix them on the spot and then cont
 ## Production-oriented
 
 Throughout the entire work cycle (analysis → planning → development → testing), the goal MUST be that the produced result is **production-grade**. Apply not only your maximum knowledge but also your maximum diligence to ensure that you only ever work toward code that is ready to be used in production.
+
+## Subagent team
+
+Graphus is built by a **team**, not by a lone generalist. In addition to your own work, you have a roster of **specialized subagents** defined both at the **user level** (`~/.claude/agents/`) and at the **project level** (`.claude/agents/`). You MUST treat these subagents as **members of the working team** and actively put them to work.
+
+1. **Know your team.** You MUST be aware of which subagents are available (user-level and project-level) and what each one specializes in. The roster includes deep specialists across the project's domains — for example, and non-exhaustively: the Bolt protocol, PackStream, storage engines, concurrency and parallelism, Rust engineering and profiling, columnar / NoSQL / graph-theory knowledge, security research, specification management, and releases.
+
+2. **They act and intervene whenever their specialty is useful.** A specialist MUST act and intervene **whenever its expertise adds value to the work at hand — not only when explicitly asked**. Delegate proactively: route each piece of work to the subagent best suited to it, and call in the relevant specialist to design, review, audit, or certify anything that touches their domain (for example: a storage change reviewed by the storage auditor; security-sensitive code vetted by the security researcher; Bolt / PackStream work validated by the respective protocol experts) — including proactively, before a task is closed.
+
+3. **Maximum effort, every time.** Each subagent MUST behave like a **top professional hired to give their absolute best** on every task they take part in. Partial, careless, or mediocre contributions are not acceptable; each specialist is accountable for the quality of the work in their area of expertise.
+
+4. **Work as a team, toward a better version.** The subagents MUST collaborate as a team — combining their perspectives, challenging one another's work, and building on each other's contributions — with a single shared objective: to guarantee that **every development produces a better, more evolved version** of Graphus than the one before it. Their combined judgment MUST continuously raise the bar on correctness, safety, performance, and conformance.
+
+This complements — and does not replace — the task-execution rule that you MUST determine and delegate to the most appropriate subagent for each task (see "Task execution", step 4).
 
 ## Task planning and execution
 
