@@ -1439,15 +1439,58 @@ fn run_one<E: RestEngine>(
 /// summary). Shared by the handle-based buffered path ([`run_one`]) and the single-statement
 /// auto-commit buffered path ([`buffer_autocommit`], rmp #527). The summary is read AFTER the rows
 /// drain, so an engine auto-commit's committed side-effect counters are already published (`rmp` #512).
+/// Upper bound on the serialized bytes a **buffered** statement result may accumulate (`rmp` #553).
+///
+/// The single-statement WRITE path (and any multi-statement batch) BUFFERS its whole result before
+/// responding, deliberately, so a commit-time serialization conflict becomes a clean `409` instead of a
+/// dropped mid-stream body (`rmp` #530). Without a cap that buffer is unbounded: one cheap authenticated
+/// request — `UNWIND range(1, 1e8) AS i CREATE (n {v:i}) RETURN n` — accumulates the entire result set
+/// in RAM (an OOM DoS). This caps the accumulated serialized size; over the cap the (not-yet-committed)
+/// statement is aborted with a `400`, so a large write never commits half-way and never *silently
+/// truncates* (the prior `rmp` #488 anti-pattern). Set generously at 4× the 4 MiB request-body cap
+/// ([`MAX_REQUEST_BODY_BYTES`]) — well above any reasonable transactional write, well below an OOM. A
+/// client that needs a large result set should page it through a READ (which STREAMS, `rmp` #475).
+const MAX_BUFFERED_RESULT_BYTES: usize = 16 * 1024 * 1024;
+
+/// A zero-allocation [`std::io::Write`] that only counts the bytes written — used to measure a row's
+/// serialized size for the [`MAX_BUFFERED_RESULT_BYTES`] budget without materialising a scratch buffer.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn serialize_stream<S: ResultStream>(stream: &mut S) -> Result<StatementResult, GraphusError> {
     let fields = stream.fields().to_vec();
     let mut data = Vec::new();
+    let mut buffered_bytes = 0usize;
     while let Some(row) = stream.next_row()? {
-        data.push(Json::Array(
+        let row_json = Json::Array(
             row.iter()
                 .map(crate::restvalue::restvalue_to_jolt)
                 .collect(),
-        ));
+        );
+        // Bound the buffered result (rmp #553): measure this row's serialized size and abort the
+        // statement (before commit) once the running total crosses the cap. `to_writer` into a
+        // byte-counter is allocation-free; the error propagates through `run_one` to
+        // `run_statements_buffered`, which rolls back — so the write never commits.
+        let mut counter = ByteCounter(0);
+        let _ = serde_json::to_writer(&mut counter, &row_json);
+        buffered_bytes = buffered_bytes.saturating_add(counter.0);
+        if buffered_bytes > MAX_BUFFERED_RESULT_BYTES {
+            return Err(GraphusError::Runtime(format!(
+                "result set too large to buffer for a transactional response \
+                 (exceeded {MAX_BUFFERED_RESULT_BYTES} bytes); narrow the RETURN or page a large \
+                 result through a read query, which streams"
+            )));
+        }
+        data.push(row_json);
     }
     let summary = encode_summary(&stream.summary());
     Ok(StatementResult {

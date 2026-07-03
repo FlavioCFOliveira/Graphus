@@ -2454,3 +2454,63 @@ async fn login_cbor_request_and_response_round_trip() {
         1 + DEFAULT_LOGIN_TOKEN_TTL_SECS
     );
 }
+
+// ---- rmp #553: buffered-result byte cap (single-statement WRITE / multi-statement batch) --------
+
+/// A [`ResultStream`] that yields `remaining` rows, each a single string cell of `payload`, so a test
+/// can drive [`serialize_stream`]'s accumulated-byte budget without a real engine.
+struct SizedStream {
+    fields: Vec<String>,
+    remaining: usize,
+    payload: String,
+}
+
+impl crate::engine::ResultStream for SizedStream {
+    fn fields(&self) -> &[String] {
+        &self.fields
+    }
+    fn next_row(&mut self) -> Result<Option<Row>, GraphusError> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        Ok(Some(vec![RestValue::Value(Value::String(
+            self.payload.clone(),
+        ))]))
+    }
+    fn summary(&self) -> RunSummary {
+        RunSummary::default()
+    }
+}
+
+#[test]
+fn buffered_result_over_the_byte_cap_is_rejected_not_oom() {
+    // rmp #553: the buffered WRITE/batch path must abort a result set that would exceed the buffered
+    // cap (an OOM DoS otherwise) with a clean client error — never OOM, never a silent truncation.
+    let payload = "x".repeat(1024); // ~1 KiB per row
+    let n = super::MAX_BUFFERED_RESULT_BYTES / 1024 + 1_000; // comfortably over the cap
+    let mut stream = SizedStream {
+        fields: vec!["v".to_owned()],
+        remaining: n,
+        payload,
+    };
+    let err = super::serialize_stream(&mut stream)
+        .expect_err("an over-cap buffered result must be rejected, not accumulated");
+    assert!(
+        matches!(err, GraphusError::Runtime(_)),
+        "the cap breach must surface as a client Runtime error (maps to HTTP 400), got {err:?}"
+    );
+}
+
+#[test]
+fn buffered_result_under_the_byte_cap_serializes_all_rows() {
+    // A normal transactional write result (well under the cap) buffers fully — preserving the rmp #530
+    // buffer-for-a-clean-409 behaviour.
+    let mut stream = SizedStream {
+        fields: vec!["v".to_owned()],
+        remaining: 500,
+        payload: "small".to_owned(),
+    };
+    let result = super::serialize_stream(&mut stream).expect("an in-budget result buffers cleanly");
+    assert_eq!(result.data.len(), 500, "every in-budget row is buffered");
+}
