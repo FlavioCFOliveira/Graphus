@@ -117,6 +117,19 @@ impl FreeList {
         self.stack.pop()
     }
 
+    /// Removes every occurrence of `id` from the stack, preserving the relative (LIFO) order of the
+    /// remaining ids.
+    ///
+    /// Used by [`RecordStore::rollback`](crate::store::RecordStore::rollback) to undo a rolled-back
+    /// GC pass's own free-list pushes (`rmp` #578): after a live rollback restores the pre-rollback
+    /// in-memory free list, the aborting transaction's pushes must be withdrawn because the WAL undo
+    /// has just restored the corresponding records' `in_use` bit. A well-formed free list holds each
+    /// id at most once (an id can only be freed again after being re-allocated, which pops it), so
+    /// this removes exactly the transaction's push.
+    pub fn remove_id(&mut self, id: u64) {
+        self.stack.retain(|&x| x != id);
+    }
+
     /// The number of free ids currently held.
     #[must_use]
     pub fn len(&self) -> usize {
