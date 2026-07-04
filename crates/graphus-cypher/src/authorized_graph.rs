@@ -331,6 +331,18 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.morsel_label_scan(label)
     }
 
+    fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {
+        // The `rmp` #575 frontier morsel source, composed with RBAC exactly as `morsel_label_scan` above:
+        // an unrestricted principal gets the inner surface verbatim; a restricted principal is
+        // conservatively **declined** (return `None`) so the executor falls back to the serial pipeline,
+        // which RBAC-composes per node/edge. A restricted principal must never read filtered-out
+        // nodes/relationships through an off-thread morsel that has no per-node RBAC gate.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.frontier_morsel_source()
+    }
+
     fn merge_morsel_buffer(&self, buffer: graphus_txn::SsiReadBuffer) {
         // Forward unconditionally (`rmp` task #339): a restricted principal never produced a morsel
         // buffer (its `morsel_label_scan` declined), so there is nothing to gate. The inner seam folds

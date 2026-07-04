@@ -2386,6 +2386,37 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         })
     }
 
+    fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {
+        // The `rmp` #575 frontier morsel enabler: capture, on the engine thread, the erased `Send`,
+        // cheap-cloneable read surface (an owned `StoreReadView` + `TokenSnapshot`) + this statement's
+        // visibility inputs — WITHOUT any coarse predicate registration (unlike `morsel_label_scan`: the
+        // frontier anchors are already-bound nodes, so there is no label-scan phantom to guard here; the
+        // earlier sub-plan the executor drains registered `mark_all_live_nodes` for the anchor set, and each
+        // morsel's own `expand` records the final-hop relationship-pattern predicate + per-edge + per-row
+        // markers, whose UNION at `merge_morsel_buffer` is byte-identical to serial).
+        //
+        // Coordinated path only (same rationale as `morsel_label_scan`): the morsels fold their SIREAD
+        // buffers into THIS statement's shared `SsiTracker` via `merge_morsel_buffer`, which exists only on
+        // the coordinated `attach` path. A standalone / historical read has no shared tracker (markers are
+        // no-ops) — decline so the caller runs the always-correct serial pipeline. The restricted-RBAC
+        // decline is handled one layer up by `AuthorizedGraph` (mirroring `morsel_label_scan`), so a
+        // restricted reader never bypasses per-node RBAC through a morsel.
+        self.index.as_ref()?;
+
+        let store = self.store.borrow();
+        let source: Box<dyn crate::morsel::MorselSource> = Box::new(
+            crate::morsel::MorselView::new(store.read_view(), store.token_snapshot()),
+        );
+        drop(store);
+
+        Some(crate::morsel::MorselFrontierSource {
+            source,
+            snapshot: self.snapshot,
+            registry: self.registry.clone(),
+            txn: self.txn,
+        })
+    }
+
     fn merge_morsel_buffer(&self, buffer: SsiReadBuffer) {
         // Convergence (`rmp` task #339): fold a morsel's accumulated SIREAD markers into this statement's
         // shared `SsiTracker`, on the engine thread (the merge must run where the tracker lives). The

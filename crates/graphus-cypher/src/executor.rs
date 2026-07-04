@@ -2024,6 +2024,20 @@ fn build_operator(
             {
                 return Ok(Operator::Buffered { rows });
             }
+            // Morsel-driven parallel FRONTIER-seeded grouped aggregation (`rmp` #575 — the reco `r3_fof3`
+            // class: a single-seed multi-hop traversal → final `(f)-[:T]->(b)` expand → anti-join → grouped
+            // `count(DISTINCT f)`). Materializes the multi-hop frontier serially (byte-identical markers +
+            // isomorphism), then partitions the distinct anchors into contiguous morsels and expands +
+            // filters (incl. the graph anti-join) + groups + aggregates each concurrently on the dedicated
+            // pool, merging the partials deterministically (the #360 merge, reused verbatim). Covers exactly
+            // the shape #558 declines (its final expand must anchor on a bare label scan, and it rejects the
+            // anti-join pattern predicate); declines (falls through) for any non-conforming shape, knob<=1,
+            // RBAC restriction, standalone / historical read, a non-constant seed, or a morsel error.
+            if let Some(rows) =
+                try_morsel_frontier_fof_aggregate(input, group_keys, aggregates, ctx)?
+            {
+                return Ok(Operator::Buffered { rows });
+            }
             // Morsel-driven parallel GROUPED aggregation (`rmp` #360 — the actual LDBC-BI bottleneck): for
             // a *large* bare `MATCH (n:Label) RETURN <bare group keys>, <bare mergeable aggregates>`, split
             // the candidate-id vector into contiguous morsels, build a LOCAL group table per morsel
@@ -3213,6 +3227,348 @@ fn try_morsel_expand_group_aggregate(
     // Finish each merged group into its output row, in serial first-seen order — the bare group key value
     // IS the column value and each aggregate value IS `acc.finish()` (the recognizer guaranteed bare
     // columns), exactly as the #360 grouped tier builds its rows.
+    let mut out = VecDeque::with_capacity(converged.groups.len());
+    for group in converged.groups {
+        let mut row = Row::empty();
+        for (col, kv) in group_keys.iter().zip(group.key) {
+            row.set(col.alias.clone(), kv);
+        }
+        for (col, acc) in aggregates.iter().zip(group.accs) {
+            row.set(col.alias.clone(), acc.finish());
+        }
+        out.push_back(row);
+    }
+    Ok(Some(out))
+}
+
+/// Whether every pattern part of `ex` is a **purely structural** pattern (no inline property map / no
+/// `WHERE` predicate / no full-query subquery) — so the existence check is a read-only, snapshot-
+/// deterministic, cross-row-free graph read (`rmp` task #575). Such a predicate records byte-identical
+/// SIREAD markers whether evaluated serially or per morsel. Inline properties / a `WHERE` could embed a
+/// non-deterministic function (`rand()`), so they conservatively decline (the whole tier falls to serial).
+fn is_structural_pattern_existence(ex: &crate::ast::ExistsSubquery) -> bool {
+    if ex.full_query.is_some() || ex.predicate.is_some() || ex.pattern.is_empty() {
+        return false;
+    }
+    ex.pattern.iter().all(|part| {
+        let el = &part.element;
+        el.start.properties.is_none()
+            && el.chain.iter().all(|link| {
+                link.node.properties.is_none() && link.relationship.properties.is_none()
+            })
+    })
+}
+
+/// Finds the relationship-type alternatives of the `ExpandAll` / `ExpandInto` in `op`'s (linear) sub-plan
+/// that binds `rel_var` (`rmp` task #575). Used to prove a `prior_rels` edge of the SAME `MATCH` is of a
+/// relationship TYPE disjoint from the final hop's — so relationship-isomorphism is vacuous (a different
+/// type is always a different edge) and the frontier morsel need not re-check `r != prior`. Returns `None`
+/// if `rel_var` is bound by an unrecognized op (⇒ the tier conservatively declines to serial).
+fn find_expand_rel_types<'a>(
+    op: &'a PhysicalOp,
+    rel_var: &str,
+) -> Option<&'a [crate::ast::RelType]> {
+    match op {
+        PhysicalOp::ExpandAll {
+            input,
+            relationship,
+            types,
+            ..
+        }
+        | PhysicalOp::ExpandInto {
+            input,
+            relationship,
+            types,
+            ..
+        } => {
+            if relationship.name == rel_var {
+                Some(types)
+            } else {
+                find_expand_rel_types(input.as_ref(), rel_var)
+            }
+        }
+        PhysicalOp::Filter { input, .. } => find_expand_rel_types(input.as_ref(), rel_var),
+        _ => None,
+    }
+}
+
+/// Whether `pred` is a residual filter the `rmp` #575 frontier tier may evaluate off the engine thread per
+/// expansion row: either **pure per-row** ([`crate::morsel::is_pure_per_row_expr`]) OR a deterministic
+/// **pattern-existence** predicate — a bare structural `(a)-[…]->(b)` written as a boolean (optionally
+/// `NOT`-wrapped, or joined by `AND` / `OR` of such). Both are read-only, snapshot-deterministic, and
+/// cross-row-free, so a morsel evaluating them records byte-identical SIREAD markers to the serial `Filter`.
+fn is_frontier_residual_ok(pred: &Expr) -> bool {
+    if crate::morsel::is_pure_per_row_expr(pred) {
+        return true;
+    }
+    match &pred.kind {
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Not,
+            operand,
+        } => is_frontier_residual_ok(operand),
+        ExprKind::Binary {
+            op: crate::ast::BinaryOp::And | crate::ast::BinaryOp::Or,
+            lhs,
+            rhs,
+        } => is_frontier_residual_ok(lhs) && is_frontier_residual_ok(rhs),
+        ExprKind::ExistsSubquery(ex) => is_structural_pattern_existence(ex),
+        _ => false,
+    }
+}
+
+/// If `(input, group_keys, aggregates)` is the **morsel-parallel-eligible frontier-FoF shape** — a
+/// `MATCH (seed …)-…multi-hop…-(f) [WHERE …] MATCH (f)-[r(:T…)]->(b) [WHERE <pure/anti-join residual>]
+/// RETURN <bare key>, <bare mergeable aggregate over f/r/b> [ORDER BY … LIMIT …]` (`rmp` task #575, the
+/// reco `r3_fof3` class) — **materializes the frontier serially** (the earlier multi-hop sub-plan below the
+/// final expand, so its markers + relationship-isomorphism are byte-identical to serial), then partitions
+/// the distinct frontier anchors into contiguous morsels, **expands + filters + groups + aggregates each
+/// concurrently** on the dedicated pool (each over a `Send` [`ReadOnlyGraph`], driving the final hop's
+/// expand + the residual filters — including a graph anti-join pattern predicate — + the grouped fold),
+/// merges the partials deterministically ([`converge_group_aggregate_outcomes`], reused verbatim), and
+/// returns the grouped rows. Otherwise returns `None` so the caller falls through to the serial pipeline.
+///
+/// This covers exactly the shape the `rmp` #558 grouped-over-expand tier declines: #558 requires the final
+/// `ExpandAll`'s input to be a **bare label scan**, whereas here it is an arbitrary sub-plan (a single-seed
+/// multi-hop traversal), and #558's residual filter must be pure per-row (it rejects the anti-join pattern
+/// predicate). This tier is **disjoint** from #558 by construction (it declines when the final expand is
+/// anchored directly on a bare label scan — that IS #558's case).
+///
+/// # Byte-identical to serial, by construction
+/// * the earlier sub-plan runs through the **real serial executor** (identical rows, visibility, isomorphism,
+///   SIREAD markers); its distinct `from` node-ids are the frontier anchors (deduped: `count(DISTINCT f)`
+///   collapses multiplicity and the final `MATCH` is a fresh pattern, so dedup is result- and marker-safe);
+/// * each morsel drives the SAME lifted `read_source::expand` + the SAME [`eval`] (incl. the anti-join
+///   pattern existence) the serial `Operator::Expand` / `Operator::Filter` run — byte-identical rows,
+///   three-valued filter decisions, grouped values, and markers (folded via `merge_morsel_buffer`);
+/// * a `count(DISTINCT <anchor>)` per group is the set-union of the morsels' partials over a **disjoint**
+///   anchor partition — worker-count-independent — and the `ORDER BY … LIMIT` above re-sorts the groups,
+///   so the final rows are identical regardless of the merge's group order.
+///
+/// # Eligibility (ALL required, else `None`)
+/// - the morsel knob is enabled ([`Ctx::morsel_threads`] `> 1`);
+/// - `input` is `[Filter …]* ExpandAll` where the `ExpandAll` is a **fixed-length, fresh** single hop
+///   (`range` `None`, `prior_rels` empty, no inline rel-prop map) whose input is **not** a bare label scan
+///   (that is #558's case);
+/// - every residual `Filter` predicate above the expand is [`is_frontier_residual_ok`] (pure per-row or a
+///   structural pattern-existence predicate — the anti-join);
+/// - there is `>= 1` group key, every one **pure per-row**; every aggregate is a **bare mergeable**
+///   aggregate over an expansion-row variable ([`recognize_mergeable_bare_agg_vars`]);
+/// - the seam hands off a frontier read surface ([`GraphAccess::frontier_morsel_source`]) — `None` for a
+///   standalone / historical / restricted-RBAC / `MemGraph` read, which then runs serially;
+/// - every non-expansion variable the residual / keys / aggregates reference is **constant** across the
+///   materialized frontier (e.g. the single seed `me`); a non-constant such variable declines to serial.
+///
+/// On any per-morsel error (incl. a `sum` overflow) the tier discards the parallel result and returns
+/// `None`; the serial fallback re-runs the whole pipeline, re-registering the markers and re-raising the
+/// identical error.
+fn try_morsel_frontier_fof_aggregate(
+    input: &PhysicalOp,
+    group_keys: &[ProjectionColumn],
+    aggregates: &[ProjectionColumn],
+    ctx: &mut Ctx<'_>,
+) -> Result<Option<VecDeque<Row>>, ExecError> {
+    // --- cheap structural gates first (no seam work, no drain) ---
+    if ctx.morsel_threads <= 1 {
+        return Ok(None);
+    }
+    if group_keys.is_empty() || aggregates.is_empty() {
+        return Ok(None);
+    }
+
+    // Peel the residual `Filter` chain above the final `ExpandAll` (top-down), collecting predicates.
+    let mut residual_top_down: Vec<&Expr> = Vec::new();
+    let mut cur = input;
+    while let PhysicalOp::Filter { input, predicate } = cur {
+        residual_top_down.push(predicate);
+        cur = input.as_ref();
+    }
+    // The final hop: a fixed-length, fresh single `ExpandAll`.
+    let PhysicalOp::ExpandAll {
+        input: expand_input,
+        from,
+        relationship,
+        to,
+        direction,
+        types,
+        range,
+        prior_rels,
+        rel_props,
+    } = cur
+    else {
+        return Ok(None);
+    };
+    if range.is_some() || rel_props.is_some() {
+        return Ok(None);
+    }
+    // Relationship-isomorphism with prior edges of the SAME `MATCH`: the final hop `r` must differ from
+    // each `prior_rels` edge. A frontier morsel binds only the final-hop row (the prior edges live in the
+    // materialized frontier, not the morsel row), so it cannot check `r != prior`. This is SAFE to ignore
+    // ONLY when every prior edge is of a relationship TYPE disjoint from the final hop's types — then the
+    // final edge can never coincide with a prior one (different type ⇒ different edge id), so the check is
+    // vacuous. A same-type (or "any-type") prior edge could coincide, so decline to serial (which enforces
+    // isomorphism per row). E.g. the `r1_friends` `(me)-[:FRIEND]-(f)-[:PURCHASED]->(p)` prior edge is
+    // `FRIEND` and the final hop is `PURCHASED` — disjoint ⇒ engaged; a `(a)-[:R]-(b)-[:R]-(c)` chain would
+    // decline.
+    if !prior_rels.is_empty() {
+        if types.is_empty() {
+            return Ok(None); // final hop is "any type": a prior edge of any type could coincide.
+        }
+        for pr in prior_rels {
+            let disjoint =
+                find_expand_rel_types(expand_input.as_ref(), &pr.name).is_some_and(|pr_types| {
+                    !pr_types.is_empty()
+                        && !pr_types
+                            .iter()
+                            .any(|t| types.iter().any(|ft| ft.name == t.name))
+                });
+            if !disjoint {
+                return Ok(None);
+            }
+        }
+    }
+    // Disjoint from the `rmp` #558 tier: it owns the case where the final expand is anchored directly on a
+    // bare label scan. Here the anchor comes from a deeper sub-plan (a multi-hop traversal).
+    if morsel_label_scan_leaf(expand_input.as_ref()).is_some() {
+        return Ok(None);
+    }
+
+    // Residual predicates in serial APPLICATION order (innermost `Filter`, closest to the expand, first).
+    let residual: Vec<&Expr> = residual_top_down.iter().rev().copied().collect();
+    for pred in &residual {
+        if !is_frontier_residual_ok(pred) {
+            return Ok(None);
+        }
+    }
+
+    // The expansion-row variables the group keys / aggregates may reference.
+    let vars = [
+        from.name.as_str(),
+        relationship.name.as_str(),
+        to.name.as_str(),
+    ];
+    for col in group_keys {
+        if !crate::morsel::is_pure_per_row_expr(&col.expr) {
+            return Ok(None);
+        }
+    }
+    let mut any_sum = false;
+    for col in aggregates {
+        match recognize_mergeable_bare_agg_vars(&col.expr, &vars) {
+            Some(needs_integer_gate) => any_sum |= needs_integer_gate,
+            None => return Ok(None),
+        }
+    }
+
+    // --- the engine-thread seam: capture the off-thread frontier read surface. `None` (standalone /
+    // historical / restricted-RBAC / MemGraph) ⇒ decline BEFORE draining, so the serial pipeline runs
+    // verbatim with no wasted work. ---
+    let Some(fsrc) = ctx.graph.frontier_morsel_source() else {
+        return Ok(None);
+    };
+
+    // --- materialize the frontier SERIALLY: drain the earlier sub-plan through the real executor (so its
+    // rows, visibility, relationship-isomorphism, and SIREAD markers are byte-identical to serial), then
+    // collect the DISTINCT anchor ids + the constant non-expansion bindings (e.g. the single seed `me`). ---
+    let mut subop = build_operator(expand_input.as_ref(), None, ctx)?;
+    let mut seen: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+    let mut anchors: Vec<u64> = Vec::new();
+    // Constant-binding candidates: snapshot every non-anchor binding on the first frontier row, then drop
+    // any that later varies or goes missing. What survives is constant across the whole frontier.
+    let mut consts: Option<Vec<(String, RowValue)>> = None;
+    while let Some(row) = subop.next(ctx)? {
+        let Some(anchor) = row.get(&from.name).and_then(RowValue::as_node) else {
+            // A null / non-node anchor contributes no rows to the serial final expand either — skip it.
+            continue;
+        };
+        if seen.insert(anchor.0) {
+            anchors.push(anchor.0);
+        }
+        match &mut consts {
+            None => {
+                let mut cand = Vec::new();
+                for name in row.columns() {
+                    if name != &from.name {
+                        if let Some(v) = row.get(name) {
+                            cand.push((name.clone(), v.clone()));
+                        }
+                    }
+                }
+                consts = Some(cand);
+            }
+            Some(cand) => {
+                cand.retain(|(name, val)| {
+                    row.get(name)
+                        .is_some_and(|v| crate::runtime::row_values_equivalent(v, val))
+                });
+            }
+        }
+    }
+    let constants = consts.unwrap_or_default();
+    // Drop the drained sub-operator's borrow of `ctx` before re-borrowing it below.
+    drop(subop);
+
+    // --- build the parallel bundle + spec, install the per-statement deadline, dispatch ---
+    let scan = crate::morsel::MorselFrontierScan {
+        anchors,
+        source: fsrc.source,
+        snapshot: fsrc.snapshot,
+        registry: fsrc.registry,
+        txn: fsrc.txn,
+        // The per-statement wall-clock budget (`rmp` #476), so a runaway parallel expand abandons rather
+        // than pinning every core.
+        deadline: ctx.token.deadline(),
+    };
+    ctx.check_cancelled()?;
+
+    let spec = crate::morsel::MorselFrontierExpandGroupSpec {
+        from,
+        relationship,
+        to,
+        direction: *direction,
+        types,
+        residual_filters: &residual,
+        group_keys,
+        aggregates,
+        constants: &constants,
+    };
+
+    let converged = crate::morsel::run_frontier_expand_group_aggregate_morsels(
+        &scan,
+        &spec,
+        ctx.params,
+        ctx.morsel_threads,
+    );
+
+    // A per-morsel storage / evaluation error makes the parallel result untrustworthy: decline WITHOUT
+    // folding the buffers (dropped here). The serial fallback re-runs the whole pipeline (re-materializing
+    // the frontier + re-expanding through the live seam), re-registering the identical markers AND re-raising
+    // the identical error.
+    if converged.error.is_some() {
+        return Ok(None);
+    }
+
+    // The no-overflow integer gate for `sum` (`rmp` #360, finding C): a parallel `sum` is bit-identical to
+    // serial ONLY when no sub-sum saturates. Checked on the merged accumulators; a pathological near-rail
+    // column falls back to serial.
+    if any_sum
+        && converged
+            .groups
+            .iter()
+            .any(|g| g.accs.iter().any(Accumulator::sum_is_parallel_unsafe))
+    {
+        return Ok(None);
+    }
+
+    // Committed to the parallel result: record the engagement (observability), then fold the per-morsel SSI
+    // buffers into this statement's tracker on the engine thread.
+    ctx.graph.note_parallel_aggregate();
+    for buffer in converged.buffers {
+        ctx.graph.merge_morsel_buffer(buffer);
+    }
+
+    // Finish each merged group into its output row (the bare group key value IS the column value and each
+    // aggregate value IS `acc.finish()`) — exactly as the #558 / #360 grouped tiers build their rows. The
+    // `Sort` / `TopN` above the aggregation re-orders these serially, so the group order here is immaterial.
     let mut out = VecDeque::with_capacity(converged.groups.len());
     for group in converged.groups {
         let mut row = Row::empty();
