@@ -2937,8 +2937,12 @@ fn ack_prepared_commits(durable: u64, batch: &mut Vec<PendingCommit>, metrics: &
 /// Non-blocking drain of consecutive queued **batchable** commands into the current group-commit batch:
 /// explicit `Cmd::Commit`s (`rmp` #528) AND auto-commit `Cmd::Run`s (`rmp` #566). Each is dispatched via
 /// [`dispatch_command`] into the SAME batch, so ONE later harden's `fdatasync` covers them all — the
-/// coalescing that makes `K` concurrent committers pay one sync, not `K`. Stops at [`MAX_COMMIT_BATCH`],
-/// at the first NON-batchable command (stashed into `pending_cmd` for the loop to process next — IN
+/// coalescing that makes `K` concurrent committers pay one sync, not `K`. A `Begin`/`BeginAutoCommit`
+/// transaction-open (the durability-inert ticket round-trip that precedes every auto-commit write) is
+/// dispatched INLINE and the drain CONTINUES (`rmp` #570) — it appends nothing to the WAL and joins no
+/// batch, so processing it here (rather than truncating the batch) keeps concurrent auto-commit writers
+/// coalescing at `W > 4` instead of collapsing to ~1 commit per sync. Stops at [`MAX_COMMIT_BATCH`], at
+/// the first OTHER non-batchable command (stashed into `pending_cmd` for the loop to process next — IN
 /// ORDER, only after the batch is hardened and acked), or when `try_recv` reports the channel momentarily
 /// empty / disconnected.
 ///
@@ -3032,6 +3036,52 @@ fn drain_commit_batch<
                     metrics,
                     db,
                     degraded,
+                );
+            }
+            // A transaction-OPEN (`rmp` #570). An auto-commit write is TWO consecutive channel commands —
+            // a `BeginAutoCommit` (the ticket round-trip) then the `Run` — so with `W` concurrent writers
+            // the channel interleaves their `BeginAutoCommit`s BETWEEN batchable `Run`s. Treating a
+            // `Begin`/`BeginAutoCommit` as non-batchable (stash + break) truncated the coalescing batch at
+            // the first interleaved open and dropped the engine out of this pipeline loop back to the main
+            // loop, which processed the queued opens ONE PER `recv` tick — the measured W>4 coalescing
+            // COLLAPSE (batch ~3.7→~1.8, `fdatasync/commit` 0.27→0.55). A transaction-open is WAL-neutral
+            // and durability-inert: it only allocates a ticket, opens an MVCC snapshot, and replies — it
+            // appends NOTHING to the WAL and commits NOTHING. So it is dispatched INLINE here and the drain
+            // KEEPS GOING, keeping the pipeline hardening back-to-back batches and promptly unblocking the
+            // ticket-waiting writers (whose next `Run`s then flow back into a following batch).
+            //
+            // Ordering / causal safety is preserved: the open runs AFTER its channel-predecessors (already
+            // in `commit_batch`) and BEFORE its successors (still queued), so global channel order among
+            // processed commands is unchanged. Its MVCC snapshot is identical whether taken now or after
+            // the batch's ack: the batch is already `commit_prepare`d (its writes are visible in the MVCC
+            // timeline) and the ack is only the *client-facing* durability signal, which never alters
+            // server-visible state. Any OTHER non-batchable command still stashes + breaks (below).
+            Ok(cmd @ (Cmd::Begin { .. } | Cmd::BeginAutoCommit { .. })) => {
+                let mut ignored: Option<exec::InFlightInline> = None;
+                let _keep_running = dispatch_command(
+                    cmd,
+                    coordinator,
+                    open,
+                    next_ticket,
+                    plan_cache,
+                    extensions,
+                    dispatch,
+                    readers_inflight,
+                    &mut ignored,
+                    result_buffer_capacity,
+                    metrics,
+                    db,
+                    degraded,
+                    maintenance_degraded,
+                    active_txns,
+                    clock,
+                    statement_timeout,
+                    loading_session,
+                    commit_batch,
+                );
+                debug_assert!(
+                    ignored.is_none(),
+                    "a transaction-open (Begin/BeginAutoCommit) never suspends a statement"
                 );
             }
             // A non-batchable command ends the drain: stash it so the loop processes it next, in order,
