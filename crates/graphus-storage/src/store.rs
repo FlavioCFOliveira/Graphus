@@ -192,6 +192,24 @@ struct ActiveTxn {
     /// high-water floor). A normal write transaction pushes nothing here (it only *pops* ids via
     /// [`alloc_id`](RecordStore::alloc_id)), so this stays empty for it.
     freed_ids: Vec<(StoreKind, u64)>,
+    /// Physical ids this transaction **popped** (reused) from a store's free list via
+    /// [`alloc_id`](RecordStore::alloc_id) (`rmp` #581). On a **live** rollback each such reused id was
+    /// never actually consumed (the transaction aborted), so its slot should return to the free list —
+    /// but ONLY when it did not become a live-referenced **corpse** (a concurrently-committed writer
+    /// prepended onto it, the `rmp` #220/#172 pattern, which the GC corpse splice owns). The rollback
+    /// re-pushes exactly the genuinely-UNREFERENCED pops
+    /// ([`reclaim_aborted_pops`](RecordStore::reclaim_aborted_pops)); the rest are left for GC, never
+    /// double-freed. Empty for a GC pass (which only frees, never pops). This is the symmetric
+    /// reclaim that closes the bounded space leak the #578 fix documented.
+    popped_ids: Vec<(StoreKind, u64)>,
+    /// The `(owner_kind, owner_id)` a popped **property** id was prepended onto (`rmp` #581). A prop
+    /// record carries no back-pointer to its owner, so — unlike a relationship (whose endpoints live
+    /// in its own body) — the rollback needs the owner to walk the chain and decide whether the popped
+    /// prop became a live-referenced corpse. Recorded by [`add_node_property`](RecordStore::add_node_property)
+    /// / [`add_rel_property`](RecordStore::add_rel_property) only for ids that were pops (a subset of
+    /// `popped_ids`, so bounded by the free list size at begin). A popped prop with no recorded owner
+    /// is conservatively **not** re-pushed (a safe leak, never a double-free).
+    popped_prop_owners: Vec<(u64, StoreKind, u64)>,
 }
 
 /// What one [`RecordStore::gc`] pass did (observability, NFR-10; `rmp` task #59).
@@ -205,6 +223,11 @@ pub struct GcPassReport {
     /// Committed writers scheduled to be forgotten from the Active/Recent Transaction Table when
     /// the GC transaction commits (a mid-pass rollback discards the schedule and prunes nothing).
     pub prune_scheduled: usize,
+    /// The total physical-id span the **freeze sweep** visited across the three MVCC stores this pass
+    /// (`rmp` #522 observability): `Σ (high_water - freeze_low)` per kind. On a steadily-growing store
+    /// this stays ≈ the records added since the last pass (O(Δ)) instead of the whole store (O(N)) — the
+    /// direct evidence the maintenance cost is no longer quadratic.
+    pub freeze_scanned: u64,
 }
 
 /// The prune a completed [`RecordStore::gc`] freeze sweep scheduled, held until its GC transaction
@@ -279,6 +302,60 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// the GC transaction's [`commit`](Self::commit) and discarded at its
     /// [`rollback`](Self::rollback) (`rmp` task #59). `None` while no GC pass is pending.
     pending_gc_prune: Option<PendingGcPrune>,
+    /// **Incremental-GC state** (`rmp` #522). Before this, every maintenance [`gc`](Self::gc) pass
+    /// re-scanned the ENTIRE store (freeze sweep, reclaim sweep, corpse walk, property sweep) even when
+    /// almost nothing had changed since the last pass. On a monotonically growing store that made the
+    /// background-maintenance cadence O(store size) per tick and O(store size²) in aggregate. These
+    /// fields drive each sweep from only the work accrued since the previous pass, so a pass is
+    /// amortised O(Δ) instead of O(N). All are pure in-memory optimisation state: they are NOT part of
+    /// the durable [`Meta`], and are re-initialised on every [`open`](Self::open) so crash recovery and
+    /// the on-disk format are byte-for-byte unchanged.
+    ///
+    /// The **freeze frontier**: `freeze_low[kind]` is the smallest physical id that may still carry an
+    /// unfrozen committed-in-flight MVCC stamp. The freeze sweep visits only `[freeze_low, high_water)`.
+    /// Invariant: every in-use record below `freeze_low[kind]` has all its committed-writer stamps
+    /// already frozen to `Committed(ts)` and carries no in-flight-writer stamp. It is LOWERED to `id`
+    /// by [`note_created`](Self::note_created) / [`note_expired`](Self::note_expired) (a fresh
+    /// `xmin`/`xmax` in-flight stamp at `id`) and RAISED by the freeze sweep to the smallest id in the
+    /// range still bearing an in-flight-writer stamp (or `high_water` if none). Initialised to `1` on
+    /// open, so the first pass is a full freeze that settles every pre-existing on-disk stamp.
+    freeze_low: [u64; STORE_COUNT],
+    /// Reclaim candidates: per-kind physical ids of MVCC tombstones (`xmax` set) awaiting reclamation
+    /// (`rmp` #522). The reclaim sweep iterates ONLY these ids instead of scanning the whole store —
+    /// reclaiming those whose `xmax` has committed at or below the watermark and dropping entries that
+    /// are no longer in-use tombstones (reclaimed, or reverted-to-live by an abort). Populated by
+    /// [`note_expired`](Self::note_expired) and by the first full freeze sweep (which observes every
+    /// pre-existing on-disk tombstone). `Node`/`Rel` drive the direct reclaim; `Prop` gates the
+    /// property-chain sweep (prop tombstones are reclaimed owner-side by
+    /// [`gc_property_chain`](Self::gc_property_chain)). `Strings` is unused (heap blocks are freed with
+    /// their owning property, never tombstoned).
+    pending_tombstones: [std::collections::BTreeSet<u64>; STORE_COUNT],
+    /// Relationship dead-link **corpse** candidates (`rmp` #220 / #522): rel ids a rolled-back creation
+    /// left `!in_use`-but-threaded. The corpse splice runs only when this is non-empty (or a full scan
+    /// is pending), so a no-abort workload skips the whole-store corpse walk. Populated on
+    /// [`rollback`](Self::rollback) from the aborting transaction's created rels; crash-materialised
+    /// corpses are caught by the full first pass. Cleared when the splice runs (it collects every
+    /// corpse in one walk).
+    pending_corpse_rels: std::collections::BTreeSet<u64>,
+    /// Whether property dead-link corpses (`rmp` #172) may exist since the last property sweep (`rmp`
+    /// #522): set on [`rollback`](Self::rollback) of a transaction that created properties, cleared when
+    /// the property sweep runs. Together with a non-empty `pending_tombstones[Prop]` it gates the
+    /// property-chain sweep so a workload with no property deletes/aborts skips it entirely.
+    pending_prop_corpses: bool,
+    /// Forces the first [`gc`](Self::gc) pass after [`open`](Self::open) to run the FULL corpse walk and
+    /// property sweep (`rmp` #522), so any pre-existing on-disk corpses / tombstones a fresh process has
+    /// no in-memory record of are caught. Cleared after that first pass; thereafter the gated
+    /// incremental sweeps suffice because every new unit of work flows through the tracking above.
+    gc_full_scan_pending: bool,
+    /// The `(gc_txn, freeze_low-before-freeze)` savepoint of the in-progress GC pass (`rmp` #522). A GC
+    /// pass's freeze sweep advances [`freeze_low`](Self::freeze_low), but a rollback of that pass's
+    /// transaction restores (via WAL undo) the in-flight stamps it had frozen — which now sit BELOW the
+    /// advanced frontier and would be skipped by the next sweep, silently stranding a committed writer's
+    /// stamp unfrozen (an unbounded Active/Recent-Transaction-Table leak). So [`gc`](Self::gc) snapshots
+    /// the frontier here before freezing; [`rollback`](Self::rollback) restores it if the aborting
+    /// transaction is this GC pass, and [`commit_prepare`](Self::commit_prepare) clears it. `None`
+    /// outside a GC pass. Mirrors [`pending_gc_prune`](Self::pending_gc_prune)'s lifecycle.
+    gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
     /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
     /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
     /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
@@ -396,6 +473,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             meta_chain: Vec::new(),
             commit_registry: CommitRegistry::new(),
             pending_gc_prune: None,
+            // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
+            // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
+            // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
+            // sweep for anything a fresh process has no in-memory record of.
+            freeze_low: [1; STORE_COUNT],
+            pending_tombstones: Default::default(),
+            pending_corpse_rels: std::collections::BTreeSet::new(),
+            pending_prop_corpses: false,
+            gc_full_scan_pending: true,
+            gc_freeze_low_savepoint: None,
             statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: 0,
@@ -484,6 +571,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             meta_chain,
             commit_registry,
             pending_gc_prune: None,
+            // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
+            // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
+            // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
+            // sweep for anything a fresh process has no in-memory record of.
+            freeze_low: [1; STORE_COUNT],
+            pending_tombstones: Default::default(),
+            pending_corpse_rels: std::collections::BTreeSet::new(),
+            pending_prop_corpses: false,
+            gc_full_scan_pending: true,
+            gc_freeze_low_savepoint: None,
             statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: shared_len,
@@ -1102,6 +1199,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // A freed id is reused first: its store page already exists (the record once lived there), so
         // no growth — and no fallibility — is needed.
         if let Some(id) = self.store_mut(kind).free.pop() {
+            // Record the pop so a live rollback can return this reused id to the free list if the
+            // transaction aborts without the slot becoming a live-referenced corpse (`rmp` #581).
+            // Mirrors the `SYSTEM_TXN` guard of `note_created`/`free_push`: the system transaction
+            // never pops-then-aborts and is never rolled back.
+            if txn != SYSTEM_TXN {
+                self.active
+                    .entry(txn)
+                    .or_default()
+                    .popped_ids
+                    .push((kind, id));
+            }
             return Ok(id);
         }
         // Fresh id: `alloc_fresh` first (it fails closed at the `u64::MAX` ceiling, `rmp` #452, so we
@@ -1339,6 +1447,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Drop the per-txn created/expired bookkeeping (it fed the old eager settle loop; the table
         // entry below is all the durable/visible state a committed version now needs).
         self.active.remove(&txn);
+        // `rmp` #522: this GC pass is committing — its freeze frontier advance is now permanent, so the
+        // rollback savepoint is no longer needed (a GC pass never takes the read-only fast path below,
+        // since it schedules a prune, so clearing it here always runs for a committing GC pass).
+        if self
+            .gc_freeze_low_savepoint
+            .is_some_and(|(sp_txn, _)| sp_txn == txn)
+        {
+            self.gc_freeze_low_savepoint = None;
+        }
 
         // Read-only fast path (`rmp` #529): a transaction that changed nothing durable — and is not a
         // GC pass with a scheduled Active/Recent-Transaction-Table prune to apply — has nothing to
@@ -1578,6 +1695,56 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.write_region(dev, off + field_off, &word.to_le_bytes(), txn)
     }
 
+    /// Stamps the 8-byte MVCC header word at `field_off` of record `id` in `kind`'s store to
+    /// `new_word` (redo = a plain post-image patch, so recovery redo repeats history byte-for-byte),
+    /// but logs a **compare-and-set logical undo** (`rmp` #301, mirroring [`write_chain_head`] and the
+    /// `rmp` #239 chain-pointer fix): the undo restores the pre-image `old_word` **only if the word is
+    /// still `new_word`** — i.e. only if this transaction's write is still the one on the page. If a
+    /// concurrently-interleaved transaction has since re-stamped the same header word, the undo
+    /// no-ops, so a **non-LIFO** abort of this transaction never clobbers the newer stamp.
+    ///
+    /// This is the header-word twin of the free-list / high-water monotonic restores (`rmp` #578 /
+    /// #220): a plain pre-image undo of a **shared** header word is unsafe under statement-granularity
+    /// interleaving because a later writer can legitimately own the word by abort time; a plain undo
+    /// would then resurrect a stale stamp (a lost-update / visibility breach). Used for the MVCC
+    /// **tombstone** (`xmax = in_flight(txn)`) writes of [`delete_node`](Self::delete_node),
+    /// [`delete_rel`](Self::delete_rel) and [`tombstone_props_for_key`](Self::tombstone_props_for_key).
+    /// The GC-time freeze ([`freeze_store_headers`](Self::freeze_store_headers)) keeps the plain
+    /// [`patch_header_word`](Self::patch_header_word): it runs only inside a GC pass that holds the
+    /// store exclusively (no interleaving mutator), so its undo can never race a concurrent writer.
+    fn patch_header_word_cas(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        field_off: usize,
+        new_word: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let abs = off + field_off;
+        let f = self.pool.fetch(dev)?;
+        // Capture the pre-image (`old_word`) under a read latch before the overwrite — the frame stays
+        // pinned across the two sequential latches (`rmp` #337, Slice 1), exactly as `write_region` /
+        // `write_chain_head` do.
+        let old_word = self.pool.with_page(f, |p| {
+            u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+        });
+        // Redo is a plain, unconditional post-image (byte-identical to `patch_header_word`'s redo, so
+        // recovery redo is unchanged). Undo is the compare-and-set: reset to `old_word` iff the word is
+        // still `new_word` (this txn's own stamp). Redo lent by borrow; undo retained by value.
+        let redo = paging::encode_patch(abs, &new_word.to_le_bytes());
+        let undo = paging::encode_cas_patch(abs, new_word, old_word).into_vec();
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[abs..abs + 8].copy_from_slice(&new_word.to_le_bytes());
+        });
+        self.pool.unpin(f);
+        Ok(())
+    }
+
     // ------------- chain-safe writes (logical-undo discipline, `rmp` #220 / #172) -------------
     //
     // Three writes participate in a graph chain and must NOT log a plain whole-record pre-image undo,
@@ -1697,14 +1864,33 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Records that `txn` version-stamped (created) record `id` in `kind`'s store, so `commit` can
     /// settle its `xmin`. A no-op for the reserved system transaction, which never creates records.
     fn note_created(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+        // `rmp` #522: a fresh `xmin = in_flight(txn)` stamp at `id` needs freezing once `txn` commits.
+        // Lower the freeze frontier so the next freeze sweep re-visits `id` (a no-op for the common case
+        // where `id >= freeze_low[kind]` — a fresh append above the frontier — but load-bearing when a
+        // reused id lands below it). Recorded even for `SYSTEM_TXN` so a system-created record is frozen.
+        self.lower_freeze_low(kind, id);
         if txn != SYSTEM_TXN {
             self.active.entry(txn).or_default().created.push((kind, id));
+        }
+    }
+
+    /// Lowers the `rmp` #522 freeze frontier for `kind` to cover `id` (a no-op if `id` is already at or
+    /// above it). See [`freeze_low`](Self::freeze_low).
+    fn lower_freeze_low(&mut self, kind: StoreKind, id: u64) {
+        let slot = &mut self.freeze_low[kind as usize];
+        if id < *slot {
+            *slot = id;
         }
     }
 
     /// Records that `txn` tombstoned (expired) record `id` in `kind`'s store, so `commit` can settle
     /// its `xmax`.
     fn note_expired(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+        // `rmp` #522: a fresh `xmax = in_flight(txn)` stamp both needs freezing (lower the frontier) and
+        // makes `id` a reclaim candidate once the tombstone commits at or below the GC watermark. The
+        // reclaim sweep iterates this set instead of scanning the whole store.
+        self.lower_freeze_low(kind, id);
+        self.pending_tombstones[kind as usize].insert(id);
         if txn != SYSTEM_TXN {
             self.active.entry(txn).or_default().expired.push((kind, id));
         }
@@ -1734,6 +1920,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .or_default()
                 .freed_ids
                 .push((kind, id));
+        }
+    }
+
+    /// Records that property `pid` was prepended onto `(owner_kind, owner_id)` — but only if `pid` was
+    /// a **popped** (reused) id of `txn` (`rmp` #581). A prop carries no owner back-pointer, so the
+    /// rollback needs this to walk the owner's chain and decide whether an aborted pop became a live
+    /// corpse. Recorded lazily (only for pops), so a transaction that never reuses a freed prop id
+    /// stores nothing. Mirrors the `SYSTEM_TXN` guard of [`free_push`](Self::free_push).
+    fn note_popped_prop_owner(
+        &mut self,
+        txn: TxnId,
+        pid: u64,
+        owner_kind: StoreKind,
+        owner_id: u64,
+    ) {
+        if txn == SYSTEM_TXN {
+            return;
+        }
+        if let Some(a) = self.active.get_mut(&txn)
+            && a.popped_ids
+                .iter()
+                .any(|&(k, id)| k == StoreKind::Prop && id == pid)
+        {
+            a.popped_prop_owners.push((pid, owner_kind, owner_id));
         }
     }
 
@@ -1809,111 +2019,83 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn gc(&mut self, txn: TxnId, watermark: Timestamp) -> Result<GcPassReport> {
         let mut reclaimed = 0usize;
 
-        // Dead-link relationship **corpses** (`rmp` #220) — slots that an aborted/crashed creation
-        // left `!in_use` (header-only creation undo) yet not freed, with their forward chain pointers
-        // intact — are spliced out of their endpoint chains and freed by `gc_splice_corpses` BELOW,
-        // after the tombstone sweep. (Earlier this was deferred, leaving an unbounded space leak: a
-        // corpse is not a live version, so `is_reclaimable` returns false and `reclaim_rel` is never
-        // reached for it, so nothing ever freed its slot — one dead rel slot per aborted shared-node
-        // creation, forever.) The splice re-derives each corpse's TRUE position by walking the live
-        // chain rather than trusting the corpse's own (possibly stale) head/prev pointers, so it never
-        // severs a live chain even when a later committed CAS push moved the real head off the corpse;
-        // see `gc_splice_corpses`. While a corpse is unreclaimed (between its creation and the next GC
-        // pass) it is harmless to correctness and durability: every read ([`incident_rels`], the
-        // consistency checker's adjacency walk) threads transparently THROUGH it and visibility skips
-        // it, so no committed data is ever lost. (Singly-linked PROPERTY corpses are reclaimed by the
-        // owner-driven [`gc_property_chain`] splice — they cannot tangle; relationship corpses are
-        // doubly-linked into two chains, which is why their splice is walk-driven.)
-        // Page-batched read (`rmp` #365): collect every in-use rel's MVCC header with ONE pin + read
-        // latch per store page, then reclaim id-by-id. The reclaim mutation (`reclaim_rel`) still
-        // takes the per-record write latch via its WAL-logged patches — the read is batched, the
-        // write is not (no latch downgrade). `is_reclaimable` is decided on the header read here,
-        // exactly as the per-id loop did.
-        // `rmp` #563: heartbeat the drain-progress beacon across every phase of this O(N) full-store GC
-        // pass (each `scan_in_use_mvcc` is O(total records); the largest measured pass took ~18 s). The
-        // per-phase bump plus a bump every few thousand reclaim iterations keeps the beacon advancing far
-        // faster than any drain deadline, so a `STOP DATABASE` that races this pass sees a *progressing*
-        // engine and waits for it rather than force-detaching a healthy one.
+        // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
+        // this GC pass (whose WAL undo restores the stamps it froze) can restore the frontier and not
+        // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
+        // runs between here and this pass's commit/rollback (the single engine thread holds the store), so
+        // the savepoint's frontier is exactly the pre-freeze value.
+        self.gc_freeze_low_savepoint = Some((txn, self.freeze_low));
+
+        // `rmp` #563: heartbeat the drain-progress beacon across every phase of this GC pass so a
+        // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
         self.bump_drain_progress();
-        let rel_in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
-        for (i, &(id, mvcc)) in rel_in_use.iter().enumerate() {
-            if Self::is_reclaimable(mvcc, watermark, &self.commit_registry) {
-                self.reclaim_rel(txn, id)?;
-                reclaimed += 1;
-            }
-            if i % 4096 == 0 {
-                self.bump_drain_progress();
-            }
+
+        // ---- Phase A: reclaim reclaimable RELATIONSHIP tombstones (`rmp` #522: pending-set driven). ----
+        // Was an O(store) `scan_in_use_mvcc(Rel)` every tick; now iterates only the tombstones tracked
+        // since the last pass (with a full-scan fallback on the first post-open pass, which also seeds the
+        // pending set). Reclaimable ones are freed; the rest stay pending. Runs before the corpse splice
+        // (so a corpse whose neighbour was just reclaimed sees the updated chain) and before the node
+        // sweep (so a node whose only incidences were reclaimed becomes reclaimable this pass).
+        reclaimed += self.reclaim_pending(StoreKind::Rel, txn, watermark)?;
+
+        // ---- Phase B: splice out dead-link RELATIONSHIP corpses (`rmp` #220), gated (`rmp` #522). ----
+        // A corpse is a slot an aborted/crashed creation left `!in_use`-but-threaded; reads and the
+        // checker thread transparently THROUGH it, so it is harmless until reclaimed. The whole-store
+        // corpse walk runs ONLY when a rolled-back creation may have left one (`pending_corpse_rels`
+        // non-empty) or on the first post-open pass — a no-abort workload skips it entirely. The splice
+        // is walk-driven (re-derives each corpse's true chain position), so it never severs a live chain.
+        if self.gc_full_scan_pending || !self.pending_corpse_rels.is_empty() {
+            self.bump_drain_progress();
+            reclaimed += self.gc_splice_corpses(txn)?;
+            self.pending_corpse_rels.clear();
         }
 
-        // Splice out and free every dead-link relationship corpse (`rmp` #220). Runs after the
-        // tombstone rel-sweep (so a corpse whose neighbour was just reclaimed sees the updated chain)
-        // and before the node sweep (so a node whose only remaining incidences were corpses becomes
-        // reclaimable in this same pass). Walk-driven and WAL-logged — crash-safe and live-preserving.
-        reclaimed += self.gc_splice_corpses(txn)?;
+        // ---- Phase C: reclaim reclaimable NODE tombstones (pending-set driven). ----
+        // A node is reclaimed only once no live (not-yet-reclaimed) relationship still references it, so
+        // referential integrity and the incidence chains stay well-formed throughout.
+        reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
-        // Page-batched node header read (`rmp` #365), then reclaim id-by-id. The high-water mark is
-        // re-read after the rel sweep + corpse splice (a corpse splice never grows the node store, so
-        // it is stable, but read it where the per-id loop did). `has_live_incident_rels` is a
-        // per-node chain walk that needs `&mut self`, so it stays outside the batched read closure.
-        self.bump_drain_progress();
-        let node_in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
-        for (i, &(id, mvcc)) in node_in_use.iter().enumerate() {
-            if Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
-                && !self.has_live_incident_rels(id)?
-            {
-                self.reclaim_node(txn, id)?;
-                reclaimed += 1;
-            }
-            if i % 4096 == 0 {
-                self.bump_drain_progress();
-            }
+        // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
+        // Reclaims tombstoned property versions (`rmp` task #50) and dead-link property corpses (#172)
+        // from every surviving owner's chain. The full owner walk runs ONLY when a property tombstone or
+        // corpse may exist (a non-empty `pending_tombstones[Prop]`, `pending_prop_corpses`, or the first
+        // post-open pass) — a workload with no property deletes/aborts skips it. A reclaimed owner's whole
+        // chain was already freed by its reclamation, so re-checking liveness here reclaims each once.
+        if self.gc_full_scan_pending
+            || !self.pending_tombstones[StoreKind::Prop as usize].is_empty()
+            || self.pending_prop_corpses
+        {
+            reclaimed += self.sweep_property_chains(txn, watermark)?;
+            self.pending_prop_corpses = false;
+            self.prune_settled_tombstones(StoreKind::Prop)?;
         }
 
-        // Sweep the property chains of the owners that survived the node/rel reclamation above. A
-        // reclaimed owner's whole chain was already freed by its reclamation, so re-checking
-        // liveness here (after the sweeps) keeps each chain reclaimed exactly once. Re-scan the
-        // headers (page-batched) AFTER the reclamation sweeps so a just-reclaimed slot is no longer
-        // `in_use` and is skipped — same observation point as the former per-id `read_node`/`read_rel`.
-        self.bump_drain_progress();
-        let node_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
-        for (i, &(id, mvcc)) in node_live.iter().enumerate() {
-            if Self::is_live_version(mvcc) {
-                reclaimed += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
-            }
-            if i % 4096 == 0 {
-                self.bump_drain_progress();
-            }
-        }
-        self.bump_drain_progress();
-        let rel_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
-        for (i, &(id, mvcc)) in rel_live.iter().enumerate() {
-            if Self::is_live_version(mvcc) {
-                reclaimed += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
-            }
-            if i % 4096 == 0 {
-                self.bump_drain_progress();
-            }
-        }
-
-        // Freeze sweep (`rmp` task #59): settle every surviving committed in-flight stamp across
-        // all three MVCC record stores (the `strings.store` heap blocks carry no version stamps —
-        // they are never visibility-checked). Runs after the reclamation sweeps so reclaimed slots
-        // (no longer `in_use`) are skipped, and over the full id ranges so even records the
-        // reclamation sweeps could not reach (e.g. the property chain of a tombstoned-but-retained
-        // owner) are frozen.
+        // ---- Phase E: freeze committed-but-unfrozen MVCC stamps (`rmp` task #59), frontier-based. ----
+        // Settle every surviving committed in-flight stamp to its durable `Committed(ts)` form across the
+        // three MVCC record stores (heap blocks carry no version stamps). Was an O(store)
+        // `scan_in_use_mvcc` per kind every tick; now the freeze frontier (`freeze_low`) starts each scan
+        // at the smallest id that may still bear an unfrozen stamp, so a steadily-growing store freezes
+        // only the records added since the last pass (`rmp` #522). Runs AFTER the reclamation sweeps so
+        // reclaimed slots (no longer `in_use`) are skipped. After this pass no in-use record references
+        // any writer the registry records as committed, which is the precondition for the prune below.
         let mut frozen = 0usize;
-        self.bump_drain_progress();
-        frozen += self.freeze_store_headers(txn, StoreKind::Rel)?;
-        self.bump_drain_progress();
-        frozen += self.freeze_store_headers(txn, StoreKind::Node)?;
-        self.bump_drain_progress();
-        frozen += self.freeze_store_headers(txn, StoreKind::Prop)?;
+        let mut freeze_scanned = 0u64;
+        for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
+            self.bump_drain_progress();
+            let (f, s) = self.freeze_store_headers_incremental(txn, kind)?;
+            frozen += f;
+            freeze_scanned += s;
+        }
+
+        // The first post-open pass has now discovered every pre-existing on-disk corpse/tombstone and
+        // seeded the tracking sets, so subsequent passes can safely run the gated incremental sweeps.
+        self.gc_full_scan_pending = false;
 
         // Schedule the table prune: every writer recorded as committed at this point had ALL of its
-        // on-disk in-flight stamps rewritten by the sweep above (it covered every in-use record), so
-        // each becomes forgettable the moment the freeze is durable — i.e. when `txn` commits. The
-        // GC transaction itself, and any transaction that commits between here and that commit, is
+        // on-disk in-flight stamps rewritten by the freeze sweep (the frontier invariant guarantees no
+        // in-use record below `freeze_low` bears an unfrozen committed stamp, and the sweep froze the
+        // rest), so each becomes forgettable the moment the freeze is durable — i.e. when `txn` commits.
+        // The GC transaction itself, and any transaction that commits between here and that commit, is
         // not in this set and is pruned by a later pass.
         let writers = self.commit_registry.committed_writers();
         let prune_scheduled = writers.len();
@@ -1926,6 +2108,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             reclaimed,
             frozen,
             prune_scheduled,
+            freeze_scanned,
         })
     }
 
@@ -2015,6 +2198,175 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(frozen)
     }
 
+    /// The incremental freeze sweep of [`gc`](Self::gc) (`rmp` #522): freezes committed-but-unfrozen
+    /// MVCC stamps in `kind`'s store, but starting the scan at the **freeze frontier**
+    /// [`freeze_low[kind]`](Self::freeze_low) instead of at id `1`. On a steadily-growing store this
+    /// visits only the records added since the last pass — the fix for the O(store²) maintenance cost.
+    ///
+    /// Correctness rests on the frontier invariant (see [`freeze_low`](Self::freeze_low)): every in-use
+    /// record below `freeze_low[kind]` already has all committed-writer stamps frozen and bears no
+    /// in-flight-writer stamp. A fresh in-flight stamp below the frontier lowers it
+    /// ([`note_created`](Self::note_created) / [`note_expired`](Self::note_expired)), and a committed
+    /// writer's stamps always sit at or above the frontier (nothing below it was in-flight), so this
+    /// bounded scan still freezes **every** committed writer's stamps — the precondition the GC prune
+    /// relies on. After the scan the frontier is raised to the smallest id still bearing an
+    /// in-flight-writer stamp (or `high_water` if none remain).
+    ///
+    /// It also (re)seeds [`pending_tombstones[kind]`](Self::pending_tombstones) from every tombstone it
+    /// observes, which — because the first post-open pass starts at `freeze_low == 1` (a full scan) —
+    /// discovers every pre-existing on-disk tombstone that a fresh process has no in-memory record of.
+    fn freeze_store_headers_incremental(
+        &mut self,
+        txn: TxnId,
+        kind: StoreKind,
+    ) -> Result<(usize, u64)> {
+        let from = self.freeze_low[kind as usize];
+        let high_water = self.store(kind).alloc.high_water();
+        let scanned = high_water.saturating_sub(from.max(1));
+        let in_use = read_view::scan_in_use_mvcc_from(&self.pool, &self.stores, kind, from)?;
+        let mut frozen = 0usize;
+        // The next frontier: the smallest id in the scanned range still bearing an in-flight-writer
+        // stamp after this pass. If none, advance to `high_water` (everything at/above `from` settled).
+        let mut new_low = high_water;
+        for (i, &(id, mvcc)) in in_use.iter().enumerate() {
+            if let Some(word) = self.frozen_word(mvcc.created_ts) {
+                self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
+                frozen += 1;
+            }
+            if let Some(word) = self.frozen_word(mvcc.expired_ts) {
+                self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
+                frozen += 1;
+            }
+            // A tombstone (in-use, `xmax` set) is a reclaim candidate — seed the reclaim set (idempotent).
+            if mvcc.expired_ts != 0 {
+                self.pending_tombstones[kind as usize].insert(id);
+            }
+            // Still bearing an in-flight-writer stamp (a committed writer's stamp was just frozen above,
+            // so it no longer counts)? Then it must stay covered by the frontier for a later pass.
+            if self.is_inflight_of_inflight_writer(mvcc.created_ts)
+                || self.is_inflight_of_inflight_writer(mvcc.expired_ts)
+            {
+                new_low = new_low.min(id);
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
+            }
+        }
+        self.freeze_low[kind as usize] = new_low;
+        Ok((frozen, scanned))
+    }
+
+    /// Whether `word` is an in-flight stamp of a writer the registry STILL records as in-flight (`rmp`
+    /// #522, the freeze-frontier's carry-forward test): such a stamp cannot be frozen yet and must keep
+    /// its record covered by the frontier. A committed-writer stamp (frozen this pass) and an
+    /// aborted-writer stamp (reverted by that writer's undo) both return `false`.
+    fn is_inflight_of_inflight_writer(&self, word: u64) -> bool {
+        matches!(VersionStamp::from_raw(word), VersionStamp::InFlight(w)
+            if self.commit_registry.outcome(w) == TxnOutcome::InFlight)
+    }
+
+    /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
+    /// Iterates only the tracked [`pending_tombstones[kind]`](Self::pending_tombstones) set — with a
+    /// full-store fallback on the first post-open pass (`gc_full_scan_pending`), which also seeds the set
+    /// from every pre-existing on-disk tombstone. A candidate whose `xmax` has committed at or before
+    /// `watermark` (and, for a node, that no live relationship still references) is reclaimed and dropped
+    /// from the set; a candidate that is no longer an in-use tombstone (already reclaimed, or reverted to
+    /// live by an abort) is dropped; the rest stay pending for a later pass. Returns the count reclaimed.
+    fn reclaim_pending(
+        &mut self,
+        kind: StoreKind,
+        txn: TxnId,
+        watermark: Timestamp,
+    ) -> Result<usize> {
+        let candidates: Vec<u64> = if self.gc_full_scan_pending {
+            // First post-open pass: discover every on-disk tombstone by a full scan (and seed the set).
+            read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?
+                .into_iter()
+                .filter(|&(_, m)| m.expired_ts != 0)
+                .map(|(id, _)| id)
+                .collect()
+        } else {
+            self.pending_tombstones[kind as usize]
+                .iter()
+                .copied()
+                .collect()
+        };
+        let mut reclaimed = 0usize;
+        for (i, id) in candidates.into_iter().enumerate() {
+            let mvcc = self.read_mvcc(kind, id)?;
+            // Not (any longer) an in-use tombstone: drop the stale entry.
+            if !(mvcc.in_use() && mvcc.expired_ts != 0) {
+                self.pending_tombstones[kind as usize].remove(&id);
+                continue;
+            }
+            let reclaimable = Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
+                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
+            if reclaimable {
+                match kind {
+                    StoreKind::Rel => self.reclaim_rel(txn, id)?,
+                    StoreKind::Node => self.reclaim_node(txn, id)?,
+                    StoreKind::Prop | StoreKind::Strings => {}
+                }
+                self.pending_tombstones[kind as usize].remove(&id);
+                reclaimed += 1;
+            } else {
+                // Still a tombstone but not yet reclaimable (watermark hasn't passed, or a live node
+                // still references it): keep it pending. `insert` seeds it on the full-scan path.
+                self.pending_tombstones[kind as usize].insert(id);
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// The property-chain sweep of [`gc`](Self::gc) (`rmp` #522, Phase D): for every surviving live node
+    /// and relationship owner, [`gc_property_chain`](Self::gc_property_chain) reclaims its tombstoned
+    /// property versions and dead-link property corpses. Gated by the caller so it runs only when a
+    /// property tombstone/corpse may exist. Returns the count of property records reclaimed.
+    fn sweep_property_chains(&mut self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
+        let mut reclaimed = 0usize;
+        self.bump_drain_progress();
+        let node_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
+        for (i, &(id, mvcc)) in node_live.iter().enumerate() {
+            if Self::is_live_version(mvcc) {
+                reclaimed += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
+            }
+        }
+        self.bump_drain_progress();
+        let rel_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
+        for (i, &(id, mvcc)) in rel_live.iter().enumerate() {
+            if Self::is_live_version(mvcc) {
+                reclaimed += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
+            }
+            if i % 4096 == 0 {
+                self.bump_drain_progress();
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Drops entries from [`pending_tombstones[kind]`](Self::pending_tombstones) whose record is no
+    /// longer an in-use tombstone (`rmp` #522) — reclaimed (by the property sweep) or reverted to live
+    /// by an abort. Keeps the pending set bounded to the still-pending tombstones.
+    fn prune_settled_tombstones(&mut self, kind: StoreKind) -> Result<()> {
+        let ids: Vec<u64> = self.pending_tombstones[kind as usize]
+            .iter()
+            .copied()
+            .collect();
+        for id in ids {
+            let mvcc = self.read_mvcc(kind, id)?;
+            if !(mvcc.in_use() && mvcc.expired_ts != 0) {
+                self.pending_tombstones[kind as usize].remove(&id);
+            }
+        }
+        Ok(())
+    }
+
     /// Rolls `txn` back: undoes its logged page changes newest-first (writing CLRs and applying
     /// the compensating images to the cached pages), then reloads the catalog from the now-reverted
     /// metadata page so the in-memory allocators, free lists and tokens match (`04 §4.4`).
@@ -2034,12 +2386,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is reverted by the WAL undo below, and the commit timestamp was never issued (only
         // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
         // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
-        // GC pass populates `freed_ids`; a normal write transaction's is empty.
-        let aborted_freed_ids = self
-            .active
-            .remove(&txn)
-            .map(|a| a.freed_ids)
-            .unwrap_or_default();
+        // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
+        // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
+        // own reused-id pops can be RECLAIMED to the free list after the restore below.
+        let ActiveTxn {
+            created: aborted_created,
+            freed_ids: aborted_freed_ids,
+            popped_ids: aborted_popped_ids,
+            popped_prop_owners: aborted_prop_owners,
+            ..
+        } = self.active.remove(&txn).unwrap_or_default();
         // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
         // the SAME monotonicity hazard as the high-water / token / device-page state restored below,
         // but — unlike them — is NOT monotonic (ids are popped as well as pushed), so it cannot use a
@@ -2069,6 +2425,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .is_some_and(|p| p.gc_txn == txn)
         {
             self.pending_gc_prune = None;
+        }
+        // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
+        // advanced. The WAL undo below un-freezes the stamps this pass had frozen (restoring them to
+        // their in-flight form); without restoring the frontier those records would sit below it and the
+        // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
+        // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
+        if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
+            && sp_txn == txn
+        {
+            self.freeze_low = saved;
+            self.gc_freeze_low_savepoint = None;
         }
         // Capture the in-memory physical-id high-water marks BEFORE the catalog reload (`rmp` #220 /
         // #172). `reload_catalog` restores the allocators from the last COMMITTED metadata — but under
@@ -2167,9 +2534,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // stays OUT of the free list and is never double-allocated. Withdrawing `aborted_freed_ids`
         // undoes a GC pass's reclamations: the WAL undo above just restored each reclaimed record's
         // `in_use` bit, so its slot must NOT remain free. A normal write transaction pushes nothing,
-        // so its `pre_free` is restored verbatim and its own POPS are left as leaked corpses —
-        // exactly the #220 corpse model (a rolled-back creation never re-frees its slot; GC's corpse
-        // reclamation collects it later). Ordering is irrelevant: `aborted_freed_ids` and the
+        // so its `pre_free` is restored verbatim. Ordering is irrelevant: `aborted_freed_ids` and the
         // concurrent pops are disjoint id sets (a popped id is off the list; a freed id was in use).
         for (i, pf) in pre_free.into_iter().enumerate() {
             self.stores[i].free = pf;
@@ -2177,7 +2542,181 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for (kind, id) in aborted_freed_ids {
             self.stores[kind as usize].free.remove_id(id);
         }
+        // `rmp` #581: RECLAIM this transaction's own reused-id pops. Every pop the abort left as a
+        // genuinely-unreferenced dead slot returns to the free list (bounded by the pops the txn made);
+        // pops that a concurrently-committed writer turned into a live corpse are left for the #220/#172
+        // GC splice, never double-freed. Runs AFTER the free-list restore above so a re-push cannot be
+        // undone by it, and after the WAL undo (which reverted each pop's slot to `!in_use`).
+        self.reclaim_aborted_pops(&aborted_popped_ids, &aborted_prop_owners);
+        // `rmp` #522: a rolled-back creation may leave a dead-link corpse — a relationship threaded in an
+        // incidence chain by a concurrently-committed prepend (#220) or a property threaded in a property
+        // chain (#172). Register them so the NEXT GC pass runs the corpse splice / property sweep it
+        // otherwise skips. Over-inclusive by design (a non-threaded aborted creation is simply not found
+        // by the walk); the alternative — never registering — would silently leak a threaded corpse once
+        // the incremental sweeps stopped scanning the whole store.
+        for (kind, id) in aborted_created {
+            match kind {
+                StoreKind::Rel => {
+                    self.pending_corpse_rels.insert(id);
+                }
+                StoreKind::Prop => self.pending_prop_corpses = true,
+                _ => {}
+            }
+        }
         Ok(())
+    }
+
+    /// Returns this aborting transaction's genuinely-**unused** reused-id pops to the free list
+    /// (`rmp` #581) — the symmetric reclaim the #578 fix left as a documented bounded leak.
+    ///
+    /// A physical id this transaction popped from the free list (`popped_ids`) and then aborted was
+    /// never actually consumed, so its slot ought to be free again. The WAL undo has already reverted
+    /// each such slot to `!in_use`. It is safe to re-push **only** when the slot is not part of any
+    /// live chain: if a concurrently-committed writer prepended onto it (the `rmp` #220/#172 pattern),
+    /// the slot is a **live-referenced corpse** the GC splice owns, and re-pushing it would hand a
+    /// still-threaded slot back to the allocator — the exact `rmp` #578 double-allocation, in reverse.
+    /// So each pop is re-pushed only after a per-kind **referenced** check:
+    ///
+    /// * **Node** — a node is a chain *anchor*, never a chain member, and a committed relationship
+    ///   cannot reference an uncommitted-then-aborted node (MVCC hides it). Safe once `!in_use`.
+    /// * **Strings** — overflow-heap blocks are built into a property's *private* chain that is never
+    ///   shared or prepended onto by another transaction, so an aborted pop is never referenced. Safe
+    ///   once `!in_use`.
+    /// * **Rel** — walk the two endpoint incidence chains (the endpoints live in the corpse's own
+    ///   preserved body); re-push only if the slot is not threaded into either.
+    /// * **Prop** — walk the recorded owner's property chain; re-push only if the slot is not threaded
+    ///   into it. A popped prop with no recorded owner is conservatively NOT re-pushed (a safe leak).
+    ///
+    /// Best-effort and never fatal: any read/walk error skips that id (leaving it leaked, the pre-#581
+    /// behaviour) rather than failing the rollback — the reclaim is a space optimisation, never a
+    /// durability obligation.
+    fn reclaim_aborted_pops(
+        &mut self,
+        popped_ids: &[(StoreKind, u64)],
+        prop_owners: &[(u64, StoreKind, u64)],
+    ) {
+        for &(kind, id) in popped_ids {
+            // Never create a duplicate free-list entry (a re-pushed id must be unique).
+            if self.store(kind).free.ids().contains(&id) {
+                continue;
+            }
+            let safe = match kind {
+                // Anchors / private heap blocks: unreferenced once their slot is reverted to `!in_use`.
+                StoreKind::Node => matches!(self.read_node(id), Ok(n) if !n.mvcc.in_use()),
+                StoreKind::Strings => matches!(self.read_block(id), Ok(b) if !b.mvcc.in_use()),
+                StoreKind::Rel => match self.read_rel(id) {
+                    Ok(r) if !r.mvcc.in_use() => {
+                        // Endpoints come from the corpse's own preserved body (`rmp` #220): a
+                        // header-only creation undo keeps the record body intact.
+                        !self.rel_slot_referenced(id, &r).unwrap_or(true)
+                    }
+                    _ => false,
+                },
+                StoreKind::Prop => match self.read_prop(id) {
+                    Ok(p) if !p.mvcc.in_use() => {
+                        match prop_owners.iter().find(|&&(pid, _, _)| pid == id) {
+                            Some(&(_, owner_kind, owner_id)) => !self
+                                .prop_chain_visits(owner_kind, owner_id, id)
+                                .unwrap_or(true),
+                            // Owner unknown ⇒ cannot prove it is unreferenced ⇒ leave it (safe leak).
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                },
+            };
+            if safe {
+                self.store_mut(kind).free.push(id);
+            }
+        }
+    }
+
+    /// Whether relationship slot `id` (whose current image is `rel`) is still threaded into either of
+    /// its endpoints' incidence chains (`rmp` #581 corpse check). Walks each endpoint chain from the
+    /// node's `first_rel`, so it is robust to the corpse's own possibly-stale link pointers — exactly
+    /// the walk-driven discipline [`gc_splice_corpses`](Self::gc_splice_corpses) uses.
+    fn rel_slot_referenced(&mut self, id: u64, rel: &RelRecord) -> Result<bool> {
+        if rel.start_node != NULL_ID && self.chain_visits_rel(rel.start_node, id)? {
+            return Ok(true);
+        }
+        if rel.end_node != NULL_ID
+            && rel.end_node != rel.start_node
+            && self.chain_visits_rel(rel.end_node, id)?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether `target` appears as a link in node `node_id`'s incidence chain (`rmp` #581). Mirrors
+    /// [`read_view::incident_rels`](crate::read_view)'s walk exactly (same self-loop side selection,
+    /// same threading through `!in_use` corpse links, same `2 * high_water + 2` cycle guard), but
+    /// returns as soon as it reaches `target` rather than collecting live rels.
+    fn chain_visits_rel(&mut self, node_id: u64, target: u64) -> Result<bool> {
+        let mut cur = self.read_node(node_id)?.first_rel;
+        let guard = self
+            .store(StoreKind::Rel)
+            .alloc
+            .high_water()
+            .saturating_mul(2)
+            .saturating_add(2);
+        let mut steps = 0u64;
+        let mut prev_link = NULL_ID;
+        while cur != NULL_ID {
+            if cur == target {
+                return Ok(true);
+            }
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "incidence chain of node {node_id} is malformed (cycle?)"
+                )));
+            }
+            let r = self.read_rel(cur)?;
+            let is_loop = r.start_node == node_id && r.end_node == node_id;
+            let next = if is_loop {
+                let (end_prev, end_next) = r.chain_pointers(ChainSide::End);
+                if end_prev == prev_link || prev_link == NULL_ID {
+                    end_next
+                } else {
+                    r.chain_pointers(ChainSide::Start).1
+                }
+            } else if r.start_node == node_id {
+                r.start_next_rel
+            } else {
+                r.end_next_rel
+            };
+            prev_link = cur;
+            cur = next;
+        }
+        Ok(false)
+    }
+
+    /// Whether `target` appears in the property chain of `(owner_kind, owner_id)` (`rmp` #581). A
+    /// singly-linked walk from the owner's `first_prop` following `next_prop`, cycle-guarded by the
+    /// `Prop` high-water, mirroring [`gc_property_chain`](Self::gc_property_chain)'s traversal.
+    fn prop_chain_visits(
+        &mut self,
+        owner_kind: StoreKind,
+        owner_id: u64,
+        target: u64,
+    ) -> Result<bool> {
+        let mut cur = self.owner_first_prop(owner_kind, owner_id)?;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            if cur == target {
+                return Ok(true);
+            }
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of {owner_kind:?} {owner_id} is malformed (cycle?)"
+                )));
+            }
+            cur = self.read_prop(cur)?.next_prop;
+        }
+        Ok(false)
     }
 
     /// Rebuilds the in-memory catalog from the durable metadata page.
@@ -2355,7 +2894,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Reclamation at GC ([`reclaim_node`]) must NOT decrement again; rollback restores it via
         // `reload_catalog`.
         self.statistics.dec_node();
-        self.patch_header_word(
+        // `rmp` #301: compare-and-set undo for the tombstone stamp, so a non-LIFO abort never clobbers
+        // a header word a concurrently-interleaved transaction has since re-stamped.
+        self.patch_header_word_cas(
             StoreKind::Node,
             id,
             MVCC_OFF_EXPIRED_TS,
@@ -2720,7 +3261,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {id} is not in use")));
         }
-        self.patch_header_word(
+        // `rmp` #301: compare-and-set undo for the tombstone stamp (non-LIFO-safe, see
+        // [`patch_header_word_cas`](Self::patch_header_word_cas)).
+        self.patch_header_word_cas(
             StoreKind::Rel,
             id,
             MVCC_OFF_EXPIRED_TS,
@@ -3265,6 +3808,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Err(GraphusError::Storage(format!("node {node_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop, txn)?;
+        // `rmp` #581: if `pid` reused a freed slot, remember its owner so a live rollback can decide
+        // whether the popped id became a live-referenced corpse (walk this node's prop chain) or a
+        // reclaimable dead slot.
+        self.note_popped_prop_owner(txn, pid, StoreKind::Node, node_id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp. Until then the version is visible only
         // to its own transaction.
@@ -3348,7 +3895,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let prop = self.read_prop(cur)?;
             let next = prop.next_prop;
             if Self::is_live_version(prop.mvcc) && key_filter.is_none_or(|key| prop.key == key) {
-                self.patch_header_word(
+                // `rmp` #301: compare-and-set undo for the property tombstone stamp — the finding this
+                // task fixes. A plain pre-image undo of a shared `xmax` word under a non-LIFO abort
+                // resurrects a stale stamp (a lost-update / visibility breach); the CAS undo reverts
+                // only if this txn's stamp is still on the word (see `patch_header_word_cas`).
+                self.patch_header_word_cas(
                     StoreKind::Prop,
                     cur,
                     MVCC_OFF_EXPIRED_TS,
@@ -3675,6 +4226,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
         }
         let pid = self.alloc_id(StoreKind::Prop, txn)?;
+        // `rmp` #581: remember the owner of a reused prop slot for the rollback corpse check.
+        self.note_popped_prop_owner(txn, pid, StoreKind::Rel, rel_id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
         // #50); `commit` settles it to the commit timestamp.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
@@ -5345,6 +5898,449 @@ mod tests {
         assert_eq!(
             post.mvcc.expired_ts, 0,
             "the live version carries no tombstone"
+        );
+    }
+
+    /// `rmp` #301 regression: the MVCC **tombstone** (`xmax`) header write uses a **compare-and-set
+    /// logical undo** ([`RecordStore::patch_header_word_cas`]), so a **non-LIFO** abort never clobbers
+    /// an `xmax` word that a concurrently-interleaved transaction has since re-stamped. A plain
+    /// pre-image undo (the pre-#301 behaviour) would restore the aborting transaction's stale
+    /// pre-image over the newer stamp — a lost-update / visibility breach mirroring the `rmp` #239
+    /// non-LIFO relationship-recovery defect and the `rmp` #578 free-list-restore hazard.
+    ///
+    /// Reachability: the public delete/tombstone API is guarded by
+    /// [`is_live_version`](RecordStore::is_live_version), which — with the single-threaded engine and
+    /// SSI — currently serialises `xmax` writes so two live transactions cannot stamp the same word.
+    /// This is therefore a **defense-in-depth** hardening of the storage undo primitive (the `rmp`
+    /// #220/#239 discipline: a shared-field undo must be intrinsically non-LIFO-safe, never rely on a
+    /// higher layer). The test drives the primitive directly to model exactly the two-writer
+    /// interleaving the guard elides. Swapping `patch_header_word_cas` back to the plain
+    /// `patch_header_word` makes the final assertion fail (T1's abort restores `0`, clobbering T2).
+    #[test]
+    fn tombstone_xmax_undo_is_non_lifo_safe_301() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+
+        // Committed node H with a live property V0 (xmax == 0).
+        let setup = TxnId(1);
+        s.begin(setup);
+        let (h, _) = s.create_node(setup).unwrap();
+        let v0 = s
+            .set_node_property_value(setup, h, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(setup).unwrap();
+        assert_eq!(s.property(v0).unwrap().mvcc.expired_ts, 0, "V0 starts live");
+
+        // Two concurrently-open transactions BOTH stamp V0's xmax. T1 stamps first, T2 second — the
+        // interleaving the `is_live_version` guard elides, modelled directly on the storage primitive.
+        let t1 = TxnId(2);
+        let t2 = TxnId(3);
+        s.begin(t1);
+        s.begin(t2);
+        s.patch_header_word_cas(
+            StoreKind::Prop,
+            v0,
+            MVCC_OFF_EXPIRED_TS,
+            VersionStamp::in_flight(t1),
+            t1,
+        )
+        .unwrap();
+        s.patch_header_word_cas(
+            StoreKind::Prop,
+            v0,
+            MVCC_OFF_EXPIRED_TS,
+            VersionStamp::in_flight(t2),
+            t2,
+        )
+        .unwrap();
+        assert_eq!(
+            VersionStamp::from_raw(s.property(v0).unwrap().mvcc.expired_ts),
+            VersionStamp::InFlight(t2),
+            "T2's stamp is the current xmax before the non-LIFO abort"
+        );
+
+        // NON-LIFO abort: the EARLIER writer (T1) rolls back while the LATER writer (T2) still owns the
+        // word. The CAS undo reverts only if xmax is still T1's stamp — it is not (T2 overwrote it), so
+        // it no-ops and T2's stamp is PRESERVED. A plain pre-image undo would restore 0 (a clobber).
+        s.rollback(t1).unwrap();
+        assert_eq!(
+            VersionStamp::from_raw(s.property(v0).unwrap().mvcc.expired_ts),
+            VersionStamp::InFlight(t2),
+            "rmp #301: T1's non-LIFO abort must NOT clobber T2's concurrent xmax stamp"
+        );
+
+        // T2 commits: its tombstone stands (no lost update). Then GC + consistency check.
+        s.commit(t2).unwrap();
+        assert!(
+            s.commit_registry()
+                .resolve_commit_ts(s.property(v0).unwrap().mvcc.expired_ts)
+                .is_some(),
+            "V0's tombstone resolves to T2's commit ts — the delete survived"
+        );
+        let watermark = s.snapshot_ts();
+        s.begin(TxnId(4));
+        s.gc(TxnId(4), watermark).unwrap();
+        s.commit(TxnId(4)).unwrap();
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after #301 non-LIFO abort: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #301 (companion): the CAS tombstone undo is a strict superset of the old plain undo for
+    /// the common **LIFO single-transaction** abort — a property delete that rolls back alone must
+    /// restore the record to live (`xmax == 0`), exactly as before. Guards against the CAS undo
+    /// regressing the ordinary abort path.
+    #[test]
+    fn tombstone_xmax_lifo_single_txn_abort_restores_live_301() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let setup = TxnId(1);
+        s.begin(setup);
+        let (h, _) = s.create_node(setup).unwrap();
+        let v0 = s
+            .set_node_property_value(setup, h, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(setup).unwrap();
+
+        // A real delete via the public API, then a single-transaction abort.
+        let t1 = TxnId(2);
+        s.begin(t1);
+        s.remove_node_property_value(t1, h, key).unwrap();
+        assert_ne!(
+            s.property(v0).unwrap().mvcc.expired_ts,
+            0,
+            "V0 is tombstoned in-flight before the abort"
+        );
+        s.rollback(t1).unwrap();
+        assert_eq!(
+            s.property(v0).unwrap().mvcc.expired_ts,
+            0,
+            "a LIFO single-txn abort restores V0 to live (CAS undo reverts its own stamp)"
+        );
+        assert_eq!(
+            s.node_property_values(h).unwrap(),
+            vec![(v0, key, Value::Integer(1))],
+            "the property is readable again after the abort"
+        );
+    }
+
+    /// Commits a node H with one property, then deletes that property and GCs, so its physical id `P`
+    /// is freed and the durably-committed `Prop` free list is exactly `[P]`. Returns `(h, key, P)`.
+    fn setup_freed_prop_slot(s: &mut Store) -> (u64, u32, u64) {
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (h, _) = s.create_node(t0).unwrap();
+        let p = s.add_node_property(t0, h, key, 1, 0x10).unwrap();
+        s.commit(t0).unwrap();
+        let t_del = TxnId(2);
+        s.begin(t_del);
+        s.remove_node_property_value(t_del, h, key).unwrap();
+        s.commit(t_del).unwrap();
+        let wm = s.snapshot_ts();
+        s.begin(TxnId(3));
+        s.gc(TxnId(3), wm).unwrap();
+        s.commit(TxnId(3)).unwrap();
+        assert_eq!(
+            s.store(StoreKind::Prop).free.ids(),
+            &[p],
+            "setup: the deleted property's slot P is on the free list after GC"
+        );
+        (h, key, p)
+    }
+
+    /// `rmp` #581: an aborting transaction's OWN reused-id pop that ends up UNREFERENCED is returned to
+    /// the free list (reclaimed), closing the reuse-then-abort bounded space leak the #578 fix
+    /// documented. Deterministic RecordStore repro (the #578 DST-harness style).
+    #[test]
+    fn aborted_unreferenced_pop_is_reclaimed_to_the_free_list_581() {
+        let mut s = fresh();
+        let (h, key, p) = setup_freed_prop_slot(&mut s);
+
+        // T1 pops P (reuses the freed slot) as a new property head, then aborts with NO concurrent
+        // prepend, so the chain-head CAS undo unlinks P and it ends up unreferenced.
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
+        assert_eq!(
+            reused, p,
+            "T1 popped the freed slot P (precondition reached)"
+        );
+        assert!(
+            s.store(StoreKind::Prop).free.is_empty(),
+            "P is off the free list while T1 holds it"
+        );
+        s.rollback(t1).unwrap();
+
+        // #581: P was never consumed (T1 aborted) and is unreferenced, so it is BACK on the free list.
+        assert_eq!(
+            s.store(StoreKind::Prop).free.ids(),
+            &[p],
+            "rmp #581: the aborted unreferenced pop is reclaimed to the free list"
+        );
+        // Observable end-to-end: the next allocation reuses P (pre-#581 it leaked and allocated fresh).
+        let t2 = TxnId(5);
+        s.begin(t2);
+        let again = s.add_node_property(t2, h, key, 1, 0x30).unwrap();
+        assert_eq!(
+            again, p,
+            "the reclaimed slot P is reused by the next allocation"
+        );
+        s.commit(t2).unwrap();
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after #581 reclaim + reuse: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #581 (safety boundary): an aborting transaction's own reused-id pop that a
+    /// concurrently-committed writer prepended onto is a LIVE-REFERENCED corpse (the #220/#172
+    /// pattern) and MUST NOT be re-pushed — re-freeing a still-threaded slot would be the #578
+    /// double-allocation in reverse. It stays a corpse the GC property-chain splice reclaims, and the
+    /// storage consistency checker stays green throughout.
+    #[test]
+    fn aborted_pop_that_became_a_live_corpse_is_not_reclaimed_581() {
+        let mut s = fresh();
+        let (h, key, p) = setup_freed_prop_slot(&mut s);
+
+        // T1 pops P and links it as H's property head, staying OPEN.
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
+        assert_eq!(reused, p, "T1 popped the freed slot P");
+
+        // A concurrent committed writer C prepends a NEW property Q on TOP of P (so P becomes
+        // referenced by Q.next_prop). C allocates fresh — T1's pop emptied the free list.
+        let c = TxnId(5);
+        s.begin(c);
+        let q = s.add_node_property(c, h, key + 1, 1, 0x30).unwrap();
+        assert_ne!(q, p, "C allocates a fresh slot (T1 emptied the free list)");
+        s.commit(c).unwrap();
+
+        // T1 aborts (non-LIFO relative to C): P is now a live-referenced corpse (H -> Q -> P -> NULL).
+        s.rollback(t1).unwrap();
+        assert!(
+            s.store(StoreKind::Prop).free.is_empty(),
+            "rmp #581: a referenced-corpse pop must NOT be reclaimed (no double-free of a threaded slot)"
+        );
+        assert!(
+            !s.property(p).unwrap().mvcc.in_use(),
+            "P is a not-in-use corpse threaded below the committed prepend"
+        );
+        // The checker tolerates the corpse threaded in the live chain (no StillInUse / ReferencedByLiveChain).
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "corpse-threaded chain is consistent: {:?}",
+            report.violations
+        );
+        // A subsequent allocation does NOT hand out the still-referenced corpse slot P.
+        let t2 = TxnId(6);
+        s.begin(t2);
+        let fresh_id = s.add_node_property(t2, h, key + 2, 1, 0x40).unwrap();
+        assert_ne!(
+            fresh_id, p,
+            "the corpse slot P is not handed out (still referenced)"
+        );
+        s.commit(t2).unwrap();
+
+        // GC reclaims the corpse P via the property-chain splice; the checker stays green.
+        let wm2 = s.snapshot_ts();
+        s.begin(TxnId(7));
+        s.gc(TxnId(7), wm2).unwrap();
+        s.commit(TxnId(7)).unwrap();
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after GC reclaims the corpse: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #581: a reused-id pop that a transaction COMMITS is untouched — the pop reclaim fires only
+    /// on rollback, and a committed reuse is a live record, never returned to the free list.
+    #[test]
+    fn committed_pop_is_not_reclaimed_581() {
+        let mut s = fresh();
+        let (h, key, p) = setup_freed_prop_slot(&mut s);
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
+        assert_eq!(reused, p);
+        s.commit(t1).unwrap();
+        assert!(
+            s.store(StoreKind::Prop).free.is_empty(),
+            "a committed reuse leaves nothing on the free list"
+        );
+        assert!(
+            s.property(p).unwrap().mvcc.in_use(),
+            "the committed reused slot holds a live record"
+        );
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(report.is_consistent(), "{:?}", report.violations);
+    }
+
+    /// Runs a GC pass over `s` at the current snapshot as its own transaction, returning the report.
+    fn gc_pass(s: &mut Store, txn: u64) -> GcPassReport {
+        let wm = s.snapshot_ts();
+        s.begin(TxnId(txn));
+        let report = s.gc(TxnId(txn), wm).unwrap();
+        s.commit(TxnId(txn)).unwrap();
+        report
+    }
+
+    /// `rmp` #522 (measurement): the incremental freeze sweep visits only the records added since the
+    /// previous maintenance pass, so on a monotonically growing store the per-pass cost is O(Δ), not
+    /// O(store size). Grows the store in equal stages, runs one GC pass per stage, and asserts each
+    /// steady-state pass scans ≈ one stage's worth of ids — a small, bounded FRACTION of the whole
+    /// store — rather than the whole store every tick (the pre-#522 O(N²)-in-aggregate behaviour).
+    #[test]
+    fn gc_freeze_scan_is_incremental_not_quadratic_522() {
+        let mut s = fresh();
+        const STAGE: u64 = 250;
+        const STAGES: u64 = 8;
+        let mut next_txn = 1u64;
+        let mut scanned_per_pass = Vec::new();
+
+        for stage in 0..STAGES {
+            // Create one stage's worth of committed nodes.
+            let t = TxnId(next_txn);
+            next_txn += 1;
+            s.begin(t);
+            for _ in 0..STAGE {
+                s.create_node(t).unwrap();
+            }
+            s.commit(t).unwrap();
+            // One maintenance GC pass.
+            let report = gc_pass(&mut s, next_txn);
+            next_txn += 1;
+            scanned_per_pass.push(report.freeze_scanned);
+            let _ = stage;
+        }
+
+        let total_ids = STAGE * STAGES;
+        // The first pass is a full scan (freeze frontier starts at id 1). Every steady-state pass after
+        // it must scan only ≈ one stage delta, INDEPENDENT of how large the store has grown.
+        for (i, &scanned) in scanned_per_pass.iter().enumerate().skip(1) {
+            assert!(
+                scanned <= 2 * STAGE,
+                "pass {i}: freeze_scanned={scanned} must be ≈ a stage delta ({STAGE}), not the whole \
+                 {total_ids}-id store — the O(Δ) incremental-GC property"
+            );
+        }
+        // The decisive contrast: the LAST pass, over the FULLEST store, scans a small fraction of it.
+        // Pre-#522 every pass re-scanned the whole store, so this would have been ≈ total_ids.
+        let last = *scanned_per_pass.last().unwrap();
+        assert!(
+            last * 4 < total_ids,
+            "the final pass scanned {last} of {total_ids} ids — a per-tick cost proportional to the \
+             whole store would fail here (that is exactly the reverted O(N²) behaviour)"
+        );
+    }
+
+    /// `rmp` #522 (equivalence / safety): the incremental GC leaves the store in the SAME state a full
+    /// whole-store scan would. After a mixed workload (creates, deletes, aborts) driven through the
+    /// incremental sweeps, forcing a FULL-scan GC pass at the same watermark must find NOTHING left to
+    /// freeze or reclaim and must not change a single record — proving the incremental sweeps never miss
+    /// a freeze (which would silently strand a committed writer) or a reclaimable tombstone.
+    #[test]
+    fn incremental_gc_equals_full_gc_522() {
+        let mut s = fresh();
+        let rt = s.intern_token(Namespace::RelType, "R").unwrap();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let mut next = 1u64;
+        let mut nodes = Vec::new();
+
+        // Build a hub + leaves with properties and edges.
+        let t = TxnId(next);
+        next += 1;
+        s.begin(t);
+        let (hub, _) = s.create_node(t).unwrap();
+        for _ in 0..12 {
+            let (n, _) = s.create_node(t).unwrap();
+            s.add_node_property(t, n, key, 1, 0x10).unwrap();
+            s.create_rel(t, rt, hub, n).unwrap();
+            nodes.push(n);
+        }
+        s.commit(t).unwrap();
+
+        // Delete half the leaves' properties and some edges (creates tombstones), commit.
+        let t = TxnId(next);
+        next += 1;
+        s.begin(t);
+        for &n in nodes.iter().step_by(2) {
+            s.remove_node_property_value(t, n, key).unwrap();
+        }
+        s.commit(t).unwrap();
+
+        // Interleaved aborts: create a property + a self-loop on the hub, then roll back (leaves corpses
+        // / exercises the pop-reclaim + corpse-registration paths).
+        let t = TxnId(next);
+        next += 1;
+        s.begin(t);
+        s.add_node_property(t, hub, key, 1, 0x99).unwrap();
+        s.create_rel(t, rt, hub, hub).unwrap();
+        s.rollback(t).unwrap();
+
+        // Drive the INCREMENTAL GC to steady state (two passes so watermark-gated reclaims complete).
+        gc_pass(&mut s, next);
+        next += 1;
+        gc_pass(&mut s, next);
+        next += 1;
+
+        // Fingerprint the store: every in-use record's (id, xmin, xmax) per kind + the free lists.
+        let fingerprint = |s: &mut Store| -> Vec<(u8, u64, u64, u64)> {
+            let mut out = Vec::new();
+            for kind in [
+                StoreKind::Node,
+                StoreKind::Rel,
+                StoreKind::Prop,
+                StoreKind::Strings,
+            ] {
+                for (id, m) in read_view::scan_in_use_mvcc(&s.pool, &s.stores, kind).unwrap() {
+                    out.push((kind as u8, id, m.created_ts, m.expired_ts));
+                }
+                for &fid in s.store(kind).free.ids() {
+                    out.push((kind as u8, fid, u64::MAX, u64::MAX)); // free-list marker
+                }
+            }
+            out.sort_unstable();
+            out
+        };
+        let before = fingerprint(&mut s);
+
+        // Force a FULL-scan GC pass at the SAME watermark: reset the freeze frontier and the full-scan
+        // flag (the child test module reaches the private incremental-GC state directly).
+        s.freeze_low = [1; STORE_COUNT];
+        s.gc_full_scan_pending = true;
+        let wm = s.snapshot_ts();
+        s.begin(TxnId(next));
+        let full = s.gc(TxnId(next), wm).unwrap();
+        s.commit(TxnId(next)).unwrap();
+
+        assert_eq!(
+            full.frozen, 0,
+            "a full scan found unfrozen stamps the incremental sweep missed (a stranded-writer bug)"
+        );
+        assert_eq!(
+            full.reclaimed, 0,
+            "a full scan found reclaimable records the incremental sweep missed (a space leak)"
+        );
+        assert_eq!(
+            fingerprint(&mut s),
+            before,
+            "the forced full GC changed the store — the incremental GC was not equivalent"
+        );
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after #522 equivalence check: {:?}",
+            report.violations
         );
     }
 

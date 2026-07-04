@@ -575,6 +575,16 @@ struct Scan {
     corpse_rels: BTreeMap<u64, RelRecord>,
     /// Live property ids -> their record.
     live_props: BTreeMap<u64, PropRecord>,
+    /// **Dead-link corpse** property ids -> their record (`rmp` #172, the property twin of
+    /// [`corpse_rels`](Scan::corpse_rels)): slots that are `!in_use` and NOT on the free list, left by
+    /// an aborted/crashed property creation whose header-only creation undo cleared the in-use bit
+    /// while PRESERVING the `next_prop` body. When a concurrently-committed writer had prepended on
+    /// top, such a corpse remains threaded in a live owner's chain until GC's
+    /// [`gc_property_chain`](RecordStore::gc_property_chain) splices it out. The runtime read path
+    /// ([`read_view::node_properties`](crate::read_view)) threads transparently THROUGH it, so the
+    /// property-chain check must do the same rather than flag [`PropertyFault::DeadProp`] on a valid
+    /// transient state (`rmp` #581 surfaced this asymmetry).
+    corpse_props: BTreeMap<u64, PropRecord>,
     /// Live `strings.store` overflow-heap block ids -> their block (`rmp` task #43).
     live_blocks: BTreeMap<u64, HeapBlock>,
     /// Freed ids per store (from the catalog), as a set for O(log n) membership.
@@ -646,6 +656,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     }
 
     let mut live_props = BTreeMap::new();
+    let mut corpse_props = BTreeMap::new();
     for id in 1..cat.high_water(StoreKind::Prop) {
         let Ok(rec) = store.property(id) else {
             continue;
@@ -656,6 +667,10 @@ fn scan_records<D: BlockDevice, S: LogSink>(
             }
         } else if rec.mvcc.in_use() {
             live_props.insert(id, rec);
+        } else {
+            // !in_use and not on the free list: a dead-link property corpse the chain walk threads
+            // through (`rmp` #172, the property twin of `corpse_rels`).
+            corpse_props.insert(id, rec);
         }
     }
 
@@ -680,6 +695,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
         live_nodes,
         live_rels,
         live_props,
+        corpse_props,
         live_blocks,
         freed,
         freed_but_in_use,
@@ -787,7 +803,18 @@ fn check_property_chains<D: BlockDevice, S: LogSink>(
                     });
                     return;
                 }
-                let Some(rec) = scan.live_props.get(&cur) else {
+                // Follow the chain via the live record's `next_prop`, or — for a `!in_use` dead-link
+                // property **corpse** (`rmp` #172, not on the free list) — thread transparently THROUGH
+                // it exactly as the runtime read path and the adjacency corpse walk do, so a valid
+                // transient corpse (a rolled-back creation a committed prepend left threaded, `rmp`
+                // #581) is not mis-flagged. A genuinely freed / missing / unreadable prop reached by a
+                // live chain is NOT a corpse (a freed-and-referenced prop is separately reported as
+                // `FreeListFault::ReferencedByLiveChain`), so it still trips `DeadProp` here.
+                let next = if let Some(rec) = scan.live_props.get(&cur) {
+                    rec.next_prop
+                } else if let Some(corpse) = scan.corpse_props.get(&cur) {
+                    corpse.next_prop
+                } else {
                     report.push(Violation::PropertyChain {
                         owner_kind,
                         owner,
@@ -797,7 +824,7 @@ fn check_property_chains<D: BlockDevice, S: LogSink>(
                     return;
                 };
                 prev = cur;
-                cur = rec.next_prop;
+                cur = next;
             }
         };
 

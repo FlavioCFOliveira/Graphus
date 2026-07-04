@@ -327,6 +327,7 @@ fn for_each_record_slot<D, S, P, F>(
     pool: &Pool<D, S>,
     pages: &P,
     kind: StoreKind,
+    from: u64,
     mut visit: F,
 ) -> Result<()>
 where
@@ -341,17 +342,25 @@ where
     }
     let record_size = kind.record_size();
     let rpp = paging::records_per_page(record_size) as u64;
-    // The live id range `1..high_water` spans store-relative pages `0..=last_page` (id 1 lives on
-    // page 0 since `rpp >= 1`; the highest live id is `high_water - 1`). Walk those pages inclusively.
+    // Visit the id range `from.max(1)..high_water`, ascending (`rmp` #522: a `from > 1` lets the freeze
+    // sweep skip every already-settled record below the frontier by starting on the page that holds
+    // `from`, so the scan is O(records above the frontier), not O(store size)). The range spans
+    // store-relative pages `first_page..=last_page` (id 1 lives on page 0 since `rpp >= 1`; the highest
+    // live id is `high_water - 1`). Walk those pages inclusively.
+    let from = from.max(1);
+    if from >= high_water {
+        return Ok(()); // nothing at or above the frontier
+    }
+    let first_page = from / rpp;
     let last_page = (high_water - 1) / rpp;
-    for rel_page in 0..=last_page {
+    for rel_page in first_page..=last_page {
         let dev = pages.device_page(kind, rel_page)?;
         // The first id this page holds, and the (exclusive) id one past its last in-range slot. Clamp
         // the upper bound to `high_water` so the final page never visits an id at or beyond the
-        // high-water mark (an unallocated slot), and clamp the lower bound to `1` so the null-pointer
-        // slot 0 of page 0 is skipped — exactly the `1..high_water` range the per-id loop covered.
+        // high-water mark (an unallocated slot), and clamp the lower bound to `from` (>= 1) so the
+        // null-pointer slot 0 of page 0 — and every already-settled slot below the frontier — is skipped.
         let page_first_id = rel_page * rpp;
-        let id_lo = page_first_id.max(1);
+        let id_lo = page_first_id.max(from);
         let id_hi = (page_first_id + rpp).min(high_water);
         // ONE pin + read latch for the whole page (concurrent.rs:442): walk every in-range slot under
         // it. The closure does pure decode work; it never re-enters the pool with this page.
@@ -385,7 +394,7 @@ pub fn scan_node_ids<D: BlockDevice, S: LogSink, P: StorePages>(
     pages: &P,
 ) -> Result<Vec<u64>> {
     let mut out = Vec::new();
-    for_each_record_slot(pool, pages, StoreKind::Node, |id, rec| {
+    for_each_record_slot(pool, pages, StoreKind::Node, 1, |id, rec| {
         // The `in_use` flag lives in the first MVCC-header byte of every record (record.rs:30): read
         // just that header from the slot, exactly as `read_node(...).mvcc.in_use()` did.
         if MvccHeader::read(&rec[..MVCC_HEADER_SIZE]).in_use() {
@@ -408,7 +417,7 @@ pub fn scan_rel_ids<D: BlockDevice, S: LogSink, P: StorePages>(
     pages: &P,
 ) -> Result<Vec<u64>> {
     let mut out = Vec::new();
-    for_each_record_slot(pool, pages, StoreKind::Rel, |id, rec| {
+    for_each_record_slot(pool, pages, StoreKind::Rel, 1, |id, rec| {
         if MvccHeader::read(&rec[..MVCC_HEADER_SIZE]).in_use() {
             out.push(id);
         }
@@ -435,8 +444,24 @@ pub fn scan_in_use_mvcc<D: BlockDevice, S: LogSink, P: StorePages>(
     pages: &P,
     kind: StoreKind,
 ) -> Result<Vec<(u64, MvccHeader)>> {
+    scan_in_use_mvcc_from(pool, pages, kind, 1)
+}
+
+/// Like [`scan_in_use_mvcc`] but visits only the id range `from..high_water` (`rmp` #522): the
+/// incremental freeze sweep passes its per-kind freeze frontier as `from`, so it reads only the
+/// records that may still carry an unfrozen stamp instead of re-scanning the whole store every
+/// maintenance tick. `from == 1` is exactly [`scan_in_use_mvcc`].
+///
+/// # Errors
+/// Returns a storage error if a store page in the range cannot be read.
+pub fn scan_in_use_mvcc_from<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    from: u64,
+) -> Result<Vec<(u64, MvccHeader)>> {
     let mut out = Vec::new();
-    for_each_record_slot(pool, pages, kind, |id, rec| {
+    for_each_record_slot(pool, pages, kind, from, |id, rec| {
         let mvcc = MvccHeader::read(&rec[..MVCC_HEADER_SIZE]);
         if mvcc.in_use() {
             out.push((id, mvcc));
