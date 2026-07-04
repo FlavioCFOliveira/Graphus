@@ -308,3 +308,95 @@ fn concurrent_autocommit_writes_coalesce_and_survive_restart() {
     drop(handle2);
     graceful_shutdown(reopened);
 }
+
+/// `rmp` #570 — auto-commit coalescing must NOT collapse as concurrency rises past W=4.
+///
+/// An auto-commit write is TWO consecutive engine commands: a `BeginAutoCommit` (the ticket
+/// round-trip) then the `Run`. With many concurrent writers the engine channel interleaves their
+/// `BeginAutoCommit`s BETWEEN the batchable `Run`s. Before #570 an interleaved open was treated as
+/// non-batchable — it truncated the group-commit batch at the first open and dropped the engine out of
+/// the pipeline loop — so coalescing COLLAPSED at higher W (measured batch ~1.8, i.e.
+/// `fdatasync/commit` ~0.55, *worse* than W=4's ~0.27). #570 dispatches the durability-inert
+/// transaction-open inline and keeps draining, so the batch grows with W again.
+///
+/// This test pins the anti-collapse property at W=16: real coalescing (avg batch strictly > 3, which a
+/// collapse to ~1.8 fails) AND full durability — every write acked, committed-visible, and surviving a
+/// recover-from-WAL restart. It is deliberately conservative (batch > 3, vs. the ~15 measured at W=16)
+/// so it never flakes under CI load while still failing hard if the collapse is ever reintroduced.
+#[test]
+fn autocommit_coalescing_scales_and_does_not_collapse_at_w16() {
+    const W: usize = 16;
+    const M: i64 = 100; // writes per thread
+    let total = W as i64 * M;
+
+    let dir = TempDir::new("noncollapse");
+    let hardens = Arc::new(AtomicU64::new(0));
+    let engine = create_engine(&dir.path, Arc::clone(&hardens));
+    let handle = engine.handle.clone();
+
+    // Warm the catalog (label + prop key interned) so the concurrent phase is steady-state.
+    assert!(write_acct(&handle, -1), "warmup write commits");
+    let hardens_before = hardens.load(Ordering::Relaxed);
+
+    let acked = Arc::new(AtomicU64::new(0));
+    let mut threads = Vec::new();
+    for t in 0..W {
+        let h = handle.clone();
+        let acked = Arc::clone(&acked);
+        threads.push(std::thread::spawn(move || {
+            let base = (t as i64) * 1_000_000;
+            let mut n = 0u64;
+            for k in 0..M {
+                if write_acct(&h, base + k) {
+                    n += 1;
+                }
+            }
+            acked.fetch_add(n, Ordering::Relaxed);
+        }));
+    }
+    for th in threads {
+        th.join().expect("writer joins");
+    }
+
+    // (1) Every write acked (liveness + the offload never drops/hangs an ack).
+    assert_eq!(
+        acked.load(Ordering::Relaxed),
+        total as u64,
+        "every concurrent auto-commit write must be acknowledged"
+    );
+
+    // (2) Anti-collapse: strong coalescing — the average batch is strictly > 3 commits per physical
+    // harden. A collapse (batch ~1.8) would need >= total/1.8 hardens (> total/3), failing this.
+    let concurrent_hardens = hardens.load(Ordering::Relaxed) - hardens_before;
+    assert!(
+        concurrent_hardens > 0,
+        "the concurrent phase must perform real hardens (durability), got 0"
+    );
+    assert!(
+        concurrent_hardens * 3 < total as u64,
+        "auto-commit coalescing COLLAPSED at W={W}: {concurrent_hardens} hardens for {total} commits \
+         (avg batch {:.2}); #570 requires the interleaved transaction-opens to be folded inline so the \
+         batch stays > 3 commits per sync",
+        total as f64 / concurrent_hardens as f64,
+    );
+
+    // (3) Every committed write is visible.
+    assert_eq!(
+        count_accts(&handle),
+        total + 1,
+        "all concurrent writes + the warmup must be committed-visible"
+    );
+
+    // (4) Durability across a restart — every acked write survives the recover-from-WAL reopen.
+    drop(handle);
+    graceful_shutdown(engine);
+    let reopened = reopen_engine(&dir.path);
+    let handle2 = reopened.handle.clone();
+    assert_eq!(
+        count_accts(&handle2),
+        total + 1,
+        "every acknowledged auto-commit write must survive a recover-from-WAL restart"
+    );
+    drop(handle2);
+    graceful_shutdown(reopened);
+}
