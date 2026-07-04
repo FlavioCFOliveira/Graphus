@@ -110,8 +110,7 @@ fn seed_reco(s: &mut RecordStore<MemBlockDevice, MemLogSink>, cfg: SeedCfg) {
     }
     for u in 0..cfg.users {
         for k in 0..cfg.purchase_deg {
-            let p =
-                (u.wrapping_mul(31).wrapping_add(k.wrapping_mul(97))).rem_euclid(cfg.products);
+            let p = (u.wrapping_mul(31).wrapping_add(k.wrapping_mul(97))).rem_euclid(cfg.products);
             s.create_rel(txn, t_purchased, users[u as usize], products[p as usize])
                 .unwrap();
         }
@@ -191,7 +190,9 @@ fn run_explicit(
     stmt: &str,
     id: i64,
 ) -> Vec<Vec<graphus_cypher::MaterializedValue>> {
-    let ticket = handle.begin_blocking(AccessMode::Read).expect("begin explicit");
+    let ticket = handle
+        .begin_blocking(AccessMode::Read)
+        .expect("begin explicit");
     let params = vec![("id".to_owned(), Value::Integer(id))];
     let mut rows = Vec::new();
     match handle.run_blocking(ticket, stmt.to_owned(), params, false, None) {
@@ -204,12 +205,17 @@ fn run_explicit(
         },
         Err(e) => panic!("explicit run failed: {e:?}"),
     }
-    handle.commit_blocking(ticket).expect("explicit read commits");
+    handle
+        .commit_blocking(ticket)
+        .expect("explicit read commits");
     rows
 }
 
 fn shutdown(eng: Engine, handle: EngineHandle) {
-    let Engine { handle: inner, join } = eng;
+    let Engine {
+        handle: inner,
+        join,
+    } = eng;
     drop(handle);
     drop(inner);
     join.join().expect("engine joins");
@@ -310,10 +316,16 @@ fn proc_cpu_secs() -> f64 {
 fn measure_reader_pool_morsel_width() {
     let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let env_i64 = |k: &str, d: i64| {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     let env_usize = |k: &str, d: usize| {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     let cfg = SeedCfg {
         users: env_i64("GRAPHUS_BENCH_USERS", 30_000),
@@ -340,7 +352,10 @@ fn measure_reader_pool_morsel_width() {
 
     // ---- Regime 1: LONE read (reader pool otherwise idle) ----
     println!("\n[regime 1] lone heavy read (K=1):");
-    for (label, knob) in [("clamp-to-1 (rmp #377 v1)", 1usize), ("adaptive (rmp #575-g.1)", pool)] {
+    for (label, knob) in [
+        ("clamp-to-1 (rmp #377 v1)", 1usize),
+        ("adaptive (rmp #575-g.1)", pool),
+    ] {
         graphus_cypher::morsel::set_morsel_threads(knob);
         let _ = run_auto(&handle, R3_FOF3, 0); // settle
         let (cpu0, wall0) = (proc_cpu_secs(), Instant::now());
@@ -363,7 +378,10 @@ fn measure_reader_pool_morsel_width() {
             continue;
         }
         println!("\n[regime 2] K={k} concurrent heavy reads:");
-        for (label, knob) in [("clamp-to-1 (rmp #377 v1)", 1usize), ("adaptive (rmp #575-g.1)", pool)] {
+        for (label, knob) in [
+            ("clamp-to-1 (rmp #377 v1)", 1usize),
+            ("adaptive (rmp #575-g.1)", pool),
+        ] {
             graphus_cypher::morsel::set_morsel_threads(knob);
             let barrier = Arc::new(std::sync::Barrier::new(k + 1));
             let done = Arc::new(AtomicUsize::new(0));
@@ -460,7 +478,10 @@ fn measure_inline_routing_write_stall() {
 
     // `inline_read == true` is the design-(b) proxy (heavy read in an explicit txn → inline on the engine
     // thread); `false` is design (a) (heavy read auto-commit → off-thread with adaptive width).
-    for (label, inline_read) in [("(a) read off-thread ", false), ("(b) read inline (proxy)", true)] {
+    for (label, inline_read) in [
+        ("(a) read off-thread ", false),
+        ("(b) read inline (proxy)", true),
+    ] {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reads_done = Arc::new(AtomicUsize::new(0));
         let h_read = handle.clone();

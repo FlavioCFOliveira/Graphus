@@ -396,10 +396,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if self.has_error() {
             return None;
         }
-        let source: Box<dyn crate::morsel::MorselSource> = Box::new(crate::morsel::MorselView::new(
-            self.view.clone(),
-            self.tokens.clone(),
-        ));
+        let source: Box<dyn crate::morsel::MorselSource> = Box::new(
+            crate::morsel::MorselView::new(self.view.clone(), self.tokens.clone()),
+        );
         Some(crate::morsel::MorselFrontierSource {
             source,
             snapshot: self.snapshot,

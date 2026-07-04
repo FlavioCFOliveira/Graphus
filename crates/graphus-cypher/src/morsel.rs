@@ -241,7 +241,7 @@ pub fn morsel_threads() -> usize {
         n => n,
     };
     match READER_POOL_MORSEL_WIDTH.with(Cell::get) {
-        0 => configured,                       // engine thread / non-reader: full configured width
+        0 => configured, // engine thread / non-reader: full configured width
         width => width.min(configured).max(1), // reader-pool worker: adaptive width, capped by the knob
     }
 }
@@ -3209,15 +3209,26 @@ mod reader_pool_suppression_tests {
         {
             let _g = ReaderPoolWorkerGuard::enter_with_width(8);
             assert!(is_reader_pool_worker());
-            assert_eq!(morsel_threads(), 8, "reader worker reports its intended width");
+            assert_eq!(
+                morsel_threads(),
+                8,
+                "reader worker reports its intended width"
+            );
         }
-        assert!(!is_reader_pool_worker(), "width restored to the not-a-worker sentinel on drop");
+        assert!(
+            !is_reader_pool_worker(),
+            "width restored to the not-a-worker sentinel on drop"
+        );
         assert_eq!(morsel_threads(), 8);
 
         // An intended width above the configured knob is capped by the knob (never over-fans).
         {
             let _g = ReaderPoolWorkerGuard::enter_with_width(64);
-            assert_eq!(morsel_threads(), 8, "width is capped by the configured morsel-thread count");
+            assert_eq!(
+                morsel_threads(),
+                8,
+                "width is capped by the configured morsel-thread count"
+            );
         }
 
         // Width 1 (K >= P collapse) reproduces the #377 v1 serial-per-read clamp.
@@ -3250,7 +3261,11 @@ mod reader_pool_suppression_tests {
         set_analytics_pool_threads(8); // fixed pool P = 8 for a deterministic assertion
 
         // Lone read (0 already in flight → this read is the 1st): full pool.
-        assert_eq!(reader_pool_morsel_width(0), 8, "a lone read fans across the whole analytics pool");
+        assert_eq!(
+            reader_pool_morsel_width(0),
+            8,
+            "a lone read fans across the whole analytics pool"
+        );
 
         // K concurrent reads: each gets <= P/K, and the SUM never exceeds P (no over-subscription).
         for k in 1u64..=12 {
@@ -3260,7 +3275,10 @@ mod reader_pool_suppression_tests {
             assert_eq!(width, expected, "width at k={k} inflight");
             // If all k reads dispatched at the same inflight snapshot, the worst-case sum is bounded by P
             // (+ the min-1 floor once k > P, where each read is serial on its own reader thread).
-            assert!(width * (k as usize) <= 8 || width == 1, "sum bound at k={k}");
+            assert!(
+                width * (k as usize) <= 8 || width == 1,
+                "sum bound at k={k}"
+            );
         }
 
         // K >= P: width collapses to exactly 1 (the #377 v1 serial-per-read clamp).
@@ -3269,7 +3287,11 @@ mod reader_pool_suppression_tests {
 
         // Morsel globally disabled (determinism pin): every reader-pool read stays serial regardless.
         set_morsel_threads(1);
-        assert_eq!(reader_pool_morsel_width(0), 1, "disabled morsel keeps a lone reader read serial");
+        assert_eq!(
+            reader_pool_morsel_width(0),
+            1,
+            "disabled morsel keeps a lone reader read serial"
+        );
         assert_eq!(reader_pool_morsel_width(3), 1);
 
         set_analytics_pool_threads(prev_analytics);

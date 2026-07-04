@@ -494,7 +494,9 @@ pub(super) fn handle_run<
                     // not how many peers are in flight), and carried to the worker's `ReaderPoolWorkerGuard`.
                     // A lone read (`readers_inflight == 0`) fans across the whole analytics pool; `K`
                     // concurrent reads get `<= P/K` each (sum `<= P`, no over-subscription; `1` at `K >= P`).
-                    morsel_width: graphus_cypher::morsel::reader_pool_morsel_width(readers_inflight),
+                    morsel_width: graphus_cypher::morsel::reader_pool_morsel_width(
+                        readers_inflight,
+                    ),
                     row_tx,
                     row_rx: row_rx
                         .take()
