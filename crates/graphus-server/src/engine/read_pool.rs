@@ -84,6 +84,13 @@ pub struct ReadTask<D: BlockDevice, S: LogSink> {
     /// same budget an inline statement gets: the reader builds its cursor's deadline-bearing
     /// cancellation token from it.
     pub deadline: Option<std::time::Instant>,
+    /// The intended intra-query **morsel width** for this read (`rmp` task #575-g.1), chosen on the engine
+    /// thread at dispatch from `readers_inflight` via
+    /// [`reader_pool_morsel_width`](graphus_cypher::morsel::reader_pool_morsel_width). The worker enters a
+    /// [`ReaderPoolWorkerGuard`](graphus_cypher::morsel::ReaderPoolWorkerGuard) with this width, so a lone
+    /// heavy read fans out across the whole analytics pool while `K` concurrent reads share it without
+    /// over-subscription (their widths sum to `<= pool capacity`). `1` = serial-within-statement.
+    pub morsel_width: usize,
     /// The egress channel the reader streams rows into; handed back at retirement so the engine can
     /// send a terminal auto-commit error through it (the auto-commit terminal-error contract).
     pub row_tx: RowSender,
@@ -127,7 +134,9 @@ pub struct ReadRetirement {
 /// [`RunReply`] over `reply` **before** the first row (so the consumer can drain concurrently), streams
 /// rows, then surfaces — in priority order — an authorization denial, then the seam's captured
 /// error/write-degrade (R3), as the `outcome`. The engine then merges + auto-commits.
-pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRetirement {
+pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
+    task: ReadTask<D, S>,
+) -> ReadRetirement {
     let ReadTask {
         txn,
         ticket,
@@ -137,6 +146,9 @@ pub fn run_read_task<D: BlockDevice, S: LogSink>(task: ReadTask<D, S>) -> ReadRe
         extensions,
         privileges,
         deadline,
+        // The morsel width is consumed by the worker loop (to enter the `ReaderPoolWorkerGuard`) *before*
+        // the task is moved here, so `run_read_task` itself ignores it.
+        morsel_width: _,
         row_tx,
         row_rx,
         reply,
@@ -346,7 +358,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 /// One reader worker's loop: pull a task under the shared lock, run it, post the retirement. Ends when
 /// the work queue is closed (the engine dropped the sender at shutdown). If the engine's retirement
 /// channel is closed (engine gone), the send fails harmlessly and the worker drains the rest.
-fn worker_loop<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>(
+fn worker_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     work_rx: &Arc<std::sync::Mutex<Receiver<ReadTask<D, S>>>>,
     retire_tx: &Sender<ReadRetirement>,
     metrics: &Metrics,
@@ -366,13 +378,16 @@ fn worker_loop<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>(
             // Queue closed: the engine is shutting down. Exit so the worker can be joined.
             return;
         };
-        // `rmp` task #377: mark this thread a reader-pool worker for the read's duration so the morsel
-        // tier suppresses itself (`Ctx.morsel_threads` clamps to 1 at every `Cursor::open` on this
-        // thread). A heavy read dispatched here is cross-statement-parallel (this is one of up to
-        // `min(N,16)` reader threads) and must NOT *also* fan out onto the shared analytics pool —
-        // `K` concurrent large reads would otherwise queue `K × min(N,16)` morsel tasks on a
-        // `min(N,16)`-thread pool. The guard restores the prior flag on drop (incl. panic-unwind), so it
-        // never leaks to the next task this reused worker runs.
+        // `rmp` tasks #377 / #575-g.1: mark this thread a reader-pool worker for the read's duration,
+        // carrying the **adaptive morsel width** the engine dispatch site chose from `readers_inflight`
+        // (`Ctx.morsel_threads` reads this width at every `Cursor::open` on this thread). A lone heavy
+        // read (reader pool otherwise idle) was dispatched with the FULL analytics-pool width, so it fans
+        // out across all cores (the `rmp` #575 intra-query win); `K` concurrent reads were each dispatched
+        // with width `<= P/K`, so the SUM of their fan-outs never exceeds the analytics pool capacity `P`
+        // (the `rmp` #377 no-oversubscription guarantee — width collapses to `1`, i.e. serial-per-read, at
+        // `K >= P`). The width is snapshotted here *before* `task` is moved into `run_read_task`. The guard
+        // restores the prior width on drop (incl. panic-unwind), so it never leaks to the next task this
+        // reused worker runs.
         // `rmp` task #386: isolate the read behind a panic boundary. A panic in a read task (executor,
         // materializer, UDF, or a `rayon`-propagated morsel/GDS worker panic re-raised on *this* worker
         // thread) must NOT kill the worker — that would silently shrink the pool, leak
@@ -389,9 +404,11 @@ fn worker_loop<D: BlockDevice + Send + Sync, S: LogSink + Send + Sync>(
         // `finish_reader` rolls the reader's transaction back regardless of where the panic struck.
         let txn = task.txn;
         let ticket = task.ticket;
+        let morsel_width = task.morsel_width;
         let row_tx_fallback = task.row_tx.clone();
         let retirement = {
-            let _morsel_suppression = graphus_cypher::morsel::ReaderPoolWorkerGuard::enter();
+            let _morsel_width =
+                graphus_cypher::morsel::ReaderPoolWorkerGuard::enter_with_width(morsel_width);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_read_task(task))) {
                 Ok(retirement) => retirement,
                 Err(panic_payload) => {

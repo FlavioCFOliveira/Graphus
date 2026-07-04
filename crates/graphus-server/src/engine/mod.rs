@@ -2138,6 +2138,10 @@ fn run_statement_isolated<
             privileges,
             extensions,
             dispatch,
+            // `rmp` task #575-g.1: the count of reads already in flight, so the dispatch site can size
+            // this read's adaptive morsel width (a snapshot BEFORE this read is counted — it becomes the
+            // `+ 1` in `reader_pool_morsel_width`). Read on the engine thread; never mutated here.
+            *readers_inflight,
             result_buffer_capacity,
             metrics,
             db,

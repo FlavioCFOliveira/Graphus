@@ -276,6 +276,29 @@ impl SsiReadBuffer {
         self.predicates.push(predicate);
     }
 
+    /// Folds another buffer's markers into this one (`rmp` task #575-g.1): appends its physical-key and
+    /// predicate markers, in append order.
+    ///
+    /// Used by the **off-thread** [`ReadOnlyGraph`](../../graphus_cypher)`::merge_morsel_buffer` to
+    /// converge a morsel's SIREAD markers into the reader's **own** buffer. A reader thread holds no
+    /// shared [`SsiTracker`], so — unlike the inline `RecordStoreGraph`, which folds each morsel buffer
+    /// straight into the tracker via [`merge_read_buffer`](SsiTracker::merge_read_buffer) — the reader
+    /// accumulates every marker here and its whole buffer is merged into the tracker once, at retirement
+    /// (M1). Folding here is therefore timing-equivalent: [`merge_read_buffer`] sorts + dedups + replays,
+    /// so the resulting conflict graph is the **union** of the morsels' markers regardless of whether they
+    /// reached the tracker directly (inline) or via this buffer (off-thread) — byte-identical rw-edges.
+    ///
+    /// Both buffers must accumulate for the **same** reader transaction (the markers are replayed under
+    /// this buffer's `reader`); a mismatch is a programming error (a morsel built for a different txn).
+    pub fn absorb(&mut self, other: SsiReadBuffer) {
+        debug_assert_eq!(
+            self.reader, other.reader,
+            "SsiReadBuffer::absorb: both buffers must accumulate for the same reader txn"
+        );
+        self.keys.extend(other.keys);
+        self.predicates.extend(other.predicates);
+    }
+
     /// Consumes the buffer into its **canonical** marker form: the reader id plus the sorted+deduped
     /// physical-key markers and sorted+deduped predicate markers (`rmp` task #336, Slice 3b-i).
     ///

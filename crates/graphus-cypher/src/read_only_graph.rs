@@ -252,7 +252,13 @@ impl<D: BlockDevice, S: LogSink> ReadSink for ReadOnlyGraph<D, S> {
     }
 }
 
-impl<D: BlockDevice, S: LogSink> GraphAccess for ReadOnlyGraph<D, S> {
+// `Send + Sync + 'static` on `D, S` (mirroring `RecordStoreGraph`'s `GraphAccess` impl): the
+// `rmp` #575-g.1 `frontier_morsel_source` boxes a `MorselView<D, S>` into a `Box<dyn MorselSource>`
+// (`Send + Sync`), which needs the store types to be `Send + Sync`. The off-thread reader path already
+// requires this (the whole `ReadOnlyGraph` is moved to a worker thread), so it is no real restriction.
+impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> GraphAccess
+    for ReadOnlyGraph<D, S>
+{
     // ---- reads: the single lifted body over this reader's ReadViewSource ----------------------
 
     fn scan_nodes(&self) -> Vec<NodeId> {
@@ -366,6 +372,58 @@ impl<D: BlockDevice, S: LogSink> GraphAccess for ReadOnlyGraph<D, S> {
             node,
             search,
         ))
+    }
+
+    // ---- morsel intra-query parallelism (off-thread, `rmp` task #575-g.1) ---------------------------
+
+    fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {
+        // `rmp` task #575-g.1: let the off-thread reader engage the `rmp` #575 **frontier** morsel tier
+        // (the heavy `r3_fof3` recommendation shape). Before this, `ReadOnlyGraph` used the trait default
+        // (`None`), so — even with the `rmp` #575-g.1 adaptive morsel width in force on the reader worker —
+        // the tier declined here and a lone heavy read still ran on ONE reader thread; the `rmp` #575 win
+        // never reached the live server.
+        //
+        // An off-thread reader IS a **coordinated** read: it accumulates SIREAD markers into its own
+        // buffer, which the engine merges into the shared `SsiTracker` at retirement (M1) — so, unlike a
+        // standalone/historical read (no shared tracker), it may hand off the frontier source. It captures
+        // exactly the pieces `RecordStoreGraph::frontier_morsel_source` does: the owned, `Send`,
+        // cheap-cloneable read surface (a `StoreReadView` + `TokenSnapshot` clone — `Arc` bumps, no page
+        // copy) plus this reader's snapshot + commit-registry clone + txn. No index is needed (the frontier
+        // anchors come from the earlier sub-plan the executor drains serially, through THIS graph, so its
+        // anchor-set markers land in this reader's buffer) and no coarse predicate is registered here
+        // (mirroring the inline seam). A captured error makes the result untrustworthy, so decline and let
+        // the serial fallback re-run + surface it.
+        if self.has_error() {
+            return None;
+        }
+        let source: Box<dyn crate::morsel::MorselSource> = Box::new(crate::morsel::MorselView::new(
+            self.view.clone(),
+            self.tokens.clone(),
+        ));
+        Some(crate::morsel::MorselFrontierSource {
+            source,
+            snapshot: self.snapshot,
+            registry: self.registry.clone(),
+            txn: self.txn,
+        })
+    }
+
+    fn merge_morsel_buffer(&self, buffer: graphus_txn::SsiReadBuffer) {
+        // Convergence (`rmp` task #575-g.1): fold a morsel's accumulated SIREAD markers into THIS reader's
+        // own buffer. A reader thread holds no shared `SsiTracker` (that lives only on the engine thread),
+        // so — unlike `RecordStoreGraph::merge_morsel_buffer`, which folds straight into the tracker — the
+        // reader absorbs every morsel's markers into its buffer and the whole buffer is merged into the
+        // tracker once, at retirement (M1). `SsiTracker::merge_read_buffer` sorts + dedups + replays, so
+        // the resulting conflict graph is the UNION of the morsels' markers — byte-identical rw-edges to
+        // both the serial scan and the inline morsel path. The morsel buffers are tagged with this
+        // reader's txn (the frontier source captured `self.txn`), so `absorb`'s reader-match holds.
+        //
+        // If the buffer was already taken (retirement in progress, buffer moved out via `take_buffer`),
+        // there is nothing to fold into — but that only happens AFTER the statement finished streaming, so
+        // a mid-statement morsel convergence always finds the buffer present.
+        if let Some(buf) = self.buffer.borrow_mut().as_mut() {
+            buf.absorb(buffer);
+        }
     }
 
     // ---- writes: statically unreachable on the reader path → capture-degrade ------------------
