@@ -449,6 +449,33 @@ pub trait GraphAccess {
         None
     }
 
+    /// Captures the engine-thread read surface + visibility inputs the `rmp` #575 **frontier** morsel tier
+    /// needs to parallelize the final expand + residual filters + grouped `count(DISTINCT <anchor>)` of the
+    /// `r3_fof3` reco class (`MATCH (me)-…3-hop…-(f3) MATCH (f3)-[:PURCHASED]->(p) WHERE NOT (me)-…->(p)
+    /// RETURN p.id, count(DISTINCT f3) …`). The executor materializes the frontier anchors itself (draining
+    /// the earlier multi-hop sub-plan serially on the engine thread — so its markers + relationship
+    /// isomorphism are byte-identical to serial) and combines them with this into a
+    /// [`MorselFrontierScan`](crate::morsel::MorselFrontierScan).
+    ///
+    /// # Contract (why the parallel result equals the serial one)
+    ///
+    /// Unlike [`morsel_label_scan`](Self::morsel_label_scan) there is **no** coarse label-scan predicate
+    /// footprint to register: the anchors are already-bound nodes (validated by the drained sub-plan, which
+    /// also registered its `mark_all_live_nodes` phantom footprint on the engine thread), and the final
+    /// hop's relationship-pattern predicate + per-edge markers + per-row filter/property/anti-join reads are
+    /// all recorded by each morsel's own reads (folded back via
+    /// [`merge_morsel_buffer`](Self::merge_morsel_buffer); commutative + idempotent ⇒ the union = serial's
+    /// marker set). An implementation that cannot guarantee marker-, visibility-, and RBAC-identical
+    /// behaviour MUST return `None` and let the caller fall back to the serial pipeline.
+    ///
+    /// Returns `None` by default. `None` is also the correct decline for a restricted principal (the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator returns it), for a
+    /// historical / standalone read (no shared SSI tracker to fold into), and for any backend without an
+    /// off-thread read view (e.g. [`MemGraph`]).
+    fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {
+        None
+    }
+
     /// Folds a morsel's accumulated SIREAD-marker buffer (`rmp` task #339) into this statement's shared
     /// SSI tracker, on the engine thread — the convergence counterpart to
     /// [`morsel_label_scan`](Self::morsel_label_scan). Called once per morsel after the parallel read
