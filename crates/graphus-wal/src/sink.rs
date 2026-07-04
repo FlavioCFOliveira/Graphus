@@ -295,6 +295,33 @@ pub trait LogSink {
 /// contract recovery relies on (it skips a leading zero run to the first surviving record). No offset
 /// is ever rebased, so commit-record LSNs, `page_lsn` references, and the `unfrozen_commit_lsn` floor
 /// all stay valid across a reclaim — which is what makes this recovery-safe.
+///
+/// ## Opt-in **deferred-harden** mode (`rmp` #554, commit-pipelining fidelity)
+///
+/// By **default** ([`new`](MemLogSink::new)) `begin_harden` hardens **inline** (the trait default: a full
+/// `sync` + an [`already_durable`](FsyncJob::already_durable) no-op job) — the exact synchronous path DST
+/// replays bit-identically, on which thousands of tests and the determinism substrate depend. That default
+/// cannot represent the production commit-pipeline crash window, where a batch's records are **written to
+/// the WAL but not yet `fdatasync`'d** (`durable_len < written_len`), so DST could not exercise it.
+///
+/// [`with_deferred_harden`](MemLogSink::with_deferred_harden) opts a sink into modelling that window with a
+/// third region between `tail` (durable) and `pending` (not-yet-written):
+///
+/// - **`written`** holds the **written-but-un-synced** bytes, covering logical offsets
+///   `[durable_end, durable_end + written.len())`. A [`begin_harden`](LogSink::begin_harden) moves `pending`
+///   here (advancing the *write* frontier / [`buffered_len`](LogSink::buffered_len)) but does **not**
+///   advance [`durable_len`](LogSink::durable_len); it returns a real [`FsyncJob::deferred`] whose `run` is
+///   a no-op and whose paired [`complete_harden`](LogSink::complete_harden) promotes the
+///   `[durable_end, target)` prefix of `written` into the durable `tail`.
+/// - [`durable_len`](LogSink::durable_len) / [`durable_bytes`](MemLogSink::durable_bytes) **exclude**
+///   `written`, so a crash correctly drops it.
+/// - [`sync`](LogSink::sync) (the WAL-before-data path an eviction takes during the window) hardens the
+///   **whole** written-but-un-synced range — `written` then `pending` — modelling the buffer pool's
+///   `ensure_durable` hardening inline so a home page is never written over an un-synced WAL record.
+/// - [`crash`](MemLogSink::crash) drops **both** `written` and `pending` (neither was `fdatasync`'d); only
+///   the durable prefix survives.
+///
+/// In the default mode `written` stays permanently empty, so every method is byte-identical to before.
 #[derive(Debug, Default, Clone)]
 pub struct MemLogSink {
     /// The never-reclaimed durable prefix `[0, head.len())` — the log header (and any bytes below the
@@ -305,19 +332,45 @@ pub struct MemLogSink {
     base: u64,
     /// The retained reclaimable durable bytes, covering logical offsets `[base, base + tail.len())`.
     tail: Vec<u8>,
+    /// **Written-but-un-synced** bytes at logical offsets `[durable_end, durable_end + written.len())`
+    /// — used **only** in [`deferred_harden`](MemLogSink::with_deferred_harden) mode (`rmp` #554), where
+    /// `begin_harden` writes a batch to the WAL's write frontier without `fdatasync`ing it. Excluded from
+    /// [`durable_len`](LogSink::durable_len); dropped by [`crash`](MemLogSink::crash). Always empty in the
+    /// default (inline-harden) mode, so it is transparent to every non-deferred sink.
+    written: Vec<u8>,
     pending: Vec<u8>,
+    /// When set, [`begin_harden`](LogSink::begin_harden) defers the `fdatasync` (populating `written`)
+    /// instead of hardening inline — opt-in via [`with_deferred_harden`](MemLogSink::with_deferred_harden).
+    deferred_harden: bool,
     armed_sync_error: bool,
 }
 
 impl MemLogSink {
-    /// An empty sink.
+    /// An empty sink whose `begin_harden` hardens **inline** (the default DST/replay path) — every method
+    /// is byte-identical to before `rmp` #554.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Models power loss: discards all appended-but-un-synced bytes.
+    /// An empty sink in **deferred-harden** mode (`rmp` #554): `begin_harden` writes the batch to a
+    /// written-but-un-synced frontier WITHOUT `fdatasync`ing (returning a real deferred [`FsyncJob`]),
+    /// so DST can crash IN the commit-pipeline overlap window where `durable_len < written_len`. Opt-in,
+    /// used only by the deferred-fsync recovery scenario — see the type-level docs for the full contract.
+    #[must_use]
+    pub fn with_deferred_harden() -> Self {
+        Self {
+            deferred_harden: true,
+            ..Self::default()
+        }
+    }
+
+    /// Models power loss: discards **all** un-synced bytes — the written-but-un-synced `written` frontier
+    /// (deferred-harden mode; never `fdatasync`'d) **and** the not-yet-written `pending` tail. Only the
+    /// durable prefix survives. In the default (inline-harden) mode `written` is always empty, so this is
+    /// byte-identical to the historical `pending.clear()`.
     pub fn crash(&mut self) {
+        self.written.clear();
         self.pending.clear();
     }
 
@@ -354,6 +407,20 @@ impl MemLogSink {
     pub fn retained_bytes(&self) -> usize {
         self.head.capacity() + self.tail.capacity()
     }
+
+    /// A copy of the **written-but-un-synced** bytes — the `written` frontier of deferred-harden mode
+    /// (`rmp` #554), covering logical offsets `[durable_len(), durable_len() + len)`. These are records a
+    /// [`begin_harden`](LogSink::begin_harden) wrote to the WAL's write frontier but whose deferred
+    /// `fdatasync` has NOT run, so they are **not** durable and [`crash`](MemLogSink::crash) drops them.
+    ///
+    /// Empty in the default (inline-harden) mode. Test/oracle helper: splicing this onto
+    /// [`durable_bytes`](MemLogSink::durable_bytes) reconstructs the *incorrect* "overlap tail wrongly kept
+    /// durable" image, so a recovery scenario can prove the crash model genuinely drops it (a mutation
+    /// oracle — recovery from that image must diverge from the committed-or-nothing model).
+    #[must_use]
+    pub fn unsynced_written_bytes(&self) -> Vec<u8> {
+        self.written.clone()
+    }
 }
 
 impl LogSink for MemLogSink {
@@ -368,8 +435,58 @@ impl LogSink for MemLogSink {
                 "injected fdatasync failure".to_owned(),
             ));
         }
+        // Harden the WHOLE written-but-un-synced range: the deferred-mode `written` frontier FIRST (the
+        // records `begin_harden` wrote to the file but did not `fdatasync` — `rmp` #554/#532), then the
+        // not-yet-written `pending` tail. This mirrors `FileLogSink::sync`, which `fdatasync`s the whole
+        // `[durable_len, written_len)` range so an eviction's inline `sync` during the pipeline overlap
+        // never leaves a home page written over an un-synced WAL record (the WAL-before-data rule). In the
+        // default (inline-harden) mode `written` is always empty, so this is byte-identical to the
+        // historical `tail.append(&mut pending)`.
+        if !self.written.is_empty() {
+            self.tail.append(&mut self.written);
+        }
         self.tail.append(&mut self.pending);
         Ok(())
+    }
+
+    fn begin_harden(&mut self) -> Result<FsyncJob> {
+        if !self.deferred_harden {
+            // DEFAULT (DST/replay) path — byte-identical to the trait default: harden inline, return a
+            // no-op `already_durable` job. Every existing test and the determinism substrate depends on
+            // this exact synchronous behaviour.
+            self.sync()?;
+            return Ok(FsyncJob::already_durable(self.durable_len()));
+        }
+        // DEFERRED path (`rmp` #554): move `pending` into the written-but-un-synced `written` frontier,
+        // advancing the WRITE frontier (`buffered_len`) WITHOUT advancing `durable_len` — the `fdatasync`
+        // is deferred to the returned job (a no-op over an in-memory sink). The captured `target` is the
+        // write frontier; the paired `complete_harden(target)` promotes `written`'s `[durable_end, target)`
+        // prefix into the durable `tail`. This reproduces the exact `durable_len < written_len` crash
+        // window of the production `FileLogSink::begin_harden`.
+        self.written.append(&mut self.pending);
+        let target = self.durable_end() + self.written.len() as u64;
+        Ok(FsyncJob::deferred(|| Ok(()), target))
+    }
+
+    fn complete_harden(&mut self, target_len: u64) {
+        if !self.deferred_harden {
+            // The default `begin_harden` hardened inline; nothing to advance (matches the trait default).
+            return;
+        }
+        // Advance `durable_len` to `target_len` by promoting the `[durable_end, target_len)` prefix of the
+        // written-but-un-synced `written` buffer into the durable `tail`. Monotonic: a concurrent inline
+        // `sync` during the overlap (a buffer-pool eviction honouring WAL-before-data) may already have
+        // hardened this or a longer range — leaving `durable_end >= target_len` and `written` shorter — so
+        // a stale/duplicate completion is a no-op and can never regress `durable_len`.
+        let durable_end = self.durable_end();
+        if target_len <= durable_end {
+            return;
+        }
+        let promote = ((target_len - durable_end) as usize).min(self.written.len());
+        // The promoted prefix is contiguous immediately after the current durable `tail` (`written` starts
+        // at `durable_end`), so appending it keeps `tail` a gap-free `[base, base + tail.len())` region.
+        self.tail.extend_from_slice(&self.written[..promote]);
+        self.written.drain(..promote);
     }
 
     fn durable_len(&self) -> u64 {
@@ -377,7 +494,9 @@ impl LogSink for MemLogSink {
     }
 
     fn buffered_len(&self) -> u64 {
-        self.durable_end() + self.pending.len() as u64
+        // durable (`tail`) + written-but-un-synced (`written`, deferred mode) + not-yet-written (`pending`).
+        // In the default mode `written` is empty, so this is the historical `durable_end + pending.len()`.
+        self.durable_end() + self.written.len() as u64 + self.pending.len() as u64
     }
 
     fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> Result<()> {
@@ -1254,6 +1373,168 @@ mod tests {
             from += 4; // RISING from — the pattern that used to panic/corrupt
             up_to += 4;
         }
+    }
+
+    // ---- Deferred-harden mode (`rmp` #554, commit-pipelining fidelity) ----
+
+    #[test]
+    fn default_mode_begin_harden_still_hardens_inline() {
+        // The DEFAULT sink must keep the exact synchronous inline-harden path (DST/replay depends on it):
+        // `begin_harden` fully hardens and returns a no-op `already_durable` job. `written` stays empty.
+        let mut s = MemLogSink::new();
+        s.append(b"batch");
+        let job = s.begin_harden().unwrap();
+        // Hardened inline: durable == buffered already, before the job runs.
+        assert_eq!(s.durable_len(), 5);
+        assert_eq!(s.buffered_len(), 5);
+        assert!(s.unsynced_written_bytes().is_empty());
+        // The job is a no-op; completing it never regresses/changes anything.
+        let target = job.target_len();
+        job.run().unwrap();
+        s.complete_harden(target);
+        assert_eq!(s.durable_len(), 5);
+    }
+
+    #[test]
+    fn deferred_begin_harden_writes_without_syncing() {
+        // In deferred mode `begin_harden` advances the WRITE frontier (`buffered_len`) but NOT
+        // `durable_len`; `durable_bytes()`/`read_durable` exclude the written-but-un-synced range, and
+        // `unsynced_written_bytes()` exposes exactly it.
+        let mut s = MemLogSink::with_deferred_harden();
+        s.append(b"HEADER"); // stands in for a durable prefix
+        s.sync().unwrap();
+        assert_eq!(s.durable_len(), 6);
+
+        s.append(b"batchK"); // 6 bytes
+        let job = s.begin_harden().unwrap();
+        // WRITTEN but not durable: the write frontier advanced, the durable watermark did not.
+        assert_eq!(s.buffered_len(), 12);
+        assert_eq!(
+            s.durable_len(),
+            6,
+            "begin_harden must NOT advance durable_len"
+        );
+        assert_eq!(s.unsynced_written_bytes(), b"batchK");
+        assert_eq!(job.target_len(), 12);
+        // Durable image excludes the written tail.
+        let mut buf = Vec::new();
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(buf, b"HEADER");
+        assert_eq!(s.durable_bytes(), b"HEADER");
+
+        // complete_harden promotes the written prefix into the durable tail.
+        let target = job.target_len();
+        job.run().unwrap();
+        s.complete_harden(target);
+        assert_eq!(s.durable_len(), 12);
+        assert!(s.unsynced_written_bytes().is_empty());
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(buf, b"HEADERbatchK");
+    }
+
+    #[test]
+    fn deferred_crash_drops_the_written_but_unsynced_tail() {
+        // A crash in the overlap window drops BOTH the written-but-un-synced frontier AND pending; only
+        // the durable prefix survives — the exact power-loss semantics `durable_bytes()` must report.
+        let mut s = MemLogSink::with_deferred_harden();
+        s.append(b"DURABLE");
+        s.sync().unwrap();
+        s.append(b"written");
+        let _job = s.begin_harden().unwrap(); // -> written frontier, not synced
+        s.append(b"pending"); // not even written
+        assert_eq!(s.durable_len(), 7);
+        assert_eq!(s.buffered_len(), 7 + 7 + 7);
+
+        s.crash();
+        assert_eq!(s.durable_len(), 7, "crash keeps only the durable prefix");
+        assert_eq!(s.buffered_len(), 7, "crash drops written AND pending");
+        assert!(s.unsynced_written_bytes().is_empty());
+        assert_eq!(s.durable_bytes(), b"DURABLE");
+    }
+
+    #[test]
+    fn deferred_inline_sync_hardens_the_written_range() {
+        // WAL-before-data (`rmp` #532): during the overlap an eviction's inline `sync` must harden the
+        // WHOLE written-but-un-synced range (written THEN pending), advancing `durable_len` to the write
+        // frontier — so a home page is never written over an un-synced WAL record. The subsequent
+        // `complete_harden` is then a monotonic no-op.
+        let mut s = MemLogSink::with_deferred_harden();
+        s.append(b"D");
+        s.sync().unwrap();
+        s.append(b"written");
+        let job = s.begin_harden().unwrap();
+        s.append(b"pend"); // an append that raced in during the overlap
+        assert_eq!(s.durable_len(), 1);
+
+        s.sync().unwrap(); // the eviction's inline harden
+        assert_eq!(
+            s.durable_len(),
+            1 + 7 + 4,
+            "inline sync hardens the whole written-but-un-synced range (written + pending)"
+        );
+        // complete_harden(target) is now a monotonic no-op — it never regresses the watermark.
+        let target = job.target_len();
+        job.run().unwrap();
+        s.complete_harden(target);
+        assert_eq!(s.durable_len(), 12);
+        let mut buf = Vec::new();
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(buf, b"Dwrittenpend");
+    }
+
+    #[test]
+    fn deferred_complete_harden_promotes_only_its_own_prefix() {
+        // A depth-2 written buffer (batch K then batch K+1 both begin_harden'd before either completes):
+        // `complete_harden(target_K)` must promote ONLY batch K's `[durable_end, target_K)` prefix into
+        // the durable tail, leaving batch K+1 still written-but-un-synced. A crash then keeps K, drops K+1.
+        let mut s = MemLogSink::with_deferred_harden();
+        s.append(b"H");
+        s.sync().unwrap(); // durable = 1
+
+        s.append(b"KKKK");
+        let job_k = s.begin_harden().unwrap(); // written = "KKKK", target_K = 5
+        s.append(b"PPP");
+        let _job_kp1 = s.begin_harden().unwrap(); // written = "KKKKPPP", target_{K+1} = 8
+        assert_eq!(s.unsynced_written_bytes(), b"KKKKPPP");
+        assert_eq!(s.durable_len(), 1);
+
+        // Complete only K: promote its 4-byte prefix; K+1 ("PPP") stays un-synced.
+        let target_k = job_k.target_len();
+        assert_eq!(target_k, 5);
+        s.complete_harden(target_k);
+        assert_eq!(s.durable_len(), 5, "only batch K became durable");
+        assert_eq!(
+            s.unsynced_written_bytes(),
+            b"PPP",
+            "batch K+1 stays un-synced"
+        );
+
+        // Crash between the two: K survives whole, K+1 dropped whole.
+        s.crash();
+        assert_eq!(s.durable_len(), 5);
+        assert_eq!(s.durable_bytes(), b"HKKKK");
+    }
+
+    #[test]
+    fn deferred_complete_harden_is_monotonic_and_ignores_stale_targets() {
+        // A stale/duplicate `complete_harden` (target already durable via a prior inline sync) must be a
+        // no-op — never regress `durable_len` nor mis-drain `written`.
+        let mut s = MemLogSink::with_deferred_harden();
+        s.append(b"H");
+        s.sync().unwrap();
+        s.append(b"data");
+        let job = s.begin_harden().unwrap();
+        s.sync().unwrap(); // inline harden advances durable to the frontier (5)
+        assert_eq!(s.durable_len(), 5);
+        // The offloaded job's completion is now stale; it must not regress or corrupt anything.
+        let target = job.target_len();
+        job.run().unwrap();
+        s.complete_harden(target);
+        assert_eq!(s.durable_len(), 5);
+        // An even staler completion (below the frontier) is likewise a no-op.
+        s.complete_harden(3);
+        assert_eq!(s.durable_len(), 5);
+        assert_eq!(s.durable_bytes(), b"Hdata");
     }
 
     // miri has filesystem isolation enabled by default, so the real `open`/`remove_dir_all`
