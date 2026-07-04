@@ -56,12 +56,18 @@
 //! thread. Filter/project rows-out, ORDER BY / top-k, and expand/FoF are Slices 3b/3c. The morsel tier
 //! runs on a **shared analytics** pool ([`analytics_pool`], `rmp` task #376 — never the global `rayon`
 //! pool; GDS centrality now shares *this same* pool via [`run_on_analytics_pool`] so the morsel + GDS
-//! peak runnable-thread sum is bounded to one `min(N,16)`-thread pool rather than `2 × N`). It is engaged
-//! only when **not** running on a `rmp` #336 off-thread reader-pool worker: that path clamps
-//! `Ctx.morsel_threads = 1` via the [`ReaderPoolWorkerGuard`] thread-local (`rmp` task #377), so a heavy
-//! read is **either** cross-statement-parallel (many reader threads, 1 morsel each) **or**
-//! intra-statement-parallel (the engine thread, full analytics pool), never both — the pool-on-pool
-//! oversubscription this doc once only *claimed* to prevent is now enforced in code.
+//! peak runnable-thread sum is bounded to one `min(N,16)`-thread pool rather than `2 × N`).
+//!
+//! On a `rmp` #336 off-thread reader-pool worker the fan-out width is **adaptive** (`rmp` tasks #377 /
+//! #575-g.1): the engine dispatch site, which knows `readers_inflight`, chooses a width of
+//! `floor(analytics_pool_threads / (readers_inflight + 1))` via [`reader_pool_morsel_width`] and carries
+//! it into [`ReaderPoolWorkerGuard::enter_with_width`], so [`Ctx.morsel_threads`](crate::executor) at
+//! cursor-open on that worker is that width. A **lone** heavy read (reader pool otherwise idle) engages
+//! the **full** analytics pool (all cores — the `rmp` #575 win, previously lost to the `rmp` #377 v1 hard
+//! clamp-to-1); `K` concurrent reads get `<= P/K` each, so their **sum** never exceeds the pool capacity
+//! `P` (the `rmp` #377 no-oversubscription guarantee), collapsing to width `1` (exactly the #377 v1 clamp:
+//! each read serial on its own reader thread) once `K >= P`. The engine-thread heavy-query path (never a
+//! reader-pool worker) always keeps the full morsel fan-out.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -139,80 +145,136 @@ pub fn set_morsel_threads(threads: usize) {
 }
 
 thread_local! {
-    /// Per-thread "this thread is a `rmp` #336 off-thread reader-pool worker" flag (`rmp` task #377).
+    /// Per-thread **intended intra-query morsel width** for a `rmp` #336 off-thread reader-pool worker
+    /// (`rmp` tasks #377 / #575-g.1). `0` is the sentinel "this thread is **not** a reader-pool worker"
+    /// (the engine thread, a GDS rayon worker, a test thread); `>= 1` means "this thread is a reader-pool
+    /// worker whose reads should fan out to **this many** morsel workers".
     ///
     /// The reader pool runs `AccessMode::Read` auto-commit statements on up-to-`min(N,16)` worker
     /// threads, concurrently with the engine thread, so *separate* reads scale across cores
     /// (cross-statement parallelism). The morsel tier (`rmp` #339) makes a *single* heavy read scale
     /// across cores (intra-statement parallelism) by fanning a scan onto the shared analytics pool.
-    /// Engaging **both** at once is pool-on-pool oversubscription: K concurrent large reads on K reader
-    /// threads would each fan out `min(N,16)` morsel tasks onto the *shared* `min(N,16)`-thread analytics
-    /// pool — `K × min(N,16)` tasks contending for `min(N,16)` cores, the exact thrash the morsel module
-    /// doc claims is prevented but never enforced in code.
+    /// Engaging both **without a bound** is what `rmp` #377 guarded against: `K` concurrent large reads,
+    /// each fanning `min(N,16)` morsel tasks onto the *shared* `min(N,16)`-thread analytics pool, is
+    /// `K × min(N,16)` tasks for `min(N,16)` cores. `rmp` #377 v1 fixed this by clamping every reader-pool
+    /// read to a **single** morsel (serial-within-statement) — which left a *lone* heavy read (the reader
+    /// pool otherwise idle) stuck on one core, since it, too, was clamped.
     ///
-    /// When this flag is set, [`morsel_threads`] reports `1`, so [`Ctx.morsel_threads`](crate::executor)
-    /// is clamped to `1` at cursor-open on a reader-pool worker and the morsel tier early-returns to the
-    /// serial pipeline. The invariant is then enforced in code: a heavy read is **either**
-    /// cross-statement-parallel (many reader threads, 1 morsel each) **or** intra-statement-parallel (the
-    /// engine thread, full analytics pool), never both. The engine-thread heavy-query path (which is not
-    /// a reader-pool worker, so the flag is unset) keeps the full morsel fan-out — the `rmp` #339/#360
-    /// wins are preserved.
-    static READER_POOL_WORKER: Cell<bool> = const { Cell::new(false) };
+    /// **The `rmp` #575-g.1 refinement (adaptive width):** instead of a hard clamp to `1`, the engine
+    /// **dispatch site** — which knows `readers_inflight` — computes an intended width of
+    /// `floor(analytics_pool_threads / (readers_inflight + 1))` (see [`reader_pool_morsel_width`]) and
+    /// carries it into this cell via [`ReaderPoolWorkerGuard::enter_with_width`]. A lone read
+    /// (`readers_inflight == 0`) gets the **full** pool → all cores; `K` concurrent reads get `<= P/K`
+    /// each, so their **sum** never exceeds the analytics pool capacity `P` — the no-oversubscription
+    /// guarantee `rmp` #377 preserves, now without starving the lone read. At `K >= P` the width collapses
+    /// to `1`, reproducing `rmp` #377 v1 **exactly** (each read serial on its own reader thread, no
+    /// fan-out overhead). The analytics pool is a **fixed** `P`-thread `rayon` pool, so the *runnable*
+    /// thread count is capped at `P` for **any** width; the width bounds each read's fan-out granularity
+    /// (and hence cross-read scheduling interference), which is what the sum-`<= P` bound is really about.
+    static READER_POOL_MORSEL_WIDTH: Cell<usize> = const { Cell::new(0) };
 }
 
-/// An RAII guard that marks the current thread as a `rmp` #336 reader-pool worker for its lifetime
-/// (`rmp` task #377), restoring the prior value on drop. The server's reader `worker_loop` holds one of
-/// these around each [`run_read_task`](../../graphus_server) so every `Cursor::open` on that thread
-/// reads `morsel_threads() == 1` (morsel suppressed); the engine thread never holds one, so its heavy
+/// An RAII guard that marks the current thread as a `rmp` #336 reader-pool worker for its lifetime,
+/// carrying the **intended intra-query morsel width** the dispatch site chose (`rmp` tasks #377 /
+/// #575-g.1), and restoring the prior value on drop. The server's reader `worker_loop` holds one of
+/// these around each [`run_read_task`](../../graphus_server) so every `Cursor::open` on that thread reads
+/// `morsel_threads() == width` (the adaptive fan-out); the engine thread never holds one, so its heavy
 /// queries keep the full morsel fan-out.
 ///
 /// Restoring the prior value (rather than unconditionally clearing) keeps the guard correct under
 /// nesting and panic-unwind: a worker thread is reused across many tasks, and a panic inside
-/// `run_read_task` still runs the guard's `Drop`, so the flag never leaks to the next task on that
+/// `run_read_task` still runs the guard's `Drop`, so the width never leaks to the next task on that
 /// thread.
-#[must_use = "the guard clears the reader-pool-worker flag when dropped; bind it to a name"]
+#[must_use = "the guard restores the reader-pool morsel width when dropped; bind it to a name"]
 pub struct ReaderPoolWorkerGuard {
-    prev: bool,
+    prev: usize,
 }
 
 impl ReaderPoolWorkerGuard {
-    /// Marks the current thread as a reader-pool worker until the returned guard is dropped.
+    /// Marks the current thread as a reader-pool worker whose reads fan out to **one** morsel worker
+    /// (serial-within-statement — the `rmp` #377 v1 hard clamp), until the returned guard is dropped.
+    /// Equivalent to [`enter_with_width(1)`](Self::enter_with_width); retained for the `rmp` #377
+    /// suppression unit tests and any caller that wants the unconditional clamp.
     pub fn enter() -> Self {
-        let prev = READER_POOL_WORKER.with(|f| f.replace(true));
+        Self::enter_with_width(1)
+    }
+
+    /// Marks the current thread as a reader-pool worker whose reads fan out to `width` morsel workers
+    /// (`rmp` task #575-g.1), until the returned guard is dropped. `width` is floored at `1` (a reader
+    /// worker is always flagged, so [`is_reader_pool_worker`] stays `true`; `width == 1` means serial
+    /// within the statement). The server's reader `worker_loop` passes the dispatch-computed
+    /// [`reader_pool_morsel_width`] here.
+    pub fn enter_with_width(width: usize) -> Self {
+        let prev = READER_POOL_MORSEL_WIDTH.with(|f| f.replace(width.max(1)));
         Self { prev }
     }
 }
 
 impl Drop for ReaderPoolWorkerGuard {
     fn drop(&mut self) {
-        READER_POOL_WORKER.with(|f| f.set(self.prev));
+        READER_POOL_MORSEL_WIDTH.with(|f| f.set(self.prev));
     }
 }
 
 /// Whether the current thread is a `rmp` #336 off-thread reader-pool worker (`rmp` task #377). Read by
-/// [`morsel_threads`] to clamp the per-statement morsel-thread count to `1` on the reader-pool path.
+/// [`morsel_threads`] to apply the adaptive per-read morsel width on the reader-pool path, and by the
+/// `ext.readerPoolWorker` dispatch-oracle probe (`rmp` #546).
 #[must_use]
 pub fn is_reader_pool_worker() -> bool {
-    READER_POOL_WORKER.with(Cell::get)
+    READER_POOL_MORSEL_WIDTH.with(Cell::get) != 0
 }
 
 /// The effective morsel-thread count (`rmp` task #339): the value [`set_morsel_threads`] last stored,
 /// or `1` (fully serial) when never set (the un-initialised `0` sentinel). Read at every `Ctx`
 /// construction to populate `Ctx.morsel_threads`.
 ///
-/// **Reader-pool suppression (`rmp` task #377):** when the calling thread is an off-thread reader-pool
-/// worker ([`is_reader_pool_worker`]), this reports `1` regardless of the configured count, so a heavy
-/// read dispatched to the reader pool does **not** also fan out onto the shared analytics pool
-/// (pool-on-pool oversubscription). See [`ReaderPoolWorkerGuard`].
+/// **Reader-pool adaptive width (`rmp` tasks #377 / #575-g.1):** when the calling thread is an off-thread
+/// reader-pool worker ([`is_reader_pool_worker`]), this reports the **intended width** the dispatch site
+/// chose (carried in [`ReaderPoolWorkerGuard`]), **capped by the configured count** — so a lone heavy read
+/// engages the full pool while `K` concurrent reads share it without exceeding its capacity, and a
+/// determinism-pinned deployment (configured count `1`) still forces every reader-pool read serial. See
+/// [`ReaderPoolWorkerGuard`] and [`reader_pool_morsel_width`].
 #[must_use]
 pub fn morsel_threads() -> usize {
-    if is_reader_pool_worker() {
-        return 1;
-    }
-    match MORSEL_THREADS.load(Ordering::Relaxed) {
+    let configured = match MORSEL_THREADS.load(Ordering::Relaxed) {
         0 => 1,
         n => n,
+    };
+    match READER_POOL_MORSEL_WIDTH.with(Cell::get) {
+        0 => configured,                       // engine thread / non-reader: full configured width
+        width => width.min(configured).max(1), // reader-pool worker: adaptive width, capped by the knob
     }
+}
+
+/// The intended intra-query morsel width for a read about to be **dispatched to the reader pool**, given
+/// how many reads are already in flight (`rmp` task #575-g.1). Computed on the engine thread at dispatch
+/// and carried into the worker's [`ReaderPoolWorkerGuard::enter_with_width`].
+///
+/// `floor(analytics_pool_threads / (readers_inflight + 1))`, floored at `1`: the `+ 1` counts the read
+/// being dispatched, so a **lone** read (`readers_inflight == 0`) gets the whole analytics pool (all
+/// cores), and `K` concurrent reads get `<= P/K` each — their **sum** is bounded by the pool capacity
+/// `P`, so no set of concurrent reader-pool reads over-fans the shared analytics pool (the `rmp` #377
+/// no-oversubscription guarantee). At `K >= P` the width is `1`, reproducing the `rmp` #377 v1 clamp
+/// exactly (each read serial on its own reader thread). When the morsel tier is globally disabled
+/// (configured count `<= 1` — e.g. a determinism-pinned Raspberry Pi), the width is `1` regardless, so a
+/// reader-pool read stays serial.
+///
+/// Counting **all** inflight reads (not just the morsel-eligible ones) is deliberately conservative: a
+/// heavy read concurrent with several trivial point-lookups gets a smaller width than it strictly needs,
+/// which only ever *under*-fans — it never breaches the sum-`<= P` bound.
+#[must_use]
+pub fn reader_pool_morsel_width(readers_inflight: u64) -> usize {
+    let configured = match MORSEL_THREADS.load(Ordering::Relaxed) {
+        0 => 1,
+        n => n,
+    };
+    if configured <= 1 {
+        return 1; // morsel globally disabled (determinism pin): keep reader-pool reads serial.
+    }
+    let pool = analytics_pool_threads().max(1) as u64;
+    let concurrent = readers_inflight.saturating_add(1);
+    let width = (pool / concurrent).max(1);
+    (width as usize).min(configured).max(1)
 }
 
 /// The minimum estimated label cardinality at which the morsel tier is even attempted (`rmp` task
@@ -3129,6 +3191,86 @@ mod reader_pool_suppression_tests {
         // An explicit pin is honoured and bounded.
         set_analytics_pool_threads(3);
         assert_eq!(analytics_pool_threads(), 3);
+
+        set_analytics_pool_threads(prev_analytics);
+        MORSEL_THREADS.store(prev_morsel, Ordering::Relaxed);
+    }
+
+    /// `rmp` task #575-g.1: `enter_with_width` carries the dispatch-chosen adaptive width, and
+    /// `morsel_threads()` reports it on the reader-pool worker (capped by the configured count), restoring
+    /// exactly on drop.
+    #[test]
+    fn enter_with_width_reports_adaptive_width_capped_by_knob() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let prev = MORSEL_THREADS.load(Ordering::Relaxed);
+        set_morsel_threads(8);
+
+        // A lone read gets the full pool width; the reader path reports it.
+        {
+            let _g = ReaderPoolWorkerGuard::enter_with_width(8);
+            assert!(is_reader_pool_worker());
+            assert_eq!(morsel_threads(), 8, "reader worker reports its intended width");
+        }
+        assert!(!is_reader_pool_worker(), "width restored to the not-a-worker sentinel on drop");
+        assert_eq!(morsel_threads(), 8);
+
+        // An intended width above the configured knob is capped by the knob (never over-fans).
+        {
+            let _g = ReaderPoolWorkerGuard::enter_with_width(64);
+            assert_eq!(morsel_threads(), 8, "width is capped by the configured morsel-thread count");
+        }
+
+        // Width 1 (K >= P collapse) reproduces the #377 v1 serial-per-read clamp.
+        {
+            let _g = ReaderPoolWorkerGuard::enter_with_width(1);
+            assert!(is_reader_pool_worker());
+            assert_eq!(morsel_threads(), 1);
+        }
+
+        // Width 0 is floored to 1 (a reader worker is always flagged).
+        {
+            let _g = ReaderPoolWorkerGuard::enter_with_width(0);
+            assert!(is_reader_pool_worker());
+            assert_eq!(morsel_threads(), 1);
+        }
+
+        MORSEL_THREADS.store(prev, Ordering::Relaxed);
+    }
+
+    /// `rmp` task #575-g.1: the dispatch-site width formula — a lone read gets the whole pool, `K`
+    /// concurrent reads get `<= P/K` each (sum `<= P`, no over-subscription), width collapses to `1` at
+    /// `K >= P` (exact #377 v1 clamp), and a disabled morsel knob keeps every reader read serial.
+    #[test]
+    fn reader_pool_morsel_width_bounds_the_concurrent_fanout_sum() {
+        let _lock = KNOB_LOCK.lock().unwrap();
+        let prev_morsel = MORSEL_THREADS.load(Ordering::Relaxed);
+        let prev_analytics = ANALYTICS_POOL_THREADS.load(Ordering::Relaxed);
+
+        set_morsel_threads(16);
+        set_analytics_pool_threads(8); // fixed pool P = 8 for a deterministic assertion
+
+        // Lone read (0 already in flight → this read is the 1st): full pool.
+        assert_eq!(reader_pool_morsel_width(0), 8, "a lone read fans across the whole analytics pool");
+
+        // K concurrent reads: each gets <= P/K, and the SUM never exceeds P (no over-subscription).
+        for k in 1u64..=12 {
+            // `k-1` already in flight when the k-th read dispatches.
+            let width = reader_pool_morsel_width(k - 1);
+            let expected = (8 / k).max(1) as usize;
+            assert_eq!(width, expected, "width at k={k} inflight");
+            // If all k reads dispatched at the same inflight snapshot, the worst-case sum is bounded by P
+            // (+ the min-1 floor once k > P, where each read is serial on its own reader thread).
+            assert!(width * (k as usize) <= 8 || width == 1, "sum bound at k={k}");
+        }
+
+        // K >= P: width collapses to exactly 1 (the #377 v1 serial-per-read clamp).
+        assert_eq!(reader_pool_morsel_width(8), 1);
+        assert_eq!(reader_pool_morsel_width(50), 1);
+
+        // Morsel globally disabled (determinism pin): every reader-pool read stays serial regardless.
+        set_morsel_threads(1);
+        assert_eq!(reader_pool_morsel_width(0), 1, "disabled morsel keeps a lone reader read serial");
+        assert_eq!(reader_pool_morsel_width(3), 1);
 
         set_analytics_pool_threads(prev_analytics);
         MORSEL_THREADS.store(prev_morsel, Ordering::Relaxed);

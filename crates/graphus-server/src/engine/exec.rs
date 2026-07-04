@@ -306,6 +306,12 @@ pub(super) fn handle_run<
     privileges: Option<EffectivePrivileges>,
     extensions: &Arc<ExtensionRegistry>,
     dispatch: &ReadDispatch<D, S>,
+    // How many off-thread reads are already in flight on the engine (`rmp` task #575-g.1). Read-only, a
+    // snapshot taken on the engine thread just before this statement: the dispatch site derives this read's
+    // **adaptive morsel width** from it (`floor(analytics_pool_threads / (readers_inflight + 1))`) so a
+    // lone heavy read fans out across the whole analytics pool while `K` concurrent reads share it without
+    // over-subscription. Unused on every non-dispatch path.
+    readers_inflight: u64,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     db: &str,
@@ -483,6 +489,12 @@ pub(super) fn handle_run<
                     // The per-statement deadline (`rmp` #476) rides the `Send` task to the reader thread,
                     // so an off-thread read is bounded by the same budget as an inline one.
                     deadline,
+                    // The adaptive intra-query morsel width (`rmp` task #575-g.1): derived HERE on the
+                    // engine thread from `readers_inflight` (the reader knows only that it is *a* worker,
+                    // not how many peers are in flight), and carried to the worker's `ReaderPoolWorkerGuard`.
+                    // A lone read (`readers_inflight == 0`) fans across the whole analytics pool; `K`
+                    // concurrent reads get `<= P/K` each (sum `<= P`, no over-subscription; `1` at `K >= P`).
+                    morsel_width: graphus_cypher::morsel::reader_pool_morsel_width(readers_inflight),
                     row_tx,
                     row_rx: row_rx
                         .take()
