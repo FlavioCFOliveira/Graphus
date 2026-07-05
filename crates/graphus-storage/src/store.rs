@@ -2091,6 +2091,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // seeded the tracking sets, so subsequent passes can safely run the gated incremental sweeps.
         self.gc_full_scan_pending = false;
 
+        // `rmp` #522 (durability-audit W1 regression guard): before scheduling the prune that will
+        // forget every committed writer, assert the freeze sweep actually settled ALL of their on-disk
+        // in-flight stamps — the invariant the prune's soundness rests on (a stranded committed stamp
+        // whose writer is forgotten reads as invisible: silent lost committed data). Debug-only, so it
+        // is compiled out (and costs nothing) in release. See [`debug_assert_freeze_complete`].
+        self.debug_assert_freeze_complete();
+
         // Schedule the table prune: every writer recorded as committed at this point had ALL of its
         // on-disk in-flight stamps rewritten by the freeze sweep (the frontier invariant guarantees no
         // in-use record below `freeze_low` bears an unfrozen committed stamp, and the sweep froze the
@@ -2131,6 +2138,51 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             VersionStamp::None | VersionStamp::Committed(_) => None,
         }
     }
+
+    /// **Debug-only invariant check** for the `rmp` #522 incremental-freeze prune (the W1 regression
+    /// guard from the 2026-07 durability audit). Called by [`gc`](Self::gc) after the freeze sweep and
+    /// immediately before it schedules the Active/Recent-Transaction-Table prune: it asserts that **no
+    /// in-use record in any MVCC store still bears an unfrozen committed-writer in-flight stamp**.
+    ///
+    /// That is exactly the precondition the prune's soundness rests on — every writer the registry
+    /// records as `Committed` must have had *all* of its on-disk in-flight stamps rewritten to
+    /// `Committed(ts)` by the freeze sweep — and it holds only if the incremental freeze frontier
+    /// (`freeze_low`) actually covered every such record. The **full-range** scan here (not just
+    /// `[freeze_low, high_water)`) is what surfaces a stamp stranded **below** the frontier;
+    /// [`frozen_word`](Self::frozen_word)`.is_some()` is the exact "unfrozen committed stamp" predicate
+    /// the sweep clears. A firing means a committed version would be forgotten while still keyed by an
+    /// unresolvable in-flight `TxnId` — which [`is_visible`](graphus_txn::is_visible) reads as
+    /// **invisible**, i.e. silent lost committed data (the class the frontier carry-forward fix in
+    /// [`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer) closes). Compiled out
+    /// entirely in release.
+    #[cfg(debug_assertions)]
+    fn debug_assert_freeze_complete(&self) {
+        for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
+            let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)
+                .expect("W1 freeze-completeness guard reads only in-use MVCC headers");
+            for &(id, mvcc) in &in_use {
+                assert!(
+                    self.frozen_word(mvcc.created_ts).is_none()
+                        && self.frozen_word(mvcc.expired_ts).is_none(),
+                    "rmp #522 freeze-frontier invariant VIOLATED: in-use {kind:?} record {id} still \
+                     bears an unfrozen committed-writer in-flight stamp (xmin={:#018x}, \
+                     xmax={:#018x}) after the freeze sweep. Its writer committed but the incremental \
+                     freeze never settled the stamp (the frontier was raised past it), so forgetting \
+                     that writer at the prune below would make its committed version read as INVISIBLE \
+                     (silent lost committed data).",
+                    mvcc.created_ts,
+                    mvcc.expired_ts,
+                );
+            }
+        }
+    }
+
+    /// Release-build no-op counterpart of the debug-only W1 freeze-completeness guard (`rmp` #522):
+    /// the full-store scan it performs is purely a test/debug assertion, so it must cost nothing in an
+    /// optimized build.
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn debug_assert_freeze_complete(&self) {}
 
     /// Freezes **every** committed-but-unfrozen MVCC header in all three record stores under `txn`,
     /// settling each in-flight `TxnId` stamp to its durable `Committed(ts)` form (the freeze sweep of
@@ -2256,13 +2308,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok((frozen, scanned))
     }
 
-    /// Whether `word` is an in-flight stamp of a writer the registry STILL records as in-flight (`rmp`
-    /// #522, the freeze-frontier's carry-forward test): such a stamp cannot be frozen yet and must keep
-    /// its record covered by the frontier. A committed-writer stamp (frozen this pass) and an
-    /// aborted-writer stamp (reverted by that writer's undo) both return `false`.
+    /// Whether `word` is an in-flight stamp of a writer that is **still open** (`rmp` #522, the
+    /// freeze-frontier's carry-forward test): such a stamp cannot be frozen yet — its writer has not
+    /// committed, so [`frozen_word`](Self::frozen_word) declines it — and its record MUST stay covered
+    /// by the frontier so a later pass (after the writer commits) freezes it. A committed-writer stamp
+    /// (frozen this pass) and an aborted-writer stamp (reverted by that writer's undo) both return
+    /// `false`.
+    ///
+    /// **Openness is tested against the store's [`active`](Self#structfield.active) set, NOT
+    /// `commit_registry.outcome(w) == InFlight`.** The [`CommitRegistry`] only ever records a writer at
+    /// *commit* ([`record_commit`](graphus_txn::CommitRegistry)) — a begun-but-uncommitted writer has
+    /// no entry, and [`outcome`](graphus_txn::CommitRegistry::outcome) maps an unknown id to
+    /// `Aborted`, never `InFlight`. So the old `outcome(w) == InFlight` predicate was **dead — always
+    /// `false`** — which raised the frontier PAST records still bearing a genuinely open writer's
+    /// stamp whenever a maintenance GC ran while that writer was in-flight (an explicit `BEGIN … RUN
+    /// …` spanning engine commands). When the writer then committed, the next incremental sweep skipped
+    /// those records (now below the frontier), left their committed stamps **unfrozen**, and the GC
+    /// prune forgot the writer — so [`is_visible`](graphus_txn::is_visible) resolved the version's
+    /// stamp against a now-unknown (→ aborted) writer and read the committed value as **invisible**:
+    /// silent lost committed data (regression `tests/incremental_freeze_inflight_writer.rs`). Testing
+    /// live membership in `active` is the correct "the writer might still commit, so keep covering it"
+    /// signal.
     fn is_inflight_of_inflight_writer(&self, word: u64) -> bool {
         matches!(VersionStamp::from_raw(word), VersionStamp::InFlight(w)
-            if self.commit_registry.outcome(w) == TxnOutcome::InFlight)
+            if self.active.contains_key(&w))
     }
 
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
