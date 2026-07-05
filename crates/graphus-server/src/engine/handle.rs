@@ -343,6 +343,17 @@ impl EngineHandle {
         recv_async(rx).await?
     }
 
+    /// Blocking variant of [`checkpoint`](Self::checkpoint), for a synchronous caller (e.g. a real-thread
+    /// concurrency test that drives maintenance GC from an OS thread).
+    ///
+    /// # Errors
+    /// As [`checkpoint`](Self::checkpoint).
+    pub fn checkpoint_blocking(&self) -> Result<CheckpointReply, GraphusError> {
+        let (reply, rx) = reply_channel();
+        self.submit_blocking(EngineCommand::Checkpoint { reply })?;
+        recv_blocking(rx)?
+    }
+
     /// Ingests one batch of a **network bulk-import Mode A session** (`08-network-bulk-import.md`
     /// §5.1/§7.1, `rmp` #519): low-level store writes committed through the coordinator's own
     /// transaction id source, with the durable checkpoint sentinel updated in the same commit. Like

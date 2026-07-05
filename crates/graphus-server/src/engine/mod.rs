@@ -1004,12 +1004,22 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     degraded: &EngineDegraded,
     active_txns: &mut ActiveTxnGauge,
 ) {
+    let mut any_retired = false;
     while let Ok(retirement) = retire_rx.try_recv() {
         if let Some(coord) = coordinator.as_mut() {
             finish_reader(coord, open, retirement, metrics, db, degraded);
         }
         *readers_inflight = readers_inflight.saturating_sub(1);
         active_txns.publish(coordinator.as_ref().map_or(0, TxnCoordinator::active_count));
+        any_retired = true;
+    }
+    // `rmp` #588: a retired reader may have been the last one predating some GC-freed slot's reuse
+    // barrier — lift the hold on every slot the (now-advanced) oldest open transaction has passed, so a
+    // freed slot becomes reusable promptly rather than waiting for the next maintenance pass. Cheap: a
+    // no-op when nothing is shadow-held.
+    if any_retired && let Some(coord) = coordinator.as_ref() {
+        let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+        coord.release_reusable_slots(oldest_open_ticket);
     }
 }
 
@@ -1159,6 +1169,23 @@ fn maintenance_interval_bytes(loading_session_active: bool, store_bytes: u64) ->
     }
 }
 
+/// **`rmp` #588 (sprint-52 B1).** The reuse barrier for a GC pass that may free record slots while an
+/// off-thread reader (`rmp` #336) is walking a chain through them.
+///
+/// Returns `Some(next_ticket + 1)` when `readers_inflight > 0`, and `None` otherwise. The `+ 1` is
+/// load-bearing: [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket =
+/// *next_ticket`), so the newest open transaction's ticket **equals** `next_ticket`; the barrier must be
+/// strictly greater so that [`RecordStore::release_held`](graphus_storage::RecordStore::release_held) —
+/// which releases a held slot once `oldest_open_ticket >= barrier` — keeps the slot held while that
+/// newest reader is still the oldest open (a lost `+ 1` releases the slot under the newest reader's feet
+/// and reopens #588). Gating on `readers_inflight` keeps the hold to the only regime that needs it: when
+/// no off-thread reader is in flight (the inline/DST driver never dispatches one) the barrier is `None`,
+/// so `held_slots` stays empty and the freed-id reuse order — hence the DST golden trace — is unchanged.
+fn gc_reuse_barrier(next_ticket: u64, readers_inflight: u64) -> Option<u64> {
+    (readers_inflight > 0).then(|| next_ticket + 1)
+}
+
+#[allow(clippy::too_many_arguments)] // the engine loop threads its maintenance context through here
 fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     wal_at_last_maintenance: &mut u64,
@@ -1167,6 +1194,11 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     maintenance_degraded: &MaintenanceDegraded,
     loading_session_active: bool,
     loading_just_ended: bool,
+    // `rmp` #588: the reuse barrier for this pass's GC frees (`Some(next_ticket + 1)` when an off-thread
+    // reader is in flight, else `None`) and the oldest open transaction's ticket (the release threshold,
+    // or `u64::MAX` when none is open). See [`gc_reuse_barrier`] and `RecordStore`.
+    reuse_barrier: Option<u64>,
+    oldest_open_ticket: u64,
 ) {
     let Some(coord) = coordinator.as_mut() else {
         return;
@@ -1199,7 +1231,13 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     if durable.saturating_sub(*wal_at_last_maintenance) < interval {
         return;
     }
-    match coord.checkpoint() {
+    // `rmp` #588 (sprint-52 B1): reader-safe reclaim — shadow-hold the slots this pass frees from reuse
+    // while an off-thread reader that predates the pass may still be walking a chain through them, then
+    // lift the hold for every slot whose predating readers have all retired. With no open reader
+    // `oldest_open_ticket` is `u64::MAX`, so the hold is released immediately (the inline/DST path and the
+    // no-reader fast path are unchanged).
+    let outcome = coord.checkpoint_reader_safe(reuse_barrier, oldest_open_ticket);
+    match outcome {
         Ok(report) => {
             // Success: record progress (aggregate observability counters) and clear **this engine's
             // own** reclamation-degraded flag (`rmp` #435 — never another engine's); reset the streak.
@@ -1840,6 +1878,13 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // its watermark and skips the O(N) GC pass so it cannot block the `Shutdown` a `STOP DATABASE` queues
     // right after `End` (the force-detach trigger).
     let loading_just_ended = was_loading && loading_session.is_none();
+    // `rmp` #588: the reuse barrier (`Some(next_ticket + 1)` iff an off-thread reader is in flight) and
+    // the release threshold (the oldest open transaction's ticket, or `u64::MAX` when none is open, so
+    // freed slots are immediately reusable). Both are read here where `open`/`next_ticket`/
+    // `readers_inflight` are in scope, so a GC-freed slot cannot be reused while a reader that predates
+    // the free is still walking a chain through it.
+    let reuse_barrier = gc_reuse_barrier(*next_ticket, *readers_inflight);
+    let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
     maybe_run_maintenance(
         coordinator,
         wal_at_last_maintenance,
@@ -1848,6 +1893,8 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         maintenance_degraded,
         loading_session.is_some(),
         loading_just_ended,
+        reuse_barrier,
+        oldest_open_ticket,
     );
     true
 }
@@ -2008,7 +2055,12 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let _ = reply.send(out);
         }
         Cmd::Checkpoint { reply } => {
-            let out = handle_checkpoint(coord);
+            // `rmp` #588: an explicit `CHECKPOINT DATABASE` runs the same reader-unsafe GC reclaim as the
+            // background cadence, so it must bracket the pass with the reuse barrier too — otherwise a
+            // slot it frees could be reused while a concurrent off-thread reader walks a chain through it.
+            let reuse_barrier = gc_reuse_barrier(*next_ticket, *readers_inflight);
+            let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+            let out = handle_checkpoint(coord, reuse_barrier, oldest_open_ticket);
             // A manual (admin-triggered) checkpoint that succeeds is proof reclamation is making
             // progress again, so clear **this engine's own** maintenance-degraded flag (`rmp` #435 —
             // never another engine's). On failure the flag is left as-is (an operator's manual probe
@@ -2019,7 +2071,17 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let _ = reply.send(out);
         }
         Cmd::BulkImportBatch { batch, reply } => {
+            // `rmp` #588: a Mode A `End` runs `reclaim_after_bulk_load`'s GC reclaim, which — if the
+            // target database carried pre-existing tombstones — frees record slots that a concurrent
+            // off-thread reader could still be walking through. Bracket the batch with the reuse barrier
+            // so any freed slot is shadow-held from reuse until predating readers retire (ingest itself
+            // frees nothing, so the barrier only bites at the reclaiming `End`).
+            let reuse_barrier = gc_reuse_barrier(*next_ticket, *readers_inflight);
+            let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+            coord.set_reuse_barrier(reuse_barrier);
             let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
+            coord.set_reuse_barrier(None);
+            coord.release_reusable_slots(oldest_open_ticket);
             let _ = reply.send(out);
         }
         Cmd::BulkImportModeBChunk {
@@ -2582,8 +2644,12 @@ fn handle_backup<D: BlockDevice, S: LogSink>(
 /// Touches the (`!Send`) coordinator directly, between commands, never under a held statement seam.
 fn handle_checkpoint<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
+    reuse_barrier: Option<u64>,
+    oldest_open_ticket: u64,
 ) -> Result<CheckpointReply> {
-    let report = coordinator.checkpoint()?;
+    // `rmp` #588: reader-safe reclaim — shadow-hold freed slots from reuse while a predating off-thread
+    // reader may still be walking a chain through them (see `TxnCoordinator::checkpoint_reader_safe`).
+    let report = coordinator.checkpoint_reader_safe(reuse_barrier, oldest_open_ticket)?;
     Ok(CheckpointReply {
         reclaimed: report.reclaimed,
         frozen: report.frozen,
@@ -3405,6 +3471,35 @@ where
 mod maintenance_tests {
     use super::*;
 
+    /// `rmp` #588 (sprint-52 B1) GATE: the GC reuse barrier must **strictly exceed** the newest open
+    /// transaction's ticket, and must be `None` when no off-thread reader is in flight.
+    ///
+    /// [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket = *next_ticket`), so
+    /// the newest open transaction's ticket EQUALS `next_ticket`. [`RecordStore::release_held`] releases
+    /// a slot held at barrier `b` once `oldest_open_ticket >= b`; if the barrier merely equalled the
+    /// newest ticket, that reader — while it is the oldest open — would release the slot under its own
+    /// feet and reopen #588. The `+ 1` (this test's invariant) makes `barrier > oldest_open_ticket` hold
+    /// while the newest reader is still open. Gating on `readers_inflight` keeps `held_slots` empty on
+    /// the inline/DST path (no off-thread reader), preserving the deterministic golden trace.
+    #[test]
+    fn gc_reuse_barrier_strictly_exceeds_the_newest_open_ticket() {
+        // A reader opened when `next_ticket` becomes `N` has ticket `N` (post-increment), and is the
+        // newest — hence the oldest open when it is the only one. The barrier must be `> N`.
+        for next_ticket in [1u64, 2, 7, 1000, u64::MAX - 1] {
+            let barrier = gc_reuse_barrier(next_ticket, 1).expect("a reader is in flight");
+            assert!(
+                barrier > next_ticket,
+                "#588 off-by-one: barrier {barrier} must strictly exceed the newest open ticket \
+                 {next_ticket}, else release_held frees the slot under the newest reader"
+            );
+        }
+        // No off-thread reader in flight => no hold (the inline/DST path stays byte-identical).
+        assert_eq!(gc_reuse_barrier(42, 0), None);
+        assert_eq!(gc_reuse_barrier(0, 0), None);
+        // Any positive reader count arms the barrier.
+        assert_eq!(gc_reuse_barrier(5, 3), Some(6));
+    }
+
     /// rmp #521/#522 GATE: a `Loading` Mode A bulk-import session must use the much wider
     /// [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] interval regardless of store size — the
     /// O(N²) maintenance-cost finding (measured: 9 checkpoint passes consumed 85% of wall time on a
@@ -3500,6 +3595,8 @@ mod maintenance_tests {
                 &maintenance_degraded,
                 loading,
                 false,
+                None,     // `rmp` #588: no off-thread reader in this unit test => no hold ...
+                u64::MAX, // ... and oldest-open = MAX releases immediately.
             );
         }
 
@@ -3539,8 +3636,10 @@ mod maintenance_tests {
             &mut consecutive_failures,
             &metrics,
             &maintenance_degraded,
-            false, // session already cleared by the `End` handler
-            true,  // ...but it JUST ended: this is the edge
+            false,    // session already cleared by the `End` handler
+            true,     // ...but it JUST ended: this is the edge
+            None,     // `rmp` #588: no off-thread reader here — no hold,
+            u64::MAX, // oldest-open = MAX => immediate release.
         );
 
         // Watermark re-anchored to the live WAL length (the pass was skipped, not run).

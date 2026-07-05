@@ -2989,6 +2989,59 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Propagates a storage error from the GC pass, its commit, or the checkpoint flush/reclaim.
+    /// **`rmp` #588 (sprint-52 B1).** Brackets a maintenance GC pass with the reuse barrier so the
+    /// slots it frees are shadow-held from physical reuse while an off-thread reader that predates the
+    /// pass may still be walking a chain through them. The engine passes `Some(next_ticket)` around a
+    /// [`checkpoint`](Self::checkpoint) and `None` after; forwards to
+    /// [`RecordStore::set_reuse_barrier`]. See [`release_reusable_slots`](Self::release_reusable_slots).
+    pub fn set_reuse_barrier(&self, barrier: Option<u64>) {
+        self.store.borrow_mut().set_reuse_barrier(barrier);
+    }
+
+    /// **`rmp` #588.** Lifts the reuse hold on every GC-freed slot whose barrier the oldest open
+    /// transaction's ticket has now reached (`barrier <= oldest_open_ticket`); `u64::MAX` (no open
+    /// transaction) releases everything. The engine calls this after each maintenance pass and as
+    /// readers retire, so a freed slot becomes reusable exactly when no predating reader remains — no
+    /// space leak, no premature reuse. Forwards to [`RecordStore::release_held`].
+    pub fn release_reusable_slots(&self, oldest_open_ticket: u64) {
+        self.store.borrow_mut().release_held(oldest_open_ticket);
+    }
+
+    /// **`rmp` #588** (observability): physical slots currently shadow-held from reuse (see
+    /// [`RecordStore::held_slots_len`]).
+    #[must_use]
+    pub fn held_slots_len(&self) -> usize {
+        self.store.borrow().held_slots_len()
+    }
+
+    /// **`rmp` #588 (sprint-52 B1).** A [`checkpoint`](Self::checkpoint) whose GC reclaim is **reader-
+    /// safe**: it brackets the pass with the reuse barrier so a freed physical slot is shadow-held from
+    /// reuse until every transaction that predates the free has retired, then lifts the hold for every
+    /// slot the oldest open transaction's ticket has passed. `reuse_barrier` is `Some(next_ticket + 1)`
+    /// **only when an off-thread reader is in flight** — `next_ticket` equals the newest open
+    /// transaction's own ticket (`open_tx` issues it post-increment), so `+ 1` makes the barrier
+    /// strictly exceed every open ticket, and [`release_held`](graphus_storage::RecordStore::release_held)
+    /// (which releases a slot once `oldest_open_ticket >= barrier`) then keeps a slot held while the
+    /// newest reader is still the oldest open. `None` when no off-thread reader is in flight (the
+    /// inline/DST path and the no-reader fast path): freed slots are immediately reusable and
+    /// `held_slots` stays empty, preserving DST determinism. `oldest_open_ticket` is the oldest open
+    /// transaction's ticket (`u64::MAX` when none is open). Every production GC reclaim trigger that can
+    /// run concurrently with an off-thread reader (`rmp` #336) MUST use this, never bare
+    /// [`checkpoint`](Self::checkpoint).
+    pub fn checkpoint_reader_safe(
+        &mut self,
+        reuse_barrier: Option<u64>,
+        oldest_open_ticket: u64,
+    ) -> Result<GcPassReport> {
+        self.set_reuse_barrier(reuse_barrier);
+        let outcome = self.checkpoint();
+        // Clear the barrier BEFORE releasing so a subsequent non-GC free is not held, then lift the hold
+        // on every slot whose predating readers have all retired. Both run on every path (Ok or Err).
+        self.set_reuse_barrier(None);
+        self.release_reusable_slots(oldest_open_ticket);
+        outcome
+    }
+
     pub fn checkpoint(&mut self) -> Result<GcPassReport> {
         let report = self.gc()?;
         self.store.borrow_mut().checkpoint()?;

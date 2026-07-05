@@ -356,6 +356,27 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// transaction is this GC pass, and [`commit_prepare`](Self::commit_prepare) clears it. `None`
     /// outside a GC pass. Mirrors [`pending_gc_prune`](Self::pending_gc_prune)'s lifecycle.
     gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
+    /// **`rmp` #588 (sprint-52 B1) — reader-safe physical-slot reuse.** A per-kind, in-memory overlay
+    /// of GC-freed physical ids that [`alloc_id`](Self::alloc_id) must NOT hand back out **yet**,
+    /// mapping `id -> reuse barrier`. A [`gc`](Self::gc)-freed relationship/node/property slot keeps its
+    /// record body (chain pointers) intact — only its `in_use` bit is cleared — so a still-in-flight
+    /// **off-thread reader** (`rmp` #336) that cached `predecessor.next = id` across an unlatched hop
+    /// still threads correctly THROUGH the freed corpse to the live record below it. The hazard is
+    /// **reuse**: if a later create pops `id` and overwrites its body while that reader is mid-walk, the
+    /// reader reads a FOREIGN record and diverts — losing a committed live edge or reporting a foreign
+    /// one (an ACID Isolation violation). So a freed id is *listed* on the durable free list at reclaim
+    /// (recovery has no in-flight readers → it is immediately reusable after a restart) but is **shadow-
+    /// held** here until every reader that predates the free has retired, tracked by comparing the
+    /// barrier (the engine's `next_ticket` at free time — every open transaction then has a strictly
+    /// smaller ticket) against the oldest open transaction's ticket in [`release_held`](Self::release_held).
+    /// Empty on the inline/DST path and whenever no transaction is open (immediate reuse — the pre-#588
+    /// behaviour), so it is allocation-free and deterministic there.
+    held_slots: [HashMap<u64, u64>; STORE_COUNT],
+    /// **`rmp` #588.** The reuse barrier stamped onto every [`free_push`](Self::free_push) while a GC
+    /// pass runs with at least one open transaction. `None` outside a bracketed GC pass (set by the
+    /// engine via [`set_reuse_barrier`](Self::set_reuse_barrier) around [`gc`](Self::gc)), in which case
+    /// a freed id is immediately reusable — the inline/DST path and the no-open-reader fast path.
+    reuse_barrier: Option<u64>,
     /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
     /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
     /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
@@ -483,6 +504,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_prop_corpses: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
+            // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
+            held_slots: std::array::from_fn(|_| HashMap::new()),
+            reuse_barrier: None,
             statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: 0,
@@ -581,6 +605,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_prop_corpses: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
+            // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
+            held_slots: std::array::from_fn(|_| HashMap::new()),
+            reuse_barrier: None,
             statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_len_at_last_checkpoint: shared_len,
@@ -1197,8 +1224,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`PhysicalAllocator::alloc_fresh`]) or if mapping the fresh id's page fails (e.g. ENOSPC).
     fn alloc_id(&mut self, kind: StoreKind, txn: TxnId) -> Result<u64> {
         // A freed id is reused first: its store page already exists (the record once lived there), so
-        // no growth — and no fallibility — is needed.
-        if let Some(id) = self.store_mut(kind).free.pop() {
+        // no growth — and no fallibility — is needed. `rmp` #588: SKIP any freed id still shadow-held
+        // for an in-flight off-thread reader (see [`held_slots`](Self#structfield.held_slots)) — reusing
+        // its slot would let that reader read a foreign record mid chain-walk (an ACID Isolation
+        // violation). Held ids are stashed and re-listed so they stay free for later reuse once released;
+        // if only held ids remain we grow a fresh id rather than reuse one. On the common path
+        // (`held_slots` empty) `contains_key` is a cheap miss and this is the pre-#588 single pop.
+        let reused = if self.held_slots[kind as usize].is_empty() {
+            self.store_mut(kind).free.pop()
+        } else {
+            let mut stash: Vec<u64> = Vec::new();
+            let picked = loop {
+                match self.store_mut(kind).free.pop() {
+                    Some(id) if self.held_slots[kind as usize].contains_key(&id) => stash.push(id),
+                    other => break other,
+                }
+            };
+            for id in stash {
+                self.store_mut(kind).free.push(id);
+            }
+            picked
+        };
+        if let Some(id) = reused {
             // Record the pop so a live rollback can return this reused id to the free list if the
             // transaction aborts without the slot becoming a live-referenced corpse (`rmp` #581).
             // Mirrors the `SYSTEM_TXN` guard of `note_created`/`free_push`: the system transaction
@@ -1921,6 +1968,47 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .freed_ids
                 .push((kind, id));
         }
+        // `rmp` #588: while a GC pass runs with open transactions, shadow-hold the freed id so
+        // [`alloc_id`](Self::alloc_id) does not reuse its slot until every reader that predates the free
+        // has retired (see [`held_slots`](Self#structfield.held_slots)). Overwriting an existing entry is
+        // correct — the id is on the free list only because THIS push listed it, so its recorded barrier
+        // is always the current (newest) one. Outside a bracketed GC pass (`reuse_barrier == None`) — the
+        // inline/DST path and every non-GC free (e.g. a rollback of a just-popped id) — the slot is
+        // immediately reusable, exactly as before #588.
+        if let Some(barrier) = self.reuse_barrier {
+            self.held_slots[kind as usize].insert(id, barrier);
+        }
+    }
+
+    /// **`rmp` #588.** Sets (or clears) the reuse barrier stamped onto GC-pass frees. The engine brackets
+    /// each maintenance [`gc`](Self::gc) pass with `Some(next_ticket)` … `None` so only that pass's freed
+    /// slots are shadow-held (see [`held_slots`](Self#structfield.held_slots)); every open transaction at
+    /// that instant has a strictly smaller ticket, so [`release_held`](Self::release_held) can later tell
+    /// when they have all retired.
+    pub fn set_reuse_barrier(&mut self, barrier: Option<u64>) {
+        self.reuse_barrier = barrier;
+    }
+
+    /// **`rmp` #588.** Releases every shadow-held slot whose reuse barrier is now safe: a slot held at
+    /// barrier `b` becomes reusable once no transaction older than `b` is still open, i.e. once the
+    /// **oldest open transaction's ticket** `oldest_open_ticket` has reached `b` (`b <= oldest_open_ticket`).
+    /// `u64::MAX` (no open transaction) releases everything. The released ids are already on the durable
+    /// free list — this only lifts the in-memory reuse hold — so [`alloc_id`](Self::alloc_id) may hand
+    /// them out again. Called by the engine after each maintenance pass and as readers retire.
+    pub fn release_held(&mut self, oldest_open_ticket: u64) {
+        for k in 0..STORE_COUNT {
+            if !self.held_slots[k].is_empty() {
+                self.held_slots[k].retain(|_id, &mut barrier| barrier > oldest_open_ticket);
+            }
+        }
+    }
+
+    /// **`rmp` #588** (observability / tests): the total number of physical slots currently shadow-held
+    /// from reuse across all stores. `0` on the inline/DST path and whenever no off-thread reader is
+    /// holding a freed slot.
+    #[must_use]
+    pub fn held_slots_len(&self) -> usize {
+        self.held_slots.iter().map(HashMap::len).sum()
     }
 
     /// Records that property `pid` was prepended onto `(owner_kind, owner_id)` — but only if `pid` was
