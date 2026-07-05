@@ -38,7 +38,7 @@
 //!    measurement); run with `--ignored --nocapture`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use graphus_core::capability::Clock;
@@ -528,4 +528,145 @@ fn measure_inline_routing_write_stall() {
     graphus_cypher::morsel::set_morsel_threads(1);
     shutdown(eng, handle);
     println!();
+}
+
+/// Like [`engine_seeded`] but with an explicit (typically SMALL relative to the working set) buffer-pool
+/// page budget, so reads plus the writer's page growth force `ConcurrentBufferPool` eviction/victim sweeps —
+/// the read+write contention regime `rmp` #575's wider off-thread fan-out first creates.
+fn engine_seeded_pooled(
+    reader_threads: usize,
+    pool: usize,
+    pool_pages: usize,
+    cfg: SeedCfg,
+) -> Engine {
+    graphus_cypher::morsel::set_morsel_threads(pool);
+    graphus_cypher::morsel::set_analytics_pool_threads(pool);
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SharedClock::new(0));
+    let metrics = Arc::new(graphus_server::metrics::Metrics::new());
+    spawn_engine::<MemBlockDevice, MemLogSink, _>(
+        std::sync::Arc::from("test"),
+        move || {
+            let device = MemBlockDevice::new(0);
+            let wal = WalManager::create(MemLogSink::new())?;
+            let mut store = RecordStore::create(device, wal, pool_pages, 1)?;
+            seed_reco(&mut store, cfg);
+            Ok(graphus_cypher::TxnCoordinator::new(store))
+        },
+        4096,
+        256,
+        reader_threads,
+        metrics,
+        clock,
+    )
+    .expect("spawn threaded engine (explicit pool)")
+}
+
+/// `rmp` #583 (F1/F1b) + #584 — the first test to drive N concurrent OFF-THREAD fanned-out morsel readers
+/// TOGETHER WITH a sustained concurrent writer, under a buffer pool smaller than the (growing) working set.
+/// It exercises, together, three paths neither prior test covered at once:
+///   * the `ConcurrentBufferPool` eviction / victim-sweep path under real read+write contention (`rmp` #359
+///     — a contended sweep must fail CLOSED, never return a wrong/torn result);
+///   * the group-commit drain with reads/opens interleaving the write batch (`rmp` #583 F1 — the drain must
+///     stay bounded rather than starve the engine's top-of-loop maintenance); and
+///   * off-thread reader-retirement release BETWEEN hardened batches during a sustained write storm
+///     (`rmp` #583 F1b — a finished reader must not keep pinning the GC watermark for the whole storm).
+///
+/// Correctness oracle: the concurrent writer only creates DISJOINT `:Filler` nodes — it never touches the
+/// `:User` FRIEND/PURCHASED graph the readers query — so every reader's `r3_fof3` over the ORIGINAL anchors
+/// is invariant and MUST stay byte-identical to the serial reference computed over the seeded graph, with
+/// zero read errors, while thousands of writes commit concurrently.
+#[test]
+fn concurrent_off_thread_readers_and_writer_under_bufpool_pressure() {
+    let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let cfg = SeedCfg {
+        users: 2_000,
+        products: 200,
+        friend_deg: 10,
+        purchase_deg: 6,
+    };
+    let pool = 8;
+    // Comfortably above the peak concurrent pin count (so sweeps always find a victim → no spurious
+    // fail-closed), but far below what the writer grows the store to — so eviction genuinely happens under
+    // concurrent reads.
+    let pool_pages = 4096;
+    let eng = engine_seeded_pooled(pool, pool, pool_pages, cfg);
+    let handle = eng.handle.clone();
+
+    // Serial reference results (inline explicit reads — never dispatched off-thread) for a spread of anchors.
+    graphus_cypher::morsel::set_morsel_threads(pool);
+    let anchors: Arc<Vec<i64>> = Arc::new(vec![0, 1, 7, 13, 101, 499]);
+    let refs: Arc<Vec<Vec<Vec<graphus_cypher::MaterializedValue>>>> = Arc::new(
+        anchors
+            .iter()
+            .map(|&a| run_explicit(&handle, R3_FOF3, a))
+            .collect(),
+    );
+    assert!(
+        refs.iter().all(|r| !r.is_empty()),
+        "every reference result must be non-empty (else the equivalence is vacuous)"
+    );
+
+    // A sustained concurrent writer: auto-commit CREATE of DISJOINT `:Filler` nodes — durable write commits
+    // that drive the group-commit pipeline and grow the store past the pool — for the whole read-stress window.
+    let stop = Arc::new(AtomicBool::new(false));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let h = handle.clone();
+        let stop = stop.clone();
+        let committed = committed.clone();
+        std::thread::spawn(move || {
+            let mut k = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                if run_write(&h, &format!("CREATE (:Filler {{id: {k}}})")) {
+                    committed.fetch_add(1, Ordering::Relaxed);
+                }
+                k += 1;
+            }
+        })
+    };
+
+    // K concurrent off-thread readers, each hammering r3_fof3 over the anchors for many iterations. Every
+    // result must be byte-identical to the serial reference and stream no error (run_auto panics on error).
+    let n_readers = pool;
+    let iters = 8usize;
+    let readers: Vec<_> = (0..n_readers)
+        .map(|w| {
+            let h = handle.clone();
+            let anchors = anchors.clone();
+            let refs = refs.clone();
+            std::thread::spawn(move || {
+                for it in 0..iters {
+                    let ai = (w + it) % anchors.len();
+                    let got = run_auto(&h, R3_FOF3, anchors[ai]);
+                    assert_eq!(
+                        got, refs[ai],
+                        "reader {w} iter {it} (anchor {}): an off-thread fanned-out read over the untouched \
+                         :User graph must be byte-identical to the serial reference — the concurrent writes \
+                         are disjoint :Filler nodes, so a mismatch means a torn read / bufpool race / lost SSI marker",
+                        anchors[ai]
+                    );
+                }
+            })
+        })
+        .collect();
+
+    // Join ALL readers (each runs to completion or panics) BEFORE stopping the writer, so no reader thread
+    // is left detached; then propagate the first reader panic, if any.
+    let results: Vec<std::thread::Result<()>> = readers.into_iter().map(|r| r.join()).collect();
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread joins");
+    for r in results {
+        if let Err(e) = r {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    assert!(
+        committed.load(Ordering::Relaxed) > 0,
+        "the concurrent writer must have committed durable writes during the read stress (else the test did \
+         not actually exercise read+write concurrency)"
+    );
+
+    graphus_cypher::morsel::set_morsel_threads(1);
+    shutdown(eng, handle);
 }
