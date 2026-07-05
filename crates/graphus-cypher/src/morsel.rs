@@ -64,10 +64,16 @@
 //! it into [`ReaderPoolWorkerGuard::enter_with_width`], so [`Ctx.morsel_threads`](crate::executor) at
 //! cursor-open on that worker is that width. A **lone** heavy read (reader pool otherwise idle) engages
 //! the **full** analytics pool (all cores — the `rmp` #575 win, previously lost to the `rmp` #377 v1 hard
-//! clamp-to-1); `K` concurrent reads get `<= P/K` each, so their **sum** never exceeds the pool capacity
-//! `P` (the `rmp` #377 no-oversubscription guarantee), collapsing to width `1` (exactly the #377 v1 clamp:
-//! each read serial on its own reader thread) once `K >= P`. The engine-thread heavy-query path (never a
-//! reader-pool worker) always keeps the full morsel fan-out.
+//! clamp-to-1). The `+ 1` counts the arriving read itself, so a read that starts while `K` others are
+//! in flight fans out to `<= P/(K+1)`, and no single read ever oversubscribes the pool on its own. The
+//! **hard** no-oversubscription guarantee, though, comes from the substrate, not the arithmetic: the
+//! analytics pool is a **fixed `P`-thread** `rayon` pool (`rmp` #377), so the total number of *runnable*
+//! morsel threads is capped at `P` for any mix of widths — reads arriving sequentially see decreasing
+//! `readers_inflight` and so take widths `P, P/2, P/3, …` whose instantaneous sum can exceed `P`, but that
+//! only enqueues extra rayon tasks behind the `P` threads (finer fan-out granularity / scheduling
+//! interference), never more concurrent OS threads. Width collapses to `1` once `readers_inflight >= P`
+//! (exactly the #377 v1 clamp: each read serial on its own reader thread). The engine-thread heavy-query
+//! path (never a reader-pool worker) always keeps the full morsel fan-out.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -164,13 +170,16 @@ thread_local! {
     /// **dispatch site** — which knows `readers_inflight` — computes an intended width of
     /// `floor(analytics_pool_threads / (readers_inflight + 1))` (see [`reader_pool_morsel_width`]) and
     /// carries it into this cell via [`ReaderPoolWorkerGuard::enter_with_width`]. A lone read
-    /// (`readers_inflight == 0`) gets the **full** pool → all cores; `K` concurrent reads get `<= P/K`
-    /// each, so their **sum** never exceeds the analytics pool capacity `P` — the no-oversubscription
-    /// guarantee `rmp` #377 preserves, now without starving the lone read. At `K >= P` the width collapses
-    /// to `1`, reproducing `rmp` #377 v1 **exactly** (each read serial on its own reader thread, no
-    /// fan-out overhead). The analytics pool is a **fixed** `P`-thread `rayon` pool, so the *runnable*
-    /// thread count is capped at `P` for **any** width; the width bounds each read's fan-out granularity
-    /// (and hence cross-read scheduling interference), which is what the sum-`<= P` bound is really about.
+    /// (`readers_inflight == 0`) gets the **full** pool → all cores; a read that starts while `K` others
+    /// are already in flight gets `<= P/(K+1)`, so no single read oversubscribes the pool on its own, now
+    /// without starving the lone read. At `readers_inflight >= P` the width collapses to `1`, reproducing
+    /// `rmp` #377 v1 **exactly** (each read serial on its own reader thread, no fan-out overhead). The
+    /// no-oversubscription guarantee is enforced by the **substrate**, not the arithmetic: the analytics
+    /// pool is a **fixed** `P`-thread `rayon` pool, so the *runnable* thread count is capped at `P` for
+    /// **any** mix of widths. (Reads arriving sequentially see decreasing `readers_inflight` and take widths
+    /// `P, P/2, P/3, …` whose instantaneous sum can exceed `P`; that only queues extra rayon tasks behind
+    /// the `P` threads — finer fan-out granularity and cross-read scheduling interference — never more OS
+    /// threads.)
     static READER_POOL_MORSEL_WIDTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -252,16 +261,20 @@ pub fn morsel_threads() -> usize {
 ///
 /// `floor(analytics_pool_threads / (readers_inflight + 1))`, floored at `1`: the `+ 1` counts the read
 /// being dispatched, so a **lone** read (`readers_inflight == 0`) gets the whole analytics pool (all
-/// cores), and `K` concurrent reads get `<= P/K` each — their **sum** is bounded by the pool capacity
-/// `P`, so no set of concurrent reader-pool reads over-fans the shared analytics pool (the `rmp` #377
-/// no-oversubscription guarantee). At `K >= P` the width is `1`, reproducing the `rmp` #377 v1 clamp
-/// exactly (each read serial on its own reader thread). When the morsel tier is globally disabled
-/// (configured count `<= 1` — e.g. a determinism-pinned Raspberry Pi), the width is `1` regardless, so a
-/// reader-pool read stays serial.
+/// cores), and a read starting while `K` others are already in flight gets `<= P/(K+1)` — so no single
+/// read over-fans the shared analytics pool on its own. At `readers_inflight >= P` the width is `1`,
+/// reproducing the `rmp` #377 v1 clamp exactly (each read serial on its own reader thread). When the
+/// morsel tier is globally disabled (configured count `<= 1` — e.g. a determinism-pinned Raspberry Pi),
+/// the width is `1` regardless, so a reader-pool read stays serial.
 ///
-/// Counting **all** inflight reads (not just the morsel-eligible ones) is deliberately conservative: a
-/// heavy read concurrent with several trivial point-lookups gets a smaller width than it strictly needs,
-/// which only ever *under*-fans — it never breaches the sum-`<= P` bound.
+/// The **hard** no-oversubscription guarantee is the substrate's, not this arithmetic's: the analytics
+/// pool is a **fixed** `P`-thread `rayon` pool, so the runnable morsel-thread count is capped at `P` for
+/// any mix of widths. Reads that arrive sequentially each see a smaller `readers_inflight` than the final
+/// concurrency and so take widths `P, P/2, P/3, …` whose *instantaneous* sum can exceed `P` — that merely
+/// enqueues extra rayon tasks behind the `P` threads (finer granularity / scheduling interference), never
+/// more OS threads. Counting **all** inflight reads (not just the morsel-eligible ones) is deliberately
+/// conservative: a heavy read concurrent with several trivial point-lookups gets a smaller width than it
+/// strictly needs, which only ever *under*-fans.
 #[must_use]
 pub fn reader_pool_morsel_width(readers_inflight: u64) -> usize {
     let configured = match MORSEL_THREADS.load(Ordering::Relaxed) {

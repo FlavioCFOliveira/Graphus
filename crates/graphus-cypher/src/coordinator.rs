@@ -2767,6 +2767,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .commit_ft_spatial_marker(txn, commit_ts);
+        // LOAD-BEARING for the pipelined group commit (`rmp` #583, F1b): `record_commit` publishes the
+        // committer's timestamp into the SSI tracker HERE, at PREPARE time — *before* the WAL harden, and
+        // before `pipelined_group_commit` may drain an off-thread reader's retirement between two hardened
+        // batches. That retirement folds the reader's SIREAD markers and runs `detect_pivot_abort`; because
+        // a prepared-but-unhardened writer is already recorded committed (and removed from `active` below),
+        // the reader's rw-edge to it fires the eager committed-pivot break and correctly dooms the read-only
+        // reader on a dangerous structure. If this `record_commit` were ever deferred to harden/complete
+        // time (leaving prepared writers "active" in SSI), that mid-pipeline merge could MISS the structure
+        // — so this ordering must not move.
         self.ssi.borrow_mut().record_commit(txn, commit_ts);
         self.locks.borrow_mut().release_all(txn);
         self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);

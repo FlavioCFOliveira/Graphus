@@ -186,6 +186,22 @@ pub const QUERY_ENGINE_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// (not this cap) ends every batch.
 const MAX_COMMIT_BATCH: usize = 128;
 
+/// The hard cap on how many commands ONE [`drain_commit_batch`] call processes before it returns to the
+/// engine loop, regardless of how many of them join the group-commit batch (`rmp` task #583, F1).
+///
+/// [`MAX_COMMIT_BATCH`] bounds only the **durable-write** commits folded into the batch. But the drain
+/// also processes, *without growing the batch*, two other command kinds and KEEPS DRAINING: auto-commit
+/// **reads** (dispatched off-thread, `rmp` #543) and `Begin`/`BeginAutoCommit` **transaction-opens**
+/// (dispatched inline, `rmp` #570). So a concurrent burst of reads/opens interleaved on the channel could
+/// otherwise stretch a single drain far past `MAX_COMMIT_BATCH` iterations — and while the engine is
+/// inside the drain it never returns to the loop top, starving [`process_retirements`] (which releases
+/// off-thread readers' GC-watermark pins), [`maybe_reap_aged`] and [`resume_parked_statements`]. Capping
+/// the TOTAL commands processed guarantees the drain returns — and that maintenance sweep runs — after at
+/// most `MAX_DRAIN_COMMANDS`, at the cost only of a marginally smaller batch under extreme mixed pressure
+/// (the leftover queued commits simply form the next batch). `2 × MAX_COMMIT_BATCH` leaves ample room for
+/// a full write batch plus its interleaved opens/reads before the bound bites.
+const MAX_DRAIN_COMMANDS: usize = 2 * MAX_COMMIT_BATCH;
+
 /// A dedicated blocking thread that runs the offloaded WAL `fdatasync` of the **pipelined**
 /// group-commit harden (`rmp` #532, commit pipelining / fsync offload).
 ///
@@ -881,6 +897,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 builds_were_pending: &mut builds_were_pending,
                 pending_cmd: &mut pending_cmd,
                 wal_sync: &wal_sync,
+                retire_rx: &retire_rx,
             }) {
                 break 'engine;
             }
@@ -957,6 +974,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             builds_were_pending: &mut builds_were_pending,
             pending_cmd: &mut pending_cmd,
             wal_sync: &wal_sync,
+            retire_rx: &retire_rx,
         }) {
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
@@ -1685,6 +1703,10 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// The dedicated WAL fsync thread the pipelined group-commit harden offloads each batch's
     /// `fdatasync` to (`rmp` #532). Lives for the engine's lifetime.
     wal_sync: &'a WalSyncThread,
+    /// The off-thread reader retirement channel (`rmp` #336). Threaded in so [`pipelined_group_commit`]
+    /// can release readers' GC-watermark pins BETWEEN hardened batches under a sustained write storm,
+    /// instead of leaving them pinned until the engine loop's next top-of-tick sweep (`rmp` #583, F1b).
+    retire_rx: &'a std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
 }
 
 /// Processes one received [`EngineCommand`] end-to-end (`rmp` #528): dispatches it, coalesces a
@@ -1729,6 +1751,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         builds_were_pending,
         pending_cmd,
         wal_sync,
+        retire_rx,
     } = ctx;
 
     // Whether a Mode A bulk-import loading session is active **before** this command is dispatched, so
@@ -1794,6 +1817,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             clock,
             statement_timeout,
             loading_session,
+            retire_rx,
         );
         // The redo-bounding checkpoint, once, AFTER every batch is acked (the commits are all durable).
         checkpoint_after_batch(coordinator);
@@ -2835,6 +2859,7 @@ fn pipelined_group_commit<
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
+    retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
 ) {
     // The current PREPAREd batch (batch K). First coalesce further queued commits into it, exactly as
     // the inline path did before hardening — so a burst that is all already-queued still forms ONE
@@ -2915,6 +2940,27 @@ fn pipelined_group_commit<
         } else {
             batch.clear();
         }
+
+        // Release off-thread reader GC-watermark pins BETWEEN hardened batches (`rmp` #583, F1b). Under a
+        // sustained write storm this outer loop hardens batch after batch without returning to the engine
+        // loop, so the loop's top-of-tick [`process_retirements`] would not run and any off-thread reader
+        // (`rmp` #543) that finished mid-pipeline would keep pinning `oldest_active_snapshot` for the whole
+        // storm — letting dead versions accumulate in proportion to its duration. Draining retirements here
+        // finalises each finished reader (M1 merge + auto-commit) so its snapshot stops pinning the GC
+        // watermark within one batch. Safe: this is the SAME single engine thread, and the retirements are
+        // processed in channel arrival order, so [`finish_reader`]'s in-order no-lost-edge SSI guarantee is
+        // unchanged — this is exactly the top-of-loop sweep, run at a finer granularity.
+        process_retirements(
+            retire_rx,
+            coordinator,
+            open,
+            readers_inflight,
+            metrics,
+            db,
+            degraded,
+            active_txns,
+        );
+
         batch = next_batch;
     }
 }
@@ -2993,7 +3039,11 @@ fn drain_commit_batch<
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
 ) {
-    while commit_batch.len() < MAX_COMMIT_BATCH {
+    // `rmp` #583 (F1): bound the drain by TOTAL commands processed as well as by batch size — reads and
+    // transaction-opens are processed here without growing `commit_batch`, so `MAX_COMMIT_BATCH` alone
+    // does not bound the drain length under a concurrent read/open burst (see `MAX_DRAIN_COMMANDS`).
+    let mut processed = 0usize;
+    while commit_batch.len() < MAX_COMMIT_BATCH && processed < MAX_DRAIN_COMMANDS {
         match rx.try_recv() {
             // An explicit COMMIT (`rmp` #528) OR an auto-commit statement (`rmp` #566): dispatch it into
             // the SAME batch. An explicit `Commit` PREPAREs (cheap, never suspends). An auto-commit `Run`
@@ -3006,6 +3056,7 @@ fn drain_commit_batch<
                     auto_commit: true, ..
                 }),
             ) => {
+                processed += 1; // `rmp` #583 (F1): count every processed command toward the drain cap.
                 let mut just_suspended: Option<exec::InFlightInline> = None;
                 let _keep_running = dispatch_command(
                     cmd,
@@ -3061,6 +3112,7 @@ fn drain_commit_batch<
             // timeline) and the ack is only the *client-facing* durability signal, which never alters
             // server-visible state. Any OTHER non-batchable command still stashes + breaks (below).
             Ok(cmd @ (Cmd::Begin { .. } | Cmd::BeginAutoCommit { .. })) => {
+                processed += 1; // `rmp` #583 (F1): a processed inline open counts toward the drain cap too.
                 let mut ignored: Option<exec::InFlightInline> = None;
                 let _keep_running = dispatch_command(
                     cmd,
